@@ -19,12 +19,13 @@ pub struct RetreadConfig {
     ///
     /// Example matching pixi's `[pypi-dependencies]` syntax:
     /// ```toml
-    /// [build.config.wheels]
+    /// [build.config.retread-wheels]
     /// isaacsim = { version = "==5.1.0", index = "https://pypi.nvidia.com", extras = ["all", "extscache"] }
     /// mujoco   = { version = "==3.5.0", index = "https://py.mujoco.org" }
     /// foo      = { url = "https://example.com/foo-1.whl", sha256 = "..." }   # direct URL fallback
     /// ```
-    pub wheels: BTreeMap<String, WheelEntry>,
+    #[serde(rename = "retread-wheels", alias = "wheels")]
+    pub retread_wheels: BTreeMap<String, WheelEntry>,
 
     /// How aggressively to widen dependency pins from the wheel's METADATA.
     ///

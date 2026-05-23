@@ -182,9 +182,98 @@ fn widen_star(v: &Version, negate: bool) -> Option<String> {
     }
 }
 
-/// Default marker env used when evaluating dependency markers. Targets
-/// Python 3.11 on linux-x86_64. TODO: derive from host_platform parameter
-/// in conda/outputs once we wire that through.
+/// Build a marker env from a conda subdir + Python version. This is the
+/// production path called from the JSON-RPC handler. `host_platform` comes
+/// from `CondaOutputsParams::host_platform`; `python_version` from the
+/// pixi workspace's variant configuration (typically `python = "3.11"`).
+///
+/// Falls back to sensible defaults for fields PEP 508 markers rarely touch
+/// (platform_release, platform_version).
+pub fn marker_env_for(
+    conda_subdir: &str,
+    python_version: &str,
+) -> Result<MarkerEnvironment> {
+    let plat = PlatformAttrs::for_subdir(conda_subdir);
+    let normalized = if python_version.contains('.') {
+        python_version.to_string()
+    } else {
+        format!("{python_version}.0")
+    };
+    let full = format!("{normalized}.0");
+    let python_version_ref = normalized.as_str();
+
+    MarkerEnvironment::try_from(MarkerEnvironmentBuilder {
+        implementation_name: "cpython",
+        implementation_version: &full,
+        os_name: plat.os_name,
+        platform_machine: plat.machine,
+        platform_python_implementation: "CPython",
+        platform_release: "",
+        platform_system: plat.system,
+        platform_version: "",
+        python_full_version: &full,
+        python_version: python_version_ref,
+        sys_platform: plat.sys_platform,
+    })
+    .map_err(|e| anyhow!("building marker env: {e}"))
+}
+
+struct PlatformAttrs {
+    os_name: &'static str,
+    sys_platform: &'static str,
+    machine: &'static str,
+    system: &'static str,
+}
+
+impl PlatformAttrs {
+    fn for_subdir(subdir: &str) -> Self {
+        match subdir {
+            "linux-64" => Self {
+                os_name: "posix",
+                sys_platform: "linux",
+                machine: "x86_64",
+                system: "Linux",
+            },
+            "linux-aarch64" => Self {
+                os_name: "posix",
+                sys_platform: "linux",
+                machine: "aarch64",
+                system: "Linux",
+            },
+            "osx-64" => Self {
+                os_name: "posix",
+                sys_platform: "darwin",
+                machine: "x86_64",
+                system: "Darwin",
+            },
+            "osx-arm64" => Self {
+                os_name: "posix",
+                sys_platform: "darwin",
+                machine: "arm64",
+                system: "Darwin",
+            },
+            "win-64" => Self {
+                os_name: "nt",
+                sys_platform: "win32",
+                machine: "AMD64",
+                system: "Windows",
+            },
+            // noarch and unknowns fall back to linux-x86_64; markers that
+            // would care (sys_platform-specific deps) are rare in pure-python
+            // wheels.
+            _ => Self {
+                os_name: "posix",
+                sys_platform: "linux",
+                machine: "x86_64",
+                system: "Linux",
+            },
+        }
+    }
+}
+
+/// Convenience wrapper that targets linux-x86_64 + the given Python version.
+/// Used by code paths that don't have access to the conda subdir (tests,
+/// recipe generator's fallback).
 pub fn default_marker_env(python_version: &str) -> Result<MarkerEnvironment> {
     // Accept "3" (any minor) or "3.11". The PEP 508 `python_version` marker
     // must be MAJOR.MINOR; pad accordingly. `python_full_version` adds .0.

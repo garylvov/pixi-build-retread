@@ -82,7 +82,7 @@ async fn fetch_isaacsim_kernel_end_to_end() {
     assert!(!meta.is_pure_python, "isaacsim-kernel is platform-specific");
 
     let config = RetreadConfig {
-        wheels: BTreeMap::new(),
+        retread_wheels: BTreeMap::new(),
         relax: RelaxPolicy::Minor,
         overrides: BTreeMap::new(),
         name_map: BTreeMap::new(),

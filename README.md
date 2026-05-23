@@ -141,6 +141,30 @@ on demand.
   the wheel is platform-specific and ships shared libs. For now the
   `--no-deps` pip install handles it.
 
+## Development
+
+Hook setup once you've cloned:
+
+```bash
+pre-commit install
+```
+
+The pre-commit config runs `cargo fmt --check`, `cargo clippy -D warnings`,
+and the default `cargo test` suite on every commit. Heavy network tests
+(`tests/pypi_resolve_live.rs`'s `#[ignore]`d variants, `tests/e2e_ros_isaacsim.rs`)
+are *not* run by the hook — they belong in CI.
+
+To run them locally:
+
+```bash
+cargo test -- --include-ignored        # live PyPI + isaacsim wheel fetch
+cargo test --test e2e_ros_isaacsim -- --include-ignored --nocapture
+```
+
+The e2e test needs `pixi` and `rattler-build` on PATH. Easiest way is
+`pixi shell` in the project root, or use the dev env from
+`/home/garylvov/projects/pixi`.
+
 ## Status
 
 Pre-alpha. Tested only against pixi 0.62.x at the pinned `pixi_build_types`

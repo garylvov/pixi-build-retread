@@ -1,6 +1,6 @@
 //! JSON-RPC method handlers. The four entry points pixi calls.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -15,16 +15,16 @@ use pixi_build_types::procedures::{
     initialize::{InitializeParams, InitializeResult},
     negotiate_capabilities::{NegotiateCapabilitiesParams, NegotiateCapabilitiesResult},
 };
-use pixi_build_types::{BackendCapabilities, BinaryPackageSpec, NamedSpec, PackageSpec};
+use pixi_build_types::{BackendCapabilities, BinaryPackageSpec, NamedSpec, PackageSpec, VariantValue};
 use rattler_conda_types::{NoArchType, PackageName, Platform, VersionSpec, VersionWithSource};
 use serde_json::Value;
 use tokio::sync::RwLock;
 use uv_pep508::uv_pep440::Operator;
 
-use crate::config::{RetreadConfig, WheelEntry};
+use crate::config::RetreadConfig;
 use crate::pypi::{self, WheelTarget};
 use crate::recipe::{build_recipe, to_yaml};
-use crate::relax::{default_marker_env, python_version_from_wheel_tag};
+use crate::relax::{default_marker_env, marker_env_for, python_version_from_wheel_tag};
 use crate::rpc::{ok, parse_params, RpcError};
 use crate::wheel::{fetch_wheel, read_metadata, WheelMetadata};
 
@@ -101,7 +101,7 @@ impl Handler {
             }
         };
 
-        if config.wheels.is_empty() {
+        if config.retread_wheels.is_empty() {
             return Err(RpcError::invalid_params(
                 "[build.config].wheels must list at least one wheel",
             ));
@@ -109,7 +109,7 @@ impl Handler {
 
         // Eagerly validate each entry now so misconfigurations surface at
         // initialize time rather than mid-build.
-        for (name, entry) in &config.wheels {
+        for (name, entry) in &config.retread_wheels {
             entry
                 .validate(name)
                 .map_err(|e| RpcError::invalid_params(e.to_string()))?;
@@ -126,7 +126,8 @@ impl Handler {
         params: CondaOutputsParams,
     ) -> Result<CondaOutputsResult, RpcError> {
         let (config, download_dir) = self.snapshot(&params.work_directory).await?;
-        let target = wheel_target_for(params.host_platform);
+        let python_version = python_from_variants(params.variant_configuration.as_ref());
+        let target = wheel_target_for(params.host_platform, &python_version);
 
         let resolved = resolve_all(&config, &target, &download_dir)
             .await
@@ -135,9 +136,9 @@ impl Handler {
         let mut outputs = Vec::with_capacity(resolved.len());
         for r in &resolved {
             outputs.push(
-                produce_output(r, &config, params.host_platform).map_err(|e| {
-                    RpcError::internal(format!("output for {}: {e:#}", r.conda_name))
-                })?,
+                produce_output(r, &config, params.host_platform, &python_version).map_err(
+                    |e| RpcError::internal(format!("output for {}: {e:#}", r.conda_name)),
+                )?,
             );
         }
         Ok(CondaOutputsResult {
@@ -151,7 +152,16 @@ impl Handler {
         params: CondaBuildV1Params,
     ) -> Result<CondaBuildV1Result, RpcError> {
         let (config, download_dir) = self.snapshot(&params.work_directory).await?;
-        let target = wheel_target_for(params.output.subdir);
+        // conda/build_v1 doesn't carry the variant set; the chosen variant
+        // is encoded in params.output.variant. Look up `python` there;
+        // fall back to the default if absent.
+        let python_version = params
+            .output
+            .variant
+            .get("python")
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| DEFAULT_PYTHON.to_string());
+        let target = wheel_target_for(params.output.subdir, &python_version);
 
         // We re-resolve the full set (the lookup is cheap once cached) and
         // pick the entry matching the requested output.
@@ -202,18 +212,32 @@ impl Handler {
     }
 }
 
-fn wheel_target_for(subdir: Platform) -> WheelTarget {
-    // Python version isn't currently passed through variant configuration --
-    // default to 3.11 and let the user override per-spec by picking a wheel
-    // for a different cpXY tag (URL form) once we wire variant support.
+fn python_from_variants(
+    variants: Option<&std::collections::BTreeMap<String, Vec<VariantValue>>>,
+) -> String {
+    variants
+        .and_then(|v| v.get("python"))
+        .and_then(|values| values.first())
+        .map(|val| val.to_string())
+        .unwrap_or_else(|| DEFAULT_PYTHON.to_string())
+}
+
+fn wheel_target_for(subdir: Platform, python_version: &str) -> WheelTarget {
+    // The python_version comes from variant configuration (or the chosen
+    // output's variant in conda/build_v1). It drives wheel selection on
+    // the PyPI index (cp tag matching) and the marker env in relax.rs.
     WheelTarget {
-        python_version: DEFAULT_PYTHON.to_string(),
+        python_version: python_version.to_string(),
         conda_subdir: subdir.to_string(),
     }
 }
 
 /// Resolve every user-supplied entry into a flat list of concrete wheels,
-/// expanding `extras` one level deep. Cycle-detects by conda package name.
+/// recursively expanding `extras` — every newly-discovered wheel has its
+/// own extras (if any were requested by the parent's Requires-Dist line)
+/// followed, until no new wheels are discovered. Cycle-detected by
+/// conda-normalized name so that diamond dependencies (A and B both
+/// require C) and self-cycles are handled.
 async fn resolve_all(
     config: &RetreadConfig,
     target: &WheelTarget,
@@ -221,51 +245,85 @@ async fn resolve_all(
 ) -> Result<Vec<Resolved>> {
     let mut out = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
+    let mut work: VecDeque<Pending> = VecDeque::new();
 
-    for (entry_name, entry) in &config.wheels {
-        let (url, sha256_hint) = match entry_url(entry, entry_name, target).await? {
-            EntryResolution::Url { url, sha256 } => (url, sha256),
-        };
-        let metadata = fetch_and_parse(&url, sha256_hint.as_deref(), download_dir).await?;
-
-        let conda_name = entry_name.to_ascii_lowercase().replace('_', "-");
-        if seen.insert(conda_name.clone()) {
+    // Seed worklist from user-supplied entries.
+    for (entry_name, entry) in &config.retread_wheels {
+        let map_key_name = conda_name_from(entry_name);
+        if let Some(url) = &entry.url {
+            // URL form: resolve inline (no index lookup needed).
+            if !seen.insert(map_key_name.clone()) {
+                continue;
+            }
+            let metadata = fetch_and_parse(url, entry.sha256.as_deref(), download_dir).await?;
             out.push(Resolved {
-                conda_name: conda_name.clone(),
+                conda_name: map_key_name,
                 url: url.clone(),
-                metadata: metadata.clone(),
+                metadata,
+            });
+        } else {
+            // Spec form: dispatch through the worklist.
+            let version = entry
+                .normalized_version()
+                .ok_or_else(|| anyhow!("wheel `{entry_name}` has neither url nor version"))?;
+            work.push_back(Pending {
+                pypi_name: entry_name.clone(),
+                version,
+                index: entry.index_url(),
+                extras: entry.extras.clone(),
+                override_conda_name: Some(map_key_name),
             });
         }
+    }
 
-        // Expand requested extras (one level deep).
-        if !entry.extras.is_empty() {
-            let index = entry.index_url();
-            for extra in &entry.extras {
-                for raw in &metadata.requires_dist {
-                    let Some((dep_name, dep_version)) = pep508_extra_dep(raw, extra)? else {
-                        continue;
-                    };
-                    let dep_conda_name = dep_name.to_ascii_lowercase().replace('_', "-");
-                    if !seen.insert(dep_conda_name.clone()) {
-                        continue;
-                    }
-                    let resolved = pypi::resolve(&index, &dep_name, &dep_version, target)
-                        .await
-                        .with_context(|| {
-                            format!("resolving extra {extra}::{dep_name}=={dep_version}")
-                        })?;
-                    let dep_meta = fetch_and_parse(
-                        &resolved.url,
-                        resolved.sha256.as_deref(),
-                        download_dir,
-                    )
-                    .await?;
-                    out.push(Resolved {
-                        conda_name: dep_conda_name,
-                        url: resolved.url,
-                        metadata: dep_meta,
-                    });
+    while let Some(pending) = work.pop_front() {
+        let conda_name = pending
+            .override_conda_name
+            .clone()
+            .unwrap_or_else(|| conda_name_from(&pending.pypi_name));
+        if !seen.insert(conda_name.clone()) {
+            continue;
+        }
+
+        let resolved = pypi::resolve(&pending.index, &pending.pypi_name, &pending.version, target)
+            .await
+            .with_context(|| {
+                format!(
+                    "resolving {}=={} on index {}",
+                    pending.pypi_name, pending.version, pending.index,
+                )
+            })?;
+        let metadata =
+            fetch_and_parse(&resolved.url, resolved.sha256.as_deref(), download_dir).await?;
+        out.push(Resolved {
+            conda_name: conda_name.clone(),
+            url: resolved.url,
+            metadata: metadata.clone(),
+        });
+
+        // Each requested extra contributes more entries to the worklist.
+        // Sub-packages' own extras (encoded as `pkg[foo,bar]==1.0` in the
+        // parent's Requires-Dist line) are also followed.
+        for extra in &pending.extras {
+            for raw in &metadata.requires_dist {
+                let Some(dep) = pep508_extra_dep(raw, extra)? else {
+                    continue;
+                };
+                let dep_conda_name = conda_name_from(&dep.name);
+                if seen.contains(&dep_conda_name) {
+                    continue;
                 }
+                work.push_back(Pending {
+                    pypi_name: dep.name,
+                    version: dep.version,
+                    // Extras-derived deps inherit the parent's index. This
+                    // matches how `isaacsim[all]` works: the `==X` pin in
+                    // `Requires-Dist: isaacsim-core==5.1.0.0 ; extra == "all"`
+                    // resolves on the same NVIDIA index.
+                    index: pending.index.clone(),
+                    extras: dep.extras,
+                    override_conda_name: None,
+                });
             }
         }
     }
@@ -273,32 +331,23 @@ async fn resolve_all(
     Ok(out)
 }
 
-enum EntryResolution {
-    Url {
-        url: url::Url,
-        sha256: Option<String>,
-    },
+/// One unit of pending work in the resolver BFS.
+#[derive(Debug, Clone)]
+struct Pending {
+    pypi_name: String,
+    version: String,
+    index: String,
+    /// Extras to activate on this wheel. Drives further worklist additions
+    /// for `Requires-Dist: name ; extra == "X"` lines.
+    extras: Vec<String>,
+    /// If `Some`, use this as the conda package name instead of deriving
+    /// from `pypi_name`. Set for user-supplied entries so the map key wins
+    /// over the wheel's METADATA Name.
+    override_conda_name: Option<String>,
 }
 
-async fn entry_url(
-    entry: &WheelEntry,
-    entry_name: &str,
-    target: &WheelTarget,
-) -> Result<EntryResolution> {
-    if let Some(url) = &entry.url {
-        return Ok(EntryResolution::Url {
-            url: url.clone(),
-            sha256: entry.sha256.clone(),
-        });
-    }
-    let version = entry
-        .normalized_version()
-        .ok_or_else(|| anyhow!("wheel `{entry_name}` has neither url nor version"))?;
-    let resolved = pypi::resolve(&entry.index_url(), entry_name, &version, target).await?;
-    Ok(EntryResolution::Url {
-        url: resolved.url,
-        sha256: resolved.sha256,
-    })
+fn conda_name_from(pypi_name: &str) -> String {
+    pypi_name.to_ascii_lowercase().replace('_', "-")
 }
 
 async fn fetch_and_parse(
@@ -312,11 +361,20 @@ async fn fetch_and_parse(
         .context("metadata reader panicked")?
 }
 
-/// Returns Some((name, version)) if `raw` is a `Requires-Dist` matching the
-/// active extra and is an exact `==` pin. Returns None if the requirement is
-/// gated on a different extra, has no matching marker, or isn't an exact pin
-/// we can resolve.
-fn pep508_extra_dep(raw: &str, extra: &str) -> Result<Option<(String, String)>> {
+/// One extras-derived dependency: PyPI name + exact version + any extras
+/// the requirement itself declares (`pkg[foo,bar]==1.0` form).
+#[derive(Debug, Clone)]
+struct ExtraDep {
+    name: String,
+    version: String,
+    extras: Vec<String>,
+}
+
+/// Returns `Some(ExtraDep)` if `raw` is a `Requires-Dist` line that is
+/// gated on the requested extra, and is an exact `==` pin. Returns None if
+/// the requirement is gated on a different extra (or has no marker, i.e.
+/// is a base dep we don't repack at all).
+fn pep508_extra_dep(raw: &str, extra: &str) -> Result<Option<ExtraDep>> {
     use std::str::FromStr;
     let req: uv_pep508::Requirement = uv_pep508::Requirement::from_str(raw)
         .map_err(|e| anyhow!("parsing extra requirement `{raw}`: {e}"))?;
@@ -344,16 +402,28 @@ fn pep508_extra_dep(raw: &str, extra: &str) -> Result<Option<(String, String)>> 
              Range resolution is on the TODO list."
         );
     }
-    Ok(Some((req.name.to_string(), specs[0].version().to_string())))
+    Ok(Some(ExtraDep {
+        name: req.name.to_string(),
+        version: specs[0].version().to_string(),
+        extras: req.extras.iter().map(|e| e.to_string()).collect(),
+    }))
 }
 
 fn produce_output(
     r: &Resolved,
     config: &RetreadConfig,
     host_platform: Platform,
+    workspace_python_version: &str,
 ) -> Result<CondaOutput> {
-    let python_version =
-        python_version_from_wheel_tag(&r.metadata.filename).unwrap_or_else(|| "3".into());
+    // Prefer the workspace's requested Python version; only fall back to
+    // parsing the wheel filename if the variant doesn't say anything (e.g.
+    // for a noarch / pure-python wheel where the cp tag is `py3`).
+    let python_version = if r.metadata.is_pure_python {
+        workspace_python_version.to_string()
+    } else {
+        python_version_from_wheel_tag(&r.metadata.filename)
+            .unwrap_or_else(|| workspace_python_version.to_string())
+    };
     let subdir = if r.metadata.is_pure_python {
         Platform::NoArch
     } else {
@@ -367,7 +437,7 @@ fn produce_output(
     };
 
     let mut depends = vec![spec_from_str(&python_dep)?];
-    let env = default_marker_env(&python_version)?;
+    let env = marker_env_for(&host_platform.to_string(), &python_version)?;
     for raw in &r.metadata.requires_dist {
         if let Some(dep) = crate::relax::translate(
             raw,

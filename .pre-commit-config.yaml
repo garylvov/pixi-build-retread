@@ -1,0 +1,50 @@
+# Pre-commit hooks for pixi-build-retread.
+#
+# Install once: `pre-commit install`
+# Run manually: `pre-commit run --all-files`
+#
+# Heavy tests (live network, e2e) are NOT run here -- they would slow every
+# commit to minutes. CI is the right place for those; the hooks below only
+# enforce things that must hold for any committed code to compile.
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: mixed-line-ending
+        args: [--fix=lf]
+
+  # Cargo hooks run inside the local repo (system: local), not pulled from a
+  # remote pre-commit repo, because we want to use whatever rust toolchain the
+  # contributor already has rather than version-pinning one here.
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt --check
+        entry: cargo fmt --all -- --check
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: cargo clippy --all-targets -- -D warnings
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-test
+        # Runs the fast suite only. The wheel_fetch_live test makes one tiny
+        # HTTP call (tomli ~12KB); the heavy ignored tests (isaacsim live,
+        # py.mujoco.org, e2e) are NOT run -- those belong in CI behind a
+        # separate workflow.
+        name: cargo test (fast)
+        entry: cargo test --all-targets
+        language: system
+        types: [rust]
+        pass_filenames: false
