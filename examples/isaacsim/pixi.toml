@@ -1,15 +1,12 @@
-# Example: repack the isaacsim 5.1.0 wheel as a conda package with minor-level
-# relaxed pins so it slots into a workspace that already pulls in ROS, conda
-# numpy, etc.
+# Example: repack the isaacsim 5.1.0 metapackage with extras into a single
+# conda source package, using retread's PyPI-style spec form. Compare to the
+# 22-line hand-curated wheel URL list in pixi#5230 comment 24 -- one entry
+# here expands the same set via the wheel's METADATA.
 #
 # To smoke-test locally:
 #   cd examples/isaacsim
 #   pixi install
 #   pixi run python -c "import isaacsim; print(isaacsim.__version__)"
-#
-# When developing the backend itself, point the [build] backend at the
-# path-built binary instead of resolving from a channel:
-#   backend = { path = "../../target/release/pixi-build-retread" }
 
 [workspace]
 name = "isaacsim-repack-demo"
@@ -24,7 +21,7 @@ version = "5.1.0"
 [build]
 backend = { name = "pixi-build-retread", version = "*" }
 channels = [
-  "https://prefix.dev/pixi-build-backends",
+  "https://prefix.dev/garylvov",
   "https://prefix.dev/conda-forge",
 ]
 
@@ -32,22 +29,17 @@ channels = [
 relax = "minor"
 build-number = 0
 
-[[build.config.wheels]]
-url = "https://pypi.nvidia.com/isaacsim/isaacsim-5.1.0-cp311-none-manylinux_2_35_x86_64.whl"
-sha256 = "ad2c027831ed5d4a62552735bb799dea4e4604530d2ab9b526ddb6cd19a98c11"
+# Same syntax pixi uses for [pypi-dependencies]. retread resolves this
+# against the PEP 503 simple index, then follows `extras` one level deep
+# to pick up every `Requires-Dist: name ; extra == "X"` line in the
+# wheel's METADATA.
+[build.config.wheels]
+isaacsim = { version = "==5.1.0", index = "https://pypi.nvidia.com", extras = ["all", "extscache"] }
 
 [build.config.overrides]
-# isaacsim's metadata pins numpy and torch hard; relax to ranges that match
-# what the rest of the workspace can satisfy.
-numpy = "==1.26.4"
-torch = ">=2.7"
-pillow = "==12.0.0"
+# Keep numpy strictly <2 -- ros2-jazzy bindings still need it.
+numpy = ">=1.26,<2"
 
 [build.config.name-map]
-# Conda calls headless OpenCV `py-opencv`.
+# PyPI ships headless OpenCV as opencv-python-headless; conda calls it py-opencv.
 opencv-python-headless = "py-opencv"
-
-# Consumer side: depend on the source package we just built.
-[dependencies]
-isaacsim = { path = "." }
-python = "3.11.*"

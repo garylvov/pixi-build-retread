@@ -1,6 +1,6 @@
 [package]
 name = "pixi-build-retread"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Pixi build backend that repacks PyPI wheels as conda packages with relaxed dependency pins"
 license = "BSD-3-Clause"
@@ -34,6 +34,7 @@ zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
 sha2 = "0.10"
 # uv's PEP 508 parser is the gold standard for Requires-Dist values.
 uv-pep508 = { git = "https://github.com/astral-sh/uv", tag = "0.9.5" }
+uv-normalize = { git = "https://github.com/astral-sh/uv", tag = "0.9.5" }
 
 # Recipe generation. rattler-build is invoked as a subprocess (matches what
 # pixi-build-rattler-build does); the conda recipe for this backend declares
@@ -48,6 +49,7 @@ anyhow = "1.0.97"
 thiserror = "1"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+regex = "1"
 
 [profile.release]
 lto = "thin"

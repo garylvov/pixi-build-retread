@@ -126,7 +126,7 @@ mod tests {
 
     fn cfg() -> RetreadConfig {
         RetreadConfig {
-            wheels: vec![],
+            wheels: BTreeMap::new(),
             relax: RelaxPolicy::Minor,
             overrides: BTreeMap::new(),
             name_map: BTreeMap::new(),

@@ -51,7 +51,7 @@ fn baseline_config() -> RetreadConfig {
     // block in /home/garylvov/projects/gigastrap/pixi.toml — that's what
     // should NOT be needed once retread is in the loop.
     RetreadConfig {
-        wheels: vec![],
+        wheels: BTreeMap::new(),
         relax: RelaxPolicy::Minor,
         overrides: BTreeMap::new(),
         name_map: BTreeMap::new(),

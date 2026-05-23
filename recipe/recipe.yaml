@@ -2,7 +2,7 @@ schema_version: 1
 
 context:
   name: pixi-build-retread
-  version: "0.1.0"
+  version: "0.2.0"
 
 package:
   name: ${{ name }}
@@ -14,12 +14,13 @@ source:
 build:
   number: 0
   script:
-    # cargo is bundled with the rust compiler package. The pinned git deps
-    # (pixi_build_types, uv-pep508) are fetched at build time; rattler-build
-    # leaves networking enabled by default so this works inside the sandbox.
-    - cargo build --release --locked --bin pixi-build-retread
-    - mkdir -p $PREFIX/bin
-    - cp target/release/pixi-build-retread $PREFIX/bin/pixi-build-retread
+    # cargo is bundled with the rust compiler package. The conda rust
+    # toolchain builds with an explicit target triple, so we use
+    # `cargo install` rather than `cargo build` to avoid hardcoding the
+    # triple in a `cp` path. Git deps (pixi_build_types, uv-pep508,
+    # uv-normalize) are fetched at build time; rattler-build leaves
+    # networking enabled by default so this works inside the sandbox.
+    - cargo install --locked --no-track --bin pixi-build-retread --path . --root $PREFIX
 
 requirements:
   build:
@@ -32,6 +33,7 @@ requirements:
     - pixi-build-api-version >=4,<5
 
 about:
+  repository: https://github.com/garylvov/pixi-build-retread
   homepage: https://github.com/garylvov/pixi-build-retread
   summary: |
     A pixi build backend that repacks PyPI wheels as conda packages with

@@ -37,9 +37,14 @@ channels = ["https://prefix.dev/conda-forge"]  # plus wherever retread is hosted
 [build.config]
 relax = "minor"          # patch | minor | major | none
 build-number = 0
-[[build.config.wheels]]
-url = "https://pypi.nvidia.com/isaacsim/isaacsim-5.1.0-cp311-none-manylinux_2_35_x86_64.whl"
-sha256 = "ad2c027831ed5d4a62552735bb799dea4e4604530d2ab9b526ddb6cd19a98c11"
+
+# Same syntax as pixi's `[pypi-dependencies]`. Use `version` + optional
+# `index` and `extras` to resolve from a PEP 503 simple index (PyPI public
+# by default), or `url` + `sha256` for an explicit wheel.
+[build.config.wheels]
+isaacsim = { version = "==5.1.0", index = "https://pypi.nvidia.com", extras = ["all", "extscache"] }
+mujoco   = { version = "==3.5.0", index = "https://py.mujoco.org" }
+# foo    = { url = "https://example.com/foo-1.whl", sha256 = "..." }   # explicit URL fallback
 
 [build.config.overrides]
 # Per-PyPI-name overrides applied after the relax policy. Use to escape-hatch
@@ -142,3 +147,22 @@ Pre-alpha. Tested only against pixi 0.62.x at the pinned `pixi_build_types`
 git revision in `Cargo.toml`. Bump that rev together with the
 `pixi-build-api-version` constraint in `recipe/recipe.yaml` when the pixi
 protocol moves.
+
+## Acknowledgements
+
+This backend exists because of the design discussion in
+[prefix-dev/pixi#5230](https://github.com/prefix-dev/pixi/issues/5230). Thank
+you to:
+
+- **The pixi team** at [prefix.dev](https://prefix.dev) for building pixi
+  itself, the `pixi-build` protocol, and the broader rattler/conda-forge
+  ecosystem this backend plugs into.
+- **[@ruben-arts](https://github.com/ruben-arts)** and
+  **[@tdejager](https://github.com/tdejager)** for the architectural
+  guidance in pixi#5230 — in particular, [@tdejager](https://github.com/tdejager)
+  surfaced the idea of "an extension that finds the correct overrides," which
+  this backend is one concrete realization of.
+- **[@diegoferigo-rai](https://github.com/diegoferigo-rai)** for the
+  hand-written Isaac Sim `recipe.yaml` shared in
+  [pixi#5230 (comment 24)](https://github.com/prefix-dev/pixi/issues/5230#issuecomment-comment-24),
+  which is the static template this project automates.

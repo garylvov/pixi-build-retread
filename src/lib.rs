@@ -5,6 +5,7 @@
 
 pub mod config;
 pub mod handler;
+pub mod pypi;
 pub mod recipe;
 pub mod relax;
 pub mod rpc;

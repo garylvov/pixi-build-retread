@@ -1,5 +1,6 @@
 //! JSON-RPC method handlers. The four entry points pixi calls.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -18,10 +19,12 @@ use pixi_build_types::{BackendCapabilities, BinaryPackageSpec, NamedSpec, Packag
 use rattler_conda_types::{NoArchType, PackageName, Platform, VersionSpec, VersionWithSource};
 use serde_json::Value;
 use tokio::sync::RwLock;
+use uv_pep508::uv_pep440::Operator;
 
 use crate::config::{RetreadConfig, WheelEntry};
+use crate::pypi::{self, WheelTarget};
 use crate::recipe::{build_recipe, to_yaml};
-use crate::relax::python_version_from_wheel_tag;
+use crate::relax::{default_marker_env, python_version_from_wheel_tag};
 use crate::rpc::{ok, parse_params, RpcError};
 use crate::wheel::{fetch_wheel, read_metadata, WheelMetadata};
 
@@ -29,6 +32,8 @@ const NEGOTIATE: &str = "negotiateCapabilities";
 const INITIALIZE: &str = "initialize";
 const CONDA_OUTPUTS: &str = "conda/outputs";
 const CONDA_BUILD_V1: &str = "conda/build_v1";
+
+const DEFAULT_PYTHON: &str = "3.11";
 
 #[derive(Default)]
 struct State {
@@ -39,6 +44,16 @@ struct State {
 #[derive(Clone, Default)]
 pub struct Handler {
     state: Arc<RwLock<State>>,
+}
+
+/// One wheel after full resolution: URL is concrete, metadata parsed,
+/// conda package name decided. Both URL-form and spec-form entries collapse
+/// into this once we've fetched + parsed the wheel.
+#[derive(Debug, Clone)]
+struct Resolved {
+    conda_name: String,
+    url: url::Url,
+    metadata: WheelMetadata,
 }
 
 impl Handler {
@@ -81,7 +96,7 @@ impl Handler {
                 .map_err(|e| RpcError::invalid_params(format!("[build.config]: {e}")))?,
             None => {
                 return Err(RpcError::invalid_params(
-                    "pixi-build-retread requires a [build.config] table with at least `wheels = [...]`",
+                    "pixi-build-retread requires a [build.config] table with at least `wheels = { ... }`",
                 ))
             }
         };
@@ -92,10 +107,17 @@ impl Handler {
             ));
         }
 
+        // Eagerly validate each entry now so misconfigurations surface at
+        // initialize time rather than mid-build.
+        for (name, entry) in &config.wheels {
+            entry
+                .validate(name)
+                .map_err(|e| RpcError::invalid_params(e.to_string()))?;
+        }
+
         let mut state = self.state.write().await;
         state.config = Some(config);
         state.cache_dir = params.cache_directory;
-
         Ok(InitializeResult {})
     }
 
@@ -104,15 +126,20 @@ impl Handler {
         params: CondaOutputsParams,
     ) -> Result<CondaOutputsResult, RpcError> {
         let (config, download_dir) = self.snapshot(&params.work_directory).await?;
+        let target = wheel_target_for(params.host_platform);
 
-        let mut outputs = Vec::with_capacity(config.wheels.len());
-        for wheel in &config.wheels {
-            let output = produce_output(wheel, &config, &download_dir, params.host_platform)
-                .await
-                .map_err(|e| RpcError::internal(format!("processing {}: {e:#}", wheel.url)))?;
-            outputs.push(output);
+        let resolved = resolve_all(&config, &target, &download_dir)
+            .await
+            .map_err(|e| RpcError::internal(format!("resolving wheels: {e:#}")))?;
+
+        let mut outputs = Vec::with_capacity(resolved.len());
+        for r in &resolved {
+            outputs.push(
+                produce_output(r, &config, params.host_platform).map_err(|e| {
+                    RpcError::internal(format!("output for {}: {e:#}", r.conda_name))
+                })?,
+            );
         }
-
         Ok(CondaOutputsResult {
             outputs,
             input_globs: Default::default(),
@@ -124,16 +151,23 @@ impl Handler {
         params: CondaBuildV1Params,
     ) -> Result<CondaBuildV1Result, RpcError> {
         let (config, download_dir) = self.snapshot(&params.work_directory).await?;
+        let target = wheel_target_for(params.output.subdir);
 
-        // Match the requested output to one of our configured wheels by name.
-        let requested_name = params.output.name.as_normalized().to_string();
-        let wheel = config
-            .wheels
+        // We re-resolve the full set (the lookup is cheap once cached) and
+        // pick the entry matching the requested output.
+        let resolved = resolve_all(&config, &target, &download_dir)
+            .await
+            .map_err(|e| RpcError::internal(format!("resolving wheels: {e:#}")))?;
+
+        let requested = params.output.name.as_normalized().to_string();
+        let picked = resolved
             .iter()
-            .find(|w| filename_to_pep503(&extract_filename(&w.url)) == requested_name)
+            .find(|r| r.conda_name == requested)
             .ok_or_else(|| {
                 RpcError::invalid_params(format!(
-                    "no [build.config].wheels entry matches requested output `{requested_name}`"
+                    "no resolved wheel matches requested output `{requested}`; \
+                     known: {:?}",
+                    resolved.iter().map(|r| &r.conda_name).collect::<Vec<_>>()
                 ))
             })?;
 
@@ -141,16 +175,16 @@ impl Handler {
             .output_directory
             .clone()
             .unwrap_or_else(|| params.work_directory.join("output"));
+
         build_one(
-            wheel,
+            picked,
             &config,
-            &download_dir,
             &params.work_directory,
             &output_dir,
             params.output.subdir,
         )
         .await
-        .map_err(|e| RpcError::internal(format!("build {}: {e:#}", wheel.url)))
+        .map_err(|e| RpcError::internal(format!("build {}: {e:#}", picked.conda_name)))
     }
 
     async fn snapshot(&self, work_dir: &Path) -> Result<(RetreadConfig, PathBuf), RpcError> {
@@ -168,56 +202,192 @@ impl Handler {
     }
 }
 
-async fn produce_output(
-    wheel: &WheelEntry,
+fn wheel_target_for(subdir: Platform) -> WheelTarget {
+    // Python version isn't currently passed through variant configuration --
+    // default to 3.11 and let the user override per-spec by picking a wheel
+    // for a different cpXY tag (URL form) once we wire variant support.
+    WheelTarget {
+        python_version: DEFAULT_PYTHON.to_string(),
+        conda_subdir: subdir.to_string(),
+    }
+}
+
+/// Resolve every user-supplied entry into a flat list of concrete wheels,
+/// expanding `extras` one level deep. Cycle-detects by conda package name.
+async fn resolve_all(
     config: &RetreadConfig,
+    target: &WheelTarget,
     download_dir: &Path,
+) -> Result<Vec<Resolved>> {
+    let mut out = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+
+    for (entry_name, entry) in &config.wheels {
+        let (url, sha256_hint) = match entry_url(entry, entry_name, target).await? {
+            EntryResolution::Url { url, sha256 } => (url, sha256),
+        };
+        let metadata = fetch_and_parse(&url, sha256_hint.as_deref(), download_dir).await?;
+
+        let conda_name = entry_name.to_ascii_lowercase().replace('_', "-");
+        if seen.insert(conda_name.clone()) {
+            out.push(Resolved {
+                conda_name: conda_name.clone(),
+                url: url.clone(),
+                metadata: metadata.clone(),
+            });
+        }
+
+        // Expand requested extras (one level deep).
+        if !entry.extras.is_empty() {
+            let index = entry.index_url();
+            for extra in &entry.extras {
+                for raw in &metadata.requires_dist {
+                    let Some((dep_name, dep_version)) = pep508_extra_dep(raw, extra)? else {
+                        continue;
+                    };
+                    let dep_conda_name = dep_name.to_ascii_lowercase().replace('_', "-");
+                    if !seen.insert(dep_conda_name.clone()) {
+                        continue;
+                    }
+                    let resolved = pypi::resolve(&index, &dep_name, &dep_version, target)
+                        .await
+                        .with_context(|| {
+                            format!("resolving extra {extra}::{dep_name}=={dep_version}")
+                        })?;
+                    let dep_meta = fetch_and_parse(
+                        &resolved.url,
+                        resolved.sha256.as_deref(),
+                        download_dir,
+                    )
+                    .await?;
+                    out.push(Resolved {
+                        conda_name: dep_conda_name,
+                        url: resolved.url,
+                        metadata: dep_meta,
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+enum EntryResolution {
+    Url {
+        url: url::Url,
+        sha256: Option<String>,
+    },
+}
+
+async fn entry_url(
+    entry: &WheelEntry,
+    entry_name: &str,
+    target: &WheelTarget,
+) -> Result<EntryResolution> {
+    if let Some(url) = &entry.url {
+        return Ok(EntryResolution::Url {
+            url: url.clone(),
+            sha256: entry.sha256.clone(),
+        });
+    }
+    let version = entry
+        .normalized_version()
+        .ok_or_else(|| anyhow!("wheel `{entry_name}` has neither url nor version"))?;
+    let resolved = pypi::resolve(&entry.index_url(), entry_name, &version, target).await?;
+    Ok(EntryResolution::Url {
+        url: resolved.url,
+        sha256: resolved.sha256,
+    })
+}
+
+async fn fetch_and_parse(
+    url: &url::Url,
+    sha256_hint: Option<&str>,
+    download_dir: &Path,
+) -> Result<WheelMetadata> {
+    let path = fetch_wheel(url, sha256_hint, download_dir).await?;
+    tokio::task::spawn_blocking(move || read_metadata(&path))
+        .await
+        .context("metadata reader panicked")?
+}
+
+/// Returns Some((name, version)) if `raw` is a `Requires-Dist` matching the
+/// active extra and is an exact `==` pin. Returns None if the requirement is
+/// gated on a different extra, has no matching marker, or isn't an exact pin
+/// we can resolve.
+fn pep508_extra_dep(raw: &str, extra: &str) -> Result<Option<(String, String)>> {
+    use std::str::FromStr;
+    let req: uv_pep508::Requirement = uv_pep508::Requirement::from_str(raw)
+        .map_err(|e| anyhow!("parsing extra requirement `{raw}`: {e}"))?;
+
+    let extra_name = uv_normalize::ExtraName::from_owned(extra.to_string())
+        .map_err(|e| anyhow!("invalid extra name `{extra}`: {e}"))?;
+
+    // The marker must match when this extra is active AND must not match
+    // with no extras active (otherwise it's a base dep, not an extra dep).
+    let env = default_marker_env(DEFAULT_PYTHON)?;
+    let matches_with_extra = req.marker.evaluate(&env, &[extra_name.clone()]);
+    let matches_without = req.marker.evaluate(&env, &[]);
+    if !matches_with_extra || matches_without {
+        return Ok(None);
+    }
+
+    // Need an exact == specifier we can use to drive the resolver.
+    let Some(uv_pep508::VersionOrUrl::VersionSpecifier(specs)) = req.version_or_url.as_ref() else {
+        bail!("extra `{extra}` requirement has no version specifier: {raw}");
+    };
+    let specs: Vec<_> = specs.iter().collect();
+    if specs.len() != 1 || *specs[0].operator() != Operator::Equal {
+        bail!(
+            "extra `{extra}` requires an exact version pin, got `{raw}`. \
+             Range resolution is on the TODO list."
+        );
+    }
+    Ok(Some((req.name.to_string(), specs[0].version().to_string())))
+}
+
+fn produce_output(
+    r: &Resolved,
+    config: &RetreadConfig,
     host_platform: Platform,
 ) -> Result<CondaOutput> {
-    let metadata = fetch_and_read(wheel, download_dir).await?;
-    let python_version = python_version_from_wheel_tag(&metadata.filename).unwrap_or_else(|| "3".into());
-    let subdir = if metadata.is_pure_python {
+    let python_version =
+        python_version_from_wheel_tag(&r.metadata.filename).unwrap_or_else(|| "3".into());
+    let subdir = if r.metadata.is_pure_python {
         Platform::NoArch
     } else {
         host_platform
     };
 
-    let mut depends = Vec::new();
     let python_dep = if python_version.contains('.') {
         format!("python {python_version}.*")
     } else {
         format!("python {python_version}")
     };
-    depends.push(spec_from_str(&python_dep)?);
 
-    // Reuse the same translation pipeline the recipe generator uses so the
-    // conda/outputs metadata stays in sync with what conda/build_v1 will
-    // produce.
-    let env = crate::relax::default_marker_env(&python_version)?;
-    for raw in &metadata.requires_dist {
-        match crate::relax::translate(
+    let mut depends = vec![spec_from_str(&python_dep)?];
+    let env = default_marker_env(&python_version)?;
+    for raw in &r.metadata.requires_dist {
+        if let Some(dep) = crate::relax::translate(
             raw,
             &env,
             &config.name_map,
             &config.overrides,
             config.relax,
         )? {
-            Some(dep) => depends.push(spec_from_str(&dep.0)?),
-            None => {}
+            depends.push(spec_from_str(&dep.0)?);
         }
     }
 
-    let conda_name = metadata.name.to_ascii_lowercase().replace('_', "-");
-    let name = PackageName::new_unchecked(conda_name);
-    let version = VersionWithSource::from_str(&metadata.version)
-        .map_err(|e| anyhow!("parsing version `{}`: {e}", metadata.version))?;
-
-    let noarch = if metadata.is_pure_python {
+    let name = PackageName::new_unchecked(r.conda_name.clone());
+    let version = VersionWithSource::from_str(&r.metadata.version)
+        .map_err(|e| anyhow!("parsing version `{}`: {e}", r.metadata.version))?;
+    let noarch = if r.metadata.is_pure_python {
         NoArchType::python()
     } else {
         NoArchType::none()
     };
-
     let py_short = python_version.replace('.', "");
     let build = format!("py{py_short}_{}", config.build_number);
 
@@ -237,10 +407,7 @@ async fn produce_output(
         },
         build_dependencies: None,
         host_dependencies: Some(CondaOutputDependencies {
-            depends: vec![
-                spec_from_str(&python_dep)?,
-                spec_from_str("pip")?,
-            ],
+            depends: vec![spec_from_str(&python_dep)?, spec_from_str("pip")?],
             constraints: Vec::new(),
         }),
         run_dependencies: CondaOutputDependencies {
@@ -254,18 +421,19 @@ async fn produce_output(
 }
 
 async fn build_one(
-    wheel: &WheelEntry,
+    r: &Resolved,
     config: &RetreadConfig,
-    download_dir: &Path,
     work_dir: &Path,
     output_dir: &Path,
     target_subdir: Platform,
 ) -> Result<CondaBuildV1Result> {
-    let metadata = fetch_and_read(wheel, download_dir).await?;
-    let recipe = build_recipe(&metadata, &wheel.url, config)?;
+    // Override the recipe's package name with the conda_name we decided
+    // earlier (which may differ from the wheel's METADATA Name when the
+    // user supplied a map-key override).
+    let mut recipe = build_recipe(&r.metadata, &r.url, config)?;
+    recipe.package.name = r.conda_name.clone();
     let yaml = to_yaml(&recipe)?;
 
-    // Lay out a clean recipe directory under work_dir/<package>.
     let recipe_dir = work_dir.join(format!("recipe-{}", recipe.package.name));
     tokio::fs::create_dir_all(&recipe_dir).await?;
     let recipe_path = recipe_dir.join("recipe.yaml");
@@ -274,9 +442,7 @@ async fn build_one(
 
     tokio::fs::create_dir_all(output_dir).await?;
 
-    // Shell out to rattler-build. The conda recipe declares rattler-build as a
-    // run dep so the binary is on PATH when pixi invokes us.
-    let target_platform = platform_str(target_subdir);
+    let target_platform = target_subdir.to_string();
     let status = tokio::process::Command::new("rattler-build")
         .arg("build")
         .arg("--recipe")
@@ -294,13 +460,11 @@ async fn build_one(
         bail!("rattler-build exited with status {status}");
     }
 
-    // Locate the produced .conda file. rattler-build writes
-    // `<output_dir>/<subdir>/<name>-<version>-<build>.conda`.
     let subdir_dir = output_dir.join(&target_platform);
-    let output_file = find_conda_artifact(&subdir_dir, &recipe.package.name, &recipe.package.version)
-        .await?;
+    let output_file =
+        find_conda_artifact(&subdir_dir, &recipe.package.name, &recipe.package.version).await?;
 
-    let py_short = python_version_from_wheel_tag(&metadata.filename)
+    let py_short = python_version_from_wheel_tag(&r.metadata.filename)
         .unwrap_or_default()
         .replace('.', "");
     Ok(CondaBuildV1Result {
@@ -311,40 +475,6 @@ async fn build_one(
         build: format!("py{py_short}_{}", config.build_number),
         subdir: target_subdir,
     })
-}
-
-async fn fetch_and_read(wheel: &WheelEntry, download_dir: &Path) -> Result<WheelMetadata> {
-    let path = fetch_wheel(&wheel.url, wheel.sha256.as_deref(), download_dir).await?;
-    let metadata = tokio::task::spawn_blocking(move || read_metadata(&path))
-        .await
-        .context("metadata reader panicked")??;
-    Ok(metadata)
-}
-
-fn extract_filename(url: &url::Url) -> String {
-    url.path_segments()
-        .and_then(|s| s.last())
-        .map(|s| s.to_string())
-        .unwrap_or_default()
-}
-
-fn filename_to_pep503(filename: &str) -> String {
-    // `Foo_Bar-1.2.3-cp311-...whl` -> `foo-bar`
-    let stem = filename.split('-').next().unwrap_or("");
-    let mut out = String::new();
-    let mut prev_dash = false;
-    for c in stem.to_ascii_lowercase().chars() {
-        if c == '_' || c == '.' || c == '-' {
-            if !prev_dash {
-                out.push('-');
-                prev_dash = true;
-            }
-        } else {
-            out.push(c);
-            prev_dash = false;
-        }
-    }
-    out.trim_matches('-').to_string()
 }
 
 fn spec_from_str(s: &str) -> Result<NamedSpec<PackageSpec>> {
@@ -367,10 +497,6 @@ fn spec_from_str(s: &str) -> Result<NamedSpec<PackageSpec>> {
             ..Default::default()
         }),
     })
-}
-
-fn platform_str(p: Platform) -> String {
-    p.to_string()
 }
 
 async fn find_conda_artifact(dir: &Path, name: &str, version: &str) -> Result<PathBuf> {
