@@ -1,0 +1,43 @@
+schema_version: 1
+
+context:
+  name: pixi-build-retread
+  version: "0.1.0"
+
+package:
+  name: ${{ name }}
+  version: ${{ version }}
+
+source:
+  - path: ..
+
+build:
+  number: 0
+  script:
+    # cargo is bundled with the rust compiler package. The pinned git deps
+    # (pixi_build_types, uv-pep508) are fetched at build time; rattler-build
+    # leaves networking enabled by default so this works inside the sandbox.
+    - cargo build --release --locked --bin pixi-build-retread
+    - mkdir -p $PREFIX/bin
+    - cp target/release/pixi-build-retread $PREFIX/bin/pixi-build-retread
+
+requirements:
+  build:
+    - ${{ compiler('rust') }}
+  run:
+    # The backend shells out to `rattler-build` for the actual conda build.
+    - rattler-build >=0.27
+    # pixi-build-api-version pins the protocol version. Bump alongside any
+    # change to the pixi_build_types git rev in our Cargo.toml.
+    - pixi-build-api-version >=4,<5
+
+about:
+  homepage: https://github.com/garylvov/pixi-build-retread
+  summary: |
+    A pixi build backend that repacks PyPI wheels as conda packages with
+    relaxed dependency pins, so conda/pypi mixed solves stop fighting over
+    over-strict upstream pins (e.g. Isaac Sim).
+  license: BSD-3-Clause
+  # Inside the build sandbox the parent directory was copied via `source.path = ..`,
+  # so the LICENSE file lives at $SRC_DIR/LICENSE.
+  license_file: LICENSE

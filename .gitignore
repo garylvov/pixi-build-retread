@@ -1,0 +1,11 @@
+/target
+.pixi
+/local-channel
+*.conda
+*.tar.bz2
+/output
+# Cargo.lock is committed (binary crate) for reproducible recipe builds with
+# `cargo build --locked`.
+*.conda
+*.tar.bz2
+/output

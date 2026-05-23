@@ -1,0 +1,53 @@
+# Example: repack the isaacsim 5.1.0 wheel as a conda package with minor-level
+# relaxed pins so it slots into a workspace that already pulls in ROS, conda
+# numpy, etc.
+#
+# To smoke-test locally:
+#   cd examples/isaacsim
+#   pixi install
+#   pixi run python -c "import isaacsim; print(isaacsim.__version__)"
+#
+# When developing the backend itself, point the [build] backend at the
+# path-built binary instead of resolving from a channel:
+#   backend = { path = "../../target/release/pixi-build-retread" }
+
+[workspace]
+name = "isaacsim-repack-demo"
+channels = ["https://prefix.dev/conda-forge"]
+platforms = ["linux-64"]
+preview = ["pixi-build"]
+
+[package]
+name = "isaacsim"
+version = "5.1.0"
+
+[build]
+backend = { name = "pixi-build-retread", version = "*" }
+channels = [
+  "https://prefix.dev/pixi-build-backends",
+  "https://prefix.dev/conda-forge",
+]
+
+[build.config]
+relax = "minor"
+build-number = 0
+
+[[build.config.wheels]]
+url = "https://pypi.nvidia.com/isaacsim/isaacsim-5.1.0-cp311-none-manylinux_2_35_x86_64.whl"
+sha256 = "ad2c027831ed5d4a62552735bb799dea4e4604530d2ab9b526ddb6cd19a98c11"
+
+[build.config.overrides]
+# isaacsim's metadata pins numpy and torch hard; relax to ranges that match
+# what the rest of the workspace can satisfy.
+numpy = "==1.26.4"
+torch = ">=2.7"
+pillow = "==12.0.0"
+
+[build.config.name-map]
+# Conda calls headless OpenCV `py-opencv`.
+opencv-python-headless = "py-opencv"
+
+# Consumer side: depend on the source package we just built.
+[dependencies]
+isaacsim = { path = "." }
+python = "3.11.*"

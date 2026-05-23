@@ -1,0 +1,67 @@
+# Stripped-down version of /home/garylvov/projects/gigastrap/pixi.toml that
+# omits the painstaking 50+ lines of conda pins and pypi
+# `dependency-overrides` from `[feature.isaaclab.dependencies]` and
+# `[feature.isaaclab.pypi-options.dependency-overrides]` -- the manual
+# workaround documented in https://github.com/prefix-dev/pixi/issues/5230.
+#
+# The premise: retread does that work declaratively. Isaac Sim wheels are
+# repacked into a local conda channel with `relax = "minor"`, so the
+# `gsi-ros2` environment (ros-humble-* + isaacsim) can solve without a
+# wall of overrides.
+#
+# This is a TEST FIXTURE, not a runnable manifest until the retread backend
+# is installed (locally via path, or via prefix.dev once published). To
+# smoke-test:
+#
+#   cd tests/fixtures/gigastrap_stripped
+#   pixi install -e gsi-ros2
+#
+# Expected result: solve succeeds without the override blocks that the real
+# gigastrap manifest needs today.
+
+[workspace]
+name = "gigastrap-stripped"
+channels = ["https://prefix.dev/conda-forge", "https://prefix.dev/robostack-jazzy"]
+platforms = ["linux-64"]
+preview = ["pixi-build"]
+
+[environments]
+ros2-gpu = { features = ["gpu", "ros2"] }
+isaacsim-only = { features = ["gpu", "isaacsim"] }
+# The motivating case: both at once. Without retread this needs the manual
+# overrides; with retread, declarative relax + per-dep escape hatches.
+gsi-ros2 = { features = ["gpu", "ros2", "isaacsim"] }
+
+[dependencies]
+python = "==3.11"
+pip = ">=25.1.1,<26"
+
+# ----- gpu feature -----
+[feature.gpu.dependencies]
+pytorch-gpu = ">=2.7.1,<3"
+cuda-version = "12.4.*"
+
+[feature.gpu.system-requirements]
+cuda = "12.4"
+
+# ----- ros2 feature (conda packages) -----
+[feature.ros2.dependencies]
+ros-humble-ros-core = "*"
+ros-humble-rviz2 = "*"
+ros-humble-rosbag2 = "*"
+ros-humble-xacro = "*"
+ros-humble-joint-state-publisher = "*"
+ros-humble-tf2-ros = "*"
+colcon-common-extensions = "*"
+colcon-ros = "*"
+
+# ----- isaacsim feature: declaratively repacked via retread -----
+# Note the absence of:
+#   * [feature.isaaclab.dependencies] with 40+ exact pins
+#   * [feature.isaaclab.pypi-options.dependency-overrides] with 15+ overrides
+# Those become the [build.config] block in the source package below.
+[feature.isaacsim.dependencies]
+isaacsim = { path = "./isaacsim-repack" }
+
+[feature.isaacsim.system-requirements]
+libc = "2.35"

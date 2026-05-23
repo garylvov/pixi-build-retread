@@ -1,0 +1,55 @@
+[package]
+name = "pixi-build-retread"
+version = "0.1.0"
+edition = "2024"
+description = "Pixi build backend that repacks PyPI wheels as conda packages with relaxed dependency pins"
+license = "BSD-3-Clause"
+repository = "https://github.com/garylvov/pixi-build-retread"
+publish = false
+
+[[bin]]
+name = "pixi-build-retread"
+path = "src/main.rs"
+
+[dependencies]
+# Pixi build protocol types. Pulled directly from the pixi repo at a pinned rev
+# because these crates are not (yet) published to crates.io.
+pixi_build_types = { git = "https://github.com/prefix-dev/pixi", rev = "dc5d0dc59b29f0f9f546e8308d1e6049566555e5" }
+
+# Match the pinned versions in pixi's workspace so the on-wire types serialize
+# identically.
+rattler_conda_types = { version = "0.42.0", default-features = false }
+rattler_digest = { version = "1.2.0", default-features = false, features = ["serde"] }
+ordermap = { version = "1.0.0", features = ["serde"] }
+
+# Async runtime. JSON-RPC 2.0 is hand-framed over line-delimited stdio (matches
+# pixi's transport in crates/pixi_build_frontend/src/jsonrpc/stdio.rs).
+tokio = { version = "1.43.0", features = ["macros", "rt-multi-thread", "io-std", "io-util", "sync", "fs", "process"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+futures = "0.3"
+
+# Wheel fetching + parsing.
+reqwest = { version = "0.12.12", default-features = false, features = ["rustls-tls"] }
+zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
+sha2 = "0.10"
+# uv's PEP 508 parser is the gold standard for Requires-Dist values.
+uv-pep508 = { git = "https://github.com/astral-sh/uv", tag = "0.9.5" }
+
+# Recipe generation. rattler-build is invoked as a subprocess (matches what
+# pixi-build-rattler-build does); the conda recipe for this backend declares
+# rattler-build as a runtime dep so the binary is on PATH at execution time.
+serde_yaml = "0.9"
+
+# Standard fare.
+serde = { version = "1.0.218", features = ["derive"] }
+serde_json = "1.0"
+url = { version = "2.5.4", features = ["serde"] }
+anyhow = "1.0.97"
+thiserror = "1"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
