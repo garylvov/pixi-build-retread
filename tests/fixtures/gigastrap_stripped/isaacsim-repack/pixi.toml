@@ -15,8 +15,8 @@ channels = [
 ]
 
 [build.config]
-relax = "minor"
-build-number = 0
+retread-relax = "minor"
+retread-build-number = 0
 
 # Same syntax as pixi's `[pypi-dependencies]`. retread resolves this on the
 # PEP 503 simple index at `index` and expands `extras` one level deep via

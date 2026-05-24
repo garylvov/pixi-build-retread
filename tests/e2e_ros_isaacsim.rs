@@ -87,8 +87,8 @@ backend = { name = "pixi-build-retread", version = "*" }
 channels = ["https://prefix.dev/garylvov", "https://prefix.dev/conda-forge"]
 
 [build.config]
-relax = "minor"
-build-number = 0
+retread-relax = "minor"
+retread-build-number = 0
 
 [build.config.retread-wheels]
 isaacsim = { version = "==5.1.0", index = "https://pypi.nvidia.com", extras = ["all", "extscache"] }

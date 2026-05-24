@@ -30,8 +30,8 @@ channels = [
 ]
 
 [build.config]
-relax = "minor"
-build-number = 0
+retread-relax = "minor"
+retread-build-number = 0
 
 # Same syntax pixi uses for [pypi-dependencies]. retread resolves this
 # against the PEP 503 simple index, then follows `extras` recursively

@@ -126,20 +126,39 @@ impl Handler {
         params: CondaOutputsParams,
     ) -> Result<CondaOutputsResult, RpcError> {
         let (config, download_dir) = self.snapshot(&params.work_directory).await?;
-        let python_version = python_from_variants(params.variant_configuration.as_ref());
-        let target = wheel_target_for(params.host_platform, &python_version);
 
-        let resolved = resolve_all(&config, &target, &download_dir)
-            .await
-            .map_err(|e| RpcError::internal(format!("resolving wheels: {e:#}")))?;
+        // Pick the target Python versions. Precedence:
+        //   1. workspace.build-variants python = [...]
+        //   2. [build.config] python = "3.11" / ["3.11", "3.12"]
+        //   3. DEFAULT_PYTHON
+        let pythons = pythons_for(&config, params.variant_configuration.as_ref());
 
-        let mut outputs = Vec::with_capacity(resolved.len());
-        for r in &resolved {
-            outputs.push(
-                produce_output(r, &config, params.host_platform, &python_version).map_err(
-                    |e| RpcError::internal(format!("output for {}: {e:#}", r.conda_name)),
-                )?,
-            );
+        // Fan out: one output per (python, wheel). If a target python has no
+        // matching wheel on the index (e.g. user asked for 3.12 but the
+        // upstream wheel is cp311-only), log and skip the combination rather
+        // than failing the whole call -- other Python versions might still
+        // resolve cleanly.
+        let mut outputs = Vec::new();
+        for python_version in &pythons {
+            let target = wheel_target_for(params.host_platform, python_version);
+            let resolved = match resolve_all(&config, &target, &download_dir).await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        python = %python_version,
+                        error = %format!("{e:#}"),
+                        "skipping python variant: no matching wheels"
+                    );
+                    continue;
+                }
+            };
+            for r in &resolved {
+                outputs.push(
+                    produce_output(r, &config, params.host_platform, python_version).map_err(
+                        |e| RpcError::internal(format!("output for {}: {e:#}", r.conda_name)),
+                    )?,
+                );
+            }
         }
         Ok(CondaOutputsResult {
             outputs,
@@ -212,14 +231,31 @@ impl Handler {
     }
 }
 
-fn python_from_variants(
+/// Pick the Python versions to fan outputs over. Precedence:
+///
+/// 1. `variant_configuration["python"]` from the workspace — pixi sets this
+///    from `[workspace.build-variants] python = [...]`. Multiple values
+///    produce multiple outputs.
+/// 2. `[build.config] python` — single string or list, set by the user in
+///    the source package itself. Convenience for workspaces that haven't
+///    learned about build-variants.
+/// 3. Hardcoded default `3.11`.
+fn pythons_for(
+    config: &RetreadConfig,
     variants: Option<&std::collections::BTreeMap<String, Vec<VariantValue>>>,
-) -> String {
-    variants
-        .and_then(|v| v.get("python"))
-        .and_then(|values| values.first())
-        .map(|val| val.to_string())
-        .unwrap_or_else(|| DEFAULT_PYTHON.to_string())
+) -> Vec<String> {
+    if let Some(values) = variants.and_then(|v| v.get("python")) {
+        if !values.is_empty() {
+            return values.iter().map(|v| v.to_string()).collect();
+        }
+    }
+    if let Some(spec) = &config.python {
+        let versions = spec.as_versions();
+        if !versions.is_empty() {
+            return versions;
+        }
+    }
+    vec![DEFAULT_PYTHON.to_string()]
 }
 
 fn wheel_target_for(subdir: Platform, python_version: &str) -> WheelTarget {
@@ -461,6 +497,14 @@ fn produce_output(
     let py_short = python_version.replace('.', "");
     let build = format!("py{py_short}_{}", config.build_number);
 
+    // Encode the python variant so pixi-build's variant matrix can pick
+    // the right output. conda_build_v1 reads this back from params.output.variant.
+    let mut variant = std::collections::BTreeMap::new();
+    variant.insert(
+        "python".to_string(),
+        VariantValue::String(python_version.clone()),
+    );
+
     Ok(CondaOutput {
         metadata: CondaOutputMetadata {
             name,
@@ -473,7 +517,7 @@ fn produce_output(
             noarch,
             purls: None,
             python_site_packages_path: None,
-            variant: Default::default(),
+            variant,
         },
         build_dependencies: None,
         host_dependencies: Some(CondaOutputDependencies {

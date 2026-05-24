@@ -56,6 +56,7 @@ fn baseline_config() -> RetreadConfig {
         overrides: BTreeMap::new(),
         name_map: BTreeMap::new(),
         build_number: 0,
+            python: None,
     }
 }
 

@@ -33,7 +33,7 @@ pub struct RetreadConfig {
     /// - `patch`: ==X.Y.Z -> >=X.Y.Z,<X.Y+1
     /// - `minor` (default): ==X.Y.Z -> >=X.Y,<X+1
     /// - `major`: ==X.Y.Z -> >=X (drop upper bound)
-    #[serde(default)]
+    #[serde(default, rename = "retread-relax", alias = "relax")]
     pub relax: RelaxPolicy,
 
     /// Per-dependency overrides, applied after the relax policy. Map of
@@ -47,10 +47,36 @@ pub struct RetreadConfig {
     #[serde(default)]
     pub name_map: BTreeMap<String, String>,
 
-    /// Conda build number. Bump to force re-resolution downstream after a
-    /// policy change.
-    #[serde(default)]
+    /// Conda build number for the produced packages. Bump to force
+    /// re-resolution downstream after a policy change.
+    #[serde(default, rename = "retread-build-number", alias = "build-number")]
     pub build_number: u64,
+
+    /// Python version(s) to build for, as a fallback when the workspace
+    /// does not declare `[workspace.build-variants] python = [...]`.
+    ///
+    /// Accepts either a single string ("3.11") or a list of strings
+    /// (`["3.11", "3.12"]`). When the workspace's variant configuration
+    /// provides `python`, that wins; this field is purely a convenience for
+    /// single-Python workspaces. The default is `3.11`.
+    #[serde(default)]
+    pub python: Option<PythonSpec>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum PythonSpec {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl PythonSpec {
+    pub fn as_versions(&self) -> Vec<String> {
+        match self {
+            Self::One(v) => vec![v.clone()],
+            Self::Many(v) => v.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -115,7 +141,8 @@ mod tests {
                 },
                 "foo": { "url": "https://example.com/foo-1.whl", "sha256": "abc" }
             },
-            "relax": "minor",
+            "retread-relax": "minor",
+            "retread-build-number": 0,
             "overrides": { "numpy": ">=1.26,<2" },
         });
         let cfg: RetreadConfig = serde_json::from_value(json).unwrap();
@@ -129,16 +156,19 @@ mod tests {
     }
 
     #[test]
-    fn legacy_wheels_alias_still_parses() {
-        // One-release migration cushion: the old `wheels` key should still
-        // work for users who haven't updated their manifests yet.
+    fn legacy_unprefixed_keys_still_parse() {
+        // One-release migration cushion: pre-0.4 `wheels`, `relax`, and
+        // `build-number` keys without the `retread-` prefix should still
+        // deserialize so users have time to update their manifests.
         let json = serde_json::json!({
-            "wheels": {
-                "foo": { "version": "1.2.3" }
-            }
+            "wheels": { "foo": { "version": "1.2.3" } },
+            "relax": "patch",
+            "build-number": 7,
         });
         let cfg: RetreadConfig = serde_json::from_value(json).unwrap();
         assert_eq!(cfg.retread_wheels.len(), 1);
+        assert_eq!(cfg.relax, RelaxPolicy::Patch);
+        assert_eq!(cfg.build_number, 7);
     }
 
     #[test]
@@ -165,6 +195,15 @@ mod tests {
             ..Default::default()
         };
         assert!(entry.validate("x").is_err());
+    }
+
+    #[test]
+    fn python_spec_accepts_string_or_list() {
+        let one: PythonSpec = serde_json::from_value(serde_json::json!("3.11")).unwrap();
+        assert_eq!(one.as_versions(), vec!["3.11"]);
+        let many: PythonSpec =
+            serde_json::from_value(serde_json::json!(["3.11", "3.12"])).unwrap();
+        assert_eq!(many.as_versions(), vec!["3.11", "3.12"]);
     }
 }
 

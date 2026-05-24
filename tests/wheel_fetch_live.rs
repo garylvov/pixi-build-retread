@@ -87,6 +87,7 @@ async fn fetch_isaacsim_kernel_end_to_end() {
         overrides: BTreeMap::new(),
         name_map: BTreeMap::new(),
         build_number: 0,
+            python: None,
     };
     let recipe = build_recipe(&meta, &url, &config).unwrap();
     let yaml = to_yaml(&recipe).unwrap();
