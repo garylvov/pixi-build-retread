@@ -1,16 +1,20 @@
-# Example: repack the isaacsim 5.1.0 metapackage with extras into a single
-# conda source package, using retread's PyPI-style spec form. Compare to the
-# 22-line hand-curated wheel URL list in pixi#5230 comment 24 -- one entry
-# here expands the same set via the wheel's METADATA.
+# Example: combine PyPI Isaac Sim with conda ROS 2 humble (the
+# real-world scenario that motivates retread). Same conflict surface
+# documented in prefix-dev/pixi#5230 -- without retread, the strict
+# upstream pins in the isaacsim sub-wheels collide with conda's
+# ros-humble-* dependency tree.
 #
 # To smoke-test locally:
 #   cd examples/isaacsim
-#   pixi install
-#   pixi run python -c "import isaacsim; print(isaacsim.__version__)"
+#   pixi install                                # solves both
+#   pixi run python -c "import isaacsim, rclpy"
 
 [workspace]
-name = "isaacsim-repack-demo"
-channels = ["https://prefix.dev/conda-forge"]
+name = "isaacsim-ros2-demo"
+channels = [
+  "https://prefix.dev/conda-forge",
+  "https://prefix.dev/robostack-humble",
+]
 platforms = ["linux-64"]
 preview = ["pixi-build"]
 
@@ -30,16 +34,33 @@ relax = "minor"
 build-number = 0
 
 # Same syntax pixi uses for [pypi-dependencies]. retread resolves this
-# against the PEP 503 simple index, then follows `extras` one level deep
-# to pick up every `Requires-Dist: name ; extra == "X"` line in the
-# wheel's METADATA.
-[build.config.wheels]
+# against the PEP 503 simple index, then follows `extras` recursively
+# via the wheel's METADATA.
+[build.config.retread-wheels]
 isaacsim = { version = "==5.1.0", index = "https://pypi.nvidia.com", extras = ["all", "extscache"] }
 
 [build.config.overrides]
-# Keep numpy strictly <2 -- ros2-jazzy bindings still need it.
+# Keep numpy strictly <2 so the ros2-humble bindings (which still
+# depend on numpy<2 in many places) stay compatible.
 numpy = ">=1.26,<2"
 
 [build.config.name-map]
-# PyPI ships headless OpenCV as opencv-python-headless; conda calls it py-opencv.
+# PyPI ships headless OpenCV as opencv-python-headless; conda calls it
+# py-opencv.
 opencv-python-headless = "py-opencv"
+
+# Conda-side runtime + ROS 2 humble. This is the dependency set that
+# would conflict catastrophically with isaacsim's strict PyPI pins
+# WITHOUT retread relaxing them. Compare to gigastrap's
+# [feature.isaaclab.pypi-options.dependency-overrides] block (~16
+# entries) which exists solely to absorb those conflicts manually.
+[dependencies]
+python = "==3.11"
+ros-humble-ros-core = "*"
+ros-humble-rviz2 = "*"
+ros-humble-rosbag2 = "*"
+ros-humble-xacro = "*"
+ros-humble-joint-state-publisher = "*"
+ros-humble-tf2-ros = "*"
+colcon-common-extensions = "*"
+colcon-ros = "*"

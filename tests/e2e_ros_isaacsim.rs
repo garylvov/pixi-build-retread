@@ -52,14 +52,29 @@ fn tempdir() -> PathBuf {
 const ROOT_MANIFEST: &str = r#"
 [workspace]
 name = "retread-e2e"
-channels = ["https://prefix.dev/conda-forge", "https://prefix.dev/robostack-humble"]
+channels = [
+    "https://prefix.dev/conda-forge",
+    "https://prefix.dev/robostack-humble",
+]
 platforms = ["linux-64"]
 preview = ["pixi-build"]
 
+# The realistic conflict surface: a chunk of ros-humble that touches the
+# same transitive deps isaacsim pins hard (opencv, numpy, pillow, scipy,
+# packaging, ...). Without retread, the conda solve finishes but the PyPI
+# solve fails because pixi forwards conda's versions as constraints into
+# uv. Repacking isaacsim via retread eliminates that round-trip.
 [dependencies]
 python = "==3.11"
 isaacsim = { path = "./isaacsim-repack" }
 ros-humble-ros-core = "*"
+ros-humble-rviz2 = "*"
+ros-humble-rosbag2 = "*"
+ros-humble-xacro = "*"
+ros-humble-joint-state-publisher = "*"
+ros-humble-tf2-ros = "*"
+colcon-common-extensions = "*"
+colcon-ros = "*"
 "#;
 
 const REPACK_MANIFEST: &str = r#"

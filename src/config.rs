@@ -99,6 +99,75 @@ pub struct WheelEntry {
     pub extras: Vec<String>,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_retread_wheels_key() {
+        // Mirrors the inline-table syntax from the README and examples.
+        let json = serde_json::json!({
+            "retread-wheels": {
+                "isaacsim": {
+                    "version": "==5.1.0",
+                    "index": "https://pypi.nvidia.com",
+                    "extras": ["all", "extscache"],
+                },
+                "foo": { "url": "https://example.com/foo-1.whl", "sha256": "abc" }
+            },
+            "relax": "minor",
+            "overrides": { "numpy": ">=1.26,<2" },
+        });
+        let cfg: RetreadConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.retread_wheels.len(), 2);
+        assert_eq!(cfg.relax, RelaxPolicy::Minor);
+        assert!(cfg.retread_wheels.contains_key("isaacsim"));
+        let isaac = &cfg.retread_wheels["isaacsim"];
+        assert_eq!(isaac.normalized_version().unwrap(), "5.1.0");
+        assert!(isaac.is_spec());
+        assert_eq!(isaac.extras, vec!["all", "extscache"]);
+    }
+
+    #[test]
+    fn legacy_wheels_alias_still_parses() {
+        // One-release migration cushion: the old `wheels` key should still
+        // work for users who haven't updated their manifests yet.
+        let json = serde_json::json!({
+            "wheels": {
+                "foo": { "version": "1.2.3" }
+            }
+        });
+        let cfg: RetreadConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.retread_wheels.len(), 1);
+    }
+
+    #[test]
+    fn rejects_entry_with_both_url_and_version() {
+        let entry = WheelEntry {
+            url: Some("https://example.com/x.whl".parse().unwrap()),
+            version: Some("1.0".into()),
+            ..Default::default()
+        };
+        assert!(entry.validate("x").is_err());
+    }
+
+    #[test]
+    fn rejects_entry_with_neither_url_nor_version() {
+        let entry = WheelEntry::default();
+        assert!(entry.validate("x").is_err());
+    }
+
+    #[test]
+    fn rejects_extras_on_url_form() {
+        let entry = WheelEntry {
+            url: Some("https://example.com/x.whl".parse().unwrap()),
+            extras: vec!["all".into()],
+            ..Default::default()
+        };
+        assert!(entry.validate("x").is_err());
+    }
+}
+
 impl WheelEntry {
     pub fn is_url(&self) -> bool {
         self.url.is_some()

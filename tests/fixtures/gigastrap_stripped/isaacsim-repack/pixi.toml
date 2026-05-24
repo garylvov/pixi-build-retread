@@ -22,7 +22,7 @@ build-number = 0
 # PEP 503 simple index at `index` and expands `extras` one level deep via
 # the wheel's `Requires-Dist: name ; extra == "X"` lines. Compare to the
 # 22-line hand-curated URL list in pixi#5230 comment 24.
-[build.config.wheels]
+[build.config.retread-wheels]
 isaacsim = { version = "==5.1.0", index = "https://pypi.nvidia.com", extras = ["all", "extscache"] }
 
 # Per-PyPI-name escape hatches. Use these only for cases that minor relax

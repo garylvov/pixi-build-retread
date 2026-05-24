@@ -32,7 +32,12 @@ version = "5.1.0"
 
 [build]
 backend = { name = "pixi-build-retread", version = "*" }
-channels = ["https://prefix.dev/conda-forge"]  # plus wherever retread is hosted
+# Pull the retread backend from the published channel first, then
+# fall back to conda-forge for everything else.
+channels = [
+  "https://prefix.dev/garylvov",
+  "https://prefix.dev/conda-forge",
+]
 
 [build.config]
 relax = "minor"          # patch | minor | major | none
@@ -41,7 +46,7 @@ build-number = 0
 # Same syntax as pixi's `[pypi-dependencies]`. Use `version` + optional
 # `index` and `extras` to resolve from a PEP 503 simple index (PyPI public
 # by default), or `url` + `sha256` for an explicit wheel.
-[build.config.wheels]
+[build.config.retread-wheels]
 isaacsim = { version = "==5.1.0", index = "https://pypi.nvidia.com", extras = ["all", "extscache"] }
 mujoco   = { version = "==3.5.0", index = "https://py.mujoco.org" }
 # foo    = { url = "https://example.com/foo-1.whl", sha256 = "..." }   # explicit URL fallback
