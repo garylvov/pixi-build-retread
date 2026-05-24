@@ -11,39 +11,85 @@ hand-written
 
 ## Use
 
+retread is a pixi-build backend. pixi-build's model is **workspace
+consumes source package** — two `pixi.toml` files. The workspace
+depends on the source package via a path, and the source package
+declares `[package.build]` pointing at retread.
+
+```
+your-project/
+├── pixi.toml                # workspace -- your existing manifest
+└── isaacsim-repack/
+    └── pixi.toml            # source package -- retread config
+```
+
+### Workspace `pixi.toml` (your existing one)
+
+Add `preview = ["pixi-build"]` and pull in the source package as a
+regular conda dependency:
+
 ```toml
 [workspace]
-preview  = ["pixi-build"]
+preview  = ["pixi-build"]                       # required for source packages
 channels = ["https://prefix.dev/conda-forge"]
 
+[dependencies]
+isaacsim = { path = "./isaacsim-repack" }       # consumes the source package
+# plus whatever else: ros-humble-*, python, pytorch-gpu, ...
+```
+
+### Source-package `pixi.toml` (the new file)
+
+This is the entire content of `isaacsim-repack/pixi.toml`:
+
+```toml
 [package]
-name    = "isaacsim-repack"
+name    = "isaacsim"
 version = "5.1.0"
 
 [package.build]
-backend  = { name = "pixi-build-retread", version = "*" }
-channels = ["https://prefix.dev/garylvov", "https://prefix.dev/conda-forge"]
+backend = { name = "pixi-build-retread", version = "*", channels = ["https://prefix.dev/garylvov", "https://prefix.dev/conda-forge"] }
 
 [package.build.config]
 retread-relax        = "minor"   # patch | minor | major | none
 retread-build-number = 0
 
-# Same syntax as `[pypi-dependencies]`. `version` + optional `index` and
-# `extras` resolves on a PEP 503 simple index; `url` + `sha256` is the
-# explicit fallback.
+# Same syntax as pixi's `[pypi-dependencies]`. `version` + optional
+# `index` and `extras` resolves on a PEP 503 simple index; `url` +
+# `sha256` is the explicit fallback.
 [package.build.config.retread-wheels]
 isaacsim = { version = "==5.1.0", index = "https://pypi.nvidia.com", extras = ["all", "extscache"] }
-
-# Escape hatch for upstream conflicts the relax policy can't resolve.
-[package.build.config.retread-overrides]
-numpy = ">=1.26,<2"
-
-# PyPI -> conda name remap on top of PEP 503 normalization.
-[package.build.config.retread-name-map]
-opencv-python-headless = "py-opencv"
 ```
 
-Worked example with conda ros2-humble: [`examples/isaacsim/`](examples/isaacsim/).
+That's it. No overrides, no name-maps, no drop-deps. The auto-bundle
+default handles PyPI-only transitives (aiodns, qdldl, ...) and
+parselmouth supplies the standard PyPI<->conda name skews
+(torch->pytorch, ...). For edge cases see [Escape hatches](#escape-hatches).
+
+Worked example: [`examples/isaacsim/`](examples/isaacsim/).
+
+## Escape hatches
+
+When the auto-bundle path doesn't produce a working solve, four
+opt-in knobs sit in `[package.build.config]`:
+
+```toml
+[package.build.config.retread-overrides]
+# Replace the spec retread would emit. Use when the relaxed range
+# doesn't match what conda channels have (e.g., conda-forge ships
+# aiodns 3.0 but isaacsim pins 3.1 -- loosen here).
+aiodns = "*"
+
+[package.build.config.retread-name-map]
+# Force a PyPI->conda name translation that parselmouth misses.
+# (Most known cases are already in retread's FALLBACK list and
+# don't need manual entries.)
+some-pkg = "different-conda-name"
+
+[package.build.config]
+retread-conda-deps = ["pytorch"]    # keep on conda side, don't bundle
+retread-drop-deps  = ["weird-shim"] # drop from run-deps entirely
+```
 
 ## Multi-Python
 
