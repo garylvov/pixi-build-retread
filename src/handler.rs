@@ -624,7 +624,7 @@ fn produce_output(
     let vendored: HashSet<String> = bundle.all_wheels().map(|w| w.pypi_name.clone()).collect();
 
     // User-specified deps to drop entirely (no conda counterpart available).
-    let mut dropped: HashSet<String> = config
+    let user_dropped: HashSet<String> = config
         .drop_deps
         .iter()
         .map(|n| conda_name_from(n))
@@ -633,15 +633,21 @@ fn produce_output(
     // Built-in: Windows-only PyPI shims that are commonly mis-declared as
     // unconditional `Requires-Dist` lines without `sys_platform` markers.
     // Saves users from having to add the same entries to drop-deps for
-    // every isaacsim-style upstream that ships these.
-    if host_platform != Platform::Win64
+    // every isaacsim-style upstream that ships these. Skipped if the user
+    // explicitly overrode the dep -- the override always wins, so callers
+    // who actually need (say) pyreadline3 on Linux can re-enable it.
+    let auto_dropped: HashSet<String> = if host_platform != Platform::Win64
         && host_platform != Platform::Win32
         && host_platform != Platform::WinArm64
     {
-        for pkg in BUILT_IN_WIN_ONLY {
-            dropped.insert((*pkg).to_string());
-        }
-    }
+        BUILT_IN_WIN_ONLY
+            .iter()
+            .map(|p| (*p).to_string())
+            .filter(|p| !config.overrides.contains_key(p))
+            .collect()
+    } else {
+        HashSet::new()
+    };
     tracing::debug!(
         bundle = %bundle.conda_name,
         vendored = ?vendored,
@@ -678,8 +684,21 @@ fn produce_output(
             if vendored.contains(&dep_name) {
                 continue;
             }
-            if dropped.contains(&dep_name) {
+            if user_dropped.contains(&dep_name) {
                 tracing::debug!(dep = %dep_name, "dropping per retread-drop-deps");
+                continue;
+            }
+            if auto_dropped.contains(&dep_name) {
+                // Surface this prominently so the user has a chance to
+                // notice if the auto-drop ate something they actually need.
+                tracing::warn!(
+                    dep = %dep_name,
+                    bundle = %bundle.conda_name,
+                    "auto-dropping built-in Windows-only PyPI shim on \
+                     non-Windows target. If you actually need this on this \
+                     platform, set `retread-overrides.{dep_name} = \"*\"` to \
+                     bypass the auto-drop.",
+                );
                 continue;
             }
             if !seen_dep_names.insert(dep_name.clone()) {
@@ -891,6 +910,90 @@ mod tests {
             url: format!("https://example.com/{pypi}.whl").parse().unwrap(),
             metadata: m,
         }
+    }
+
+    fn solo_bundle(name: &str, requires: Vec<&str>) -> Bundle {
+        Bundle {
+            conda_name: name.into(),
+            primary: rw(name, meta(name, "1.0.0", requires, true)),
+            extras: vec![],
+        }
+    }
+
+    #[test]
+    fn built_in_win_only_dropped_on_linux() {
+        // idna-ssl is in BUILT_IN_WIN_ONLY. Targeting linux-64, it must
+        // not appear in run-deps even though it has no explicit
+        // `sys_platform == "win32"` marker.
+        let bundle = solo_bundle("isaacsim", vec!["idna-ssl==1.1.0", "numpy==1.26.0"]);
+        let output = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11").unwrap();
+        let names: Vec<String> = output
+            .run_dependencies
+            .depends
+            .iter()
+            .map(|d| d.name.clone())
+            .collect();
+        assert!(!names.iter().any(|n| n == "idna-ssl"),
+            "idna-ssl auto-drop on linux failed; got: {names:?}");
+        assert!(names.iter().any(|n| n == "numpy"),
+            "numpy must still be emitted; got: {names:?}");
+    }
+
+    #[test]
+    fn built_in_win_only_kept_on_windows() {
+        // Same input, win-64 target. The auto-drop is non-Windows-only,
+        // so idna-ssl is expected to remain.
+        let bundle = solo_bundle("isaacsim", vec!["idna-ssl==1.1.0"]);
+        let output = produce_output(&bundle, &cfg(), Platform::Win64, "3.11").unwrap();
+        let names: Vec<String> = output
+            .run_dependencies
+            .depends
+            .iter()
+            .map(|d| d.name.clone())
+            .collect();
+        assert!(names.iter().any(|n| n == "idna-ssl"),
+            "idna-ssl should NOT be auto-dropped on win-64; got: {names:?}");
+    }
+
+    #[test]
+    fn explicit_override_beats_built_in_win_only() {
+        // If a user actually needs idna-ssl on linux, retread-overrides
+        // is the documented escape hatch. Setting it to any spec must
+        // cancel the built-in auto-drop.
+        let mut config = cfg();
+        config
+            .overrides
+            .insert("idna-ssl".to_string(), "*".to_string());
+        let bundle = solo_bundle("isaacsim", vec!["idna-ssl==1.1.0"]);
+        let output = produce_output(&bundle, &config, Platform::Linux64, "3.11").unwrap();
+        let names: Vec<String> = output
+            .run_dependencies
+            .depends
+            .iter()
+            .map(|d| d.name.clone())
+            .collect();
+        assert!(names.iter().any(|n| n == "idna-ssl"),
+            "retread-overrides should cancel the auto-drop; got: {names:?}");
+    }
+
+    #[test]
+    fn user_drop_deps_silently_drops() {
+        // User-specified drop happens at debug level (no warn), unlike
+        // the built-in auto-drop which warns. Behavior parity: dep is
+        // not emitted.
+        let mut config = cfg();
+        config.drop_deps.push("requests".to_string());
+        let bundle = solo_bundle("foo", vec!["requests==2.32.0", "numpy==1.26.0"]);
+        let output = produce_output(&bundle, &config, Platform::Linux64, "3.11").unwrap();
+        let names: Vec<String> = output
+            .run_dependencies
+            .depends
+            .iter()
+            .map(|d| d.name.clone())
+            .collect();
+        assert!(!names.iter().any(|n| n == "requests"),
+            "requests should be dropped per retread-drop-deps; got: {names:?}");
+        assert!(names.iter().any(|n| n == "numpy"));
     }
 
     #[test]
