@@ -16,7 +16,7 @@ use pixi_build_types::procedures::{
     negotiate_capabilities::{NegotiateCapabilitiesParams, NegotiateCapabilitiesResult},
 };
 use pixi_build_types::{BackendCapabilities, BinaryPackageSpec, NamedSpec, PackageSpec, VariantValue};
-use rattler_conda_types::{NoArchType, PackageName, Platform, VersionSpec, VersionWithSource};
+use rattler_conda_types::{ChannelUrl, NoArchType, PackageName, Platform, VersionSpec, VersionWithSource};
 use serde_json::Value;
 use tokio::sync::RwLock;
 use uv_pep508::uv_pep440::Operator;
@@ -46,6 +46,117 @@ const DEFAULT_PYTHON: &str = "3.11";
 /// on non-Windows is meaningless. Cross-platform packages (colorama,
 /// chardet) do NOT belong here — they just happen to be most-cited on
 /// Windows.
+/// URL of prefix-dev/parselmouth's canonical conda-forge -> PyPI name
+/// mapping. The JSON is keyed by conda-forge package name with values
+/// equal to a list of PyPI distribution names that this conda package
+/// provides (or null if no PyPI counterpart). Crucially the list can
+/// have multiple entries -- e.g. conda's `libopencv` provides PyPI
+/// `opencv-python` AND `opencv-python-headless` -- which we invert at
+/// load time to look up all conda candidates from a single PyPI name.
+/// Fetched once per backend invocation.
+const PARSELMOUTH_MAPPING_URL: &str =
+    "https://raw.githubusercontent.com/prefix-dev/parselmouth/main/files/v0/conda-forge/compressed_mapping.json";
+
+/// Hard-coded PyPI->conda name mappings that PATCH the parselmouth data.
+/// These entries are merged into the inverse map on top of parselmouth's
+/// (i.e., they ADD candidates rather than replacing). Used for known
+/// gaps in parselmouth's coverage -- when the upstream issue is fixed
+/// these entries become harmless duplicates.
+///
+/// Each entry should be accompanied by a link to the relevant
+/// parselmouth issue so it can be removed when fixed.
+const FALLBACK_PYPI_TO_CONDA: &[(&str, &str)] = &[
+    // prefix-dev/parselmouth#10: `py-opencv` (conda-forge) is incorrectly
+    // mapped to `None` instead of providing `opencv-python` /
+    // `opencv-python-headless`. Both are real conda-forge packages.
+    ("opencv-python",          "py-opencv"),
+    ("opencv-python-headless", "py-opencv"),
+    // Already covered by parselmouth (`pytorch: [torch]`) but here as a
+    // safety net in case the fetch fails entirely.
+    ("torch",                  "pytorch"),
+];
+
+/// Inverted parselmouth mapping: PyPI name -> conda-forge candidates.
+/// One PyPI name can have multiple conda names (e.g., split packages
+/// like `airflow` -> `apache-airflow`).
+type PypiToCondaMap = std::collections::HashMap<String, Vec<String>>;
+
+/// Best-effort fetch of the parselmouth mapping. Returns a fallback map
+/// if the network call fails -- never errors. Async because it makes an
+/// HTTP request.
+async fn load_pypi_to_conda_map() -> PypiToCondaMap {
+    let mut inverse: PypiToCondaMap = std::collections::HashMap::new();
+
+    match reqwest::get(PARSELMOUTH_MAPPING_URL).await {
+        Ok(resp) => match resp.error_for_status() {
+            Ok(resp) => {
+                match resp
+                    .json::<std::collections::HashMap<String, Option<Vec<String>>>>()
+                    .await
+                {
+                    Ok(forward) => {
+                        for (conda_name, pypi_list) in forward {
+                            for pypi in pypi_list.unwrap_or_default() {
+                                inverse
+                                    .entry(conda_name_from(&pypi))
+                                    .or_default()
+                                    .push(conda_name.clone());
+                            }
+                        }
+                        tracing::info!(
+                            entries = inverse.len(),
+                            "loaded parselmouth PyPI<->conda mapping"
+                        );
+                    }
+                    Err(e) => tracing::warn!(error = %e, "parselmouth JSON parse failed"),
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "parselmouth fetch failed"),
+        },
+        Err(e) => tracing::warn!(error = %e, "parselmouth fetch failed"),
+    }
+
+    // Patch in known-missing entries from FALLBACK on top of parselmouth.
+    // These are gaps in parselmouth's data (see each entry's comment for
+    // the corresponding upstream issue). When the upstream issues are
+    // fixed, the entries become harmless duplicates.
+    for (pypi, conda) in FALLBACK_PYPI_TO_CONDA {
+        let key = conda_name_from(pypi);
+        let entry = inverse.entry(key).or_default();
+        if !entry.iter().any(|c| c == conda) {
+            entry.push((*conda).to_string());
+        }
+    }
+
+    inverse
+}
+
+/// Returns the conda package names to check when looking up `pypi_name`
+/// on a conda channel. Always includes the PEP 503 normalized PyPI name,
+/// any parselmouth-derived aliases, and any user-supplied alias from
+/// `retread-name-map`.
+fn conda_candidates_for(
+    pypi_name: &str,
+    name_map: &std::collections::BTreeMap<String, String>,
+    pypi_to_conda: &PypiToCondaMap,
+) -> Vec<String> {
+    let normalized = conda_name_from(pypi_name);
+    let mut out = vec![normalized.clone()];
+    if let Some(conda_names) = pypi_to_conda.get(&normalized) {
+        for cn in conda_names {
+            if !out.iter().any(|n| n == cn) {
+                out.push(cn.clone());
+            }
+        }
+    }
+    if let Some(user) = name_map.get(pypi_name) {
+        if !out.iter().any(|n| n == user) {
+            out.push(user.clone());
+        }
+    }
+    out
+}
+
 const BUILT_IN_WIN_ONLY: &[&str] = &[
     "comtypes",         // COM bindings
     "idna-ssl",         // async SSL shim, last release 2017
@@ -189,20 +300,21 @@ impl Handler {
         let mut outputs = Vec::new();
         for python_version in &pythons {
             let target = wheel_target_for(params.host_platform, python_version);
-            let resolved = match resolve_all(&config, &target, &download_dir).await {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!(
-                        python = %python_version,
-                        error = %format!("{e:#}"),
-                        "skipping python variant: no matching wheels"
-                    );
-                    continue;
-                }
-            };
+            let (resolved, effective_config) =
+                match resolve_all(&config, &target, &download_dir, &params.channels).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(
+                            python = %python_version,
+                            error = %format!("{e:#}"),
+                            "skipping python variant: no matching wheels"
+                        );
+                        continue;
+                    }
+                };
             for bundle in &resolved {
                 outputs.push(
-                    produce_output(bundle, &config, params.host_platform, python_version)
+                    produce_output(bundle, &effective_config, params.host_platform, python_version)
                         .map_err(|e| {
                             RpcError::internal(format!("output for {}: {e:#}", bundle.conda_name))
                         })?,
@@ -233,9 +345,10 @@ impl Handler {
 
         // We re-resolve the full set (the lookup is cheap once cached) and
         // pick the entry matching the requested output.
-        let resolved = resolve_all(&config, &target, &download_dir)
-            .await
-            .map_err(|e| RpcError::internal(format!("resolving wheels: {e:#}")))?;
+        let (resolved, effective_config) =
+            resolve_all(&config, &target, &download_dir, &params.channels)
+                .await
+                .map_err(|e| RpcError::internal(format!("resolving wheels: {e:#}")))?;
 
         let requested = params.output.name.as_normalized().to_string();
         let picked = resolved
@@ -256,7 +369,7 @@ impl Handler {
 
         build_one(
             picked,
-            &config,
+            &effective_config,
             &params.work_directory,
             &output_dir,
             params.output.subdir,
@@ -330,24 +443,64 @@ async fn resolve_all(
     config: &RetreadConfig,
     target: &WheelTarget,
     download_dir: &Path,
-) -> Result<Vec<Bundle>> {
+    conda_channels: &[ChannelUrl],
+) -> Result<(Vec<Bundle>, RetreadConfig)> {
     let mut bundles = Vec::with_capacity(config.retread_wheels.len());
-    for (entry_name, entry) in &config.retread_wheels {
-        let mut bundle = resolve_bundle(entry_name, entry, target, download_dir).await?;
-        if config.auto_bundle && entry.url.is_none() {
-            // URL-form entries don't have an index to autoresolve against.
+
+    // Load parselmouth once and reuse across bundles. We also merge it
+    // into the effective name-map: when parselmouth says PyPI name X
+    // corresponds to conda name Y, we emit Y in the conda run-deps
+    // (otherwise the conda solver would fail to find X). Single-conda-
+    // -name PyPI entries are unambiguous; multi-conda entries are
+    // skipped from the merge (user must disambiguate via
+    // retread-name-map).
+    let pypi_to_conda = if config.auto_bundle {
+        load_pypi_to_conda_map().await
+    } else {
+        Default::default()
+    };
+
+    // Build an effective config whose name_map merges three sources, in
+    // precedence order:
+    //   1. User's retread-name-map (always wins).
+    //   2. FALLBACK_PYPI_TO_CONDA -- our manually-curated answers for
+    //      parselmouth gaps (opencv-python-headless -> py-opencv, etc.).
+    //   3. Parselmouth's unambiguous (single-conda-name) entries.
+    let mut effective = config.clone();
+    for (pypi, conda) in FALLBACK_PYPI_TO_CONDA {
+        let key = conda_name_from(pypi);
+        effective
+            .name_map
+            .entry(key)
+            .or_insert_with(|| (*conda).to_string());
+    }
+    for (pypi, conda_names) in &pypi_to_conda {
+        if conda_names.len() == 1 {
+            effective
+                .name_map
+                .entry(pypi.clone())
+                .or_insert_with(|| conda_names[0].clone());
+        }
+    }
+
+    for (entry_name, entry) in &effective.retread_wheels {
+        let mut bundle =
+            resolve_bundle(entry_name, entry, target, download_dir).await?;
+        if effective.auto_bundle && entry.url.is_none() {
             auto_bundle_transitives(
                 &mut bundle,
                 &entry.index_url(),
                 target,
                 download_dir,
-                config,
+                &effective,
+                conda_channels,
+                &pypi_to_conda,
             )
             .await?;
         }
         bundles.push(bundle);
     }
-    Ok(bundles)
+    Ok((bundles, effective))
 }
 
 async fn resolve_bundle(
@@ -459,6 +612,8 @@ async fn auto_bundle_transitives(
     target: &WheelTarget,
     download_dir: &Path,
     config: &RetreadConfig,
+    conda_channels: &[ChannelUrl],
+    pypi_to_conda: &PypiToCondaMap,
 ) -> Result<()> {
     // Build the skip set: anything already in the bundle, plus the user's
     // `retread-conda-deps` allowlist (deps that should stay as conda
@@ -477,23 +632,6 @@ async fn auto_bundle_transitives(
     skip.extend(config.drop_deps.iter().map(|n| conda_name_from(n)));
     skip.extend(config.overrides.keys().map(|n| conda_name_from(n)));
 
-    // Walk every Requires-Dist line in every already-resolved wheel,
-    // collecting exact-pinned base deps that aren't in skip.
-    let mut candidates: Vec<(String, String)> = Vec::new();
-    let mut seen_candidate: HashSet<String> = HashSet::new();
-    for wheel in bundle.all_wheels() {
-        for raw in &wheel.metadata.requires_dist {
-            let Some((name, version)) = pep508_exact_base_dep(raw)? else {
-                continue;
-            };
-            let conda_name = conda_name_from(&name);
-            if skip.contains(&conda_name) || !seen_candidate.insert(conda_name.clone()) {
-                continue;
-            }
-            candidates.push((name, version));
-        }
-    }
-
     // Fallback chain: entry's index first (for siblings on private
     // indexes like pypi.nvidia.com), then public PyPI (for the broader
     // ecosystem -- aiodns, qdldl, ...). Public PyPI is hardcoded rather
@@ -505,65 +643,171 @@ async fn auto_bundle_transitives(
         indexes.push(public);
     }
 
-    // Resolve each candidate against the index chain. First successful
-    // resolve wins (and adds the wheel to the bundle); a candidate that
-    // can't be resolved anywhere falls back to conda emission with a
-    // debug log.
-    'next_candidate: for (name, version) in candidates {
-        let conda_name = conda_name_from(&name);
-        for index in &indexes {
-            match pypi::resolve(index, &name, &version, target).await {
-                Ok(resolved) => {
-                    let metadata = match fetch_and_parse(
-                        &resolved.url,
-                        resolved.sha256.as_deref(),
-                        download_dir,
-                    )
-                    .await
-                    {
-                        Ok(m) => m,
-                        Err(e) => {
-                            tracing::debug!(
-                                dep = %name,
-                                error = %format!("{e:#}"),
-                                "auto-bundle fetch failed, leaving as conda dep"
-                            );
-                            continue 'next_candidate;
-                        }
-                    };
-                    tracing::info!(
-                        dep = %name,
-                        version = %version,
-                        index = %index,
-                        "auto-bundled into {}",
-                        bundle.conda_name,
-                    );
-                    bundle.extras.push(ResolvedWheel {
-                        pypi_name: conda_name,
-                        url: resolved.url,
-                        metadata,
-                    });
-                    continue 'next_candidate;
+
+    // Fixed-point loop: each newly-bundled wheel has its own
+    // Requires-Dist that may name more PyPI-only transitives, which
+    // themselves should be auto-bundled (e.g. bundling torch pulls in
+    // nvidia-cuda-nvrtc-cu12). Re-scan after every bundle until no new
+    // wheels are added. Cycle-detected via seen_candidate, which
+    // accumulates across iterations.
+    let mut seen_candidate: HashSet<String> = skip.clone();
+    let mut processed_wheel_count = 0;
+    loop {
+        // Collect new candidates from wheels we haven't scanned yet.
+        let mut candidates: Vec<(String, String)> = Vec::new();
+        for wheel in bundle.all_wheels().skip(processed_wheel_count) {
+            for raw in &wheel.metadata.requires_dist {
+                let Some((name, version)) = pep508_exact_base_dep(raw)? else {
+                    continue;
+                };
+                let conda_name = conda_name_from(&name);
+                if !seen_candidate.insert(conda_name) {
+                    continue;
                 }
-                Err(e) => {
-                    tracing::debug!(
-                        dep = %name,
-                        version = %version,
-                        index = %index,
-                        error = %format!("{e:#}"),
-                        "auto-bundle resolve failed on this index"
-                    );
+                candidates.push((name, version));
+            }
+        }
+        processed_wheel_count = bundle.all_wheels().count();
+        if candidates.is_empty() {
+            break;
+        }
+
+        // The auto-bundle policy is "bundle by default": every
+        // transitive dep is fetched from PyPI and pip-installed into
+        // the conda package. Reasoning: that's the only way to
+        // guarantee the upstream version pin (e.g. isaacsim wants
+        // aiodns 3.1, conda-forge has 3.0) is satisfied without
+        // forcing the user to enumerate conflicts manually.
+        //
+        // To OPT OUT (e.g. for ABI-sensitive packages like numpy where
+        // a bundled wheel would collide with the workspace's conda
+        // version), list the package in `retread-conda-deps`. Those
+        // already-in-`skip` deps are emitted as conda run-deps using
+        // the parselmouth-derived conda name when one exists.
+        //
+        // (The prefix.dev existence API is also checked for non-
+        // conda-forge channels, in case the user has a private channel
+        // hosting the package.)
+        let mut on_conda: HashSet<String> = HashSet::new();
+        for (pypi_name, _) in &candidates {
+            let conda_candidates =
+                conda_candidates_for(pypi_name, &config.name_map, pypi_to_conda);
+            for candidate_name in &conda_candidates {
+                if check_on_any_channel(candidate_name, conda_channels).await {
+                    on_conda.insert(conda_name_from(pypi_name));
+                    break;
                 }
             }
         }
-        tracing::debug!(
-            dep = %name,
-            version = %version,
-            "auto-bundle exhausted all indexes; leaving as conda dep. \
-             If conda can't satisfy it, add to retread-drop-deps."
-        );
+
+        let mut added_any = false;
+        'next_candidate: for (name, version) in candidates {
+            let conda_name = conda_name_from(&name);
+            if on_conda.contains(&conda_name) {
+                continue;
+            }
+            for index in &indexes {
+                match pypi::resolve(index, &name, &version, target).await {
+                    Ok(resolved) => {
+                        let metadata = match fetch_and_parse(
+                            &resolved.url,
+                            resolved.sha256.as_deref(),
+                            download_dir,
+                        )
+                        .await
+                        {
+                            Ok(m) => m,
+                            Err(e) => {
+                                tracing::debug!(
+                                    dep = %name,
+                                    error = %format!("{e:#}"),
+                                    "auto-bundle fetch failed; leaving as conda dep"
+                                );
+                                continue 'next_candidate;
+                            }
+                        };
+                        tracing::info!(
+                            dep = %name,
+                            version = %version,
+                            index = %index,
+                            "auto-bundled into {}",
+                            bundle.conda_name,
+                        );
+                        bundle.extras.push(ResolvedWheel {
+                            pypi_name: conda_name,
+                            url: resolved.url,
+                            metadata,
+                        });
+                        added_any = true;
+                        continue 'next_candidate;
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            dep = %name,
+                            version = %version,
+                            index = %index,
+                            error = %format!("{e:#}"),
+                            "auto-bundle resolve failed on this index"
+                        );
+                    }
+                }
+            }
+            tracing::debug!(
+                dep = %name,
+                version = %version,
+                "auto-bundle exhausted all indexes; leaving as conda dep. \
+                 If conda can't satisfy it, add to retread-drop-deps."
+            );
+        }
+
+        // Loop again only if we added at least one wheel; the new
+        // wheels' Requires-Dist may need further auto-bundling.
+        if !added_any {
+            break;
+        }
     }
     Ok(())
+}
+
+/// True if `package_name` exists on at least one of the workspace's conda
+/// channels. Hits prefix.dev's package-existence API; channels not hosted
+/// on prefix.dev are skipped (conservative -- those deps will go through
+/// the auto-bundle path).
+async fn check_on_any_channel(package_name: &str, channels: &[ChannelUrl]) -> bool {
+    for channel in channels {
+        let url_str = channel.url().as_str().trim_end_matches('/');
+        // Only prefix.dev channels are supported by the existence API.
+        // For other hosts we'd need to fetch repodata; skip for now.
+        let Some(channel_name) = url_str.strip_prefix("https://prefix.dev/") else {
+            continue;
+        };
+        if channel_name.is_empty() {
+            continue;
+        }
+        let api_url = format!(
+            "https://prefix.dev/api/v1/channels/{channel_name}/packages/{package_name}"
+        );
+        match reqwest::Client::new().head(&api_url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                tracing::debug!(
+                    package = %package_name,
+                    channel = %channel_name,
+                    "found on conda channel; skip auto-bundle"
+                );
+                return true;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::debug!(
+                    package = %package_name,
+                    channel = %channel_name,
+                    error = %e,
+                    "conda-availability check failed; assuming not present"
+                );
+            }
+        }
+    }
+    false
 }
 
 /// Returns Some((name, exact_version)) if `raw` is a base dep (no

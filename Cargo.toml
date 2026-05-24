@@ -1,6 +1,6 @@
 [package]
 name = "pixi-build-retread"
-version = "0.6.0"
+version = "0.7.1"
 edition = "2024"
 description = "Pixi build backend that repacks PyPI wheels as conda packages with relaxed dependency pins"
 license = "BSD-3-Clause"
@@ -29,7 +29,7 @@ tokio-util = { version = "0.7", features = ["codec"] }
 futures = "0.3"
 
 # Wheel fetching + parsing.
-reqwest = { version = "0.12.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.12.12", default-features = false, features = ["rustls-tls", "json"] }
 zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
 sha2 = "0.10"
 # uv's PEP 508 parser is the gold standard for Requires-Dist values.

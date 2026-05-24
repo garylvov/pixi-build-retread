@@ -88,13 +88,11 @@ backend = { name = "pixi-build-retread", version = "*", channels = ["https://pre
 [package.build.config]
 retread-relax        = "minor"
 retread-build-number = 0
-# Keep these on the conda side instead of auto-bundling. ABI-sensitive
-# C extensions where the workspace's conda version must be the one
-# Python imports.
-retread-conda-deps = ["numpy", "scipy", "torch", "pytorch", "pandas"]
-# retread-drop-deps would go here for deps that have no conda
-# counterpart. Windows-only shims (idna-ssl, pywin32, ...) are
-# auto-dropped on non-Windows targets, so nothing to add for those.
+# retread-conda-deps is intentionally empty: the auto-bundle path
+# queries each candidate against the workspace's conda channels via
+# prefix.dev's API and skips bundling whatever's already there.
+# Pkgs that exist on conda-forge (numpy, scipy, pytorch, ...) stay
+# on the conda side automatically.
 
 [package.build.config.retread-wheels]
 isaacsim = { version = "==5.1.0", index = "https://pypi.nvidia.com", extras = ["all", "extscache"] }
@@ -104,11 +102,10 @@ isaacsim = { version = "==5.1.0", index = "https://pypi.nvidia.com", extras = ["
 # and pip-installed into the bundle -- no manual overrides needed.
 # numpy stays on the conda side via retread-conda-deps above.
 
-[package.build.config.retread-name-map]
-opencv-python-headless = "py-opencv"
-# PyPI "torch" -> conda-forge "pytorch". Required because the
-# retread-conda-deps list above keeps torch on the conda side.
-torch = "pytorch"
+# retread-name-map intentionally empty: parselmouth supplies the
+# common renames (torch->pytorch, ...) at runtime, and retread's
+# built-in FALLBACK_PYPI_TO_CONDA patches known parselmouth gaps
+# (opencv-python-headless->py-opencv per parselmouth#10).
 "#;
 
 fn ensure_release_build() {
