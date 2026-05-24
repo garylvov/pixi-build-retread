@@ -9,6 +9,17 @@ Automates [@diegoferigo-rai](https://github.com/diegoferigo-rai)'s
 hand-written
 [Isaac Sim `recipe.yaml`](https://github.com/prefix-dev/pixi/issues/5230#issuecomment-comment-24).
 
+## Requirements
+
+- **pixi >= 0.63.0** — earlier versions only support pixi-build API
+  versions 1-3; retread targets API v4 (where the `[package.build]`
+  layout, `conda/outputs`, and `conda/build_v1` stabilized). If you
+  hit `the constraint pixi-build-api-version >=1,<4 cannot be
+  fulfilled`, upgrade pixi (`pixi self-update`) and re-run.
+- **rattler-build** on `PATH` whenever pixi invokes retread — the
+  conda recipe declares it as a runtime dep, so options that
+  install retread via a conda channel handle this automatically.
+
 ## Use
 
 retread is a pixi-build backend. pixi-build's model is **workspace
