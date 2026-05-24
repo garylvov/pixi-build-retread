@@ -333,7 +333,19 @@ async fn resolve_all(
 ) -> Result<Vec<Bundle>> {
     let mut bundles = Vec::with_capacity(config.retread_wheels.len());
     for (entry_name, entry) in &config.retread_wheels {
-        bundles.push(resolve_bundle(entry_name, entry, target, download_dir).await?);
+        let mut bundle = resolve_bundle(entry_name, entry, target, download_dir).await?;
+        if config.auto_bundle && entry.url.is_none() {
+            // URL-form entries don't have an index to autoresolve against.
+            auto_bundle_transitives(
+                &mut bundle,
+                &entry.index_url(),
+                target,
+                download_dir,
+                config,
+            )
+            .await?;
+        }
+        bundles.push(bundle);
     }
     Ok(bundles)
 }
@@ -431,6 +443,148 @@ async fn resolve_bundle(
         primary,
         extras,
     })
+}
+
+/// After the user-driven (extras + prefix) BFS, optionally bundle any
+/// exact-pinned base deps that resolve cleanly on the entry's PyPI index.
+/// This is the "pip autoresolve" path: deps that exist on PyPI but might
+/// not be on the workspace's conda channels (`aiodns`, `qdldl`, etc.) get
+/// pip-installed into the conda package alongside the primary wheel.
+///
+/// Best-effort: a resolve failure logs at debug and leaves the dep to be
+/// emitted as a conda run-dep (current fallback behavior).
+async fn auto_bundle_transitives(
+    bundle: &mut Bundle,
+    entry_index: &str,
+    target: &WheelTarget,
+    download_dir: &Path,
+    config: &RetreadConfig,
+) -> Result<()> {
+    // Build the skip set: anything already in the bundle, plus the user's
+    // `retread-conda-deps` allowlist (deps that should stay as conda
+    // run-deps), plus drop-deps, plus packages with explicit overrides
+    // (user is forcing conda emission via a spec).
+    //
+    // There is intentionally NO built-in "conda-preferred" list. ABI
+    // collisions (e.g. between a bundled numpy 1.26 and the workspace's
+    // conda numpy 2.x) are the user's call -- add the package name to
+    // `retread-conda-deps` to keep it on the conda side.
+    let mut skip: HashSet<String> = bundle
+        .all_wheels()
+        .map(|w| w.pypi_name.clone())
+        .collect();
+    skip.extend(config.conda_deps.iter().map(|n| conda_name_from(n)));
+    skip.extend(config.drop_deps.iter().map(|n| conda_name_from(n)));
+    skip.extend(config.overrides.keys().map(|n| conda_name_from(n)));
+
+    // Walk every Requires-Dist line in every already-resolved wheel,
+    // collecting exact-pinned base deps that aren't in skip.
+    let mut candidates: Vec<(String, String)> = Vec::new();
+    let mut seen_candidate: HashSet<String> = HashSet::new();
+    for wheel in bundle.all_wheels() {
+        for raw in &wheel.metadata.requires_dist {
+            let Some((name, version)) = pep508_exact_base_dep(raw)? else {
+                continue;
+            };
+            let conda_name = conda_name_from(&name);
+            if skip.contains(&conda_name) || !seen_candidate.insert(conda_name.clone()) {
+                continue;
+            }
+            candidates.push((name, version));
+        }
+    }
+
+    // Fallback chain: entry's index first (for siblings on private
+    // indexes like pypi.nvidia.com), then public PyPI (for the broader
+    // ecosystem -- aiodns, qdldl, ...). Public PyPI is hardcoded rather
+    // than configurable for now; if a user has air-gap requirements
+    // they can disable retread-auto-bundle entirely.
+    let mut indexes = vec![entry_index.to_string()];
+    let public = "https://pypi.org/simple/".to_string();
+    if entry_index != public {
+        indexes.push(public);
+    }
+
+    // Resolve each candidate against the index chain. First successful
+    // resolve wins (and adds the wheel to the bundle); a candidate that
+    // can't be resolved anywhere falls back to conda emission with a
+    // debug log.
+    'next_candidate: for (name, version) in candidates {
+        let conda_name = conda_name_from(&name);
+        for index in &indexes {
+            match pypi::resolve(index, &name, &version, target).await {
+                Ok(resolved) => {
+                    let metadata = match fetch_and_parse(
+                        &resolved.url,
+                        resolved.sha256.as_deref(),
+                        download_dir,
+                    )
+                    .await
+                    {
+                        Ok(m) => m,
+                        Err(e) => {
+                            tracing::debug!(
+                                dep = %name,
+                                error = %format!("{e:#}"),
+                                "auto-bundle fetch failed, leaving as conda dep"
+                            );
+                            continue 'next_candidate;
+                        }
+                    };
+                    tracing::info!(
+                        dep = %name,
+                        version = %version,
+                        index = %index,
+                        "auto-bundled into {}",
+                        bundle.conda_name,
+                    );
+                    bundle.extras.push(ResolvedWheel {
+                        pypi_name: conda_name,
+                        url: resolved.url,
+                        metadata,
+                    });
+                    continue 'next_candidate;
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        dep = %name,
+                        version = %version,
+                        index = %index,
+                        error = %format!("{e:#}"),
+                        "auto-bundle resolve failed on this index"
+                    );
+                }
+            }
+        }
+        tracing::debug!(
+            dep = %name,
+            version = %version,
+            "auto-bundle exhausted all indexes; leaving as conda dep. \
+             If conda can't satisfy it, add to retread-drop-deps."
+        );
+    }
+    Ok(())
+}
+
+/// Returns Some((name, exact_version)) if `raw` is a base dep (no
+/// extras marker) with a single `== X.Y.Z` specifier. Returns None for
+/// extras-gated deps, ranges, ~=, or URL deps.
+fn pep508_exact_base_dep(raw: &str) -> Result<Option<(String, String)>> {
+    use std::str::FromStr;
+    let req: uv_pep508::Requirement = uv_pep508::Requirement::from_str(raw)
+        .map_err(|e| anyhow!("parsing requirement `{raw}`: {e}"))?;
+    let env = default_marker_env(DEFAULT_PYTHON)?;
+    if !req.marker.evaluate(&env, &[]) {
+        return Ok(None);
+    }
+    let Some(uv_pep508::VersionOrUrl::VersionSpecifier(specs)) = req.version_or_url.as_ref() else {
+        return Ok(None);
+    };
+    let specs: Vec<_> = specs.iter().collect();
+    if specs.len() != 1 || *specs[0].operator() != Operator::Equal {
+        return Ok(None);
+    }
+    Ok(Some((req.name.to_string(), specs[0].version().to_string())))
 }
 
 /// One unit of pending work in the resolver BFS.
@@ -885,6 +1039,8 @@ mod tests {
             name_map: BTreeMap::new(),
             build_number: 0,
             drop_deps: Vec::new(),
+            auto_bundle: false,
+            conda_deps: Vec::new(),
             python: None,
         }
     }

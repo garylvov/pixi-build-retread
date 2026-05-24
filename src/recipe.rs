@@ -176,6 +176,8 @@ mod tests {
             name_map: BTreeMap::new(),
             build_number: 0,
             drop_deps: Vec::new(),
+            auto_bundle: false,
+            conda_deps: Vec::new(),
             python: None,
         }
     }

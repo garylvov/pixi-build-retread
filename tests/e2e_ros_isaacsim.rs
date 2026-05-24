@@ -88,6 +88,10 @@ backend = { name = "pixi-build-retread", version = "*", channels = ["https://pre
 [package.build.config]
 retread-relax        = "minor"
 retread-build-number = 0
+# Keep these on the conda side instead of auto-bundling. ABI-sensitive
+# C extensions where the workspace's conda version must be the one
+# Python imports.
+retread-conda-deps = ["numpy", "scipy", "torch", "pytorch", "pandas"]
 # retread-drop-deps would go here for deps that have no conda
 # counterpart. Windows-only shims (idna-ssl, pywin32, ...) are
 # auto-dropped on non-Windows targets, so nothing to add for those.
@@ -95,15 +99,16 @@ retread-build-number = 0
 [package.build.config.retread-wheels]
 isaacsim = { version = "==5.1.0", index = "https://pypi.nvidia.com", extras = ["all", "extscache"] }
 
-[package.build.config.retread-overrides]
-# Override the dep spec but keep the package required. Use when the
-# version range we'd emit doesn't match what's on conda channels.
-numpy  = ">=1.26,<2"
-# conda-forge only ships aiodns 3.0.0; isaacsim pins 3.1.1. Loosen.
-aiodns = "*"
+# retread-overrides intentionally absent. With retread-auto-bundle
+# on (default), `aiodns`, `qdldl`, etc. are auto-fetched from PyPI
+# and pip-installed into the bundle -- no manual overrides needed.
+# numpy stays on the conda side via retread-conda-deps above.
 
 [package.build.config.retread-name-map]
 opencv-python-headless = "py-opencv"
+# PyPI "torch" -> conda-forge "pytorch". Required because the
+# retread-conda-deps list above keeps torch on the conda side.
+torch = "pytorch"
 "#;
 
 fn ensure_release_build() {

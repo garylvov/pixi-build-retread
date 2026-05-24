@@ -55,6 +55,29 @@ pub struct RetreadConfig {
     #[serde(default, rename = "retread-drop-deps", alias = "drop-deps", alias = "drop_deps")]
     pub drop_deps: Vec<String>,
 
+    /// When true (default), retread tries to resolve every exact-pinned
+    /// transitive `Requires-Dist` line on the entry's PyPI index (with
+    /// public PyPI as fallback). If a wheel exists, it's pip-installed
+    /// into the conda package and dropped from the conda run-deps.
+    /// Eliminates the need to manually `retread-overrides` /
+    /// `retread-drop-deps` every PyPI package that isn't on conda-forge
+    /// (`aiodns`, `qdldl`, ...).
+    ///
+    /// Deps in `retread-conda-deps` are never auto-bundled -- they
+    /// always emit as conda run-deps. Set this to `false` to disable
+    /// auto-bundling entirely.
+    #[serde(default = "default_true", rename = "retread-auto-bundle", alias = "auto-bundle")]
+    pub auto_bundle: bool,
+
+    /// PyPI names that must stay as conda run-deps even when
+    /// `retread-auto-bundle` is on. Use for ABI-sensitive packages where
+    /// installing both a bundled wheel and the conda-channel version
+    /// causes a collision -- typically the scientific stack (`numpy`,
+    /// `scipy`, `pytorch`, `pandas`, ...). Empty by default; retread
+    /// intentionally does NOT hard-code a list.
+    #[serde(default, rename = "retread-conda-deps", alias = "conda-deps")]
+    pub conda_deps: Vec<String>,
+
     /// Conda build number for the produced packages. Bump to force
     /// re-resolution downstream after a policy change.
     #[serde(default, rename = "retread-build-number", alias = "build-number")]
@@ -85,6 +108,10 @@ impl PythonSpec {
             Self::Many(v) => v.clone(),
         }
     }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]

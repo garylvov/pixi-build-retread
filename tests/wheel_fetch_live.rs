@@ -88,6 +88,8 @@ async fn fetch_isaacsim_kernel_end_to_end() {
         name_map: BTreeMap::new(),
         build_number: 0,
             drop_deps: Vec::new(),
+            auto_bundle: false,
+            conda_deps: Vec::new(),
             python: None,
     };
     let recipe = build_bundle_recipe("isaacsim-kernel", &[BundleSource { pypi_name: &meta.name, url: &url, metadata: &meta }], &config).unwrap();
