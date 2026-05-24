@@ -7,14 +7,14 @@
 name = "isaacsim"
 version = "5.1.0"
 
-[build]
+[package.build]
 backend = { name = "pixi-build-retread", version = "*" }
 channels = [
   "https://prefix.dev/garylvov",
   "https://prefix.dev/conda-forge",
 ]
 
-[build.config]
+[package.build.config]
 retread-relax = "minor"
 retread-build-number = 0
 
@@ -22,14 +22,14 @@ retread-build-number = 0
 # PEP 503 simple index at `index` and expands `extras` one level deep via
 # the wheel's `Requires-Dist: name ; extra == "X"` lines. Compare to the
 # 22-line hand-curated URL list in pixi#5230 comment 24.
-[build.config.retread-wheels]
+[package.build.config.retread-wheels]
 isaacsim = { version = "==5.1.0", index = "https://pypi.nvidia.com", extras = ["all", "extscache"] }
 
 # Per-PyPI-name escape hatches. Use these only for cases that minor relax
 # cannot resolve. Compare to gigastrap's 16-entry
 # [feature.isaaclab.pypi-options.dependency-overrides] block.
-[build.config.overrides]
+[package.build.config.retread-overrides]
 numpy = ">=1.26,<2"
 
-[build.config.name-map]
+[package.build.config.retread-name-map]
 opencv-python-headless = "py-opencv"

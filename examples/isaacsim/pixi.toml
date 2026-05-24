@@ -22,29 +22,29 @@ preview = ["pixi-build"]
 name = "isaacsim"
 version = "5.1.0"
 
-[build]
+[package.build]
 backend = { name = "pixi-build-retread", version = "*" }
 channels = [
   "https://prefix.dev/garylvov",
   "https://prefix.dev/conda-forge",
 ]
 
-[build.config]
+[package.build.config]
 retread-relax = "minor"
 retread-build-number = 0
 
 # Same syntax pixi uses for [pypi-dependencies]. retread resolves this
 # against the PEP 503 simple index, then follows `extras` recursively
 # via the wheel's METADATA.
-[build.config.retread-wheels]
+[package.build.config.retread-wheels]
 isaacsim = { version = "==5.1.0", index = "https://pypi.nvidia.com", extras = ["all", "extscache"] }
 
-[build.config.overrides]
+[package.build.config.retread-overrides]
 # Keep numpy strictly <2 so the ros2-humble bindings (which still
 # depend on numpy<2 in many places) stay compatible.
 numpy = ">=1.26,<2"
 
-[build.config.name-map]
+[package.build.config.retread-name-map]
 # PyPI ships headless OpenCV as opencv-python-headless; conda calls it
 # py-opencv.
 opencv-python-headless = "py-opencv"

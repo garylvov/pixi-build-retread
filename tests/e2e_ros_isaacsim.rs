@@ -19,7 +19,7 @@
 //!   sitting alongside.
 //!
 //! Failures here are the ones that matter. The override block in
-//! `[build.config.overrides]` documents which upstream conflicts retread
+//! `[package.build.config.retread-overrides]` documents which upstream conflicts retread
 //! could NOT resolve on its own (e.g. pillow disagrees with itself across
 //! isaacsim sub-wheels); update those as we learn what breaks.
 
@@ -82,26 +82,27 @@ const REPACK_MANIFEST: &str = r#"
 name = "isaacsim"
 version = "5.1.0"
 
-[build]
-backend = { name = "pixi-build-retread", version = "*" }
-channels = ["https://prefix.dev/garylvov", "https://prefix.dev/conda-forge"]
+[package.build]
+backend = { name = "pixi-build-retread", version = "*", channels = ["https://prefix.dev/garylvov", "https://prefix.dev/conda-forge"] }
 
-[build.config]
-retread-relax = "minor"
+[package.build.config]
+retread-relax        = "minor"
 retread-build-number = 0
+# retread-drop-deps would go here for deps that have no conda
+# counterpart. Windows-only shims (idna-ssl, pywin32, ...) are
+# auto-dropped on non-Windows targets, so nothing to add for those.
 
-[build.config.retread-wheels]
+[package.build.config.retread-wheels]
 isaacsim = { version = "==5.1.0", index = "https://pypi.nvidia.com", extras = ["all", "extscache"] }
 
-[build.config.overrides]
-# These are the conflicts that survive `relax = "minor"`. Each one
-# documents an upstream metadata bug or a PyPI<->conda name skew that
-# the workspace operator has to break manually. Expand the list as new
-# conflicts surface; treat shrinkage as a leading indicator that
-# upstream is healing.
-numpy = ">=1.26,<2"
+[package.build.config.retread-overrides]
+# Override the dep spec but keep the package required. Use when the
+# version range we'd emit doesn't match what's on conda channels.
+numpy  = ">=1.26,<2"
+# conda-forge only ships aiodns 3.0.0; isaacsim pins 3.1.1. Loosen.
+aiodns = "*"
 
-[build.config.name-map]
+[package.build.config.retread-name-map]
 opencv-python-headless = "py-opencv"
 "#;
 

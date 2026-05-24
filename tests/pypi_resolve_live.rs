@@ -33,6 +33,24 @@ async fn resolves_small_public_pypi_package() {
 
 #[tokio::test]
 #[ignore = "hits pypi.nvidia.com; bandwidth-light but external dep"]
+async fn resolves_isaacsim_with_pep440_normalized_version() {
+    // The user writes `version = "==5.1.0"` (the natural form). The index
+    // serves wheels at `isaacsim-5.1.0.0-cp311-...` (four-component, with
+    // trailing zero). PEP 440 normalizes trailing zeros, so these must be
+    // treated as equivalent.
+    let r = resolve(
+        "https://pypi.nvidia.com",
+        "isaacsim",
+        "5.1.0",
+        &linux64("3.11"),
+    )
+    .await
+    .expect("`5.1.0` should resolve to the `5.1.0.0` wheel");
+    assert!(r.filename.starts_with("isaacsim-5.1.0.0"));
+}
+
+#[tokio::test]
+#[ignore = "hits pypi.nvidia.com; bandwidth-light but external dep"]
 async fn resolves_isaacsim_kernel_via_nvidia_index() {
     let r = resolve(
         "https://pypi.nvidia.com",

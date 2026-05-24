@@ -4,7 +4,9 @@
 
 use anyhow::{anyhow, bail, Result};
 use regex::Regex;
+use std::str::FromStr;
 use std::sync::OnceLock;
+use uv_pep508::uv_pep440;
 
 #[derive(Debug, Clone)]
 pub struct ResolvedWheel {
@@ -52,19 +54,29 @@ pub async fn resolve(
         bail!("no wheels listed at {index_url}");
     }
 
-    let filename_pattern = wheel_filename_prefix(name, version);
+    // PEP 440 semantic comparison so `5.1.0` and `5.1.0.0` resolve to the
+    // same wheel: pixi's `[pypi-dependencies]` syntax uses three-component
+    // versions naturally, but indexes (like NVIDIA's) often publish wheels
+    // at four-component versions with a trailing zero.
+    let target_version = uv_pep440::Version::from_str(version)
+        .map_err(|e| anyhow!("invalid version `{version}`: {e}"))?;
+    let name_prefix = format!("{}-", name.replace('-', "_"));
     candidates.retain(|c| {
-        c.filename.starts_with(&filename_pattern)
-            // After the version comes either `-` (start of next tag) or `_` (some
-            // version strings include trailing zeros that look like the prefix
-            // boundary). Be strict: require `-` so we don't match `5.1.0.0a1`
-            // when asked for `5.1.0`.
-            && c.filename[filename_pattern.len()..].starts_with('-')
+        let Some(rest) = c.filename.strip_prefix(&name_prefix) else {
+            return false;
+        };
+        let Some(version_str) = rest.split('-').next() else {
+            return false;
+        };
+        let Ok(cand_version) = uv_pep440::Version::from_str(version_str) else {
+            return false;
+        };
+        cand_version == target_version
     });
     if candidates.is_empty() {
         bail!(
             "no wheels match {name} == {version} at {index_url}; \
-             checked prefix `{filename_pattern}`"
+             checked PEP 440 normalized version against filename prefix `{name_prefix}`"
         );
     }
 
@@ -108,12 +120,6 @@ fn pep503_normalize(name: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
-/// Wheel filename prefix per PEP 427: `{distribution}-{version}` where
-/// distribution uses `_` in place of `-`. PEP 503 normalization to lowercase
-/// applies too in modern wheels, but to be safe we don't enforce case here.
-fn wheel_filename_prefix(name: &str, version: &str) -> String {
-    format!("{}-{version}", name.replace('-', "_"))
-}
 
 fn parse_index_links(html: &str, base: &url::Url) -> Result<Vec<ResolvedWheel>> {
     static RE: OnceLock<Regex> = OnceLock::new();

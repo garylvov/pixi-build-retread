@@ -24,7 +24,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use pixi_build_retread::config::{RelaxPolicy, RetreadConfig};
-use pixi_build_retread::recipe::{build_recipe, to_yaml};
+use pixi_build_retread::recipe::{build_bundle_recipe, to_yaml, BundleSource};
 use pixi_build_retread::wheel::{fetch_wheel, read_metadata};
 
 fn tempdir(label: &str) -> PathBuf {
@@ -87,9 +87,10 @@ async fn fetch_isaacsim_kernel_end_to_end() {
         overrides: BTreeMap::new(),
         name_map: BTreeMap::new(),
         build_number: 0,
+            drop_deps: Vec::new(),
             python: None,
     };
-    let recipe = build_recipe(&meta, &url, &config).unwrap();
+    let recipe = build_bundle_recipe("isaacsim-kernel", &[BundleSource { pypi_name: &meta.name, url: &url, metadata: &meta }], &config).unwrap();
     let yaml = to_yaml(&recipe).unwrap();
 
     // Same compatibility assertion as the snapshot test, but on live data.

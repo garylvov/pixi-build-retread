@@ -21,9 +21,9 @@ use serde_json::Value;
 use tokio::sync::RwLock;
 use uv_pep508::uv_pep440::Operator;
 
-use crate::config::RetreadConfig;
+use crate::config::{RetreadConfig, WheelEntry};
 use crate::pypi::{self, WheelTarget};
-use crate::recipe::{build_recipe, to_yaml};
+use crate::recipe::{build_bundle_recipe, to_yaml, BundleSource};
 use crate::relax::{default_marker_env, marker_env_for, python_version_from_wheel_tag};
 use crate::rpc::{ok, parse_params, RpcError};
 use crate::wheel::{fetch_wheel, read_metadata, WheelMetadata};
@@ -34,6 +34,32 @@ const CONDA_OUTPUTS: &str = "conda/outputs";
 const CONDA_BUILD_V1: &str = "conda/build_v1";
 
 const DEFAULT_PYTHON: &str = "3.11";
+
+/// PyPI packages that are Windows-only and frequently declared as
+/// unconditional `Requires-Dist` lines by upstream packagers (notably the
+/// Isaac Sim wheels). Auto-dropped from run-deps when the target platform
+/// isn't Windows, so users don't have to enumerate them in retread-drop-deps.
+///
+/// Inclusion criteria: ships wheels only for `win_*` platforms OR the
+/// package is exclusively a shim for a Windows-specific subsystem (Win32
+/// API, COM, registry, ANSI terminal compat, etc.) such that running it
+/// on non-Windows is meaningless. Cross-platform packages (colorama,
+/// chardet) do NOT belong here — they just happen to be most-cited on
+/// Windows.
+const BUILT_IN_WIN_ONLY: &[&str] = &[
+    "comtypes",         // COM bindings
+    "idna-ssl",         // async SSL shim, last release 2017
+    "pyreadline",       // readline replacement (deprecated)
+    "pyreadline3",      // readline replacement (current)
+    "pywin32",          // Win32 API bindings
+    "pywin32-ctypes",   // ctypes-only fallback for pywin32
+    "pywinpty",         // Windows pseudo-terminal (jupyter, IPython)
+    "win32-setctime",   // ctime setter for Windows files
+    "winregistry",      // registry helper (stdlib winreg on Windows)
+    "winrt-runtime",    // Windows Runtime API
+    "winshell",         // shell helpers
+    "wmi",              // Windows Management Instrumentation
+];
 
 #[derive(Default)]
 struct State {
@@ -46,14 +72,36 @@ pub struct Handler {
     state: Arc<RwLock<State>>,
 }
 
-/// One wheel after full resolution: URL is concrete, metadata parsed,
-/// conda package name decided. Both URL-form and spec-form entries collapse
-/// into this once we've fetched + parsed the wheel.
+/// One wheel after full resolution: URL is concrete, metadata parsed.
 #[derive(Debug, Clone)]
-struct Resolved {
-    conda_name: String,
+struct ResolvedWheel {
+    /// PEP 503 normalized PyPI name of this wheel (e.g. "isaacsim-kernel").
+    /// Used to filter vendored deps out of the bundle's run-deps and to
+    /// build the recipe.yaml's `source` list comments.
+    pypi_name: String,
     url: url::Url,
     metadata: WheelMetadata,
+}
+
+/// One conda output's worth of wheels: a "bundle" produced by a single
+/// `[retread-wheels]` user entry. The primary wheel plus all extras-derived
+/// wheels are installed together into the same conda package, matching the
+/// pattern in pixi#5230 comment 24.
+#[derive(Debug, Clone)]
+struct Bundle {
+    /// Conda package name from the user entry's map key.
+    conda_name: String,
+    /// The primary wheel (the one the user named) — drives the package's
+    /// version + filename for platform detection.
+    primary: ResolvedWheel,
+    /// All extras-derived sub-wheels, in BFS discovery order.
+    extras: Vec<ResolvedWheel>,
+}
+
+impl Bundle {
+    fn all_wheels(&self) -> impl Iterator<Item = &ResolvedWheel> {
+        std::iter::once(&self.primary).chain(self.extras.iter())
+    }
 }
 
 impl Handler {
@@ -152,11 +200,12 @@ impl Handler {
                     continue;
                 }
             };
-            for r in &resolved {
+            for bundle in &resolved {
                 outputs.push(
-                    produce_output(r, &config, params.host_platform, python_version).map_err(
-                        |e| RpcError::internal(format!("output for {}: {e:#}", r.conda_name)),
-                    )?,
+                    produce_output(bundle, &config, params.host_platform, python_version)
+                        .map_err(|e| {
+                            RpcError::internal(format!("output for {}: {e:#}", bundle.conda_name))
+                        })?,
                 );
             }
         }
@@ -191,12 +240,12 @@ impl Handler {
         let requested = params.output.name.as_normalized().to_string();
         let picked = resolved
             .iter()
-            .find(|r| r.conda_name == requested)
+            .find(|b| b.conda_name == requested)
             .ok_or_else(|| {
                 RpcError::invalid_params(format!(
-                    "no resolved wheel matches requested output `{requested}`; \
+                    "no resolved bundle matches requested output `{requested}`; \
                      known: {:?}",
-                    resolved.iter().map(|r| &r.conda_name).collect::<Vec<_>>()
+                    resolved.iter().map(|b| &b.conda_name).collect::<Vec<_>>()
                 ))
             })?;
 
@@ -268,59 +317,86 @@ fn wheel_target_for(subdir: Platform, python_version: &str) -> WheelTarget {
     }
 }
 
-/// Resolve every user-supplied entry into a flat list of concrete wheels,
-/// recursively expanding `extras` — every newly-discovered wheel has its
-/// own extras (if any were requested by the parent's Requires-Dist line)
-/// followed, until no new wheels are discovered. Cycle-detected by
-/// conda-normalized name so that diamond dependencies (A and B both
-/// require C) and self-cycles are handled.
+/// Resolve every user-supplied entry into a list of bundles. Each bundle
+/// represents one conda output that pixi will see; its `primary` wheel is
+/// the user-named one, `extras` are the recursively-resolved sub-wheels.
+/// All wheels in a bundle are installed together into the same conda
+/// package, matching the pattern in pixi#5230 comment 24.
+///
+/// Extras expansion is BFS with cycle detection (by PEP 503 normalized
+/// name) scoped per-bundle, so two different user entries can independently
+/// pull in the same sub-package.
 async fn resolve_all(
     config: &RetreadConfig,
     target: &WheelTarget,
     download_dir: &Path,
-) -> Result<Vec<Resolved>> {
-    let mut out = Vec::new();
+) -> Result<Vec<Bundle>> {
+    let mut bundles = Vec::with_capacity(config.retread_wheels.len());
+    for (entry_name, entry) in &config.retread_wheels {
+        bundles.push(resolve_bundle(entry_name, entry, target, download_dir).await?);
+    }
+    Ok(bundles)
+}
+
+async fn resolve_bundle(
+    entry_name: &str,
+    entry: &WheelEntry,
+    target: &WheelTarget,
+    download_dir: &Path,
+) -> Result<Bundle> {
+    let conda_name = conda_name_from(entry_name);
     let mut seen: HashSet<String> = HashSet::new();
     let mut work: VecDeque<Pending> = VecDeque::new();
 
-    // Seed worklist from user-supplied entries.
-    for (entry_name, entry) in &config.retread_wheels {
-        let map_key_name = conda_name_from(entry_name);
-        if let Some(url) = &entry.url {
-            // URL form: resolve inline (no index lookup needed).
-            if !seen.insert(map_key_name.clone()) {
-                continue;
-            }
-            let metadata = fetch_and_parse(url, entry.sha256.as_deref(), download_dir).await?;
-            out.push(Resolved {
-                conda_name: map_key_name,
-                url: url.clone(),
-                metadata,
-            });
-        } else {
-            // Spec form: dispatch through the worklist.
-            let version = entry
-                .normalized_version()
-                .ok_or_else(|| anyhow!("wheel `{entry_name}` has neither url nor version"))?;
-            work.push_back(Pending {
-                pypi_name: entry_name.clone(),
-                version,
-                index: entry.index_url(),
-                extras: entry.extras.clone(),
-                override_conda_name: Some(map_key_name),
-            });
+    // Resolve and fetch the primary wheel first.
+    let primary = if let Some(url) = &entry.url {
+        let metadata = fetch_and_parse(url, entry.sha256.as_deref(), download_dir).await?;
+        ResolvedWheel {
+            pypi_name: conda_name_from(entry_name),
+            url: url.clone(),
+            metadata,
         }
-    }
+    } else {
+        let version = entry
+            .normalized_version()
+            .ok_or_else(|| anyhow!("wheel `{entry_name}` has neither url nor version"))?;
+        let resolved = pypi::resolve(&entry.index_url(), entry_name, &version, target).await?;
+        let metadata =
+            fetch_and_parse(&resolved.url, resolved.sha256.as_deref(), download_dir).await?;
+        ResolvedWheel {
+            pypi_name: conda_name_from(entry_name),
+            url: resolved.url,
+            metadata,
+        }
+    };
+    seen.insert(primary.pypi_name.clone());
 
+    // Seed BFS from the primary's deps. Two flavors:
+    // 1. Extras-gated (`; extra == "X"`) for each requested extra.
+    // 2. Sibling base deps -- requirements without an extras marker whose
+    //    PyPI name shares the entry's namespace prefix (`<entry>-...`).
+    //    Real-world example: the isaacsim metapackage lists
+    //    `Requires-Dist: isaacsim-kernel==5.1.0.0` (no marker) because the
+    //    kernel is essential to ANY install of isaacsim. We bundle these
+    //    sub-packages so the conda solver doesn't try to find them
+    //    separately.
+    let prefix = format!("{}-", conda_name);
+    seed_worklist(
+        &primary.metadata,
+        &entry.extras,
+        &entry.index_url(),
+        &prefix,
+        &seen,
+        &mut work,
+    )?;
+
+    // BFS, accumulating sub-wheels.
+    let mut extras = Vec::new();
     while let Some(pending) = work.pop_front() {
-        let conda_name = pending
-            .override_conda_name
-            .clone()
-            .unwrap_or_else(|| conda_name_from(&pending.pypi_name));
-        if !seen.insert(conda_name.clone()) {
+        let dep_conda_name = conda_name_from(&pending.pypi_name);
+        if !seen.insert(dep_conda_name.clone()) {
             continue;
         }
-
         let resolved = pypi::resolve(&pending.index, &pending.pypi_name, &pending.version, target)
             .await
             .with_context(|| {
@@ -331,40 +407,30 @@ async fn resolve_all(
             })?;
         let metadata =
             fetch_and_parse(&resolved.url, resolved.sha256.as_deref(), download_dir).await?;
-        out.push(Resolved {
-            conda_name: conda_name.clone(),
-            url: resolved.url,
-            metadata: metadata.clone(),
-        });
 
-        // Each requested extra contributes more entries to the worklist.
-        // Sub-packages' own extras (encoded as `pkg[foo,bar]==1.0` in the
-        // parent's Requires-Dist line) are also followed.
-        for extra in &pending.extras {
-            for raw in &metadata.requires_dist {
-                let Some(dep) = pep508_extra_dep(raw, extra)? else {
-                    continue;
-                };
-                let dep_conda_name = conda_name_from(&dep.name);
-                if seen.contains(&dep_conda_name) {
-                    continue;
-                }
-                work.push_back(Pending {
-                    pypi_name: dep.name,
-                    version: dep.version,
-                    // Extras-derived deps inherit the parent's index. This
-                    // matches how `isaacsim[all]` works: the `==X` pin in
-                    // `Requires-Dist: isaacsim-core==5.1.0.0 ; extra == "all"`
-                    // resolves on the same NVIDIA index.
-                    index: pending.index.clone(),
-                    extras: dep.extras,
-                    override_conda_name: None,
-                });
-            }
-        }
+        // Recurse: this sub-wheel's own extras and prefix-matching base
+        // deps also get pulled in.
+        seed_worklist(
+            &metadata,
+            &pending.extras,
+            &pending.index,
+            &prefix,
+            &seen,
+            &mut work,
+        )?;
+
+        extras.push(ResolvedWheel {
+            pypi_name: dep_conda_name,
+            url: resolved.url,
+            metadata,
+        });
     }
 
-    Ok(out)
+    Ok(Bundle {
+        conda_name,
+        primary,
+        extras,
+    })
 }
 
 /// One unit of pending work in the resolver BFS.
@@ -376,14 +442,92 @@ struct Pending {
     /// Extras to activate on this wheel. Drives further worklist additions
     /// for `Requires-Dist: name ; extra == "X"` lines.
     extras: Vec<String>,
-    /// If `Some`, use this as the conda package name instead of deriving
-    /// from `pypi_name`. Set for user-supplied entries so the map key wins
-    /// over the wheel's METADATA Name.
-    override_conda_name: Option<String>,
 }
 
 fn conda_name_from(pypi_name: &str) -> String {
     pypi_name.to_ascii_lowercase().replace('_', "-")
+}
+
+/// Add extras-gated and prefix-matched base deps from `metadata` to `work`.
+/// Skips entries already in `seen` so the BFS terminates.
+fn seed_worklist(
+    metadata: &WheelMetadata,
+    extras_requested: &[String],
+    index: &str,
+    bundle_prefix: &str,
+    seen: &HashSet<String>,
+    work: &mut VecDeque<Pending>,
+) -> Result<()> {
+    for raw in &metadata.requires_dist {
+        // 1. Extras-gated lines for each requested extra.
+        let mut added = false;
+        for extra in extras_requested {
+            if let Some(dep) = pep508_extra_dep(raw, extra)? {
+                let dn = conda_name_from(&dep.name);
+                if seen.contains(&dn) {
+                    continue;
+                }
+                work.push_back(Pending {
+                    pypi_name: dep.name,
+                    version: dep.version,
+                    index: index.to_string(),
+                    extras: dep.extras,
+                });
+                added = true;
+            }
+        }
+        if added {
+            continue;
+        }
+        // 2. Base deps (no marker) whose PyPI name matches the bundle prefix.
+        if let Some(dep) = pep508_base_dep_in_prefix(raw, bundle_prefix)? {
+            let dn = conda_name_from(&dep.name);
+            if seen.contains(&dn) {
+                continue;
+            }
+            work.push_back(Pending {
+                pypi_name: dep.name,
+                version: dep.version,
+                index: index.to_string(),
+                extras: dep.extras,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Returns Some(ExtraDep) if `raw` is a base dep (no extras marker, or a
+/// marker that's satisfied with empty extras) whose PEP 503 normalized name
+/// starts with `prefix`. Used to bundle sibling sub-packages like
+/// `isaacsim-kernel` that the metapackage depends on unconditionally.
+fn pep508_base_dep_in_prefix(raw: &str, prefix: &str) -> Result<Option<ExtraDep>> {
+    use std::str::FromStr;
+    let req: uv_pep508::Requirement = uv_pep508::Requirement::from_str(raw)
+        .map_err(|e| anyhow!("parsing requirement `{raw}`: {e}"))?;
+
+    // Base dep: marker (if any) satisfied with empty extras.
+    let env = default_marker_env(DEFAULT_PYTHON)?;
+    if !req.marker.evaluate(&env, &[]) {
+        return Ok(None);
+    }
+
+    let conda_name = conda_name_from(req.name.as_ref());
+    if !conda_name.starts_with(prefix) {
+        return Ok(None);
+    }
+
+    let Some(uv_pep508::VersionOrUrl::VersionSpecifier(specs)) = req.version_or_url.as_ref() else {
+        return Ok(None);
+    };
+    let specs: Vec<_> = specs.iter().collect();
+    if specs.len() != 1 || *specs[0].operator() != Operator::Equal {
+        return Ok(None);
+    }
+    Ok(Some(ExtraDep {
+        name: req.name.to_string(),
+        version: specs[0].version().to_string(),
+        extras: req.extras.iter().map(|e| e.to_string()).collect(),
+    }))
 }
 
 async fn fetch_and_parse(
@@ -446,24 +590,25 @@ fn pep508_extra_dep(raw: &str, extra: &str) -> Result<Option<ExtraDep>> {
 }
 
 fn produce_output(
-    r: &Resolved,
+    bundle: &Bundle,
     config: &RetreadConfig,
     host_platform: Platform,
     workspace_python_version: &str,
 ) -> Result<CondaOutput> {
-    // Prefer the workspace's requested Python version; only fall back to
-    // parsing the wheel filename if the variant doesn't say anything (e.g.
-    // for a noarch / pure-python wheel where the cp tag is `py3`).
-    let python_version = if r.metadata.is_pure_python {
+    // Python version: prefer the workspace's variant; fall back to parsing
+    // the primary wheel's cp tag.
+    let python_version = if bundle.primary.metadata.is_pure_python {
         workspace_python_version.to_string()
     } else {
-        python_version_from_wheel_tag(&r.metadata.filename)
+        python_version_from_wheel_tag(&bundle.primary.metadata.filename)
             .unwrap_or_else(|| workspace_python_version.to_string())
     };
-    let subdir = if r.metadata.is_pure_python {
-        Platform::NoArch
-    } else {
+    // If ANY wheel in the bundle is platform-specific, the output is too.
+    let any_platform_specific = bundle.all_wheels().any(|w| !w.metadata.is_pure_python);
+    let subdir = if any_platform_specific {
         host_platform
+    } else {
+        Platform::NoArch
     };
 
     let python_dep = if python_version.contains('.') {
@@ -472,33 +617,105 @@ fn produce_output(
         format!("python {python_version}")
     };
 
-    let mut depends = vec![spec_from_str(&python_dep)?];
+    // Vendored set: every wheel that's part of this bundle is installed
+    // alongside its siblings, so any `Requires-Dist` line that names one of
+    // them must be dropped from the conda run-deps (otherwise conda would
+    // try to install a separate copy from a channel that doesn't have it).
+    let vendored: HashSet<String> = bundle.all_wheels().map(|w| w.pypi_name.clone()).collect();
+
+    // User-specified deps to drop entirely (no conda counterpart available).
+    let mut dropped: HashSet<String> = config
+        .drop_deps
+        .iter()
+        .map(|n| conda_name_from(n))
+        .collect();
+
+    // Built-in: Windows-only PyPI shims that are commonly mis-declared as
+    // unconditional `Requires-Dist` lines without `sys_platform` markers.
+    // Saves users from having to add the same entries to drop-deps for
+    // every isaacsim-style upstream that ships these.
+    if host_platform != Platform::Win64
+        && host_platform != Platform::Win32
+        && host_platform != Platform::WinArm64
+    {
+        for pkg in BUILT_IN_WIN_ONLY {
+            dropped.insert((*pkg).to_string());
+        }
+    }
+    tracing::debug!(
+        bundle = %bundle.conda_name,
+        vendored = ?vendored,
+        n_wheels = bundle.extras.len() + 1,
+        "computed vendored set"
+    );
+
+    // Union the relaxed run-deps across every wheel. Dedupe by conda name;
+    // when two wheels disagree, the first-encountered spec wins. Genuine
+    // upstream disagreements (e.g. pillow 11.3 vs 12.0 in isaacsim) are the
+    // user's responsibility to resolve via [build.config.overrides].
     let env = marker_env_for(&host_platform.to_string(), &python_version)?;
-    for raw in &r.metadata.requires_dist {
-        if let Some(dep) = crate::relax::translate(
-            raw,
-            &env,
-            &config.name_map,
-            &config.overrides,
-            config.relax,
-        )? {
-            depends.push(spec_from_str(&dep.0)?);
+    let mut depends_specs: Vec<NamedSpec<PackageSpec>> = vec![spec_from_str(&python_dep)?];
+    let mut seen_dep_names: HashSet<String> = HashSet::from(["python".to_string()]);
+    for wheel in bundle.all_wheels() {
+        for raw in &wheel.metadata.requires_dist {
+            let Some(dep) = crate::relax::translate(
+                raw,
+                &env,
+                &config.name_map,
+                &config.overrides,
+                config.relax,
+            )?
+            else {
+                continue;
+            };
+            // Skip if this dep refers to another wheel we're vendoring.
+            let dep_name = dep
+                .0
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_string();
+            if vendored.contains(&dep_name) {
+                continue;
+            }
+            if dropped.contains(&dep_name) {
+                tracing::debug!(dep = %dep_name, "dropping per retread-drop-deps");
+                continue;
+            }
+            if !seen_dep_names.insert(dep_name.clone()) {
+                continue;
+            }
+            depends_specs.push(spec_from_str(&dep.0)?);
         }
     }
 
-    let name = PackageName::new_unchecked(r.conda_name.clone());
-    let version = VersionWithSource::from_str(&r.metadata.version)
-        .map_err(|e| anyhow!("parsing version `{}`: {e}", r.metadata.version))?;
-    let noarch = if r.metadata.is_pure_python {
-        NoArchType::python()
-    } else {
+    // Surface the final run-dep list at info level so users can spot
+    // potentially-problematic deps before conda's solver complains.
+    // Anything here that fails downstream is a candidate for
+    // retread-drop-deps, retread-overrides, or retread-name-map.
+    let emitted: Vec<&str> = depends_specs.iter().map(|s| s.name.as_str()).collect();
+    tracing::info!(
+        bundle = %bundle.conda_name,
+        run_deps = ?emitted,
+        "bundle run-deps emitted; if conda can't find one, add it to \
+         retread-drop-deps / retread-overrides / retread-name-map"
+    );
+
+    let name = PackageName::new_unchecked(bundle.conda_name.clone());
+    let version = VersionWithSource::from_str(&bundle.primary.metadata.version).map_err(|e| {
+        anyhow!(
+            "parsing version `{}`: {e}",
+            bundle.primary.metadata.version
+        )
+    })?;
+    let noarch = if any_platform_specific {
         NoArchType::none()
+    } else {
+        NoArchType::python()
     };
     let py_short = python_version.replace('.', "");
     let build = format!("py{py_short}_{}", config.build_number);
 
-    // Encode the python variant so pixi-build's variant matrix can pick
-    // the right output. conda_build_v1 reads this back from params.output.variant.
     let mut variant = std::collections::BTreeMap::new();
     variant.insert(
         "python".to_string(),
@@ -525,7 +742,7 @@ fn produce_output(
             constraints: Vec::new(),
         }),
         run_dependencies: CondaOutputDependencies {
-            depends,
+            depends: depends_specs,
             constraints: Vec::new(),
         },
         ignore_run_exports: CondaOutputIgnoreRunExports::default(),
@@ -535,17 +752,22 @@ fn produce_output(
 }
 
 async fn build_one(
-    r: &Resolved,
+    bundle: &Bundle,
     config: &RetreadConfig,
     work_dir: &Path,
     output_dir: &Path,
     target_subdir: Platform,
 ) -> Result<CondaBuildV1Result> {
-    // Override the recipe's package name with the conda_name we decided
-    // earlier (which may differ from the wheel's METADATA Name when the
-    // user supplied a map-key override).
-    let mut recipe = build_recipe(&r.metadata, &r.url, config)?;
-    recipe.package.name = r.conda_name.clone();
+    // Lay out one BundleSource per wheel (primary first), in BFS order.
+    let sources: Vec<BundleSource> = bundle
+        .all_wheels()
+        .map(|w| BundleSource {
+            pypi_name: &w.pypi_name,
+            url: &w.url,
+            metadata: &w.metadata,
+        })
+        .collect();
+    let recipe = build_bundle_recipe(&bundle.conda_name, &sources, config)?;
     let yaml = to_yaml(&recipe)?;
 
     let recipe_dir = work_dir.join(format!("recipe-{}", recipe.package.name));
@@ -578,7 +800,7 @@ async fn build_one(
     let output_file =
         find_conda_artifact(&subdir_dir, &recipe.package.name, &recipe.package.version).await?;
 
-    let py_short = python_version_from_wheel_tag(&r.metadata.filename)
+    let py_short = python_version_from_wheel_tag(&bundle.primary.metadata.filename)
         .unwrap_or_default()
         .replace('.', "");
     Ok(CondaBuildV1Result {
@@ -628,4 +850,106 @@ async fn find_conda_artifact(dir: &Path, name: &str, version: &str) -> Result<Pa
         }
     }
     bail!("no .conda artifact found in {} matching {prefix}*.conda", dir.display())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::RelaxPolicy;
+    use std::collections::BTreeMap;
+
+    fn cfg() -> RetreadConfig {
+        RetreadConfig {
+            retread_wheels: BTreeMap::new(),
+            relax: RelaxPolicy::Minor,
+            overrides: BTreeMap::new(),
+            name_map: BTreeMap::new(),
+            build_number: 0,
+            drop_deps: Vec::new(),
+            python: None,
+        }
+    }
+
+    fn meta(name: &str, version: &str, requires: Vec<&str>, platform_specific: bool) -> WheelMetadata {
+        WheelMetadata {
+            name: name.into(),
+            version: version.into(),
+            requires_dist: requires.into_iter().map(String::from).collect(),
+            is_pure_python: !platform_specific,
+            sha256: format!("sha-{name}"),
+            filename: if platform_specific {
+                format!("{}-{version}-cp311-none-manylinux_2_35_x86_64.whl", name.replace('-', "_"))
+            } else {
+                format!("{}-{version}-py3-none-any.whl", name.replace('-', "_"))
+            },
+        }
+    }
+
+    fn rw(pypi: &str, m: WheelMetadata) -> ResolvedWheel {
+        ResolvedWheel {
+            pypi_name: pypi.to_string(),
+            url: format!("https://example.com/{pypi}.whl").parse().unwrap(),
+            metadata: m,
+        }
+    }
+
+    #[test]
+    fn vendored_sub_packages_dropped_from_run_deps() {
+        // Mirror the isaacsim bundle: primary depends on sub-packages,
+        // sub-packages depend on each other, all are vendored together.
+        let bundle = Bundle {
+            conda_name: "isaacsim".into(),
+            primary: rw(
+                "isaacsim",
+                meta(
+                    "isaacsim",
+                    "5.1.0.0",
+                    vec!["isaacsim-kernel==5.1.0.0 ; extra == \"all\""],
+                    true,
+                ),
+            ),
+            extras: vec![
+                rw(
+                    "isaacsim-kernel",
+                    meta(
+                        "isaacsim-kernel",
+                        "5.1.0.0",
+                        vec!["numpy==1.26.0", "Pillow==11.3.0"],
+                        true,
+                    ),
+                ),
+                rw(
+                    "isaacsim-core",
+                    meta(
+                        "isaacsim-core",
+                        "5.1.0.0",
+                        vec![
+                            "isaacsim-kernel==5.1.0.0",
+                            "numpy==1.26.0",
+                            "scipy==1.15.3",
+                        ],
+                        true,
+                    ),
+                ),
+            ],
+        };
+
+        let output = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11").unwrap();
+        let dep_names: Vec<String> = output
+            .run_dependencies
+            .depends
+            .iter()
+            .map(|d| d.name.clone())
+            .collect();
+        assert!(!dep_names.iter().any(|n| n == "isaacsim-kernel"),
+            "isaacsim-kernel is vendored and must NOT appear in run-deps; got: {dep_names:?}");
+        assert!(!dep_names.iter().any(|n| n == "isaacsim-core"),
+            "isaacsim-core is vendored and must NOT appear in run-deps; got: {dep_names:?}");
+        assert!(dep_names.iter().any(|n| n == "numpy"),
+            "numpy must appear (deduped from multiple wheels); got: {dep_names:?}");
+        assert!(dep_names.iter().any(|n| n == "pillow"),
+            "pillow must appear; got: {dep_names:?}");
+        assert!(dep_names.iter().any(|n| n == "scipy"),
+            "scipy must appear; got: {dep_names:?}");
+    }
 }

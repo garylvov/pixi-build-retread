@@ -20,26 +20,26 @@ channels = ["https://prefix.dev/conda-forge"]
 name    = "isaacsim-repack"
 version = "5.1.0"
 
-[build]
+[package.build]
 backend  = { name = "pixi-build-retread", version = "*" }
 channels = ["https://prefix.dev/garylvov", "https://prefix.dev/conda-forge"]
 
-[build.config]
+[package.build.config]
 retread-relax        = "minor"   # patch | minor | major | none
 retread-build-number = 0
 
 # Same syntax as `[pypi-dependencies]`. `version` + optional `index` and
 # `extras` resolves on a PEP 503 simple index; `url` + `sha256` is the
 # explicit fallback.
-[build.config.retread-wheels]
+[package.build.config.retread-wheels]
 isaacsim = { version = "==5.1.0", index = "https://pypi.nvidia.com", extras = ["all", "extscache"] }
 
 # Escape hatch for upstream conflicts the relax policy can't resolve.
-[build.config.overrides]
+[package.build.config.retread-overrides]
 numpy = ">=1.26,<2"
 
 # PyPI -> conda name remap on top of PEP 503 normalization.
-[build.config.name-map]
+[package.build.config.retread-name-map]
 opencv-python-headless = "py-opencv"
 ```
 
@@ -62,14 +62,14 @@ python = ["3.11", "3.12"]
 ```
 
 ```toml
-# Or in the source package's [build.config] -- a shortcut for users
+# Or in the source package's [package.build.config] -- a shortcut for users
 # who haven't declared build-variants. Accepts a string or a list.
-[build.config]
+[package.build.config]
 python = "3.11"           # single version
 # python = ["3.11", "3.12"]   # or a matrix
 ```
 
-Precedence is `[workspace.build-variants]` > `[build.config] python` >
+Precedence is `[workspace.build-variants]` > `[package.build.config] python` >
 default `3.11`. Each variant point gets its own conda package with a
 `build` string of `pyXY_<build_number>`, so pixi can resolve different
 workspaces to different builds of the same source package.
@@ -103,7 +103,7 @@ cargo build --release
 # 2. Export the override pointing at the local binary.
 export PIXI_BUILD_BACKEND_OVERRIDE=pixi-build-retread=$(pwd)/target/release/pixi-build-retread
 
-# 3. Work in any consumer workspace -- its [build] table still says
+# 3. Work in any consumer workspace -- its [package.build] table still says
 #    `backend = { name = "pixi-build-retread", ... }`, but pixi will
 #    spawn the local binary instead of the channel copy.
 cd ~/your-workspace

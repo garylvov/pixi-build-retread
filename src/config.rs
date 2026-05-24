@@ -38,14 +38,22 @@ pub struct RetreadConfig {
 
     /// Per-dependency overrides, applied after the relax policy. Map of
     /// PyPI name -> conda match-spec (e.g. `"*"`, `">=2.7"`).
-    #[serde(default)]
+    #[serde(default, rename = "retread-overrides", alias = "overrides")]
     pub overrides: BTreeMap<String, String>,
 
     /// PyPI -> conda name mapping overrides on top of the built-in identity
     /// mapping. Use for the common drift cases (`opencv-python-headless` ->
     /// `py-opencv`, etc.).
-    #[serde(default)]
+    #[serde(default, rename = "retread-name-map", alias = "name-map", alias = "name_map")]
     pub name_map: BTreeMap<String, String>,
+
+    /// PyPI names to drop from the conda run-deps entirely. Use for
+    /// upstream-pinned deps that don't exist on the target conda channel
+    /// (Windows-only shims like `idna-ssl`, `pywin32`) or otherwise can't
+    /// be satisfied. The wheel still gets installed; conda just won't
+    /// require these at solve time.
+    #[serde(default, rename = "retread-drop-deps", alias = "drop-deps", alias = "drop_deps")]
+    pub drop_deps: Vec<String>,
 
     /// Conda build number for the produced packages. Bump to force
     /// re-resolution downstream after a policy change.
