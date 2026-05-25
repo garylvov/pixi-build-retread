@@ -108,6 +108,45 @@ pub struct PixiTomlBlocks {
     pub pypi_options_dependency_overrides: String,
 }
 
+/// v0.14.1+: one routing decision the BFS / auto-bundle path made
+/// against the conda channel probe. Records WHAT was probed, WHAT
+/// conda returned, and WHAT retread did with the answer. Written to
+/// the audit even when the conda solve fails downstream (audit is
+/// flushed at conda/outputs, not just conda/build_v1). This is the
+/// disk-side answer to "why did retread emit `gym >=0.23,<0.24` as a
+/// conda run-dep when conda-forge has no py3.11 build?"
+#[derive(Debug, Clone, Serialize)]
+pub struct ProbeDecision {
+    /// Where in retread the decision happened.
+    /// `"bfs"` = `resolve_bundle` extras/base-dep BFS.
+    /// `"auto_bundle"` = `auto_bundle_transitives` (post-merge).
+    pub stage: String,
+    /// PyPI name as it appeared in the wheel's Requires-Dist.
+    pub pypi_name: String,
+    /// Conda name retread looked up (parselmouth alias or identity).
+    pub conda_name: String,
+    /// Spec retread asked the probe about (PyPI specifiers, post-
+    /// normalization).
+    pub spec: String,
+    /// Target python version retread asked the probe to filter for.
+    pub target_python: String,
+    /// Channels the probe actually consulted (non-prefix.dev channels
+    /// silently skipped; empty list means "indecisive").
+    pub channels_consulted: Vec<String>,
+    /// Some(true) at least one channel had a python-compatible
+    /// satisfying version; Some(false) all consulted channels had
+    /// candidates but none satisfied python+spec; None = indecisive
+    /// (no channels consulted OR all probes errored).
+    pub satisfiable: Option<bool>,
+    /// Diagnostic count of matching variants across all channels.
+    pub matching_candidates: usize,
+    /// What retread did with the answer: `"short-circuit"` (emit as
+    /// conda run-dep), `"fall-through-to-pypi"` (resolve+bundle from
+    /// PyPI), `"indecisive-short-circuit"` (kept legacy optimistic
+    /// behavior).
+    pub routing_decision: String,
+}
+
 /// All info about one conda output retread produced.
 #[derive(Debug, Serialize)]
 pub struct BundleAudit {
@@ -116,6 +155,12 @@ pub struct BundleAudit {
     pub wheels: Vec<WheelAudit>,
     pub emitted_run_deps: Vec<EmittedDep>,
     pub pixi_toml_blocks: PixiTomlBlocks,
+    /// v0.14.1+: per-dep routing decisions made via the conda channel
+    /// probe. Populated incrementally during resolve_all + auto-bundle;
+    /// always present in the on-disk audit so debugging "why did this
+    /// dep go to conda?" doesn't require any --trace flags.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub probe_decisions: Vec<ProbeDecision>,
 }
 
 /// Top-level audit: keyed by the (conda_name, python_version) pair
@@ -168,11 +213,14 @@ fn render_conda_deps(emitted: &[EmittedDep]) -> String {
 
 impl BundleAudit {
     /// Construct a BundleAudit including the rendered TOML blocks.
+    /// `probe_decisions` is the routing-trace collected during the
+    /// BFS + auto-bundle passes (v0.14.1+). Empty for legacy callers.
     pub fn new(
         conda_name: String,
         version: String,
         wheels: Vec<WheelAudit>,
         emitted_run_deps: Vec<EmittedDep>,
+        probe_decisions: Vec<ProbeDecision>,
     ) -> Self {
         let pypi_options_dependency_overrides = render_pypi_overrides(&wheels);
         let dependencies = render_conda_deps(&emitted_run_deps);
@@ -185,6 +233,7 @@ impl BundleAudit {
                 dependencies,
                 pypi_options_dependency_overrides,
             },
+            probe_decisions,
         }
     }
 }
@@ -276,6 +325,7 @@ mod tests {
                 EmittedDep { name: "numpy".into(), spec: "numpy >=1".into() },
                 EmittedDep { name: "pyglet".into(), spec: "pyglet".into() },
             ],
+            vec![],
         );
         let json = serde_json::to_string_pretty(&audit).unwrap();
         // Spot-check shape rather than exact bytes (field order is

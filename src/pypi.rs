@@ -109,6 +109,96 @@ pub async fn resolve(
     )
 }
 
+/// v0.18.0+: PyPI Simple resolution scoped to source distributions
+/// (`.tar.gz`, `.zip`). Used as the BFS fallback when [`resolve`]
+/// returns "no wheels match" for a dep that PyPI only ships as sdist
+/// (gym, classic-control, packages where the maintainer never uploads
+/// wheels). The caller pipes the returned sdist URL through
+/// `source_build::build_wheel_from_sdist_url` -> uv build --wheel,
+/// then the produced wheel reenters the normal bundle pipeline.
+pub async fn resolve_sdist(
+    index: &str,
+    name: &str,
+    specifiers: &VersionSpecifiers,
+) -> Result<ResolvedWheel> {
+    let index_url = build_index_url(index, name)?;
+    tracing::info!(url = %index_url, "sdist fallback: fetching simple index");
+    let html = reqwest::get(index_url.clone())
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
+
+    let mut candidates = parse_index_links_any(&html, &index_url)?;
+    // sdist suffixes per PEP 625 + the legacy ones still on PyPI.
+    candidates.retain(|c| {
+        let f = c.filename.to_ascii_lowercase();
+        f.ends_with(".tar.gz") || f.ends_with(".zip") || f.ends_with(".tar.bz2")
+    });
+    if candidates.is_empty() {
+        bail!("no sdists listed at {index_url}");
+    }
+
+    let name_norm_dash = name.replace('_', "-").to_ascii_lowercase();
+    let name_norm_underscore = name.replace('-', "_").to_ascii_lowercase();
+    let mut versioned: Vec<(uv_pep440::Version, ResolvedWheel)> = candidates
+        .into_iter()
+        .filter_map(|c| {
+            let f_lower = c.filename.to_ascii_lowercase();
+            // sdist filenames: `<name>-<version>.tar.gz`. Name uses
+            // either dash or underscore depending on the maintainer.
+            // Try both, longest-prefix wins (so `gym-0.23.1.tar.gz`
+            // doesn't match for `gym-notices`).
+            let stem = f_lower
+                .strip_suffix(".tar.gz")
+                .or_else(|| f_lower.strip_suffix(".zip"))
+                .or_else(|| f_lower.strip_suffix(".tar.bz2"))?;
+            let rest = stem
+                .strip_prefix(&format!("{name_norm_dash}-"))
+                .or_else(|| stem.strip_prefix(&format!("{name_norm_underscore}-")))?;
+            let version = uv_pep440::Version::from_str(rest).ok()?;
+            Some((version, c))
+        })
+        .filter(|(v, _)| specifiers.contains(v))
+        .collect();
+    if versioned.is_empty() {
+        bail!("no sdist for {name} {specifiers} at {index_url}");
+    }
+    versioned.sort_by(|a, b| b.0.cmp(&a.0));
+    Ok(versioned.into_iter().next().unwrap().1)
+}
+
+/// Parser variant that DOES NOT filter by `.whl` suffix. Used by
+/// [`resolve_sdist`] which wants tarballs.
+fn parse_index_links_any(html: &str, base: &url::Url) -> Result<Vec<ResolvedWheel>> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r#"href="([^"]+)""#).unwrap());
+    let mut out = Vec::new();
+    for cap in re.captures_iter(html) {
+        let href = &cap[1];
+        let url = match base.join(href) {
+            Ok(u) => u,
+            Err(_) => continue,
+        };
+        let filename = match url.path_segments().and_then(|s| s.last()) {
+            Some(f) if !f.is_empty() => percent_encoding::percent_decode_str(f)
+                .decode_utf8_lossy()
+                .into_owned(),
+            _ => continue,
+        };
+        let sha256 = url.fragment().and_then(|f| {
+            f.strip_prefix("sha256=")
+                .filter(|h| h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit()))
+                .map(|h| h.to_ascii_lowercase())
+        });
+        out.push(ResolvedWheel { url, sha256, filename });
+    }
+    if out.is_empty() {
+        bail!("no `<a href=...>` links found at index");
+    }
+    Ok(out)
+}
+
 fn build_index_url(index: &str, name: &str) -> Result<url::Url> {
     // PEP 503: name normalized to lowercase, runs of `_.-` collapsed to a
     // single `-`. The index path ends with a `/`.

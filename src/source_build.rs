@@ -131,6 +131,79 @@ async fn newest_wheel_in(dir: &Path) -> Result<Option<PathBuf>> {
     Ok(best.map(|(_, p)| p))
 }
 
+/// v0.18.0+: download a PyPI sdist (`.tar.gz` / `.zip`) and run
+/// `uv build --wheel` on it. Used as the BFS fallback when a dep is
+/// sdist-only on PyPI (gym, classic-control, ...). Output is a normal
+/// wheel that re-enters the bundle pipeline.
+///
+/// `out_dir` should be per-entry (e.g. `<pack>/wheels/<entry>/`) so
+/// cache reuse and cleanup match what other materialize paths do.
+/// Returns the path to the built wheel.
+pub async fn build_wheel_from_sdist_url(
+    sdist_url: &url::Url,
+    out_dir: &Path,
+    python_version: &str,
+) -> Result<PathBuf> {
+    tokio::fs::create_dir_all(out_dir)
+        .await
+        .with_context(|| format!("creating sdist-build out dir {}", out_dir.display()))?;
+
+    // Cache: if a wheel was already built here, reuse it.
+    if let Some(cached) = newest_wheel_in(out_dir).await? {
+        tracing::info!(
+            sdist = %sdist_url,
+            wheel = %cached.display(),
+            "reusing cached wheel from previous sdist build",
+        );
+        return Ok(cached);
+    }
+
+    // Pull the sdist filename out of the URL.
+    let filename = sdist_url
+        .path_segments()
+        .and_then(|s| s.last())
+        .and_then(|f| if f.is_empty() { None } else { Some(f) })
+        .ok_or_else(|| anyhow!("sdist URL {sdist_url} has no filename component"))?
+        .to_string();
+    let sdist_path = out_dir.join(&filename);
+
+    tracing::info!(
+        url = %sdist_url,
+        dst = %sdist_path.display(),
+        "downloading sdist for last-resort wheel build",
+    );
+    let bytes = reqwest::get(sdist_url.clone())
+        .await
+        .with_context(|| format!("downloading sdist {sdist_url}"))?
+        .error_for_status()
+        .with_context(|| format!("sdist HTTP error for {sdist_url}"))?
+        .bytes()
+        .await
+        .with_context(|| format!("reading sdist body from {sdist_url}"))?;
+    tokio::fs::write(&sdist_path, &bytes)
+        .await
+        .with_context(|| format!("writing sdist to {}", sdist_path.display()))?;
+
+    tracing::info!(
+        sdist = %sdist_path.display(),
+        python = %python_version,
+        "uv build --wheel on sdist (downloads python if needed)",
+    );
+    let py_arg = format!("--python={python_version}");
+    let out_arg = format!("--out-dir={}", out_dir.display());
+    run_capturing_uv(
+        &[
+            "build",
+            "--wheel",
+            &py_arg,
+            &out_arg,
+            &sdist_path.display().to_string(),
+        ],
+    )
+    .await?;
+    find_built_wheel(out_dir).await
+}
+
 /// Compute the on-disk source-tree directory that
 /// [`build_wheel_from_git`] will (or did) build from, without doing
 /// any clone work. Lets callers feed the same directory into

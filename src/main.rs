@@ -10,6 +10,11 @@ use tracing_subscriber::EnvFilter;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Log to stderr only — stdout is reserved for the JSON-RPC transport.
+    // Per-bundle probe + routing decisions ALSO land on disk as part of
+    // the audit JSON (retread-audit-<bundle>.json next to the pack's
+    // pixi.toml). That audit is what to read when pixi swallows stderr
+    // and you can't see this stream.
+    // Filter: PIXI_BUILD_RETREAD_LOG (NOT RUST_LOG -- common gotcha).
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(

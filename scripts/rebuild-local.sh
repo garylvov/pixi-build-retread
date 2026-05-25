@@ -108,15 +108,24 @@ rm -rf ~/.cache/rattler/cache/backends-v0/pixi-build-retread-*
 echo "[rebuild-local] nuking retread git-clone cache"
 rm -rf ~/.cache/rattler/cache/retread-git-clones
 
-# (5) Nuke the consumer project's pixi caches if pointed at one.
-#     Skip silently when CONSUMER_PROJECT isn't set -- not everyone has
-#     a downstream workspace they're iterating against.
+# (5) Nuke the consumer project's pixi caches AND retread audit/trace
+#     files if pointed at one. Skip silently when CONSUMER_PROJECT
+#     isn't set -- not everyone has a downstream workspace they're
+#     iterating against. The audit + trace deletion is what makes
+#     `cat retread-probe-trace-*.json | head -3` a reliable check
+#     of "did this run actually invoke retread?" -- without nuking,
+#     stale files from earlier runs masquerade as fresh data.
 if [[ -n "${CONSUMER_PROJECT:-}" ]]; then
     echo "[rebuild-local] nuking consumer caches under $CONSUMER_PROJECT"
     rm -rf "$CONSUMER_PROJECT/.pixi/meta-v0/"isaac* \
            "$CONSUMER_PROJECT/.pixi/bld/"isaac* || true
     rm -rf ~/.cache/rattler/cache/bld/metadata-v0/isaac* \
            ~/.cache/rattler/cache/bld/source_metadata-v0/isaac* || true
+    # Nuke stale retread audit + probe-trace files in every source
+    # package under the consumer (anything containing pixi.toml at
+    # max-depth 2). Best-effort -- skip silently if find errors.
+    find "$CONSUMER_PROJECT" -maxdepth 3 -name "retread-audit-*.json" -delete 2>/dev/null || true
+    find "$CONSUMER_PROJECT" -maxdepth 3 -name "retread-probe-trace-*.json" -delete 2>/dev/null || true
 fi
 
 # (6) Rebuild. Variant config is included so multi-python recipes work
@@ -147,6 +156,25 @@ echo "[rebuild-local] done. Next step:"
 if [[ -n "${CONSUMER_PROJECT:-}" ]]; then
     echo "    cd $CONSUMER_PROJECT && pixi install"
 else
+    # CONSUMER_PROJECT not set -- script skipped the per-workspace
+    # nuke. Be NOISY about what the user still has to clean by hand,
+    # because skipping any of these is the #1 reason "edit code ->
+    # rebuild -> still see old error" persists.
+    echo ""
+    echo "[rebuild-local] WARN: CONSUMER_PROJECT not set; per-workspace caches were NOT nuked." >&2
+    echo "[rebuild-local] Before re-solving in your workspace, manually run:" >&2
+    echo "" >&2
+    echo "    rm -rf \\" >&2
+    echo "      <your-workspace>/.pixi/meta-v0/<pack-name>* \\" >&2
+    echo "      <your-workspace>/.pixi/bld/<pack-name>* \\" >&2
+    echo "      ~/.cache/rattler/cache/bld/metadata-v0/<pack-name>* \\" >&2
+    echo "      ~/.cache/rattler/cache/bld/source_metadata-v0/<pack-name>* \\" >&2
+    echo "      <your-workspace>/<source-pack-dir>/retread-audit-*.json \\" >&2
+    echo "      <your-workspace>/<source-pack-dir>/retread-probe-trace-*.json" >&2
+    echo "" >&2
+    echo "[rebuild-local] OR re-run this script with CONSUMER_PROJECT=/abs/path to do it automatically:" >&2
+    echo "    CONSUMER_PROJECT=/abs/path bash scripts/rebuild-local.sh" >&2
+    echo "" >&2
     echo "    cd <your-workspace> && pixi install"
     echo "    (set CONSUMER_PROJECT=/path/to/workspace to also nuke its pixi caches automatically)"
 fi

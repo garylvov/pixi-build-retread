@@ -84,7 +84,7 @@ version = "5.1.0"
 # Bump as new releases ship so pixi reproducibly picks the same
 # backend across machines. Use `version = "*"` only if you're OK
 # with auto-picking the highest available on every solve.
-backend = { name = "pixi-build-retread", version = "==0.11.2" }
+backend = { name = "pixi-build-retread", version = ">=0.14.0" }
 channels = [
   "https://prefix.dev/garylvov",
   "https://prefix.dev/conda-forge",
@@ -121,7 +121,6 @@ rev = "867cbf9b7b4edbb03f32e1209c585a38cb3d8edf"
 #  * `from = "<name>"` + optional `subdirectory` + optional `extras`
 #                                                      → pip wheel git (named)
 #
-# As of v0.12.0, `extras = [...]` is valid on EVERY form except `url`.
 # Source-form extras (path/git/from) follow the same BFS the PyPI form
 # uses: each extras-gated `Requires-Dist: <pkg>; extra == "<name>"` in
 # the built wheel's METADATA gets resolved as a sub-wheel. URL
@@ -134,7 +133,8 @@ rev = "867cbf9b7b4edbb03f32e1209c585a38cb3d8edf"
 #
 # Mix freely. Each gets the same METADATA-rewrite + bundle treatment.
 [package.build.config.retread-wheels]
-isaacsim = { version = "==5.1.0", index = "https://pypi.nvidia.com", extras = ["all", "extscache"] }
+isaacsim = { version = "==5.1.0", index = "https://pypi.nvidia.com", 
+              extras = ["all", "extscache"] }
 
 # IsaacLab sub-packages -- all six are needed because they reference
 # each other (isaaclab pulls isaaclab-assets / isaaclab-tasks;
