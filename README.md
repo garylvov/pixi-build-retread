@@ -84,7 +84,7 @@ version = "5.1.0"
 # Bump as new releases ship so pixi reproducibly picks the same
 # backend across machines. Use `version = "*"` only if you're OK
 # with auto-picking the highest available on every solve.
-backend = { name = "pixi-build-retread", version = ">=0.14.0" }
+backend = { name = "pixi-build-retread", version = ">=0.20.0" }
 channels = [
   "https://prefix.dev/garylvov",
   "https://prefix.dev/conda-forge",
