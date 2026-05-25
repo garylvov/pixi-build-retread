@@ -1,6 +1,6 @@
 [package]
 name = "pixi-build-retread"
-version = "0.20.0"
+version = "0.21.0"
 edition = "2024"
 description = "Retread PyPI wheels as conda packages, with dep versions loosened and shared deps preferred from conda"
 license = "BSD-3-Clause"
@@ -60,6 +60,11 @@ regex = "1"
 # WalkBuilder + standard_filters (.git, .gitignore, .git/info/exclude,
 # global gitignore). Same engine as ripgrep.
 ignore = "0.4"
+# Decompress conda repodata.json.zst directly. v0.22.0+ probe fetches
+# the per-channel-subdir repodata once (cached) instead of hitting a
+# per-package prefix.dev API endpoint that returns 404 on the latest
+# API revision and silently triggered false-unsat across every probe.
+zstd = "0.13"
 
 [profile.release]
 lto = "thin"

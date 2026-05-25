@@ -169,11 +169,26 @@ pub fn inject_checkout_root_data(
         {
             continue;
         }
-        // Sibling-wheel subdirectory skip: any path that descends into
-        // a subdirectory already shipped as a wheel by another entry in
-        // this bundle gets dropped (would otherwise double-ship the
-        // Python package source).
-        if path_is_under_any(rel, &skip_set) {
+        // Sibling-wheel subdirectory skip (v0.21.0+ refinement):
+        // when a file is under a subdir that's already shipped as a
+        // wheel by another bundle entry, we only skip it if it's
+        // PYTHON SOURCE (would be a duplicate of what pip wheel put
+        // in site-packages). Non-Python files (Kit extension.toml,
+        // data assets, config dirs, README) STILL get shipped under
+        // `<env>/lib/<rel>` because Omniverse Kit (and similar tools
+        // that resolve files via `__file__` arithmetic OR via an
+        // extension-search path) need them at the on-disk layout the
+        // upstream repo provides, NOT in site-packages.
+        //
+        // Concrete case: IsaacLab declares Kit extensions named
+        // "isaaclab", "isaaclab_assets", etc. in its .kit experience
+        // files. Kit scans `${app}/../source/<ext>/config/extension.toml`
+        // to find them. Before v0.21, we skipped all of source/* (since
+        // those subdirs are wheel'd) -- Kit found nothing and exited
+        // with "untrusted extension". v0.21 ships the non-Python
+        // sibling files (extension.toml, data/, etc.) so Kit's scan
+        // succeeds without double-shipping the Python source.
+        if path_is_under_any(rel, &skip_set) && is_python_artifact(rel) {
             continue;
         }
         let file_type = match entry.file_type() {
@@ -274,6 +289,48 @@ fn path_to_forward_slash(p: &Path) -> String {
         parts.push(c.as_os_str().to_string_lossy().into_owned());
     }
     parts.join("/")
+}
+
+/// v0.21.0+: identify files that pip wheel would have shipped into
+/// site-packages. Used by the `skip_subdirs` filter to drop ONLY
+/// Python source/cache/build-meta files, while letting non-Python
+/// siblings (Kit extension.toml, data/, config/, assets) through so
+/// they land at `<env>/lib/<rel>` for tools that read them by path.
+///
+/// Conservative match: only files clearly produced by / consumed by
+/// pip's build pipeline get classified as Python artifacts. Anything
+/// else is treated as upstream-authored data and shipped.
+fn is_python_artifact(rel: &Path) -> bool {
+    // Any component in __pycache__ -> python bytecode cache.
+    if rel
+        .components()
+        .any(|c| c.as_os_str() == "__pycache__")
+    {
+        return true;
+    }
+    let name = rel
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    // Cache + bytecode + stubs.
+    if name.ends_with(".py")
+        || name.ends_with(".pyi")
+        || name.ends_with(".pyc")
+        || name.ends_with(".pyo")
+    {
+        return true;
+    }
+    // Packaging metadata pip itself reads/writes.
+    matches!(
+        name,
+        "setup.py"
+            | "setup.cfg"
+            | "pyproject.toml"
+            | "MANIFEST.in"
+            | "PKG-INFO"
+            | "Pipfile"
+            | "Pipfile.lock"
+    )
 }
 
 /// True when `rel` (path inside the checkout root) is at or beneath any
@@ -439,6 +496,70 @@ mod tests {
         ] {
             assert!(record.contains(path), "RECORD missing {path}:\n{record}");
         }
+        Ok(())
+    }
+
+    /// v0.21.0+: under skip_subdirs, ONLY python source/cache/build
+    /// files get skipped. Non-Python siblings (extension.toml, data
+    /// files, config dirs, assets) still get shipped so tools that
+    /// read them by path (Omniverse Kit extension scanner) find them.
+    #[test]
+    fn skip_subdirs_ships_non_python_files_under_skipped_dir() -> Result<()> {
+        let parent = tempdir_in_target("retread-data-inject-non-python")?;
+        let checkout = parent.join("repo");
+        fs::create_dir_all(&checkout)?;
+        // Mimic IsaacLab's source/isaaclab/ layout.
+        write_file(&checkout, "source/isaaclab/isaaclab/__init__.py", b"# py\n");
+        write_file(&checkout, "source/isaaclab/setup.py", b"# py\n");
+        write_file(&checkout, "source/isaaclab/pyproject.toml", b"# build-meta\n");
+        // Kit extension config + data that Kit needs to find at the
+        // on-disk source layout.
+        write_file(
+            &checkout,
+            "source/isaaclab/config/extension.toml",
+            b"[package]\nversion=\"4.5.22\"\n",
+        );
+        write_file(&checkout, "source/isaaclab/data/robot.usd", b"USD-FAKE\n");
+        write_file(&checkout, "source/isaaclab/docs/README.md", b"# docs\n");
+
+        let src_wheel = parent.join("stub.whl");
+        let dst_wheel = parent.join("stub.injected.whl");
+        fs::write(&src_wheel, build_stub_wheel("baz", "1.0"))?;
+        let injected = inject_checkout_root_data(
+            &src_wheel,
+            &dst_wheel,
+            &checkout,
+            &[PathBuf::from("source/isaaclab")],
+        )?;
+        // Expected: extension.toml + robot.usd + README.md (3 non-Python)
+        // Skipped: __init__.py, setup.py, pyproject.toml (Python artifacts)
+        assert_eq!(injected, 3, "expected 3 non-Python files shipped, py source skipped");
+        let out_bytes = fs::read(&dst_wheel)?;
+        let mut archive = ZipArchive::new(Cursor::new(&out_bytes))?;
+        let names: Vec<String> = (0..archive.len())
+            .map(|i| archive.by_index(i).unwrap().name().to_string())
+            .collect();
+        // Non-Python files INSIDE the skipped subdir landed at .data/.
+        assert!(names.contains(
+            &"baz-1.0.data/data/lib/source/isaaclab/config/extension.toml".to_string()
+        ), "extension.toml must be shipped so Kit finds the extension");
+        assert!(names.contains(
+            &"baz-1.0.data/data/lib/source/isaaclab/data/robot.usd".to_string()
+        ));
+        assert!(names.contains(
+            &"baz-1.0.data/data/lib/source/isaaclab/docs/README.md".to_string()
+        ));
+        // Python files were correctly skipped (they're in the wheel
+        // already via pip wheel). Only check INJECTED entries (under
+        // `<dist>-<ver>.data/data/lib/`) -- the stub wheel itself
+        // ships `baz/__init__.py` at the zip root, which is unrelated.
+        let injected_names: Vec<&String> = names
+            .iter()
+            .filter(|n| n.starts_with("baz-1.0.data/data/lib/"))
+            .collect();
+        assert!(!injected_names.iter().any(|n| n.ends_with("/__init__.py")));
+        assert!(!injected_names.iter().any(|n| n.ends_with("/setup.py")));
+        assert!(!injected_names.iter().any(|n| n.ends_with("/pyproject.toml")));
         Ok(())
     }
 
