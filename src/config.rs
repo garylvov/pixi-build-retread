@@ -150,6 +150,30 @@ pub enum RelaxPolicy {
     /// the conda side to pick a working version.
     #[serde(rename = "strong-major")]
     StrongMajor,
+    /// v0.19.0+ "with-last-resort" family. Each behaves IDENTICALLY
+    /// to its base (patch / minor / major) at translate time, plus an
+    /// automated cascade for deps whose post-translate conda spec
+    /// turns out unsatisfiable on the workspace's channels. Cascade
+    /// per dep, in order:
+    ///   (1) try conda with the base-relaxed spec (probe)
+    ///   (2) try PyPI wheel (BFS)            -- already wired (v0.13.x)
+    ///   (3) try PyPI sdist (BFS fallback)   -- already wired (v0.18.0)
+    ///   (4) try conda with `*` (any version) -- last-resort widening
+    ///   (5) try PyPI bundle with empty spec  -- TODO v0.20
+    /// Widening only triggers for deps that FAIL step 1; zero cost for
+    /// the common case where parselmouth-routed deps satisfy their
+    /// strict spec. `minor-with-last-resort` is the recommended
+    /// default; `patch-with-last-resort` for super-strict envs (still
+    /// auto-widens when forced); `major-with-last-resort` mostly
+    /// equivalent to plain `major` since major already widens broadly,
+    /// but exists for symmetry. Surgical alternative to `strong-major`
+    /// which strips upper bounds bundle-wide regardless of need.
+    #[serde(rename = "patch-with-last-resort")]
+    PatchWithLastResort,
+    #[serde(rename = "minor-with-last-resort")]
+    MinorWithLastResort,
+    #[serde(rename = "major-with-last-resort")]
+    MajorWithLastResort,
     /// TODO(conda-aware): NOT YET IMPLEMENTED. The variant deserializes
     /// and accepts the value `"conda-aware"` from user config, but the
     /// probe layer described below does not exist -- at translate time
@@ -157,7 +181,8 @@ pub enum RelaxPolicy {
     /// upper bound unconditionally). Do not document this option in the
     /// README until the probe is wired up. For "strict by default, widen
     /// only when needed" semantics today, use `minor` + per-package
-    /// `retread-overrides` entries.
+    /// `retread-overrides` entries, OR use `minor-with-last-resort`
+    /// which automates the widening for unsatisfiable deps.
     ///
     /// Intended design when implemented: per-dep adaptive widening.
     /// Starts at major (exact pins widen, ranges pass through). Then
@@ -169,6 +194,19 @@ pub enum RelaxPolicy {
     /// in `retread-audit.json` under `probe_results[]`.
     #[serde(rename = "conda-aware")]
     CondaAware,
+}
+
+impl RelaxPolicy {
+    /// True for any `*-with-last-resort` variant. Used by
+    /// `last_resort_widen_pass` to decide whether to run the cascade.
+    pub fn has_last_resort(self) -> bool {
+        matches!(
+            self,
+            RelaxPolicy::PatchWithLastResort
+                | RelaxPolicy::MinorWithLastResort
+                | RelaxPolicy::MajorWithLastResort,
+        )
+    }
 }
 
 /// Either a direct URL ({url, sha256?}) or a PyPI-style spec

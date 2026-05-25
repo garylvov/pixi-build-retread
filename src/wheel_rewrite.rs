@@ -276,15 +276,25 @@ fn widen_exact_to_pep508(v: &Version, policy: RelaxPolicy) -> Option<String> {
     } else {
         format!("{major}")
     };
+    // The `*WithLastResort` variants behave IDENTICALLY to their base
+    // at translate/widen-exact time; the cascade is a separate
+    // post-translate probe pass in handler.rs. Grouped here so the
+    // pattern stays exhaustive and so adding more bases doesn't drift
+    // the two sides apart.
     match policy {
         RelaxPolicy::None => None,
-        RelaxPolicy::Patch => Some(format!(">={lower_patch},<{major}.{}", minor + 1)),
-        RelaxPolicy::Minor => Some(format!(">={lower_minor},<{}", major + 1)),
+        RelaxPolicy::Patch | RelaxPolicy::PatchWithLastResort => {
+            Some(format!(">={lower_patch},<{major}.{}", minor + 1))
+        }
+        RelaxPolicy::Minor | RelaxPolicy::MinorWithLastResort => {
+            Some(format!(">={lower_minor},<{}", major + 1))
+        }
         // TODO(conda-aware): grouped with Major/StrongMajor as a
         // stopgap; the real probe-and-decide logic is not wired up.
-        RelaxPolicy::Major | RelaxPolicy::StrongMajor | RelaxPolicy::CondaAware => {
-            Some(format!(">={major}"))
-        }
+        RelaxPolicy::Major
+        | RelaxPolicy::MajorWithLastResort
+        | RelaxPolicy::StrongMajor
+        | RelaxPolicy::CondaAware => Some(format!(">={major}")),
     }
 }
 

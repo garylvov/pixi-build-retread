@@ -91,7 +91,13 @@ channels = [
 ]
 
 [package.build.config]
-retread-relax        = "minor"   # patch | minor | major | strong-major | none
+# Recommended default. Behaves like `minor` (preserves upstream ranges,
+# widens `==X.Y.Z` pins to `>=X.Y,<X+1`) plus an automated last-resort
+# cascade for deps whose post-relax conda spec is unsatisfiable on the
+# workspace's channels (probes conda, widens to `*` only for those
+# specific deps). Eliminates hand-edited `[retread-overrides]` for the
+# `pyglet`-class pins. See "Relax policies" below for the full table.
+retread-relax        = "minor-with-last-resort"
 retread-build-number = 0
 # Recommended: pin the python version this pack targets. Without it,
 # retread falls back to DEFAULT_PYTHON (3.11) when pixi forwards only a
@@ -399,18 +405,21 @@ that needs it).
 
 ## Relax policies
 
-| Policy          | `numpy==1.26.4` becomes  | `pyglet<2` becomes |
-|-----------------|--------------------------|--------------------|
-| `none`          | `numpy ==1.26.4`         | `pyglet <2`        |
-| `patch`         | `numpy >=1.26.4,<1.27`   | `pyglet <2`        |
-| `minor`         | `numpy >=1.26,<2`        | `pyglet <2`        |
-| `major`         | `numpy >=1`              | `pyglet <2`        |
-| `strong-major`  | `numpy >=1`              | `pyglet`           |
+| Policy                       | `numpy==1.26.4` becomes  | `pyglet<2` becomes | Auto-widen unsat? |
+|------------------------------|--------------------------|--------------------|--------------------|
+| `none`                       | `numpy ==1.26.4`         | `pyglet <2`        | no                 |
+| `patch`                      | `numpy >=1.26.4,<1.27`   | `pyglet <2`        | no                 |
+| `minor`                      | `numpy >=1.26,<2`        | `pyglet <2`        | no                 |
+| `major`                      | `numpy >=1`              | `pyglet <2`        | no                 |
+| `strong-major`               | `numpy >=1`              | `pyglet`           | no                 |
+| `patch-with-last-resort`     | `numpy >=1.26.4,<1.27`   | `pyglet <2`        | yes (probe + `*` widen) |
+| `minor-with-last-resort` ★   | `numpy >=1.26,<2`        | `pyglet <2`        | yes (probe + `*` widen) |
+| `major-with-last-resort`     | `numpy >=1`              | `pyglet <2`        | yes (probe + `*` widen) |
 
 Non-`==` specifiers (ranges, `~=`, etc.) pass through unchanged under
-`none`/`patch`/`minor`/`major`. `strong-major` additionally strips
-every upper-bound clause from range specs (`<X`, `<=X`, the `<Y` half
-of `>=A,<B`, the implicit upper of `~=X.Y`) so upstream caps stop
+every policy except `strong-major`, which additionally strips every
+upper-bound clause from range specs (`<X`, `<=X`, the `<Y` half of
+`>=A,<B`, the implicit upper of `~=X.Y`) so upstream caps stop
 blocking the conda solve. Lower bounds (`>=`, `>`) stay so conda
 doesn't pick something pre-historic.
 
@@ -419,11 +428,69 @@ ABI meaning (e.g. `python >=3`) or trip rattler-build's "missing range
 specifier" check (`python 3`), so a `Requires-Dist: python` line is
 passed through verbatim no matter what `retread-relax` is set to.
 
-### "Strict by default, widen only when needed"
+### `*-with-last-resort`: strict-by-default, auto-widens on unsat (v0.19.0+, recommended)
 
-If you want minimal widening with surgical exceptions, pick `minor`
-(or `patch` / `none`) and add the offending packages to
-`retread-overrides` one at a time as the solver complains:
+Each `*-with-last-resort` variant behaves IDENTICALLY to its base
+(`patch` / `minor` / `major`) at translate time, plus an automated
+per-dep cascade that fires ONLY for deps whose emitted conda spec
+turns out unsatisfiable on the workspace's channels:
+
+1. Probe conda channels with the base-relaxed spec
+2. If satisfiable → emit normally (no behavior change)
+3. If unsatisfiable → probe conda with `*` (any version, python-compatible)
+4. If satisfied with `*` → inject `pkg = "*"` override → emit widened
+5. If still unsatisfiable → log a warning (manual `retread-drop-deps` or
+   a separate `retread-wheels` entry is needed; PyPI any-version
+   fallback is v0.20 roadmap)
+
+`minor-with-last-resort` is the recommended default — it preserves
+the strictness of `minor` for the common case but eliminates the
+hand-editing of `retread-overrides` for the pyglet-class pins where
+conda-forge's candidates happen to be python-incompatible.
+
+Every widening decision is recorded under `probe_decisions[].stage =
+"last-resort-widen"` in `retread-probe-trace-<bundle>.json`, so the
+auto-widenings stay auditable. Cost is zero for deps that satisfy
+their strict spec.
+
+### Channels: pytorch family
+
+If your workspace has `torch` / `torchaudio` / `torchvision` /
+`torchcodec` in any bundle, **add `https://prefix.dev/pytorch` to
+your workspace `channels` list** ahead of `conda-forge`:
+
+```toml
+[workspace]
+channels = ["https://prefix.dev/pytorch", "https://prefix.dev/conda-forge"]
+```
+
+conda-forge's torch builds are CPU-only or behind the official
+release; the `pytorch` channel ships GPU-enabled cp311 builds.
+Without this, retread's probe correctly identifies `torchaudio
+>=2.7,<3` as unsatisfiable on conda-forge and falls back to PyPI
+(bundling those huge wheels into your conda artifact), which is
+slower and disk-heavier than letting the conda solver pull them
+from the pytorch channel directly.
+
+### Performance note (v0.19.0)
+
+First solve of a non-trivial bundle (e.g. isaac-pack with isaacsim +
+IsaacLab) takes minutes — retread downloads multi-GB wheels, builds
+sdists when needed, runs the auto-data inject and probe cascade per
+bundle. Subsequent solves hit the wheel cache under `<pack>/wheels/`
+and the probe cache under `~/.cache/rattler/cache/retread-probes/`,
+so re-solves are usually under a minute. `rattler-build`'s "preparing
+packages" step is also slow on first build — it's downloading the
+build env (rust toolchain, etc.) into a sandbox. To force a cold
+rebuild, use `bash scripts/rebuild-local.sh`; it nukes the right
+caches in the right order (see [Iteration: one script does the whole
+dance](#iteration-one-script-does-the-whole-dance) below).
+
+### Legacy: "strict by default, widen only when needed" (pre-v0.19.0)
+
+Before `minor-with-last-resort` existed, the manual pattern was
+`minor` + per-package `retread-overrides` added one at a time as the
+solver complained:
 
 ```toml
 [package.build.config]
@@ -435,10 +502,10 @@ retread-relax = "minor"
 pyglet = "*"
 ```
 
-The override list grows into an auditable file documenting exactly
-which upstream caps don't match your channels. (An automatic
-"`conda-aware`" mode that probes the channels per-spec is on the
-roadmap but not yet implemented.)
+This still works and gives explicit control over which widenings
+happen. `minor-with-last-resort` automates it for the common case
+where the override would just be `pkg = "*"`. Both patterns coexist
+fine — user overrides win over auto-widenings.
 
 ## Local development
 

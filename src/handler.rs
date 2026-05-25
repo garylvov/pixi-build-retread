@@ -619,7 +619,11 @@ async fn resolve_all(
     // this lets the workspace declare a single conda dep and have it
     // install the whole pack. Entries without `bundle` keep the legacy
     // behavior (one entry = one output named after the entry key).
-    let mut groups: std::collections::BTreeMap<String, Vec<(String, &WheelEntry)>> =
+    // Owned-clone so the loop below can mutably borrow `effective`
+    // when running the v0.19.0+ last-resort widen pass (which mutates
+    // effective.overrides). The clone cost is trivial -- entries are
+    // small structs of strings and a few enums.
+    let mut groups: std::collections::BTreeMap<String, Vec<(String, WheelEntry)>> =
         std::collections::BTreeMap::new();
     for (entry_name, entry) in &effective.retread_wheels {
         let group_name = entry
@@ -629,7 +633,7 @@ async fn resolve_all(
         groups
             .entry(group_name)
             .or_default()
-            .push((entry_name.clone(), entry));
+            .push((entry_name.clone(), entry.clone()));
     }
 
     for (group_name, group_entries) in groups {
@@ -745,9 +749,173 @@ async fn resolve_all(
                 .await?;
             }
         }
+        // v0.19.0+ last-resort widening pass. Runs for any
+        // `*-with-last-resort` relax policy (patch/minor/major). Walks
+        // every emitted conda dep of every wheel in the bundle, probes
+        // the post-translate spec against the workspace's conda
+        // channels, and for each definitively-unsatisfiable spec
+        // injects an override `<pkg> = "*"` into the EFFECTIVE config
+        // so subsequent translate calls emit the widened spec
+        // automatically. Surgical -- only the deps that actually need
+        // widening get widened, the rest emit the user's base-relaxed
+        // spec untouched.
+        if effective.relax.has_last_resort() {
+            last_resort_widen_pass(
+                &mut bundle,
+                &mut effective,
+                conda_channels,
+                target,
+            )
+            .await?;
+        }
         bundles.push(bundle);
     }
     Ok((bundles, effective))
+}
+
+/// v0.19.0: last-resort widening cascade. For each conda run-dep this
+/// bundle would emit, probe the workspace's conda channels with the
+/// post-translate spec. If definitively unsatisfiable AND a `*` probe
+/// would be satisfiable, inject `<conda_name> = "*"` into
+/// effective.overrides so the next translate call emits the widened
+/// spec. Records the decision in `bundle.probe_decisions` under
+/// `stage = "last-resort-widen"` so the audit shows every widening.
+///
+/// Why we re-translate per dep rather than re-using the BFS probe
+/// results: pyglet (and similar conda-routed deps that AREN'T in the
+/// BFS's extras/prefix set) never get probed by the BFS. They land
+/// directly at translate-time with a strict spec and the conda solver
+/// then fails. This pass catches them.
+async fn last_resort_widen_pass(
+    bundle: &mut Bundle,
+    effective: &mut RetreadConfig,
+    conda_channels: &[ChannelUrl],
+    target: &WheelTarget,
+) -> Result<()> {
+    use crate::relax::{default_marker_env, translate};
+    let env = default_marker_env(&target.python_version)?;
+    // Names of wheels in the bundle itself. translate emissions for
+    // these (e.g. an isaaclab sub-package referencing isaaclab-tasks)
+    // would be self-references that the bundle satisfies internally;
+    // probing them would mislead the widening.
+    let bundled_names: std::collections::HashSet<String> = bundle
+        .all_wheels()
+        .map(|w| conda_name_from(&w.pypi_name))
+        .collect();
+    // Dedup across multiple wheels declaring the same dep -- we only
+    // need to probe each (conda_name, spec) once per bundle.
+    let mut seen_probes: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
+    // Walk every wheel's Requires-Dist; for each line that translates
+    // to a conda spec WITH an upper bound or strict pin, probe.
+    let raw_lines: Vec<String> = bundle
+        .all_wheels()
+        .flat_map(|w| w.metadata.requires_dist.iter().cloned())
+        .collect();
+    for raw in raw_lines {
+        // Predict what translate WOULD emit. If translate returns
+        // None (marker false / vendored / dropped), skip.
+        let dep = match translate(&raw, &env, &effective.name_map, &effective.overrides, effective.relax) {
+            Ok(Some(d)) => d.0,
+            _ => continue,
+        };
+        // dep is "<conda_name> <spec>" or just "<conda_name>" (no spec
+        // = any). Bare-name = no upper bound to widen, skip cheaply.
+        let mut parts = dep.splitn(2, char::is_whitespace);
+        let conda_name = match parts.next() {
+            Some(n) if !n.is_empty() => n.to_string(),
+            _ => continue,
+        };
+        let spec = parts.next().map(|s| s.trim().to_string()).unwrap_or_default();
+        if spec.is_empty() || spec == "*" {
+            // Already maximally widened; nothing to probe.
+            continue;
+        }
+        if bundled_names.contains(&conda_name) {
+            continue;
+        }
+        if effective.overrides.contains_key(&conda_name) {
+            // User already pinned this; their pin wins.
+            continue;
+        }
+        if !seen_probes.insert((conda_name.clone(), spec.clone())) {
+            continue;
+        }
+
+        // (1) Probe the strict spec. If satisfiable -> no widening.
+        let strict_probe = crate::probe::probe(
+            conda_channels,
+            &conda_name,
+            &spec,
+            Some(&target.python_version),
+        )
+        .await;
+        if strict_probe.is_satisfied() {
+            continue;
+        }
+        if !strict_probe.is_definitively_unsatisfied() {
+            // Indecisive (no consultable channels). Don't widen
+            // optimistically; record + move on.
+            bundle.probe_decisions.push(crate::audit::ProbeDecision {
+                stage: "last-resort-widen".into(),
+                pypi_name: conda_name.clone(),
+                conda_name: conda_name.clone(),
+                spec: spec.clone(),
+                target_python: target.python_version.clone(),
+                channels_consulted: strict_probe.channels_consulted.clone(),
+                satisfiable: strict_probe.satisfiable,
+                matching_candidates: strict_probe.matching_candidates,
+                routing_decision: "skipped-indecisive-strict-probe".into(),
+            });
+            continue;
+        }
+
+        // (2) Strict spec is definitively unsatisfiable. Probe `*` to
+        // see if conda has ANY py-compatible build of the package at
+        // all. If yes -> inject override and widen.
+        let any_probe = crate::probe::probe(
+            conda_channels,
+            &conda_name,
+            "*",
+            Some(&target.python_version),
+        )
+        .await;
+        let widened_to_any = any_probe.is_satisfied();
+        let routing_decision = if widened_to_any {
+            "widened-to-any-version"
+        } else {
+            "no-py-compat-version-on-conda"
+        };
+        bundle.probe_decisions.push(crate::audit::ProbeDecision {
+            stage: "last-resort-widen".into(),
+            pypi_name: conda_name.clone(),
+            conda_name: conda_name.clone(),
+            spec: spec.clone(),
+            target_python: target.python_version.clone(),
+            channels_consulted: any_probe.channels_consulted.clone(),
+            satisfiable: any_probe.satisfiable,
+            matching_candidates: any_probe.matching_candidates,
+            routing_decision: routing_decision.into(),
+        });
+        if widened_to_any {
+            tracing::info!(
+                dep = %conda_name,
+                strict_spec = %spec,
+                "last-resort-widen: conda has py-compat builds at OTHER versions; widening emitted spec to `*`",
+            );
+            effective.overrides.insert(conda_name, "*".into());
+        } else {
+            // PyPI fallback (step 5 of the cascade) would land here.
+            // Not implemented yet -- log so the user knows to drop or
+            // hand-bundle.
+            tracing::warn!(
+                dep = %conda_name,
+                strict_spec = %spec,
+                "last-resort-widen: conda has ZERO py-compat builds; consider retread-drop-deps + post-install pip, or add as a separate retread-wheels entry. PyPI-side last-resort (TODO v0.20) would auto-bundle here.",
+            );
+        }
+    }
+    Ok(())
 }
 
 async fn resolve_bundle(

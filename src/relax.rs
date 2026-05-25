@@ -219,10 +219,18 @@ pub fn widen_exact(v: &Version, policy: RelaxPolicy) -> Option<String> {
     let minor = r.get(1).copied().unwrap_or(0);
     let patch = r.get(2).copied().unwrap_or(0);
 
+    // The `*WithLastResort` variants behave IDENTICALLY to their base
+    // here; the cascade is a separate post-translate probe pass in
+    // handler.rs::last_resort_widen_pass that only widens further for
+    // unsatisfiable specs.
     match policy {
         RelaxPolicy::None => Some(format!("=={v}")),
-        RelaxPolicy::Patch => Some(format!(">={major}.{minor}.{patch},<{major}.{}", minor + 1)),
-        RelaxPolicy::Minor => Some(format!(">={major}.{minor},<{}", major + 1)),
+        RelaxPolicy::Patch | RelaxPolicy::PatchWithLastResort => {
+            Some(format!(">={major}.{minor}.{patch},<{major}.{}", minor + 1))
+        }
+        RelaxPolicy::Minor | RelaxPolicy::MinorWithLastResort => {
+            Some(format!(">={major}.{minor},<{}", major + 1))
+        }
         // Major / StrongMajor all widen exact pins to bare-major; the
         // difference is range handling (Major: passthrough;
         // StrongMajor: strip uppers). TODO(conda-aware): CondaAware is
@@ -230,9 +238,10 @@ pub fn widen_exact(v: &Version, policy: RelaxPolicy) -> Option<String> {
         // implemented -- it currently degrades to StrongMajor's
         // unconditional upper-strip. See RelaxPolicy::CondaAware doc
         // for the intended design.
-        RelaxPolicy::Major | RelaxPolicy::StrongMajor | RelaxPolicy::CondaAware => {
-            Some(format!(">={major}"))
-        }
+        RelaxPolicy::Major
+        | RelaxPolicy::MajorWithLastResort
+        | RelaxPolicy::StrongMajor
+        | RelaxPolicy::CondaAware => Some(format!(">={major}")),
     }
 }
 
