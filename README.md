@@ -1,4 +1,4 @@
-# pixi-build-retread
+# pixi-build-retread - doesn't work yet, fixes inbound
 
 **Retread PyPI wheels as conda packages, with dep versions loosened and
 shared deps preferred from conda.**
