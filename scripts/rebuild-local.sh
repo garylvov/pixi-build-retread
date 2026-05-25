@@ -108,6 +108,16 @@ rm -rf ~/.cache/rattler/cache/backends-v0/pixi-build-retread-*
 echo "[rebuild-local] nuking retread git-clone cache"
 rm -rf ~/.cache/rattler/cache/retread-git-clones
 
+# (4b) Nuke retread's probe + repodata caches. v0.22.0+ caches conda
+#      repodata.json[.zst] per (channel, subdir) under retread-repodata;
+#      the older v0.13-v0.21 path stored per-package probe results
+#      under retread-probes. Both 30-min TTL; nuking them on every
+#      rebuild forces probes to re-query upstream so the new version's
+#      probe logic isn't masked by a result computed by the old logic.
+echo "[rebuild-local] nuking retread probe + repodata caches"
+rm -rf ~/.cache/rattler/cache/retread-probes \
+       ~/.cache/rattler/cache/retread-repodata
+
 # (5) Nuke the consumer project's pixi caches AND retread audit/trace
 #     files if pointed at one. Skip silently when CONSUMER_PROJECT
 #     isn't set -- not everyone has a downstream workspace they're
@@ -126,6 +136,12 @@ if [[ -n "${CONSUMER_PROJECT:-}" ]]; then
     # max-depth 2). Best-effort -- skip silently if find errors.
     find "$CONSUMER_PROJECT" -maxdepth 3 -name "retread-audit-*.json" -delete 2>/dev/null || true
     find "$CONSUMER_PROJECT" -maxdepth 3 -name "retread-probe-trace-*.json" -delete 2>/dev/null || true
+    # Nuke per-entry wheel caches under each source pack's wheels/
+    # dir. These accumulated suffix-stack wheels from pre-v0.13.7
+    # (`*.injected.autodata.injected.autodata.whl`) waste disk and
+    # confuse cache-reuse heuristics when iterating on the pipeline.
+    find "$CONSUMER_PROJECT" -maxdepth 3 -type d -name "wheels" \
+        -exec rm -rf {} + 2>/dev/null || true
 fi
 
 # (6) Rebuild. Variant config is included so multi-python recipes work
