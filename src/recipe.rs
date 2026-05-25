@@ -42,6 +42,31 @@ pub struct Build {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub noarch: Option<String>,
     pub script: String,
+    /// Per rattler-build's recipe schema, `binary_relocation` lives under
+    /// `build.dynamic_linking`, NOT at the top level of `build`. See the
+    /// dynamic_linking section in rattler-build docs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dynamic_linking: Option<DynamicLinking>,
+}
+
+/// rattler-build's `build.dynamic_linking` group. Only emit fields we
+/// actually set, so we don't accidentally override rattler-build's
+/// defaults for anything else.
+#[derive(Debug, Serialize)]
+pub struct DynamicLinking {
+    /// Skip rattler-build's patchelf/relink pass on bundled `.so` files.
+    /// Vendor wheels (NVIDIA Omniverse, manylinux) ship with pre-baked
+    /// rpaths that point into their own extscache trees. rattler-build's
+    /// default behavior rewrites those to be prefix-relative, which
+    /// (a) overflows the original DT_RPATH slot for many of NVIDIA's libs
+    /// (`× error new value is longer than old value`) and (b) trips a
+    /// goblin ELF parser panic on libs whose string tables contain
+    /// non-UTF8 bytes (Failed to parse the ELF file: invalid utf8). Both
+    /// fire during the "Packaging new files" phase. Disabling the pass
+    /// keeps the wheels' original rpaths -- which is what they were built
+    /// to use.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binary_relocation: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -80,19 +105,21 @@ pub fn build_bundle_recipe(
     conda_name: &str,
     sources: &[BundleSource<'_>],
     config: &RetreadConfig,
+    workspace_python_version: &str,
 ) -> anyhow::Result<Recipe> {
     let primary = sources
         .first()
         .ok_or_else(|| anyhow::anyhow!("bundle must have at least one source"))?;
-    let python_version = python_version_from_wheel_tag(&primary.metadata.filename)
-        .unwrap_or_else(|| "3".to_string());
-    let env = default_marker_env(&python_version)?;
-
-    let python_pin = if python_version.contains('.') {
-        format!("python {python_version}.*")
-    } else {
-        format!("python {python_version}")
+    // Prefer the primary wheel's tag (it pins the cpXY ABI), but fall back
+    // to the workspace python whenever the wheel only carries a bare-major
+    // tag (`py3-none-any`). Without that fallback the recipe emits
+    // `python 3` which rattler-build rejects as "missing range specifier".
+    let python_version = match python_version_from_wheel_tag(&primary.metadata.filename) {
+        Some(v) if v.contains('.') => v,
+        _ => workspace_python_version.to_string(),
     };
+    let env = default_marker_env(&python_version)?;
+    let python_pin = format!("python {python_version}.*");
 
     let vendored: HashSet<String> = sources.iter().map(|s| s.pypi_name.to_string()).collect();
 
@@ -145,6 +172,16 @@ pub fn build_bundle_recipe(
         build: Build {
             number: config.build_number,
             noarch,
+            // Vendor wheels (Omniverse, manylinux) ship pre-baked rpaths;
+            // rattler-build's default relocation pass either overflows the
+            // original DT_RPATH slot or chokes on non-UTF8 in some .so
+            // string tables. Skip the patchelf step. Only meaningful for
+            // platform-specific bundles -- noarch has no native libs.
+            dynamic_linking: if any_platform_specific {
+                Some(DynamicLinking { binary_relocation: Some(false) })
+            } else {
+                None
+            },
             // `--no-deps` is essential: conda solves deps from the run: list,
             // not from pip re-resolving Requires-Dist at install time.
             script: "${{ PYTHON }} -m pip install *.whl -vv --no-deps --no-build-isolation"
@@ -178,6 +215,7 @@ mod tests {
             drop_deps: Vec::new(),
             auto_bundle: false,
             conda_deps: Vec::new(),
+            git_sources: std::collections::BTreeMap::new(),
             python: None,
         }
     }
@@ -208,13 +246,30 @@ mod tests {
             filename: "example_pkg-1.2.3-cp311-none-manylinux_2_35_x86_64.whl".into(),
         };
         let url: url::Url = "https://example.com/example_pkg-1.2.3-cp311-none-manylinux_2_35_x86_64.whl".parse().unwrap();
-        let r = build_bundle_recipe("example-pkg", &one_source(&meta, &url), &cfg()).unwrap();
+        let r = build_bundle_recipe("example-pkg", &one_source(&meta, &url), &cfg(), "3.11").unwrap();
         let yaml = to_yaml(&r).unwrap();
         assert!(yaml.contains("python 3.11.*"), "yaml:\n{yaml}");
         assert!(yaml.contains("numpy >=1.26,<2"), "yaml:\n{yaml}");
         assert!(yaml.contains("torch >=2.7,<3"), "yaml:\n{yaml}");
         assert!(yaml.contains("requests >=2.0"), "yaml:\n{yaml}");
         assert!(!yaml.contains("noarch"), "should be platform-specific");
+        // Platform-specific bundles must disable rattler-build's patchelf
+        // pass -- NVIDIA's libs have rpath slots too short to rewrite and
+        // some have non-UTF8 in their string tables that crashes goblin.
+        // rattler-build's schema places `binary_relocation` under the
+        // `dynamic_linking` group; emitting it at the top level of `build`
+        // produces "unknown field 'binary_relocation'" at solve time.
+        let dl = r
+            .build
+            .dynamic_linking
+            .as_ref()
+            .expect("platform-specific bundle must populate build.dynamic_linking");
+        assert_eq!(dl.binary_relocation, Some(false));
+        // YAML check pins down the exact nesting rattler-build expects.
+        assert!(
+            yaml.contains("dynamic_linking:") && yaml.contains("binary_relocation: false"),
+            "expected `dynamic_linking:` with nested `binary_relocation: false`; yaml:\n{yaml}",
+        );
     }
 
     #[test]
@@ -228,8 +283,11 @@ mod tests {
             filename: "pure-0.1.0-py3-none-any.whl".into(),
         };
         let url = "https://example.com/pure-0.1.0-py3-none-any.whl".parse().unwrap();
-        let r = build_bundle_recipe("pure", &one_source(&meta, &url), &cfg()).unwrap();
+        let r = build_bundle_recipe("pure", &one_source(&meta, &url), &cfg(), "3.11").unwrap();
         assert_eq!(r.build.noarch.as_deref(), Some("python"));
+        // noarch bundles have nothing to relocate -- don't emit the field
+        // (and don't risk poisoning future rattler-build default changes).
+        assert!(r.build.dynamic_linking.is_none());
     }
 
     #[test]
@@ -271,7 +329,7 @@ mod tests {
                 metadata: &kernel,
             },
         ];
-        let r = build_bundle_recipe("isaacsim", &sources, &cfg()).unwrap();
+        let r = build_bundle_recipe("isaacsim", &sources, &cfg(), "3.11").unwrap();
         let yaml = to_yaml(&r).unwrap();
 
         assert_eq!(r.source.len(), 2, "two sources in the recipe");

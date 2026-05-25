@@ -78,6 +78,22 @@ pub struct RetreadConfig {
     #[serde(default, rename = "retread-conda-deps", alias = "conda-deps")]
     pub conda_deps: Vec<String>,
 
+    /// Named git sources, referenced from `[retread-wheels]` entries
+    /// via `from = "<name>"`. Avoids repeating `git = "..."` + `rev =
+    /// "..."` across many sub-package entries from the same repo.
+    /// Example:
+    ///
+    /// ```toml
+    /// [package.build.config.retread-git-sources]
+    /// isaaclab = { url = "https://github.com/isaac-sim/IsaacLab.git", rev = "deadbeef" }
+    ///
+    /// [package.build.config.retread-wheels]
+    /// isaaclab        = { from = "isaaclab", subdirectory = "source/isaaclab" }
+    /// isaaclab-assets = { from = "isaaclab", subdirectory = "source/isaaclab_assets" }
+    /// ```
+    #[serde(default, rename = "retread-git-sources", alias = "git-sources")]
+    pub git_sources: BTreeMap<String, NamedGitSource>,
+
     /// Conda build number for the produced packages. Bump to force
     /// re-resolution downstream after a policy change.
     #[serde(default, rename = "retread-build-number", alias = "build-number")]
@@ -90,7 +106,11 @@ pub struct RetreadConfig {
     /// (`["3.11", "3.12"]`). When the workspace's variant configuration
     /// provides `python`, that wins; this field is purely a convenience for
     /// single-Python workspaces. The default is `3.11`.
-    #[serde(default)]
+    ///
+    /// Also used as the fallback in conda/build_v1 when pixi forwards a
+    /// bare-major variant value (`"3"`) — see handler.rs::conda_build_v1.
+    /// The bare name `python` is also accepted as a legacy alias.
+    #[serde(default, rename = "retread-python", alias = "python")]
     pub python: Option<PythonSpec>,
 }
 
@@ -122,6 +142,33 @@ pub enum RelaxPolicy {
     #[default]
     Minor,
     Major,
+    /// Major widening AND aggressive range-spec relaxing: drops every
+    /// upper bound on every requirement (`<X`, `<=X`, the `<Y` half of
+    /// `>=X,<Y`, the implicit upper of `~=X.Y`). Lower bounds (`>=`,
+    /// `>`) stay so conda doesn't pick something pre-historic. Use
+    /// when upstream caps are blocking the conda solve and you trust
+    /// the conda side to pick a working version.
+    #[serde(rename = "strong-major")]
+    StrongMajor,
+    /// TODO(conda-aware): NOT YET IMPLEMENTED. The variant deserializes
+    /// and accepts the value `"conda-aware"` from user config, but the
+    /// probe layer described below does not exist -- at translate time
+    /// this currently behaves IDENTICALLY to `StrongMajor` (strips every
+    /// upper bound unconditionally). Do not document this option in the
+    /// README until the probe is wired up. For "strict by default, widen
+    /// only when needed" semantics today, use `minor` + per-package
+    /// `retread-overrides` entries.
+    ///
+    /// Intended design when implemented: per-dep adaptive widening.
+    /// Starts at major (exact pins widen, ranges pass through). Then
+    /// for each emitted spec containing an upper bound (`<`, `<=`,
+    /// `~=`), retread probes the workspace's conda channels: if zero
+    /// candidates satisfy the spec under the workspace's python,
+    /// retread strips the upper bound and re-emits for that one dep.
+    /// Specs without upper bounds skip the probe. All decisions land
+    /// in `retread-audit.json` under `probe_results[]`.
+    #[serde(rename = "conda-aware")]
+    CondaAware,
 }
 
 /// Either a direct URL ({url, sha256?}) or a PyPI-style spec
@@ -158,6 +205,71 @@ pub struct WheelEntry {
     /// resolved against the same index.
     #[serde(default)]
     pub extras: Vec<String>,
+
+    // ---- Local source form ----
+    /// Local path to a Python project. retread runs `pip wheel --no-deps`
+    /// against this path to produce a wheel, then runs it through the
+    /// usual METADATA-rewrite + bundle pipeline. Relative paths resolve
+    /// against the source package's pixi.toml directory.
+    #[serde(default)]
+    pub path: Option<String>,
+
+    // ---- Git source form ----
+    /// HTTPS git URL of a Python project. retread clones at `rev` and
+    /// runs `pip wheel --no-deps` on `subdirectory` (defaulting to ".").
+    #[serde(default)]
+    pub git: Option<String>,
+
+    /// Git revision (commit SHA, tag, or branch) for `git` source.
+    /// Required when `git` is set.
+    #[serde(default)]
+    pub rev: Option<String>,
+
+    /// Subdirectory within the git clone containing the Python project
+    /// to build. Defaults to "." (the repo root).
+    #[serde(default)]
+    pub subdirectory: Option<String>,
+
+    /// If true, after the wheel is built and the conda env is
+    /// materialized, the user is expected to run
+    /// `pip install -e <path> --no-deps --force-reinstall` to overlay
+    /// editable on top of the bundled installation. retread doesn't
+    /// run this for you -- see the example pixi.toml's
+    /// `overlay-editable` task. The wheel is still built normally so
+    /// retread can rewrite METADATA + emit a coherent dep set.
+    #[serde(default)]
+    pub editable: bool,
+
+    // ---- Named git source reference ----
+    /// Reference to a `[retread-git-sources]` entry. The named entry
+    /// provides `url` + `rev`; this wheel entry only contributes
+    /// `subdirectory` (defaulting to "."). Lets many sub-packages from
+    /// the same monorepo share a single rev declaration.
+    #[serde(default)]
+    pub from: Option<String>,
+
+    /// Group entries that share this string into a single conda output.
+    /// The output's name is the bundle string. All wheels from grouped
+    /// entries become the bundle's wheels (primary = first entry's
+    /// primary, others as extras). Without this field each entry
+    /// produces its own conda output named after the entry key.
+    ///
+    /// Use this when you want a single workspace declaration (e.g.
+    /// `isaac-pack = { path = "./isaac-pack" }`) to install every
+    /// wheel in the pack -- pixi-build only builds outputs the
+    /// workspace declared, so grouping into one output sidesteps the
+    /// N-line declaration problem at the cost of a bigger artifact.
+    #[serde(default)]
+    pub bundle: Option<String>,
+}
+
+/// A named (url, rev) pair used to share a git source across many
+/// `[retread-wheels]` entries.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct NamedGitSource {
+    pub url: String,
+    pub rev: String,
 }
 
 #[cfg(test)]
@@ -207,6 +319,65 @@ mod tests {
     }
 
     #[test]
+    fn parses_bundle_field_on_entry() {
+        // Regression: when the `bundle` field was added to WheelEntry,
+        // a stale retread without the field would reject the user's
+        // pixi.toml with `unknown field bundle, expected one of ...`
+        // (because of `deny_unknown_fields`). This test pins the
+        // parse-side contract: any new optional field added to
+        // WheelEntry must be tested through serde deserialization
+        // BEFORE we ship it, or stale binaries break every user's
+        // pixi.toml during the upgrade window.
+        let json = serde_json::json!({
+            "retread-wheels": {
+                "isaacsim": {
+                    "version": "==5.1.0",
+                    "index": "https://pypi.nvidia.com",
+                    "extras": ["all"],
+                    "bundle": "isaac-pack",
+                },
+                "isaaclab": {
+                    "from": "isaaclab",
+                    "subdirectory": "source/isaaclab",
+                    "bundle": "isaac-pack",
+                },
+                "loner": { "version": "==1.0" }
+            }
+        });
+        let cfg: RetreadConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            cfg.retread_wheels["isaacsim"].bundle.as_deref(),
+            Some("isaac-pack")
+        );
+        assert_eq!(
+            cfg.retread_wheels["isaaclab"].bundle.as_deref(),
+            Some("isaac-pack")
+        );
+        // Default is None when omitted -- one entry == one output.
+        assert_eq!(cfg.retread_wheels["loner"].bundle, None);
+    }
+
+    #[test]
+    fn rejects_unknown_field_on_entry() {
+        // Mirror image of the above: deny_unknown_fields must fire on
+        // anything we haven't added to WheelEntry. If this test ever
+        // starts failing, it means we shipped a permissive parser and
+        // the next time we add a field, stale binaries won't break --
+        // but neither will typos in user pixi.toml. Trade-off
+        // documented; current default is strict.
+        let json = serde_json::json!({
+            "retread-wheels": {
+                "foo": { "version": "==1.0", "totally-bogus-key": "x" }
+            }
+        });
+        let err = serde_json::from_value::<RetreadConfig>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("totally-bogus-key"),
+            "unknown-field error should name the offender; got: {err}",
+        );
+    }
+
+    #[test]
     fn rejects_entry_with_both_url_and_version() {
         let entry = WheelEntry {
             url: Some("https://example.com/x.whl".parse().unwrap()),
@@ -232,6 +403,37 @@ mod tests {
         assert!(entry.validate("x").is_err());
     }
 
+    /// v0.12.0+: extras are valid on git/path/named-git entries. The
+    /// extras' deps come through METADATA's `Requires-Dist: ...; extra
+    /// == "<name>"` lines on the built wheel and get BFS-resolved via
+    /// PyPI Simple by the handler, same as for the spec form.
+    #[test]
+    fn accepts_extras_on_path_and_git_and_named_git() {
+        let path_entry = WheelEntry {
+            path: Some("./local-pkg".into()),
+            extras: vec!["rl_games".into()],
+            ..Default::default()
+        };
+        path_entry.validate("a").expect("extras valid on path form");
+
+        let git_entry = WheelEntry {
+            git: Some("https://example.com/repo.git".into()),
+            rev: Some("HEAD".into()),
+            extras: vec!["rl_games".into()],
+            ..Default::default()
+        };
+        git_entry.validate("b").expect("extras valid on git form");
+
+        let named_git_entry = WheelEntry {
+            from: Some("isaaclab".into()),
+            extras: vec!["rl_games".into()],
+            ..Default::default()
+        };
+        named_git_entry
+            .validate("c")
+            .expect("extras valid on named-git form");
+    }
+
     #[test]
     fn python_spec_accepts_string_or_list() {
         let one: PythonSpec = serde_json::from_value(serde_json::json!("3.11")).unwrap();
@@ -247,28 +449,58 @@ impl WheelEntry {
         self.url.is_some()
     }
     pub fn is_spec(&self) -> bool {
-        !self.is_url() && self.version.is_some()
+        !self.is_url() && !self.is_path() && !self.is_git() && self.version.is_some()
+    }
+    pub fn is_path(&self) -> bool {
+        self.path.is_some()
+    }
+    pub fn is_git(&self) -> bool {
+        self.git.is_some()
+    }
+    pub fn is_named_git(&self) -> bool {
+        self.from.is_some()
     }
 
-    /// Validate that the entry has exactly one form. Returns the normalized
-    /// version (with leading `==` stripped) when in spec form.
+    /// Validate that the entry has exactly one form.
     pub fn validate(&self, name: &str) -> Result<()> {
-        if self.is_url() && self.version.is_some() {
+        let form_count = [
+            self.url.is_some(),
+            self.version.is_some(),
+            self.path.is_some(),
+            self.git.is_some(),
+            self.from.is_some(),
+        ]
+        .into_iter()
+        .filter(|b| *b)
+        .count();
+        if form_count == 0 {
             return Err(anyhow!(
-                "wheel `{name}`: set either `url` or `version`, not both"
+                "wheel `{name}`: requires one of `url`, `version`, `path`, `git`, or `from`"
             ));
         }
-        if !self.is_url() && self.version.is_none() {
+        if form_count > 1 {
             return Err(anyhow!(
-                "wheel `{name}`: requires either `url = ...` or `version = ...`"
+                "wheel `{name}`: set exactly ONE of `url`, `version`, `path`, `git`, `from`"
+            ));
+        }
+        if self.is_git() && self.rev.is_none() {
+            return Err(anyhow!(
+                "wheel `{name}`: `git` requires `rev` (commit, tag, or branch)"
             ));
         }
         if self.is_url() && !self.extras.is_empty() {
             return Err(anyhow!(
-                "wheel `{name}`: `extras` is only meaningful for the PyPI \
-                 spec form (with `version`), not for direct URLs"
+                "wheel `{name}`: `extras` is not meaningful on the bare-URL \
+                 form (the upstream filename doesn't carry a project name to \
+                 attach extras to). Use the `version`, `path`, `git`, or \
+                 `from` form instead."
             ));
         }
+        // v0.12.0+: extras now valid on path/git/named-git. The wheel
+        // built from those sources carries `Requires-Dist: ...; extra
+        // == "<name>"` lines in METADATA, and the handler runs the
+        // standard extras BFS on them (just like PyPI form), pulling
+        // the extras' deps via PyPI Simple.
         Ok(())
     }
 

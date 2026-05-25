@@ -2,7 +2,7 @@ schema_version: 1
 
 context:
   name: pixi-build-retread
-  version: "0.7.1"
+  version: "0.13.11"
 
 package:
   name: ${{ name }}
@@ -31,14 +31,34 @@ requirements:
     # pixi-build-api-version pins the protocol version. Bump alongside any
     # change to the pixi_build_types git rev in our Cargo.toml.
     - pixi-build-api-version >=4,<5
+    # uv replaces pip + setuptools + a baked-in python for source builds.
+    # `uv pip wheel --python <ver>` downloads python-build-standalone on
+    # demand and uses it for the build, so retread itself is
+    # python-agnostic: any python the workspace requests just works
+    # without rebuilding retread. (Pre-0.11 retread was variant-pinned
+    # per python minor and required a retread rebuild for every new
+    # python release; uv removes that constraint entirely.)
+    - uv >=0.5
+    # For [retread-wheels] entries with `git = ...` retread shells out to
+    # `git clone`.
+    - git
 
 about:
   repository: https://github.com/garylvov/pixi-build-retread
   homepage: https://github.com/garylvov/pixi-build-retread
   summary: |
-    A pixi build backend that repacks PyPI wheels as conda packages with
-    relaxed dependency pins, so conda/pypi mixed solves stop fighting over
-    over-strict upstream pins (e.g. Isaac Sim).
+    Retread PyPI wheels as conda packages, with dep versions loosened
+    and shared deps preferred from conda.
+
+    A pixi build backend. Pixi solves conda first, then runs uv against
+    PyPI with conda's chosen versions forwarded as hard pins; upstream
+    PyPI wheels routinely pin transitives exactly, so those forwarded
+    pins clash and the install fails. retread rewrites each exact pin
+    to a range in the wheel's METADATA and the emitted conda run-deps,
+    and reroutes any shared transitive with a conda equivalent (via
+    parselmouth + a small fallback table) onto the conda side before
+    uv runs. Deps with no conda equivalent stay bundled in the wheel
+    and skip uv entirely.
   license: BSD-3-Clause
   # Inside the build sandbox the parent directory was copied via `source.path = ..`,
   # so the LICENSE file lives at $SRC_DIR/LICENSE.

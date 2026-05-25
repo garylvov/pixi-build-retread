@@ -59,6 +59,7 @@ fn baseline_config() -> RetreadConfig {
             drop_deps: Vec::new(),
             auto_bundle: false,
             conda_deps: Vec::new(),
+            git_sources: std::collections::BTreeMap::new(),
             python: None,
     }
 }
@@ -99,7 +100,7 @@ fn isaacsim_kernel_pins_widen_under_minor_relax() {
         .parse()
         .unwrap();
 
-    let recipe = build_bundle_recipe("isaacsim-test", &[BundleSource { pypi_name: &metadata.name, url: &url, metadata: &metadata }], &baseline_config()).unwrap();
+    let recipe = build_bundle_recipe("isaacsim-test", &[BundleSource { pypi_name: &metadata.name, url: &url, metadata: &metadata }], &baseline_config(), "3.11").unwrap();
     let yaml = to_yaml(&recipe).unwrap();
 
     // These are the deps that the manual gigastrap workaround pins to keep
@@ -147,7 +148,7 @@ fn isaacsim_core_compat_with_ros2_workspace_pins() {
     let url: url::Url = format!("https://pypi.nvidia.com/isaacsim-core/{filename}")
         .parse()
         .unwrap();
-    let recipe = build_bundle_recipe("isaacsim-test", &[BundleSource { pypi_name: &metadata.name, url: &url, metadata: &metadata }], &baseline_config()).unwrap();
+    let recipe = build_bundle_recipe("isaacsim-test", &[BundleSource { pypi_name: &metadata.name, url: &url, metadata: &metadata }], &baseline_config(), "3.11").unwrap();
     let yaml = to_yaml(&recipe).unwrap();
 
     let scipy = find_run_dep(&yaml, "scipy").expect("scipy must appear");
@@ -179,7 +180,7 @@ fn name_map_remaps_opencv_to_conda() {
     let mut cfg = baseline_config();
     cfg.name_map
         .insert("opencv-python-headless".into(), "py-opencv".into());
-    let recipe = build_bundle_recipe("isaacsim-test", &[BundleSource { pypi_name: &metadata.name, url: &url, metadata: &metadata }], &cfg).unwrap();
+    let recipe = build_bundle_recipe("isaacsim-test", &[BundleSource { pypi_name: &metadata.name, url: &url, metadata: &metadata }], &cfg, "3.11").unwrap();
     let yaml = to_yaml(&recipe).unwrap();
 
     assert!(
@@ -203,7 +204,7 @@ fn aggressive_major_relax_drops_upper_bounds() {
 
     let mut cfg = baseline_config();
     cfg.relax = RelaxPolicy::Major;
-    let recipe = build_bundle_recipe("isaacsim-test", &[BundleSource { pypi_name: &metadata.name, url: &url, metadata: &metadata }], &cfg).unwrap();
+    let recipe = build_bundle_recipe("isaacsim-test", &[BundleSource { pypi_name: &metadata.name, url: &url, metadata: &metadata }], &cfg, "3.11").unwrap();
     let yaml = to_yaml(&recipe).unwrap();
 
     let numpy = find_run_dep(&yaml, "numpy").expect("numpy must appear");

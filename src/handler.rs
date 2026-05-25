@@ -19,9 +19,9 @@ use pixi_build_types::{BackendCapabilities, BinaryPackageSpec, NamedSpec, Packag
 use rattler_conda_types::{ChannelUrl, NoArchType, PackageName, Platform, VersionSpec, VersionWithSource};
 use serde_json::Value;
 use tokio::sync::RwLock;
-use uv_pep508::uv_pep440::Operator;
+use uv_pep508::uv_pep440::VersionSpecifiers;
 
-use crate::config::{RetreadConfig, WheelEntry};
+use crate::config::{RelaxPolicy, RetreadConfig, WheelEntry};
 use crate::pypi::{self, WheelTarget};
 use crate::recipe::{build_bundle_recipe, to_yaml, BundleSource};
 use crate::relax::{default_marker_env, marker_env_for, python_version_from_wheel_tag};
@@ -135,6 +135,11 @@ async fn load_pypi_to_conda_map() -> PypiToCondaMap {
 /// on a conda channel. Always includes the PEP 503 normalized PyPI name,
 /// any parselmouth-derived aliases, and any user-supplied alias from
 /// `retread-name-map`.
+///
+/// Currently unused (we no longer probe conda channels for transitives;
+/// see auto_bundle_transitives for why). Kept available for future
+/// per-channel availability checks.
+#[allow(dead_code)]
 fn conda_candidates_for(
     pypi_name: &str,
     name_map: &std::collections::BTreeMap<String, String>,
@@ -176,6 +181,9 @@ const BUILT_IN_WIN_ONLY: &[&str] = &[
 struct State {
     config: Option<RetreadConfig>,
     cache_dir: Option<PathBuf>,
+    /// Directory containing the source package's `pixi.toml`. Used to
+    /// resolve relative `path = "..."` entries in [retread-wheels].
+    source_dir: Option<PathBuf>,
 }
 
 #[derive(Clone, Default)]
@@ -192,6 +200,26 @@ struct ResolvedWheel {
     pypi_name: String,
     url: url::Url,
     metadata: WheelMetadata,
+    /// v0.12.0+: extras the user requested on the originating
+    /// `[retread-wheels]` entry. Surfaced in the audit so debugging
+    /// "did extras=[all] expand to the right sub-wheels?" is grep-able.
+    /// Empty for sub-wheels pulled by the BFS (extras live on the
+    /// primary, not on the resolved transitives).
+    #[allow(dead_code)] // read at audit time
+    extras_requested: Vec<String>,
+    /// v0.12.0+: when this wheel carried the auto-data-files inject
+    /// for a checkout root (phase 1.6), the report of what got
+    /// shipped. `None` for: PyPI/URL/path entries (no checkout root),
+    /// BFS sub-wheels (caller doesn't pass auto-data), and dedup'd
+    /// siblings (an earlier wheel from the same checkout carried it).
+    #[allow(dead_code)] // read at audit time
+    auto_data: Option<crate::audit::AutoDataReport>,
+    /// v0.12.0+: present when this wheel was the 2..N entry sharing a
+    /// checkout root with an earlier wheel that already carried the
+    /// auto-data inject. Records the shared root so the audit shows
+    /// WHY this wheel didn't ship the repo-root tree.
+    #[allow(dead_code)] // read at audit time
+    auto_data_dedup_skipped_root: Option<PathBuf>,
 }
 
 /// One conda output's worth of wheels: a "bundle" produced by a single
@@ -277,6 +305,10 @@ impl Handler {
         let mut state = self.state.write().await;
         state.config = Some(config);
         state.cache_dir = params.cache_directory;
+        // source_directory falls back to the manifest's containing dir.
+        state.source_dir = params.source_directory.or_else(|| {
+            params.manifest_path.parent().map(PathBuf::from)
+        });
         Ok(InitializeResult {})
     }
 
@@ -284,7 +316,8 @@ impl Handler {
         &self,
         params: CondaOutputsParams,
     ) -> Result<CondaOutputsResult, RpcError> {
-        let (config, download_dir) = self.snapshot(&params.work_directory).await?;
+        let (config, download_dir, source_dir, cache_dir) =
+            self.snapshot(&params.work_directory).await?;
 
         // Pick the target Python versions. Precedence:
         //   1. workspace.build-variants python = [...]
@@ -292,32 +325,49 @@ impl Handler {
         //   3. DEFAULT_PYTHON
         let pythons = pythons_for(&config, params.variant_configuration.as_ref());
 
-        // Fan out: one output per (python, wheel). If a target python has no
-        // matching wheel on the index (e.g. user asked for 3.12 but the
-        // upstream wheel is cp311-only), log and skip the combination rather
-        // than failing the whole call -- other Python versions might still
-        // resolve cleanly.
+        // Fan out: one output per (python, wheel). Any resolve error
+        // propagates immediately -- pixi reports a useless "package not
+        // provided" message if we return empty outputs, so surfacing the
+        // per-entry context from resolve_all is the only way the user
+        // ever learns which [retread-wheels] entry actually broke.
         let mut outputs = Vec::new();
         for python_version in &pythons {
             let target = wheel_target_for(params.host_platform, python_version);
-            let (resolved, effective_config) =
-                match resolve_all(&config, &target, &download_dir, &params.channels).await {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tracing::warn!(
-                            python = %python_version,
-                            error = %format!("{e:#}"),
-                            "skipping python variant: no matching wheels"
-                        );
-                        continue;
-                    }
-                };
+            let (resolved, effective_config) = resolve_all(
+                &config,
+                &target,
+                &download_dir,
+                &source_dir,
+                &cache_dir,
+                &params.channels,
+            )
+            .await
+            .map_err(|e| {
+                RpcError::invalid_params(format!(
+                    "resolving wheels for python {python_version}: {e:#}"
+                ))
+            })?;
+            // Cross-output linking: collect each bundle's (conda_name,
+            // version) so produce_output can emit the other bundles as
+            // run-dependencies. Declaring any single output in the
+            // workspace then pulls in the whole pack, instead of the
+            // workspace needing one line per [retread-wheels] entry.
+            let siblings: Vec<(String, String)> = resolved
+                .iter()
+                .map(|b| (b.conda_name.clone(), b.primary.metadata.version.clone()))
+                .collect();
             for bundle in &resolved {
                 outputs.push(
-                    produce_output(bundle, &effective_config, params.host_platform, python_version)
-                        .map_err(|e| {
-                            RpcError::internal(format!("output for {}: {e:#}", bundle.conda_name))
-                        })?,
+                    produce_output(
+                        bundle,
+                        &effective_config,
+                        params.host_platform,
+                        python_version,
+                        &siblings,
+                    )
+                    .map_err(|e| {
+                        RpcError::internal(format!("output for {}: {e:#}", bundle.conda_name))
+                    })?,
                 );
             }
         }
@@ -331,24 +381,66 @@ impl Handler {
         &self,
         params: CondaBuildV1Params,
     ) -> Result<CondaBuildV1Result, RpcError> {
-        let (config, download_dir) = self.snapshot(&params.work_directory).await?;
+        let (config, download_dir, source_dir, cache_dir) =
+            self.snapshot(&params.work_directory).await?;
         // conda/build_v1 doesn't carry the variant set; the chosen variant
         // is encoded in params.output.variant. Look up `python` there;
         // fall back to the default if absent.
-        let python_version = params
+        // Pick python: prefer the variant pixi sent back, but reject
+        // bare-major ("3"). pixi forwards the workspace's
+        // build-variants only when the recipe declares the variant
+        // via `${{ python }}` template -- our generated bundle recipe
+        // hardcodes `python 3.11.*` so pixi falls back to bare-major.
+        // bare-major fails every cp tag match on PyPI Simple, so we
+        // resolve a real X.Y from config.python (preferred) or
+        // DEFAULT_PYTHON (last resort, with a loud warn since the
+        // user can avoid it by setting `[package.build.config] python`).
+        let config_python = config.python.as_ref().and_then(|s| s.as_versions().into_iter().next());
+        let raw = params
             .output
             .variant
             .get("python")
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| DEFAULT_PYTHON.to_string());
+            .map(|v| v.to_string());
+        let python_version = match raw.as_deref() {
+            Some(v) if v.contains('.') => v.to_string(),
+            Some(other) => {
+                let fallback = config_python.clone().unwrap_or_else(|| DEFAULT_PYTHON.to_string());
+                if config_python.is_none() {
+                    tracing::warn!(
+                        received = %other,
+                        falling_back_to = %fallback,
+                        "conda/build_v1: variant python is bare-major and \
+                         [package.build.config] retread-python is not set; \
+                         using DEFAULT_PYTHON. Set `retread-python = \"3.11\"` \
+                         (or your preferred minor) under [package.build.config] \
+                         in the source package's pixi.toml to silence this warning.",
+                    );
+                } else {
+                    tracing::info!(
+                        received = %other,
+                        falling_back_to = %fallback,
+                        "conda/build_v1: variant python is bare-major; \
+                         using [package.build.config] retread-python",
+                    );
+                }
+                fallback
+            }
+            None => config_python.unwrap_or_else(|| DEFAULT_PYTHON.to_string()),
+        };
         let target = wheel_target_for(params.output.subdir, &python_version);
 
         // We re-resolve the full set (the lookup is cheap once cached) and
         // pick the entry matching the requested output.
-        let (resolved, effective_config) =
-            resolve_all(&config, &target, &download_dir, &params.channels)
-                .await
-                .map_err(|e| RpcError::internal(format!("resolving wheels: {e:#}")))?;
+        let (resolved, effective_config) = resolve_all(
+            &config,
+            &target,
+            &download_dir,
+            &source_dir,
+            &cache_dir,
+            &params.channels,
+        )
+        .await
+        .map_err(|e| RpcError::internal(format!("resolving wheels: {e:#}")))?;
 
         let requested = params.output.name.as_normalized().to_string();
         let picked = resolved
@@ -373,23 +465,37 @@ impl Handler {
             &params.work_directory,
             &output_dir,
             params.output.subdir,
+            &python_version,
+            &source_dir,
+            params.output.build.as_deref(),
         )
         .await
         .map_err(|e| RpcError::internal(format!("build {}: {e:#}", picked.conda_name)))
     }
 
-    async fn snapshot(&self, work_dir: &Path) -> Result<(RetreadConfig, PathBuf), RpcError> {
+    async fn snapshot(
+        &self,
+        work_dir: &Path,
+    ) -> Result<(RetreadConfig, PathBuf, PathBuf, PathBuf), RpcError> {
         let state = self.state.read().await;
         let config = state
             .config
             .clone()
             .ok_or_else(|| RpcError::internal("initialize was not called"))?;
-        let download_dir = state
+        let cache_dir = state
             .cache_dir
             .clone()
-            .map(|d| d.join("pixi-build-retread-wheels"))
-            .unwrap_or_else(|| work_dir.join("wheels"));
-        Ok((config, download_dir))
+            .unwrap_or_else(|| work_dir.join("cache"));
+        let source_dir = state
+            .source_dir
+            .clone()
+            .unwrap_or_else(|| work_dir.to_path_buf());
+        // Materialized wheels (downloads, source-builds, and relaxed copies)
+        // live inside the pack folder so they're visible alongside the
+        // pack's pixi.toml instead of buried in pixi's opaque cache.
+        // cache_dir remains the scratch root for git clones.
+        let download_dir = source_dir.join("wheels");
+        Ok((config, download_dir, source_dir, cache_dir))
     }
 }
 
@@ -443,6 +549,8 @@ async fn resolve_all(
     config: &RetreadConfig,
     target: &WheelTarget,
     download_dir: &Path,
+    source_dir: &Path,
+    cache_dir: &Path,
     conda_channels: &[ChannelUrl],
 ) -> Result<(Vec<Bundle>, RetreadConfig)> {
     let mut bundles = Vec::with_capacity(config.retread_wheels.len());
@@ -483,20 +591,132 @@ async fn resolve_all(
         }
     }
 
+    // Group entries by their `bundle` field. Entries that share a bundle
+    // name fold into ONE conda output containing all their wheels --
+    // this lets the workspace declare a single conda dep and have it
+    // install the whole pack. Entries without `bundle` keep the legacy
+    // behavior (one entry = one output named after the entry key).
+    let mut groups: std::collections::BTreeMap<String, Vec<(String, &WheelEntry)>> =
+        std::collections::BTreeMap::new();
     for (entry_name, entry) in &effective.retread_wheels {
-        let mut bundle =
-            resolve_bundle(entry_name, entry, target, download_dir).await?;
-        if effective.auto_bundle && entry.url.is_none() {
-            auto_bundle_transitives(
-                &mut bundle,
-                &entry.index_url(),
+        let group_name = entry
+            .bundle
+            .clone()
+            .unwrap_or_else(|| entry_name.clone());
+        groups
+            .entry(group_name)
+            .or_default()
+            .push((entry_name.clone(), entry));
+    }
+
+    for (group_name, group_entries) in groups {
+        // Build each entry's sub-bundle (primary + BFS extras + D rewrite)
+        // independently, then fold them into one merged bundle named
+        // after the group. The first entry in BTreeMap order becomes the
+        // merged bundle's primary -- pick your entry names accordingly
+        // if version selection matters (merged bundle's version = primary
+        // wheel's version).
+        //
+        // v0.12.0+: precompute per-(bundle, checkout_root) auto-data
+        // dedup state up front so the FIRST entry that owns a given
+        // checkout root carries the auto-data; subsequent siblings
+        // sharing that root get None. skip_subdirs for the carrier is
+        // the union of every subdirectory of every sibling sharing the
+        // root -- so the walk doesn't re-ship Python package source
+        // that pip wheel already put in site-packages.
+        let entry_checkouts: Vec<Option<PathBuf>> = group_entries
+            .iter()
+            .map(|(_, e)| checkout_root_for_entry(e, &effective.git_sources, source_dir, cache_dir))
+            .collect();
+        let mut emitted_auto_data: HashSet<PathBuf> = HashSet::new();
+        let auto_data_per_entry: Vec<Option<AutoDataConfig>> = entry_checkouts
+            .iter()
+            .map(|maybe_root| {
+                let root = maybe_root.as_ref()?;
+                if emitted_auto_data.contains(root) {
+                    return None;
+                }
+                emitted_auto_data.insert(root.clone());
+                let skip_subdirs: Vec<PathBuf> = entry_checkouts
+                    .iter()
+                    .zip(group_entries.iter())
+                    .filter_map(|(other_root, (_, e))| {
+                        if other_root.as_ref() == Some(root) {
+                            Some(PathBuf::from(
+                                e.subdirectory.as_deref().unwrap_or("."),
+                            ))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                Some(AutoDataConfig {
+                    checkout_root: root.clone(),
+                    skip_subdirs,
+                })
+            })
+            .collect();
+
+        let mut sub_bundles: Vec<Bundle> = Vec::with_capacity(group_entries.len());
+        for ((entry_name, entry), auto_data) in
+            group_entries.iter().zip(auto_data_per_entry.into_iter())
+        {
+            let sub = resolve_bundle(
+                entry_name,
+                entry,
                 target,
                 download_dir,
-                &effective,
-                conda_channels,
+                source_dir,
+                cache_dir,
+                effective.relax,
+                &effective.git_sources,
+                auto_data,
                 &pypi_to_conda,
+                conda_channels,
             )
-            .await?;
+            .await
+            .with_context(|| {
+                if group_entries.len() == 1 {
+                    format!(
+                        "resolving wheel entry `{entry_name}` (one of {} in [retread-wheels])",
+                        effective.retread_wheels.len(),
+                    )
+                } else {
+                    format!(
+                        "resolving wheel entry `{entry_name}` (bundle `{group_name}`, one of {} in [retread-wheels])",
+                        effective.retread_wheels.len(),
+                    )
+                }
+            })?;
+            sub_bundles.push(sub);
+        }
+        let mut bundle = sub_bundles.remove(0);
+        bundle.conda_name = conda_name_from(&group_name);
+        for sub in sub_bundles {
+            bundle.extras.push(sub.primary);
+            bundle.extras.extend(sub.extras);
+        }
+        // Auto-bundle scans the whole merged bundle's Requires-Dist, so
+        // it naturally handles transitives pulled by any wheel in the
+        // group. Use the first non-URL entry's index for the candidate
+        // fallback chain (URL-form entries can't auto-bundle anyway --
+        // they have no PyPI index to resolve from).
+        let auto_index: Option<String> = group_entries
+            .iter()
+            .find_map(|(_, e)| if e.url.is_none() { Some(e.index_url()) } else { None });
+        if effective.auto_bundle {
+            if let Some(idx) = auto_index {
+                auto_bundle_transitives(
+                    &mut bundle,
+                    &idx,
+                    target,
+                    download_dir,
+                    &effective,
+                    conda_channels,
+                    &pypi_to_conda,
+                )
+                .await?;
+            }
         }
         bundles.push(bundle);
     }
@@ -508,33 +728,76 @@ async fn resolve_bundle(
     entry: &WheelEntry,
     target: &WheelTarget,
     download_dir: &Path,
+    source_dir: &Path,
+    cache_dir: &Path,
+    relax: RelaxPolicy,
+    git_sources: &std::collections::BTreeMap<String, crate::config::NamedGitSource>,
+    auto_data: Option<AutoDataConfig>,
+    // v0.13.10+: BFS short-circuits PyPI-form Pending deps that
+    // parselmouth knows about. v0.13.11+: also probes the workspace's
+    // conda channels for satisfiability BEFORE short-circuiting --
+    // same probe that auto_bundle_transitives uses. If conda has the
+    // package but no version matches the spec (gym's `>=0.23,<0.24`
+    // when conda-forge skipped from gym 0.21 to 0.26.2), the short-
+    // circuit is suppressed and the dep falls through to the regular
+    // PyPI resolve + bundle path. URL/git Pending deps NEVER short-
+    // circuit: user opted into a specific upstream source via PEP 508
+    // `pkg @ <url>` and substituting conda would silently swap deps.
+    pypi_to_conda: &PypiToCondaMap,
+    conda_channels: &[ChannelUrl],
 ) -> Result<Bundle> {
     let conda_name = conda_name_from(entry_name);
     let mut seen: HashSet<String> = HashSet::new();
     let mut work: VecDeque<Pending> = VecDeque::new();
 
-    // Resolve and fetch the primary wheel first.
-    let primary = if let Some(url) = &entry.url {
-        let metadata = fetch_and_parse(url, entry.sha256.as_deref(), download_dir).await?;
-        ResolvedWheel {
-            pypi_name: conda_name_from(entry_name),
-            url: url.clone(),
-            metadata,
-        }
+    // Materialize the primary wheel to disk by any of the four source
+    // forms (url/version/path/git), then apply D (wheel METADATA
+    // surgery) per the relax policy, then parse the resulting wheel.
+    // For the primary wheel: surface the user's `extras` list in the
+    // audit, and record dedup status. The caller (resolve_all) computed
+    // the dedup decision and packed it via parallel arrays alongside
+    // `auto_data`; resolve_bundle re-derives the "skipped root" by
+    // looking at what `auto_data` is NOT carrying when the entry has a
+    // checkout root.
+    let dedup_skipped_root = if auto_data.is_none() {
+        // Cheap recompute; matches the resolve_all decision logic.
+        checkout_root_for_entry(entry, git_sources, source_dir, cache_dir)
     } else {
-        let version = entry
-            .normalized_version()
-            .ok_or_else(|| anyhow!("wheel `{entry_name}` has neither url nor version"))?;
-        let resolved = pypi::resolve(&entry.index_url(), entry_name, &version, target).await?;
-        let metadata =
-            fetch_and_parse(&resolved.url, resolved.sha256.as_deref(), download_dir).await?;
-        ResolvedWheel {
-            pypi_name: conda_name_from(entry_name),
-            url: resolved.url,
-            metadata,
-        }
+        None
     };
+    let primary = materialize_and_rewrite(
+        entry,
+        entry_name,
+        target,
+        download_dir,
+        source_dir,
+        cache_dir,
+        relax,
+        git_sources,
+        auto_data,
+        EntryAuditInfo {
+            extras_requested: entry.extras.clone(),
+            dedup_skipped_root,
+        },
+    )
+    .await?;
     seen.insert(primary.pypi_name.clone());
+
+    // path/git/from sources are authored project code, not metapackages
+    // with extras-gated transitives. SKIP the BFS entirely unless the
+    // user explicitly asked for extras on this entry (v0.12.0+). When
+    // extras IS requested, fall through and run the BFS so the wheel's
+    // METADATA `; extra == "X"` deps get pulled in -- but DON'T do the
+    // sibling-prefix base-dep dance, since project code doesn't have a
+    // metapackage's namespace convention.
+    let is_source_form = entry.is_path() || entry.is_git() || entry.is_named_git();
+    if is_source_form && entry.extras.is_empty() {
+        return Ok(Bundle {
+            conda_name,
+            primary,
+            extras: vec![],
+        });
+    }
 
     // Seed BFS from the primary's deps. Two flavors:
     // 1. Extras-gated (`; extra == "X"`) for each requested extra.
@@ -545,7 +808,15 @@ async fn resolve_bundle(
     //    kernel is essential to ANY install of isaacsim. We bundle these
     //    sub-packages so the conda solver doesn't try to find them
     //    separately.
-    let prefix = format!("{}-", conda_name);
+    //
+    // Source-form entries (git/path/named-git) get extras BUT NOT the
+    // sibling-prefix base-dep matching -- a git-built project doesn't
+    // own a `<conda_name>-foo` namespace.
+    let prefix = if is_source_form {
+        String::new()
+    } else {
+        format!("{}-", conda_name)
+    };
     seed_worklist(
         &primary.metadata,
         &entry.extras,
@@ -555,30 +826,163 @@ async fn resolve_bundle(
         &mut work,
     )?;
 
-    // BFS, accumulating sub-wheels.
+    // BFS, accumulating sub-wheels. v0.12.0+: PyPI-Simple deps go
+    // through the existing `pypi::resolve` path; URL/git deps from
+    // PEP 508 `pkg @ <url>` form get synthesized into a `WheelEntry`
+    // and run through `materialize_and_rewrite` so the same caching,
+    // METADATA surgery, and source-build pipeline applies. Url/git
+    // sub-wheels propagate their own extras but NOT prefix-base-dep
+    // matching (they're project code, same rule as primary).
     let mut extras = Vec::new();
     while let Some(pending) = work.pop_front() {
         let dep_conda_name = conda_name_from(&pending.pypi_name);
         if !seen.insert(dep_conda_name.clone()) {
             continue;
         }
-        let resolved = pypi::resolve(&pending.index, &pending.pypi_name, &pending.version, target)
-            .await
-            .with_context(|| {
-                format!(
-                    "resolving {}=={} on index {}",
-                    pending.pypi_name, pending.version, pending.index,
+        // v0.13.8+: prefer-conda short-circuit for PyPI-Simple deps.
+        // v0.13.11+: probe-gated. If parselmouth knows about the name
+        // AND the workspace's conda channels have a satisfying
+        // version, short-circuit. If conda HAS the package but no
+        // satisfying version (gym's `>=0.23,<0.24` when conda-forge
+        // only has 0.21 and 0.26.2), suppress the short-circuit and
+        // fall through to PyPI resolve + bundle. Indecisive probe
+        // (offline, no prefix.dev channels) keeps the legacy optimistic
+        // behavior so a network blip doesn't silently reshape routing.
+        if let (PendingSource::Pypi { specifiers, .. }, true) = (
+            &pending.source,
+            pypi_to_conda.contains_key(&dep_conda_name),
+        ) {
+            // Pick a conda candidate name. Prefer parselmouth's first
+            // (most common when it disagrees with identity, e.g.
+            // `torch -> pytorch`); fall back to PEP 503 identity.
+            let conda_target_name = pypi_to_conda
+                .get(&dep_conda_name)
+                .and_then(|v| v.first().cloned())
+                .unwrap_or_else(|| dep_conda_name.clone());
+            // Probe spec: the RAW PyPI specifiers passed through as
+            // conda match-spec syntax. Conda's matchspec parser is
+            // largely PEP 440-compatible for ranges; if it can't parse
+            // (e.g. a `~=` it doesn't recognize), the probe returns
+            // indecisive and we short-circuit (safe legacy behavior).
+            let probe_spec = specifiers.to_string();
+            let probe_result = crate::probe::probe(
+                conda_channels,
+                &conda_target_name,
+                &probe_spec,
+            )
+            .await;
+            if probe_result.is_definitively_unsatisfied() {
+                tracing::info!(
+                    dep = %pending.pypi_name,
+                    conda_name = %conda_target_name,
+                    spec = %probe_spec,
+                    channels = ?probe_result.channels_consulted,
+                    "BFS prefer-conda: conda channels lack a satisfying version; falling back to PyPI resolve + bundle",
+                );
+                // intentional fall-through to the regular pypi::resolve path
+            } else {
+                tracing::info!(
+                    dep = %pending.pypi_name,
+                    conda_name = %conda_target_name,
+                    spec = %probe_spec,
+                    matches = probe_result.matching_candidates,
+                    "BFS prefer-conda short-circuit: skipping PyPI resolve, will emit as conda run-dep",
+                );
+                continue;
+            }
+        }
+        let (sub_url, sub_metadata, sub_index_for_recurse) = match &pending.source {
+            PendingSource::Pypi { specifiers, index } => {
+                let resolved = pypi::resolve(index, &pending.pypi_name, specifiers, target)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "resolving {}{} on index {}",
+                            pending.pypi_name, specifiers, index,
+                        )
+                    })?;
+                let metadata = fetch_and_parse(
+                    &resolved.url,
+                    resolved.sha256.as_deref(),
+                    download_dir,
                 )
-            })?;
-        let metadata =
-            fetch_and_parse(&resolved.url, resolved.sha256.as_deref(), download_dir).await?;
+                .await?;
+                (resolved.url, metadata, index.clone())
+            }
+            PendingSource::Git { url, rev } => {
+                let synth = WheelEntry {
+                    git: Some(url.clone()),
+                    rev: rev.clone().or_else(|| Some("HEAD".to_string())),
+                    ..Default::default()
+                };
+                let synth_name = pending.pypi_name.clone();
+                let sub = materialize_and_rewrite(
+                    &synth,
+                    &synth_name,
+                    target,
+                    download_dir,
+                    source_dir,
+                    cache_dir,
+                    relax,
+                    git_sources,
+                    None,
+                    EntryAuditInfo::default(),
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "materializing URL Requires-Dist `{} @ git+{}@{}`",
+                        pending.pypi_name,
+                        url,
+                        rev.as_deref().unwrap_or("HEAD"),
+                    )
+                })?;
+                // For the recurse, use the parent ENTRY's index (not
+                // `prefix` -- that's a name-prefix string, NOT a URL).
+                // The recurse fires for Pypi-form Requires-Dist of the
+                // sub-wheel; those go through pypi::resolve which needs
+                // a real Simple index URL.
+                (sub.url, sub.metadata, entry.index_url())
+            }
+            PendingSource::Url { wheel_url } => {
+                let synth = WheelEntry {
+                    url: Some(wheel_url.clone()),
+                    ..Default::default()
+                };
+                let synth_name = pending.pypi_name.clone();
+                let sub = materialize_and_rewrite(
+                    &synth,
+                    &synth_name,
+                    target,
+                    download_dir,
+                    source_dir,
+                    cache_dir,
+                    relax,
+                    git_sources,
+                    None,
+                    EntryAuditInfo::default(),
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "materializing URL Requires-Dist `{} @ {}`",
+                        pending.pypi_name, wheel_url,
+                    )
+                })?;
+                // Same fix as the Git arm: recurse uses the parent
+                // entry's PyPI Simple index, not the name `prefix`.
+                (sub.url, sub.metadata, entry.index_url())
+            }
+        };
 
         // Recurse: this sub-wheel's own extras and prefix-matching base
-        // deps also get pulled in.
+        // deps also get pulled in. URL/git sub-wheels reuse the parent
+        // bundle's `prefix` (often empty for source-form parents) so
+        // they don't pull random siblings.
         seed_worklist(
-            &metadata,
+            &sub_metadata,
             &pending.extras,
-            &pending.index,
+            &sub_index_for_recurse,
             &prefix,
             &seen,
             &mut work,
@@ -586,8 +990,11 @@ async fn resolve_bundle(
 
         extras.push(ResolvedWheel {
             pypi_name: dep_conda_name,
-            url: resolved.url,
-            metadata,
+            url: sub_url,
+            metadata: sub_metadata,
+            extras_requested: vec![],
+            auto_data: None,
+            auto_data_dedup_skipped_root: None,
         });
     }
 
@@ -598,11 +1005,398 @@ async fn resolve_bundle(
     })
 }
 
+/// True if `output` exists on disk and is newer than `input`. Used to
+/// skip the inject + D-rewrite passes when their inputs haven't moved.
+/// Missing files (either side) return false so we always recompute.
+fn is_fresh(output: &Path, input: &Path) -> Result<bool> {
+    let (Ok(out_meta), Ok(in_meta)) = (output.metadata(), input.metadata()) else {
+        return Ok(false);
+    };
+    let (Ok(out_t), Ok(in_t)) = (out_meta.modified(), in_meta.modified()) else {
+        return Ok(false);
+    };
+    Ok(out_t >= in_t)
+}
+
 /// After the user-driven (extras + prefix) BFS, optionally bundle any
 /// exact-pinned base deps that resolve cleanly on the entry's PyPI index.
+/// Compute the upstream checkout root for an entry, when one exists.
+/// Used by [`resolve_all`] to dedup the v0.12.0+ auto-data-files inject
+/// across entries that share a single clone.
+///
+/// - git inline: cache_dir/retread-git-clones/<slug>/ (the repo root,
+///   *parent* of the entry's subdirectory).
+/// - named-git (`from = "<name>"`): same path resolution as inline git,
+///   with url + rev pulled from `[retread-git-sources]`.
+/// - path: returns None. Path entries point directly at a Python
+///   package source; there's no upstream "repo" with sibling content
+///   to ship. Users wanting to attach data from adjacent paths declare
+///   a separate `[retread-wheels]` entry.
+/// - url / spec: None. No source tree, no auto-data inject possible.
+fn checkout_root_for_entry(
+    entry: &WheelEntry,
+    git_sources: &std::collections::BTreeMap<String, crate::config::NamedGitSource>,
+    _source_dir: &Path,
+    cache_dir: &Path,
+) -> Option<PathBuf> {
+    if let Some(from_name) = &entry.from {
+        let src = git_sources.get(from_name)?;
+        Some(crate::source_build::git_checkout_root(
+            &src.url, &src.rev, cache_dir,
+        ))
+    } else if let Some(git_url) = &entry.git {
+        let rev = entry.rev.as_ref()?;
+        Some(crate::source_build::git_checkout_root(
+            git_url, rev, cache_dir,
+        ))
+    } else {
+        None
+    }
+}
+
+/// v0.12.0+: per-bundle configuration for the auto-data-files inject
+/// phase. When `Some`, the wheel produced by phase 1.5 gets a phase
+/// 1.6 pass that walks `checkout_root` (respecting `.gitignore`) and
+/// emits every non-ignored, non-`skip_subdirs` file as a wheel
+/// `.data/data/lib/<rel>` entry -- so the upstream repo's sibling
+/// content (apps/, tools/, share/, etc.) lands at `$PREFIX/lib/<rel>`
+/// when pip installs the wheel. Computed by the caller in
+/// [`resolve_all`] so dedup across the bundle's entries is centralized.
+#[derive(Debug, Clone)]
+pub(crate) struct AutoDataConfig {
+    pub checkout_root: PathBuf,
+    /// Subdirectories (relative to `checkout_root`) that sibling
+    /// entries in this bundle already shipped as wheels -- the walk
+    /// descends through them but emits no files (avoids re-shipping the
+    /// Python package source into `$PREFIX/lib/source/...`).
+    pub skip_subdirs: Vec<PathBuf>,
+}
+
+/// v0.12.0+: audit context passed alongside `AutoDataConfig` so the
+/// resulting `ResolvedWheel` carries enough info to populate the audit
+/// without a second pass. `extras_requested` comes from the entry;
+/// `dedup_skipped_root` is `Some` when the caller decided NOT to emit
+/// auto-data for this wheel because a sibling already covered the
+/// checkout root.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct EntryAuditInfo {
+    pub extras_requested: Vec<String>,
+    pub dedup_skipped_root: Option<PathBuf>,
+}
+
+/// Build / fetch the primary wheel for an entry, apply D, return as
+/// a [`ResolvedWheel`].
+async fn materialize_and_rewrite(
+    entry: &crate::config::WheelEntry,
+    entry_name: &str,
+    target: &WheelTarget,
+    download_dir: &Path,
+    source_dir: &Path,
+    cache_dir: &Path,
+    relax: RelaxPolicy,
+    git_sources: &std::collections::BTreeMap<String, crate::config::NamedGitSource>,
+    auto_data: Option<AutoDataConfig>,
+    audit_info: EntryAuditInfo,
+) -> Result<ResolvedWheel> {
+    use crate::wheel_rewrite::rewrite_wheel;
+    let pypi_name = conda_name_from(entry_name);
+
+    // Phase 1: get the raw wheel onto disk. For source-built wheels
+    // (path / git / from), also remember the source root so phase 1.5
+    // can inject any files pip wheel failed to ship.
+    let mut source_root: Option<PathBuf> = None;
+    let raw_path: PathBuf = if let Some(from_name) = &entry.from {
+        // Named git-source reference: look up url + rev from the
+        // [retread-git-sources] table, treat subdirectory just like
+        // an inline git entry.
+        let src = git_sources.get(from_name).ok_or_else(|| {
+            anyhow!(
+                "wheel `{entry_name}`: `from = \"{from_name}\"` not found in \
+                 [retread-git-sources]"
+            )
+        })?;
+        let subdir = entry.subdirectory.as_deref().unwrap_or(".");
+        let out = download_dir.join(entry_name);
+        let wheel = crate::source_build::build_wheel_from_git(
+            &src.url, &src.rev, subdir, cache_dir, &out, &target.python_version,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "phase 1 named-git build for entry `{entry_name}` \
+                 (from=`{}`, url=`{}`, rev=`{}`, subdir=`{subdir}`, out_dir={})",
+                entry.from.as_deref().unwrap_or(""),
+                src.url, src.rev,
+                out.display(),
+            )
+        })?;
+        source_root = Some(crate::source_build::git_source_root(
+            &src.url, &src.rev, subdir, cache_dir,
+        ));
+        wheel
+    } else if let Some(url) = &entry.url {
+        fetch_wheel(url, entry.sha256.as_deref(), download_dir)
+            .await
+            .with_context(|| format!("phase 1 URL fetch for entry `{entry_name}` (url=`{url}`)"))?
+    } else if let Some(path) = &entry.path {
+        let abs = if Path::new(path).is_absolute() {
+            PathBuf::from(path)
+        } else {
+            source_dir.join(path)
+        };
+        let out = download_dir.join(entry_name);
+        let wheel = crate::source_build::build_wheel_from_path(&abs, &out, &target.python_version)
+            .await
+            .with_context(|| {
+                format!(
+                    "phase 1 path build for entry `{entry_name}` (source={}, out_dir={})",
+                    abs.display(), out.display(),
+                )
+            })?;
+        source_root = Some(abs);
+        wheel
+    } else if let Some(git_url) = &entry.git {
+        let rev = entry
+            .rev
+            .as_ref()
+            .ok_or_else(|| anyhow!("git source `{entry_name}` missing rev"))?;
+        let subdir = entry.subdirectory.as_deref().unwrap_or(".");
+        let out = download_dir.join(entry_name);
+        let wheel = crate::source_build::build_wheel_from_git(
+            git_url, rev, subdir, cache_dir, &out, &target.python_version,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "phase 1 inline-git build for entry `{entry_name}` \
+                 (url=`{git_url}`, rev=`{rev}`, subdir=`{subdir}`, out_dir={})",
+                out.display(),
+            )
+        })?;
+        source_root = Some(crate::source_build::git_source_root(
+            git_url, rev, subdir, cache_dir,
+        ));
+        wheel
+    } else {
+        // PyPI version spec form.
+        let version = entry
+            .normalized_version()
+            .ok_or_else(|| anyhow!("wheel `{entry_name}` has no version, url, path, or git"))?;
+        let specifiers = VersionSpecifiers::from_str(&format!("=={version}"))
+            .map_err(|e| anyhow!("wheel `{entry_name}` version `{version}`: {e}"))?;
+        let resolved = pypi::resolve(&entry.index_url(), entry_name, &specifiers, target)
+            .await
+            .with_context(|| {
+                format!(
+                    "phase 1 PyPI resolve for entry `{entry_name}` \
+                     (version=`{version}`, index=`{}`)",
+                    entry.index_url(),
+                )
+            })?;
+        fetch_wheel(&resolved.url, resolved.sha256.as_deref(), download_dir)
+            .await
+            .with_context(|| {
+                format!(
+                    "phase 1 PyPI fetch for entry `{entry_name}` (url=`{}`)",
+                    resolved.url,
+                )
+            })?
+    };
+
+    // Phase 1.5: for source-built wheels, top up the wheel with any
+    // files the upstream's setup.py forgot to ship. Common breakage:
+    // `packages=["isaaclab"]` without find_packages() emits a wheel
+    // containing only `isaaclab/__init__.py`, missing every submodule
+    // AND sibling data dirs (`config/extension.toml`). Editable
+    // installs paper over this; conda installs don't. Auto-inject so
+    // the wheel is actually self-sufficient. Cache reuse: skip if the
+    // `*.injected.whl` already exists and is newer than the raw wheel.
+    let injected_path = if let Some(root) = source_root {
+        let out = raw_path.with_extension("injected.whl");
+        if is_fresh(&out, &raw_path)? {
+            tracing::info!(
+                entry = %entry_name,
+                wheel = %out.display(),
+                "reusing cached injected wheel",
+            );
+        } else {
+            tracing::info!(
+                entry = %entry_name,
+                source = %root.display(),
+                "auto-injecting missing source-root files into wheel",
+            );
+            crate::wheel_inject::inject(&raw_path, &out, &root)
+                .with_context(|| {
+                    format!(
+                        "phase 1.5 source-root inject for entry `{entry_name}` \
+                         (source={}, raw_wheel={}, out_wheel={})",
+                        root.display(), raw_path.display(), out.display(),
+                    )
+                })?;
+        }
+        out
+    } else {
+        raw_path
+    };
+
+    // Phase 1.6 (v0.12.0+): if the caller passed an `AutoDataConfig`,
+    // walk the upstream checkout root (parent of this entry's
+    // subdirectory) honoring its own `.gitignore` and inject every
+    // non-ignored, non-sibling-subdir file as a wheel `.data/data/lib/
+    // <rel>` entry -- those land at `$CONDA_PREFIX/lib/<rel>` after
+    // pip installs the wheel. Solves the IsaacLab case where the
+    // `.kit` experience files live at the repo root but the wheel only
+    // captures `source/<pkg>/`. Cache key: `*.autodata.whl`, refreshed
+    // when the injected wheel changes (auto-data inject doesn't see
+    // checkout-root file mtimes; clearing the auto-data cache when
+    // upstream files change is the user's job via the existing
+    // backend-cache invalidation step).
+    let mut auto_data_file_count: Option<usize> = None;
+    let with_data_path = if let Some(cfg) = auto_data.as_ref() {
+        let out = injected_path.with_extension("autodata.whl");
+        if is_fresh(&out, &injected_path)? {
+            tracing::info!(
+                entry = %entry_name,
+                wheel = %out.display(),
+                "reusing cached auto-data wheel",
+            );
+            // Re-read the cached wheel's RECORD to recover the count
+            // would be precise but is overkill for the audit -- use 0
+            // as a sentinel that the cache hit happened.
+            auto_data_file_count = Some(0);
+        } else {
+            tracing::info!(
+                entry = %entry_name,
+                checkout = %cfg.checkout_root.display(),
+                skip_subdirs = ?cfg.skip_subdirs,
+                "phase 1.6: injecting checkout-root tree as wheel .data/data/lib/* (lands at $PREFIX/lib/*)",
+            );
+            let n = crate::wheel_inject_data::inject_checkout_root_data(
+                &injected_path,
+                &out,
+                &cfg.checkout_root,
+                &cfg.skip_subdirs,
+            )
+            .with_context(|| {
+                format!(
+                    "phase 1.6 checkout-root auto-data inject for entry `{entry_name}` \
+                     (checkout={}, skip_subdirs={:?}, input={}, output={})",
+                    cfg.checkout_root.display(),
+                    cfg.skip_subdirs,
+                    injected_path.display(),
+                    out.display(),
+                )
+            })?;
+            auto_data_file_count = Some(n);
+        }
+        out
+    } else {
+        injected_path
+    };
+
+    // Phase 2: apply D (rewrite METADATA per the relax policy). For
+    // policies that aren't 'none', the output is a new wheel file with
+    // updated METADATA + RECORD; for 'none' it's a no-op copy. Either
+    // way we recompute the sha256 of the final file. Cache reuse: skip
+    // the rewrite when `*.relaxed.whl` is already up to date.
+    let final_path = if relax == RelaxPolicy::None {
+        with_data_path
+    } else {
+        let rewritten = with_data_path.with_extension("relaxed.whl");
+        if is_fresh(&rewritten, &with_data_path)? {
+            tracing::info!(
+                entry = %entry_name,
+                wheel = %rewritten.display(),
+                "reusing cached relaxed wheel",
+            );
+        } else {
+            tracing::info!(
+                entry = %entry_name,
+                policy = ?relax,
+                "applying relax policy to wheel METADATA",
+            );
+            let _new_sha = rewrite_wheel(&with_data_path, &rewritten, relax)
+                .with_context(|| {
+                    format!(
+                        "phase 2 wheel METADATA rewrite for entry `{entry_name}` (policy={relax:?}, \
+                         input={}, output={})",
+                        with_data_path.display(), rewritten.display(),
+                    )
+                })?;
+        }
+        rewritten
+    };
+
+    let metadata = tokio::task::spawn_blocking({
+        let p = final_path.clone();
+        move || crate::wheel::read_metadata(&p)
+    })
+    .await
+    .context("metadata reader panicked")??;
+
+    // The recipe's `source:` URL points at the POST-D wheel. If we
+    // returned the upstream URL here, rattler-build would re-download
+    // the un-rewritten file and pip would install strict pins into
+    // site-packages; uv on the consumer side then reads the strict
+    // pins from METADATA and collides with whatever the conda solver
+    // chose for those same deps. Always emit file:// of final_path
+    // so the on-disk wheel matches the metadata we already emitted.
+    let final_url = url::Url::from_file_path(&final_path).map_err(|_| {
+        anyhow!(
+            "rewritten wheel at {} is not a valid file URL",
+            final_path.display()
+        )
+    })?;
+
+    let auto_data_report = auto_data.as_ref().map(|cfg| crate::audit::AutoDataReport {
+        checkout_root: cfg.checkout_root.clone(),
+        file_count: auto_data_file_count.unwrap_or(0),
+        skip_subdirs: cfg.skip_subdirs.clone(),
+    });
+    Ok(ResolvedWheel {
+        pypi_name,
+        url: final_url,
+        extras_requested: audit_info.extras_requested,
+        auto_data: auto_data_report,
+        auto_data_dedup_skipped_root: audit_info.dedup_skipped_root,
+        metadata,
+    })
+}
+
+/// Returns `true` if `conda_normalized_pypi_name` has an unambiguous conda
+/// equivalent in the effective name_map (parselmouth + FALLBACK + user
+/// retread-name-map). When true, the prefer-conda policy in
+/// [`auto_bundle_transitives`] skips bundling so the dep flows through to
+/// emission as a conda run-dep.
+fn prefer_conda_match(
+    conda_normalized_pypi_name: &str,
+    name_map: &std::collections::BTreeMap<String, String>,
+) -> bool {
+    name_map.contains_key(conda_normalized_pypi_name)
+}
+
+/// Build the conda match-spec string the channel probe should look
+/// for, given a resolved PyPI version and the active relax policy.
+/// Mirrors what `translate(==<version>)` would emit, since that's
+/// the spec the conda solver will eventually face. Falls back to
+/// `*` (any version) when the version can't be parsed -- a generous
+/// default that lets the probe succeed if ANY build of the package
+/// exists on the channel.
+fn probe_spec_for(version_str: &str, policy: RelaxPolicy) -> String {
+    use std::str::FromStr;
+    match uv_pep508::uv_pep440::Version::from_str(version_str) {
+        Ok(v) => crate::relax::widen_exact(&v, policy).unwrap_or_else(|| "*".to_string()),
+        Err(_) => "*".to_string(),
+    }
+}
+
 /// This is the "pip autoresolve" path: deps that exist on PyPI but might
 /// not be on the workspace's conda channels (`aiodns`, `qdldl`, etc.) get
 /// pip-installed into the conda package alongside the primary wheel.
+///
+/// Prefer-conda by default: anything parselmouth or the user's name_map
+/// knows a conda equivalent for is skipped here and emitted as a conda
+/// run-dep instead.
 ///
 /// Best-effort: a resolve failure logs at debug and leaves the dep to be
 /// emitted as a conda run-dep (current fallback behavior).
@@ -672,42 +1466,86 @@ async fn auto_bundle_transitives(
             break;
         }
 
-        // The auto-bundle policy is "bundle by default": every
-        // transitive dep is fetched from PyPI and pip-installed into
-        // the conda package. Reasoning: that's the only way to
-        // guarantee the upstream version pin (e.g. isaacsim wants
-        // aiodns 3.1, conda-forge has 3.0) is satisfied without
-        // forcing the user to enumerate conflicts manually.
+        // Policy: prefer conda. If parselmouth (or our FALLBACK or the
+        // user's retread-name-map) knows an unambiguous conda equivalent
+        // for the PyPI name, skip bundling -- the dep flows through to
+        // emission as a conda run-dep via `translate`, which uses the
+        // same effective name_map.
         //
-        // To OPT OUT (e.g. for ABI-sensitive packages like numpy where
-        // a bundled wheel would collide with the workspace's conda
-        // version), list the package in `retread-conda-deps`. Those
-        // already-in-`skip` deps are emitted as conda run-deps using
-        // the parselmouth-derived conda name when one exists.
+        // Why prefer conda for a conda-based tool: bundling vendors the
+        // upstream-pinned version, but the conda copy is what every
+        // other native package in the env was built against (BLAS,
+        // glibc, CUDA, ABI in general). Double-installing a wheel on
+        // top of a conda equivalent at best wastes disk and download
+        // time; at worst it shadows the ABI-correct copy with one that
+        // wasn't built for this env.
         //
-        // (The prefix.dev existence API is also checked for non-
-        // conda-forge channels, in case the user has a private channel
-        // hosting the package.)
-        let mut on_conda: HashSet<String> = HashSet::new();
-        for (pypi_name, _) in &candidates {
-            let conda_candidates =
-                conda_candidates_for(pypi_name, &config.name_map, pypi_to_conda);
-            for candidate_name in &conda_candidates {
-                if check_on_any_channel(candidate_name, conda_channels).await {
-                    on_conda.insert(conda_name_from(pypi_name));
-                    break;
-                }
-            }
-        }
+        // Bundling still happens for everything parselmouth doesn't
+        // know about (niche PyPI-only helpers). The fallback path below
+        // is the original behavior, just with a smaller candidate set.
+        //
+        // Escape hatches when prefer-conda picks wrong: drop the dep
+        // via `retread-drop-deps`, force a specific spec via
+        // `retread-overrides`, or remove the parselmouth-discovered
+        // entry by overriding it in `retread-name-map` (set to "" to
+        // disable). For pin-forwarding conflicts arising on the PyPI
+        // side, relax the offending editable's pyproject pin directly
+        // (it's your code).
 
         let mut added_any = false;
         'next_candidate: for (name, version) in candidates {
             let conda_name = conda_name_from(&name);
-            if on_conda.contains(&conda_name) {
-                continue;
+            if prefer_conda_match(&conda_name, &config.name_map) {
+                // Probe the workspace's conda channels for whether the
+                // spec retread would emit is actually satisfiable. If
+                // ANY channel has a matching candidate, keep on conda.
+                // If every channel was reachable and returned versions
+                // but NONE matched, fall through to auto-bundle. An
+                // indecisive probe (no prefix.dev channels, or all
+                // probes errored) keeps the legacy prefer-conda
+                // behavior so a prefix.dev outage doesn't silently
+                // reshape routing.
+                let conda_target_name = config.name_map[&conda_name].clone();
+                let probe_spec = probe_spec_for(&version, config.relax);
+                let probe_result = crate::probe::probe(
+                    conda_channels,
+                    &conda_target_name,
+                    &probe_spec,
+                )
+                .await;
+                if probe_result.is_definitively_unsatisfied() {
+                    tracing::info!(
+                        dep = %name,
+                        conda = %conda_target_name,
+                        spec = %probe_spec,
+                        channels = ?probe_result.channels_consulted,
+                        "prefer-conda: conda spec is UNSATISFIABLE on workspace channels; falling back to auto-bundle from PyPI",
+                    );
+                    // intentional fall-through: continue with bundle path
+                } else {
+                    tracing::info!(
+                        dep = %name,
+                        conda = %conda_target_name,
+                        spec = %probe_spec,
+                        matches = probe_result.matching_candidates,
+                        "prefer-conda: skipping auto-bundle; dep will be emitted as a conda run-dep",
+                    );
+                    continue;
+                }
             }
+            let specifiers = match VersionSpecifiers::from_str(&format!("=={version}")) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::debug!(
+                        dep = %name, version = %version,
+                        error = %e,
+                        "auto-bundle: skipping unparseable version"
+                    );
+                    continue;
+                }
+            };
             for index in &indexes {
-                match pypi::resolve(index, &name, &version, target).await {
+                match pypi::resolve(index, &name, &specifiers, target).await {
                     Ok(resolved) => {
                         let metadata = match fetch_and_parse(
                             &resolved.url,
@@ -737,6 +1575,9 @@ async fn auto_bundle_transitives(
                             pypi_name: conda_name,
                             url: resolved.url,
                             metadata,
+                            extras_requested: vec![],
+                            auto_data: None,
+                            auto_data_dedup_skipped_root: None,
                         });
                         added_any = true;
                         continue 'next_candidate;
@@ -773,6 +1614,7 @@ async fn auto_bundle_transitives(
 /// channels. Hits prefix.dev's package-existence API; channels not hosted
 /// on prefix.dev are skipped (conservative -- those deps will go through
 /// the auto-bundle path).
+#[allow(dead_code)]
 async fn check_on_any_channel(package_name: &str, channels: &[ChannelUrl]) -> bool {
     for channel in channels {
         let url_str = channel.url().as_str().trim_end_matches('/');
@@ -825,7 +1667,9 @@ fn pep508_exact_base_dep(raw: &str) -> Result<Option<(String, String)>> {
         return Ok(None);
     };
     let specs: Vec<_> = specs.iter().collect();
-    if specs.len() != 1 || *specs[0].operator() != Operator::Equal {
+    if specs.len() != 1
+        || *specs[0].operator() != uv_pep508::uv_pep440::Operator::Equal
+    {
         return Ok(None);
     }
     Ok(Some((req.name.to_string(), specs[0].version().to_string())))
@@ -835,11 +1679,28 @@ fn pep508_exact_base_dep(raw: &str) -> Result<Option<(String, String)>> {
 #[derive(Debug, Clone)]
 struct Pending {
     pypi_name: String,
-    version: String,
-    index: String,
+    source: PendingSource,
     /// Extras to activate on this wheel. Drives further worklist additions
     /// for `Requires-Dist: name ; extra == "X"` lines.
     extras: Vec<String>,
+}
+
+/// v0.12.0+: a dep can be sourced from a PyPI Simple index (the
+/// original behavior) or from a direct URL / git URL declared via PEP
+/// 508 `<name> @ <url>` form. URL-form deps are common in
+/// `[project.optional-dependencies]` and previously made retread bail.
+#[derive(Debug, Clone)]
+enum PendingSource {
+    /// `Requires-Dist: <name> <specifiers>` -- resolve via PyPI Simple.
+    Pypi {
+        specifiers: VersionSpecifiers,
+        index: String,
+    },
+    /// `Requires-Dist: <name> @ git+<scheme>://<host>/<path>@<rev>` --
+    /// clone + `pip wheel --no-deps`.
+    Git { url: String, rev: Option<String> },
+    /// `Requires-Dist: <name> @ <scheme>://...` (direct wheel/sdist).
+    Url { wheel_url: url::Url },
 }
 
 fn conda_name_from(pypi_name: &str) -> String {
@@ -867,8 +1728,7 @@ fn seed_worklist(
                 }
                 work.push_back(Pending {
                     pypi_name: dep.name,
-                    version: dep.version,
-                    index: index.to_string(),
+                    source: extra_dep_source_to_pending(dep.source, index),
                     extras: dep.extras,
                 });
                 added = true;
@@ -885,13 +1745,23 @@ fn seed_worklist(
             }
             work.push_back(Pending {
                 pypi_name: dep.name,
-                version: dep.version,
-                index: index.to_string(),
+                source: extra_dep_source_to_pending(dep.source, index),
                 extras: dep.extras,
             });
         }
     }
     Ok(())
+}
+
+fn extra_dep_source_to_pending(src: ExtraDepSource, default_index: &str) -> PendingSource {
+    match src {
+        ExtraDepSource::Pypi(specifiers) => PendingSource::Pypi {
+            specifiers,
+            index: default_index.to_string(),
+        },
+        ExtraDepSource::Git { url, rev } => PendingSource::Git { url, rev },
+        ExtraDepSource::Url(wheel_url) => PendingSource::Url { wheel_url },
+    }
 }
 
 /// Returns Some(ExtraDep) if `raw` is a base dep (no extras marker, or a
@@ -914,18 +1784,46 @@ fn pep508_base_dep_in_prefix(raw: &str, prefix: &str) -> Result<Option<ExtraDep>
         return Ok(None);
     }
 
-    let Some(uv_pep508::VersionOrUrl::VersionSpecifier(specs)) = req.version_or_url.as_ref() else {
-        return Ok(None);
+    // Same any-version handling as pep508_extra_dep: a bare-name base
+    // dep is legal PEP 508 and resolves to latest at the PyPI index.
+    let source = match req.version_or_url.as_ref() {
+        Some(uv_pep508::VersionOrUrl::VersionSpecifier(specs)) => ExtraDepSource::Pypi(specs.clone()),
+        Some(uv_pep508::VersionOrUrl::Url(verbatim)) => extra_dep_source_from_url(verbatim.raw())?,
+        None => ExtraDepSource::Pypi(uv_pep508::uv_pep440::VersionSpecifiers::empty()),
     };
-    let specs: Vec<_> = specs.iter().collect();
-    if specs.len() != 1 || *specs[0].operator() != Operator::Equal {
-        return Ok(None);
-    }
     Ok(Some(ExtraDep {
         name: req.name.to_string(),
-        version: specs[0].version().to_string(),
+        source,
         extras: req.extras.iter().map(|e| e.to_string()).collect(),
     }))
+}
+
+/// Convert a PEP 508 URL Requires-Dist into one of our
+/// [`ExtraDepSource`] variants. Splits `git+<scheme>://...@<rev>` into
+/// `(base_url, Some(rev))`; plain `https://.../file.whl` becomes a
+/// direct-URL fetch.
+fn extra_dep_source_from_url(raw_url: &url::Url) -> Result<ExtraDepSource> {
+    let s = raw_url.as_str();
+    if let Some(stripped) = s.strip_prefix("git+") {
+        // PEP 508 doesn't say where the @<rev> lives but pip-compatible
+        // syntax is `git+<scheme>://<host>/<path>@<rev>`. Find the
+        // rightmost `@` that comes after `://` (skipping any in user-
+        // info, though those are rare for public git).
+        let scheme_end = stripped.find("://").map(|i| i + 3).unwrap_or(0);
+        let (base, rev) = match stripped[scheme_end..].rfind('@') {
+            Some(rel) => {
+                let abs = scheme_end + rel;
+                (
+                    stripped[..abs].to_string(),
+                    Some(stripped[abs + 1..].to_string()),
+                )
+            }
+            None => (stripped.to_string(), None),
+        };
+        Ok(ExtraDepSource::Git { url: base, rev })
+    } else {
+        Ok(ExtraDepSource::Url(raw_url.clone()))
+    }
 }
 
 async fn fetch_and_parse(
@@ -939,19 +1837,29 @@ async fn fetch_and_parse(
         .context("metadata reader panicked")?
 }
 
-/// One extras-derived dependency: PyPI name + exact version + any extras
-/// the requirement itself declares (`pkg[foo,bar]==1.0` form).
+/// One extras-derived dependency. v0.12.0+: source can be PyPI Simple
+/// OR a direct URL / git URL (`pkg @ git+https://...@<rev>` or `pkg @
+/// https://.../file.whl`). PyPI is the common case; URL+git unlock
+/// extras like IsaacLab's `rl_games` which pulls `rl-games @ git+...`.
 #[derive(Debug, Clone)]
 struct ExtraDep {
     name: String,
-    version: String,
+    source: ExtraDepSource,
     extras: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+enum ExtraDepSource {
+    Pypi(VersionSpecifiers),
+    Git { url: String, rev: Option<String> },
+    Url(url::Url),
+}
+
 /// Returns `Some(ExtraDep)` if `raw` is a `Requires-Dist` line that is
-/// gated on the requested extra, and is an exact `==` pin. Returns None if
-/// the requirement is gated on a different extra (or has no marker, i.e.
-/// is a base dep we don't repack at all).
+/// gated on the requested extra. Returns None if the requirement is gated
+/// on a different extra (or has no marker, i.e. is a base dep we don't
+/// repack at all). Any specifier set is accepted; range resolution
+/// happens at the index-fetch layer in pypi::resolve.
 fn pep508_extra_dep(raw: &str, extra: &str) -> Result<Option<ExtraDep>> {
     use std::str::FromStr;
     let req: uv_pep508::Requirement = uv_pep508::Requirement::from_str(raw)
@@ -969,29 +1877,36 @@ fn pep508_extra_dep(raw: &str, extra: &str) -> Result<Option<ExtraDep>> {
         return Ok(None);
     }
 
-    // Need an exact == specifier we can use to drive the resolver.
-    let Some(uv_pep508::VersionOrUrl::VersionSpecifier(specs)) = req.version_or_url.as_ref() else {
-        bail!("extra `{extra}` requirement has no version specifier: {raw}");
+    // Bare name with no specifier and no URL is legal PEP 508
+    // (`Requires-Dist: tqdm; extra == "sb3"`) -- means "any version".
+    // Treat as PyPI with an empty specifier set; pypi::resolve returns
+    // the latest matching the target python. Without this, every
+    // extras-gated bare name in upstream wheels (rich, tqdm, gym, ...)
+    // made retread bail with "no version or URL".
+    let source = match req.version_or_url.as_ref() {
+        Some(uv_pep508::VersionOrUrl::VersionSpecifier(specs)) => ExtraDepSource::Pypi(specs.clone()),
+        Some(uv_pep508::VersionOrUrl::Url(verbatim)) => extra_dep_source_from_url(verbatim.raw())?,
+        None => ExtraDepSource::Pypi(uv_pep508::uv_pep440::VersionSpecifiers::empty()),
     };
-    let specs: Vec<_> = specs.iter().collect();
-    if specs.len() != 1 || *specs[0].operator() != Operator::Equal {
-        bail!(
-            "extra `{extra}` requires an exact version pin, got `{raw}`. \
-             Range resolution is on the TODO list."
-        );
-    }
+    let _ = extra; // extras name is only used for marker evaluation above
     Ok(Some(ExtraDep {
         name: req.name.to_string(),
-        version: specs[0].version().to_string(),
+        source,
         extras: req.extras.iter().map(|e| e.to_string()).collect(),
     }))
 }
 
+/// `siblings`: every (conda_name, version) produced by the same
+/// `conda/outputs` call (including this bundle's own pair, which is
+/// skipped). Each non-self entry becomes a run-dep on this output so
+/// declaring any one output in the workspace pulls the whole pack via
+/// the conda solver.
 fn produce_output(
     bundle: &Bundle,
     config: &RetreadConfig,
     host_platform: Platform,
     workspace_python_version: &str,
+    siblings: &[(String, String)],
 ) -> Result<CondaOutput> {
     // Python version: prefer the workspace's variant; fall back to parsing
     // the primary wheel's cp tag.
@@ -1009,10 +1924,17 @@ fn produce_output(
         Platform::NoArch
     };
 
-    let python_dep = if python_version.contains('.') {
-        format!("python {python_version}.*")
-    } else {
+    // Always emit the glob form (`python {ver}.*`). Without the `.*`,
+    // rattler-conda-types' VersionSpec under Lenient parsing interprets
+    // a bare `3` as exact-equals `==3`, and the rattler-build host
+    // solve then errors with "No candidates were found for python ==3"
+    // because no python package is at literally version 3. The glob is
+    // safe for both bare-major ("3" -> "3.*") and dotted ("3.11" ->
+    // "3.11.*") because rattler accepts trailing `.*` either way.
+    let python_dep = if python_version.contains('*') {
         format!("python {python_version}")
+    } else {
+        format!("python {python_version}.*")
     };
 
     // Vendored set: every wheel that's part of this bundle is installed
@@ -1106,6 +2028,22 @@ fn produce_output(
         }
     }
 
+    // Cross-output linking: pin each sibling output produced by the same
+    // conda/outputs call as an exact-version run-dep on this output. The
+    // workspace then only needs to declare ONE of the names from the
+    // pack -- conda solves the rest transitively. Without this, each
+    // [retread-wheels] entry needs its own line in the workspace
+    // pixi.toml, which gets verbose for stacks like IsaacLab (8 names).
+    for (sib_name, sib_version) in siblings {
+        if sib_name == &bundle.conda_name {
+            continue;
+        }
+        if !seen_dep_names.insert(sib_name.clone()) {
+            continue;
+        }
+        depends_specs.push(spec_from_str(&format!("{sib_name} =={sib_version}"))?);
+    }
+
     // Surface the final run-dep list at info level so users can spot
     // potentially-problematic deps before conda's solver complains.
     // Anything here that fails downstream is a candidate for
@@ -1168,12 +2106,60 @@ fn produce_output(
     })
 }
 
+/// Construct a [`crate::audit::BundleAudit`] from the bundle we're
+/// about to ship to rattler-build and the generated recipe. Strictly
+/// informational; the resulting JSON lands next to recipe.yaml so the
+/// user can see exactly which upstream `Requires-Dist:` lines became
+/// which conda run-deps, and copy-paste the rendered TOML blocks into
+/// their workspace if they want to mirror the bundle exactly.
+fn build_bundle_audit(
+    bundle: &Bundle,
+    recipe: &crate::recipe::Recipe,
+) -> crate::audit::BundleAudit {
+    let wheels = bundle
+        .all_wheels()
+        .map(|w| crate::audit::WheelAudit {
+            name: w.metadata.name.clone(),
+            version: w.metadata.version.clone(),
+            requires_dist: w.metadata.requires_dist.clone(),
+            extras: w.extras_requested.clone(),
+            auto_data: w.auto_data.clone(),
+            auto_data_dedup_skipped_root: w.auto_data_dedup_skipped_root.clone(),
+        })
+        .collect();
+    let emitted_run_deps = recipe
+        .requirements
+        .run
+        .iter()
+        .map(|spec| {
+            // Recipe's run list is `Vec<String>` of "<name> <constraint>"
+            // strings; split into (name, full-spec) so the audit consumer
+            // can render the conda-deps TOML block from constraint side
+            // alone.
+            let name = spec.split_whitespace().next().unwrap_or(spec).to_string();
+            crate::audit::EmittedDep {
+                name,
+                spec: spec.clone(),
+            }
+        })
+        .collect();
+    crate::audit::BundleAudit::new(
+        bundle.conda_name.clone(),
+        bundle.primary.metadata.version.clone(),
+        wheels,
+        emitted_run_deps,
+    )
+}
+
 async fn build_one(
     bundle: &Bundle,
     config: &RetreadConfig,
     work_dir: &Path,
     output_dir: &Path,
     target_subdir: Platform,
+    workspace_python_version: &str,
+    source_dir: &Path,
+    expected_build: Option<&str>,
 ) -> Result<CondaBuildV1Result> {
     // Lay out one BundleSource per wheel (primary first), in BFS order.
     let sources: Vec<BundleSource> = bundle
@@ -1184,7 +2170,12 @@ async fn build_one(
             metadata: &w.metadata,
         })
         .collect();
-    let recipe = build_bundle_recipe(&bundle.conda_name, &sources, config)?;
+    let recipe = build_bundle_recipe(
+        &bundle.conda_name,
+        &sources,
+        config,
+        workspace_python_version,
+    )?;
     let yaml = to_yaml(&recipe)?;
 
     let recipe_dir = work_dir.join(format!("recipe-{}", recipe.package.name));
@@ -1193,10 +2184,31 @@ async fn build_one(
     tokio::fs::write(&recipe_path, &yaml).await?;
     tracing::info!(path = %recipe_path.display(), "wrote recipe.yaml");
 
+    // Audit: dump per-wheel pre-D Requires-Dist + post-translate
+    // run-deps as JSON, plus copy-paste-friendly pixi.toml fragments.
+    // Lands in the source-package (pack) folder -- next to pixi.toml
+    // and the `wheels/` cache -- so it survives pixi cache clears and
+    // is right where users go to inspect what the build produced. The
+    // filename includes the bundle name so multi-bundle packs don't
+    // collide.
+    let audit = build_bundle_audit(bundle, &recipe);
+    let audit_json = serde_json::to_string_pretty(&audit)
+        .context("serializing audit record")?;
+    let audit_path = source_dir.join(format!("retread-audit-{}.json", recipe.package.name));
+    if let Err(e) = tokio::fs::write(&audit_path, &audit_json).await {
+        tracing::warn!(path = %audit_path.display(), error = %e, "failed to write audit record (non-fatal)");
+    } else {
+        tracing::info!(path = %audit_path.display(), "wrote audit");
+    }
+
     tokio::fs::create_dir_all(output_dir).await?;
 
     let target_platform = target_subdir.to_string();
-    let status = tokio::process::Command::new("rattler-build")
+    // CRITICAL: rattler-build writes progress to stdout, but retread's
+    // stdout is the JSON-RPC channel to pixi. Capture both streams so
+    // they don't corrupt the protocol. Surface them via tracing
+    // (which writes to OUR stderr) on failure.
+    let output = tokio::process::Command::new("rattler-build")
         .arg("build")
         .arg("--recipe")
         .arg(&recipe_path)
@@ -1206,26 +2218,38 @@ async fn build_one(
         .arg(&target_platform)
         .arg("--no-test")
         .stdin(std::process::Stdio::null())
-        .status()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
         .await
         .context("spawning rattler-build (is it on PATH?)")?;
-    if !status.success() {
-        bail!("rattler-build exited with status {status}");
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        tracing::error!(stdout = %stdout, stderr = %stderr, "rattler-build failed");
+        bail!("rattler-build exited with status {}", output.status);
     }
 
     let subdir_dir = output_dir.join(&target_platform);
     let output_file =
         find_conda_artifact(&subdir_dir, &recipe.package.name, &recipe.package.version).await?;
 
-    let py_short = python_version_from_wheel_tag(&bundle.primary.metadata.filename)
-        .unwrap_or_default()
-        .replace('.', "");
+    // Build string contract: pixi computes the expected build string
+    // from the variant it sent us in conda/outputs and rejects mismatches
+    // with "The build backend did not return the expected package: ...".
+    // Echo back exactly what pixi expects when it tells us. Only synthesize
+    // from workspace_python_version when there's no expectation (e.g.,
+    // direct test calls).
+    let build = expected_build.map(|s| s.to_string()).unwrap_or_else(|| {
+        let py_short = workspace_python_version.replace('.', "");
+        format!("py{py_short}_{}", config.build_number)
+    });
     Ok(CondaBuildV1Result {
         output_file,
         input_globs: Default::default(),
         name: recipe.package.name.clone(),
         version: VersionWithSource::from_str(&recipe.package.version)?,
-        build: format!("py{py_short}_{}", config.build_number),
+        build,
         subdir: target_subdir,
     })
 }
@@ -1285,6 +2309,7 @@ mod tests {
             drop_deps: Vec::new(),
             auto_bundle: false,
             conda_deps: Vec::new(),
+            git_sources: std::collections::BTreeMap::new(),
             python: None,
         }
     }
@@ -1309,6 +2334,9 @@ mod tests {
             pypi_name: pypi.to_string(),
             url: format!("https://example.com/{pypi}.whl").parse().unwrap(),
             metadata: m,
+            extras_requested: vec![],
+            auto_data: None,
+            auto_data_dedup_skipped_root: None,
         }
     }
 
@@ -1326,7 +2354,7 @@ mod tests {
         // not appear in run-deps even though it has no explicit
         // `sys_platform == "win32"` marker.
         let bundle = solo_bundle("isaacsim", vec!["idna-ssl==1.1.0", "numpy==1.26.0"]);
-        let output = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11").unwrap();
+        let output = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[]).unwrap();
         let names: Vec<String> = output
             .run_dependencies
             .depends
@@ -1344,7 +2372,7 @@ mod tests {
         // Same input, win-64 target. The auto-drop is non-Windows-only,
         // so idna-ssl is expected to remain.
         let bundle = solo_bundle("isaacsim", vec!["idna-ssl==1.1.0"]);
-        let output = produce_output(&bundle, &cfg(), Platform::Win64, "3.11").unwrap();
+        let output = produce_output(&bundle, &cfg(), Platform::Win64, "3.11", &[]).unwrap();
         let names: Vec<String> = output
             .run_dependencies
             .depends
@@ -1365,7 +2393,7 @@ mod tests {
             .overrides
             .insert("idna-ssl".to_string(), "*".to_string());
         let bundle = solo_bundle("isaacsim", vec!["idna-ssl==1.1.0"]);
-        let output = produce_output(&bundle, &config, Platform::Linux64, "3.11").unwrap();
+        let output = produce_output(&bundle, &config, Platform::Linux64, "3.11", &[]).unwrap();
         let names: Vec<String> = output
             .run_dependencies
             .depends
@@ -1384,7 +2412,7 @@ mod tests {
         let mut config = cfg();
         config.drop_deps.push("requests".to_string());
         let bundle = solo_bundle("foo", vec!["requests==2.32.0", "numpy==1.26.0"]);
-        let output = produce_output(&bundle, &config, Platform::Linux64, "3.11").unwrap();
+        let output = produce_output(&bundle, &config, Platform::Linux64, "3.11", &[]).unwrap();
         let names: Vec<String> = output
             .run_dependencies
             .depends
@@ -1437,7 +2465,7 @@ mod tests {
             ],
         };
 
-        let output = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11").unwrap();
+        let output = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[]).unwrap();
         let dep_names: Vec<String> = output
             .run_dependencies
             .depends
@@ -1454,5 +2482,483 @@ mod tests {
             "pillow must appear; got: {dep_names:?}");
         assert!(dep_names.iter().any(|n| n == "scipy"),
             "scipy must appear; got: {dep_names:?}");
+    }
+
+    #[tokio::test]
+    #[ignore = "spawns pip wheel; needs PATH with pip + setuptools (same prerequisites as path_source_does_not_corrupt_stdout)"]
+    async fn d_rewrites_metadata_on_the_wheel_the_recipe_will_source() {
+        // Regression for the silent-D bug: ResolvedWheel.url used to
+        // carry the pre-D URL (upstream for PyPI form, file:// of the
+        // unrewritten built wheel for path / git). That meant the conda
+        // emission saw the relaxed pins but the wheel rattler-build
+        // actually copied into the conda package still had the strict
+        // pins -- pixi forwarded conda's choice to uv as a hard pin, uv
+        // then read site-packages METADATA and found a conflicting
+        // strict pin, and the solve failed with the classic "PyPI
+        // packages have been pinned by the conda solve" error.
+        // Contract: after a non-None relax policy, ResolvedWheel.url
+        // points at a file:// path whose METADATA matches what we
+        // emitted into conda run-deps.
+        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/sample_with_buildtime_dep");
+        let tmp = std::env::temp_dir().join(format!(
+            "retread-d-on-disk-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let entry = crate::config::WheelEntry {
+            path: Some(fixture.to_string_lossy().to_string()),
+            ..Default::default()
+        };
+        let target = WheelTarget {
+            python_version: "3.11".into(),
+            conda_subdir: "linux-64".into(),
+        };
+
+        let resolved = materialize_and_rewrite(
+            &entry,
+            "retread-sample",
+            &target,
+            &tmp,
+            &fixture,
+            &tmp,
+            RelaxPolicy::Minor,
+            &std::collections::BTreeMap::new(),
+            None,
+            EntryAuditInfo::default(),
+        )
+        .await
+        .expect("materialize_and_rewrite");
+
+        assert_eq!(
+            resolved.url.scheme(),
+            "file",
+            "recipe source URL must be file:// of the rewritten wheel; got {}",
+            resolved.url,
+        );
+        let on_disk = resolved.url.to_file_path().expect("file path from URL");
+        let on_disk_meta = crate::wheel::read_metadata(&on_disk)
+            .expect("read METADATA from wheel-on-disk");
+
+        let starlette_lines: Vec<&String> = on_disk_meta
+            .requires_dist
+            .iter()
+            .filter(|l| l.to_lowercase().contains("starlette"))
+            .collect();
+        assert!(
+            !starlette_lines.is_empty(),
+            "fixture must declare starlette; got Requires-Dist: {:?}",
+            on_disk_meta.requires_dist,
+        );
+        assert!(
+            starlette_lines.iter().all(|l| !l.contains("==0.49.1")),
+            "wheel on disk must have starlette pin relaxed (minor relax => `>=0.49,<1`), \
+             but at least one Requires-Dist still reads `==0.49.1`: {:?}",
+            on_disk_meta.requires_dist,
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn bundle_field_groups_entries_into_one_output() {
+        // Contract: two [retread-wheels] entries with the same `bundle`
+        // field collapse to ONE conda output containing both wheels.
+        // Verified at the produce_output level by constructing a Bundle
+        // whose conda_name is the bundle group's name and whose
+        // primary+extras list covers wheels from both source entries.
+        //
+        // resolve_all's grouping is integration-shaped (it shells out
+        // to PyPI/pip); the contract this test pins is the downstream
+        // behavior produce_output exposes: the bundle's conda_name
+        // drives the output name, and all wheels in the bundle
+        // contribute their Requires-Dist to the merged run-deps.
+        let bundle = Bundle {
+            conda_name: "isaac-pack".into(),
+            primary: rw(
+                "isaacsim",
+                meta(
+                    "isaacsim",
+                    "5.1.0.0",
+                    vec!["numpy==1.26.0"],
+                    true,
+                ),
+            ),
+            extras: vec![
+                rw(
+                    "isaaclab",
+                    meta("isaaclab", "0.51.1", vec!["scipy==1.15.0"], true),
+                ),
+                rw(
+                    "pytorch3d",
+                    meta(
+                        "pytorch3d",
+                        "0.7.8+5043d15pt2.7.0cu128",
+                        vec!["pillow==11.0.0"],
+                        true,
+                    ),
+                ),
+            ],
+        };
+
+        let output =
+            produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[]).unwrap();
+
+        // Output name is the bundle's conda_name, not any one entry name.
+        assert_eq!(
+            output.metadata.name.as_normalized(),
+            "isaac-pack",
+            "merged bundle's conda output should be named after the bundle group",
+        );
+        // All three wheels' Requires-Dist flow into the merged run-deps.
+        let dep_names: Vec<String> = output
+            .run_dependencies
+            .depends
+            .iter()
+            .map(|d| d.name.clone())
+            .collect();
+        for sib_dep in ["numpy", "scipy", "pillow"] {
+            assert!(
+                dep_names.iter().any(|n| n == sib_dep),
+                "merged bundle should emit {sib_dep} from one of its wheels; got: {dep_names:?}",
+            );
+        }
+    }
+
+    // Regression: handoff-2026-05-24. The merged-bundle primary (alphabetically
+    // first entry in [retread-wheels]) was `isaaclab` -- a `py3-none-any`
+    // wheel. After D rewrite the file on disk is named
+    // `isaaclab-0.51.1-py3-none-any.relaxed.whl`. `WheelMetadata.is_pure_python`
+    // was computed from `filename.contains("-none-any.whl")`, which is false
+    // on the relaxed filename. `produce_output` then took the wheel-tag
+    // fallback branch and `python_version_from_wheel_tag` returned bare
+    // `"3"` (from the `py3` tag), so the emitted run-dep was `python 3.*`.
+    // The conda solver, given `python 3.*`, picked python 3.14 and implied
+    // `python_abi 3.14.* *_cp314`, which collided with the workspace's
+    // `python==3.11` pin -- producing the user-facing error:
+    //   isaac-pack 0.51.1 would require python_abi 3.14.* *_cp314
+    // Fix: `is_pure_python` is now derived from the canonical PEP 425 tag
+    // via `wheel::is_pure_python_wheel_filename`, which strips the
+    // cosmetic `.relaxed.whl` suffix before checking the platform tag.
+    // This test pins the *end-to-end* contract: a relaxed pure-Python
+    // primary must yield `python {workspace_python_version}.*`, NOT
+    // `python 3.*`. Previously only `wheel.rs` had unit coverage of the
+    // helper; nothing asserted the downstream produce_output behavior, so
+    // the bug shipped silently.
+    #[test]
+    fn relaxed_pure_python_primary_pins_python_to_workspace_variant() {
+        use crate::wheel::is_pure_python_wheel_filename;
+
+        // Construct a bundle whose primary mirrors the post-D state of
+        // the `isaaclab` wheel that fooled the previous filename check.
+        let filename = "isaaclab-0.51.1-py3-none-any.relaxed.whl".to_string();
+        // Helper-driven is_pure_python -- this is exactly what wheel.rs's
+        // read_metadata path produces for the on-disk relaxed wheel.
+        let is_pure = is_pure_python_wheel_filename(&filename);
+        assert!(
+            is_pure,
+            "regression guard: helper must report relaxed py3-none-any wheel as pure"
+        );
+        let primary = WheelMetadata {
+            name: "isaaclab".into(),
+            version: "0.51.1".into(),
+            requires_dist: vec![],
+            is_pure_python: is_pure,
+            sha256: "sha".into(),
+            filename,
+        };
+        let bundle = Bundle {
+            conda_name: "isaac-pack".into(),
+            primary: ResolvedWheel {
+                pypi_name: "isaaclab".into(),
+                url: "https://example.com/isaaclab-0.51.1-py3-none-any.relaxed.whl"
+                    .parse()
+                    .unwrap(),
+                metadata: primary,
+                extras_requested: vec![],
+                auto_data: None,
+                auto_data_dedup_skipped_root: None,
+            },
+            extras: vec![],
+        };
+
+        let output =
+            produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[]).unwrap();
+
+        // The conda output's variant must be the workspace's 3.11, not the
+        // bare-major "3" parsed from the py3 tag.
+        let variant_python = output
+            .metadata
+            .variant
+            .get("python")
+            .map(|v| v.to_string())
+            .expect("variant.python must be set");
+        assert_eq!(
+            variant_python, "3.11",
+            "variant.python must inherit the workspace's variant, not the wheel tag's bare major"
+        );
+
+        // Run-dep must be `python 3.11.*`, NOT `python 3.*` (which lets the
+        // solver pick 3.14 and triggers the python_abi 3.14 collision).
+        // rattler's NamelessMatchSpec Debug format is structural:
+        //   StrictRange(StartsWith, StrictVersion(Version { version: [[0], [3], [11]], local: [] }))
+        // so we search for the segment list `[0], [3], [11]` -- bare-major
+        // would render as `[0], [3]` with only TWO components. Anchor with
+        // both `[3]` and `[11]` to catch the minor; absence of `[11]` is the
+        // smoking gun for the regression we just fixed.
+        let python_spec = output
+            .run_dependencies
+            .depends
+            .iter()
+            .find(|d| d.name == "python")
+            .map(|d| format!("{:?}", d.spec))
+            .expect("python in run_deps");
+        assert!(
+            python_spec.contains("[3]") && python_spec.contains("[11]"),
+            "run-dep python must pin to 3.11 (look for [3] and [11] segments); got: {python_spec}"
+        );
+        assert!(
+            python_spec.contains("StartsWith"),
+            "run-dep python must use StartsWith range (== `3.11.*`); got: {python_spec}"
+        );
+
+        // build_v1 reads the python version from the output's variant when
+        // constructing the recipe; so as long as variant.python is right,
+        // the recipe is too. The variant assertion above already covers
+        // this -- pinning the contract here in case the read path changes.
+    }
+
+    #[test]
+    fn bare_major_python_emits_glob_not_strict_equals() {
+        // Regression: when python_version is bare-major like "3" (e.g.
+        // wheel tag parsing yields just the major, or a workspace
+        // variant is "python = [\"3\"]"), the emitted host-dep was
+        // `python 3` which rattler-conda-types Lenient-parses as
+        // `==3` strict, causing rattler-build to fail the host solve
+        // with "No candidates were found for python ==3". Always
+        // append `.*` so the glob form is used.
+        //
+        // Construct a bundle whose primary wheel produces python_version
+        // = "3" via the pure-Python fallback (workspace_python_version)
+        // -- pass "3" as the workspace_python_version arg.
+        let bundle = solo_bundle("foo", vec![]);
+        let output = produce_output(&bundle, &cfg(), Platform::Linux64, "3", &[]).unwrap();
+
+        // python must appear with a wildcard, NOT as strict equals.
+        let python = output
+            .host_dependencies
+            .as_ref()
+            .unwrap()
+            .depends
+            .iter()
+            .find(|d| d.name == "python")
+            .expect("python in host_deps");
+        let rendered = format!("{:?}", python.spec);
+        assert!(
+            !rendered.contains("Equals") || rendered.contains("Glob") || rendered.contains("*"),
+            "host python dep must be a glob, not strict ==; got: {rendered}",
+        );
+    }
+
+    #[test]
+    fn cross_output_siblings_appear_as_run_deps() {
+        // Contract: when a pack emits multiple outputs (isaacsim,
+        // isaaclab, isaaclab-arena, pytorch3d, ...), each output's
+        // run_dependencies must include every sibling at exact version.
+        // Then the workspace pixi.toml can declare just one name and
+        // conda transitively pulls the rest; without this, every
+        // [retread-wheels] entry needs its own line in the consumer's
+        // pixi.toml or its conda package sits unused. Also pins that
+        // PEP 440 local version identifiers (the +5043d15... in
+        // pytorch3d's version) survive verbatim in the run-dep spec.
+        let bundle = solo_bundle("isaacsim", vec![]);
+        let siblings = vec![
+            ("isaacsim".to_string(), "1.0.0".to_string()), // self -- must be skipped
+            ("isaaclab".to_string(), "0.51.1".to_string()),
+            ("isaaclab-arena".to_string(), "0.4.2".to_string()),
+            ("pytorch3d".to_string(), "0.7.8+5043d15pt2.7.0cu128".to_string()),
+        ];
+        let output =
+            produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &siblings).unwrap();
+
+        let dep_names: Vec<String> = output
+            .run_dependencies
+            .depends
+            .iter()
+            .map(|d| d.name.clone())
+            .collect();
+
+        // Self must not appear in own run-deps.
+        assert_eq!(
+            dep_names.iter().filter(|n| *n == "isaacsim").count(),
+            0,
+            "self should not be a sibling run-dep; got {dep_names:?}",
+        );
+        for sib in ["isaaclab", "isaaclab-arena", "pytorch3d"] {
+            assert!(
+                dep_names.iter().any(|n| n == sib),
+                "missing sibling run-dep {sib}; got: {dep_names:?}",
+            );
+        }
+
+        // Spec for the pytorch3d sibling must preserve the +local
+        // version identifier. conda's match-spec parser splits the
+        // local segment into tokens (e.g. `[5043, 'd', 15, 'pt', 2]`),
+        // so the original string isn't contiguous in Debug -- check
+        // for the distinctive token components and the `local:` marker
+        // proving the +local segment was stored at all.
+        let pytorch3d_spec = output
+            .run_dependencies
+            .depends
+            .iter()
+            .find(|d| d.name == "pytorch3d")
+            .map(|d| format!("{:?}", d.spec))
+            .expect("pytorch3d in deps");
+        assert!(
+            pytorch3d_spec.contains("local:"),
+            "pytorch3d sibling pin lost the +local segment entirely; got: {pytorch3d_spec}",
+        );
+        for token in ["5043", "pt", "cu", "128"] {
+            assert!(
+                pytorch3d_spec.contains(token),
+                "pytorch3d sibling pin missing token `{token}` from +local segment; got: {pytorch3d_spec}",
+            );
+        }
+    }
+
+    #[test]
+    fn prefer_conda_skips_parselmouth_known_deps() {
+        // Contract: anything in the effective name_map (parselmouth +
+        // FALLBACK + user retread-name-map) is NOT auto-bundled -- it
+        // flows to emission as a conda run-dep via translate. This is
+        // the prefer-conda default. Concretely: torch in the bundle's
+        // candidates should be skipped because parselmouth maps it to
+        // pytorch; a niche pure-PyPI helper with no conda equivalent
+        // (e.g. qdldl) should not be skipped.
+        let mut name_map: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        name_map.insert("torch".to_string(), "pytorch".to_string());
+        name_map.insert("numpy".to_string(), "numpy".to_string());
+        name_map.insert(
+            "opencv-python-headless".to_string(),
+            "py-opencv".to_string(),
+        );
+
+        // Parselmouth-known => prefer conda, don't bundle.
+        assert!(prefer_conda_match("torch", &name_map));
+        assert!(prefer_conda_match("numpy", &name_map));
+        // FALLBACK_PYPI_TO_CONDA entry survives the same way.
+        assert!(prefer_conda_match("opencv-python-headless", &name_map));
+
+        // Unknown to parselmouth => fall through to auto-bundle path.
+        // (These are the long tail retread should still vendor.)
+        assert!(!prefer_conda_match("qdldl", &name_map));
+        assert!(!prefer_conda_match("asteval", &name_map));
+        assert!(!prefer_conda_match("aiodns", &name_map));
+    }
+
+    #[test]
+    fn pep508_extra_dep_accepts_range_specifier() {
+        // Regression: isaacsim's METADATA has
+        //   Requires-Dist: isaacsim-extscache-kit>=5 ; extra == "extscache"
+        // We used to require an exact `==X.Y.Z` pin on extras-gated
+        // requirements and bail otherwise. NVIDIA publishes plenty of
+        // metapackages that use `>=` to gate to a major series, so range
+        // resolution is a hard requirement -- we now resolve the highest
+        // matching version off the index instead of refusing.
+        let dep = pep508_extra_dep(
+            "isaacsim-extscache-kit>=5 ; extra == \"extscache\"",
+            "extscache",
+        )
+        .expect("pep508 parse")
+        .expect("extras-gated dep, got None");
+        assert_eq!(dep.name, "isaacsim-extscache-kit");
+        let specs = match &dep.source {
+            ExtraDepSource::Pypi(s) => s,
+            other => panic!("expected PyPI source, got {other:?}"),
+        };
+        assert!(
+            specs.to_string().contains(">=5"),
+            "specifiers must preserve `>=5`, got: {specs}",
+        );
+    }
+
+    /// v0.12.0+: URL Requires-Dist (PEP 508 `pkg @ <url>`) is parsed
+    /// into `ExtraDepSource::Git` / `Url` instead of bailing. Mirrors
+    /// IsaacLab's `rl_games` extra:
+    ///   Requires-Dist: rl-games @ git+https://.../rl_games.git@python3.11 ; extra == "rl_games"
+    #[test]
+    fn pep508_extra_dep_handles_git_url() {
+        let dep = pep508_extra_dep(
+            "rl-games @ git+https://github.com/isaac-sim/rl_games.git@python3.11 ; extra == \"rl_games\"",
+            "rl_games",
+        )
+        .expect("pep508 parse")
+        .expect("extras-gated dep, got None");
+        assert_eq!(dep.name, "rl-games");
+        match dep.source {
+            ExtraDepSource::Git { url, rev } => {
+                assert_eq!(url, "https://github.com/isaac-sim/rl_games.git");
+                assert_eq!(rev.as_deref(), Some("python3.11"));
+            }
+            other => panic!("expected Git source, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pep508_extra_dep_handles_direct_url() {
+        let dep = pep508_extra_dep(
+            "foo @ https://example.com/foo-1.2.3-py3-none-any.whl ; extra == \"foo\"",
+            "foo",
+        )
+        .expect("pep508 parse")
+        .expect("extras-gated dep, got None");
+        assert_eq!(dep.name, "foo");
+        match dep.source {
+            ExtraDepSource::Url(u) => {
+                assert_eq!(u.as_str(), "https://example.com/foo-1.2.3-py3-none-any.whl");
+            }
+            other => panic!("expected Url source, got {other:?}"),
+        }
+    }
+
+    /// Regression: extras-gated bare names (no version, no URL) are
+    /// legal PEP 508 -- e.g. IsaacLab's
+    ///   Requires-Dist: tqdm; extra == "sb3"
+    ///   Requires-Dist: gym; extra == "rl_games"
+    ///   Requires-Dist: rich; extra == "sb3"
+    /// Previously made retread bail with "no version or URL". Now
+    /// resolves as PyPI with empty specifiers -> latest matching the
+    /// target python.
+    #[test]
+    fn pep508_extra_dep_handles_bare_name() {
+        let dep = pep508_extra_dep(
+            "tqdm; extra == \"sb3\"",
+            "sb3",
+        )
+        .expect("pep508 parse")
+        .expect("extras-gated bare-name dep, got None");
+        assert_eq!(dep.name, "tqdm");
+        match dep.source {
+            ExtraDepSource::Pypi(specs) => {
+                assert_eq!(specs.to_string(), "", "bare name -> empty specifiers, got: {specs}");
+            }
+            other => panic!("expected PyPI source, got {other:?}"),
+        }
+    }
+
+    /// git URL without `@<rev>` -> Some(url), None for rev. Pipeline
+    /// will default to HEAD when synthesizing the WheelEntry.
+    #[test]
+    fn extra_dep_source_from_url_git_without_rev() {
+        let url: url::Url = "git+https://github.com/foo/bar.git".parse().unwrap();
+        match extra_dep_source_from_url(&url).expect("parse") {
+            ExtraDepSource::Git { url, rev } => {
+                assert_eq!(url, "https://github.com/foo/bar.git");
+                assert_eq!(rev, None);
+            }
+            other => panic!("expected Git, got {other:?}"),
+        }
     }
 }

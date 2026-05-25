@@ -1,0 +1,16 @@
+[build-system]
+# `toml` is intentionally a build-time-only dep that setuptools won't
+# bundle by itself. If retread's pip wheel call passes
+# `--no-build-isolation`, this setup.py errors with ModuleNotFoundError.
+requires = ["setuptools", "wheel", "toml"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "retread-sample"
+version = "0.1.0"
+# Strict pin that retread's relax policy must rewrite both in the conda
+# emission AND in the wheel file ultimately landed on disk. starlette is
+# only listed here as a representative third-party PyPI name; the wheel
+# isn't installed during retread's `pip wheel --no-deps`, so this stays
+# offline-friendly.
+dependencies = ["starlette==0.49.1"]

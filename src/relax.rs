@@ -42,10 +42,22 @@ pub fn translate(
         return Ok(Some(CondaDep(format_dep(&conda_name, spec))));
     }
 
+    // `python` is fully off-limits to relax: every widened form
+    // (`python >=3,<4` from major, `python >=3` from strong-major,
+    // and the bare `python` that strong-major produces from a single
+    // `==X.Y.Z`) is either meaningless or rejected by the conda solver
+    // (`python 3` => "missing range specifier"). Pass python through
+    // untouched under every policy.
+    let effective_policy = if conda_name == "python" {
+        RelaxPolicy::None
+    } else {
+        policy
+    };
+
     let spec = match &req.version_or_url {
         None => String::new(),
         Some(VersionOrUrl::VersionSpecifier(specifiers)) => {
-            convert_specifiers(specifiers, policy)
+            convert_specifiers(specifiers, effective_policy)
         }
         Some(VersionOrUrl::Url(_)) => {
             // URL deps aren't expressible as conda match specs.
@@ -100,12 +112,67 @@ fn convert_specifiers(
         }
     }
 
+    // TODO(conda-aware): CondaAware currently behaves IDENTICALLY to
+    // StrongMajor here -- both unconditionally strip every upper bound
+    // from range specs. The real conda-aware design probes the
+    // workspace's conda channels per-spec and only strips when zero
+    // candidates satisfy the bound; see RelaxPolicy::CondaAware doc.
+    // Until that probe lands, conda-aware silently degrades to
+    // strong-major.
+    if matches!(policy, RelaxPolicy::StrongMajor | RelaxPolicy::CondaAware) {
+        return strip_upper_bounds(&specs)
+            .iter()
+            .filter_map(|s| convert_one(s))
+            .collect::<Vec<_>>()
+            .join(",");
+    }
+
     // Otherwise pass through, converting each specifier individually.
     specs
         .iter()
         .filter_map(|s| convert_one(s))
         .collect::<Vec<_>>()
         .join(",")
+}
+
+/// Drop specifiers that impose an upper bound, expand `~=` to its
+/// lower-bound-only form. Used by StrongMajor / CondaAware to keep
+/// upstream caps from blocking the conda solve.
+///
+/// Kept inputs: `>X`, `>=X`, `!=X` (point exclusion isn't an upper),
+/// `==X.*`/`!=X.*` (these are conceptually upper-bounded but rare;
+/// passed through to convert_one which expands them as ranges and
+/// would still satisfy any candidate).
+///
+/// Stripped: `<X`, `<=X`, the `<` half of `>=X,<Y`, the implicit upper
+/// of `~=X.Y`.
+fn strip_upper_bounds(
+    specs: &[&uv_pep440::VersionSpecifier],
+) -> Vec<uv_pep440::VersionSpecifier> {
+    use std::str::FromStr;
+    let mut kept: Vec<uv_pep440::VersionSpecifier> = Vec::with_capacity(specs.len());
+    for spec in specs {
+        match spec.operator() {
+            Operator::LessThan | Operator::LessThanEqual => {
+                // Drop entirely -- this is a pure upper bound.
+            }
+            Operator::TildeEqual => {
+                // `~=X.Y` means `>=X.Y,<X.(Y+1)`. Keep the lower half.
+                let r = spec.version().release();
+                if r.is_empty() {
+                    continue;
+                }
+                let major = r[0];
+                let minor = r.get(1).copied().unwrap_or(0);
+                let lower = format!(">={major}.{minor}");
+                if let Ok(parsed) = uv_pep440::VersionSpecifier::from_str(&lower) {
+                    kept.push(parsed);
+                }
+            }
+            _ => kept.push((*spec).clone()),
+        }
+    }
+    kept
 }
 
 fn convert_one(spec: &uv_pep440::VersionSpecifier) -> Option<String> {
@@ -143,7 +210,7 @@ fn convert_one(spec: &uv_pep440::VersionSpecifier) -> Option<String> {
     Some(format!("{op}{}", spec.version()))
 }
 
-fn widen_exact(v: &Version, policy: RelaxPolicy) -> Option<String> {
+pub fn widen_exact(v: &Version, policy: RelaxPolicy) -> Option<String> {
     let r = v.release();
     if r.is_empty() {
         return None;
@@ -156,7 +223,16 @@ fn widen_exact(v: &Version, policy: RelaxPolicy) -> Option<String> {
         RelaxPolicy::None => Some(format!("=={v}")),
         RelaxPolicy::Patch => Some(format!(">={major}.{minor}.{patch},<{major}.{}", minor + 1)),
         RelaxPolicy::Minor => Some(format!(">={major}.{minor},<{}", major + 1)),
-        RelaxPolicy::Major => Some(format!(">={major}")),
+        // Major / StrongMajor all widen exact pins to bare-major; the
+        // difference is range handling (Major: passthrough;
+        // StrongMajor: strip uppers). TODO(conda-aware): CondaAware is
+        // grouped here as well but the probe-and-decide layer is not
+        // implemented -- it currently degrades to StrongMajor's
+        // unconditional upper-strip. See RelaxPolicy::CondaAware doc
+        // for the intended design.
+        RelaxPolicy::Major | RelaxPolicy::StrongMajor | RelaxPolicy::CondaAware => {
+            Some(format!(">={major}"))
+        }
     }
 }
 
@@ -403,6 +479,93 @@ mod tests {
     #[test]
     fn marker_filters() {
         assert!(t(r#"pywin32; sys_platform == "win32""#, RelaxPolicy::Minor).is_none());
+    }
+
+    #[test]
+    fn strong_major_strips_upper_bounds() {
+        // pyglet<2 -> conda spec with no upper bound. This is the
+        // exact case that prompted strong-major: a transitive
+        // Requires-Dist cap that conda-forge can't satisfy under
+        // python 3.11 (only old pyglet 1.x is available with that
+        // constraint, and those need python 3.5).
+        assert_eq!(t("pyglet<2", RelaxPolicy::StrongMajor).as_deref(), Some("pyglet"));
+        // >=A,<B keeps the lower bound, drops the upper.
+        assert_eq!(
+            t("numpy>=1.26,<2", RelaxPolicy::StrongMajor).as_deref(),
+            Some("numpy >=1.26"),
+        );
+        // ~=A.B becomes >=A.B (no upper).
+        assert_eq!(
+            t("requests~=2.0", RelaxPolicy::StrongMajor).as_deref(),
+            Some("requests >=2.0"),
+        );
+        // Exact pins behave like Major.
+        assert_eq!(
+            t("numpy==1.26.4", RelaxPolicy::StrongMajor).as_deref(),
+            Some("numpy >=1"),
+        );
+        // Pure lower bound passes through.
+        assert_eq!(
+            t("setuptools>=40.8.0", RelaxPolicy::StrongMajor).as_deref(),
+            Some("setuptools >=40.8.0"),
+        );
+    }
+
+    #[test]
+    fn conda_aware_behaves_like_strong_major_at_translate_time() {
+        // The probe step is in handler.rs / a future repodata
+        // probe; the translate-time behavior is identical to
+        // strong-major. This pins that contract so the future
+        // probe layer can be a pure refinement on top.
+        assert_eq!(t("pyglet<2", RelaxPolicy::CondaAware).as_deref(), Some("pyglet"));
+        assert_eq!(
+            t("numpy==1.26.4", RelaxPolicy::CondaAware).as_deref(),
+            Some("numpy >=1"),
+        );
+    }
+
+    #[test]
+    fn major_still_passes_ranges_unchanged() {
+        // Regression: don't accidentally regress Major's existing
+        // semantics when adding StrongMajor.
+        assert_eq!(
+            t("pyglet<2", RelaxPolicy::Major).as_deref(),
+            Some("pyglet <2"),
+            "Major must NOT strip upper bounds -- only StrongMajor/CondaAware do",
+        );
+    }
+
+    #[test]
+    fn python_dep_is_never_relaxed() {
+        // No relax policy may widen a python requirement. Major would
+        // emit `python >=3,<4`; strong-major / conda-aware would strip
+        // the upper to give `python >=3` (and `python` from a single
+        // exact pin), all of which either lose ABI meaning or trip
+        // rattler-build's "missing range specifier" error. Pass through
+        // unchanged regardless of policy.
+        for policy in [
+            RelaxPolicy::Patch,
+            RelaxPolicy::Minor,
+            RelaxPolicy::Major,
+            RelaxPolicy::StrongMajor,
+            RelaxPolicy::CondaAware,
+        ] {
+            assert_eq!(
+                t("python==3.11.0", policy).as_deref(),
+                Some("python ==3.11.0"),
+                "policy {policy:?} must not modify python",
+            );
+            assert_eq!(
+                t("python>=3.9,<3.13", policy).as_deref(),
+                Some("python >=3.9,<3.13"),
+                "policy {policy:?} must not modify python range",
+            );
+        }
+        // Sanity: non-python deps under Major still get bare-major widening.
+        assert_eq!(
+            t("numpy==1.26.4", RelaxPolicy::Major).as_deref(),
+            Some("numpy >=1"),
+        );
     }
 
     #[test]

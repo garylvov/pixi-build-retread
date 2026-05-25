@@ -90,9 +90,10 @@ async fn fetch_isaacsim_kernel_end_to_end() {
             drop_deps: Vec::new(),
             auto_bundle: false,
             conda_deps: Vec::new(),
+            git_sources: std::collections::BTreeMap::new(),
             python: None,
     };
-    let recipe = build_bundle_recipe("isaacsim-kernel", &[BundleSource { pypi_name: &meta.name, url: &url, metadata: &meta }], &config).unwrap();
+    let recipe = build_bundle_recipe("isaacsim-kernel", &[BundleSource { pypi_name: &meta.name, url: &url, metadata: &meta }], &config, "3.11").unwrap();
     let yaml = to_yaml(&recipe).unwrap();
 
     // Same compatibility assertion as the snapshot test, but on live data.

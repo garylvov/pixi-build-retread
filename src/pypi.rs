@@ -6,7 +6,7 @@ use anyhow::{anyhow, bail, Result};
 use regex::Regex;
 use std::str::FromStr;
 use std::sync::OnceLock;
-use uv_pep508::uv_pep440;
+use uv_pep508::uv_pep440::{self, VersionSpecifiers};
 
 #[derive(Debug, Clone)]
 pub struct ResolvedWheel {
@@ -31,13 +31,14 @@ pub struct WheelTarget {
     pub conda_subdir: String,
 }
 
-/// Fetch the simple index for `name` and pick the best wheel for
-/// `(version, target)`. Returns the URL (absolute) and the sha256 carried in
-/// the `#sha256=` URL fragment.
+/// Fetch the simple index for `name` and pick the best wheel for the
+/// `(specifiers, target)` pair. When `specifiers` matches multiple versions
+/// on the index (e.g. `>=5`), the highest matching version that also has a
+/// target-compatible wheel wins.
 pub async fn resolve(
     index: &str,
     name: &str,
-    version: &str,
+    specifiers: &VersionSpecifiers,
     target: &WheelTarget,
 ) -> Result<ResolvedWheel> {
     let index_url = build_index_url(index, name)?;
@@ -54,42 +55,58 @@ pub async fn resolve(
         bail!("no wheels listed at {index_url}");
     }
 
-    // PEP 440 semantic comparison so `5.1.0` and `5.1.0.0` resolve to the
-    // same wheel: pixi's `[pypi-dependencies]` syntax uses three-component
-    // versions naturally, but indexes (like NVIDIA's) often publish wheels
-    // at four-component versions with a trailing zero.
-    let target_version = uv_pep440::Version::from_str(version)
-        .map_err(|e| anyhow!("invalid version `{version}`: {e}"))?;
-    let name_prefix = format!("{}-", name.replace('-', "_"));
-    candidates.retain(|c| {
-        let Some(rest) = c.filename.strip_prefix(&name_prefix) else {
-            return false;
-        };
-        let Some(version_str) = rest.split('-').next() else {
-            return false;
-        };
-        let Ok(cand_version) = uv_pep440::Version::from_str(version_str) else {
-            return false;
-        };
-        cand_version == target_version
-    });
-    if candidates.is_empty() {
+    // PEP 427 says wheel filenames use the project distribution name with
+    // `-` replaced by `_`. Some publishers preserve case (`Pillow-...whl`),
+    // some normalize to lowercase (`pillow-...whl`). PEP 503 normalizes
+    // names case-insensitively, so we match the same way: lowercase both
+    // the prefix and the filename before comparing.
+    let name_prefix_lower = format!("{}-", name.replace('-', "_").to_ascii_lowercase());
+
+    // Parse (version, candidate) from every wheel whose filename name-prefix
+    // matches, then filter to those whose version satisfies `specifiers`.
+    // PEP 440 normalization makes `5.1.0` and `5.1.0.0` compare equal, so
+    // a user pin of `==5.1.0` still matches a four-component publisher tag.
+    let mut versioned: Vec<(uv_pep440::Version, ResolvedWheel)> = candidates
+        .into_iter()
+        .filter_map(|c| {
+            let filename_lower = c.filename.to_ascii_lowercase();
+            let rest = filename_lower.strip_prefix(&name_prefix_lower)?;
+            let version_str = rest.split('-').next()?;
+            let version = uv_pep440::Version::from_str(version_str).ok()?;
+            Some((version, c))
+        })
+        .filter(|(v, _)| specifiers.contains(v))
+        .collect();
+    if versioned.is_empty() {
         bail!(
-            "no wheels match {name} == {version} at {index_url}; \
-             checked PEP 440 normalized version against filename prefix `{name_prefix}`"
+            "no wheels match {name} {specifiers} at {index_url}; \
+             checked PEP 440 normalized version against case-insensitive filename prefix `{name_prefix_lower}`"
         );
     }
 
-    let picked = pick_best(candidates, target).ok_or_else(|| {
-        anyhow!(
-            "no wheel at {index_url} for {name}=={version} matches target \
-             python={} subdir={}",
-            target.python_version,
-            target.conda_subdir,
-        )
-    })?;
-
-    Ok(picked)
+    // Descending version order. For each version (highest first), see if any
+    // of its wheels are target-compatible; return the first match. The
+    // version sort runs before the tag pick so a higher-version wheel that
+    // happens to be (say) cp310-only doesn't block a lower-version cp311.
+    versioned.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut grouped: Vec<(uv_pep440::Version, Vec<ResolvedWheel>)> = Vec::new();
+    for (v, w) in versioned {
+        match grouped.last_mut() {
+            Some((last_v, group)) if *last_v == v => group.push(w),
+            _ => grouped.push((v, vec![w])),
+        }
+    }
+    for (_v, group) in grouped {
+        if let Some(picked) = pick_best(group, target) {
+            return Ok(picked);
+        }
+    }
+    bail!(
+        "no wheel for {name} {specifiers} at {index_url} matches target \
+         python={} subdir={}",
+        target.python_version,
+        target.conda_subdir,
+    )
 }
 
 fn build_index_url(index: &str, name: &str) -> Result<url::Url> {
@@ -136,8 +153,19 @@ fn parse_index_links(html: &str, base: &url::Url) -> Result<Vec<ResolvedWheel>> 
             Ok(u) => u,
             Err(_) => continue,
         };
+        // `path_segments()` returns segments percent-encoded. miropsota's
+        // torch_packages_builder index URL-encodes `+` (the PEP 440
+        // local-version-identifier marker) as `%2B`, so the raw segment
+        // for a pytorch3d wheel reads
+        //   `pytorch3d-0.7.9%2Bd9839a9pt2.10.0cpu-cp311-cp311-linux_x86_64.whl`.
+        // uv_pep440 rejects that on parse (% isn't legal in a version),
+        // so we'd silently drop every candidate and report "no wheels
+        // match" at the version-filter step. Decode here so the filename
+        // we store and parse downstream is the literal wheel name.
         let filename = match url.path_segments().and_then(|s| s.last()) {
-            Some(f) if !f.is_empty() => f.to_string(),
+            Some(f) if !f.is_empty() => percent_encoding::percent_decode_str(f)
+                .decode_utf8_lossy()
+                .into_owned(),
             _ => continue,
         };
         if !filename.ends_with(".whl") {
@@ -180,7 +208,8 @@ fn score_wheel(filename: &str, target: &WheelTarget) -> i64 {
         None => return -1,
     };
 
-    let py_score = match score_python_tag(&parts.python, &target.python_version) {
+    let py_score = match score_python_tag_with_abi(&parts.python, &parts.abi, &target.python_version)
+    {
         Some(s) => s,
         None => return -1,
     };
@@ -193,9 +222,49 @@ fn score_wheel(filename: &str, target: &WheelTarget) -> i64 {
     py_score as i64 + plat_score
 }
 
+/// Wraps `score_python_tag` with abi3 awareness. PEP 425: when the ABI
+/// tag is `abi3`, the wheel uses the CPython stable ABI and the python
+/// tag declares the MINIMUM supported python (e.g. `cp36-abi3` is
+/// compatible with python 3.6+, including 3.11). Without this, retread
+/// rejected every psutil 5.x wheel (all are cp36-abi3) when the target
+/// was 3.11.
+fn score_python_tag_with_abi(python_tag: &str, abi_tag: &str, target: &str) -> Option<u32> {
+    if abi_tag == "abi3" {
+        let (target_major, target_minor) = parse_python_version(target)?;
+        for sub in python_tag.split('.') {
+            if let Some(score) = score_abi3_python(sub, target_major, target_minor) {
+                return Some(score);
+            }
+        }
+        // Fall through to regular check for cases like cpXY-abi3-none
+        // where the cpXY happens to match exactly (caller would still
+        // accept it via the regular path).
+    }
+    score_python_tag(python_tag, target)
+}
+
+/// abi3-specific: `cpXY-abi3` is compatible with any target python
+/// where (major, minor) >= (X, Y).
+fn score_abi3_python(tag: &str, t_major: u32, t_minor: u32) -> Option<u32> {
+    let digits = tag.strip_prefix("cp")?;
+    let (major, minor) = split_python_digits(digits)?;
+    if major != t_major {
+        return None; // py2 abi3 doesn't satisfy py3 (and vice versa)
+    }
+    if minor <= t_minor {
+        // Slightly lower score than the exact `cpXY-cpXY` match so
+        // identical-version-built wheels still win when both exist.
+        Some(80)
+    } else {
+        None
+    }
+}
+
 struct WheelTags<'a> {
     python: &'a str,
-    #[allow(dead_code)]
+    /// PEP 425 ABI tag. v0.13.10+: consumed by
+    /// `score_python_tag_with_abi` to treat `abi3` as compatible with
+    /// any python >= the python tag's declared minimum.
     abi: &'a str,
     platform: &'a str,
 }
@@ -361,6 +430,29 @@ mod tests {
     }
 
     #[test]
+    fn decodes_percent_encoded_plus_in_filename() {
+        // miropsota's torch_packages_builder hosts pytorch3d wheels at
+        // GitHub release URLs where the `+` between upstream version and
+        // local-version identifier is URL-encoded as `%2B`. Without
+        // decoding the path segment, the stored filename contains `%2B`
+        // literally, uv_pep440 rejects the version on parse, and every
+        // candidate is silently filtered out at the version step
+        // (symptom: "no wheels match pytorch3d ==0.7.8+... at <index>").
+        let html = r#"
+            <a href="https://github.com/MiroPsota/torch_packages_builder/releases/download/pytorch3d-0.7.9%2Bd9839a9/pytorch3d-0.7.9%2Bd9839a9pt2.10.0cpu-cp311-cp311-linux_x86_64.whl">link</a>
+        "#;
+        let base = url::Url::parse("https://miropsota.github.io/torch_packages_builder/pytorch3d/")
+            .unwrap();
+        let links = parse_index_links(html, &base).unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(
+            links[0].filename,
+            "pytorch3d-0.7.9+d9839a9pt2.10.0cpu-cp311-cp311-linux_x86_64.whl",
+            "filename must be percent-decoded so `+` is literal for uv_pep440",
+        );
+    }
+
+    #[test]
     fn parses_links_without_sha256() {
         // py.mujoco.org and other indexes don't include sha256 in the URL.
         let html = r#"
@@ -385,6 +477,50 @@ mod tests {
         ];
         let picked = pick_best(cands, &t()).unwrap();
         assert!(picked.filename.contains("manylinux_2_28_x86_64"));
+    }
+
+    /// v0.13.10+ regression: abi3 wheels declare the MINIMUM python they
+    /// support via the python tag; the matcher must accept them for any
+    /// target python >= that minimum. psutil 5.9.x only ships
+    /// `cp36-abi3` wheels; before this fix retread bailed with
+    /// "no wheel matches target python=3.11" even though py3.11
+    /// satisfies the stable-ABI compatibility contract.
+    #[test]
+    fn abi3_wheel_matches_newer_python() {
+        let cands = vec![
+            mk("psutil-5.9.8-cp36-abi3-manylinux_2_12_x86_64.manylinux2010_x86_64.manylinux_2_17_x86_64.manylinux2014_x86_64.whl"),
+        ];
+        let picked = pick_best(cands, &t()).unwrap();
+        assert!(picked.filename.starts_with("psutil-5.9.8-cp36-abi3-"));
+    }
+
+    /// Exact cpXY-cpXY match still beats cpXY-abi3 when both are present
+    /// (closer-to-target version wins via a higher score).
+    #[test]
+    fn exact_python_tag_beats_abi3_when_both_present() {
+        let cands = vec![
+            mk("foo-1.0-cp36-abi3-manylinux_2_17_x86_64.whl"),
+            mk("foo-1.0-cp311-cp311-manylinux_2_17_x86_64.whl"),
+        ];
+        let picked = pick_best(cands, &t()).unwrap();
+        assert!(
+            picked.filename.contains("cp311-cp311"),
+            "exact cp311 should outscore cp36-abi3; got {}",
+            picked.filename,
+        );
+    }
+
+    /// abi3 with a python tag declaring a HIGHER min than target is
+    /// rejected (e.g. cp310-abi3 doesn't satisfy target=3.9).
+    #[test]
+    fn abi3_python_min_higher_than_target_rejected() {
+        let cands = vec![
+            mk("foo-1.0-cp312-abi3-manylinux_2_17_x86_64.whl"),
+        ];
+        // target python is 3.11 (from t() helper); cp312-abi3 declares
+        // min=3.12, so should be rejected.
+        let picked = pick_best(cands, &t());
+        assert!(picked.is_none(), "cp312-abi3 must not match target=3.11");
     }
 
     #[test]
@@ -423,6 +559,42 @@ mod tests {
         let cands = vec![mk("requests-2.32.5-py3-none-any.whl")];
         let picked = pick_best(cands, &t()).unwrap();
         assert!(picked.filename.contains("none-any"));
+    }
+
+    #[test]
+    fn local_version_identifier_round_trips_through_resolve_logic() {
+        // pytorch3d ships wheels with PEP 440 local-version identifiers
+        // ("+5043d15pt2.7.0cu128") that encode the torch/CUDA matrix.
+        // This pins the resolve()-internal filename->version extraction
+        // and the spec containment check for that case so future
+        // refactors of the parsing block can't silently drop support.
+        //
+        // Mirrors the inline logic in resolve(): name-prefix strip,
+        // split on '-' to get the version segment, parse via uv_pep440,
+        // check VersionSpecifiers::contains.
+        let spec = VersionSpecifiers::from_str("==0.7.8+5043d15pt2.7.0cu128").unwrap();
+        let filename =
+            "pytorch3d-0.7.8+5043d15pt2.7.0cu128-cp311-cp311-linux_x86_64.whl";
+        let stem = filename.strip_suffix(".whl").unwrap();
+        let rest = stem.strip_prefix("pytorch3d-").unwrap();
+        let version_str = rest.split('-').next().unwrap();
+        let version = uv_pep440::Version::from_str(version_str)
+            .expect("uv_pep440 must accept PEP 440 local-version identifiers");
+        assert!(
+            spec.contains(&version),
+            "spec `==0.7.8+5043d15pt2.7.0cu128` must match extracted version `{version}`",
+        );
+
+        // Negative: a wheel for the same upstream version but a
+        // different local-version identifier MUST NOT match. Otherwise
+        // we'd silently install a torch-2.6 build into a torch-2.7 env.
+        let other = "pytorch3d-0.7.8+abcdefgpt2.6.0cu124-cp311-cp311-linux_x86_64.whl";
+        let other_rest = other.strip_suffix(".whl").unwrap().strip_prefix("pytorch3d-").unwrap();
+        let other_v = uv_pep440::Version::from_str(other_rest.split('-').next().unwrap()).unwrap();
+        assert!(
+            !spec.contains(&other_v),
+            "different +local identifier must not match the exact pin",
+        );
     }
 
     fn mk(name: &str) -> ResolvedWheel {

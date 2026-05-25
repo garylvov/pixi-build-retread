@@ -1,0 +1,7 @@
+pyproject.toml
+setup.py
+retread_sample.egg-info/PKG-INFO
+retread_sample.egg-info/SOURCES.txt
+retread_sample.egg-info/dependency_links.txt
+retread_sample.egg-info/requires.txt
+retread_sample.egg-info/top_level.txt

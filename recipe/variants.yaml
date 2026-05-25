@@ -1,0 +1,10 @@
+# Variant config for retread's recipe.
+#
+# As of 0.11.0 retread is python-agnostic: it uses `uv pip wheel
+# --python <version>`, and uv downloads python-build-standalone on
+# demand. retread builds ONCE per platform, never per python minor.
+# Any python the workspace requests (3.10, 3.11, ..., 3.20 in the
+# future) works at solve time without rebuilding retread.
+#
+# This file is intentionally empty -- kept so callers that pass
+# `--variant-config recipe/variants.yaml` to rattler-build don't error.

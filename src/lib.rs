@@ -3,10 +3,16 @@
 //! in another tool. The binary at `src/main.rs` consumes these modules
 //! through the crate.
 
+pub mod audit;
 pub mod config;
 pub mod handler;
+pub mod probe;
 pub mod pypi;
 pub mod recipe;
 pub mod relax;
 pub mod rpc;
+pub mod source_build;
 pub mod wheel;
+pub mod wheel_inject;
+pub mod wheel_inject_data;
+pub mod wheel_rewrite;
