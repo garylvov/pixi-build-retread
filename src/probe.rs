@@ -210,6 +210,11 @@ enum PythonConstraint {
 struct VariantInfo {
     version: Version,
     python_constraint: PythonConstraint,
+    /// v0.32.0+: the raw `depends` array from the conda record. Kept
+    /// so transitive-constraint extraction can walk each workspace
+    /// conda dep's latest build and accumulate what IT requires.
+    /// Strings look like `"numpy >=1.26,<2"`, `"python_abi 3.11.* *_cp311"`.
+    depends: Vec<String>,
 }
 
 /// Parsed repodata for one (channel, subdir), indexed by package
@@ -288,6 +293,7 @@ fn build_index(file: RepodataFile) -> RepodataIndex {
             .push(VariantInfo {
                 version,
                 python_constraint,
+                depends: rec.depends,
             });
     }
     RepodataIndex { by_name }
@@ -420,6 +426,72 @@ async fn write_disk_cache(channel_url: &str, subdir: &str, bytes: &[u8]) -> Resu
         .await
         .with_context(|| format!("writing cache {}", path.display()))?;
     Ok(())
+}
+
+/// v0.32.0+: fetch the `depends` array of the LATEST target-python-
+/// compatible build of `(package, spec)` across the given channels.
+/// Used by the workspace-transitive-constraint extractor to learn
+/// what each workspace-declared conda dep requires of OTHER deps
+/// (e.g. `ros-humble-joint-state-publisher` declares `numpy >=1.26,<2`).
+///
+/// Returns the raw `depends` strings (`["numpy >=1.26,<2", "python_abi
+/// 3.11.* *_cp311", ...]`) of the highest-version matching build that
+/// also satisfies the target python. Returns an empty Vec if no
+/// channel had a matching build, or if all candidates failed the
+/// python filter.
+pub async fn fetch_latest_build_depends(
+    channels: &[ChannelUrl],
+    package: &str,
+    spec: &str,
+    target_python: Option<&str>,
+) -> Vec<String> {
+    let parsed_spec = match VersionSpec::from_str(spec, ParseStrictness::Lenient) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let target_py_version: Option<Version> = target_python.and_then(|tp| Version::from_str(tp).ok());
+
+    let target_subdir = "linux-64";
+    let mut work: Vec<(String, String)> = Vec::new();
+    for channel in channels {
+        let url = channel.url().as_str().trim_end_matches('/').to_string();
+        work.push((url.clone(), target_subdir.to_string()));
+        work.push((url, "noarch".to_string()));
+    }
+
+    use futures::stream::{FuturesUnordered, StreamExt};
+    let mut futs: FuturesUnordered<_> = work
+        .into_iter()
+        .map(|(channel_url, subdir)| async move {
+            get_repodata(&channel_url, &subdir).await.ok()
+        })
+        .collect();
+
+    // Walk every (channel, subdir), keep the candidate with the
+    // highest version that satisfies spec + python filter.
+    let mut best: Option<(Version, Vec<String>)> = None;
+    while let Some(maybe_idx) = futs.next().await {
+        let Some(idx) = maybe_idx else { continue };
+        let Some(records) = idx.by_name.get(package) else { continue };
+        for v in records {
+            if !parsed_spec.matches(&v.version) {
+                continue;
+            }
+            let py_ok = match (&target_py_version, &v.python_constraint) {
+                (None, _) => true,
+                (Some(_), PythonConstraint::Any) => true,
+                (Some(tp), PythonConstraint::Spec(s)) => s.matches(tp),
+            };
+            if !py_ok {
+                continue;
+            }
+            match &best {
+                Some((best_v, _)) if best_v >= &v.version => {}
+                _ => best = Some((v.version.clone(), v.depends.clone())),
+            }
+        }
+    }
+    best.map(|(_, deps)| deps).unwrap_or_default()
 }
 
 /// Convenience wrapper used by the auto-bundle path: probe many

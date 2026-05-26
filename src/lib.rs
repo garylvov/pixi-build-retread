@@ -16,3 +16,5 @@ pub mod wheel;
 pub mod wheel_inject;
 pub mod wheel_inject_data;
 pub mod wheel_rewrite;
+pub mod solve_check;
+pub mod workspace;

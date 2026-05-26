@@ -1,0 +1,46 @@
+# Source package that re-emits Isaac Sim + IsaacLab + IsaacLab-Arena +
+# pytorch3d as conda packages via pixi-build-retread. Every entry under
+# [package.build.config.retread-wheels] sets `bundle = "isaac-pack"` so
+# retread merges them into ONE conda output named `isaac-pack` -- the
+# consumer workspace pixi.toml then needs only `isaac-pack = { path =
+# "./isaac-pack" }` to install the whole pack.
+#
+# Copied from gigastrap as a retread iteration playground. Keep this
+# in sync with gigastrap/isaac-pack/pixi.toml when iterating on retread
+# changes that need real-world wheels to exercise.
+
+[package]
+name = "isaac-pack"
+version = "5.1.0"
+
+[package.build]
+# file:// channel points at the locally built retread artifact so
+# iteration doesn't require a prefix.dev upload between rebuilds.
+# `bash ../../scripts/rebuild-local.sh` produces the .conda there.
+backend = { name = "pixi-build-retread", version = "*", channels = ["file:///home/garylvov/projects/pixi-build-retread/local-channel", "https://prefix.dev/conda-forge"] }
+
+[package.build.config]
+# v0.30.0+ tiered cascade. Mirrors `Patch` at translate time; per-dep
+# escalates patch -> PyPI -> minor -> PyPI -> major -> PyPI -> `*`
+# when probes prove the current widening level is unsatisfiable on the
+# workspace's conda channels.
+retread-relax        = "patch-then-minor-then-major-then-last-resort"
+retread-build-number = 0
+
+[package.build.config.retread-git-sources.isaaclab]
+url = "https://github.com/isaac-sim/IsaacLab.git"
+rev = "54cf64beb4eee99bc7b78e0353c8a4a8a13aa2c0"
+
+[package.build.config.retread-git-sources.isaaclab-arena]
+url = "https://github.com/isaac-sim/IsaacLab-Arena"
+rev = "867cbf9b7b4edbb03f32e1209c585a38cb3d8edf"
+
+[package.build.config.retread-wheels]
+isaacsim        = { version = "==5.1.0", index = "https://pypi.nvidia.com", extras = ["all", "extscache"], bundle = "isaac-pack" }
+isaaclab        = { from = "isaaclab", subdirectory = "source/isaaclab",        bundle = "isaac-pack" }
+isaaclab-assets = { from = "isaaclab", subdirectory = "source/isaaclab_assets", bundle = "isaac-pack" }
+isaaclab-tasks  = { from = "isaaclab", subdirectory = "source/isaaclab_tasks",  bundle = "isaac-pack" }
+isaaclab-rl     = { from = "isaaclab", subdirectory = "source/isaaclab_rl",     bundle = "isaac-pack", extras = ["all"] }
+isaaclab-mimic  = { from = "isaaclab", subdirectory = "source/isaaclab_mimic",  bundle = "isaac-pack" }
+isaaclab-arena  = { from = "isaaclab-arena",                                    bundle = "isaac-pack" }
+pytorch3d       = { version = "==0.7.8+5043d15pt2.7.0cu128", index = "https://miropsota.github.io/torch_packages_builder", bundle = "isaac-pack" }

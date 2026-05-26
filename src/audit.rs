@@ -161,6 +161,28 @@ pub struct BundleAudit {
     /// dep go to conda?" doesn't require any --trace flags.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub probe_decisions: Vec<ProbeDecision>,
+    /// v0.33.0+: result of running a real conda solve over (workspace
+    /// effective deps + retread's emitted run-deps for this output).
+    /// Catches cross-package conflicts (cuda 13 vs cuda 12.8 etc.)
+    /// that the per-dep probe can't see because they live in the
+    /// `depends` arrays of OTHER packages, not in the package retread
+    /// is emitting. `None` when the check was skipped (no workspace,
+    /// no cached repodata).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub solve_diagnostics: Option<SolveDiagnostics>,
+}
+
+/// Persisted form of `solve_check::SolveOutcome`. Mirrors the in-memory
+/// type to keep the audit format stable even if rattler_solve's error
+/// API changes. Stored in `retread-audit-<name>.json` under
+/// `solve_diagnostics`.
+#[derive(Debug, Clone, Serialize)]
+pub struct SolveDiagnostics {
+    pub satisfiable: bool,
+    pub unsat_explanations: Vec<String>,
+    pub channels_consulted: Vec<String>,
+    pub specs_count: usize,
+    pub records_count: usize,
 }
 
 /// Top-level audit: keyed by the (conda_name, python_version) pair
@@ -221,6 +243,7 @@ impl BundleAudit {
         wheels: Vec<WheelAudit>,
         emitted_run_deps: Vec<EmittedDep>,
         probe_decisions: Vec<ProbeDecision>,
+        solve_diagnostics: Option<SolveDiagnostics>,
     ) -> Self {
         let pypi_options_dependency_overrides = render_pypi_overrides(&wheels);
         let dependencies = render_conda_deps(&emitted_run_deps);
@@ -234,6 +257,7 @@ impl BundleAudit {
                 pypi_options_dependency_overrides,
             },
             probe_decisions,
+            solve_diagnostics,
         }
     }
 }
@@ -326,6 +350,7 @@ mod tests {
                 EmittedDep { name: "pyglet".into(), spec: "pyglet".into() },
             ],
             vec![],
+            None,
         );
         let json = serde_json::to_string_pretty(&audit).unwrap();
         // Spot-check shape rather than exact bytes (field order is

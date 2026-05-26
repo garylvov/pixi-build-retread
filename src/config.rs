@@ -174,6 +174,24 @@ pub enum RelaxPolicy {
     MinorWithLastResort,
     #[serde(rename = "major-with-last-resort")]
     MajorWithLastResort,
+    /// v0.30.0+ tiered cascade. At translate time emits at the narrowest
+    /// (patch) widening, then per-dep escalates only when probes prove
+    /// the current widening level is unsatisfiable. Per dep, in order:
+    ///   (1) probe conda at the patch-widened spec
+    ///   (2) probe PyPI for a wheel matching the patch range -> bundle + drop conda emit
+    ///   (3) probe conda at the minor-widened spec
+    ///   (4) probe PyPI at the minor range -> bundle + drop conda emit
+    ///   (5) probe conda at the major-widened spec
+    ///   (6) probe PyPI at the major range -> bundle + drop conda emit
+    ///   (7) widen the emitted conda spec to `*` (any version)
+    /// At each conda step the workspace's conda solver picks the highest
+    /// in-range candidate; at each PyPI step the PyPI resolver picks the
+    /// highest in-range wheel. Decisions per step land in the audit
+    /// under stage `tiered-cascade-stepN-{conda,pypi}`. Use this when
+    /// you want strict-by-default behavior with automatic recovery
+    /// across multiple widening levels before reaching for `*`.
+    #[serde(rename = "patch-then-minor-then-major-then-last-resort")]
+    PatchThenMinorThenMajorThenLastResort,
     /// TODO(conda-aware): NOT YET IMPLEMENTED. The variant deserializes
     /// and accepts the value `"conda-aware"` from user config, but the
     /// probe layer described below does not exist -- at translate time
@@ -197,8 +215,8 @@ pub enum RelaxPolicy {
 }
 
 impl RelaxPolicy {
-    /// True for any `*-with-last-resort` variant. Used by
-    /// `last_resort_widen_pass` to decide whether to run the cascade.
+    /// True for any `*-with-last-resort` variant. Used by the pre/post
+    /// widen passes' simpler "widen unsat -> `*`" mutation path.
     pub fn has_last_resort(self) -> bool {
         matches!(
             self,
@@ -206,6 +224,21 @@ impl RelaxPolicy {
                 | RelaxPolicy::MinorWithLastResort
                 | RelaxPolicy::MajorWithLastResort,
         )
+    }
+
+    /// True for the v0.30.0+ tiered cascade variant. Triggers the
+    /// patch -> minor -> major -> last-resort escalation in both
+    /// widening passes (pre-emit + post-emit).
+    pub fn has_tiered_cascade(self) -> bool {
+        matches!(self, RelaxPolicy::PatchThenMinorThenMajorThenLastResort)
+    }
+
+    /// True if mutation (override injection / spec rewriting) is
+    /// allowed for unsat probes. Both passes always *probe* and
+    /// *record* regardless of policy; they only *mutate* when this
+    /// returns true.
+    pub fn allows_widening_mutation(self) -> bool {
+        self.has_last_resort() || self.has_tiered_cascade()
     }
 }
 
@@ -393,6 +426,33 @@ mod tests {
         );
         // Default is None when omitted -- one entry == one output.
         assert_eq!(cfg.retread_wheels["loner"].bundle, None);
+    }
+
+    #[test]
+    fn parses_tiered_cascade_policy() {
+        // v0.30.0+ tiered cascade variant. New string value; pin the
+        // serde rename so stale binaries don't reject pixi.toml with
+        // "unknown variant" during the upgrade window.
+        let json = serde_json::json!({
+            "retread-wheels": { "foo": { "version": "1.2.3" } },
+            "retread-relax": "patch-then-minor-then-major-then-last-resort",
+        });
+        let cfg: RetreadConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.relax, RelaxPolicy::PatchThenMinorThenMajorThenLastResort);
+        assert!(cfg.relax.has_tiered_cascade());
+        assert!(cfg.relax.allows_widening_mutation());
+        assert!(!cfg.relax.has_last_resort());
+    }
+
+    #[test]
+    fn relax_policy_helper_semantics() {
+        assert!(RelaxPolicy::MinorWithLastResort.has_last_resort());
+        assert!(RelaxPolicy::MinorWithLastResort.allows_widening_mutation());
+        assert!(!RelaxPolicy::MinorWithLastResort.has_tiered_cascade());
+
+        assert!(!RelaxPolicy::Minor.has_last_resort());
+        assert!(!RelaxPolicy::Minor.has_tiered_cascade());
+        assert!(!RelaxPolicy::Minor.allows_widening_mutation());
     }
 
     #[test]

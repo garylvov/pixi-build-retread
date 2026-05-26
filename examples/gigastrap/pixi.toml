@@ -1,0 +1,669 @@
+[workspace]
+# pytorch channel needed for torch/torchaudio/torchvision/torchcodec py3.11
+# builds that conda-forge doesn't ship (its torch builds are CPU-only or
+# limited to older pythons). retread's probe identified torchaudio
+# >=2.7,<3 as definitively unsatisfiable on conda-forge for py3.11 and
+# fell back to PyPI bundle, but the cleaner path is letting conda
+# resolve from the pytorch channel directly. List BEFORE conda-forge so
+# torch-family deps prefer pytorch's GPU-enabled builds.
+channels = ["https://prefix.dev/conda-forge"]
+name = "gigastrap"
+platforms = ["linux-64"]
+version = "0.1.0"
+# Added for retread test: enables `[package.build]` source packages.
+# To revert: drop this line.
+preview = ["pixi-build"]
+# Single source of truth for the python minor used across the workspace
+# AND every pixi-build source-package backend (e.g. retread). pixi-build
+# forwards this to source packages' `conda/outputs` calls AND uses it
+# when selecting variants of the backend itself, so retread's
+# variant-built artifact (py311 vs py312) is auto-picked to match.
+# Upgrade by editing just this one line; rebuild retread only if you
+# add a python the variant list doesn't cover (see retread's
+# recipe/variants.yaml). Inline form (one line) keeps the [workspace]
+# table contiguous -- a [workspace.build-variants] sub-table header
+# would steal every subsequent key-value pair like `conda-pypi-map`.
+build-variants = { python = ["3.11"] }
+# Map conda pywin32 to satisfy pypi pypin32 requirement (isaacsim needs pywin32 but it's Windows-only on PyPI)
+conda-pypi-map = { "https://prefix.dev/conda-forge" = "patches/conda_pypi_map.json" }
+
+# Global PyPI options - extra indexes for NVIDIA and MuJoCo packages
+[pypi-options]
+extra-index-urls = ["https://pypi.nvidia.com", "https://py.mujoco.org"]
+# Default uv index-strategy is "first-index" — it stops at the first index
+# that publishes a package. Because py.mujoco.org publishes mujoco (only dev
+# wheels >=3.7), uv refuses to fall through to PyPI for stable 3.5.x. We
+# trust both indexes (NVIDIA, mujoco.org, PyPI) so allow uv to pick the
+# best version across all of them.
+index-strategy = "unsafe-best-match"
+# flatdict 4.0.1 ships only as sdist; its setup.py imports pkg_resources,
+# which modern setuptools (>=82) drops.  Disabling build isolation lets uv
+# use the conda-installed setuptools (which still bundles pkg_resources).
+no-build-isolation = ["flatdict"]
+
+# Override malformed dependencies from mujoco-warp and newton git packages.
+# mujoco upper bound: 3.6+ wheels vendor a `mujoco_warp` snapshot whose API
+# (wp.array2d[int], wp.Texture2D, ...) doesn't match the warp 1.8.2 that Isaac
+# Sim ships in omni.warp.core. Stay on the 3.5.x line until Isaac Sim bumps
+# its bundled warp.
+# Floor at 3.3.3 (light_type API). py.mujoco.org has pruned old dev wheels;
+# the actual stable 3.5.0 wheel is on regular PyPI — see the per-feature
+# index pin below.
+
+
+#### All possible environment combinations
+[environments]
+cpu = { features = ["cpu"] } # All you need for bare-bones
+gpu = { features = ["gpu", ] }
+ros2-gpu = { features = [ "gpu", "ros2", ]}
+ros2-cpu = { features = ["cpu", "ros2"]}
+# genesis-gpu = { features = ["gpu", "genesis"]}
+# genesis-ros2-gpu = { features = ["gpu", "genesis", "ros2", ]} # Advanced users ;)
+
+# Isaac Lab is not yet compatible with the other environments, due to Python and Torch version conflicts
+# use on it's own for now. See below for more info.
+isaaclab-gpu = {features = ["isaaclab", "gpu" ]}
+# isaaclab-ros2-gpu ={ features = ["isaaclab", "ros2", "gpu"]} # Some torch issues with this
+# Now, for the other environment configurations.
+### ONLY CUSTOM IN FILE
+gsi = { features = ["isaaclab", "gpu", "gigastrap_sim", "gigastrap_sim_physx"] } # GigaStrap Isaac Sim (PhysX)
+gsn = { features = ["isaaclab", "gpu", "gigastrap_sim", "gigastrap_sim_newton"] } # GigaStrap Isaac Sim (Newton)
+gsi-ros2 = { features = ["isaaclab", "ros2", "gpu", "gigastrap_sim", "gigastrap_sim_physx"] } # GigaStrap Isaac Sim (PhysX) with ROS 2
+gsrli = { features = ["robotwin_rlinf"], no-default-feature = true } # RoboTwin RLinf (SAPIEN 3 -- fully standalone, no global deps)
+# GigaStrap FlashSAC env (torch 2.9, JAX 0.7). Standalone -- shares no features
+# with `gsi`/`gsn` because FlashRL hard-pins torch==2.9.1 / torchvision==0.24.1,
+# which conflict with `feature.gpu`'s `pytorch-gpu>=2.7.1,<3` and
+# `feature.isaaclab`'s `torch==2.7.1` dep override. This env mirrors `gsrli`'s
+# standalone pattern: it owns its own python, CUDA toolkit, torch wheel, and
+# pulls `isaacsim`/`isaaclab` directly from `https://pypi.nvidia.com` (NOT the
+# editable IsaacLab submodule -- FlashRL expects the published wheel layout via
+# its `isaaclab` extra).
+#
+# FlashRL is vendored as a submodule at `third_party/flash_rl` (URL:
+# https://github.com/Holiday-Robot/FlashSAC, pinned to upstream `main` HEAD
+# `87edc9061150ae9e962dd84e6544e27a1554b3ab`). Its upstream `pyproject.toml`
+# has no `[build-system]` and no `[tool.setuptools.packages]` declaration, so
+# setuptools flat-layout auto-discovery refuses to build it (sees `results/`,
+# `configs/`, `flash_rl/` as sibling top-level candidates). The patch at
+# `patches/flash_rl_build_system.patch` prepends the missing two blocks; it is
+# applied idempotently by `scripts/get_submodules_and_patches.bash` after
+# `git submodule update --init`. Run that script (or `pixi run -e # gsf
+# post-install`) before `pixi install -e gsf`.
+gsf = { features = ["gigastrap_flash_sac"], no-default-feature = true } # GigaStrap FlashSAC (torch 2.9, JAX 0.7); local submodule at third_party/flash_rl, build-system patched in scripts/get_submodules_and_patches.bash
+record = { features = ["pusht_record"], no-default-feature = true } # PushT teleop demo recorder (third_party/gym_pusht/scripts/record_demos.py)
+# Feel free to ignore and delete features you don't need!
+
+[dependencies] # Global dependencies across all environments
+python = "==3.11"
+pip = ">=25.1.1,<26"
+setuptools = ">=59.6.0,<80"  # Global: needed for no-build-isolation packages (flatdict) that import pkg_resources
+hatchling = ">=1.27.0,<2"
+pysocks = "*"  # Satisfies requests[socks] extra requirement
+git-lfs = "*"  # Required for LW-BenchHub robot assets and demo datasets
+requests = "==2.32.5"
+# numpy = ">=1.26.4,<2"  # vggt requires numpy<2 . GSI uses numpy == 1.26.4
+# open3d moved to [pypi-dependencies] for GPU support
+
+networkx = "*"
+graphviz = "*"
+pytest = ">=7.0.0"
+hypothesis = ">=6.0,<7"  # Property-based testing strategies used by rsl_rl_g/tests/conftest.py
+pre-commit = ">=3.6.0"
+rich = "*"
+
+jupyter = ">=1.1.1,<2"
+ipywidgets = ">=8.1.5,<9"
+transformers = ">=5.4.0,<5.6"
+rerun-sdk = "*"
+tensorboard = ">=2.20.0,<3"
+timm = "*"
+nvtop = ">=3.2.0,<4"
+htop = ">=3.4.1,<4"
+seaborn = ">=0.13.2,<0.14"
+pandas = ">=2.0.0"
+streamlit = ">=1.30.0,<2"
+h5py = ">=3.13.0,<4"
+scipy = "==1.16.3"
+doit = ">=0.37.0,<0.38"
+diffusers = ">=0.35.2,<0.36"
+ffmpeg = "*"
+
+[pypi-dependencies]
+open3d = ">=0.18.0"  # PyPI version has GPU support (conda-forge is CPU-only)
+gdown = "*"
+scikit-learn = ">=1.4.0"
+umap-learn = ">=0.5.0"
+uniplot = ">=0.12.0"  # terminal ASCII plots for the rsl_rl_g training plotter
+
+[pypi-options.dependency-overrides]
+torchcodec = "==0.6.0"
+# Pin warp-lang to IsaacLabNewton's tested version. 1.11.0.dev20251205 is the
+# last release with the `warp.context.Devicelike` deprecation shim that
+# newton beta-0.2.1 (which IsaacLabNewton hard-pins) imports against. Newer
+# warp (1.13+) deleted `warp.context` entirely.
+warp-lang = "==1.11.0" # "==1.11.0.dev20251205"
+mujoco = ">=3.3.3,<3.6"
+gymnasium = "==1.3.0"
+
+[tasks]
+# Task runner (wraps doit with automatic arg passthrough)
+doit = "python scripts/doit_run.py"
+
+[target.unix.activation]
+scripts = ["scripts/post-install.bash"] # pip  install the package in editable mode
+
+##### CPU Env for Git
+[feature.cpu]
+
+#### GPU Environment-----------------------------------------------------------------------------
+[feature.gpu]
+# Channels would go here.
+
+# Set CUDA_HOME for torch.compile/Triton to find ptxas
+[feature.gpu.activation.env]
+CUDA_HOME = "$CONDA_PREFIX"
+
+# CUDA-enabled FFmpeg overlay. conda-forge's ffmpeg ships without
+# --enable-cuda (NVENC SDK redistribution restrictions), so torchcodec's
+# VideoDecoder(device="cuda") can't create an NVDEC hwdevice and silently
+# falls back to CPU. cuda_ffmpeg.bash is source-or-execute: sourced on env
+# activation, it downloads BtbN's pre-built ffmpeg-7.1 GPL shared build
+# (~52 MB, ~30s) into third_party/ffmpeg-cuda/ on first run, then exports
+# LD_PRELOAD so torchcodec resolves the CUDA-enabled libavcodec at runtime.
+# (LD_PRELOAD, not LD_LIBRARY_PATH: pixi's python has DT_RPATH baked in
+# that overrides LD_LIBRARY_PATH for its own env's lib dir; LD_PRELOAD is
+# the only override that wins.) `pixi run setup-cuda-ffmpeg` invokes the
+# same script for manual refresh / verification.
+[feature.gpu.target.unix.activation]
+scripts = ["scripts/cuda_ffmpeg.bash"]
+
+[feature.gpu.tasks]
+setup-cuda-ffmpeg = "bash scripts/cuda_ffmpeg.bash"
+
+[feature.gpu.system-requirements]
+# Thank you to Matthew Feickert for the system requirements tip!
+# https://pixi.sh/latest/workspace/system_requirements/
+# https://matthewfeickert-talks.github.io/reproducible-ml-for-scientists-with-pixi-scipy-2025/cuda-conda
+cuda   = "12"
+[feature.gpu.dependencies]
+# CUDA 12.8 required for Blackwell GPU (sm_120) support with torch.compile/Triton
+# https://pytorch.org/blog/pytorch-2-7/
+cuda-version = "==12.8"
+cuda-nvcc_linux-64 = "12.8.*"
+cuda-toolkit = "12.8.*"
+# Needed for Madrona
+clangxx_linux-64 = "*"
+clang_linux-64 = "*"
+libcxx = "*"
+libcxx-devel = "*"
+libgl-devel = "*"
+xorg-libx11 = "*"
+xorg-libxrandr = "*"
+xorg-libxinerama = "*"
+xorg-libxcursor = "*"
+xorg-libxi = "*"
+jax = "<0.6.0"
+# End of Needed for Madrona
+pytorch-gpu = ">=2.7.1,<3" # Isaac Lab likes this to be in PyPi instead
+torchvision = ">=0.22.0" # moved to pypi-dependencies for CUDA 12.8 wheel
+imageio = ">=2.37.0,<3"
+scikit-image = ">=0.25.2,<0.26"
+# pygame / pymunk / shapely are also picked up by third_party/gym_pusht's
+# CPU env when it happens to be imported from a gpu-env script, but the
+# canonical teleop recorder uses the separate `record` env below since
+# isaaclab in gsi/gsi-ros2 pins gymnasium to a different major version.
+#pygame = ">=2.5.2,<3"
+# pymunk = ">=6.6.0,<7"
+#shapely = ">=2.0.3,<3"
+# opencv = "*"
+
+[feature.gpu.pypi-dependencies]
+nvidia-ml-py = ">=12.560.30"
+# torch = { version = "==2.7.0", index = "https://download.pytorch.org/whl/cu128" }
+# torchvision = { version = "==0.22.0", index = "https://download.pytorch.org/whl/cu128" }
+# Special thank you to @MiroPsota for these wheels
+# https://github.com/facebookresearch/pytorch3d/discussions/1752?
+# Moved into isaac-pack/ so D relaxes the strict torchcodec pin; declared
+# as a conda dep below in [feature.isaaclab.dependencies]. Restore as a
+# pypi-dep with: sed -i 's/^# RETREAD: //' pixi.toml
+# pytorch3d = { version = "==0.7.8+5043d15pt2.7.0cu128", index = "https://miropsota.github.io/torch_packages_builder" }
+flash_muon = {git = "https://github.com/nil0x9/flash-muon.git", rev = "80ac87f"}
+brax = "*"
+# VGGT vision encoder - weights downloaded from HuggingFace at runtime
+vggt = {git = "https://github.com/facebookresearch/vggt.git"}
+# NOTE: third_party/madrona_mjx requires mujoco >= 3.3.3 for the light_type API
+# (3.3.3 changed light_directional/light_mode to light_type)
+# https://mujoco.readthedocs.io/en/stable/changelog.html
+# Installed via pip to avoid libabseil conflict with pytorch conda package.
+# Upper bound: see top-level dependency-overrides — mujoco 3.6+ vendors a
+# mujoco_warp that breaks against Isaac Sim's bundled warp 1.8.2.
+# Index pin: py.mujoco.org has dropped stable 3.5.x and only hosts 3.7+ dev
+# builds, so we point uv at regular PyPI where mujoco==3.5.0 is published.
+mujoco = { version = ">=3.3.3,<3.6", index = "https://pypi.org/simple" }
+mujoco-mjx = { version = ">=3.5,<3.6", index = "https://pypi.org/simple" }
+#### Genesis Simulation Environment------------------------------------------------------------
+# [feature.genesis.dependencies]
+# numpy = "==1.26.4" # otherwise, genesis complains:
+# pyopengl="*"
+# pillow = "<12.0" # moviepy (dependency of genesis-world) requires pillow<12.0
+# [feature.genesis.pypi-dependencies]
+# PyOpenGL_accelerate = "*"
+# genesis-world = { git = "https://github.com/Genesis-Embodied-AI/Genesis.git", tag = "ec40996d4959d9a347e03c1a2ae63a27089d3952" }
+# # genesis-world = ">=0.2.1, <0.3" # Only available built wheels at the moment, for a more stable release
+# [feature.genesis.target.unix.activation]
+# scripts = ["scripts/config-genesis.bash"]
+
+#### ROS 2 Environment---------------------------------------------------------------------------
+[feature.ros2]
+# "https://prefix.dev/robostack-[humble|jazzy|kilted]"
+channels = ["https://prefix.dev/robostack-humble", "https://prefix.dev/conda-forge", ]
+[feature.ros2.dependencies]
+# For minimal dep set
+ros-humble-ros-core	= "*"
+# For full feature set
+ros-humble-rviz2 = "*"
+ros-humble-rosbag2 = "*"
+ros-humble-rosbag2-storage-mcap = "*"
+compilers = "*"
+cmake = "*"
+pkg-config = "*"
+make = "*"
+ninja = "*"
+colcon-common-extensions = "*" # needed for using ros2_ws/colcon-defaults.yaml
+colcon-mixin = "*"
+# Maybe extra colcon stuff...
+colcon-devtools = "*"
+colcon-parallel-executor = "*"
+colcon-defaults = "*"
+colcon-package-selection = "*"
+colcon-python-setup-py = "*"
+colcon-recursive-crawl = "*"
+colcon-ros = "*"
+binutils = "*"
+ld_impl_linux-64 = "*"
+# " error: option --editable not recognized for setuptools==80.1.0 " occurs for building ROS 2 Humble Python Packages
+setuptools = ">=59.6.0,<=79.0.1"
+ros-humble-xacro = "*"
+# ros-humble-robot-state-publisher = "*"
+ros-humble-joint-state-publisher = "*"
+
+[feature.ros2.tasks]
+[feature.ros2.target.unix.activation]
+scripts = ["ros2_ws/install/setup.bash", "scripts/config-ros2-colcon.bash"]
+
+[feature.isaaclab]
+[feature.isaaclab.dependencies]
+sysroot_linux-64 = ">=2.35"
+# Need newer GCC/binutils to work with glibc 2.39's .relr.dyn sections
+gxx_linux-64 = ">=12"
+gcc_linux-64 = ">=12"
+binutils_linux-64 = ">=2.40"
+cmake = "==4.1.0"
+
+# >>> retread test: source-package replacement for PyPI isaacsim,
+# IsaacLab + sub-packages, IsaacLab-Arena, and pytorch3d. Every entry
+# in ./isaac-pack/pixi.toml's [retread-wheels] sets `bundle =
+# "isaac-pack"`, so retread merges them into one conda output named
+# `isaac-pack` -- the line below pulls the whole pack with one
+# declaration. To go back to one-output-per-entry, drop the `bundle`
+# field from the entries in isaac-pack/pixi.toml and list each
+# desired output name here.
+ isaac-pack = { path = "./isaac-pack" }
+# <<< retread test
+
+# >>> retread test: the block below was the manual workaround for
+# isaacsim's strict transitive pins. retread relaxes these
+# automatically; commenting out to verify. Revert with:
+#   sed -i 's/^# RETREAD: //' pixi.toml
+# Pin versions required by isaacsim-kernel to override conda's defaults
+# requests moved to pypi-dependencies to include [socks] extra
+# psutil = "==5.9.8"
+# propcache = "==0.2.1"
+# aiohappyeyeballs = "==2.4.4"
+# pytz = "==2024.1"
+# frozenlist = "==1.5.0"
+# charset-normalizer = "==3.3.2"
+# watchdog = "==4.0.0"
+# aiosignal = "==1.3.2"
+# coverage = "==7.4.4"
+# typing-extensions = "==4.12.2"
+# idna = "==3.10"
+# yarl= "==1.18.3"
+# multidict = "==6.1.0"
+# attrs = "==25.1.0"
+# click = "==8.1.7"
+# aiohttp = "==3.11.11"
+# sympy = "==1.13.3"
+# networkx = "==3.3"
+# # mujoco moved to [feature.gpu.pypi-dependencies] to avoid libabseil conflict
+# fsspec = "==2024.6.1"
+# filelock = "==3.13.1"
+# cryptography = "==44.0.0"
+# pyyaml = "==6.0.2"
+# tornado = "==6.5.1"
+# starlette = "==0.49.1"
+# python-multipart = "==0.0.20"
+# httptools = "==0.6.1"
+# packaging = "==25.0"
+# kiwisolver = "==1.4.4"
+# cycler = "==0.11.0"
+# pyparsing = "==3.0.9"
+# fonttools = "==4.55.3"
+# contourpy = "==1.3.1"
+# matplotlib = "==3.10.3"
+# markupsafe = "==2.1.3"
+# nest-asyncio = "==1.5.6"
+# # Conda pywin32 stub satisfies isaacsim's pywin32 requirement on Linux
+# pywin32 = ">=306"
+# ipywidgets = "==8.1.5"
+# tqdm = "==4.67.1"
+# wrapt = "==2.0.1"
+# <<< retread test
+[feature.isaaclab.system-requirements]
+libc = "2.35"
+
+# >>> retread test: PyPI-side workaround. retread auto-bundles these
+# from PyPI (or maps them to conda equivalents via parselmouth +
+# our FALLBACK list) so the explicit overrides aren't needed.
+# Revert with: sed -i 's/^# RETREAD: //' pixi.toml
+[feature.isaaclab.pypi-options.dependency-overrides]
+# opencv-python = "<4.13"
+# numpy = "==1.26.4"
+# cmeel-boost = "<1.88"  # 1.89+ requires numpy>=2.3 on Python 3.11; keep compat with numpy<2
+# torch = "==2.7.1"
+# pillow = "==12.0.0"
+# scipy = "==1.16.3"
+# pywin32 = "*"
+# triton = "==3.3.0"
+# requests = "==2.32.5"
+# isaacsim-kernel = "==5.1.0.0"
+# starlette = "==0.49.1"
+# python-multipart = "==0.0.20"
+# httptools = "==0.6.1"
+# wrapt = "==2.0.1"
+# packaging = "==25.0"
+# rerun-sdk = ">=0.24.0,<0.26"
+# huggingface-hub = ">=0.34.2"
+# [feature.isaaclab.pypi-dependencies]
+# isaacsim = { version = "==5.1.0", index = "https://pypi.nvidia.com", extras = ["all", "extscache"] }
+# scipy = "==1.16.3"
+# <<< retread test
+[feature.isaaclab.tasks]
+
+[feature.gigastrap_sim]
+[feature.gigastrap_sim.dependencies]
+pinocchio = ">=3.6"
+
+[feature.gigastrap_sim.pypi-dependencies]
+# torchrl_g: TorchRL-based runner mirroring rsl_rl_g (teacher PPO + vision distill
+# with batched DINO feature cache). Built on the upstream IsaacLabWrapper +
+# MultiCollector worker-process pattern from
+# pytorch/rl examples/collectors/isaaclab_rnn_ppo_memory.py. torchrl 0.10+ supports
+# torch 2.7; tensordict is a transitive dep but pin-listed for clarity. See
+# plans/torchrl_g_plan.md for the full design.
+torchrl = ">=0.12,<0.13"
+tensordict = ">=0.12,<0.13"
+torchrl-g = { path = "torchrl_g", editable = true }
+# SBX: JAX-based reference SAC for cross-validating our loss implementations.
+# Pinned at 0.26.0 (JAX 0.5.3 is already a transitive dep via the gpu feature).
+# Used by rsl_rl_g/tests/integration/test_sac_vs_sbx.py.
+sbx-rl = "==0.26.0"
+# Patched egl_probe (CMake 3.5+ fix)
+egl-probe = { path = "patches/egl_probe", editable = true }
+# HF Accelerate -- used by lerobot training + our `accelerate launch` doit tasks
+accelerate = ">=1.10.0,<2.0.0"
+# Pin torchcodec to version compatible with PyTorch 2.7 (0.10.0 requires PyTorch 2.8+)
+torchcodec = { version = "==0.5", index = "https://download.pytorch.org/whl/cu128" }
+# libero dependencies
+bddl = "==1.0.1"
+easydict = "*"
+future = ">=0.18.2"
+robosuite = "==1.4.0"
+thop = "*"
+lightwheel-sdk = "==1.0.1"
+# isaaclab_arena eagerly imports all embodiments, pulling in these at module load
+onnxruntime = "*"
+pin-pink = "==3.1.0"
+# lw_benchhub runtime deps (subset needed for our render/eval pipelines)
+lazy-import = "*"
+tyro = "*"
+mediapy = "*"
+# Quadric edge collapse mesh decimation (used by scene_strip.py to reduce RTX per-env RAM)
+fast-simplification = ">=0.1.7"
+meshoptimizer = ">=0.2.20"
+
+[feature.gigastrap_sim.target.unix.activation]
+scripts = ["scripts/post-install-gigastrap-sim.bash",]
+#            "ros2_ws/install/orcahand_description/share/orcahand_description/local_setup.bash"]
+
+[feature.gigastrap_sim_physx]
+[feature.gigastrap_sim_physx.tasks]
+
+[feature.gigastrap_sim_physx.pypi-dependencies]
+numpy = "==1.26.4" # prevent shadowing of numpy
+# IsaacLab PhysX packages -- editable installs handled in
+# scripts/post-install-gigastrap-sim.bash via `pip install -e --no-deps
+# --force-reinstall`, AFTER the retread-bundled isaacsim conda package
+# lands. Listing them here as editable pypi-deps tells uv to resolve
+# their pyproject pins (pillow==11.2.1, etc.) at solve time, which
+# collides with whatever conda picks for the same transitives. The
+# post-install overlay keeps the editable code-on-disk benefit without
+# re-introducing the pins. Restore with:
+#   sed -i 's/^# RETREAD: //' pixi.toml
+# isaaclab        = { path = "IsaacLab/source/isaaclab", editable = true }
+# isaaclab-assets = { path = "IsaacLab/source/isaaclab_assets", editable = true }
+# isaaclab-tasks  = { path = "IsaacLab/source/isaaclab_tasks", editable = true }
+# isaaclab-rl     = { path = "IsaacLab/source/isaaclab_rl", editable = true }
+# isaaclab-mimic  = { path = "IsaacLab/source/isaaclab_mimic", editable = true }
+# isaaclab-arena  = { path = "third_party/IsaacLab-Arena", editable = true }
+# RoboTwin IsaacLab Arena - manipulation eval tasks (bridges RoboTwin dual-arm tasks into Arena)
+manip-eval-tasks = { path = "third_party/RoboTwinIsaacLabArena/source/manip_eval_tasks", editable = true }
+
+[feature.gigastrap_sim_newton]
+# IMPORTANT — known issues, gated by newton.bash at run time (NOT at activation):
+#
+# 1. usd-core 25.5 and usd-exchange 2.2.2 ship overlapping `pxr/Trace/_trace.so`
+#    (and other pxr/*.so) files. uv installs in topological order: usd-core
+#    (a transitive dep of usd-exchange) lands first, then usd-exchange
+#    overwrites the shared paths with its own broken copy. usd-exchange
+#    2.2.2's _trace.so bundles libtbb 2020.3 but FORGOT to bundle the
+#    matching libtbbmalloc.so.2; libusd_tf's static init fails to resolve
+#    `scalable_malloc` and aborts with `free(): invalid pointer`.
+#
+# 2. mujoco-warp and newton have malformed metadata (non-standard `index:`
+#    syntax) that pixi/uv reject during resolution. They have to be
+#    pip-installed manually.
+#
+# Both repairs live in `newton.bash` so the output is visible in the user's
+# terminal (pixi swallows activation-script output). `pixi run -e gsn verify`
+# is the smoke-test on a fresh clone.
+
+# Override packages that have malformed (index: ...) syntax in their dependencies
+[feature.gigastrap_sim_newton.pypi-options.dependency-overrides]
+# See top-level [pypi-options.dependency-overrides] for why warp is pinned exact.
+warp-lang = "==1.11.1" #"==1.11.0.dev20251205"
+# Match the top-level mujoco cap. newton beta-0.2.1's _convert_to_mjc passes
+# `stiffness` as a scalar, but mujoco 3.8 changed MjsBody.add_joint to expect
+# `Optional[list[float]]` and rejects scalars with "stiffness should be a
+# numeric scalar or list". Stay on the 3.5.x line until newton is bumped.
+mujoco = ">=3.3.3,<3.6"
+rerun-sdk = "*"
+
+[feature.gigastrap_sim_newton.pypi-dependencies]
+# Pre-install these before other packages resolve them with malformed index syntax.
+# warp-lang exact-pinned -- newer versions removed `warp.context` which newton beta-0.2.1 imports.
+warp-lang = { version = "==1.11.1",  index = "https://pypi.nvidia.com"} #"==1.11.0.dev20251205",
+mujoco = { version = ">=3.3.3,<3.6", index = "https://py.mujoco.org" }
+omniverseclient = { version = "*", index = "https://pypi.nvidia.com" }
+# IsaacLab Newton packages -- editable installs handled in
+# scripts/post-install-gigastrap-sim-newton.bash via `pip install -e
+# --no-deps --force-reinstall`, AFTER the retread-bundled isaacsim
+# conda package lands. Same reasoning as the PhysX block above: listing
+# them here forces uv to read editable pyproject pins at solve time,
+# which collides with whatever conda picks for shared transitives
+# (pillow, starlette, ...). The post-install overlay swaps the code in
+# site-packages without re-introducing the pins. Restore with:
+#   sed -i 's/^# RETREAD: //' pixi.toml
+# Note: mujoco-warp and newton have malformed metadata - they must be installed separately via:
+#   pip install "mujoco-warp @ git+https://github.com/google-deepmind/mujoco_warp.git@e9a67538f2c14486121635074c5a5fd6ca55fa83"
+#   pip install "newton @ git+https://github.com/newton-physics/newton.git@beta-0.2.1"
+# isaaclab        = { path = "IsaacLabNewton/source/isaaclab", editable = true }
+# isaaclab-assets = { path = "IsaacLabNewton/source/isaaclab_assets", editable = true }
+# isaaclab-tasks  = { path = "IsaacLabNewton/source/isaaclab_tasks", editable = true }
+# isaaclab-rl     = { path = "IsaacLabNewton/source/isaaclab_rl", editable = true }
+# isaaclab-newton = { path = "IsaacLabNewton/source/isaaclab_newton", editable = true }
+# isaaclab-arena  = { path = "third_party/IsaacLab-Arena", editable = true }
+# RoboTwin IsaacLab Arena - manipulation eval tasks (same package works with Newton)
+manip-eval-tasks = { path = "third_party/RoboTwinIsaacLabArena/source/manip_eval_tasks", editable = true }
+# leisaac (same package works with Newton)
+
+[feature.gigastrap_sim_newton.tasks]
+# Smoke test: verify pxr imports cleanly (catches the usd-core/usd-exchange
+# overlap regression) and that mujoco-warp + newton resolve. Run this on a
+# fresh clone to confirm the env is healthy.
+verify = "bash scripts/verify-newton.bash"
+
+# Newton-only activation: lazy pip-install mujoco-warp + newton when missing
+# (their metadata is malformed; can't be declarative). The pxr health check
+# is NOT here — it lives in the Python training entrypoint where its output
+# is visible to the user. See gigastrap_isaaclab_ext/newton/_runtime_check.py.
+[feature.gigastrap_sim_newton.target.unix.activation]
+scripts = ["scripts/post-install-gigastrap-sim-newton.bash"]
+
+[feature.gigastrap_sim.tasks]
+
+#### GigaStrap FlashSAC Environment (torch 2.9, JAX 0.7) -----------------------------------------
+# Standalone env for FlashRL / FlashSAC (https://github.com/Holiday-Robot/FlashSAC).
+# Cannot share `feature.gpu` or `feature.isaaclab` with `gsi` because FlashRL hard-pins
+# torch==2.9.1 + torchvision==0.24.1 (see DIVERGENCE_NOTES.md), which conflict with
+# gsi's torch==2.7.1 pin and pytorch-gpu conda dep. Therefore: own python, own CUDA
+# stack, own isaacsim/isaaclab pulled from `https://pypi.nvidia.com` (not editable
+# submodule). Used by `scripts/benchmarks/sac_head_to_head.py` for cross-validation;
+# `gsi` users cannot run FlashSAC in-process — they must launch the harness under
+# `pixi run -e gsf ...` instead.
+#
+# CURRENT STATUS: wired to the `gsf` environment via the `flash-rl =
+# { path = "third_party/flash_rl", editable = true, extras = ["isaaclab"] }`
+# pypi-dependency below. FlashRL's missing `[build-system]` block is patched in
+# by `scripts/get_submodules_and_patches.bash` using
+# `patches/flash_rl_build_system.patch`. Run that script (e.g. via the
+# `post-install-gigastrap-sim.bash` chain or directly) before `pixi install -e
+# gsf`, otherwise the editable build will fail with "Multiple top-level packages
+# discovered" from setuptools' flat-layout auto-discovery.
+#
+# The pins below are transcribed from FlashRL's upstream pyproject.toml
+# `[tool.uv.override-dependencies]` block; if FlashRL bumps versions, mirror here.
+[feature.gigastrap_flash_sac]
+[feature.gigastrap_flash_sac.system-requirements]
+cuda = "12"
+libc = "2.35"
+
+[feature.gigastrap_flash_sac.dependencies]
+python = "==3.11"
+pip = "*"
+cuda-version = "==12.8"
+cuda-toolkit = "12.8.*"
+pytest = ">=7.0.0"     # required by rsl_rl_g/tests/integration/test_sac_head_to_head_smoke.py
+hypothesis = ">=6.0,<7"  # rsl_rl_g/tests/conftest.py imports `hypothesis.strategies`
+# Stable-Baselines3 base for the SBX head-to-head bench (sbx itself is
+# PyPI-only and lives in [feature.gigastrap_flash_sac.pypi-dependencies]).
+
+[feature.gigastrap_flash_sac.pypi-options.dependency-overrides]
+torch = "==2.9.1"
+torchvision = "==0.24.1"
+flatdict = "==4.0.0"
+setuptools = "==82.0.1"  # override flash_rl pyproject.toml's `setuptools<=65` runtime pin
+
+[feature.gigastrap_flash_sac.pypi-dependencies]
+torch = { version = "==2.9.1", index = "https://download.pytorch.org/whl/cu128" }
+torchvision = { version = "==0.24.1", index = "https://download.pytorch.org/whl/cu128" }
+# Intentionally NOT installing the `isaaclab` extra: flash_rl/flash_rl/* has zero
+# isaacsim imports, and the `isaaclab` extra pulls isaacsim[all,extscache] which
+# transitively brings pywin32 (Windows-only). For gymnasium-env head-to-head this
+# is unneeded.
+flashrl = { path = "third_party/flash_rl", editable = true }
+# rsl_rl_g is the "ours" side of `scripts/benchmarks/sac_head_to_head.py`; both
+# halves run in one process so we install it editable here as well.
+rsl-rl-g = { path = "rsl_rl_g", editable = true }
+# JAX stack from FlashRL pyproject (pin explicitly to avoid surprise resolution).
+jax = { version = "==0.7.1", extras = ["cuda12"] }
+jaxlib = "==0.7.1"
+flax = "==0.10.1"
+wandb = "==0.23"
+Cython = "==0.29.37"
+# brax + MJX = GPU-vectorised MuJoCo for 10k-env head-to-head benches
+# (scripts/benchmarks/{sac_vec,ppo,hybrid_sac_ppo}_head_to_head.py).
+# Brax 0.14.x requires jax>=0.4.6 (compatible with our pin 0.7.1) and pulls
+# mujoco-mjx in lockstep with the mujoco runtime (currently 3.8.1 in gsf).
+brax = ">=0.14.2"
+mujoco-mjx = ">=3.3.3,<3.9"
+jaxopt = "*"
+
+# SBX (Stable-Baselines-Jax). Conda-forge doesn't publish it, so PyPI-only.
+# stable-baselines3 (the SB3 base) IS on conda-forge -- see the
+# [feature.gigastrap_flash_sac.dependencies] block above for that pin.
+# Together they let the head-to-head benches run OURS + FlashSAC + SBX
+# all against the same brax/MJX env in a single pixi env, so the
+# comparison is truly apples-to-apples on physics.
+sbx-rl = ">=0.26.0"
+
+#### RoboTwin RLinf Environment (SAPIEN 3) -------------------------------------------------------
+# Completely separate from Isaac Lab -- uses SAPIEN 3 physics, not PhysX/Newton
+# Not pip-installed; added to PYTHONPATH via activation script
+[feature.robotwin_rlinf]
+[feature.robotwin_rlinf.dependencies]
+python = "==3.11"
+pip = ">=25.1.1,<26"
+setuptools = ">=59.6.0,<80"
+numpy = ">=1.26.4,<2"
+# h5py = ">=3.13.0,<4"
+scipy = ">=1.10.1"
+imageio = ">=2.34.2"
+matplotlib = "*"
+
+[feature.robotwin_rlinf.pypi-dependencies]
+open3d = ">=0.18.0"
+# SAPIEN 3 physics simulator
+sapien = "==3.0.0b1"
+# Motion planning
+mplib = "==0.2.1"
+# RL environment API
+gymnasium = "==0.29.1"
+# Torch 2.4.1 (SAPIEN 3 tested version -- bundles its own CUDA runtime)
+torch = "==2.4.1"
+torchvision = "*"
+# Geometric utilities
+transforms3d = "==0.4.2"
+trimesh = ">=4.4.3"
+toppra = "*"
+# Data collection & logging
+wandb = "*"
+termcolor = "*"
+pydantic = "*"
+zarr = "*"
+av = "*"
+moviepy = "*"
+huggingface-hub = ">=0.25.0"
+
+[feature.robotwin_rlinf.target.unix.activation]
+scripts = ["scripts/post-install-robotwin-rlinf.bash"]
+
+
+#### PushT teleop demo recorder env -----------------------------------------
+# Minimal, standalone env for third_party/gym_pusht/scripts/record_demos.py.
+# Avoids the gymnasium-version conflict between gym_pusht (>=0.29.1) and
+# isaaclab (==1.2.1 / ==1.3.0) by living in its own no-default-feature env.
+[feature.pusht_record]
+[feature.pusht_record.dependencies]
+python = "==3.11"
+pip = "*"
+numpy = ">=1.26.4,<3"
+#pygame = "*"
+# pymunk = ">=6.6.0,<7"
+shapely = ">=2.0.3,<3"
+# opencv = "*"
+gymnasium = ">=0.29.1,<1.0"
+imageio = ">=2.37.0,<3"
+imageio-ffmpeg = ">=0.4.9"
+pyarrow = ">=15.0,<25"
+ffmpeg = "*"

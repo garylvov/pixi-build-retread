@@ -225,7 +225,14 @@ pub fn widen_exact(v: &Version, policy: RelaxPolicy) -> Option<String> {
     // unsatisfiable specs.
     match policy {
         RelaxPolicy::None => Some(format!("=={v}")),
-        RelaxPolicy::Patch | RelaxPolicy::PatchWithLastResort => {
+        // Tiered cascade starts at the narrowest (patch) widening and
+        // escalates only when probes prove the current spec unsat. So
+        // translate-time emission mirrors plain Patch; the escalation
+        // happens in handler.rs's pre/post widen passes via override
+        // injection / spec mutation.
+        RelaxPolicy::Patch
+        | RelaxPolicy::PatchWithLastResort
+        | RelaxPolicy::PatchThenMinorThenMajorThenLastResort => {
             Some(format!(">={major}.{minor}.{patch},<{major}.{}", minor + 1))
         }
         RelaxPolicy::Minor | RelaxPolicy::MinorWithLastResort => {
@@ -574,6 +581,28 @@ mod tests {
         assert_eq!(
             t("numpy==1.26.4", RelaxPolicy::Major).as_deref(),
             Some("numpy >=1"),
+        );
+    }
+
+    #[test]
+    fn tiered_cascade_emits_at_patch_widening() {
+        // The new policy mirrors `Patch` at translate time; the
+        // patch -> minor -> major -> `*` escalation happens in
+        // handler.rs's pre_emit_widen_pass via override injection.
+        assert_eq!(
+            t("numpy==1.26.4", RelaxPolicy::PatchThenMinorThenMajorThenLastResort).as_deref(),
+            Some("numpy >=1.26.4,<1.27"),
+        );
+        // Ranges pass through unchanged at translate time -- the
+        // cascade catches them post-emit if conda can't satisfy.
+        assert_eq!(
+            t("pyglet<2", RelaxPolicy::PatchThenMinorThenMajorThenLastResort).as_deref(),
+            Some("pyglet <2"),
+        );
+        // python is never widened under any policy.
+        assert_eq!(
+            t("python==3.11.0", RelaxPolicy::PatchThenMinorThenMajorThenLastResort).as_deref(),
+            Some("python ==3.11.0"),
         );
     }
 

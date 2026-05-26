@@ -283,7 +283,11 @@ fn widen_exact_to_pep508(v: &Version, policy: RelaxPolicy) -> Option<String> {
     // the two sides apart.
     match policy {
         RelaxPolicy::None => None,
-        RelaxPolicy::Patch | RelaxPolicy::PatchWithLastResort => {
+        // Tiered cascade emits at patch widening on the wheel side
+        // too; conda-side escalation is independent (no wheel rewrite).
+        RelaxPolicy::Patch
+        | RelaxPolicy::PatchWithLastResort
+        | RelaxPolicy::PatchThenMinorThenMajorThenLastResort => {
             Some(format!(">={lower_patch},<{major}.{}", minor + 1))
         }
         RelaxPolicy::Minor | RelaxPolicy::MinorWithLastResort => {
@@ -388,6 +392,16 @@ mod tests {
         let raw = "numpy==1.26.0";
         let out = relax_pep508(raw, RelaxPolicy::Major).unwrap();
         assert_eq!(out, "numpy>=1");
+    }
+
+    #[test]
+    fn tiered_cascade_rewrites_exact_pin_to_patch_range() {
+        // The tiered cascade mirrors Patch at wheel rewrite time; the
+        // conda-side escalation is independent.
+        let raw = "numpy==1.26.4";
+        let out =
+            relax_pep508(raw, RelaxPolicy::PatchThenMinorThenMajorThenLastResort).unwrap();
+        assert_eq!(out, "numpy>=1.26.4,<1.27");
     }
 
     #[test]

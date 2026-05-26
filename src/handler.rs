@@ -1,6 +1,6 @@
 //! JSON-RPC method handlers. The four entry points pixi calls.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -184,6 +184,10 @@ struct State {
     /// Directory containing the source package's `pixi.toml`. Used to
     /// resolve relative `path = "..."` entries in [retread-wheels].
     source_dir: Option<PathBuf>,
+    /// v0.31.0+ workspace root passed by pixi at initialize. Used by
+    /// the cascade's last-resort step to mirror the workspace's
+    /// `[dependencies]` pin (if any) instead of widening to `*`.
+    workspace_dir: Option<PathBuf>,
 }
 
 #[derive(Clone, Default)]
@@ -242,6 +246,11 @@ struct Bundle {
     /// audit. The audit is also flushed early (at conda/outputs) so
     /// failed conda solves still leave this trace on disk.
     probe_decisions: Vec<crate::audit::ProbeDecision>,
+    /// v0.33.0+: outcome of the pre-emission solve check over
+    /// (workspace effective deps + this output's emitted run-deps).
+    /// Persisted in the audit so users see the real cross-package
+    /// conflict before pixi gives them a misleading leaf error.
+    solve_diagnostics: Option<crate::audit::SolveDiagnostics>,
 }
 
 impl Bundle {
@@ -316,6 +325,7 @@ impl Handler {
         state.source_dir = params.source_directory.or_else(|| {
             params.manifest_path.parent().map(PathBuf::from)
         });
+        state.workspace_dir = params.workspace_directory;
         Ok(InitializeResult {})
     }
 
@@ -323,7 +333,7 @@ impl Handler {
         &self,
         params: CondaOutputsParams,
     ) -> Result<CondaOutputsResult, RpcError> {
-        let (config, download_dir, source_dir, cache_dir) =
+        let (config, download_dir, source_dir, cache_dir, workspace_dir) =
             self.snapshot(&params.work_directory).await?;
 
         // Pick the target Python versions. Precedence:
@@ -340,13 +350,16 @@ impl Handler {
         let mut outputs = Vec::new();
         for python_version in &pythons {
             let target = wheel_target_for(params.host_platform, python_version);
-            let (resolved, effective_config) = resolve_all(
+            // Phase 1: materialize wheels + auto-bundle. Env-agnostic;
+            // results reused across all per-env emissions.
+            let (materialized, base_config) = resolve_all(
                 &config,
                 &target,
                 &download_dir,
                 &source_dir,
                 &cache_dir,
                 &params.channels,
+                workspace_dir.as_deref(),
             )
             .await
             .map_err(|e| {
@@ -354,44 +367,127 @@ impl Handler {
                     "resolving wheels for python {python_version}: {e:#}"
                 ))
             })?;
-            // Cross-output linking: collect each bundle's (conda_name,
-            // version) so produce_output can emit the other bundles as
-            // run-dependencies. Declaring any single output in the
-            // workspace then pulls in the whole pack, instead of the
-            // workspace needing one line per [retread-wheels] entry.
-            let siblings: Vec<(String, String)> = resolved
-                .iter()
-                .map(|b| (b.conda_name.clone(), b.primary.metadata.version.clone()))
-                .collect();
-            for bundle in &resolved {
-                // v0.14.1+: write a probe-only trace per bundle BEFORE
-                // returning outputs to pixi. If the conda solve fails
-                // downstream (which is when "no candidates were found
-                // for gym" errors fire), conda/build_v1 is never
-                // called and the full audit doesn't get written --
-                // but this side-file does, so the user can `cat
-                // <pack>/retread-probe-trace-<name>.json` to see
-                // exactly what each probe decided. Best-effort: a
-                // write error logs at warn and never fails the solve.
-                if let Err(e) = write_probe_trace(bundle, &source_dir).await {
-                    tracing::warn!(
-                        bundle = %bundle.conda_name,
-                        error = %format!("{e:#}"),
-                        "probe trace write failed (non-fatal)",
-                    );
-                }
-                outputs.push(
-                    produce_output(
-                        bundle,
-                        &effective_config,
+            // Phase 2: autodiscover one emission per workspace path-dep
+            // referencing this source package. When nothing references
+            // it (initial setup, missing workspace pixi.toml), returns
+            // ONE default emission named after the materialized bundle.
+            let bundle_names: HashSet<String> =
+                materialized.iter().map(|b| b.conda_name.clone()).collect();
+            // For multi-bundle source packages, autodiscovery runs per
+            // bundle so each bundle's name is the default fallback.
+            // For typical single-bundle packs this is one entry.
+            let default_name = materialized
+                .first()
+                .map(|b| b.conda_name.clone())
+                .unwrap_or_default();
+            let emissions = discover_emissions(
+                &source_dir,
+                workspace_dir.as_deref(),
+                &default_name,
+                &params.channels,
+                python_version,
+                &bundle_names,
+            )
+            .await;
+            // Cross-output siblings: per-emission so envs only link
+            // to their own siblings (not other envs' renames).
+            for emission in &emissions {
+                let env_bundles: Vec<Bundle> = materialized
+                    .iter()
+                    .map(|b| apply_emission(b, &base_config, emission).0)
+                    .collect();
+                let siblings: Vec<(String, String)> = env_bundles
+                    .iter()
+                    .map(|b| (b.conda_name.clone(), b.primary.metadata.version.clone()))
+                    .collect();
+                for base_bundle in &materialized {
+                    let (mut bundle, mut effective) =
+                        apply_emission(base_bundle, &base_config, emission);
+                    // v0.30.0+ pre-emit widen pass: now scoped to this env's
+                    // channels + transitive overrides. Probes recorded
+                    // regardless of policy; mutation gated by
+                    // RelaxPolicy::allows_widening_mutation().
+                    pre_emit_widen_pass(
+                        &mut bundle,
+                        &mut effective,
+                        &emission.channels,
+                        &target,
+                        &download_dir,
+                    )
+                    .await
+                    .map_err(|e| {
+                        RpcError::internal(format!(
+                            "pre-emit widen for {}: {e:#}",
+                            bundle.conda_name,
+                        ))
+                    })?;
+                    let mut output = produce_output(
+                        &bundle,
+                        &effective,
                         params.host_platform,
                         python_version,
                         &siblings,
                     )
                     .map_err(|e| {
                         RpcError::internal(format!("output for {}: {e:#}", bundle.conda_name))
-                    })?,
-                );
+                    })?;
+                    post_emit_widen_pass(
+                        &mut output,
+                        &emission.channels,
+                        python_version,
+                        effective.relax,
+                        &mut bundle.probe_decisions,
+                    )
+                    .await
+                    .map_err(|e| {
+                        RpcError::internal(format!(
+                            "post-emit widen for {}: {e:#}",
+                            bundle.conda_name,
+                        ))
+                    })?;
+                    // v0.33.0+ pre-emission solve check. Build the
+                    // combined spec set (this output's emitted
+                    // run-deps + every override -- which carries the
+                    // workspace's transitive constraints) and run a
+                    // real conda solve to detect cross-package
+                    // conflicts. The solver's unsat strings surface
+                    // in the audit so users see the real chain
+                    // (cuda-bindings 13 -> cuda 13 vs cuda-toolkit
+                    // 12.8 -> cuda 12.8) instead of pixi's misleading
+                    // leaf error.
+                    let solve_specs = collect_solve_specs(&output, &effective);
+                    let outcome = crate::solve_check::run_solve_check(
+                        &emission.channels,
+                        &solve_specs,
+                        python_version,
+                        &params.host_platform.to_string(),
+                    )
+                    .await;
+                    if !outcome.satisfiable && !outcome.unsat_explanations.is_empty() {
+                        tracing::warn!(
+                            bundle = %bundle.conda_name,
+                            reasons = ?outcome.unsat_explanations,
+                            "pre-emission solve check: UNSAT -- conda will fail at solve time. \
+                             See retread-audit-{bundle}.json.solve_diagnostics for the chain.",
+                            bundle = bundle.conda_name.as_str(),
+                        );
+                    }
+                    bundle.solve_diagnostics = Some(crate::audit::SolveDiagnostics {
+                        satisfiable: outcome.satisfiable,
+                        unsat_explanations: outcome.unsat_explanations,
+                        channels_consulted: outcome.channels_consulted,
+                        specs_count: outcome.specs_count,
+                        records_count: outcome.records_count,
+                    });
+                    if let Err(e) = write_probe_trace(&bundle, &source_dir).await {
+                        tracing::warn!(
+                            bundle = %bundle.conda_name,
+                            error = %format!("{e:#}"),
+                            "probe trace write failed (non-fatal)",
+                        );
+                    }
+                    outputs.push(output);
+                }
             }
         }
         Ok(CondaOutputsResult {
@@ -404,7 +500,7 @@ impl Handler {
         &self,
         params: CondaBuildV1Params,
     ) -> Result<CondaBuildV1Result, RpcError> {
-        let (config, download_dir, source_dir, cache_dir) =
+        let (config, download_dir, source_dir, cache_dir, workspace_dir) =
             self.snapshot(&params.work_directory).await?;
         // conda/build_v1 doesn't carry the variant set; the chosen variant
         // is encoded in params.output.variant. Look up `python` there;
@@ -452,30 +548,55 @@ impl Handler {
         };
         let target = wheel_target_for(params.output.subdir, &python_version);
 
-        // We re-resolve the full set (the lookup is cheap once cached) and
-        // pick the entry matching the requested output.
-        let (resolved, effective_config) = resolve_all(
+        // Re-resolve materialized bundles, then autodiscover emissions
+        // and pick the one matching the requested output name.
+        let (materialized, base_config) = resolve_all(
             &config,
             &target,
             &download_dir,
             &source_dir,
             &cache_dir,
             &params.channels,
+            workspace_dir.as_deref(),
         )
         .await
         .map_err(|e| RpcError::internal(format!("resolving wheels: {e:#}")))?;
+        let bundle_names: HashSet<String> =
+            materialized.iter().map(|b| b.conda_name.clone()).collect();
+        let default_name = materialized
+            .first()
+            .map(|b| b.conda_name.clone())
+            .unwrap_or_default();
+        let emissions = discover_emissions(
+            &source_dir,
+            workspace_dir.as_deref(),
+            &default_name,
+            &params.channels,
+            &python_version,
+            &bundle_names,
+        )
+        .await;
 
         let requested = params.output.name.as_normalized().to_string();
-        let picked = resolved
+        let picked_emission = emissions
             .iter()
-            .find(|b| b.conda_name == requested)
+            .find(|e| e.output_name == requested)
             .ok_or_else(|| {
                 RpcError::invalid_params(format!(
-                    "no resolved bundle matches requested output `{requested}`; \
+                    "no discovered output matches requested name `{requested}`; \
                      known: {:?}",
-                    resolved.iter().map(|b| &b.conda_name).collect::<Vec<_>>()
+                    emissions.iter().map(|e| &e.output_name).collect::<Vec<_>>()
                 ))
             })?;
+        // Apply emission to the matching base bundle. For typical
+        // single-bundle source packs there's one bundle; for multi-
+        // bundle packs we pick the bundle whose name starts the same.
+        // Falling back to materialized[0] keeps single-pack behavior
+        // identical to before.
+        let base_bundle = materialized.first().ok_or_else(|| {
+            RpcError::invalid_params("no bundles produced; check [retread-wheels]".to_string())
+        })?;
+        let (bundle, effective) = apply_emission(base_bundle, &base_config, picked_emission);
 
         let output_dir = params
             .output_directory
@@ -483,8 +604,8 @@ impl Handler {
             .unwrap_or_else(|| params.work_directory.join("output"));
 
         build_one(
-            picked,
-            &effective_config,
+            &bundle,
+            &effective,
             &params.work_directory,
             &output_dir,
             params.output.subdir,
@@ -493,13 +614,13 @@ impl Handler {
             params.output.build.as_deref(),
         )
         .await
-        .map_err(|e| RpcError::internal(format!("build {}: {e:#}", picked.conda_name)))
+        .map_err(|e| RpcError::internal(format!("build {}: {e:#}", bundle.conda_name)))
     }
 
     async fn snapshot(
         &self,
         work_dir: &Path,
-    ) -> Result<(RetreadConfig, PathBuf, PathBuf, PathBuf), RpcError> {
+    ) -> Result<(RetreadConfig, PathBuf, PathBuf, PathBuf, Option<PathBuf>), RpcError> {
         let state = self.state.read().await;
         let config = state
             .config
@@ -518,7 +639,8 @@ impl Handler {
         // pack's pixi.toml instead of buried in pixi's opaque cache.
         // cache_dir remains the scratch root for git clones.
         let download_dir = source_dir.join("wheels");
-        Ok((config, download_dir, source_dir, cache_dir))
+        let workspace_dir = state.workspace_dir.clone();
+        Ok((config, download_dir, source_dir, cache_dir, workspace_dir))
     }
 }
 
@@ -575,6 +697,7 @@ async fn resolve_all(
     source_dir: &Path,
     cache_dir: &Path,
     conda_channels: &[ChannelUrl],
+    _workspace_dir: Option<&Path>,
 ) -> Result<(Vec<Bundle>, RetreadConfig)> {
     let mut bundles = Vec::with_capacity(config.retread_wheels.len());
 
@@ -749,49 +872,248 @@ async fn resolve_all(
                 .await?;
             }
         }
-        // v0.19.0+ last-resort widening pass. Runs for any
-        // `*-with-last-resort` relax policy (patch/minor/major). Walks
-        // every emitted conda dep of every wheel in the bundle, probes
-        // the post-translate spec against the workspace's conda
-        // channels, and for each definitively-unsatisfiable spec
-        // injects an override `<pkg> = "*"` into the EFFECTIVE config
-        // so subsequent translate calls emit the widened spec
-        // automatically. Surgical -- only the deps that actually need
-        // widening get widened, the rest emit the user's base-relaxed
-        // spec untouched.
-        if effective.relax.has_last_resort() {
-            last_resort_widen_pass(
-                &mut bundle,
-                &mut effective,
-                conda_channels,
-                target,
-            )
-            .await?;
-        }
+        // v0.32.0+: pre_emit_widen_pass moved OUT of resolve_all into
+        // the per-env emission loop in conda_outputs. Materialization
+        // (download/build/auto-bundle) is env-agnostic; the cascade +
+        // override injection is env-specific so per_env can run it N
+        // times with N different channel sets / transitive
+        // constraints.
         bundles.push(bundle);
     }
     Ok((bundles, effective))
 }
 
-/// v0.19.0: last-resort widening cascade. For each conda run-dep this
-/// bundle would emit, probe the workspace's conda channels with the
-/// post-translate spec. If definitively unsatisfiable AND a `*` probe
-/// would be satisfiable, inject `<conda_name> = "*"` into
-/// effective.overrides so the next translate call emits the widened
-/// spec. Records the decision in `bundle.probe_decisions` under
-/// `stage = "last-resort-widen"` so the audit shows every widening.
+
+/// One emission targeting a specific discovered output name. The
+/// `output_name` is what pixi expects (e.g. "isaac-pack-physx"); the
+/// bundle's conda_name gets renamed to it.
+#[derive(Debug, Clone)]
+struct DiscoveredEmission {
+    output_name: String,
+    channels: Vec<ChannelUrl>,
+    transitive_overrides: BTreeMap<String, String>,
+}
+
+/// Autodiscovery-based emission planner. Walks the workspace
+/// pixi.toml looking for path-deps that resolve to `source_dir`:
+///
+///   * If the workspace declares e.g. `isaac-pack-physx = { path = "./isaac-pack" }`
+///     in `[feature.isaaclab_physx.dependencies]`, AND `isaaclab_physx`
+///     is referenced by envs `gsi` + `gsi-ros2`, retread emits ONE
+///     output named `isaac-pack-physx` whose constraints union those
+///     two envs' deps + transitive constraints.
+///   * If the workspace declares `isaac-pack-newton = { path = "./isaac-pack" }`
+///     in a feature only `gsn` uses, retread emits a second output
+///     named `isaac-pack-newton` with gsn's constraints.
+///
+/// Returns the planned emissions. When nothing in the workspace
+/// references the source package (initial setup; workspace pixi.toml
+/// missing), returns a single default emission named after
+/// `[package].name` with no env constraints (preserves single-output
+/// backward compatibility).
+async fn discover_emissions(
+    source_dir: &Path,
+    workspace_dir: Option<&Path>,
+    default_output_name: &str,
+    default_channels: &[ChannelUrl],
+    target_python: &str,
+    bundle_names: &HashSet<String>,
+) -> Vec<DiscoveredEmission> {
+    let manifest_opt = workspace_dir.and_then(crate::workspace::WorkspaceManifest::load);
+    let default_emission = || DiscoveredEmission {
+        output_name: default_output_name.to_string(),
+        channels: default_channels.to_vec(),
+        transitive_overrides: BTreeMap::new(),
+    };
+
+    let (Some(manifest), Some(ws_dir)) = (manifest_opt.as_ref(), workspace_dir) else {
+        return vec![default_emission()];
+    };
+    let discovered = manifest.discover_outputs_for_source(ws_dir, source_dir);
+    if discovered.is_empty() {
+        return vec![default_emission()];
+    }
+
+    let mut out = Vec::with_capacity(discovered.len());
+    for d in discovered {
+        // Union channels across all envs that reference this output.
+        let chan_strs = manifest.union_effective_channels(&d.envs);
+        let env_chans: Vec<ChannelUrl> = chan_strs
+            .iter()
+            .filter_map(|s| url::Url::parse(s).ok().map(ChannelUrl::from))
+            .collect();
+        let channels = if env_chans.is_empty() {
+            default_channels.to_vec()
+        } else {
+            env_chans
+        };
+
+        // Union transitive constraints across all envs that reference
+        // this output. Two envs sharing the same output must coexist
+        // under whatever retread emits; intersecting their constraints
+        // (via comma-AND) gives the conda solver the right shape.
+        let mut accumulated: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for env in &d.envs {
+            let trans = crate::workspace::extract_transitive_constraints(
+                manifest,
+                env,
+                target_python,
+                &channels,
+                bundle_names,
+            )
+            .await;
+            for (dep, specs) in trans {
+                let entry = accumulated.entry(dep).or_default();
+                for s in specs {
+                    if !entry.contains(&s) {
+                        entry.push(s);
+                    }
+                }
+            }
+        }
+        // Also fold in each env's direct [dependencies] pins as
+        // override candidates so the cascade respects them too.
+        let direct = manifest.union_effective_dependencies(&d.envs);
+        for (dep, specs) in direct {
+            let key = conda_name_from(&dep);
+            let entry = accumulated.entry(key).or_default();
+            for s in specs {
+                if !entry.contains(&s) {
+                    entry.push(s);
+                }
+            }
+        }
+
+        out.push(DiscoveredEmission {
+            output_name: d.name,
+            channels,
+            transitive_overrides: join_transitive_to_overrides(accumulated),
+        });
+    }
+    out
+}
+
+/// Collapse `dep_name -> [spec1, spec2, ...]` into comma-AND match-
+/// specs: `dep_name -> "spec1,spec2"`. The conda solver intersects
+/// comma-separated specs; an empty intersection (workspace requires
+/// conflicting versions of the same dep) becomes the conda solver's
+/// problem to surface, OR retread's cascade catches it and falls
+/// through to PyPI bundle.
+fn join_transitive_to_overrides(
+    transitive: BTreeMap<String, Vec<String>>,
+) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for (k, specs) in transitive {
+        // Dedup while preserving order. Also drop no-op specs
+        // (empty string or bare `*`): both mean "any version" and
+        // including them in the comma-AND join produces invalid
+        // match-specs like `pytorch >=1.4,*,==2.10.0` that the conda
+        // parser rejects. Defense-in-depth -- `extract_transitive_
+        // constraints` already filters at extraction time.
+        let mut seen = HashSet::new();
+        let unique: Vec<String> = specs
+            .into_iter()
+            .filter(|s| !s.is_empty() && s != "*")
+            .filter(|s| seen.insert(s.clone()))
+            .collect();
+        if unique.is_empty() {
+            continue;
+        }
+        out.insert(k, unique.join(","));
+    }
+    out
+}
+
+/// v0.33.0+: gather the spec list for the pre-emission solve check.
+/// Combines:
+///   * every run-dep this output emits (rendered as `name <spec>` or
+///     `name *` if the spec is empty)
+///   * every entry in `effective.overrides` (which carries the
+///     workspace's transitive constraints + the user's manual
+///     [retread-overrides]) -- ensures the solve respects what the
+///     workspace WILL impose at its own solve time
+fn collect_solve_specs(
+    output: &CondaOutput,
+    effective: &RetreadConfig,
+) -> Vec<String> {
+    let mut specs: Vec<String> = Vec::new();
+    for nspec in &output.run_dependencies.depends {
+        let name = nspec.name.as_str();
+        let raw = format_packagespec(&nspec.spec);
+        if raw.is_empty() {
+            specs.push(name.to_string());
+        } else {
+            specs.push(format!("{name} {raw}"));
+        }
+    }
+    for (name, spec) in &effective.overrides {
+        if spec.is_empty() || spec == "*" {
+            specs.push(name.clone());
+        } else {
+            specs.push(format!("{name} {spec}"));
+        }
+    }
+    specs
+}
+
+/// Apply a `DiscoveredEmission` to a materialized bundle + base
+/// config. Renames the bundle to the discovered output name and
+/// injects the env-union transitive constraints into the config's
+/// overrides. The cascade then treats them as authoritative.
+fn apply_emission(
+    base_bundle: &Bundle,
+    base_config: &RetreadConfig,
+    emission: &DiscoveredEmission,
+) -> (Bundle, RetreadConfig) {
+    let mut bundle = base_bundle.clone();
+    bundle.conda_name = emission.output_name.clone();
+    // Reset the per-bundle probe trace: env-specific cascade decisions
+    // get recorded fresh. Materialize-phase decisions belong to the
+    // shared materialization, not this env's solve.
+    bundle.probe_decisions.clear();
+
+    let mut config = base_config.clone();
+    for (dep, spec) in &emission.transitive_overrides {
+        // User's manual [retread-overrides] wins over workspace
+        // transitive; preserve their entry if present.
+        config
+            .overrides
+            .entry(dep.clone())
+            .or_insert_with(|| spec.clone());
+    }
+    (bundle, config)
+}
+
+/// v0.30.0 pre-emit widening pass. ALWAYS runs (regardless of relax
+/// policy) so the audit captures probe outcomes for every dep this
+/// bundle would emit. Mutation is policy-gated:
+///
+/// * `*-with-last-resort`: widen unsat specs to `*` via override
+///   injection (v0.19.0 behavior, renamed from `last_resort_widen_pass`).
+/// * `patch-then-minor-then-major-then-last-resort`: per-dep escalate
+///   patch -> PyPI -> minor -> PyPI -> major -> PyPI -> `*`, stopping at
+///   the first level that satisfies. PyPI hits add the wheel to the
+///   bundle and drop the dep from conda emission.
+/// * Everything else: probe + record only, no mutation.
 ///
 /// Why we re-translate per dep rather than re-using the BFS probe
 /// results: pyglet (and similar conda-routed deps that AREN'T in the
 /// BFS's extras/prefix set) never get probed by the BFS. They land
 /// directly at translate-time with a strict spec and the conda solver
 /// then fails. This pass catches them.
-async fn last_resort_widen_pass(
+async fn pre_emit_widen_pass(
     bundle: &mut Bundle,
     effective: &mut RetreadConfig,
     conda_channels: &[ChannelUrl],
     target: &WheelTarget,
+    download_dir: &Path,
 ) -> Result<()> {
+    // v0.32.0+: workspace pins flow in via effective.overrides
+    // (injected by apply_emission from the per-env EnvEmission's
+    // transitive_overrides). The cascade still uses them at step 7;
+    // keep the alias name so the existing logic doesn't need to know
+    // about the rename.
+    let workspace_pins: BTreeMap<String, String> = effective.overrides.clone();
     use crate::relax::{default_marker_env, translate};
     let env = default_marker_env(&target.python_version)?;
     // Names of wheels in the bundle itself. translate emissions for
@@ -812,15 +1134,26 @@ async fn last_resort_widen_pass(
         .all_wheels()
         .flat_map(|w| w.metadata.requires_dist.iter().cloned())
         .collect();
+    let tiered = effective.relax.has_tiered_cascade();
+    let allows_mut = effective.relax.allows_widening_mutation();
     for raw in raw_lines {
-        // Predict what translate WOULD emit. If translate returns
-        // None (marker false / vendored / dropped), skip.
+        // Capture the original PyPI name + specifiers from the raw
+        // requires_dist line. Needed for tiered-cascade PyPI fallback.
+        let parsed: Option<uv_pep508::Requirement> =
+            uv_pep508::Requirement::from_str(&raw).ok();
+        let pypi_name = parsed.as_ref().map(|r| r.name.to_string());
+        let pypi_specs: Option<VersionSpecifiers> = parsed.as_ref().and_then(|r| match &r.version_or_url {
+            Some(uv_pep508::VersionOrUrl::VersionSpecifier(s)) => Some(s.clone()),
+            _ => None,
+        });
+
+        // Predict what translate WOULD emit at the effective policy.
+        // If translate returns None (marker false / vendored / dropped),
+        // skip.
         let dep = match translate(&raw, &env, &effective.name_map, &effective.overrides, effective.relax) {
             Ok(Some(d)) => d.0,
             _ => continue,
         };
-        // dep is "<conda_name> <spec>" or just "<conda_name>" (no spec
-        // = any). Bare-name = no upper bound to widen, skip cheaply.
         let mut parts = dep.splitn(2, char::is_whitespace);
         let conda_name = match parts.next() {
             Some(n) if !n.is_empty() => n.to_string(),
@@ -828,21 +1161,19 @@ async fn last_resort_widen_pass(
         };
         let spec = parts.next().map(|s| s.trim().to_string()).unwrap_or_default();
         if spec.is_empty() || spec == "*" {
-            // Already maximally widened; nothing to probe.
             continue;
         }
         if bundled_names.contains(&conda_name) {
             continue;
         }
         if effective.overrides.contains_key(&conda_name) {
-            // User already pinned this; their pin wins.
             continue;
         }
         if !seen_probes.insert((conda_name.clone(), spec.clone())) {
             continue;
         }
 
-        // (1) Probe the strict spec. If satisfiable -> no widening.
+        // Step 1: probe the base-level spec. Always recorded.
         let strict_probe = crate::probe::probe(
             conda_channels,
             &conda_name,
@@ -850,70 +1181,393 @@ async fn last_resort_widen_pass(
             Some(&target.python_version),
         )
         .await;
-        if strict_probe.is_satisfied() {
+        let stage1 = if tiered { "tiered-cascade-step1-conda" } else { "pre-emit-widen-strict" };
+        let initial_routing = if strict_probe.is_satisfied() {
+            "satisfied"
+        } else if strict_probe.is_definitively_unsatisfied() {
+            "unsat"
+        } else {
+            "indecisive"
+        };
+        bundle.probe_decisions.push(crate::audit::ProbeDecision {
+            stage: stage1.into(),
+            pypi_name: pypi_name.clone().unwrap_or_else(|| conda_name.clone()),
+            conda_name: conda_name.clone(),
+            spec: spec.clone(),
+            target_python: target.python_version.clone(),
+            channels_consulted: strict_probe.channels_consulted.clone(),
+            satisfiable: strict_probe.satisfiable,
+            matching_candidates: strict_probe.matching_candidates,
+            routing_decision: initial_routing.into(),
+        });
+        if strict_probe.is_satisfied() || !strict_probe.is_definitively_unsatisfied() {
             continue;
         }
-        if !strict_probe.is_definitively_unsatisfied() {
-            // Indecisive (no consultable channels). Don't widen
-            // optimistically; record + move on.
+        // Strict spec is definitively unsat. Mutation requires policy opt-in.
+        if !allows_mut {
+            continue;
+        }
+
+        if tiered {
+            tiered_cascade_for_dep(
+                bundle,
+                effective,
+                conda_channels,
+                target,
+                download_dir,
+                &raw,
+                &env,
+                pypi_name.as_deref().unwrap_or(&conda_name),
+                pypi_specs.as_ref(),
+                &conda_name,
+                &workspace_pins,
+            )
+            .await?;
+        } else {
+            // `*-with-last-resort`: prefer the workspace's `[dependencies]`
+            // pin if one exists (audit clarity + workspace wins anyway);
+            // else probe `*` and inject if conda has any py-compatible
+            // build of the package.
+            let (target_spec, source_tag) = match workspace_pins.get(&conda_name) {
+                Some(pin) => (pin.clone(), "from-workspace-pin"),
+                None => ("*".to_string(), "any-version"),
+            };
+            let probe_result = crate::probe::probe(
+                conda_channels,
+                &conda_name,
+                &target_spec,
+                Some(&target.python_version),
+            )
+            .await;
+            let widened = probe_result.is_satisfied();
+            let routing_decision = if widened {
+                if source_tag == "from-workspace-pin" {
+                    "widened-to-workspace-pin"
+                } else {
+                    "widened-to-any-version"
+                }
+            } else {
+                "no-py-compat-version-on-conda"
+            };
             bundle.probe_decisions.push(crate::audit::ProbeDecision {
                 stage: "last-resort-widen".into(),
                 pypi_name: conda_name.clone(),
                 conda_name: conda_name.clone(),
-                spec: spec.clone(),
+                spec: target_spec.clone(),
                 target_python: target.python_version.clone(),
-                channels_consulted: strict_probe.channels_consulted.clone(),
-                satisfiable: strict_probe.satisfiable,
-                matching_candidates: strict_probe.matching_candidates,
-                routing_decision: "skipped-indecisive-strict-probe".into(),
+                channels_consulted: probe_result.channels_consulted.clone(),
+                satisfiable: probe_result.satisfiable,
+                matching_candidates: probe_result.matching_candidates,
+                routing_decision: routing_decision.into(),
             });
-            continue;
+            if widened {
+                tracing::info!(
+                    dep = %conda_name,
+                    strict_spec = %spec,
+                    widened_to = %target_spec,
+                    source = %source_tag,
+                    "last-resort-widen: conda satisfies widened spec; injecting override",
+                );
+                effective.overrides.insert(conda_name, target_spec);
+            } else {
+                tracing::warn!(
+                    dep = %conda_name,
+                    strict_spec = %spec,
+                    "last-resort-widen: conda has ZERO py-compat builds; consider retread-drop-deps + post-install pip, or use the patch-then-minor-then-major-then-last-resort policy for automatic PyPI fallback.",
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// v0.30.0 tiered cascade: per-dep escalate widening levels with PyPI
+/// fallback between them. Called only when the policy is
+/// `patch-then-minor-then-major-then-last-resort` AND step 1 (base
+/// patch probe) already came back definitively unsat.
+///
+/// Cascade steps (step 1 already attempted by caller):
+///   2. PyPI at patch range -> bundle + drop conda emit
+///   3. conda at minor widening
+///   4. PyPI at minor range -> bundle + drop conda emit
+///   5. conda at major widening
+///   6. PyPI at major range -> bundle + drop conda emit
+///   7. widen conda emit to `*`
+///
+/// "Drop conda emit" is done by pushing the PyPI name into
+/// `effective.drop_deps`, which `translate` consults to skip emission.
+/// The added wheel lives in `bundle.extras` and gets pip-installed at
+/// build time.
+async fn tiered_cascade_for_dep(
+    bundle: &mut Bundle,
+    effective: &mut RetreadConfig,
+    conda_channels: &[ChannelUrl],
+    target: &WheelTarget,
+    download_dir: &Path,
+    raw: &str,
+    env: &uv_pep508::MarkerEnvironment,
+    pypi_name: &str,
+    pypi_specs: Option<&VersionSpecifiers>,
+    conda_name: &str,
+    workspace_pins: &std::collections::BTreeMap<String, String>,
+) -> Result<()> {
+    use crate::relax::translate;
+    use std::collections::BTreeMap;
+
+    let empty_overrides: BTreeMap<String, String> = BTreeMap::new();
+
+    // Steps 2/4/6: each level's PyPI fallback resolves the original
+    // PyPI requirement and bundles the wheel. The original `pypi_specs`
+    // already encodes the upstream version range; we don't widen the
+    // PyPI search range at each conda-widening level because PyPI's
+    // job is just "give me a compatible wheel for the upstream pin",
+    // and the conda widening is independent of that.
+    let pypi_index = "https://pypi.org/simple/";
+
+    for (level_idx, level_policy) in [
+        (0usize, RelaxPolicy::Patch),
+        (1, RelaxPolicy::Minor),
+        (2, RelaxPolicy::Major),
+    ]
+    .into_iter()
+    {
+        // PyPI fallback happens AFTER the conda probe at each level
+        // EXCEPT level 0 (Patch), where the caller already did the
+        // conda probe. So the sequence becomes:
+        //   level 0: caller did conda (failed) -> step 2 PyPI here
+        //   level 1: step 3 conda, step 4 PyPI
+        //   level 2: step 5 conda, step 6 PyPI
+
+        // For levels 1 and 2: re-translate at this widening level and
+        // probe conda.
+        if level_idx > 0 {
+            let widened_dep = match translate(raw, env, &effective.name_map, &empty_overrides, level_policy) {
+                Ok(Some(d)) => d.0,
+                _ => continue,
+            };
+            let mut parts = widened_dep.splitn(2, char::is_whitespace);
+            let _ = parts.next();
+            let widened_spec = parts.next().map(|s| s.trim().to_string()).unwrap_or_default();
+            if widened_spec.is_empty() {
+                continue;
+            }
+            let conda_stage = match level_idx {
+                1 => "tiered-cascade-step3-conda",
+                2 => "tiered-cascade-step5-conda",
+                _ => unreachable!(),
+            };
+            let probe = crate::probe::probe(
+                conda_channels,
+                conda_name,
+                &widened_spec,
+                Some(&target.python_version),
+            )
+            .await;
+            let routing = if probe.is_satisfied() {
+                "satisfied-widened"
+            } else if probe.is_definitively_unsatisfied() {
+                "unsat"
+            } else {
+                "indecisive"
+            };
+            bundle.probe_decisions.push(crate::audit::ProbeDecision {
+                stage: conda_stage.into(),
+                pypi_name: pypi_name.to_string(),
+                conda_name: conda_name.to_string(),
+                spec: widened_spec.clone(),
+                target_python: target.python_version.clone(),
+                channels_consulted: probe.channels_consulted.clone(),
+                satisfiable: probe.satisfiable,
+                matching_candidates: probe.matching_candidates,
+                routing_decision: routing.into(),
+            });
+            if probe.is_satisfied() {
+                tracing::info!(
+                    dep = %conda_name,
+                    widened_spec = %widened_spec,
+                    level = ?level_policy,
+                    "tiered-cascade: conda satisfied at widened level; injecting override",
+                );
+                effective.overrides.insert(conda_name.to_string(), widened_spec);
+                return Ok(());
+            }
+            if !probe.is_definitively_unsatisfied() {
+                // Indecisive at this level -- don't escalate further,
+                // don't widen optimistically. Bail out of the cascade.
+                return Ok(());
+            }
         }
 
-        // (2) Strict spec is definitively unsatisfiable. Probe `*` to
-        // see if conda has ANY py-compatible build of the package at
-        // all. If yes -> inject override and widen.
+        // PyPI fallback at this level.
+        let pypi_stage = match level_idx {
+            0 => "tiered-cascade-step2-pypi",
+            1 => "tiered-cascade-step4-pypi",
+            2 => "tiered-cascade-step6-pypi",
+            _ => unreachable!(),
+        };
+        if let Some(specs) = pypi_specs {
+            match pypi::resolve(pypi_index, pypi_name, specs, target).await {
+                Ok(resolved) => {
+                    match fetch_and_parse(&resolved.url, resolved.sha256.as_deref(), download_dir).await {
+                        Ok(metadata) => {
+                            bundle.probe_decisions.push(crate::audit::ProbeDecision {
+                                stage: pypi_stage.into(),
+                                pypi_name: pypi_name.to_string(),
+                                conda_name: conda_name.to_string(),
+                                spec: specs.to_string(),
+                                target_python: target.python_version.clone(),
+                                channels_consulted: vec![pypi_index.to_string()],
+                                satisfiable: Some(true),
+                                matching_candidates: 1,
+                                routing_decision: "pypi-bundled-dropping-conda-emit".into(),
+                            });
+                            tracing::info!(
+                                dep = %pypi_name,
+                                level = ?level_policy,
+                                url = %resolved.url,
+                                "tiered-cascade: PyPI fallback bundled wheel; dropping conda emit",
+                            );
+                            bundle.extras.push(ResolvedWheel {
+                                pypi_name: conda_name_from(pypi_name),
+                                url: resolved.url,
+                                metadata,
+                                extras_requested: vec![],
+                                auto_data: None,
+                                auto_data_dedup_skipped_root: None,
+                            });
+                            effective.drop_deps.push(pypi_name.to_string());
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                dep = %pypi_name,
+                                error = %format!("{e:#}"),
+                                "tiered-cascade: PyPI fetch failed; trying next level",
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    bundle.probe_decisions.push(crate::audit::ProbeDecision {
+                        stage: pypi_stage.into(),
+                        pypi_name: pypi_name.to_string(),
+                        conda_name: conda_name.to_string(),
+                        spec: specs.to_string(),
+                        target_python: target.python_version.clone(),
+                        channels_consulted: vec![pypi_index.to_string()],
+                        satisfiable: Some(false),
+                        matching_candidates: 0,
+                        routing_decision: "pypi-resolve-failed".into(),
+                    });
+                    tracing::debug!(
+                        dep = %pypi_name,
+                        error = %format!("{e:#}"),
+                        "tiered-cascade: PyPI resolve failed at this level; trying next",
+                    );
+                }
+            }
+        } else {
+            // No version specifiers (URL/git/bare dep). PyPI fallback
+            // doesn't apply; just record + advance.
+            bundle.probe_decisions.push(crate::audit::ProbeDecision {
+                stage: pypi_stage.into(),
+                pypi_name: pypi_name.to_string(),
+                conda_name: conda_name.to_string(),
+                spec: String::new(),
+                target_python: target.python_version.clone(),
+                channels_consulted: vec![],
+                satisfiable: None,
+                matching_candidates: 0,
+                routing_decision: "no-pypi-specs-skipped".into(),
+            });
+        }
+    }
+
+    // Step 7: last resort. Prefer the workspace's `[dependencies]`
+    // pin (if any) over `*` so retread's emission mirrors the
+    // workspace's source of truth -- the audit shows the real spec
+    // instead of an opaque wildcard, and the conda solver picks the
+    // same version it would have anyway. Fall through to `*` if the
+    // workspace doesn't pin this dep or its pin doesn't probe-satisfy.
+    let (target_spec, source_tag) = match workspace_pins.get(conda_name) {
+        Some(pin) => (pin.clone(), "from-workspace-pin"),
+        None => ("*".to_string(), "any-version"),
+    };
+    let probe_result = crate::probe::probe(
+        conda_channels,
+        conda_name,
+        &target_spec,
+        Some(&target.python_version),
+    )
+    .await;
+    let widened = probe_result.is_satisfied();
+    bundle.probe_decisions.push(crate::audit::ProbeDecision {
+        stage: "tiered-cascade-step7-last-resort".into(),
+        pypi_name: pypi_name.to_string(),
+        conda_name: conda_name.to_string(),
+        spec: target_spec.clone(),
+        target_python: target.python_version.clone(),
+        channels_consulted: probe_result.channels_consulted.clone(),
+        satisfiable: probe_result.satisfiable,
+        matching_candidates: probe_result.matching_candidates,
+        routing_decision: if widened {
+            if source_tag == "from-workspace-pin" {
+                "widened-to-workspace-pin"
+            } else {
+                "widened-to-any-version"
+            }
+        } else {
+            "no-py-compat-version-on-conda"
+        }
+        .into(),
+    });
+    if widened {
+        tracing::info!(
+            dep = %conda_name,
+            widened_to = %target_spec,
+            source = %source_tag,
+            "tiered-cascade: last-resort widening; injecting override",
+        );
+        effective.overrides.insert(conda_name.to_string(), target_spec);
+    } else if source_tag == "from-workspace-pin" {
+        // Workspace pin didn't probe-satisfy. Fall back to `*` so
+        // conda solver can at least try.
         let any_probe = crate::probe::probe(
             conda_channels,
-            &conda_name,
+            conda_name,
             "*",
             Some(&target.python_version),
         )
         .await;
-        let widened_to_any = any_probe.is_satisfied();
-        let routing_decision = if widened_to_any {
-            "widened-to-any-version"
-        } else {
-            "no-py-compat-version-on-conda"
-        };
-        bundle.probe_decisions.push(crate::audit::ProbeDecision {
-            stage: "last-resort-widen".into(),
-            pypi_name: conda_name.clone(),
-            conda_name: conda_name.clone(),
-            spec: spec.clone(),
-            target_python: target.python_version.clone(),
-            channels_consulted: any_probe.channels_consulted.clone(),
-            satisfiable: any_probe.satisfiable,
-            matching_candidates: any_probe.matching_candidates,
-            routing_decision: routing_decision.into(),
-        });
-        if widened_to_any {
+        if any_probe.is_satisfied() {
             tracing::info!(
                 dep = %conda_name,
-                strict_spec = %spec,
-                "last-resort-widen: conda has py-compat builds at OTHER versions; widening emitted spec to `*`",
+                workspace_pin = %target_spec,
+                "tiered-cascade: workspace pin didn't probe-satisfy; falling through to `*`",
             );
-            effective.overrides.insert(conda_name, "*".into());
+            bundle.probe_decisions.push(crate::audit::ProbeDecision {
+                stage: "tiered-cascade-step7-last-resort".into(),
+                pypi_name: pypi_name.to_string(),
+                conda_name: conda_name.to_string(),
+                spec: "*".into(),
+                target_python: target.python_version.clone(),
+                channels_consulted: any_probe.channels_consulted.clone(),
+                satisfiable: any_probe.satisfiable,
+                matching_candidates: any_probe.matching_candidates,
+                routing_decision: "widened-to-any-version-after-workspace-pin-miss".into(),
+            });
+            effective.overrides.insert(conda_name.to_string(), "*".into());
         } else {
-            // PyPI fallback (step 5 of the cascade) would land here.
-            // Not implemented yet -- log so the user knows to drop or
-            // hand-bundle.
             tracing::warn!(
                 dep = %conda_name,
-                strict_spec = %spec,
-                "last-resort-widen: conda has ZERO py-compat builds; consider retread-drop-deps + post-install pip, or add as a separate retread-wheels entry. PyPI-side last-resort (TODO v0.20) would auto-bundle here.",
+                "tiered-cascade: every step exhausted; conda has no py-compat build. Consider retread-drop-deps.",
             );
         }
+    } else {
+        tracing::warn!(
+            dep = %conda_name,
+            "tiered-cascade: every step exhausted; conda has no py-compat build at any version. Solve will fail. Consider retread-drop-deps.",
+        );
     }
     Ok(())
 }
@@ -996,6 +1650,7 @@ async fn resolve_bundle(
             primary,
             extras: vec![],
             probe_decisions: vec![],
+            solve_diagnostics: None,
         });
     }
 
@@ -1332,6 +1987,7 @@ async fn resolve_bundle(
         primary,
         extras,
         probe_decisions,
+        solve_diagnostics: None,
     })
 }
 
@@ -2501,10 +3157,110 @@ fn build_bundle_audit(
         wheels,
         emitted_run_deps,
         bundle.probe_decisions.clone(),
+        bundle.solve_diagnostics.clone(),
     )
 }
 
 /// v0.14.1+: dump just the bundle's probe decisions to a side file
+/// v0.23.0+ POST-EMIT widening: probe every run-dep that produce_output
+/// emitted, widen any that the workspace's conda channels can't satisfy.
+///
+/// Runs in `conda_outputs` AFTER produce_output produces the
+/// CondaOutput. Walks `output.run_dependencies.depends`, calls
+/// `probe::probe(name, spec, python)` for each non-python spec. For
+/// any spec that's definitively unsatisfied, mutates the spec in
+/// place to `*` (the "widen to any version" fallback) AND records a
+/// ProbeDecision under stage `"post-emit-widen"` so the audit shows
+/// what got changed.
+///
+/// Why this is in addition to (and arguably instead of) the pre-emit
+/// `last_resort_widen_pass`: the pre-emit cascade re-translates each
+/// wheel's `requires_dist` and probes the result, but produce_output's
+/// emit path also applies the vendored/dropped/cross-output filters
+/// and dedups by first-spec-wins -- so what cascade predicts can
+/// diverge from what produce_output actually emits. This pass probes
+/// the ACTUAL output, eliminating that drift.
+async fn post_emit_widen_pass(
+    output: &mut CondaOutput,
+    conda_channels: &[ChannelUrl],
+    target_python: &str,
+    policy: RelaxPolicy,
+    decisions: &mut Vec<crate::audit::ProbeDecision>,
+) -> Result<()> {
+    let allows_mut = policy.allows_widening_mutation();
+    for spec in output.run_dependencies.depends.iter_mut() {
+        let name_str = spec.name.as_str().to_string();
+        if name_str == "python" {
+            continue;
+        }
+        let spec_str = format_packagespec(&spec.spec);
+        if spec_str.is_empty() || spec_str == "*" {
+            continue;
+        }
+        let probe_result = crate::probe::probe(
+            conda_channels,
+            &name_str,
+            &spec_str,
+            Some(target_python),
+        )
+        .await;
+        let routing_decision = if probe_result.is_definitively_unsatisfied() {
+            if allows_mut { "widened-to-any-version" } else { "unsat-no-mutation" }
+        } else if probe_result.is_satisfied() {
+            "no-widening-needed"
+        } else {
+            "skipped-indecisive"
+        };
+        decisions.push(crate::audit::ProbeDecision {
+            stage: "post-emit-widen".into(),
+            pypi_name: name_str.clone(),
+            conda_name: name_str.clone(),
+            spec: spec_str.clone(),
+            target_python: target_python.to_string(),
+            channels_consulted: probe_result.channels_consulted.clone(),
+            satisfiable: probe_result.satisfiable,
+            matching_candidates: probe_result.matching_candidates,
+            routing_decision: routing_decision.into(),
+        });
+        if probe_result.is_definitively_unsatisfied() && allows_mut {
+            tracing::info!(
+                dep = %name_str,
+                strict_spec = %spec_str,
+                "post-emit-widen: emitted spec is unsat on conda channels; rewriting to `*`",
+            );
+            spec.spec = wildcard_packagespec();
+        }
+    }
+    Ok(())
+}
+
+/// Render a PackageSpec to its conda match-spec string form (just the
+/// version-constraint half, name not included).
+fn format_packagespec(spec: &PackageSpec) -> String {
+    match spec {
+        PackageSpec::Binary(b) => b
+            .version
+            .as_ref()
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+/// Build a wildcard ("any version") PackageSpec for the post-emit
+/// widening fallback.
+fn wildcard_packagespec() -> PackageSpec {
+    use rattler_conda_types::{ParseStrictness, VersionSpec};
+    use std::str::FromStr;
+    PackageSpec::Binary(BinaryPackageSpec {
+        version: Some(
+            VersionSpec::from_str("*", ParseStrictness::Lenient)
+                .expect("'*' is always a valid VersionSpec"),
+        ),
+        ..Default::default()
+    })
+}
+
 /// next to the source-package pixi.toml. Always-on; survives a failed
 /// conda solve. The full audit (a superset) still gets written at
 /// conda/build_v1 time. Filename matches the audit convention:
@@ -2686,6 +3442,29 @@ mod tests {
     use crate::config::RelaxPolicy;
     use std::collections::BTreeMap;
 
+    fn test_tmpdir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "retread-handler-test-{label}-{}-{}",
+            std::process::id(),
+            uuid_like(),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn uuid_like() -> String {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        format!("{ns:x}")
+    }
+
+    // v0.32.0+: workspace pin/transitive-constraint parsing moved to
+    // src/workspace.rs (see WorkspaceManifest::extract_transitive_constraints
+    // + discover_outputs_for_source). Tests for that live there.
+
     fn cfg() -> RetreadConfig {
         RetreadConfig {
             retread_wheels: BTreeMap::new(),
@@ -2733,6 +3512,7 @@ mod tests {
             primary: rw(name, meta(name, "1.0.0", requires, true)),
             extras: vec![],
             probe_decisions: vec![],
+            solve_diagnostics: None,
         }
     }
 
@@ -2852,6 +3632,7 @@ mod tests {
                 ),
             ],
             probe_decisions: vec![],
+            solve_diagnostics: None,
         };
 
         let output = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[]).unwrap();
@@ -2990,6 +3771,7 @@ mod tests {
                 ),
             ],
             probe_decisions: vec![],
+            solve_diagnostics: None,
         };
 
         let output =
@@ -3072,6 +3854,7 @@ mod tests {
             },
             extras: vec![],
             probe_decisions: vec![],
+            solve_diagnostics: None,
         };
 
         let output =
