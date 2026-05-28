@@ -1,6 +1,6 @@
 [package]
 name = "pixi-build-retread"
-version = "0.33.0"
+version = "0.36.4"
 edition = "2024"
 description = "Retread PyPI wheels as conda packages, with dep versions loosened and shared deps preferred from conda"
 license = "BSD-3-Clause"
@@ -18,14 +18,14 @@ pixi_build_types = { git = "https://github.com/prefix-dev/pixi", rev = "dc5d0dc5
 
 # Match the pinned versions in pixi's workspace so the on-wire types serialize
 # identically.
-rattler_conda_types = { version = "0.42.2", default-features = false }
+# v0.34.3+: pinned rattler trio with mutually-compatible rattler_conda_types
+# (=0.42.5). rattler_solve does pre-emission conda solves;
+# rattler_virtual_packages detects host vpkgs so the solve check
+# isn't false-unsat on __archspec / __glibc / etc.
+rattler_conda_types = { version = "=0.42.2", default-features = false }
 rattler_digest = { version = "1.2.0", default-features = false, features = ["serde"] }
-# v0.33.0+ pre-emission solve check. Runs a real conda solve over
-# (workspace effective deps + retread's emitted run-deps) at the end
-# of conda/outputs to surface cross-package conflicts (cuda 13 vs
-# cuda 12.8, etc.) BEFORE pixi runs and blames the wrong leaf.
-# Matched version with our rattler_conda_types 0.42.x line.
 rattler_solve = { version = "=4.1.0", default-features = false, features = ["resolvo"] }
+rattler_virtual_packages = { version = "=2.3.2", default-features = false }
 ordermap = { version = "1.0.0", features = ["serde"] }
 
 # Async runtime. JSON-RPC 2.0 is hand-framed over line-delimited stdio (matches

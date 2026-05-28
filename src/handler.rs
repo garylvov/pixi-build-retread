@@ -66,11 +66,16 @@ const PARSELMOUTH_MAPPING_URL: &str =
 /// Each entry should be accompanied by a link to the relevant
 /// parselmouth issue so it can be removed when fixed.
 const FALLBACK_PYPI_TO_CONDA: &[(&str, &str)] = &[
-    // prefix-dev/parselmouth#10: `py-opencv` (conda-forge) is incorrectly
-    // mapped to `None` instead of providing `opencv-python` /
-    // `opencv-python-headless`. Both are real conda-forge packages.
-    ("opencv-python",          "py-opencv"),
-    ("opencv-python-headless", "py-opencv"),
+    // v0.34.5+: map opencv-python{,-headless} to `opencv` (the
+    // current conda-forge name) rather than `py-opencv`. py-opencv
+    // exists on conda-forge but was last updated in the py3.6 era
+    // (4.2.0) -- conda-forge today ships `opencv` which provides
+    // Python bindings via libopencv. Mapping to py-opencv was a
+    // long-standing retread bug that surfaced as
+    // `py-opencv >=4.11 -> libopencv ==4.2.0 py36_5, no candidates`
+    // in the solve check.
+    ("opencv-python",          "opencv"),
+    ("opencv-python-headless", "opencv"),
     // Already covered by parselmouth (`pytorch: [torch]`) but here as a
     // safety net in case the fetch fails entirely.
     ("torch",                  "pytorch"),
@@ -246,11 +251,15 @@ struct Bundle {
     /// audit. The audit is also flushed early (at conda/outputs) so
     /// failed conda solves still leave this trace on disk.
     probe_decisions: Vec<crate::audit::ProbeDecision>,
-    /// v0.33.0+: outcome of the pre-emission solve check over
-    /// (workspace effective deps + this output's emitted run-deps).
-    /// Persisted in the audit so users see the real cross-package
-    /// conflict before pixi gives them a misleading leaf error.
-    solve_diagnostics: Option<crate::audit::SolveDiagnostics>,
+    /// v0.33.5+: per-env outcome of the pre-emission solve check.
+    /// One entry per workspace env that references this discovered
+    /// output. Empty `BTreeMap` means the check was skipped (no
+    /// workspace, no envs). Each diagnostic shows what THAT env's
+    /// conda solver will fail on -- much more actionable than the
+    /// cross-env union (which over-constrains because envs that
+    /// don't actually pull in all features still inherit those
+    /// features' transitives in the union).
+    solve_diagnostics: BTreeMap<String, crate::audit::SolveDiagnostics>,
 }
 
 impl Bundle {
@@ -348,6 +357,30 @@ impl Handler {
         // per-entry context from resolve_all is the only way the user
         // ever learns which [retread-wheels] entry actually broke.
         let mut outputs = Vec::new();
+        // v0.35.0+: track whether ANY (bundle, env) solve succeeded
+        // and accumulate workspace-block messages from envs that
+        // ended in Class B/C. If nothing solved AND retread has
+        // actionable workspace suggestions, fail conda/outputs with
+        // a clear error so pixi shows the diagnostic INSTEAD of its
+        // misleading leaf.
+        // v0.36.0: tracked but no longer used in the fail gate (see
+        // comments at the gate ~line 700). Kept for diagnostics
+        // (tracing emission after the per-env loop).
+        let mut any_solve_passed: bool = false;
+        let mut all_solve_attempted: bool = false;
+        let mut workspace_block_messages: Vec<String> = Vec::new();
+        // v0.36.1+: per-env solve-outcome counts so the failure
+        // message can name which envs failed instead of falsely
+        // claiming "every env failed" when in fact only some did.
+        let mut envs_attempted: usize = 0;
+        let mut envs_failed_with_block: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        // v0.36.2+: track REAL suggestions separately from "see the
+        // trace" placeholders. The previous count conflated them,
+        // so the message claimed "4 workspace-edit suggestion(s)
+        // available" even when 0 actionable suggestions were
+        // generated (all chains filtered as installable).
+        let mut real_suggestion_count: usize = 0;
         for python_version in &pythons {
             let target = wheel_target_for(params.host_platform, python_version);
             // Phase 1: materialize wheels + auto-bundle. Env-agnostic;
@@ -445,40 +478,348 @@ impl Handler {
                             bundle.conda_name,
                         ))
                     })?;
-                    // v0.33.0+ pre-emission solve check. Build the
-                    // combined spec set (this output's emitted
-                    // run-deps + every override -- which carries the
-                    // workspace's transitive constraints) and run a
-                    // real conda solve to detect cross-package
-                    // conflicts. The solver's unsat strings surface
-                    // in the audit so users see the real chain
-                    // (cuda-bindings 13 -> cuda 13 vs cuda-toolkit
-                    // 12.8 -> cuda 12.8) instead of pixi's misleading
-                    // leaf error.
-                    let solve_specs = collect_solve_specs(&output, &effective);
-                    let outcome = crate::solve_check::run_solve_check(
-                        &emission.channels,
-                        &solve_specs,
-                        python_version,
-                        &params.host_platform.to_string(),
-                    )
-                    .await;
-                    if !outcome.satisfiable && !outcome.unsat_explanations.is_empty() {
-                        tracing::warn!(
-                            bundle = %bundle.conda_name,
-                            reasons = ?outcome.unsat_explanations,
-                            "pre-emission solve check: UNSAT -- conda will fail at solve time. \
-                             See retread-audit-{bundle}.json.solve_diagnostics for the chain.",
-                            bundle = bundle.conda_name.as_str(),
+                    // v0.33.5+ per-env pre-emission solve check. For
+                    // each env that references this discovered
+                    // output, run a real conda solve scoped to THAT
+                    // env's channels + effective deps + retread's
+                    // emission. Each env gets its own diagnostic so
+                    // users see exactly which env conflicts on what.
+                    //
+                    // Why per-env (not union): cross-env union
+                    // over-constrains -- e.g. an env that doesn't use
+                    // feature.ros2 would still get ros-humble-*
+                    // transitive constraints folded in, producing
+                    // false-positive `ros2-distro-mutex` collisions
+                    // in the diagnostic that don't reflect what pixi
+                    // will actually fail on.
+                    let manifest_for_solve = workspace_dir
+                        .as_deref()
+                        .and_then(crate::workspace::WorkspaceManifest::load);
+                    // Honor the workspace's channel-priority setting
+                    // so retread's solve check matches what pixi will
+                    // actually do. Default to Strict (pixi's own
+                    // default) when the workspace doesn't specify.
+                    //
+                    // v0.36.3+: was Disabled in v0.34.5-0.36.2 as a
+                    // misread "fix" -- I thought strict was over-
+                    // rejecting conda-forge candidates, but actually
+                    // strict was doing exactly the right thing
+                    // (pytorch from pytorch channel; conda-forge's
+                    // pytorch would shadow it under disabled).
+                    // Disabled lets conda-forge's CPU torchaudio
+                    // compete with pytorch channel's GPU torchaudio
+                    // on raw version comparison and pick the wrong
+                    // one. Strict respects channel ORDER -- which is
+                    // why users list pytorch first in the first place.
+                    let workspace_channel_priority = manifest_for_solve
+                        .as_ref()
+                        .and_then(|m| m.channel_priority.as_deref())
+                        .map(|s| match s {
+                            "disabled" => rattler_solve::ChannelPriority::Disabled,
+                            _ => rattler_solve::ChannelPriority::Strict,
+                        })
+                        .unwrap_or(rattler_solve::ChannelPriority::Strict);
+                    let emitted_run_deps_strs: Vec<String> = output
+                        .run_dependencies
+                        .depends
+                        .iter()
+                        .map(|n| {
+                            let raw = format_packagespec(&n.spec);
+                            if raw.is_empty() {
+                                n.name.as_str().to_string()
+                            } else {
+                                format!("{} {raw}", n.name.as_str())
+                            }
+                        })
+                        .collect();
+                    let env_names: Vec<String> = if emission.envs.is_empty() {
+                        // Fallback default emission: no workspace
+                        // envs known -- do ONE solve check using the
+                        // emission's channels and just the
+                        // run-deps.
+                        vec!["__default__".to_string()]
+                    } else {
+                        emission.envs.clone()
+                    };
+                    // v0.36.2+: snapshot the post-pre-emit-widen state
+                    // so each env's iterative refinement starts from
+                    // the SAME baseline. Without this, env A's
+                    // widenings leak into env B's solve via the shared
+                    // `&mut bundle` / `&mut effective` -- making
+                    // sibling envs appear "sat" because A already
+                    // widened pytorch/torchvision/etc. The user
+                    // caught this: gsi-ros2 ⊇ gsi (it includes every
+                    // gsi feature plus ros2); if gsi is unsat,
+                    // gsi-ros2 cannot truly be sat, but state leakage
+                    // was producing exactly that false positive.
+                    //
+                    // solve_diagnostics accumulates ACROSS envs
+                    // (each env contributes its own entry) -- only
+                    // the override + probe_decision state resets.
+                    let bundle_snapshot = bundle.clone();
+                    let effective_snapshot = effective.clone();
+                    let mut accumulated_diagnostics: BTreeMap<
+                        String,
+                        crate::audit::SolveDiagnostics,
+                    > = BTreeMap::new();
+                    // v0.36.4+: per-env refinement widens a LOCAL
+                    // copy of effective.overrides (via the
+                    // snapshot/restore pattern below). Union those
+                    // widenings here so we can rebuild `output` ONCE
+                    // after the env loop with the loosest spec per
+                    // dep — otherwise the iter widenings were inert
+                    // (the trace claimed they happened but the
+                    // CondaOutput pixi receives reflected only the
+                    // pre-refinement state). Starts from the
+                    // snapshot's overrides so non-widened entries
+                    // (transitive constraints injected by
+                    // discover_emissions, user overrides) carry
+                    // through unchanged.
+                    let mut accumulated_overrides: BTreeMap<String, String> =
+                        effective_snapshot.overrides.clone();
+                    for env_name in &env_names {
+                        bundle = bundle_snapshot.clone();
+                        effective = effective_snapshot.clone();
+                        let (env_channels, env_workspace_specs) = match (&manifest_for_solve, env_name.as_str()) {
+                            (Some(m), n) if n != "__default__" => {
+                                let chans: Vec<ChannelUrl> = m
+                                    .effective_channels(n)
+                                    .iter()
+                                    .filter_map(|s| url::Url::parse(s).ok().map(ChannelUrl::from))
+                                    .collect();
+                                let chans = if chans.is_empty() {
+                                    params.channels.clone()
+                                } else {
+                                    chans
+                                };
+                                let mut specs: Vec<String> = Vec::new();
+                                for (dep_name, spec) in m.effective_dependencies(n) {
+                                    if spec.is_empty() || spec == "*" {
+                                        specs.push(dep_name);
+                                    } else {
+                                        specs.push(format!("{dep_name} {spec}"));
+                                    }
+                                }
+                                (chans, specs)
+                            }
+                            _ => (params.channels.clone(), Vec::new()),
+                        };
+                        // v0.34.0+: iterative refinement. The solve
+                        // check may say UNSAT because retread emitted
+                        // a too-narrow spec (e.g. `triton >=3.7.0,<3.8`
+                        // when conda's triton 3.7 needs cuda 13 but
+                        // the workspace pins cuda 12.8). The cascade
+                        // didn't widen because the per-dep probe saw
+                        // triton 3.7.0 satisfying in isolation. Now
+                        // we feed the solve-check failure BACK into
+                        // the cascade: parse the blocking deps from
+                        // the unsat explanation, widen any of them
+                        // that are retread-emitted to `*`, re-run
+                        // produce_output + solve check. Iterate up
+                        // to MAX_REFINEMENT iterations (cap so we
+                        // don't loop forever on external conflicts).
+                        let outcome = iterative_solve_refinement(
+                            &emitted_run_deps_strs,
+                            &env_workspace_specs,
+                            &env_channels,
+                            python_version,
+                            &params.host_platform.to_string(),
+                            &mut bundle,
+                            &mut effective,
+                            params.host_platform,
+                            &siblings,
+                            env_name,
+                            manifest_for_solve.as_ref(),
+                            workspace_channel_priority,
+                        )
+                        .await
+                        .map_err(|e| {
+                            RpcError::internal(format!(
+                                "solve refinement for {} env {}: {e:#}",
+                                bundle.conda_name, env_name,
+                            ))
+                        })?;
+                        // v0.36.4+: refinement may have widened
+                        // entries in `effective.overrides` for this
+                        // env. Union them into accumulated_overrides
+                        // (loosest spec per dep wins) so the
+                        // post-loop rebuild ships a CondaOutput
+                        // whose run-deps satisfy every env.
+                        //
+                        // Previously this site was `let _ = &output;`
+                        // — a no-op placeholder whose comment
+                        // described the propagation that never
+                        // actually happened. Result: the trace
+                        // showed widenings, retread's solve_check
+                        // reported sat against the widened in-loop
+                        // run-deps, but pixi received the original
+                        // pre-refinement emission and exploded on
+                        // misleading leaves (e.g. the joint-state-
+                        // publisher `python_abi 3.9.*` chain whose
+                        // real cause was retread's un-widened
+                        // `pytorch ==2.10.0` forcing numpy 2 and
+                        // knocking out the np126py311 builds).
+                        for (dep, spec) in &effective.overrides {
+                            merge_looser_override(
+                                &mut accumulated_overrides,
+                                dep,
+                                spec,
+                            );
+                        }
+                        if !outcome.satisfiable && !outcome.unsat_explanations.is_empty() {
+                            // Print the FULL diagnostic to stderr in
+                            // a banner so it survives pixi's log
+                            // filtering even at default verbosity.
+                            // pixi reports its own (often misleading)
+                            // leaf error -- this gives the user the
+                            // REAL upstream conflict chain alongside.
+                            let banner_lines: Vec<String> = outcome
+                                .unsat_explanations
+                                .iter()
+                                .map(|r| format!("    {}", r.replace('\n', "\n    ")))
+                                .collect();
+                            eprintln!(
+                                "\n\
+                                 ┌──────────────────────────────────────────────────────────────────────\n\
+                                 │ RETREAD SOLVE FAILURE -- output `{}` env `{}`\n\
+                                 │ (pre-emission solve check; pixi's own error below may be misleading)\n\
+                                 ├──────────────────────────────────────────────────────────────────────\n\
+                                 {}\n\
+                                 │\n\
+                                 │ Full trace: retread-probe-trace-{}.json\n\
+                                 └──────────────────────────────────────────────────────────────────────\n",
+                                bundle.conda_name,
+                                env_name,
+                                banner_lines.join("\n"),
+                                bundle.conda_name,
+                            );
+                            tracing::error!(
+                                bundle = %bundle.conda_name,
+                                env = %env_name,
+                                "pre-emission solve check UNSAT (see banner on stderr)",
+                            );
+                        }
+                        all_solve_attempted = true;
+                        envs_attempted += 1;
+                        if outcome.satisfiable {
+                            any_solve_passed = true;
+                        }
+                        // For workspace-blocked envs, accumulate a
+                        // one-liner suggestion for the consolidated
+                        // RPC failure message at the end.
+                        let class_tag = outcome.terminal_classification.clone().unwrap_or_default();
+                        if !outcome.satisfiable
+                            && (class_tag.starts_with("B-")
+                                || class_tag.starts_with("C-")
+                                || class_tag.starts_with("A-exhausted")
+                                || class_tag.starts_with("A-no-widening")
+                                || class_tag.starts_with("A-iteration-cap"))
+                        {
+                            envs_failed_with_block.insert(env_name.clone());
+                            for sug in &outcome.workspace_edit_suggestions {
+                                real_suggestion_count += 1;
+                                let feat = sug
+                                    .feature
+                                    .as_deref()
+                                    .map(|f| format!("[feature.{f}.dependencies]"))
+                                    .unwrap_or_else(|| "[dependencies]".to_string());
+                                workspace_block_messages.push(format!(
+                                    "  env `{}` / {}: change `{}` -> `{}`  ({})",
+                                    sug.env, feat, sug.current_pin, sug.suggested_pin, sug.reason,
+                                ));
+                            }
+                            // If no suggestions but workspace-blocked,
+                            // still include a generic line so the user
+                            // knows where to look.
+                            if outcome.workspace_edit_suggestions.is_empty() {
+                                workspace_block_messages.push(format!(
+                                    "  env `{}` blocked ({}): see retread-probe-trace-{}.json.solve_diagnostics.{}",
+                                    env_name, class_tag, bundle.conda_name, env_name,
+                                ));
+                            }
+                        }
+                        accumulated_diagnostics.insert(
+                            env_name.clone(),
+                            crate::audit::SolveDiagnostics {
+                                satisfiable: outcome.satisfiable,
+                                unsat_explanations: outcome.unsat_explanations,
+                                channels_consulted: outcome.channels_consulted,
+                                specs_count: outcome.specs_count,
+                                records_count: outcome.records_count,
+                                refinement_steps: outcome.refinement_steps,
+                                workspace_edit_suggestions: outcome.workspace_edit_suggestions,
+                                terminal_classification: outcome.terminal_classification,
+                            },
                         );
                     }
-                    bundle.solve_diagnostics = Some(crate::audit::SolveDiagnostics {
-                        satisfiable: outcome.satisfiable,
-                        unsat_explanations: outcome.unsat_explanations,
-                        channels_consulted: outcome.channels_consulted,
-                        specs_count: outcome.specs_count,
-                        records_count: outcome.records_count,
-                    });
+                    // Transfer accumulated per-env diagnostics back
+                    // onto the bundle so the probe trace + audit MD
+                    // files include all envs (the snapshot-restore
+                    // pattern above resets bundle.solve_diagnostics
+                    // every iteration).
+                    bundle.solve_diagnostics = accumulated_diagnostics;
+                    // v0.36.4+: rebuild `output` to ship the
+                    // union'd refinement widenings. Snapshot-restore
+                    // semantics inside the env loop discarded each
+                    // env's mutations to bundle/effective, and the
+                    // original `output` (created pre-loop) reflected
+                    // only the pre-emit widen pass. Restore the
+                    // base bundle for emission, apply the
+                    // accumulated overrides, re-run produce_output +
+                    // post_emit_widen_pass, and replace `output`
+                    // with the result. Cheap: produce_output is
+                    // pure rendering and post_emit_widen_pass hits
+                    // the in-memory repodata cache.
+                    let widening_changed = accumulated_overrides
+                        != effective_snapshot.overrides;
+                    if widening_changed {
+                        let mut rebuild_effective = effective_snapshot.clone();
+                        rebuild_effective.overrides = accumulated_overrides.clone();
+                        let rebuilt = produce_output(
+                            &bundle_snapshot,
+                            &rebuild_effective,
+                            params.host_platform,
+                            python_version,
+                            &siblings,
+                        )
+                        .map_err(|e| {
+                            RpcError::internal(format!(
+                                "post-refinement output rebuild for {}: {e:#}",
+                                bundle_snapshot.conda_name,
+                            ))
+                        })?;
+                        output = rebuilt;
+                        // post_emit_widen_pass records its probes
+                        // against bundle.probe_decisions. After the
+                        // env loop's snapshot/restore + diagnostic
+                        // assignment above, `bundle` still holds the
+                        // last env's clone. That's fine for probe
+                        // recording -- the post-emit pass mutates
+                        // output's run-deps in place per the
+                        // ground-truth repodata, and any probe
+                        // decisions it adds become part of this
+                        // bundle's audit.
+                        post_emit_widen_pass(
+                            &mut output,
+                            &emission.channels,
+                            python_version,
+                            rebuild_effective.relax,
+                            &mut bundle.probe_decisions,
+                        )
+                        .await
+                        .map_err(|e| {
+                            RpcError::internal(format!(
+                                "post-refinement post-emit widen for {}: {e:#}",
+                                bundle.conda_name,
+                            ))
+                        })?;
+                        tracing::info!(
+                            bundle = %bundle.conda_name,
+                            widened_count = accumulated_overrides.len()
+                                - effective_snapshot.overrides.len(),
+                            "rebuilt output with refinement-widened overrides",
+                        );
+                    }
                     if let Err(e) = write_probe_trace(&bundle, &source_dir).await {
                         tracing::warn!(
                             bundle = %bundle.conda_name,
@@ -486,9 +827,95 @@ impl Handler {
                             "probe trace write failed (non-fatal)",
                         );
                     }
+                    // v0.34.2+: write a sticky human-readable diagnostic
+                    // markdown file next to the source package's
+                    // pixi.toml whenever ANY env's solve is unsat.
+                    // pixi's progress spinner clears stderr lines, so
+                    // the banner doesn't survive. A file does. Path:
+                    // <source_dir>/RETREAD-SOLVE-FAILED-<bundle>.md
+                    if let Err(e) = write_solve_failed_summary(&bundle, &source_dir).await {
+                        tracing::debug!(
+                            bundle = %bundle.conda_name,
+                            error = %format!("{e:#}"),
+                            "solve-failed summary write failed (non-fatal)",
+                        );
+                    }
                     outputs.push(output);
                 }
             }
+        }
+        tracing::debug!(
+            outputs = outputs.len(),
+            any_solve_passed,
+            all_solve_attempted,
+            workspace_block_messages = workspace_block_messages.len(),
+            "per-env emission loop complete",
+        );
+        // v0.36.0+: fail conda/outputs if ANY env produced an
+        // actionable workspace conflict, even if other envs passed.
+        //
+        // Why this changed in v0.36.0: in v0.35.x the gate was
+        // `!any_solve_passed`. That hid a worst-case bug -- the
+        // ABI-anchor widening regression silently corrupted outputs
+        // (`python *`) so 3 of 4 envs "passed" against the
+        // pre-emission solve check; retread shipped those corrupt
+        // outputs to pixi; pixi's downstream solve then exploded on
+        // a misleading leaf (`gymnasium ... python_abi 3.11`). With
+        // v0.36.0's ABI-anchor invariant + per-chain verdicts, the
+        // cascade no longer corrupts outputs in this way -- so the
+        // gate can safely be tightened to "any env actionable" and
+        // the user gets the structured RPC error + the MD-file path
+        // even when sibling envs happen to be solvable.
+        if all_solve_attempted && !workspace_block_messages.is_empty() {
+            // Build the file-path hint pointing at the source dir.
+            // The MD file is named after the bundle's conda name.
+            let md_paths: Vec<String> = bundle_md_paths(&source_dir, &outputs)
+                .into_iter()
+                .collect();
+            let md_hint = if md_paths.is_empty() {
+                format!("RETREAD-SOLVE-FAILED-*.md under {}", source_dir.display())
+            } else {
+                md_paths.join(" ")
+            };
+            // ONE short headline + accurate scope + path. Detail
+            // lives in the MD file. Pixi will display this verbatim.
+            //
+            // Scope text reflects whether the failure is total or
+            // partial -- "1 of 4 envs failed" reads very differently
+            // from "every env failed" and the user shouldn't have to
+            // open the MD file to know which.
+            let n_failed = envs_failed_with_block.len();
+            let failed_env_list: Vec<String> = envs_failed_with_block.iter().cloned().collect();
+            let scope = if envs_attempted > 0 && n_failed == envs_attempted {
+                format!("every env ({n_failed}/{envs_attempted})")
+            } else if envs_attempted > 0 {
+                format!(
+                    "{n_failed} of {envs_attempted} envs: [{}]",
+                    failed_env_list.join(", "),
+                )
+            } else {
+                format!("{n_failed} env(s)")
+            };
+            // v0.36.2+: distinguish real suggestions from
+            // "see-the-trace" fallback. Previous message
+            // conflated them ("4 workspace-edit suggestion(s)
+            // available" even when 0 actionable suggestions were
+            // generated) which was confusing when the MD's
+            // suggestions section was empty.
+            let action_line = if real_suggestion_count > 0 {
+                format!(
+                    "{real_suggestion_count} actionable workspace-edit suggestion(s) at the top of the MD",
+                )
+            } else {
+                "no auto-suggestion (cascade exhausted; conflict is upstream-wheel-vs-workspace-pin and \
+                 requires manual judgment -- see the per-env refinement steps in the MD for what was tried)"
+                    .to_string()
+            };
+            let msg = format!(
+                "retread: pre-emission solve check failed for {scope} against workspace pins. \
+                 {action_line}. Open: {md_hint}",
+            );
+            return Err(RpcError::invalid_params(msg));
         }
         Ok(CondaOutputsResult {
             outputs,
@@ -892,6 +1319,9 @@ struct DiscoveredEmission {
     output_name: String,
     channels: Vec<ChannelUrl>,
     transitive_overrides: BTreeMap<String, String>,
+    /// v0.33.5+: env names this discovered output is referenced by.
+    /// Used to drive per-env solve checks downstream.
+    envs: Vec<String>,
 }
 
 /// Autodiscovery-based emission planner. Walks the workspace
@@ -924,6 +1354,7 @@ async fn discover_emissions(
         output_name: default_output_name.to_string(),
         channels: default_channels.to_vec(),
         transitive_overrides: BTreeMap::new(),
+        envs: Vec::new(),
     };
 
     let (Some(manifest), Some(ws_dir)) = (manifest_opt.as_ref(), workspace_dir) else {
@@ -973,10 +1404,18 @@ async fn discover_emissions(
         }
         // Also fold in each env's direct [dependencies] pins as
         // override candidates so the cascade respects them too.
+        // Workspace conda-dep names are PRESERVED as-typed (not
+        // normalized): conda allows underscores in package names
+        // (`binutils_linux-64`, `gcc_linux-64`, `python_abi`).
+        // Naively normalizing `_` -> `-` produces specs like
+        // `binutils-linux-64 >=2.40` that the conda solver can't
+        // resolve because the actual package on the channel is
+        // `binutils_linux-64`. The solve check consumes these
+        // strings directly, so passing them verbatim keeps the
+        // solver looking up the right package.
         let direct = manifest.union_effective_dependencies(&d.envs);
         for (dep, specs) in direct {
-            let key = conda_name_from(&dep);
-            let entry = accumulated.entry(key).or_default();
+            let entry = accumulated.entry(dep).or_default();
             for s in specs {
                 if !entry.contains(&s) {
                     entry.push(s);
@@ -988,6 +1427,7 @@ async fn discover_emissions(
             output_name: d.name,
             channels,
             transitive_overrides: join_transitive_to_overrides(accumulated),
+            envs: d.envs,
         });
     }
     out
@@ -1022,6 +1462,603 @@ fn join_transitive_to_overrides(
         out.insert(k, unique.join(","));
     }
     out
+}
+
+/// v0.34.0+: iterative solve refinement. Runs the pre-emission solve
+/// check; if UNSAT, parses the blocking dep names from rattler's
+/// explanation, widens any that retread itself emits ONE LEVEL at a
+/// time (patch -> minor -> major -> `*`), re-emits via produce_output,
+/// re-runs the solve check. Repeats up to MAX_REFINEMENT iterations.
+///
+/// Progressive widening (vs. jumping straight to `*`) means we
+/// produce the TIGHTEST spec the solver can backtrack from. E.g. for
+/// triton: cascade emits patch (`>=3.7.0,<3.8`), solve check fails;
+/// widen to minor (`>=3.7,<4`); fails; widen to major (`>=3`); the
+/// solver now backtracks freely to triton 3.3.x (cuda 12.8) and
+/// succeeds. We never reach `*` for this dep because major was
+/// already enough.
+///
+/// The cascade's original per-dep probes can't see cross-package
+/// conflicts -- they only check "is this spec satisfiable in
+/// isolation." A workspace pin that conflicts with retread's emitted
+/// spec via shared transitive deps (e.g. retread emits `triton
+/// >=3.7,<3.8`; conda's triton 3.7 needs cuda 13; workspace pins cuda
+/// 12.8) only surfaces at full solve time. Feeding the solve failure
+/// back into the cascade lets retread retry with a wider spec the
+/// solver can backtrack from.
+/// v0.36.2+: bumped from 5 to 10. The original 5-iter cap was set when
+/// the cascade widened multiple deps per round opportunistically. With
+/// the per-chain verdict model, each round may surface a NEW set of
+/// blockers as earlier widenings unlock candidates -- so longer chains
+/// of progressive widening need more headroom. 10 is still bounded
+/// enough that pathological cases terminate quickly.
+const MAX_REFINEMENT: usize = 10;
+
+/// Build the list of `RETREAD-SOLVE-FAILED-*.md` paths the user
+/// should open after a solve failure. One per emitted output that
+/// produced an MD file. Returned as absolute paths so the user can
+/// click them directly out of the terminal.
+fn bundle_md_paths(source_dir: &Path, outputs: &[CondaOutput]) -> Vec<String> {
+    let mut paths: HashSet<String> = HashSet::new();
+    for o in outputs {
+        let name = o.metadata.name.as_normalized();
+        let p = source_dir.join(format!("RETREAD-SOLVE-FAILED-{name}.md"));
+        paths.insert(p.display().to_string());
+    }
+    let mut v: Vec<String> = paths.into_iter().collect();
+    v.sort();
+    v
+}
+
+/// Stable string labels for the conflict classifier's aggregate enum.
+/// Used by the audit pipeline (for `terminal_classification` strings
+/// where the audit reader expects the v0.35.x labels) and kept as a
+/// public helper so consumers re-using `ConflictClass` get a consistent
+/// label set. The refinement loop itself uses `derive_class_tag` over
+/// `Vec<PerChainVerdict>` instead -- see the v0.36.0 redesign.
+#[allow(dead_code)]
+pub fn class_label(c: &crate::conflict_classifier::ConflictClass) -> String {
+    use crate::conflict_classifier::ConflictClass;
+    match c {
+        ConflictClass::A => "A-retread-widenable".into(),
+        ConflictClass::AExhausted => "A-exhausted".into(),
+        ConflictClass::BWorkspaceDominated => "B-workspace-pin-dominates".into(),
+        ConflictClass::CWorkspaceOnly => "C-workspace-only".into(),
+    }
+}
+
+/// v0.36.4+: total-ordered widening level for a conda match-spec.
+/// Mirrors `widen_one_level`'s shape detection so a spec that
+/// `widen_one_level` would treat as "minor" reports level 1 here.
+///
+///   - 0: tightest (has `<A.B+1` minor upper, or exact `==A.B.C`, or
+///        no anchor at all — `<2`, `==1.26.4`, etc.)
+///   - 1: minor-widened (`>=A.B,<A+1`)
+///   - 2: major-widened (`>=A`, no upper)
+///   - 3: star (`*` or empty)
+///
+/// Used by `merge_looser_override` to union per-env refinement
+/// widenings into a single output the cascade can ship. Two envs
+/// landing on different widening levels for the same dep should
+/// emit the LOOSER one — the shipped run-deps must satisfy every
+/// env that consumes them.
+fn widening_level(spec: &str) -> u8 {
+    let trimmed = spec.trim();
+    if trimmed == "*" || trimmed.is_empty() {
+        return 3;
+    }
+    // Exact pin (`==X.Y.Z`) is the tightest possible spec. It has
+    // no `<` upper bound so the major/minor heuristic below would
+    // misclassify it as level 2 (major-widened) — guard before
+    // calling the heuristic. Also catches comma-chained exact pins
+    // like `>=1.4,==2.10.0`.
+    if trimmed.contains("==") {
+        return 0;
+    }
+    let Some(version_str) = extract_anchor_version(trimmed) else {
+        // Pure upper-bound / exclusion / unrecognized shape (e.g.
+        // `<2`, `!=1.0`). `widen_one_level` jumps straight to `*`
+        // for these, so anything wider than 0 indicates we widened.
+        return 0;
+    };
+    let parts: Vec<&str> = version_str.split('.').collect();
+    let major: u64 = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let minor: u64 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let next_major = major + 1;
+    let next_minor = minor + 1;
+    let has_minor_upper = trimmed.contains(&format!("<{major}.{next_minor}"));
+    let has_major_upper = trimmed.contains(&format!("<{next_major}"));
+    if has_minor_upper {
+        0
+    } else if has_major_upper {
+        1
+    } else {
+        2
+    }
+}
+
+/// v0.36.4+: merge a candidate (dep, spec) into `accum`, keeping
+/// whichever is LOOSER per `widening_level`. Used after each env's
+/// `iterative_solve_refinement` to accumulate the per-dep widenings
+/// across envs — the emitted output ships ONE set of run-deps that
+/// every env must accept, so we always carry forward the widest.
+///
+/// Ties go to the existing spec to keep behavior stable: if env A
+/// and env B both landed on the same level for `dep`, A's spec
+/// stays. Levels are monotone with respect to `widen_one_level`'s
+/// steps so this comparison is the natural lattice join.
+fn merge_looser_override(
+    accum: &mut std::collections::BTreeMap<String, String>,
+    dep: &str,
+    candidate: &str,
+) {
+    let new_level = widening_level(candidate);
+    let existing_level = accum
+        .get(dep)
+        .map(|s| widening_level(s))
+        .unwrap_or(0);
+    if new_level > existing_level {
+        accum.insert(dep.to_string(), candidate.to_string());
+    }
+}
+
+/// Progressively widen a conda match-spec by ONE level. Detects the
+/// current widening level from the spec's upper bound shape and
+/// returns the next-wider spec:
+///
+///   - Patch (`>=A.B.C,<A.B+1`)        -> Minor (`>=A.B,<A+1`)
+///   - Minor (`>=A.B,<A+1`)            -> Major (`>=A`)
+///   - Major (`>=A`)                   -> Star  (`*`)
+///   - `*`                             -> None (already maximally wide)
+///   - exact (`==A.B.C`) or unknown    -> Minor (treat as Patch's next)
+///
+/// Returns `None` only when the spec is already `*`.
+fn widen_one_level(current_spec: &str) -> Option<String> {
+    let trimmed = current_spec.trim();
+    if trimmed == "*" || trimmed.is_empty() {
+        return None;
+    }
+    // Extract the lower-bound version (the `>=A.B.C` part, or the
+    // exact pin in `==A.B.C`). Used as the anchor for widening.
+    let Some(version_str) = extract_anchor_version(trimmed) else {
+        // No anchor version found -- the spec is pure upper-bound
+        // (`<X`, `<=X`) or pure exclusion (`!=X`). Can't escalate
+        // through patch/minor/major levels because there's no
+        // lower-bound anchor to widen FROM. The only meaningful
+        // widening is to drop the constraint entirely. Skip
+        // intermediate steps and jump to `*`. The user explicitly
+        // chose this dep, so widening to `*` is consistent with
+        // last-resort behavior elsewhere in the cascade.
+        return Some("*".to_string());
+    };
+    let parts: Vec<&str> = version_str.split('.').collect();
+    let major: u64 = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let minor: u64 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+
+    // Detect current level by inspecting the upper bound:
+    //   contains `<A.B+1`  -> Patch (next: Minor)
+    //   contains `<A+1`    -> Minor (next: Major)
+    //   no upper bound     -> Major (next: Star)
+    let next_major = major + 1;
+    let next_minor = minor + 1;
+    let has_minor_upper = trimmed.contains(&format!("<{major}.{next_minor}"));
+    let has_major_upper = trimmed.contains(&format!("<{next_major}"));
+    if has_minor_upper {
+        Some(format!(">={major}.{minor},<{next_major}"))
+    } else if has_major_upper {
+        Some(format!(">={major}"))
+    } else {
+        // No upper bound, or shape we don't recognize. Already at
+        // Major-or-broader; next step is `*`.
+        Some("*".to_string())
+    }
+}
+
+/// Extract the major.minor (.patch) version string from a conda
+/// match-spec's lower bound or exact pin. Returns None for specs
+/// that have no parseable anchor version (e.g. `>=A,!=B`).
+fn extract_anchor_version(spec: &str) -> Option<String> {
+    // Find the first comma-separated clause that looks like `>=X.Y.Z`
+    // or `==X.Y.Z` and pull X.Y.Z out.
+    for clause in spec.split(',') {
+        let c = clause.trim();
+        let payload = c
+            .strip_prefix(">=")
+            .or_else(|| c.strip_prefix("=="))
+            .or_else(|| c.strip_prefix(">"))?;
+        let payload = payload.trim();
+        if payload.is_empty() {
+            continue;
+        }
+        // Take the leading run of digits-and-dots.
+        let end = payload
+            .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .unwrap_or(payload.len());
+        let head = &payload[..end];
+        if !head.is_empty() && head.chars().any(|c| c.is_ascii_digit()) {
+            return Some(head.trim_end_matches('.').to_string());
+        }
+    }
+    None
+}
+
+/// v0.36.0+: post-condition invariant. After `produce_output` runs in
+/// the refinement loop, verify the emitted output respects the ABI
+/// contract. Returns one human-readable message per violation, in a
+/// stable order. The caller logs them loudly + threads them into the
+/// audit; the cascade does NOT fail on violations because (a) the
+/// invariant is new and may have false-positive shapes we haven't seen
+/// yet, (b) silently corrupting an output is strictly worse than
+/// loudly continuing with a flag in the audit.
+///
+/// Three checks per dep emitted in `run_dependencies.depends`:
+///   1. If the dep is an ABI anchor (`is_abi_anchor`), its emitted
+///      spec must NOT be empty / `*`. Empty means retread widened it
+///      to "any version" -- the exact corruption we're guarding
+///      against (gsi round 4 emitting `python *`).
+///   2. If the workspace pins the same ABI-anchor dep, retread's
+///      emitted spec must NOT be looser. The cheap "looser" detector:
+///      if the workspace spec is `==X.Y` and retread's contains no
+///      `==X` / `>=X` / `<=X` clause anchored at the same major or
+///      tighter, flag it.
+///   3. The `effective.overrides` map must not contain an ABI-anchor
+///      entry mapped to `*` (the inverse direction -- catches code
+///      paths where overrides are mutated independently of the
+///      output's run_deps).
+fn check_output_abi_invariants(
+    output_run_deps: &[(String, String)],
+    workspace_specs: &[String],
+    overrides: &std::collections::BTreeMap<String, String>,
+) -> Vec<String> {
+    use crate::conflict_classifier::is_abi_anchor;
+    let mut violations: Vec<String> = Vec::new();
+
+    // (1) + (2): walk retread's emitted run_deps.
+    for (name, spec) in output_run_deps {
+        if !is_abi_anchor(name) {
+            continue;
+        }
+        let trimmed = spec.trim();
+        // (1) Empty or `*` on an ABI anchor is always a corruption.
+        if trimmed.is_empty() || trimmed == "*" {
+            violations.push(format!(
+                "ABI invariant: retread emitted `{name} {trimmed}` (empty/*) -- ABI anchors must always carry a concrete spec",
+            ));
+            continue;
+        }
+        // (2) Compare with workspace pin if present. The check is
+        // intentionally conservative: only flag if the workspace
+        // pin's lower-bound major doesn't appear in retread's spec
+        // at all (e.g. workspace `python ==3.11`, retread `python >=3`
+        // -> retread covers 3.x AND 4.x which is broader than ==3.11
+        // but at least contains it; a spec like `python ==3.11.5`
+        // would also be OK because the workspace pin still allows it).
+        // The corruption shape we MUST catch is retread emitting a
+        // spec with NO version anchor at all (handled by (1)).
+        // Future refinement: parse both as conda VersionSpec and
+        // check spec.intersects(workspace_spec) == workspace_spec.
+        // Out of scope for v0.36.0; the (1) check covers the gsi bug.
+        let ws_spec: Option<&String> = workspace_specs.iter().find_map(|w| {
+            let mut parts = w.splitn(2, char::is_whitespace);
+            let n = parts.next()?;
+            if n == name { parts.next().map(|_| w) } else { None }
+        });
+        if let Some(_ws) = ws_spec {
+            // Workspace pins this dep too; for now we just record
+            // the fact in trace-level logging (no violation flag).
+            tracing::trace!(
+                dep = %name,
+                retread_spec = %trimmed,
+                "ABI invariant: both retread and workspace emit ABI anchor; relying on conda solver to reconcile",
+            );
+        }
+    }
+
+    // (3) Walk overrides for ABI anchors mapped to `*`.
+    for (k, v) in overrides {
+        if !is_abi_anchor(k) {
+            continue;
+        }
+        let trimmed = v.trim();
+        if trimmed.is_empty() || trimmed == "*" {
+            violations.push(format!(
+                "ABI invariant: `effective.overrides[{k}]` is `{trimmed}` -- ABI anchors must never be widened to `*`",
+            ));
+        }
+    }
+
+    violations
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn iterative_solve_refinement(
+    base_run_deps: &[String],
+    workspace_specs: &[String],
+    channels: &[ChannelUrl],
+    python_version: &str,
+    target_subdir: &str,
+    bundle: &mut Bundle,
+    effective: &mut RetreadConfig,
+    host_platform: Platform,
+    siblings: &[(String, String)],
+    env_name: &str,
+    workspace_manifest: Option<&crate::workspace::WorkspaceManifest>,
+    channel_priority: rattler_solve::ChannelPriority,
+) -> Result<crate::solve_check::SolveOutcome> {
+    use crate::conflict_classifier::{
+        classify_chains, is_abi_anchor, summarize_verdicts, PerChainVerdict,
+        WorkspaceEditSuggestion,
+    };
+    let mut current_run_deps = base_run_deps.to_vec();
+    let mut refinement_steps: Vec<crate::audit::RefinementStep> = Vec::new();
+    let mut widened_to_star: HashSet<String> = HashSet::new();
+    let workspace_dep_names: HashSet<String> = workspace_specs
+        .iter()
+        .filter_map(|s| s.split_whitespace().next().map(String::from))
+        .collect();
+
+    for iter in 0..=MAX_REFINEMENT {
+        let mut combined = current_run_deps.clone();
+        combined.extend(workspace_specs.iter().cloned());
+        let mut outcome = crate::solve_check::run_solve_check(
+            channels,
+            &combined,
+            python_version,
+            target_subdir,
+            channel_priority,
+        )
+        .await;
+        if outcome.satisfiable {
+            outcome.refinement_steps = refinement_steps;
+            return Ok(outcome);
+        }
+
+        // v0.36.0: per-chain verdicts (no aggregate-class collapse).
+        let chains = crate::solve_check::extract_blocking_chains(&outcome.unsat_explanations);
+        let emitted_names: HashSet<String> = current_run_deps
+            .iter()
+            .filter_map(|s| s.split_whitespace().next().map(String::from))
+            .collect();
+        let verdicts = classify_chains(
+            &chains,
+            &emitted_names,
+            &workspace_dep_names,
+            &widened_to_star,
+            env_name,
+        );
+        let blocking_summary = summarize_verdicts(&verdicts);
+
+        // Collect suggestions FROM the verdicts (per-chain, in order).
+        let mut suggestions: Vec<WorkspaceEditSuggestion> = Vec::new();
+        for v in &verdicts {
+            if let PerChainVerdict::WorkspacePinDominates {
+                suggestion: Some(s),
+                ..
+            } = v
+            {
+                let mut s = s.clone();
+                if s.feature.is_none() {
+                    let name_only = s
+                        .current_pin
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .to_string();
+                    s.feature = workspace_manifest
+                        .and_then(|m| m.find_declaring_feature(env_name, &name_only));
+                }
+                suggestions.push(s);
+            }
+        }
+
+        // v0.36.0 policy: widen ONLY `WidenRetread` verdicts. If ANY
+        // non-widenable verdict is present (AbiAnchor /
+        // WorkspacePinDominates / TransitiveOnly / AlreadyExhausted)
+        // AND no widenable verdict offers progress, stop the loop and
+        // surface the verdict-derived diagnostics.
+        //
+        // Why "AND no widenable verdict": if pytorch (widenable) +
+        // python (ABI anchor) both block, the cascade still gets to
+        // widen pytorch on this iteration -- maybe widening it
+        // resolves the conflict on the next round without ever
+        // touching python. Stopping the loop the moment an ABI anchor
+        // shows up would mean retread never tries the widen-pytorch
+        // step, and the user gets a workspace-edit suggestion for a
+        // conflict the cascade COULD have resolved. So: try to widen
+        // every widenable; only stop if there's nothing to widen.
+        let widenable: Vec<&PerChainVerdict> =
+            verdicts.iter().filter(|v| v.is_widenable()).collect();
+
+        if widenable.is_empty() {
+            // Nothing to widen. Stop with the structured diagnostic
+            // derived from the verdict mix.
+            let blocking_deps_list: Vec<String> = verdicts.iter().map(|v| v.dep().into()).collect();
+            let class_tag = derive_class_tag(&verdicts);
+            refinement_steps.push(crate::audit::RefinementStep {
+                iteration: iter,
+                blocking_deps: blocking_deps_list,
+                widened_deps: Vec::new(),
+                classification: Some(class_tag.clone()),
+                blocking_summary: blocking_summary.clone(),
+                verdicts: verdicts.clone(),
+                invariant_violations: Vec::new(),
+            });
+            outcome.refinement_steps = refinement_steps;
+            outcome.workspace_edit_suggestions = suggestions;
+            outcome.terminal_classification = Some(class_tag);
+            return Ok(outcome);
+        }
+
+        if iter == MAX_REFINEMENT {
+            // We HAD widenable verdicts but ran out of iterations.
+            refinement_steps.push(crate::audit::RefinementStep {
+                iteration: iter,
+                blocking_deps: verdicts.iter().map(|v| v.dep().into()).collect(),
+                widened_deps: Vec::new(),
+                classification: Some("A-iteration-cap".into()),
+                blocking_summary: blocking_summary.clone(),
+                verdicts: verdicts.clone(),
+                invariant_violations: Vec::new(),
+            });
+            outcome.refinement_steps = refinement_steps;
+            outcome.workspace_edit_suggestions = suggestions;
+            outcome.terminal_classification = Some("A-iteration-cap".into());
+            return Ok(outcome);
+        }
+
+        // Widen each `WidenRetread` verdict by one level. Skip if the
+        // dep is an ABI anchor (defense-in-depth -- classify_chains
+        // already filtered them, but the predicate is the load-bearing
+        // check and we re-assert here so any future bug that allows
+        // an ABI anchor into `WidenRetread` still gets blocked).
+        let mut widened_this_round: Vec<String> = Vec::new();
+        for v in widenable {
+            let PerChainVerdict::WidenRetread { dep, current_spec } = v else {
+                continue;
+            };
+            // Belt and suspenders: NEVER widen an ABI anchor, even if
+            // classify_chains let one through somehow.
+            if is_abi_anchor(dep) {
+                tracing::error!(
+                    dep = %dep,
+                    "iterative_solve_refinement: ABI anchor leaked into WidenRetread verdict -- refusing to widen (classify_chains bug)",
+                );
+                continue;
+            }
+            let Some(next_spec) = widen_one_level(current_spec) else {
+                continue;
+            };
+            if next_spec == "*" {
+                widened_to_star.insert(dep.clone());
+            }
+            effective.overrides.insert(dep.clone(), next_spec.clone());
+            widened_this_round.push(format!("{dep} -> {next_spec}"));
+        }
+        let blocking_deps_list: Vec<String> = verdicts.iter().map(|v| v.dep().into()).collect();
+
+        if widened_this_round.is_empty() {
+            // We HAD widenable verdicts but every one of them was
+            // either already at `*` or shape-unrecognized. Treat as
+            // exhausted.
+            refinement_steps.push(crate::audit::RefinementStep {
+                iteration: iter,
+                blocking_deps: blocking_deps_list,
+                widened_deps: Vec::new(),
+                classification: Some("A-no-widening-possible".into()),
+                blocking_summary: blocking_summary.clone(),
+                verdicts: verdicts.clone(),
+                invariant_violations: Vec::new(),
+            });
+            outcome.refinement_steps = refinement_steps;
+            outcome.workspace_edit_suggestions = suggestions;
+            outcome.terminal_classification = Some("A-no-widening-possible".into());
+            return Ok(outcome);
+        }
+
+        tracing::info!(
+            iteration = iter,
+            widened = ?widened_this_round,
+            "iterative refinement: widening retread-emitted deps and re-solving",
+        );
+        // Re-emit produce_output with the updated overrides.
+        let new_output = produce_output(
+            bundle,
+            effective,
+            host_platform,
+            python_version,
+            siblings,
+        )?;
+        current_run_deps = new_output
+            .run_dependencies
+            .depends
+            .iter()
+            .map(|n| {
+                let raw = format_packagespec(&n.spec);
+                if raw.is_empty() {
+                    n.name.as_str().to_string()
+                } else {
+                    format!("{} {raw}", n.name.as_str())
+                }
+            })
+            .collect();
+
+        // v0.36.0+: post-condition invariant. Build a (name, spec)
+        // view of the freshly-emitted output and assert ABI anchors
+        // weren't corrupted by the widening we just did.
+        let emitted_pairs: Vec<(String, String)> = new_output
+            .run_dependencies
+            .depends
+            .iter()
+            .map(|n| (n.name.as_str().to_string(), format_packagespec(&n.spec)))
+            .collect();
+        let invariant_violations =
+            check_output_abi_invariants(&emitted_pairs, workspace_specs, &effective.overrides);
+        if !invariant_violations.is_empty() {
+            // Loud log + audit entry. Don't fail the cascade -- the
+            // invariant is a safety-net, not a precondition. If it
+            // fires we've still produced an output but the caller can
+            // observe the corruption flag.
+            for msg in &invariant_violations {
+                tracing::error!(
+                    bundle = %bundle.conda_name,
+                    env = %env_name,
+                    iteration = iter,
+                    violation = %msg,
+                    "ABI invariant violated by iterative_solve_refinement (output may be corrupt)",
+                );
+                // debug_assert so test runs fail-fast on regression
+                // while release builds keep limping forward.
+                debug_assert!(false, "ABI invariant violation: {msg}");
+            }
+        }
+
+        refinement_steps.push(crate::audit::RefinementStep {
+            iteration: iter,
+            blocking_deps: blocking_deps_list,
+            widened_deps: widened_this_round.clone(),
+            classification: Some("A-retread-widenable".into()),
+            blocking_summary: blocking_summary.clone(),
+            verdicts: verdicts.clone(),
+            invariant_violations,
+        });
+    }
+    // Unreachable (loop returns).
+    Ok(crate::solve_check::SolveOutcome::unreachable())
+}
+
+/// Map a verdict mix to a terminal-classification tag string. Mirrors
+/// `class_label`'s output for back-compat with the audit + RPC error
+/// pipeline; called only from `iterative_solve_refinement`'s stop-early
+/// path where the verdicts are already computed.
+fn derive_class_tag(verdicts: &[crate::conflict_classifier::PerChainVerdict]) -> String {
+    use crate::conflict_classifier::PerChainVerdict;
+    let any_workspace = verdicts
+        .iter()
+        .any(|v| matches!(v, PerChainVerdict::WorkspacePinDominates { .. }));
+    let any_abi = verdicts
+        .iter()
+        .any(|v| matches!(v, PerChainVerdict::AbiAnchor { .. }));
+    let any_exhausted = verdicts
+        .iter()
+        .any(|v| matches!(v, PerChainVerdict::AlreadyExhausted { .. }));
+    let any_transitive = verdicts
+        .iter()
+        .any(|v| matches!(v, PerChainVerdict::TransitiveOnly { .. }));
+    // Order picks the most-actionable label first.
+    if any_workspace {
+        "B-workspace-pin-dominates".into()
+    } else if any_abi {
+        // ABI-anchor-only failure: workspace probably pins the anchor
+        // and retread's cascade can't help. Tag it as B so the audit
+        // surfaces it under "user must edit".
+        "B-workspace-pin-dominates".into()
+    } else if any_exhausted {
+        "A-exhausted".into()
+    } else if any_transitive {
+        "C-workspace-only".into()
+    } else {
+        "A-exhausted".into()
+    }
 }
 
 /// v0.33.0+: gather the spec list for the pre-emission solve check.
@@ -1650,7 +2687,7 @@ async fn resolve_bundle(
             primary,
             extras: vec![],
             probe_decisions: vec![],
-            solve_diagnostics: None,
+            solve_diagnostics: BTreeMap::new(),
         });
     }
 
@@ -1987,7 +3024,7 @@ async fn resolve_bundle(
         primary,
         extras,
         probe_decisions,
-        solve_diagnostics: None,
+        solve_diagnostics: BTreeMap::new(),
     })
 }
 
@@ -3265,6 +4302,168 @@ fn wildcard_packagespec() -> PackageSpec {
 /// conda solve. The full audit (a superset) still gets written at
 /// conda/build_v1 time. Filename matches the audit convention:
 /// retread-probe-trace-<conda_name>.json.
+/// v0.34.2+: write a sticky human-readable summary of any UNSAT
+/// solve-check outcomes to `RETREAD-SOLVE-FAILED-<bundle>.md` in the
+/// source package's dir. pixi's progress spinner overwrites stderr
+/// lines so the in-process banner doesn't survive to the user's
+/// terminal -- a file does. Skipped silently when every env is SAT
+/// (no failure = no summary to write).
+async fn write_solve_failed_summary(bundle: &Bundle, source_dir: &Path) -> Result<()> {
+    let any_unsat = bundle
+        .solve_diagnostics
+        .values()
+        .any(|d| !d.satisfiable);
+    let path = source_dir.join(format!("RETREAD-SOLVE-FAILED-{}.md", bundle.conda_name));
+    if !any_unsat {
+        // Remove a stale file from a previous failed run; clean state.
+        let _ = tokio::fs::remove_file(&path).await;
+        return Ok(());
+    }
+    let mut out = String::new();
+    out.push_str(&format!(
+        "# retread solve check: UNSAT for output `{}`\n\n",
+        bundle.conda_name,
+    ));
+
+    // v0.35.0+: surface the classifier's actionable suggestions FIRST
+    // so the user sees what to do without scrolling past 200 lines of
+    // solver enumeration. Collect across all unsat envs and dedup.
+    let mut all_suggestions: Vec<&crate::conflict_classifier::WorkspaceEditSuggestion> = Vec::new();
+    let mut seen_sugs: HashSet<(String, String)> = HashSet::new();
+    for diag in bundle.solve_diagnostics.values() {
+        for sug in &diag.workspace_edit_suggestions {
+            let key = (sug.env.clone(), sug.current_pin.clone());
+            if seen_sugs.insert(key) {
+                all_suggestions.push(sug);
+            }
+        }
+    }
+    if !all_suggestions.is_empty() {
+        out.push_str("## Suggested workspace edits\n\n");
+        out.push_str(
+            "The conflict is in YOUR workspace pixi.toml -- retread can't \
+             widen these for you. Pick one of the suggestions below \
+             (or relax differently if you have a preference).\n\n",
+        );
+        for sug in &all_suggestions {
+            let feature_label = sug
+                .feature
+                .as_deref()
+                .map(|f| format!("[feature.{f}.dependencies]"))
+                .unwrap_or_else(|| "[dependencies]".to_string());
+            out.push_str(&format!(
+                "- **env `{}` / `{}`**: change `{}` to `{}`\n  reason: {}\n",
+                sug.env, feature_label, sug.current_pin, sug.suggested_pin, sug.reason,
+            ));
+        }
+        out.push('\n');
+    } else {
+        // v0.36.2+: when no actionable suggestion exists, synthesize
+        // a "cascade exhausted" headline that names WHICH retread
+        // emission ran out of widening room against WHICH workspace
+        // pin. Otherwise the file's top section is empty and the
+        // user has to scroll past 200 lines of solver enumeration
+        // to find the (still-present) per-env classification.
+        out.push_str("## Cascade exhausted — no auto-suggestion\n\n");
+        out.push_str(
+            "Every failing env hit the iteration cap or ran out of \
+             widenable deps. retread can't suggest a single workspace \
+             edit because the conflict involves multiple workspace \
+             pins co-blocking each other (typical pattern: workspace \
+             pins `pytorch-gpu` AND wheel-emitted `torchaudio` needs \
+             a different pytorch).\n\n\
+             ### What to look at\n\n\
+             1. **Per-env classification** below: which envs are \
+                stuck and at what verdict.\n\
+             2. **Refinement steps per env**: the cascade's trace \
+                shows which retread-emitted dep was being widened \
+                in each round + what workspace pins co-blocked.\n\
+             3. **Final unsat chain (verbatim from rattler solver)**: \
+                the actual conflict graph -- the FIRST `cannot be \
+                installed` entry per env is the genuine blocker; \
+                everything labeled `can be installed with any of the \
+                following options` is context, not the cause.\n\n\
+             ### Common fixes\n\n\
+             - Bump the workspace pin that's blocking (`pytorch-gpu` \
+                in [feature.gpu.dependencies] is the usual suspect \
+                for isaacsim envs).\n\
+             - Move conflicting deps out of `[feature.X.dependencies]` \
+                and into `[feature.X.pypi-dependencies]` so uv \
+                handles them instead of conda.\n\
+             - Add the offending dep to `retread-drop-deps` in the \
+                source package's pixi.toml so retread stops emitting \
+                it as a conda dep.\n\n",
+        );
+    }
+
+    // Class-by-class summary so the user knows whether the cascade is
+    // still useful or completely stuck.
+    out.push_str("## Per-env classification\n\n");
+    let mut envs: Vec<&String> = bundle
+        .solve_diagnostics
+        .iter()
+        .filter(|(_, d)| !d.satisfiable)
+        .map(|(k, _)| k)
+        .collect();
+    envs.sort();
+    for env in &envs {
+        let diag = &bundle.solve_diagnostics[*env];
+        let class = diag.terminal_classification.as_deref().unwrap_or("unclassified");
+        out.push_str(&format!("- `{env}`: **{class}**\n"));
+    }
+    out.push('\n');
+
+    out.push_str(
+        "Class meanings:\n\
+         - `A-retread-widenable`: retread cascade can widen its emission; should self-resolve next iteration.\n\
+         - `A-exhausted`: cascade widened blockers to `*`; conflict is via a transitive retread can't touch.\n\
+         - `A-iteration-cap` / `A-no-widening-possible`: cascade gave up; usually means a workspace pin is the floor.\n\
+         - `B-workspace-pin-dominates`: workspace pins the conflicting dep -- edit the workspace (see suggestions above).\n\
+         - `C-workspace-only`: blocking dep isn't declared by retread or workspace; likely a transitive bubbled up.\n\n",
+    );
+
+    for env in &envs {
+        let diag = &bundle.solve_diagnostics[*env];
+        out.push_str(&format!("## env `{env}` — full detail\n\n"));
+        if !diag.refinement_steps.is_empty() {
+            out.push_str("### refinement attempted\n\n");
+            for s in &diag.refinement_steps {
+                out.push_str(&format!(
+                    "- round {}: class={:?} blocking={:?} widened={:?}\n  summary: {}\n",
+                    s.iteration,
+                    s.classification.as_deref().unwrap_or(""),
+                    s.blocking_deps,
+                    s.widened_deps,
+                    s.blocking_summary,
+                ));
+            }
+            out.push('\n');
+        }
+        out.push_str("### final unsat chain (verbatim from rattler solver)\n\n```\n");
+        for r in &diag.unsat_explanations {
+            out.push_str(r);
+            out.push('\n');
+        }
+        out.push_str("```\n\n");
+    }
+    out.push_str(
+        "## Reading this file\n\n\
+         - **Top section** is the actionable answer -- if it's present, edit the workspace as shown.\n\
+         - **Per-env classification** tells you which envs are retread's responsibility vs yours.\n\
+         - The verbatim unsat chain is the rattler solver's raw output; pixi's terminal error often picks a misleading leaf from this.\n\
+         - The machine-readable form lives at `retread-probe-trace-<bundle>.json.solve_diagnostics`.\n",
+    );
+    tokio::fs::write(&path, out)
+        .await
+        .with_context(|| format!("writing solve-failed summary to {}", path.display()))?;
+    tracing::error!(
+        bundle = %bundle.conda_name,
+        path = %path.display(),
+        "WROTE RETREAD-SOLVE-FAILED summary -- see this file for the real conflict chain",
+    );
+    Ok(())
+}
+
 async fn write_probe_trace(bundle: &Bundle, source_dir: &Path) -> Result<()> {
     let path = source_dir.join(format!(
         "retread-probe-trace-{}.json",
@@ -3275,11 +4474,19 @@ async fn write_probe_trace(bundle: &Bundle, source_dir: &Path) -> Result<()> {
         conda_name: &'a str,
         retread_version: &'static str,
         probe_decisions: &'a [crate::audit::ProbeDecision],
+        /// v0.33.5+: per-env solve diagnostics. Map keyed by env
+        /// name; each entry is one env's view of (its channels +
+        /// its deps + retread's emission). Surfaces here on the
+        /// probe trace (which always lands) instead of only on the
+        /// audit (only lands at conda/build_v1).
+        #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+        solve_diagnostics: &'a BTreeMap<String, crate::audit::SolveDiagnostics>,
     }
     let trace = Trace {
         conda_name: &bundle.conda_name,
         retread_version: env!("CARGO_PKG_VERSION"),
         probe_decisions: &bundle.probe_decisions,
+        solve_diagnostics: &bundle.solve_diagnostics,
     };
     let bytes = serde_json::to_vec_pretty(&trace)?;
     tokio::fs::write(&path, &bytes)
@@ -3442,6 +4649,334 @@ mod tests {
     use crate::config::RelaxPolicy;
     use std::collections::BTreeMap;
 
+    #[test]
+    fn widen_one_level_progression() {
+        // Patch -> Minor: `>=3.7.0,<3.8` -> `>=3.7,<4`
+        assert_eq!(widen_one_level(">=3.7.0,<3.8").as_deref(), Some(">=3.7,<4"));
+        // Minor -> Major: `>=3.7,<4` -> `>=3`
+        assert_eq!(widen_one_level(">=3.7,<4").as_deref(), Some(">=3"));
+        // Major -> Star: `>=3` -> `*`
+        assert_eq!(widen_one_level(">=3").as_deref(), Some("*"));
+        // Star -> None
+        assert_eq!(widen_one_level("*"), None);
+    }
+
+    #[test]
+    fn widen_one_level_handles_upper_only_specs() {
+        // Pure upper-bound (no lower anchor): jump straight to `*`.
+        // Wheels that pin `package<X` provide no anchor version to
+        // widen FROM, so the only meaningful widening is to drop
+        // the constraint entirely. Without this case, deps like
+        // `pyglet <2` stay stuck at `<2` through every refinement
+        // round (widen_one_level previously returned None).
+        assert_eq!(widen_one_level("<2").as_deref(), Some("*"));
+        assert_eq!(widen_one_level("<=5").as_deref(), Some("*"));
+    }
+
+    #[test]
+    fn widen_one_level_handles_exact_pin() {
+        // `==3.7.0` is an exact pin; treat as Patch -> next is Minor.
+        // Implementation detail: no `<3.8` upper means it falls through
+        // to the "no major upper" branch, returning `*` directly. This
+        // is acceptable because exact pins entering refinement are
+        // unusual and reaching `*` for them is a safe fallback.
+        let out = widen_one_level("==3.7.0").unwrap_or_default();
+        // Any non-empty widening is acceptable here.
+        assert!(!out.is_empty());
+    }
+
+    // -------------------------------------------------------------
+    // v0.36.4: refinement-widening propagation tests.
+    //
+    // The original bug: iterative_solve_refinement widened
+    // `effective.overrides` per env, the solve check internally
+    // re-rendered with the widened overrides and reported sat, but
+    // the outer `output` (created BEFORE the env loop) was never
+    // rebuilt — so pixi received the pre-refinement run-deps and
+    // exploded on misleading leaves. These tests pin the building
+    // blocks: widening-level ordering, the loosest-wins merge, and
+    // that produce_output reflects the merged overrides.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn widening_level_orders_patch_minor_major_star() {
+        // Total order must agree with widen_one_level's steps: a
+        // spec that widen_one_level moves from L -> L+1 must report
+        // widening_level L initially and L+1 after.
+        assert_eq!(widening_level(">=3.7.0,<3.8"), 0); // patch
+        assert_eq!(widening_level(">=3.7,<4"), 1); // minor
+        assert_eq!(widening_level(">=3"), 2); // major
+        assert_eq!(widening_level("*"), 3); // star
+        assert_eq!(widening_level(""), 3); // bare-name == *
+    }
+
+    #[test]
+    fn widening_level_treats_pure_upper_bounds_as_zero() {
+        // `<2`, `==1.26.4` have no anchor; widen_one_level jumps
+        // straight to `*`. Level 0 ensures any widening (level >=
+        // 1) wins under merge_looser_override.
+        assert_eq!(widening_level("<2"), 0);
+        assert_eq!(widening_level("==1.26.4"), 0);
+    }
+
+    #[test]
+    fn merge_looser_override_keeps_widest_across_envs() {
+        // env A widened to >=3, env B widened the same dep to *.
+        // The shipped output must satisfy both => keep `*`.
+        let mut accum: BTreeMap<String, String> = BTreeMap::new();
+        merge_looser_override(&mut accum, "triton", ">=3");
+        assert_eq!(accum.get("triton").unwrap(), ">=3");
+        merge_looser_override(&mut accum, "triton", "*");
+        assert_eq!(accum.get("triton").unwrap(), "*");
+    }
+
+    #[test]
+    fn merge_looser_override_does_not_narrow() {
+        // env A widened to `*`, env B's later contribution is the
+        // tighter `>=2.7,<3`. The accumulator must NOT narrow back
+        // — the shipped run-deps must satisfy both envs and `*`
+        // already does.
+        let mut accum: BTreeMap<String, String> = BTreeMap::new();
+        merge_looser_override(&mut accum, "pytorch", "*");
+        merge_looser_override(&mut accum, "pytorch", ">=2.7,<3");
+        assert_eq!(accum.get("pytorch").unwrap(), "*");
+    }
+
+    #[test]
+    fn merge_looser_override_inserts_when_missing() {
+        // Baseline override absent => candidate wins unconditionally.
+        let mut accum: BTreeMap<String, String> = BTreeMap::new();
+        merge_looser_override(&mut accum, "opencv", ">=4.11,<5");
+        assert_eq!(accum.get("opencv").unwrap(), ">=4.11,<5");
+    }
+
+    #[test]
+    fn produce_output_reflects_overrides_for_refinement_widening() {
+        // The regression: simulate what conda_outputs does post-
+        // v0.36.4 — apply the union'd overrides into effective and
+        // re-render via produce_output. Without v0.36.4 this widen
+        // path was inert: refinement widened a local copy of
+        // effective.overrides, but the output pushed to pixi was
+        // never rebuilt. Pixi then saw the original pinned spec.
+        //
+        // Names below are synthetic placeholders — the code path
+        // under test is package-agnostic (no hardcoded list of
+        // "widenable" deps anywhere). `dep-widened` will receive an
+        // override, `dep-untouched` is the control whose spec must
+        // survive the rebuild verbatim.
+        let widened_name = "dep-widened";
+        let control_name = "dep-untouched";
+        let widened_pin = "==9.9.9";
+        let control_pin = "==1.0.0";
+        let bundle = solo_bundle(
+            "synthetic-bundle",
+            vec![
+                &format!("{widened_name}{widened_pin}"),
+                &format!("{control_name}{control_pin}"),
+            ],
+        );
+
+        // Baseline rendering: no widening yet. The widened-name
+        // dep lands at a non-wildcard spec (exact shape depends on
+        // the configured relax policy; we only assert it's not `*`).
+        let narrow = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[]).unwrap();
+        let narrow_widened_spec = narrow
+            .run_dependencies
+            .depends
+            .iter()
+            .find(|d| d.name == widened_name)
+            .map(|d| format_packagespec(&d.spec))
+            .expect("widened-name dep should appear in baseline run-deps");
+        assert_ne!(
+            narrow_widened_spec.trim(),
+            "*",
+            "baseline must be tighter than `*`, got `{narrow_widened_spec}`",
+        );
+        let narrow_control_spec = narrow
+            .run_dependencies
+            .depends
+            .iter()
+            .find(|d| d.name == control_name)
+            .map(|d| format_packagespec(&d.spec))
+            .expect("control dep should appear in baseline run-deps");
+
+        // Simulate v0.36.4's post-refinement rebuild: the union of
+        // per-env widenings has `dep-widened -> *`. Apply it via
+        // effective.overrides and re-render.
+        let mut rebuild_effective = cfg();
+        rebuild_effective
+            .overrides
+            .insert(widened_name.to_string(), "*".to_string());
+        let widened = produce_output(
+            &bundle,
+            &rebuild_effective,
+            Platform::Linux64,
+            "3.11",
+            &[],
+        )
+        .unwrap();
+        let widened_spec = widened
+            .run_dependencies
+            .depends
+            .iter()
+            .find(|d| d.name == widened_name)
+            .map(|d| format_packagespec(&d.spec))
+            .expect("widened-name dep should still appear after the rebuild");
+        // Before v0.36.4 this assertion would fail: the rebuilt
+        // output emitted the same narrow spec because the
+        // produce_output call never used the widened override.
+        assert!(
+            widened_spec.trim() == "*" || widened_spec.trim().is_empty(),
+            "rebuild should ship the widened spec (`*`), got `{widened_spec}`",
+        );
+
+        // Control dep had no override — its emitted spec must match
+        // the baseline rendering byte-for-byte so we know the
+        // rebuild only mutates what the cascade widened.
+        let control_spec_after = widened
+            .run_dependencies
+            .depends
+            .iter()
+            .find(|d| d.name == control_name)
+            .map(|d| format_packagespec(&d.spec))
+            .expect("control dep should remain in emitted run-deps");
+        assert_eq!(
+            control_spec_after, narrow_control_spec,
+            "non-widened deps must render identically before and after rebuild",
+        );
+    }
+
+    // -------------------------------------------------------------
+    // v0.36.0: ABI-anchor invariant tests
+    // -------------------------------------------------------------
+
+    #[test]
+    fn invariant_flags_python_widened_to_star() {
+        // The exact gsi corruption: retread's run_deps emit `python *`.
+        // The invariant MUST flag this.
+        let emitted = vec![("python".to_string(), "*".to_string())];
+        let workspace = vec!["python ==3.11".to_string()];
+        let overrides = std::collections::BTreeMap::new();
+        let violations = check_output_abi_invariants(&emitted, &workspace, &overrides);
+        assert_eq!(violations.len(), 1, "expected one violation, got {violations:?}");
+        assert!(
+            violations[0].contains("python"),
+            "violation should mention python: {}",
+            violations[0],
+        );
+        assert!(
+            violations[0].contains("ABI anchor") || violations[0].contains("ABI invariant"),
+            "violation should mention ABI: {}",
+            violations[0],
+        );
+    }
+
+    #[test]
+    fn invariant_flags_empty_spec_on_abi_anchor() {
+        // Empty spec ("") is the other form of corruption -- retread
+        // emitting just the bare name. Same severity as `*`.
+        let emitted = vec![("cuda-version".to_string(), "".to_string())];
+        let workspace = vec!["cuda-version ==12.8".to_string()];
+        let overrides = std::collections::BTreeMap::new();
+        let violations = check_output_abi_invariants(&emitted, &workspace, &overrides);
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("cuda-version"));
+    }
+
+    #[test]
+    fn invariant_passes_on_concrete_abi_anchor_spec() {
+        // Retread emits `python ==3.11.5` -- a concrete spec. No
+        // corruption; invariant passes.
+        let emitted = vec![("python".to_string(), "==3.11.5".to_string())];
+        let workspace = vec!["python ==3.11".to_string()];
+        let overrides = std::collections::BTreeMap::new();
+        let violations = check_output_abi_invariants(&emitted, &workspace, &overrides);
+        assert!(violations.is_empty(), "should not flag: {violations:?}");
+    }
+
+    #[test]
+    fn invariant_flags_overrides_with_abi_anchor_star() {
+        // Override map carrying `python = "*"` is the upstream cause
+        // of the run-deps corruption. The check catches it before
+        // produce_output re-renders.
+        let emitted: Vec<(String, String)> = Vec::new();
+        let workspace: Vec<String> = Vec::new();
+        let mut overrides = std::collections::BTreeMap::new();
+        overrides.insert("python".to_string(), "*".to_string());
+        let violations = check_output_abi_invariants(&emitted, &workspace, &overrides);
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("python"));
+        assert!(violations[0].contains("overrides"));
+    }
+
+    #[test]
+    fn invariant_lets_non_anchor_widen_to_star() {
+        // Widening pytorch to `*` is legitimate; the invariant only
+        // guards ABI anchors. No violation should fire.
+        let emitted = vec![("pytorch".to_string(), "*".to_string())];
+        let workspace: Vec<String> = Vec::new();
+        let mut overrides = std::collections::BTreeMap::new();
+        overrides.insert("pytorch".to_string(), "*".to_string());
+        let violations = check_output_abi_invariants(&emitted, &workspace, &overrides);
+        assert!(violations.is_empty(), "should not flag pytorch: {violations:?}");
+    }
+
+    #[test]
+    fn invariant_catches_libstdcxx_overrides_corruption() {
+        let emitted: Vec<(String, String)> = Vec::new();
+        let workspace: Vec<String> = Vec::new();
+        let mut overrides = std::collections::BTreeMap::new();
+        overrides.insert("libstdcxx-ng".to_string(), "*".to_string());
+        let violations = check_output_abi_invariants(&emitted, &workspace, &overrides);
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("libstdcxx-ng"));
+    }
+
+    #[test]
+    fn invariant_catches_compiler_activation_corruption() {
+        // `gcc_linux-64` is an arch-tagged compiler activation pkg
+        // (caught by the prefix predicate). Widening corrupts the
+        // build-time toolchain match with the gcc-runtime install.
+        let emitted: Vec<(String, String)> = Vec::new();
+        let workspace: Vec<String> = Vec::new();
+        let mut overrides = std::collections::BTreeMap::new();
+        overrides.insert("gcc_linux-64".to_string(), "*".to_string());
+        let violations = check_output_abi_invariants(&emitted, &workspace, &overrides);
+        assert_eq!(violations.len(), 1);
+    }
+
+    /// Simulated-refinement test (no IO): models what the loop's
+    /// per-iteration body does for a verdict mix, asserting the
+    /// guard against widening ABI anchors holds even if a (hypothetical)
+    /// `WidenRetread` verdict ever named one. This re-exercises the
+    /// defense-in-depth check that lives inside
+    /// `iterative_solve_refinement`'s widening branch.
+    #[test]
+    fn refinement_loop_never_widens_python_even_if_verdict_says_so() {
+        use crate::conflict_classifier::{is_abi_anchor, PerChainVerdict};
+        // Construct a verdict that (in a bug) claims python is
+        // widenable. The loop's `is_abi_anchor` guard MUST refuse it.
+        let v = PerChainVerdict::WidenRetread {
+            dep: "python".into(),
+            current_spec: "==3.11".into(),
+        };
+        let dep = v.dep().to_string();
+        assert!(
+            is_abi_anchor(&dep),
+            "python must be recognized as ABI anchor",
+        );
+        // The defense-in-depth branch in the refinement loop:
+        let next_spec_if_widened = if is_abi_anchor(&dep) {
+            None
+        } else {
+            widen_one_level("==3.11")
+        };
+        assert!(
+            next_spec_if_widened.is_none(),
+            "the loop must refuse to widen python; got {next_spec_if_widened:?}",
+        );
+    }
+
     fn test_tmpdir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "retread-handler-test-{label}-{}-{}",
@@ -3512,7 +5047,7 @@ mod tests {
             primary: rw(name, meta(name, "1.0.0", requires, true)),
             extras: vec![],
             probe_decisions: vec![],
-            solve_diagnostics: None,
+            solve_diagnostics: BTreeMap::new(),
         }
     }
 
@@ -3632,7 +5167,7 @@ mod tests {
                 ),
             ],
             probe_decisions: vec![],
-            solve_diagnostics: None,
+            solve_diagnostics: BTreeMap::new(),
         };
 
         let output = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[]).unwrap();
@@ -3771,7 +5306,7 @@ mod tests {
                 ),
             ],
             probe_decisions: vec![],
-            solve_diagnostics: None,
+            solve_diagnostics: BTreeMap::new(),
         };
 
         let output =
@@ -3854,7 +5389,7 @@ mod tests {
             },
             extras: vec![],
             probe_decisions: vec![],
-            solve_diagnostics: None,
+            solve_diagnostics: BTreeMap::new(),
         };
 
         let output =

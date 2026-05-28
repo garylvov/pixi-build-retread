@@ -161,15 +161,13 @@ pub struct BundleAudit {
     /// dep go to conda?" doesn't require any --trace flags.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub probe_decisions: Vec<ProbeDecision>,
-    /// v0.33.0+: result of running a real conda solve over (workspace
-    /// effective deps + retread's emitted run-deps for this output).
-    /// Catches cross-package conflicts (cuda 13 vs cuda 12.8 etc.)
-    /// that the per-dep probe can't see because they live in the
-    /// `depends` arrays of OTHER packages, not in the package retread
-    /// is emitting. `None` when the check was skipped (no workspace,
-    /// no cached repodata).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub solve_diagnostics: Option<SolveDiagnostics>,
+    /// v0.33.5+: per-env results of running a real conda solve over
+    /// (this env's effective deps + retread's emitted run-deps for
+    /// this output). Keyed by env name. Each entry shows what THAT
+    /// env's conda solver will fail on -- much more actionable than
+    /// a cross-env union which would over-constrain.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub solve_diagnostics: BTreeMap<String, SolveDiagnostics>,
 }
 
 /// Persisted form of `solve_check::SolveOutcome`. Mirrors the in-memory
@@ -183,6 +181,63 @@ pub struct SolveDiagnostics {
     pub channels_consulted: Vec<String>,
     pub specs_count: usize,
     pub records_count: usize,
+    /// v0.34.0+: iterative refinement steps applied to make the
+    /// emission solvable. Each entry records one widening pass; later
+    /// passes saw the conflict shift to a new dep. Empty when the
+    /// first solve passed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refinement_steps: Vec<RefinementStep>,
+    /// v0.35.0+: actionable workspace-edit suggestions when the
+    /// classifier determined the conflict is workspace-side
+    /// (Class B/C). Empty for Class A (cascade resolved or in
+    /// progress) and for sat outcomes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workspace_edit_suggestions: Vec<crate::conflict_classifier::WorkspaceEditSuggestion>,
+    /// v0.35.0+: terminal classification. Tells the user at a glance
+    /// whether the failure is retread's responsibility ("A"/"A-exhausted")
+    /// or the workspace's ("B"/"C"). Empty for sat outcomes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_classification: Option<String>,
+}
+
+/// One iteration of the solve-driven cascade refinement.
+#[derive(Debug, Clone, Serialize)]
+pub struct RefinementStep {
+    /// 0-based iteration counter.
+    pub iteration: usize,
+    /// Top-level dep names rattler_solve flagged as the conflict
+    /// entry points (before this widening).
+    pub blocking_deps: Vec<String>,
+    /// Deps retread widened to `*` in this iteration. Subset of
+    /// blocking_deps (only deps retread is emitting can be widened
+    /// from retread's side -- workspace-pinned deps go unwidened).
+    pub widened_deps: Vec<String>,
+    /// v0.35.0+: classifier verdict for THIS iteration's unsat.
+    /// Tells the user whether retread can help or whether the
+    /// workspace needs editing. `None` for legacy/empty rounds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classification: Option<String>,
+    /// v0.35.0+: human-readable summary of what blocked, per
+    /// classifier.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub blocking_summary: String,
+    /// v0.36.0+: per-chain verdicts (one entry per blocking chain).
+    /// Replaces v0.35.0's aggregate `classification` as the
+    /// audit-readable source of truth for the loop's decisions.
+    /// Each verdict tells the user exactly what retread did with
+    /// THAT chain (widened, refused-as-ABI-anchor, suggested
+    /// workspace edit, ...).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verdicts: Vec<crate::conflict_classifier::PerChainVerdict>,
+    /// v0.36.0+: invariant-violation messages emitted by the
+    /// post-condition assertion in `iterative_solve_refinement`.
+    /// Non-empty means retread caught itself trying to corrupt the
+    /// output's ABI contract. Each entry names the offending dep +
+    /// the expected vs actual spec. The cascade does NOT fail on
+    /// these (they're logged loudly) but the audit makes them
+    /// observable so a downstream test can pin them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub invariant_violations: Vec<String>,
 }
 
 /// Top-level audit: keyed by the (conda_name, python_version) pair
@@ -243,7 +298,7 @@ impl BundleAudit {
         wheels: Vec<WheelAudit>,
         emitted_run_deps: Vec<EmittedDep>,
         probe_decisions: Vec<ProbeDecision>,
-        solve_diagnostics: Option<SolveDiagnostics>,
+        solve_diagnostics: BTreeMap<String, SolveDiagnostics>,
     ) -> Self {
         let pypi_options_dependency_overrides = render_pypi_overrides(&wheels);
         let dependencies = render_conda_deps(&emitted_run_deps);
@@ -350,7 +405,7 @@ mod tests {
                 EmittedDep { name: "pyglet".into(), spec: "pyglet".into() },
             ],
             vec![],
-            None,
+            BTreeMap::new(),
         );
         let json = serde_json::to_string_pretty(&audit).unwrap();
         // Spot-check shape rather than exact bytes (field order is

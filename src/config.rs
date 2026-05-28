@@ -31,8 +31,12 @@ pub struct RetreadConfig {
     ///
     /// - `none`: keep pins as-is (== stays ==)
     /// - `patch`: ==X.Y.Z -> >=X.Y.Z,<X.Y+1
-    /// - `minor` (default): ==X.Y.Z -> >=X.Y,<X+1
+    /// - `minor`: ==X.Y.Z -> >=X.Y,<X+1
     /// - `major`: ==X.Y.Z -> >=X (drop upper bound)
+    /// - `patch-then-minor-then-major-then-last-resort` (default,
+    ///   v0.30.0+): emit at patch initially; the cascade widens
+    ///   progressively on solve failure. See "Relax policies" in
+    ///   the README.
     #[serde(default, rename = "retread-relax", alias = "relax")]
     pub relax: RelaxPolicy,
 
@@ -139,7 +143,6 @@ fn default_true() -> bool {
 pub enum RelaxPolicy {
     None,
     Patch,
-    #[default]
     Minor,
     Major,
     /// Major widening AND aggressive range-spec relaxing: drops every
@@ -190,6 +193,7 @@ pub enum RelaxPolicy {
     /// under stage `tiered-cascade-stepN-{conda,pypi}`. Use this when
     /// you want strict-by-default behavior with automatic recovery
     /// across multiple widening levels before reaching for `*`.
+    #[default]
     #[serde(rename = "patch-then-minor-then-major-then-last-resort")]
     PatchThenMinorThenMajorThenLastResort,
     /// TODO(conda-aware): NOT YET IMPLEMENTED. The variant deserializes

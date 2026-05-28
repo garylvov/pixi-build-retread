@@ -5,6 +5,7 @@
 
 pub mod audit;
 pub mod config;
+pub mod conflict_classifier;
 pub mod handler;
 pub mod probe;
 pub mod pypi;

@@ -9,3 +9,4 @@
 *.conda
 *.tar.bz2
 /output
+examples/gigastrap/isaac-pack/*

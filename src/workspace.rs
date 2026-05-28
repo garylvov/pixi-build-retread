@@ -24,6 +24,12 @@ use std::path::Path;
 pub struct WorkspaceManifest {
     /// Top-level `[workspace].channels`.
     pub channels: Vec<String>,
+    /// Top-level `[workspace].channel-priority` setting. `None` when
+    /// unspecified. Used by the solve check to match what pixi's
+    /// own solver will do -- without this, retread defaults to
+    /// Strict and reports false unsats when the workspace actually
+    /// runs Disabled (pytorch + conda-forge mixed-channel envs).
+    pub channel_priority: Option<String>,
     /// Top-level `[dependencies]` — conda deps with a version spec.
     /// Used for transitive constraint extraction (each maps to a real
     /// channel package whose `depends` array we walk).
@@ -83,6 +89,11 @@ impl WorkspaceManifest {
                     .filter_map(|v| v.as_str().map(String::from))
                     .collect();
             }
+            out.channel_priority = workspace
+                .get("channel-priority")
+                .or_else(|| workspace.get("channel_priority"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
         }
 
         if let Some(deps) = parsed.get("dependencies").and_then(|v| v.as_table()) {
@@ -334,6 +345,34 @@ impl WorkspaceManifest {
             }
         }
         out
+    }
+
+    /// v0.35.0+: find which feature's `[feature.X.dependencies]`
+    /// table (or the implicit top-level `default` feature) declares
+    /// a conda dep with the given name, scoped to the active features
+    /// of `env_name`. Used by the conflict classifier to attach
+    /// workspace-edit suggestions to the right TOML block.
+    ///
+    /// Returns:
+    /// - `Some("default")` -- the dep is in top-level [dependencies]
+    /// - `Some("<feature>")` -- declared in `[feature.<feature>.dependencies]`
+    /// - `None` -- env doesn't exist, or no active feature declares it
+    pub fn find_declaring_feature(&self, env_name: &str, dep_name: &str) -> Option<String> {
+        let env = self.environments.get(env_name)?;
+        // Default first (top-level [dependencies]). If env opts out
+        // via no-default-feature, skip.
+        if !env.no_default_feature && self.dependencies.contains_key(dep_name) {
+            return Some("default".to_string());
+        }
+        for feat_name in &env.features {
+            let Some(feat) = self.features.get(feat_name) else {
+                continue;
+            };
+            if feat.dependencies.contains_key(dep_name) {
+                return Some(feat_name.clone());
+            }
+        }
+        None
     }
 
     /// Compute effective channels across multiple envs, in
@@ -657,6 +696,91 @@ channels = ["https://prefix.dev/robostack-humble", "https://prefix.dev/conda-for
         );
         assert_eq!(split_conda_dep_line(""), None);
         assert_eq!(split_conda_dep_line("   "), None);
+    }
+
+    #[test]
+    fn parses_channel_priority_setting() {
+        // Explicit "disabled"
+        let ws = ws_toml(
+            r#"
+[workspace]
+channels = ["a"]
+channel-priority = "disabled"
+"#,
+        );
+        assert_eq!(ws.channel_priority.as_deref(), Some("disabled"));
+
+        // Explicit "strict"
+        let ws = ws_toml(
+            r#"
+[workspace]
+channels = ["a"]
+channel-priority = "strict"
+"#,
+        );
+        assert_eq!(ws.channel_priority.as_deref(), Some("strict"));
+
+        // Underscore alias parsed too
+        let ws = ws_toml(
+            r#"
+[workspace]
+channels = ["a"]
+channel_priority = "disabled"
+"#,
+        );
+        assert_eq!(ws.channel_priority.as_deref(), Some("disabled"));
+
+        // Unspecified -> None (caller picks default)
+        let ws = ws_toml(
+            r#"
+[workspace]
+channels = ["a"]
+"#,
+        );
+        assert_eq!(ws.channel_priority, None);
+    }
+
+    #[test]
+    fn find_declaring_feature_locates_pin() {
+        let ws = ws_toml(
+            r#"
+[workspace]
+channels = ["conda-forge"]
+
+[dependencies]
+numpy = "==1.26.4"
+
+[environments]
+gsi = { features = ["gpu"] }
+standalone = { features = ["x"], no-default-feature = true }
+
+[feature.gpu]
+
+[feature.gpu.dependencies]
+pytorch-gpu = ">=2.7"
+
+[feature.x]
+
+[feature.x.dependencies]
+something = "*"
+"#,
+        );
+        // Top-level [dependencies] -> "default"
+        assert_eq!(
+            ws.find_declaring_feature("gsi", "numpy").as_deref(),
+            Some("default"),
+        );
+        // Feature-scoped
+        assert_eq!(
+            ws.find_declaring_feature("gsi", "pytorch-gpu").as_deref(),
+            Some("gpu"),
+        );
+        // no-default-feature env -> skip top-level
+        assert_eq!(ws.find_declaring_feature("standalone", "numpy"), None);
+        // Unknown dep
+        assert_eq!(ws.find_declaring_feature("gsi", "asdf"), None);
+        // Unknown env
+        assert_eq!(ws.find_declaring_feature("nope", "numpy"), None);
     }
 
     #[test]
