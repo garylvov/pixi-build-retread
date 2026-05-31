@@ -430,6 +430,35 @@ pub fn python_version_from_wheel_tag(filename: &str) -> Option<String> {
     Some(if minor > 0 { format!("{major}.{minor}") } else { format!("{major}") })
 }
 
+/// The dotted `X.Y` python to stamp on the emitted conda output (its
+/// `variant`, build string, and `python` dep) AND on the build recipe.
+///
+/// Prefer the primary wheel's cpXY tag when it is dotted (`cp311` -> `3.11`):
+/// a compiled wheel pins a real ABI, so the conda package genuinely only
+/// works on that minor. Fall back to the workspace build-variant python
+/// whenever the wheel carries only a bare-major tag (`py3-none-*`, including
+/// the platform-specific `py3-none-manylinux...` form whose `is_pure_python`
+/// is false) or no parseable tag.
+///
+/// This function NEVER returns a bare-major string. A bare-major python is an
+/// ABI-anchor corruption: it makes retread emit `variant {python: "3"}`,
+/// build `py3_0`, and `python 3.*`. With that anchor the consumer's solver
+/// floats `python_abi` (the source package's build-host env resolves
+/// `python 3.*` unpinned and the `"3"` variant pins no cpXY), so every
+/// transitive dep that requires a concrete `python_abi X.Y.* *_cpXY`
+/// (gymnasium, ros-humble-*, ...) reports "no candidates were found" and the
+/// whole environment goes unsat against a misleading leaf.
+///
+/// Single source of truth for both `handler::produce_output` (the
+/// `conda/outputs` metadata the solver consumes) and `recipe::build_recipe`
+/// (the recipe rattler-build builds), so the two paths can never drift.
+pub fn emit_python_version(primary_wheel_filename: &str, workspace_python_version: &str) -> String {
+    match python_version_from_wheel_tag(primary_wheel_filename) {
+        Some(v) if v.contains('.') => v,
+        _ => workspace_python_version.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -620,5 +649,45 @@ mod tests {
             python_version_from_wheel_tag("requests-2.32.5-py3-none-any.whl"),
             Some("3".to_string())
         );
+    }
+
+    #[test]
+    fn emit_python_prefers_dotted_cp_tag() {
+        // A compiled cp311 wheel pins a real ABI -> use it verbatim.
+        assert_eq!(
+            emit_python_version(
+                "isaacsim-5.1.0.0-cp311-none-manylinux_2_35_x86_64.whl",
+                "3.11"
+            ),
+            "3.11"
+        );
+    }
+
+    #[test]
+    fn emit_python_rejects_bare_major_platform_wheel() {
+        // THE BUG: a platform-specific wheel with a bare `py3` python tag
+        // (is_pure_python == false, so produce_output took the wheel-tag
+        // branch) parses to "3". emit_python_version must NOT return that --
+        // it must fall back to the workspace's dotted python. A bare-major
+        // emission corrupts the ABI anchor (`variant {python: "3"}`,
+        // `python 3.*`) and floats python_abi in the consumer's solve.
+        assert_eq!(
+            emit_python_version("someext-1.0-py3-none-manylinux_2_35_x86_64.whl", "3.11"),
+            "3.11"
+        );
+    }
+
+    #[test]
+    fn emit_python_rejects_bare_major_pure_wheel() {
+        // py3-none-any (pure python) also has a bare tag -> workspace fallback.
+        assert_eq!(
+            emit_python_version("isaaclab-0.1.0-py3-none-any.whl", "3.11"),
+            "3.11"
+        );
+    }
+
+    #[test]
+    fn emit_python_falls_back_when_tag_unparseable() {
+        assert_eq!(emit_python_version("not-a-wheel-filename", "3.12"), "3.12");
     }
 }

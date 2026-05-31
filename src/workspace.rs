@@ -43,6 +43,13 @@ pub struct WorkspaceManifest {
     pub environments: BTreeMap<String, EnvironmentDef>,
     /// Per-feature blocks from `[feature.X.*]`.
     pub features: BTreeMap<String, FeatureDef>,
+    /// v0.37.0+ (D1): top-level `[system-requirements]`. Keys are
+    /// pixi-schema names (`cuda`, `libc`, `macos`, `archspec`, ...);
+    /// values are the declared version. Mapped to rattler virtual
+    /// packages (`cuda`->`__cuda`, `libc`->`__glibc`, ...) at the
+    /// solve_check boundary so retread's solve matches pixi's instead
+    /// of defaulting to the build host's detected virtual packages.
+    pub system_requirements: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -64,6 +71,10 @@ pub struct FeatureDef {
     /// autodiscovery walks these to find features that reference the
     /// source package retread is building for.
     pub path_dependencies: BTreeMap<String, String>,
+    /// v0.37.0+ (D1): `[feature.X.system-requirements]`. Same shape as
+    /// the top-level table; unioned per active env with feature-wins
+    /// precedence by `effective_system_requirements`.
+    pub system_requirements: BTreeMap<String, String>,
 }
 
 impl WorkspaceManifest {
@@ -110,6 +121,22 @@ impl WorkspaceManifest {
             }
         }
 
+        // v0.37.0+ (D1): top-level [system-requirements]. Scalar values
+        // (`cuda = "12"`) stored verbatim; table form
+        // (`libc = { family = "glibc", version = "2.35" }`) takes the
+        // version field. Unrecognized shapes are skipped.
+        if let Some(sysreqs) = parsed
+            .get("system-requirements")
+            .or_else(|| parsed.get("system_requirements"))
+            .and_then(|v| v.as_table())
+        {
+            for (k, v) in sysreqs {
+                if let Some(s) = parse_system_requirement_value(v) {
+                    out.system_requirements.insert(k.clone(), s);
+                }
+            }
+        }
+
         if let Some(envs) = parsed.get("environments").and_then(|v| v.as_table()) {
             for (name, value) in envs {
                 if let Some(def) = parse_env_def(value) {
@@ -138,6 +165,18 @@ impl WorkspaceManifest {
                                     def.path_dependencies.insert(dep_name.clone(), path);
                                 }
                                 DepKind::Other => {}
+                            }
+                        }
+                    }
+                    // v0.37.0+ (D1): per-feature system-requirements.
+                    if let Some(sysreqs) = fmap
+                        .get("system-requirements")
+                        .or_else(|| fmap.get("system_requirements"))
+                        .and_then(|v| v.as_table())
+                    {
+                        for (k, v) in sysreqs {
+                            if let Some(s) = parse_system_requirement_value(v) {
+                                def.system_requirements.insert(k.clone(), s);
                             }
                         }
                     }
@@ -170,6 +209,33 @@ impl WorkspaceManifest {
                 continue;
             };
             for (k, v) in &feat.dependencies {
+                out.insert(k.clone(), v.clone());
+            }
+        }
+        out
+    }
+
+    /// v0.37.0+ (D1): effective system requirements for an environment.
+    /// Top-level requirements first (unless no-default-feature), then
+    /// each active feature overrides/extends in declaration order
+    /// (pixi precedence). Keys are pixi-schema names (`cuda`, `libc`,
+    /// ...); translation to rattler virtual-package names (`__cuda`,
+    /// `__glibc`, ...) happens at the solve_check boundary.
+    pub fn effective_system_requirements(&self, env_name: &str) -> BTreeMap<String, String> {
+        let Some(env) = self.environments.get(env_name) else {
+            return BTreeMap::new();
+        };
+        let mut out = BTreeMap::new();
+        if !env.no_default_feature {
+            for (k, v) in &self.system_requirements {
+                out.insert(k.clone(), v.clone());
+            }
+        }
+        for feat_name in &env.features {
+            let Some(feat) = self.features.get(feat_name) else {
+                continue;
+            };
+            for (k, v) in &feat.system_requirements {
                 out.insert(k.clone(), v.clone());
             }
         }
@@ -491,6 +557,29 @@ fn conda_normalize(s: &str) -> String {
     s.to_ascii_lowercase().replace('_', "-")
 }
 
+/// v0.37.0+ (D1): parse one `[system-requirements]` value. pixi allows
+/// either a bare scalar (`cuda = "12"`, sometimes a number) or a table
+/// (`libc = { family = "glibc", version = "2.35" }`). Scalars are kept
+/// verbatim; tables contribute their `version` field. Anything else
+/// returns `None` so the caller skips it.
+fn parse_system_requirement_value(v: &toml::Value) -> Option<String> {
+    if let Some(s) = v.as_str() {
+        return Some(s.to_string());
+    }
+    if let Some(i) = v.as_integer() {
+        return Some(i.to_string());
+    }
+    if let Some(f) = v.as_float() {
+        return Some(f.to_string());
+    }
+    if let Some(t) = v.as_table() {
+        if let Some(ver) = t.get("version").and_then(|x| x.as_str()) {
+            return Some(ver.to_string());
+        }
+    }
+    None
+}
+
 /// Split a conda match-spec line into (name, spec). The line is what
 /// repodata `depends` entries look like: name + optional whitespace +
 /// optional spec + optional build-string. We only care about (name,
@@ -652,6 +741,54 @@ python = "==3.12"
         assert_eq!(eff.get("python").map(String::as_str), Some("==3.12"));
         // torch absent — top-level skipped.
         assert!(!eff.contains_key("torch"));
+    }
+
+    // v0.37.0 D1: system-requirements parsing + effective rollup.
+    // (Restored after an accidental revert; mirrors the gigastrap layout
+    // where [feature.gpu] declares cuda=12 and [feature.isaaclab] libc.)
+    #[test]
+    fn effective_system_requirements_unions_features_over_top_level() {
+        let ws = ws_toml(
+            r#"
+[system-requirements]
+cuda = "11"
+
+[environments]
+gpu = { features = ["g", "lab"] }
+
+[feature.g]
+[feature.g.system-requirements]
+cuda = "12"
+
+[feature.lab]
+[feature.lab.system-requirements]
+libc = { family = "glibc", version = "2.35" }
+"#,
+        );
+        let sr = ws.effective_system_requirements("gpu");
+        // feature cuda (12) overrides top-level (11); table form -> version.
+        assert_eq!(sr.get("cuda").map(String::as_str), Some("12"));
+        assert_eq!(sr.get("libc").map(String::as_str), Some("2.35"));
+    }
+
+    #[test]
+    fn effective_system_requirements_no_default_feature_skips_top_level() {
+        let ws = ws_toml(
+            r#"
+[system-requirements]
+cuda = "12"
+
+[environments]
+standalone = { features = ["f"], no-default-feature = true }
+
+[feature.f]
+[feature.f.system-requirements]
+libc = "2.39"
+"#,
+        );
+        let sr = ws.effective_system_requirements("standalone");
+        assert_eq!(sr.get("libc").map(String::as_str), Some("2.39"));
+        assert!(!sr.contains_key("cuda")); // top-level skipped
     }
 
     #[test]

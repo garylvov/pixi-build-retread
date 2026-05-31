@@ -24,7 +24,7 @@ use uv_pep508::uv_pep440::VersionSpecifiers;
 use crate::config::{RelaxPolicy, RetreadConfig, WheelEntry};
 use crate::pypi::{self, WheelTarget};
 use crate::recipe::{build_bundle_recipe, to_yaml, BundleSource};
-use crate::relax::{default_marker_env, marker_env_for, python_version_from_wheel_tag};
+use crate::relax::{default_marker_env, emit_python_version, marker_env_for};
 use crate::rpc::{ok, parse_params, RpcError};
 use crate::wheel::{fetch_wheel, read_metadata, WheelMetadata};
 
@@ -342,6 +342,14 @@ impl Handler {
         &self,
         params: CondaOutputsParams,
     ) -> Result<CondaOutputsResult, RpcError> {
+        // Emitted before anything else so the user sees retread is alive the
+        // moment pixi hands off -- the work below (parselmouth load, wheel
+        // materialization, repodata probes, solve checks) can run for many
+        // seconds with no other output. Generic: no package-specific text.
+        tracing::info!(
+            retread_version = env!("CARGO_PKG_VERSION"),
+            "retread: computing conda outputs (resolving wheels + probing channels; large wheels may download here)",
+        );
         let (config, download_dir, source_dir, cache_dir, workspace_dir) =
             self.snapshot(&params.work_directory).await?;
 
@@ -580,7 +588,7 @@ impl Handler {
                     for env_name in &env_names {
                         bundle = bundle_snapshot.clone();
                         effective = effective_snapshot.clone();
-                        let (env_channels, env_workspace_specs) = match (&manifest_for_solve, env_name.as_str()) {
+                        let (env_channels, env_workspace_specs, env_system_requirements) = match (&manifest_for_solve, env_name.as_str()) {
                             (Some(m), n) if n != "__default__" => {
                                 let chans: Vec<ChannelUrl> = m
                                     .effective_channels(n)
@@ -600,9 +608,19 @@ impl Handler {
                                         specs.push(format!("{dep_name} {spec}"));
                                     }
                                 }
-                                (chans, specs)
+                                // v0.37.0 D1b: pull per-env
+                                // system-requirements so solve_check
+                                // sees workspace-declared __cuda /
+                                // __glibc / __osx instead of the
+                                // build host's detected values.
+                                let sysreqs = m.effective_system_requirements(n);
+                                (chans, specs, sysreqs)
                             }
-                            _ => (params.channels.clone(), Vec::new()),
+                            _ => (
+                                params.channels.clone(),
+                                Vec::new(),
+                                std::collections::BTreeMap::new(),
+                            ),
                         };
                         // v0.34.0+: iterative refinement. The solve
                         // check may say UNSAT because retread emitted
@@ -631,6 +649,7 @@ impl Handler {
                             env_name,
                             manifest_for_solve.as_ref(),
                             workspace_channel_priority,
+                            &env_system_requirements,
                         )
                         .await
                         .map_err(|e| {
@@ -927,6 +946,14 @@ impl Handler {
         &self,
         params: CondaBuildV1Params,
     ) -> Result<CondaBuildV1Result, RpcError> {
+        // First thing out, before the heavy resolve/materialize/build below,
+        // so a plain `pixi install` shows movement instead of a silent hang.
+        // Generic: names come from params, nothing hardcoded.
+        tracing::info!(
+            retread_version = env!("CARGO_PKG_VERSION"),
+            output = %params.output.name.as_normalized(),
+            "retread: building package (materializing wheels, then rattler-build; large wheels download here and can take minutes)",
+        );
         let (config, download_dir, source_dir, cache_dir, workspace_dir) =
             self.snapshot(&params.work_directory).await?;
         // conda/build_v1 doesn't carry the variant set; the chosen variant
@@ -1030,6 +1057,19 @@ impl Handler {
             .clone()
             .unwrap_or_else(|| params.work_directory.join("output"));
 
+        // Build the recipe's run-deps from the EXACT specs pixi solved and
+        // locked with (forwarded in `params.run_dependencies`), not by
+        // re-deriving from the wheels' requires_dist. This keeps the built
+        // package's run-deps identical to what `conda/outputs` emitted +
+        // the solver locked (including cascade widenings like `pytorch >=1`),
+        // and avoids re-emitting the raw transitive override that
+        // rattler-build rejects as a malformed spec. Falls back to
+        // requires_dist derivation if pixi didn't forward run-deps.
+        let run_override: Option<Vec<String>> = params
+            .run_dependencies
+            .as_ref()
+            .map(|deps| deps.iter().map(|d| d.spec.to_string()).collect());
+
         build_one(
             &bundle,
             &effective,
@@ -1039,6 +1079,7 @@ impl Handler {
             &python_version,
             &source_dir,
             params.output.build.as_deref(),
+            run_override.as_deref(),
         )
         .await
         .map_err(|e| RpcError::internal(format!("build {}: {e:#}", bundle.conda_name)))
@@ -1086,7 +1127,44 @@ fn pythons_for(
 ) -> Vec<String> {
     if let Some(values) = variants.and_then(|v| v.get("python")) {
         if !values.is_empty() {
-            return values.iter().map(|v| v.to_string()).collect();
+            // v0.37.0+: reject bare-major variant values (e.g. `"3"`).
+            // Pixi sometimes forwards just the major when the
+            // workspace's `build-variants = { python = ["3.11"] }`
+            // doesn't reach the source-package backend cleanly.
+            // Letting a bare major through poisons the entire pipeline:
+            //   - solve_check installs `__cpython 3.0.0` as the virtual
+            //     package (not 3.11), corrupting transitive ABI checks
+            //   - produce_output emits `python 3.*` in host/run deps
+            //   - the ABI invariant should catch the latter, but a
+            //     bare-major slipping past variants is the upstream cause.
+            // Same validation pattern as conda_build_v1 — fall back to
+            // config.python or DEFAULT_PYTHON with a loud warn so it's
+            // discoverable in pixi logs. Document the workaround so it
+            // can be removed when pixi stops forwarding bare-major.
+            let validated: Vec<String> = values
+                .iter()
+                .map(|v| v.to_string())
+                .filter(|s| {
+                    let is_full = s.contains('.');
+                    if !is_full {
+                        tracing::warn!(
+                            variant_value = %s,
+                            "pythons_for: rejecting bare-major python variant value; \
+                             falling back to config.python or DEFAULT_PYTHON. \
+                             This usually means pixi forwarded only the major version. \
+                             Confirm `build-variants = {{ python = [\"X.Y\"] }}` is set \
+                             at workspace top-level with the inline form.",
+                        );
+                    }
+                    is_full
+                })
+                .collect();
+            if !validated.is_empty() {
+                return validated;
+            }
+            // Fall through to config / default if the entire list was
+            // bare-major. (Edge case but real — protects against
+            // pixi forwarding `["3"]` exclusively.)
         }
     }
     if let Some(spec) = &config.python {
@@ -1439,27 +1517,73 @@ async fn discover_emissions(
 /// conflicting versions of the same dep) becomes the conda solver's
 /// problem to surface, OR retread's cascade catches it and falls
 /// through to PyPI bundle.
+///
+/// v0.37.0 D4: clause-level dedup, not full-spec dedup. Pre-0.37 we
+/// dedup'd entire spec strings, which left textual junk like
+/// `setuptools >=41.0.0,>=59.6.0,<80,>=59.6.0,<=79.0.1` in shipped
+/// emissions — two `>=59.6.0` clauses survived because they were
+/// embedded in different parent specs. Splitting each input spec
+/// into its comma-separated clauses first, deduping at the clause
+/// level, then re-joining produces the simplest equivalent spec the
+/// downstream MatchSpec parser will accept. Validating the rejoined
+/// result with `VersionSpec::from_str` is the contract: if the
+/// dedup'd output doesn't parse, we fall back to the original
+/// (concatenated) form so the cascade keeps working even if the
+/// inputs are exotic.
 fn join_transitive_to_overrides(
     transitive: BTreeMap<String, Vec<String>>,
 ) -> BTreeMap<String, String> {
+    use rattler_conda_types::{ParseStrictness, VersionSpec};
     let mut out = BTreeMap::new();
     for (k, specs) in transitive {
-        // Dedup while preserving order. Also drop no-op specs
-        // (empty string or bare `*`): both mean "any version" and
-        // including them in the comma-AND join produces invalid
-        // match-specs like `pytorch >=1.4,*,==2.10.0` that the conda
-        // parser rejects. Defense-in-depth -- `extract_transitive_
-        // constraints` already filters at extraction time.
+        // Split every input spec into individual clauses
+        // (comma-separated), trim, drop empties and `*`, dedup
+        // across the entire dep's input set. Order-preserving so
+        // diagnostics remain stable across runs.
+        let mut clauses: Vec<String> = Vec::new();
         let mut seen = HashSet::new();
-        let unique: Vec<String> = specs
-            .into_iter()
-            .filter(|s| !s.is_empty() && s != "*")
-            .filter(|s| seen.insert(s.clone()))
-            .collect();
-        if unique.is_empty() {
+        for raw in &specs {
+            for clause in raw.split(',') {
+                let t = clause.trim();
+                if t.is_empty() || t == "*" {
+                    continue;
+                }
+                if seen.insert(t.to_string()) {
+                    clauses.push(t.to_string());
+                }
+            }
+        }
+        if clauses.is_empty() {
             continue;
         }
-        out.insert(k, unique.join(","));
+        let joined = clauses.join(",");
+        // Sanity check: the rejoined spec must parse as a
+        // VersionSpec, else the cascade will choke when it tries
+        // to pass it to rattler later. Fall back to the original
+        // textual concat if parsing fails (degraded but functional).
+        let final_spec = match VersionSpec::from_str(&joined, ParseStrictness::Lenient) {
+            Ok(_) => joined,
+            Err(e) => {
+                tracing::debug!(
+                    dep = %k,
+                    joined = %joined,
+                    error = %e,
+                    "join_transitive_to_overrides: dedup'd spec failed to parse, \
+                     falling back to plain concatenation",
+                );
+                let mut full_seen = HashSet::new();
+                specs
+                    .iter()
+                    .filter(|s| !s.is_empty() && s.as_str() != "*")
+                    .filter(|s| full_seen.insert(s.to_string()))
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(",")
+            }
+        };
+        if !final_spec.is_empty() {
+            out.insert(k, final_spec);
+        }
     }
     out
 }
@@ -1726,6 +1850,33 @@ fn check_output_abi_invariants(
             ));
             continue;
         }
+        // v0.37.0+: bare-major glob (`3.*`, `12.*`) is the second
+        // corruption shape, distinct from `*`/empty. Surfaced by the
+        // pixi-forwards-bare-major-python bug: retread emitted `python
+        // 3.*` in host/run deps because the variant arrived as `"3"`.
+        // `pythons_for` now rejects bare-major at the input boundary
+        // (v0.37.0 D2) so this should never fire in practice, but the
+        // invariant is defense-in-depth — a future code path that
+        // synthesizes specs from a major-only template would otherwise
+        // recreate the gsn corruption silently.
+        //
+        // Conservative shape detection: `^[0-9]+\.\*$` (digits + dot
+        // + asterisk, nothing else). Anything tighter (`3.11.*`,
+        // `>=3.11`, `==3.11.5`) is fine.
+        let trimmed_no_ws = trimmed.replace(' ', "");
+        let is_bare_major_glob = {
+            let parts: Vec<&str> = trimmed_no_ws.split('.').collect();
+            parts.len() == 2
+                && parts[0].chars().all(|c| c.is_ascii_digit())
+                && !parts[0].is_empty()
+                && parts[1] == "*"
+        };
+        if is_bare_major_glob {
+            violations.push(format!(
+                "ABI invariant: retread emitted `{name} {trimmed}` (bare-major glob) -- ABI anchors must carry minor or stricter (e.g. `3.11.*`)",
+            ));
+            continue;
+        }
         // (2) Compare with workspace pin if present. The check is
         // intentionally conservative: only flag if the workspace
         // pin's lower-bound major doesn't appear in retread's spec
@@ -1784,6 +1935,7 @@ async fn iterative_solve_refinement(
     env_name: &str,
     workspace_manifest: Option<&crate::workspace::WorkspaceManifest>,
     channel_priority: rattler_solve::ChannelPriority,
+    system_requirements: &std::collections::BTreeMap<String, String>,
 ) -> Result<crate::solve_check::SolveOutcome> {
     use crate::conflict_classifier::{
         classify_chains, is_abi_anchor, summarize_verdicts, PerChainVerdict,
@@ -1806,6 +1958,7 @@ async fn iterative_solve_refinement(
             python_version,
             target_subdir,
             channel_priority,
+            system_requirements,
         )
         .await;
         if outcome.satisfiable {
@@ -3953,14 +4106,14 @@ fn produce_output(
     workspace_python_version: &str,
     siblings: &[(String, String)],
 ) -> Result<CondaOutput> {
-    // Python version: prefer the workspace's variant; fall back to parsing
-    // the primary wheel's cp tag.
-    let python_version = if bundle.primary.metadata.is_pure_python {
-        workspace_python_version.to_string()
-    } else {
-        python_version_from_wheel_tag(&bundle.primary.metadata.filename)
-            .unwrap_or_else(|| workspace_python_version.to_string())
-    };
+    // Python version for the emitted variant/build/`python` dep. Shared with
+    // the build recipe via `emit_python_version` so the metadata and the
+    // recipe can never disagree. NEVER bare-major: a `py3-none-manylinux`
+    // primary wheel (is_pure_python == false, tag parses to "3") used to slip
+    // through here as `variant {python: "3"}` / `python 3.*`, corrupting the
+    // ABI anchor and floating python_abi in the consumer's solve.
+    let python_version =
+        emit_python_version(&bundle.primary.metadata.filename, workspace_python_version);
     // If ANY wheel in the bundle is platform-specific, the output is too.
     let any_platform_specific = bundle.all_wheels().any(|w| !w.metadata.is_pure_python);
     let subdir = if any_platform_specific {
@@ -4510,6 +4663,7 @@ async fn build_one(
     workspace_python_version: &str,
     source_dir: &Path,
     expected_build: Option<&str>,
+    run_override: Option<&[String]>,
 ) -> Result<CondaBuildV1Result> {
     // Lay out one BundleSource per wheel (primary first), in BFS order.
     let sources: Vec<BundleSource> = bundle
@@ -4525,6 +4679,7 @@ async fn build_one(
         &sources,
         config,
         workspace_python_version,
+        run_override,
     )?;
     let yaml = to_yaml(&recipe)?;
 
@@ -4710,6 +4865,210 @@ mod tests {
         assert_eq!(widening_level(""), 3); // bare-name == *
     }
 
+    // -------------------------------------------------------------
+    // v0.37.0 D4: join_transitive_to_overrides clause-level dedup.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn join_transitive_dedups_clauses_across_input_specs() {
+        // The exact junk shape from shipped meta-v0:
+        //   setuptools >=41.0.0,>=59.6.0,<80,>=59.6.0,<=79.0.1
+        // Two `>=59.6.0` clauses survived because the input had
+        // them embedded in two different parent spec strings.
+        // Clause-level dedup must collapse to ONE `>=59.6.0`.
+        let mut input: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        input.insert(
+            "setuptools".to_string(),
+            vec![
+                ">=41.0.0".to_string(),
+                ">=59.6.0,<80".to_string(),
+                ">=59.6.0,<=79.0.1".to_string(),
+            ],
+        );
+        let out = join_transitive_to_overrides(input);
+        let joined = out.get("setuptools").expect("setuptools should be present");
+        // Count occurrences of `>=59.6.0` — must be exactly one.
+        let occurrences = joined.matches(">=59.6.0").count();
+        assert_eq!(
+            occurrences, 1,
+            "expected one `>=59.6.0` clause after dedup, got `{joined}`",
+        );
+        // All other clauses preserved.
+        for needed in [">=41.0.0", "<80", "<=79.0.1"] {
+            assert!(
+                joined.contains(needed),
+                "missing clause `{needed}` in `{joined}`",
+            );
+        }
+    }
+
+    #[test]
+    fn join_transitive_filters_star_and_empty_clauses() {
+        // Mixed input where some entries are bare `*` or empty —
+        // these impose no constraint and including them produces
+        // invalid match-specs like `pytorch >=1,*,==2`. Drop them
+        // at the clause boundary.
+        let mut input: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        input.insert(
+            "pytorch".to_string(),
+            vec![
+                ">=1.4".to_string(),
+                "*".to_string(),
+                "".to_string(),
+                "==2.10.0,*".to_string(),
+            ],
+        );
+        let out = join_transitive_to_overrides(input);
+        let joined = out.get("pytorch").expect("pytorch should be present");
+        assert!(
+            !joined.contains('*'),
+            "`*` clauses must be filtered out, got `{joined}`",
+        );
+        assert!(joined.contains(">=1.4"));
+        assert!(joined.contains("==2.10.0"));
+    }
+
+    #[test]
+    fn join_transitive_falls_back_when_build_strings_leak_through() {
+        // v0.37.0 regression: if `extract_transitive_constraints`
+        // ever fails to strip a build-string before pushing to the
+        // override map, `join_transitive_to_overrides` must still
+        // produce a parseable result. Tests the VersionSpec
+        // validation fallback path: the cleaned join `>=1.4,2.10.0
+        // cuda*_mkl*303,...` is not a valid VersionSpec, so we
+        // expect the function to either skip the dep or fall back to
+        // SOMETHING that at minimum doesn't crash. The current
+        // implementation uses plain-concat as fallback; assert that
+        // at least the dep doesn't disappear into a panic.
+        let mut input: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        input.insert(
+            "pytorch".to_string(),
+            vec![
+                ">=1.4".to_string(),
+                "2.10.0 cuda*_mkl*303".to_string(),
+                ">=2.10.0,<2.11.0a0".to_string(),
+            ],
+        );
+        // No panic, no crash. Either skipped or fallback string.
+        let out = join_transitive_to_overrides(input);
+        if let Some(s) = out.get("pytorch") {
+            // If kept, the entry must not be empty.
+            assert!(!s.is_empty());
+        }
+    }
+
+    #[test]
+    fn join_transitive_result_parses_as_version_spec() {
+        // Contract: every emitted joined spec must be a parseable
+        // VersionSpec. If it isn't, the cascade chokes downstream.
+        // This test asserts the fallback path doesn't get
+        // exercised under normal inputs.
+        use rattler_conda_types::{ParseStrictness, VersionSpec};
+        let mut input: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        input.insert(
+            "numpy".to_string(),
+            vec![">=1.26".to_string(), ">=1.26,<2".to_string(), "<3".to_string()],
+        );
+        let out = join_transitive_to_overrides(input);
+        let joined = out.get("numpy").expect("numpy should be present");
+        assert!(
+            VersionSpec::from_str(joined, ParseStrictness::Lenient).is_ok(),
+            "joined spec must be parseable, got `{joined}`",
+        );
+    }
+
+    // -------------------------------------------------------------
+    // v0.37.0: pythons_for bare-major rejection (D2).
+    // -------------------------------------------------------------
+
+    #[test]
+    fn pythons_for_rejects_bare_major_variant() {
+        // Pixi sometimes forwards `["3"]` to pixi-build backends when
+        // the workspace's `build-variants` declaration doesn't reach
+        // cleanly. retread must reject this and fall back to the
+        // configured python or DEFAULT_PYTHON. Without the rejection,
+        // every downstream concept (`__cpython` virtual package,
+        // `python 3.*` emitted spec, ABI invariant checks) breaks
+        // silently. This test pins the rejection.
+        let mut variants: BTreeMap<String, Vec<VariantValue>> = BTreeMap::new();
+        variants.insert(
+            "python".to_string(),
+            vec![VariantValue::String("3".to_string())],
+        );
+        let cfg = RetreadConfig {
+            retread_wheels: BTreeMap::new(),
+            relax: RelaxPolicy::Minor,
+            overrides: BTreeMap::new(),
+            name_map: BTreeMap::new(),
+            build_number: 0,
+            drop_deps: Vec::new(),
+            auto_bundle: false,
+            conda_deps: Vec::new(),
+            git_sources: std::collections::BTreeMap::new(),
+            python: None,
+        };
+        let result = pythons_for(&cfg, Some(&variants));
+        assert_eq!(
+            result,
+            vec![DEFAULT_PYTHON.to_string()],
+            "bare-major variant must fall through to DEFAULT_PYTHON, got {result:?}",
+        );
+    }
+
+    #[test]
+    fn pythons_for_accepts_dotted_variant() {
+        // Sanity check the happy path: a properly forwarded `"3.11"`
+        // variant survives validation and gets used directly.
+        let mut variants: BTreeMap<String, Vec<VariantValue>> = BTreeMap::new();
+        variants.insert(
+            "python".to_string(),
+            vec![VariantValue::String("3.11".to_string())],
+        );
+        let cfg = RetreadConfig {
+            retread_wheels: BTreeMap::new(),
+            relax: RelaxPolicy::Minor,
+            overrides: BTreeMap::new(),
+            name_map: BTreeMap::new(),
+            build_number: 0,
+            drop_deps: Vec::new(),
+            auto_bundle: false,
+            conda_deps: Vec::new(),
+            git_sources: std::collections::BTreeMap::new(),
+            python: None,
+        };
+        let result = pythons_for(&cfg, Some(&variants));
+        assert_eq!(result, vec!["3.11".to_string()]);
+    }
+
+    #[test]
+    fn pythons_for_filters_bare_major_keeps_dotted() {
+        // Mixed list: `["3", "3.11"]` — drop the bare, keep the dotted.
+        // Realistic scenario if pixi ever sent a hybrid set.
+        let mut variants: BTreeMap<String, Vec<VariantValue>> = BTreeMap::new();
+        variants.insert(
+            "python".to_string(),
+            vec![
+                VariantValue::String("3".to_string()),
+                VariantValue::String("3.11".to_string()),
+                VariantValue::String("3.12".to_string()),
+            ],
+        );
+        let cfg = RetreadConfig {
+            retread_wheels: BTreeMap::new(),
+            relax: RelaxPolicy::Minor,
+            overrides: BTreeMap::new(),
+            name_map: BTreeMap::new(),
+            build_number: 0,
+            drop_deps: Vec::new(),
+            auto_bundle: false,
+            conda_deps: Vec::new(),
+            git_sources: std::collections::BTreeMap::new(),
+            python: None,
+        };
+        let result = pythons_for(&cfg, Some(&variants));
+        assert_eq!(result, vec!["3.11".to_string(), "3.12".to_string()]);
+    }
+
     #[test]
     fn widening_level_treats_pure_upper_bounds_as_zero() {
         // `<2`, `==1.26.4` have no anchor; widen_one_level jumps
@@ -4892,6 +5251,56 @@ mod tests {
         let overrides = std::collections::BTreeMap::new();
         let violations = check_output_abi_invariants(&emitted, &workspace, &overrides);
         assert!(violations.is_empty(), "should not flag: {violations:?}");
+    }
+
+    // v0.37.0 D6: bare-major glob is a new ABI corruption shape.
+    #[test]
+    fn invariant_flags_python_bare_major_glob() {
+        // The gsn-failure smoking gun: meta-v0 emitted `python 3.*`
+        // because pixi forwarded variant `"3"` and `pythons_for`
+        // accepted it (since fixed in D2). Invariant should flag the
+        // glob even if it slipped past the input boundary.
+        let emitted = vec![("python".to_string(), "3.*".to_string())];
+        let workspace = vec!["python ==3.11".to_string()];
+        let overrides = std::collections::BTreeMap::new();
+        let violations = check_output_abi_invariants(&emitted, &workspace, &overrides);
+        assert_eq!(
+            violations.len(),
+            1,
+            "expected exactly one bare-major violation, got {violations:?}",
+        );
+        assert!(
+            violations[0].contains("bare-major"),
+            "violation should mention bare-major: {}",
+            violations[0],
+        );
+    }
+
+    #[test]
+    fn invariant_accepts_dotted_minor_glob_on_abi_anchor() {
+        // `python 3.11.*` is the correct emission shape; must NOT
+        // trigger the bare-major glob check.
+        let emitted = vec![("python".to_string(), "3.11.*".to_string())];
+        let workspace = vec!["python ==3.11".to_string()];
+        let overrides = std::collections::BTreeMap::new();
+        let violations = check_output_abi_invariants(&emitted, &workspace, &overrides);
+        assert!(violations.is_empty(), "should not flag: {violations:?}");
+    }
+
+    #[test]
+    fn invariant_flags_cuda_version_bare_major_glob() {
+        // The bare-major glob check applies to every ABI anchor, not
+        // just python. `cuda-version 12.*` is the same shape of
+        // corruption.
+        let emitted = vec![("cuda-version".to_string(), "12.*".to_string())];
+        let workspace: Vec<String> = Vec::new();
+        let overrides = std::collections::BTreeMap::new();
+        let violations = check_output_abi_invariants(&emitted, &workspace, &overrides);
+        assert_eq!(
+            violations.len(),
+            1,
+            "expected one violation, got {violations:?}",
+        );
     }
 
     #[test]

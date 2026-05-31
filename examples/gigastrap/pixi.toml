@@ -1,12 +1,24 @@
 [workspace]
 # pytorch channel needed for torch/torchaudio/torchvision/torchcodec py3.11
-# builds that conda-forge doesn't ship (its torch builds are CPU-only or
-# limited to older pythons). retread's probe identified torchaudio
-# >=2.7,<3 as definitively unsatisfiable on conda-forge for py3.11 and
-# fell back to PyPI bundle, but the cleaner path is letting conda
-# resolve from the pytorch channel directly. List BEFORE conda-forge so
-# torch-family deps prefer pytorch's GPU-enabled builds.
+# GPU builds that conda-forge doesn't ship (conda-forge's torch builds
+# are CPU-only or limited to older pythons). Listed BEFORE conda-forge
+# so torch-family deps prefer pytorch's GPU-enabled builds. Requires
+# `channel-priority = "disabled"` (below) -- with the default strict
+# channel priority, pixi/conda would refuse to mix packages from the
+# pytorch channel and conda-forge in the same env, which is exactly
+# what we need (pytorch from pytorch channel, everything else from
+# conda-forge).
 channels = ["https://prefix.dev/conda-forge"]
+# Strict (pixi's default): each package is sourced from the FIRST
+# channel that lists it. The pytorch channel is added ONLY to the
+# gpu feature (see [feature.gpu] below) so GPU envs get
+# torch/torchaudio/torchvision from pytorch (GPU builds) while CPU
+# envs stay on conda-forge alone. Putting pytorch at workspace
+# top-level would force every env -- including `cpu`, `ros2-cpu`,
+# `gsrli`, etc. that don't want GPU torch -- to source torchvision
+# from pytorch channel, but pytorch channel's builds need a
+# cuda*-tagged pytorch the cpu env can't satisfy.
+channel-priority = "strict"
 name = "gigastrap"
 platforms = ["linux-64"]
 version = "0.1.0"
@@ -135,15 +147,18 @@ scikit-learn = ">=1.4.0"
 umap-learn = ">=0.5.0"
 uniplot = ">=0.12.0"  # terminal ASCII plots for the rsl_rl_g training plotter
 
-[pypi-options.dependency-overrides]
-torchcodec = "==0.6.0"
-# Pin warp-lang to IsaacLabNewton's tested version. 1.11.0.dev20251205 is the
-# last release with the `warp.context.Devicelike` deprecation shim that
-# newton beta-0.2.1 (which IsaacLabNewton hard-pins) imports against. Newer
-# warp (1.13+) deleted `warp.context` entirely.
-warp-lang = "==1.11.0" # "==1.11.0.dev20251205"
-mujoco = ">=3.3.3,<3.6"
-gymnasium = "==1.3.0"
+# RETREAD: bad-remnant PyPI override hacks removed. gymnasium==1.3.0 was
+# actively WRONG -- stable-baselines3 2.8.0 (pulled by sbx-rl) requires
+# gymnasium<1.3.0,>=0.29.1, so this override directly contradicted it and
+# was the conda->uv pin-forwarding failure. torchcodec/warp-lang/mujoco are
+# redundant with the direct [pypi-dependencies] pins below (gigastrap_sim's
+# torchcodec==0.5, newton's warp-lang==1.11.1, the per-feature mujoco caps),
+# which still apply. Revert with: sed -i 's/^# RETREAD-OV: //' pixi.toml
+# RETREAD-OV: [pypi-options.dependency-overrides]
+# RETREAD-OV: torchcodec = "==0.6.0"
+# RETREAD-OV: warp-lang = "==1.11.0"
+# RETREAD-OV: mujoco = ">=3.3.3,<3.6"
+# RETREAD-OV: gymnasium = "==1.3.0"
 
 [tasks]
 # Task runner (wraps doit with automatic arg passthrough)
@@ -157,7 +172,15 @@ scripts = ["scripts/post-install.bash"] # pip  install the package in editable m
 
 #### GPU Environment-----------------------------------------------------------------------------
 [feature.gpu]
-# Channels would go here.
+# No extra channels at the feature level -- conda-forge supplies
+# both `pytorch-gpu` (GPU variant) and matching `torchvision` /
+# `torchaudio` (with `pytorch * cuda*` build tags). The pytorch
+# channel was tried earlier but only ships GPU builds for cuda
+# 12.6 (older torch) or 12.9+ (newer torch); it doesn't carry a
+# cuda-12.8 build matrix the workspace's `cuda-version ==12.8`
+# pin can satisfy. conda-forge does. With workspace `pytorch-gpu
+# >=2.7.1,<3` + `cuda-version ==12.8`, conda-forge supplies the
+# matching GPU torch + tooling cleanly.
 
 # Set CUDA_HOME for torch.compile/Triton to find ptxas
 [feature.gpu.activation.env]
@@ -204,8 +227,8 @@ xorg-libxcursor = "*"
 xorg-libxi = "*"
 jax = "<0.6.0"
 # End of Needed for Madrona
-pytorch-gpu = ">=2.7.1,<3" # Isaac Lab likes this to be in PyPi instead
-torchvision = ">=0.22.0" # moved to pypi-dependencies for CUDA 12.8 wheel
+pytorch-gpu = ">=2.7.1,<3"   # Isaac Sim's tested pytorch line; retread's cascade widens the isaacsim wheel's `==2.10.0` pin so this works
+torchvision = ">=0.22.0"     # matches pytorch 2.7; cascade widens any tighter wheel-side pin if conda solver needs it
 imageio = ">=2.37.0,<3"
 scikit-image = ">=0.25.2,<0.26"
 # pygame / pymunk / shapely are also picked up by third_party/gym_pusht's
@@ -403,17 +426,21 @@ pinocchio = ">=3.6"
 # plans/torchrl_g_plan.md for the full design.
 torchrl = ">=0.12,<0.13"
 tensordict = ">=0.12,<0.13"
-torchrl-g = { path = "torchrl_g", editable = true }
+# torchrl-g = { path = "torchrl_g", editable = true }   # commented out: path doesn't exist in this example workspace
 # SBX: JAX-based reference SAC for cross-validating our loss implementations.
 # Pinned at 0.26.0 (JAX 0.5.3 is already a transitive dep via the gpu feature).
 # Used by rsl_rl_g/tests/integration/test_sac_vs_sbx.py.
 sbx-rl = "==0.26.0"
 # Patched egl_probe (CMake 3.5+ fix)
-egl-probe = { path = "patches/egl_probe", editable = true }
+# egl-probe = { path = "patches/egl_probe", editable = true }   # commented out: path doesn't exist in this example workspace
 # HF Accelerate -- used by lerobot training + our `accelerate launch` doit tasks
 accelerate = ">=1.10.0,<2.0.0"
-# Pin torchcodec to version compatible with PyTorch 2.7 (0.10.0 requires PyTorch 2.8+)
-torchcodec = { version = "==0.5", index = "https://download.pytorch.org/whl/cu128" }
+# RETREAD: torchcodec PyPI pin removed. conda's torchaudio drags in
+# torchcodec 0.6.0 (conda deems it consistent with its torch pick); pinning
+# PyPI torchcodec==0.5 collided with that via pixi's conda->uv forwarding.
+# Dropping the pin lets the conda-resolved torchcodec flow through to uv with
+# nothing contradicting it. Revert with: sed -i 's/^# RETREAD-TC: //' pixi.toml
+# RETREAD-TC: torchcodec = { version = "==0.5", index = "https://download.pytorch.org/whl/cu128" }
 # libero dependencies
 bddl = "==1.0.1"
 easydict = "*"
@@ -457,7 +484,7 @@ numpy = "==1.26.4" # prevent shadowing of numpy
 # isaaclab-mimic  = { path = "IsaacLab/source/isaaclab_mimic", editable = true }
 # isaaclab-arena  = { path = "third_party/IsaacLab-Arena", editable = true }
 # RoboTwin IsaacLab Arena - manipulation eval tasks (bridges RoboTwin dual-arm tasks into Arena)
-manip-eval-tasks = { path = "third_party/RoboTwinIsaacLabArena/source/manip_eval_tasks", editable = true }
+# manip-eval-tasks = { path = "third_party/RoboTwinIsaacLabArena/source/manip_eval_tasks", editable = true }   # commented out: path doesn't exist in this example workspace
 
 [feature.gigastrap_sim_newton]
 # IMPORTANT — known issues, gated by newton.bash at run time (NOT at activation):
@@ -514,7 +541,7 @@ omniverseclient = { version = "*", index = "https://pypi.nvidia.com" }
 # isaaclab-newton = { path = "IsaacLabNewton/source/isaaclab_newton", editable = true }
 # isaaclab-arena  = { path = "third_party/IsaacLab-Arena", editable = true }
 # RoboTwin IsaacLab Arena - manipulation eval tasks (same package works with Newton)
-manip-eval-tasks = { path = "third_party/RoboTwinIsaacLabArena/source/manip_eval_tasks", editable = true }
+# manip-eval-tasks = { path = "third_party/RoboTwinIsaacLabArena/source/manip_eval_tasks", editable = true }   # commented out: path doesn't exist in this example workspace
 # leisaac (same package works with Newton)
 
 [feature.gigastrap_sim_newton.tasks]
@@ -581,10 +608,10 @@ torchvision = { version = "==0.24.1", index = "https://download.pytorch.org/whl/
 # isaacsim imports, and the `isaaclab` extra pulls isaacsim[all,extscache] which
 # transitively brings pywin32 (Windows-only). For gymnasium-env head-to-head this
 # is unneeded.
-flashrl = { path = "third_party/flash_rl", editable = true }
+# flashrl = { path = "third_party/flash_rl", editable = true }   # commented out: path doesn't exist in this example workspace
 # rsl_rl_g is the "ours" side of `scripts/benchmarks/sac_head_to_head.py`; both
 # halves run in one process so we install it editable here as well.
-rsl-rl-g = { path = "rsl_rl_g", editable = true }
+# rsl-rl-g = { path = "rsl_rl_g", editable = true }   # commented out: path doesn't exist in this example workspace
 # JAX stack from FlashRL pyproject (pin explicitly to avoid surprise resolution).
 jax = { version = "==0.7.1", extras = ["cuda12"] }
 jaxlib = "==0.7.1"

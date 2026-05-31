@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use serde::Serialize;
 
 use crate::config::RetreadConfig;
-use crate::relax::{default_marker_env, python_version_from_wheel_tag, translate};
+use crate::relax::{default_marker_env, emit_python_version, translate};
 use crate::wheel::WheelMetadata;
 
 #[derive(Debug, Serialize)]
@@ -106,44 +106,65 @@ pub fn build_bundle_recipe(
     sources: &[BundleSource<'_>],
     config: &RetreadConfig,
     workspace_python_version: &str,
+    run_override: Option<&[String]>,
 ) -> anyhow::Result<Recipe> {
     let primary = sources
         .first()
         .ok_or_else(|| anyhow::anyhow!("bundle must have at least one source"))?;
     // Prefer the primary wheel's tag (it pins the cpXY ABI), but fall back
     // to the workspace python whenever the wheel only carries a bare-major
-    // tag (`py3-none-any`). Without that fallback the recipe emits
-    // `python 3` which rattler-build rejects as "missing range specifier".
-    let python_version = match python_version_from_wheel_tag(&primary.metadata.filename) {
-        Some(v) if v.contains('.') => v,
-        _ => workspace_python_version.to_string(),
-    };
-    let env = default_marker_env(&python_version)?;
+    // tag (`py3-none-any`). Shared with `handler::produce_output` via
+    // `emit_python_version` so the recipe and the conda/outputs metadata
+    // always agree on the same dotted X.Y.
+    let python_version = emit_python_version(&primary.metadata.filename, workspace_python_version);
     let python_pin = format!("python {python_version}.*");
 
-    let vendored: HashSet<String> = sources.iter().map(|s| s.pypi_name.to_string()).collect();
-
-    let mut run = vec![python_pin.clone()];
-    let mut seen: HashSet<String> = HashSet::from(["python".to_string()]);
-    for source in sources {
-        for raw in &source.metadata.requires_dist {
-            match translate(raw, &env, &config.name_map, &config.overrides, config.relax) {
-                Ok(Some(dep)) => {
-                    let dep_name = dep.0.split_whitespace().next().unwrap_or("").to_string();
-                    if vendored.contains(&dep_name) {
-                        continue;
+    // Run-deps: PREFER the exact specs pixi solved/locked with, forwarded by
+    // pixi in `CondaBuildV1Params.run_dependencies` (-> `run_override`). This
+    // guarantees the BUILT package's run-deps MATCH what the solve produced --
+    // including cascade widenings the metadata applied (e.g. `pytorch >=1`).
+    // Re-deriving from each wheel's requires_dist here (the fallback below)
+    // diverges from the solve and can comma-join the raw, un-widened
+    // transitive override into a malformed spec like
+    // `pytorch >=1.4,2.10.0,>=2.10.0,<2.11.0a0`, which rattler-build rejects
+    // ("missing range specifier for '2.10.0'"). pixi's specs are already
+    // parsed MatchSpecs, so they round-trip cleanly.
+    let run: Vec<String> = if let Some(over) = run_override {
+        let mut r: Vec<String> = over.to_vec();
+        // The solved run-deps normally include `python`; if a host (older
+        // pixi) ever omits it, keep the package importable.
+        if !r.iter().any(|s| s == "python" || s.starts_with("python ")) {
+            r.insert(0, python_pin.clone());
+        }
+        r
+    } else {
+        // Fallback for older pixi that doesn't forward run_dependencies in
+        // the build params: derive from each wheel's requires_dist.
+        let env = default_marker_env(&python_version)?;
+        let vendored: HashSet<String> = sources.iter().map(|s| s.pypi_name.to_string()).collect();
+        let mut run = vec![python_pin.clone()];
+        let mut seen: HashSet<String> = HashSet::from(["python".to_string()]);
+        for source in sources {
+            for raw in &source.metadata.requires_dist {
+                match translate(raw, &env, &config.name_map, &config.overrides, config.relax) {
+                    Ok(Some(dep)) => {
+                        let dep_name = dep.0.split_whitespace().next().unwrap_or("").to_string();
+                        if vendored.contains(&dep_name) {
+                            continue;
+                        }
+                        if seen.insert(dep_name) {
+                            run.push(dep.0);
+                        }
                     }
-                    if seen.insert(dep_name) {
-                        run.push(dep.0);
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(req = %raw, error = %e, "could not translate requirement; dropping");
                     }
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    tracing::warn!(req = %raw, error = %e, "could not translate requirement; dropping");
                 }
             }
         }
-    }
+        run
+    };
 
     let host = vec![python_pin, "pip".to_string()];
 
@@ -246,7 +267,7 @@ mod tests {
             filename: "example_pkg-1.2.3-cp311-none-manylinux_2_35_x86_64.whl".into(),
         };
         let url: url::Url = "https://example.com/example_pkg-1.2.3-cp311-none-manylinux_2_35_x86_64.whl".parse().unwrap();
-        let r = build_bundle_recipe("example-pkg", &one_source(&meta, &url), &cfg(), "3.11").unwrap();
+        let r = build_bundle_recipe("example-pkg", &one_source(&meta, &url), &cfg(), "3.11", None).unwrap();
         let yaml = to_yaml(&r).unwrap();
         assert!(yaml.contains("python 3.11.*"), "yaml:\n{yaml}");
         assert!(yaml.contains("numpy >=1.26,<2"), "yaml:\n{yaml}");
@@ -283,7 +304,7 @@ mod tests {
             filename: "pure-0.1.0-py3-none-any.whl".into(),
         };
         let url = "https://example.com/pure-0.1.0-py3-none-any.whl".parse().unwrap();
-        let r = build_bundle_recipe("pure", &one_source(&meta, &url), &cfg(), "3.11").unwrap();
+        let r = build_bundle_recipe("pure", &one_source(&meta, &url), &cfg(), "3.11", None).unwrap();
         assert_eq!(r.build.noarch.as_deref(), Some("python"));
         // noarch bundles have nothing to relocate -- don't emit the field
         // (and don't risk poisoning future rattler-build default changes).
@@ -329,7 +350,7 @@ mod tests {
                 metadata: &kernel,
             },
         ];
-        let r = build_bundle_recipe("isaacsim", &sources, &cfg(), "3.11").unwrap();
+        let r = build_bundle_recipe("isaacsim", &sources, &cfg(), "3.11", None).unwrap();
         let yaml = to_yaml(&r).unwrap();
 
         assert_eq!(r.source.len(), 2, "two sources in the recipe");
@@ -338,6 +359,51 @@ mod tests {
         assert!(
             !yaml.contains("isaacsim-kernel >="),
             "vendored sibling must NOT appear in run-deps: {yaml}"
+        );
+    }
+
+    #[test]
+    fn run_override_is_used_verbatim_not_rederived() {
+        // When pixi forwards the solved run-deps (CondaBuildV1Params.
+        // run_dependencies -> run_override), the recipe must use them as-is,
+        // NOT re-derive from requires_dist. This keeps the built package's
+        // deps identical to what the solve locked (cascade-widened) and avoids
+        // re-emitting the raw transitive override that rattler-build rejects
+        // as a malformed spec ("missing range specifier for '2.10.0'").
+        let meta = WheelMetadata {
+            name: "isaacsim".into(),
+            version: "5.1.0.0".into(),
+            // requires_dist that, if re-derived, would emit a tight torch pin.
+            requires_dist: vec!["torch==2.10.0".into(), "numpy==1.26.4".into()],
+            is_pure_python: false,
+            sha256: "s".into(),
+            filename: "isaacsim-5.1.0.0-cp311-none-manylinux_2_35_x86_64.whl".into(),
+        };
+        let url: url::Url =
+            "https://example.com/isaacsim-5.1.0.0-cp311-none-manylinux_2_35_x86_64.whl"
+                .parse()
+                .unwrap();
+        let over = vec![
+            "python 3.11.*".to_string(),
+            "pytorch >=1".to_string(), // the cascade-widened spec pixi solved with
+            "numpy >=1.26,<2".to_string(),
+        ];
+        let r = build_bundle_recipe("isaacsim", &one_source(&meta, &url), &cfg(), "3.11", Some(&over))
+            .unwrap();
+        assert!(
+            r.requirements.run.iter().any(|s| s == "pytorch >=1"),
+            "must use the widened override verbatim: {:?}",
+            r.requirements.run
+        );
+        assert!(
+            !r.requirements.run.iter().any(|s| s.contains("2.10.0")),
+            "must NOT re-derive the tight torch pin from requires_dist: {:?}",
+            r.requirements.run
+        );
+        assert!(
+            r.requirements.run.iter().any(|s| s.starts_with("python ")),
+            "python must remain in run-deps: {:?}",
+            r.requirements.run
         );
     }
 }

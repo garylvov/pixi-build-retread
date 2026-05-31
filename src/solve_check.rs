@@ -90,12 +90,110 @@ impl SolveOutcome {
 ///
 /// `target_subdir` is the linux-64/osx-64/etc. selector. retread today
 /// targets linux-64 only.
+/// v0.37.0+: build the rattler virtual-package set the solver
+/// should see. Order of operations:
+///   1. Host detection (`__archspec`, `__linux`, `__glibc`, `__cuda`,
+///      `__osx`, ...) — provides defaults for keys the workspace
+///      doesn't constrain explicitly.
+///   2. `__cpython` override from the variant-derived `target_python`
+///      so transitive `python_abi` constraints resolve consistently
+///      with what pixi will install.
+///   3. Workspace `[feature.X.system-requirements]` overrides — pixi
+///      treats these as authoritative; retread must too. Keys map:
+///        cuda     -> __cuda
+///        libc     -> __glibc   (linux; value is glibc version)
+///        macos    -> __osx
+///        archspec -> __archspec (build-string encoded)
+///        linux    -> __linux
+///      Unrecognized keys are trace-logged + skipped (forward-compat).
+///
+/// Without (3), retread's solve_check sees the BUILD HOST's virtual
+/// packages while pixi's actual solve sees the WORKSPACE-declared
+/// ones — the asymmetry produced "retread sat, pixi unsat" for the
+/// gsn gymnasium failure that motivated v0.37.0. Extracted into a
+/// pure function so the mapping logic is unit-testable without
+/// running a full solve.
+pub fn build_virtual_packages(
+    target_python: &str,
+    system_requirements: &std::collections::BTreeMap<String, String>,
+) -> Vec<GenericVirtualPackage> {
+    let mut virtual_packages: Vec<GenericVirtualPackage> =
+        match rattler_virtual_packages::VirtualPackage::detect(
+            &rattler_virtual_packages::VirtualPackageOverrides::default(),
+        ) {
+            Ok(vps) => vps.into_iter().map(GenericVirtualPackage::from).collect(),
+            Err(e) => {
+                tracing::debug!(
+                    error = %e,
+                    "solve-check: host virtual package detection failed; falling back to minimal set",
+                );
+                Vec::new()
+            }
+        };
+    if let Ok(v) = Version::from_str(target_python) {
+        if let Ok(name) = PackageName::from_str("__cpython") {
+            virtual_packages.retain(|vp| vp.name.as_normalized() != "__cpython");
+            virtual_packages.push(GenericVirtualPackage {
+                name,
+                version: v,
+                build_string: String::new(),
+            });
+        }
+    }
+    for (req_key, req_value) in system_requirements {
+        let (vp_name, is_build_string) = match req_key.as_str() {
+            "cuda" => ("__cuda", false),
+            "libc" | "glibc" => ("__glibc", false),
+            "macos" | "osx" => ("__osx", false),
+            // Archspec is unconditionally a build-string virtual
+            // package -- even values like "1" or "10" that LOOK
+            // like versions are arch identifiers; treat as such.
+            "archspec" => ("__archspec", true),
+            "linux" => ("__linux", false),
+            other => {
+                tracing::trace!(
+                    key = %other,
+                    "solve-check: ignoring unrecognized system-requirement key (not in pixi schema)",
+                );
+                continue;
+            }
+        };
+        let Ok(name) = PackageName::from_str(vp_name) else {
+            continue;
+        };
+        let (version, build_string) = if is_build_string {
+            let Ok(v1) = Version::from_str("1.0") else {
+                continue;
+            };
+            (v1, req_value.clone())
+        } else {
+            match Version::from_str(req_value) {
+                Ok(v) => (v, String::new()),
+                Err(_) => {
+                    let Ok(v1) = Version::from_str("1.0") else {
+                        continue;
+                    };
+                    (v1, req_value.clone())
+                }
+            }
+        };
+        virtual_packages.retain(|vp| vp.name.as_normalized() != vp_name);
+        virtual_packages.push(GenericVirtualPackage {
+            name,
+            version,
+            build_string,
+        });
+    }
+    virtual_packages
+}
+
 pub async fn run_solve_check(
     channels: &[ChannelUrl],
     specs: &[String],
     target_python: &str,
     target_subdir: &str,
     channel_priority: ChannelPriority,
+    system_requirements: &std::collections::BTreeMap<String, String>,
 ) -> SolveOutcome {
     // Parse the specs first; bad input shouldn't be hidden behind
     // network IO. Skip specs that don't parse (rare; logged at debug).
@@ -178,38 +276,7 @@ pub async fn run_solve_check(
         };
     }
 
-    // v0.34.3+: detect host virtual packages via rattler's own
-    // detection (same logic pixi uses). Without these the solve
-    // check false-unsat's on `__archspec`/`__glibc`/`__cuda` chains
-    // baked into ~every conda-forge package's `depends` array,
-    // masking the REAL conflict. Falls back to a minimal manual set
-    // if detection fails (e.g. running in a non-linux build env).
-    let mut virtual_packages: Vec<GenericVirtualPackage> =
-        match rattler_virtual_packages::VirtualPackage::detect(
-            &rattler_virtual_packages::VirtualPackageOverrides::default(),
-        ) {
-            Ok(vps) => vps.into_iter().map(GenericVirtualPackage::from).collect(),
-            Err(e) => {
-                tracing::debug!(
-                    error = %e,
-                    "solve-check: host virtual package detection failed; falling back to minimal set",
-                );
-                Vec::new()
-            }
-        };
-    // Override / ensure __cpython matches the target python (the
-    // workspace's build-variants python -- which may differ from
-    // the host's installed python).
-    if let Ok(v) = Version::from_str(target_python) {
-        if let Ok(name) = PackageName::from_str("__cpython") {
-            virtual_packages.retain(|vp| vp.name.as_normalized() != "__cpython");
-            virtual_packages.push(GenericVirtualPackage {
-                name,
-                version: v,
-                build_string: String::new(),
-            });
-        }
-    }
+    let virtual_packages = build_virtual_packages(target_python, system_requirements);
 
     let records_count = all_records.len();
     let specs_count = parsed_specs.len();
@@ -225,7 +292,18 @@ pub async fn run_solve_check(
         channel_priority,
         exclude_newer: None,
         min_age: None,
-        strategy: SolveStrategy::default(),
+        // v0.37.0+: pinned explicitly to match pixi's own default.
+        // rattler_solve 4.1.x's `SolveStrategy::default()` is
+        // `Highest`; pixi also defaults to Highest. If pixi ever
+        // changes its default (or starts honoring a workspace-level
+        // override like `[workspace].solve-strategy`), retread
+        // should mirror — divergence here means retread's solver
+        // explores branches in a different order than pixi's,
+        // producing different (numpy, cuda, python_abi) tuples for
+        // the same spec set and silently disagreeing on
+        // satisfiability. Pin explicitly so the contract is
+        // visible in code review.
+        strategy: SolveStrategy::Highest,
     };
     let mut solver = resolvo::Solver;
     match solver.solve(task) {
@@ -614,5 +692,104 @@ mod tests {
         let o = SolveOutcome::unreachable();
         assert!(!o.satisfiable);
         assert_eq!(o.unsat_explanations.len(), 1);
+    }
+
+    // -------------------------------------------------------------
+    // v0.37.0 T1: build_virtual_packages exposes the workspace -> rattler
+    // virtual-package mapping for unit testing. The full end-to-end
+    // run_solve_check parity test against synthetic RepoData is left
+    // as future work (it would require committing repodata fixtures
+    // under tests/fixtures/); these unit tests pin the contract that
+    // the mapping is correct, which is the load-bearing piece. If
+    // these pass and the cascade is wired right, retread's solver
+    // sees the same virtual packages pixi's will.
+    // -------------------------------------------------------------
+
+    fn vp_lookup<'a>(vps: &'a [GenericVirtualPackage], name: &str) -> Option<&'a GenericVirtualPackage> {
+        vps.iter().find(|vp| vp.name.as_normalized() == name)
+    }
+
+    #[test]
+    fn build_virtual_packages_injects_cpython_from_target_python() {
+        let sysreqs = std::collections::BTreeMap::new();
+        let vps = build_virtual_packages("3.11", &sysreqs);
+        let cp = vp_lookup(&vps, "__cpython").expect("__cpython must be present");
+        // Version parses as `3.11.0` (zero-extended).
+        assert!(cp.version.to_string().starts_with("3.11"));
+    }
+
+    #[test]
+    fn build_virtual_packages_maps_workspace_cuda_to_double_underscore() {
+        // The load-bearing case for v0.37.0 D1: workspace declares
+        // `cuda = "12"` in `[feature.gpu.system-requirements]`. Without
+        // this mapping, retread sees the build host's `__cuda` (which
+        // may be absent or a different version), pixi sees __cuda 12,
+        // they disagree on whether a `__cuda >=12` dep is installable.
+        let mut sysreqs = std::collections::BTreeMap::new();
+        sysreqs.insert("cuda".into(), "12".into());
+        let vps = build_virtual_packages("3.11", &sysreqs);
+        let cuda = vp_lookup(&vps, "__cuda").expect("__cuda must be injected");
+        assert!(
+            cuda.version.to_string().starts_with("12"),
+            "expected __cuda 12.x, got {}",
+            cuda.version,
+        );
+    }
+
+    #[test]
+    fn build_virtual_packages_maps_libc_to_glibc() {
+        // pixi's schema names the glibc requirement `libc` (or `glibc`).
+        // The matching virtual package is `__glibc` (linux-specific
+        // family). Without this mapping, packages that declare
+        // `__glibc >=2.35` would see the host's __glibc instead of
+        // the workspace's declaration.
+        let mut sysreqs = std::collections::BTreeMap::new();
+        sysreqs.insert("libc".into(), "2.35".into());
+        let vps = build_virtual_packages("3.11", &sysreqs);
+        let glibc = vp_lookup(&vps, "__glibc").expect("__glibc must be injected");
+        assert_eq!(glibc.version.to_string(), "2.35");
+    }
+
+    #[test]
+    fn build_virtual_packages_overrides_host_detection() {
+        // Workspace value MUST win over host detection. The build host
+        // probably has a __glibc version different from the workspace's
+        // declared one; the workspace's value is authoritative because
+        // that's what pixi uses.
+        let mut sysreqs = std::collections::BTreeMap::new();
+        sysreqs.insert("libc".into(), "9.99".into());
+        let vps = build_virtual_packages("3.11", &sysreqs);
+        // Exactly ONE __glibc entry (overriding any host-detected one).
+        let count = vps
+            .iter()
+            .filter(|vp| vp.name.as_normalized() == "__glibc")
+            .count();
+        assert_eq!(count, 1, "must replace, not append, the host's __glibc");
+        let glibc = vp_lookup(&vps, "__glibc").unwrap();
+        assert_eq!(glibc.version.to_string(), "9.99");
+    }
+
+    #[test]
+    fn build_virtual_packages_archspec_encodes_as_build_string() {
+        // Archspec values are NOT versions (`x86_64`, `aarch64`); they
+        // belong in the build-string slot. Pin that encoding.
+        let mut sysreqs = std::collections::BTreeMap::new();
+        sysreqs.insert("archspec".into(), "x86_64".into());
+        let vps = build_virtual_packages("3.11", &sysreqs);
+        let arch = vp_lookup(&vps, "__archspec").expect("__archspec must be injected");
+        assert_eq!(arch.build_string, "x86_64");
+    }
+
+    #[test]
+    fn build_virtual_packages_skips_unknown_keys() {
+        // Forward-compat: future pixi schema additions shouldn't kill
+        // the solve check. Unknown keys log + skip.
+        let mut sysreqs = std::collections::BTreeMap::new();
+        sysreqs.insert("something-new-in-pixi".into(), "12".into());
+        let vps_baseline = build_virtual_packages("3.11", &std::collections::BTreeMap::new());
+        let vps = build_virtual_packages("3.11", &sysreqs);
+        // No __something-new-in-pixi (or any other) was added.
+        assert_eq!(vps.len(), vps_baseline.len(),
+            "unknown system-requirement keys must not add virtual packages");
     }
 }

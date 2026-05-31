@@ -79,16 +79,28 @@ pub async fn fetch_wheel(
         }
     }
 
-    tracing::info!(url = %url, "downloading wheel");
     let resp = reqwest::get(url.clone())
         .await
         .with_context(|| format!("GET {url}"))?
         .error_for_status()
         .with_context(|| format!("HTTP error for {url}"))?;
+    // Log the size up front: the body read below pulls the whole wheel into
+    // memory in one shot (no streaming), so a multi-GB NVIDIA/Isaac wheel is
+    // a multi-minute silent gap here. Announcing the size tells the user the
+    // wait is expected rather than a hang.
+    match resp.content_length() {
+        Some(len) => tracing::info!(
+            %filename,
+            size_mb = len / 1_048_576,
+            "downloading wheel (reads into memory; large wheels take a few minutes)",
+        ),
+        None => tracing::info!(%filename, "downloading wheel"),
+    }
     let bytes = resp
         .bytes()
         .await
         .with_context(|| format!("reading body of {url}"))?;
+    tracing::info!(%filename, "wheel download complete");
 
     if let Some(expected) = expected_sha256 {
         let actual = hex_sha256(&bytes);

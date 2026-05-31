@@ -91,13 +91,16 @@ channels = [
 ]
 
 [package.build.config]
-# Recommended default. Behaves like `minor` (preserves upstream ranges,
-# widens `==X.Y.Z` pins to `>=X.Y,<X+1`) plus an automated last-resort
-# cascade for deps whose post-relax conda spec is unsatisfiable on the
-# workspace's channels (probes conda, widens to `*` only for those
-# specific deps). Eliminates hand-edited `[retread-overrides]` for the
-# `pyglet`-class pins. See "Relax policies" below for the full table.
-retread-relax        = "minor-with-last-resort"
+# `retread-relax` is OPTIONAL as of v0.35.3+. Omit it and you get the
+# default: `patch-then-minor-then-major-then-last-resort`. It emits
+# at patch widening initially, then runs a real conda solve and
+# progressively widens any blocker retread emits (patch -> minor ->
+# major -> `*`) until the solve passes. If the workspace itself
+# pins a conflicting dep, retread stops and writes an actionable
+# suggestion to `RETREAD-SOLVE-FAILED-<bundle>.md` rather than
+# uselessly widening its own emission. Override here only if you
+# want stricter / narrower emission. See "Relax policies" below.
+retread-relax        = "patch-then-minor-then-major-then-last-resort"
 retread-build-number = 0
 # Recommended: pin the python version this pack targets. Without it,
 # retread falls back to DEFAULT_PYTHON (3.11) when pixi forwards only a
@@ -157,7 +160,7 @@ isaaclab-mimic  = { from = "isaaclab", subdirectory = "source/isaaclab_mimic" }
 isaaclab-arena  = { from = "isaaclab-arena" }   # subdirectory defaults to "."
 ```
 
-### Wheel cache + audit (`<pack>/`)
+### Wheel cache + introspection files (`<pack>/`)
 
 Every wheel retread materializes (direct downloads, PyPI resolves,
 `pip wheel` outputs from path/git sources, and the post-D `*.relaxed.whl`
@@ -165,26 +168,93 @@ copies) lands inside the source-package directory under
 `./wheels/<entry_name>/`. Side-by-side with the pack's `pixi.toml` so
 you can inspect or diff the exact bytes rattler-build will pick up.
 
-Each conda output also drops a `retread-audit-<conda_name>.json` next
-to `pixi.toml`: per-bundled-wheel pre-D `Requires-Dist`, post-translate
-conda run-deps, and copy-paste-ready `[dependencies]` /
-`[pypi-options.dependency-overrides]` TOML blocks. Use it to see
-exactly what was relaxed, requested, and emitted on the last solve.
+Three introspection artifacts also land next to `pixi.toml`. Each
+serves a different debugging purpose:
 
 ```
 isaac-pack/
 ├── pixi.toml
-├── retread-audit-isaac-pack.json        # what was relaxed / emitted
+├── retread-audit-<conda_name>.json          # what was relaxed / emitted (post-build)
+├── retread-probe-trace-<conda_name>.json    # per-env probe + solve diagnostics (live)
+├── RETREAD-SOLVE-FAILED-<conda_name>.md     # human-readable summary (only on UNSAT)
 └── wheels/
     ├── isaacsim/
     │   ├── isaacsim-5.1.0-cp311-...-x86_64.whl
     │   └── isaacsim-5.1.0-cp311-...-x86_64.relaxed.whl   # post-D
-    ├── isaaclab/
-    │   └── isaaclab-0.0.1-py3-none-any.relaxed.whl
     └── ...
 ```
 
-Add `wheels/` (and `retread-audit-*.json` if you don't want it
+#### `retread-audit-<conda_name>.json` (post-build)
+
+Written at `conda/build_v1` time — i.e. AFTER pixi successfully
+solves and the bundle actually builds. Contains:
+
+- `wheels[]`: per-bundled-wheel pre-D `Requires-Dist` (verbatim from
+  upstream METADATA) + post-translate spec, plus the auto-data
+  inject summary if any.
+- `emitted_run_deps[]`: the conda `name + spec` retread emitted for
+  this output, post-cascade-widening + post-solve-refinement.
+- `pixi_toml_blocks.{dependencies, pypi_options_dependency_overrides}`:
+  copy-paste-ready TOML blocks mirroring the bundle's actual content,
+  so you can reproduce the same pinning manually if you ever stop
+  using retread.
+- `probe_decisions[]`: the cascade's per-dep routing trace (BFS +
+  auto-bundle + last-resort widening).
+- `solve_diagnostics`: per-env solve check (see below).
+
+Use it to answer "what did retread actually relax / emit on the
+last build?"
+
+#### `retread-probe-trace-<conda_name>.json` (live)
+
+Written during `conda/outputs` — i.e. BEFORE pixi attempts its
+solve. Always lands, even when the workspace solve later fails.
+Same shape as the audit but only carries the parts retread can
+compute pre-build:
+
+- `probe_decisions[]`: every channel probe + routing decision.
+- `solve_diagnostics`: a `{env_name -> SolveDiagnostics}` map. Each
+  entry is a real conda solve run for that env's effective channels
+  + workspace deps + retread's emission. Carries the
+  `refinement_steps[]` list documenting each iteration of the
+  solve-driven cascade (`patch -> minor -> major -> *`).
+
+This is the file to grep when pixi reports a misleading leaf
+error and you want to see what conda's solver REALLY tripped on.
+
+```bash
+python3 -c "
+import json
+d = json.load(open('isaac-pack/retread-probe-trace-isaac-pack.json'))
+for env, diag in sorted(d.get('solve_diagnostics', {}).items()):
+    print(f'=== {env} | sat={diag[\"satisfiable\"]} ===')
+    for s in diag.get('refinement_steps', []):
+        print(f'  round {s[\"iteration\"]}: blocking={s[\"blocking_deps\"]} widened={s[\"widened_deps\"]}')
+    if not diag['satisfiable']:
+        for r in diag['unsat_explanations']:
+            print(r[:800])
+"
+```
+
+#### `RETREAD-SOLVE-FAILED-<conda_name>.md` (UNSAT-only)
+
+Human-readable markdown summary, written whenever ANY env's solve
+check is UNSAT. Survives pixi's progress spinner (which overwrites
+stderr lines). Includes:
+
+- Per-env refinement history (what got widened, in what order).
+- Final unsat chain from the rattler solver.
+- An action checklist (which blocker is yours to fix vs which
+  retread can't help with).
+
+When the file is absent, every env solved cleanly. When present, it
+points at the actual root cause — usually a workspace pin retread
+can't widen on your behalf (CUDA version mismatch, missing channel,
+etc.).
+
+#### Cleanup
+
+Add `wheels/` (and the introspection files if you don't want them
 checked in) to the pack's `.gitignore`; the NVIDIA wheels alone are
 multi-GB. To force re-materialization (after bumping a git rev,
 changing the relax policy, etc.) delete the per-entry folder or the
@@ -192,9 +262,11 @@ whole `wheels/` tree and re-run pixi; retread re-fetches/re-builds on
 the next solve:
 
 ```bash
-rm -rf isaac-pack/wheels                  # nuke everything
-rm -rf isaac-pack/wheels/isaaclab         # or just one entry
-rm -f  isaac-pack/retread-audit-*.json    # audits are regenerated on every solve
+rm -rf isaac-pack/wheels                            # nuke everything
+rm -rf isaac-pack/wheels/isaaclab                   # or just one entry
+rm -f  isaac-pack/retread-audit-*.json              # regenerated at build_v1
+rm -f  isaac-pack/retread-probe-trace-*.json        # regenerated at conda/outputs
+rm -f  isaac-pack/RETREAD-SOLVE-FAILED-*.md         # regenerated whenever solve is UNSAT
 ```
 
 You still need to clear pixi's caches alongside it when iterating on
@@ -405,16 +477,22 @@ that needs it).
 
 ## Relax policies
 
-| Policy                       | `numpy==1.26.4` becomes  | `pyglet<2` becomes | Auto-widen unsat? |
-|------------------------------|--------------------------|--------------------|--------------------|
-| `none`                       | `numpy ==1.26.4`         | `pyglet <2`        | no                 |
-| `patch`                      | `numpy >=1.26.4,<1.27`   | `pyglet <2`        | no                 |
-| `minor`                      | `numpy >=1.26,<2`        | `pyglet <2`        | no                 |
-| `major`                      | `numpy >=1`              | `pyglet <2`        | no                 |
-| `strong-major`               | `numpy >=1`              | `pyglet`           | no                 |
-| `patch-with-last-resort`     | `numpy >=1.26.4,<1.27`   | `pyglet <2`        | yes (probe + `*` widen) |
-| `minor-with-last-resort` ★   | `numpy >=1.26,<2`        | `pyglet <2`        | yes (probe + `*` widen) |
-| `major-with-last-resort`     | `numpy >=1`              | `pyglet <2`        | yes (probe + `*` widen) |
+| Policy                                            | `numpy==1.26.4` becomes  | `pyglet<2` becomes | Auto-widen unsat? |
+|---------------------------------------------------|--------------------------|--------------------|--------------------|
+| `none`                                            | `numpy ==1.26.4`         | `pyglet <2`        | no                 |
+| `patch`                                           | `numpy >=1.26.4,<1.27`   | `pyglet <2`        | no                 |
+| `minor`                                           | `numpy >=1.26,<2`        | `pyglet <2`        | no                 |
+| `major`                                           | `numpy >=1`              | `pyglet <2`        | no                 |
+| `strong-major`                                    | `numpy >=1`              | `pyglet`           | no                 |
+| `patch-with-last-resort`                          | `numpy >=1.26.4,<1.27`   | `pyglet <2`        | yes (`*` widen)    |
+| `minor-with-last-resort`                          | `numpy >=1.26,<2`        | `pyglet <2`        | yes (`*` widen)    |
+| `major-with-last-resort`                          | `numpy >=1`              | `pyglet <2`        | yes (`*` widen)    |
+| `patch-then-minor-then-major-then-last-resort` ★  | `numpy >=1.26.4,<1.27`   | `pyglet <2`        | yes (progressive)  |
+
+★ = **default** as of v0.35.3. Omitting `retread-relax` picks this
+policy. All other policies still work; set `retread-relax = "..."`
+explicitly to choose a narrower one if you want stricter emission
+and accept iterating on overrides by hand.
 
 Non-`==` specifiers (ranges, `~=`, etc.) pass through unchanged under
 every policy except `strong-major`, which additionally strips every
@@ -428,7 +506,82 @@ ABI meaning (e.g. `python >=3`) or trip rattler-build's "missing range
 specifier" check (`python 3`), so a `Requires-Dist: python` line is
 passed through verbatim no matter what `retread-relax` is set to.
 
-### `*-with-last-resort`: strict-by-default, auto-widens on unsat (v0.19.0+, recommended)
+### `patch-then-minor-then-major-then-last-resort`: solve-driven cascade (v0.30.0+, recommended)
+
+The recommended default. Three things happen per emission:
+
+1. **Translate-time emission**: `==X.Y.Z` widens to patch
+   (`>=X.Y.Z,<X.Y+1`) -- the narrowest possible. Ranges pass through.
+2. **Pre-emission solve check** (v0.33.0+): retread runs a real
+   conda solve (via `rattler_solve`) over (workspace effective
+   deps + emitted run-deps) against the workspace's effective
+   channels. If unsat, the failure chain is parsed.
+3. **Iterative refinement** (v0.34.0+, classifier-guided in v0.35.0+):
+   the conflict is classified into one of four modes:
+   - **A-retread-widenable**: blocker is one retread emits and
+     hasn't been widened yet → cascade widens it ONE level (patch →
+     minor → major → `*`) and re-solves. Loops up to 5 times.
+   - **A-exhausted**: cascade already widened to `*` but the
+     transitive still conflicts → audit reports the chain; no fix
+     retread can apply.
+   - **B-workspace-pin-dominates**: the workspace itself pins the
+     conflicting dep → retread emits a workspace-edit suggestion
+     (which pin, which `[feature.X.dependencies]` block, what to
+     change it to) and stops.
+   - **C-workspace-only**: the conflict involves a name retread
+     doesn't emit at all → surface the chain; nothing retread can do.
+
+The progressive widening (vs jumping to `*`) keeps emitted specs as
+tight as possible while still solving. Each step is recorded in
+`retread-probe-trace-<bundle>.json.solve_diagnostics.<env>.refinement_steps`
+so the audit shows exactly what got widened in what round.
+
+When the cascade gives up because every env hits Class B/C/A-exhausted
+and retread has suggestions, **conda/outputs fails with a short error
+pointing at `RETREAD-SOLVE-FAILED-<bundle>.md`**, which leads with
+the suggested workspace edits. Pixi displays backend errors verbatim,
+so the user sees retread's diagnostic — not pixi's own misleading
+leaf error.
+
+### Solve check + diagnostic files
+
+Whenever retread emits an output, three files land next to the
+source-package `pixi.toml`:
+
+| File | When | Purpose |
+|---|---|---|
+| `retread-probe-trace-<bundle>.json` | every solve | machine-readable: per-dep probes + per-env `solve_diagnostics` (sat/unsat, refinement steps, suggestions, full unsat chain) |
+| `retread-audit-<bundle>.json` | after `conda/build_v1` succeeds | post-build audit: wheels, emitted run-deps, copy-paste TOML blocks |
+| `RETREAD-SOLVE-FAILED-<bundle>.md` | only when any env unsat | human-readable summary with **suggested workspace edits at the top** |
+
+If pixi shows a misleading leaf error like "package X requires
+python_abi 3.9", that's the dead-end leaf pixi's solver gave up
+at — **not the real conflict**. Read the MD file or grep the JSON:
+
+```bash
+python3 -c "
+import json
+d = json.load(open('isaac-pack/retread-probe-trace-isaac-pack.json'))
+for env, diag in sorted(d['solve_diagnostics'].items()):
+    print(f'=== {env} | class={diag[\"terminal_classification\"]} ===')
+    for s in diag.get('refinement_steps', []):
+        print(f'  r{s[\"iteration\"]}: blocking={s[\"blocking_deps\"]} widened={s[\"widened_deps\"]}')
+    for s in diag.get('workspace_edit_suggestions', []):
+        print(f'  fix: {s[\"current_pin\"]} -> {s[\"suggested_pin\"]} ({s[\"feature\"]})')
+"
+```
+
+The solve check honors the workspace's `[workspace].channel-priority`
+setting (v0.35.2+). retread defaults to `"strict"` (pixi's own
+default) when the workspace doesn't specify. With strict priority,
+each package comes from the FIRST channel that lists it -- so
+listing `https://prefix.dev/pytorch` ahead of `conda-forge` makes
+the GPU torch-family builds win cleanly, with conda-forge supplying
+everything else. Set `channel-priority = "disabled"` in the workspace
+explicitly if you want raw best-version comparison across channels
+(rare; usually wrong for torch/CUDA stacks).
+
+### `*-with-last-resort`: simpler `*`-widen variants (v0.19.0+, still supported)
 
 Each `*-with-last-resort` variant behaves IDENTICALLY to its base
 (`patch` / `minor` / `major`) at translate time, plus an automated
