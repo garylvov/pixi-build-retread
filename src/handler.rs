@@ -28,6 +28,38 @@ use crate::relax::{default_marker_env, emit_python_version, marker_env_for};
 use crate::rpc::{ok, parse_params, RpcError};
 use crate::wheel::{fetch_wheel, read_metadata, WheelMetadata};
 
+/// Process-global memo of `conda/outputs` results, keyed by the params
+/// that determine the outputs (host/build platform, sorted channels,
+/// python variant set). pixi calls `conda/outputs` ONCE PER LOCK-FILE
+/// ENVIRONMENT that references the source package (e.g. resolving `gsi`
+/// also re-locks `gsi-ros2`, `isaaclab-gpu`, ... that share isaac-pack),
+/// but retread's handler already computes EVERY env's outputs in a
+/// single call -- so calls 2..N with identical params redo the full
+/// multi-env solve for nothing. Memoizing the result collapses those
+/// redundant calls to a hash lookup. retread is one long-lived process
+/// per `pixi` invocation, so this survives across the repeated calls and
+/// is dropped when the backend exits. Same pattern as
+/// `solve_check::RECORDS_CACHE`.
+static CONDA_OUTPUTS_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, CondaOutputsResult>>,
+> = std::sync::OnceLock::new();
+
+/// Build the cache key from the params that actually determine the
+/// outputs. `work_directory` is deliberately EXCLUDED: it's a scratch
+/// dir that doesn't affect the emitted metadata, and including it would
+/// miss cache hits if pixi varies it per call.
+fn conda_outputs_cache_key(params: &CondaOutputsParams) -> String {
+    let mut chans: Vec<String> = params.channels.iter().map(|c| c.url().to_string()).collect();
+    chans.sort();
+    format!(
+        "{}|{}|{}|{:?}",
+        params.host_platform,
+        params.build_platform,
+        chans.join(","),
+        params.variant_configuration,
+    )
+}
+
 const NEGOTIATE: &str = "negotiateCapabilities";
 const INITIALIZE: &str = "initialize";
 const CONDA_OUTPUTS: &str = "conda/outputs";
@@ -79,6 +111,14 @@ const FALLBACK_PYPI_TO_CONDA: &[(&str, &str)] = &[
     // Already covered by parselmouth (`pytorch: [torch]`) but here as a
     // safety net in case the fetch fails entirely.
     ("torch",                  "pytorch"),
+    // isaacsim's `Requires-Dist` lists `pywin32` (it's Windows-only on
+    // PyPI, but Isaac Sim declares it unconditionally). conda-forge ships a
+    // `pywin32` stub on Linux that satisfies the import, so route the PyPI
+    // name to the identically-named conda package. Baked in here so the
+    // consumer workspace no longer needs a `conda-pypi-map` patch for it
+    // (parselmouth doesn't map pywin32). Same intent as the gigastrap
+    // `patches/conda_pypi_map.json` { "pywin32": "pywin32" } entry.
+    ("pywin32",                "pywin32"),
 ];
 
 /// Inverted parselmouth mapping: PyPI name -> conda-forge candidates.
@@ -346,9 +386,37 @@ impl Handler {
         // moment pixi hands off -- the work below (parselmouth load, wheel
         // materialization, repodata probes, solve checks) can run for many
         // seconds with no other output. Generic: no package-specific text.
+        // Cache hit? pixi re-requests conda/outputs once per lock-file env
+        // that shares this source package; the result is identical for
+        // identical params, so return the memoized one instead of redoing
+        // the whole multi-env solve. (See CONDA_OUTPUTS_CACHE.)
+        let cache_key = conda_outputs_cache_key(&params);
+        if let Some(cached) = CONDA_OUTPUTS_CACHE
+            .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+            .lock()
+            .unwrap()
+            .get(&cache_key)
+            .cloned()
+        {
+            tracing::info!(
+                "retread: conda/outputs cache hit -- returning memoized result (pixi re-requested for another env)",
+            );
+            crate::status::tty(
+                "reusing already-computed outputs (pixi re-requested this package for another environment).",
+            );
+            return Ok(cached);
+        }
         tracing::info!(
             retread_version = env!("CARGO_PKG_VERSION"),
             "retread: computing conda outputs (resolving wheels + probing channels; large wheels may download here)",
+        );
+        // tracing -> stderr is invisible during pixi's solve phase (pixi hides
+        // backend stderr behind its "updating lock-file" spinner, even at -vv).
+        // Mirror the key status to /dev/tty so the user sees retread is alive.
+        crate::status::tty(
+            "resolving source package: materializing wheels, then per-environment \
+             solve checks (first run downloads the package wheels and runs many \
+             conda solves -- large wheels can take several minutes).",
         );
         let (config, download_dir, source_dir, cache_dir, workspace_dir) =
             self.snapshot(&params.work_directory).await?;
@@ -540,7 +608,7 @@ impl Handler {
                             }
                         })
                         .collect();
-                    let env_names: Vec<String> = if emission.envs.is_empty() {
+                    let mut env_names: Vec<String> = if emission.envs.is_empty() {
                         // Fallback default emission: no workspace
                         // envs known -- do ONE solve check using the
                         // emission's channels and just the
@@ -549,6 +617,29 @@ impl Handler {
                     } else {
                         emission.envs.clone()
                     };
+                    // v0.44.0: solve the SMALLEST (most base) env first.
+                    // Workspace envs nest -- e.g. isaaclab-gpu ⊆ gsi ⊆
+                    // gsi-ros2 (each child adds features on top). Solving
+                    // the base env first lets its discovered widenings
+                    // SEED the children's refinement (see the
+                    // `accumulated_overrides` seed passed into
+                    // iterative_solve_refinement below), so a child env
+                    // doesn't re-discover the base's widening chain from
+                    // scratch. Ordering by ascending effective-dependency
+                    // count is a cheap proxy for the subset relation
+                    // (a superset env has at least as many deps). Pure
+                    // performance: seeding only cuts iteration count, the
+                    // final emission still unions every env's widenings
+                    // and every solve is re-verified.
+                    if let Some(m) = manifest_for_solve.as_ref() {
+                        env_names.sort_by_key(|n| {
+                            if n == "__default__" {
+                                0
+                            } else {
+                                m.effective_dependencies(n).len()
+                            }
+                        });
+                    }
                     // v0.36.2+: snapshot the post-pre-emit-widen state
                     // so each env's iterative refinement starts from
                     // the SAME baseline. Without this, env A's
@@ -638,6 +729,7 @@ impl Handler {
                         // don't loop forever on external conflicts).
                         let outcome = iterative_solve_refinement(
                             &emitted_run_deps_strs,
+                            &accumulated_overrides,
                             &env_workspace_specs,
                             &env_channels,
                             python_version,
@@ -936,10 +1028,18 @@ impl Handler {
             );
             return Err(RpcError::invalid_params(msg));
         }
-        Ok(CondaOutputsResult {
+        let result = CondaOutputsResult {
             outputs,
             input_globs: Default::default(),
-        })
+        };
+        // Memoize so pixi's subsequent per-env re-requests (identical
+        // params) skip the whole recompute.
+        CONDA_OUTPUTS_CACHE
+            .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+            .lock()
+            .unwrap()
+            .insert(cache_key, result.clone());
+        Ok(result)
     }
 
     async fn conda_build_v1(
@@ -954,6 +1054,10 @@ impl Handler {
             output = %params.output.name.as_normalized(),
             "retread: building package (materializing wheels, then rattler-build; large wheels download here and can take minutes)",
         );
+        crate::status::tty(&format!(
+            "building '{}': materializing wheels, then rattler-build (slow on first build).",
+            params.output.name.as_normalized()
+        ));
         let (config, download_dir, source_dir, cache_dir, workspace_dir) =
             self.snapshot(&params.work_directory).await?;
         // conda/build_v1 doesn't carry the variant set; the chosen variant
@@ -1327,6 +1431,7 @@ async fn resolve_all(
                 &effective.git_sources,
                 auto_data,
                 &pypi_to_conda,
+                &effective.name_map,
                 conda_channels,
             )
             .await
@@ -1658,8 +1763,9 @@ pub fn class_label(c: &crate::conflict_classifier::ConflictClass) -> String {
 ///   - 0: tightest (has `<A.B+1` minor upper, or exact `==A.B.C`, or
 ///        no anchor at all — `<2`, `==1.26.4`, etc.)
 ///   - 1: minor-widened (`>=A.B,<A+1`)
-///   - 2: major-widened (`>=A`, no upper)
-///   - 3: star (`*` or empty)
+///   - 2: major FLOOR, still bounded (`>=A,<A+1`)
+///   - 3: major-open (`>=A`, no upper)
+///   - 4: star (`*` or empty)
 ///
 /// Used by `merge_looser_override` to union per-env refinement
 /// widenings into a single output the cascade can ship. Two envs
@@ -1669,7 +1775,7 @@ pub fn class_label(c: &crate::conflict_classifier::ConflictClass) -> String {
 fn widening_level(spec: &str) -> u8 {
     let trimmed = spec.trim();
     if trimmed == "*" || trimmed.is_empty() {
-        return 3;
+        return 4;
     }
     // Exact pin (`==X.Y.Z`) is the tightest possible spec. It has
     // no `<` upper bound so the major/minor heuristic below would
@@ -1692,12 +1798,15 @@ fn widening_level(spec: &str) -> u8 {
     let next_minor = minor + 1;
     let has_minor_upper = trimmed.contains(&format!("<{major}.{next_minor}"));
     let has_major_upper = trimmed.contains(&format!("<{next_major}"));
+    let lower_has_minor = trimmed.contains(&format!(">={major}."));
     if has_minor_upper {
         0
+    } else if has_major_upper && lower_has_minor {
+        1 // minor range `>=A.B,<A+1`
     } else if has_major_upper {
-        1
+        2 // major floor, still bounded `>=A,<A+1`
     } else {
-        2
+        3 // major-open `>=A`, no upper
     }
 }
 
@@ -1767,13 +1876,24 @@ fn widen_one_level(current_spec: &str) -> Option<String> {
     let next_minor = minor + 1;
     let has_minor_upper = trimmed.contains(&format!("<{major}.{next_minor}"));
     let has_major_upper = trimmed.contains(&format!("<{next_major}"));
+    // Does the lower bound carry a minor component (`>=A.B...`) or is it
+    // a bare major floor (`>=A`)? Distinguishes `>=2.10,<3` (minor lower)
+    // from `>=2,<3` (major-floor lower) so the major step makes progress
+    // WITHOUT dropping the upper bound prematurely.
+    let lower_has_minor = trimmed.contains(&format!(">={major}."));
     if has_minor_upper {
+        // patch/minor -> minor: `>=3.7.0,<3.8` -> `>=3.7,<4`.
         Some(format!(">={major}.{minor},<{next_major}"))
-    } else if has_major_upper {
-        Some(format!(">={major}"))
+    } else if has_major_upper && lower_has_minor {
+        // minor range -> major FLOOR, KEEPING the `<A+1` upper:
+        // `>=2.10,<3` -> `>=2,<3`. (v0.46.0: preserve the upper so the
+        // emitted pack stays bounded to one major even without a
+        // workspace pin -- previously this dropped to `>=2`, unbounded.)
+        Some(format!(">={major},<{next_major}"))
     } else {
-        // No upper bound, or shape we don't recognize. Already at
-        // Major-or-broader; next step is `*`.
+        // Either a bare-major floor with an upper (`>=2,<3`) or no upper
+        // bound at all (`>=2`) -- both have nowhere tighter to go but
+        // `*`. (Dropping the major upper is the last widening step.)
         Some("*".to_string())
     }
 }
@@ -1782,14 +1902,32 @@ fn widen_one_level(current_spec: &str) -> Option<String> {
 /// match-spec's lower bound or exact pin. Returns None for specs
 /// that have no parseable anchor version (e.g. `>=A,!=B`).
 fn extract_anchor_version(spec: &str) -> Option<String> {
-    // Find the first comma-separated clause that looks like `>=X.Y.Z`
-    // or `==X.Y.Z` and pull X.Y.Z out.
+    // Among all `>=X.Y.Z` / `==X.Y.Z` / `>X` clauses, pick the HIGHEST
+    // (tightest) anchor version.
+    //
+    // A merged spec can carry several lower bounds from different wheels:
+    // e.g. `>=1.4,==2.10.0,>=2.10.0,<2.11.0a0` (one wheel pins
+    // `torch>=1.4`, isaacsim pins `torch==2.10.0`). The tightest lower
+    // bound (2.10.0) is the one that actually constrains, so widen FROM
+    // it. The previous "first clause wins" logic anchored on the stray
+    // `>=1.4`, and `has_major_upper`'s `<2` substring test then matched
+    // `<2.11.0a0`, collapsing the spec to `>=1` in a single step --
+    // discarding the real 2.10 anchor AND the upper bound. Comparing
+    // candidates as PEP 440 versions and keeping the max fixes that:
+    // 2.10.0 widens to `>=2.10,<3` (the `<2.11` upper is recognized),
+    // then `>=2`, never `>=1`.
+    use std::str::FromStr;
+    let mut best: Option<(uv_pep508::uv_pep440::Version, String)> = None;
+    let mut fallback: Option<String> = None;
     for clause in spec.split(',') {
         let c = clause.trim();
-        let payload = c
+        let Some(payload) = c
             .strip_prefix(">=")
             .or_else(|| c.strip_prefix("=="))
-            .or_else(|| c.strip_prefix(">"))?;
+            .or_else(|| c.strip_prefix(">"))
+        else {
+            continue;
+        };
         let payload = payload.trim();
         if payload.is_empty() {
             continue;
@@ -1798,12 +1936,21 @@ fn extract_anchor_version(spec: &str) -> Option<String> {
         let end = payload
             .find(|c: char| !(c.is_ascii_digit() || c == '.'))
             .unwrap_or(payload.len());
-        let head = &payload[..end];
-        if !head.is_empty() && head.chars().any(|c| c.is_ascii_digit()) {
-            return Some(head.trim_end_matches('.').to_string());
+        let head = payload[..end].trim_end_matches('.');
+        if head.is_empty() || !head.chars().any(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        // First parseable clause is the fallback if NONE compare cleanly.
+        if fallback.is_none() {
+            fallback = Some(head.to_string());
+        }
+        if let Ok(v) = uv_pep508::uv_pep440::Version::from_str(head) {
+            if best.as_ref().map_or(true, |(bv, _)| &v > bv) {
+                best = Some((v, head.to_string()));
+            }
         }
     }
-    None
+    best.map(|(_, s)| s).or(fallback)
 }
 
 /// v0.36.0+: post-condition invariant. After `produce_output` runs in
@@ -1921,9 +2068,22 @@ fn check_output_abi_invariants(
     violations
 }
 
+/// Compact a list of "dep -> spec" change strings into one short line
+/// for the /dev/tty status. Shows the first two verbatim and collapses
+/// the rest into "(+N more)" so the status never wraps the console even
+/// when a round widens many deps at once.
+fn summarize_changes(changes: &[String]) -> String {
+    match changes.len() {
+        0 => "(no change)".to_string(),
+        1 | 2 => changes.join(", "),
+        n => format!("{}, {} (+{} more)", changes[0], changes[1], n - 2),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn iterative_solve_refinement(
     base_run_deps: &[String],
+    seed_overrides: &BTreeMap<String, String>,
     workspace_specs: &[String],
     channels: &[ChannelUrl],
     python_version: &str,
@@ -1944,12 +2104,96 @@ async fn iterative_solve_refinement(
     let mut current_run_deps = base_run_deps.to_vec();
     let mut refinement_steps: Vec<crate::audit::RefinementStep> = Vec::new();
     let mut widened_to_star: HashSet<String> = HashSet::new();
+
+    // v0.44.0: seed from sibling envs' already-discovered widenings.
+    // env_names is solved base-first (see conda_outputs), so by the
+    // time a superset env reaches here, `seed_overrides`
+    // (= accumulated_overrides) carries the looser specs the base env
+    // converged on. Apply any that are STRICTLY looser than this env's
+    // current override for the same dep, then re-emit once so iter 0
+    // solves against the shared widening frontier instead of
+    // re-discovering it one level per round.
+    //
+    // SAFE re: the v0.36.2 false-SAT bug. That bug was leaked &mut
+    // state letting an env be reported sat off another env's widenings
+    // WITHOUT its own verification. Here every iteration -- including
+    // iter 0 with the seed applied -- runs a real `run_solve_check`
+    // resolvo solve, so a SAT verdict always reflects a genuine
+    // solution for THIS env's full spec set. Seeding only changes how
+    // many iterations we need; never whether we verify. ABI anchors are
+    // never seeded (defense-in-depth: classify_chains/widen already
+    // refuse them, and the post-widen invariant check still runs).
+    let seed_to_apply: Vec<(String, String)> = seed_overrides
+        .iter()
+        .filter(|&(dep, spec)| {
+            !is_abi_anchor(dep)
+                && widening_level(spec)
+                    > effective
+                        .overrides
+                        .get(dep)
+                        .map(|s| widening_level(s))
+                        .unwrap_or(0)
+        })
+        .map(|(d, s)| (d.clone(), s.clone()))
+        .collect();
+    if !seed_to_apply.is_empty() {
+        for (dep, spec) in &seed_to_apply {
+            if *spec == "*" {
+                widened_to_star.insert(dep.clone());
+            }
+            effective.overrides.insert(dep.clone(), spec.clone());
+        }
+        let seeded = produce_output(bundle, effective, host_platform, python_version, siblings)?;
+        current_run_deps = seeded
+            .run_dependencies
+            .depends
+            .iter()
+            .map(|n| {
+                let raw = format_packagespec(&n.spec);
+                if raw.is_empty() {
+                    n.name.as_str().to_string()
+                } else {
+                    format!("{} {raw}", n.name.as_str())
+                }
+            })
+            .collect();
+        tracing::info!(
+            env = %env_name,
+            seeded = ?seed_to_apply.iter().map(|(d, s)| format!("{d} -> {s}")).collect::<Vec<_>>(),
+            "iterative refinement: seeded from sibling envs' widenings (base-first ordering)",
+        );
+    }
     let workspace_dep_names: HashSet<String> = workspace_specs
         .iter()
         .filter_map(|s| s.split_whitespace().next().map(String::from))
         .collect();
 
+    // One-line summary of what the PREVIOUS attempt changed (the dep it
+    // widened, or the sibling-env seed), shown as a suffix on the next
+    // attempt's status line so the user can see WHY we're re-solving --
+    // without a second line per attempt. None on attempt 1 (nothing
+    // widened yet).
+    let mut last_action: Option<String> = if seed_to_apply.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "seeded from base env: {}",
+            summarize_changes(&seed_to_apply.iter().map(|(d, s)| format!("{d} -> {s}")).collect::<Vec<_>>()),
+        ))
+    };
+
     for iter in 0..=MAX_REFINEMENT {
+        // Heartbeat to /dev/tty: each solve over ~1M records takes a while and
+        // pixi shows nothing during conda/outputs, so without this the user
+        // sees a multi-minute silent freeze. (stderr equivalent is hidden.)
+        let suffix = match &last_action {
+            Some(a) => format!(" -- {a}"),
+            None => String::new(),
+        };
+        crate::status::tty(&format!(
+            "solve-check: env '{env_name}' (attempt {}){suffix}",
+            iter + 1
+        ));
         let mut combined = current_run_deps.clone();
         combined.extend(workspace_specs.iter().cloned());
         let mut outcome = crate::solve_check::run_solve_check(
@@ -2113,6 +2357,9 @@ async fn iterative_solve_refinement(
             widened = ?widened_this_round,
             "iterative refinement: widening retread-emitted deps and re-solving",
         );
+        // Record what this round changed so the NEXT attempt's status
+        // line can show it (one line, no console blow-up).
+        last_action = Some(format!("widened {}", summarize_changes(&widened_this_round)));
         // Re-emit produce_output with the updated overrides.
         let new_output = produce_output(
             bundle,
@@ -2783,6 +3030,15 @@ async fn resolve_bundle(
     // circuit: user opted into a specific upstream source via PEP 508
     // `pkg @ <url>` and substituting conda would silently swap deps.
     pypi_to_conda: &PypiToCondaMap,
+    // v0.46.0: the merged effective name-map (user retread-name-map +
+    // FALLBACK_PYPI_TO_CONDA + unambiguous parselmouth). The BFS prefer-
+    // conda picker consults THIS first, so curated answers like
+    // torch->pytorch route to conda even when parselmouth's inverted map
+    // is ambiguous (multiple conda candidates, no identity match). Without
+    // it, `torch` fell through to PyPI and got bundled at latest (2.12.0),
+    // clobbering conda's pinned pytorch at install. Emission already used
+    // this map; the BFS now matches it.
+    name_map: &std::collections::BTreeMap<String, String>,
     conda_channels: &[ChannelUrl],
 ) -> Result<Bundle> {
     let conda_name = conda_name_from(entry_name);
@@ -2908,26 +3164,27 @@ async fn resolve_bundle(
         // question. v0.17.0 fixes the picker.
         let mut routed_to_conda = false;
         if let PendingSource::Pypi { specifiers, .. } = &pending.source {
-            if let Some(candidates) = pypi_to_conda.get(&dep_conda_name) {
+            // v0.46.0: the curated/user name-map wins over parselmouth.
+            // If it has an entry for this dep (e.g. torch->pytorch from
+            // FALLBACK), treat that as the unambiguous conda target --
+            // otherwise fall back to parselmouth's inverted candidates,
+            // which are often ambiguous for exactly the deps the FALLBACK
+            // table exists to disambiguate.
+            {
                 let picked: Option<String> =
-                    if candidates.iter().any(|c| c == &dep_conda_name) {
-                        Some(dep_conda_name.clone())
-                    } else if candidates.len() == 1 {
-                        Some(candidates[0].clone())
-                    } else {
-                        None
-                    };
+                    pick_conda_target(&dep_conda_name, name_map, pypi_to_conda);
                 match picked {
                     None => {
+                        let amb = pypi_to_conda.get(&dep_conda_name);
                         tracing::info!(
                             dep = %pending.pypi_name,
-                            candidates = ?candidates,
+                            candidates = ?amb,
                             "BFS prefer-conda: ambiguous parselmouth mapping with no identity match; not short-circuiting (add retread-name-map to force conda routing)",
                         );
                         probe_decisions.push(crate::audit::ProbeDecision {
                             stage: "bfs".into(),
                             pypi_name: pending.pypi_name.clone(),
-                            conda_name: format!("(ambiguous: {candidates:?})"),
+                            conda_name: format!("(ambiguous: {amb:?})"),
                             spec: specifiers.to_string(),
                             target_python: target.python_version.clone(),
                             channels_consulted: vec![],
@@ -3002,6 +3259,52 @@ async fn resolve_bundle(
                         );
                         if routing_decision != "fall-through-to-pypi" {
                             routed_to_conda = true;
+                        } else {
+                            // v0.46.0: the EXACT wheel spec isn't on conda
+                            // (e.g. wheel pins torch==2.7.0 but conda has
+                            // 2.7.1, or the dep resolved to PyPI-latest in
+                            // isolation). Bundling here vendors a PyPI build
+                            // that SHADOWS conda's ABI-correct copy and
+                            // double-installs a dep we also emit as a conda
+                            // run-dep. Before falling through to PyPI, probe
+                            // whether conda has the package at ANY (py-compat)
+                            // version; if so, keep it on conda and let the
+                            // run-dep emission + solve cascade pick the
+                            // ABI-correct build. Only bundle when conda truly
+                            // lacks the package.
+                            let name_level = crate::probe::probe(
+                                conda_channels,
+                                &conda_target_name,
+                                "*",
+                                Some(&target.python_version),
+                            )
+                            .await;
+                            probe_decisions.push(crate::audit::ProbeDecision {
+                                stage: "bfs_name_level".into(),
+                                pypi_name: pending.pypi_name.clone(),
+                                conda_name: conda_target_name.clone(),
+                                spec: "*".into(),
+                                target_python: target.python_version.clone(),
+                                channels_consulted: name_level.channels_consulted.clone(),
+                                satisfiable: name_level.satisfiable,
+                                matching_candidates: name_level.matching_candidates,
+                                routing_decision: if name_level.is_satisfied() {
+                                    "name-level-conda-keep"
+                                } else {
+                                    "fall-through-to-pypi"
+                                }
+                                .into(),
+                            });
+                            if name_level.is_satisfied() {
+                                tracing::info!(
+                                    dep = %pending.pypi_name,
+                                    conda_name = %conda_target_name,
+                                    wheel_spec = %probe_spec,
+                                    conda_matches = name_level.matching_candidates,
+                                    "BFS prefer-conda: exact wheel spec absent on conda but the package exists at other versions -- keeping on conda (ABI-correct) instead of bundling a PyPI build",
+                                );
+                                routed_to_conda = true;
+                            }
                         }
                     }
                 }
@@ -3551,6 +3854,40 @@ fn prefer_conda_match(
     name_map.contains_key(conda_normalized_pypi_name)
 }
 
+/// v0.46.0: pick the conda target name for a PyPI dep in the BFS
+/// prefer-conda decision.
+///
+/// Precedence (matches what emission's `translate` uses, so the BFS and
+/// emission agree on routing):
+///   1. The merged `name_map` (user retread-name-map + FALLBACK_PYPI_TO_CONDA
+///      + unambiguous parselmouth) -- a curated, unambiguous answer wins
+///      outright. This is what makes `torch -> pytorch` route to conda even
+///      though parselmouth's inverted map lists multiple ambiguous conda
+///      candidates for `torch` with no identity match.
+///   2. Else parselmouth's inverted candidates: an identity match
+///      (`numpy -> numpy`) wins; else a single candidate; else `None`
+///      (ambiguous -> caller leaves it on the PyPI/bundle path).
+///
+/// Returns the conda package name to probe/route to, or `None` to keep the
+/// dep on the PyPI side.
+fn pick_conda_target(
+    dep_conda_name: &str,
+    name_map: &std::collections::BTreeMap<String, String>,
+    pypi_to_conda: &PypiToCondaMap,
+) -> Option<String> {
+    if let Some(target) = name_map.get(dep_conda_name) {
+        return Some(target.clone());
+    }
+    let candidates = pypi_to_conda.get(dep_conda_name)?;
+    if candidates.iter().any(|c| c == dep_conda_name) {
+        Some(dep_conda_name.to_string())
+    } else if candidates.len() == 1 {
+        Some(candidates[0].clone())
+    } else {
+        None
+    }
+}
+
 /// Build the conda match-spec string the channel probe should look
 /// for, given a resolved PyPI version and the active relax policy.
 /// Mirrors what `translate(==<version>)` would emit, since that's
@@ -3711,12 +4048,63 @@ async fn auto_bundle_transitives(
                         routing_decision: routing_decision.into(),
                     });
                 if probe_result.is_definitively_unsatisfied() {
+                    // v0.46.0: the EXACT resolved version isn't on conda --
+                    // but that's usually because the transitive was resolved
+                    // to PyPI-latest in isolation (e.g. a bundled `pytorch3d`
+                    // pulls `torch`, which resolves to 2.12.0 while conda
+                    // tops out at pytorch 2.7.x). Bundling that too-new wheel
+                    // SHADOWS conda's ABI-correct copy (a cu130 torch wheel
+                    // over the env's cu128 pytorch) AND double-installs a dep
+                    // retread also emits as a conda run-dep -- the bundled
+                    // wheel then clobbers the conda build at install time.
+                    //
+                    // So before bundling, probe whether conda has the package
+                    // at ANY (python-compatible) version. If it does, keep it
+                    // on the conda side: the run-dep emission + solve cascade
+                    // pick the ABI-correct conda build, derived from the
+                    // wheel's ORIGINAL requirement (not PyPI-latest). Only
+                    // bundle when conda genuinely lacks the package -- a true
+                    // PyPI-only dependency. (Escape hatch if this picks wrong:
+                    // retread-overrides to force a spec, or retread-drop-deps.)
+                    let name_level = crate::probe::probe(
+                        conda_channels,
+                        &conda_target_name,
+                        "*",
+                        Some(&target.python_version),
+                    )
+                    .await;
+                    bundle.probe_decisions.push(crate::audit::ProbeDecision {
+                        stage: "auto_bundle_name_level".into(),
+                        pypi_name: name.clone(),
+                        conda_name: conda_target_name.clone(),
+                        spec: "*".into(),
+                        target_python: target.python_version.clone(),
+                        channels_consulted: name_level.channels_consulted.clone(),
+                        satisfiable: name_level.satisfiable,
+                        matching_candidates: name_level.matching_candidates,
+                        routing_decision: if name_level.is_satisfied() {
+                            "name-level-conda-keep"
+                        } else {
+                            "fall-through-to-pypi"
+                        }
+                        .into(),
+                    });
+                    if name_level.is_satisfied() {
+                        tracing::info!(
+                            dep = %name,
+                            conda = %conda_target_name,
+                            resolved_version = %version,
+                            conda_matches = name_level.matching_candidates,
+                            "prefer-conda: exact resolved version absent on conda, but the package exists at other versions -- keeping on conda (ABI-correct) instead of bundling a too-new PyPI build",
+                        );
+                        continue;
+                    }
                     tracing::info!(
                         dep = %name,
                         conda = %conda_target_name,
                         spec = %probe_spec,
                         channels = ?probe_result.channels_consulted,
-                        "prefer-conda: conda spec is UNSATISFIABLE on workspace channels; falling back to auto-bundle from PyPI",
+                        "prefer-conda: conda has no build of this package at any version; falling back to auto-bundle from PyPI",
                     );
                     // intentional fall-through: continue with bundle path
                 } else {
@@ -4804,16 +5192,117 @@ mod tests {
     use crate::config::RelaxPolicy;
     use std::collections::BTreeMap;
 
+    // -----------------------------------------------------------------
+    // v0.46.0: BFS prefer-conda picker. Regression coverage for the bug
+    // where `torch` (whose parselmouth inverted map is ambiguous) fell
+    // through to PyPI and got bundled at latest (2.12.0), clobbering
+    // conda's pinned pytorch at install. The merged name_map (which
+    // carries the FALLBACK torch->pytorch) must win over the ambiguous
+    // parselmouth candidates so the BFS routes it to conda.
+    // -----------------------------------------------------------------
+
+    fn pypi_map(pairs: &[(&str, &[&str])]) -> PypiToCondaMap {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.iter().map(|s| s.to_string()).collect()))
+            .collect()
+    }
+
+    #[test]
+    fn pick_conda_target_name_map_wins_over_ambiguous_parselmouth() {
+        // THE torch regression: parselmouth lists several conda
+        // candidates for `torch` with NO identity match (torch != any).
+        // Parselmouth alone -> None -> bundle. With the FALLBACK
+        // torch->pytorch in the merged name_map, the picker returns
+        // pytorch so the BFS routes it to conda instead of bundling.
+        let parselmouth = pypi_map(&[("torch", &["pytorch", "pytorch-cpu", "pytorch-gpu"])]);
+        let mut name_map: BTreeMap<String, String> = BTreeMap::new();
+        name_map.insert("torch".into(), "pytorch".into());
+        assert_eq!(
+            pick_conda_target("torch", &name_map, &parselmouth).as_deref(),
+            Some("pytorch"),
+        );
+    }
+
+    #[test]
+    fn pick_conda_target_ambiguous_parselmouth_without_name_map_is_none() {
+        // Documents the pre-fix behavior: ambiguous parselmouth + no
+        // curated answer -> None (caller leaves it on the PyPI/bundle
+        // path). This is exactly why the FALLBACK entry is load-bearing.
+        let parselmouth = pypi_map(&[("torch", &["pytorch", "pytorch-cpu", "pytorch-gpu"])]);
+        let name_map: BTreeMap<String, String> = BTreeMap::new();
+        assert_eq!(pick_conda_target("torch", &name_map, &parselmouth), None);
+    }
+
+    #[test]
+    fn pick_conda_target_parselmouth_identity_match_wins() {
+        // numpy -> numpy is an identity match among the candidates; no
+        // name_map entry needed.
+        let parselmouth = pypi_map(&[("numpy", &["numpy", "manifpy"])]);
+        let name_map: BTreeMap<String, String> = BTreeMap::new();
+        assert_eq!(
+            pick_conda_target("numpy", &name_map, &parselmouth).as_deref(),
+            Some("numpy"),
+        );
+    }
+
+    #[test]
+    fn pick_conda_target_single_parselmouth_candidate() {
+        let parselmouth = pypi_map(&[("some-pypi-only", &["the-conda-name"])]);
+        let name_map: BTreeMap<String, String> = BTreeMap::new();
+        assert_eq!(
+            pick_conda_target("some-pypi-only", &name_map, &parselmouth).as_deref(),
+            Some("the-conda-name"),
+        );
+    }
+
+    #[test]
+    fn pick_conda_target_unknown_dep_is_none() {
+        // Not in name_map and not in parselmouth -> stays on PyPI.
+        let parselmouth = pypi_map(&[("torch", &["pytorch"])]);
+        let name_map: BTreeMap<String, String> = BTreeMap::new();
+        assert_eq!(
+            pick_conda_target("totally-unknown-pkg", &name_map, &parselmouth),
+            None,
+        );
+    }
+
+    #[test]
+    fn pick_conda_target_user_name_map_overrides_parselmouth_identity() {
+        // A user retread-name-map entry beats even a parselmouth identity
+        // match -- the curated answer is authoritative.
+        let parselmouth = pypi_map(&[("opencv-python-headless", &["opencv-python-headless"])]);
+        let mut name_map: BTreeMap<String, String> = BTreeMap::new();
+        name_map.insert("opencv-python-headless".into(), "py-opencv".into());
+        assert_eq!(
+            pick_conda_target("opencv-python-headless", &name_map, &parselmouth).as_deref(),
+            Some("py-opencv"),
+        );
+    }
+
     #[test]
     fn widen_one_level_progression() {
         // Patch -> Minor: `>=3.7.0,<3.8` -> `>=3.7,<4`
         assert_eq!(widen_one_level(">=3.7.0,<3.8").as_deref(), Some(">=3.7,<4"));
-        // Minor -> Major: `>=3.7,<4` -> `>=3`
-        assert_eq!(widen_one_level(">=3.7,<4").as_deref(), Some(">=3"));
-        // Major -> Star: `>=3` -> `*`
+        // Minor -> Major FLOOR (keeps the `<4` upper): `>=3.7,<4` -> `>=3,<4`
+        // (v0.46.0: was `>=3`; we now preserve the upper bound so the
+        // emitted spec stays bounded to one major version.)
+        assert_eq!(widen_one_level(">=3.7,<4").as_deref(), Some(">=3,<4"));
+        // Major floor -> Star: `>=3,<4` -> `*` (drop the upper last).
+        assert_eq!(widen_one_level(">=3,<4").as_deref(), Some("*"));
+        // Bare major-open (no upper) -> Star.
         assert_eq!(widen_one_level(">=3").as_deref(), Some("*"));
         // Star -> None
         assert_eq!(widen_one_level("*"), None);
+    }
+
+    #[test]
+    fn widen_one_level_preserves_upper_through_major() {
+        // The pytorch case: the merged spec widens to a bounded major
+        // range, NOT an unbounded `>=2`. `>=2.10,<3` -> `>=2,<3`.
+        assert_eq!(widen_one_level(">=2.10,<3").as_deref(), Some(">=2,<3"));
+        // And only THEN, if still unsat, drops the upper to `*`.
+        assert_eq!(widen_one_level(">=2,<3").as_deref(), Some("*"));
     }
 
     #[test]
@@ -4826,6 +5315,32 @@ mod tests {
         // round (widen_one_level previously returned None).
         assert_eq!(widen_one_level("<2").as_deref(), Some("*"));
         assert_eq!(widen_one_level("<=5").as_deref(), Some("*"));
+    }
+
+    #[test]
+    fn extract_anchor_version_picks_highest_among_merged_clauses() {
+        // The torch regression: a merged spec carrying a stray low lower
+        // bound (>=1.4) plus the real exact pin (==2.10.0). The tightest
+        // anchor (2.10.0) must win -- NOT the first clause (1.4).
+        assert_eq!(
+            extract_anchor_version(">=1.4,==2.10.0,>=2.10.0,<2.11.0a0").as_deref(),
+            Some("2.10.0"),
+        );
+    }
+
+    #[test]
+    fn widen_one_level_merged_spec_does_not_collapse_to_one() {
+        // Regression: `>=1.4,==2.10.0,>=2.10.0,<2.11.0a0` previously
+        // widened straight to `>=1` (anchored on 1.4; `<2` matched
+        // `<2.11.0a0`). It must instead recognize the 2.10 anchor + the
+        // `<2.11` minor upper and step to `>=2.10,<3`.
+        assert_eq!(
+            widen_one_level(">=1.4,==2.10.0,>=2.10.0,<2.11.0a0").as_deref(),
+            Some(">=2.10,<3"),
+        );
+        // And the next step is the bounded major floor, never dipping
+        // below the 2.x line and never going unbounded.
+        assert_eq!(widen_one_level(">=2.10,<3").as_deref(), Some(">=2,<3"));
     }
 
     #[test]
@@ -4859,10 +5374,31 @@ mod tests {
         // spec that widen_one_level moves from L -> L+1 must report
         // widening_level L initially and L+1 after.
         assert_eq!(widening_level(">=3.7.0,<3.8"), 0); // patch
-        assert_eq!(widening_level(">=3.7,<4"), 1); // minor
-        assert_eq!(widening_level(">=3"), 2); // major
-        assert_eq!(widening_level("*"), 3); // star
-        assert_eq!(widening_level(""), 3); // bare-name == *
+        assert_eq!(widening_level(">=3.7,<4"), 1); // minor range
+        assert_eq!(widening_level(">=3,<4"), 2); // major floor, bounded
+        assert_eq!(widening_level(">=3"), 3); // major-open, no upper
+        assert_eq!(widening_level("*"), 4); // star
+        assert_eq!(widening_level(""), 4); // bare-name == *
+    }
+
+    #[test]
+    fn widening_level_strictly_increases_along_widen_chain() {
+        // The merge in merge_looser_override needs a TOTAL order that
+        // agrees with widen_one_level: each step must report a strictly
+        // higher level than the last, so "loosest wins" picks correctly.
+        let mut spec = ">=2.10.0,<2.11".to_string();
+        let mut last = widening_level(&spec);
+        for _ in 0..6 {
+            let Some(next) = widen_one_level(&spec) else { break };
+            let lvl = widening_level(&next);
+            assert!(
+                lvl > last,
+                "widening {spec} -> {next} must raise level ({last} -> {lvl})",
+            );
+            last = lvl;
+            spec = next;
+        }
+        assert_eq!(spec, "*", "chain should terminate at star");
     }
 
     // -------------------------------------------------------------

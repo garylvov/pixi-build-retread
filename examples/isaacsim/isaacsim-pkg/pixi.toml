@@ -1,0 +1,36 @@
+# Package-only manifest: the retread source package that repacks the
+# PyPI Isaac Sim wheels as a single conda package with relaxed pins.
+# The workspace one directory up (../pixi.toml) depends on this via
+# `isaacsim = { path = "./isaacsim-pkg" }`, which is what pulls the
+# built package into the default environment. Mirrors the structure of
+# gigastrap/isaac-pack/ (package-only; no [workspace] table here).
+
+[package]
+name = "isaacsim"
+version = "5.1.0"
+
+[package.build]
+backend = { name = "pixi-build-retread", version = ">=0.46.0", channels = [
+  "https://prefix.dev/garylvov",
+  "https://prefix.dev/conda-forge",
+] }
+
+[package.build.config]
+retread-relax = "minor"
+retread-build-number = 0
+
+# Same syntax pixi uses for [pypi-dependencies]. retread resolves this
+# against the PEP 503 simple index, then follows `extras` recursively
+# via the wheel's METADATA.
+[package.build.config.retread-wheels]
+isaacsim = { version = "==5.1.0", index = "https://pypi.nvidia.com", extras = ["all", "extscache"] }
+
+[package.build.config.retread-overrides]
+# Keep numpy strictly <2 so the ros2-humble bindings (which still
+# depend on numpy<2 in many places) stay compatible.
+numpy = ">=1.26,<2"
+
+[package.build.config.retread-name-map]
+# PyPI ships headless OpenCV as opencv-python-headless; conda calls it
+# py-opencv.
+opencv-python-headless = "py-opencv"

@@ -1,0 +1,46 @@
+name: CI
+
+# Runs the same pre-commit hooks contributors run locally: file hygiene,
+# `cargo fmt --check`, `cargo clippy --all-targets -D warnings`, and the fast
+# `cargo test --all-targets` suite. Heavy live/e2e tests (#[ignore]'d:
+# isaacsim, py.mujoco.org, e2e_ros_isaacsim) are NOT run here.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pre-commit:
+    name: pre-commit (fmt, clippy, test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # edition 2024 needs Rust >= 1.85; stable provides it. rustfmt +
+      # clippy components are required by the cargo hooks.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # Cache the cargo registry, git deps (pixi/uv/pubgrub), and the build
+      # so clippy+test don't recompile ~200 crates from scratch every run.
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Set up Python (for pre-commit)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install pre-commit
+        run: pip install pre-commit
+
+      - name: Run pre-commit hooks
+        run: pre-commit run --all-files --show-diff-on-failure --color=always

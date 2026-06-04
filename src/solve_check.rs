@@ -18,14 +18,21 @@
 //! spec I'd emit have ANY candidate on the channel" -- not "does that
 //! candidate compose with the rest of the workspace."
 //!
-//! Cost: one full conda solve per (python_variant, discovered_output).
-//! For a typical isaac-pack with 1 output this adds ~1-3 seconds to
-//! conda/outputs. Repodata is already cached in memory by probe.rs so
-//! we don't pay the fetch cost again.
+//! Cost: the iterative refinement loop calls this ~8x per env across
+//! ~4 envs (~32 solves). v0.43.0: the ~1M repodata records are now
+//! parsed from the disk cache ONCE per (subdir, channel-set) and shared
+//! across every solve via `RECORDS_CACHE` (an `Arc<RecordSet>`). Before
+//! this, `run_solve_check` re-read + re-parsed + re-deduped ~1.08M
+//! RepoDataRecords on EVERY call -- ~32 redundant parses of hundreds of
+//! MB of JSON, which was the dominant CPU cost and the ~4 GB RSS thrash
+//! (NOT the resolvo solve itself). The older "repodata is cached by
+//! probe.rs" claim here was false: probe.rs caches a different parsed
+//! form (`RepodataIndex`) that the solver can't consume.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{anyhow, Context, Result};
 use rattler_conda_types::{
@@ -187,6 +194,86 @@ pub fn build_virtual_packages(
     virtual_packages
 }
 
+/// Repodata records for one channel-set, parsed once and shared across
+/// every solve. See `RECORDS_CACHE`.
+struct RecordSet {
+    records: Vec<RepoDataRecord>,
+    /// `"<channel>/<subdir>"` strings actually consulted (for the audit).
+    consulted: Vec<String>,
+}
+
+/// Process-global cache of parsed `RepoDataRecord`s, keyed by the exact
+/// (target_subdir, channel-set) a solve consults. retread is a long-lived
+/// backend, so this survives across the ~32 solves of one `conda/outputs`
+/// call. The expensive ~1M-record JSON parse now runs ~2x (the gigastrap
+/// channel sets with vs without robostack-humble) instead of ~32x.
+static RECORDS_CACHE: OnceLock<Mutex<HashMap<String, Arc<RecordSet>>>> = OnceLock::new();
+
+/// Load (or reuse) the deduped record set for `channels`. The slow JSON
+/// parse + record build runs only on the first call per channel-set.
+async fn load_records(channels: &[ChannelUrl], target_subdir: &str) -> Arc<RecordSet> {
+    let mut key = String::from(target_subdir);
+    for c in channels {
+        key.push('\u{1}');
+        key.push_str(c.url().as_str());
+    }
+    if let Some(rs) = RECORDS_CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .get(&key)
+    {
+        return Arc::clone(rs);
+    }
+    // Build OFF the lock -- the disk read + parse is the slow part and must
+    // not block other channel-sets. A concurrent miss on the same key just
+    // rebuilds once more (idempotent), which is acceptable.
+    let mut records: Vec<RepoDataRecord> = Vec::new();
+    let mut consulted: Vec<String> = Vec::new();
+    // Dedup filenames as we collect: the same package can appear across
+    // channel/subdir boundaries and rattler_solve aborts on DuplicateRecords.
+    // Keep first-seen; channel priority is honored by iterating in order.
+    let mut seen_filenames: HashSet<String> = HashSet::new();
+    for channel_url in channels {
+        let channel_str = channel_url.url().as_str().trim_end_matches('/').to_string();
+        for subdir in [target_subdir, "noarch"] {
+            let Ok(Some(bytes)) = read_disk_cache(&channel_str, subdir).await else {
+                continue;
+            };
+            let repo_data: RepoData = match serde_json::from_slice(&bytes) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::debug!(channel = %channel_str, subdir = %subdir, error = %e, "solve-check: failed to parse cached repodata");
+                    continue;
+                }
+            };
+            // Default ChannelConfig is fine; we never resolve relative aliases.
+            let cfg = ChannelConfig::default_with_root_dir(std::env::temp_dir());
+            let channel = match Channel::from_str(&channel_str, &cfg) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::debug!(channel = %channel_str, error = %e, "solve-check: failed to build Channel for record URL synthesis");
+                    continue;
+                }
+            };
+            let recs = repo_data.into_repo_data_records(&channel);
+            consulted.push(format!("{channel_str}/{subdir}"));
+            for rec in recs {
+                if seen_filenames.insert(rec.file_name.clone()) {
+                    records.push(rec);
+                }
+            }
+        }
+    }
+    let rs = Arc::new(RecordSet { records, consulted });
+    RECORDS_CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .insert(key, Arc::clone(&rs));
+    rs
+}
+
 pub async fn run_solve_check(
     channels: &[ChannelUrl],
     specs: &[String],
@@ -207,59 +294,13 @@ pub async fn run_solve_check(
         }
     }
 
-    let mut all_records: Vec<RepoDataRecord> = Vec::new();
-    let mut consulted: Vec<String> = Vec::new();
-    // Dedup filenames as we collect. Across channel/subdir
-    // boundaries (e.g. the same package appearing in both linux-64
-    // and noarch repodata, or duplicated across channel mirrors)
-    // rattler_solve aborts with `DuplicateRecords` before ever
-    // attempting a solve. Keep first-seen filename and skip the
-    // rest -- they would have been treated as the same package by
-    // the solver anyway. Channel priority is still honored because
-    // we iterate channels in `channels` order.
-    let mut seen_filenames: HashSet<String> = HashSet::new();
-    for channel_url in channels {
-        let channel_str = channel_url.url().as_str().trim_end_matches('/').to_string();
-        for subdir in [target_subdir, "noarch"] {
-            let Ok(Some(bytes)) = read_disk_cache(&channel_str, subdir).await else {
-                continue;
-            };
-            let repo_data: RepoData = match serde_json::from_slice(&bytes) {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::debug!(
-                        channel = %channel_str,
-                        subdir = %subdir,
-                        error = %e,
-                        "solve-check: failed to parse cached repodata",
-                    );
-                    continue;
-                }
-            };
-            // Build a Channel for record URL synthesis. ChannelConfig
-            // is required by the constructor; default config is fine
-            // because we'll never resolve relative aliases here.
-            let cfg = ChannelConfig::default_with_root_dir(std::env::temp_dir());
-            let channel = match Channel::from_str(&channel_str, &cfg) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::debug!(
-                        channel = %channel_str,
-                        error = %e,
-                        "solve-check: failed to build Channel for record URL synthesis",
-                    );
-                    continue;
-                }
-            };
-            let records = repo_data.into_repo_data_records(&channel);
-            consulted.push(format!("{channel_str}/{subdir}"));
-            for rec in records {
-                if seen_filenames.insert(rec.file_name.clone()) {
-                    all_records.push(rec);
-                }
-            }
-        }
-    }
+    // Parse the ~1M repodata records ONCE per channel-set and reuse across
+    // every solve in this process (the refinement loop calls us ~8x/env x
+    // ~4 envs). Before this the parse ran on every call -- the dominant CPU
+    // cost and the ~4 GB RSS thrash.
+    let record_set = load_records(channels, target_subdir).await;
+    let all_records = &record_set.records;
+    let consulted = record_set.consulted.clone();
 
     if all_records.is_empty() {
         return SolveOutcome {
@@ -282,7 +323,7 @@ pub async fn run_solve_check(
     let specs_count = parsed_specs.len();
 
     let task = SolverTask {
-        available_packages: vec![&all_records],
+        available_packages: vec![all_records],
         locked_packages: Vec::new(),
         pinned_packages: Vec::new(),
         virtual_packages,

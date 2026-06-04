@@ -9,8 +9,10 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
+use futures::StreamExt as _;
 use sha2::{Digest, Sha256};
 use tokio::fs;
+use tokio::io::AsyncWriteExt as _;
 
 #[derive(Debug, Clone)]
 pub struct WheelMetadata {
@@ -84,36 +86,81 @@ pub async fn fetch_wheel(
         .with_context(|| format!("GET {url}"))?
         .error_for_status()
         .with_context(|| format!("HTTP error for {url}"))?;
-    // Log the size up front: the body read below pulls the whole wheel into
-    // memory in one shot (no streaming), so a multi-GB NVIDIA/Isaac wheel is
-    // a multi-minute silent gap here. Announcing the size tells the user the
-    // wait is expected rather than a hang.
-    match resp.content_length() {
+    let total = resp.content_length();
+    match total {
         Some(len) => tracing::info!(
             %filename,
             size_mb = len / 1_048_576,
-            "downloading wheel (reads into memory; large wheels take a few minutes)",
+            "downloading wheel (streaming to disk; large wheels can take minutes)",
         ),
-        None => tracing::info!(%filename, "downloading wheel"),
+        None => tracing::info!(%filename, "downloading wheel (streaming to disk)"),
     }
-    let bytes = resp
-        .bytes()
+    // /dev/tty status: wheel downloads happen during conda/outputs, where pixi
+    // hides backend stderr -- so this is the only way the user sees the
+    // multi-GB NVIDIA wheels actually downloading.
+    crate::status::tty(&format!(
+        "downloading {filename}{}",
+        total
+            .map(|t| format!(" ({} MB)", t / 1_048_576))
+            .unwrap_or_default()
+    ));
+
+    // Stream the body to disk in chunks instead of `resp.bytes()` (which
+    // buffers the WHOLE wheel in memory). The isaacsim extscache wheels are
+    // several GB: buffering spiked RSS to multiple GB AND produced a
+    // multi-minute SILENT gap (one log line, then nothing -- looks frozen).
+    // Streaming caps memory at one chunk, hashes incrementally, and logs
+    // steady progress so the download is visibly alive in pixi's output.
+    let part = dest_dir.join(format!("{filename}.part"));
+    let mut file = fs::File::create(&part)
         .await
-        .with_context(|| format!("reading body of {url}"))?;
-    tracing::info!(%filename, "wheel download complete");
+        .with_context(|| format!("creating {}", part.display()))?;
+    let mut hasher = Sha256::new();
+    let mut downloaded: u64 = 0;
+    let mut last_logged: u64 = 0;
+    let mut stream = std::pin::pin!(resp.bytes_stream());
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.with_context(|| format!("reading body of {url}"))?;
+        hasher.update(&chunk);
+        file.write_all(&chunk)
+            .await
+            .with_context(|| format!("writing {}", part.display()))?;
+        downloaded += chunk.len() as u64;
+        // Log roughly every 100 MB so multi-GB wheels show steady movement.
+        if downloaded - last_logged >= 100 * 1_048_576 {
+            last_logged = downloaded;
+            match total {
+                Some(t) => tracing::info!(
+                    %filename,
+                    mb = downloaded / 1_048_576,
+                    of_mb = t / 1_048_576,
+                    "download progress",
+                ),
+                None => tracing::info!(%filename, mb = downloaded / 1_048_576, "download progress"),
+            }
+        }
+    }
+    file.flush()
+        .await
+        .with_context(|| format!("flushing {}", part.display()))?;
+    drop(file);
+    tracing::info!(%filename, mb = downloaded / 1_048_576, "wheel download complete");
 
     if let Some(expected) = expected_sha256 {
-        let actual = hex_sha256(&bytes);
+        let digest = hasher.finalize();
+        let mut actual = String::with_capacity(64);
+        for b in digest {
+            write!(&mut actual, "{b:02x}").expect("write to String");
+        }
         if !actual.eq_ignore_ascii_case(expected) {
-            bail!(
-                "SHA-256 mismatch for {url}: expected {expected}, got {actual}"
-            );
+            fs::remove_file(&part).await.ok();
+            bail!("SHA-256 mismatch for {url}: expected {expected}, got {actual}");
         }
     }
 
-    fs::write(&dest, &bytes)
+    fs::rename(&part, &dest)
         .await
-        .with_context(|| format!("writing {}", dest.display()))?;
+        .with_context(|| format!("renaming {} -> {}", part.display(), dest.display()))?;
     Ok(dest)
 }
 
