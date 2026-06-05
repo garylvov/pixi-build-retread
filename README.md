@@ -2,19 +2,19 @@
 
 [![CI](https://github.com/garylvov/pixi-build-retread/actions/workflows/ci.yml/badge.svg)](https://github.com/garylvov/pixi-build-retread/actions/workflows/ci.yml)
 
-**Retread PyPI wheels as conda packages, with dep versions loosened and
-shared deps preferred from conda.**
+**A pixi build backend that relaxes malformed exact PyPI pins to ranges,
+prefers a conda equivalent for any shared transitive, and re-emits the
+result so pixi's conda solver and uv's PyPI solver stop conflicting.**
 
-A [pixi](https://pixi.sh) build backend. Pixi solves conda first, then runs
-uv against PyPI with conda's chosen versions forwarded as hard pins. Upstream
-wheels routinely pin transitives exactly (`Requires-Dist: numpy==1.26.0`), so
-those forwarded pins clash with what the wheel demands and the install fails.
-
-retread fixes both sides: it rewrites each exact pin to a range (default
-`>=X.Y,<X+1`) in the wheel's METADATA *and* the emitted conda run-deps, and
-reroutes any shared transitive that has a conda equivalent (via parselmouth +
-a small fallback table) onto the conda side *before* uv runs. Deps with no
-conda equivalent stay bundled in the wheel and skip uv entirely.
+[pixi](https://pixi.sh) solves conda first, then runs uv against PyPI with
+conda's chosen versions forwarded as hard pins. Upstream wheels routinely pin
+transitives exactly (`Requires-Dist: numpy==1.26.0`), so those forwarded pins
+clash with what the wheel demands and the install fails. retread rewrites each
+exact pin to a range (default `>=X.Y,<X+1`) in the wheel's METADATA *and* the
+emitted conda run-deps, and reroutes any shared transitive that has a conda
+equivalent (via parselmouth + a small fallback table) onto the conda side
+*before* uv runs. Deps with no conda equivalent stay bundled in the wheel and
+skip uv entirely.
 
 Motivated by [prefix-dev/pixi#5230](https://github.com/prefix-dev/pixi/issues/5230);
 automates [@diegoferigo-rai](https://github.com/diegoferigo-rai)'s hand-written
@@ -33,16 +33,18 @@ and a GPU pytorch stack) demonstrates this approach, which can be installed via 
 
 ## Use
 
-pixi-build's model is **workspace consumes source package** — two `pixi.toml`s:
+pixi-build's model is **workspace consumes source package** — two separate
+`pixi.toml`s. The second one is a *new* manifest you create **inside the
+`isaac-pack/` subdirectory**; it is not part of your workspace manifest:
 
 ```
 your-project/
-├── pixi.toml          # workspace -- your existing manifest
-└── isaac-pack/
-    └── pixi.toml      # source package -- retread config
+├── pixi.toml          # 1. workspace -- your existing manifest
+└── isaac-pack/        # the source-package directory
+    └── pixi.toml      # 2. a SECOND manifest, living inside isaac-pack/ -- retread config
 ```
 
-### Workspace `pixi.toml`
+### Workspace `pixi.toml` (your existing manifest, at the project root)
 
 Add `preview = ["pixi-build"]` and declare the source package. Every
 `[retread-wheels]` entry that shares a `bundle` collapses into one conda
@@ -58,7 +60,7 @@ isaac-pack = { path = "./isaac-pack" }   # one decl pulls the whole pack
 # plus your usual deps: python, pytorch-gpu, ros-humble-*, ...
 ```
 
-### Source-package `pixi.toml`
+### Source-package `pixi.toml` (the second manifest, at `isaac-pack/pixi.toml`)
 
 ```toml
 [package]
