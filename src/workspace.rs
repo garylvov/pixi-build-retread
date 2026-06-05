@@ -469,11 +469,7 @@ fn canonical_or_self(p: &Path) -> std::path::PathBuf {
 /// True if `raw_path` (relative to `workspace_dir`) resolves to the
 /// same directory as `source_canon`. Handles both absolute and
 /// relative `raw_path`.
-fn path_matches(
-    workspace_dir: &Path,
-    raw_path: &str,
-    source_canon: &Path,
-) -> bool {
+fn path_matches(workspace_dir: &Path, raw_path: &str, source_canon: &Path) -> bool {
     let candidate = std::path::PathBuf::from(raw_path);
     let joined = if candidate.is_absolute() {
         candidate
@@ -572,10 +568,10 @@ fn parse_system_requirement_value(v: &toml::Value) -> Option<String> {
     if let Some(f) = v.as_float() {
         return Some(f.to_string());
     }
-    if let Some(t) = v.as_table() {
-        if let Some(ver) = t.get("version").and_then(|x| x.as_str()) {
-            return Some(ver.to_string());
-        }
+    if let Some(t) = v.as_table()
+        && let Some(ver) = t.get("version").and_then(|x| x.as_str())
+    {
+        return Some(ver.to_string());
     }
     None
 }
@@ -645,8 +641,14 @@ isaac-pack = { path = "./isaac-pack" }
 "#,
         );
         assert_eq!(ws.channels, vec!["https://prefix.dev/conda-forge"]);
-        assert_eq!(ws.dependencies.get("numpy").map(String::as_str), Some("==1.26.4"));
-        assert_eq!(ws.dependencies.get("torch").map(String::as_str), Some(">=2.7"));
+        assert_eq!(
+            ws.dependencies.get("numpy").map(String::as_str),
+            Some("==1.26.4")
+        );
+        assert_eq!(
+            ws.dependencies.get("torch").map(String::as_str),
+            Some(">=2.7")
+        );
         // path-form entries are not version pins; skipped.
         assert!(!ws.dependencies.contains_key("isaac-pack"));
     }

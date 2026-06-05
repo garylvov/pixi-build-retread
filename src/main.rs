@@ -23,7 +23,10 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    tracing::info!(version = env!("CARGO_PKG_VERSION"), "pixi-build-retread starting");
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        "pixi-build-retread starting"
+    );
 
     let handler = handler::Handler::new();
     rpc::serve(move |method, params| {

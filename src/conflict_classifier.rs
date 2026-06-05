@@ -98,9 +98,14 @@ fn is_abi_anchor_pattern(name: &str) -> bool {
     // `binutils_linux-64`, `gfortran_linux-64`, `clang_linux-64`,
     // `clangxx_linux-64`, etc. Match the `_<os>-<arch>` suffix shape.
     let abi_tagged_prefixes = [
-        "gcc_", "gxx_", "g++_", "gfortran_",
-        "clang_", "clangxx_",
-        "binutils_", "ld_",
+        "gcc_",
+        "gxx_",
+        "g++_",
+        "gfortran_",
+        "clang_",
+        "clangxx_",
+        "binutils_",
+        "ld_",
         "sysroot_",
     ];
     if abi_tagged_prefixes.iter().any(|p| name.starts_with(p)) {
@@ -137,16 +142,10 @@ pub fn is_abi_anchor(name: &str) -> bool {
 pub enum PerChainVerdict {
     /// Retread emits this dep, workspace doesn't pin it, and it isn't
     /// an ABI anchor. Safe to widen one level.
-    WidenRetread {
-        dep: String,
-        current_spec: String,
-    },
+    WidenRetread { dep: String, current_spec: String },
     /// ABI anchor (python, libc, cuda-version, *_compiler, ...).
     /// Never widen, regardless of whether retread emits it.
-    AbiAnchor {
-        dep: String,
-        reason: String,
-    },
+    AbiAnchor { dep: String, reason: String },
     /// Workspace pins this dep (possibly in addition to retread).
     /// Workspace pin is the floor; widening retread's emission won't
     /// help. A suggestion is attached for the audit.
@@ -164,9 +163,7 @@ pub enum PerChainVerdict {
     },
     /// Surfaced as top-level but declared by neither side. Almost
     /// certainly a transitive that bubbled up.
-    TransitiveOnly {
-        dep: String,
-    },
+    TransitiveOnly { dep: String },
 }
 
 impl PerChainVerdict {
@@ -389,7 +386,9 @@ pub fn classify_unsat(
         })
         .collect();
 
-    let any_widen = verdicts.iter().any(|v| matches!(v, PerChainVerdict::WidenRetread { .. }));
+    let any_widen = verdicts
+        .iter()
+        .any(|v| matches!(v, PerChainVerdict::WidenRetread { .. }));
     let any_workspace_or_abi = verdicts.iter().any(|v| {
         matches!(
             v,
@@ -496,7 +495,9 @@ fn derive_suggestion(
     Some(WorkspaceEditSuggestion {
         env: env_name.to_string(),
         feature: None,
-        current_pin: format!("{} {}", chain.name, chain.current_spec).trim().to_string(),
+        current_pin: format!("{} {}", chain.name, chain.current_spec)
+            .trim()
+            .to_string(),
         suggested_pin: if no_cap_works {
             suggested_pin
         } else {
@@ -541,10 +542,8 @@ fn lowest_version(versions: &[String]) -> Option<String> {
     if versions.is_empty() {
         return None;
     }
-    let mut indexed: Vec<(Vec<u64>, &String)> = versions
-        .iter()
-        .map(|v| (parse_loose(v), v))
-        .collect();
+    let mut indexed: Vec<(Vec<u64>, &String)> =
+        versions.iter().map(|v| (parse_loose(v), v)).collect();
     indexed.sort_by(|a, b| a.0.cmp(&b.0));
     indexed.first().map(|(_, v)| (*v).clone())
 }
@@ -678,13 +677,7 @@ mod tests {
         // blocking list with Class A actionable on another chain.
         // v0.36.0: ABI anchor wins absolutely; never widen, period.
         let chains = vec![chain_with("python", "==3.11", vec!["3.14.5"], "")];
-        let v = classify_chains(
-            &chains,
-            &hs(&["python"]),
-            &hs(&["python"]),
-            &hs(&[]),
-            "gsi",
-        );
+        let v = classify_chains(&chains, &hs(&["python"]), &hs(&["python"]), &hs(&[]), "gsi");
         assert_eq!(v.len(), 1);
         match &v[0] {
             PerChainVerdict::AbiAnchor { dep, .. } => assert_eq!(dep, "python"),
@@ -708,13 +701,7 @@ mod tests {
             vec!["3.0"],
             "pytorch >=3",
         )];
-        let v = classify_chains(
-            &chains,
-            &hs(&[]),
-            &hs(&["pytorch-gpu"]),
-            &hs(&[]),
-            "gsi",
-        );
+        let v = classify_chains(&chains, &hs(&[]), &hs(&["pytorch-gpu"]), &hs(&[]), "gsi");
         assert_eq!(v.len(), 1);
         match &v[0] {
             PerChainVerdict::WorkspacePinDominates {
@@ -842,13 +829,7 @@ mod tests {
     #[test]
     fn aggregate_class_b_when_no_widenable_but_abi_anchor() {
         let chains = vec![chain_with("python", "==3.11", vec![], "")];
-        let out = classify_unsat(
-            &chains,
-            &hs(&["python"]),
-            &hs(&["python"]),
-            &hs(&[]),
-            "gsi",
-        );
+        let out = classify_unsat(&chains, &hs(&["python"]), &hs(&["python"]), &hs(&[]), "gsi");
         assert_eq!(out.class, ConflictClass::BWorkspaceDominated);
     }
 
@@ -900,9 +881,7 @@ mod tests {
             "suggested_pin should NOT be empty-range `<0.22`: {}",
             sug.suggested_pin,
         );
-        assert!(
-            sug.suggested_pin.contains("remove") || sug.suggested_pin.contains("relax"),
-        );
+        assert!(sug.suggested_pin.contains("remove") || sug.suggested_pin.contains("relax"),);
         assert!(sug.suggested_pin.contains("pytorch"));
     }
 
@@ -922,7 +901,11 @@ mod tests {
 
     #[test]
     fn lowest_version_orders_dotted_numeric() {
-        let v = vec!["1.10.0".to_string(), "1.2.0".to_string(), "1.9.0".to_string()];
+        let v = vec![
+            "1.10.0".to_string(),
+            "1.2.0".to_string(),
+            "1.9.0".to_string(),
+        ];
         assert_eq!(lowest_version(&v), Some("1.2.0".to_string()));
     }
 

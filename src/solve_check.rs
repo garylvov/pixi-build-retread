@@ -34,12 +34,12 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use rattler_conda_types::{
     Channel, ChannelConfig, ChannelUrl, GenericVirtualPackage, MatchSpec, PackageName,
     ParseStrictness, RepoData, RepoDataRecord, Version,
 };
-use rattler_solve::{resolvo, ChannelPriority, SolveStrategy, SolverImpl, SolverTask};
+use rattler_solve::{ChannelPriority, SolveStrategy, SolverImpl, SolverTask, resolvo};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -75,9 +75,7 @@ impl SolveOutcome {
     pub fn unreachable() -> Self {
         Self {
             satisfiable: false,
-            unsat_explanations: vec![
-                "solve-check skipped: no repodata could be loaded".into(),
-            ],
+            unsat_explanations: vec!["solve-check skipped: no repodata could be loaded".into()],
             channels_consulted: Vec::new(),
             specs_count: 0,
             records_count: 0,
@@ -107,12 +105,10 @@ impl SolveOutcome {
 ///      with what pixi will install.
 ///   3. Workspace `[feature.X.system-requirements]` overrides — pixi
 ///      treats these as authoritative; retread must too. Keys map:
-///        cuda     -> __cuda
-///        libc     -> __glibc   (linux; value is glibc version)
-///        macos    -> __osx
-///        archspec -> __archspec (build-string encoded)
-///        linux    -> __linux
-///      Unrecognized keys are trace-logged + skipped (forward-compat).
+///      `cuda -> __cuda`, `libc -> __glibc` (linux; value is glibc
+///      version), `macos -> __osx`, `archspec -> __archspec`
+///      (build-string encoded), `linux -> __linux`. Unrecognized keys
+///      are trace-logged + skipped (forward-compat).
 ///
 /// Without (3), retread's solve_check sees the BUILD HOST's virtual
 /// packages while pixi's actual solve sees the WORKSPACE-declared
@@ -137,15 +133,15 @@ pub fn build_virtual_packages(
                 Vec::new()
             }
         };
-    if let Ok(v) = Version::from_str(target_python) {
-        if let Ok(name) = PackageName::from_str("__cpython") {
-            virtual_packages.retain(|vp| vp.name.as_normalized() != "__cpython");
-            virtual_packages.push(GenericVirtualPackage {
-                name,
-                version: v,
-                build_string: String::new(),
-            });
-        }
+    if let Ok(v) = Version::from_str(target_python)
+        && let Ok(name) = PackageName::from_str("__cpython")
+    {
+        virtual_packages.retain(|vp| vp.name.as_normalized() != "__cpython");
+        virtual_packages.push(GenericVirtualPackage {
+            name,
+            version: v,
+            build_string: String::new(),
+        });
     }
     for (req_key, req_value) in system_requirements {
         let (vp_name, is_build_string) = match req_key.as_str() {
@@ -405,7 +401,10 @@ fn disk_cache_path(channel_url: &str, subdir: &str) -> PathBuf {
 
 fn dirs_cache_root() -> PathBuf {
     if let Some(home) = std::env::var_os("HOME") {
-        PathBuf::from(home).join(".cache").join("rattler").join("cache")
+        PathBuf::from(home)
+            .join(".cache")
+            .join("rattler")
+            .join("cache")
     } else {
         std::env::temp_dir().join("retread-cache")
     }
@@ -512,7 +511,10 @@ pub fn extract_blocking_chains(unsat_strs: &[String]) -> Vec<BlockingChain> {
                 continue;
             }
             let name = token.split('[').next().unwrap_or(token);
-            if name.chars().any(|c| matches!(c, '<' | '>' | '=' | ',' | '!' | '~' | '*')) {
+            if name
+                .chars()
+                .any(|c| matches!(c, '<' | '>' | '=' | ',' | '!' | '~' | '*'))
+            {
                 continue;
             }
             if !seen.insert(name.to_string()) {
@@ -540,8 +542,11 @@ pub fn extract_blocking_chains(unsat_strs: &[String]) -> Vec<BlockingChain> {
             let mut rejected_seen: HashSet<String> = HashSet::new();
             let mut transitive_requirement: String = String::new();
             for tail in lines.iter().skip(idx + 1) {
-                if !tail.starts_with('│') && !tail.starts_with(' ') && !tail.starts_with('├')
-                    && !tail.starts_with('└') && !tail.starts_with('\t')
+                if !tail.starts_with('│')
+                    && !tail.starts_with(' ')
+                    && !tail.starts_with('├')
+                    && !tail.starts_with('└')
+                    && !tail.starts_with('\t')
                 {
                     // Back to top-level, this chain is over.
                     if !tail.is_empty() {
@@ -555,10 +560,9 @@ pub fn extract_blocking_chains(unsat_strs: &[String]) -> Vec<BlockingChain> {
                     let before = &tail[..would_idx];
                     // Strip leading tree decoration: any chars in
                     // `│├└─ \t`.
-                    let payload = before
-                        .trim_start_matches(|c: char| {
-                            matches!(c, '│' | '├' | '└' | '─' | ' ' | '\t')
-                        });
+                    let payload = before.trim_start_matches(|c: char| {
+                        matches!(c, '│' | '├' | '└' | '─' | ' ' | '\t')
+                    });
                     // payload looks like `<name> 0.25.0 | 0.25.0 | ...`
                     // Drop the name (first whitespace-separated token).
                     let mut it = payload.splitn(2, char::is_whitespace);
@@ -603,7 +607,7 @@ pub fn extract_blocking_chains(unsat_strs: &[String]) -> Vec<BlockingChain> {
                         && candidate
                             .chars()
                             .next()
-                            .map_or(false, |c| c.is_ascii_alphabetic() || c == '_')
+                            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
                     {
                         transitive_requirement = candidate;
                     }
@@ -641,16 +645,23 @@ mod parse_tests {
         let blocking = extract_blocking_dep_names(&unsat);
         // Both `triton` and `another-pkg` are top-level conflict
         // entry points. Nested deps (cuda-version) are NOT.
-        assert!(blocking.contains(&"triton".to_string()), "expected triton in {blocking:?}");
-        assert!(blocking.contains(&"another-pkg".to_string()), "expected another-pkg in {blocking:?}");
-        assert!(!blocking.contains(&"cuda-version".to_string()), "cuda-version is nested, not top-level: {blocking:?}");
+        assert!(
+            blocking.contains(&"triton".to_string()),
+            "expected triton in {blocking:?}"
+        );
+        assert!(
+            blocking.contains(&"another-pkg".to_string()),
+            "expected another-pkg in {blocking:?}"
+        );
+        assert!(
+            !blocking.contains(&"cuda-version".to_string()),
+            "cuda-version is nested, not top-level: {blocking:?}"
+        );
     }
 
     #[test]
     fn extract_blocking_dep_names_dedups() {
-        let unsat = vec![
-            "├─ pkg cannot be installed\n├─ pkg also cannot be installed".to_string(),
-        ];
+        let unsat = vec!["├─ pkg cannot be installed\n├─ pkg also cannot be installed".to_string()];
         let blocking = extract_blocking_dep_names(&unsat);
         assert_eq!(blocking, vec!["pkg".to_string()]);
     }
@@ -746,7 +757,10 @@ mod tests {
     // sees the same virtual packages pixi's will.
     // -------------------------------------------------------------
 
-    fn vp_lookup<'a>(vps: &'a [GenericVirtualPackage], name: &str) -> Option<&'a GenericVirtualPackage> {
+    fn vp_lookup<'a>(
+        vps: &'a [GenericVirtualPackage],
+        name: &str,
+    ) -> Option<&'a GenericVirtualPackage> {
         vps.iter().find(|vp| vp.name.as_normalized() == name)
     }
 
@@ -830,7 +844,10 @@ mod tests {
         let vps_baseline = build_virtual_packages("3.11", &std::collections::BTreeMap::new());
         let vps = build_virtual_packages("3.11", &sysreqs);
         // No __something-new-in-pixi (or any other) was added.
-        assert_eq!(vps.len(), vps_baseline.len(),
-            "unknown system-requirement keys must not add virtual packages");
+        assert_eq!(
+            vps.len(),
+            vps_baseline.len(),
+            "unknown system-requirement keys must not add virtual packages"
+        );
     }
 }

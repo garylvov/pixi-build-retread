@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -48,7 +48,12 @@ pub struct RetreadConfig {
     /// PyPI -> conda name mapping overrides on top of the built-in identity
     /// mapping. Use for the common drift cases (`opencv-python-headless` ->
     /// `py-opencv`, etc.).
-    #[serde(default, rename = "retread-name-map", alias = "name-map", alias = "name_map")]
+    #[serde(
+        default,
+        rename = "retread-name-map",
+        alias = "name-map",
+        alias = "name_map"
+    )]
     pub name_map: BTreeMap<String, String>,
 
     /// PyPI names to drop from the conda run-deps entirely. Use for
@@ -56,7 +61,12 @@ pub struct RetreadConfig {
     /// (Windows-only shims like `idna-ssl`, `pywin32`) or otherwise can't
     /// be satisfied. The wheel still gets installed; conda just won't
     /// require these at solve time.
-    #[serde(default, rename = "retread-drop-deps", alias = "drop-deps", alias = "drop_deps")]
+    #[serde(
+        default,
+        rename = "retread-drop-deps",
+        alias = "drop-deps",
+        alias = "drop_deps"
+    )]
     pub drop_deps: Vec<String>,
 
     /// When true (default), retread tries to resolve every exact-pinned
@@ -70,7 +80,11 @@ pub struct RetreadConfig {
     /// Deps in `retread-conda-deps` are never auto-bundled -- they
     /// always emit as conda run-deps. Set this to `false` to disable
     /// auto-bundling entirely.
-    #[serde(default = "default_true", rename = "retread-auto-bundle", alias = "auto-bundle")]
+    #[serde(
+        default = "default_true",
+        rename = "retread-auto-bundle",
+        alias = "auto-bundle"
+    )]
     pub auto_bundle: bool,
 
     /// PyPI names that must stay as conda run-deps even when
@@ -347,6 +361,82 @@ pub struct NamedGitSource {
     pub rev: String,
 }
 
+impl WheelEntry {
+    pub fn is_url(&self) -> bool {
+        self.url.is_some()
+    }
+    pub fn is_spec(&self) -> bool {
+        !self.is_url() && !self.is_path() && !self.is_git() && self.version.is_some()
+    }
+    pub fn is_path(&self) -> bool {
+        self.path.is_some()
+    }
+    pub fn is_git(&self) -> bool {
+        self.git.is_some()
+    }
+    pub fn is_named_git(&self) -> bool {
+        self.from.is_some()
+    }
+
+    /// Validate that the entry has exactly one form.
+    pub fn validate(&self, name: &str) -> Result<()> {
+        let form_count = [
+            self.url.is_some(),
+            self.version.is_some(),
+            self.path.is_some(),
+            self.git.is_some(),
+            self.from.is_some(),
+        ]
+        .into_iter()
+        .filter(|b| *b)
+        .count();
+        if form_count == 0 {
+            return Err(anyhow!(
+                "wheel `{name}`: requires one of `url`, `version`, `path`, `git`, or `from`"
+            ));
+        }
+        if form_count > 1 {
+            return Err(anyhow!(
+                "wheel `{name}`: set exactly ONE of `url`, `version`, `path`, `git`, `from`"
+            ));
+        }
+        if self.is_git() && self.rev.is_none() {
+            return Err(anyhow!(
+                "wheel `{name}`: `git` requires `rev` (commit, tag, or branch)"
+            ));
+        }
+        if self.is_url() && !self.extras.is_empty() {
+            return Err(anyhow!(
+                "wheel `{name}`: `extras` is not meaningful on the bare-URL \
+                 form (the upstream filename doesn't carry a project name to \
+                 attach extras to). Use the `version`, `path`, `git`, or \
+                 `from` form instead."
+            ));
+        }
+        // v0.12.0+: extras now valid on path/git/named-git. The wheel
+        // built from those sources carries `Requires-Dist: ...; extra
+        // == "<name>"` lines in METADATA, and the handler runs the
+        // standard extras BFS on them (just like PyPI form), pulling
+        // the extras' deps via PyPI Simple.
+        Ok(())
+    }
+
+    /// Normalized version string (leading `==` stripped). Only meaningful
+    /// for spec-form entries.
+    pub fn normalized_version(&self) -> Option<String> {
+        self.version
+            .as_ref()
+            .map(|v| v.trim().trim_start_matches("==").trim().to_string())
+    }
+
+    /// Default index when in spec form.
+    pub fn index_url(&self) -> String {
+        self.index
+            .clone()
+            .unwrap_or_else(|| "https://pypi.org/simple/".to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,7 +532,10 @@ mod tests {
             "retread-relax": "patch-then-minor-then-major-then-last-resort",
         });
         let cfg: RetreadConfig = serde_json::from_value(json).unwrap();
-        assert_eq!(cfg.relax, RelaxPolicy::PatchThenMinorThenMajorThenLastResort);
+        assert_eq!(
+            cfg.relax,
+            RelaxPolicy::PatchThenMinorThenMajorThenLastResort
+        );
         assert!(cfg.relax.has_tiered_cascade());
         assert!(cfg.relax.allows_widening_mutation());
         assert!(!cfg.relax.has_last_resort());
@@ -540,84 +633,7 @@ mod tests {
     fn python_spec_accepts_string_or_list() {
         let one: PythonSpec = serde_json::from_value(serde_json::json!("3.11")).unwrap();
         assert_eq!(one.as_versions(), vec!["3.11"]);
-        let many: PythonSpec =
-            serde_json::from_value(serde_json::json!(["3.11", "3.12"])).unwrap();
+        let many: PythonSpec = serde_json::from_value(serde_json::json!(["3.11", "3.12"])).unwrap();
         assert_eq!(many.as_versions(), vec!["3.11", "3.12"]);
-    }
-}
-
-impl WheelEntry {
-    pub fn is_url(&self) -> bool {
-        self.url.is_some()
-    }
-    pub fn is_spec(&self) -> bool {
-        !self.is_url() && !self.is_path() && !self.is_git() && self.version.is_some()
-    }
-    pub fn is_path(&self) -> bool {
-        self.path.is_some()
-    }
-    pub fn is_git(&self) -> bool {
-        self.git.is_some()
-    }
-    pub fn is_named_git(&self) -> bool {
-        self.from.is_some()
-    }
-
-    /// Validate that the entry has exactly one form.
-    pub fn validate(&self, name: &str) -> Result<()> {
-        let form_count = [
-            self.url.is_some(),
-            self.version.is_some(),
-            self.path.is_some(),
-            self.git.is_some(),
-            self.from.is_some(),
-        ]
-        .into_iter()
-        .filter(|b| *b)
-        .count();
-        if form_count == 0 {
-            return Err(anyhow!(
-                "wheel `{name}`: requires one of `url`, `version`, `path`, `git`, or `from`"
-            ));
-        }
-        if form_count > 1 {
-            return Err(anyhow!(
-                "wheel `{name}`: set exactly ONE of `url`, `version`, `path`, `git`, `from`"
-            ));
-        }
-        if self.is_git() && self.rev.is_none() {
-            return Err(anyhow!(
-                "wheel `{name}`: `git` requires `rev` (commit, tag, or branch)"
-            ));
-        }
-        if self.is_url() && !self.extras.is_empty() {
-            return Err(anyhow!(
-                "wheel `{name}`: `extras` is not meaningful on the bare-URL \
-                 form (the upstream filename doesn't carry a project name to \
-                 attach extras to). Use the `version`, `path`, `git`, or \
-                 `from` form instead."
-            ));
-        }
-        // v0.12.0+: extras now valid on path/git/named-git. The wheel
-        // built from those sources carries `Requires-Dist: ...; extra
-        // == "<name>"` lines in METADATA, and the handler runs the
-        // standard extras BFS on them (just like PyPI form), pulling
-        // the extras' deps via PyPI Simple.
-        Ok(())
-    }
-
-    /// Normalized version string (leading `==` stripped). Only meaningful
-    /// for spec-form entries.
-    pub fn normalized_version(&self) -> Option<String> {
-        self.version
-            .as_ref()
-            .map(|v| v.trim().trim_start_matches("==").trim().to_string())
-    }
-
-    /// Default index when in spec form.
-    pub fn index_url(&self) -> String {
-        self.index
-            .clone()
-            .unwrap_or_else(|| "https://pypi.org/simple/".to_string())
     }
 }

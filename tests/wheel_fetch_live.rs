@@ -24,14 +24,11 @@ use std::fs;
 use std::path::PathBuf;
 
 use pixi_build_retread::config::{RelaxPolicy, RetreadConfig};
-use pixi_build_retread::recipe::{build_bundle_recipe, to_yaml, BundleSource};
+use pixi_build_retread::recipe::{BundleSource, build_bundle_recipe, to_yaml};
 use pixi_build_retread::wheel::{fetch_wheel, read_metadata};
 
 fn tempdir(label: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "retread-test-{label}-{}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("retread-test-{label}-{}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
     dir
 }
@@ -78,7 +75,10 @@ async fn fetch_isaacsim_kernel_end_to_end() {
         .expect("fetching isaacsim-kernel wheel");
     let meta = read_metadata(&path).expect("parsing live isaacsim-kernel METADATA");
 
-    assert_eq!(meta.name.to_ascii_lowercase().replace('_', "-"), "isaacsim-kernel");
+    assert_eq!(
+        meta.name.to_ascii_lowercase().replace('_', "-"),
+        "isaacsim-kernel"
+    );
     assert!(!meta.is_pure_python, "isaacsim-kernel is platform-specific");
 
     let config = RetreadConfig {
@@ -87,13 +87,24 @@ async fn fetch_isaacsim_kernel_end_to_end() {
         overrides: BTreeMap::new(),
         name_map: BTreeMap::new(),
         build_number: 0,
-            drop_deps: Vec::new(),
-            auto_bundle: false,
-            conda_deps: Vec::new(),
-            git_sources: std::collections::BTreeMap::new(),
-            python: None,
+        drop_deps: Vec::new(),
+        auto_bundle: false,
+        conda_deps: Vec::new(),
+        git_sources: std::collections::BTreeMap::new(),
+        python: None,
     };
-    let recipe = build_bundle_recipe("isaacsim-kernel", &[BundleSource { pypi_name: &meta.name, url: &url, metadata: &meta }], &config, "3.11").unwrap();
+    let recipe = build_bundle_recipe(
+        "isaacsim-kernel",
+        &[BundleSource {
+            pypi_name: &meta.name,
+            url: &url,
+            metadata: &meta,
+        }],
+        &config,
+        "3.11",
+        None,
+    )
+    .unwrap();
     let yaml = to_yaml(&recipe).unwrap();
 
     // Same compatibility assertion as the snapshot test, but on live data.

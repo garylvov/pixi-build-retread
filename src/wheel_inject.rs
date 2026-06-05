@@ -25,7 +25,7 @@ use std::fs;
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use sha2::{Digest, Sha256};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
@@ -87,13 +87,7 @@ const DENY_COMPONENTS: &[&str] = &[
 
 /// File-suffix patterns to skip at every level. Cheap substring match
 /// because none of these legitimately appear inside a desired filename.
-const DENY_SUFFIXES: &[&str] = &[
-    ".egg-info",
-    ".dist-info",
-    ".pyc",
-    ".pyo",
-    ".swp",
-];
+const DENY_SUFFIXES: &[&str] = &[".egg-info", ".dist-info", ".pyc", ".pyo", ".swp"];
 
 /// Top-level filenames to skip (project-root noise that we don't want
 /// in every package install).
@@ -158,8 +152,8 @@ pub fn inject_source_extras(src: &Path, dst: &Path, source_root: &Path) -> Resul
             record_name = Some(name);
         }
     }
-    let record_name =
-        record_name.ok_or_else(|| anyhow!("no root-level .dist-info/RECORD in {}", src.display()))?;
+    let record_name = record_name
+        .ok_or_else(|| anyhow!("no root-level .dist-info/RECORD in {}", src.display()))?;
 
     // Walk the source root, collecting every (rel_path, bytes) the
     // deny-list permits and the wheel doesn't already carry.
@@ -188,8 +182,7 @@ pub fn inject_source_extras(src: &Path, dst: &Path, source_root: &Path) -> Resul
 
     // Rewrite the wheel: copy every original entry through, swap
     // RECORD for the new one, then append the extras at the end.
-    let dst_file = fs::File::create(dst)
-        .with_context(|| format!("creating {}", dst.display()))?;
+    let dst_file = fs::File::create(dst).with_context(|| format!("creating {}", dst.display()))?;
     let mut writer = ZipWriter::new(dst_file);
 
     for i in 0..archive.len() {
@@ -227,12 +220,7 @@ fn collect_extras(source_root: &Path, existing: &HashSet<String>) -> Result<Vec<
     Ok(out)
 }
 
-fn walk(
-    root: &Path,
-    dir: &Path,
-    existing: &HashSet<String>,
-    out: &mut Vec<Extra>,
-) -> Result<()> {
+fn walk(root: &Path, dir: &Path, existing: &HashSet<String>, out: &mut Vec<Extra>) -> Result<()> {
     let read = match fs::read_dir(dir) {
         Ok(r) => r,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -299,13 +287,13 @@ fn is_denied(name: &str, top_level: bool) -> bool {
     if name.is_empty() {
         return true;
     }
-    if DENY_COMPONENTS.iter().any(|d| *d == name) {
+    if DENY_COMPONENTS.contains(&name) {
         return true;
     }
     if DENY_SUFFIXES.iter().any(|s| name.ends_with(s)) {
         return true;
     }
-    if top_level && DENY_TOP_LEVEL.iter().any(|d| *d == name) {
+    if top_level && DENY_TOP_LEVEL.contains(&name) {
         return true;
     }
     false
@@ -323,7 +311,7 @@ fn extend_record(record: &str, record_name: &str, extras: &[Extra]) -> Result<St
             out.push_str(line);
             continue;
         }
-        let path = trimmed.splitn(2, ',').next().unwrap_or("");
+        let path = trimmed.split(',').next().unwrap_or("");
         if path == record_name {
             // Hold RECORD's self-line until the end.
             record_line = Some(line.to_string());
@@ -331,7 +319,11 @@ fn extend_record(record: &str, record_name: &str, extras: &[Extra]) -> Result<St
         }
         out.push_str(line);
     }
-    let newline = if record.contains("\r\n") { "\r\n" } else { "\n" };
+    let newline = if record.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
     for extra in extras {
         out.push_str(&format!(
             "{},sha256={},{}{}",
@@ -361,8 +353,7 @@ pub(crate) fn sha256_base64_urlsafe_nopad(bytes: &[u8]) -> String {
 }
 
 fn base64_urlsafe_nopad(bytes: &[u8]) -> String {
-    const ALPHA: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    const ALPHA: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut out = String::with_capacity((bytes.len() * 4).div_ceil(3));
     let mut i = 0;
     while i + 3 <= bytes.len() {
@@ -387,6 +378,17 @@ fn base64_urlsafe_nopad(bytes: &[u8]) -> String {
     out
 }
 
+/// Convenience wrapper used by `handler::materialize_and_rewrite`:
+/// resolve `source_root` to its canonical absolute form (so the walk
+/// doesn't trip on `..` segments) before invoking the inject pass.
+pub fn inject(src: &Path, dst: &Path, source_root: &Path) -> Result<PathBuf> {
+    let canon = source_root
+        .canonicalize()
+        .with_context(|| format!("canonicalizing source root {}", source_root.display()))?;
+    inject_source_extras(src, dst, &canon)?;
+    Ok(dst.to_path_buf())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -397,8 +399,19 @@ mod tests {
         // level, so a stray tests/ or .git/ inside a package dir is
         // still excluded.
         for name in [
-            ".git", ".github", "tests", "test", "docs", "doc", "build", "dist",
-            "__pycache__", "setup.py", "pyproject.toml", "node_modules", ".pixi",
+            ".git",
+            ".github",
+            "tests",
+            "test",
+            "docs",
+            "doc",
+            "build",
+            "dist",
+            "__pycache__",
+            "setup.py",
+            "pyproject.toml",
+            "node_modules",
+            ".pixi",
         ] {
             assert!(is_denied(name, false), "{name} should be denied");
         }
@@ -410,7 +423,14 @@ mod tests {
         assert!(is_denied("README.md", true));
         assert!(!is_denied("README.md", false));
         // Legitimate data dirs pass through.
-        for name in ["config", "data", "assets", "resources", "templates", "isaaclab"] {
+        for name in [
+            "config",
+            "data",
+            "assets",
+            "resources",
+            "templates",
+            "isaaclab",
+        ] {
             assert!(!is_denied(name, false), "{name} should pass");
             assert!(!is_denied(name, true), "{name} should pass at top");
         }
@@ -471,7 +491,10 @@ mod tests {
         fs::create_dir_all(tmp.join("tests"))?;
         fs::write(tmp.join("foo/__init__.py"), b"# top-level only\n")?;
         fs::write(tmp.join("foo/sub/mod.py"), b"x = 1\n")?;
-        fs::write(tmp.join("config/extension.toml"), b"[package]\nversion = '0.1.0'\n")?;
+        fs::write(
+            tmp.join("config/extension.toml"),
+            b"[package]\nversion = '0.1.0'\n",
+        )?;
         fs::write(tmp.join("tests/test_x.py"), b"def test(): pass\n")?;
         fs::write(tmp.join("README.md"), b"# foo\n")?;
 
@@ -507,7 +530,8 @@ mod tests {
 
         // Existing wheel entries pass through untouched.
         let mut existing_init = String::new();
-        zip.by_name("foo/__init__.py")?.read_to_string(&mut existing_init)?;
+        zip.by_name("foo/__init__.py")?
+            .read_to_string(&mut existing_init)?;
         assert_eq!(existing_init, "# top-level only\n");
 
         // RECORD picked up one line per extra and kept its self-line
@@ -515,10 +539,20 @@ mod tests {
         let mut record = String::new();
         zip.by_name("foo-0.1.0.dist-info/RECORD")?
             .read_to_string(&mut record)?;
-        assert!(record.contains("config/extension.toml,sha256="), "record:\n{record}");
-        assert!(record.contains("foo/sub/mod.py,sha256="), "record:\n{record}");
         assert!(
-            record.lines().last().unwrap().starts_with("foo-0.1.0.dist-info/RECORD,,"),
+            record.contains("config/extension.toml,sha256="),
+            "record:\n{record}"
+        );
+        assert!(
+            record.contains("foo/sub/mod.py,sha256="),
+            "record:\n{record}"
+        );
+        assert!(
+            record
+                .lines()
+                .last()
+                .unwrap()
+                .starts_with("foo-0.1.0.dist-info/RECORD,,"),
             "RECORD self-line must be last; got:\n{record}",
         );
 
@@ -544,7 +578,8 @@ mod tests {
         // download_dir, NOT inside the source tree, so keep that split
         // here -- otherwise the wheel file itself would be walked and
         // injected as an extra.
-        let base = std::env::temp_dir().join(format!("retread-inject-empty-{}", std::process::id()));
+        let base =
+            std::env::temp_dir().join(format!("retread-inject-empty-{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
         let src_root = base.join("src");
         let wheels = base.join("wheels");
@@ -573,15 +608,4 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
         Ok(())
     }
-}
-
-/// Convenience wrapper used by `handler::materialize_and_rewrite`:
-/// resolve `source_root` to its canonical absolute form (so the walk
-/// doesn't trip on `..` segments) before invoking the inject pass.
-pub fn inject(src: &Path, dst: &Path, source_root: &Path) -> Result<PathBuf> {
-    let canon = source_root
-        .canonicalize()
-        .with_context(|| format!("canonicalizing source root {}", source_root.display()))?;
-    inject_source_extras(src, dst, &canon)?;
-    Ok(dst.to_path_buf())
 }

@@ -199,7 +199,9 @@ pub fn build_bundle_recipe(
             // string tables. Skip the patchelf step. Only meaningful for
             // platform-specific bundles -- noarch has no native libs.
             dynamic_linking: if any_platform_specific {
-                Some(DynamicLinking { binary_relocation: Some(false) })
+                Some(DynamicLinking {
+                    binary_relocation: Some(false),
+                })
             } else {
                 None
             },
@@ -241,10 +243,7 @@ mod tests {
         }
     }
 
-    fn one_source<'a>(
-        meta: &'a WheelMetadata,
-        url: &'a url::Url,
-    ) -> Vec<BundleSource<'a>> {
+    fn one_source<'a>(meta: &'a WheelMetadata, url: &'a url::Url) -> Vec<BundleSource<'a>> {
         vec![BundleSource {
             pypi_name: &meta.name,
             url,
@@ -266,8 +265,18 @@ mod tests {
             sha256: "deadbeef".into(),
             filename: "example_pkg-1.2.3-cp311-none-manylinux_2_35_x86_64.whl".into(),
         };
-        let url: url::Url = "https://example.com/example_pkg-1.2.3-cp311-none-manylinux_2_35_x86_64.whl".parse().unwrap();
-        let r = build_bundle_recipe("example-pkg", &one_source(&meta, &url), &cfg(), "3.11", None).unwrap();
+        let url: url::Url =
+            "https://example.com/example_pkg-1.2.3-cp311-none-manylinux_2_35_x86_64.whl"
+                .parse()
+                .unwrap();
+        let r = build_bundle_recipe(
+            "example-pkg",
+            &one_source(&meta, &url),
+            &cfg(),
+            "3.11",
+            None,
+        )
+        .unwrap();
         let yaml = to_yaml(&r).unwrap();
         assert!(yaml.contains("python 3.11.*"), "yaml:\n{yaml}");
         assert!(yaml.contains("numpy >=1.26,<2"), "yaml:\n{yaml}");
@@ -303,8 +312,11 @@ mod tests {
             sha256: "abc".into(),
             filename: "pure-0.1.0-py3-none-any.whl".into(),
         };
-        let url = "https://example.com/pure-0.1.0-py3-none-any.whl".parse().unwrap();
-        let r = build_bundle_recipe("pure", &one_source(&meta, &url), &cfg(), "3.11", None).unwrap();
+        let url = "https://example.com/pure-0.1.0-py3-none-any.whl"
+            .parse()
+            .unwrap();
+        let r =
+            build_bundle_recipe("pure", &one_source(&meta, &url), &cfg(), "3.11", None).unwrap();
         assert_eq!(r.build.noarch.as_deref(), Some("python"));
         // noarch bundles have nothing to relocate -- don't emit the field
         // (and don't risk poisoning future rattler-build default changes).
@@ -319,10 +331,7 @@ mod tests {
         let primary = WheelMetadata {
             name: "isaacsim".into(),
             version: "5.1.0.0".into(),
-            requires_dist: vec![
-                "isaacsim-kernel==5.1.0.0".into(),
-                "numpy==1.26.4".into(),
-            ],
+            requires_dist: vec!["isaacsim-kernel==5.1.0.0".into(), "numpy==1.26.4".into()],
             is_pure_python: false,
             sha256: "primary_sha".into(),
             filename: "isaacsim-5.1.0.0-cp311-none-manylinux_2_35_x86_64.whl".into(),
@@ -354,8 +363,14 @@ mod tests {
         let yaml = to_yaml(&r).unwrap();
 
         assert_eq!(r.source.len(), 2, "two sources in the recipe");
-        assert!(yaml.contains("numpy >=1.26,<2"), "primary dep stays: {yaml}");
-        assert!(yaml.contains("pillow >=12.0,<13"), "extras dep stays: {yaml}");
+        assert!(
+            yaml.contains("numpy >=1.26,<2"),
+            "primary dep stays: {yaml}"
+        );
+        assert!(
+            yaml.contains("pillow >=12.0,<13"),
+            "extras dep stays: {yaml}"
+        );
         assert!(
             !yaml.contains("isaacsim-kernel >="),
             "vendored sibling must NOT appear in run-deps: {yaml}"
@@ -388,8 +403,14 @@ mod tests {
             "pytorch >=1".to_string(), // the cascade-widened spec pixi solved with
             "numpy >=1.26,<2".to_string(),
         ];
-        let r = build_bundle_recipe("isaacsim", &one_source(&meta, &url), &cfg(), "3.11", Some(&over))
-            .unwrap();
+        let r = build_bundle_recipe(
+            "isaacsim",
+            &one_source(&meta, &url),
+            &cfg(),
+            "3.11",
+            Some(&over),
+        )
+        .unwrap();
         assert!(
             r.requirements.run.iter().any(|s| s == "pytorch >=1"),
             "must use the widened override verbatim: {:?}",

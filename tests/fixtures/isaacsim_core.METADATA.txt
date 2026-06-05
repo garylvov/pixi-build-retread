@@ -75,4 +75,3 @@ Isaac Sim core extensions and APIs
 
 See [Install Isaac Sim using PIP](https://docs.isaacsim.omniverse.nvidia.com/latest/installation/install_python.html)
 for details on how to install and run Isaac Sim in a (virtual) Python environment.
-

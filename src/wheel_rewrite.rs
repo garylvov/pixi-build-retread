@@ -17,10 +17,10 @@ use std::io::{Cursor, Read, Write};
 use std::path::Path;
 use std::str::FromStr;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use sha2::{Digest, Sha256};
-use uv_pep508::uv_pep440::{Operator, Version};
 use uv_pep508::Requirement;
+use uv_pep508::uv_pep440::{Operator, Version};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
@@ -34,8 +34,7 @@ use crate::config::RelaxPolicy;
 /// Returns the new sha256 of the rewritten wheel (useful for recipe
 /// generation).
 pub fn rewrite_wheel(src: &Path, dst: &Path, relax: RelaxPolicy) -> Result<String> {
-    let bytes = std::fs::read(src)
-        .with_context(|| format!("reading {}", src.display()))?;
+    let bytes = std::fs::read(src).with_context(|| format!("reading {}", src.display()))?;
     let mut archive = ZipArchive::new(Cursor::new(&bytes))
         .with_context(|| format!("opening zip {}", src.display()))?;
 
@@ -54,12 +53,10 @@ pub fn rewrite_wheel(src: &Path, dst: &Path, relax: RelaxPolicy) -> Result<Strin
             record_name = Some(name.to_string());
         }
     }
-    let metadata_name = metadata_name.ok_or_else(|| {
-        anyhow!("no root-level .dist-info/METADATA in {}", src.display())
-    })?;
-    let record_name = record_name.ok_or_else(|| {
-        anyhow!("no root-level .dist-info/RECORD in {}", src.display())
-    })?;
+    let metadata_name = metadata_name
+        .ok_or_else(|| anyhow!("no root-level .dist-info/METADATA in {}", src.display()))?;
+    let record_name = record_name
+        .ok_or_else(|| anyhow!("no root-level .dist-info/RECORD in {}", src.display()))?;
 
     // Read original METADATA + RECORD.
     let mut metadata_str = String::new();
@@ -67,7 +64,9 @@ pub fn rewrite_wheel(src: &Path, dst: &Path, relax: RelaxPolicy) -> Result<Strin
         .by_name(&metadata_name)?
         .read_to_string(&mut metadata_str)?;
     let mut record_str = String::new();
-    archive.by_name(&record_name)?.read_to_string(&mut record_str)?;
+    archive
+        .by_name(&record_name)?
+        .read_to_string(&mut record_str)?;
 
     // Rewrite METADATA per the relax policy.
     let new_metadata = rewrite_metadata_text(&metadata_str, relax)?;
@@ -89,8 +88,8 @@ pub fn rewrite_wheel(src: &Path, dst: &Path, relax: RelaxPolicy) -> Result<Strin
     // Write new wheel zip. Iterate every entry; substitute METADATA/RECORD,
     // pass everything else through. Preserve compression and timestamps so
     // tools that inspect the wheel see a minimally-different file.
-    let dst_file = std::fs::File::create(dst)
-        .with_context(|| format!("creating {}", dst.display()))?;
+    let dst_file =
+        std::fs::File::create(dst).with_context(|| format!("creating {}", dst.display()))?;
     let mut writer = ZipWriter::new(dst_file);
 
     for i in 0..archive.len() {
@@ -132,25 +131,23 @@ fn rewrite_metadata_text(content: &str, relax: RelaxPolicy) -> Result<String> {
             // Blank line ends the RFC 822 headers; body follows untouched.
             in_headers = false;
         }
-        if in_headers {
-            if let Some(value) = line.strip_prefix("Requires-Dist: ") {
-                let trimmed = value.trim_end_matches(['\r', '\n']);
-                match relax_pep508(trimmed, relax) {
-                    Ok(rewritten) => {
-                        out.push_str("Requires-Dist: ");
-                        out.push_str(&rewritten);
-                        // Preserve the original line ending.
-                        if line.ends_with("\r\n") {
-                            out.push_str("\r\n");
-                        } else {
-                            out.push('\n');
-                        }
-                        continue;
+        if in_headers && let Some(value) = line.strip_prefix("Requires-Dist: ") {
+            let trimmed = value.trim_end_matches(['\r', '\n']);
+            match relax_pep508(trimmed, relax) {
+                Ok(rewritten) => {
+                    out.push_str("Requires-Dist: ");
+                    out.push_str(&rewritten);
+                    // Preserve the original line ending.
+                    if line.ends_with("\r\n") {
+                        out.push_str("\r\n");
+                    } else {
+                        out.push('\n');
                     }
-                    Err(_) => {
-                        // Could not parse; leave unchanged so we never
-                        // corrupt a wheel just because one line confused us.
-                    }
+                    continue;
+                }
+                Err(_) => {
+                    // Could not parse; leave unchanged so we never
+                    // corrupt a wheel just because one line confused us.
                 }
             }
         }
@@ -163,8 +160,8 @@ fn rewrite_metadata_text(content: &str, relax: RelaxPolicy) -> Result<String> {
 /// `==X.Y.Z` specifier, widen it per `policy` and return the rebuilt
 /// requirement (still PEP 508 syntax). All other shapes pass through.
 fn relax_pep508(raw: &str, policy: RelaxPolicy) -> Result<String> {
-    let req: Requirement = Requirement::from_str(raw)
-        .map_err(|e| anyhow!("parsing `{raw}`: {e}"))?;
+    let req: Requirement =
+        Requirement::from_str(raw).map_err(|e| anyhow!("parsing `{raw}`: {e}"))?;
     // `python` is off-limits to every relax policy; see the matching
     // guard in src/relax.rs::translate. METADATA rewrites must stay in
     // lock-step or pip on the consumer side would still see the widened
@@ -321,7 +318,12 @@ fn rebuild_requirement(req: &Requirement, new_spec: &str) -> String {
 /// Replace the RECORD line for `entry_name` with a new hash and size.
 /// RECORD format: `<path>,sha256=<hex>,<size>\n` per PEP 376. The line
 /// for RECORD itself has empty hash/size by convention; leave those alone.
-fn update_record_line(record: &str, entry_name: &str, new_sha: &str, new_size: usize) -> Result<String> {
+fn update_record_line(
+    record: &str,
+    entry_name: &str,
+    new_sha: &str,
+    new_size: usize,
+) -> Result<String> {
     let mut out = String::with_capacity(record.len());
     let mut found = false;
     for line in record.split_inclusive('\n') {
@@ -399,8 +401,7 @@ mod tests {
         // The tiered cascade mirrors Patch at wheel rewrite time; the
         // conda-side escalation is independent.
         let raw = "numpy==1.26.4";
-        let out =
-            relax_pep508(raw, RelaxPolicy::PatchThenMinorThenMajorThenLastResort).unwrap();
+        let out = relax_pep508(raw, RelaxPolicy::PatchThenMinorThenMajorThenLastResort).unwrap();
         assert_eq!(out, "numpy>=1.26.4,<1.27");
     }
 
@@ -501,7 +502,8 @@ mod tests {
         let record = "foo/__init__.py,sha256=AAAA,42\n\
                       foo-1.0.0.dist-info/METADATA,sha256=OLD,100\n\
                       foo-1.0.0.dist-info/RECORD,,\n";
-        let out = update_record_line(record, "foo-1.0.0.dist-info/METADATA", "NEWHASH", 200).unwrap();
+        let out =
+            update_record_line(record, "foo-1.0.0.dist-info/METADATA", "NEWHASH", 200).unwrap();
         assert!(out.contains("foo-1.0.0.dist-info/METADATA,sha256=NEWHASH,200"));
         assert!(out.contains("foo/__init__.py,sha256=AAAA,42"));
         assert!(out.contains("foo-1.0.0.dist-info/RECORD,,"));

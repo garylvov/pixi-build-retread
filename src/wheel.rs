@@ -8,7 +8,7 @@ use std::fmt::Write as _;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use futures::StreamExt as _;
 use sha2::{Digest, Sha256};
 use tokio::fs;
@@ -39,7 +39,7 @@ pub struct WheelMetadata {
 pub fn wheel_filename_from_url(url: &url::Url) -> Result<String> {
     let raw = url
         .path_segments()
-        .and_then(|s| s.last())
+        .and_then(|mut s| s.next_back())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| anyhow!("URL has no filename component: {url}"))?;
     let decoded = percent_encoding::percent_decode_str(raw)
@@ -226,7 +226,10 @@ pub fn read_metadata(wheel_path: &Path) -> Result<WheelMetadata> {
         }
     }
     let idx = metadata_idx.ok_or_else(|| {
-        anyhow!("no root-level .dist-info/METADATA in {}", wheel_path.display())
+        anyhow!(
+            "no root-level .dist-info/METADATA in {}",
+            wheel_path.display()
+        )
     })?;
 
     let mut entry = archive.by_index(idx)?;
@@ -307,7 +310,13 @@ mod tests {
                    Requires-Dist: torch>=2.7\n\
                    \n\
                    Some description.\n";
-        let m = parse_metadata(raw, "example_pkg-1.2.3-py3-none-any.whl".into(), true, "abc".into()).unwrap();
+        let m = parse_metadata(
+            raw,
+            "example_pkg-1.2.3-py3-none-any.whl".into(),
+            true,
+            "abc".into(),
+        )
+        .unwrap();
         assert_eq!(m.name, "example-pkg");
         assert_eq!(m.version, "1.2.3");
         assert_eq!(m.requires_dist, vec!["numpy==1.26.4", "torch>=2.7"]);
@@ -327,7 +336,9 @@ mod tests {
     #[test]
     fn detects_pure_python_through_relaxed_suffix() {
         // Plain pure-Python wheel: pure.
-        assert!(is_pure_python_wheel_filename("isaaclab-0.51.1-py3-none-any.whl"));
+        assert!(is_pure_python_wheel_filename(
+            "isaaclab-0.51.1-py3-none-any.whl"
+        ));
         // Plain platform-specific wheel: not pure.
         assert!(!is_pure_python_wheel_filename(
             "isaacsim-5.1.0.0-cp311-none-manylinux_2_35_x86_64.whl"
@@ -341,7 +352,9 @@ mod tests {
             "isaacsim-5.1.0.0-cp311-none-manylinux_2_35_x86_64.relaxed.whl"
         ));
         // py2.py3-none-any (universal) wheel: pure.
-        assert!(is_pure_python_wheel_filename("six-1.16.0-py2.py3-none-any.whl"));
+        assert!(is_pure_python_wheel_filename(
+            "six-1.16.0-py2.py3-none-any.whl"
+        ));
         // Not a wheel at all: false.
         assert!(!is_pure_python_wheel_filename("foo.tar.gz"));
     }
@@ -365,22 +378,19 @@ mod tests {
             .unwrap();
         let name = wheel_filename_from_url(&url).unwrap();
         assert_eq!(
-            name,
-            "pytorch3d-0.7.8+5043d15pt2.7.0cu128-cp311-cp311-linux_x86_64.whl",
+            name, "pytorch3d-0.7.8+5043d15pt2.7.0cu128-cp311-cp311-linux_x86_64.whl",
             "wheel_filename_from_url must decode `%2B` to `+`",
         );
     }
 
     #[test]
     fn wheel_filename_passes_through_unencoded() {
-        let url: url::Url = "https://pypi.nvidia.com/isaacsim/isaacsim-5.1.0-cp311-none-manylinux_2_35_x86_64.whl"
-            .parse()
-            .unwrap();
+        let url: url::Url =
+            "https://pypi.nvidia.com/isaacsim/isaacsim-5.1.0-cp311-none-manylinux_2_35_x86_64.whl"
+                .parse()
+                .unwrap();
         let name = wheel_filename_from_url(&url).unwrap();
-        assert_eq!(
-            name,
-            "isaacsim-5.1.0-cp311-none-manylinux_2_35_x86_64.whl",
-        );
+        assert_eq!(name, "isaacsim-5.1.0-cp311-none-manylinux_2_35_x86_64.whl",);
     }
 
     #[test]
@@ -401,6 +411,9 @@ mod tests {
             "sha".into(),
         )
         .unwrap();
-        assert!(m.is_pure_python, "relaxed pure-Python wheels must remain marked pure");
+        assert!(
+            m.is_pure_python,
+            "relaxed pure-Python wheels must remain marked pure"
+        );
     }
 }

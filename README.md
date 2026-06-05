@@ -20,9 +20,8 @@ Motivated by [prefix-dev/pixi#5230](https://github.com/prefix-dev/pixi/issues/52
 automates [@diegoferigo-rai](https://github.com/diegoferigo-rai)'s hand-written
 [Isaac Sim `recipe.yaml`](https://github.com/prefix-dev/pixi/issues/5230#issuecomment-comment-24).
 
-**Status: working end-to-end.** The [`examples/gigastrap/`](examples/gigastrap/)
-workspace (Isaac Sim + IsaacLab + IsaacLab-Arena + pytorch3d, mixed with ROS 2
-and a GPU pytorch stack) solves, builds, and installs via `pixi install -e gsi`.
+The [`examples/gigastrap/`](examples/gigastrap/) workspace (Isaac Sim + IsaacLab + IsaacLab-Arena + pytorch3d, mixed with ROS 2
+and a GPU pytorch stack) demonstrates this approach, which can be installed via `pixi install -e gsi`.
 
 ## Requirements
 
@@ -67,7 +66,7 @@ name    = "isaac-pack"
 version = "5.1.0"
 
 [package.build]
-backend  = { name = "pixi-build-retread", version = ">=0.46.0" }
+backend  = { name = "pixi-build-retread", version = ">=1.0.0" }
 channels = ["https://prefix.dev/garylvov", "https://prefix.dev/conda-forge"]
 
 [package.build.config]
@@ -175,13 +174,14 @@ retread-drop-deps  = ["weird-shim"]   # drop from run-deps entirely
 
 | Policy | `numpy==1.26.4` → | `pyglet<2` → | Auto-widen unsat? |
 |---|---|---|---|
+| `patch-then-minor-then-major-then-last-resort` ★ (Default) | `>=1.26.4,<1.27` | `<2` | yes (progressive) |
 | `none` | `==1.26.4` | `<2` | no |
 | `patch` | `>=1.26.4,<1.27` | `<2` | no |
 | `minor` | `>=1.26,<2` | `<2` | no |
 | `major` | `>=1` | `<2` | no |
 | `strong-major` | `>=1` | `pyglet` (cap stripped) | no |
 | `*-with-last-resort` (patch/minor/major) | as base | `<2` | yes (`*`) |
-| `patch-then-minor-then-major-then-last-resort` ★ | `>=1.26.4,<1.27` | `<2` | yes (progressive) |
+
 
 ★ = **default** (omit `retread-relax`). Non-`==` specs pass through unchanged
 except under `strong-major`, which strips upper bounds. `python` is exempt

@@ -7,9 +7,9 @@
 use std::future::Future;
 
 use futures::StreamExt;
-use serde::de::DeserializeOwned;
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde::de::DeserializeOwned;
+use serde_json::{Value, json};
 use tokio::io::{AsyncWriteExt, BufWriter, Stdout};
 use tokio::sync::Mutex;
 use tokio_util::codec::{FramedRead, LinesCodec};
@@ -29,10 +29,18 @@ pub struct RpcError {
 
 impl RpcError {
     pub fn invalid_params(msg: impl Into<String>) -> Self {
-        Self { code: INVALID_PARAMS, message: msg.into(), data: None }
+        Self {
+            code: INVALID_PARAMS,
+            message: msg.into(),
+            data: None,
+        }
     }
     pub fn internal(msg: impl Into<String>) -> Self {
-        Self { code: INTERNAL_ERROR, message: msg.into(), data: None }
+        Self {
+            code: INTERNAL_ERROR,
+            message: msg.into(),
+            data: None,
+        }
     }
 }
 

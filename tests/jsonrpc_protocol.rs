@@ -18,7 +18,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn backend_binary() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/release/pixi-build-retread")
@@ -105,10 +105,7 @@ fn negotiate_initialize_outputs_round_trip() {
     // conda/outputs with one URL-form wheel that resolves without
     // building anything heavy. This catches the protocol-corruption
     // class even on a fast wheel.
-    let tmp = std::env::temp_dir().join(format!(
-        "retread-rpc-test-{}",
-        std::process::id()
-    ));
+    let tmp = std::env::temp_dir().join(format!("retread-rpc-test-{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
 
     let requests = vec![
@@ -181,10 +178,7 @@ fn path_source_does_not_corrupt_stdout() {
         fixture.display()
     );
 
-    let tmp = std::env::temp_dir().join(format!(
-        "retread-rpc-path-test-{}",
-        std::process::id()
-    ));
+    let tmp = std::env::temp_dir().join(format!("retread-rpc-path-test-{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
 
     let requests = vec![
@@ -244,10 +238,7 @@ fn broken_entry_surfaces_with_entry_name() {
     // located at './Y'" -- with no mention of WHICH entry failed or WHY.
     // This test pins the fail-fast contract: a deterministically-broken
     // entry must produce an error response whose message names the entry.
-    let tmp = std::env::temp_dir().join(format!(
-        "retread-rpc-broken-{}",
-        std::process::id()
-    ));
+    let tmp = std::env::temp_dir().join(format!("retread-rpc-broken-{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
 
     let requests = vec![

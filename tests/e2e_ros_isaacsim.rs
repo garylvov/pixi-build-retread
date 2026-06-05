@@ -153,10 +153,7 @@ fn ros2_humble_plus_isaacsim_solves() {
 
     // We want the backend to find rattler-build at runtime; piggyback on the
     // caller's PATH (the test runner is expected to be in an env that has it).
-    let override_spec = format!(
-        "pixi-build-retread={}",
-        backend_binary().to_string_lossy()
-    );
+    let override_spec = format!("pixi-build-retread={}", backend_binary().to_string_lossy());
 
     let output = Command::new("pixi")
         .args(["lock", "--no-progress"])
@@ -181,8 +178,5 @@ fn ros2_humble_plus_isaacsim_solves() {
     );
 
     // Leave the tempdir around on success so it can be inspected manually.
-    eprintln!(
-        "ok. Inspect resolved lock at {}/pixi.lock",
-        work.display()
-    );
+    eprintln!("ok. Inspect resolved lock at {}/pixi.lock", work.display());
 }

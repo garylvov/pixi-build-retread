@@ -2,7 +2,7 @@
 //! concrete `(url, sha256)` for the wheel matching our target platform +
 //! python tag.
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, bail};
 use regex::Regex;
 use std::str::FromStr;
 use std::sync::OnceLock;
@@ -180,7 +180,7 @@ fn parse_index_links_any(html: &str, base: &url::Url) -> Result<Vec<ResolvedWhee
             Ok(u) => u,
             Err(_) => continue,
         };
-        let filename = match url.path_segments().and_then(|s| s.last()) {
+        let filename = match url.path_segments().and_then(|mut s| s.next_back()) {
             Some(f) if !f.is_empty() => percent_encoding::percent_decode_str(f)
                 .decode_utf8_lossy()
                 .into_owned(),
@@ -191,7 +191,11 @@ fn parse_index_links_any(html: &str, base: &url::Url) -> Result<Vec<ResolvedWhee
                 .filter(|h| h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit()))
                 .map(|h| h.to_ascii_lowercase())
         });
-        out.push(ResolvedWheel { url, sha256, filename });
+        out.push(ResolvedWheel {
+            url,
+            sha256,
+            filename,
+        });
     }
     if out.is_empty() {
         bail!("no `<a href=...>` links found at index");
@@ -227,7 +231,6 @@ fn pep503_normalize(name: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
-
 fn parse_index_links(html: &str, base: &url::Url) -> Result<Vec<ResolvedWheel>> {
     static RE: OnceLock<Regex> = OnceLock::new();
     // PEP 503 advertises hashes in the URL fragment (`#sha256=<hex>`) but
@@ -252,7 +255,7 @@ fn parse_index_links(html: &str, base: &url::Url) -> Result<Vec<ResolvedWheel>> 
         // so we'd silently drop every candidate and report "no wheels
         // match" at the version-filter step. Decode here so the filename
         // we store and parse downstream is the literal wheel name.
-        let filename = match url.path_segments().and_then(|s| s.last()) {
+        let filename = match url.path_segments().and_then(|mut s| s.next_back()) {
             Some(f) if !f.is_empty() => percent_encoding::percent_decode_str(f)
                 .decode_utf8_lossy()
                 .into_owned(),
@@ -266,7 +269,11 @@ fn parse_index_links(html: &str, base: &url::Url) -> Result<Vec<ResolvedWheel>> 
                 .filter(|h| h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit()))
                 .map(|h| h.to_ascii_lowercase())
         });
-        out.push(ResolvedWheel { url, sha256, filename });
+        out.push(ResolvedWheel {
+            url,
+            sha256,
+            filename,
+        });
     }
     if out.is_empty() {
         bail!("no `<a href=...>` wheel links found at index");
@@ -274,10 +281,7 @@ fn parse_index_links(html: &str, base: &url::Url) -> Result<Vec<ResolvedWheel>> 
     Ok(out)
 }
 
-fn pick_best(
-    mut candidates: Vec<ResolvedWheel>,
-    target: &WheelTarget,
-) -> Option<ResolvedWheel> {
+fn pick_best(mut candidates: Vec<ResolvedWheel>, target: &WheelTarget) -> Option<ResolvedWheel> {
     // Score each candidate; higher is better. Negative score = incompatible.
     candidates
         .iter()
@@ -298,12 +302,12 @@ fn score_wheel(filename: &str, target: &WheelTarget) -> i64 {
         None => return -1,
     };
 
-    let py_score = match score_python_tag_with_abi(&parts.python, &parts.abi, &target.python_version)
+    let py_score = match score_python_tag_with_abi(parts.python, parts.abi, &target.python_version)
     {
         Some(s) => s,
         None => return -1,
     };
-    let plat_score = match score_platform_tag(&parts.platform, &target.conda_subdir) {
+    let plat_score = match score_platform_tag(parts.platform, &target.conda_subdir) {
         Some(s) => s,
         None => return -1,
     };
@@ -385,15 +389,13 @@ fn score_python_tag(tag: &str, target: &str) -> Option<u32> {
 }
 
 fn score_one_python(tag: &str, t_major: u32, t_minor: u32) -> Option<u32> {
-    if tag.starts_with("cp") {
+    if let Some(digits) = tag.strip_prefix("cp") {
         // cp311 means CPython 3.11 (most preferred when matching exactly).
-        let digits = &tag[2..];
         let (major, minor) = split_python_digits(digits)?;
         if major == t_major && minor == t_minor {
             return Some(100);
         }
-    } else if tag.starts_with("py") {
-        let digits = &tag[2..];
+    } else if let Some(digits) = tag.strip_prefix("py") {
         if digits.is_empty() {
             return None;
         }
@@ -477,11 +479,7 @@ fn score_one_platform_tag(tag: &str, conda_subdir: &str) -> Option<i64> {
         return None;
     }
 
-    if tag.contains(arch) {
-        Some(120)
-    } else {
-        None
-    }
+    if tag.contains(arch) { Some(120) } else { None }
 }
 
 #[cfg(test)]
@@ -512,7 +510,10 @@ mod tests {
         let base = url::Url::parse("https://pypi.nvidia.com/isaacsim/").unwrap();
         let links = parse_index_links(html, &base).unwrap();
         assert_eq!(links.len(), 2);
-        assert_eq!(links[0].filename, "isaacsim-5.1.0.0-cp311-none-manylinux_2_35_x86_64.whl");
+        assert_eq!(
+            links[0].filename,
+            "isaacsim-5.1.0.0-cp311-none-manylinux_2_35_x86_64.whl"
+        );
         assert_eq!(
             links[0].sha256.as_deref(),
             Some("ad2c027831ed5d4a62552735bb799dea4e4604530d2ab9b526ddb6cd19a98c11"),
@@ -536,8 +537,7 @@ mod tests {
         let links = parse_index_links(html, &base).unwrap();
         assert_eq!(links.len(), 1);
         assert_eq!(
-            links[0].filename,
-            "pytorch3d-0.7.9+d9839a9pt2.10.0cpu-cp311-cp311-linux_x86_64.whl",
+            links[0].filename, "pytorch3d-0.7.9+d9839a9pt2.10.0cpu-cp311-cp311-linux_x86_64.whl",
             "filename must be percent-decoded so `+` is literal for uv_pep440",
         );
     }
@@ -562,9 +562,9 @@ mod tests {
     fn compressed_tag_set_matches() {
         // PEP 425 compressed tag sets: one wheel that lists multiple platform
         // tags joined by `.`. Common with mujoco wheels.
-        let cands = vec![
-            mk("mujoco-3.5.1-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl"),
-        ];
+        let cands = vec![mk(
+            "mujoco-3.5.1-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+        )];
         let picked = pick_best(cands, &t()).unwrap();
         assert!(picked.filename.contains("manylinux_2_28_x86_64"));
     }
@@ -577,9 +577,9 @@ mod tests {
     /// satisfies the stable-ABI compatibility contract.
     #[test]
     fn abi3_wheel_matches_newer_python() {
-        let cands = vec![
-            mk("psutil-5.9.8-cp36-abi3-manylinux_2_12_x86_64.manylinux2010_x86_64.manylinux_2_17_x86_64.manylinux2014_x86_64.whl"),
-        ];
+        let cands = vec![mk(
+            "psutil-5.9.8-cp36-abi3-manylinux_2_12_x86_64.manylinux2010_x86_64.manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        )];
         let picked = pick_best(cands, &t()).unwrap();
         assert!(picked.filename.starts_with("psutil-5.9.8-cp36-abi3-"));
     }
@@ -604,9 +604,7 @@ mod tests {
     /// rejected (e.g. cp310-abi3 doesn't satisfy target=3.9).
     #[test]
     fn abi3_python_min_higher_than_target_rejected() {
-        let cands = vec![
-            mk("foo-1.0-cp312-abi3-manylinux_2_17_x86_64.whl"),
-        ];
+        let cands = vec![mk("foo-1.0-cp312-abi3-manylinux_2_17_x86_64.whl")];
         // target python is 3.11 (from t() helper); cp312-abi3 declares
         // min=3.12, so should be rejected.
         let picked = pick_best(cands, &t());
@@ -663,8 +661,7 @@ mod tests {
         // split on '-' to get the version segment, parse via uv_pep440,
         // check VersionSpecifiers::contains.
         let spec = VersionSpecifiers::from_str("==0.7.8+5043d15pt2.7.0cu128").unwrap();
-        let filename =
-            "pytorch3d-0.7.8+5043d15pt2.7.0cu128-cp311-cp311-linux_x86_64.whl";
+        let filename = "pytorch3d-0.7.8+5043d15pt2.7.0cu128-cp311-cp311-linux_x86_64.whl";
         let stem = filename.strip_suffix(".whl").unwrap();
         let rest = stem.strip_prefix("pytorch3d-").unwrap();
         let version_str = rest.split('-').next().unwrap();
@@ -679,7 +676,11 @@ mod tests {
         // different local-version identifier MUST NOT match. Otherwise
         // we'd silently install a torch-2.6 build into a torch-2.7 env.
         let other = "pytorch3d-0.7.8+abcdefgpt2.6.0cu124-cp311-cp311-linux_x86_64.whl";
-        let other_rest = other.strip_suffix(".whl").unwrap().strip_prefix("pytorch3d-").unwrap();
+        let other_rest = other
+            .strip_suffix(".whl")
+            .unwrap()
+            .strip_prefix("pytorch3d-")
+            .unwrap();
         let other_v = uv_pep440::Version::from_str(other_rest.split('-').next().unwrap()).unwrap();
         assert!(
             !spec.contains(&other_v),

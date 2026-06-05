@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use tokio::process::Command;
 
 /// Build a wheel from a local source tree using `uv pip wheel --no-deps`.
@@ -64,15 +64,13 @@ pub async fn build_wheel_from_path(
     // -- so no equivalent of pip's `--no-deps` is needed.
     let py_arg = format!("--python={python_version}");
     let out_arg = format!("--out-dir={}", out_dir.display());
-    run_capturing_uv(
-        &[
-            "build",
-            "--wheel",
-            &py_arg,
-            &out_arg,
-            &source.display().to_string(),
-        ],
-    )
+    run_capturing_uv(&[
+        "build",
+        "--wheel",
+        &py_arg,
+        &out_arg,
+        &source.display().to_string(),
+    ])
     .await?;
     find_built_wheel(out_dir).await
 }
@@ -110,11 +108,7 @@ async fn newest_wheel_in(dir: &Path) -> Result<Option<PathBuf>> {
         // git clone hits ENAMETOOLONG. Burned a multi-version-bump
         // debug session on exactly this. Add every new suffix here
         // when introducing a new pipeline phase.
-        const RETREAD_SUFFIXES: &[&str] = &[
-            ".injected.",
-            ".autodata.",
-            ".relaxed.",
-        ];
+        const RETREAD_SUFFIXES: &[&str] = &[".injected.", ".autodata.", ".relaxed."];
         if RETREAD_SUFFIXES.iter().any(|s| name.contains(s)) {
             continue;
         }
@@ -124,7 +118,7 @@ async fn newest_wheel_in(dir: &Path) -> Result<Option<PathBuf>> {
             .with_context(|| format!("stat'ing wheel {}", path.display()))?
             .modified()
             .with_context(|| format!("reading mtime of {}", path.display()))?;
-        if best.as_ref().map_or(true, |(t, _)| mtime > *t) {
+        if best.as_ref().is_none_or(|(t, _)| mtime > *t) {
             best = Some((mtime, path));
         }
     }
@@ -161,7 +155,7 @@ pub async fn build_wheel_from_sdist_url(
     // Pull the sdist filename out of the URL.
     let filename = sdist_url
         .path_segments()
-        .and_then(|s| s.last())
+        .and_then(|mut s| s.next_back())
         .and_then(|f| if f.is_empty() { None } else { Some(f) })
         .ok_or_else(|| anyhow!("sdist URL {sdist_url} has no filename component"))?
         .to_string();
@@ -191,15 +185,13 @@ pub async fn build_wheel_from_sdist_url(
     );
     let py_arg = format!("--python={python_version}");
     let out_arg = format!("--out-dir={}", out_dir.display());
-    run_capturing_uv(
-        &[
-            "build",
-            "--wheel",
-            &py_arg,
-            &out_arg,
-            &sdist_path.display().to_string(),
-        ],
-    )
+    run_capturing_uv(&[
+        "build",
+        "--wheel",
+        &py_arg,
+        &out_arg,
+        &sdist_path.display().to_string(),
+    ])
     .await?;
     find_built_wheel(out_dir).await
 }
@@ -224,8 +216,9 @@ pub fn git_source_root(url: &str, rev: &str, subdirectory: &str, cache_dir: &Pat
 /// This is what pip/uv do (the wheel itself stays a normal PEP 427
 /// filename; disambiguation rides in parent directories). Each path
 /// component is independently bounded:
-///   - <slug>: repo-name slug, truncated to 24 chars
-///   - <sha12>: 12 hex chars of sha256(url + "\0" + rev)
+///   - `<slug>`: repo-name slug, truncated to 24 chars
+///   - `<sha12>`: 12 hex chars of sha256(url + "\0" + rev)
+///
 /// Previously the (slug + raw 40-char git SHA) was flattened into one
 /// 60+ char component; combined with the rattler cache prefix and
 /// deep upstream repo internals (IsaacLab's nested test/snapshot
@@ -241,19 +234,12 @@ pub fn git_checkout_root(url: &str, rev: &str, cache_dir: &Path) -> PathBuf {
     hasher.update(b"\0");
     hasher.update(rev.as_bytes());
     let digest = hasher.finalize();
-    let sha12: String = digest
-        .iter()
-        .take(6)
-        .map(|b| format!("{b:02x}"))
-        .collect();
+    let sha12: String = digest.iter().take(6).map(|b| format!("{b:02x}")).collect();
     let mut slug = git_slug(url);
     // The slug strips `https___github.com_`; cap whatever's left so
     // big-org/long-name repos don't blow the slug component.
     slug.truncate(24);
-    cache_dir
-        .join("retread-git-clones")
-        .join(slug)
-        .join(sha12)
+    cache_dir.join("retread-git-clones").join(slug).join(sha12)
 }
 
 /// Clone a git URL at a specific revision into `cache_dir`, then build
@@ -278,15 +264,13 @@ pub async fn build_wheel_from_git(
 
     if !clone_dir.exists() {
         let parent = clone_dir.parent().unwrap();
-        tokio::fs::create_dir_all(parent)
-            .await
-            .with_context(|| {
-                format!(
-                    "creating git-clone parent dir {} (for url={url}, rev={rev}, target={})",
-                    parent.display(),
-                    clone_dir.display(),
-                )
-            })?;
+        tokio::fs::create_dir_all(parent).await.with_context(|| {
+            format!(
+                "creating git-clone parent dir {} (for url={url}, rev={rev}, target={})",
+                parent.display(),
+                clone_dir.display(),
+            )
+        })?;
         tracing::info!(url = %url, rev = %rev, "cloning git source");
         // Clone shallow without checkout. Use a two-step fetch so we can
         // target arbitrary commits (not just branch/tag tips).
@@ -368,10 +352,7 @@ async fn run_capturing_uv(args: &[&str]) -> Result<()> {
         } else {
             snippet.to_string()
         };
-        bail!(
-            "uv {:?} failed (status {}): {snippet}",
-            args, output.status,
-        );
+        bail!("uv {:?} failed (status {}): {snippet}", args, output.status,);
     }
     if !stdout.trim().is_empty() {
         tracing::debug!(stdout = %stdout, "uv output");
@@ -480,10 +461,11 @@ mod tests {
     /// v0.13.3+ regression: every on-disk path component in the
     /// checkout-root path is independently bounded. Layout is
     /// cache/retread-git-clones/<slug<=24>/<sha12>, so the longest
-    /// component should be the 24-char slug cap. Previously the (slug
-    /// + 40-char raw SHA) flattened into one 60+ char component;
-    /// combined with the rattler cache prefix and deep IsaacLab
-    /// internals, pathnames tripped ENAMETOOLONG on git checkout.
+    /// component should be the 24-char slug cap. Previously the
+    /// (slug + 40-char raw SHA) flattened into one 60+ char
+    /// component; combined with the rattler cache prefix and deep
+    /// IsaacLab internals, pathnames tripped ENAMETOOLONG on git
+    /// checkout.
     #[test]
     fn checkout_root_components_are_short() {
         let cache = std::path::Path::new("/tmp/cache");
@@ -500,7 +482,11 @@ mod tests {
         // slug (<=24 chars). Neither anywhere near NAME_MAX / 255.
         let last = comps.last().expect("at least one component");
         let parent = &comps[comps.len() - 2];
-        assert_eq!(last.len(), 12, "sha12 must be exactly 12 chars; got: {last}");
+        assert_eq!(
+            last.len(),
+            12,
+            "sha12 must be exactly 12 chars; got: {last}"
+        );
         assert!(parent.len() <= 24, "slug must be <=24 chars; got {parent}");
     }
 

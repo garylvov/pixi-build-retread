@@ -350,7 +350,10 @@ mod tests {
         let block = render_pypi_overrides(&wheels);
 
         // Each wheel produces one line, ==<exact-version>.
-        assert!(block.contains("isaacsim = \"==5.1.0.0\""), "block:\n{block}");
+        assert!(
+            block.contains("isaacsim = \"==5.1.0.0\""),
+            "block:\n{block}"
+        );
         assert!(block.contains("isaaclab = \"==0.51.1\""));
         // PEP 440 local-version identifier must survive verbatim --
         // this is the case (pytorch3d) that fails on the PyPI side
@@ -376,9 +379,18 @@ mod tests {
     #[test]
     fn conda_deps_block_renders_spec_constraints() {
         let emitted = vec![
-            EmittedDep { name: "numpy".into(), spec: "numpy >=1".into() },
-            EmittedDep { name: "pyglet".into(), spec: "pyglet".into() }, // no constraint
-            EmittedDep { name: "pytorch".into(), spec: "pytorch >=2.7,<3".into() },
+            EmittedDep {
+                name: "numpy".into(),
+                spec: "numpy >=1".into(),
+            },
+            EmittedDep {
+                name: "pyglet".into(),
+                spec: "pyglet".into(),
+            }, // no constraint
+            EmittedDep {
+                name: "pytorch".into(),
+                spec: "pytorch >=2.7,<3".into(),
+            },
         ];
         let block = render_conda_deps(&emitted);
         assert!(block.contains("numpy = \">=1\""), "block:\n{block}");
@@ -401,8 +413,14 @@ mod tests {
             "5.1.0.0".into(),
             vec![wheel("isaacsim", "5.1.0.0", &["numpy==1.26.0", "pyglet<2"])],
             vec![
-                EmittedDep { name: "numpy".into(), spec: "numpy >=1".into() },
-                EmittedDep { name: "pyglet".into(), spec: "pyglet".into() },
+                EmittedDep {
+                    name: "numpy".into(),
+                    spec: "numpy >=1".into(),
+                },
+                EmittedDep {
+                    name: "pyglet".into(),
+                    spec: "pyglet".into(),
+                },
             ],
             vec![],
             BTreeMap::new(),

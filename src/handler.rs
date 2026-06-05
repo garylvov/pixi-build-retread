@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use pixi_build_types::procedures::{
     conda_build_v1::{CondaBuildV1Params, CondaBuildV1Result},
     conda_outputs::{
@@ -15,18 +15,22 @@ use pixi_build_types::procedures::{
     initialize::{InitializeParams, InitializeResult},
     negotiate_capabilities::{NegotiateCapabilitiesParams, NegotiateCapabilitiesResult},
 };
-use pixi_build_types::{BackendCapabilities, BinaryPackageSpec, NamedSpec, PackageSpec, VariantValue};
-use rattler_conda_types::{ChannelUrl, NoArchType, PackageName, Platform, VersionSpec, VersionWithSource};
+use pixi_build_types::{
+    BackendCapabilities, BinaryPackageSpec, NamedSpec, PackageSpec, VariantValue,
+};
+use rattler_conda_types::{
+    ChannelUrl, NoArchType, PackageName, Platform, VersionSpec, VersionWithSource,
+};
 use serde_json::Value;
 use tokio::sync::RwLock;
 use uv_pep508::uv_pep440::VersionSpecifiers;
 
 use crate::config::{RelaxPolicy, RetreadConfig, WheelEntry};
 use crate::pypi::{self, WheelTarget};
-use crate::recipe::{build_bundle_recipe, to_yaml, BundleSource};
+use crate::recipe::{BundleSource, build_bundle_recipe, to_yaml};
 use crate::relax::{default_marker_env, emit_python_version, marker_env_for};
-use crate::rpc::{ok, parse_params, RpcError};
-use crate::wheel::{fetch_wheel, read_metadata, WheelMetadata};
+use crate::rpc::{RpcError, ok, parse_params};
+use crate::wheel::{WheelMetadata, fetch_wheel, read_metadata};
 
 /// Process-global memo of `conda/outputs` results, keyed by the params
 /// that determine the outputs (host/build platform, sorted channels,
@@ -49,7 +53,11 @@ static CONDA_OUTPUTS_CACHE: std::sync::OnceLock<
 /// dir that doesn't affect the emitted metadata, and including it would
 /// miss cache hits if pixi varies it per call.
 fn conda_outputs_cache_key(params: &CondaOutputsParams) -> String {
-    let mut chans: Vec<String> = params.channels.iter().map(|c| c.url().to_string()).collect();
+    let mut chans: Vec<String> = params
+        .channels
+        .iter()
+        .map(|c| c.url().to_string())
+        .collect();
     chans.sort();
     format!(
         "{}|{}|{}|{:?}",
@@ -86,8 +94,7 @@ const DEFAULT_PYTHON: &str = "3.11";
 /// `opencv-python` AND `opencv-python-headless` -- which we invert at
 /// load time to look up all conda candidates from a single PyPI name.
 /// Fetched once per backend invocation.
-const PARSELMOUTH_MAPPING_URL: &str =
-    "https://raw.githubusercontent.com/prefix-dev/parselmouth/main/files/v0/conda-forge/compressed_mapping.json";
+const PARSELMOUTH_MAPPING_URL: &str = "https://raw.githubusercontent.com/prefix-dev/parselmouth/main/files/v0/conda-forge/compressed_mapping.json";
 
 /// Hard-coded PyPI->conda name mappings that PATCH the parselmouth data.
 /// These entries are merged into the inverse map on top of parselmouth's
@@ -106,11 +113,11 @@ const FALLBACK_PYPI_TO_CONDA: &[(&str, &str)] = &[
     // long-standing retread bug that surfaced as
     // `py-opencv >=4.11 -> libopencv ==4.2.0 py36_5, no candidates`
     // in the solve check.
-    ("opencv-python",          "opencv"),
+    ("opencv-python", "opencv"),
     ("opencv-python-headless", "opencv"),
     // Already covered by parselmouth (`pytorch: [torch]`) but here as a
     // safety net in case the fetch fails entirely.
-    ("torch",                  "pytorch"),
+    ("torch", "pytorch"),
     // isaacsim's `Requires-Dist` lists `pywin32` (it's Windows-only on
     // PyPI, but Isaac Sim declares it unconditionally). conda-forge ships a
     // `pywin32` stub on Linux that satisfies the import, so route the PyPI
@@ -118,7 +125,7 @@ const FALLBACK_PYPI_TO_CONDA: &[(&str, &str)] = &[
     // consumer workspace no longer needs a `conda-pypi-map` patch for it
     // (parselmouth doesn't map pywin32). Same intent as the gigastrap
     // `patches/conda_pypi_map.json` { "pywin32": "pywin32" } entry.
-    ("pywin32",                "pywin32"),
+    ("pywin32", "pywin32"),
 ];
 
 /// Inverted parselmouth mapping: PyPI name -> conda-forge candidates.
@@ -199,27 +206,27 @@ fn conda_candidates_for(
             }
         }
     }
-    if let Some(user) = name_map.get(pypi_name) {
-        if !out.iter().any(|n| n == user) {
-            out.push(user.clone());
-        }
+    if let Some(user) = name_map.get(pypi_name)
+        && !out.iter().any(|n| n == user)
+    {
+        out.push(user.clone());
     }
     out
 }
 
 const BUILT_IN_WIN_ONLY: &[&str] = &[
-    "comtypes",         // COM bindings
-    "idna-ssl",         // async SSL shim, last release 2017
-    "pyreadline",       // readline replacement (deprecated)
-    "pyreadline3",      // readline replacement (current)
-    "pywin32",          // Win32 API bindings
-    "pywin32-ctypes",   // ctypes-only fallback for pywin32
-    "pywinpty",         // Windows pseudo-terminal (jupyter, IPython)
-    "win32-setctime",   // ctime setter for Windows files
-    "winregistry",      // registry helper (stdlib winreg on Windows)
-    "winrt-runtime",    // Windows Runtime API
-    "winshell",         // shell helpers
-    "wmi",              // Windows Management Instrumentation
+    "comtypes",       // COM bindings
+    "idna-ssl",       // async SSL shim, last release 2017
+    "pyreadline",     // readline replacement (deprecated)
+    "pyreadline3",    // readline replacement (current)
+    "pywin32",        // Win32 API bindings
+    "pywin32-ctypes", // ctypes-only fallback for pywin32
+    "pywinpty",       // Windows pseudo-terminal (jupyter, IPython)
+    "win32-setctime", // ctime setter for Windows files
+    "winregistry",    // registry helper (stdlib winreg on Windows)
+    "winrt-runtime",  // Windows Runtime API
+    "winshell",       // shell helpers
+    "wmi",            // Windows Management Instrumentation
 ];
 
 #[derive(Default)]
@@ -318,7 +325,10 @@ impl Handler {
             NEGOTIATE => self.negotiate(parse_params(params)?).await.and_then(ok),
             INITIALIZE => self.initialize(parse_params(params)?).await.and_then(ok),
             CONDA_OUTPUTS => self.conda_outputs(parse_params(params)?).await.and_then(ok),
-            CONDA_BUILD_V1 => self.conda_build_v1(parse_params(params)?).await.and_then(ok),
+            CONDA_BUILD_V1 => self
+                .conda_build_v1(parse_params(params)?)
+                .await
+                .and_then(ok),
             other => Err(RpcError {
                 code: crate::rpc::METHOD_NOT_FOUND,
                 message: format!("unknown method `{other}`"),
@@ -339,17 +349,14 @@ impl Handler {
         })
     }
 
-    async fn initialize(
-        &self,
-        params: InitializeParams,
-    ) -> Result<InitializeResult, RpcError> {
+    async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult, RpcError> {
         let config: RetreadConfig = match params.configuration {
             Some(v) => serde_json::from_value(v)
                 .map_err(|e| RpcError::invalid_params(format!("[build.config]: {e}")))?,
             None => {
                 return Err(RpcError::invalid_params(
                     "pixi-build-retread requires a [build.config] table with at least `wheels = { ... }`",
-                ))
+                ));
             }
         };
 
@@ -371,9 +378,9 @@ impl Handler {
         state.config = Some(config);
         state.cache_dir = params.cache_directory;
         // source_directory falls back to the manifest's containing dir.
-        state.source_dir = params.source_directory.or_else(|| {
-            params.manifest_path.parent().map(PathBuf::from)
-        });
+        state.source_dir = params
+            .source_directory
+            .or_else(|| params.manifest_path.parent().map(PathBuf::from));
         state.workspace_dir = params.workspace_directory;
         Ok(InitializeResult {})
     }
@@ -679,40 +686,43 @@ impl Handler {
                     for env_name in &env_names {
                         bundle = bundle_snapshot.clone();
                         effective = effective_snapshot.clone();
-                        let (env_channels, env_workspace_specs, env_system_requirements) = match (&manifest_for_solve, env_name.as_str()) {
-                            (Some(m), n) if n != "__default__" => {
-                                let chans: Vec<ChannelUrl> = m
-                                    .effective_channels(n)
-                                    .iter()
-                                    .filter_map(|s| url::Url::parse(s).ok().map(ChannelUrl::from))
-                                    .collect();
-                                let chans = if chans.is_empty() {
-                                    params.channels.clone()
-                                } else {
-                                    chans
-                                };
-                                let mut specs: Vec<String> = Vec::new();
-                                for (dep_name, spec) in m.effective_dependencies(n) {
-                                    if spec.is_empty() || spec == "*" {
-                                        specs.push(dep_name);
+                        let (env_channels, env_workspace_specs, env_system_requirements) =
+                            match (&manifest_for_solve, env_name.as_str()) {
+                                (Some(m), n) if n != "__default__" => {
+                                    let chans: Vec<ChannelUrl> = m
+                                        .effective_channels(n)
+                                        .iter()
+                                        .filter_map(|s| {
+                                            url::Url::parse(s).ok().map(ChannelUrl::from)
+                                        })
+                                        .collect();
+                                    let chans = if chans.is_empty() {
+                                        params.channels.clone()
                                     } else {
-                                        specs.push(format!("{dep_name} {spec}"));
+                                        chans
+                                    };
+                                    let mut specs: Vec<String> = Vec::new();
+                                    for (dep_name, spec) in m.effective_dependencies(n) {
+                                        if spec.is_empty() || spec == "*" {
+                                            specs.push(dep_name);
+                                        } else {
+                                            specs.push(format!("{dep_name} {spec}"));
+                                        }
                                     }
+                                    // v0.37.0 D1b: pull per-env
+                                    // system-requirements so solve_check
+                                    // sees workspace-declared __cuda /
+                                    // __glibc / __osx instead of the
+                                    // build host's detected values.
+                                    let sysreqs = m.effective_system_requirements(n);
+                                    (chans, specs, sysreqs)
                                 }
-                                // v0.37.0 D1b: pull per-env
-                                // system-requirements so solve_check
-                                // sees workspace-declared __cuda /
-                                // __glibc / __osx instead of the
-                                // build host's detected values.
-                                let sysreqs = m.effective_system_requirements(n);
-                                (chans, specs, sysreqs)
-                            }
-                            _ => (
-                                params.channels.clone(),
-                                Vec::new(),
-                                std::collections::BTreeMap::new(),
-                            ),
-                        };
+                                _ => (
+                                    params.channels.clone(),
+                                    Vec::new(),
+                                    std::collections::BTreeMap::new(),
+                                ),
+                            };
                         // v0.34.0+: iterative refinement. The solve
                         // check may say UNSAT because retread emitted
                         // a too-narrow spec (e.g. `triton >=3.7.0,<3.8`
@@ -771,11 +781,7 @@ impl Handler {
                         // `pytorch ==2.10.0` forcing numpy 2 and
                         // knocking out the np126py311 builds).
                         for (dep, spec) in &effective.overrides {
-                            merge_looser_override(
-                                &mut accumulated_overrides,
-                                dep,
-                                spec,
-                            );
+                            merge_looser_override(&mut accumulated_overrides, dep, spec);
                         }
                         if !outcome.satisfiable && !outcome.unsat_explanations.is_empty() {
                             // Print the FULL diagnostic to stderr in
@@ -881,8 +887,7 @@ impl Handler {
                     // with the result. Cheap: produce_output is
                     // pure rendering and post_emit_widen_pass hits
                     // the in-memory repodata cache.
-                    let widening_changed = accumulated_overrides
-                        != effective_snapshot.overrides;
+                    let widening_changed = accumulated_overrides != effective_snapshot.overrides;
                     if widening_changed {
                         let mut rebuild_effective = effective_snapshot.clone();
                         rebuild_effective.overrides = accumulated_overrides.clone();
@@ -980,9 +985,8 @@ impl Handler {
         if all_solve_attempted && !workspace_block_messages.is_empty() {
             // Build the file-path hint pointing at the source dir.
             // The MD file is named after the bundle's conda name.
-            let md_paths: Vec<String> = bundle_md_paths(&source_dir, &outputs)
-                .into_iter()
-                .collect();
+            let md_paths: Vec<String> =
+                bundle_md_paths(&source_dir, &outputs).into_iter().collect();
             let md_hint = if md_paths.is_empty() {
                 format!("RETREAD-SOLVE-FAILED-*.md under {}", source_dir.display())
             } else {
@@ -1072,16 +1076,17 @@ impl Handler {
         // resolve a real X.Y from config.python (preferred) or
         // DEFAULT_PYTHON (last resort, with a loud warn since the
         // user can avoid it by setting `[package.build.config] python`).
-        let config_python = config.python.as_ref().and_then(|s| s.as_versions().into_iter().next());
-        let raw = params
-            .output
-            .variant
-            .get("python")
-            .map(|v| v.to_string());
+        let config_python = config
+            .python
+            .as_ref()
+            .and_then(|s| s.as_versions().into_iter().next());
+        let raw = params.output.variant.get("python").map(|v| v.to_string());
         let python_version = match raw.as_deref() {
             Some(v) if v.contains('.') => v.to_string(),
             Some(other) => {
-                let fallback = config_python.clone().unwrap_or_else(|| DEFAULT_PYTHON.to_string());
+                let fallback = config_python
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_PYTHON.to_string());
                 if config_python.is_none() {
                     tracing::warn!(
                         received = %other,
@@ -1229,47 +1234,47 @@ fn pythons_for(
     config: &RetreadConfig,
     variants: Option<&std::collections::BTreeMap<String, Vec<VariantValue>>>,
 ) -> Vec<String> {
-    if let Some(values) = variants.and_then(|v| v.get("python")) {
-        if !values.is_empty() {
-            // v0.37.0+: reject bare-major variant values (e.g. `"3"`).
-            // Pixi sometimes forwards just the major when the
-            // workspace's `build-variants = { python = ["3.11"] }`
-            // doesn't reach the source-package backend cleanly.
-            // Letting a bare major through poisons the entire pipeline:
-            //   - solve_check installs `__cpython 3.0.0` as the virtual
-            //     package (not 3.11), corrupting transitive ABI checks
-            //   - produce_output emits `python 3.*` in host/run deps
-            //   - the ABI invariant should catch the latter, but a
-            //     bare-major slipping past variants is the upstream cause.
-            // Same validation pattern as conda_build_v1 — fall back to
-            // config.python or DEFAULT_PYTHON with a loud warn so it's
-            // discoverable in pixi logs. Document the workaround so it
-            // can be removed when pixi stops forwarding bare-major.
-            let validated: Vec<String> = values
-                .iter()
-                .map(|v| v.to_string())
-                .filter(|s| {
-                    let is_full = s.contains('.');
-                    if !is_full {
-                        tracing::warn!(
-                            variant_value = %s,
-                            "pythons_for: rejecting bare-major python variant value; \
-                             falling back to config.python or DEFAULT_PYTHON. \
-                             This usually means pixi forwarded only the major version. \
-                             Confirm `build-variants = {{ python = [\"X.Y\"] }}` is set \
-                             at workspace top-level with the inline form.",
-                        );
-                    }
-                    is_full
-                })
-                .collect();
-            if !validated.is_empty() {
-                return validated;
-            }
-            // Fall through to config / default if the entire list was
-            // bare-major. (Edge case but real — protects against
-            // pixi forwarding `["3"]` exclusively.)
+    if let Some(values) = variants.and_then(|v| v.get("python"))
+        && !values.is_empty()
+    {
+        // v0.37.0+: reject bare-major variant values (e.g. `"3"`).
+        // Pixi sometimes forwards just the major when the
+        // workspace's `build-variants = { python = ["3.11"] }`
+        // doesn't reach the source-package backend cleanly.
+        // Letting a bare major through poisons the entire pipeline:
+        //   - solve_check installs `__cpython 3.0.0` as the virtual
+        //     package (not 3.11), corrupting transitive ABI checks
+        //   - produce_output emits `python 3.*` in host/run deps
+        //   - the ABI invariant should catch the latter, but a
+        //     bare-major slipping past variants is the upstream cause.
+        // Same validation pattern as conda_build_v1 — fall back to
+        // config.python or DEFAULT_PYTHON with a loud warn so it's
+        // discoverable in pixi logs. Document the workaround so it
+        // can be removed when pixi stops forwarding bare-major.
+        let validated: Vec<String> = values
+            .iter()
+            .map(|v| v.to_string())
+            .filter(|s| {
+                let is_full = s.contains('.');
+                if !is_full {
+                    tracing::warn!(
+                        variant_value = %s,
+                        "pythons_for: rejecting bare-major python variant value; \
+                         falling back to config.python or DEFAULT_PYTHON. \
+                         This usually means pixi forwarded only the major version. \
+                         Confirm `build-variants = {{ python = [\"X.Y\"] }}` is set \
+                         at workspace top-level with the inline form.",
+                    );
+                }
+                is_full
+            })
+            .collect();
+        if !validated.is_empty() {
+            return validated;
         }
+        // Fall through to config / default if the entire list was
+        // bare-major. (Edge case but real — protects against
+        // pixi forwarding `["3"]` exclusively.)
     }
     if let Some(spec) = &config.python {
         let versions = spec.as_versions();
@@ -1358,10 +1363,7 @@ async fn resolve_all(
     let mut groups: std::collections::BTreeMap<String, Vec<(String, WheelEntry)>> =
         std::collections::BTreeMap::new();
     for (entry_name, entry) in &effective.retread_wheels {
-        let group_name = entry
-            .bundle
-            .clone()
-            .unwrap_or_else(|| entry_name.clone());
+        let group_name = entry.bundle.clone().unwrap_or_else(|| entry_name.clone());
         groups
             .entry(group_name)
             .or_default()
@@ -1401,9 +1403,7 @@ async fn resolve_all(
                     .zip(group_entries.iter())
                     .filter_map(|(other_root, (_, e))| {
                         if other_root.as_ref() == Some(root) {
-                            Some(PathBuf::from(
-                                e.subdirectory.as_deref().unwrap_or("."),
-                            ))
+                            Some(PathBuf::from(e.subdirectory.as_deref().unwrap_or(".")))
                         } else {
                             None
                         }
@@ -1465,22 +1465,25 @@ async fn resolve_all(
         // group. Use the first non-URL entry's index for the candidate
         // fallback chain (URL-form entries can't auto-bundle anyway --
         // they have no PyPI index to resolve from).
-        let auto_index: Option<String> = group_entries
-            .iter()
-            .find_map(|(_, e)| if e.url.is_none() { Some(e.index_url()) } else { None });
-        if effective.auto_bundle {
-            if let Some(idx) = auto_index {
-                auto_bundle_transitives(
-                    &mut bundle,
-                    &idx,
-                    target,
-                    download_dir,
-                    &effective,
-                    conda_channels,
-                    &pypi_to_conda,
-                )
-                .await?;
+        let auto_index: Option<String> = group_entries.iter().find_map(|(_, e)| {
+            if e.url.is_none() {
+                Some(e.index_url())
+            } else {
+                None
             }
+        });
+        if effective.auto_bundle
+            && let Some(idx) = auto_index
+        {
+            auto_bundle_transitives(
+                &mut bundle,
+                &idx,
+                target,
+                download_dir,
+                &effective,
+                conda_channels,
+            )
+            .await?;
         }
         // v0.32.0+: pre_emit_widen_pass moved OUT of resolve_all into
         // the per-env emission loop in conda_outputs. Materialization
@@ -1492,7 +1495,6 @@ async fn resolve_all(
     }
     Ok((bundles, effective))
 }
-
 
 /// One emission targeting a specific discovered output name. The
 /// `output_name` is what pixi expects (e.g. "isaac-pack-physx"); the
@@ -1712,15 +1714,15 @@ fn join_transitive_to_overrides(
 /// isolation." A workspace pin that conflicts with retread's emitted
 /// spec via shared transitive deps (e.g. retread emits `triton
 /// >=3.7,<3.8`; conda's triton 3.7 needs cuda 13; workspace pins cuda
-/// 12.8) only surfaces at full solve time. Feeding the solve failure
-/// back into the cascade lets retread retry with a wider spec the
-/// solver can backtrack from.
-/// v0.36.2+: bumped from 5 to 10. The original 5-iter cap was set when
-/// the cascade widened multiple deps per round opportunistically. With
-/// the per-chain verdict model, each round may surface a NEW set of
-/// blockers as earlier widenings unlock candidates -- so longer chains
-/// of progressive widening need more headroom. 10 is still bounded
-/// enough that pathological cases terminate quickly.
+/// > 12.8) only surfaces at full solve time. Feeding the solve failure
+/// > back into the cascade lets retread retry with a wider spec the
+/// > solver can backtrack from.
+/// > v0.36.2+: bumped from 5 to 10. The original 5-iter cap was set when
+/// > the cascade widened multiple deps per round opportunistically. With
+/// > the per-chain verdict model, each round may surface a NEW set of
+/// > blockers as earlier widenings unlock candidates -- so longer chains
+/// > of progressive widening need more headroom. 10 is still bounded
+/// > enough that pathological cases terminate quickly.
 const MAX_REFINEMENT: usize = 10;
 
 /// Build the list of `RETREAD-SOLVE-FAILED-*.md` paths the user
@@ -1761,7 +1763,7 @@ pub fn class_label(c: &crate::conflict_classifier::ConflictClass) -> String {
 /// `widen_one_level` would treat as "minor" reports level 1 here.
 ///
 ///   - 0: tightest (has `<A.B+1` minor upper, or exact `==A.B.C`, or
-///        no anchor at all — `<2`, `==1.26.4`, etc.)
+///     no anchor at all — `<2`, `==1.26.4`, etc.)
 ///   - 1: minor-widened (`>=A.B,<A+1`)
 ///   - 2: major FLOOR, still bounded (`>=A,<A+1`)
 ///   - 3: major-open (`>=A`, no upper)
@@ -1826,10 +1828,7 @@ fn merge_looser_override(
     candidate: &str,
 ) {
     let new_level = widening_level(candidate);
-    let existing_level = accum
-        .get(dep)
-        .map(|s| widening_level(s))
-        .unwrap_or(0);
+    let existing_level = accum.get(dep).map(|s| widening_level(s)).unwrap_or(0);
     if new_level > existing_level {
         accum.insert(dep.to_string(), candidate.to_string());
     }
@@ -1944,10 +1943,10 @@ fn extract_anchor_version(spec: &str) -> Option<String> {
         if fallback.is_none() {
             fallback = Some(head.to_string());
         }
-        if let Ok(v) = uv_pep508::uv_pep440::Version::from_str(head) {
-            if best.as_ref().map_or(true, |(bv, _)| &v > bv) {
-                best = Some((v, head.to_string()));
-            }
+        if let Ok(v) = uv_pep508::uv_pep440::Version::from_str(head)
+            && best.as_ref().is_none_or(|(bv, _)| &v > bv)
+        {
+            best = Some((v, head.to_string()));
         }
     }
     best.map(|(_, s)| s).or(fallback)
@@ -2039,7 +2038,11 @@ fn check_output_abi_invariants(
         let ws_spec: Option<&String> = workspace_specs.iter().find_map(|w| {
             let mut parts = w.splitn(2, char::is_whitespace);
             let n = parts.next()?;
-            if n == name { parts.next().map(|_| w) } else { None }
+            if n == name {
+                parts.next().map(|_| w)
+            } else {
+                None
+            }
         });
         if let Some(_ws) = ws_spec {
             // Workspace pins this dep too; for now we just record
@@ -2098,8 +2101,8 @@ async fn iterative_solve_refinement(
     system_requirements: &std::collections::BTreeMap<String, String>,
 ) -> Result<crate::solve_check::SolveOutcome> {
     use crate::conflict_classifier::{
-        classify_chains, is_abi_anchor, summarize_verdicts, PerChainVerdict,
-        WorkspaceEditSuggestion,
+        PerChainVerdict, WorkspaceEditSuggestion, classify_chains, is_abi_anchor,
+        summarize_verdicts,
     };
     let mut current_run_deps = base_run_deps.to_vec();
     let mut refinement_steps: Vec<crate::audit::RefinementStep> = Vec::new();
@@ -2178,7 +2181,12 @@ async fn iterative_solve_refinement(
     } else {
         Some(format!(
             "seeded from base env: {}",
-            summarize_changes(&seed_to_apply.iter().map(|(d, s)| format!("{d} -> {s}")).collect::<Vec<_>>()),
+            summarize_changes(
+                &seed_to_apply
+                    .iter()
+                    .map(|(d, s)| format!("{d} -> {s}"))
+                    .collect::<Vec<_>>()
+            ),
         ))
     };
 
@@ -2359,15 +2367,13 @@ async fn iterative_solve_refinement(
         );
         // Record what this round changed so the NEXT attempt's status
         // line can show it (one line, no console blow-up).
-        last_action = Some(format!("widened {}", summarize_changes(&widened_this_round)));
+        last_action = Some(format!(
+            "widened {}",
+            summarize_changes(&widened_this_round)
+        ));
         // Re-emit produce_output with the updated overrides.
-        let new_output = produce_output(
-            bundle,
-            effective,
-            host_platform,
-            python_version,
-            siblings,
-        )?;
+        let new_output =
+            produce_output(bundle, effective, host_platform, python_version, siblings)?;
         current_run_deps = new_output
             .run_dependencies
             .depends
@@ -2461,38 +2467,6 @@ fn derive_class_tag(verdicts: &[crate::conflict_classifier::PerChainVerdict]) ->
     }
 }
 
-/// v0.33.0+: gather the spec list for the pre-emission solve check.
-/// Combines:
-///   * every run-dep this output emits (rendered as `name <spec>` or
-///     `name *` if the spec is empty)
-///   * every entry in `effective.overrides` (which carries the
-///     workspace's transitive constraints + the user's manual
-///     [retread-overrides]) -- ensures the solve respects what the
-///     workspace WILL impose at its own solve time
-fn collect_solve_specs(
-    output: &CondaOutput,
-    effective: &RetreadConfig,
-) -> Vec<String> {
-    let mut specs: Vec<String> = Vec::new();
-    for nspec in &output.run_dependencies.depends {
-        let name = nspec.name.as_str();
-        let raw = format_packagespec(&nspec.spec);
-        if raw.is_empty() {
-            specs.push(name.to_string());
-        } else {
-            specs.push(format!("{name} {raw}"));
-        }
-    }
-    for (name, spec) in &effective.overrides {
-        if spec.is_empty() || spec == "*" {
-            specs.push(name.clone());
-        } else {
-            specs.push(format!("{name} {spec}"));
-        }
-    }
-    specs
-}
-
 /// Apply a `DiscoveredEmission` to a materialized bundle + base
 /// config. Renames the bundle to the discovered output name and
 /// injects the env-union transitive constraints into the config's
@@ -2576,18 +2550,24 @@ async fn pre_emit_widen_pass(
     for raw in raw_lines {
         // Capture the original PyPI name + specifiers from the raw
         // requires_dist line. Needed for tiered-cascade PyPI fallback.
-        let parsed: Option<uv_pep508::Requirement> =
-            uv_pep508::Requirement::from_str(&raw).ok();
+        let parsed: Option<uv_pep508::Requirement> = uv_pep508::Requirement::from_str(&raw).ok();
         let pypi_name = parsed.as_ref().map(|r| r.name.to_string());
-        let pypi_specs: Option<VersionSpecifiers> = parsed.as_ref().and_then(|r| match &r.version_or_url {
-            Some(uv_pep508::VersionOrUrl::VersionSpecifier(s)) => Some(s.clone()),
-            _ => None,
-        });
+        let pypi_specs: Option<VersionSpecifiers> =
+            parsed.as_ref().and_then(|r| match &r.version_or_url {
+                Some(uv_pep508::VersionOrUrl::VersionSpecifier(s)) => Some(s.clone()),
+                _ => None,
+            });
 
         // Predict what translate WOULD emit at the effective policy.
         // If translate returns None (marker false / vendored / dropped),
         // skip.
-        let dep = match translate(&raw, &env, &effective.name_map, &effective.overrides, effective.relax) {
+        let dep = match translate(
+            &raw,
+            &env,
+            &effective.name_map,
+            &effective.overrides,
+            effective.relax,
+        ) {
             Ok(Some(d)) => d.0,
             _ => continue,
         };
@@ -2596,7 +2576,10 @@ async fn pre_emit_widen_pass(
             Some(n) if !n.is_empty() => n.to_string(),
             _ => continue,
         };
-        let spec = parts.next().map(|s| s.trim().to_string()).unwrap_or_default();
+        let spec = parts
+            .next()
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
         if spec.is_empty() || spec == "*" {
             continue;
         }
@@ -2618,7 +2601,11 @@ async fn pre_emit_widen_pass(
             Some(&target.python_version),
         )
         .await;
-        let stage1 = if tiered { "tiered-cascade-step1-conda" } else { "pre-emit-widen-strict" };
+        let stage1 = if tiered {
+            "tiered-cascade-step1-conda"
+        } else {
+            "pre-emit-widen-strict"
+        };
         let initial_routing = if strict_probe.is_satisfied() {
             "satisfied"
         } else if strict_probe.is_definitively_unsatisfied() {
@@ -2735,6 +2722,7 @@ async fn pre_emit_widen_pass(
 /// `effective.drop_deps`, which `translate` consults to skip emission.
 /// The added wheel lives in `bundle.extras` and gets pip-installed at
 /// build time.
+#[allow(clippy::too_many_arguments)]
 async fn tiered_cascade_for_dep(
     bundle: &mut Bundle,
     effective: &mut RetreadConfig,
@@ -2778,13 +2766,22 @@ async fn tiered_cascade_for_dep(
         // For levels 1 and 2: re-translate at this widening level and
         // probe conda.
         if level_idx > 0 {
-            let widened_dep = match translate(raw, env, &effective.name_map, &empty_overrides, level_policy) {
+            let widened_dep = match translate(
+                raw,
+                env,
+                &effective.name_map,
+                &empty_overrides,
+                level_policy,
+            ) {
                 Ok(Some(d)) => d.0,
                 _ => continue,
             };
             let mut parts = widened_dep.splitn(2, char::is_whitespace);
             let _ = parts.next();
-            let widened_spec = parts.next().map(|s| s.trim().to_string()).unwrap_or_default();
+            let widened_spec = parts
+                .next()
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default();
             if widened_spec.is_empty() {
                 continue;
             }
@@ -2825,7 +2822,9 @@ async fn tiered_cascade_for_dep(
                     level = ?level_policy,
                     "tiered-cascade: conda satisfied at widened level; injecting override",
                 );
-                effective.overrides.insert(conda_name.to_string(), widened_spec);
+                effective
+                    .overrides
+                    .insert(conda_name.to_string(), widened_spec);
                 return Ok(());
             }
             if !probe.is_definitively_unsatisfied() {
@@ -2845,7 +2844,9 @@ async fn tiered_cascade_for_dep(
         if let Some(specs) = pypi_specs {
             match pypi::resolve(pypi_index, pypi_name, specs, target).await {
                 Ok(resolved) => {
-                    match fetch_and_parse(&resolved.url, resolved.sha256.as_deref(), download_dir).await {
+                    match fetch_and_parse(&resolved.url, resolved.sha256.as_deref(), download_dir)
+                        .await
+                    {
                         Ok(metadata) => {
                             bundle.probe_decisions.push(crate::audit::ProbeDecision {
                                 stage: pypi_stage.into(),
@@ -2965,7 +2966,9 @@ async fn tiered_cascade_for_dep(
             source = %source_tag,
             "tiered-cascade: last-resort widening; injecting override",
         );
-        effective.overrides.insert(conda_name.to_string(), target_spec);
+        effective
+            .overrides
+            .insert(conda_name.to_string(), target_spec);
     } else if source_tag == "from-workspace-pin" {
         // Workspace pin didn't probe-satisfy. Fall back to `*` so
         // conda solver can at least try.
@@ -2993,7 +2996,9 @@ async fn tiered_cascade_for_dep(
                 matching_candidates: any_probe.matching_candidates,
                 routing_decision: "widened-to-any-version-after-workspace-pin-miss".into(),
             });
-            effective.overrides.insert(conda_name.to_string(), "*".into());
+            effective
+                .overrides
+                .insert(conda_name.to_string(), "*".into());
         } else {
             tracing::warn!(
                 dep = %conda_name,
@@ -3009,6 +3014,7 @@ async fn tiered_cascade_for_dep(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn resolve_bundle(
     entry_name: &str,
     entry: &WheelEntry,
@@ -3320,8 +3326,8 @@ async fn resolve_bundle(
                 // shipping wheels; uv builds the sdist into a wheel).
                 // Sdist fallback uses the SAME spec, so a narrow
                 // version pin still gets honored.
-                let wheel_result = pypi::resolve(index, &pending.pypi_name, specifiers, target)
-                    .await;
+                let wheel_result =
+                    pypi::resolve(index, &pending.pypi_name, specifiers, target).await;
                 let (resolved_url, metadata) = match wheel_result {
                     Ok(resolved) => {
                         let metadata = fetch_and_parse(
@@ -3565,6 +3571,7 @@ pub(crate) struct EntryAuditInfo {
 
 /// Build / fetch the primary wheel for an entry, apply D, return as
 /// a [`ResolvedWheel`].
+#[allow(clippy::too_many_arguments)]
 async fn materialize_and_rewrite(
     entry: &crate::config::WheelEntry,
     entry_name: &str,
@@ -3597,7 +3604,12 @@ async fn materialize_and_rewrite(
         let subdir = entry.subdirectory.as_deref().unwrap_or(".");
         let out = download_dir.join(entry_name);
         let wheel = crate::source_build::build_wheel_from_git(
-            &src.url, &src.rev, subdir, cache_dir, &out, &target.python_version,
+            &src.url,
+            &src.rev,
+            subdir,
+            cache_dir,
+            &out,
+            &target.python_version,
         )
         .await
         .with_context(|| {
@@ -3605,7 +3617,8 @@ async fn materialize_and_rewrite(
                 "phase 1 named-git build for entry `{entry_name}` \
                  (from=`{}`, url=`{}`, rev=`{}`, subdir=`{subdir}`, out_dir={})",
                 entry.from.as_deref().unwrap_or(""),
-                src.url, src.rev,
+                src.url,
+                src.rev,
                 out.display(),
             )
         })?;
@@ -3629,7 +3642,8 @@ async fn materialize_and_rewrite(
             .with_context(|| {
                 format!(
                     "phase 1 path build for entry `{entry_name}` (source={}, out_dir={})",
-                    abs.display(), out.display(),
+                    abs.display(),
+                    out.display(),
                 )
             })?;
         source_root = Some(abs);
@@ -3642,7 +3656,12 @@ async fn materialize_and_rewrite(
         let subdir = entry.subdirectory.as_deref().unwrap_or(".");
         let out = download_dir.join(entry_name);
         let wheel = crate::source_build::build_wheel_from_git(
-            git_url, rev, subdir, cache_dir, &out, &target.python_version,
+            git_url,
+            rev,
+            subdir,
+            cache_dir,
+            &out,
+            &target.python_version,
         )
         .await
         .with_context(|| {
@@ -3704,14 +3723,15 @@ async fn materialize_and_rewrite(
                 source = %root.display(),
                 "auto-injecting missing source-root files into wheel",
             );
-            crate::wheel_inject::inject(&raw_path, &out, &root)
-                .with_context(|| {
-                    format!(
-                        "phase 1.5 source-root inject for entry `{entry_name}` \
+            crate::wheel_inject::inject(&raw_path, &out, &root).with_context(|| {
+                format!(
+                    "phase 1.5 source-root inject for entry `{entry_name}` \
                          (source={}, raw_wheel={}, out_wheel={})",
-                        root.display(), raw_path.display(), out.display(),
-                    )
-                })?;
+                    root.display(),
+                    raw_path.display(),
+                    out.display(),
+                )
+            })?;
         }
         out
     } else {
@@ -3859,8 +3879,8 @@ fn prefer_conda_match(
 ///
 /// Precedence (matches what emission's `translate` uses, so the BFS and
 /// emission agree on routing):
-///   1. The merged `name_map` (user retread-name-map + FALLBACK_PYPI_TO_CONDA
-///      + unambiguous parselmouth) -- a curated, unambiguous answer wins
+///   1. The merged `name_map` (user retread-name-map, FALLBACK_PYPI_TO_CONDA,
+///      and unambiguous parselmouth) -- a curated, unambiguous answer wins
 ///      outright. This is what makes `torch -> pytorch` route to conda even
 ///      though parselmouth's inverted map lists multiple ambiguous conda
 ///      candidates for `torch` with no identity match.
@@ -3920,7 +3940,6 @@ async fn auto_bundle_transitives(
     download_dir: &Path,
     config: &RetreadConfig,
     conda_channels: &[ChannelUrl],
-    pypi_to_conda: &PypiToCondaMap,
 ) -> Result<()> {
     // Build the skip set: anything already in the bundle, plus the user's
     // `retread-conda-deps` allowlist (deps that should stay as conda
@@ -3931,10 +3950,7 @@ async fn auto_bundle_transitives(
     // collisions (e.g. between a bundled numpy 1.26 and the workspace's
     // conda numpy 2.x) are the user's call -- add the package name to
     // `retread-conda-deps` to keep it on the conda side.
-    let mut skip: HashSet<String> = bundle
-        .all_wheels()
-        .map(|w| w.pypi_name.clone())
-        .collect();
+    let mut skip: HashSet<String> = bundle.all_wheels().map(|w| w.pypi_name.clone()).collect();
     skip.extend(config.conda_deps.iter().map(|n| conda_name_from(n)));
     skip.extend(config.drop_deps.iter().map(|n| conda_name_from(n)));
     skip.extend(config.overrides.keys().map(|n| conda_name_from(n)));
@@ -3949,7 +3965,6 @@ async fn auto_bundle_transitives(
     if entry_index != public {
         indexes.push(public);
     }
-
 
     // Fixed-point loop: each newly-bundled wheel has its own
     // Requires-Dist that may name more PyPI-only transitives, which
@@ -4034,19 +4049,17 @@ async fn auto_bundle_transitives(
                 } else {
                     "indecisive-short-circuit"
                 };
-                bundle
-                    .probe_decisions
-                    .push(crate::audit::ProbeDecision {
-                        stage: "auto_bundle".into(),
-                        pypi_name: name.clone(),
-                        conda_name: conda_target_name.clone(),
-                        spec: probe_spec.clone(),
-                        target_python: target.python_version.clone(),
-                        channels_consulted: probe_result.channels_consulted.clone(),
-                        satisfiable: probe_result.satisfiable,
-                        matching_candidates: probe_result.matching_candidates,
-                        routing_decision: routing_decision.into(),
-                    });
+                bundle.probe_decisions.push(crate::audit::ProbeDecision {
+                    stage: "auto_bundle".into(),
+                    pypi_name: name.clone(),
+                    conda_name: conda_target_name.clone(),
+                    spec: probe_spec.clone(),
+                    target_python: target.python_version.clone(),
+                    channels_consulted: probe_result.channels_consulted.clone(),
+                    satisfiable: probe_result.satisfiable,
+                    matching_candidates: probe_result.matching_candidates,
+                    routing_decision: routing_decision.into(),
+                });
                 if probe_result.is_definitively_unsatisfied() {
                     // v0.46.0: the EXACT resolved version isn't on conda --
                     // but that's usually because the transitive was resolved
@@ -4212,9 +4225,8 @@ async fn check_on_any_channel(package_name: &str, channels: &[ChannelUrl]) -> bo
         if channel_name.is_empty() {
             continue;
         }
-        let api_url = format!(
-            "https://prefix.dev/api/v1/channels/{channel_name}/packages/{package_name}"
-        );
+        let api_url =
+            format!("https://prefix.dev/api/v1/channels/{channel_name}/packages/{package_name}");
         match reqwest::Client::new().head(&api_url).send().await {
             Ok(resp) if resp.status().is_success() => {
                 tracing::debug!(
@@ -4253,9 +4265,7 @@ fn pep508_exact_base_dep(raw: &str) -> Result<Option<(String, String)>> {
         return Ok(None);
     };
     let specs: Vec<_> = specs.iter().collect();
-    if specs.len() != 1
-        || *specs[0].operator() != uv_pep508::uv_pep440::Operator::Equal
-    {
+    if specs.len() != 1 || *specs[0].operator() != uv_pep508::uv_pep440::Operator::Equal {
         return Ok(None);
     }
     Ok(Some((req.name.to_string(), specs[0].version().to_string())))
@@ -4373,7 +4383,9 @@ fn pep508_base_dep_in_prefix(raw: &str, prefix: &str) -> Result<Option<ExtraDep>
     // Same any-version handling as pep508_extra_dep: a bare-name base
     // dep is legal PEP 508 and resolves to latest at the PyPI index.
     let source = match req.version_or_url.as_ref() {
-        Some(uv_pep508::VersionOrUrl::VersionSpecifier(specs)) => ExtraDepSource::Pypi(specs.clone()),
+        Some(uv_pep508::VersionOrUrl::VersionSpecifier(specs)) => {
+            ExtraDepSource::Pypi(specs.clone())
+        }
         Some(uv_pep508::VersionOrUrl::Url(verbatim)) => extra_dep_source_from_url(verbatim.raw())?,
         None => ExtraDepSource::Pypi(uv_pep508::uv_pep440::VersionSpecifiers::empty()),
     };
@@ -4457,7 +4469,7 @@ fn pep508_extra_dep(raw: &str, extra: &str) -> Result<Option<ExtraDep>> {
     // The marker must match when this extra is active AND must not match
     // with no extras active (otherwise it's a base dep, not an extra dep).
     let env = default_marker_env(DEFAULT_PYTHON)?;
-    let matches_with_extra = req.marker.evaluate(&env, &[extra_name.clone()]);
+    let matches_with_extra = req.marker.evaluate(&env, std::slice::from_ref(&extra_name));
     let matches_without = req.marker.evaluate(&env, &[]);
     if !matches_with_extra || matches_without {
         return Ok(None);
@@ -4470,7 +4482,9 @@ fn pep508_extra_dep(raw: &str, extra: &str) -> Result<Option<ExtraDep>> {
     // extras-gated bare name in upstream wheels (rich, tqdm, gym, ...)
     // made retread bail with "no version or URL".
     let source = match req.version_or_url.as_ref() {
-        Some(uv_pep508::VersionOrUrl::VersionSpecifier(specs)) => ExtraDepSource::Pypi(specs.clone()),
+        Some(uv_pep508::VersionOrUrl::VersionSpecifier(specs)) => {
+            ExtraDepSource::Pypi(specs.clone())
+        }
         Some(uv_pep508::VersionOrUrl::Url(verbatim)) => extra_dep_source_from_url(verbatim.raw())?,
         None => ExtraDepSource::Pypi(uv_pep508::uv_pep440::VersionSpecifiers::empty()),
     };
@@ -4581,12 +4595,7 @@ fn produce_output(
                 continue;
             };
             // Skip if this dep refers to another wheel we're vendoring.
-            let dep_name = dep
-                .0
-                .split_whitespace()
-                .next()
-                .unwrap_or("")
-                .to_string();
+            let dep_name = dep.0.split_whitespace().next().unwrap_or("").to_string();
             if vendored.contains(&dep_name) {
                 continue;
             }
@@ -4643,12 +4652,8 @@ fn produce_output(
     );
 
     let name = PackageName::new_unchecked(bundle.conda_name.clone());
-    let version = VersionWithSource::from_str(&bundle.primary.metadata.version).map_err(|e| {
-        anyhow!(
-            "parsing version `{}`: {e}",
-            bundle.primary.metadata.version
-        )
-    })?;
+    let version = VersionWithSource::from_str(&bundle.primary.metadata.version)
+        .map_err(|e| anyhow!("parsing version `{}`: {e}", bundle.primary.metadata.version))?;
     let noarch = if any_platform_specific {
         NoArchType::none()
     } else {
@@ -4775,15 +4780,14 @@ async fn post_emit_widen_pass(
         if spec_str.is_empty() || spec_str == "*" {
             continue;
         }
-        let probe_result = crate::probe::probe(
-            conda_channels,
-            &name_str,
-            &spec_str,
-            Some(target_python),
-        )
-        .await;
+        let probe_result =
+            crate::probe::probe(conda_channels, &name_str, &spec_str, Some(target_python)).await;
         let routing_decision = if probe_result.is_definitively_unsatisfied() {
-            if allows_mut { "widened-to-any-version" } else { "unsat-no-mutation" }
+            if allows_mut {
+                "widened-to-any-version"
+            } else {
+                "unsat-no-mutation"
+            }
         } else if probe_result.is_satisfied() {
             "no-widening-needed"
         } else {
@@ -4829,7 +4833,6 @@ fn format_packagespec(spec: &PackageSpec) -> String {
 /// widening fallback.
 fn wildcard_packagespec() -> PackageSpec {
     use rattler_conda_types::{ParseStrictness, VersionSpec};
-    use std::str::FromStr;
     PackageSpec::Binary(BinaryPackageSpec {
         version: Some(
             VersionSpec::from_str("*", ParseStrictness::Lenient)
@@ -4850,10 +4853,7 @@ fn wildcard_packagespec() -> PackageSpec {
 /// terminal -- a file does. Skipped silently when every env is SAT
 /// (no failure = no summary to write).
 async fn write_solve_failed_summary(bundle: &Bundle, source_dir: &Path) -> Result<()> {
-    let any_unsat = bundle
-        .solve_diagnostics
-        .values()
-        .any(|d| !d.satisfiable);
+    let any_unsat = bundle.solve_diagnostics.values().any(|d| !d.satisfiable);
     let path = source_dir.join(format!("RETREAD-SOLVE-FAILED-{}.md", bundle.conda_name));
     if !any_unsat {
         // Remove a stale file from a previous failed run; clean state.
@@ -4949,7 +4949,10 @@ async fn write_solve_failed_summary(bundle: &Bundle, source_dir: &Path) -> Resul
     envs.sort();
     for env in &envs {
         let diag = &bundle.solve_diagnostics[*env];
-        let class = diag.terminal_classification.as_deref().unwrap_or("unclassified");
+        let class = diag
+            .terminal_classification
+            .as_deref()
+            .unwrap_or("unclassified");
         out.push_str(&format!("- `{env}`: **{class}**\n"));
     }
     out.push('\n');
@@ -5006,10 +5009,7 @@ async fn write_solve_failed_summary(bundle: &Bundle, source_dir: &Path) -> Resul
 }
 
 async fn write_probe_trace(bundle: &Bundle, source_dir: &Path) -> Result<()> {
-    let path = source_dir.join(format!(
-        "retread-probe-trace-{}.json",
-        bundle.conda_name,
-    ));
+    let path = source_dir.join(format!("retread-probe-trace-{}.json", bundle.conda_name,));
     #[derive(serde::Serialize)]
     struct Trace<'a> {
         conda_name: &'a str,
@@ -5042,6 +5042,7 @@ async fn write_probe_trace(bundle: &Bundle, source_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn build_one(
     bundle: &Bundle,
     config: &RetreadConfig,
@@ -5085,8 +5086,7 @@ async fn build_one(
     // filename includes the bundle name so multi-bundle packs don't
     // collide.
     let audit = build_bundle_audit(bundle, &recipe);
-    let audit_json = serde_json::to_string_pretty(&audit)
-        .context("serializing audit record")?;
+    let audit_json = serde_json::to_string_pretty(&audit).context("serializing audit record")?;
     let audit_path = source_dir.join(format!("retread-audit-{}.json", recipe.package.name));
     if let Err(e) = tokio::fs::write(&audit_path, &audit_json).await {
         tracing::warn!(path = %audit_path.display(), error = %e, "failed to write audit record (non-fatal)");
@@ -5183,7 +5183,10 @@ async fn find_conda_artifact(dir: &Path, name: &str, version: &str) -> Result<Pa
             return Ok(path);
         }
     }
-    bail!("no .conda artifact found in {} matching {prefix}*.conda", dir.display())
+    bail!(
+        "no .conda artifact found in {} matching {prefix}*.conda",
+        dir.display()
+    )
 }
 
 #[cfg(test)]
@@ -5389,7 +5392,9 @@ mod tests {
         let mut spec = ">=2.10.0,<2.11".to_string();
         let mut last = widening_level(&spec);
         for _ in 0..6 {
-            let Some(next) = widen_one_level(&spec) else { break };
+            let Some(next) = widen_one_level(&spec) else {
+                break;
+            };
             let lvl = widening_level(&next);
             assert!(
                 lvl > last,
@@ -5503,7 +5508,11 @@ mod tests {
         let mut input: BTreeMap<String, Vec<String>> = BTreeMap::new();
         input.insert(
             "numpy".to_string(),
-            vec![">=1.26".to_string(), ">=1.26,<2".to_string(), "<3".to_string()],
+            vec![
+                ">=1.26".to_string(),
+                ">=1.26,<2".to_string(),
+                "<3".to_string(),
+            ],
         );
         let out = join_transitive_to_overrides(input);
         let joined = out.get("numpy").expect("numpy should be present");
@@ -5702,14 +5711,8 @@ mod tests {
         rebuild_effective
             .overrides
             .insert(widened_name.to_string(), "*".to_string());
-        let widened = produce_output(
-            &bundle,
-            &rebuild_effective,
-            Platform::Linux64,
-            "3.11",
-            &[],
-        )
-        .unwrap();
+        let widened =
+            produce_output(&bundle, &rebuild_effective, Platform::Linux64, "3.11", &[]).unwrap();
         let widened_spec = widened
             .run_dependencies
             .depends
@@ -5753,7 +5756,11 @@ mod tests {
         let workspace = vec!["python ==3.11".to_string()];
         let overrides = std::collections::BTreeMap::new();
         let violations = check_output_abi_invariants(&emitted, &workspace, &overrides);
-        assert_eq!(violations.len(), 1, "expected one violation, got {violations:?}");
+        assert_eq!(
+            violations.len(),
+            1,
+            "expected one violation, got {violations:?}"
+        );
         assert!(
             violations[0].contains("python"),
             "violation should mention python: {}",
@@ -5863,7 +5870,10 @@ mod tests {
         let mut overrides = std::collections::BTreeMap::new();
         overrides.insert("pytorch".to_string(), "*".to_string());
         let violations = check_output_abi_invariants(&emitted, &workspace, &overrides);
-        assert!(violations.is_empty(), "should not flag pytorch: {violations:?}");
+        assert!(
+            violations.is_empty(),
+            "should not flag pytorch: {violations:?}"
+        );
     }
 
     #[test]
@@ -5898,7 +5908,7 @@ mod tests {
     /// `iterative_solve_refinement`'s widening branch.
     #[test]
     fn refinement_loop_never_widens_python_even_if_verdict_says_so() {
-        use crate::conflict_classifier::{is_abi_anchor, PerChainVerdict};
+        use crate::conflict_classifier::{PerChainVerdict, is_abi_anchor};
         // Construct a verdict that (in a bug) claims python is
         // widenable. The loop's `is_abi_anchor` guard MUST refuse it.
         let v = PerChainVerdict::WidenRetread {
@@ -5922,25 +5932,6 @@ mod tests {
         );
     }
 
-    fn test_tmpdir(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "retread-handler-test-{label}-{}-{}",
-            std::process::id(),
-            uuid_like(),
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    fn uuid_like() -> String {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let ns = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        format!("{ns:x}")
-    }
-
     // v0.32.0+: workspace pin/transitive-constraint parsing moved to
     // src/workspace.rs (see WorkspaceManifest::extract_transitive_constraints
     // + discover_outputs_for_source). Tests for that live there.
@@ -5960,7 +5951,12 @@ mod tests {
         }
     }
 
-    fn meta(name: &str, version: &str, requires: Vec<&str>, platform_specific: bool) -> WheelMetadata {
+    fn meta(
+        name: &str,
+        version: &str,
+        requires: Vec<&str>,
+        platform_specific: bool,
+    ) -> WheelMetadata {
         WheelMetadata {
             name: name.into(),
             version: version.into(),
@@ -5968,7 +5964,10 @@ mod tests {
             is_pure_python: !platform_specific,
             sha256: format!("sha-{name}"),
             filename: if platform_specific {
-                format!("{}-{version}-cp311-none-manylinux_2_35_x86_64.whl", name.replace('-', "_"))
+                format!(
+                    "{}-{version}-cp311-none-manylinux_2_35_x86_64.whl",
+                    name.replace('-', "_")
+                )
             } else {
                 format!("{}-{version}-py3-none-any.whl", name.replace('-', "_"))
             },
@@ -6009,10 +6008,14 @@ mod tests {
             .iter()
             .map(|d| d.name.clone())
             .collect();
-        assert!(!names.iter().any(|n| n == "idna-ssl"),
-            "idna-ssl auto-drop on linux failed; got: {names:?}");
-        assert!(names.iter().any(|n| n == "numpy"),
-            "numpy must still be emitted; got: {names:?}");
+        assert!(
+            !names.iter().any(|n| n == "idna-ssl"),
+            "idna-ssl auto-drop on linux failed; got: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "numpy"),
+            "numpy must still be emitted; got: {names:?}"
+        );
     }
 
     #[test]
@@ -6027,8 +6030,10 @@ mod tests {
             .iter()
             .map(|d| d.name.clone())
             .collect();
-        assert!(names.iter().any(|n| n == "idna-ssl"),
-            "idna-ssl should NOT be auto-dropped on win-64; got: {names:?}");
+        assert!(
+            names.iter().any(|n| n == "idna-ssl"),
+            "idna-ssl should NOT be auto-dropped on win-64; got: {names:?}"
+        );
     }
 
     #[test]
@@ -6048,8 +6053,10 @@ mod tests {
             .iter()
             .map(|d| d.name.clone())
             .collect();
-        assert!(names.iter().any(|n| n == "idna-ssl"),
-            "retread-overrides should cancel the auto-drop; got: {names:?}");
+        assert!(
+            names.iter().any(|n| n == "idna-ssl"),
+            "retread-overrides should cancel the auto-drop; got: {names:?}"
+        );
     }
 
     #[test]
@@ -6067,8 +6074,10 @@ mod tests {
             .iter()
             .map(|d| d.name.clone())
             .collect();
-        assert!(!names.iter().any(|n| n == "requests"),
-            "requests should be dropped per retread-drop-deps; got: {names:?}");
+        assert!(
+            !names.iter().any(|n| n == "requests"),
+            "requests should be dropped per retread-drop-deps; got: {names:?}"
+        );
         assert!(names.iter().any(|n| n == "numpy"));
     }
 
@@ -6102,11 +6111,7 @@ mod tests {
                     meta(
                         "isaacsim-core",
                         "5.1.0.0",
-                        vec![
-                            "isaacsim-kernel==5.1.0.0",
-                            "numpy==1.26.0",
-                            "scipy==1.15.3",
-                        ],
+                        vec!["isaacsim-kernel==5.1.0.0", "numpy==1.26.0", "scipy==1.15.3"],
                         true,
                     ),
                 ),
@@ -6122,16 +6127,26 @@ mod tests {
             .iter()
             .map(|d| d.name.clone())
             .collect();
-        assert!(!dep_names.iter().any(|n| n == "isaacsim-kernel"),
-            "isaacsim-kernel is vendored and must NOT appear in run-deps; got: {dep_names:?}");
-        assert!(!dep_names.iter().any(|n| n == "isaacsim-core"),
-            "isaacsim-core is vendored and must NOT appear in run-deps; got: {dep_names:?}");
-        assert!(dep_names.iter().any(|n| n == "numpy"),
-            "numpy must appear (deduped from multiple wheels); got: {dep_names:?}");
-        assert!(dep_names.iter().any(|n| n == "pillow"),
-            "pillow must appear; got: {dep_names:?}");
-        assert!(dep_names.iter().any(|n| n == "scipy"),
-            "scipy must appear; got: {dep_names:?}");
+        assert!(
+            !dep_names.iter().any(|n| n == "isaacsim-kernel"),
+            "isaacsim-kernel is vendored and must NOT appear in run-deps; got: {dep_names:?}"
+        );
+        assert!(
+            !dep_names.iter().any(|n| n == "isaacsim-core"),
+            "isaacsim-core is vendored and must NOT appear in run-deps; got: {dep_names:?}"
+        );
+        assert!(
+            dep_names.iter().any(|n| n == "numpy"),
+            "numpy must appear (deduped from multiple wheels); got: {dep_names:?}"
+        );
+        assert!(
+            dep_names.iter().any(|n| n == "pillow"),
+            "pillow must appear; got: {dep_names:?}"
+        );
+        assert!(
+            dep_names.iter().any(|n| n == "scipy"),
+            "scipy must appear; got: {dep_names:?}"
+        );
     }
 
     #[tokio::test]
@@ -6151,10 +6166,7 @@ mod tests {
         // emitted into conda run-deps.
         let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/sample_with_buildtime_dep");
-        let tmp = std::env::temp_dir().join(format!(
-            "retread-d-on-disk-{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("retread-d-on-disk-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
 
         let entry = crate::config::WheelEntry {
@@ -6188,8 +6200,8 @@ mod tests {
             resolved.url,
         );
         let on_disk = resolved.url.to_file_path().expect("file path from URL");
-        let on_disk_meta = crate::wheel::read_metadata(&on_disk)
-            .expect("read METADATA from wheel-on-disk");
+        let on_disk_meta =
+            crate::wheel::read_metadata(&on_disk).expect("read METADATA from wheel-on-disk");
 
         let starlette_lines: Vec<&String> = on_disk_meta
             .requires_dist
@@ -6228,12 +6240,7 @@ mod tests {
             conda_name: "isaac-pack".into(),
             primary: rw(
                 "isaacsim",
-                meta(
-                    "isaacsim",
-                    "5.1.0.0",
-                    vec!["numpy==1.26.0"],
-                    true,
-                ),
+                meta("isaacsim", "5.1.0.0", vec!["numpy==1.26.0"], true),
             ),
             extras: vec![
                 rw(
@@ -6254,8 +6261,7 @@ mod tests {
             solve_diagnostics: BTreeMap::new(),
         };
 
-        let output =
-            produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[]).unwrap();
+        let output = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[]).unwrap();
 
         // Output name is the bundle's conda_name, not any one entry name.
         assert_eq!(
@@ -6337,8 +6343,7 @@ mod tests {
             solve_diagnostics: BTreeMap::new(),
         };
 
-        let output =
-            produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[]).unwrap();
+        let output = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[]).unwrap();
 
         // The conda output's variant must be the workspace's 3.11, not the
         // bare-major "3" parsed from the py3 tag.
@@ -6431,10 +6436,12 @@ mod tests {
             ("isaacsim".to_string(), "1.0.0".to_string()), // self -- must be skipped
             ("isaaclab".to_string(), "0.51.1".to_string()),
             ("isaaclab-arena".to_string(), "0.4.2".to_string()),
-            ("pytorch3d".to_string(), "0.7.8+5043d15pt2.7.0cu128".to_string()),
+            (
+                "pytorch3d".to_string(),
+                "0.7.8+5043d15pt2.7.0cu128".to_string(),
+            ),
         ];
-        let output =
-            produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &siblings).unwrap();
+        let output = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &siblings).unwrap();
 
         let dep_names: Vec<String> = output
             .run_dependencies
@@ -6587,16 +6594,17 @@ mod tests {
     /// target python.
     #[test]
     fn pep508_extra_dep_handles_bare_name() {
-        let dep = pep508_extra_dep(
-            "tqdm; extra == \"sb3\"",
-            "sb3",
-        )
-        .expect("pep508 parse")
-        .expect("extras-gated bare-name dep, got None");
+        let dep = pep508_extra_dep("tqdm; extra == \"sb3\"", "sb3")
+            .expect("pep508 parse")
+            .expect("extras-gated bare-name dep, got None");
         assert_eq!(dep.name, "tqdm");
         match dep.source {
             ExtraDepSource::Pypi(specs) => {
-                assert_eq!(specs.to_string(), "", "bare name -> empty specifiers, got: {specs}");
+                assert_eq!(
+                    specs.to_string(),
+                    "",
+                    "bare name -> empty specifiers, got: {specs}"
+                );
             }
             other => panic!("expected PyPI source, got {other:?}"),
         }

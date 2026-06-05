@@ -8,7 +8,9 @@
 //!   `https://pypi.nvidia.com` (provides `#sha256=` fragments) AND
 //!   `https://py.mujoco.org` (does NOT). Both must round-trip cleanly.
 
-use pixi_build_retread::pypi::{resolve, WheelTarget};
+use pixi_build_retread::pypi::{WheelTarget, resolve};
+use std::str::FromStr;
+use uv_pep508::uv_pep440::VersionSpecifiers;
 
 fn linux64(py: &str) -> WheelTarget {
     WheelTarget {
@@ -17,14 +19,25 @@ fn linux64(py: &str) -> WheelTarget {
     }
 }
 
+/// `resolve` takes parsed PEP 440 specifiers; the tests express the pin as a
+/// bare version, so wrap it as an exact `==` spec.
+fn eq(version: &str) -> VersionSpecifiers {
+    VersionSpecifiers::from_str(&format!("=={version}")).unwrap()
+}
+
 #[tokio::test]
 async fn resolves_small_public_pypi_package() {
     // `tomli` is a stable, tiny, pure-python wheel. The resolve targets
     // public PyPI and confirms the simple-index round-trip works against
     // the canonical index (not just NVIDIA's).
-    let r = resolve("https://pypi.org/simple/", "tomli", "2.0.1", &linux64("3.11"))
-        .await
-        .expect("resolve tomli 2.0.1");
+    let r = resolve(
+        "https://pypi.org/simple/",
+        "tomli",
+        &eq("2.0.1"),
+        &linux64("3.11"),
+    )
+    .await
+    .expect("resolve tomli 2.0.1");
     assert_eq!(r.filename, "tomli-2.0.1-py3-none-any.whl");
     assert!(r.sha256.is_some(), "public PyPI advertises sha256");
     // The URL itself may carry a `#sha256=...` fragment, so check the path.
@@ -41,7 +54,7 @@ async fn resolves_isaacsim_with_pep440_normalized_version() {
     let r = resolve(
         "https://pypi.nvidia.com",
         "isaacsim",
-        "5.1.0",
+        &eq("5.1.0"),
         &linux64("3.11"),
     )
     .await
@@ -55,7 +68,7 @@ async fn resolves_isaacsim_kernel_via_nvidia_index() {
     let r = resolve(
         "https://pypi.nvidia.com",
         "isaacsim-kernel",
-        "5.1.0.0",
+        &eq("5.1.0.0"),
         &linux64("3.11"),
     )
     .await
@@ -89,7 +102,7 @@ async fn resolves_mujoco_via_index_without_sha256() {
     let r = resolve(
         "https://py.mujoco.org",
         "mujoco",
-        "3.9.0.dev920201340",
+        &eq("3.9.0.dev920201340"),
         &linux64("3.13"),
     )
     .await

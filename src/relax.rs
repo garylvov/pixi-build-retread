@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::str::FromStr;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use uv_pep508::uv_pep440::{self, Operator, Version};
 use uv_pep508::{MarkerEnvironment, MarkerEnvironmentBuilder, Requirement, VersionOrUrl};
 
@@ -38,7 +38,10 @@ pub fn translate(
     let conda_name = map_name(pypi_name, name_map);
 
     // User override wins, full replacement.
-    if let Some(spec) = overrides.get(pypi_name).or_else(|| overrides.get(&conda_name)) {
+    if let Some(spec) = overrides
+        .get(pypi_name)
+        .or_else(|| overrides.get(&conda_name))
+    {
         return Ok(Some(CondaDep(format_dep(&conda_name, spec))));
     }
 
@@ -100,16 +103,15 @@ fn map_name(pypi: &str, overrides: &BTreeMap<String, String>) -> String {
     out.trim_matches('-').to_string()
 }
 
-fn convert_specifiers(
-    specifiers: &uv_pep440::VersionSpecifiers,
-    policy: RelaxPolicy,
-) -> String {
+fn convert_specifiers(specifiers: &uv_pep440::VersionSpecifiers, policy: RelaxPolicy) -> String {
     // Detect single `==X.Y.Z` pin -> apply relax policy.
     let specs: Vec<_> = specifiers.iter().collect();
-    if specs.len() == 1 && *specs[0].operator() == Operator::Equal && policy != RelaxPolicy::None {
-        if let Some(widened) = widen_exact(specs[0].version(), policy) {
-            return widened;
-        }
+    if specs.len() == 1
+        && *specs[0].operator() == Operator::Equal
+        && policy != RelaxPolicy::None
+        && let Some(widened) = widen_exact(specs[0].version(), policy)
+    {
+        return widened;
     }
 
     // TODO(conda-aware): CondaAware currently behaves IDENTICALLY to
@@ -122,7 +124,7 @@ fn convert_specifiers(
     if matches!(policy, RelaxPolicy::StrongMajor | RelaxPolicy::CondaAware) {
         return strip_upper_bounds(&specs)
             .iter()
-            .filter_map(|s| convert_one(s))
+            .filter_map(convert_one)
             .collect::<Vec<_>>()
             .join(",");
     }
@@ -146,9 +148,7 @@ fn convert_specifiers(
 ///
 /// Stripped: `<X`, `<=X`, the `<` half of `>=X,<Y`, the implicit upper
 /// of `~=X.Y`.
-fn strip_upper_bounds(
-    specs: &[&uv_pep440::VersionSpecifier],
-) -> Vec<uv_pep440::VersionSpecifier> {
+fn strip_upper_bounds(specs: &[&uv_pep440::VersionSpecifier]) -> Vec<uv_pep440::VersionSpecifier> {
     use std::str::FromStr;
     let mut kept: Vec<uv_pep440::VersionSpecifier> = Vec::with_capacity(specs.len());
     for spec in specs {
@@ -258,15 +258,22 @@ fn widen_star(v: &Version, negate: bool) -> Option<String> {
     if r.len() < 2 {
         return None;
     }
-    let lo = format!(
-        "{}",
-        r.iter().take(r.len()).map(|n| n.to_string()).collect::<Vec<_>>().join(".")
-    );
+    let lo = r
+        .iter()
+        .take(r.len())
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join(".")
+        .to_string();
     // Bump the last digit for the upper bound.
     let mut upper = r.to_vec();
     let last = upper.len() - 1;
     upper[last] += 1;
-    let hi = upper.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(".");
+    let hi = upper
+        .iter()
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join(".");
     if negate {
         Some(format!("<{lo}|>={hi}"))
     } else {
@@ -281,10 +288,7 @@ fn widen_star(v: &Version, negate: bool) -> Option<String> {
 ///
 /// Falls back to sensible defaults for fields PEP 508 markers rarely touch
 /// (platform_release, platform_version).
-pub fn marker_env_for(
-    conda_subdir: &str,
-    python_version: &str,
-) -> Result<MarkerEnvironment> {
+pub fn marker_env_for(conda_subdir: &str, python_version: &str) -> Result<MarkerEnvironment> {
     let plat = PlatformAttrs::for_subdir(conda_subdir);
     let normalized = if python_version.contains('.') {
         python_version.to_string()
@@ -422,12 +426,16 @@ pub fn python_version_from_wheel_tag(filename: &str) -> Option<String> {
         } else {
             continue;
         };
-        if best.map_or(true, |b| (major, minor) > b) {
+        if best.is_none_or(|b| (major, minor) > b) {
             best = Some((major, minor));
         }
     }
     let (major, minor) = best?;
-    Some(if minor > 0 { format!("{major}.{minor}") } else { format!("{major}") })
+    Some(if minor > 0 {
+        format!("{major}.{minor}")
+    } else {
+        format!("{major}")
+    })
 }
 
 /// The dotted `X.Y` python to stamp on the emitted conda output (its
@@ -475,17 +483,26 @@ mod tests {
 
     #[test]
     fn exact_pin_minor_relax() {
-        assert_eq!(t("numpy==1.26.4", RelaxPolicy::Minor).as_deref(), Some("numpy >=1.26,<2"));
+        assert_eq!(
+            t("numpy==1.26.4", RelaxPolicy::Minor).as_deref(),
+            Some("numpy >=1.26,<2")
+        );
     }
 
     #[test]
     fn exact_pin_patch_relax() {
-        assert_eq!(t("pillow==12.0.0", RelaxPolicy::Patch).as_deref(), Some("pillow >=12.0.0,<12.1"));
+        assert_eq!(
+            t("pillow==12.0.0", RelaxPolicy::Patch).as_deref(),
+            Some("pillow >=12.0.0,<12.1")
+        );
     }
 
     #[test]
     fn exact_pin_no_relax() {
-        assert_eq!(t("torch==2.7.1", RelaxPolicy::None).as_deref(), Some("torch ==2.7.1"));
+        assert_eq!(
+            t("torch==2.7.1", RelaxPolicy::None).as_deref(),
+            Some("torch ==2.7.1")
+        );
     }
 
     #[test]
@@ -503,7 +520,10 @@ mod tests {
 
     #[test]
     fn name_normalization() {
-        assert_eq!(t("Typing_Extensions==4.12.2", RelaxPolicy::Minor).as_deref(), Some("typing-extensions >=4.12,<5"));
+        assert_eq!(
+            t("Typing_Extensions==4.12.2", RelaxPolicy::Minor).as_deref(),
+            Some("typing-extensions >=4.12,<5")
+        );
     }
 
     #[test]
@@ -533,7 +553,10 @@ mod tests {
         // Requires-Dist cap that conda-forge can't satisfy under
         // python 3.11 (only old pyglet 1.x is available with that
         // constraint, and those need python 3.5).
-        assert_eq!(t("pyglet<2", RelaxPolicy::StrongMajor).as_deref(), Some("pyglet"));
+        assert_eq!(
+            t("pyglet<2", RelaxPolicy::StrongMajor).as_deref(),
+            Some("pyglet")
+        );
         // >=A,<B keeps the lower bound, drops the upper.
         assert_eq!(
             t("numpy>=1.26,<2", RelaxPolicy::StrongMajor).as_deref(),
@@ -562,7 +585,10 @@ mod tests {
         // probe; the translate-time behavior is identical to
         // strong-major. This pins that contract so the future
         // probe layer can be a pure refinement on top.
-        assert_eq!(t("pyglet<2", RelaxPolicy::CondaAware).as_deref(), Some("pyglet"));
+        assert_eq!(
+            t("pyglet<2", RelaxPolicy::CondaAware).as_deref(),
+            Some("pyglet")
+        );
         assert_eq!(
             t("numpy==1.26.4", RelaxPolicy::CondaAware).as_deref(),
             Some("numpy >=1"),
@@ -619,18 +645,30 @@ mod tests {
         // patch -> minor -> major -> `*` escalation happens in
         // handler.rs's pre_emit_widen_pass via override injection.
         assert_eq!(
-            t("numpy==1.26.4", RelaxPolicy::PatchThenMinorThenMajorThenLastResort).as_deref(),
+            t(
+                "numpy==1.26.4",
+                RelaxPolicy::PatchThenMinorThenMajorThenLastResort
+            )
+            .as_deref(),
             Some("numpy >=1.26.4,<1.27"),
         );
         // Ranges pass through unchanged at translate time -- the
         // cascade catches them post-emit if conda can't satisfy.
         assert_eq!(
-            t("pyglet<2", RelaxPolicy::PatchThenMinorThenMajorThenLastResort).as_deref(),
+            t(
+                "pyglet<2",
+                RelaxPolicy::PatchThenMinorThenMajorThenLastResort
+            )
+            .as_deref(),
             Some("pyglet <2"),
         );
         // python is never widened under any policy.
         assert_eq!(
-            t("python==3.11.0", RelaxPolicy::PatchThenMinorThenMajorThenLastResort).as_deref(),
+            t(
+                "python==3.11.0",
+                RelaxPolicy::PatchThenMinorThenMajorThenLastResort
+            )
+            .as_deref(),
             Some("python ==3.11.0"),
         );
     }

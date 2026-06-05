@@ -32,7 +32,7 @@ use std::fs;
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use ignore::WalkBuilder;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
@@ -223,7 +223,11 @@ pub fn inject_checkout_root_data(
             }
         };
         let sha_b64 = sha256_base64_urlsafe_nopad(&bytes);
-        data_entries.push(DataEntry { zip_path, bytes, sha_b64 });
+        data_entries.push(DataEntry {
+            zip_path,
+            bytes,
+            sha_b64,
+        });
     }
 
     // Stable ordering so on-disk wheel layouts and tests are
@@ -256,8 +260,8 @@ pub fn inject_checkout_root_data(
     // Two-pass writeback identical in shape to wheel_inject: copy
     // every original entry through (substituting RECORD for the
     // rebuilt one), then append new data entries.
-    let dst_file = fs::File::create(dst_wheel)
-        .with_context(|| format!("creating {}", dst_wheel.display()))?;
+    let dst_file =
+        fs::File::create(dst_wheel).with_context(|| format!("creating {}", dst_wheel.display()))?;
     let mut writer = ZipWriter::new(dst_file);
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i)?;
@@ -302,16 +306,10 @@ fn path_to_forward_slash(p: &Path) -> String {
 /// else is treated as upstream-authored data and shipped.
 fn is_python_artifact(rel: &Path) -> bool {
     // Any component in __pycache__ -> python bytecode cache.
-    if rel
-        .components()
-        .any(|c| c.as_os_str() == "__pycache__")
-    {
+    if rel.components().any(|c| c.as_os_str() == "__pycache__") {
         return true;
     }
-    let name = rel
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or_default();
+    let name = rel.file_name().and_then(|n| n.to_str()).unwrap_or_default();
     // Cache + bytecode + stubs.
     if name.ends_with(".py")
         || name.ends_with(".pyi")
@@ -368,14 +366,18 @@ fn extend_record_with_data(
             out.push_str(line);
             continue;
         }
-        let path = trimmed.splitn(2, ',').next().unwrap_or("");
+        let path = trimmed.split(',').next().unwrap_or("");
         if path == record_name {
             record_line = Some(line.to_string());
             continue;
         }
         out.push_str(line);
     }
-    let newline = if record.contains("\r\n") { "\r\n" } else { "\n" };
+    let newline = if record.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
     for data in extras {
         out.push_str(&format!(
             "{},sha256={},{}{}",
@@ -410,11 +412,16 @@ mod tests {
                 .unwrap();
             w.write_all(b"").unwrap();
             w.start_file(format!("{dist_info}/METADATA"), opts).unwrap();
-            w.write_all(format!("Metadata-Version: 2.1\nName: {dist_name}\nVersion: {dist_version}\n").as_bytes())
-                .unwrap();
+            w.write_all(
+                format!("Metadata-Version: 2.1\nName: {dist_name}\nVersion: {dist_version}\n")
+                    .as_bytes(),
+            )
+            .unwrap();
             w.start_file(format!("{dist_info}/WHEEL"), opts).unwrap();
-            w.write_all(b"Wheel-Version: 1.0\nGenerator: stub\nRoot-Is-Purelib: true\nTag: py3-none-any\n")
-                .unwrap();
+            w.write_all(
+                b"Wheel-Version: 1.0\nGenerator: stub\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+            )
+            .unwrap();
             w.start_file(format!("{dist_info}/RECORD"), opts).unwrap();
             // Real wheels list every shipped file in RECORD; for the
             // test we only need the self-line in the right shape so the
@@ -464,15 +471,13 @@ mod tests {
         let dst_wheel = parent.join("stub.injected.whl");
         fs::write(&src_wheel, build_stub_wheel("foo", "1.0"))?;
 
-        let injected = inject_checkout_root_data(
-            &src_wheel,
-            &dst_wheel,
-            &checkout,
-            &[],
-        )?;
+        let injected = inject_checkout_root_data(&src_wheel, &dst_wheel, &checkout, &[])?;
         // 2 apps/ files + 1 .gitignore (project content, intentionally
         // shipped).
-        assert_eq!(injected, 3, "expected apps/foo.kit, apps/sub/bar.kit, .gitignore");
+        assert_eq!(
+            injected, 3,
+            "expected apps/foo.kit, apps/sub/bar.kit, .gitignore"
+        );
 
         let out_bytes = fs::read(&dst_wheel)?;
         let mut archive = ZipArchive::new(Cursor::new(&out_bytes))?;
@@ -511,7 +516,11 @@ mod tests {
         // Mimic IsaacLab's source/isaaclab/ layout.
         write_file(&checkout, "source/isaaclab/isaaclab/__init__.py", b"# py\n");
         write_file(&checkout, "source/isaaclab/setup.py", b"# py\n");
-        write_file(&checkout, "source/isaaclab/pyproject.toml", b"# build-meta\n");
+        write_file(
+            &checkout,
+            "source/isaaclab/pyproject.toml",
+            b"# build-meta\n",
+        );
         // Kit extension config + data that Kit needs to find at the
         // on-disk source layout.
         write_file(
@@ -533,22 +542,28 @@ mod tests {
         )?;
         // Expected: extension.toml + robot.usd + README.md (3 non-Python)
         // Skipped: __init__.py, setup.py, pyproject.toml (Python artifacts)
-        assert_eq!(injected, 3, "expected 3 non-Python files shipped, py source skipped");
+        assert_eq!(
+            injected, 3,
+            "expected 3 non-Python files shipped, py source skipped"
+        );
         let out_bytes = fs::read(&dst_wheel)?;
         let mut archive = ZipArchive::new(Cursor::new(&out_bytes))?;
         let names: Vec<String> = (0..archive.len())
             .map(|i| archive.by_index(i).unwrap().name().to_string())
             .collect();
         // Non-Python files INSIDE the skipped subdir landed at .data/.
-        assert!(names.contains(
-            &"baz-1.0.data/data/lib/source/isaaclab/config/extension.toml".to_string()
-        ), "extension.toml must be shipped so Kit finds the extension");
-        assert!(names.contains(
-            &"baz-1.0.data/data/lib/source/isaaclab/data/robot.usd".to_string()
-        ));
-        assert!(names.contains(
-            &"baz-1.0.data/data/lib/source/isaaclab/docs/README.md".to_string()
-        ));
+        assert!(
+            names.contains(
+                &"baz-1.0.data/data/lib/source/isaaclab/config/extension.toml".to_string()
+            ),
+            "extension.toml must be shipped so Kit finds the extension"
+        );
+        assert!(
+            names.contains(&"baz-1.0.data/data/lib/source/isaaclab/data/robot.usd".to_string())
+        );
+        assert!(
+            names.contains(&"baz-1.0.data/data/lib/source/isaaclab/docs/README.md".to_string())
+        );
         // Python files were correctly skipped (they're in the wheel
         // already via pip wheel). Only check INJECTED entries (under
         // `<dist>-<ver>.data/data/lib/`) -- the stub wheel itself
@@ -559,7 +574,11 @@ mod tests {
             .collect();
         assert!(!injected_names.iter().any(|n| n.ends_with("/__init__.py")));
         assert!(!injected_names.iter().any(|n| n.ends_with("/setup.py")));
-        assert!(!injected_names.iter().any(|n| n.ends_with("/pyproject.toml")));
+        assert!(
+            !injected_names
+                .iter()
+                .any(|n| n.ends_with("/pyproject.toml"))
+        );
         Ok(())
     }
 
@@ -607,12 +626,7 @@ mod tests {
         let src_wheel = parent.join("stub.whl");
         let dst_wheel = parent.join("stub.injected.whl");
         fs::write(&src_wheel, build_stub_wheel("baz", "0.1"))?;
-        let count = inject_checkout_root_data(
-            &src_wheel,
-            &dst_wheel,
-            &checkout,
-            &[],
-        )?;
+        let count = inject_checkout_root_data(&src_wheel, &dst_wheel, &checkout, &[])?;
         assert_eq!(count, 0);
         assert_eq!(fs::read(&src_wheel)?, fs::read(&dst_wheel)?);
         Ok(())

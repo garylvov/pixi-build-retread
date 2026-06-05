@@ -39,7 +39,7 @@ use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use rattler_conda_types::{ChannelUrl, ParseStrictness, Version, VersionSpec};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -110,8 +110,8 @@ pub async fn probe(
         }
     };
 
-    let target_py_version: Option<Version> = target_python.and_then(|tp| {
-        match Version::from_str(tp) {
+    let target_py_version: Option<Version> =
+        target_python.and_then(|tp| match Version::from_str(tp) {
             Ok(v) => Some(v),
             Err(e) => {
                 tracing::debug!(
@@ -120,8 +120,7 @@ pub async fn probe(
                 );
                 None
             }
-        }
-    });
+        });
 
     // Build the full (channel, subdir) work list. linux-64 is the
     // only retread target today; noarch lives alongside it on every
@@ -146,8 +145,7 @@ pub async fn probe(
         })
         .collect();
 
-    let mut consulted: std::collections::BTreeSet<String> =
-        std::collections::BTreeSet::new();
+    let mut consulted: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut total_matching: usize = 0;
     let mut any_reachable: bool = false;
     while let Some((channel_url, subdir, res)) = futs.next().await {
@@ -224,13 +222,15 @@ struct RepodataIndex {
     by_name: HashMap<String, Vec<VariantInfo>>,
 }
 
+/// In-memory repodata cache map, keyed by `(channel_url, subdir)`.
+type RepodataCache = AsyncMutex<HashMap<(String, String), Arc<RepodataIndex>>>;
+
 /// In-memory cache keyed by `(channel_url, subdir)`. Survives across
 /// every probe call in a single retread process. Concurrent probe
 /// calls coordinate via the AsyncMutex so multiple callers don't
 /// double-fetch the same repodata.
-fn cache() -> &'static AsyncMutex<HashMap<(String, String), Arc<RepodataIndex>>> {
-    static CACHE: OnceLock<AsyncMutex<HashMap<(String, String), Arc<RepodataIndex>>>> =
-        OnceLock::new();
+fn cache() -> &'static RepodataCache {
+    static CACHE: OnceLock<RepodataCache> = OnceLock::new();
     CACHE.get_or_init(|| AsyncMutex::new(HashMap::new()))
 }
 
@@ -281,20 +281,20 @@ struct PackageRecord {
 
 fn build_index(file: RepodataFile) -> RepodataIndex {
     let mut by_name: HashMap<String, Vec<VariantInfo>> = HashMap::new();
-    let all = file.packages.into_values().chain(file.packages_conda.into_values());
+    let all = file
+        .packages
+        .into_values()
+        .chain(file.packages_conda.into_values());
     for rec in all {
         let Ok(version) = Version::from_str(&rec.version) else {
             continue;
         };
         let python_constraint = python_constraint_from_depends(&rec.depends);
-        by_name
-            .entry(rec.name)
-            .or_default()
-            .push(VariantInfo {
-                version,
-                python_constraint,
-                depends: rec.depends,
-            });
+        by_name.entry(rec.name).or_default().push(VariantInfo {
+            version,
+            python_constraint,
+            depends: rec.depends,
+        });
     }
     RepodataIndex { by_name }
 }
@@ -348,8 +348,8 @@ async fn fetch_repodata_bytes(channel_url: &str, subdir: &str) -> Result<Vec<u8>
             .bytes()
             .await
             .with_context(|| format!("reading body of {zst_url}"))?;
-        let decoded = zstd::decode_all(bytes.as_ref())
-            .with_context(|| format!("zstd-decoding {zst_url}"))?;
+        let decoded =
+            zstd::decode_all(bytes.as_ref()).with_context(|| format!("zstd-decoding {zst_url}"))?;
         return Ok(decoded);
     }
     // Fall back to uncompressed.
@@ -391,7 +391,10 @@ fn disk_cache_path(channel_url: &str, subdir: &str) -> PathBuf {
 
 fn dirs_cache_root() -> PathBuf {
     if let Some(home) = std::env::var_os("HOME") {
-        PathBuf::from(home).join(".cache").join("rattler").join("cache")
+        PathBuf::from(home)
+            .join(".cache")
+            .join("rattler")
+            .join("cache")
     } else {
         std::env::temp_dir().join("retread-cache")
     }
@@ -407,7 +410,9 @@ async fn read_disk_cache(channel_url: &str, subdir: &str) -> Result<Option<Vec<u
     let mtime = meta
         .modified()
         .with_context(|| format!("mtime {}", path.display()))?;
-    let age = SystemTime::now().duration_since(mtime).unwrap_or(Duration::ZERO);
+    let age = SystemTime::now()
+        .duration_since(mtime)
+        .unwrap_or(Duration::ZERO);
     if age > REPODATA_TTL {
         return Ok(None);
     }
@@ -449,7 +454,8 @@ pub async fn fetch_latest_build_depends(
         Ok(s) => s,
         Err(_) => return Vec::new(),
     };
-    let target_py_version: Option<Version> = target_python.and_then(|tp| Version::from_str(tp).ok());
+    let target_py_version: Option<Version> =
+        target_python.and_then(|tp| Version::from_str(tp).ok());
 
     let target_subdir = "linux-64";
     let mut work: Vec<(String, String)> = Vec::new();
@@ -462,9 +468,7 @@ pub async fn fetch_latest_build_depends(
     use futures::stream::{FuturesUnordered, StreamExt};
     let mut futs: FuturesUnordered<_> = work
         .into_iter()
-        .map(|(channel_url, subdir)| async move {
-            get_repodata(&channel_url, &subdir).await.ok()
-        })
+        .map(|(channel_url, subdir)| async move { get_repodata(&channel_url, &subdir).await.ok() })
         .collect();
 
     // Walk every (channel, subdir), keep the candidate with the
@@ -472,7 +476,9 @@ pub async fn fetch_latest_build_depends(
     let mut best: Option<(Version, Vec<String>)> = None;
     while let Some(maybe_idx) = futs.next().await {
         let Some(idx) = maybe_idx else { continue };
-        let Some(records) = idx.by_name.get(package) else { continue };
+        let Some(records) = idx.by_name.get(package) else {
+            continue;
+        };
         for v in records {
             if !parsed_spec.matches(&v.version) {
                 continue;
