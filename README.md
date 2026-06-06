@@ -2,21 +2,18 @@
 
 [![CI](https://github.com/garylvov/pixi-build-retread/actions/workflows/ci.yml/badge.svg)](https://github.com/garylvov/pixi-build-retread/actions/workflows/ci.yml)
 
-**A Pixi build backend that relaxes strict PyPI dependency pins to ranges, prefers the
-conda equivalent for any shared transitive, and iteratively reconciles
-conflicts at the fixed boundary between Pixi's conda solver and uv's
-PyPI solver.**
+**Retread relaxes strict PyPI dependency pins, prefers the Conda equivalent for any shared transitive, and iteratively reconciles conflicts at the fixed boundary between Pixi's Conda and uv's PyPI solver.**
 
-[Pixi](https://pixi.sh) solves conda first, then runs uv against PyPI with
-conda's chosen versions forwarded as hard pins. Upstream wheels routinely pin
+[Pixi](https://pixi.sh) solves Conda first, then runs uv against PyPI with
+Conda's chosen versions forwarded as hard pins. Upstream wheels routinely pin
 the same shared transitives exactly (`Requires-Dist: numpy==1.26.0`), so that
-handoff becomes a hard barrier: conda has already committed to one version,
+handoff becomes a hard barrier: Conda has already committed to one version,
 while uv is forced to accept another, and the install fails. retread rewrites
 each exact pin to a range (default `>=X.Y,<X+1`) in the wheel's METADATA *and*
-the emitted conda run-deps, routes any shared transitive with a conda
-equivalent (via parselmouth + a small fallback table) onto the conda side
+the emitted Conda run-deps, routes any shared transitive with a Conda
+equivalent (via parselmouth + a small fallback table) onto the Conda side
 *before* uv runs, and iteratively re-solves the emitted metadata until the
-conda/uv boundary stops fighting the workspace. Deps with no conda equivalent
+Conda/uv boundary stops fighting the workspace. Deps with no Conda equivalent
 stay bundled in the wheel and skip uv entirely.
 
 Motivated by [prefix-dev/pixi#5230](https://github.com/prefix-dev/pixi/issues/5230);
