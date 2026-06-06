@@ -1,4 +1,4 @@
-name: CI
+name: linux-x86_64
 
 # Runs the same pre-commit hooks contributors run locally: file hygiene,
 # `cargo fmt --check`, `cargo clippy --all-targets -D warnings`, and the fast
