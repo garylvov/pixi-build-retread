@@ -874,7 +874,7 @@ impl Handler {
                     // files include all envs (the snapshot-restore
                     // pattern above resets bundle.solve_diagnostics
                     // every iteration).
-                    bundle.solve_diagnostics = accumulated_diagnostics;
+                    bundle.solve_diagnostics = accumulated_diagnostics.clone();
                     // v0.36.4+: rebuild `output` to ship the
                     // union'd refinement widenings. Snapshot-restore
                     // semantics inside the env loop discarded each
@@ -935,6 +935,94 @@ impl Handler {
                                 - effective_snapshot.overrides.len(),
                             "rebuilt output with refinement-widened overrides",
                         );
+                        let rebuilt_run_deps_strs: Vec<String> = output
+                            .run_dependencies
+                            .depends
+                            .iter()
+                            .map(|n| {
+                                let raw = format_packagespec(&n.spec);
+                                if raw.is_empty() {
+                                    n.name.as_str().to_string()
+                                } else {
+                                    format!("{} {raw}", n.name.as_str())
+                                }
+                            })
+                            .collect();
+                        for env_name in &env_names {
+                            let should_reverify = accumulated_diagnostics
+                                .get(env_name)
+                                .map(|d| !d.satisfiable)
+                                .unwrap_or(true);
+                            if !should_reverify {
+                                continue;
+                            }
+                            let (env_channels, env_workspace_specs, env_system_requirements) =
+                                match (&manifest_for_solve, env_name.as_str()) {
+                                    (Some(m), n) if n != "__default__" => {
+                                        let chans: Vec<ChannelUrl> = m
+                                            .effective_channels(n)
+                                            .iter()
+                                            .filter_map(|s| {
+                                                url::Url::parse(s).ok().map(ChannelUrl::from)
+                                            })
+                                            .collect();
+                                        let chans = if chans.is_empty() {
+                                            params.channels.clone()
+                                        } else {
+                                            chans
+                                        };
+                                        let mut specs: Vec<String> = Vec::new();
+                                        for (dep_name, spec) in m.effective_dependencies(n) {
+                                            if spec.is_empty() || spec == "*" {
+                                                specs.push(dep_name);
+                                            } else {
+                                                specs.push(format!("{dep_name} {spec}"));
+                                            }
+                                        }
+                                        let sysreqs = m.effective_system_requirements(n);
+                                        (chans, specs, sysreqs)
+                                    }
+                                    _ => (
+                                        params.channels.clone(),
+                                        Vec::new(),
+                                        std::collections::BTreeMap::new(),
+                                    ),
+                                };
+                            let mut combined = rebuilt_run_deps_strs.clone();
+                            combined.extend(env_workspace_specs.iter().cloned());
+                            let outcome = crate::solve_check::run_solve_check(
+                                &env_channels,
+                                &combined,
+                                python_version,
+                                &params.host_platform.to_string(),
+                                workspace_channel_priority,
+                                &env_system_requirements,
+                            )
+                            .await;
+                            if outcome.satisfiable {
+                                any_solve_passed = true;
+                                envs_failed_with_block.remove(env_name);
+                                accumulated_diagnostics.insert(
+                                    env_name.clone(),
+                                    crate::audit::SolveDiagnostics {
+                                        satisfiable: true,
+                                        unsat_explanations: Vec::new(),
+                                        channels_consulted: outcome.channels_consulted,
+                                        specs_count: outcome.specs_count,
+                                        records_count: outcome.records_count,
+                                        refinement_steps: Vec::new(),
+                                        workspace_edit_suggestions: Vec::new(),
+                                        terminal_classification: None,
+                                    },
+                                );
+                                tracing::info!(
+                                    bundle = %bundle.conda_name,
+                                    env = %env_name,
+                                    "rebuilt output re-verified SAT after sibling-env widenings",
+                                );
+                            }
+                        }
+                        bundle.solve_diagnostics = accumulated_diagnostics.clone();
                     }
                     if let Err(e) = write_probe_trace(&bundle, &source_dir).await {
                         tracing::warn!(
@@ -1417,9 +1505,7 @@ async fn resolve_all(
             .collect();
 
         let mut sub_bundles: Vec<Bundle> = Vec::with_capacity(group_entries.len());
-        for ((entry_name, entry), auto_data) in
-            group_entries.iter().zip(auto_data_per_entry.into_iter())
-        {
+        for ((entry_name, entry), auto_data) in group_entries.iter().zip(auto_data_per_entry) {
             let sub = resolve_bundle(
                 entry_name,
                 entry,

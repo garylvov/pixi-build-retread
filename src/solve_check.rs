@@ -29,7 +29,7 @@
 //! probe.rs" claim here was false: probe.rs caches a different parsed
 //! form (`RepodataIndex`) that the solver can't consume.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -84,6 +84,54 @@ impl SolveOutcome {
             terminal_classification: None,
         }
     }
+}
+
+/// Solve a spec set against already-loaded records and return the
+/// concrete records the solver selected. Shared by the pre-emission
+/// solve check and workspace transitive extraction so both reason
+/// about the SAME coherent solution instead of each inventing its own
+/// approximation.
+fn solve_selected_records_from_records(
+    parsed_specs: Vec<MatchSpec>,
+    all_records: &[RepoDataRecord],
+    target_python: &str,
+    channel_priority: ChannelPriority,
+    system_requirements: &BTreeMap<String, String>,
+    strategy: SolveStrategy,
+) -> std::result::Result<Vec<RepoDataRecord>, Vec<String>> {
+    let virtual_packages = build_virtual_packages(target_python, system_requirements);
+    let task = SolverTask {
+        available_packages: vec![all_records],
+        locked_packages: Vec::new(),
+        pinned_packages: Vec::new(),
+        virtual_packages,
+        specs: parsed_specs,
+        constraints: Vec::new(),
+        timeout: Some(std::time::Duration::from_secs(60)),
+        channel_priority,
+        exclude_newer: None,
+        min_age: None,
+        strategy,
+    };
+    let mut solver = resolvo::Solver;
+    match solver.solve(task) {
+        Ok(solution) => Ok(solution.records),
+        Err(rattler_solve::SolveError::Unsolvable(reasons)) => Err(reasons),
+        Err(other) => Err(vec![format!("solver error: {other}")]),
+    }
+}
+
+fn parse_match_specs(specs: &[String]) -> Vec<MatchSpec> {
+    let mut parsed_specs: Vec<MatchSpec> = Vec::with_capacity(specs.len());
+    for raw in specs {
+        match MatchSpec::from_str(raw, ParseStrictness::Lenient) {
+            Ok(s) => parsed_specs.push(s),
+            Err(e) => {
+                tracing::debug!(spec = %raw, error = %e, "solve-check: skipping unparseable spec");
+            }
+        }
+    }
+    parsed_specs
 }
 
 /// Run a conda solve over the combined spec set. `specs` must include
@@ -233,8 +281,32 @@ async fn load_records(channels: &[ChannelUrl], target_subdir: &str) -> Arc<Recor
     for channel_url in channels {
         let channel_str = channel_url.url().as_str().trim_end_matches('/').to_string();
         for subdir in [target_subdir, "noarch"] {
-            let Ok(Some(bytes)) = read_disk_cache(&channel_str, subdir).await else {
-                continue;
+            let bytes = match read_disk_cache(&channel_str, subdir).await {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) => match fetch_repodata_bytes(&channel_str, subdir).await {
+                    Ok(bytes) => {
+                        let _ = write_disk_cache(&channel_str, subdir, &bytes).await;
+                        bytes
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            channel = %channel_str,
+                            subdir = %subdir,
+                            error = %format!("{e:#}"),
+                            "solve-check: repodata unavailable; skipping channel/subdir",
+                        );
+                        continue;
+                    }
+                },
+                Err(e) => {
+                    tracing::debug!(
+                        channel = %channel_str,
+                        subdir = %subdir,
+                        error = %format!("{e:#}"),
+                        "solve-check: disk-cache read failed; skipping channel/subdir",
+                    );
+                    continue;
+                }
             };
             let repo_data: RepoData = match serde_json::from_slice(&bytes) {
                 Ok(r) => r,
@@ -280,15 +352,7 @@ pub async fn run_solve_check(
 ) -> SolveOutcome {
     // Parse the specs first; bad input shouldn't be hidden behind
     // network IO. Skip specs that don't parse (rare; logged at debug).
-    let mut parsed_specs: Vec<MatchSpec> = Vec::with_capacity(specs.len());
-    for raw in specs {
-        match MatchSpec::from_str(raw, ParseStrictness::Lenient) {
-            Ok(s) => parsed_specs.push(s),
-            Err(e) => {
-                tracing::debug!(spec = %raw, error = %e, "solve-check: skipping unparseable spec");
-            }
-        }
-    }
+    let parsed_specs = parse_match_specs(specs);
 
     // Parse the ~1M repodata records ONCE per channel-set and reuse across
     // every solve in this process (the refinement loop calls us ~8x/env x
@@ -313,38 +377,17 @@ pub async fn run_solve_check(
         };
     }
 
-    let virtual_packages = build_virtual_packages(target_python, system_requirements);
-
     let records_count = all_records.len();
     let specs_count = parsed_specs.len();
-
-    let task = SolverTask {
-        available_packages: vec![all_records],
-        locked_packages: Vec::new(),
-        pinned_packages: Vec::new(),
-        virtual_packages,
-        specs: parsed_specs,
-        constraints: Vec::new(),
-        timeout: Some(std::time::Duration::from_secs(60)),
+    match solve_selected_records_from_records(
+        parsed_specs,
+        all_records,
+        target_python,
         channel_priority,
-        exclude_newer: None,
-        min_age: None,
-        // v0.37.0+: pinned explicitly to match pixi's own default.
-        // rattler_solve 4.1.x's `SolveStrategy::default()` is
-        // `Highest`; pixi also defaults to Highest. If pixi ever
-        // changes its default (or starts honoring a workspace-level
-        // override like `[workspace].solve-strategy`), retread
-        // should mirror — divergence here means retread's solver
-        // explores branches in a different order than pixi's,
-        // producing different (numpy, cuda, python_abi) tuples for
-        // the same spec set and silently disagreeing on
-        // satisfiability. Pin explicitly so the contract is
-        // visible in code review.
-        strategy: SolveStrategy::Highest,
-    };
-    let mut solver = resolvo::Solver;
-    match solver.solve(task) {
-        Ok(_solution) => SolveOutcome {
+        system_requirements,
+        SolveStrategy::Highest,
+    ) {
+        Ok(_records) => SolveOutcome {
             satisfiable: true,
             unsat_explanations: Vec::new(),
             channels_consulted: consulted,
@@ -354,7 +397,7 @@ pub async fn run_solve_check(
             workspace_edit_suggestions: Vec::new(),
             terminal_classification: None,
         },
-        Err(rattler_solve::SolveError::Unsolvable(reasons)) => SolveOutcome {
+        Err(reasons) => SolveOutcome {
             satisfiable: false,
             unsat_explanations: reasons,
             channels_consulted: consulted,
@@ -364,17 +407,39 @@ pub async fn run_solve_check(
             workspace_edit_suggestions: Vec::new(),
             terminal_classification: None,
         },
-        Err(other) => SolveOutcome {
-            satisfiable: false,
-            unsat_explanations: vec![format!("solver error: {other}")],
-            channels_consulted: consulted,
-            specs_count,
-            records_count,
-            refinement_steps: Vec::new(),
-            workspace_edit_suggestions: Vec::new(),
-            terminal_classification: None,
-        },
     }
+}
+
+/// Solve a spec set against cached repodata and return the concrete
+/// records the solver selected. Callers that need to reason about
+/// transitives must use this instead of "latest matching build"
+/// guesses, otherwise open-ended pins like `torchvision >=0.22` and
+/// `pytorch-gpu >=2.7` get their transitives sourced from DIFFERENT
+/// package generations and create impossible merged constraints.
+pub async fn solve_selected_records(
+    channels: &[ChannelUrl],
+    specs: &[String],
+    target_python: &str,
+    target_subdir: &str,
+    channel_priority: ChannelPriority,
+    system_requirements: &BTreeMap<String, String>,
+    strategy: SolveStrategy,
+) -> std::result::Result<Vec<RepoDataRecord>, Vec<String>> {
+    let parsed_specs = parse_match_specs(specs);
+    let record_set = load_records(channels, target_subdir).await;
+    if record_set.records.is_empty() {
+        return Err(vec![
+            "solve-check skipped: no repodata available from disk cache".into(),
+        ]);
+    }
+    solve_selected_records_from_records(
+        parsed_specs,
+        &record_set.records,
+        target_python,
+        channel_priority,
+        system_requirements,
+        strategy,
+    )
 }
 
 /// Compute the disk-cache path for repodata. Must match probe.rs's
@@ -411,6 +476,7 @@ fn dirs_cache_root() -> PathBuf {
 }
 
 const REPODATA_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+const HTTP_USER_AGENT: &str = concat!("pixi-build-retread/", env!("CARGO_PKG_VERSION"));
 
 async fn read_disk_cache(channel_url: &str, subdir: &str) -> Result<Option<Vec<u8>>> {
     let path = disk_cache_path(channel_url, subdir);
@@ -426,14 +492,58 @@ async fn read_disk_cache(channel_url: &str, subdir: &str) -> Result<Option<Vec<u
         .duration_since(mtime)
         .unwrap_or(std::time::Duration::ZERO);
     if age > REPODATA_TTL {
-        // Stale; probe.rs will refresh on its next call but we don't
-        // refetch here -- the cache is best-effort for solve check.
         return Ok(None);
     }
     let bytes = tokio::fs::read(&path)
         .await
         .with_context(|| format!("reading {}", path.display()))?;
     Ok(Some(bytes))
+}
+
+async fn write_disk_cache(channel_url: &str, subdir: &str, bytes: &[u8]) -> Result<()> {
+    let path = disk_cache_path(channel_url, subdir);
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await.ok();
+    }
+    tokio::fs::write(&path, bytes)
+        .await
+        .with_context(|| format!("writing cache {}", path.display()))?;
+    Ok(())
+}
+
+async fn fetch_repodata_bytes(channel_url: &str, subdir: &str) -> Result<Vec<u8>> {
+    let client = reqwest::Client::builder()
+        .user_agent(HTTP_USER_AGENT)
+        .build()
+        .context("building reqwest client")?;
+    let zst_url = format!("{channel_url}/{subdir}/repodata.json.zst");
+    let resp = client
+        .get(&zst_url)
+        .send()
+        .await
+        .with_context(|| format!("GET {zst_url}"))?;
+    if resp.status().is_success() {
+        let bytes = resp
+            .bytes()
+            .await
+            .with_context(|| format!("reading body of {zst_url}"))?;
+        let decoded =
+            zstd::decode_all(bytes.as_ref()).with_context(|| format!("zstd-decoding {zst_url}"))?;
+        return Ok(decoded);
+    }
+    let plain_url = format!("{channel_url}/{subdir}/repodata.json");
+    let resp = client
+        .get(&plain_url)
+        .send()
+        .await
+        .with_context(|| format!("GET {plain_url}"))?
+        .error_for_status()
+        .with_context(|| format!("HTTP error for {plain_url}"))?;
+    let bytes = resp
+        .bytes()
+        .await
+        .with_context(|| format!("reading body of {plain_url}"))?;
+    Ok(bytes.to_vec())
 }
 
 #[allow(dead_code)]
@@ -738,6 +848,28 @@ mod parse_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rattler_conda_types::{PackageRecord, RepoDataRecord, VersionWithSource};
+    use std::str::FromStr;
+    use url::Url;
+
+    fn repo_record(name: &str, version: &str, depends: &[&str]) -> RepoDataRecord {
+        let mut package_record = PackageRecord::new(
+            name.parse().unwrap(),
+            VersionWithSource::from_str(version).unwrap(),
+            "h123456_0".to_string(),
+        );
+        package_record.subdir = "linux-64".to_string();
+        package_record.depends = depends.iter().map(|s| (*s).to_string()).collect();
+        RepoDataRecord {
+            package_record,
+            file_name: format!("{name}-{version}-h123456_0.conda"),
+            url: Url::parse(&format!(
+                "https://example.invalid/linux-64/{name}-{version}-h123456_0.conda"
+            ))
+            .unwrap(),
+            channel: Some("https://example.invalid".into()),
+        }
+    }
 
     #[test]
     fn solve_outcome_unreachable_default() {
@@ -849,5 +981,50 @@ mod tests {
             vps_baseline.len(),
             "unknown system-requirement keys must not add virtual packages"
         );
+    }
+
+    #[test]
+    fn solve_selected_records_can_pick_lowest_direct_torch_line() {
+        let all_records = vec![
+            repo_record("python", "3.11.5", &[]),
+            repo_record("pytorch", "2.7.0", &["python >=3.11,<3.12.0a0"]),
+            repo_record("pytorch", "2.10.0", &["python >=3.11,<3.12.0a0"]),
+            repo_record("pytorch", "2.11.0", &["python >=3.11,<3.12.0a0"]),
+            repo_record("pytorch-gpu", "2.7.1", &["pytorch 2.7.0"]),
+            repo_record("pytorch-gpu", "2.11.0", &["pytorch 2.11.0"]),
+            repo_record("torchvision", "0.22.0", &["pytorch >=2.7.0,<2.8.0a0"]),
+            repo_record("torchvision", "0.25.0", &["pytorch >=2.10.0,<2.11.0a0"]),
+            repo_record("torchvision", "0.26.0", &["pytorch >=2.11.0,<2.12.0a0"]),
+        ];
+        let specs = parse_match_specs(&[
+            "pytorch-gpu >=2.7.1,<3".to_string(),
+            "torchvision >=0.22.0".to_string(),
+        ]);
+        let solved = solve_selected_records_from_records(
+            specs,
+            &all_records,
+            "3.11",
+            ChannelPriority::Strict,
+            &BTreeMap::new(),
+            SolveStrategy::LowestVersionDirect,
+        )
+        .expect("torch family should solve coherently");
+
+        let pytorch_gpu = solved
+            .iter()
+            .find(|r| r.package_record.name.as_normalized() == "pytorch-gpu")
+            .expect("pytorch-gpu must be selected");
+        let torchvision = solved
+            .iter()
+            .find(|r| r.package_record.name.as_normalized() == "torchvision")
+            .expect("torchvision must be selected");
+        let pytorch = solved
+            .iter()
+            .find(|r| r.package_record.name.as_normalized() == "pytorch")
+            .expect("pytorch must be selected");
+
+        assert_eq!(pytorch_gpu.package_record.version.as_str(), "2.7.1");
+        assert_eq!(torchvision.package_record.version.as_str(), "0.22.0");
+        assert_eq!(pytorch.package_record.version.as_str(), "2.7.0");
     }
 }

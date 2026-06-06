@@ -2,7 +2,7 @@ schema_version: 1
 
 context:
   name: pixi-build-retread
-  version: "1.0.0"
+  version: "1.1.0"
 
 package:
   name: ${{ name }}
@@ -12,7 +12,7 @@ source:
   - path: ..
 
 build:
-  number: 0
+  number: 1
   script:
     # cargo is bundled with the rust compiler package. The conda rust
     # toolchain builds with an explicit target triple, so we use

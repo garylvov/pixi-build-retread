@@ -479,12 +479,12 @@ fn path_matches(workspace_dir: &Path, raw_path: &str, source_canon: &Path) -> bo
     canonical_or_self(&joined) == *source_canon
 }
 
-/// v0.32.0+: walk each conda dep an env declares, fetch its latest
-/// target-python-compatible build from the workspace's channels, and
-/// accumulate the `depends` constraints those builds carry. The result
-/// is a map `dep_name -> list of constraint strings` telling retread
-/// what each of THIS env's already-pinned conda packages requires
-/// from OTHER packages.
+/// v0.32.0+: solve the env's direct conda deps coherently against the
+/// workspace's channels, then accumulate the `depends` constraints of
+/// the ACTUAL selected builds. The result is a map
+/// `dep_name -> list of constraint strings` telling retread what each
+/// of THIS env's already-pinned conda packages requires from OTHER
+/// packages.
 ///
 /// Example: gsi-ros2 declares `ros-humble-joint-state-publisher = "*"`.
 /// Robostack's latest py3.11 build of that package depends on
@@ -504,22 +504,54 @@ pub async fn extract_transitive_constraints(
 ) -> BTreeMap<String, Vec<String>> {
     let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let deps = manifest.effective_dependencies(env_name);
+    let channel_priority = match manifest.channel_priority.as_deref() {
+        Some("disabled") => rattler_solve::ChannelPriority::Disabled,
+        _ => rattler_solve::ChannelPriority::Strict,
+    };
+    let system_requirements = manifest.effective_system_requirements(env_name);
+    let solve_specs: Vec<String> = deps
+        .iter()
+        .filter_map(|(dep_name, dep_spec)| {
+            let conda_name = conda_normalize(dep_name);
+            if bundle_names.contains(&conda_name) {
+                return None;
+            }
+            if dep_spec.is_empty() || dep_spec == "*" {
+                Some(conda_name)
+            } else {
+                Some(format!("{conda_name} {dep_spec}"))
+            }
+        })
+        .collect();
 
-    for (dep_name, dep_spec) in deps {
-        let conda_name = conda_normalize(&dep_name);
-        if bundle_names.contains(&conda_name) {
-            // The bundle itself provides this; its constraints are
-            // irrelevant for retread's own emission.
+    let solved_records = match crate::solve_check::solve_selected_records(
+        conda_channels,
+        &solve_specs,
+        target_python,
+        "linux-64",
+        channel_priority,
+        &system_requirements,
+        rattler_solve::SolveStrategy::LowestVersionDirect,
+    )
+    .await
+    {
+        Ok(records) => records,
+        Err(reasons) => {
+            tracing::debug!(
+                env = %env_name,
+                reasons = ?reasons,
+                "workspace: coherent solve for transitive extraction failed; skipping transitive constraints"
+            );
+            return out;
+        }
+    };
+
+    for record in solved_records {
+        let conda_name = record.package_record.name.as_normalized();
+        if bundle_names.contains(conda_name) {
             continue;
         }
-        let depends = crate::probe::fetch_latest_build_depends(
-            conda_channels,
-            &conda_name,
-            &dep_spec,
-            Some(target_python),
-        )
-        .await;
-        for raw in depends {
+        for raw in record.package_record.depends {
             // Each entry looks like `"numpy >=1.26,<2"` or `"libstdcxx >=12"`
             // or `"python_abi 3.11.* *_cp311"` (build-string-bearing).
             // Skip python / python_abi — relax policy never widens
