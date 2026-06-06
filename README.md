@@ -2,19 +2,22 @@
 
 [![CI](https://github.com/garylvov/pixi-build-retread/actions/workflows/ci.yml/badge.svg)](https://github.com/garylvov/pixi-build-retread/actions/workflows/ci.yml)
 
-**A pixi build backend that relaxes malformed exact PyPI pins to ranges,
-prefers a conda equivalent for any shared transitive, and re-emits the
-result so pixi's conda solver and uv's PyPI solver stop conflicting.**
+**A Pixi build backend that relaxes strict PyPI dependency pins to ranges, prefers the
+conda equivalent for any shared transitive, and iteratively reconciles
+conflicts at the fixed boundary between Pixi's conda solver and uv's
+PyPI solver.**
 
-[pixi](https://pixi.sh) solves conda first, then runs uv against PyPI with
+[Pixi](https://pixi.sh) solves conda first, then runs uv against PyPI with
 conda's chosen versions forwarded as hard pins. Upstream wheels routinely pin
-transitives exactly (`Requires-Dist: numpy==1.26.0`), so those forwarded pins
-clash with what the wheel demands and the install fails. retread rewrites each
-exact pin to a range (default `>=X.Y,<X+1`) in the wheel's METADATA *and* the
-emitted conda run-deps, and reroutes any shared transitive that has a conda
+the same shared transitives exactly (`Requires-Dist: numpy==1.26.0`), so that
+handoff becomes a hard barrier: conda has already committed to one version,
+while uv is forced to accept another, and the install fails. retread rewrites
+each exact pin to a range (default `>=X.Y,<X+1`) in the wheel's METADATA *and*
+the emitted conda run-deps, routes any shared transitive with a conda
 equivalent (via parselmouth + a small fallback table) onto the conda side
-*before* uv runs. Deps with no conda equivalent stay bundled in the wheel and
-skip uv entirely.
+*before* uv runs, and iteratively re-solves the emitted metadata until the
+conda/uv boundary stops fighting the workspace. Deps with no conda equivalent
+stay bundled in the wheel and skip uv entirely.
 
 Motivated by [prefix-dev/pixi#5230](https://github.com/prefix-dev/pixi/issues/5230);
 automates [@diegoferigo-rai](https://github.com/diegoferigo-rai)'s hand-written
@@ -25,8 +28,8 @@ and a GPU pytorch stack) demonstrates this approach, which can be installed via 
 
 ## Requirements
 
-- **pixi >= 0.63.0** — targets pixi-build API v4. Older pixi → `pixi self-update`.
-- **rattler-build** and **uv** on `PATH` when pixi invokes retread (both are
+- **Pixi >= 0.63.0** — targets pixi-build API v4. Older Pixi → `pixi self-update`.
+- **rattler-build** and **uv** on `PATH` when Pixi invokes retread (both are
   declared as runtime deps in the conda recipe, so a channel install handles
   them). uv supplies the python for source builds on demand; retread ships no
   python and pins to none.
@@ -40,7 +43,7 @@ pixi-build's model is **workspace consumes source package** — two separate
 ```
 your-project/
 ├── pixi.toml          # 1. workspace -- your existing manifest
-└── isaac-pack/        # the source-package directory
+└── isaac-pack/        # the source-package directory, can be different name, where the PyPi deps go
     └── pixi.toml      # 2. a SECOND manifest, living inside isaac-pack/ -- retread config
 ```
 
@@ -68,7 +71,7 @@ name    = "isaac-pack"
 version = "5.1.0"
 
 [package.build]
-backend  = { name = "pixi-build-retread", version = ">=1.0.0" }
+backend  = { name = "pixi-build-retread", version = ">=1.1.0" }
 channels = ["https://prefix.dev/garylvov", "https://prefix.dev/conda-forge"]
 
 [package.build.config]
@@ -110,7 +113,7 @@ Worked example: [`examples/gigastrap/`](examples/gigastrap/).
 ### Files retread writes into the pack (`<pack>/`)
 
 ```
-isaac-pack/
+isaac-pack/ # or preferred name
 ├── pixi.toml
 ├── retread-audit-<name>.json         # what was relaxed/emitted (after build)
 ├── retread-probe-trace-<name>.json   # per-env probe + solve diagnostics (during conda/outputs)
@@ -122,7 +125,7 @@ isaac-pack/
   run-deps, copy-paste-ready TOML blocks, probe + solve diagnostics.
 - **probe-trace** (during `conda/outputs`, always written): per-dep routing
   plus an `{env -> solve_diagnostics}` map with `refinement_steps`. Grep this
-  when pixi prints a misleading leaf error to see what conda's solver really
+  when Pixi prints a misleading leaf error to see what conda's solver really
   tripped on.
 - **SOLVE-FAILED.md** (UNSAT only): per-env refinement history, the real unsat
   chain, and an action checklist (which blocker is yours vs retread's). Absent
@@ -151,7 +154,7 @@ python3 -m pip install -e ./IsaacLab/source/isaaclab --no-deps --force-reinstall
 ```
 
 `--no-deps` keeps retread's resolution; this swaps only the importable code.
-Wrap it in a pixi task or activation hook.
+Wrap it in a Pixi task or activation hook.
 
 ## Escape hatches
 
@@ -189,15 +192,16 @@ retread-drop-deps  = ["weird-shim"]   # drop from run-deps entirely
 except under `strong-major`, which strips upper bounds. `python` is exempt
 from every policy (widening it loses ABI meaning / breaks rattler-build).
 
-**The default, solve-driven cascade:** emit at patch → run a real
-`rattler_solve` over (workspace deps + emitted run-deps) on the workspace's
-channels → on unsat, classify the conflict and either widen one
-retread-emitted blocker a level and re-solve (up to the iteration cap), or —
-when the *workspace* pin dominates — emit a workspace-edit suggestion and stop
-rather than uselessly widening. Every step lands in the probe-trace's
-`refinement_steps`. The check honors `[workspace].channel-priority` (default
-`strict`, matching pixi). pixi shows backend errors verbatim, so on a hard
-conflict you see retread's diagnostic, not pixi's misleading leaf.
+**The default, solve-driven cascade:** start from the narrowest safe rewrite,
+run a real `rattler_solve` over (workspace deps + emitted run-deps) on the
+workspace's channels, and on unsat iteratively widen only the retread-emitted
+blocker that is actually causing the Pixi-to-uv solver handoff to fail. If
+the dominant constraint belongs to the *workspace*, retread stops widening,
+surfaces that conflict clearly, and emits a workspace-edit suggestion instead
+of thrashing. Every step lands in the probe-trace's `refinement_steps`. The
+check honors `[workspace].channel-priority` (default `strict`, matching Pixi).
+Pixi shows backend errors verbatim, so on a hard conflict you see retread's
+diagnostic, not Pixi's misleading leaf.
 
 ## Multi-Python
 
@@ -254,8 +258,8 @@ backend = { name = "pixi-build-retread", version = "*", channels = [
 `bash scripts/rebuild-local.sh` does the whole nuke-rebuild-verify dance (bump
 `Cargo.toml` + `recipe/recipe.yaml` to the same version first; it aborts on
 mismatch). `CONSUMER_PROJECT=/abs/path bash scripts/rebuild-local.sh` also
-clears that workspace's pixi caches. The script exists because three caches
-otherwise serve a stale build: the channel's appended `repodata.json`, pixi's
+clears that workspace's Pixi caches. The script exists because three caches
+otherwise serve a stale build: the channel's appended `repodata.json`, Pixi's
 backend-executable cache (`~/.cache/rattler/cache/backends-v0/`), and retread's
 git-clone cache. Never delete `local-channel/noarch/repodata.json` —
 rattler-build needs that empty placeholder.
@@ -267,7 +271,7 @@ cargo build --release
 export PIXI_BUILD_BACKEND_OVERRIDE=pixi-build-retread=$(pwd)/target/release/pixi-build-retread
 ```
 
-Faster inner loop, but pixi may reuse cached metadata — use Option A when in
+Faster inner loop, but Pixi may reuse cached metadata — use Option A when in
 doubt. `rattler-build` must be on `PATH` whenever retread runs.
 
 ### Contributing
@@ -282,7 +286,7 @@ and PR.
 
 ## Acknowledgements
 
-The [prefix.dev](https://prefix.dev) team for pixi.
+The [prefix.dev](https://prefix.dev) team for Pixi.
 [@ruben-arts](https://github.com/ruben-arts) and
 [@tdejager](https://github.com/tdejager) for the
 [pixi#5230](https://github.com/prefix-dev/pixi/issues/5230) discussion that
