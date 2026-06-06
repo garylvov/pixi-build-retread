@@ -4,17 +4,7 @@
 
 **Retread relaxes strict PyPI dependency pins, prefers the Conda equivalent for any shared transitive, and iteratively reconciles conflicts at the fixed boundary between Pixi's Conda and uv's PyPI solver.**
 
-[Pixi](https://pixi.sh) solves Conda first, then runs uv against PyPI with
-Conda's chosen versions forwarded as hard pins. Upstream wheels routinely pin
-the same shared transitives exactly (`Requires-Dist: numpy==1.26.0`), so that
-handoff becomes a hard barrier: Conda has already committed to one version,
-while uv is forced to accept another, and the install fails. retread rewrites
-each exact pin to a range (default `>=X.Y,<X+1`) in the wheel's METADATA *and*
-the emitted Conda run-deps, routes any shared transitive with a Conda
-equivalent (via parselmouth + a small fallback table) onto the Conda side
-*before* uv runs, and iteratively re-solves the emitted metadata until the
-Conda/uv boundary stops fighting the workspace. Deps with no Conda equivalent
-stay bundled in the wheel and skip uv entirely.
+[Pixi](https://pixi.sh) resolves Conda packages first, then runs `uv` against PyPI using Conda's selections as hard pins. This handoff frequently fails because upstream wheels often strictly pin their own transitive dependencies. When Conda commits to one version and an upstream wheel demands another, `uv` gets trapped in the middle and the installation fails. Retread solves this by rewriting exact pins into flexible ranges within both the wheel's `METADATA` and the emitted Conda run-dependencies. Using [parselmouth](https://github.com/prefix-dev/parselmouth) and a small fallback table, Retread intercepts shared transitives and routes them to their Conda equivalents *before* `uv` runs. It iteratively re-solves the metadata until the Conda/uv boundary stabilizes, leaving any remaining PyPI-only dependencies untouched in the metadata so `uv` can seamlessly resolve them.
 
 Motivated by [prefix-dev/pixi#5230](https://github.com/prefix-dev/pixi/issues/5230);
 automates [@diegoferigo-rai](https://github.com/diegoferigo-rai)'s hand-written
