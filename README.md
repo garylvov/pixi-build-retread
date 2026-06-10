@@ -2,7 +2,7 @@
 
 [![linux-x86_64](https://github.com/garylvov/pixi-build-retread/actions/workflows/ci.yml/badge.svg)](https://github.com/garylvov/pixi-build-retread/actions/workflows/ci.yml)
 
-**Retread relaxes strict PyPI dependency pins, prefers the Conda equivalent for any shared transitive, and iteratively reconciles conflicts at the fixed boundary between Pixi's Conda and uv's PyPI solver.**
+**Retread relaxes strict PyPI dependency pins, prefers the Conda equivalent for any shared transitive, and iteratively reconciles conflicts at the fixed boundary between Pixi's Conda and uv's PyPI solver.**  Ships as a statically linked musl binary: runs on any ``x86_64`` Linux distro, with no glibc version requirement.
 
 [Pixi](https://pixi.sh) resolves Conda packages first, then runs `uv` against PyPI using Conda's selections as hard pins. This handoff frequently fails because upstream wheels often strictly pin their own transitive dependencies. When Conda commits to one version and an upstream wheel demands another, `uv` gets trapped in the middle and the installation fails. Retread solves this by rewriting exact pins into flexible ranges within both the wheel's `METADATA` and the emitted Conda run-dependencies. Using [parselmouth](https://github.com/prefix-dev/parselmouth) and a small fallback table, Retread intercepts shared transitives and routes them to their Conda equivalents *before* `uv` runs. It iteratively re-solves the metadata until the Conda/uv boundary stabilizes, leaving any remaining PyPI-only dependencies untouched in the metadata so `uv` can seamlessly resolve them.
 
@@ -58,7 +58,7 @@ name    = "isaac-pack"
 version = "5.1.0"
 
 [package.build]
-backend  = { name = "pixi-build-retread", version = ">=1.1.0" }
+backend  = { name = "pixi-build-retread", version = ">=1.2.0" }
 channels = ["https://prefix.dev/garylvov", "https://prefix.dev/conda-forge"]
 
 [package.build.config]

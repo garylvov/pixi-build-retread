@@ -44,3 +44,38 @@ jobs:
 
       - name: Run pre-commit hooks
         run: pre-commit run --all-files --show-diff-on-failure --color=always
+
+  # The release artifact is a statically linked musl binary (v1.2.0+), so
+  # it runs on any x86_64 Linux regardless of glibc version. This job
+  # mirrors the recipe's build flags and fails if dynamic linking or
+  # glibc symbol references ever sneak back in.
+  musl-static:
+    name: static musl build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (musl target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # _FORTIFY_SOURCE emits glibc-only __memcpy_chk-style symbols in the
+      # C objects (ring, zstd-sys) that musl lacks; disable it, same as
+      # recipe/recipe.yaml.
+      - name: Build statically linked binary
+        env:
+          CC_x86_64_unknown_linux_musl: gcc
+          CFLAGS_x86_64_unknown_linux_musl: -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0
+        run: cargo build --release --locked --target x86_64-unknown-linux-musl
+
+      - name: Assert fully static (no dynamic linker, no glibc refs)
+        run: |
+          BIN=target/x86_64-unknown-linux-musl/release/pixi-build-retread
+          ldd "$BIN" 2>&1 | grep -Eq 'statically linked|not a dynamic executable'
+          if readelf -d "$BIN" | grep -qi needed; then
+            echo "ERROR: binary has dynamic dependencies" >&2; exit 1
+          fi

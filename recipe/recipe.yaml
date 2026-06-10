@@ -2,7 +2,7 @@ schema_version: 1
 
 context:
   name: pixi-build-retread
-  version: "1.1.0"
+  version: "1.2.0"
 
 package:
   name: ${{ name }}
@@ -12,19 +12,58 @@ source:
   - path: ..
 
 build:
-  number: 1
+  number: 0
   script:
-    # cargo is bundled with the rust compiler package. The conda rust
-    # toolchain builds with an explicit target triple, so we use
-    # `cargo install` rather than `cargo build` to avoid hardcoding the
-    # triple in a `cp` path. Git deps (pixi_build_types, uv-pep508,
-    # uv-normalize) are fetched at build time; rattler-build leaves
-    # networking enabled by default so this works inside the sandbox.
-    - cargo install --locked --no-track --bin pixi-build-retread --path . --root $PREFIX
+    # v1.2.0+: statically linked against musl so the binary runs on any
+    # x86_64 Linux regardless of glibc version. The conda-forge rust
+    # toolchain only ships the glibc std (rust-std-x86_64-unknown-linux-gnu)
+    # and links against the BUILD HOST's glibc, which produced binaries
+    # requiring GLIBC_2.39 that failed on Ubuntu 22.04 (glibc 2.35).
+    # conda-forge has no rust-std for *-musl, so we bootstrap the musl
+    # target via rustup at build time. Networking inside the sandbox is
+    # already a given: git deps (pixi_build_types, uv-pep508,
+    # uv-normalize) are fetched at build time too.
+    - export RUSTUP_HOME=$SRC_DIR/.rustup CARGO_HOME=$SRC_DIR/.cargo
+    - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o rustup-init.sh
+    - sh rustup-init.sh -y --profile minimal --default-toolchain stable
+      --target x86_64-unknown-linux-musl --no-modify-path
+    - export PATH=$CARGO_HOME/bin:$PATH
+    # ring + zstd-sys compile C; point the cc crate at the conda gcc.
+    # The objects only reference unversioned libc symbols, so linking
+    # them against musl's static libc.a (rust's self-contained mode,
+    # the default for *-musl) is sound -- EXCEPT _FORTIFY_SOURCE, which
+    # gcc/conda CFLAGS enable by default and which emits glibc-only
+    # __memcpy_chk-style symbols musl lacks. Disable it for these objects.
+    - export CC_x86_64_unknown_linux_musl=$CC
+    - export CFLAGS_x86_64_unknown_linux_musl="-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0"
+    # The conda gcc drives the link and resolves `-ldl` (emitted by the
+    # libloading crate) to the conda sysroot's glibc 2.17 libdl.a, whose
+    # __dlclose-style internals don't exist under musl. Modern glibc ships
+    # libdl/libpthread/librt/etc. as EMPTY stubs (everything lives in
+    # libc); musl likewise folds them into libc.a. Shadow the sysroot
+    # stubs with empty archives. (GNU ld applies -L paths to every -l
+    # regardless of command-line order, so one flag covers them all.)
+    - mkdir -p $SRC_DIR/.shimlibs
+    - for l in dl pthread rt m util; do ${AR:-ar} rcs $SRC_DIR/.shimlibs/lib$l.a; done
+    - export RUSTFLAGS="-L native=$SRC_DIR/.shimlibs"
+    # `cargo install` rather than `cargo build` + cp, to avoid a second
+    # hardcoded triple in a `cp` path.
+    - cargo install --locked --no-track --bin pixi-build-retread --path .
+      --target x86_64-unknown-linux-musl --root $PREFIX
+    # Fail the build loudly if dynamic linking ever sneaks back in.
+    - ldd $PREFIX/bin/pixi-build-retread 2>&1 | grep -Eq 'statically linked|not a dynamic executable'
 
 requirements:
   build:
-    - ${{ compiler('rust') }}
+    # C compiler for the cc-rs build scripts (ring, zstd-sys); rust
+    # itself comes from rustup (see build script).
+    - ${{ compiler('c') }}
+    - curl
+  ignore_run_exports:
+    # The binary is fully static; without this the C compiler's strong
+    # run-export would add a pointless libgcc run dep.
+    from_package:
+      - ${{ compiler('c') }}
   run:
     # The backend shells out to `rattler-build` for the actual conda build.
     - rattler-build >=0.27
