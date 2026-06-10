@@ -50,6 +50,12 @@ pub struct WorkspaceManifest {
     /// solve_check boundary so retread's solve matches pixi's instead
     /// of defaulting to the build host's detected virtual packages.
     pub system_requirements: BTreeMap<String, String>,
+    /// v1.3.0: top-level `[pypi-options]` index URLs -- `index-url`
+    /// first, then `extra-index-urls` in declaration order. Feeds the
+    /// cascade's PyPI fallback chain so workspace-declared private
+    /// indexes are consulted when bundling PyPI-only deps, not just
+    /// the `[retread-wheels]` entry indexes.
+    pub pypi_index_urls: Vec<String>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -75,6 +81,9 @@ pub struct FeatureDef {
     /// the top-level table; unioned per active env with feature-wins
     /// precedence by `effective_system_requirements`.
     pub system_requirements: BTreeMap<String, String>,
+    /// v1.3.0: `[feature.X.pypi-options]` index URLs, same shape as
+    /// the top-level field.
+    pub pypi_index_urls: Vec<String>,
 }
 
 impl WorkspaceManifest {
@@ -137,6 +146,9 @@ impl WorkspaceManifest {
             }
         }
 
+        // v1.3.0: top-level [pypi-options] index URLs.
+        out.pypi_index_urls = parse_pypi_index_urls(parsed);
+
         if let Some(envs) = parsed.get("environments").and_then(|v| v.as_table()) {
             for (name, value) in envs {
                 if let Some(def) = parse_env_def(value) {
@@ -180,6 +192,8 @@ impl WorkspaceManifest {
                             }
                         }
                     }
+                    // v1.3.0: per-feature [pypi-options] index URLs.
+                    def.pypi_index_urls = parse_pypi_index_urls(fvalue);
                 }
                 out.features.insert(name.clone(), def);
             }
@@ -221,6 +235,26 @@ impl WorkspaceManifest {
     /// (pixi precedence). Keys are pixi-schema names (`cuda`, `libc`,
     /// ...); translation to rattler virtual-package names (`__cuda`,
     /// `__glibc`, ...) happens at the solve_check boundary.
+    /// Every PyPI index the workspace declares anywhere: top-level
+    /// `[pypi-options]` first, then each feature's in name order,
+    /// deduped preserving first occurrence. The cascade's PyPI
+    /// fallback is a harmless try-in-order chain, so a flat union is
+    /// the right shape -- consulting an env-inactive feature's index
+    /// can only find a wheel, never mis-route a dep.
+    pub fn all_pypi_index_urls(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let all = self
+            .pypi_index_urls
+            .iter()
+            .chain(self.features.values().flat_map(|f| f.pypi_index_urls.iter()));
+        for url in all {
+            if !out.contains(url) {
+                out.push(url.clone());
+            }
+        }
+        out
+    }
+
     pub fn effective_system_requirements(&self, env_name: &str) -> BTreeMap<String, String> {
         let Some(env) = self.environments.get(env_name) else {
             return BTreeMap::new();
@@ -590,6 +624,36 @@ fn conda_normalize(s: &str) -> String {
 /// (`libc = { family = "glibc", version = "2.35" }`). Scalars are kept
 /// verbatim; tables contribute their `version` field. Anything else
 /// returns `None` so the caller skips it.
+/// Pull index URLs out of a `[pypi-options]` table nested under
+/// `container` (the manifest root, or a `[feature.X]` table value):
+/// `index-url` first (it replaces pixi's default index, so it leads
+/// the fallback chain), then `extra-index-urls` in declaration order.
+fn parse_pypi_index_urls(container: &toml::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(opts) = container
+        .get("pypi-options")
+        .or_else(|| container.get("pypi_options"))
+        .and_then(|v| v.as_table())
+    else {
+        return out;
+    };
+    if let Some(url) = opts
+        .get("index-url")
+        .or_else(|| opts.get("index_url"))
+        .and_then(|v| v.as_str())
+    {
+        out.push(url.to_string());
+    }
+    if let Some(extra) = opts
+        .get("extra-index-urls")
+        .or_else(|| opts.get("extra_index_urls"))
+        .and_then(|v| v.as_array())
+    {
+        out.extend(extra.iter().filter_map(|v| v.as_str().map(String::from)));
+    }
+    out
+}
+
 fn parse_system_requirement_value(v: &toml::Value) -> Option<String> {
     if let Some(s) = v.as_str() {
         return Some(s.to_string());
@@ -867,6 +931,60 @@ channels = ["https://prefix.dev/robostack-humble", "https://prefix.dev/conda-for
         );
         assert_eq!(split_conda_dep_line(""), None);
         assert_eq!(split_conda_dep_line("   "), None);
+    }
+
+    #[test]
+    fn parses_pypi_options_index_urls() {
+        let ws = ws_toml(
+            r#"
+[workspace]
+channels = ["conda-forge"]
+
+[pypi-options]
+index-url = "https://pypi.nvidia.com"
+extra-index-urls = ["https://download.pytorch.org/whl/cu128"]
+
+[feature.sim.pypi-options]
+extra-index-urls = ["https://py.mujoco.org"]
+
+[feature.gpu.pypi-options]
+index-url = "https://pypi.nvidia.com"
+"#,
+        );
+        // Top-level: index-url leads, extra-index-urls follow.
+        assert_eq!(
+            ws.pypi_index_urls,
+            vec![
+                "https://pypi.nvidia.com".to_string(),
+                "https://download.pytorch.org/whl/cu128".to_string(),
+            ],
+        );
+        assert_eq!(
+            ws.features["sim"].pypi_index_urls,
+            vec!["https://py.mujoco.org".to_string()],
+        );
+        // Rollup: top-level first, features in name order, deduped
+        // (gpu's nvidia index already present from top-level).
+        assert_eq!(
+            ws.all_pypi_index_urls(),
+            vec![
+                "https://pypi.nvidia.com".to_string(),
+                "https://download.pytorch.org/whl/cu128".to_string(),
+                "https://py.mujoco.org".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn pypi_options_absent_yields_empty() {
+        let ws = ws_toml(
+            r#"
+[workspace]
+channels = ["conda-forge"]
+"#,
+        );
+        assert!(ws.pypi_index_urls.is_empty());
+        assert!(ws.all_pypi_index_urls().is_empty());
     }
 
     #[test]

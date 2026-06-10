@@ -185,7 +185,16 @@ workspace's channels, and on unsat iteratively widen only the retread-emitted
 blocker that is actually causing the Pixi-to-uv solver handoff to fail. If
 the dominant constraint belongs to the *workspace*, retread stops widening,
 surfaces that conflict clearly, and emits a workspace-edit suggestion instead
-of thrashing. Every step lands in the probe-trace's `refinement_steps`. The
+of thrashing. When a dep provably has **zero conda candidates at any version**
+(PyPI-only packages — `isaacsim-*`, `nvidia-*-cu1x`, …), the cascade bundles
+the wheel from PyPI and drops the conda emission automatically — no
+`retread-drop-deps` needed. The index fallback chain is built from the
+manifests, nothing vendor-specific: each `[retread-wheels]` entry's `index`,
+then any workspace `[pypi-options]` / `[feature.X.pypi-options]` `index-url` +
+`extra-index-urls`, then public PyPI. The reroute happens only on a definitive probe
+(a channel fetch failure never reroutes) and never for deps the pack pins to
+conda via `retread-conda-deps`; the audit records it as
+`auto-pypi-no-conda-candidates`. Every step lands in the probe-trace's `refinement_steps`. The
 check honors `[workspace].channel-priority` (default `strict`, matching Pixi).
 Pixi shows backend errors verbatim, so on a hard conflict you see retread's
 diagnostic, not Pixi's misleading leaf.

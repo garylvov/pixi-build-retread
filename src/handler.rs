@@ -505,6 +505,18 @@ impl Handler {
                 &bundle_names,
             )
             .await;
+            // PyPI index fallback chain for the cascade's bundling
+            // steps: entry indexes first (pypi.nvidia.com siblings),
+            // then workspace [pypi-options] indexes, then public PyPI.
+            // Extends the chain auto_bundle_transitives uses; without
+            // it the cascade could only bundle from pypi.org and
+            // private-index-only deps fell through to a doomed conda
+            // emission.
+            let workspace_manifest = workspace_dir
+                .as_deref()
+                .and_then(crate::workspace::WorkspaceManifest::load);
+            let cascade_pypi_indexes =
+                pypi_fallback_indexes(&base_config, workspace_manifest.as_ref());
             // Cross-output siblings: per-emission so envs only link
             // to their own siblings (not other envs' renames).
             for emission in &emissions {
@@ -529,6 +541,7 @@ impl Handler {
                         &emission.channels,
                         &target,
                         &download_dir,
+                        &cascade_pypi_indexes,
                     )
                     .await
                     .map_err(|e| {
@@ -1399,9 +1412,17 @@ async fn resolve_all(
     source_dir: &Path,
     cache_dir: &Path,
     conda_channels: &[ChannelUrl],
-    _workspace_dir: Option<&Path>,
+    workspace_dir: Option<&Path>,
 ) -> Result<(Vec<Bundle>, RetreadConfig)> {
     let mut bundles = Vec::with_capacity(config.retread_wheels.len());
+
+    // v1.3.0: workspace [pypi-options] indexes participate in
+    // auto-bundle's fallback chain (between the entry index and public
+    // PyPI), matching the cascade's chain.
+    let workspace_pypi_indexes: Vec<String> = workspace_dir
+        .and_then(crate::workspace::WorkspaceManifest::load)
+        .map(|m| m.all_pypi_index_urls())
+        .unwrap_or_default();
 
     // Load parselmouth once and reuse across bundles. We also merge it
     // into the effective name-map: when parselmouth says PyPI name X
@@ -1564,6 +1585,7 @@ async fn resolve_all(
             auto_bundle_transitives(
                 &mut bundle,
                 &idx,
+                &workspace_pypi_indexes,
                 target,
                 download_dir,
                 &effective,
@@ -2604,6 +2626,7 @@ async fn pre_emit_widen_pass(
     conda_channels: &[ChannelUrl],
     target: &WheelTarget,
     download_dir: &Path,
+    pypi_indexes: &[String],
 ) -> Result<()> {
     // v0.32.0+: workspace pins flow in via effective.overrides
     // (injected by apply_emission from the per-env EnvEmission's
@@ -2725,6 +2748,7 @@ async fn pre_emit_widen_pass(
                 conda_channels,
                 target,
                 download_dir,
+                pypi_indexes,
                 &raw,
                 &env,
                 pypi_name.as_deref().unwrap_or(&conda_name),
@@ -2791,6 +2815,129 @@ async fn pre_emit_widen_pass(
     Ok(())
 }
 
+/// Index fallback chain for the cascade's PyPI bundling steps, tried
+/// in order: every distinct non-URL `[retread-wheels]` entry index
+/// (private indexes like pypi.nvidia.com first, in declaration order),
+/// then every index the consumer workspace declares under
+/// `[pypi-options]` / `[feature.X.pypi-options]` (`index-url` +
+/// `extra-index-urls`), then public PyPI. Nothing here is
+/// vendor-specific -- any manifest-declared index participates.
+/// Mirrors (and extends) the chain `auto_bundle_transitives` builds.
+fn pypi_fallback_indexes(
+    config: &RetreadConfig,
+    workspace: Option<&crate::workspace::WorkspaceManifest>,
+) -> Vec<String> {
+    fn push_unique(list: &mut Vec<String>, idx: String) {
+        // Trailing-slash-insensitive: "https://pypi.org/simple" and
+        // ".../simple/" are the same index; don't probe it twice.
+        if !list
+            .iter()
+            .any(|e| e.trim_end_matches('/') == idx.trim_end_matches('/'))
+        {
+            list.push(idx);
+        }
+    }
+    let mut indexes: Vec<String> = Vec::new();
+    for entry in config.retread_wheels.values() {
+        if entry.url.is_none() {
+            push_unique(&mut indexes, entry.index_url());
+        }
+    }
+    if let Some(ws) = workspace {
+        for url in ws.all_pypi_index_urls() {
+            push_unique(&mut indexes, url);
+        }
+    }
+    push_unique(&mut indexes, "https://pypi.org/simple/".to_string());
+    indexes
+}
+
+/// Resolve + fetch `pypi_name` from each index in turn; on the first
+/// success, vendor the wheel into the bundle and drop the dep from
+/// conda emission (push to `effective.drop_deps`, which `translate`
+/// consults). Records one ProbeDecision per resolve attempt. Returns
+/// true when a wheel was bundled.
+#[allow(clippy::too_many_arguments)]
+async fn try_pypi_bundle(
+    bundle: &mut Bundle,
+    effective: &mut RetreadConfig,
+    target: &WheelTarget,
+    download_dir: &Path,
+    pypi_indexes: &[String],
+    pypi_name: &str,
+    conda_name: &str,
+    specs: &VersionSpecifiers,
+    stage: &str,
+    success_routing: &str,
+) -> bool {
+    for index in pypi_indexes {
+        match pypi::resolve(index, pypi_name, specs, target).await {
+            Ok(resolved) => {
+                match fetch_and_parse(&resolved.url, resolved.sha256.as_deref(), download_dir).await
+                {
+                    Ok(metadata) => {
+                        bundle.probe_decisions.push(crate::audit::ProbeDecision {
+                            stage: stage.into(),
+                            pypi_name: pypi_name.to_string(),
+                            conda_name: conda_name.to_string(),
+                            spec: specs.to_string(),
+                            target_python: target.python_version.clone(),
+                            channels_consulted: vec![index.clone()],
+                            satisfiable: Some(true),
+                            matching_candidates: 1,
+                            routing_decision: success_routing.into(),
+                        });
+                        tracing::info!(
+                            dep = %pypi_name,
+                            index = %index,
+                            url = %resolved.url,
+                            "tiered-cascade: PyPI fallback bundled wheel; dropping conda emit",
+                        );
+                        bundle.extras.push(ResolvedWheel {
+                            pypi_name: conda_name_from(pypi_name),
+                            url: resolved.url,
+                            metadata,
+                            extras_requested: vec![],
+                            auto_data: None,
+                            auto_data_dedup_skipped_root: None,
+                        });
+                        effective.drop_deps.push(pypi_name.to_string());
+                        return true;
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            dep = %pypi_name,
+                            index = %index,
+                            error = %format!("{e:#}"),
+                            "tiered-cascade: PyPI fetch failed; trying next index",
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                bundle.probe_decisions.push(crate::audit::ProbeDecision {
+                    stage: stage.into(),
+                    pypi_name: pypi_name.to_string(),
+                    conda_name: conda_name.to_string(),
+                    spec: specs.to_string(),
+                    target_python: target.python_version.clone(),
+                    channels_consulted: vec![index.clone()],
+                    satisfiable: Some(false),
+                    matching_candidates: 0,
+                    routing_decision: "pypi-resolve-failed".into(),
+                });
+                tracing::debug!(
+                    dep = %pypi_name,
+                    index = %index,
+                    error = %format!("{e:#}"),
+                    "tiered-cascade: PyPI resolve failed on this index; trying next",
+                );
+            }
+        }
+    }
+    false
+}
+
 /// v0.30.0 tiered cascade: per-dep escalate widening levels with PyPI
 /// fallback between them. Called only when the policy is
 /// `patch-then-minor-then-major-then-last-resort` AND step 1 (base
@@ -2803,6 +2950,14 @@ async fn pre_emit_widen_pass(
 ///   5. conda at major widening
 ///   6. PyPI at major range -> bundle + drop conda emit
 ///   7. widen conda emit to `*`
+///   8. (v1.3.0) conda DEFINITIVELY has zero py-compat builds at any
+///      version: bundle from PyPI at any version -> bundle + drop
+///      conda emit. Leaving the dep on the conda side is guaranteed
+///      to fail the solve, so auto-rerouting cannot make things worse
+///      and is never silent (warn + ProbeDecision). Skipped when the
+///      user forced the conda side via `retread-conda-deps` or when
+///      the probe was indecisive (channel fetch failure must not
+///      reroute deps).
 ///
 /// "Drop conda emit" is done by pushing the PyPI name into
 /// `effective.drop_deps`, which `translate` consults to skip emission.
@@ -2815,6 +2970,7 @@ async fn tiered_cascade_for_dep(
     conda_channels: &[ChannelUrl],
     target: &WheelTarget,
     download_dir: &Path,
+    pypi_indexes: &[String],
     raw: &str,
     env: &uv_pep508::MarkerEnvironment,
     pypi_name: &str,
@@ -2833,8 +2989,6 @@ async fn tiered_cascade_for_dep(
     // PyPI search range at each conda-widening level because PyPI's
     // job is just "give me a compatible wheel for the upstream pin",
     // and the conda widening is independent of that.
-    let pypi_index = "https://pypi.org/simple/";
-
     for (level_idx, level_policy) in [
         (0usize, RelaxPolicy::Patch),
         (1, RelaxPolicy::Minor),
@@ -2928,67 +3082,21 @@ async fn tiered_cascade_for_dep(
             _ => unreachable!(),
         };
         if let Some(specs) = pypi_specs {
-            match pypi::resolve(pypi_index, pypi_name, specs, target).await {
-                Ok(resolved) => {
-                    match fetch_and_parse(&resolved.url, resolved.sha256.as_deref(), download_dir)
-                        .await
-                    {
-                        Ok(metadata) => {
-                            bundle.probe_decisions.push(crate::audit::ProbeDecision {
-                                stage: pypi_stage.into(),
-                                pypi_name: pypi_name.to_string(),
-                                conda_name: conda_name.to_string(),
-                                spec: specs.to_string(),
-                                target_python: target.python_version.clone(),
-                                channels_consulted: vec![pypi_index.to_string()],
-                                satisfiable: Some(true),
-                                matching_candidates: 1,
-                                routing_decision: "pypi-bundled-dropping-conda-emit".into(),
-                            });
-                            tracing::info!(
-                                dep = %pypi_name,
-                                level = ?level_policy,
-                                url = %resolved.url,
-                                "tiered-cascade: PyPI fallback bundled wheel; dropping conda emit",
-                            );
-                            bundle.extras.push(ResolvedWheel {
-                                pypi_name: conda_name_from(pypi_name),
-                                url: resolved.url,
-                                metadata,
-                                extras_requested: vec![],
-                                auto_data: None,
-                                auto_data_dedup_skipped_root: None,
-                            });
-                            effective.drop_deps.push(pypi_name.to_string());
-                            return Ok(());
-                        }
-                        Err(e) => {
-                            tracing::debug!(
-                                dep = %pypi_name,
-                                error = %format!("{e:#}"),
-                                "tiered-cascade: PyPI fetch failed; trying next level",
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    bundle.probe_decisions.push(crate::audit::ProbeDecision {
-                        stage: pypi_stage.into(),
-                        pypi_name: pypi_name.to_string(),
-                        conda_name: conda_name.to_string(),
-                        spec: specs.to_string(),
-                        target_python: target.python_version.clone(),
-                        channels_consulted: vec![pypi_index.to_string()],
-                        satisfiable: Some(false),
-                        matching_candidates: 0,
-                        routing_decision: "pypi-resolve-failed".into(),
-                    });
-                    tracing::debug!(
-                        dep = %pypi_name,
-                        error = %format!("{e:#}"),
-                        "tiered-cascade: PyPI resolve failed at this level; trying next",
-                    );
-                }
+            if try_pypi_bundle(
+                bundle,
+                effective,
+                target,
+                download_dir,
+                pypi_indexes,
+                pypi_name,
+                conda_name,
+                specs,
+                pypi_stage,
+                "pypi-bundled-dropping-conda-emit",
+            )
+            .await
+            {
+                return Ok(());
             }
         } else {
             // No version specifiers (URL/git/bare dep). PyPI fallback
@@ -3055,9 +3163,15 @@ async fn tiered_cascade_for_dep(
         effective
             .overrides
             .insert(conda_name.to_string(), target_spec);
-    } else if source_tag == "from-workspace-pin" {
-        // Workspace pin didn't probe-satisfy. Fall back to `*` so
-        // conda solver can at least try.
+        return Ok(());
+    }
+
+    // Establish the name-level result: can conda provide ANY py-compat
+    // version of this package? When there was no workspace pin,
+    // `probe_result` above already probed `*`; with a pin that didn't
+    // probe-satisfy, fall back to `*` (and inject it if satisfied) the
+    // way pre-v1.3.0 did.
+    let name_level_probe = if source_tag == "from-workspace-pin" {
         let any_probe = crate::probe::probe(
             conda_channels,
             conda_name,
@@ -3085,18 +3199,53 @@ async fn tiered_cascade_for_dep(
             effective
                 .overrides
                 .insert(conda_name.to_string(), "*".into());
-        } else {
+            return Ok(());
+        }
+        any_probe
+    } else {
+        probe_result
+    };
+
+    // Step 8: conda definitively has zero py-compat builds of this
+    // package at any version. A conda run-dep is guaranteed to fail the
+    // solve, so bundle the wheel from PyPI instead -- unless the user
+    // explicitly forced the conda side via retread-conda-deps, or the
+    // probe was indecisive (a channel fetch failure must not silently
+    // reroute deps that conda may well have).
+    let user_forced_conda = effective
+        .conda_deps
+        .iter()
+        .any(|n| conda_name_from(n) == conda_name);
+    if name_level_probe.is_definitively_unsatisfied() && !user_forced_conda {
+        let any_specs = pypi_specs
+            .cloned()
+            .unwrap_or_else(VersionSpecifiers::empty);
+        if try_pypi_bundle(
+            bundle,
+            effective,
+            target,
+            download_dir,
+            pypi_indexes,
+            pypi_name,
+            conda_name,
+            &any_specs,
+            "tiered-cascade-step8-pypi-last-resort",
+            "auto-pypi-no-conda-candidates",
+        )
+        .await
+        {
             tracing::warn!(
                 dep = %conda_name,
-                "tiered-cascade: every step exhausted; conda has no py-compat build. Consider retread-drop-deps.",
+                pypi = %pypi_name,
+                "tiered-cascade: conda has no py-compat build at any version; auto-bundled the wheel from PyPI and dropped the conda emission",
             );
+            return Ok(());
         }
-    } else {
-        tracing::warn!(
-            dep = %conda_name,
-            "tiered-cascade: every step exhausted; conda has no py-compat build at any version. Solve will fail. Consider retread-drop-deps.",
-        );
     }
+    tracing::warn!(
+        dep = %conda_name,
+        "tiered-cascade: every step exhausted; conda has no py-compat build at any version and PyPI bundling did not produce a wheel. Solve will fail. Consider retread-drop-deps.",
+    );
     Ok(())
 }
 
@@ -4022,6 +4171,7 @@ fn probe_spec_for(version_str: &str, policy: RelaxPolicy) -> String {
 async fn auto_bundle_transitives(
     bundle: &mut Bundle,
     entry_index: &str,
+    workspace_indexes: &[String],
     target: &WheelTarget,
     download_dir: &Path,
     config: &RetreadConfig,
@@ -4042,13 +4192,25 @@ async fn auto_bundle_transitives(
     skip.extend(config.overrides.keys().map(|n| conda_name_from(n)));
 
     // Fallback chain: entry's index first (for siblings on private
-    // indexes like pypi.nvidia.com), then public PyPI (for the broader
-    // ecosystem -- aiodns, qdldl, ...). Public PyPI is hardcoded rather
-    // than configurable for now; if a user has air-gap requirements
-    // they can disable retread-auto-bundle entirely.
+    // indexes like pypi.nvidia.com), then workspace [pypi-options]
+    // indexes, then public PyPI (for the broader ecosystem -- aiodns,
+    // qdldl, ...). Public PyPI is hardcoded rather than configurable
+    // for now; if a user has air-gap requirements they can disable
+    // retread-auto-bundle entirely.
     let mut indexes = vec![entry_index.to_string()];
+    for url in workspace_indexes {
+        if !indexes
+            .iter()
+            .any(|e| e.trim_end_matches('/') == url.trim_end_matches('/'))
+        {
+            indexes.push(url.clone());
+        }
+    }
     let public = "https://pypi.org/simple/".to_string();
-    if entry_index != public {
+    if !indexes
+        .iter()
+        .any(|e| e.trim_end_matches('/') == public.trim_end_matches('/'))
+    {
         indexes.push(public);
     }
 
@@ -6079,6 +6241,226 @@ mod tests {
             probe_decisions: vec![],
             solve_diagnostics: BTreeMap::new(),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // v1.3.0: cascade PyPI index fallback chain + step-8 auto-bundle
+    // gating. The chain must mirror auto_bundle_transitives' (entry
+    // indexes first, then public PyPI) so NVIDIA-only deps resolvable
+    // only on pypi.nvidia.com can be bundled by the cascade instead of
+    // falling through to a doomed conda emission.
+    // -----------------------------------------------------------------
+
+    fn spec_entry(version: &str, index: Option<&str>) -> WheelEntry {
+        let mut v = serde_json::json!({ "version": version });
+        if let Some(idx) = index {
+            v["index"] = serde_json::Value::String(idx.to_string());
+        }
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn pypi_fallback_indexes_dedups_entries_and_appends_public() {
+        let mut config = cfg();
+        config
+            .retread_wheels
+            .insert("isaacsim".into(), spec_entry("==6.0.0", Some("https://pypi.nvidia.com")));
+        config
+            .retread_wheels
+            .insert("isaacsim-extra".into(), spec_entry("==6.0.0", Some("https://pypi.nvidia.com")));
+        config.retread_wheels.insert(
+            "pytorch3d".into(),
+            spec_entry("==0.7.8", Some("https://miropsota.github.io/torch_packages_builder")),
+        );
+        config.retread_wheels.insert(
+            "urlform".into(),
+            serde_json::from_value(serde_json::json!({ "url": "https://example.com/x.whl" }))
+                .unwrap(),
+        );
+        assert_eq!(
+            pypi_fallback_indexes(&config, None),
+            vec![
+                "https://pypi.nvidia.com".to_string(),
+                "https://miropsota.github.io/torch_packages_builder".to_string(),
+                "https://pypi.org/simple/".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn pypi_fallback_indexes_defaults_to_public_only() {
+        // No entries (and spec-form entries without an explicit index
+        // default to public anyway) -> just public PyPI, once.
+        assert_eq!(
+            pypi_fallback_indexes(&cfg(), None),
+            vec!["https://pypi.org/simple/".to_string()],
+        );
+        let mut config = cfg();
+        config
+            .retread_wheels
+            .insert("tomli".into(), spec_entry("==2.0.1", None));
+        assert_eq!(
+            pypi_fallback_indexes(&config, None),
+            vec!["https://pypi.org/simple/".to_string()],
+        );
+    }
+
+    #[test]
+    fn pypi_fallback_indexes_includes_workspace_pypi_options() {
+        // Workspace [pypi-options] indexes (top-level + feature) slot
+        // between the entry indexes and public PyPI; dedup is
+        // trailing-slash-insensitive so a workspace-declared
+        // "https://pypi.org/simple" doesn't double the public index.
+        let manifest: toml::Value = toml::from_str(
+            r#"
+[pypi-options]
+index-url = "https://pypi.org/simple"
+extra-index-urls = ["https://download.pytorch.org/whl/cu128"]
+
+[feature.sim.pypi-options]
+extra-index-urls = ["https://py.mujoco.org", "https://download.pytorch.org/whl/cu128"]
+"#,
+        )
+        .unwrap();
+        let ws = crate::workspace::WorkspaceManifest::from_toml(&manifest);
+        let mut config = cfg();
+        config
+            .retread_wheels
+            .insert("isaacsim".into(), spec_entry("==6.0.0", Some("https://pypi.nvidia.com")));
+        assert_eq!(
+            pypi_fallback_indexes(&config, Some(&ws)),
+            vec![
+                "https://pypi.nvidia.com".to_string(),
+                "https://pypi.org/simple".to_string(),
+                "https://download.pytorch.org/whl/cu128".to_string(),
+                "https://py.mujoco.org".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn tiered_cascade_indecisive_probe_never_reroutes() {
+        // Empty channel list -> every probe returns satisfiable=None
+        // (indecisive). The cascade must not widen, must not bundle
+        // from PyPI (step 8 requires a DEFINITIVELY zero-candidate
+        // name-level probe), and must not push drop_deps. A channel
+        // fetch failure silently rerouting deps to PyPI is exactly
+        // what the definitive-probe gate exists to prevent. Bare dep
+        // (no version spec) so the per-level PyPI fallback steps skip
+        // and the test stays offline.
+        let mut bundle = solo_bundle("isaac-pack", vec![]);
+        let mut effective = cfg();
+        let target = wheel_target_for(Platform::Linux64, "3.11");
+        let env = default_marker_env("3.11").unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(tiered_cascade_for_dep(
+            &mut bundle,
+            &mut effective,
+            &[],
+            &target,
+            &std::env::temp_dir(),
+            &["https://pypi.org/simple/".to_string()],
+            "isaacsim-kernel",
+            &env,
+            "isaacsim-kernel",
+            None,
+            "isaacsim-kernel",
+            &BTreeMap::new(),
+        ))
+        .unwrap();
+        assert!(
+            bundle.extras.is_empty(),
+            "indecisive probe must not auto-bundle: {:?}",
+            bundle.extras,
+        );
+        assert!(
+            effective.drop_deps.is_empty(),
+            "indecisive probe must not drop conda emission: {:?}",
+            effective.drop_deps,
+        );
+        assert!(
+            effective.overrides.is_empty(),
+            "indecisive probe must not inject overrides: {:?}",
+            effective.overrides,
+        );
+    }
+
+    #[test]
+    #[ignore = "live: fetches conda-forge repodata + a PyPI wheel"]
+    fn tiered_cascade_step8_bundles_pypi_only_dep_live() {
+        // The user-reported failure shape: a PyPI-only NVIDIA dep
+        // (zero conda-forge candidates at ANY version) reached
+        // emission as a conda run-dep and the solve died with "no
+        // candidates". Step 8 must instead bundle the wheel from PyPI
+        // and drop the conda emission. Bare dep (no version spec) so
+        // steps 2/4/6 skip and step 8 is the only PyPI attempt.
+        let mut bundle = solo_bundle("isaac-pack", vec![]);
+        let mut effective = cfg();
+        let target = wheel_target_for(Platform::Linux64, "3.11");
+        let env = default_marker_env("3.11").unwrap();
+        let channels = vec![ChannelUrl::from(
+            url::Url::parse("https://prefix.dev/conda-forge").unwrap(),
+        )];
+        let tmp = std::env::temp_dir().join(format!("retread-step8-live-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(tiered_cascade_for_dep(
+            &mut bundle,
+            &mut effective,
+            &channels,
+            &target,
+            &tmp,
+            &["https://pypi.org/simple/".to_string()],
+            "nvidia-cuda-nvrtc-cu12",
+            &env,
+            "nvidia-cuda-nvrtc-cu12",
+            None,
+            "nvidia-cuda-nvrtc-cu12",
+            &BTreeMap::new(),
+        ))
+        .unwrap();
+        assert_eq!(
+            bundle.extras.len(),
+            1,
+            "step 8 must bundle the PyPI-only wheel; decisions: {:#?}",
+            bundle.probe_decisions,
+        );
+        assert_eq!(bundle.extras[0].pypi_name, "nvidia-cuda-nvrtc-cu12");
+        assert!(
+            effective
+                .drop_deps
+                .contains(&"nvidia-cuda-nvrtc-cu12".to_string()),
+            "step 8 must drop the conda emission",
+        );
+        assert!(
+            bundle.probe_decisions.iter().any(|d| {
+                d.stage == "tiered-cascade-step8-pypi-last-resort"
+                    && d.routing_decision == "auto-pypi-no-conda-candidates"
+            }),
+            "audit must record the auto-reroute: {:#?}",
+            bundle.probe_decisions,
+        );
+    }
+
+    #[test]
+    fn tiered_cascade_step8_respects_retread_conda_deps() {
+        // Step 8 must never reroute a dep the user explicitly forced to
+        // the conda side. With empty channels the probe is indecisive,
+        // which already gates step 8 -- so to pin the conda_deps guard
+        // specifically, assert the predicate the gate uses.
+        let mut effective = cfg();
+        effective.conda_deps.push("isaacsim_kernel".into());
+        let forced = effective
+            .conda_deps
+            .iter()
+            .any(|n| conda_name_from(n) == "isaacsim-kernel");
+        assert!(forced, "conda_deps guard must normalize names the way emission does");
     }
 
     #[test]
