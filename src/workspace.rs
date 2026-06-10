@@ -90,11 +90,37 @@ impl WorkspaceManifest {
     /// Open `workspace_dir/pixi.toml` and parse. Returns `None` if the
     /// file is missing or fundamentally malformed; individual
     /// malformed entries are skipped rather than aborting.
+    ///
+    /// v1.4.0: memoized per (path, mtime). `conda_outputs` and its
+    /// callees load the manifest 5+ times per request; the file never
+    /// changes mid-request, so re-reading + re-parsing the same TOML
+    /// was pure waste. The mtime key keeps the memo correct if the
+    /// file IS edited while the backend process is alive.
     pub fn load(workspace_dir: &Path) -> Option<Self> {
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+        use std::sync::{Mutex, OnceLock};
+        use std::time::SystemTime;
+
+        static CACHE: OnceLock<Mutex<HashMap<PathBuf, (SystemTime, WorkspaceManifest)>>> =
+            OnceLock::new();
+
         let pixi_toml = workspace_dir.join("pixi.toml");
+        let mtime = std::fs::metadata(&pixi_toml).ok()?.modified().ok()?;
+        let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        if let Some((cached_mtime, manifest)) = cache.lock().unwrap().get(&pixi_toml)
+            && *cached_mtime == mtime
+        {
+            return Some(manifest.clone());
+        }
         let bytes = std::fs::read_to_string(&pixi_toml).ok()?;
         let parsed: toml::Value = toml::from_str(&bytes).ok()?;
-        Some(Self::from_toml(&parsed))
+        let manifest = Self::from_toml(&parsed);
+        cache
+            .lock()
+            .unwrap()
+            .insert(pixi_toml, (mtime, manifest.clone()));
+        Some(manifest)
     }
 
     /// Build from an already-parsed TOML value. Useful for testing

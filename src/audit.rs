@@ -198,6 +198,12 @@ pub struct SolveDiagnostics {
     /// or the workspace's ("B"/"C"). Empty for sat outcomes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_classification: Option<String>,
+    /// v1.4.0: true when the check could not run (no channels / no
+    /// repodata) and abstained. `satisfiable: false` + `skipped: true`
+    /// means "unknown", not "unsat" -- the SOLVE-FAILED summary and
+    /// the conda/outputs fail gate both ignore skipped entries.
+    #[serde(default)]
+    pub skipped: bool,
 }
 
 /// One iteration of the solve-driven cascade refinement.

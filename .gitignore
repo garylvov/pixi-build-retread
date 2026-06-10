@@ -10,3 +10,6 @@
 *.tar.bz2
 /output
 examples/gigastrap/isaac-pack/*
+examples/isaac6/isaac-pack/wheels/
+examples/isaac6/isaac-pack/retread-*.json
+examples/isaac6/isaac-pack/RETREAD-SOLVE-FAILED-*.md

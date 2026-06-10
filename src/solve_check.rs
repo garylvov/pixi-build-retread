@@ -69,6 +69,17 @@ pub struct SolveOutcome {
     /// v0.35.0+: terminal classification name (A/AExhausted/B/C/None).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_classification: Option<String>,
+    /// v1.4.0: true when the check COULD NOT RUN (no channels given,
+    /// or no repodata loadable from any of them). A skipped check is
+    /// an abstention, not an unsat verdict: callers must not refine
+    /// against it, print failure banners for it, or fail conda/outputs
+    /// because of it. Before this flag, an empty/unreachable channel
+    /// set surfaced as `satisfiable: false`, the refinement loop
+    /// classified the "no repodata" text as cascade-exhausted, and
+    /// the fail gate hard-errored the build -- a diagnostic that
+    /// never ran was vetoing the output.
+    #[serde(default)]
+    pub skipped: bool,
 }
 
 impl SolveOutcome {
@@ -82,6 +93,7 @@ impl SolveOutcome {
             refinement_steps: Vec::new(),
             workspace_edit_suggestions: Vec::new(),
             terminal_classification: None,
+            skipped: true,
         }
     }
 }
@@ -119,6 +131,33 @@ fn solve_selected_records_from_records(
         Err(rattler_solve::SolveError::Unsolvable(reasons)) => Err(reasons),
         Err(other) => Err(vec![format!("solver error: {other}")]),
     }
+}
+
+/// v1.4.0: run the resolvo solve on the blocking thread pool. The
+/// solve is pure CPU (seconds on ~1M records); calling it directly on
+/// the async executor pinned a runtime worker for the duration of
+/// every solve (up to 40 per bundle across the refinement loop),
+/// starving concurrent probes and downloads.
+async fn solve_on_blocking_pool(
+    parsed_specs: Vec<MatchSpec>,
+    record_set: Arc<RecordSet>,
+    target_python: String,
+    channel_priority: ChannelPriority,
+    system_requirements: BTreeMap<String, String>,
+    strategy: SolveStrategy,
+) -> std::result::Result<Vec<RepoDataRecord>, Vec<String>> {
+    tokio::task::spawn_blocking(move || {
+        solve_selected_records_from_records(
+            parsed_specs,
+            &record_set.records,
+            &target_python,
+            channel_priority,
+            &system_requirements,
+            strategy,
+        )
+    })
+    .await
+    .unwrap_or_else(|e| Err(vec![format!("solver task panicked: {e}")]))
 }
 
 fn parse_match_specs(specs: &[String]) -> Vec<MatchSpec> {
@@ -374,19 +413,22 @@ pub async fn run_solve_check(
             refinement_steps: Vec::new(),
             workspace_edit_suggestions: Vec::new(),
             terminal_classification: None,
+            skipped: true,
         };
     }
 
     let records_count = all_records.len();
     let specs_count = parsed_specs.len();
-    match solve_selected_records_from_records(
+    match solve_on_blocking_pool(
         parsed_specs,
-        all_records,
-        target_python,
+        Arc::clone(&record_set),
+        target_python.to_string(),
         channel_priority,
-        system_requirements,
+        system_requirements.clone(),
         SolveStrategy::Highest,
-    ) {
+    )
+    .await
+    {
         Ok(_records) => SolveOutcome {
             satisfiable: true,
             unsat_explanations: Vec::new(),
@@ -396,6 +438,7 @@ pub async fn run_solve_check(
             refinement_steps: Vec::new(),
             workspace_edit_suggestions: Vec::new(),
             terminal_classification: None,
+            skipped: false,
         },
         Err(reasons) => SolveOutcome {
             satisfiable: false,
@@ -406,6 +449,7 @@ pub async fn run_solve_check(
             refinement_steps: Vec::new(),
             workspace_edit_suggestions: Vec::new(),
             terminal_classification: None,
+            skipped: false,
         },
     }
 }
@@ -432,14 +476,15 @@ pub async fn solve_selected_records(
             "solve-check skipped: no repodata available from disk cache".into(),
         ]);
     }
-    solve_selected_records_from_records(
+    solve_on_blocking_pool(
         parsed_specs,
-        &record_set.records,
-        target_python,
+        Arc::clone(&record_set),
+        target_python.to_string(),
         channel_priority,
-        system_requirements,
+        system_requirements.clone(),
         strategy,
     )
+    .await
 }
 
 /// Compute the disk-cache path for repodata. Must match probe.rs's
@@ -894,6 +939,32 @@ mod tests {
         name: &str,
     ) -> Option<&'a GenericVirtualPackage> {
         vps.iter().find(|vp| vp.name.as_normalized() == name)
+    }
+
+    #[test]
+    fn run_solve_check_with_no_channels_abstains() {
+        // v1.4.0 regression (caught by tests/jsonrpc_protocol.rs):
+        // with no channels (or none loadable), the check must ABSTAIN
+        // (skipped=true, no terminal classification), not report a
+        // pseudo-unsat that the refinement loop classifies as
+        // cascade-exhausted and the fail gate turns into a hard
+        // conda/outputs error. A diagnostic that never ran must not
+        // veto the build.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let outcome = rt.block_on(run_solve_check(
+            &[],
+            &["python ==3.11".to_string()],
+            "3.11",
+            "linux-64",
+            ChannelPriority::Strict,
+            &std::collections::BTreeMap::new(),
+        ));
+        assert!(outcome.skipped, "no channels -> the check must abstain");
+        assert!(!outcome.satisfiable, "skipped is not a sat verdict either");
+        assert!(outcome.terminal_classification.is_none());
     }
 
     #[test]

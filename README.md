@@ -36,9 +36,10 @@ your-project/
 
 ### Workspace `pixi.toml` (your existing manifest, at the project root)
 
-Add `preview = ["pixi-build"]` and declare the source package. Every
-`[retread-wheels]` entry that shares a `bundle` collapses into one conda
-output, so the workspace declares that single name and gets the whole pack:
+Add `preview = ["pixi-build"]` and declare the source package. With
+`retread-bundle = "<name>"` set (below), every `[retread-wheels]` entry
+collapses into one conda output, so the workspace declares that single name
+and gets the whole pack:
 
 ```toml
 [workspace]
@@ -66,6 +67,10 @@ retread-build-number = 0
 # Pack target python. Defaults to 3.11. A list (["3.11","3.12"]) needs every
 # entry to ship a wheel for every python -- see Multi-Python.
 retread-python       = "3.11"
+# Default bundle group (v1.4.0): every entry below lands in this one conda
+# output. Omit it and each entry produces its own output; a per-entry
+# `bundle = "..."` overrides the default for mixed grouping.
+retread-bundle       = "isaac-pack"
 # retread-relax is OPTIONAL; default is the solve-driven cascade (see below).
 
 # Named git sources, referenced by `from = "<name>"`. Keeps each rev in one place.

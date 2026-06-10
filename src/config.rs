@@ -96,6 +96,22 @@ pub struct RetreadConfig {
     #[serde(default, rename = "retread-conda-deps", alias = "conda-deps")]
     pub conda_deps: Vec<String>,
 
+    /// v1.4.0: default `bundle` group for every `[retread-wheels]`
+    /// entry that doesn't set its own `bundle` field. Saves repeating
+    /// `bundle = "<name>"` on every entry of a single-output pack:
+    ///
+    /// ```toml
+    /// [package.build.config]
+    /// retread-bundle = "isaac-pack"
+    /// ```
+    ///
+    /// A per-entry `bundle` still wins, so mixed grouping (some
+    /// entries in the default group, some elsewhere or standalone)
+    /// stays expressible. Unset preserves the historical behavior:
+    /// entries without `bundle` each produce their own conda output.
+    #[serde(default, rename = "retread-bundle", alias = "default-bundle")]
+    pub default_bundle: Option<String>,
+
     /// Named git sources, referenced from `[retread-wheels]` entries
     /// via `from = "<name>"`. Avoids repeating `git = "..."` + `rev =
     /// "..."` across many sub-package entries from the same repo.
@@ -465,6 +481,26 @@ mod tests {
         assert_eq!(isaac.normalized_version().unwrap(), "5.1.0");
         assert!(isaac.is_spec());
         assert_eq!(isaac.extras, vec!["all", "extscache"]);
+    }
+
+    #[test]
+    fn parses_retread_bundle_key() {
+        // v1.4.0: pack-wide default bundle group. Invariant #6: every
+        // new config field needs a serde test or stale binaries reject
+        // user pixi.toml with "unknown field" during upgrades.
+        let json = serde_json::json!({
+            "retread-wheels": { "foo": { "version": "==1.0" } },
+            "retread-bundle": "isaac-pack",
+        });
+        let cfg: RetreadConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.default_bundle.as_deref(), Some("isaac-pack"));
+
+        // Unset stays None (historical per-entry-output behavior).
+        let json = serde_json::json!({
+            "retread-wheels": { "foo": { "version": "==1.0" } },
+        });
+        let cfg: RetreadConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.default_bundle, None);
     }
 
     #[test]

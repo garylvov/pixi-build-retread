@@ -59,6 +59,7 @@ fn baseline_config() -> RetreadConfig {
         drop_deps: Vec::new(),
         auto_bundle: false,
         conda_deps: Vec::new(),
+        default_bundle: None,
         git_sources: std::collections::BTreeMap::new(),
         python: None,
     }

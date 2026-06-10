@@ -1,0 +1,27 @@
+# Source package that re-emits Isaac Sim 6.0 as a conda package via
+# pixi-build-retread. Counterpart to examples/gigastrap/isaac-pack
+# (Isaac Sim 5.1); exists to reproduce/regress the Isaac Sim 6 routing
+# issue: PyPI-only isaacsim-*/nvidia-* deps must be auto-bundled from
+# pypi.nvidia.com (cascade step 8, v1.3.0+), never emitted as conda
+# run-deps that the solver can't satisfy.
+
+[package]
+name = "isaac-pack-6"
+version = "6.0.0.1"
+
+[package.build]
+# file:// channel points at the locally built retread artifact so
+# iteration doesn't require a prefix.dev upload between rebuilds.
+# `bash ../../scripts/rebuild-local.sh` produces the .conda there.
+backend = { name = "pixi-build-retread", version = "*", channels = ["file:///home/garylvov/projects/pixi-build-retread/local-channel", "https://prefix.dev/garylvov", "https://prefix.dev/conda-forge"] }
+
+[package.build.config]
+retread-relax        = "patch-then-minor-then-major-then-last-resort"
+retread-build-number = 0
+retread-python       = "3.12"
+# v1.4.0 pack-wide default bundle group (single entry today, but keeps
+# the shape identical to gigastrap's multi-entry pack).
+retread-bundle       = "isaac-pack-6"
+
+[package.build.config.retread-wheels]
+isaacsim = { version = "==6.0.0.1", index = "https://pypi.nvidia.com", extras = ["all", "extscache"] }

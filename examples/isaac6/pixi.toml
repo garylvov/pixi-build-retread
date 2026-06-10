@@ -1,0 +1,39 @@
+# Minimal workspace that reproduces the Isaac Sim 6.0 routing issue
+# through retread. Mirrors examples/gigastrap/ but stripped to the one
+# thing under test: isaacsim 6.0 repacked as a conda package.
+#
+# Isaac Sim 6.0 gotcha #1: the 6.0.0.x wheels on pypi.nvidia.com are
+# cp312-ONLY (5.1 was cp311). A workspace pinned to python 3.11 fails
+# at wheel resolution with "no wheel for isaacsim ==6.0.0.1 ... matches
+# target python=3.11" before any dep routing happens. This workspace
+# pins 3.12 throughout.
+#
+# Reproduce with (from this directory):
+#   pixi lock
+# First run downloads the isaacsim 6 wheel set into
+# isaac-pack/wheels/ (multi-GB with the extras; the 5.1 equivalent is
+# ~5.2G). Routing diagnostics land in
+# isaac-pack/retread-probe-trace-isaac-pack-6.json.
+
+[workspace]
+name = "isaac6"
+channels = ["https://prefix.dev/conda-forge"]
+channel-priority = "strict"
+platforms = ["linux-64"]
+preview = ["pixi-build"]
+build-variants = { python = ["3.12"] }
+
+[dependencies]
+python = "==3.12"
+pip = "*"
+isaac-pack-6 = { path = "./isaac-pack" }
+
+[feature.gpu.system-requirements]
+cuda = "12"
+
+[feature.gpu.dependencies]
+cuda-version = "==12.8"
+
+[environments]
+default = []
+gpu = { features = ["gpu"] }

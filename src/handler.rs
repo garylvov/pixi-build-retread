@@ -796,7 +796,10 @@ impl Handler {
                         for (dep, spec) in &effective.overrides {
                             merge_looser_override(&mut accumulated_overrides, dep, spec);
                         }
-                        if !outcome.satisfiable && !outcome.unsat_explanations.is_empty() {
+                        if !outcome.satisfiable
+                            && !outcome.skipped
+                            && !outcome.unsat_explanations.is_empty()
+                        {
                             // Print the FULL diagnostic to stderr in
                             // a banner so it survives pixi's log
                             // filtering even at default verbosity.
@@ -829,7 +832,11 @@ impl Handler {
                                 "pre-emission solve check UNSAT (see banner on stderr)",
                             );
                         }
-                        all_solve_attempted = true;
+                        // v1.4.0: a SKIPPED check (no repodata) is an
+                        // abstention -- it must not arm the fail gate.
+                        if !outcome.skipped {
+                            all_solve_attempted = true;
+                        }
                         envs_attempted += 1;
                         if outcome.satisfiable {
                             any_solve_passed = true;
@@ -879,6 +886,7 @@ impl Handler {
                                 refinement_steps: outcome.refinement_steps,
                                 workspace_edit_suggestions: outcome.workspace_edit_suggestions,
                                 terminal_classification: outcome.terminal_classification,
+                                skipped: outcome.skipped,
                             },
                         );
                     }
@@ -1026,6 +1034,7 @@ impl Handler {
                                         refinement_steps: Vec::new(),
                                         workspace_edit_suggestions: Vec::new(),
                                         terminal_classification: None,
+                                        skipped: outcome.skipped,
                                     },
                                 );
                                 tracing::info!(
@@ -1472,7 +1481,7 @@ async fn resolve_all(
     let mut groups: std::collections::BTreeMap<String, Vec<(String, WheelEntry)>> =
         std::collections::BTreeMap::new();
     for (entry_name, entry) in &effective.retread_wheels {
-        let group_name = entry.bundle.clone().unwrap_or_else(|| entry_name.clone());
+        let group_name = bundle_group_for(entry_name, entry, effective.default_bundle.as_deref());
         groups
             .entry(group_name)
             .or_default()
@@ -1676,16 +1685,25 @@ async fn discover_emissions(
         // this output. Two envs sharing the same output must coexist
         // under whatever retread emits; intersecting their constraints
         // (via comma-AND) gives the conda solver the right shape.
-        let mut accumulated: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for env in &d.envs {
-            let trans = crate::workspace::extract_transitive_constraints(
+        //
+        // v1.4.0: the per-env extractions are independent at this
+        // stage (no seed_overrides flow between them -- that's the
+        // MAIN env loop's contract, not this one), so run them
+        // concurrently. join_all preserves input order, keeping the
+        // accumulated clause order (and thus the joined spec strings)
+        // deterministic.
+        let env_results = futures::future::join_all(d.envs.iter().map(|env| {
+            crate::workspace::extract_transitive_constraints(
                 manifest,
                 env,
                 target_python,
                 &channels,
                 bundle_names,
             )
-            .await;
+        }))
+        .await;
+        let mut accumulated: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for trans in env_results {
             for (dep, specs) in trans {
                 let entry = accumulated.entry(dep).or_default();
                 for s in specs {
@@ -2325,6 +2343,21 @@ async fn iterative_solve_refinement(
             outcome.refinement_steps = refinement_steps;
             return Ok(outcome);
         }
+        if outcome.skipped {
+            // v1.4.0: the check COULD NOT RUN (no channels / no
+            // repodata). Abstain: don't classify the "no repodata"
+            // text as an unsat chain, don't widen anything, don't
+            // burn MAX_REFINEMENT rounds against a checker with zero
+            // information. terminal_classification stays None so the
+            // fail gate downstream doesn't treat this as a
+            // workspace-blocked env.
+            tracing::warn!(
+                env = %env_name,
+                "solve check skipped (no repodata available); emitting without pre-emission verification",
+            );
+            outcome.refinement_steps = refinement_steps;
+            return Ok(outcome);
+        }
 
         // v0.36.0: per-chain verdicts (no aggregate-class collapse).
         let chains = crate::solve_check::extract_blocking_chains(&outcome.unsat_explanations);
@@ -2656,6 +2689,16 @@ async fn pre_emit_widen_pass(
         .collect();
     let tiered = effective.relax.has_tiered_cascade();
     let allows_mut = effective.relax.allows_widening_mutation();
+    // Phase A (pure, no awaits): collect probe candidates. The skip
+    // filters mirror the previous serial loop exactly.
+    struct PreEmitCandidate {
+        raw: String,
+        pypi_name: Option<String>,
+        pypi_specs: Option<VersionSpecifiers>,
+        conda_name: String,
+        spec: String,
+    }
+    let mut candidates: Vec<PreEmitCandidate> = Vec::new();
     for raw in raw_lines {
         // Capture the original PyPI name + specifiers from the raw
         // requires_dist line. Needed for tiered-cascade PyPI fallback.
@@ -2692,7 +2735,16 @@ async fn pre_emit_widen_pass(
         if spec.is_empty() || spec == "*" {
             continue;
         }
-        if bundled_names.contains(&conda_name) {
+        // Match the bundle's vendored wheels on EITHER namespace: the
+        // wheels are recorded under PyPI names, but name_map may
+        // translate this dep's emission to a different conda name
+        // (tinyobjloader -> tinyobjloader-python). Same skew class as
+        // the produce_output drop filters (v1.4.x).
+        if bundled_names.contains(&conda_name)
+            || pypi_name
+                .as_ref()
+                .is_some_and(|p| bundled_names.contains(&conda_name_from(p)))
+        {
             continue;
         }
         if effective.overrides.contains_key(&conda_name) {
@@ -2701,15 +2753,56 @@ async fn pre_emit_widen_pass(
         if !seen_probes.insert((conda_name.clone(), spec.clone())) {
             continue;
         }
+        candidates.push(PreEmitCandidate {
+            raw,
+            pypi_name,
+            pypi_specs,
+            conda_name,
+            spec,
+        });
+    }
 
-        // Step 1: probe the base-level spec. Always recorded.
-        let strict_probe = crate::probe::probe(
-            conda_channels,
-            &conda_name,
-            &spec,
-            Some(&target.python_version),
-        )
-        .await;
+    // Phase B (v1.4.0): batch every step-1 probe through probe_many
+    // (16-way bounded) instead of one serial await per dep. ~80 deps
+    // per bundle previously meant ~80 sequential awaits here.
+    // buffer_unordered yields in completion order, so results are
+    // re-keyed by (package, spec) -- unique per candidate thanks to
+    // the seen_probes dedup above.
+    let pairs: Vec<(String, String)> = candidates
+        .iter()
+        .map(|c| (c.conda_name.clone(), c.spec.clone()))
+        .collect();
+    let mut probes_by_key: std::collections::HashMap<(String, String), crate::probe::ProbeResult> =
+        crate::probe::probe_many(conda_channels, pairs, Some(&target.python_version))
+            .await
+            .into_iter()
+            .map(|r| ((r.package.clone(), r.spec.clone()), r))
+            .collect();
+
+    // Phase C: record decisions + run cascades serially in candidate
+    // order. Cascades mutate bundle/effective, so they stay serial;
+    // the fresh overrides re-check below preserves the old serial
+    // semantics where an earlier candidate's injected override skips
+    // later candidates of the same dep.
+    for c in candidates {
+        let PreEmitCandidate {
+            raw,
+            pypi_name,
+            pypi_specs,
+            conda_name,
+            spec,
+        } = c;
+        if effective.overrides.contains_key(&conda_name) {
+            continue;
+        }
+        let Some(strict_probe) = probes_by_key.remove(&(conda_name.clone(), spec.clone())) else {
+            tracing::debug!(
+                dep = %conda_name,
+                spec = %spec,
+                "pre-emit widen: probe result missing from batch; skipping",
+            );
+            continue;
+        };
         let stage1 = if tiered {
             "tiered-cascade-step1-conda"
         } else {
@@ -2813,6 +2906,18 @@ async fn pre_emit_widen_pass(
         }
     }
     Ok(())
+}
+
+/// Bundle group for a `[retread-wheels]` entry: the per-entry `bundle`
+/// field wins, then the pack-wide `retread-bundle` default (v1.4.0),
+/// then standalone (the entry's own name -- one conda output per
+/// entry, the historical behavior).
+fn bundle_group_for(entry_name: &str, entry: &WheelEntry, default_bundle: Option<&str>) -> String {
+    entry
+        .bundle
+        .clone()
+        .or_else(|| default_bundle.map(String::from))
+        .unwrap_or_else(|| entry_name.to_string())
 }
 
 /// Index fallback chain for the cascade's PyPI bundling steps, tried
@@ -3212,10 +3317,13 @@ async fn tiered_cascade_for_dep(
     // explicitly forced the conda side via retread-conda-deps, or the
     // probe was indecisive (a channel fetch failure must not silently
     // reroute deps that conda may well have).
-    let user_forced_conda = effective
-        .conda_deps
-        .iter()
-        .any(|n| conda_name_from(n) == conda_name);
+    // retread-conda-deps entries are PyPI names by documented
+    // convention, but accept either namespace: the dep's emission name
+    // may differ from its PyPI name via name_map.
+    let user_forced_conda = effective.conda_deps.iter().any(|n| {
+        let norm = conda_name_from(n);
+        norm == conda_name || norm == conda_name_from(pypi_name)
+    });
     if name_level_probe.is_definitively_unsatisfied() && !user_forced_conda {
         let any_specs = pypi_specs.cloned().unwrap_or_else(VersionSpecifiers::empty);
         if try_pypi_bundle(
@@ -4266,8 +4374,34 @@ async fn auto_bundle_transitives(
         // side, relax the offending editable's pyproject pin directly
         // (it's your code).
 
+        // v1.4.0: batch this round's prefer-conda probes (16-way
+        // bounded) instead of one serial await per candidate. The
+        // name-level + PyPI fallback steps below stay serial -- they
+        // only run for the few definitively-unsat candidates, against
+        // the already-warm in-memory repodata cache.
+        let prefer_pairs: Vec<(String, String)> = candidates
+            .iter()
+            .filter(|(name, _)| prefer_conda_match(&conda_name_from(name), &config.name_map))
+            .map(|(name, version)| {
+                let conda_name = conda_name_from(name);
+                (
+                    config.name_map[&conda_name].clone(),
+                    probe_spec_for(version, config.relax),
+                )
+            })
+            .collect();
+        let prefer_probes: std::collections::HashMap<(String, String), crate::probe::ProbeResult> =
+            crate::probe::probe_many(conda_channels, prefer_pairs, Some(&target.python_version))
+                .await
+                .into_iter()
+                .map(|r| ((r.package.clone(), r.spec.clone()), r))
+                .collect();
+
         let mut added_any = false;
-        'next_candidate: for (name, version) in candidates {
+        // Candidates routed to PyPI this round; fetched concurrently
+        // after the (serial, mutating) routing decisions below.
+        let mut to_fetch: Vec<(String, String, String, VersionSpecifiers)> = Vec::new();
+        for (name, version) in candidates {
             let conda_name = conda_name_from(&name);
             if prefer_conda_match(&conda_name, &config.name_map) {
                 // Probe the workspace's conda channels for whether the
@@ -4281,13 +4415,22 @@ async fn auto_bundle_transitives(
                 // reshape routing.
                 let conda_target_name = config.name_map[&conda_name].clone();
                 let probe_spec = probe_spec_for(&version, config.relax);
-                let probe_result = crate::probe::probe(
-                    conda_channels,
-                    &conda_target_name,
-                    &probe_spec,
-                    Some(&target.python_version),
-                )
-                .await;
+                let probe_result =
+                    match prefer_probes.get(&(conda_target_name.clone(), probe_spec.clone())) {
+                        Some(r) => r.clone(),
+                        // Defensive: shouldn't happen (pairs built from the
+                        // same predicate), but fall back to a direct probe
+                        // rather than mis-routing.
+                        None => {
+                            crate::probe::probe(
+                                conda_channels,
+                                &conda_target_name,
+                                &probe_spec,
+                                Some(&target.python_version),
+                            )
+                            .await
+                        }
+                    };
                 let routing_decision = if probe_result.is_definitively_unsatisfied() {
                     "fall-through-to-pypi"
                 } else if probe_result.is_satisfied() {
@@ -4389,61 +4532,88 @@ async fn auto_bundle_transitives(
                     continue;
                 }
             };
-            for index in &indexes {
-                match pypi::resolve(index, &name, &specifiers, target).await {
-                    Ok(resolved) => {
-                        let metadata = match fetch_and_parse(
-                            &resolved.url,
-                            resolved.sha256.as_deref(),
-                            download_dir,
-                        )
-                        .await
-                        {
-                            Ok(m) => m,
+            to_fetch.push((name, version, conda_name, specifiers));
+        }
+
+        // v1.4.0: fetch this round's PyPI-bound wheels concurrently
+        // (8-way bounded). `buffered` (not buffer_unordered) preserves
+        // candidate order, so extras order -- and therefore the next
+        // round's Requires-Dist scan order -- stays deterministic.
+        // Per item, the index fallback chain is still walked serially
+        // exactly as before: a resolve failure tries the next index, a
+        // FETCH failure gives up on the candidate (leaves it as a
+        // conda dep), exhaustion logs the retread-drop-deps hint.
+        let fetched: Vec<Option<(String, String, ResolvedWheel)>> = {
+            use futures::stream::{self, StreamExt};
+            let indexes_ref = &indexes;
+            stream::iter(to_fetch)
+                .map(|(name, version, conda_name, specifiers)| async move {
+                    for index in indexes_ref {
+                        match pypi::resolve(index, &name, &specifiers, target).await {
+                            Ok(resolved) => {
+                                match fetch_and_parse(
+                                    &resolved.url,
+                                    resolved.sha256.as_deref(),
+                                    download_dir,
+                                )
+                                .await
+                                {
+                                    Ok(metadata) => {
+                                        return Some((
+                                            name,
+                                            version,
+                                            ResolvedWheel {
+                                                pypi_name: conda_name,
+                                                url: resolved.url,
+                                                metadata,
+                                                extras_requested: vec![],
+                                                auto_data: None,
+                                                auto_data_dedup_skipped_root: None,
+                                            },
+                                        ));
+                                    }
+                                    Err(e) => {
+                                        tracing::debug!(
+                                            dep = %name,
+                                            error = %format!("{e:#}"),
+                                            "auto-bundle fetch failed; leaving as conda dep"
+                                        );
+                                        return None;
+                                    }
+                                }
+                            }
                             Err(e) => {
                                 tracing::debug!(
                                     dep = %name,
+                                    version = %version,
+                                    index = %index,
                                     error = %format!("{e:#}"),
-                                    "auto-bundle fetch failed; leaving as conda dep"
+                                    "auto-bundle resolve failed on this index"
                                 );
-                                continue 'next_candidate;
                             }
-                        };
-                        tracing::info!(
-                            dep = %name,
-                            version = %version,
-                            index = %index,
-                            "auto-bundled into {}",
-                            bundle.conda_name,
-                        );
-                        bundle.extras.push(ResolvedWheel {
-                            pypi_name: conda_name,
-                            url: resolved.url,
-                            metadata,
-                            extras_requested: vec![],
-                            auto_data: None,
-                            auto_data_dedup_skipped_root: None,
-                        });
-                        added_any = true;
-                        continue 'next_candidate;
+                        }
                     }
-                    Err(e) => {
-                        tracing::debug!(
-                            dep = %name,
-                            version = %version,
-                            index = %index,
-                            error = %format!("{e:#}"),
-                            "auto-bundle resolve failed on this index"
-                        );
-                    }
-                }
-            }
-            tracing::debug!(
+                    tracing::debug!(
+                        dep = %name,
+                        version = %version,
+                        "auto-bundle exhausted all indexes; leaving as conda dep. \
+                         If conda can't satisfy it, add to retread-drop-deps."
+                    );
+                    None
+                })
+                .buffered(8)
+                .collect()
+                .await
+        };
+        for (name, version, wheel) in fetched.into_iter().flatten() {
+            tracing::info!(
                 dep = %name,
                 version = %version,
-                "auto-bundle exhausted all indexes; leaving as conda dep. \
-                 If conda can't satisfy it, add to retread-drop-deps."
+                "auto-bundled into {}",
+                bundle.conda_name,
             );
+            bundle.extras.push(wheel);
+            added_any = true;
         }
 
         // Loop again only if we added at least one wheel; the new
@@ -4841,15 +5011,31 @@ fn produce_output(
                 continue;
             };
             // Skip if this dep refers to another wheel we're vendoring.
+            //
+            // v1.4.0: check BOTH the translated conda name AND the raw
+            // line's PyPI name. The cascade records bundled wheels and
+            // drops under the PYPI name (e.g. `tinyobjloader`), but
+            // name_map/parselmouth may translate the emission to a
+            // DIFFERENT conda name (`tinyobjloader-python`). Matching
+            // only the conda name shipped a doomed conda run-dep
+            // alongside the already-bundled wheel -- found via
+            // examples/isaac6 (isaacsim 6.0's tinyobjloader dep).
             let dep_name = dep.0.split_whitespace().next().unwrap_or("").to_string();
-            if vendored.contains(&dep_name) {
+            let parsed_raw: Option<uv_pep508::Requirement> =
+                uv_pep508::Requirement::from_str(raw).ok();
+            let raw_pypi_name: Option<String> =
+                parsed_raw.map(|r| conda_name_from(r.name.as_ref()));
+            let in_set = |set: &HashSet<String>| {
+                set.contains(&dep_name) || raw_pypi_name.as_ref().is_some_and(|p| set.contains(p))
+            };
+            if in_set(&vendored) {
                 continue;
             }
-            if user_dropped.contains(&dep_name) {
+            if in_set(&user_dropped) {
                 tracing::debug!(dep = %dep_name, "dropping per retread-drop-deps");
                 continue;
             }
-            if auto_dropped.contains(&dep_name) {
+            if in_set(&auto_dropped) {
                 // Surface this prominently so the user has a chance to
                 // notice if the auto-drop ate something they actually need.
                 tracing::warn!(
@@ -5017,6 +5203,32 @@ async fn post_emit_widen_pass(
     decisions: &mut Vec<crate::audit::ProbeDecision>,
 ) -> Result<()> {
     let allows_mut = policy.allows_widening_mutation();
+    // v1.4.0: batch the per-dep probes (16-way bounded) instead of one
+    // serial await per emitted run-dep (~80 per bundle). Pairs are
+    // deduped because probe_many yields in completion order and
+    // results are re-keyed by (package, spec).
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    let mut seen_pairs: HashSet<(String, String)> = HashSet::new();
+    for spec in output.run_dependencies.depends.iter() {
+        let name_str = spec.name.as_str().to_string();
+        if name_str == "python" {
+            continue;
+        }
+        let spec_str = format_packagespec(&spec.spec);
+        if spec_str.is_empty() || spec_str == "*" {
+            continue;
+        }
+        if seen_pairs.insert((name_str.clone(), spec_str.clone())) {
+            pairs.push((name_str, spec_str));
+        }
+    }
+    let probes_by_key: std::collections::HashMap<(String, String), crate::probe::ProbeResult> =
+        crate::probe::probe_many(conda_channels, pairs, Some(target_python))
+            .await
+            .into_iter()
+            .map(|r| ((r.package.clone(), r.spec.clone()), r))
+            .collect();
+
     for spec in output.run_dependencies.depends.iter_mut() {
         let name_str = spec.name.as_str().to_string();
         if name_str == "python" {
@@ -5026,8 +5238,9 @@ async fn post_emit_widen_pass(
         if spec_str.is_empty() || spec_str == "*" {
             continue;
         }
-        let probe_result =
-            crate::probe::probe(conda_channels, &name_str, &spec_str, Some(target_python)).await;
+        let Some(probe_result) = probes_by_key.get(&(name_str.clone(), spec_str.clone())) else {
+            continue;
+        };
         let routing_decision = if probe_result.is_definitively_unsatisfied() {
             if allows_mut {
                 "widened-to-any-version"
@@ -5099,7 +5312,11 @@ fn wildcard_packagespec() -> PackageSpec {
 /// terminal -- a file does. Skipped silently when every env is SAT
 /// (no failure = no summary to write).
 async fn write_solve_failed_summary(bundle: &Bundle, source_dir: &Path) -> Result<()> {
-    let any_unsat = bundle.solve_diagnostics.values().any(|d| !d.satisfiable);
+    // Skipped checks are abstentions ("unknown"), not failures.
+    let any_unsat = bundle
+        .solve_diagnostics
+        .values()
+        .any(|d| !d.satisfiable && !d.skipped);
     let path = source_dir.join(format!("RETREAD-SOLVE-FAILED-{}.md", bundle.conda_name));
     if !any_unsat {
         // Remove a stale file from a previous failed run; clean state.
@@ -5795,6 +6012,7 @@ mod tests {
             drop_deps: Vec::new(),
             auto_bundle: false,
             conda_deps: Vec::new(),
+            default_bundle: None,
             git_sources: std::collections::BTreeMap::new(),
             python: None,
         };
@@ -5824,6 +6042,7 @@ mod tests {
             drop_deps: Vec::new(),
             auto_bundle: false,
             conda_deps: Vec::new(),
+            default_bundle: None,
             git_sources: std::collections::BTreeMap::new(),
             python: None,
         };
@@ -5853,6 +6072,7 @@ mod tests {
             drop_deps: Vec::new(),
             auto_bundle: false,
             conda_deps: Vec::new(),
+            default_bundle: None,
             git_sources: std::collections::BTreeMap::new(),
             python: None,
         };
@@ -6192,6 +6412,7 @@ mod tests {
             drop_deps: Vec::new(),
             auto_bundle: false,
             conda_deps: Vec::new(),
+            default_bundle: None,
             git_sources: std::collections::BTreeMap::new(),
             python: None,
         }
@@ -6255,6 +6476,88 @@ mod tests {
             v["index"] = serde_json::Value::String(idx.to_string());
         }
         serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn name_mapped_dep_dropped_by_pypi_name() {
+        // v1.4.0 regression (found via examples/isaac6): the cascade
+        // bundles a wheel and records the drop under the PYPI name
+        // ("tinyobjloader"), but name_map translates the emission to a
+        // different conda name ("tinyobjloader-python"). The drop and
+        // vendored filters must match on EITHER name -- before this,
+        // the doomed conda run-dep shipped alongside the bundled wheel
+        // and the solve died with "No candidates were found for
+        // tinyobjloader-python".
+        let mut config = cfg();
+        config
+            .name_map
+            .insert("tinyobjloader".into(), "tinyobjloader-python".into());
+
+        // Case 1: drop recorded under the PyPI name (what the cascade
+        // pushes).
+        let mut dropped_cfg = config.clone();
+        dropped_cfg.drop_deps.push("tinyobjloader".into());
+        let bundle = solo_bundle(
+            "isaac-pack-6",
+            vec!["tinyobjloader==2.0.0rc13", "numpy==1.26.0"],
+        );
+        let output = produce_output(&bundle, &dropped_cfg, Platform::Linux64, "3.12", &[]).unwrap();
+        let names: Vec<String> = output
+            .run_dependencies
+            .depends
+            .iter()
+            .map(|d| d.name.as_str().to_string())
+            .collect();
+        assert!(
+            !names.iter().any(|n| n.contains("tinyobjloader")),
+            "pypi-name drop must also drop the name-mapped conda emission; got: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "numpy"),
+            "control dep must survive"
+        );
+
+        // Case 2: the wheel is vendored in the bundle under the PyPI
+        // name (what try_pypi_bundle pushes to extras).
+        let mut vendored_bundle = solo_bundle("isaac-pack-6", vec!["tinyobjloader==2.0.0rc13"]);
+        vendored_bundle.extras.push(rw(
+            "tinyobjloader",
+            meta("tinyobjloader", "2.0.0rc13", vec![], true),
+        ));
+        let output =
+            produce_output(&vendored_bundle, &config, Platform::Linux64, "3.12", &[]).unwrap();
+        let names: Vec<String> = output
+            .run_dependencies
+            .depends
+            .iter()
+            .map(|d| d.name.as_str().to_string())
+            .collect();
+        assert!(
+            !names.iter().any(|n| n.contains("tinyobjloader")),
+            "vendored wheel must drop the name-mapped conda emission; got: {names:?}"
+        );
+    }
+
+    #[test]
+    fn bundle_group_default_and_precedence() {
+        // v1.4.0 retread-bundle: per-entry bundle > pack default >
+        // standalone (entry's own name).
+        let plain = spec_entry("==1.0", None);
+        let mut grouped = spec_entry("==1.0", None);
+        grouped.bundle = Some("other-pack".into());
+
+        // No default: entry without bundle is standalone.
+        assert_eq!(bundle_group_for("foo", &plain, None), "foo");
+        // Default fills in for entries without a bundle.
+        assert_eq!(
+            bundle_group_for("foo", &plain, Some("isaac-pack")),
+            "isaac-pack"
+        );
+        // Per-entry bundle wins over the default (mixed mode).
+        assert_eq!(
+            bundle_group_for("foo", &grouped, Some("isaac-pack")),
+            "other-pack"
+        );
     }
 
     #[test]

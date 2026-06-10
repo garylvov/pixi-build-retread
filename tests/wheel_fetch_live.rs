@@ -90,6 +90,7 @@ async fn fetch_isaacsim_kernel_end_to_end() {
         drop_deps: Vec::new(),
         auto_bundle: false,
         conda_deps: Vec::new(),
+        default_bundle: None,
         git_sources: std::collections::BTreeMap::new(),
         python: None,
     };
