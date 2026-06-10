@@ -243,10 +243,11 @@ impl WorkspaceManifest {
     /// can only find a wheel, never mis-route a dep.
     pub fn all_pypi_index_urls(&self) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
-        let all = self
-            .pypi_index_urls
-            .iter()
-            .chain(self.features.values().flat_map(|f| f.pypi_index_urls.iter()));
+        let all = self.pypi_index_urls.iter().chain(
+            self.features
+                .values()
+                .flat_map(|f| f.pypi_index_urls.iter()),
+        );
         for url in all {
             if !out.contains(url) {
                 out.push(url.clone());

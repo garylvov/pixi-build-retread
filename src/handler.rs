@@ -3217,9 +3217,7 @@ async fn tiered_cascade_for_dep(
         .iter()
         .any(|n| conda_name_from(n) == conda_name);
     if name_level_probe.is_definitively_unsatisfied() && !user_forced_conda {
-        let any_specs = pypi_specs
-            .cloned()
-            .unwrap_or_else(VersionSpecifiers::empty);
+        let any_specs = pypi_specs.cloned().unwrap_or_else(VersionSpecifiers::empty);
         if try_pypi_bundle(
             bundle,
             effective,
@@ -6262,15 +6260,20 @@ mod tests {
     #[test]
     fn pypi_fallback_indexes_dedups_entries_and_appends_public() {
         let mut config = cfg();
-        config
-            .retread_wheels
-            .insert("isaacsim".into(), spec_entry("==6.0.0", Some("https://pypi.nvidia.com")));
-        config
-            .retread_wheels
-            .insert("isaacsim-extra".into(), spec_entry("==6.0.0", Some("https://pypi.nvidia.com")));
+        config.retread_wheels.insert(
+            "isaacsim".into(),
+            spec_entry("==6.0.0", Some("https://pypi.nvidia.com")),
+        );
+        config.retread_wheels.insert(
+            "isaacsim-extra".into(),
+            spec_entry("==6.0.0", Some("https://pypi.nvidia.com")),
+        );
         config.retread_wheels.insert(
             "pytorch3d".into(),
-            spec_entry("==0.7.8", Some("https://miropsota.github.io/torch_packages_builder")),
+            spec_entry(
+                "==0.7.8",
+                Some("https://miropsota.github.io/torch_packages_builder"),
+            ),
         );
         config.retread_wheels.insert(
             "urlform".into(),
@@ -6324,9 +6327,10 @@ extra-index-urls = ["https://py.mujoco.org", "https://download.pytorch.org/whl/c
         .unwrap();
         let ws = crate::workspace::WorkspaceManifest::from_toml(&manifest);
         let mut config = cfg();
-        config
-            .retread_wheels
-            .insert("isaacsim".into(), spec_entry("==6.0.0", Some("https://pypi.nvidia.com")));
+        config.retread_wheels.insert(
+            "isaacsim".into(),
+            spec_entry("==6.0.0", Some("https://pypi.nvidia.com")),
+        );
         assert_eq!(
             pypi_fallback_indexes(&config, Some(&ws)),
             vec![
@@ -6460,7 +6464,10 @@ extra-index-urls = ["https://py.mujoco.org", "https://download.pytorch.org/whl/c
             .conda_deps
             .iter()
             .any(|n| conda_name_from(n) == "isaacsim-kernel");
-        assert!(forced, "conda_deps guard must normalize names the way emission does");
+        assert!(
+            forced,
+            "conda_deps guard must normalize names the way emission does"
+        );
     }
 
     #[test]
