@@ -11,7 +11,7 @@ use uv_pep508::uv_pep440::VersionSpecifiers;
 
 use crate::config::{RelaxPolicy, RetreadConfig, WheelEntry};
 use crate::pypi;
-use crate::relax::conda_name_simple;
+use crate::relax::canonical_conda_name;
 
 use super::auto_bundle::metadata_preferring_sidecar;
 use super::{Bundle, ResolvedWheel};
@@ -83,6 +83,9 @@ pub(crate) fn merge_looser_override(
     let new_level = widening_level(candidate);
     let existing_level = accum.get(dep).map(|s| widening_level(s)).unwrap_or(0);
     if new_level > existing_level {
+        // 0c boundary contract (debug-only): widened specs entering
+        // the accumulation chokepoint must parse as MatchSpecs.
+        crate::relax::assert_spec_roundtrips(dep, candidate);
         accum.insert(dep.to_string(), candidate.to_string());
     }
 }
@@ -780,7 +783,7 @@ pub(crate) async fn pre_emit_widen_pass(
     // probing them would mislead the widening.
     let bundled_names: std::collections::HashSet<String> = bundle
         .all_wheels()
-        .map(|w| conda_name_simple(&w.pypi_name))
+        .map(|w| canonical_conda_name(&w.pypi_name))
         .collect();
     // Dedup across multiple wheels declaring the same dep -- we only
     // need to probe each (conda_name, spec) once per bundle.
@@ -848,7 +851,7 @@ pub(crate) async fn pre_emit_widen_pass(
         if bundled_names.contains(&conda_name)
             || pypi_name
                 .as_ref()
-                .is_some_and(|p| bundled_names.contains(&conda_name_simple(p)))
+                .is_some_and(|p| bundled_names.contains(&canonical_conda_name(p)))
         {
             continue;
         }
@@ -1106,7 +1109,7 @@ pub(crate) async fn try_pypi_bundle(
                         "tiered-cascade: PyPI fallback bundled wheel; dropping conda emit",
                     );
                     bundle.extras.push(ResolvedWheel {
-                        pypi_name: conda_name_simple(pypi_name),
+                        pypi_name: canonical_conda_name(pypi_name),
                         url: resolved.url,
                         metadata,
                         extras_requested: vec![],
@@ -1427,8 +1430,8 @@ pub(crate) async fn tiered_cascade_for_dep(
     // convention, but accept either namespace: the dep's emission name
     // may differ from its PyPI name via name_map.
     let user_forced_conda = effective.conda_deps.iter().any(|n| {
-        let norm = conda_name_simple(n);
-        norm == conda_name || norm == conda_name_simple(pypi_name)
+        let norm = canonical_conda_name(n);
+        norm == conda_name || norm == canonical_conda_name(pypi_name)
     });
     if name_level_probe.is_definitively_unsatisfied() && !user_forced_conda {
         let any_specs = pypi_specs.cloned().unwrap_or_else(VersionSpecifiers::empty);

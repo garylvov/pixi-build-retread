@@ -1151,7 +1151,7 @@ fn tiered_cascade_step8_respects_retread_conda_deps() {
     let forced = effective
         .conda_deps
         .iter()
-        .any(|n| conda_name_simple(n) == "isaacsim-kernel");
+        .any(|n| canonical_conda_name(n) == "isaacsim-kernel");
     assert!(
         forced,
         "conda_deps guard must normalize names the way emission does"

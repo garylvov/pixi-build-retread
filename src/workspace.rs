@@ -573,7 +573,7 @@ pub async fn extract_transitive_constraints(
     let solve_specs: Vec<String> = deps
         .iter()
         .filter_map(|(dep_name, dep_spec)| {
-            let conda_name = crate::relax::conda_name_simple(dep_name);
+            let conda_name = crate::relax::canonical_conda_name(dep_name);
             if bundle_names.contains(&conda_name) {
                 return None;
             }

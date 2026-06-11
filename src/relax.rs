@@ -80,23 +80,26 @@ fn format_dep(name: &str, spec: &str) -> String {
     }
 }
 
-/// v1.5.x cleanup 0a: THE shared simple normalizer -- lowercase +
-/// `_` -> `-` only. This is the exact body the former twins
-/// `handler::conda_name_from` and `workspace::conda_normalize` both
-/// carried; unified here with zero behavior change. NOTE: `map_name`
-/// below applies FULL PEP 503 (collapses `. _ -` runs) -- the two are
-/// intentionally distinct until the explicit 0c semantic change.
-pub(crate) fn conda_name_simple(name: &str) -> String {
-    name.to_ascii_lowercase().replace('_', "-")
-}
-
-fn map_name(pypi: &str, overrides: &BTreeMap<String, String>) -> String {
-    if let Some(mapped) = overrides.get(pypi) {
-        return mapped.clone();
+/// v1.5.x cleanup 0c: THE canonical conda-name normalizer -- full
+/// PEP 503: lowercase, runs of `_ . -` collapsed to a single `-`,
+/// leading/trailing separators trimmed. This replaced the simpler
+/// underscore-only normalizer (the former `conda_name_from` /
+/// `conda_normalize` twins, briefly unified as `conda_name_simple`):
+/// the two normalizations disagreed on dotted names (`ruamel.yaml`),
+/// so a user's `retread-name-map` entry could be keyed under one form
+/// and looked up under the other and silently never match. One fn,
+/// one canonical form, bug class closed. NOTE: `map_name` does its
+/// override lookup on the RAW pypi string BEFORE canonicalizing, so
+/// user map keys written in any spelling keep matching.
+pub(crate) fn canonical_conda_name(name: &str) -> String {
+    // Rattler virtual packages (`__cuda`, `__glibc`, ...) are
+    // conda-side specials, never PyPI names -- PEP 503's
+    // separator-trim would corrupt them (`__cuda` -> `cuda`). Pass
+    // them through untouched (caught by the 0c anchor-surface test).
+    if name.starts_with("__") {
+        return name.to_ascii_lowercase();
     }
-    // PEP 503 normalization: lowercase, runs of _ . - collapsed to single -.
-    // Conda canonical form is also lowercase with single-dash separators.
-    let lower = pypi.to_ascii_lowercase();
+    let lower = name.to_ascii_lowercase();
     let mut out = String::with_capacity(lower.len());
     let mut prev_dash = false;
     for c in lower.chars() {
@@ -111,6 +114,51 @@ fn map_name(pypi: &str, overrides: &BTreeMap<String, String>) -> String {
         }
     }
     out.trim_matches('-').to_string()
+}
+
+fn map_name(pypi: &str, overrides: &BTreeMap<String, String>) -> String {
+    if let Some(mapped) = overrides.get(pypi) {
+        return mapped.clone();
+    }
+    canonical_conda_name(pypi)
+}
+
+/// v1.5.x cleanup 0c (grizzly finding #7): debug-time contract that a
+/// `(name, spec)` pair survives the string pipeline -- it must parse
+/// as a conda MatchSpec exactly as the downstream layers will parse
+/// it. Compiled out of release builds (the e2e gates guard the release
+/// path); in test/dev builds a layer emitting a malformed pair fails
+/// fast at the boundary that produced it instead of at a misleading
+/// downstream leaf (the v0.37.1 build-string-leak class).
+pub(crate) fn assert_spec_roundtrips(name: &str, spec: &str) {
+    #[cfg(debug_assertions)]
+    {
+        // Validate the parts the way downstream actually parses them:
+        // the spec portion as a VersionSpec (override-map values,
+        // comma-joins -- this is where the v0.37.1 embedded-space
+        // build-string leak broke), the name as a PackageName. NOTE:
+        // MatchSpec::from_str on the joined string is too lenient for
+        // this contract -- it happily reads an embedded space as a
+        // build-string separator, which is exactly the corruption the
+        // contract exists to catch.
+        debug_assert!(
+            spec.is_empty()
+                || rattler_conda_types::VersionSpec::from_str(
+                    spec,
+                    rattler_conda_types::ParseStrictness::Lenient
+                )
+                .is_ok(),
+            "spec pipeline contract violated: `{spec}` (for `{name}`) does not parse as a VersionSpec",
+        );
+        debug_assert!(
+            rattler_conda_types::PackageName::try_from(name).is_ok(),
+            "spec pipeline contract violated: `{name}` is not a valid conda package name",
+        );
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = (name, spec);
+    }
 }
 
 fn convert_specifiers(specifiers: &uv_pep440::VersionSpecifiers, policy: RelaxPolicy) -> String {
@@ -481,34 +529,111 @@ pub fn emit_python_version(primary_wheel_filename: &str, workspace_python_versio
 mod tests {
     use super::*;
 
+    // -----------------------------------------------------------------
+    // Cleanup 0c: the explicit PEP 503 semantic matrix. The 0a property
+    // test (legacy twin equivalence) is superseded by these -- the
+    // legacy underscore-only behavior is intentionally GONE for dotted
+    // and doubled-separator names; that divergence was the latent
+    // ruamel.yaml-class bug (a name-map entry keyed under one
+    // normalization and looked up under the other never matched).
+    // -----------------------------------------------------------------
+
     #[test]
-    fn conda_name_simple_matches_legacy_twins() {
-        // Cleanup 0a: this fn replaced the byte-identical twins
-        // handler::conda_name_from and workspace::conda_normalize
-        // (both `to_ascii_lowercase().replace('_', "-")`). The table
-        // pins EXACT legacy behavior -- including the cases where the
-        // simple normalizer deliberately differs from map_name's full
-        // PEP 503 (dots preserved, separator runs preserved). Those
-        // divergences are the 0c semantic change, not this one.
-        let legacy = |s: &str| s.to_ascii_lowercase().replace('_', "-");
-        for input in [
-            "numpy",
-            "opencv_python",
-            "Pillow",
-            "isaacsim_extscache_kit",
-            "ruamel.yaml", // dot PRESERVED by the simple normalizer
-            "a__b",        // run NOT collapsed (becomes "a--b")
+    fn canonical_conda_name_pep503_matrix() {
+        // Skip-set class: names normalize to one canonical form.
+        assert_eq!(canonical_conda_name("ruamel.yaml"), "ruamel-yaml");
+        assert_eq!(canonical_conda_name("a__b"), "a-b");
+        assert_eq!(canonical_conda_name("a.-_b"), "a-b");
+        assert_eq!(
+            canonical_conda_name("_leading.trailing_"),
+            "leading-trailing"
+        );
+        // Unchanged for the simple cases (the 99% path).
+        assert_eq!(canonical_conda_name("numpy"), "numpy");
+        assert_eq!(canonical_conda_name("opencv_python"), "opencv-python");
+        assert_eq!(canonical_conda_name("Pillow"), "pillow");
+        assert_eq!(
+            canonical_conda_name("nvidia-cuda-nvrtc-cu12"),
+            "nvidia-cuda-nvrtc-cu12"
+        );
+    }
+
+    #[test]
+    fn canonical_conda_name_abi_anchor_surface_unchanged_by_0c() {
+        // ABI-compare class (invariant #8): anchor checks happen on
+        // RAW conda-side names (depends arrays, emissions) that never
+        // pass through the pypi-name normalizer -- pinned here first.
+        use crate::conflict_classifier::is_abi_anchor;
+        let anchors = [
+            "python",
             "python_abi",
-            "nvidia-cuda-nvrtc-cu12",
-        ] {
+            "cuda-version",
+            "libstdcxx-ng",
+            "__cuda",
+        ];
+        for anchor in anchors {
+            assert!(is_abi_anchor(anchor), "raw anchor {anchor:?} must match");
+        }
+        // And for the paths that DO normalize pypi names: 0c changed
+        // nothing for these names relative to the pre-0c simple
+        // normalizer (underscore-to-dash happened under BOTH; no dots
+        // or doubled separators are involved). Pins that 0c introduced
+        // no NEW divergence on the anchor surface.
+        let pre_0c = |s: &str| s.to_ascii_lowercase().replace('_', "-");
+        for anchor in ["python", "python_abi", "cuda-version", "libstdcxx-ng"] {
             assert_eq!(
-                conda_name_simple(input),
-                legacy(input),
-                "divergence from legacy twins on {input:?}"
+                canonical_conda_name(anchor),
+                pre_0c(anchor),
+                "0c must not change normalization of anchor {anchor:?}"
             );
         }
-        assert_eq!(conda_name_simple("a__b"), "a--b");
-        assert_eq!(conda_name_simple("ruamel.yaml"), "ruamel.yaml");
+        // Virtual packages pass through untouched (the pre-0c simple
+        // normalizer mangled them to "--cuda"; nothing ever fed them
+        // through it, and the new fn makes the safe behavior explicit).
+        assert_eq!(canonical_conda_name("__cuda"), "__cuda");
+        assert_eq!(canonical_conda_name("__glibc"), "__glibc");
+    }
+
+    #[test]
+    fn name_map_override_keyed_on_raw_string_still_resolves() {
+        // Name-map class (grizzly guard): map_name does the override
+        // lookup on the RAW pypi string BEFORE canonicalizing, so a
+        // user key written as "ruamel.yaml" keeps matching even though
+        // the canonical form is "ruamel-yaml".
+        let mut overrides = BTreeMap::new();
+        overrides.insert("ruamel.yaml".to_string(), "custom-target".to_string());
+        assert_eq!(map_name("ruamel.yaml", &overrides), "custom-target");
+        // Without an override, the canonical form is produced.
+        assert_eq!(map_name("ruamel.yaml", &BTreeMap::new()), "ruamel-yaml");
+    }
+
+    #[test]
+    fn name_map_round_trip_through_translate() {
+        // Round-trip through the real consumer: a dotted-name dep line
+        // translates to its canonical conda name (pre-0c the lookup
+        // and the emission disagreed on this class).
+        let dep = t("ruamel.yaml==0.18.6", RelaxPolicy::Minor).unwrap();
+        assert!(
+            dep.starts_with("ruamel-yaml "),
+            "dotted pypi name must emit canonical conda name, got: {dep}"
+        );
+    }
+
+    #[test]
+    fn spec_roundtrip_contract() {
+        // Good pairs pass silently.
+        assert_spec_roundtrips("numpy", ">=1.26,<2");
+        assert_spec_roundtrips("pytorch", "");
+    }
+
+    #[test]
+    #[should_panic(expected = "spec pipeline contract violated")]
+    #[cfg(debug_assertions)]
+    fn spec_roundtrip_contract_trips_on_malformed() {
+        // The v0.37.1 class: a build string leaking into a comma-joined
+        // version spec produces an embedded space that MatchSpec
+        // rejects. The contract must fail fast at the boundary.
+        assert_spec_roundtrips("pytorch", ">=1.4,2.10.0 cuda*_mkl*303,>=2.10.0");
     }
 
     fn env() -> MarkerEnvironment {

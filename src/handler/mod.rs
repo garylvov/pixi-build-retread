@@ -46,7 +46,7 @@ use uv_pep508::uv_pep440::VersionSpecifiers;
 use crate::config::{RelaxPolicy, RetreadConfig, WheelEntry};
 use crate::pypi::{self, WheelTarget};
 use crate::recipe::{BundleSource, build_bundle_recipe, to_yaml};
-use crate::relax::{conda_name_simple, emit_python_version, marker_env_for};
+use crate::relax::{canonical_conda_name, emit_python_version, marker_env_for};
 use crate::rpc::{RpcError, ok, parse_params};
 use crate::wheel::{WheelMetadata, fetch_wheel};
 
@@ -168,7 +168,7 @@ async fn load_pypi_to_conda_map() -> PypiToCondaMap {
                         for (conda_name, pypi_list) in forward {
                             for pypi in pypi_list.unwrap_or_default() {
                                 inverse
-                                    .entry(conda_name_simple(&pypi))
+                                    .entry(canonical_conda_name(&pypi))
                                     .or_default()
                                     .push(conda_name.clone());
                             }
@@ -191,7 +191,7 @@ async fn load_pypi_to_conda_map() -> PypiToCondaMap {
     // the corresponding upstream issue). When the upstream issues are
     // fixed, the entries become harmless duplicates.
     for (pypi, conda) in FALLBACK_PYPI_TO_CONDA {
-        let key = conda_name_simple(pypi);
+        let key = canonical_conda_name(pypi);
         let entry = inverse.entry(key).or_default();
         if !entry.iter().any(|c| c == conda) {
             entry.push((*conda).to_string());
@@ -1534,7 +1534,7 @@ async fn resolve_all(
     //   3. Parselmouth's unambiguous (single-conda-name) entries.
     let mut effective = config.clone();
     for (pypi, conda) in FALLBACK_PYPI_TO_CONDA {
-        let key = conda_name_simple(pypi);
+        let key = canonical_conda_name(pypi);
         effective
             .name_map
             .entry(key)
@@ -1647,7 +1647,7 @@ async fn resolve_all(
             sub_bundles.push(sub);
         }
         let mut bundle = sub_bundles.remove(0);
-        bundle.conda_name = conda_name_simple(&group_name);
+        bundle.conda_name = canonical_conda_name(&group_name);
         for sub in sub_bundles {
             bundle.extras.push(sub.primary);
             bundle.extras.extend(sub.extras);
@@ -1895,6 +1895,11 @@ fn join_transitive_to_overrides(
             }
         };
         if !final_spec.is_empty() {
+            // NOTE: no assert_spec_roundtrips here -- this function
+            // self-validates above and deliberately falls back to a
+            // degraded-but-functional concat when the dedup'd spec
+            // doesn't parse (v0.37.0 D4). The boundary contract lives
+            // at the cascade accumulation chokepoint instead.
             out.insert(k, final_spec);
         }
     }
@@ -1978,7 +1983,7 @@ async fn resolve_bundle(
     name_map: &std::collections::BTreeMap<String, String>,
     conda_channels: &[ChannelUrl],
 ) -> Result<Bundle> {
-    let conda_name = conda_name_simple(entry_name);
+    let conda_name = canonical_conda_name(entry_name);
     let mut seen: HashSet<String> = HashSet::new();
     let mut work: VecDeque<Pending> = VecDeque::new();
     // v0.14.1+: collect every probe + routing decision so the audit
@@ -2089,7 +2094,7 @@ async fn resolve_bundle(
         // also consults `seen` before enqueuing.)
         let mut frontier: Vec<Pending> = Vec::new();
         while let Some(pending) = work.pop_front() {
-            let dep_conda_name = conda_name_simple(&pending.pypi_name);
+            let dep_conda_name = canonical_conda_name(&pending.pypi_name);
             if !seen.insert(dep_conda_name) {
                 continue;
             }
@@ -2125,7 +2130,7 @@ async fn resolve_bundle(
             // an arbitrary candidate gave nonsense like `numpy -> manifpy`
             // and `torch -> pytorch-cpu`. The probe then asked the wrong
             // question. v0.17.0 fixes the picker.
-            let dep_conda_name = conda_name_simple(&pending.pypi_name);
+            let dep_conda_name = canonical_conda_name(&pending.pypi_name);
             let mut routed_to_conda = false;
             if let PendingSource::Pypi { specifiers, .. } = &pending.source {
                 // v0.46.0: the curated/user name-map wins over parselmouth.
@@ -2314,7 +2319,7 @@ async fn resolve_bundle(
         // seed the next level, accumulate extras. Order matches the
         // old pop order exactly.
         for (pending, fetch_result) in fetched {
-            let dep_conda_name = conda_name_simple(&pending.pypi_name);
+            let dep_conda_name = canonical_conda_name(&pending.pypi_name);
             let (sub_url, sub_metadata, sub_index_for_recurse) =
                 match (&pending.source, fetch_result?) {
                     (PendingSource::Pypi { .. }, Some((resolved_url, metadata, index))) => {
@@ -2590,7 +2595,7 @@ async fn materialize_and_rewrite(
     audit_info: EntryAuditInfo,
 ) -> Result<ResolvedWheel> {
     use crate::wheel_rewrite::rewrite_wheel;
-    let pypi_name = conda_name_simple(entry_name);
+    let pypi_name = canonical_conda_name(entry_name);
 
     // Phase 1: get the raw wheel onto disk. For source-built wheels
     // (path / git / from), also remember the source root so phase 1.5
@@ -2926,7 +2931,7 @@ fn produce_output(
     let user_dropped: HashSet<String> = config
         .drop_deps
         .iter()
-        .map(|n| conda_name_simple(n))
+        .map(|n| canonical_conda_name(n))
         .collect();
 
     // Built-in: Windows-only PyPI shims that are commonly mis-declared as
@@ -2987,7 +2992,7 @@ fn produce_output(
             let parsed_raw: Option<uv_pep508::Requirement> =
                 uv_pep508::Requirement::from_str(raw).ok();
             let raw_pypi_name: Option<String> =
-                parsed_raw.map(|r| conda_name_simple(r.name.as_ref()));
+                parsed_raw.map(|r| canonical_conda_name(r.name.as_ref()));
             let in_set = |set: &HashSet<String>| {
                 set.contains(&dep_name) || raw_pypi_name.as_ref().is_some_and(|p| set.contains(p))
             };

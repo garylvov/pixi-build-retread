@@ -14,7 +14,7 @@ use uv_pep508::uv_pep440::VersionSpecifiers;
 
 use crate::config::{RelaxPolicy, RetreadConfig};
 use crate::pypi;
-use crate::relax::{conda_name_simple, default_marker_env};
+use crate::relax::{canonical_conda_name, default_marker_env};
 use crate::wheel::WheelMetadata;
 
 use super::{Bundle, DEFAULT_PYTHON, PypiToCondaMap, ResolvedWheel};
@@ -108,9 +108,9 @@ pub(crate) async fn auto_bundle_transitives(
     // conda numpy 2.x) are the user's call -- add the package name to
     // `retread-conda-deps` to keep it on the conda side.
     let mut skip: HashSet<String> = bundle.all_wheels().map(|w| w.pypi_name.clone()).collect();
-    skip.extend(config.conda_deps.iter().map(|n| conda_name_simple(n)));
-    skip.extend(config.drop_deps.iter().map(|n| conda_name_simple(n)));
-    skip.extend(config.overrides.keys().map(|n| conda_name_simple(n)));
+    skip.extend(config.conda_deps.iter().map(|n| canonical_conda_name(n)));
+    skip.extend(config.drop_deps.iter().map(|n| canonical_conda_name(n)));
+    skip.extend(config.overrides.keys().map(|n| canonical_conda_name(n)));
 
     // Fallback chain: entry's index first (for siblings on private
     // indexes like pypi.nvidia.com), then workspace [pypi-options]
@@ -151,7 +151,7 @@ pub(crate) async fn auto_bundle_transitives(
                 let Some((name, version)) = pep508_exact_base_dep(raw)? else {
                     continue;
                 };
-                let conda_name = conda_name_simple(&name);
+                let conda_name = canonical_conda_name(&name);
                 if !seen_candidate.insert(conda_name) {
                     continue;
                 }
@@ -196,9 +196,9 @@ pub(crate) async fn auto_bundle_transitives(
         // the already-warm in-memory repodata cache.
         let prefer_pairs: Vec<(String, String)> = candidates
             .iter()
-            .filter(|(name, _)| prefer_conda_match(&conda_name_simple(name), &config.name_map))
+            .filter(|(name, _)| prefer_conda_match(&canonical_conda_name(name), &config.name_map))
             .map(|(name, version)| {
-                let conda_name = conda_name_simple(name);
+                let conda_name = canonical_conda_name(name);
                 (
                     config.name_map[&conda_name].clone(),
                     probe_spec_for(version, config.relax),
@@ -217,7 +217,7 @@ pub(crate) async fn auto_bundle_transitives(
         // after the (serial, mutating) routing decisions below.
         let mut to_fetch: Vec<(String, String, String, VersionSpecifiers)> = Vec::new();
         for (name, version) in candidates {
-            let conda_name = conda_name_simple(&name);
+            let conda_name = canonical_conda_name(&name);
             if prefer_conda_match(&conda_name, &config.name_map) {
                 // Probe the workspace's conda channels for whether the
                 // spec retread would emit is actually satisfiable. If
@@ -501,7 +501,7 @@ pub(crate) fn seed_worklist(
         let mut added = false;
         for extra in extras_requested {
             if let Some(dep) = pep508_extra_dep(raw, extra)? {
-                let dn = conda_name_simple(&dep.name);
+                let dn = canonical_conda_name(&dep.name);
                 if seen.contains(&dn) {
                     continue;
                 }
@@ -518,7 +518,7 @@ pub(crate) fn seed_worklist(
         }
         // 2. Base deps (no marker) whose PyPI name matches the bundle prefix.
         if let Some(dep) = pep508_base_dep_in_prefix(raw, bundle_prefix)? {
-            let dn = conda_name_simple(&dep.name);
+            let dn = canonical_conda_name(&dep.name);
             if seen.contains(&dn) {
                 continue;
             }
@@ -557,7 +557,7 @@ fn pep508_base_dep_in_prefix(raw: &str, prefix: &str) -> Result<Option<ExtraDep>
         return Ok(None);
     }
 
-    let conda_name = conda_name_simple(req.name.as_ref());
+    let conda_name = canonical_conda_name(req.name.as_ref());
     if !conda_name.starts_with(prefix) {
         return Ok(None);
     }
