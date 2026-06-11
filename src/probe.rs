@@ -114,14 +114,10 @@ pub async fn probe(
 
     // Build the full (channel, subdir) work list. linux-64 is the
     // only retread target today; noarch lives alongside it on every
-    // channel. We fan out both per channel.
+    // channel. Both subdirs are fanned out via the shared helper so
+    // this list is always consistent with sparse_pairs.
     let target_subdir = "linux-64";
-    let mut work: Vec<(String, String)> = Vec::new();
-    for channel in channels {
-        let url = channel.url().as_str().trim_end_matches('/').to_string();
-        work.push((url.clone(), target_subdir.to_string()));
-        work.push((url, "noarch".to_string()));
-    }
+    let work = crate::repodata::channel_subdir_pairs(channels, target_subdir);
 
     // Parallel fetch all (channel, subdir) repodatas. Each
     // get_repodata is in-memory-cached after first call, so repeated
@@ -298,12 +294,9 @@ pub async fn fetch_latest_build_depends(
         target_python.and_then(|tp| Version::from_str(tp).ok());
 
     let target_subdir = "linux-64";
-    let mut work: Vec<(String, String)> = Vec::new();
-    for channel in channels {
-        let url = channel.url().as_str().trim_end_matches('/').to_string();
-        work.push((url.clone(), target_subdir.to_string()));
-        work.push((url, "noarch".to_string()));
-    }
+    // Reuse the shared fan-out helper so the work list here is
+    // always identical to what probe() and sparse_pairs use.
+    let work = crate::repodata::channel_subdir_pairs(channels, target_subdir);
 
     use futures::stream::{FuturesUnordered, StreamExt};
     let mut futs: FuturesUnordered<_> =

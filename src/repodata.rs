@@ -69,6 +69,25 @@ pub async fn sparse(channel_url: &str, subdir: &str) -> Option<Arc<SparseRepoDat
         .clone()
 }
 
+/// Build the ordered (channel_url, subdir) work list for a given
+/// `target_subdir`. Every channel contributes two pairs: one for
+/// `target_subdir` itself and one for `"noarch"` (which lives alongside
+/// it on every channel). Both `sparse_pairs` and the probe layer use
+/// exactly this fan-out; centralising it here ensures they can never
+/// diverge.
+///
+/// Returns bare URL strings (no trailing slash) so they can be used
+/// directly as cache keys and passed to `sparse()`.
+pub fn channel_subdir_pairs(channels: &[ChannelUrl], target_subdir: &str) -> Vec<(String, String)> {
+    let mut work: Vec<(String, String)> = Vec::with_capacity(channels.len() * 2);
+    for channel in channels {
+        let url = channel.url().as_str().trim_end_matches('/').to_string();
+        work.push((url.clone(), target_subdir.to_string()));
+        work.push((url, "noarch".to_string()));
+    }
+    work
+}
+
 /// The full (channel x [target_subdir, noarch]) fan-out every consumer
 /// wants, built concurrently, returned in channel-priority order as
 /// `("<channel>/<subdir>" label, handle)` pairs. Unreachable pairs are
@@ -77,12 +96,7 @@ pub async fn sparse_pairs(
     channels: &[ChannelUrl],
     target_subdir: &str,
 ) -> Vec<(String, Arc<SparseRepoData>)> {
-    let mut work: Vec<(String, String)> = Vec::new();
-    for channel in channels {
-        let url = channel.url().as_str().trim_end_matches('/').to_string();
-        work.push((url.clone(), target_subdir.to_string()));
-        work.push((url, "noarch".to_string()));
-    }
+    let work = channel_subdir_pairs(channels, target_subdir);
     let handles = futures::future::join_all(
         work.iter()
             .map(|(channel_url, subdir)| sparse(channel_url, subdir)),
