@@ -417,16 +417,27 @@ impl Handler {
             retread_version = env!("CARGO_PKG_VERSION"),
             "retread: computing conda outputs (resolving wheels + probing channels; large wheels may download here)",
         );
+        let phase_start = std::time::Instant::now();
+        let (config, download_dir, source_dir, cache_dir, workspace_dir) =
+            self.snapshot(&params.work_directory).await?;
         // tracing -> stderr is invisible during pixi's solve phase (pixi hides
         // backend stderr behind its "updating lock-file" spinner, even at -vv).
         // Mirror the key status to /dev/tty so the user sees retread is alive.
-        crate::status::tty(
+        // v1.4.6: cache-aware wording -- with a populated wheels/ dir the
+        // "first run downloads" caveat was misleading (the wheels are read
+        // from disk; only the conda solves remain).
+        let wheels_cached = std::fs::read_dir(&download_dir)
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false);
+        crate::status::tty(if wheels_cached {
+            "resolving source package: wheels found in the local cache; running \
+             per-environment conda solve checks (repodata parse + solves can \
+             take a few minutes)."
+        } else {
             "resolving source package: materializing wheels, then per-environment \
              solve checks (first run downloads the package wheels and runs many \
-             conda solves -- large wheels can take several minutes).",
-        );
-        let (config, download_dir, source_dir, cache_dir, workspace_dir) =
-            self.snapshot(&params.work_directory).await?;
+             conda solves -- large wheels can take several minutes)."
+        });
 
         // Pick the target Python versions. Precedence:
         //   1. workspace.build-variants python = [...]
@@ -468,6 +479,7 @@ impl Handler {
             let target = wheel_target_for(params.host_platform, python_version);
             // Phase 1: materialize wheels + auto-bundle. Env-agnostic;
             // results reused across all per-env emissions.
+            let t_materialize = std::time::Instant::now();
             let (materialized, base_config) = resolve_all(
                 &config,
                 &target,
@@ -483,6 +495,12 @@ impl Handler {
                     "resolving wheels for python {python_version}: {e:#}"
                 ))
             })?;
+            tracing::info!(
+                python = %python_version,
+                elapsed_ms = t_materialize.elapsed().as_millis() as u64,
+                bundles = materialized.len(),
+                "bench: resolve_all (materialize + auto-bundle) finished",
+            );
             // Phase 2: autodiscover one emission per workspace path-dep
             // referencing this source package. When nothing references
             // it (initial setup, missing workspace pixi.toml), returns
@@ -496,6 +514,7 @@ impl Handler {
                 .first()
                 .map(|b| b.conda_name.clone())
                 .unwrap_or_default();
+            let t_discover = std::time::Instant::now();
             let emissions = discover_emissions(
                 &source_dir,
                 workspace_dir.as_deref(),
@@ -505,6 +524,11 @@ impl Handler {
                 &bundle_names,
             )
             .await;
+            tracing::info!(
+                elapsed_ms = t_discover.elapsed().as_millis() as u64,
+                emissions = emissions.len(),
+                "bench: discover_emissions (workspace transitive extraction) finished",
+            );
             // PyPI index fallback chain for the cascade's bundling
             // steps: entry indexes first (pypi.nvidia.com siblings),
             // then workspace [pypi-options] indexes, then public PyPI.
@@ -803,6 +827,7 @@ impl Handler {
                                     // produce_output + solve check. Iterate up
                                     // to MAX_REFINEMENT iterations (cap so we
                                     // don't loop forever on external conflicts).
+                                    let t_env = std::time::Instant::now();
                                     let outcome = iterative_solve_refinement(
                                         emitted_run_deps_strs,
                                         level_seed,
@@ -826,6 +851,13 @@ impl Handler {
                                             bundle.conda_name, env_name,
                                         ))
                                     })?;
+                                    tracing::info!(
+                                        env = %env_name,
+                                        elapsed_ms = t_env.elapsed().as_millis() as u64,
+                                        satisfiable = outcome.satisfiable,
+                                        refinement_rounds = outcome.refinement_steps.len(),
+                                        "bench: env refinement finished",
+                                    );
                                     Ok((env_name.clone(), outcome, effective.overrides))
                                 }
                             }))
@@ -1202,6 +1234,11 @@ impl Handler {
             outputs,
             input_globs: Default::default(),
         };
+        tracing::info!(
+            elapsed_ms = phase_start.elapsed().as_millis() as u64,
+            outputs = result.outputs.len(),
+            "bench: conda_outputs total",
+        );
         // Memoize so pixi's subsequent per-env re-requests (identical
         // params) skip the whole recompute.
         CONDA_OUTPUTS_CACHE

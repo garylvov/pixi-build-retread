@@ -11,6 +11,7 @@ pub mod probe;
 pub mod pypi;
 pub mod recipe;
 pub mod relax;
+pub mod repodata;
 pub mod rpc;
 pub mod solve_check;
 pub mod source_build;

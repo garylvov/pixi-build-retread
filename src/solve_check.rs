@@ -29,19 +29,15 @@
 //! probe.rs" claim here was false: probe.rs caches a different parsed
 //! form (`RepodataIndex`) that the solver can't consume.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::PathBuf;
+use std::collections::{BTreeMap, HashSet};
 use std::str::FromStr;
-use std::sync::{Arc, Mutex, OnceLock};
 
-use anyhow::{Context, Result, anyhow};
 use rattler_conda_types::{
-    Channel, ChannelConfig, ChannelUrl, GenericVirtualPackage, MatchSpec, PackageName,
-    ParseStrictness, RepoData, RepoDataRecord, Version,
+    ChannelUrl, GenericVirtualPackage, MatchSpec, PackageName, ParseStrictness, RepoDataRecord,
+    Version,
 };
 use rattler_solve::{ChannelPriority, SolveStrategy, SolverImpl, SolverTask, resolvo};
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 
 /// Result of running the solve check.
 #[derive(Debug, Clone, Serialize)]
@@ -140,16 +136,19 @@ fn solve_selected_records_from_records(
 /// starving concurrent probes and downloads.
 async fn solve_on_blocking_pool(
     parsed_specs: Vec<MatchSpec>,
-    record_set: Arc<RecordSet>,
+    records: Vec<RepoDataRecord>,
     target_python: String,
     channel_priority: ChannelPriority,
     system_requirements: BTreeMap<String, String>,
     strategy: SolveStrategy,
 ) -> std::result::Result<Vec<RepoDataRecord>, Vec<String>> {
-    tokio::task::spawn_blocking(move || {
+    let t_solve = std::time::Instant::now();
+    let specs_count = parsed_specs.len();
+    let records_count = records.len();
+    let result = tokio::task::spawn_blocking(move || {
         solve_selected_records_from_records(
             parsed_specs,
-            &record_set.records,
+            &records,
             &target_python,
             channel_priority,
             &system_requirements,
@@ -157,7 +156,15 @@ async fn solve_on_blocking_pool(
         )
     })
     .await
-    .unwrap_or_else(|e| Err(vec![format!("solver task panicked: {e}")]))
+    .unwrap_or_else(|e| Err(vec![format!("solver task panicked: {e}")]));
+    tracing::info!(
+        elapsed_ms = t_solve.elapsed().as_millis() as u64,
+        satisfiable = result.is_ok(),
+        specs = specs_count,
+        records = records_count,
+        "bench: resolvo solve finished",
+    );
+    result
 }
 
 fn parse_match_specs(specs: &[String]) -> Vec<MatchSpec> {
@@ -277,140 +284,78 @@ pub fn build_virtual_packages(
     virtual_packages
 }
 
-/// Repodata records for one channel-set, parsed once and shared across
-/// every solve. See `RECORDS_CACHE`.
-struct RecordSet {
-    records: Vec<RepoDataRecord>,
-    /// `"<channel>/<subdir>"` strings actually consulted (for the audit).
-    consulted: Vec<String>,
-}
-
-/// Process-global cache of parsed `RepoDataRecord`s, keyed by the exact
-/// (target_subdir, channel-set) a solve consults. retread is a long-lived
-/// backend, so this survives across the ~32 solves of one `conda/outputs`
-/// call. The expensive ~1M-record JSON parse now runs ~2x (the gigastrap
-/// channel sets with vs without robostack-humble) instead of ~32x.
-/// One channel-set's lazily-built record set. The async OnceCell means
-/// a concurrent miss AWAITS the in-flight build instead of paying the
-/// full multi-100MB parse a second time (the old "rebuilds once more
-/// (idempotent)" race).
-type RecordSetCell = Arc<tokio::sync::OnceCell<Arc<RecordSet>>>;
-
-/// v1.4.3: per-key async OnceCells (see [`RecordSetCell`]).
-static RECORDS_CACHE: OnceLock<Mutex<HashMap<String, RecordSetCell>>> = OnceLock::new();
-
-/// Load (or reuse) the deduped record set for `channels`. The slow JSON
-/// parse + record build runs only on the first call per channel-set.
-async fn load_records(channels: &[ChannelUrl], target_subdir: &str) -> Arc<RecordSet> {
-    let mut key = String::from(target_subdir);
-    for c in channels {
-        key.push('\u{1}');
-        key.push_str(c.url().as_str());
+/// v1.5.0: load only the records REACHABLE from the spec set's
+/// package names (transitive closure over `depends`), via the shared
+/// memory-mapped sparse repodata store in `crate::repodata`. The old
+/// path fully parsed and materialized every channel record (~1M
+/// records, seconds of CPU, GBs of RSS, once per channel-set); the
+/// reachable subset for a typical bundle is a few thousand records
+/// loaded in milliseconds. Returns `(records, consulted)` -- empty
+/// `consulted` means NO repodata could be obtained (callers abstain).
+/// Dedup is first-seen filename in channel-priority order, because
+/// rattler_solve aborts on DuplicateRecords.
+async fn load_selected_records_sparse(
+    channels: &[ChannelUrl],
+    target_subdir: &str,
+    parsed_specs: &[MatchSpec],
+) -> (Vec<RepoDataRecord>, Vec<String>) {
+    use rattler_repodata_gateway::sparse::{PackageFormatSelection, SparseRepoData};
+    let pairs = crate::repodata::sparse_pairs(channels, target_subdir).await;
+    if pairs.is_empty() {
+        return (Vec::new(), Vec::new());
     }
-    let cell = {
-        let mut map = RECORDS_CACHE
-            .get_or_init(|| Mutex::new(HashMap::new()))
-            .lock()
-            .unwrap();
-        Arc::clone(
-            map.entry(key)
-                .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new())),
-        )
-    };
-    cell.get_or_init(|| build_record_set(channels, target_subdir))
-        .await
-        .clone()
-}
-
-/// Build the record set for one channel-set: fetch + parse every
-/// (channel, subdir) pair CONCURRENTLY, each parse on the blocking
-/// pool (a single conda-forge repodata is a multi-100MB JSON document
-/// -- parsing it on the async executor pins a runtime worker).
-/// The merge runs in INPUT order so the first-seen filename dedup
-/// keeps honoring channel priority exactly like the old serial loop.
-async fn build_record_set(channels: &[ChannelUrl], target_subdir: &str) -> Arc<RecordSet> {
-    let pairs: Vec<(String, String)> = channels
+    let consulted: Vec<String> = pairs.iter().map(|(label, _)| label.clone()).collect();
+    // Exact-named specs seed the reachable-set walk. Glob/regex
+    // matchers (rare; retread never emits them) can't seed a name walk
+    // -- they're skipped here and simply unmatchable in the subset,
+    // identical to how an absent package behaved in the full set.
+    let root_names: Vec<PackageName> = parsed_specs
         .iter()
-        .flat_map(|channel_url| {
-            let channel_str = channel_url.url().as_str().trim_end_matches('/').to_string();
-            [target_subdir.to_string(), "noarch".to_string()]
-                .into_iter()
-                .map(move |subdir| (channel_str.clone(), subdir))
+        .filter_map(|spec| match spec.name.as_ref() {
+            Some(rattler_conda_types::PackageNameMatcher::Exact(name)) => Some(name.clone()),
+            _ => None,
         })
         .collect();
-
-    let fetched: Vec<Option<(String, Vec<RepoDataRecord>)>> =
-        futures::future::join_all(pairs.into_iter().map(|(channel_str, subdir)| async move {
-            let bytes = match read_disk_cache(&channel_str, &subdir).await {
-                Ok(Some(bytes)) => bytes,
-                Ok(None) => match fetch_repodata_bytes(&channel_str, &subdir).await {
-                    Ok(bytes) => {
-                        let _ = write_disk_cache(&channel_str, &subdir, &bytes).await;
-                        bytes
-                    }
-                    Err(e) => {
-                        tracing::debug!(
-                            channel = %channel_str,
-                            subdir = %subdir,
-                            error = %format!("{e:#}"),
-                            "solve-check: repodata unavailable; skipping channel/subdir",
-                        );
-                        return None;
-                    }
-                },
-                Err(e) => {
-                    tracing::debug!(
-                        channel = %channel_str,
-                        subdir = %subdir,
-                        error = %format!("{e:#}"),
-                        "solve-check: disk-cache read failed; skipping channel/subdir",
-                    );
-                    return None;
-                }
-            };
-            tokio::task::spawn_blocking(move || {
-                let repo_data: RepoData = match serde_json::from_slice(&bytes) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        tracing::debug!(channel = %channel_str, subdir = %subdir, error = %e, "solve-check: failed to parse cached repodata");
-                        return None;
-                    }
-                };
-                // Default ChannelConfig is fine; we never resolve relative aliases.
-                let cfg = ChannelConfig::default_with_root_dir(std::env::temp_dir());
-                let channel = match Channel::from_str(&channel_str, &cfg) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::debug!(channel = %channel_str, error = %e, "solve-check: failed to build Channel for record URL synthesis");
-                        return None;
-                    }
-                };
-                let recs = repo_data.into_repo_data_records(&channel);
-                Some((format!("{channel_str}/{subdir}"), recs))
-            })
-            .await
-            .ok()
-            .flatten()
-        }))
-        .await;
-
-    // Serial ordered merge. Dedup filenames as we collect: the same
-    // package can appear across channel/subdir boundaries and
-    // rattler_solve aborts on DuplicateRecords. Keep first-seen;
-    // channel priority is honored because `fetched` is in pair order.
+    let roots = root_names.len();
+    let t = std::time::Instant::now();
+    let handles: Vec<_> = pairs.into_iter().map(|(_, h)| h).collect();
+    let per_repo = match tokio::task::spawn_blocking(move || {
+        SparseRepoData::load_records_recursive(
+            handles.iter().map(|h| h.as_ref()),
+            root_names,
+            None,
+            PackageFormatSelection::default(),
+        )
+    })
+    .await
+    {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "solve-check: sparse record load failed");
+            return (Vec::new(), consulted);
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "solve-check: sparse record load panicked");
+            return (Vec::new(), consulted);
+        }
+    };
     let mut records: Vec<RepoDataRecord> = Vec::new();
-    let mut consulted: Vec<String> = Vec::new();
     let mut seen_filenames: HashSet<String> = HashSet::new();
-    for item in fetched.into_iter().flatten() {
-        let (label, recs) = item;
-        consulted.push(label);
-        for rec in recs {
+    for repo_records in per_repo {
+        for rec in repo_records {
             if seen_filenames.insert(rec.file_name.clone()) {
                 records.push(rec);
             }
         }
     }
-    Arc::new(RecordSet { records, consulted })
+    tracing::info!(
+        elapsed_ms = t.elapsed().as_millis() as u64,
+        records = records.len(),
+        roots,
+        pairs = consulted.len(),
+        "bench: sparse reachable records loaded",
+    );
+    (records, consulted)
 }
 
 pub async fn run_solve_check(
@@ -425,15 +370,10 @@ pub async fn run_solve_check(
     // network IO. Skip specs that don't parse (rare; logged at debug).
     let parsed_specs = parse_match_specs(specs);
 
-    // Parse the ~1M repodata records ONCE per channel-set and reuse across
-    // every solve in this process (the refinement loop calls us ~8x/env x
-    // ~4 envs). Before this the parse ran on every call -- the dominant CPU
-    // cost and the ~4 GB RSS thrash.
-    let record_set = load_records(channels, target_subdir).await;
-    let all_records = &record_set.records;
-    let consulted = record_set.consulted.clone();
+    let (records, consulted) =
+        load_selected_records_sparse(channels, target_subdir, &parsed_specs).await;
 
-    if all_records.is_empty() {
+    if records.is_empty() {
         return SolveOutcome {
             satisfiable: false,
             unsat_explanations: vec![
@@ -449,11 +389,11 @@ pub async fn run_solve_check(
         };
     }
 
-    let records_count = all_records.len();
+    let records_count = records.len();
     let specs_count = parsed_specs.len();
     match solve_on_blocking_pool(
         parsed_specs,
-        Arc::clone(&record_set),
+        records,
         target_python.to_string(),
         channel_priority,
         system_requirements.clone(),
@@ -502,15 +442,16 @@ pub async fn solve_selected_records(
     strategy: SolveStrategy,
 ) -> std::result::Result<Vec<RepoDataRecord>, Vec<String>> {
     let parsed_specs = parse_match_specs(specs);
-    let record_set = load_records(channels, target_subdir).await;
-    if record_set.records.is_empty() {
+    let (records, _consulted) =
+        load_selected_records_sparse(channels, target_subdir, &parsed_specs).await;
+    if records.is_empty() {
         return Err(vec![
             "solve-check skipped: no repodata available from disk cache".into(),
         ]);
     }
     solve_on_blocking_pool(
         parsed_specs,
-        Arc::clone(&record_set),
+        records,
         target_python.to_string(),
         channel_priority,
         system_requirements.clone(),
@@ -521,113 +462,6 @@ pub async fn solve_selected_records(
 
 /// Compute the disk-cache path for repodata. Must match probe.rs's
 /// layout exactly -- we read what that module wrote.
-fn disk_cache_path(channel_url: &str, subdir: &str) -> PathBuf {
-    let mut hasher = Sha256::new();
-    hasher.update(channel_url.as_bytes());
-    hasher.update(b"|");
-    hasher.update(subdir.as_bytes());
-    let digest = hasher.finalize();
-    let mut hex = String::with_capacity(16);
-    for b in &digest[..8] {
-        hex.push_str(&format!("{b:02x}"));
-    }
-    let dir = dirs_cache_root().join("retread-repodata");
-    let slug = channel_url
-        .trim_end_matches('/')
-        .rsplit('/')
-        .next()
-        .unwrap_or("channel")
-        .replace(|c: char| !c.is_ascii_alphanumeric(), "_");
-    dir.join(format!("{slug}--{subdir}--{hex}.json"))
-}
-
-fn dirs_cache_root() -> PathBuf {
-    if let Some(home) = std::env::var_os("HOME") {
-        PathBuf::from(home)
-            .join(".cache")
-            .join("rattler")
-            .join("cache")
-    } else {
-        std::env::temp_dir().join("retread-cache")
-    }
-}
-
-const REPODATA_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
-const HTTP_USER_AGENT: &str = concat!("pixi-build-retread/", env!("CARGO_PKG_VERSION"));
-
-async fn read_disk_cache(channel_url: &str, subdir: &str) -> Result<Option<Vec<u8>>> {
-    let path = disk_cache_path(channel_url, subdir);
-    let meta = match tokio::fs::metadata(&path).await {
-        Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e).with_context(|| format!("stat {}", path.display())),
-    };
-    let mtime = meta
-        .modified()
-        .with_context(|| format!("mtime {}", path.display()))?;
-    let age = std::time::SystemTime::now()
-        .duration_since(mtime)
-        .unwrap_or(std::time::Duration::ZERO);
-    if age > REPODATA_TTL {
-        return Ok(None);
-    }
-    let bytes = tokio::fs::read(&path)
-        .await
-        .with_context(|| format!("reading {}", path.display()))?;
-    Ok(Some(bytes))
-}
-
-async fn write_disk_cache(channel_url: &str, subdir: &str, bytes: &[u8]) -> Result<()> {
-    let path = disk_cache_path(channel_url, subdir);
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await.ok();
-    }
-    tokio::fs::write(&path, bytes)
-        .await
-        .with_context(|| format!("writing cache {}", path.display()))?;
-    Ok(())
-}
-
-async fn fetch_repodata_bytes(channel_url: &str, subdir: &str) -> Result<Vec<u8>> {
-    let client = reqwest::Client::builder()
-        .user_agent(HTTP_USER_AGENT)
-        .build()
-        .context("building reqwest client")?;
-    let zst_url = format!("{channel_url}/{subdir}/repodata.json.zst");
-    let resp = client
-        .get(&zst_url)
-        .send()
-        .await
-        .with_context(|| format!("GET {zst_url}"))?;
-    if resp.status().is_success() {
-        let bytes = resp
-            .bytes()
-            .await
-            .with_context(|| format!("reading body of {zst_url}"))?;
-        let decoded =
-            zstd::decode_all(bytes.as_ref()).with_context(|| format!("zstd-decoding {zst_url}"))?;
-        return Ok(decoded);
-    }
-    let plain_url = format!("{channel_url}/{subdir}/repodata.json");
-    let resp = client
-        .get(&plain_url)
-        .send()
-        .await
-        .with_context(|| format!("GET {plain_url}"))?
-        .error_for_status()
-        .with_context(|| format!("HTTP error for {plain_url}"))?;
-    let bytes = resp
-        .bytes()
-        .await
-        .with_context(|| format!("reading body of {plain_url}"))?;
-    Ok(bytes.to_vec())
-}
-
-#[allow(dead_code)]
-fn _quiet_anyhow_warning() -> Result<()> {
-    Err(anyhow!("unused"))
-}
-
 /// v0.34.0+: parse rattler_solve's tree-formatted unsat explanation
 /// strings to find the package names that are the ENTRY POINTS of the
 /// conflict graph. These are the deps the solver couldn't satisfy at
