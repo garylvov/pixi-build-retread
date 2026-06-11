@@ -1036,29 +1036,18 @@ pub(crate) fn pypi_fallback_indexes(
     config: &RetreadConfig,
     workspace: Option<&crate::workspace::WorkspaceManifest>,
 ) -> Vec<String> {
-    fn push_unique(list: &mut Vec<String>, idx: String) {
-        // Trailing-slash-insensitive: "https://pypi.org/simple" and
-        // ".../simple/" are the same index; don't probe it twice.
-        if !list
-            .iter()
-            .any(|e| e.trim_end_matches('/') == idx.trim_end_matches('/'))
-        {
-            list.push(idx);
-        }
-    }
-    let mut indexes: Vec<String> = Vec::new();
-    for entry in config.retread_wheels.values() {
-        if entry.url.is_none() {
-            push_unique(&mut indexes, entry.index_url());
-        }
-    }
-    if let Some(ws) = workspace {
-        for url in ws.all_pypi_index_urls() {
-            push_unique(&mut indexes, url);
-        }
-    }
-    push_unique(&mut indexes, "https://pypi.org/simple/".to_string());
-    indexes
+    // Primary: every entry index (non-URL entries only, since URL
+    // entries don't have an associated PyPI index).
+    let primary = config
+        .retread_wheels
+        .values()
+        .filter(|e| e.url.is_none())
+        .map(|e| e.index_url());
+    // Extra: workspace [pypi-options] indexes (if any).
+    let extra: Vec<String> = workspace
+        .map(|ws| ws.all_pypi_index_urls())
+        .unwrap_or_default();
+    super::merge_index_chain(primary, &extra)
 }
 
 /// Resolve + fetch `pypi_name` from each index in turn; on the first

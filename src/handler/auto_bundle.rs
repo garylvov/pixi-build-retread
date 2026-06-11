@@ -122,25 +122,13 @@ pub(crate) async fn auto_bundle_transitives(
     // Fallback chain: entry's index first (for siblings on private
     // indexes like pypi.nvidia.com), then workspace [pypi-options]
     // indexes, then public PyPI (for the broader ecosystem -- aiodns,
-    // qdldl, ...). Public PyPI is hardcoded rather than configurable
-    // for now; if a user has air-gap requirements they can disable
-    // retread-auto-bundle entirely.
-    let mut indexes = vec![entry_index.to_string()];
-    for url in workspace_indexes {
-        if !indexes
-            .iter()
-            .any(|e| e.trim_end_matches('/') == url.trim_end_matches('/'))
-        {
-            indexes.push(url.clone());
-        }
-    }
-    let public = "https://pypi.org/simple/".to_string();
-    if !indexes
-        .iter()
-        .any(|e| e.trim_end_matches('/') == public.trim_end_matches('/'))
-    {
-        indexes.push(public);
-    }
+    // qdldl, ...). Public PyPI is appended by merge_index_chain when
+    // not already present; ordering and trailing-slash dedup are both
+    // handled there.
+    let indexes = super::merge_index_chain(
+        std::iter::once(entry_index.to_string()),
+        workspace_indexes,
+    );
 
     // Fixed-point loop: each newly-bundled wheel has its own
     // Requires-Dist that may name more PyPI-only transitives, which

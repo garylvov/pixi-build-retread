@@ -5,7 +5,7 @@ use super::cascade::{
     bundle_group_for, check_output_abi_invariants, extract_anchor_version, merge_looser_override,
     pypi_fallback_indexes, tiered_cascade_for_dep, widen_one_level, widening_level,
 };
-use super::*;
+use super::{merge_index_chain, *};
 use crate::config::RelaxPolicy;
 use crate::relax::default_marker_env;
 use std::collections::BTreeMap;
@@ -1022,6 +1022,72 @@ fn bundle_group_default_and_precedence() {
     assert_eq!(
         bundle_group_for("foo", &grouped, Some("isaac-pack")),
         "other-pack"
+    );
+}
+
+// -----------------------------------------------------------------
+// merge_index_chain: order and dedup semantics
+// -----------------------------------------------------------------
+
+#[test]
+fn merge_index_chain_preserves_order_primary_then_extra_then_public() {
+    // The canonical use case: entry index + workspace indexes.
+    // Public PyPI should land last, entry index first.
+    let result = merge_index_chain(
+        ["https://pypi.nvidia.com".to_string()],
+        &["https://download.pytorch.org/whl/cu128".to_string()],
+    );
+    assert_eq!(
+        result,
+        vec![
+            "https://pypi.nvidia.com".to_string(),
+            "https://download.pytorch.org/whl/cu128".to_string(),
+            PUBLIC_PYPI.to_string(),
+        ],
+    );
+}
+
+#[test]
+fn merge_index_chain_deduplicates_trailing_slash_insensitive() {
+    // public PyPI appears in extra without trailing slash -- must not
+    // be added twice even though the stored constant has a trailing slash.
+    let result = merge_index_chain(
+        ["https://pypi.nvidia.com".to_string()],
+        &["https://pypi.org/simple".to_string()],
+    );
+    assert_eq!(
+        result,
+        vec![
+            "https://pypi.nvidia.com".to_string(),
+            "https://pypi.org/simple".to_string(),
+        ],
+        "public PyPI without trailing slash should suppress the appended PUBLIC_PYPI",
+    );
+}
+
+#[test]
+fn merge_index_chain_empty_primary_appends_public() {
+    let result = merge_index_chain(std::iter::empty::<String>(), &[]);
+    assert_eq!(result, vec![PUBLIC_PYPI.to_string()]);
+}
+
+#[test]
+fn merge_index_chain_deduplicates_repeated_primary() {
+    // Two primary items that are the same URL (one with, one without slash)
+    // should only appear once.
+    let result = merge_index_chain(
+        [
+            "https://pypi.nvidia.com".to_string(),
+            "https://pypi.nvidia.com/".to_string(),
+        ],
+        &[],
+    );
+    assert_eq!(
+        result,
+        vec![
+            "https://pypi.nvidia.com".to_string(),
+            PUBLIC_PYPI.to_string(),
+        ],
     );
 }
 

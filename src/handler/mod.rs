@@ -202,6 +202,47 @@ const INITIALIZE: &str = "initialize";
 const CONDA_OUTPUTS: &str = "conda/outputs";
 const CONDA_BUILD_V1: &str = "conda/build_v1";
 
+/// Canonical public PyPI Simple index. Both the auto-bundle BFS and the
+/// tiered-cascade need it as the final fallback. Trailing slash is
+/// required by PEP 503 and kept here so `trim_end_matches('/')` in the
+/// dedup check still works (both with and without the slash normalise to
+/// the same key).
+pub(crate) const PUBLIC_PYPI: &str = "https://pypi.org/simple/";
+
+/// Build a deduplicated PyPI index chain, preserving ORDER semantics:
+/// `primary` items first, then `extra` items, then `PUBLIC_PYPI` if
+/// not already present. Deduplication is trailing-slash-insensitive so
+/// `"https://pypi.org/simple"` and `"https://pypi.org/simple/"` are
+/// treated as the same index.
+///
+/// This is the shared core extracted from two independent inline
+/// implementations:
+/// - `cascade::pypi_fallback_indexes` (entry indexes + workspace indexes)
+/// - `auto_bundle::auto_bundle_transitives` (entry_index + workspace_indexes)
+/// Both had identical push-unique + append-public-PyPI logic.
+pub(crate) fn merge_index_chain(
+    primary: impl IntoIterator<Item = String>,
+    extra: &[String],
+) -> Vec<String> {
+    fn push_unique(list: &mut Vec<String>, idx: String) {
+        if !list
+            .iter()
+            .any(|e| e.trim_end_matches('/') == idx.trim_end_matches('/'))
+        {
+            list.push(idx);
+        }
+    }
+    let mut indexes: Vec<String> = Vec::new();
+    for idx in primary {
+        push_unique(&mut indexes, idx);
+    }
+    for idx in extra {
+        push_unique(&mut indexes, idx.clone());
+    }
+    push_unique(&mut indexes, PUBLIC_PYPI.to_string());
+    indexes
+}
+
 const DEFAULT_PYTHON: &str = "3.11";
 
 /// PyPI packages that are Windows-only and frequently declared as
