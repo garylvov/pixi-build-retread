@@ -2,6 +2,11 @@
     use super::auto_bundle::{
         ExtraDepSource, extra_dep_source_from_url, pep508_extra_dep, prefer_conda_match,
     };
+    use super::cascade::{
+        bundle_group_for, check_output_abi_invariants, extract_anchor_version,
+        merge_looser_override, pypi_fallback_indexes, tiered_cascade_for_dep, widen_one_level,
+        widening_level,
+    };
     use crate::config::RelaxPolicy;
     use crate::relax::default_marker_env;
     use std::collections::BTreeMap;
