@@ -107,7 +107,14 @@ pub(crate) async fn auto_bundle_transitives(
     // collisions (e.g. between a bundled numpy 1.26 and the workspace's
     // conda numpy 2.x) are the user's call -- add the package name to
     // `retread-conda-deps` to keep it on the conda side.
-    let mut skip: HashSet<String> = bundle.all_wheels().map(|w| w.pypi_name.clone()).collect();
+    // P2 (grizzly #2): seed CANONICAL names. Wheels record raw pypi
+    // names (underscores, case, dots); candidates are checked in
+    // canonical form -- a raw-seeded set missed them and re-bundled an
+    // already-present wheel (double-installing ABI-sensitive deps).
+    let mut skip: HashSet<String> = bundle
+        .all_wheels()
+        .map(|w| canonical_conda_name(&w.pypi_name))
+        .collect();
     skip.extend(config.conda_deps.iter().map(|n| canonical_conda_name(n)));
     skip.extend(config.drop_deps.iter().map(|n| canonical_conda_name(n)));
     skip.extend(config.overrides.keys().map(|n| canonical_conda_name(n)));

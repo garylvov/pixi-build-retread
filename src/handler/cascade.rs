@@ -843,16 +843,12 @@ pub(crate) async fn pre_emit_widen_pass(
         if spec.is_empty() || spec == "*" {
             continue;
         }
-        // Match the bundle's vendored wheels on EITHER namespace: the
-        // wheels are recorded under PyPI names, but name_map may
-        // translate this dep's emission name to a different conda name
-        // (tinyobjloader -> tinyobjloader-python). Same skew class as
-        // the produce_output drop filters (v1.4.x).
-        if bundled_names.contains(&conda_name)
-            || pypi_name
-                .as_ref()
-                .is_some_and(|p| bundled_names.contains(&canonical_conda_name(p)))
-        {
+        // Match the bundle's vendored wheels on EITHER namespace via
+        // the shared dual-namespace helper (P2): the wheels are
+        // recorded under PyPI names, but name_map may translate this
+        // dep's emission name to a different conda name
+        // (tinyobjloader -> tinyobjloader-python).
+        if crate::relax::already_covered(&bundled_names, &conda_name, pypi_name.as_deref()) {
             continue;
         }
         if effective.overrides.contains_key(&conda_name) {

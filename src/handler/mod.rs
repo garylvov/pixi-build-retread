@@ -2182,7 +2182,10 @@ async fn resolve_bundle(
         },
     )
     .await?;
-    seen.insert(primary.pypi_name.clone());
+    // P2 (grizzly #2): canonical seed -- the BFS dedups candidates in
+    // canonical form (see the `canonical_conda_name(&pending.pypi_name)`
+    // drain below), so the primary must be seeded the same way.
+    seen.insert(canonical_conda_name(&primary.pypi_name));
 
     // path/git/from sources are authored project code, not metapackages
     // with extras-gated transitives. SKIP the BFS entirely unless the
@@ -3085,7 +3088,11 @@ fn produce_output(
     // alongside its siblings, so any `Requires-Dist` line that names one of
     // them must be dropped from the conda run-deps (otherwise conda would
     // try to install a separate copy from a channel that doesn't have it).
-    let vendored: HashSet<String> = bundle.all_wheels().map(|w| w.pypi_name.clone()).collect();
+    // P2: seeded CANONICAL (matches already_covered's query side).
+    let vendored: HashSet<String> = bundle
+        .all_wheels()
+        .map(|w| crate::relax::canonical_conda_name(&w.pypi_name))
+        .collect();
 
     // User-specified deps to drop entirely (no conda counterpart available).
     let user_dropped: HashSet<String> = config
@@ -3151,10 +3158,11 @@ fn produce_output(
             let dep_name = dep.0.split_whitespace().next().unwrap_or("").to_string();
             let parsed_raw: Option<uv_pep508::Requirement> =
                 uv_pep508::Requirement::from_str(raw).ok();
-            let raw_pypi_name: Option<String> =
-                parsed_raw.map(|r| canonical_conda_name(r.name.as_ref()));
+            let raw_pypi_name: Option<String> = parsed_raw.map(|r| r.name.to_string());
+            // P2: one dual-namespace membership helper for all three
+            // filters (canonicalizes both query names internally).
             let in_set = |set: &HashSet<String>| {
-                set.contains(&dep_name) || raw_pypi_name.as_ref().is_some_and(|p| set.contains(p))
+                crate::relax::already_covered(set, &dep_name, raw_pypi_name.as_deref())
             };
             if in_set(&vendored) {
                 continue;

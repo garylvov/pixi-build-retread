@@ -116,6 +116,21 @@ pub(crate) fn canonical_conda_name(name: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
+/// P2 (bloat M2 / grizzly #2): dual-namespace set membership. True
+/// when the canonical form of EITHER the conda-side name OR the
+/// pypi-side name is in `set`. Sets must be seeded with
+/// `canonical_conda_name` output; canonicalizing both query names here
+/// means no call site can reintroduce the raw-vs-canonical skew that
+/// shipped doomed conda deps alongside bundled wheels.
+pub(crate) fn already_covered(
+    set: &std::collections::HashSet<String>,
+    conda_name: &str,
+    pypi_name: Option<&str>,
+) -> bool {
+    set.contains(&canonical_conda_name(conda_name))
+        || pypi_name.is_some_and(|p| set.contains(&canonical_conda_name(p)))
+}
+
 fn map_name(pypi: &str, overrides: &BTreeMap<String, String>) -> String {
     if let Some(mapped) = overrides.get(pypi) {
         return mapped.clone();

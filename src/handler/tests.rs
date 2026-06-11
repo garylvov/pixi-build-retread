@@ -866,6 +866,47 @@ fn localize_wheel_source_prefers_cached_copy() {
 }
 
 #[test]
+fn vendored_filter_matches_underscore_pypi_name() {
+    // P2 (grizzly #2) through the real consumer: a bundle wheel whose
+    // recorded pypi_name uses underscores ("opencv_python") must still
+    // suppress the conda run-dep emitted for "opencv-python". Pre-P2
+    // the vendored set was seeded RAW while the query side was
+    // canonical, so the filter missed and the dep shipped.
+    let mut bundle = solo_bundle("isaac-pack", vec!["opencv-python==4.9.0", "numpy==1.26.0"]);
+    bundle.extras.push(rw(
+        "opencv_python",
+        meta("opencv_python", "4.9.0", vec![], true),
+    ));
+    let output = produce_output(&bundle, &cfg(), Platform::Linux64, "3.12", &[]).unwrap();
+    let names: Vec<String> = output
+        .run_dependencies
+        .depends
+        .iter()
+        .map(|d| d.name.as_str().to_string())
+        .collect();
+    assert!(
+        !names.iter().any(|n| n.contains("opencv")),
+        "underscore-named vendored wheel must suppress the emission; got: {names:?}"
+    );
+    assert!(names.iter().any(|n| n == "numpy"), "control dep survives");
+}
+
+#[test]
+fn already_covered_dotted_name() {
+    // P2 dotted-name class: a skip set seeded from a "ruamel.yaml"
+    // wheel covers the canonical "ruamel-yaml" query and vice versa.
+    let mut set = std::collections::HashSet::new();
+    set.insert(crate::relax::canonical_conda_name("ruamel.yaml"));
+    assert!(crate::relax::already_covered(&set, "ruamel-yaml", None));
+    assert!(crate::relax::already_covered(
+        &set,
+        "x",
+        Some("ruamel.yaml")
+    ));
+    assert!(!crate::relax::already_covered(&set, "ruamel", None));
+}
+
+#[test]
 fn name_mapped_dep_dropped_by_pypi_name() {
     // v1.4.0 regression (found via examples/isaac6): the cascade
     // bundles a wheel and records the drop under the PYPI name
