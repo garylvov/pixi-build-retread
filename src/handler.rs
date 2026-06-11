@@ -696,123 +696,173 @@ impl Handler {
                     // through unchanged.
                     let mut accumulated_overrides: BTreeMap<String, String> =
                         effective_snapshot.overrides.clone();
-                    for env_name in &env_names {
-                        bundle = bundle_snapshot.clone();
-                        effective = effective_snapshot.clone();
-                        let (env_channels, env_workspace_specs, env_system_requirements) =
-                            match (&manifest_for_solve, env_name.as_str()) {
+                    // v1.4.3: group the (ascending-dep-count-sorted)
+                    // envs into levels of equal count and solve each
+                    // level's envs CONCURRENTLY. The v0.44 parent-first
+                    // seed contract orders base -> superset envs, and a
+                    // strict superset always has strictly more
+                    // effective deps -- so two envs with EQUAL counts
+                    // cannot be a base/superset pair (equal sets gain
+                    // nothing from seeding anyway). Each env still runs
+                    // on its own clone of the post-pre-emit snapshot
+                    // (the v0.36.1/.2 isolation contract), every
+                    // iteration still runs a real run_solve_check, and
+                    // the merge below runs serially in env order so
+                    // accumulated_overrides stays a deterministic
+                    // monotonic union.
+                    let env_levels: Vec<Vec<String>> = {
+                        let count_of = |n: &str| -> usize {
+                            match (&manifest_for_solve, n) {
                                 (Some(m), n) if n != "__default__" => {
-                                    let chans: Vec<ChannelUrl> = m
-                                        .effective_channels(n)
-                                        .iter()
-                                        .filter_map(|s| {
-                                            url::Url::parse(s).ok().map(ChannelUrl::from)
-                                        })
-                                        .collect();
-                                    let chans = if chans.is_empty() {
-                                        params.channels.clone()
-                                    } else {
-                                        chans
-                                    };
-                                    let mut specs: Vec<String> = Vec::new();
-                                    for (dep_name, spec) in m.effective_dependencies(n) {
-                                        if spec.is_empty() || spec == "*" {
-                                            specs.push(dep_name);
-                                        } else {
-                                            specs.push(format!("{dep_name} {spec}"));
-                                        }
-                                    }
-                                    // v0.37.0 D1b: pull per-env
-                                    // system-requirements so solve_check
-                                    // sees workspace-declared __cuda /
-                                    // __glibc / __osx instead of the
-                                    // build host's detected values.
-                                    let sysreqs = m.effective_system_requirements(n);
-                                    (chans, specs, sysreqs)
+                                    m.effective_dependencies(n).len()
                                 }
-                                _ => (
-                                    params.channels.clone(),
-                                    Vec::new(),
-                                    std::collections::BTreeMap::new(),
-                                ),
-                            };
-                        // v0.34.0+: iterative refinement. The solve
-                        // check may say UNSAT because retread emitted
-                        // a too-narrow spec (e.g. `triton >=3.7.0,<3.8`
-                        // when conda's triton 3.7 needs cuda 13 but
-                        // the workspace pins cuda 12.8). The cascade
-                        // didn't widen because the per-dep probe saw
-                        // triton 3.7.0 satisfying in isolation. Now
-                        // we feed the solve-check failure BACK into
-                        // the cascade: parse the blocking deps from
-                        // the unsat explanation, widen any of them
-                        // that are retread-emitted to `*`, re-run
-                        // produce_output + solve check. Iterate up
-                        // to MAX_REFINEMENT iterations (cap so we
-                        // don't loop forever on external conflicts).
-                        let outcome = iterative_solve_refinement(
-                            &emitted_run_deps_strs,
-                            &accumulated_overrides,
-                            &env_workspace_specs,
-                            &env_channels,
-                            python_version,
-                            &params.host_platform.to_string(),
-                            &mut bundle,
-                            &mut effective,
-                            params.host_platform,
-                            &siblings,
-                            env_name,
-                            manifest_for_solve.as_ref(),
-                            workspace_channel_priority,
-                            &env_system_requirements,
-                        )
-                        .await
-                        .map_err(|e| {
-                            RpcError::internal(format!(
-                                "solve refinement for {} env {}: {e:#}",
-                                bundle.conda_name, env_name,
-                            ))
-                        })?;
-                        // v0.36.4+: refinement may have widened
-                        // entries in `effective.overrides` for this
-                        // env. Union them into accumulated_overrides
-                        // (loosest spec per dep wins) so the
-                        // post-loop rebuild ships a CondaOutput
-                        // whose run-deps satisfy every env.
-                        //
-                        // Previously this site was `let _ = &output;`
-                        // — a no-op placeholder whose comment
-                        // described the propagation that never
-                        // actually happened. Result: the trace
-                        // showed widenings, retread's solve_check
-                        // reported sat against the widened in-loop
-                        // run-deps, but pixi received the original
-                        // pre-refinement emission and exploded on
-                        // misleading leaves (e.g. the joint-state-
-                        // publisher `python_abi 3.9.*` chain whose
-                        // real cause was retread's un-widened
-                        // `pytorch ==2.10.0` forcing numpy 2 and
-                        // knocking out the np126py311 builds).
-                        for (dep, spec) in &effective.overrides {
-                            merge_looser_override(&mut accumulated_overrides, dep, spec);
+                                _ => 0,
+                            }
+                        };
+                        let mut levels: Vec<Vec<String>> = Vec::new();
+                        let mut last_count: Option<usize> = None;
+                        for n in &env_names {
+                            let c = count_of(n);
+                            if last_count == Some(c) {
+                                levels.last_mut().unwrap().push(n.clone());
+                            } else {
+                                levels.push(vec![n.clone()]);
+                                last_count = Some(c);
+                            }
                         }
-                        if !outcome.satisfiable
-                            && !outcome.skipped
-                            && !outcome.unsat_explanations.is_empty()
-                        {
-                            // Print the FULL diagnostic to stderr in
-                            // a banner so it survives pixi's log
-                            // filtering even at default verbosity.
-                            // pixi reports its own (often misleading)
-                            // leaf error -- this gives the user the
-                            // REAL upstream conflict chain alongside.
-                            let banner_lines: Vec<String> = outcome
-                                .unsat_explanations
-                                .iter()
-                                .map(|r| format!("    {}", r.replace('\n', "\n    ")))
-                                .collect();
-                            eprintln!(
-                                "\n\
+                        levels
+                    };
+                    for level in &env_levels {
+                        // Per-level seed snapshot: every env in this
+                        // level sees the widenings of all COMPLETED
+                        // levels, never a same-level sibling's.
+                        let level_seed = accumulated_overrides.clone();
+                        let level_results: Vec<Result<EnvSolveResult, RpcError>> =
+                            futures::future::join_all(level.iter().map(|env_name| {
+                                let mut bundle = bundle_snapshot.clone();
+                                let mut effective = effective_snapshot.clone();
+                                // Reference bindings so `async move` moves
+                                // only the &refs, not the outer values.
+                                let level_seed = &level_seed;
+                                let manifest_for_solve = &manifest_for_solve;
+                                let params = &params;
+                                let emitted_run_deps_strs = &emitted_run_deps_strs;
+                                let siblings = &siblings;
+                                async move {
+                                    let (
+                                        env_channels,
+                                        env_workspace_specs,
+                                        env_system_requirements,
+                                    ) = match (manifest_for_solve, env_name.as_str()) {
+                                        (Some(m), n) if n != "__default__" => {
+                                            let chans: Vec<ChannelUrl> = m
+                                                .effective_channels(n)
+                                                .iter()
+                                                .filter_map(|s| {
+                                                    url::Url::parse(s).ok().map(ChannelUrl::from)
+                                                })
+                                                .collect();
+                                            let chans = if chans.is_empty() {
+                                                params.channels.clone()
+                                            } else {
+                                                chans
+                                            };
+                                            let mut specs: Vec<String> = Vec::new();
+                                            for (dep_name, spec) in m.effective_dependencies(n) {
+                                                if spec.is_empty() || spec == "*" {
+                                                    specs.push(dep_name);
+                                                } else {
+                                                    specs.push(format!("{dep_name} {spec}"));
+                                                }
+                                            }
+                                            // v0.37.0 D1b: pull per-env
+                                            // system-requirements so solve_check
+                                            // sees workspace-declared __cuda /
+                                            // __glibc / __osx instead of the
+                                            // build host's detected values.
+                                            let sysreqs = m.effective_system_requirements(n);
+                                            (chans, specs, sysreqs)
+                                        }
+                                        _ => (
+                                            params.channels.clone(),
+                                            Vec::new(),
+                                            std::collections::BTreeMap::new(),
+                                        ),
+                                    };
+                                    // v0.34.0+: iterative refinement. The solve
+                                    // check may say UNSAT because retread emitted
+                                    // a too-narrow spec (e.g. `triton >=3.7.0,<3.8`
+                                    // when conda's triton 3.7 needs cuda 13 but
+                                    // the workspace pins cuda 12.8). The cascade
+                                    // didn't widen because the per-dep probe saw
+                                    // triton 3.7.0 satisfying in isolation. Now
+                                    // we feed the solve-check failure BACK into
+                                    // the cascade: parse the blocking deps from
+                                    // the unsat explanation, widen any of them
+                                    // that are retread-emitted to `*`, re-run
+                                    // produce_output + solve check. Iterate up
+                                    // to MAX_REFINEMENT iterations (cap so we
+                                    // don't loop forever on external conflicts).
+                                    let outcome = iterative_solve_refinement(
+                                        emitted_run_deps_strs,
+                                        level_seed,
+                                        &env_workspace_specs,
+                                        &env_channels,
+                                        python_version,
+                                        &params.host_platform.to_string(),
+                                        &mut bundle,
+                                        &mut effective,
+                                        params.host_platform,
+                                        siblings,
+                                        env_name,
+                                        manifest_for_solve.as_ref(),
+                                        workspace_channel_priority,
+                                        &env_system_requirements,
+                                    )
+                                    .await
+                                    .map_err(|e| {
+                                        RpcError::internal(format!(
+                                            "solve refinement for {} env {}: {e:#}",
+                                            bundle.conda_name, env_name,
+                                        ))
+                                    })?;
+                                    Ok((env_name.clone(), outcome, effective.overrides))
+                                }
+                            }))
+                            .await;
+
+                        // Serial, in env order: union widenings +
+                        // bookkeeping. Identical to the old per-env
+                        // tail, just hoisted out of the parallel part.
+                        for result in level_results {
+                            let (env_name, outcome, env_overrides) = result?;
+                            let env_name = &env_name;
+                            // v0.36.4+: refinement may have widened
+                            // entries in `effective.overrides` for this
+                            // env. Union them into accumulated_overrides
+                            // (loosest spec per dep wins) so the
+                            // post-loop rebuild ships a CondaOutput
+                            // whose run-deps satisfy every env.
+                            for (dep, spec) in &env_overrides {
+                                merge_looser_override(&mut accumulated_overrides, dep, spec);
+                            }
+                            if !outcome.satisfiable
+                                && !outcome.skipped
+                                && !outcome.unsat_explanations.is_empty()
+                            {
+                                // Print the FULL diagnostic to stderr in
+                                // a banner so it survives pixi's log
+                                // filtering even at default verbosity.
+                                // pixi reports its own (often misleading)
+                                // leaf error -- this gives the user the
+                                // REAL upstream conflict chain alongside.
+                                let banner_lines: Vec<String> = outcome
+                                    .unsat_explanations
+                                    .iter()
+                                    .map(|r| format!("    {}", r.replace('\n', "\n    ")))
+                                    .collect();
+                                eprintln!(
+                                    "\n\
                                  ┌──────────────────────────────────────────────────────────────────────\n\
                                  │ RETREAD SOLVE FAILURE -- output `{}` env `{}`\n\
                                  │ (pre-emission solve check; pixi's own error below may be misleading)\n\
@@ -821,74 +871,80 @@ impl Handler {
                                  │\n\
                                  │ Full trace: retread-probe-trace-{}.json\n\
                                  └──────────────────────────────────────────────────────────────────────\n",
-                                bundle.conda_name,
-                                env_name,
-                                banner_lines.join("\n"),
-                                bundle.conda_name,
-                            );
-                            tracing::error!(
-                                bundle = %bundle.conda_name,
-                                env = %env_name,
-                                "pre-emission solve check UNSAT (see banner on stderr)",
-                            );
-                        }
-                        // v1.4.0: a SKIPPED check (no repodata) is an
-                        // abstention -- it must not arm the fail gate.
-                        if !outcome.skipped {
-                            all_solve_attempted = true;
-                        }
-                        envs_attempted += 1;
-                        if outcome.satisfiable {
-                            any_solve_passed = true;
-                        }
-                        // For workspace-blocked envs, accumulate a
-                        // one-liner suggestion for the consolidated
-                        // RPC failure message at the end.
-                        let class_tag = outcome.terminal_classification.clone().unwrap_or_default();
-                        if !outcome.satisfiable
-                            && (class_tag.starts_with("B-")
-                                || class_tag.starts_with("C-")
-                                || class_tag.starts_with("A-exhausted")
-                                || class_tag.starts_with("A-no-widening")
-                                || class_tag.starts_with("A-iteration-cap"))
-                        {
-                            envs_failed_with_block.insert(env_name.clone());
-                            for sug in &outcome.workspace_edit_suggestions {
-                                real_suggestion_count += 1;
-                                let feat = sug
-                                    .feature
-                                    .as_deref()
-                                    .map(|f| format!("[feature.{f}.dependencies]"))
-                                    .unwrap_or_else(|| "[dependencies]".to_string());
-                                workspace_block_messages.push(format!(
-                                    "  env `{}` / {}: change `{}` -> `{}`  ({})",
-                                    sug.env, feat, sug.current_pin, sug.suggested_pin, sug.reason,
-                                ));
+                                    bundle.conda_name,
+                                    env_name,
+                                    banner_lines.join("\n"),
+                                    bundle.conda_name,
+                                );
+                                tracing::error!(
+                                    bundle = %bundle.conda_name,
+                                    env = %env_name,
+                                    "pre-emission solve check UNSAT (see banner on stderr)",
+                                );
                             }
-                            // If no suggestions but workspace-blocked,
-                            // still include a generic line so the user
-                            // knows where to look.
-                            if outcome.workspace_edit_suggestions.is_empty() {
-                                workspace_block_messages.push(format!(
+                            // v1.4.0: a SKIPPED check (no repodata) is an
+                            // abstention -- it must not arm the fail gate.
+                            if !outcome.skipped {
+                                all_solve_attempted = true;
+                            }
+                            envs_attempted += 1;
+                            if outcome.satisfiable {
+                                any_solve_passed = true;
+                            }
+                            // For workspace-blocked envs, accumulate a
+                            // one-liner suggestion for the consolidated
+                            // RPC failure message at the end.
+                            let class_tag =
+                                outcome.terminal_classification.clone().unwrap_or_default();
+                            if !outcome.satisfiable
+                                && (class_tag.starts_with("B-")
+                                    || class_tag.starts_with("C-")
+                                    || class_tag.starts_with("A-exhausted")
+                                    || class_tag.starts_with("A-no-widening")
+                                    || class_tag.starts_with("A-iteration-cap"))
+                            {
+                                envs_failed_with_block.insert(env_name.clone());
+                                for sug in &outcome.workspace_edit_suggestions {
+                                    real_suggestion_count += 1;
+                                    let feat = sug
+                                        .feature
+                                        .as_deref()
+                                        .map(|f| format!("[feature.{f}.dependencies]"))
+                                        .unwrap_or_else(|| "[dependencies]".to_string());
+                                    workspace_block_messages.push(format!(
+                                        "  env `{}` / {}: change `{}` -> `{}`  ({})",
+                                        sug.env,
+                                        feat,
+                                        sug.current_pin,
+                                        sug.suggested_pin,
+                                        sug.reason,
+                                    ));
+                                }
+                                // If no suggestions but workspace-blocked,
+                                // still include a generic line so the user
+                                // knows where to look.
+                                if outcome.workspace_edit_suggestions.is_empty() {
+                                    workspace_block_messages.push(format!(
                                     "  env `{}` blocked ({}): see retread-probe-trace-{}.json.solve_diagnostics.{}",
                                     env_name, class_tag, bundle.conda_name, env_name,
                                 ));
+                                }
                             }
+                            accumulated_diagnostics.insert(
+                                env_name.clone(),
+                                crate::audit::SolveDiagnostics {
+                                    satisfiable: outcome.satisfiable,
+                                    unsat_explanations: outcome.unsat_explanations,
+                                    channels_consulted: outcome.channels_consulted,
+                                    specs_count: outcome.specs_count,
+                                    records_count: outcome.records_count,
+                                    refinement_steps: outcome.refinement_steps,
+                                    workspace_edit_suggestions: outcome.workspace_edit_suggestions,
+                                    terminal_classification: outcome.terminal_classification,
+                                    skipped: outcome.skipped,
+                                },
+                            );
                         }
-                        accumulated_diagnostics.insert(
-                            env_name.clone(),
-                            crate::audit::SolveDiagnostics {
-                                satisfiable: outcome.satisfiable,
-                                unsat_explanations: outcome.unsat_explanations,
-                                channels_consulted: outcome.channels_consulted,
-                                specs_count: outcome.specs_count,
-                                records_count: outcome.records_count,
-                                refinement_steps: outcome.refinement_steps,
-                                workspace_edit_suggestions: outcome.workspace_edit_suggestions,
-                                terminal_classification: outcome.terminal_classification,
-                                skipped: outcome.skipped,
-                            },
-                        );
                     }
                     // Transfer accumulated per-env diagnostics back
                     // onto the bundle so the probe trace + audit MD
@@ -2977,48 +3033,45 @@ async fn try_pypi_bundle(
 ) -> bool {
     for index in pypi_indexes {
         match pypi::resolve(index, pypi_name, specs, target).await {
-            Ok(resolved) => {
-                match fetch_and_parse(&resolved.url, resolved.sha256.as_deref(), download_dir).await
-                {
-                    Ok(metadata) => {
-                        bundle.probe_decisions.push(crate::audit::ProbeDecision {
-                            stage: stage.into(),
-                            pypi_name: pypi_name.to_string(),
-                            conda_name: conda_name.to_string(),
-                            spec: specs.to_string(),
-                            target_python: target.python_version.clone(),
-                            channels_consulted: vec![index.clone()],
-                            satisfiable: Some(true),
-                            matching_candidates: 1,
-                            routing_decision: success_routing.into(),
-                        });
-                        tracing::info!(
-                            dep = %pypi_name,
-                            index = %index,
-                            url = %resolved.url,
-                            "tiered-cascade: PyPI fallback bundled wheel; dropping conda emit",
-                        );
-                        bundle.extras.push(ResolvedWheel {
-                            pypi_name: conda_name_from(pypi_name),
-                            url: resolved.url,
-                            metadata,
-                            extras_requested: vec![],
-                            auto_data: None,
-                            auto_data_dedup_skipped_root: None,
-                        });
-                        effective.drop_deps.push(pypi_name.to_string());
-                        return true;
-                    }
-                    Err(e) => {
-                        tracing::debug!(
-                            dep = %pypi_name,
-                            index = %index,
-                            error = %format!("{e:#}"),
-                            "tiered-cascade: PyPI fetch failed; trying next index",
-                        );
-                    }
+            Ok(resolved) => match metadata_preferring_sidecar(&resolved, download_dir).await {
+                Ok(metadata) => {
+                    bundle.probe_decisions.push(crate::audit::ProbeDecision {
+                        stage: stage.into(),
+                        pypi_name: pypi_name.to_string(),
+                        conda_name: conda_name.to_string(),
+                        spec: specs.to_string(),
+                        target_python: target.python_version.clone(),
+                        channels_consulted: vec![index.clone()],
+                        satisfiable: Some(true),
+                        matching_candidates: 1,
+                        routing_decision: success_routing.into(),
+                    });
+                    tracing::info!(
+                        dep = %pypi_name,
+                        index = %index,
+                        url = %resolved.url,
+                        "tiered-cascade: PyPI fallback bundled wheel; dropping conda emit",
+                    );
+                    bundle.extras.push(ResolvedWheel {
+                        pypi_name: conda_name_from(pypi_name),
+                        url: resolved.url,
+                        metadata,
+                        extras_requested: vec![],
+                        auto_data: None,
+                        auto_data_dedup_skipped_root: None,
+                    });
+                    effective.drop_deps.push(pypi_name.to_string());
+                    return true;
                 }
-            }
+                Err(e) => {
+                    tracing::debug!(
+                        dep = %pypi_name,
+                        index = %index,
+                        error = %format!("{e:#}"),
+                        "tiered-cascade: PyPI fetch failed; trying next index",
+                    );
+                }
+            },
             Err(e) => {
                 bundle.probe_decisions.push(crate::audit::ProbeDecision {
                     stage: stage.into(),
@@ -3482,344 +3535,345 @@ async fn resolve_bundle(
     // sub-wheels propagate their own extras but NOT prefix-base-dep
     // matching (they're project code, same rule as primary).
     let mut extras = Vec::new();
-    while let Some(pending) = work.pop_front() {
-        let dep_conda_name = conda_name_from(&pending.pypi_name);
-        if !seen.insert(dep_conda_name.clone()) {
-            continue;
+    // v1.4.3: process the BFS level by level. A child's existence is
+    // only known after its parent's METADATA is parsed, but items at
+    // the SAME depth never read each other's results -- so each
+    // level's expensive wheel fetches run with bounded concurrency.
+    // Routing probes stay serial (the in-memory repodata cache makes
+    // them hashmap lookups after the first call); seed_worklist +
+    // extras.push stay a serial in-order sweep so the audit order and
+    // extras order are deterministic and identical to the old
+    // one-item-at-a-time BFS. Git/URL-form deps are also fetched
+    // serially: two materializations of the same repo would race the
+    // git-clone cache.
+    'levels: loop {
+        // Drain the current frontier, deduping at drain time. (The old
+        // loop deduped at pop time -- equivalent, since seed_worklist
+        // also consults `seen` before enqueuing.)
+        let mut frontier: Vec<Pending> = Vec::new();
+        while let Some(pending) = work.pop_front() {
+            let dep_conda_name = conda_name_from(&pending.pypi_name);
+            if !seen.insert(dep_conda_name) {
+                continue;
+            }
+            frontier.push(pending);
         }
-        // v0.17.0+ probe-gated prefer-conda short-circuit. Decision:
-        //   (a) Non-Pypi pending source (URL/git PEP 508 dep)
-        //       -> never short-circuit (materialize via git/url path).
-        //   (b) Parselmouth doesn't know this PyPI name
-        //       -> don't short-circuit, go to PyPI.
-        //   (c) Pick canonical conda name from parselmouth candidates:
-        //         - identity match wins (numpy, psutil, pyyaml, gym...)
-        //         - else single-candidate (torch -> pytorch)
-        //         - else ambiguous-no-identity -> don't short-circuit,
-        //           record decision, go to PyPI. User can disambiguate
-        //           via retread-name-map.
-        //   (d) Probe workspace conda channels for that name under
-        //       wheel's spec + target python.
-        //   (e) satisfied / indecisive -> short-circuit.
-        //       unsatisfiable -> fall through to PyPI.
-        //
-        // The v0.13.10 `.first()` candidate picker was wrong: the
-        // inverted parselmouth map has many false positives (a conda
-        // package can list a pypi dep without "being" it), so picking
-        // an arbitrary candidate gave nonsense like `numpy -> manifpy`
-        // and `torch -> pytorch-cpu`. The probe then asked the wrong
-        // question. v0.17.0 fixes the picker.
-        let mut routed_to_conda = false;
-        if let PendingSource::Pypi { specifiers, .. } = &pending.source {
-            // v0.46.0: the curated/user name-map wins over parselmouth.
-            // If it has an entry for this dep (e.g. torch->pytorch from
-            // FALLBACK), treat that as the unambiguous conda target --
-            // otherwise fall back to parselmouth's inverted candidates,
-            // which are often ambiguous for exactly the deps the FALLBACK
-            // table exists to disambiguate.
-            {
-                let picked: Option<String> =
-                    pick_conda_target(&dep_conda_name, name_map, pypi_to_conda);
-                match picked {
-                    None => {
-                        let amb = pypi_to_conda.get(&dep_conda_name);
-                        tracing::info!(
-                            dep = %pending.pypi_name,
-                            candidates = ?amb,
-                            "BFS prefer-conda: ambiguous parselmouth mapping with no identity match; not short-circuiting (add retread-name-map to force conda routing)",
-                        );
-                        probe_decisions.push(crate::audit::ProbeDecision {
-                            stage: "bfs".into(),
-                            pypi_name: pending.pypi_name.clone(),
-                            conda_name: format!("(ambiguous: {amb:?})"),
-                            spec: specifiers.to_string(),
-                            target_python: target.python_version.clone(),
-                            channels_consulted: vec![],
-                            satisfiable: None,
-                            matching_candidates: 0,
-                            routing_decision: "skipped-ambiguous-no-identity".into(),
-                        });
-                        // routed_to_conda stays false -> falls through to pypi::resolve below
-                    }
-                    Some(conda_target_name) => {
-                        // Normalize the spec for conda's matchspec
-                        // parser:
-                        //   * Strip the space after `,` --
-                        //     `VersionSpecifiers::to_string()`
-                        //     produces `>=0.23.0, <0.24.0` (space)
-                        //     which lenient parsing accepted but
-                        //     silently dropped the second clause for
-                        //     some inputs -> probe returned satisfied
-                        //     when it shouldn't.
-                        //   * Coerce empty-spec to `*` -- bare-name
-                        //     `Requires-Dist: gym` produces empty
-                        //     VersionSpecifiers, which conda
-                        //     matchspec can't parse -> probe returned
-                        //     indecisive -> BFS short-circuited
-                        //     ("indecisive-short-circuit") instead of
-                        //     bundling. `*` means "any version" which
-                        //     is what PEP 508 bare-name means, and it
-                        //     lets the python-compat filter do its
-                        //     real job. (gym now: probe with "*"
-                        //     finds many gym versions but NONE have a
-                        //     py3.11 build -> satisfiable=false ->
-                        //     fall through to PyPI bundle.)
-                        let normalized = specifiers.to_string().replace(", ", ",");
-                        let probe_spec = if normalized.trim().is_empty() {
-                            "*".to_string()
-                        } else {
-                            normalized
-                        };
-                        let probe_result = crate::probe::probe(
-                            conda_channels,
-                            &conda_target_name,
-                            &probe_spec,
-                            Some(&target.python_version),
-                        )
-                        .await;
-                        let routing_decision = if probe_result.is_definitively_unsatisfied() {
-                            "fall-through-to-pypi"
-                        } else if probe_result.is_satisfied() {
-                            "short-circuit"
-                        } else {
-                            "indecisive-short-circuit"
-                        };
-                        probe_decisions.push(crate::audit::ProbeDecision {
-                            stage: "bfs".into(),
-                            pypi_name: pending.pypi_name.clone(),
-                            conda_name: conda_target_name.clone(),
-                            spec: probe_spec.clone(),
-                            target_python: target.python_version.clone(),
-                            channels_consulted: probe_result.channels_consulted.clone(),
-                            satisfiable: probe_result.satisfiable,
-                            matching_candidates: probe_result.matching_candidates,
-                            routing_decision: routing_decision.into(),
-                        });
-                        tracing::info!(
-                            dep = %pending.pypi_name,
-                            conda_name = %conda_target_name,
-                            spec = %probe_spec,
-                            decision = %routing_decision,
-                            matches = probe_result.matching_candidates,
-                            channels = ?probe_result.channels_consulted,
-                            "BFS prefer-conda probe result",
-                        );
-                        if routing_decision != "fall-through-to-pypi" {
-                            routed_to_conda = true;
-                        } else {
-                            // v0.46.0: the EXACT wheel spec isn't on conda
-                            // (e.g. wheel pins torch==2.7.0 but conda has
-                            // 2.7.1, or the dep resolved to PyPI-latest in
-                            // isolation). Bundling here vendors a PyPI build
-                            // that SHADOWS conda's ABI-correct copy and
-                            // double-installs a dep we also emit as a conda
-                            // run-dep. Before falling through to PyPI, probe
-                            // whether conda has the package at ANY (py-compat)
-                            // version; if so, keep it on conda and let the
-                            // run-dep emission + solve cascade pick the
-                            // ABI-correct build. Only bundle when conda truly
-                            // lacks the package.
-                            let name_level = crate::probe::probe(
+        if frontier.is_empty() {
+            break 'levels;
+        }
+
+        // Phase 1: routing (prefer-conda short-circuit), serial.
+        // Collects the items that fall through to materialization.
+        let mut to_materialize: Vec<Pending> = Vec::new();
+        for pending in frontier {
+            // v0.17.0+ probe-gated prefer-conda short-circuit. Decision:
+            //   (a) Non-Pypi pending source (URL/git PEP 508 dep)
+            //       -> never short-circuit (materialize via git/url path).
+            //   (b) Parselmouth doesn't know this PyPI name
+            //       -> don't short-circuit, go to PyPI.
+            //   (c) Pick canonical conda name from parselmouth candidates:
+            //         - identity match wins (numpy, psutil, pyyaml, gym...)
+            //         - else single-candidate (torch -> pytorch)
+            //         - else ambiguous-no-identity -> don't short-circuit,
+            //           record decision, go to PyPI. User can disambiguate
+            //           via retread-name-map.
+            //   (d) Probe workspace conda channels for that name under
+            //       wheel's spec + target python.
+            //   (e) satisfied / indecisive -> short-circuit.
+            //       unsatisfiable -> fall through to PyPI.
+            //
+            // The v0.13.10 `.first()` candidate picker was wrong: the
+            // inverted parselmouth map has many false positives (a conda
+            // package can list a pypi dep without "being" it), so picking
+            // an arbitrary candidate gave nonsense like `numpy -> manifpy`
+            // and `torch -> pytorch-cpu`. The probe then asked the wrong
+            // question. v0.17.0 fixes the picker.
+            let dep_conda_name = conda_name_from(&pending.pypi_name);
+            let mut routed_to_conda = false;
+            if let PendingSource::Pypi { specifiers, .. } = &pending.source {
+                // v0.46.0: the curated/user name-map wins over parselmouth.
+                // If it has an entry for this dep (e.g. torch->pytorch from
+                // FALLBACK), treat that as the unambiguous conda target --
+                // otherwise fall back to parselmouth's inverted candidates,
+                // which are often ambiguous for exactly the deps the FALLBACK
+                // table exists to disambiguate.
+                {
+                    let picked: Option<String> =
+                        pick_conda_target(&dep_conda_name, name_map, pypi_to_conda);
+                    match picked {
+                        None => {
+                            let amb = pypi_to_conda.get(&dep_conda_name);
+                            tracing::info!(
+                                dep = %pending.pypi_name,
+                                candidates = ?amb,
+                                "BFS prefer-conda: ambiguous parselmouth mapping with no identity match; not short-circuiting (add retread-name-map to force conda routing)",
+                            );
+                            probe_decisions.push(crate::audit::ProbeDecision {
+                                stage: "bfs".into(),
+                                pypi_name: pending.pypi_name.clone(),
+                                conda_name: format!("(ambiguous: {amb:?})"),
+                                spec: specifiers.to_string(),
+                                target_python: target.python_version.clone(),
+                                channels_consulted: vec![],
+                                satisfiable: None,
+                                matching_candidates: 0,
+                                routing_decision: "skipped-ambiguous-no-identity".into(),
+                            });
+                            // routed_to_conda stays false -> falls through to pypi::resolve below
+                        }
+                        Some(conda_target_name) => {
+                            // Normalize the spec for conda's matchspec
+                            // parser:
+                            //   * Strip the space after `,` --
+                            //     `VersionSpecifiers::to_string()`
+                            //     produces `>=0.23.0, <0.24.0` (space)
+                            //     which lenient parsing accepted but
+                            //     silently dropped the second clause for
+                            //     some inputs -> probe returned satisfied
+                            //     when it shouldn't.
+                            //   * Coerce empty-spec to `*` -- bare-name
+                            //     `Requires-Dist: gym` produces empty
+                            //     VersionSpecifiers, which conda
+                            //     matchspec can't parse -> probe returned
+                            //     indecisive -> BFS short-circuited
+                            //     ("indecisive-short-circuit") instead of
+                            //     bundling. `*` means "any version" which
+                            //     is what PEP 508 bare-name means, and it
+                            //     lets the python-compat filter do its
+                            //     real job. (gym now: probe with "*"
+                            //     finds many gym versions but NONE have a
+                            //     py3.11 build -> satisfiable=false ->
+                            //     fall through to PyPI bundle.)
+                            let normalized = specifiers.to_string().replace(", ", ",");
+                            let probe_spec = if normalized.trim().is_empty() {
+                                "*".to_string()
+                            } else {
+                                normalized
+                            };
+                            let probe_result = crate::probe::probe(
                                 conda_channels,
                                 &conda_target_name,
-                                "*",
+                                &probe_spec,
                                 Some(&target.python_version),
                             )
                             .await;
+                            let routing_decision = if probe_result.is_definitively_unsatisfied() {
+                                "fall-through-to-pypi"
+                            } else if probe_result.is_satisfied() {
+                                "short-circuit"
+                            } else {
+                                "indecisive-short-circuit"
+                            };
                             probe_decisions.push(crate::audit::ProbeDecision {
-                                stage: "bfs_name_level".into(),
+                                stage: "bfs".into(),
                                 pypi_name: pending.pypi_name.clone(),
                                 conda_name: conda_target_name.clone(),
-                                spec: "*".into(),
+                                spec: probe_spec.clone(),
                                 target_python: target.python_version.clone(),
-                                channels_consulted: name_level.channels_consulted.clone(),
-                                satisfiable: name_level.satisfiable,
-                                matching_candidates: name_level.matching_candidates,
-                                routing_decision: if name_level.is_satisfied() {
-                                    "name-level-conda-keep"
-                                } else {
-                                    "fall-through-to-pypi"
-                                }
-                                .into(),
+                                channels_consulted: probe_result.channels_consulted.clone(),
+                                satisfiable: probe_result.satisfiable,
+                                matching_candidates: probe_result.matching_candidates,
+                                routing_decision: routing_decision.into(),
                             });
-                            if name_level.is_satisfied() {
-                                tracing::info!(
-                                    dep = %pending.pypi_name,
-                                    conda_name = %conda_target_name,
-                                    wheel_spec = %probe_spec,
-                                    conda_matches = name_level.matching_candidates,
-                                    "BFS prefer-conda: exact wheel spec absent on conda but the package exists at other versions -- keeping on conda (ABI-correct) instead of bundling a PyPI build",
-                                );
+                            tracing::info!(
+                                dep = %pending.pypi_name,
+                                conda_name = %conda_target_name,
+                                spec = %probe_spec,
+                                decision = %routing_decision,
+                                matches = probe_result.matching_candidates,
+                                channels = ?probe_result.channels_consulted,
+                                "BFS prefer-conda probe result",
+                            );
+                            if routing_decision != "fall-through-to-pypi" {
                                 routed_to_conda = true;
+                            } else {
+                                // v0.46.0: the EXACT wheel spec isn't on conda
+                                // (e.g. wheel pins torch==2.7.0 but conda has
+                                // 2.7.1, or the dep resolved to PyPI-latest in
+                                // isolation). Bundling here vendors a PyPI build
+                                // that SHADOWS conda's ABI-correct copy and
+                                // double-installs a dep we also emit as a conda
+                                // run-dep. Before falling through to PyPI, probe
+                                // whether conda has the package at ANY (py-compat)
+                                // version; if so, keep it on conda and let the
+                                // run-dep emission + solve cascade pick the
+                                // ABI-correct build. Only bundle when conda truly
+                                // lacks the package.
+                                let name_level = crate::probe::probe(
+                                    conda_channels,
+                                    &conda_target_name,
+                                    "*",
+                                    Some(&target.python_version),
+                                )
+                                .await;
+                                probe_decisions.push(crate::audit::ProbeDecision {
+                                    stage: "bfs_name_level".into(),
+                                    pypi_name: pending.pypi_name.clone(),
+                                    conda_name: conda_target_name.clone(),
+                                    spec: "*".into(),
+                                    target_python: target.python_version.clone(),
+                                    channels_consulted: name_level.channels_consulted.clone(),
+                                    satisfiable: name_level.satisfiable,
+                                    matching_candidates: name_level.matching_candidates,
+                                    routing_decision: if name_level.is_satisfied() {
+                                        "name-level-conda-keep"
+                                    } else {
+                                        "fall-through-to-pypi"
+                                    }
+                                    .into(),
+                                });
+                                if name_level.is_satisfied() {
+                                    tracing::info!(
+                                        dep = %pending.pypi_name,
+                                        conda_name = %conda_target_name,
+                                        wheel_spec = %probe_spec,
+                                        conda_matches = name_level.matching_candidates,
+                                        "BFS prefer-conda: exact wheel spec absent on conda but the package exists at other versions -- keeping on conda (ABI-correct) instead of bundling a PyPI build",
+                                    );
+                                    routed_to_conda = true;
+                                }
                             }
                         }
                     }
                 }
             }
+            if routed_to_conda {
+                continue;
+            }
+            to_materialize.push(pending);
         }
-        if routed_to_conda {
-            continue;
-        }
-        let (sub_url, sub_metadata, sub_index_for_recurse) = match &pending.source {
-            PendingSource::Pypi { specifiers, index } => {
-                // Try the wheel path first. On failure, retry with
-                // sdist (PyPI publishers like OpenAI gym stopped
-                // shipping wheels; uv builds the sdist into a wheel).
-                // Sdist fallback uses the SAME spec, so a narrow
-                // version pin still gets honored.
-                let wheel_result =
-                    pypi::resolve(index, &pending.pypi_name, specifiers, target).await;
-                let (resolved_url, metadata) = match wheel_result {
-                    Ok(resolved) => {
-                        let metadata = fetch_and_parse(
-                            &resolved.url,
-                            resolved.sha256.as_deref(),
+
+        // Phase 2: fetch this level's PyPI-form wheels concurrently
+        // (8-way bounded, order-preserving `buffered`). Git/URL forms
+        // pass through untouched and materialize serially in phase 3.
+        // Per item the semantics are byte-identical to the old serial
+        // arm: wheel resolve -> fetch, with sdist fallback on
+        // wheel-resolve failure; the first error fails the whole
+        // bundle exactly as `?` did.
+        let fetched: Vec<(Pending, Result<Option<BfsFetched>>)> = {
+            use futures::stream::{self, StreamExt};
+            stream::iter(to_materialize)
+                .map(|pending| async move {
+                    let result = match &pending.source {
+                        PendingSource::Pypi { specifiers, index } => bfs_fetch_pypi(
+                            &pending.pypi_name,
+                            specifiers,
+                            index,
+                            target,
                             download_dir,
                         )
-                        .await?;
-                        (resolved.url, metadata)
+                        .await
+                        .map(Some),
+                        _ => Ok(None),
+                    };
+                    (pending, result)
+                })
+                .buffered(8)
+                .collect()
+                .await
+        };
+
+        // Phase 3: serial in-order sweep -- materialize git/URL forms,
+        // seed the next level, accumulate extras. Order matches the
+        // old pop order exactly.
+        for (pending, fetch_result) in fetched {
+            let dep_conda_name = conda_name_from(&pending.pypi_name);
+            let (sub_url, sub_metadata, sub_index_for_recurse) =
+                match (&pending.source, fetch_result?) {
+                    (PendingSource::Pypi { .. }, Some((resolved_url, metadata, index))) => {
+                        (resolved_url, metadata, index)
                     }
-                    Err(wheel_err) => {
-                        tracing::info!(
-                            dep = %pending.pypi_name,
-                            spec = %specifiers,
-                            index = %index,
-                            error = %format!("{wheel_err:#}"),
-                            "BFS PyPI wheel resolve failed; attempting sdist fallback",
-                        );
-                        let sdist =
-                            pypi::resolve_sdist(index, &pending.pypi_name, specifiers)
-                                .await
-                                .with_context(|| {
-                                    format!(
-                                        "BFS sdist fallback for {} {} on {} (after wheel-resolve failure: {})",
-                                        pending.pypi_name, specifiers, index, wheel_err,
-                                    )
-                                })?;
-                        // Per-entry build dir under download_dir so
-                        // repeats hit the wheel cache.
-                        let sdist_out = download_dir.join(&pending.pypi_name);
-                        let built = crate::source_build::build_wheel_from_sdist_url(
-                            &sdist.url,
-                            &sdist_out,
-                            &target.python_version,
+                    (PendingSource::Pypi { .. }, None) => {
+                        unreachable!("phase 2 always fetches Pypi-form items")
+                    }
+                    (PendingSource::Git { url, rev }, _) => {
+                        let synth = WheelEntry {
+                            git: Some(url.clone()),
+                            rev: rev.clone().or_else(|| Some("HEAD".to_string())),
+                            ..Default::default()
+                        };
+                        let synth_name = pending.pypi_name.clone();
+                        let sub = materialize_and_rewrite(
+                            &synth,
+                            &synth_name,
+                            target,
+                            download_dir,
+                            source_dir,
+                            cache_dir,
+                            relax,
+                            git_sources,
+                            None,
+                            EntryAuditInfo::default(),
                         )
                         .await
                         .with_context(|| {
                             format!(
-                                "uv-building wheel from sdist {} for {}",
-                                sdist.url, pending.pypi_name,
+                                "materializing URL Requires-Dist `{} @ git+{}@{}`",
+                                pending.pypi_name,
+                                url,
+                                rev.as_deref().unwrap_or("HEAD"),
                             )
                         })?;
-                        let built_url = url::Url::from_file_path(&built).map_err(|_| {
-                            anyhow!(
-                                "built wheel path is not a valid file URL: {}",
-                                built.display(),
-                            )
-                        })?;
-                        let metadata = tokio::task::spawn_blocking({
-                            let p = built.clone();
-                            move || crate::wheel::read_metadata(&p)
-                        })
+                        // For the recurse, use the parent ENTRY's index (not
+                        // `prefix` -- that's a name-prefix string, NOT a URL).
+                        // The recurse fires for Pypi-form Requires-Dist of the
+                        // sub-wheel; those go through pypi::resolve which needs
+                        // a real Simple index URL.
+                        (sub.url, sub.metadata, entry.index_url())
+                    }
+                    (PendingSource::Url { wheel_url }, _) => {
+                        let synth = WheelEntry {
+                            url: Some(wheel_url.clone()),
+                            ..Default::default()
+                        };
+                        let synth_name = pending.pypi_name.clone();
+                        let sub = materialize_and_rewrite(
+                            &synth,
+                            &synth_name,
+                            target,
+                            download_dir,
+                            source_dir,
+                            cache_dir,
+                            relax,
+                            git_sources,
+                            None,
+                            EntryAuditInfo::default(),
+                        )
                         .await
-                        .context("metadata reader panicked")??;
-                        tracing::info!(
-                            dep = %pending.pypi_name,
-                            built = %built.display(),
-                            "BFS sdist fallback: built wheel from sdist",
-                        );
-                        (built_url, metadata)
+                        .with_context(|| {
+                            format!(
+                                "materializing URL Requires-Dist `{} @ {}`",
+                                pending.pypi_name, wheel_url,
+                            )
+                        })?;
+                        // Same fix as the Git arm: recurse uses the parent
+                        // entry's PyPI Simple index, not the name `prefix`.
+                        (sub.url, sub.metadata, entry.index_url())
                     }
                 };
-                (resolved_url, metadata, index.clone())
-            }
-            PendingSource::Git { url, rev } => {
-                let synth = WheelEntry {
-                    git: Some(url.clone()),
-                    rev: rev.clone().or_else(|| Some("HEAD".to_string())),
-                    ..Default::default()
-                };
-                let synth_name = pending.pypi_name.clone();
-                let sub = materialize_and_rewrite(
-                    &synth,
-                    &synth_name,
-                    target,
-                    download_dir,
-                    source_dir,
-                    cache_dir,
-                    relax,
-                    git_sources,
-                    None,
-                    EntryAuditInfo::default(),
-                )
-                .await
-                .with_context(|| {
-                    format!(
-                        "materializing URL Requires-Dist `{} @ git+{}@{}`",
-                        pending.pypi_name,
-                        url,
-                        rev.as_deref().unwrap_or("HEAD"),
-                    )
-                })?;
-                // For the recurse, use the parent ENTRY's index (not
-                // `prefix` -- that's a name-prefix string, NOT a URL).
-                // The recurse fires for Pypi-form Requires-Dist of the
-                // sub-wheel; those go through pypi::resolve which needs
-                // a real Simple index URL.
-                (sub.url, sub.metadata, entry.index_url())
-            }
-            PendingSource::Url { wheel_url } => {
-                let synth = WheelEntry {
-                    url: Some(wheel_url.clone()),
-                    ..Default::default()
-                };
-                let synth_name = pending.pypi_name.clone();
-                let sub = materialize_and_rewrite(
-                    &synth,
-                    &synth_name,
-                    target,
-                    download_dir,
-                    source_dir,
-                    cache_dir,
-                    relax,
-                    git_sources,
-                    None,
-                    EntryAuditInfo::default(),
-                )
-                .await
-                .with_context(|| {
-                    format!(
-                        "materializing URL Requires-Dist `{} @ {}`",
-                        pending.pypi_name, wheel_url,
-                    )
-                })?;
-                // Same fix as the Git arm: recurse uses the parent
-                // entry's PyPI Simple index, not the name `prefix`.
-                (sub.url, sub.metadata, entry.index_url())
-            }
-        };
 
-        // Recurse: this sub-wheel's own extras and prefix-matching base
-        // deps also get pulled in. URL/git sub-wheels reuse the parent
-        // bundle's `prefix` (often empty for source-form parents) so
-        // they don't pull random siblings.
-        seed_worklist(
-            &sub_metadata,
-            &pending.extras,
-            &sub_index_for_recurse,
-            &prefix,
-            &seen,
-            &mut work,
-        )?;
+            // Recurse: this sub-wheel's own extras and prefix-matching base
+            // deps also get pulled in. URL/git sub-wheels reuse the parent
+            // bundle's `prefix` (often empty for source-form parents) so
+            // they don't pull random siblings.
+            seed_worklist(
+                &sub_metadata,
+                &pending.extras,
+                &sub_index_for_recurse,
+                &prefix,
+                &seen,
+                &mut work,
+            )?;
 
-        extras.push(ResolvedWheel {
-            pypi_name: dep_conda_name,
-            url: sub_url,
-            metadata: sub_metadata,
-            extras_requested: vec![],
-            auto_data: None,
-            auto_data_dedup_skipped_root: None,
-        });
+            extras.push(ResolvedWheel {
+                pypi_name: dep_conda_name,
+                url: sub_url,
+                metadata: sub_metadata,
+                extras_requested: vec![],
+                auto_data: None,
+                auto_data_dedup_skipped_root: None,
+            });
+        }
     }
 
     Ok(Bundle {
@@ -3829,6 +3883,79 @@ async fn resolve_bundle(
         probe_decisions,
         solve_diagnostics: BTreeMap::new(),
     })
+}
+
+/// One PyPI-form BFS item's materialization: wheel resolve -> fetch,
+/// with sdist fallback on wheel-resolve failure (PyPI publishers like
+/// OpenAI gym stopped shipping wheels; uv builds the sdist into a
+/// wheel). The sdist fallback uses the SAME spec, so a narrow version
+/// pin still gets honored. Extracted verbatim from the old serial BFS
+/// arm so phase 2 of the level loop can run items concurrently.
+async fn bfs_fetch_pypi(
+    pypi_name: &str,
+    specifiers: &VersionSpecifiers,
+    index: &str,
+    target: &WheelTarget,
+    download_dir: &Path,
+) -> Result<(url::Url, WheelMetadata, String)> {
+    let wheel_result = pypi::resolve(index, pypi_name, specifiers, target).await;
+    let (resolved_url, metadata) = match wheel_result {
+        Ok(resolved) => {
+            let metadata = metadata_preferring_sidecar(&resolved, download_dir).await?;
+            (resolved.url, metadata)
+        }
+        Err(wheel_err) => {
+            tracing::info!(
+                dep = %pypi_name,
+                spec = %specifiers,
+                index = %index,
+                error = %format!("{wheel_err:#}"),
+                "BFS PyPI wheel resolve failed; attempting sdist fallback",
+            );
+            let sdist = pypi::resolve_sdist(index, pypi_name, specifiers)
+                .await
+                .with_context(|| {
+                    format!(
+                        "BFS sdist fallback for {} {} on {} (after wheel-resolve failure: {})",
+                        pypi_name, specifiers, index, wheel_err,
+                    )
+                })?;
+            // Per-entry build dir under download_dir so repeats hit
+            // the wheel cache.
+            let sdist_out = download_dir.join(pypi_name);
+            let built = crate::source_build::build_wheel_from_sdist_url(
+                &sdist.url,
+                &sdist_out,
+                &target.python_version,
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "uv-building wheel from sdist {} for {}",
+                    sdist.url, pypi_name,
+                )
+            })?;
+            let built_url = url::Url::from_file_path(&built).map_err(|_| {
+                anyhow!(
+                    "built wheel path is not a valid file URL: {}",
+                    built.display(),
+                )
+            })?;
+            let metadata = tokio::task::spawn_blocking({
+                let p = built.clone();
+                move || crate::wheel::read_metadata(&p)
+            })
+            .await
+            .context("metadata reader panicked")??;
+            tracing::info!(
+                dep = %pypi_name,
+                built = %built.display(),
+                "BFS sdist fallback: built wheel from sdist",
+            );
+            (built_url, metadata)
+        }
+    };
+    Ok((resolved_url, metadata, index.to_string()))
 }
 
 /// True if `output` exists on disk and is newer than `input`. Used to
@@ -4551,13 +4678,7 @@ async fn auto_bundle_transitives(
                     for index in indexes_ref {
                         match pypi::resolve(index, &name, &specifiers, target).await {
                             Ok(resolved) => {
-                                match fetch_and_parse(
-                                    &resolved.url,
-                                    resolved.sha256.as_deref(),
-                                    download_dir,
-                                )
-                                .await
-                                {
+                                match metadata_preferring_sidecar(&resolved, download_dir).await {
                                     Ok(metadata) => {
                                         return Some((
                                             name,
@@ -4686,6 +4807,18 @@ fn pep508_exact_base_dep(raw: &str) -> Result<Option<(String, String)>> {
     }
     Ok(Some((req.name.to_string(), specs[0].version().to_string())))
 }
+
+/// (env name, refinement outcome, the env's final overrides) from one
+/// env's concurrent solve task in the per-level env loop.
+type EnvSolveResult = (
+    String,
+    crate::solve_check::SolveOutcome,
+    BTreeMap<String, String>,
+);
+
+/// (wheel URL, parsed METADATA, index to recurse with) for one
+/// PyPI-form BFS item fetched in the level loop's phase 2.
+type BfsFetched = (url::Url, WheelMetadata, String);
 
 /// One unit of pending work in the resolver BFS.
 #[derive(Debug, Clone)]
@@ -4849,6 +4982,48 @@ async fn fetch_and_parse(
     tokio::task::spawn_blocking(move || read_metadata(&path))
         .await
         .context("metadata reader panicked")?
+}
+
+/// v1.4.3: metadata-only acquisition for wheels whose BYTES aren't
+/// needed in this phase. BFS extras, auto-bundled, and cascade-bundled
+/// wheels enter the recipe by their UPSTREAM url -- rattler-build
+/// fetches the bytes at build time, so the local download here only
+/// ever served the METADATA read. Preference order:
+///   1. wheel already in the disk cache -> read it (no network, and
+///      warm re-runs stay as fast as before);
+///   2. index advertised a PEP 658/714 sidecar AND a sha256 fragment
+///      -> fetch the KB-sized `.metadata` sidecar instead of the
+///      potentially-GB wheel (the fragment hash stands in for the
+///      computed one the recipe pins);
+///   3. full download via fetch_and_parse (unchanged behavior).
+///
+/// pypi.org serves sidecars; pypi.nvidia.com and static GitHub-Pages
+/// indexes do not (measured 2026-06-10), so NVIDIA-index-only wheels
+/// still take path 3 on a cold cache.
+async fn metadata_preferring_sidecar(
+    resolved: &pypi::ResolvedWheel,
+    download_dir: &Path,
+) -> Result<WheelMetadata> {
+    if let Ok(filename) = crate::wheel::wheel_filename_from_url(&resolved.url)
+        && download_dir.join(&filename).exists()
+    {
+        return fetch_and_parse(&resolved.url, resolved.sha256.as_deref(), download_dir).await;
+    }
+    if resolved.has_metadata_sidecar
+        && let Some(sha) = resolved.sha256.as_deref()
+    {
+        match crate::wheel::fetch_metadata_sidecar(&resolved.url, sha).await {
+            Ok(m) => return Ok(m),
+            Err(e) => {
+                tracing::debug!(
+                    url = %resolved.url,
+                    error = %format!("{e:#}"),
+                    "metadata sidecar fetch failed; falling back to full wheel download",
+                );
+            }
+        }
+    }
+    fetch_and_parse(&resolved.url, resolved.sha256.as_deref(), download_dir).await
 }
 
 /// One extras-derived dependency. v0.12.0+: source can be PyPI Simple

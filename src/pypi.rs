@@ -17,6 +17,14 @@ pub struct ResolvedWheel {
     /// download for caching / lock-file invalidation.
     pub sha256: Option<String>,
     pub filename: String,
+    /// v1.4.3: true when the index link carried a PEP 658
+    /// `data-dist-info-metadata` (or its PEP 714 rename,
+    /// `data-core-metadata`) attribute -- the wheel's METADATA is then
+    /// served as a sidecar at `<wheel_url>.metadata`, so callers that
+    /// only need Requires-Dist can skip the (potentially multi-GB)
+    /// wheel download. pypi.org serves it; pypi.nvidia.com and most
+    /// static (GitHub Pages) indexes do not, so this stays best-effort.
+    pub has_metadata_sidecar: bool,
 }
 
 /// What we need to know about the build target in order to pick the right
@@ -195,6 +203,7 @@ fn parse_index_links_any(html: &str, base: &url::Url) -> Result<Vec<ResolvedWhee
             url,
             sha256,
             filename,
+            has_metadata_sidecar: false,
         });
     }
     if out.is_empty() {
@@ -234,18 +243,24 @@ fn pep503_normalize(name: &str) -> String {
 fn parse_index_links(html: &str, base: &url::Url) -> Result<Vec<ResolvedWheel>> {
     static RE: OnceLock<Regex> = OnceLock::new();
     // PEP 503 advertises hashes in the URL fragment (`#sha256=<hex>`) but
-    // doesn't require it. Match any `href="..."` and treat the hash as
-    // optional so non-conforming indexes (py.mujoco.org, some self-hosted
-    // simple repos) still work.
-    let re = RE.get_or_init(|| Regex::new(r#"href="([^"]+)""#).unwrap());
+    // doesn't require it. Match the whole `<a ...>` tag so the PEP 658/714
+    // metadata-sidecar attribute can be read alongside the href; treat the
+    // hash as optional so non-conforming indexes (py.mujoco.org, some
+    // self-hosted simple repos) still work.
+    let re = RE.get_or_init(|| Regex::new(r#"<a\s+[^>]*href="([^"]+)"[^>]*>"#).unwrap());
 
     let mut out = Vec::new();
     for cap in re.captures_iter(html) {
+        let full_tag = &cap[0];
         let href = &cap[1];
         let url = match base.join(href) {
             Ok(u) => u,
             Err(_) => continue,
         };
+        // PEP 658 attribute, or its PEP 714 rename. Value is either a
+        // hash or "true"; presence is what matters.
+        let has_metadata_sidecar = full_tag.contains("data-core-metadata=")
+            || full_tag.contains("data-dist-info-metadata=");
         // `path_segments()` returns segments percent-encoded. miropsota's
         // torch_packages_builder index URL-encodes `+` (the PEP 440
         // local-version-identifier marker) as `%2B`, so the raw segment
@@ -273,6 +288,7 @@ fn parse_index_links(html: &str, base: &url::Url) -> Result<Vec<ResolvedWheel>> 
             url,
             sha256,
             filename,
+            has_metadata_sidecar,
         });
     }
     if out.is_empty() {
@@ -502,6 +518,28 @@ mod tests {
     }
 
     #[test]
+    fn parses_pep658_metadata_sidecar_attribute() {
+        // pypi.org serves both the PEP 658 attribute and its PEP 714
+        // rename on the same tag; pypi.nvidia.com serves neither
+        // (measured 2026-06-10). Detection keys on attribute presence.
+        let base: url::Url = "https://example.com/simple/foo/".parse().unwrap();
+        let html = r#"
+            <a href="foo-1.0-py3-none-any.whl#sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" data-dist-info-metadata="sha256=bbbb" data-core-metadata="sha256=bbbb">old+new</a>
+            <a href="foo-2.0-py3-none-any.whl#sha256=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" data-core-metadata="true">new only</a>
+            <a href="foo-3.0-py3-none-any.whl#sha256=dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd">bare</a>
+        "#;
+        let links = parse_index_links(html, &base).unwrap();
+        assert_eq!(links.len(), 3);
+        assert!(links[0].has_metadata_sidecar, "PEP 658 spelling");
+        assert!(links[1].has_metadata_sidecar, "PEP 714 spelling");
+        assert!(!links[2].has_metadata_sidecar, "no attribute -> no sidecar");
+        assert!(
+            links[0].sha256.is_some(),
+            "wheel hash still parsed from fragment"
+        );
+    }
+
+    #[test]
     fn parses_pep503_links_with_hash() {
         let html = r#"
             <a href="isaacsim-5.1.0.0-cp311-none-manylinux_2_35_x86_64.whl#sha256=ad2c027831ed5d4a62552735bb799dea4e4604530d2ab9b526ddb6cd19a98c11">link</a>
@@ -693,6 +731,7 @@ mod tests {
             url: format!("https://example.com/{name}").parse().unwrap(),
             sha256: Some("0".repeat(64)),
             filename: name.to_string(),
+            has_metadata_sidecar: false,
         }
     }
 }

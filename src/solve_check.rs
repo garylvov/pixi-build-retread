@@ -290,7 +290,14 @@ struct RecordSet {
 /// backend, so this survives across the ~32 solves of one `conda/outputs`
 /// call. The expensive ~1M-record JSON parse now runs ~2x (the gigastrap
 /// channel sets with vs without robostack-humble) instead of ~32x.
-static RECORDS_CACHE: OnceLock<Mutex<HashMap<String, Arc<RecordSet>>>> = OnceLock::new();
+/// One channel-set's lazily-built record set. The async OnceCell means
+/// a concurrent miss AWAITS the in-flight build instead of paying the
+/// full multi-100MB parse a second time (the old "rebuilds once more
+/// (idempotent)" race).
+type RecordSetCell = Arc<tokio::sync::OnceCell<Arc<RecordSet>>>;
+
+/// v1.4.3: per-key async OnceCells (see [`RecordSetCell`]).
+static RECORDS_CACHE: OnceLock<Mutex<HashMap<String, RecordSetCell>>> = OnceLock::new();
 
 /// Load (or reuse) the deduped record set for `channels`. The slow JSON
 /// parse + record build runs only on the first call per channel-set.
@@ -300,31 +307,45 @@ async fn load_records(channels: &[ChannelUrl], target_subdir: &str) -> Arc<Recor
         key.push('\u{1}');
         key.push_str(c.url().as_str());
     }
-    if let Some(rs) = RECORDS_CACHE
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap()
-        .get(&key)
-    {
-        return Arc::clone(rs);
-    }
-    // Build OFF the lock -- the disk read + parse is the slow part and must
-    // not block other channel-sets. A concurrent miss on the same key just
-    // rebuilds once more (idempotent), which is acceptable.
-    let mut records: Vec<RepoDataRecord> = Vec::new();
-    let mut consulted: Vec<String> = Vec::new();
-    // Dedup filenames as we collect: the same package can appear across
-    // channel/subdir boundaries and rattler_solve aborts on DuplicateRecords.
-    // Keep first-seen; channel priority is honored by iterating in order.
-    let mut seen_filenames: HashSet<String> = HashSet::new();
-    for channel_url in channels {
-        let channel_str = channel_url.url().as_str().trim_end_matches('/').to_string();
-        for subdir in [target_subdir, "noarch"] {
-            let bytes = match read_disk_cache(&channel_str, subdir).await {
+    let cell = {
+        let mut map = RECORDS_CACHE
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap();
+        Arc::clone(
+            map.entry(key)
+                .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new())),
+        )
+    };
+    cell.get_or_init(|| build_record_set(channels, target_subdir))
+        .await
+        .clone()
+}
+
+/// Build the record set for one channel-set: fetch + parse every
+/// (channel, subdir) pair CONCURRENTLY, each parse on the blocking
+/// pool (a single conda-forge repodata is a multi-100MB JSON document
+/// -- parsing it on the async executor pins a runtime worker).
+/// The merge runs in INPUT order so the first-seen filename dedup
+/// keeps honoring channel priority exactly like the old serial loop.
+async fn build_record_set(channels: &[ChannelUrl], target_subdir: &str) -> Arc<RecordSet> {
+    let pairs: Vec<(String, String)> = channels
+        .iter()
+        .flat_map(|channel_url| {
+            let channel_str = channel_url.url().as_str().trim_end_matches('/').to_string();
+            [target_subdir.to_string(), "noarch".to_string()]
+                .into_iter()
+                .map(move |subdir| (channel_str.clone(), subdir))
+        })
+        .collect();
+
+    let fetched: Vec<Option<(String, Vec<RepoDataRecord>)>> =
+        futures::future::join_all(pairs.into_iter().map(|(channel_str, subdir)| async move {
+            let bytes = match read_disk_cache(&channel_str, &subdir).await {
                 Ok(Some(bytes)) => bytes,
-                Ok(None) => match fetch_repodata_bytes(&channel_str, subdir).await {
+                Ok(None) => match fetch_repodata_bytes(&channel_str, &subdir).await {
                     Ok(bytes) => {
-                        let _ = write_disk_cache(&channel_str, subdir, &bytes).await;
+                        let _ = write_disk_cache(&channel_str, &subdir, &bytes).await;
                         bytes
                     }
                     Err(e) => {
@@ -334,7 +355,7 @@ async fn load_records(channels: &[ChannelUrl], target_subdir: &str) -> Arc<Recor
                             error = %format!("{e:#}"),
                             "solve-check: repodata unavailable; skipping channel/subdir",
                         );
-                        continue;
+                        return None;
                     }
                 },
                 Err(e) => {
@@ -344,41 +365,52 @@ async fn load_records(channels: &[ChannelUrl], target_subdir: &str) -> Arc<Recor
                         error = %format!("{e:#}"),
                         "solve-check: disk-cache read failed; skipping channel/subdir",
                     );
-                    continue;
+                    return None;
                 }
             };
-            let repo_data: RepoData = match serde_json::from_slice(&bytes) {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::debug!(channel = %channel_str, subdir = %subdir, error = %e, "solve-check: failed to parse cached repodata");
-                    continue;
-                }
-            };
-            // Default ChannelConfig is fine; we never resolve relative aliases.
-            let cfg = ChannelConfig::default_with_root_dir(std::env::temp_dir());
-            let channel = match Channel::from_str(&channel_str, &cfg) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::debug!(channel = %channel_str, error = %e, "solve-check: failed to build Channel for record URL synthesis");
-                    continue;
-                }
-            };
-            let recs = repo_data.into_repo_data_records(&channel);
-            consulted.push(format!("{channel_str}/{subdir}"));
-            for rec in recs {
-                if seen_filenames.insert(rec.file_name.clone()) {
-                    records.push(rec);
-                }
+            tokio::task::spawn_blocking(move || {
+                let repo_data: RepoData = match serde_json::from_slice(&bytes) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::debug!(channel = %channel_str, subdir = %subdir, error = %e, "solve-check: failed to parse cached repodata");
+                        return None;
+                    }
+                };
+                // Default ChannelConfig is fine; we never resolve relative aliases.
+                let cfg = ChannelConfig::default_with_root_dir(std::env::temp_dir());
+                let channel = match Channel::from_str(&channel_str, &cfg) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::debug!(channel = %channel_str, error = %e, "solve-check: failed to build Channel for record URL synthesis");
+                        return None;
+                    }
+                };
+                let recs = repo_data.into_repo_data_records(&channel);
+                Some((format!("{channel_str}/{subdir}"), recs))
+            })
+            .await
+            .ok()
+            .flatten()
+        }))
+        .await;
+
+    // Serial ordered merge. Dedup filenames as we collect: the same
+    // package can appear across channel/subdir boundaries and
+    // rattler_solve aborts on DuplicateRecords. Keep first-seen;
+    // channel priority is honored because `fetched` is in pair order.
+    let mut records: Vec<RepoDataRecord> = Vec::new();
+    let mut consulted: Vec<String> = Vec::new();
+    let mut seen_filenames: HashSet<String> = HashSet::new();
+    for item in fetched.into_iter().flatten() {
+        let (label, recs) = item;
+        consulted.push(label);
+        for rec in recs {
+            if seen_filenames.insert(rec.file_name.clone()) {
+                records.push(rec);
             }
         }
     }
-    let rs = Arc::new(RecordSet { records, consulted });
-    RECORDS_CACHE
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap()
-        .insert(key, Arc::clone(&rs));
-    rs
+    Arc::new(RecordSet { records, consulted })
 }
 
 pub async fn run_solve_check(

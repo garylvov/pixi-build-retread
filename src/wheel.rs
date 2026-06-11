@@ -195,6 +195,43 @@ pub fn is_pure_python_wheel_filename(filename: &str) -> bool {
     stem.rsplit('-').next() == Some("any")
 }
 
+/// v1.4.3: fetch a wheel's METADATA via its PEP 658/714 sidecar
+/// (`<wheel_url>.metadata`) instead of downloading the whole wheel.
+/// Caller contract: only call when the index advertised the sidecar
+/// (`ResolvedWheel.has_metadata_sidecar`) AND provided the wheel's
+/// sha256 in the link fragment -- the recipe pins each source wheel's
+/// hash, and without the full bytes the index-advertised hash is the
+/// only source for it. `is_pure_python` derives from the filename, the
+/// same signal `read_metadata` uses.
+pub async fn fetch_metadata_sidecar(
+    wheel_url: &url::Url,
+    wheel_sha256: &str,
+) -> Result<WheelMetadata> {
+    let filename = wheel_filename_from_url(wheel_url)?;
+    let is_pure_python = is_pure_python_wheel_filename(&filename);
+    // The sidecar lives at the wheel URL + ".metadata"; the fragment
+    // (#sha256=...) belongs to the WHEEL link and must not leak into
+    // the sidecar request path.
+    let mut sidecar = wheel_url.clone();
+    sidecar.set_fragment(None);
+    sidecar.set_path(&format!("{}.metadata", sidecar.path()));
+    tracing::debug!(url = %sidecar, "fetching PEP 658 metadata sidecar");
+    let raw = reqwest::get(sidecar.clone())
+        .await
+        .with_context(|| format!("GET {sidecar}"))?
+        .error_for_status()
+        .with_context(|| format!("HTTP error for {sidecar}"))?
+        .text()
+        .await
+        .with_context(|| format!("reading body of {sidecar}"))?;
+    parse_metadata(
+        &raw,
+        filename,
+        is_pure_python,
+        wheel_sha256.to_ascii_lowercase(),
+    )
+}
+
 /// Read the METADATA file inside a wheel zip and parse out the fields we care
 /// about.
 pub fn read_metadata(wheel_path: &Path) -> Result<WheelMetadata> {
@@ -300,6 +337,52 @@ fn hex_sha256(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "live: fetches a PEP 658 sidecar + the full wheel from pypi.org"]
+    fn metadata_sidecar_matches_full_wheel_live() {
+        // The sidecar path must produce the same parsed metadata the
+        // full-wheel path does (sha256 aside, which the sidecar takes
+        // from the index fragment). tomli 2.0.1 is tiny and stable.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let target = crate::pypi::WheelTarget {
+                python_version: "3.11".into(),
+                conda_subdir: "linux-64".into(),
+            };
+            let specs = "==2.0.1".parse().unwrap();
+            let resolved =
+                crate::pypi::resolve("https://pypi.org/simple/", "tomli", &specs, &target)
+                    .await
+                    .unwrap();
+            assert!(
+                resolved.has_metadata_sidecar,
+                "pypi.org must advertise the PEP 658 sidecar"
+            );
+            let sha = resolved
+                .sha256
+                .as_deref()
+                .expect("pypi.org provides fragments");
+            let from_sidecar = fetch_metadata_sidecar(&resolved.url, sha).await.unwrap();
+            let tmp =
+                std::env::temp_dir().join(format!("retread-sidecar-live-{}", std::process::id()));
+            std::fs::create_dir_all(&tmp).unwrap();
+            let wheel_path = fetch_wheel(&resolved.url, Some(sha), &tmp).await.unwrap();
+            let from_wheel = read_metadata(&wheel_path).unwrap();
+            assert_eq!(from_sidecar.name, from_wheel.name);
+            assert_eq!(from_sidecar.version, from_wheel.version);
+            assert_eq!(from_sidecar.requires_dist, from_wheel.requires_dist);
+            assert_eq!(from_sidecar.is_pure_python, from_wheel.is_pure_python);
+            assert_eq!(from_sidecar.filename, from_wheel.filename);
+            assert_eq!(
+                from_sidecar.sha256, from_wheel.sha256,
+                "fragment hash must equal the computed wheel hash"
+            );
+        });
+    }
 
     #[test]
     fn parses_basic_metadata() {
