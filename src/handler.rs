@@ -5680,6 +5680,43 @@ async fn write_probe_trace(bundle: &Bundle, source_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// v1.4.5: swap an http(s) wheel source for `file://` of retread's
+/// cached copy when present. Looks in `<wheels_root>/<filename>` and
+/// one level of per-entry subdirs (`<wheels_root>/<entry>/<filename>`,
+/// the sdist-build layout). Missing file -> upstream URL unchanged.
+/// The caller's recipe pins the wheel sha256 either way, so a stale or
+/// corrupt cache file fails the build loudly at hash verification
+/// instead of silently building from wrong bytes.
+fn localize_wheel_source(url: &url::Url, wheels_root: &Path) -> url::Url {
+    if url.scheme() != "http" && url.scheme() != "https" {
+        return url.clone();
+    }
+    let Ok(filename) = crate::wheel::wheel_filename_from_url(url) else {
+        return url.clone();
+    };
+    let mut candidates = vec![wheels_root.join(&filename)];
+    if let Ok(entries) = std::fs::read_dir(wheels_root) {
+        for e in entries.flatten() {
+            if e.path().is_dir() {
+                candidates.push(e.path().join(&filename));
+            }
+        }
+    }
+    for c in candidates {
+        if c.is_file()
+            && let Ok(local) = url::Url::from_file_path(&c)
+        {
+            tracing::debug!(
+                wheel = %filename,
+                path = %c.display(),
+                "recipe source localized to cached wheel (skips rattler-build re-download)",
+            );
+            return local;
+        }
+    }
+    url.clone()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn build_one(
     bundle: &Bundle,
@@ -5693,11 +5730,28 @@ async fn build_one(
     run_override: Option<&[String]>,
 ) -> Result<CondaBuildV1Result> {
     // Lay out one BundleSource per wheel (primary first), in BFS order.
+    //
+    // v1.4.5: point each source at retread's local wheel cache when
+    // the file is already on disk. rattler-build keeps its own
+    // src_cache and re-downloads every http(s) source -- for an
+    // isaac-scale pack that was the same ~8GB fetched twice (once
+    // into <pack>/wheels/ for METADATA + D, once into rattler-build's
+    // src_cache for the build). The recipe still pins each wheel's
+    // sha256, so rattler-build verifies the local bytes exactly as it
+    // would a download. Wheels with no local copy (e.g. resolved via
+    // the v1.4.4 PEP 658 sidecar) keep their upstream URL and get
+    // downloaded exactly once -- by rattler-build.
+    let wheels_root = source_dir.join("wheels");
+    let localized_urls: Vec<url::Url> = bundle
+        .all_wheels()
+        .map(|w| localize_wheel_source(&w.url, &wheels_root))
+        .collect();
     let sources: Vec<BundleSource> = bundle
         .all_wheels()
-        .map(|w| BundleSource {
+        .zip(localized_urls.iter())
+        .map(|(w, url)| BundleSource {
             pypi_name: &w.pypi_name,
-            url: &w.url,
+            url,
             metadata: &w.metadata,
         })
         .collect();
@@ -6651,6 +6705,46 @@ mod tests {
             v["index"] = serde_json::Value::String(idx.to_string());
         }
         serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn localize_wheel_source_prefers_cached_copy() {
+        let root = std::env::temp_dir().join(format!("retread-localize-{}", std::process::id()));
+        let entry_dir = root.join("someentry");
+        std::fs::create_dir_all(&entry_dir).unwrap();
+        std::fs::write(root.join("cached_top-1.0-py3-none-any.whl"), b"x").unwrap();
+        std::fs::write(entry_dir.join("cached_sub-1.0-py3-none-any.whl"), b"x").unwrap();
+
+        // Cached at the top level -> file://.
+        let up: url::Url = "https://pypi.org/p/cached_top-1.0-py3-none-any.whl"
+            .parse()
+            .unwrap();
+        let localized = localize_wheel_source(&up, &root);
+        assert_eq!(localized.scheme(), "file");
+        assert!(
+            localized
+                .path()
+                .ends_with("cached_top-1.0-py3-none-any.whl")
+        );
+
+        // Cached in a per-entry subdir -> file://.
+        let up: url::Url = "https://pypi.org/p/cached_sub-1.0-py3-none-any.whl"
+            .parse()
+            .unwrap();
+        assert_eq!(localize_wheel_source(&up, &root).scheme(), "file");
+
+        // Not cached -> upstream URL untouched.
+        let up: url::Url = "https://pypi.org/p/absent-1.0-py3-none-any.whl"
+            .parse()
+            .unwrap();
+        assert_eq!(localize_wheel_source(&up, &root), up);
+
+        // file:// (the D-rewritten primary) passes through untouched.
+        let f: url::Url =
+            url::Url::from_file_path(root.join("cached_top-1.0-py3-none-any.whl")).unwrap();
+        assert_eq!(localize_wheel_source(&f, &root), f);
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
