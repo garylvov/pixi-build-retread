@@ -13,6 +13,23 @@ use crate::config::RelaxPolicy;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CondaDep(pub String);
 
+/// Split a conda dependency string `"<name> <spec>"` (or bare `"<name>"`)
+/// into `(name, spec)`. The first whitespace-delimited token is the name;
+/// everything after the first whitespace run (trimmed) is the spec. A bare
+/// name with no whitespace returns `(name, "")`.
+///
+/// This is the canonical place for the first-token-is-name semantic. Use it
+/// when you need BOTH name and spec from a dep string. Do NOT use it in
+/// place of `workspace::split_conda_dep_line`, which has its own
+/// build-string-aware contract (`splitn(3)`) and separate tests.
+pub(crate) fn parse_named_spec(line: &str) -> (String, String) {
+    let trimmed = line.trim();
+    let mut parts = trimmed.splitn(2, char::is_whitespace);
+    let name = parts.next().unwrap_or("").to_string();
+    let spec = parts.next().map(|s| s.trim().to_string()).unwrap_or_default();
+    (name, spec)
+}
+
 /// Translate one PEP 508 requirement string into a conda match-spec.
 ///
 /// Returns `Ok(None)` if the requirement is filtered out (marker evaluates to
@@ -543,6 +560,43 @@ pub fn emit_python_version(primary_wheel_filename: &str, workspace_python_versio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------
+    // P4.4: parse_named_spec table test.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn parse_named_spec_table() {
+        // Typical conda dep with a version spec.
+        assert_eq!(
+            parse_named_spec("numpy >=1.26,<2"),
+            ("numpy".to_string(), ">=1.26,<2".to_string()),
+        );
+        // Build-string-bearing spec: the spec portion is everything after
+        // the first whitespace, including embedded spaces. This is
+        // intentionally different from split_conda_dep_line (which
+        // handles build strings via a separate 3-way split); here the
+        // entire rest-of-line after the name is the spec.
+        assert_eq!(
+            parse_named_spec("python_abi 3.11.* *_cp311"),
+            ("python_abi".to_string(), "3.11.* *_cp311".to_string()),
+        );
+        // Bare name (no spec).
+        assert_eq!(
+            parse_named_spec("pyglet"),
+            ("pyglet".to_string(), "".to_string()),
+        );
+        // Multiple spaces between name and spec: spec is trimmed.
+        assert_eq!(
+            parse_named_spec("torch  >=2.7,<3"),
+            ("torch".to_string(), ">=2.7,<3".to_string()),
+        );
+        // Empty string produces two empty strings.
+        assert_eq!(
+            parse_named_spec(""),
+            ("".to_string(), "".to_string()),
+        );
+    }
 
     // -----------------------------------------------------------------
     // Cleanup 0c: the explicit PEP 503 semantic matrix. The 0a property

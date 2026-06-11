@@ -831,15 +831,10 @@ pub(crate) async fn pre_emit_widen_pass(
             Ok(Some(d)) => d.0,
             _ => continue,
         };
-        let mut parts = dep.splitn(2, char::is_whitespace);
-        let conda_name = match parts.next() {
-            Some(n) if !n.is_empty() => n.to_string(),
-            _ => continue,
-        };
-        let spec = parts
-            .next()
-            .map(|s| s.trim().to_string())
-            .unwrap_or_default();
+        let (conda_name, spec) = crate::relax::parse_named_spec(&dep);
+        if conda_name.is_empty() {
+            continue;
+        }
         if spec.is_empty() || spec == "*" {
             continue;
         }
