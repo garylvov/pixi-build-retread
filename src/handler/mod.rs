@@ -513,6 +513,23 @@ impl Handler {
                 .map_err(|e| RpcError::invalid_params(e.to_string()))?;
         }
 
+        // L2 (cleanup P4.6): conda-aware is not yet implemented -- warn
+        // once at initialize time so the user knows what they're getting.
+        // The variant is kept so existing manifests that set
+        // `retread-relax = "conda-aware"` keep loading without error; it
+        // silently degrades to strong-major at translate time (same upper-
+        // bound stripping, no per-dep probe). The probe layer described in
+        // RelaxPolicy::CondaAware's doc comment will replace this branch
+        // when implemented.
+        if config.relax == RelaxPolicy::CondaAware {
+            tracing::warn!(
+                "retread-relax = \"conda-aware\" is not yet implemented; \
+                 degrading to strong-major (strips all upper bounds unconditionally). \
+                 For per-dep adaptive widening today, use \
+                 \"patch-then-minor-then-major-then-last-resort\" instead.",
+            );
+        }
+
         let mut state = self.state.write().await;
         state.config = Some(config);
         state.cache_dir = params.cache_directory;

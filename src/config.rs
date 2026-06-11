@@ -189,10 +189,10 @@ pub enum RelaxPolicy {
     /// turns out unsatisfiable on the workspace's channels. Cascade
     /// per dep, in order:
     ///   (1) try conda with the base-relaxed spec (probe)
-    ///   (2) try PyPI wheel (BFS)            -- already wired (v0.13.x)
-    ///   (3) try PyPI sdist (BFS fallback)   -- already wired (v0.18.0)
+    ///   (2) try PyPI wheel (BFS)            -- wired since v0.13.x
+    ///   (3) try PyPI sdist (BFS fallback)   -- wired since v0.18.0
     ///   (4) try conda with `*` (any version) -- last-resort widening
-    ///   (5) try PyPI bundle with empty spec  -- TODO v0.20
+    ///   (5) try PyPI bundle with empty spec  -- not yet implemented
     /// Widening only triggers for deps that FAIL step 1; zero cost for
     /// the common case where parselmouth-routed deps satisfy their
     /// strict spec. `minor-with-last-resort` is the recommended
@@ -505,9 +505,10 @@ mod tests {
 
     #[test]
     fn legacy_unprefixed_keys_still_parse() {
-        // One-release migration cushion: pre-0.4 `wheels`, `relax`, and
-        // `build-number` keys without the `retread-` prefix should still
-        // deserialize so users have time to update their manifests.
+        // Kept for back-compat; removing would hard-error old manifests
+        // via deny_unknown_fields. The serde aliases (`alias = "wheels"`,
+        // `alias = "relax"`, etc.) accept the pre-0.4 unprefixed keys
+        // indefinitely so existing pixi.toml files keep loading.
         let json = serde_json::json!({
             "wheels": { "foo": { "version": "1.2.3" } },
             "relax": "patch",

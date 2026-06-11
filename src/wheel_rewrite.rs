@@ -11,7 +11,6 @@
 //! it reads the wheel's own METADATA from `$PREFIX/.../dist-info/`.
 //! Rewriting the wheel itself loosens both sides simultaneously.
 
-use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::{Cursor, Read, Write};
 use std::path::Path;
@@ -362,12 +361,6 @@ fn sha256_hex(bytes: &[u8]) -> String {
     out
 }
 
-// Force HashMap to be used somewhere or compiler complains about unused import.
-// In practice we don't use it; remove if not needed.
-#[allow(dead_code)]
-fn _unused_hashmap() -> HashMap<String, String> {
-    HashMap::new()
-}
 
 #[cfg(test)]
 mod tests {
