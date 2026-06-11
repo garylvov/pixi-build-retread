@@ -481,14 +481,14 @@ pub(crate) enum PendingSource {
 /// Add extras-gated and prefix-matched base deps from `metadata` to `work`.
 /// Skips entries already in `seen` so the BFS terminates.
 pub(crate) fn seed_worklist(
-    metadata: &WheelMetadata,
+    requires_dist: &[String],
     extras_requested: &[String],
     index: &str,
     bundle_prefix: &str,
     seen: &HashSet<String>,
     work: &mut VecDeque<Pending>,
 ) -> Result<()> {
-    for raw in &metadata.requires_dist {
+    for raw in requires_dist {
         // 1. Extras-gated lines for each requested extra.
         let mut added = false;
         for extra in extras_requested {

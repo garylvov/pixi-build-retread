@@ -5214,7 +5214,6 @@ packages:
   - python >=3.10
   license: Apache-2.0
   license_family: APACHE
-  run_exports: {}
   size: 787805
   timestamp: 1741838050970
 - conda: https://prefix.dev/conda-forge/noarch/font-ttf-dejavu-sans-mono-2.37-hab24e00_0.tar.bz2
@@ -5332,7 +5331,6 @@ packages:
   - python >=3.9
   license: MIT
   license_family: MIT
-  run_exports: {}
   size: 17397
   timestamp: 1737618427549
 - conda: https://prefix.dev/conda-forge/noarch/idna-3.17-pyhcf101f3_0.conda
@@ -5366,7 +5364,6 @@ packages:
   - python >=3.9
   - setuptools
   license: BSD 2-Clause
-  run_exports: {}
   size: 21312
   timestamp: 1737102760118
 - conda: https://prefix.dev/conda-forge/noarch/importlib_resources-7.1.0-pyhd8ed1ab_0.conda

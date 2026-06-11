@@ -158,7 +158,7 @@ fn rewrite_metadata_text(content: &str, relax: RelaxPolicy) -> Result<String> {
 /// Parse one PEP 508 requirement string. If it carries a single exact
 /// `==X.Y.Z` specifier, widen it per `policy` and return the rebuilt
 /// requirement (still PEP 508 syntax). All other shapes pass through.
-fn relax_pep508(raw: &str, policy: RelaxPolicy) -> Result<String> {
+pub(crate) fn relax_pep508(raw: &str, policy: RelaxPolicy) -> Result<String> {
     let req: Requirement =
         Requirement::from_str(raw).map_err(|e| anyhow!("parsing `{raw}`: {e}"))?;
     // `python` is off-limits to every relax policy; see the matching

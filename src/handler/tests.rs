@@ -870,6 +870,39 @@ fn localize_wheel_source_prefers_cached_copy() {
 }
 
 #[test]
+fn relaxed_retry_specs_table() {
+    // v1.5.9 patch-drift fallback math: only single exact pins under a
+    // relaxing policy produce a retry range; everything else resolves
+    // exact-first with no fallback.
+    use std::str::FromStr as _;
+    let specs = |s: &str| VersionSpecifiers::from_str(s).unwrap();
+
+    // Exact 4-component NVIDIA-style pin widens under the tiered
+    // cascade policy (mirrors Patch at rewrite time) -- this is the
+    // range that ADMITS the drifted 6.0.0.1, which is why it is only
+    // a fallback.
+    let relaxed = relaxed_retry_specs(
+        "isaacsim-kernel",
+        &specs("==6.0.0.0"),
+        RelaxPolicy::PatchThenMinorThenMajorThenLastResort,
+    )
+    .expect("exact pin must produce a retry range");
+    // PEP 440 normalization may render >=6.0.0.0 as >=6; assert
+    // semantically: the range admits both the exact version and the
+    // drifted next patch (which is WHY it is only a fallback).
+    let v = |s: &str| uv_pep508::uv_pep440::Version::from_str(s).unwrap();
+    assert!(relaxed.contains(&v("6.0.0.0")), "got {relaxed}");
+    assert!(relaxed.contains(&v("6.0.0.1")), "got {relaxed}");
+    assert!(!relaxed.contains(&v("6.1.0")), "got {relaxed}");
+    assert_ne!(relaxed, specs("==6.0.0.0"));
+
+    // Range specs pass through relax untouched -> no fallback.
+    assert!(relaxed_retry_specs("etgen", &specs(">=0.8.2,<0.9"), RelaxPolicy::Minor).is_none());
+    // Policy None never falls back.
+    assert!(relaxed_retry_specs("foo", &specs("==1.0.0"), RelaxPolicy::None).is_none());
+}
+
+#[test]
 fn capped_rerun_eligibility() {
     // P3 (grizzly #4): a capped env earns its single re-run only when
     // the level has >1 env AND at least one sibling converged.
@@ -1604,7 +1637,7 @@ async fn d_rewrites_metadata_on_the_wheel_the_recipe_will_source() {
         conda_subdir: "linux-64".into(),
     };
 
-    let resolved = materialize_and_rewrite(
+    let (resolved, original_rd) = materialize_and_rewrite(
         &entry,
         "retread-sample",
         &target,
@@ -1628,6 +1661,15 @@ async fn d_rewrites_metadata_on_the_wheel_the_recipe_will_source() {
     let on_disk = resolved.url.to_file_path().expect("file path from URL");
     let on_disk_meta =
         crate::wheel::read_metadata(&on_disk).expect("read METADATA from wheel-on-disk");
+
+    // v1.5.9: the ORIGINAL (pre-D) lines keep the exact upstream pin
+    // -- the BFS resolves sub-wheels from these so pinned families
+    // stay patch-consistent -- while the on-disk wheel carries the
+    // relaxed form for the uv/emission side.
+    assert!(
+        original_rd.iter().any(|l| l.contains("==0.49.1")),
+        "original requires_dist must keep the exact pin; got {original_rd:?}",
+    );
 
     let starlette_lines: Vec<&String> = on_disk_meta
         .requires_dist

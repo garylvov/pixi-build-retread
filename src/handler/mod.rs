@@ -2304,7 +2304,7 @@ async fn resolve_bundle(
     } else {
         None
     };
-    let primary = materialize_and_rewrite(
+    let (primary, primary_original_rd) = materialize_and_rewrite(
         entry,
         entry_name,
         target,
@@ -2361,8 +2361,10 @@ async fn resolve_bundle(
     } else {
         format!("{}-", conda_name)
     };
+    // v1.5.9: seed from the ORIGINAL (pre-D) Requires-Dist so exact
+    // family pins resolve exact-first (see materialize_and_rewrite).
     seed_worklist(
-        &primary.metadata,
+        &primary_original_rd,
         &entry.extras,
         &entry.index_url(),
         &prefix,
@@ -2604,6 +2606,7 @@ async fn resolve_bundle(
                             index,
                             target,
                             download_dir,
+                            relax,
                         )
                         .await
                         .map(Some),
@@ -2621,10 +2624,13 @@ async fn resolve_bundle(
         // old pop order exactly.
         for (pending, fetch_result) in fetched {
             let dep_conda_name = canonical_conda_name(&pending.pypi_name);
-            let (sub_url, sub_metadata, sub_index_for_recurse) =
+            let (sub_url, sub_metadata, sub_index_for_recurse, sub_seed_rd) =
                 match (&pending.source, fetch_result?) {
                     (PendingSource::Pypi { .. }, Some((resolved_url, metadata, index))) => {
-                        (resolved_url, metadata, index)
+                        // Pypi-form sub-wheels are NOT D-rewritten, so
+                        // their metadata IS the original Requires-Dist.
+                        let seed_rd = metadata.requires_dist.clone();
+                        (resolved_url, metadata, index, seed_rd)
                     }
                     (PendingSource::Pypi { .. }, None) => {
                         unreachable!("phase 2 always fetches Pypi-form items")
@@ -2636,7 +2642,7 @@ async fn resolve_bundle(
                             ..Default::default()
                         };
                         let synth_name = pending.pypi_name.clone();
-                        let sub = materialize_and_rewrite(
+                        let (sub, sub_original_rd) = materialize_and_rewrite(
                             &synth,
                             &synth_name,
                             target,
@@ -2662,7 +2668,7 @@ async fn resolve_bundle(
                         // The recurse fires for Pypi-form Requires-Dist of the
                         // sub-wheel; those go through pypi::resolve which needs
                         // a real Simple index URL.
-                        (sub.url, sub.metadata, entry.index_url())
+                        (sub.url, sub.metadata, entry.index_url(), sub_original_rd)
                     }
                     (PendingSource::Url { wheel_url }, _) => {
                         let synth = WheelEntry {
@@ -2670,7 +2676,7 @@ async fn resolve_bundle(
                             ..Default::default()
                         };
                         let synth_name = pending.pypi_name.clone();
-                        let sub = materialize_and_rewrite(
+                        let (sub, sub_original_rd) = materialize_and_rewrite(
                             &synth,
                             &synth_name,
                             target,
@@ -2691,7 +2697,7 @@ async fn resolve_bundle(
                         })?;
                         // Same fix as the Git arm: recurse uses the parent
                         // entry's PyPI Simple index, not the name `prefix`.
-                        (sub.url, sub.metadata, entry.index_url())
+                        (sub.url, sub.metadata, entry.index_url(), sub_original_rd)
                     }
                 };
 
@@ -2700,7 +2706,7 @@ async fn resolve_bundle(
             // bundle's `prefix` (often empty for source-form parents) so
             // they don't pull random siblings.
             seed_worklist(
-                &sub_metadata,
+                &sub_seed_rd,
                 &pending.extras,
                 &sub_index_for_recurse,
                 &prefix,
@@ -2734,14 +2740,74 @@ async fn resolve_bundle(
 /// wheel). The sdist fallback uses the SAME spec, so a narrow version
 /// pin still gets honored. Extracted verbatim from the old serial BFS
 /// arm so phase 2 of the level loop can run items concurrently.
+/// v1.5.9: produce the relaxed retry specifiers for a sub-wheel whose
+/// EXACT upstream pin is missing from the index. Returns None when the
+/// policy doesn't relax or relaxation changes nothing (bare deps,
+/// range specs -- relax only widens single exact pins).
+fn relaxed_retry_specs(
+    pypi_name: &str,
+    specifiers: &VersionSpecifiers,
+    relax: RelaxPolicy,
+) -> Option<VersionSpecifiers> {
+    if relax == RelaxPolicy::None {
+        return None;
+    }
+    let original = format!("{pypi_name}{specifiers}");
+    let relaxed_line = crate::wheel_rewrite::relax_pep508(&original, relax).ok()?;
+    if relaxed_line == original {
+        return None;
+    }
+    let req: uv_pep508::Requirement = uv_pep508::Requirement::from_str(&relaxed_line).ok()?;
+    match req.version_or_url {
+        Some(uv_pep508::VersionOrUrl::VersionSpecifier(specs)) if specs != *specifiers => {
+            Some(specs)
+        }
+        _ => None,
+    }
+}
+
 async fn bfs_fetch_pypi(
     pypi_name: &str,
     specifiers: &VersionSpecifiers,
     index: &str,
     target: &WheelTarget,
     download_dir: &Path,
+    relax: RelaxPolicy,
 ) -> Result<(url::Url, WheelMetadata, String)> {
-    let wheel_result = pypi::resolve(index, pypi_name, specifiers, target).await;
+    // v1.5.9 exact-first: `specifiers` are the ORIGINAL (pre-D)
+    // upstream pins, so exact family pins (isaacsim-kernel==6.0.0.0)
+    // resolve the exact version and the installed family stays
+    // patch-consistent. Only when the exact version has VANISHED from
+    // the index do we retry with the relaxed range -- loudly, because
+    // that is precisely the patch-drift condition that broke Kit
+    // extension resolution (6.0.0.0 experience files requiring
+    // extensions the 6.0.0.1 sensor wheel renamed).
+    let wheel_result = match pypi::resolve(index, pypi_name, specifiers, target).await {
+        Ok(resolved) => Ok(resolved),
+        Err(exact_err) => {
+            if let Some(relaxed) = relaxed_retry_specs(pypi_name, specifiers, relax) {
+                match pypi::resolve(index, pypi_name, &relaxed, target).await {
+                    Ok(resolved) => {
+                        tracing::warn!(
+                            dep = %pypi_name,
+                            exact = %specifiers,
+                            relaxed = %relaxed,
+                            resolved = %resolved.filename,
+                            "PATCH-DRIFT FALLBACK: exact upstream pin not on the index; resolved a relaxed match. If this dep is part of a pinned wheel family (isaacsim-*), check for runtime contract drift.",
+                        );
+                        crate::status::tty(&format!(
+                            "warning: {pypi_name}{specifiers} not on index; using relaxed match {} (possible family version drift)",
+                            resolved.filename,
+                        ));
+                        Ok(resolved)
+                    }
+                    Err(_) => Err(exact_err),
+                }
+            } else {
+                Err(exact_err)
+            }
+        }
+    };
     let (resolved_url, metadata) = match wheel_result {
         Ok(resolved) => {
             let metadata = metadata_preferring_sidecar(&resolved, download_dir).await?;
@@ -2894,7 +2960,7 @@ async fn materialize_and_rewrite(
     git_sources: &std::collections::BTreeMap<String, crate::config::NamedGitSource>,
     auto_data: Option<AutoDataConfig>,
     audit_info: EntryAuditInfo,
-) -> Result<ResolvedWheel> {
+) -> Result<(ResolvedWheel, Vec<String>)> {
     use crate::wheel_rewrite::rewrite_wheel;
     let pypi_name = canonical_conda_name(entry_name);
 
@@ -3109,6 +3175,7 @@ async fn materialize_and_rewrite(
     // updated METADATA + RECORD; for 'none' it's a no-op copy. Either
     // way we recompute the sha256 of the final file. Cache reuse: skip
     // the rewrite when `*.relaxed.whl` is already up to date.
+    let pre_d_path = with_data_path.clone();
     let final_path = if relax == RelaxPolicy::None {
         with_data_path
     } else {
@@ -3144,6 +3211,29 @@ async fn materialize_and_rewrite(
     .await
     .context("metadata reader panicked")??;
 
+    // v1.5.9 (isaacsim 6.0.0.0 vs 6.0.0.1 patch drift): keep the
+    // ORIGINAL (pre-D) Requires-Dist for the BFS to resolve sub-wheels
+    // from. D's relaxation exists for the EMISSION side (conda
+    // run-deps + the pins uv reads from site-packages); resolving
+    // PYPI sub-wheels from relaxed ranges let exact family pins like
+    // `isaacsim-kernel==6.0.0.0` float to the newest patch
+    // (>=6.0.0.0,<6.0.1 admits 6.0.0.1), splitting the installed
+    // family across patch versions and breaking runtime contracts
+    // (Kit extension names renamed between patches). Sub-wheel
+    // resolution is exact-first; the relaxed range is only a
+    // fallback when the exact version vanished from the index.
+    let original_requires_dist = if relax == RelaxPolicy::None {
+        metadata.requires_dist.clone()
+    } else {
+        tokio::task::spawn_blocking({
+            let p = pre_d_path;
+            move || crate::wheel::read_metadata(&p)
+        })
+        .await
+        .context("metadata reader panicked")??
+        .requires_dist
+    };
+
     // The recipe's `source:` URL points at the POST-D wheel. If we
     // returned the upstream URL here, rattler-build would re-download
     // the un-rewritten file and pip would install strict pins into
@@ -3163,14 +3253,17 @@ async fn materialize_and_rewrite(
         file_count: auto_data_file_count.unwrap_or(0),
         skip_subdirs: cfg.skip_subdirs.clone(),
     });
-    Ok(ResolvedWheel {
-        pypi_name,
-        url: final_url,
-        extras_requested: audit_info.extras_requested,
-        auto_data: auto_data_report,
-        auto_data_dedup_skipped_root: audit_info.dedup_skipped_root,
-        metadata,
-    })
+    Ok((
+        ResolvedWheel {
+            pypi_name,
+            url: final_url,
+            extras_requested: audit_info.extras_requested,
+            auto_data: auto_data_report,
+            auto_data_dedup_skipped_root: audit_info.dedup_skipped_root,
+            metadata,
+        },
+        original_requires_dist,
+    ))
 }
 
 /// (env name, refinement outcome, the env's final overrides) from one
