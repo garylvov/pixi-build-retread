@@ -399,7 +399,8 @@ pub(crate) async fn iterative_solve_refinement(
             }
             effective.overrides.insert(dep.clone(), spec.clone());
         }
-        let seeded = super::produce_output(bundle, effective, host_platform, python_version, siblings)?;
+        let seeded =
+            super::produce_output(bundle, effective, host_platform, python_version, siblings)?;
         current_run_deps = seeded
             .run_dependencies
             .depends
@@ -663,7 +664,12 @@ pub(crate) async fn iterative_solve_refinement(
             .run_dependencies
             .depends
             .iter()
-            .map(|n| (n.name.as_str().to_string(), super::audit_report::format_packagespec(&n.spec)))
+            .map(|n| {
+                (
+                    n.name.as_str().to_string(),
+                    super::audit_report::format_packagespec(&n.spec),
+                )
+            })
             .collect();
         let invariant_violations =
             check_output_abi_invariants(&emitted_pairs, workspace_specs, &effective.overrides);
@@ -1011,7 +1017,11 @@ pub(crate) async fn pre_emit_widen_pass(
 /// field wins, then the pack-wide `retread-bundle` default (v1.4.0),
 /// then standalone (the entry's own name -- one conda output per
 /// entry, the historical behavior).
-pub(crate) fn bundle_group_for(entry_name: &str, entry: &WheelEntry, default_bundle: Option<&str>) -> String {
+pub(crate) fn bundle_group_for(
+    entry_name: &str,
+    entry: &WheelEntry,
+    default_bundle: Option<&str>,
+) -> String {
     entry
         .bundle
         .clone()

@@ -2867,7 +2867,6 @@ async fn materialize_and_rewrite(
     })
 }
 
-
 /// (env name, refinement outcome, the env's final overrides) from one
 /// env's concurrent solve task in the per-level env loop.
 type EnvSolveResult = (
@@ -3092,7 +3091,6 @@ fn produce_output(
         input_globs: None,
     })
 }
-
 
 /// v1.4.5: swap an http(s) wheel source for `file://` of retread's
 /// cached copy when present. Looks in `<wheels_root>/<filename>` and
