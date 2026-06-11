@@ -44,6 +44,12 @@ use crate::wheel_inject::sha256_base64_urlsafe_nopad;
 /// entries where there is no `.gitignore` at all). Everything else
 /// defers to the repo's own `.gitignore` via the `ignore` crate.
 const ALWAYS_SKIP: &[&str] = &[
+    // The walker runs with .hidden(false) so .gitignore (not the
+    // leading-dot heuristic) decides what ships -- which means nothing
+    // upstream excludes the .git dir itself. It must be skipped here:
+    // it can be huge (pack files) and .git/config may embed credentials
+    // in remote URLs.
+    ".git",
     "__pycache__",
     ".pixi",
     ".venv",
@@ -464,6 +470,15 @@ mod tests {
             "__pycache__/x.cpython-311.pyc",
             b"shouldnt-ship\n",
         );
+        // .git must be dropped by ALWAYS_SKIP: the walker runs with
+        // .hidden(false), so nothing else excludes it, and .git/config
+        // can embed credentials in remote URLs.
+        write_file(&checkout, ".git/HEAD", b"ref: refs/heads/main\n");
+        write_file(
+            &checkout,
+            ".git/config",
+            b"[remote \"origin\"]\n\turl = https://user:token@example.com/r.git\n",
+        );
 
         // Wheel files live OUTSIDE the checkout root so the walker
         // doesn't sweep them up.
@@ -489,6 +504,7 @@ mod tests {
         assert!(names.contains(&"foo-1.0.data/data/lib/.gitignore".to_string()));
         assert!(!names.iter().any(|n| n.contains("build/")));
         assert!(!names.iter().any(|n| n.contains("__pycache__")));
+        assert!(!names.iter().any(|n| n.contains(".git/")));
 
         // RECORD updated with PEP 376 lines for the new data entries.
         let mut record = String::new();
