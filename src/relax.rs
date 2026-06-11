@@ -80,6 +80,16 @@ fn format_dep(name: &str, spec: &str) -> String {
     }
 }
 
+/// v1.5.x cleanup 0a: THE shared simple normalizer -- lowercase +
+/// `_` -> `-` only. This is the exact body the former twins
+/// `handler::conda_name_from` and `workspace::conda_normalize` both
+/// carried; unified here with zero behavior change. NOTE: `map_name`
+/// below applies FULL PEP 503 (collapses `. _ -` runs) -- the two are
+/// intentionally distinct until the explicit 0c semantic change.
+pub(crate) fn conda_name_simple(name: &str) -> String {
+    name.to_ascii_lowercase().replace('_', "-")
+}
+
 fn map_name(pypi: &str, overrides: &BTreeMap<String, String>) -> String {
     if let Some(mapped) = overrides.get(pypi) {
         return mapped.clone();
@@ -470,6 +480,36 @@ pub fn emit_python_version(primary_wheel_filename: &str, workspace_python_versio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conda_name_simple_matches_legacy_twins() {
+        // Cleanup 0a: this fn replaced the byte-identical twins
+        // handler::conda_name_from and workspace::conda_normalize
+        // (both `to_ascii_lowercase().replace('_', "-")`). The table
+        // pins EXACT legacy behavior -- including the cases where the
+        // simple normalizer deliberately differs from map_name's full
+        // PEP 503 (dots preserved, separator runs preserved). Those
+        // divergences are the 0c semantic change, not this one.
+        let legacy = |s: &str| s.to_ascii_lowercase().replace('_', "-");
+        for input in [
+            "numpy",
+            "opencv_python",
+            "Pillow",
+            "isaacsim_extscache_kit",
+            "ruamel.yaml", // dot PRESERVED by the simple normalizer
+            "a__b",        // run NOT collapsed (becomes "a--b")
+            "python_abi",
+            "nvidia-cuda-nvrtc-cu12",
+        ] {
+            assert_eq!(
+                conda_name_simple(input),
+                legacy(input),
+                "divergence from legacy twins on {input:?}"
+            );
+        }
+        assert_eq!(conda_name_simple("a__b"), "a--b");
+        assert_eq!(conda_name_simple("ruamel.yaml"), "ruamel.yaml");
+    }
 
     fn env() -> MarkerEnvironment {
         default_marker_env("3.11").unwrap()

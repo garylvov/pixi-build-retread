@@ -573,7 +573,7 @@ pub async fn extract_transitive_constraints(
     let solve_specs: Vec<String> = deps
         .iter()
         .filter_map(|(dep_name, dep_spec)| {
-            let conda_name = conda_normalize(dep_name);
+            let conda_name = crate::relax::conda_name_simple(dep_name);
             if bundle_names.contains(&conda_name) {
                 return None;
             }
@@ -637,13 +637,6 @@ pub async fn extract_transitive_constraints(
         }
     }
     out
-}
-
-/// Conda-normalize a package name: lowercase + replace `_` with `-`.
-/// Mirrors `handler::conda_name_from` but kept local so workspace.rs
-/// doesn't have to depend on handler.rs.
-fn conda_normalize(s: &str) -> String {
-    s.to_ascii_lowercase().replace('_', "-")
 }
 
 /// v0.37.0+ (D1): parse one `[system-requirements]` value. pixi allows
