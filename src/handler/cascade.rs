@@ -919,17 +919,15 @@ pub(crate) async fn pre_emit_widen_pass(
         } else {
             "indecisive"
         };
-        bundle.probe_decisions.push(crate::audit::ProbeDecision {
-            stage: stage1.into(),
-            pypi_name: pypi_name.clone().unwrap_or_else(|| conda_name.clone()),
-            conda_name: conda_name.clone(),
-            spec: spec.clone(),
-            target_python: target.python_version.clone(),
-            channels_consulted: strict_probe.channels_consulted.clone(),
-            satisfiable: strict_probe.satisfiable,
-            matching_candidates: strict_probe.matching_candidates,
-            routing_decision: initial_routing.into(),
-        });
+        bundle.probe_decisions.push(crate::audit::ProbeDecision::from_probe(
+            stage1,
+            &pypi_name.clone().unwrap_or_else(|| conda_name.clone()),
+            &conda_name,
+            &spec,
+            &target.python_version,
+            &strict_probe,
+            initial_routing,
+        ));
         if strict_probe.is_satisfied() || !strict_probe.is_definitively_unsatisfied() {
             continue;
         }
@@ -980,17 +978,15 @@ pub(crate) async fn pre_emit_widen_pass(
             } else {
                 "no-py-compat-version-on-conda"
             };
-            bundle.probe_decisions.push(crate::audit::ProbeDecision {
-                stage: "last-resort-widen".into(),
-                pypi_name: conda_name.clone(),
-                conda_name: conda_name.clone(),
-                spec: target_spec.clone(),
-                target_python: target.python_version.clone(),
-                channels_consulted: probe_result.channels_consulted.clone(),
-                satisfiable: probe_result.satisfiable,
-                matching_candidates: probe_result.matching_candidates,
-                routing_decision: routing_decision.into(),
-            });
+            bundle.probe_decisions.push(crate::audit::ProbeDecision::from_probe(
+                "last-resort-widen",
+                &conda_name,
+                &conda_name,
+                &target_spec,
+                &target.python_version,
+                &probe_result,
+                routing_decision,
+            ));
             if widened {
                 tracing::info!(
                     dep = %conda_name,
@@ -1254,17 +1250,15 @@ pub(crate) async fn tiered_cascade_for_dep(
             } else {
                 "indecisive"
             };
-            bundle.probe_decisions.push(crate::audit::ProbeDecision {
-                stage: conda_stage.into(),
-                pypi_name: pypi_name.to_string(),
-                conda_name: conda_name.to_string(),
-                spec: widened_spec.clone(),
-                target_python: target.python_version.clone(),
-                channels_consulted: probe.channels_consulted.clone(),
-                satisfiable: probe.satisfiable,
-                matching_candidates: probe.matching_candidates,
-                routing_decision: routing.into(),
-            });
+            bundle.probe_decisions.push(crate::audit::ProbeDecision::from_probe(
+                conda_stage,
+                pypi_name,
+                conda_name,
+                &widened_spec,
+                &target.python_version,
+                &probe,
+                routing,
+            ));
             if probe.is_satisfied() {
                 tracing::info!(
                     dep = %conda_name,
@@ -1343,16 +1337,14 @@ pub(crate) async fn tiered_cascade_for_dep(
     )
     .await;
     let widened = probe_result.is_satisfied();
-    bundle.probe_decisions.push(crate::audit::ProbeDecision {
-        stage: "tiered-cascade-step7-last-resort".into(),
-        pypi_name: pypi_name.to_string(),
-        conda_name: conda_name.to_string(),
-        spec: target_spec.clone(),
-        target_python: target.python_version.clone(),
-        channels_consulted: probe_result.channels_consulted.clone(),
-        satisfiable: probe_result.satisfiable,
-        matching_candidates: probe_result.matching_candidates,
-        routing_decision: if widened {
+    bundle.probe_decisions.push(crate::audit::ProbeDecision::from_probe(
+        "tiered-cascade-step7-last-resort",
+        pypi_name,
+        conda_name,
+        &target_spec,
+        &target.python_version,
+        &probe_result,
+        if widened {
             if source_tag == "from-workspace-pin" {
                 "widened-to-workspace-pin"
             } else {
@@ -1360,9 +1352,8 @@ pub(crate) async fn tiered_cascade_for_dep(
             }
         } else {
             "no-py-compat-version-on-conda"
-        }
-        .into(),
-    });
+        },
+    ));
     if widened {
         tracing::info!(
             dep = %conda_name,
@@ -1395,17 +1386,15 @@ pub(crate) async fn tiered_cascade_for_dep(
                 workspace_pin = %target_spec,
                 "tiered-cascade: workspace pin didn't probe-satisfy; falling through to `*`",
             );
-            bundle.probe_decisions.push(crate::audit::ProbeDecision {
-                stage: "tiered-cascade-step7-last-resort".into(),
-                pypi_name: pypi_name.to_string(),
-                conda_name: conda_name.to_string(),
-                spec: "*".into(),
-                target_python: target.python_version.clone(),
-                channels_consulted: any_probe.channels_consulted.clone(),
-                satisfiable: any_probe.satisfiable,
-                matching_candidates: any_probe.matching_candidates,
-                routing_decision: "widened-to-any-version-after-workspace-pin-miss".into(),
-            });
+            bundle.probe_decisions.push(crate::audit::ProbeDecision::from_probe(
+                "tiered-cascade-step7-last-resort",
+                pypi_name,
+                conda_name,
+                "*",
+                &target.python_version,
+                &any_probe,
+                "widened-to-any-version-after-workspace-pin-miss",
+            ));
             effective
                 .overrides
                 .insert(conda_name.to_string(), "*".into());

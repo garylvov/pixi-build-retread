@@ -154,6 +154,37 @@ pub struct ProbeDecision {
     pub routing_decision: String,
 }
 
+impl ProbeDecision {
+    /// Construct a `ProbeDecision` from a completed [`crate::probe::ProbeResult`],
+    /// copying the three fields that come from the probe
+    /// (`channels_consulted`, `satisfiable`, `matching_candidates`) and
+    /// supplying the call-site context (`stage`, `pypi_name`, `conda_name`,
+    /// `spec`, `target_python`, `routing_decision`). This eliminates the
+    /// repetitive field-by-field copy at every probe call site in the
+    /// handler.
+    pub fn from_probe(
+        stage: &str,
+        pypi_name: &str,
+        conda_name: &str,
+        spec: &str,
+        target_python: &str,
+        probe: &crate::probe::ProbeResult,
+        routing_decision: &str,
+    ) -> Self {
+        Self {
+            stage: stage.to_string(),
+            pypi_name: pypi_name.to_string(),
+            conda_name: conda_name.to_string(),
+            spec: spec.to_string(),
+            target_python: target_python.to_string(),
+            channels_consulted: probe.channels_consulted.clone(),
+            satisfiable: probe.satisfiable,
+            matching_candidates: probe.matching_candidates,
+            routing_decision: routing_decision.to_string(),
+        }
+    }
+}
+
 /// All info about one conda output retread produced.
 #[derive(Debug, Serialize)]
 pub struct BundleAudit {
@@ -428,6 +459,47 @@ mod tests {
                 "line must be a valid `key = \"value\"` pair; got: {line}",
             );
         }
+    }
+
+    /// Equivalence: `ProbeDecision::from_probe` must produce an identical
+    /// value to the hand-written struct literal that the pre-H2 code used.
+    /// This pins the constructor's contract: if any field mapping diverges,
+    /// the test catches it before it ships.
+    #[test]
+    fn probe_decision_from_probe_equals_literal() {
+        use crate::probe::ProbeResult;
+        let probe = ProbeResult {
+            package: "numpy".to_string(),
+            spec: ">=1".to_string(),
+            channels_consulted: vec!["https://conda.anaconda.org/conda-forge/linux-64".into()],
+            satisfiable: Some(true),
+            matching_candidates: 7,
+        };
+        let from_ctor = ProbeDecision::from_probe(
+            "bfs",
+            "numpy",
+            "numpy",
+            ">=1",
+            "3.11",
+            &probe,
+            "short-circuit",
+        );
+        let literal = ProbeDecision {
+            stage: "bfs".into(),
+            pypi_name: "numpy".into(),
+            conda_name: "numpy".into(),
+            spec: ">=1".into(),
+            target_python: "3.11".into(),
+            channels_consulted: probe.channels_consulted.clone(),
+            satisfiable: probe.satisfiable,
+            matching_candidates: probe.matching_candidates,
+            routing_decision: "short-circuit".into(),
+        };
+        // Compare field-by-field via JSON round-trip (ProbeDecision
+        // derives Serialize but not PartialEq).
+        let ctor_json = serde_json::to_value(&from_ctor).unwrap();
+        let lit_json = serde_json::to_value(&literal).unwrap();
+        assert_eq!(ctor_json, lit_json, "from_probe and literal must be identical");
     }
 
     #[test]
