@@ -26,8 +26,8 @@ pub struct CondaDep {
 
 impl CondaDep {
     /// Construct from separate name + spec strings. Use this in `translate`
-    /// (which already has both sides) instead of calling `format_dep` and
-    /// wrapping in `CondaDep(...)`.
+    /// (which already has both sides), since `translate` now builds `CondaDep`
+    /// directly rather than formatting a joined string first.
     pub fn new(name: String, spec: String) -> Self {
         Self { name, spec }
     }
@@ -35,9 +35,9 @@ impl CondaDep {
 
 impl std::fmt::Display for CondaDep {
     /// Produce the joined conda match-spec string: `"<name> <spec>"` when
-    /// spec is non-empty, bare `"<name>"` when spec is empty. Exactly the
-    /// form `format_dep` produced for the old tuple struct -- every call
-    /// site that previously read `dep.0` can use `dep.to_string()`.
+    /// spec is non-empty, bare `"<name>"` when spec is empty. Matches the
+    /// old tuple-struct join: every call site that previously read `dep.0`
+    /// can now use `dep.to_string()`.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.spec.is_empty() {
             write!(f, "{}", self.name)
@@ -56,6 +56,7 @@ impl std::fmt::Display for CondaDep {
 /// when you need BOTH name and spec from a dep string. Do NOT use it in
 /// place of `workspace::split_conda_dep_line`, which has its own
 /// build-string-aware contract (`splitn(3)`) and separate tests.
+#[cfg(test)]
 pub(crate) fn parse_named_spec(line: &str) -> (String, String) {
     let trimmed = line.trim();
     let mut parts = trimmed.splitn(2, char::is_whitespace);
@@ -124,14 +125,6 @@ pub fn translate(
     };
 
     Ok(Some(CondaDep::new(conda_name, spec)))
-}
-
-fn format_dep(name: &str, spec: &str) -> String {
-    if spec.is_empty() {
-        name.to_string()
-    } else {
-        format!("{name} {spec}")
-    }
 }
 
 /// v1.5.x cleanup 0c: THE canonical conda-name normalizer -- full
@@ -764,7 +757,7 @@ mod tests {
         );
 
         // Translate round-trip: the joined form from Display must match what
-        // the old CondaDep(String) produced via format_dep.
+        // the old CondaDep(String) tuple-struct produced.
         let from_translate = translate(
             "numpy==1.26.4",
             &env(),

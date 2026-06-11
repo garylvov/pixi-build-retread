@@ -219,6 +219,7 @@ pub(crate) const PUBLIC_PYPI: &str = "https://pypi.org/simple/";
 /// implementations:
 /// - `cascade::pypi_fallback_indexes` (entry indexes + workspace indexes)
 /// - `auto_bundle::auto_bundle_transitives` (entry_index + workspace_indexes)
+///
 /// Both had identical push-unique + append-public-PyPI logic.
 pub(crate) fn merge_index_chain(
     primary: impl IntoIterator<Item = String>,
