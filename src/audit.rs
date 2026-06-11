@@ -25,6 +25,13 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+/// `serde` skip-serializing predicate: omit the field when it is zero.
+/// Used by `BundleAudit::envs_skipped` so old audit JSON round-trips
+/// cleanly (absent field defaults to 0 via `#[serde(default)]`).
+fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
+
 /// v0.12.0+: per-wheel record of the auto-data-files inject phase
 /// (phase 1.6). Surfaces which wheel carried the upstream checkout-
 /// root tree as `.data/data/lib/<rel>` entries (lands at
@@ -168,6 +175,14 @@ pub struct BundleAudit {
     /// a cross-env union which would over-constrain.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub solve_diagnostics: BTreeMap<String, SolveDiagnostics>,
+    /// P1 (cleanup): how many of the attempted env solve checks were
+    /// abstentions (skipped because no repodata was reachable). When
+    /// `envs_skipped == solve_diagnostics.len()` the entire run was an
+    /// abstention and outputs shipped UNVERIFIED. Purely informational;
+    /// never used for flow control. `#[serde(default)]` keeps older audit
+    /// JSON parseable (absent field reads as 0).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub envs_skipped: usize,
 }
 
 /// Persisted form of `solve_check::SolveOutcome`. Mirrors the in-memory
@@ -298,6 +313,7 @@ impl BundleAudit {
     /// Construct a BundleAudit including the rendered TOML blocks.
     /// `probe_decisions` is the routing-trace collected during the
     /// BFS + auto-bundle passes (v0.14.1+). Empty for legacy callers.
+    /// `envs_skipped` counts how many env solve checks abstained (P1).
     pub fn new(
         conda_name: String,
         version: String,
@@ -305,6 +321,7 @@ impl BundleAudit {
         emitted_run_deps: Vec<EmittedDep>,
         probe_decisions: Vec<ProbeDecision>,
         solve_diagnostics: BTreeMap<String, SolveDiagnostics>,
+        envs_skipped: usize,
     ) -> Self {
         let pypi_options_dependency_overrides = render_pypi_overrides(&wheels);
         let dependencies = render_conda_deps(&emitted_run_deps);
@@ -319,6 +336,7 @@ impl BundleAudit {
             },
             probe_decisions,
             solve_diagnostics,
+            envs_skipped,
         }
     }
 }
@@ -430,6 +448,7 @@ mod tests {
             ],
             vec![],
             BTreeMap::new(),
+            0,
         );
         let json = serde_json::to_string_pretty(&audit).unwrap();
         // Spot-check shape rather than exact bytes (field order is

@@ -52,6 +52,16 @@ pub(crate) fn build_bundle_audit(
             }
         })
         .collect();
+    // P1: derive envs_skipped from solve_diagnostics so the audit field
+    // is populated even when build_bundle_audit is called from
+    // conda_build_v1 (which doesn't have the coordinator counter in
+    // scope). This is a pure derivation from already-stored state, so
+    // it cannot diverge from the coordinator's counter.
+    let envs_skipped = bundle
+        .solve_diagnostics
+        .values()
+        .filter(|d| d.skipped)
+        .count();
     crate::audit::BundleAudit::new(
         bundle.conda_name.clone(),
         bundle.primary.metadata.version.clone(),
@@ -59,6 +69,7 @@ pub(crate) fn build_bundle_audit(
         emitted_run_deps,
         bundle.probe_decisions.clone(),
         bundle.solve_diagnostics.clone(),
+        envs_skipped,
     )
 }
 
@@ -203,9 +214,23 @@ pub(crate) async fn write_solve_failed_summary(bundle: &Bundle, source_dir: &Pat
         .solve_diagnostics
         .values()
         .any(|d| !d.satisfiable && !d.skipped);
+    // P1 MD-deletion guard: we must NOT delete a prior failure record when
+    // the current run is an abstention (all diagnostics have skipped=true).
+    // An abstention provides no evidence that the prior conflict is resolved;
+    // removing the file would silently hide a known unsat from the user. Only
+    // delete when at least one env was actually verified (not skipped) AND
+    // none of those verified envs is unsat.
+    let all_diagnostics_skipped = !bundle.solve_diagnostics.is_empty()
+        && bundle.solve_diagnostics.values().all(|d| d.skipped);
     let path = source_dir.join(format!("RETREAD-SOLVE-FAILED-{}.md", bundle.conda_name));
     if !any_unsat {
-        // Remove a stale file from a previous failed run; clean state.
+        if all_diagnostics_skipped {
+            // Full abstention: leave any existing MD intact. The run
+            // didn't verify anything, so the prior failure record is
+            // still the best evidence we have.
+            return Ok(());
+        }
+        // At least one env verified and none unsat: clean state.
         let _ = tokio::fs::remove_file(&path).await;
         return Ok(());
     }

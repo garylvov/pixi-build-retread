@@ -1786,3 +1786,308 @@ fn extra_dep_source_from_url_git_without_rev() {
         other => panic!("expected Git, got {other:?}"),
     }
 }
+
+// -----------------------------------------------------------------
+// P1 (cleanup): classify_run_terminal table tests.
+// Invariant: the pure helper is the single source of truth for both
+// the abstention banner and the MD-deletion guard. These tests pin
+// every combination so neither consumer can silently drift.
+// -----------------------------------------------------------------
+
+#[test]
+fn classify_run_terminal_all_sat() {
+    // attempted=3, skipped=0, no block messages -> VerifiedAllSat
+    let (terminal, skipped) = classify_run_terminal(3, 0, false);
+    assert_eq!(terminal, RunTerminal::VerifiedAllSat);
+    assert_eq!(skipped, 0);
+}
+
+#[test]
+fn classify_run_terminal_all_unsat_with_block_messages() {
+    // attempted=2, skipped=0, block messages -> VerifiedUnsat
+    let (terminal, skipped) = classify_run_terminal(2, 0, true);
+    assert_eq!(terminal, RunTerminal::VerifiedUnsat);
+    assert_eq!(skipped, 0);
+}
+
+#[test]
+fn classify_run_terminal_all_abstained() {
+    // attempted==skipped -> AllAbstained regardless of block messages.
+    // (block messages cannot exist when all checks were skipped, but
+    // the classifier is pure and doesn't enforce that precondition.)
+    let (terminal, skipped) = classify_run_terminal(4, 4, false);
+    assert_eq!(terminal, RunTerminal::AllAbstained);
+    assert_eq!(skipped, 4);
+}
+
+#[test]
+fn classify_run_terminal_partial_skip_no_block() {
+    // 1 sat + 2 skipped, no workspace block -> VerifiedAllSat (the
+    // verified portion passed; the skipped portion is flagged via
+    // the non-zero skipped_count in the return value).
+    let (terminal, skipped) = classify_run_terminal(3, 2, false);
+    assert_eq!(terminal, RunTerminal::VerifiedAllSat);
+    assert_eq!(skipped, 2);
+}
+
+#[test]
+fn classify_run_terminal_partial_skip_with_block() {
+    // 1 verified unsat + 2 skipped -> VerifiedUnsat
+    let (terminal, skipped) = classify_run_terminal(3, 2, true);
+    assert_eq!(terminal, RunTerminal::VerifiedUnsat);
+    assert_eq!(skipped, 2);
+}
+
+#[test]
+fn classify_run_terminal_nothing_attempted() {
+    // attempted=0 -> NothingAttempted regardless of other args
+    let (terminal, skipped) = classify_run_terminal(0, 0, false);
+    assert_eq!(terminal, RunTerminal::NothingAttempted);
+    assert_eq!(skipped, 0);
+}
+
+// -----------------------------------------------------------------
+// P1: write_solve_failed_summary MD-deletion guard.
+// (a) abstained run (all diagnostics skipped=true) preserves a
+//     pre-existing md file -- abstention is not evidence of resolution.
+// (b) verified all-sat run deletes a stale md file.
+// These tests exercise the guard directly via a real temp-dir write.
+// -----------------------------------------------------------------
+
+mod solve_failed_summary_guard {
+    use super::super::audit_report::write_solve_failed_summary;
+    use super::*; // pulls in Bundle, ResolvedWheel, rw, meta, etc.
+    use crate::audit::SolveDiagnostics;
+
+    /// Build a minimal Bundle with the given solve_diagnostics. The
+    /// bundle's conda_name is used to derive the MD file path.
+    fn make_bundle_with_diags(name: &str, diags: BTreeMap<String, SolveDiagnostics>) -> Bundle {
+        Bundle {
+            conda_name: name.to_string(),
+            primary: rw(name, meta(name, "1.0.0", vec![], true)),
+            extras: vec![],
+            probe_decisions: vec![],
+            solve_diagnostics: diags,
+        }
+    }
+
+    fn skipped_diag() -> SolveDiagnostics {
+        SolveDiagnostics {
+            satisfiable: false, // "unknown" -- not sat, but skipped
+            unsat_explanations: vec![],
+            channels_consulted: vec![],
+            specs_count: 0,
+            records_count: 0,
+            refinement_steps: vec![],
+            workspace_edit_suggestions: vec![],
+            terminal_classification: None,
+            skipped: true,
+        }
+    }
+
+    fn unsat_diag() -> SolveDiagnostics {
+        SolveDiagnostics {
+            satisfiable: false,
+            unsat_explanations: vec!["dep A conflicts with dep B".into()],
+            channels_consulted: vec!["https://conda.anaconda.org/conda-forge/linux-64".into()],
+            specs_count: 5,
+            records_count: 100,
+            refinement_steps: vec![],
+            workspace_edit_suggestions: vec![],
+            terminal_classification: Some("B-workspace-pin".into()),
+            skipped: false,
+        }
+    }
+
+    fn sat_diag() -> SolveDiagnostics {
+        SolveDiagnostics {
+            satisfiable: true,
+            unsat_explanations: vec![],
+            channels_consulted: vec!["https://conda.anaconda.org/conda-forge/linux-64".into()],
+            specs_count: 5,
+            records_count: 100,
+            refinement_steps: vec![],
+            workspace_edit_suggestions: vec![],
+            terminal_classification: None,
+            skipped: false,
+        }
+    }
+
+    /// Test (a): abstained run preserves pre-existing MD.
+    #[tokio::test]
+    async fn abstained_run_preserves_prior_md() {
+        let dir = std::env::temp_dir().join(format!("retread_test_abstain_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bundle_name = "test-bundle-abstain";
+        let md_path = dir.join(format!("RETREAD-SOLVE-FAILED-{bundle_name}.md"));
+
+        // Pre-create the MD file (simulates a prior failed run).
+        std::fs::write(&md_path, "# Prior failure record\n").unwrap();
+        assert!(md_path.exists(), "pre-condition: md must exist");
+
+        // Run with all diagnostics skipped (full abstention).
+        let mut diags = BTreeMap::new();
+        diags.insert("gsi".to_string(), skipped_diag());
+        diags.insert("gsi-ros2".to_string(), skipped_diag());
+        let bundle = make_bundle_with_diags(bundle_name, diags);
+
+        write_solve_failed_summary(&bundle, &dir).await.unwrap();
+
+        // MD must still exist (abstention is not evidence of resolution).
+        assert!(
+            md_path.exists(),
+            "abstained run must NOT delete the prior failure MD"
+        );
+
+        // Cleanup.
+        let _ = std::fs::remove_file(&md_path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// Test (b): verified all-sat run deletes stale MD.
+    #[tokio::test]
+    async fn verified_sat_clears_stale_md() {
+        let dir =
+            std::env::temp_dir().join(format!("retread_test_sat_clear_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bundle_name = "test-bundle-sat-clear";
+        let md_path = dir.join(format!("RETREAD-SOLVE-FAILED-{bundle_name}.md"));
+
+        // Pre-create the MD file (stale from a prior failed run).
+        std::fs::write(&md_path, "# Stale prior failure\n").unwrap();
+        assert!(md_path.exists(), "pre-condition: md must exist");
+
+        // Run with all diagnostics satisfiable (verified all-sat).
+        let mut diags = BTreeMap::new();
+        diags.insert("gsi".to_string(), sat_diag());
+        let bundle = make_bundle_with_diags(bundle_name, diags);
+
+        write_solve_failed_summary(&bundle, &dir).await.unwrap();
+
+        // MD must be gone (stale file cleaned up).
+        assert!(
+            !md_path.exists(),
+            "verified sat run must delete the stale failure MD"
+        );
+
+        // Cleanup (dir may already be absent if remove_file removed it).
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// Test that a genuine unsat (non-skipped) still writes the MD.
+    #[tokio::test]
+    async fn genuine_unsat_writes_md() {
+        let dir =
+            std::env::temp_dir().join(format!("retread_test_unsat_write_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bundle_name = "test-bundle-unsat-write";
+        let md_path = dir.join(format!("RETREAD-SOLVE-FAILED-{bundle_name}.md"));
+
+        assert!(!md_path.exists(), "pre-condition: md must NOT exist");
+
+        let mut diags = BTreeMap::new();
+        diags.insert("gsi".to_string(), unsat_diag());
+        let bundle = make_bundle_with_diags(bundle_name, diags);
+
+        write_solve_failed_summary(&bundle, &dir).await.unwrap();
+
+        assert!(md_path.exists(), "genuine unsat must write the failure MD");
+
+        // Cleanup.
+        let _ = std::fs::remove_file(&md_path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+}
+
+// -----------------------------------------------------------------
+// P1: has_environment + absent-env filtering.
+// Manifest with envs {a}; filtering [a, b] keeps only [a].
+// -----------------------------------------------------------------
+
+#[test]
+fn has_environment_returns_true_for_declared_env() {
+    use crate::workspace::WorkspaceManifest;
+    let manifest: toml::Value = toml::from_str(
+        r#"
+[environments]
+a = { features = ["feat-a"] }
+
+[feature.feat-a.dependencies]
+numpy = ">=1"
+"#,
+    )
+    .unwrap();
+    let ws = WorkspaceManifest::from_toml(&manifest);
+    assert!(ws.has_environment("a"), "env 'a' is declared");
+    assert!(!ws.has_environment("b"), "env 'b' is not declared");
+    assert!(!ws.has_environment("feat-a"), "features are not envs");
+}
+
+#[test]
+fn absent_env_filter_keeps_declared_drops_absent() {
+    use crate::workspace::WorkspaceManifest;
+    let manifest: toml::Value = toml::from_str(
+        r#"
+[environments]
+a = { features = [] }
+"#,
+    )
+    .unwrap();
+    let ws = WorkspaceManifest::from_toml(&manifest);
+
+    // Simulate the retain logic from conda_outputs.
+    let mut env_names = vec!["a".to_string(), "b".to_string(), "__default__".to_string()];
+    env_names.retain(|n| {
+        if n == "__default__" {
+            return true;
+        }
+        ws.has_environment(n)
+    });
+
+    // "a" kept, "b" dropped, "__default__" always kept.
+    assert_eq!(env_names, vec!["a", "__default__"]);
+}
+
+// -----------------------------------------------------------------
+// P1: cache key changes when manifest mtime changes.
+// We exercise `conda_outputs_cache_key` directly with two different
+// synthetic `Option<SystemTime>` values and assert the keys differ.
+// -----------------------------------------------------------------
+
+#[test]
+fn cache_key_changes_when_manifest_mtime_changes() {
+    use pixi_build_types::procedures::conda_outputs::CondaOutputsParams;
+    use rattler_conda_types::Platform;
+
+    // Build minimal CondaOutputsParams with identical platform/channels/variant.
+    let make_params = || CondaOutputsParams {
+        host_platform: Platform::Linux64,
+        build_platform: Platform::Linux64,
+        channels: vec![],
+        variant_configuration: None,
+        variant_files: None,
+        work_directory: std::path::PathBuf::new(),
+    };
+
+    // Two different synthetic mtimes.
+    let t0 = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+    let t1 = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_001);
+
+    let key0 = conda_outputs_cache_key(&make_params(), Some(t0));
+    let key1 = conda_outputs_cache_key(&make_params(), Some(t1));
+    let key_none = conda_outputs_cache_key(&make_params(), None);
+
+    // Different mtimes -> different keys.
+    assert_ne!(key0, key1, "distinct mtimes must produce distinct keys");
+    // None sentinel differs from a real mtime.
+    assert_ne!(
+        key0, key_none,
+        "None mtime must not collide with a real mtime"
+    );
+    // Identical params + identical mtime -> same key (deterministic).
+    let key0_dup = conda_outputs_cache_key(&make_params(), Some(t0));
+    assert_eq!(
+        key0, key0_dup,
+        "same params+mtime must produce identical key"
+    );
+}

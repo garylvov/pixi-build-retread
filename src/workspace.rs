@@ -474,6 +474,15 @@ impl WorkspaceManifest {
         out
     }
 
+    /// P1: check whether the manifest declares an environment with the
+    /// given name. Used to filter `env_names` in `conda_outputs` before
+    /// leveling + solving so typos and removed envs never reach the solve
+    /// tasks (a missing env's effective_dependencies returns empty, which
+    /// produces a trivially-sat result and hides the misconfiguration).
+    pub fn has_environment(&self, name: &str) -> bool {
+        self.environments.contains_key(name)
+    }
+
     /// v0.35.0+: find which feature's `[feature.X.dependencies]`
     /// table (or the implicit top-level `default` feature) declares
     /// a conda dep with the given name, scoped to the active features

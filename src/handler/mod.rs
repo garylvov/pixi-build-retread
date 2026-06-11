@@ -70,20 +70,109 @@ static CONDA_OUTPUTS_CACHE: std::sync::OnceLock<
 /// outputs. `work_directory` is deliberately EXCLUDED: it's a scratch
 /// dir that doesn't affect the emitted metadata, and including it would
 /// miss cache hits if pixi varies it per call.
-fn conda_outputs_cache_key(params: &CondaOutputsParams) -> String {
+///
+/// `workspace_mtime` is the `pixi.toml`'s modification time folded into
+/// the key. Rationale: `WorkspaceManifest::load` is mtime-memoized
+/// internally, but `CONDA_OUTPUTS_CACHE` returns memoized results that
+/// bypass those loads entirely after the first call. Without the mtime
+/// in the key, a manifest edit between two pixi invocations (both with
+/// the same platform/channels/variant) would return a stale result that
+/// reflects the OLD workspace -- the cache hit would carry the previous
+/// run's emissions even if the workspace's channel list or env
+/// definitions changed. Use "0" when the mtime is unavailable (offline /
+/// read-error) so the key is still a valid string and the cache can
+/// still hit on identical conditions.
+fn conda_outputs_cache_key(
+    params: &CondaOutputsParams,
+    workspace_mtime: Option<std::time::SystemTime>,
+) -> String {
     let mut chans: Vec<String> = params
         .channels
         .iter()
         .map(|c| c.url().to_string())
         .collect();
     chans.sort();
+    // Encode the mtime as nanos-since-UNIX_EPOCH so it's both stable and
+    // human-readable in debug logs. "0" is the sentinel for "unknown".
+    let mtime_str = workspace_mtime
+        .and_then(|t| {
+            t.duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .ok()
+                .map(|d| d.subsec_nanos().to_string() + &d.as_secs().to_string())
+        })
+        .unwrap_or_else(|| "0".to_string());
     format!(
-        "{}|{}|{}|{:?}",
+        "{}|{}|{}|{:?}|{}",
         params.host_platform,
         params.build_platform,
         chans.join(","),
         params.variant_configuration,
+        mtime_str,
     )
+}
+
+/// Read the modification time of `workspace_dir/pixi.toml` for use in
+/// the `CONDA_OUTPUTS_CACHE` key. Returns `None` when the file is absent
+/// or metadata is unavailable (network-offline, read error). That causes
+/// the cache key to use the "0" sentinel and still function correctly --
+/// the cache may over-hit in that unusual case, but it will never
+/// under-hit and cause a redundant full solve.
+fn workspace_manifest_mtime(
+    workspace_dir: Option<&std::path::Path>,
+) -> Option<std::time::SystemTime> {
+    let dir = workspace_dir?;
+    std::fs::metadata(dir.join("pixi.toml"))
+        .ok()
+        .and_then(|m| m.modified().ok())
+}
+
+/// Outcome classification after all environments have been solved.
+///
+/// Used to drive BOTH the stderr abstention banner AND the MD-deletion
+/// guard in `write_solve_failed_summary` -- a single pure helper so
+/// the two call sites cannot drift apart.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RunTerminal {
+    /// Every attempted env produced a real solve (not abstained) and
+    /// none produced a workspace-block message.
+    VerifiedAllSat,
+    /// At least one env produced a real solve and at least one of those
+    /// produced a workspace-block message (unsat / B/C class).
+    VerifiedUnsat,
+    /// Every env that was attempted was skipped (no repodata reached).
+    /// The run is an abstention -- we can neither confirm nor deny.
+    AllAbstained,
+    /// No env was attempted at all (e.g. env list was empty after
+    /// filtering). Treated like abstention for the MD guard.
+    NothingAttempted,
+}
+
+/// Classify the terminal state of a conda/outputs run.
+///
+/// Arguments:
+/// - `envs_attempted`: total env iterations entered (including skipped).
+/// - `envs_skipped`: how many of those were abstentions (no repodata).
+/// - `has_block_messages`: true when `workspace_block_messages` is non-empty
+///   (i.e. at least one real unsat with a workspace-block class was found).
+///
+/// Returns `(RunTerminal, skipped_count)` where `skipped_count` mirrors
+/// `envs_skipped` (returned for convenience so callers don't need to
+/// re-compute it separately).
+pub(crate) fn classify_run_terminal(
+    envs_attempted: usize,
+    envs_skipped: usize,
+    has_block_messages: bool,
+) -> (RunTerminal, usize) {
+    let terminal = if envs_attempted == 0 {
+        RunTerminal::NothingAttempted
+    } else if envs_skipped == envs_attempted {
+        RunTerminal::AllAbstained
+    } else if has_block_messages {
+        RunTerminal::VerifiedUnsat
+    } else {
+        RunTerminal::VerifiedAllSat
+    };
+    (terminal, envs_skipped)
 }
 
 const NEGOTIATE: &str = "negotiateCapabilities";
@@ -384,7 +473,15 @@ impl Handler {
         // that shares this source package; the result is identical for
         // identical params, so return the memoized one instead of redoing
         // the whole multi-env solve. (See CONDA_OUTPUTS_CACHE.)
-        let cache_key = conda_outputs_cache_key(&params);
+        //
+        // Read workspace_dir from handler state BEFORE the lock guard so we
+        // don't hold the state lock while doing blocking I/O.
+        let pre_key_workspace_dir = {
+            let state = self.state.read().await;
+            state.workspace_dir.clone()
+        };
+        let mtime = workspace_manifest_mtime(pre_key_workspace_dir.as_deref());
+        let cache_key = conda_outputs_cache_key(&params, mtime);
         if let Some(cached) = CONDA_OUTPUTS_CACHE
             .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
             .lock()
@@ -454,6 +551,11 @@ impl Handler {
         // message can name which envs failed instead of falsely
         // claiming "every env failed" when in fact only some did.
         let mut envs_attempted: usize = 0;
+        // P1: how many of those attempts were abstentions (outcome.skipped).
+        // Accumulates OUTSIDE the parallel solve tasks (invariant #9: per-env
+        // state isolates inside tasks; aggregate counters live in the
+        // coordinator scope). Mirrors how accumulated_diagnostics works.
+        let mut envs_skipped: usize = 0;
         let mut envs_failed_with_block: std::collections::BTreeSet<String> =
             std::collections::BTreeSet::new();
         // v0.36.2+: track REAL suggestions separately from "see the
@@ -648,6 +750,30 @@ impl Handler {
                     } else {
                         emission.envs.clone()
                     };
+                    // P1: filter out env names that are not declared in
+                    // the workspace manifest. A typo or a stale reference
+                    // after an env was removed would reach the solve with
+                    // zero effective_dependencies (empty env), which the
+                    // solver trivially satisfies -- hiding the misconfiguration
+                    // and inflating `all_solve_attempted`. The __default__
+                    // sentinel is always kept because it represents the
+                    // fallback-no-workspace path, not a manifest env.
+                    if let Some(m) = manifest_for_solve.as_ref() {
+                        env_names.retain(|n| {
+                            if n == "__default__" {
+                                return true;
+                            }
+                            let present = m.has_environment(n);
+                            if !present {
+                                tracing::warn!(
+                                    env = %n,
+                                    bundle = %bundle.conda_name,
+                                    "dropping env from solve: not declared in workspace manifest (typo or removed env?)",
+                                );
+                            }
+                            present
+                        });
+                    }
                     // v0.44.0: solve the SMALLEST (most base) env first.
                     // Workspace envs nest -- e.g. isaaclab-gpu ⊆ gsi ⊆
                     // gsi-ros2 (each child adds features on top). Solving
@@ -905,6 +1031,12 @@ impl Handler {
                             // abstention -- it must not arm the fail gate.
                             if !outcome.skipped {
                                 all_solve_attempted = true;
+                            } else {
+                                // P1: count abstentions so classify_run_terminal
+                                // and the abstention banner both see the same
+                                // number. Accumulates outside the parallel tasks
+                                // (invariant #9: coordinator scope only).
+                                envs_skipped += 1;
                             }
                             envs_attempted += 1;
                             if outcome.satisfiable {
@@ -1149,9 +1281,37 @@ impl Handler {
             outputs = outputs.len(),
             any_solve_passed,
             all_solve_attempted,
+            envs_attempted,
+            envs_skipped,
             workspace_block_messages = workspace_block_messages.len(),
             "per-env emission loop complete",
         );
+        // P1: classify the run terminal state and print a banner when any
+        // env abstained. Abstentions are NOT errors (offline-best-effort
+        // contract from invariant #9 / v1.4.0 skipped semantics), but they
+        // ARE visible -- silently shipping unverified outputs is worse than
+        // a loud notice. The banner goes to stderr AND the tty status line.
+        {
+            let (terminal, skipped_count) = classify_run_terminal(
+                envs_attempted,
+                envs_skipped,
+                !workspace_block_messages.is_empty(),
+            );
+            if skipped_count > 0 {
+                let banner = format!(
+                    "retread: solve check ABSTAINED for {skipped_count} of {envs_attempted} \
+                     env(s) (no repodata reachable); those envs ship UNVERIFIED",
+                );
+                eprintln!("\nretread WARNING: {banner}");
+                crate::status::tty(&format!("WARNING: {banner}"));
+                tracing::warn!(
+                    skipped = skipped_count,
+                    attempted = envs_attempted,
+                    terminal = ?terminal,
+                    "solve check abstained for some envs -- outputs ship unverified",
+                );
+            }
+        }
         // v0.36.0+: fail conda/outputs if ANY env produced an
         // actionable workspace conflict, even if other envs passed.
         //

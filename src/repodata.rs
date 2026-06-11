@@ -37,9 +37,14 @@ const HTTP_USER_AGENT: &str = concat!("pixi-build-retread/", env!("CARGO_PKG_VER
 
 /// One (channel, subdir)'s lazily-built sparse handle. `None` inside
 /// the cell means the build was attempted and failed (channel
-/// unreachable AND no disk cache) -- callers treat it as
-/// not-consulted, and the negative result is NOT cached so a later
-/// call may retry.
+/// unreachable AND no disk cache) -- callers treat it as not-consulted.
+/// The `None` IS cached in the `OnceCell` for the process lifetime:
+/// `OnceCell::get_or_init` stores the result of the initializer (whether
+/// `Some` or `None`) permanently and returns it on subsequent calls
+/// without re-running the initializer. This is intentional -- retread is
+/// a short-lived process (one pixi invocation), so a channel that failed
+/// to fetch at startup will almost certainly fail again moments later, and
+/// retrying on every probe call would add latency with no benefit.
 type SparseCell = Arc<tokio::sync::OnceCell<Option<Arc<SparseRepoData>>>>;
 
 static SPARSE_CACHE: OnceLock<Mutex<HashMap<(String, String), SparseCell>>> = OnceLock::new();
@@ -165,6 +170,13 @@ async fn disk_cache_is_fresh(path: &PathBuf) -> bool {
         .unwrap_or(false)
 }
 
+/// Write `bytes` to `path` atomically: write to a `.part` sibling first,
+/// then rename into place. The rename is load-bearing for mmap safety:
+/// any concurrent reader that has already mmap'd the OLD file holds an
+/// open file descriptor to the old inode -- the rename creates a NEW
+/// inode at `path` without disturbing the old mapping. An in-place
+/// `write` (truncate-then-overwrite) would corrupt the active mmap by
+/// changing the bytes under it while the reader still holds a reference.
 async fn write_atomic(path: &PathBuf, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await.ok();
