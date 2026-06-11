@@ -786,19 +786,12 @@ pub(crate) async fn pre_emit_widen_pass(
         .map(|w| canonical_conda_name(&w.pypi_name))
         .collect();
     // Dedup across multiple wheels declaring the same dep -- we only
-    // need to probe each (conda_name, spec) once per bundle.
+    // need to probe each (conda_name, spec) once per bundle. Persists
+    // across fixed-point rounds.
     let mut seen_probes: std::collections::HashSet<(String, String)> =
         std::collections::HashSet::new();
-    // Walk every wheel's Requires-Dist; for each line that translates
-    // to a conda spec WITH an upper bound or strict pin, probe.
-    let raw_lines: Vec<String> = bundle
-        .all_wheels()
-        .flat_map(|w| w.metadata.requires_dist.iter().cloned())
-        .collect();
     let tiered = effective.relax.has_tiered_cascade();
     let allows_mut = effective.relax.allows_widening_mutation();
-    // Phase A (pure, no awaits): collect probe candidates. The skip
-    // filters mirror the previous serial loop exactly.
     struct PreEmitCandidate {
         raw: String,
         pypi_name: Option<String>,
@@ -806,212 +799,272 @@ pub(crate) async fn pre_emit_widen_pass(
         conda_name: String,
         spec: String,
     }
-    let mut candidates: Vec<PreEmitCandidate> = Vec::new();
-    for raw in raw_lines {
-        // Capture the original PyPI name + specifiers from the raw
-        // requires_dist line. Needed for tiered-cascade PyPI fallback.
-        let parsed: Option<uv_pep508::Requirement> = uv_pep508::Requirement::from_str(&raw).ok();
-        let pypi_name = parsed.as_ref().map(|r| r.name.to_string());
-        let pypi_specs: Option<VersionSpecifiers> =
-            parsed.as_ref().and_then(|r| match &r.version_or_url {
-                Some(uv_pep508::VersionOrUrl::VersionSpecifier(s)) => Some(s.clone()),
-                _ => None,
+    // v1.5.7 (nvidia-srl class): run the pass to a FIXED POINT. The
+    // cascade bundles wheels MID-pass (steps 2/4/6/8); a bundled
+    // wheel's OWN Requires-Dist (nvidia-srl-usd-to-urdf ->
+    // nvidia-srl-base/-math/-usd) previously never joined the
+    // candidate list -- those transitives flowed to emission, where
+    // post_emit could only WIDEN them to `*` (it cannot bundle), and
+    // the consumer solve died on `nvidia-srl-base *`. Each round now
+    // consumes only the Requires-Dist of wheels not yet processed;
+    // wheels the cascade adds feed the next round, so PyPI-only
+    // transitive chains bundle recursively. Same fixed-point shape as
+    // auto_bundle_transitives. The round cap is a runaway backstop --
+    // real chains are a few levels deep; seen_probes dedup guarantees
+    // monotone progress regardless.
+    const MAX_FIXED_POINT_ROUNDS: usize = 8;
+    let mut processed_wheels: usize = 0;
+    let mut bundled_names = bundled_names;
+    for round in 0..MAX_FIXED_POINT_ROUNDS {
+        let raw_lines: Vec<String> = bundle
+            .all_wheels()
+            .skip(processed_wheels)
+            .flat_map(|w| w.metadata.requires_dist.iter().cloned())
+            .collect();
+        processed_wheels = bundle.all_wheels().count();
+        if round > 0 {
+            // New wheels joined the bundle last round: refresh the
+            // self-reference set so their emissions are recognized as
+            // vendored, and log the recursion for the audit trail.
+            bundled_names = bundle
+                .all_wheels()
+                .map(|w| canonical_conda_name(&w.pypi_name))
+                .collect();
+            tracing::info!(
+                round,
+                new_requires_dist_lines = raw_lines.len(),
+                "pre-emit cascade: probing transitives of newly bundled wheels",
+            );
+        }
+        if raw_lines.is_empty() {
+            break;
+        }
+        // Phase A (pure, no awaits): collect probe candidates. The skip
+        // filters mirror the previous serial loop exactly.
+        let mut candidates: Vec<PreEmitCandidate> = Vec::new();
+        for raw in raw_lines {
+            // Capture the original PyPI name + specifiers from the raw
+            // requires_dist line. Needed for tiered-cascade PyPI fallback.
+            let parsed: Option<uv_pep508::Requirement> =
+                uv_pep508::Requirement::from_str(&raw).ok();
+            let pypi_name = parsed.as_ref().map(|r| r.name.to_string());
+            let pypi_specs: Option<VersionSpecifiers> =
+                parsed.as_ref().and_then(|r| match &r.version_or_url {
+                    Some(uv_pep508::VersionOrUrl::VersionSpecifier(s)) => Some(s.clone()),
+                    _ => None,
+                });
+
+            // Predict what translate WOULD emit at the effective policy.
+            // If translate returns None (marker false / vendored / dropped),
+            // skip.
+            let translated = match translate(
+                &raw,
+                &env,
+                &effective.name_map,
+                &effective.overrides,
+                effective.relax,
+            ) {
+                Ok(Some(d)) => d,
+                _ => continue,
+            };
+            let conda_name = translated.name.clone();
+            let mut spec = translated.spec.clone();
+            if conda_name.is_empty() {
+                continue;
+            }
+            // v1.5.6: BARE deps (`Requires-Dist: DracoPy`, no version
+            // spec) are probed too, at the name level (`*`). The old skip
+            // predates cascade step 8: back then a spec-less dep could
+            // only be WIDENED (pointless -- it is already maximally wide),
+            // so probing was wasted work. Step 8 changed that: a bare dep
+            // with ZERO conda candidates can now be auto-bundled from PyPI
+            // (latest compatible wheel), but only if it reaches the
+            // cascade at all. Skipping here shipped `dracopy *` as a
+            // doomed conda run-dep (genesis-world's DracoPy).
+            if spec.is_empty() {
+                spec = "*".to_string();
+            }
+            // Match the bundle's vendored wheels on EITHER namespace via
+            // the shared dual-namespace helper (P2): the wheels are
+            // recorded under PyPI names, but name_map may translate this
+            // dep's emission name to a different conda name
+            // (tinyobjloader -> tinyobjloader-python).
+            if crate::relax::already_covered(&bundled_names, &conda_name, pypi_name.as_deref()) {
+                continue;
+            }
+            if effective.overrides.contains_key(&conda_name) {
+                continue;
+            }
+            if !seen_probes.insert((conda_name.clone(), spec.clone())) {
+                continue;
+            }
+            candidates.push(PreEmitCandidate {
+                raw,
+                pypi_name,
+                pypi_specs,
+                conda_name,
+                spec,
             });
+        }
 
-        // Predict what translate WOULD emit at the effective policy.
-        // If translate returns None (marker false / vendored / dropped),
-        // skip.
-        let translated = match translate(
-            &raw,
-            &env,
-            &effective.name_map,
-            &effective.overrides,
-            effective.relax,
-        ) {
-            Ok(Some(d)) => d,
-            _ => continue,
-        };
-        let conda_name = translated.name.clone();
-        let mut spec = translated.spec.clone();
-        if conda_name.is_empty() {
-            continue;
-        }
-        // v1.5.6: BARE deps (`Requires-Dist: DracoPy`, no version
-        // spec) are probed too, at the name level (`*`). The old skip
-        // predates cascade step 8: back then a spec-less dep could
-        // only be WIDENED (pointless -- it is already maximally wide),
-        // so probing was wasted work. Step 8 changed that: a bare dep
-        // with ZERO conda candidates can now be auto-bundled from PyPI
-        // (latest compatible wheel), but only if it reaches the
-        // cascade at all. Skipping here shipped `dracopy *` as a
-        // doomed conda run-dep (genesis-world's DracoPy).
-        if spec.is_empty() {
-            spec = "*".to_string();
-        }
-        // Match the bundle's vendored wheels on EITHER namespace via
-        // the shared dual-namespace helper (P2): the wheels are
-        // recorded under PyPI names, but name_map may translate this
-        // dep's emission name to a different conda name
-        // (tinyobjloader -> tinyobjloader-python).
-        if crate::relax::already_covered(&bundled_names, &conda_name, pypi_name.as_deref()) {
-            continue;
-        }
-        if effective.overrides.contains_key(&conda_name) {
-            continue;
-        }
-        if !seen_probes.insert((conda_name.clone(), spec.clone())) {
-            continue;
-        }
-        candidates.push(PreEmitCandidate {
-            raw,
-            pypi_name,
-            pypi_specs,
-            conda_name,
-            spec,
-        });
-    }
-
-    // Phase B (v1.4.0): batch every step-1 probe through probe_many
-    // (16-way bounded) instead of one serial await per dep. ~80 deps
-    // per bundle previously meant ~80 sequential awaits here.
-    // buffer_unordered yields in completion order, so results are
-    // re-keyed by (package, spec) -- unique per candidate thanks to
-    // the seen_probes dedup above.
-    let pairs: Vec<(String, String)> = candidates
-        .iter()
-        .map(|c| (c.conda_name.clone(), c.spec.clone()))
-        .collect();
-    let mut probes_by_key: std::collections::HashMap<(String, String), crate::probe::ProbeResult> =
-        crate::probe::probe_many(conda_channels, pairs, Some(&target.python_version))
+        // Phase B (v1.4.0): batch every step-1 probe through probe_many
+        // (16-way bounded) instead of one serial await per dep. ~80 deps
+        // per bundle previously meant ~80 sequential awaits here.
+        // buffer_unordered yields in completion order, so results are
+        // re-keyed by (package, spec) -- unique per candidate thanks to
+        // the seen_probes dedup above.
+        let pairs: Vec<(String, String)> = candidates
+            .iter()
+            .map(|c| (c.conda_name.clone(), c.spec.clone()))
+            .collect();
+        let mut probes_by_key: std::collections::HashMap<
+            (String, String),
+            crate::probe::ProbeResult,
+        > = crate::probe::probe_many(conda_channels, pairs, Some(&target.python_version))
             .await
             .into_iter()
             .map(|r| ((r.package.clone(), r.spec.clone()), r))
             .collect();
 
-    // Phase C: record decisions + run cascades serially in candidate
-    // order. Cascades mutate bundle/effective, so they stay serial;
-    // the fresh overrides re-check below preserves the old serial
-    // semantics where an earlier candidate's injected override skips
-    // later candidates of the same dep.
-    for c in candidates {
-        let PreEmitCandidate {
-            raw,
-            pypi_name,
-            pypi_specs,
-            conda_name,
-            spec,
-        } = c;
-        if effective.overrides.contains_key(&conda_name) {
-            continue;
-        }
-        let Some(strict_probe) = probes_by_key.remove(&(conda_name.clone(), spec.clone())) else {
-            tracing::debug!(
-                dep = %conda_name,
-                spec = %spec,
-                "pre-emit widen: probe result missing from batch; skipping",
-            );
-            continue;
-        };
-        let stage1 = if tiered {
-            "tiered-cascade-step1-conda"
-        } else {
-            "pre-emit-widen-strict"
-        };
-        let initial_routing = if strict_probe.is_satisfied() {
-            "satisfied"
-        } else if strict_probe.is_definitively_unsatisfied() {
-            "unsat"
-        } else {
-            "indecisive"
-        };
-        bundle
-            .probe_decisions
-            .push(crate::audit::ProbeDecision::from_probe(
-                stage1,
-                &pypi_name.clone().unwrap_or_else(|| conda_name.clone()),
-                &conda_name,
-                &spec,
-                &target.python_version,
-                &strict_probe,
-                initial_routing,
-            ));
-        if strict_probe.is_satisfied() || !strict_probe.is_definitively_unsatisfied() {
-            continue;
-        }
-        // Strict spec is definitively unsat. Mutation requires policy opt-in.
-        if !allows_mut {
-            continue;
-        }
-
-        if tiered {
-            tiered_cascade_for_dep(
-                bundle,
-                effective,
-                conda_channels,
-                target,
-                download_dir,
-                pypi_indexes,
-                &raw,
-                &env,
-                pypi_name.as_deref().unwrap_or(&conda_name),
-                pypi_specs.as_ref(),
-                &conda_name,
-                &workspace_pins,
-            )
-            .await?;
-        } else {
-            // `*-with-last-resort`: prefer the workspace's `[dependencies]`
-            // pin if one exists (audit clarity + workspace wins anyway);
-            // else probe `*` and inject if conda has any py-compatible
-            // build of the package.
-            let (target_spec, source_tag) = match workspace_pins.get(&conda_name) {
-                Some(pin) => (pin.clone(), "from-workspace-pin"),
-                None => ("*".to_string(), "any-version"),
+        // Phase C: record decisions + run cascades serially in candidate
+        // order. Cascades mutate bundle/effective, so they stay serial;
+        // the fresh overrides re-check below preserves the old serial
+        // semantics where an earlier candidate's injected override skips
+        // later candidates of the same dep.
+        for c in candidates {
+            let PreEmitCandidate {
+                raw,
+                pypi_name,
+                pypi_specs,
+                conda_name,
+                spec,
+            } = c;
+            if effective.overrides.contains_key(&conda_name) {
+                continue;
+            }
+            let Some(strict_probe) = probes_by_key.remove(&(conda_name.clone(), spec.clone()))
+            else {
+                tracing::debug!(
+                    dep = %conda_name,
+                    spec = %spec,
+                    "pre-emit widen: probe result missing from batch; skipping",
+                );
+                continue;
             };
-            let probe_result = crate::probe::probe(
-                conda_channels,
-                &conda_name,
-                &target_spec,
-                Some(&target.python_version),
-            )
-            .await;
-            let widened = probe_result.is_satisfied();
-            let routing_decision = if widened {
-                if source_tag == "from-workspace-pin" {
-                    "widened-to-workspace-pin"
-                } else {
-                    "widened-to-any-version"
-                }
+            let stage1 = if tiered {
+                "tiered-cascade-step1-conda"
             } else {
-                "no-py-compat-version-on-conda"
+                "pre-emit-widen-strict"
+            };
+            let initial_routing = if strict_probe.is_satisfied() {
+                "satisfied"
+            } else if strict_probe.is_definitively_unsatisfied() {
+                "unsat"
+            } else {
+                "indecisive"
             };
             bundle
                 .probe_decisions
                 .push(crate::audit::ProbeDecision::from_probe(
-                    "last-resort-widen",
+                    stage1,
+                    &pypi_name.clone().unwrap_or_else(|| conda_name.clone()),
                     &conda_name,
+                    &spec,
+                    &target.python_version,
+                    &strict_probe,
+                    initial_routing,
+                ));
+            if strict_probe.is_satisfied() || !strict_probe.is_definitively_unsatisfied() {
+                continue;
+            }
+            // Strict spec is definitively unsat. Mutation requires policy opt-in.
+            if !allows_mut {
+                continue;
+            }
+
+            if tiered {
+                tiered_cascade_for_dep(
+                    bundle,
+                    effective,
+                    conda_channels,
+                    target,
+                    download_dir,
+                    pypi_indexes,
+                    &raw,
+                    &env,
+                    pypi_name.as_deref().unwrap_or(&conda_name),
+                    pypi_specs.as_ref(),
+                    &conda_name,
+                    &workspace_pins,
+                )
+                .await?;
+            } else {
+                // `*-with-last-resort`: prefer the workspace's `[dependencies]`
+                // pin if one exists (audit clarity + workspace wins anyway);
+                // else probe `*` and inject if conda has any py-compatible
+                // build of the package.
+                let (target_spec, source_tag) = match workspace_pins.get(&conda_name) {
+                    Some(pin) => (pin.clone(), "from-workspace-pin"),
+                    None => ("*".to_string(), "any-version"),
+                };
+                let probe_result = crate::probe::probe(
+                    conda_channels,
                     &conda_name,
                     &target_spec,
-                    &target.python_version,
-                    &probe_result,
-                    routing_decision,
-                ));
-            if widened {
-                tracing::info!(
-                    dep = %conda_name,
-                    strict_spec = %spec,
-                    widened_to = %target_spec,
-                    source = %source_tag,
-                    "last-resort-widen: conda satisfies widened spec; injecting override",
-                );
-                effective.overrides.insert(conda_name, target_spec);
-            } else {
-                tracing::warn!(
-                    dep = %conda_name,
-                    strict_spec = %spec,
-                    "last-resort-widen: conda has ZERO py-compat builds; consider retread-drop-deps + post-install pip, or use the patch-then-minor-then-major-then-last-resort policy for automatic PyPI fallback.",
-                );
+                    Some(&target.python_version),
+                )
+                .await;
+                let widened = probe_result.is_satisfied();
+                let routing_decision = if widened {
+                    if source_tag == "from-workspace-pin" {
+                        "widened-to-workspace-pin"
+                    } else {
+                        "widened-to-any-version"
+                    }
+                } else {
+                    "no-py-compat-version-on-conda"
+                };
+                bundle
+                    .probe_decisions
+                    .push(crate::audit::ProbeDecision::from_probe(
+                        "last-resort-widen",
+                        &conda_name,
+                        &conda_name,
+                        &target_spec,
+                        &target.python_version,
+                        &probe_result,
+                        routing_decision,
+                    ));
+                if widened {
+                    tracing::info!(
+                        dep = %conda_name,
+                        strict_spec = %spec,
+                        widened_to = %target_spec,
+                        source = %source_tag,
+                        "last-resort-widen: conda satisfies widened spec; injecting override",
+                    );
+                    effective.overrides.insert(conda_name, target_spec);
+                } else {
+                    tracing::warn!(
+                        dep = %conda_name,
+                        strict_spec = %spec,
+                        "last-resort-widen: conda has ZERO py-compat builds; consider retread-drop-deps + post-install pip, or use the patch-then-minor-then-major-then-last-resort policy for automatic PyPI fallback.",
+                    );
+                }
             }
+        }
+
+        // Fixed point reached when the cascade added no new wheels
+        // this round (their transitives would be the next round's
+        // candidates).
+        if bundle.all_wheels().count() == processed_wheels {
+            break;
+        }
+        if round + 1 == MAX_FIXED_POINT_ROUNDS {
+            tracing::warn!(
+                "pre-emit cascade: fixed-point round cap reached; remaining transitives of \
+                 newly bundled wheels flow to emission unprobed (deep PyPI chain?)",
+            );
         }
     }
     Ok(())

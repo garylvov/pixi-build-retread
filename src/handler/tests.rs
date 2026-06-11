@@ -1226,6 +1226,61 @@ fn tiered_cascade_indecisive_probe_never_reroutes() {
 }
 
 #[test]
+#[ignore = "live: conda-forge repodata + several PyPI wheels"]
+fn pypi_only_transitive_chain_bundles_recursively_live() {
+    // v1.5.7 regression (isaaclab-mimic's nvidia-srl chain): the
+    // cascade bundles nvidia-srl-usd-to-urdf (zero conda candidates),
+    // whose OWN Requires-Dist names nvidia-srl-base / -math / -usd --
+    // also PyPI-only. Pre-fix those transitives never joined the
+    // candidate list (collected once at pass entry), flowed to
+    // emission, and post-emit could only widen them to `*`; the
+    // consumer solve died on `nvidia-srl-base *`. The fixed-point
+    // pass must bundle the whole chain.
+    let mut bundle = solo_bundle(
+        "isaac-pack",
+        vec!["nvidia-srl-usd-to-urdf>=1.0", "numpy==1.26.0"],
+    );
+    let mut effective = cfg();
+    effective.relax = RelaxPolicy::PatchThenMinorThenMajorThenLastResort;
+    let target = wheel_target_for(Platform::Linux64, "3.11");
+    let channels = vec![ChannelUrl::from(
+        url::Url::parse("https://prefix.dev/conda-forge").unwrap(),
+    )];
+    let tmp = std::env::temp_dir().join(format!("retread-srlchain-live-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(super::cascade::pre_emit_widen_pass(
+        &mut bundle,
+        &mut effective,
+        &channels,
+        &target,
+        &tmp,
+        &["https://pypi.org/simple/".to_string()],
+    ))
+    .unwrap();
+    let bundled: Vec<&str> = bundle.extras.iter().map(|w| w.pypi_name.as_str()).collect();
+    assert!(
+        bundled.iter().any(|n| n.contains("usd-to-urdf")),
+        "root PyPI-only dep must bundle; got {bundled:?}",
+    );
+    for transitive in ["nvidia-srl-base", "nvidia-srl-math", "nvidia-srl-usd"] {
+        assert!(
+            bundled.contains(&transitive),
+            "transitive {transitive} of a bundled wheel must bundle recursively; \
+             got {bundled:?}, decisions: {:#?}",
+            bundle
+                .probe_decisions
+                .iter()
+                .map(|d| format!("{} {} -> {}", d.stage, d.conda_name, d.routing_decision))
+                .collect::<Vec<_>>(),
+        );
+    }
+}
+
+#[test]
 #[ignore = "live: conda-forge repodata + a PyPI wheel"]
 fn bare_dep_with_zero_conda_candidates_bundles_from_pypi_live() {
     // v1.5.6 regression (genesis-world's DracoPy): a BARE dep (no
