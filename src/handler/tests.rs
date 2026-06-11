@@ -1,5 +1,9 @@
     use super::*;
+    use super::auto_bundle::{
+        ExtraDepSource, extra_dep_source_from_url, pep508_extra_dep, prefer_conda_match,
+    };
     use crate::config::RelaxPolicy;
+    use crate::relax::default_marker_env;
     use std::collections::BTreeMap;
 
     // -----------------------------------------------------------------
