@@ -10,8 +10,42 @@ use uv_pep508::{MarkerEnvironment, MarkerEnvironmentBuilder, Requirement, Versio
 use crate::config::RelaxPolicy;
 
 /// A single conda dependency line ready to drop into recipe.yaml `run:` list.
+///
+/// Structured as separate `name` and `spec` fields so callers can access
+/// either side without re-parsing the joined string. The `Display` impl
+/// reproduces the EXACT joined form the old `CondaDep(String)` produced:
+/// `"<name> <spec>"` when spec is non-empty, bare `"<name>"` otherwise.
+/// This means all code that previously passed `dep.0` as a string can now
+/// pass `&dep.to_string()`, and code that split on whitespace to get the
+/// name can use `&dep.name` directly.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CondaDep(pub String);
+pub struct CondaDep {
+    pub name: String,
+    pub spec: String,
+}
+
+impl CondaDep {
+    /// Construct from separate name + spec strings. Use this in `translate`
+    /// (which already has both sides) instead of calling `format_dep` and
+    /// wrapping in `CondaDep(...)`.
+    pub fn new(name: String, spec: String) -> Self {
+        Self { name, spec }
+    }
+}
+
+impl std::fmt::Display for CondaDep {
+    /// Produce the joined conda match-spec string: `"<name> <spec>"` when
+    /// spec is non-empty, bare `"<name>"` when spec is empty. Exactly the
+    /// form `format_dep` produced for the old tuple struct -- every call
+    /// site that previously read `dep.0` can use `dep.to_string()`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.spec.is_empty() {
+            write!(f, "{}", self.name)
+        } else {
+            write!(f, "{} {}", self.name, self.spec)
+        }
+    }
+}
 
 /// Split a conda dependency string `"<name> <spec>"` (or bare `"<name>"`)
 /// into `(name, spec)`. The first whitespace-delimited token is the name;
@@ -59,7 +93,7 @@ pub fn translate(
         .get(pypi_name)
         .or_else(|| overrides.get(&conda_name))
     {
-        return Ok(Some(CondaDep(format_dep(&conda_name, spec))));
+        return Ok(Some(CondaDep::new(conda_name, spec.clone())));
     }
 
     // `python` is fully off-limits to relax: every widened form
@@ -86,7 +120,7 @@ pub fn translate(
         }
     };
 
-    Ok(Some(CondaDep(format_dep(&conda_name, &spec))))
+    Ok(Some(CondaDep::new(conda_name, spec)))
 }
 
 fn format_dep(name: &str, spec: &str) -> String {
@@ -709,10 +743,42 @@ mod tests {
         default_marker_env("3.11").unwrap()
     }
 
+    // -----------------------------------------------------------------
+    // P4.5: CondaDep Display round-trip
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn conda_dep_display_roundtrip() {
+        // Spec-bearing: `to_string()` must produce the joined form.
+        let dep = CondaDep::new("numpy".to_string(), ">=1.26,<2".to_string());
+        assert_eq!(dep.to_string(), "numpy >=1.26,<2");
+        assert_eq!(dep.name, "numpy");
+        assert_eq!(dep.spec, ">=1.26,<2");
+
+        // Empty spec -> bare name, NO trailing space.
+        let bare = CondaDep::new("pyglet".to_string(), "".to_string());
+        assert_eq!(bare.to_string(), "pyglet");
+        assert!(!bare.to_string().ends_with(' '), "must not have trailing space");
+
+        // Translate round-trip: the joined form from Display must match what
+        // the old CondaDep(String) produced via format_dep.
+        let from_translate = translate(
+            "numpy==1.26.4",
+            &env(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            crate::config::RelaxPolicy::Minor,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(from_translate.to_string(), "numpy >=1.26,<2");
+        assert_eq!(from_translate.name, "numpy");
+    }
+
     fn t(req: &str, policy: RelaxPolicy) -> Option<String> {
         translate(req, &env(), &BTreeMap::new(), &BTreeMap::new(), policy)
             .unwrap()
-            .map(|d| d.0)
+            .map(|d| d.to_string())
     }
 
     #[test]
@@ -772,7 +838,7 @@ mod tests {
             RelaxPolicy::Minor,
         )
         .unwrap();
-        assert_eq!(r.unwrap().0, "torch >=2.7");
+        assert_eq!(r.unwrap().to_string(), "torch >=2.7");
     }
 
     #[test]

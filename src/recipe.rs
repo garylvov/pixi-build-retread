@@ -148,12 +148,12 @@ pub fn build_bundle_recipe(
             for raw in &source.metadata.requires_dist {
                 match translate(raw, &env, &config.name_map, &config.overrides, config.relax) {
                     Ok(Some(dep)) => {
-                        let dep_name = dep.0.split_whitespace().next().unwrap_or("").to_string();
+                        let dep_name = dep.name.clone();
                         if vendored.contains(&dep_name) {
                             continue;
                         }
                         if seen.insert(dep_name) {
-                            run.push(dep.0);
+                            run.push(dep.to_string());
                         }
                     }
                     Ok(None) => {}

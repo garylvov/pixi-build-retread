@@ -3275,7 +3275,7 @@ fn produce_output(
             // only the conda name shipped a doomed conda run-dep
             // alongside the already-bundled wheel -- found via
             // examples/isaac6 (isaacsim 6.0's tinyobjloader dep).
-            let dep_name = dep.0.split_whitespace().next().unwrap_or("").to_string();
+            let dep_name = dep.name.clone();
             let parsed_raw: Option<uv_pep508::Requirement> =
                 uv_pep508::Requirement::from_str(raw).ok();
             let raw_pypi_name: Option<String> = parsed_raw.map(|r| r.name.to_string());
@@ -3307,7 +3307,7 @@ fn produce_output(
             if !seen_dep_names.insert(dep_name.clone()) {
                 continue;
             }
-            depends_specs.push(spec_from_str(&dep.0)?);
+            depends_specs.push(spec_from_str(&dep.to_string())?);
         }
     }
 

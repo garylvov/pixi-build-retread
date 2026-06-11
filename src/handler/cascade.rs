@@ -821,17 +821,18 @@ pub(crate) async fn pre_emit_widen_pass(
         // Predict what translate WOULD emit at the effective policy.
         // If translate returns None (marker false / vendored / dropped),
         // skip.
-        let dep = match translate(
+        let translated = match translate(
             &raw,
             &env,
             &effective.name_map,
             &effective.overrides,
             effective.relax,
         ) {
-            Ok(Some(d)) => d.0,
+            Ok(Some(d)) => d,
             _ => continue,
         };
-        let (conda_name, spec) = crate::relax::parse_named_spec(&dep);
+        let conda_name = translated.name.clone();
+        let spec = translated.spec.clone();
         if conda_name.is_empty() {
             continue;
         }
@@ -1196,22 +1197,16 @@ pub(crate) async fn tiered_cascade_for_dep(
         // For levels 1 and 2: re-translate at this widening level and
         // probe conda.
         if level_idx > 0 {
-            let widened_dep = match translate(
+            let widened_spec = match translate(
                 raw,
                 env,
                 &effective.name_map,
                 &empty_overrides,
                 level_policy,
             ) {
-                Ok(Some(d)) => d.0,
+                Ok(Some(d)) => d.spec,
                 _ => continue,
             };
-            let mut parts = widened_dep.splitn(2, char::is_whitespace);
-            let _ = parts.next();
-            let widened_spec = parts
-                .next()
-                .map(|s| s.trim().to_string())
-                .unwrap_or_default();
             if widened_spec.is_empty() {
                 continue;
             }
