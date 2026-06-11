@@ -499,7 +499,10 @@ mod tests {
         // derives Serialize but not PartialEq).
         let ctor_json = serde_json::to_value(&from_ctor).unwrap();
         let lit_json = serde_json::to_value(&literal).unwrap();
-        assert_eq!(ctor_json, lit_json, "from_probe and literal must be identical");
+        assert_eq!(
+            ctor_json, lit_json,
+            "from_probe and literal must be identical"
+        );
     }
 
     #[test]

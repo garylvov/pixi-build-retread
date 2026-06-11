@@ -125,10 +125,8 @@ pub(crate) async fn auto_bundle_transitives(
     // qdldl, ...). Public PyPI is appended by merge_index_chain when
     // not already present; ordering and trailing-slash dedup are both
     // handled there.
-    let indexes = super::merge_index_chain(
-        std::iter::once(entry_index.to_string()),
-        workspace_indexes,
-    );
+    let indexes =
+        super::merge_index_chain(std::iter::once(entry_index.to_string()), workspace_indexes);
 
     // Fixed-point loop: each newly-bundled wheel has its own
     // Requires-Dist that may name more PyPI-only transitives, which
@@ -248,15 +246,17 @@ pub(crate) async fn auto_bundle_transitives(
                 } else {
                     "indecisive-short-circuit"
                 };
-                bundle.probe_decisions.push(crate::audit::ProbeDecision::from_probe(
-                    "auto_bundle",
-                    &name,
-                    &conda_target_name,
-                    &probe_spec,
-                    &target.python_version,
-                    &probe_result,
-                    routing_decision,
-                ));
+                bundle
+                    .probe_decisions
+                    .push(crate::audit::ProbeDecision::from_probe(
+                        "auto_bundle",
+                        &name,
+                        &conda_target_name,
+                        &probe_spec,
+                        &target.python_version,
+                        &probe_result,
+                        routing_decision,
+                    ));
                 if probe_result.is_definitively_unsatisfied() {
                     // v0.46.0: the EXACT resolved version isn't on conda --
                     // but that's usually because the transitive was resolved
@@ -283,19 +283,21 @@ pub(crate) async fn auto_bundle_transitives(
                         Some(&target.python_version),
                     )
                     .await;
-                    bundle.probe_decisions.push(crate::audit::ProbeDecision::from_probe(
-                        "auto_bundle_name_level",
-                        &name,
-                        &conda_target_name,
-                        "*",
-                        &target.python_version,
-                        &name_level,
-                        if name_level.is_satisfied() {
-                            "name-level-conda-keep"
-                        } else {
-                            "fall-through-to-pypi"
-                        },
-                    ));
+                    bundle
+                        .probe_decisions
+                        .push(crate::audit::ProbeDecision::from_probe(
+                            "auto_bundle_name_level",
+                            &name,
+                            &conda_target_name,
+                            "*",
+                            &target.python_version,
+                            &name_level,
+                            if name_level.is_satisfied() {
+                                "name-level-conda-keep"
+                            } else {
+                                "fall-through-to-pypi"
+                            },
+                        ));
                     if name_level.is_satisfied() {
                         tracing::info!(
                             dep = %name,

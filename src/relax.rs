@@ -60,7 +60,10 @@ pub(crate) fn parse_named_spec(line: &str) -> (String, String) {
     let trimmed = line.trim();
     let mut parts = trimmed.splitn(2, char::is_whitespace);
     let name = parts.next().unwrap_or("").to_string();
-    let spec = parts.next().map(|s| s.trim().to_string()).unwrap_or_default();
+    let spec = parts
+        .next()
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
     (name, spec)
 }
 
@@ -626,10 +629,7 @@ mod tests {
             ("torch".to_string(), ">=2.7,<3".to_string()),
         );
         // Empty string produces two empty strings.
-        assert_eq!(
-            parse_named_spec(""),
-            ("".to_string(), "".to_string()),
-        );
+        assert_eq!(parse_named_spec(""), ("".to_string(), "".to_string()),);
     }
 
     // -----------------------------------------------------------------
@@ -758,7 +758,10 @@ mod tests {
         // Empty spec -> bare name, NO trailing space.
         let bare = CondaDep::new("pyglet".to_string(), "".to_string());
         assert_eq!(bare.to_string(), "pyglet");
-        assert!(!bare.to_string().ends_with(' '), "must not have trailing space");
+        assert!(
+            !bare.to_string().ends_with(' '),
+            "must not have trailing space"
+        );
 
         // Translate round-trip: the joined form from Display must match what
         // the old CondaDep(String) produced via format_dep.
