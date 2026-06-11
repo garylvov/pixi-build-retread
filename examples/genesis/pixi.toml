@@ -1,0 +1,25 @@
+# Minimal workspace consuming Genesis World through retread. Exists to
+# pin the bare-dependency routing case (v1.5.6): Genesis's pyproject
+# declares `DracoPy` with NO version spec; DracoPy has zero conda-forge
+# candidates. Pre-1.5.6 the cascade's spec filter skipped bare deps, so
+# `dracopy *` shipped as a doomed conda run-dep and the solve died.
+# Bare deps now probe at name level and step-8-bundle the latest
+# compatible wheel from PyPI.
+#
+# Reproduce with (from this directory):
+#   pixi lock
+# Routing diagnostics land in
+# genesis-pack/retread-probe-trace-genesis-pack.json -- grep dracopy.
+
+[workspace]
+name = "genesis"
+channels = ["https://prefix.dev/conda-forge"]
+channel-priority = "strict"
+platforms = ["linux-64"]
+preview = ["pixi-build"]
+build-variants = { python = ["3.12"] }
+
+[dependencies]
+python = "==3.12"
+pip = "*"
+genesis-pack = { path = "./genesis-pack" }

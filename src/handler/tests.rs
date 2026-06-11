@@ -1226,6 +1226,65 @@ fn tiered_cascade_indecisive_probe_never_reroutes() {
 }
 
 #[test]
+#[ignore = "live: conda-forge repodata + a PyPI wheel"]
+fn bare_dep_with_zero_conda_candidates_bundles_from_pypi_live() {
+    // v1.5.6 regression (genesis-world's DracoPy): a BARE dep (no
+    // version spec) that has zero conda candidates used to be skipped
+    // by the pre-emit cascade's spec filter and shipped as a doomed
+    // `dracopy *` conda run-dep. It must now reach the cascade at the
+    // name level and step-8-bundle the latest compatible wheel. The
+    // control dep (numpy, bare) HAS conda candidates and must remain
+    // a conda run-dep.
+    let mut bundle = solo_bundle("genesis-pack", vec!["DracoPy", "numpy"]);
+    let mut effective = cfg();
+    effective.relax = RelaxPolicy::PatchThenMinorThenMajorThenLastResort;
+    let target = wheel_target_for(Platform::Linux64, "3.12");
+    let channels = vec![ChannelUrl::from(
+        url::Url::parse("https://prefix.dev/conda-forge").unwrap(),
+    )];
+    let tmp = std::env::temp_dir().join(format!("retread-baredep-live-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(super::cascade::pre_emit_widen_pass(
+        &mut bundle,
+        &mut effective,
+        &channels,
+        &target,
+        &tmp,
+        &["https://pypi.org/simple/".to_string()],
+    ))
+    .unwrap();
+    assert!(
+        bundle
+            .extras
+            .iter()
+            .any(|w| w.pypi_name.contains("dracopy")),
+        "bare zero-candidate dep must be step-8 bundled; extras: {:?}, decisions: {:#?}",
+        bundle
+            .extras
+            .iter()
+            .map(|w| &w.pypi_name)
+            .collect::<Vec<_>>(),
+        bundle.probe_decisions,
+    );
+    assert!(
+        effective
+            .drop_deps
+            .iter()
+            .any(|d| crate::relax::canonical_conda_name(d) == "dracopy"),
+        "bundled bare dep must be dropped from conda emission: {:?}",
+        effective.drop_deps,
+    );
+    assert!(
+        !bundle.extras.iter().any(|w| w.pypi_name == "numpy"),
+        "bare dep WITH conda candidates must stay a conda run-dep",
+    );
+}
+
+#[test]
 #[ignore = "live: fetches conda-forge repodata + a PyPI wheel"]
 fn tiered_cascade_step8_bundles_pypi_only_dep_live() {
     // The user-reported failure shape: a PyPI-only NVIDIA dep

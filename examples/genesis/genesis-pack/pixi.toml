@@ -1,0 +1,30 @@
+# Source package that re-emits Genesis World as a conda package via
+# pixi-build-retread. Mirrors a real consumer pack (pixidock); kept in
+# the repo as the regression workspace for bare-dependency routing:
+# Genesis's `DracoPy` dep has no version spec AND no conda candidates,
+# so it must be auto-bundled from PyPI (cascade step 8), never emitted
+# as a `dracopy *` conda run-dep. Its bare `opencv-python` dep also
+# exercises the user name-map below.
+
+[package]
+name = "genesis-pack"
+version = "0.3.0"
+
+[package.build]
+# file:// channel points at the locally built retread artifact so
+# iteration doesn't require a prefix.dev upload between rebuilds.
+# `bash ../../scripts/rebuild-local.sh` produces the .conda there.
+backend = { name = "pixi-build-retread", version = "*", channels = ["file:///home/garylvov/projects/pixi-build-retread/local-channel", "https://prefix.dev/garylvov", "https://prefix.dev/conda-forge"] }
+
+[package.build.config]
+retread-relax        = "patch-then-minor-then-major-then-last-resort"
+retread-build-number = 0
+retread-python       = "3.12"
+retread-bundle       = "genesis-pack"
+
+[package.build.config.retread-wheels]
+genesis-world        = { git = "https://github.com/Genesis-Embodied-AI/Genesis.git", rev = "bab7363da607c362b511163bfdf950129c3243fd" }
+pyopengl-accelerate  = { version = "==3.1.9" }
+
+[package.build.config.retread-name-map]
+opencv-python = "py-opencv"

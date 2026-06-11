@@ -832,12 +832,21 @@ pub(crate) async fn pre_emit_widen_pass(
             _ => continue,
         };
         let conda_name = translated.name.clone();
-        let spec = translated.spec.clone();
+        let mut spec = translated.spec.clone();
         if conda_name.is_empty() {
             continue;
         }
-        if spec.is_empty() || spec == "*" {
-            continue;
+        // v1.5.6: BARE deps (`Requires-Dist: DracoPy`, no version
+        // spec) are probed too, at the name level (`*`). The old skip
+        // predates cascade step 8: back then a spec-less dep could
+        // only be WIDENED (pointless -- it is already maximally wide),
+        // so probing was wasted work. Step 8 changed that: a bare dep
+        // with ZERO conda candidates can now be auto-bundled from PyPI
+        // (latest compatible wheel), but only if it reaches the
+        // cascade at all. Skipping here shipped `dracopy *` as a
+        // doomed conda run-dep (genesis-world's DracoPy).
+        if spec.is_empty() {
+            spec = "*".to_string();
         }
         // Match the bundle's vendored wheels on EITHER namespace via
         // the shared dual-namespace helper (P2): the wheels are

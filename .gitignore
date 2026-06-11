@@ -13,3 +13,6 @@ examples/gigastrap/isaac-pack/*
 examples/isaac6/isaac-pack/wheels/
 examples/isaac6/isaac-pack/retread-*.json
 examples/isaac6/isaac-pack/RETREAD-SOLVE-FAILED-*.md
+examples/genesis/genesis-pack/wheels/
+examples/genesis/genesis-pack/retread-*.json
+examples/genesis/genesis-pack/RETREAD-SOLVE-FAILED-*.md
