@@ -621,29 +621,48 @@ pub async fn extract_transitive_constraints(
         if bundle_names.contains(conda_name) {
             continue;
         }
-        for raw in record.package_record.depends {
-            // Each entry looks like `"numpy >=1.26,<2"` or `"libstdcxx >=12"`
-            // or `"python_abi 3.11.* *_cp311"` (build-string-bearing).
-            // Skip python / python_abi — relax policy never widens
-            // those and they'd just clutter the constraint map.
-            let Some((trans_name, trans_spec)) = split_conda_dep_line(&raw) else {
-                continue;
-            };
-            if trans_name == "python" || trans_name == "python_abi" {
-                continue;
-            }
-            // Skip no-op specs. Empty + `*` both mean "any version"
-            // and impose zero constraint. Including either in the
-            // comma-AND join produces invalid match-specs that the
-            // conda parser rejects (e.g. `pytorch >=1.4,==2.10.0,*`
-            // -- the `*` collides syntactically with the version
-            // operators). Filtering them here is safe because they
-            // don't drop any actual constraint information.
-            if trans_spec.is_empty() || trans_spec == "*" {
-                continue;
-            }
+        // P3 (grizzly #6): walk `depends` AND `constrains`. A
+        // `run_constrained` entry imposes a real constraint in pixi's
+        // actual solve whenever the constrained package is present --
+        // skipping them was an input-parity hole vs the v0.37.0
+        // "retread's verdict predicts pixi's" contract. The skip set
+        // stays python/python_abi-ONLY deliberately: recording a
+        // workspace-imposed anchor constraint (cuda-version,
+        // libstdcxx-ng) is INPUT-side parity; the never-widen-anchor
+        // rule is EMISSION-side and enforced at its own three layers
+        // (classifier, refinement re-check, output invariant).
+        for (trans_name, trans_spec) in constraint_lines(
+            &record.package_record.depends,
+            &record.package_record.constrains,
+        ) {
             out.entry(trans_name).or_default().push(trans_spec);
         }
+    }
+    out
+}
+
+/// P3 (grizzly #6): the depends + constrains line walk for one solved
+/// record. `constrains` (run_constrained) entries impose real
+/// constraints in pixi's solve whenever the constrained package is
+/// present; they share the dep-line shape so the same parsing applies.
+/// Skips stay python/python_abi-ONLY: recording a workspace-imposed
+/// anchor constraint (cuda-version, libstdcxx-ng) is INPUT-side
+/// parity; the never-widen-anchor rule is EMISSION-side, enforced at
+/// its own three layers. Empty/`*` specs impose nothing and would
+/// corrupt the comma-AND join, so they're dropped.
+fn constraint_lines(depends: &[String], constrains: &[String]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for raw in depends.iter().chain(constrains.iter()) {
+        let Some((trans_name, trans_spec)) = split_conda_dep_line(raw) else {
+            continue;
+        };
+        if trans_name == "python" || trans_name == "python_abi" {
+            continue;
+        }
+        if trans_spec.is_empty() || trans_spec == "*" {
+            continue;
+        }
+        out.push((trans_name, trans_spec));
     }
     out
 }
@@ -960,6 +979,39 @@ channels = ["https://prefix.dev/robostack-humble", "https://prefix.dev/conda-for
         );
         assert_eq!(split_conda_dep_line(""), None);
         assert_eq!(split_conda_dep_line("   "), None);
+    }
+
+    #[test]
+    fn constraint_lines_include_constrains_and_keep_anchors() {
+        // P3 (grizzly #6): run_constrained entries are recorded
+        // alongside depends. Anchors like cuda-version are KEPT --
+        // recording a workspace-imposed constraint is input-side
+        // parity; never-widening it is emission-side and enforced
+        // elsewhere. python/python_abi stay skipped (relax never
+        // touches them; they'd clutter the comma-join).
+        let depends = vec![
+            "numpy >=1.26,<2".to_string(),
+            "python_abi 3.11.* *_cp311".to_string(),
+        ];
+        let constrains = vec![
+            "cuda-version ==12.8".to_string(),
+            "tensorboard >=2.0".to_string(),
+            "python >=3.9".to_string(),
+            "anything *".to_string(),
+        ];
+        let lines = constraint_lines(&depends, &constrains);
+        let names: Vec<&str> = lines.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"numpy"));
+        assert!(
+            names.contains(&"cuda-version"),
+            "anchor CONSTRAINT must be recorded (input parity): {names:?}"
+        );
+        assert!(names.contains(&"tensorboard"));
+        assert!(!names.contains(&"python"));
+        assert!(!names.contains(&"python_abi"));
+        assert!(!names.contains(&"anything"), "`*` imposes nothing");
+        let cuda = lines.iter().find(|(n, _)| n == "cuda-version").unwrap();
+        assert_eq!(cuda.1, "==12.8");
     }
 
     #[test]

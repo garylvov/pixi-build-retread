@@ -158,6 +158,28 @@ pub(crate) enum RunTerminal {
 /// Returns `(RunTerminal, skipped_count)` where `skipped_count` mirrors
 /// `envs_skipped` (returned for convenience so callers don't need to
 /// re-compute it separately).
+/// P3 (grizzly #4): which envs in a completed level earn the single
+/// sibling-seeded re-run. Eligible only when the level has more than
+/// one env AND at least one sibling converged (otherwise there are no
+/// sibling widenings to seed with). Returns indices of capped envs.
+pub(crate) fn capped_envs_eligible_for_rerun<'a>(
+    classifications: impl Iterator<Item = Option<&'a str>>,
+) -> Vec<usize> {
+    let tags: Vec<Option<&str>> = classifications.collect();
+    let capped: Vec<usize> = tags
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| **t == Some("A-iteration-cap"))
+        .map(|(i, _)| i)
+        .collect();
+    let any_converged = tags.iter().any(|t| *t != Some("A-iteration-cap"));
+    if tags.len() > 1 && any_converged {
+        capped
+    } else {
+        Vec::new()
+    }
+}
+
 pub(crate) fn classify_run_terminal(
     envs_attempted: usize,
     envs_skipped: usize,
@@ -874,18 +896,25 @@ impl Handler {
                         // level sees the widenings of all COMPLETED
                         // levels, never a same-level sibling's.
                         let level_seed = accumulated_overrides.clone();
-                        let level_results: Vec<Result<EnvSolveResult, RpcError>> =
-                            futures::future::join_all(level.iter().map(|env_name| {
-                                let mut bundle = bundle_snapshot.clone();
-                                let mut effective = effective_snapshot.clone();
-                                // Reference bindings so `async move` moves
-                                // only the &refs, not the outer values.
-                                let level_seed = &level_seed;
-                                let manifest_for_solve = &manifest_for_solve;
-                                let params = &params;
-                                let emitted_run_deps_strs = &emitted_run_deps_strs;
-                                let siblings = &siblings;
-                                async move {
+                        // One env's full seeded refinement, reusable by
+                        // both the parallel level fan-out and the P3
+                        // capped-env re-run. Inputs are cloned into the
+                        // future (snapshot isolation per invariant #9).
+                        let solve_env = |env_name: &String, seed: &BTreeMap<String, String>| {
+                            let mut bundle = bundle_snapshot.clone();
+                            let mut effective = effective_snapshot.clone();
+                            let env_name = env_name.clone();
+                            let seed = seed.clone();
+                            // Reference bindings so `async move` moves
+                            // only the &refs, not the outer values.
+                            let manifest_for_solve = &manifest_for_solve;
+                            let params = &params;
+                            let emitted_run_deps_strs = &emitted_run_deps_strs;
+                            let siblings = &siblings;
+                            async move {
+                                let env_name = &env_name;
+                                let level_seed = &seed;
+                                {
                                     let (
                                         env_channels,
                                         env_workspace_specs,
@@ -973,14 +1002,64 @@ impl Handler {
                                     );
                                     Ok((env_name.clone(), outcome, effective.overrides))
                                 }
-                            }))
+                            }
+                        };
+                        let level_results: Vec<Result<EnvSolveResult, RpcError>> =
+                            futures::future::join_all(
+                                level.iter().map(|e| solve_env(e, &level_seed)),
+                            )
                             .await;
+
+                        // Unwrap all results first (fail fast on RPC errors).
+                        let mut level_outcomes: Vec<EnvSolveResult> = Vec::new();
+                        for result in level_results {
+                            level_outcomes.push(result?);
+                        }
+
+                        // P3 (grizzly #4): same-level siblings can't
+                        // cross-seed during the parallel solve. When an
+                        // env hit MAX_REFINEMENT while a sibling in the
+                        // SAME level converged, give it exactly ONE
+                        // re-run with a fresh full budget, seeded with
+                        // every sibling's widenings (snapshot/restore +
+                        // union accumulator; levels stay parallel). A
+                        // second cap is final: warn loudly and classify.
+                        let capped_idx = capped_envs_eligible_for_rerun(
+                            level_outcomes
+                                .iter()
+                                .map(|(_, o, _)| o.terminal_classification.as_deref()),
+                        );
+                        if !capped_idx.is_empty() {
+                            let mut rerun_seed = level_seed.clone();
+                            for (_, _, ovr) in &level_outcomes {
+                                for (dep, spec) in ovr {
+                                    merge_looser_override(&mut rerun_seed, dep, spec);
+                                }
+                            }
+                            for i in capped_idx {
+                                let env_name = level_outcomes[i].0.clone();
+                                tracing::info!(
+                                    env = %env_name,
+                                    "P3: re-running MAX_REFINEMENT-capped env once with sibling seeds",
+                                );
+                                let rerun = solve_env(&env_name, &rerun_seed).await?;
+                                if rerun.1.terminal_classification.as_deref()
+                                    == Some("A-iteration-cap")
+                                {
+                                    tracing::warn!(
+                                        env = %env_name,
+                                        "P3: env hit MAX_REFINEMENT again after the sibling-seeded re-run; classifying capped",
+                                    );
+                                }
+                                level_outcomes[i] = rerun;
+                            }
+                        }
 
                         // Serial, in env order: union widenings +
                         // bookkeeping. Identical to the old per-env
                         // tail, just hoisted out of the parallel part.
-                        for result in level_results {
-                            let (env_name, outcome, env_overrides) = result?;
+                        for result in level_outcomes {
+                            let (env_name, outcome, env_overrides) = result;
                             let env_name = &env_name;
                             // v0.36.4+: refinement may have widened
                             // entries in `effective.overrides` for this

@@ -866,6 +866,44 @@ fn localize_wheel_source_prefers_cached_copy() {
 }
 
 #[test]
+fn capped_rerun_eligibility() {
+    // P3 (grizzly #4): a capped env earns its single re-run only when
+    // the level has >1 env AND at least one sibling converged.
+    let cap = Some("A-iteration-cap");
+    let ok = Some("B-workspace");
+    // Mixed level: capped envs get the re-run.
+    assert_eq!(
+        capped_envs_eligible_for_rerun([cap, None, cap].into_iter()),
+        vec![0, 2]
+    );
+    assert_eq!(
+        capped_envs_eligible_for_rerun([ok, cap].into_iter()),
+        vec![1]
+    );
+    // Single-env level: nothing to seed from.
+    assert!(capped_envs_eligible_for_rerun([cap].into_iter()).is_empty());
+    // Everyone capped: no converged sibling to seed from.
+    assert!(capped_envs_eligible_for_rerun([cap, cap].into_iter()).is_empty());
+    // Nobody capped: nothing to do.
+    assert!(capped_envs_eligible_for_rerun([None, ok].into_iter()).is_empty());
+}
+
+#[test]
+fn constrains_anchor_recorded_but_not_widened() {
+    // P3 load-bearing distinction: a cuda-version CONSTRAINT from the
+    // workspace is RECORDED (input-side parity, see
+    // workspace::constraint_lines test) while the emission side still
+    // refuses to widen it -- is_abi_anchor is the single source of
+    // truth all three never-widen layers consult (invariant #8).
+    use crate::conflict_classifier::is_abi_anchor;
+    assert!(is_abi_anchor("cuda-version"));
+    assert!(is_abi_anchor("libstdcxx-ng"));
+    // And the recorded spec round-trips cleanly into the override map
+    // shape the cascade consumes.
+    crate::relax::assert_spec_roundtrips("cuda-version", "==12.8");
+}
+
+#[test]
 fn vendored_filter_matches_underscore_pypi_name() {
     // P2 (grizzly #2) through the real consumer: a bundle wheel whose
     // recorded pypi_name uses underscores ("opencv_python") must still
