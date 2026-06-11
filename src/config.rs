@@ -133,6 +133,26 @@ pub struct RetreadConfig {
     #[serde(default, rename = "retread-build-number", alias = "build-number")]
     pub build_number: u64,
 
+    /// v1.5.8: zstd compression level for the produced .conda
+    /// artifact, forwarded to rattler-build as
+    /// `--package-format conda:<level>`. Unset uses rattler-build's
+    /// default (high). For locally-consumed packs full of
+    /// shared-library / asset payloads that barely compress (Isaac
+    /// Sim, extscache), a LOW level (1-3) cuts the packaging stage of
+    /// pixi's "preparing packages" phase dramatically for a few
+    /// percent more disk:
+    ///
+    /// ```toml
+    /// [package.build.config]
+    /// retread-compression-level = 1
+    /// ```
+    #[serde(
+        default,
+        rename = "retread-compression-level",
+        alias = "compression-level"
+    )]
+    pub compression_level: Option<u32>,
+
     /// Python version(s) to build for, as a fallback when the workspace
     /// does not declare `[workspace.build-variants] python = [...]`.
     ///
@@ -481,6 +501,25 @@ mod tests {
         assert_eq!(isaac.normalized_version().unwrap(), "5.1.0");
         assert!(isaac.is_spec());
         assert_eq!(isaac.extras, vec!["all", "extscache"]);
+    }
+
+    #[test]
+    fn parses_retread_compression_level_key() {
+        // v1.5.8. Invariant #6: every new config field needs a serde
+        // test or stale binaries reject user pixi.toml with "unknown
+        // field" during upgrades.
+        let json = serde_json::json!({
+            "retread-wheels": { "foo": { "version": "==1.0" } },
+            "retread-compression-level": 3,
+        });
+        let cfg: RetreadConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.compression_level, Some(3));
+
+        let json = serde_json::json!({
+            "retread-wheels": { "foo": { "version": "==1.0" } },
+        });
+        let cfg: RetreadConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.compression_level, None);
     }
 
     #[test]

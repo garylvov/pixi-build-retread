@@ -365,6 +365,7 @@ fn pythons_for_rejects_bare_major_variant() {
         auto_bundle: false,
         conda_deps: Vec::new(),
         default_bundle: None,
+        compression_level: None,
         git_sources: std::collections::BTreeMap::new(),
         python: None,
     };
@@ -395,6 +396,7 @@ fn pythons_for_accepts_dotted_variant() {
         auto_bundle: false,
         conda_deps: Vec::new(),
         default_bundle: None,
+        compression_level: None,
         git_sources: std::collections::BTreeMap::new(),
         python: None,
     };
@@ -425,6 +427,7 @@ fn pythons_for_filters_bare_major_keeps_dotted() {
         auto_bundle: false,
         conda_deps: Vec::new(),
         default_bundle: None,
+        compression_level: None,
         git_sources: std::collections::BTreeMap::new(),
         python: None,
     };
@@ -765,6 +768,7 @@ fn cfg() -> RetreadConfig {
         auto_bundle: false,
         conda_deps: Vec::new(),
         default_bundle: None,
+        compression_level: None,
         git_sources: std::collections::BTreeMap::new(),
         python: None,
     }

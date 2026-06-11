@@ -3512,19 +3512,36 @@ async fn build_one(
     tokio::fs::create_dir_all(output_dir).await?;
 
     let target_platform = target_subdir.to_string();
+    // v1.5.8: rattler-build's zstd packaging defaults to ONE thread.
+    // For isaac-scale bundles that means single-threaded compression
+    // of a ~15GB build prefix -- the dominant wall-clock chunk of
+    // pixi's "preparing packages" phase. zstd scales near-linearly
+    // with threads on inputs this size, so hand it every core.
+    let compression_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .to_string();
     // CRITICAL: rattler-build writes progress to stdout, but retread's
     // stdout is the JSON-RPC channel to pixi. Capture both streams so
     // they don't corrupt the protocol. Surface them via tracing
     // (which writes to OUR stderr) on failure.
-    let output = tokio::process::Command::new("rattler-build")
-        .arg("build")
+    let mut cmd = tokio::process::Command::new("rattler-build");
+    cmd.arg("build")
         .arg("--recipe")
         .arg(&recipe_path)
         .arg("--output-dir")
         .arg(output_dir)
         .arg("--target-platform")
         .arg(&target_platform)
-        .arg("--no-test")
+        .arg("--compression-threads")
+        .arg(&compression_threads)
+        .arg("--no-test");
+    // v1.5.8: user-tunable zstd level (retread-compression-level).
+    // Unset keeps rattler-build's default.
+    if let Some(level) = config.compression_level {
+        cmd.arg("--package-format").arg(format!("conda:{level}"));
+    }
+    let output = cmd
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
