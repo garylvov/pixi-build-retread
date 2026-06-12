@@ -61,6 +61,7 @@ fn baseline_config() -> RetreadConfig {
         conda_deps: Vec::new(),
         default_bundle: None,
         compression_level: None,
+        emit_pypi: false,
         git_sources: std::collections::BTreeMap::new(),
         python: None,
     }

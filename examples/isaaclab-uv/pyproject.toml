@@ -1,0 +1,95 @@
+# uv-only baseline for the isaac-pack benchmark.
+#
+# This is the same Isaac Sim 6.0.0.0 + IsaacLab v3.0.0-beta (a4a7602) stack
+# that examples/../isaac-pack expresses as a retread source package, but
+# resolved and installed natively by uv. It exists to benchmark uv's
+# solve+install wall time against the retread conda path
+# (pixidock_template isaaclab-gpu env) and is a strict SUPERSET of
+# isaac-pack: it additionally carries genesis-world, mjlab, mujoco-warp,
+# newton, teleop/visualizers/contrib subpackages, and rl-games.
+#
+#   uv lock     # solve
+#   uv sync     # install into .venv
+[project]
+name = "isaaclab-uv-bench"
+version = "0.1.0"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "numpy==2.3.1",
+  "torch==2.10.0",
+  "torchvision==0.25.0",
+  "torchaudio==2.10.0",
+  "isaacsim[all,extscache]==6.0.0.0",
+  # IsaacLab's top-level "all" extra excludes the separate isaacsim extra.
+  "isaaclab[all]",
+  "isaaclab-assets",
+  "isaaclab-contrib",
+  "isaaclab-physx",
+  "isaaclab-tasks",
+  # The installer path also installs subpackage extras for RL, Mimic, Newton,
+  # and visualizers.
+  "isaaclab-rl[all]",
+  "isaaclab-mimic[all]",
+  "isaaclab-newton[all]",
+  "newton[sim]==1.2.1",
+  "mujoco~=3.8.0",
+  "mujoco-warp>=3.8.0.3,<3.9",
+  "genesis-world==1.1.1",
+  "mjlab==1.4.0",
+  "isaaclab-visualizers[all]",
+  "isaaclab-teleop",
+  "pyglet>=2.0,<3",
+]
+
+[tool.uv]
+package = false
+index-strategy = "unsafe-best-match"
+prerelease = "allow"
+# IsaacLab v3.0.0-beta and isaacsim-kernel==6.0.0.0 carry incompatible exact
+# pins for some shared packages. Relax those pins to keep the runtime solve
+# moving.
+override-dependencies = [
+  "numpy==2.3.1",
+  "lxml>=5.2.2,<6",
+  "pillow==12.1.1",
+  "coverage>=7.4.4,<8",
+  "typing-extensions>=4.14.0,<5",
+  "aiohttp>=3.12.14,<4",
+  "packaging>=23,<27",
+  "imgui-bundle>=1.92.4,<2",
+  "starlette==0.49.1",
+  "websockets>=13.1,<16",
+  "newton==1.2.1",
+  "warp-lang>=1.13.0,<1.14",
+  "mujoco~=3.8.0",
+  "mujoco-warp>=3.8.0.3,<3.9",
+  "rsl-rl-lib==5.2.0",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+torchaudio = { index = "pytorch-cu128" }
+isaacsim = { index = "pypi-nvidia" }
+nvidia-srl-usd-to-urdf = { index = "pypi-nvidia" }
+warp-lang = { index = "pypi-nvidia" }
+rl-games = { git = "https://github.com/isaac-sim/rl_games.git", branch = "python3.11" }
+isaaclab = { git = "https://github.com/isaac-sim/IsaacLab.git", rev = "a4a7602f29e755e2673fe0022ea35566df6dd7d5", subdirectory = "source/isaaclab" }
+isaaclab-assets = { git = "https://github.com/isaac-sim/IsaacLab.git", rev = "a4a7602f29e755e2673fe0022ea35566df6dd7d5", subdirectory = "source/isaaclab_assets" }
+isaaclab-contrib = { git = "https://github.com/isaac-sim/IsaacLab.git", rev = "a4a7602f29e755e2673fe0022ea35566df6dd7d5", subdirectory = "source/isaaclab_contrib" }
+isaaclab-mimic = { git = "https://github.com/isaac-sim/IsaacLab.git", rev = "a4a7602f29e755e2673fe0022ea35566df6dd7d5", subdirectory = "source/isaaclab_mimic" }
+isaaclab-newton = { git = "https://github.com/isaac-sim/IsaacLab.git", rev = "a4a7602f29e755e2673fe0022ea35566df6dd7d5", subdirectory = "source/isaaclab_newton" }
+isaaclab-physx = { git = "https://github.com/isaac-sim/IsaacLab.git", rev = "a4a7602f29e755e2673fe0022ea35566df6dd7d5", subdirectory = "source/isaaclab_physx" }
+isaaclab-rl = { git = "https://github.com/isaac-sim/IsaacLab.git", rev = "a4a7602f29e755e2673fe0022ea35566df6dd7d5", subdirectory = "source/isaaclab_rl" }
+isaaclab-tasks = { git = "https://github.com/isaac-sim/IsaacLab.git", rev = "a4a7602f29e755e2673fe0022ea35566df6dd7d5", subdirectory = "source/isaaclab_tasks" }
+isaaclab-teleop = { git = "https://github.com/isaac-sim/IsaacLab.git", rev = "a4a7602f29e755e2673fe0022ea35566df6dd7d5", subdirectory = "source/isaaclab_teleop" }
+isaaclab-visualizers = { git = "https://github.com/isaac-sim/IsaacLab.git", rev = "a4a7602f29e755e2673fe0022ea35566df6dd7d5", subdirectory = "source/isaaclab_visualizers" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "pypi-nvidia"
+url = "https://pypi.nvidia.com"

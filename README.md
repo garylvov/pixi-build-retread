@@ -110,7 +110,8 @@ isaac-pack/ # or preferred name
 ├── retread-audit-<name>.json         # what was relaxed/emitted (after build)
 ├── retread-probe-trace-<name>.json   # per-env probe + solve diagnostics (during conda/outputs)
 ├── RETREAD-SOLVE-FAILED-<name>.md    # human summary, only when a solve is UNSAT
-└── wheels/<entry>/...                # materialized wheels + post-rewrite *.relaxed.whl
+├── wheels/<entry>/...                # materialized wheels + post-rewrite *.relaxed.whl
+└── retread-pypi/<bundle>/...         # emit-pypi side-channel (only with retread-emit-pypi = true)
 ```
 
 - **audit** (post-build): per-wheel pre/post `Requires-Dist`, emitted conda
@@ -125,6 +126,33 @@ isaac-pack/ # or preferred name
 
 `wheels/` is multi-GB (NVIDIA) — gitignore it. Delete a per-entry folder or
 all of `wheels/` to force re-materialization on the next solve.
+
+### emit-pypi side-channel (v1.6.0, experimental)
+
+`retread-emit-pypi = true` makes every build additionally write
+`retread-pypi/<bundle>/` next to the pack manifest:
+
+- `wheels/` — the wheels retread BUILT (git/path sources, with the
+  checkout-root data injection that makes them importable) under standard
+  filenames, usable as a pixi `find-links` source. Index-origin wheels are
+  not duplicated here.
+- `pixi-snippet.toml` — a paste-ready feature block: `[pypi-dependencies]`
+  mirroring your `[retread-wheels]` entries, plus a generated
+  `[pypi-options.dependency-overrides]` table (floor-only envelopes —
+  `>=lowest pin seen` — of every lower-bounded `Requires-Dist` pin in the
+  bundle; deliberately uncapped because version discipline comes from the
+  workspace's conda pins, and prerelease floors double as uv's per-package
+  prerelease opt-in).
+
+Why: pixi installs the conda artifact by decompress + content-validated
+relink, which is minutes for Isaac-scale packs; pixi's embedded uv installs
+wheels by hardlink from an uncompressed cache in seconds. The side-channel
+lets the same retread-fixed stack be consumed through `[pypi-dependencies]`
+for day-to-day iteration while the conda output remains the distributable
+artifact. Trade-offs: the env's PyPI side resolves with uv (conda interop
+holds only for packages your workspace pins conda-side, via pixi's
+conda-pypi mapping), and pixi locks the find-links path machine-locally.
+The snippet is regenerated every build — never hand-edit it.
 
 ### Auto-injected checkout-root data
 

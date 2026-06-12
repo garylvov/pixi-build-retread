@@ -153,6 +153,23 @@ pub struct RetreadConfig {
     )]
     pub compression_level: Option<u32>,
 
+    /// v1.6.0 (experimental): additionally write the emit-pypi
+    /// side-channel on every build -- `retread-pypi/<bundle>/` next to
+    /// the pack manifest, holding retread-built wheels under standard
+    /// filenames (a `find-links` source) plus a paste-ready
+    /// `pixi-snippet.toml` (`[pypi-dependencies]` + generated
+    /// `[pypi-options.dependency-overrides]`) so the same stack can be
+    /// consumed through pixi's native uv path with no conda
+    /// re-packaging. Purely additive: the conda output is built either
+    /// way.
+    ///
+    /// ```toml
+    /// [package.build.config]
+    /// retread-emit-pypi = true
+    /// ```
+    #[serde(default, rename = "retread-emit-pypi", alias = "emit-pypi")]
+    pub emit_pypi: bool,
+
     /// Python version(s) to build for, as a fallback when the workspace
     /// does not declare `[workspace.build-variants] python = [...]`.
     ///
@@ -520,6 +537,25 @@ mod tests {
         });
         let cfg: RetreadConfig = serde_json::from_value(json).unwrap();
         assert_eq!(cfg.compression_level, None);
+    }
+
+    #[test]
+    fn parses_retread_emit_pypi_key() {
+        // v1.6.0. Invariant #6: every new config field needs a serde
+        // test or stale binaries reject user pixi.toml with "unknown
+        // field" during upgrades.
+        let json = serde_json::json!({
+            "retread-wheels": { "foo": { "version": "==1.0" } },
+            "retread-emit-pypi": true,
+        });
+        let cfg: RetreadConfig = serde_json::from_value(json).unwrap();
+        assert!(cfg.emit_pypi);
+
+        let json = serde_json::json!({
+            "retread-wheels": { "foo": { "version": "==1.0" } },
+        });
+        let cfg: RetreadConfig = serde_json::from_value(json).unwrap();
+        assert!(!cfg.emit_pypi, "unset defaults to off");
     }
 
     #[test]

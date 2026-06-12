@@ -3602,6 +3602,61 @@ async fn build_one(
         tracing::info!(path = %audit_path.display(), "wrote audit");
     }
 
+    // v1.6.0 (experimental): emit-pypi side-channel. Derived from the
+    // exact same wheel set the recipe is built from; advisory output
+    // like the audit, so failures are non-fatal.
+    if config.emit_pypi {
+        let emit_wheels: Vec<crate::emit_pypi::EmitWheel> = bundle
+            .all_wheels()
+            .zip(localized_urls.iter())
+            .map(|(w, url)| crate::emit_pypi::EmitWheel {
+                pypi_name: w.pypi_name.clone(),
+                version: w.metadata.version.clone(),
+                requires_dist: w.metadata.requires_dist.clone(),
+                local_path: (url.scheme() == "file")
+                    .then(|| url.to_file_path().ok())
+                    .flatten(),
+                wheel_filename: url
+                    .path_segments()
+                    .and_then(|mut s| s.next_back())
+                    .unwrap_or_default()
+                    .to_string(),
+            })
+            .collect();
+        // PyPI names conda can ship at all. These never get exact-pin
+        // overrides: the consuming env's conda side may pin any
+        // version of them and conda wins. Three sources, unioned:
+        // the cascade's probe decisions (candidates > 0; empty for
+        // fully-cached builds since probes run in conda/outputs), the
+        // user's name-map (every entry is by definition conda-routed),
+        // and parselmouth's full PyPI->conda mapping -- the name-level
+        // "exists on conda" oracle that covers bundled deps the
+        // cascade never probed (requests). build_one's config is the
+        // RAW user config (resolve_all's parselmouth merge does not
+        // flow here), so the mapping is loaded explicitly; on network
+        // failure it degrades to the curated fallback entries and the
+        // probe set.
+        let mut conda_capable: std::collections::HashSet<String> = bundle
+            .probe_decisions
+            .iter()
+            .filter(|d| d.matching_candidates > 0)
+            .map(|d| canonical_conda_name(&d.pypi_name))
+            .collect();
+        conda_capable.extend(config.name_map.keys().map(|k| canonical_conda_name(k)));
+        conda_capable.extend(load_pypi_to_conda_map().await.into_keys());
+        if let Err(e) = crate::emit_pypi::emit(
+            &recipe.package.name,
+            source_dir,
+            &emit_wheels,
+            &conda_capable,
+            config,
+        )
+        .await
+        {
+            tracing::warn!(error = %format!("{e:#}"), "emit-pypi side-channel failed (non-fatal)");
+        }
+    }
+
     tokio::fs::create_dir_all(output_dir).await?;
 
     let target_platform = target_subdir.to_string();
@@ -3634,6 +3689,11 @@ async fn build_one(
     if let Some(level) = config.compression_level {
         cmd.arg("--package-format").arg(format!("conda:{level}"));
     }
+    // v1.6.0: time the packaging stage explicitly. The 2026-06-11
+    // benchmark review flagged that the gap between "wrote audit" and
+    // pixi's own progress lines was unattributed; this is the number
+    // that proves (or disproves) where build wall-clock goes.
+    let packaging_started = std::time::Instant::now();
     let output = cmd
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -3641,6 +3701,13 @@ async fn build_one(
         .output()
         .await
         .context("spawning rattler-build (is it on PATH?)")?;
+    tracing::info!(
+        output = %recipe.package.name,
+        elapsed_ms = packaging_started.elapsed().as_millis() as u64,
+        compression_threads = %compression_threads,
+        compression_level = ?config.compression_level,
+        "bench: rattler-build finished",
+    );
     if !output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
