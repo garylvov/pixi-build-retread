@@ -170,6 +170,29 @@ pub struct RetreadConfig {
     #[serde(default, rename = "retread-emit-pypi", alias = "emit-pypi")]
     pub emit_pypi: bool,
 
+    /// v1.7.0 (experimental): blueprint sub-mode of emit-pypi. Instead
+    /// of a generated `[pypi-options.dependency-overrides]` table, the
+    /// override semantics are baked into REWRITTEN WHEELS shipped to
+    /// find-links under build-tagged filenames (uv prefers a
+    /// build-tagged wheel over the registry original at the same
+    /// version), and the pack's entry pins live in a generated
+    /// `<bundle>-pypi` meta-wheel. The synced workspace block shrinks
+    /// to a static handful of lines that never change across builds.
+    /// Implies `retread-emit-pypi`.
+    ///
+    /// ```toml
+    /// [package.build.config]
+    /// retread-blueprint = true
+    /// ```
+    /// `true` builds both the blueprint and the full conda artifact;
+    /// `"only"` additionally STUBS the conda artifact (no wheel
+    /// payload, no run-deps -- packaging drops from minutes to
+    /// seconds). Use "only" when every consuming environment uses the
+    /// `<bundle>-pypi` feature; environments that install the conda
+    /// package itself get an empty no-op package in that mode.
+    #[serde(default, rename = "retread-blueprint", alias = "blueprint")]
+    pub blueprint: BlueprintMode,
+
     /// Python version(s) to build for, as a fallback when the workspace
     /// does not declare `[workspace.build-variants] python = [...]`.
     ///
@@ -183,6 +206,50 @@ pub struct RetreadConfig {
     /// The bare name `python` is also accepted as a legacy alias.
     #[serde(default, rename = "retread-python", alias = "python")]
     pub python: Option<PythonSpec>,
+}
+
+/// `retread-blueprint` accepts `false` (off), `true` (blueprint +
+/// full conda artifact), or `"only"` (blueprint + stub conda
+/// artifact).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(from = "BlueprintModeRepr")]
+pub enum BlueprintMode {
+    #[default]
+    Off,
+    Full,
+    Only,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum BlueprintModeRepr {
+    Flag(bool),
+    Mode(String),
+}
+
+impl From<BlueprintModeRepr> for BlueprintMode {
+    fn from(r: BlueprintModeRepr) -> Self {
+        match r {
+            BlueprintModeRepr::Flag(false) => Self::Off,
+            BlueprintModeRepr::Flag(true) => Self::Full,
+            BlueprintModeRepr::Mode(s) if s.eq_ignore_ascii_case("only") => Self::Only,
+            BlueprintModeRepr::Mode(s) => {
+                // deny_unknown_fields can't see inside the value; be loud
+                // rather than silently off.
+                tracing::warn!(value = %s, "unknown retread-blueprint value; treating as true");
+                Self::Full
+            }
+        }
+    }
+}
+
+impl BlueprintMode {
+    pub fn is_on(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+    pub fn is_only(self) -> bool {
+        matches!(self, Self::Only)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -556,6 +623,31 @@ mod tests {
         });
         let cfg: RetreadConfig = serde_json::from_value(json).unwrap();
         assert!(!cfg.emit_pypi, "unset defaults to off");
+    }
+
+    #[test]
+    fn parses_retread_blueprint_key() {
+        // v1.7.0. Invariant #6: every new config field needs a serde
+        // test or stale binaries reject user pixi.toml with "unknown
+        // field" during upgrades.
+        let json = serde_json::json!({
+            "retread-wheels": { "foo": { "version": "==1.0" } },
+            "retread-blueprint": true,
+        });
+        let cfg: RetreadConfig = serde_json::from_value(json).unwrap();
+        assert!(cfg.blueprint.is_on());
+        let json = serde_json::json!({
+            "retread-wheels": { "foo": { "version": "==1.0" } },
+            "retread-blueprint": "only",
+        });
+        let cfg: RetreadConfig = serde_json::from_value(json).unwrap();
+        assert!(cfg.blueprint.is_only());
+
+        let json = serde_json::json!({
+            "retread-wheels": { "foo": { "version": "==1.0" } },
+        });
+        let cfg: RetreadConfig = serde_json::from_value(json).unwrap();
+        assert!(!cfg.blueprint.is_on(), "unset defaults to off");
     }
 
     #[test]

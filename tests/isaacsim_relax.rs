@@ -62,6 +62,7 @@ fn baseline_config() -> RetreadConfig {
         default_bundle: None,
         compression_level: None,
         emit_pypi: false,
+        blueprint: Default::default(),
         git_sources: std::collections::BTreeMap::new(),
         python: None,
     }
@@ -113,6 +114,7 @@ fn isaacsim_kernel_pins_widen_under_minor_relax() {
         &baseline_config(),
         "3.11",
         None,
+        true,
     )
     .unwrap();
     let yaml = to_yaml(&recipe).unwrap();
@@ -172,6 +174,7 @@ fn isaacsim_core_compat_with_ros2_workspace_pins() {
         &baseline_config(),
         "3.11",
         None,
+        true,
     )
     .unwrap();
     let yaml = to_yaml(&recipe).unwrap();
@@ -215,6 +218,7 @@ fn name_map_remaps_opencv_to_conda() {
         &cfg,
         "3.11",
         None,
+        true,
     )
     .unwrap();
     let yaml = to_yaml(&recipe).unwrap();
@@ -250,6 +254,7 @@ fn aggressive_major_relax_drops_upper_bounds() {
         &cfg,
         "3.11",
         None,
+        true,
     )
     .unwrap();
     let yaml = to_yaml(&recipe).unwrap();

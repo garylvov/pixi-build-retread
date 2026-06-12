@@ -139,20 +139,30 @@ pub(crate) async fn auto_bundle_transitives(
     loop {
         // Collect new candidates from wheels we haven't scanned yet.
         let mut candidates: Vec<(String, String)> = Vec::new();
+        // v1.7.0: ALSO consider bare/ranged base deps. They get the
+        // step-8 gate below: bundle only when a definitive name-level
+        // probe says conda has ZERO candidates (a true PyPI-only dep);
+        // otherwise they stay conda-side exactly as before.
+        let mut loose_candidates: Vec<(String, VersionSpecifiers)> = Vec::new();
         for wheel in bundle.all_wheels().skip(processed_wheel_count) {
             for raw in &wheel.metadata.requires_dist {
-                let Some((name, version)) = pep508_exact_base_dep(raw)? else {
-                    continue;
-                };
-                let conda_name = canonical_conda_name(&name);
-                if !seen_candidate.insert(conda_name) {
-                    continue;
+                if let Some((name, version)) = pep508_exact_base_dep(raw)? {
+                    let conda_name = canonical_conda_name(&name);
+                    if !seen_candidate.insert(conda_name) {
+                        continue;
+                    }
+                    candidates.push((name, version));
+                } else if let Some((name, specs)) = pep508_loose_base_dep(raw)? {
+                    let conda_name = canonical_conda_name(&name);
+                    if !seen_candidate.insert(conda_name) {
+                        continue;
+                    }
+                    loose_candidates.push((name, specs));
                 }
-                candidates.push((name, version));
             }
         }
         processed_wheel_count = bundle.all_wheels().count();
-        if candidates.is_empty() {
+        if candidates.is_empty() && loose_candidates.is_empty() {
             break;
         }
 
@@ -342,6 +352,75 @@ pub(crate) async fn auto_bundle_transitives(
             to_fetch.push((name, version, conda_name, specifiers));
         }
 
+        // Loose (bare/ranged) candidates: the step-8 gate. A name-level
+        // probe with definitive ZERO conda candidates means conda can
+        // never satisfy the dep -- bundle it from PyPI (newest version
+        // matching the line's specifiers). Anything conda CAN ship
+        // stays conda-side (the cascade translates the line).
+        let loose_pairs: Vec<(String, String)> = loose_candidates
+            .iter()
+            .map(|(name, _)| {
+                let conda_name = canonical_conda_name(name);
+                let target_name = config
+                    .name_map
+                    .get(&conda_name)
+                    .cloned()
+                    .unwrap_or(conda_name);
+                (target_name, "*".to_string())
+            })
+            .collect();
+        let loose_probes: std::collections::HashMap<(String, String), crate::probe::ProbeResult> =
+            crate::probe::probe_many(conda_channels, loose_pairs, Some(&target.python_version))
+                .await
+                .into_iter()
+                .map(|r| ((r.package.clone(), r.spec.clone()), r))
+                .collect();
+        for (name, specs) in loose_candidates {
+            let conda_name = canonical_conda_name(&name);
+            let target_name = config
+                .name_map
+                .get(&conda_name)
+                .cloned()
+                .unwrap_or_else(|| conda_name.clone());
+            let probe_result = match loose_probes.get(&(target_name.clone(), "*".to_string())) {
+                Some(r) => r.clone(),
+                None => {
+                    crate::probe::probe(
+                        conda_channels,
+                        &target_name,
+                        "*",
+                        Some(&target.python_version),
+                    )
+                    .await
+                }
+            };
+            let bundle_it = probe_result.is_definitively_unsatisfied();
+            bundle
+                .probe_decisions
+                .push(crate::audit::ProbeDecision::from_probe(
+                    "auto_bundle_loose",
+                    &name,
+                    &target_name,
+                    "*",
+                    &target.python_version,
+                    &probe_result,
+                    if bundle_it {
+                        "auto-pypi-no-conda-candidates"
+                    } else {
+                        "conda-keep"
+                    },
+                ));
+            if !bundle_it {
+                continue;
+            }
+            tracing::info!(
+                dep = %name,
+                specs = %specs,
+                "auto-bundle: bare/ranged dep has zero conda candidates; bundling from PyPI",
+            );
+            to_fetch.push((name, specs.to_string(), conda_name, specs));
+        }
+
         // v1.4.0: fetch this round's PyPI-bound wheels concurrently
         // (8-way bounded). `buffered` (not buffer_unordered) preserves
         // candidate order, so extras order -- and therefore the next
@@ -444,6 +523,38 @@ fn pep508_exact_base_dep(raw: &str) -> Result<Option<(String, String)>> {
         return Ok(None);
     }
     Ok(Some((req.name.to_string(), specs[0].version().to_string())))
+}
+
+/// Base (unmarked, non-URL) deps that are NOT a single exact pin: bare
+/// names (`nvidia-srl-usd-to-urdf`) and ranges. Returns the name plus
+/// the line's specifiers (empty for bare). v1.7.0: the v1.5.6 bare-dep
+/// fix covered the conda_outputs cascade only; auto_bundle (which also
+/// runs at build time and is what the conda recipe + emit-pypi
+/// actually see) silently skipped these, so a PyPI-only bare
+/// transitive like isaaclab-mimic's nvidia-srl-usd-to-urdf never made
+/// it into the built pack.
+fn pep508_loose_base_dep(raw: &str) -> Result<Option<(String, VersionSpecifiers)>> {
+    let req: uv_pep508::Requirement = uv_pep508::Requirement::from_str(raw)
+        .map_err(|e| anyhow!("parsing requirement `{raw}`: {e}"))?;
+    let env = default_marker_env(DEFAULT_PYTHON)?;
+    if !req.marker.evaluate(&env, &[]) {
+        return Ok(None);
+    }
+    match req.version_or_url.as_ref() {
+        None => Ok(Some((req.name.to_string(), VersionSpecifiers::empty()))),
+        Some(uv_pep508::VersionOrUrl::VersionSpecifier(specs)) => {
+            let v: Vec<_> = specs.iter().collect();
+            let is_exact =
+                v.len() == 1 && *v[0].operator() == uv_pep508::uv_pep440::Operator::Equal;
+            if is_exact {
+                // pep508_exact_base_dep's territory.
+                Ok(None)
+            } else {
+                Ok(Some((req.name.to_string(), specs.clone())))
+            }
+        }
+        Some(uv_pep508::VersionOrUrl::Url(_)) => Ok(None),
+    }
 }
 
 /// (wheel URL, parsed METADATA, index to recurse with) for one

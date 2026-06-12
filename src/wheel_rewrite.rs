@@ -33,6 +33,20 @@ use crate::config::RelaxPolicy;
 /// Returns the new sha256 of the rewritten wheel (useful for recipe
 /// generation).
 pub fn rewrite_wheel(src: &Path, dst: &Path, relax: RelaxPolicy) -> Result<String> {
+    rewrite_wheel_with(src, dst, &|line| relax_pep508(line, relax).ok()).map(|(sha, _)| sha)
+}
+
+/// Generic core of [`rewrite_wheel`]: apply `map` to every
+/// `Requires-Dist:` value (returning `None` leaves a line unchanged).
+/// When no line changes, the output is a hard link to the input where
+/// possible (same filesystem) so isaac-scale wheels cost nothing to
+/// "ship"; falls back to a copy. v1.6.1: emit-pypi uses this to bake
+/// its override semantics directly into the shipped wheels' METADATA.
+pub(crate) fn rewrite_wheel_with(
+    src: &Path,
+    dst: &Path,
+    map: &dyn Fn(&str) -> Option<String>,
+) -> Result<(String, bool)> {
     let bytes = std::fs::read(src).with_context(|| format!("reading {}", src.display()))?;
     let mut archive = ZipArchive::new(Cursor::new(&bytes))
         .with_context(|| format!("opening zip {}", src.display()))?;
@@ -67,16 +81,26 @@ pub fn rewrite_wheel(src: &Path, dst: &Path, relax: RelaxPolicy) -> Result<Strin
         .by_name(&record_name)?
         .read_to_string(&mut record_str)?;
 
-    // Rewrite METADATA per the relax policy.
-    let new_metadata = rewrite_metadata_text(&metadata_str, relax)?;
+    // Rewrite METADATA via the mapper.
+    let new_metadata = rewrite_metadata_text_with(&metadata_str, map)?;
     if new_metadata == metadata_str {
-        // Nothing changed; just copy the file.
-        std::fs::copy(src, dst)?;
+        // Nothing changed; hard-link when possible (free for
+        // multi-GB wheels on the same filesystem), else copy.
+        if dst.exists() {
+            std::fs::remove_file(dst)?;
+        }
+        if std::fs::hard_link(src, dst).is_err() {
+            std::fs::copy(src, dst)?;
+        }
         let h = sha256_hex(&bytes);
-        return Ok(h);
+        return Ok((h, false));
     }
     let new_metadata_bytes = new_metadata.as_bytes();
-    let new_metadata_sha = sha256_hex(new_metadata_bytes);
+    // RECORD hash lines use PEP 376's urlsafe-base64-nopad form (what
+    // bdist_wheel writes). The hex form previously written here was
+    // tolerated by pip on the conda path but is wrong per spec, and
+    // blueprint-mode wheels are consumed by uv directly.
+    let new_metadata_sha = crate::wheel_inject::sha256_base64_urlsafe_nopad(new_metadata_bytes);
     let new_record = update_record_line(
         &record_str,
         &metadata_name,
@@ -113,16 +137,16 @@ pub fn rewrite_wheel(src: &Path, dst: &Path, relax: RelaxPolicy) -> Result<Strin
 
     // sha256 of the rewritten wheel file (for recipe.yaml's source: sha256).
     let dst_bytes = std::fs::read(dst)?;
-    Ok(sha256_hex(&dst_bytes))
+    Ok((sha256_hex(&dst_bytes), true))
 }
 
-/// Apply `relax` to every `Requires-Dist:` line of a METADATA text body.
-/// Lines that aren't `Requires-Dist` or whose specifier isn't an exact
-/// `==X.Y.Z` pin are passed through unchanged.
-fn rewrite_metadata_text(content: &str, relax: RelaxPolicy) -> Result<String> {
-    if relax == RelaxPolicy::None {
-        return Ok(content.to_string());
-    }
+/// Generic form: apply `map` to every `Requires-Dist:` value. `None`
+/// (including for unparseable lines) keeps the original line, so a
+/// confusing line can never corrupt a wheel.
+fn rewrite_metadata_text_with(
+    content: &str,
+    map: &dyn Fn(&str) -> Option<String>,
+) -> Result<String> {
     let mut out = String::with_capacity(content.len());
     let mut in_headers = true;
     for line in content.split_inclusive('\n') {
@@ -132,22 +156,16 @@ fn rewrite_metadata_text(content: &str, relax: RelaxPolicy) -> Result<String> {
         }
         if in_headers && let Some(value) = line.strip_prefix("Requires-Dist: ") {
             let trimmed = value.trim_end_matches(['\r', '\n']);
-            match relax_pep508(trimmed, relax) {
-                Ok(rewritten) => {
-                    out.push_str("Requires-Dist: ");
-                    out.push_str(&rewritten);
-                    // Preserve the original line ending.
-                    if line.ends_with("\r\n") {
-                        out.push_str("\r\n");
-                    } else {
-                        out.push('\n');
-                    }
-                    continue;
+            if let Some(rewritten) = map(trimmed) {
+                out.push_str("Requires-Dist: ");
+                out.push_str(&rewritten);
+                // Preserve the original line ending.
+                if line.ends_with("\r\n") {
+                    out.push_str("\r\n");
+                } else {
+                    out.push('\n');
                 }
-                Err(_) => {
-                    // Could not parse; leave unchanged so we never
-                    // corrupt a wheel just because one line confused us.
-                }
+                continue;
             }
         }
         out.push_str(line);
@@ -298,7 +316,7 @@ fn widen_exact_to_pep508(v: &Version, policy: RelaxPolicy) -> Option<String> {
     }
 }
 
-fn rebuild_requirement(req: &Requirement, new_spec: &str) -> String {
+pub(crate) fn rebuild_requirement(req: &Requirement, new_spec: &str) -> String {
     let extras = if req.extras.is_empty() {
         String::new()
     } else {
@@ -315,8 +333,9 @@ fn rebuild_requirement(req: &Requirement, new_spec: &str) -> String {
 }
 
 /// Replace the RECORD line for `entry_name` with a new hash and size.
-/// RECORD format: `<path>,sha256=<hex>,<size>\n` per PEP 376. The line
-/// for RECORD itself has empty hash/size by convention; leave those alone.
+/// RECORD format: `<path>,sha256=<urlsafe-b64-nopad>,<size>` per PEP
+/// 376. The line for RECORD itself has empty hash/size by convention;
+/// leave those alone.
 fn update_record_line(
     record: &str,
     entry_name: &str,
@@ -431,7 +450,9 @@ mod tests {
                  Requires-Dist: scipy==1.15.3\n\
                  \n\
                  Body line that mentions Requires-Dist: should not change\n";
-        let out = rewrite_metadata_text(m, RelaxPolicy::Minor).unwrap();
+        let out =
+            rewrite_metadata_text_with(m, &|line| relax_pep508(line, RelaxPolicy::Minor).ok())
+                .unwrap();
         assert!(out.contains("numpy>=1.26,<2"));
         assert!(out.contains("scipy>=1.15,<2"));
         assert!(out.contains("Body line that mentions Requires-Dist: should not change"));

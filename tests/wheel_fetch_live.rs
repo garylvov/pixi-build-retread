@@ -93,6 +93,7 @@ async fn fetch_isaacsim_kernel_end_to_end() {
         default_bundle: None,
         compression_level: None,
         emit_pypi: false,
+        blueprint: Default::default(),
         git_sources: std::collections::BTreeMap::new(),
         python: None,
     };
@@ -106,6 +107,7 @@ async fn fetch_isaacsim_kernel_end_to_end() {
         &config,
         "3.11",
         None,
+        true,
     )
     .unwrap();
     let yaml = to_yaml(&recipe).unwrap();

@@ -1675,6 +1675,7 @@ impl Handler {
             params.output.subdir,
             &python_version,
             &source_dir,
+            workspace_dir.as_deref(),
             params.output.build.as_deref(),
             run_override.as_deref(),
         )
@@ -3533,6 +3534,146 @@ fn localize_wheel_source(url: &url::Url, wheels_root: &Path) -> url::Url {
     url.clone()
 }
 
+/// v1.7.0 blueprint: discover the PyPI dependency closure REACHABLE
+/// from the bundle, metadata-only (PEP 658 sidecars where the index
+/// serves them). Marker- and extras-aware: each line is evaluated
+/// against the target python's marker environment with exactly the
+/// extras its requirer activated (an all-extras-active first cut
+/// swept 6027 packages / 3.5GB; this bounds it to what uv can reach).
+/// Returns the discovered wheels; the caller checks them against the
+/// bundle-derived override map and ships only those needing rewrites.
+/// Best-effort throughout -- an unresolvable name is logged and
+/// skipped (uv will surface it at solve time if it actually matters).
+async fn blueprint_closure_sweep(
+    seeds: Vec<(Vec<String>, Vec<String>)>,
+    known: &HashSet<String>,
+    indexes: &[String],
+    target: &crate::pypi::WheelTarget,
+    source_dir: &Path,
+) -> Vec<crate::emit_pypi::EmitWheel> {
+    use futures::stream::{self, StreamExt};
+    const MAX_ROUNDS: usize = 12;
+    let download_dir = source_dir.join("wheels");
+    let env = match crate::relax::default_marker_env(&target.python_version) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "blueprint sweep: no marker env; skipped");
+            return Vec::new();
+        }
+    };
+    let mut seen: HashSet<String> = known.clone();
+    seen.insert("python".to_string());
+
+    // (dep name, specifiers, extras the requirer activates on it)
+    type Item = (String, VersionSpecifiers, Vec<String>);
+    let collect_deps =
+        |requires: &[String], active_extras: &[String], seen: &mut HashSet<String>| -> Vec<Item> {
+            let extra_names: Vec<uv_normalize::ExtraName> = active_extras
+                .iter()
+                .filter_map(|e| uv_normalize::ExtraName::from_owned(e.clone()).ok())
+                .collect();
+            let mut out: Vec<Item> = Vec::new();
+            for raw in requires {
+                let req: uv_pep508::Requirement = match uv_pep508::Requirement::from_str(raw) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                if !req.marker.evaluate(&env, &extra_names) {
+                    continue;
+                }
+                let name = req.name.to_string();
+                if !seen.insert(canonical_conda_name(&name)) {
+                    continue;
+                }
+                let child_extras: Vec<String> = req.extras.iter().map(|e| e.to_string()).collect();
+                let specs = match req.version_or_url {
+                    Some(uv_pep508::VersionOrUrl::VersionSpecifier(s)) => s,
+                    Some(uv_pep508::VersionOrUrl::Url(_)) => continue,
+                    None => VersionSpecifiers::empty(),
+                };
+                out.push((name, specs, child_extras));
+            }
+            out
+        };
+
+    let mut frontier: Vec<Item> = Vec::new();
+    for (requires, extras) in &seeds {
+        frontier.extend(collect_deps(requires, extras, &mut seen));
+    }
+    let mut discovered: Vec<crate::emit_pypi::EmitWheel> = Vec::new();
+    for round in 0..MAX_ROUNDS {
+        if frontier.is_empty() {
+            break;
+        }
+        let resolved: Vec<Option<(crate::emit_pypi::EmitWheel, Vec<String>)>> = stream::iter(
+            frontier.drain(..),
+        )
+        .map(|(name, specs, extras)| {
+            let download_dir = download_dir.clone();
+            async move {
+                for index in indexes {
+                    match pypi::resolve(index, &name, &specs, target).await {
+                        Ok(r) => {
+                            match crate::handler::auto_bundle::metadata_preferring_sidecar(
+                                &r,
+                                &download_dir,
+                            )
+                            .await
+                            {
+                                Ok(metadata) => {
+                                    return Some((
+                                        crate::emit_pypi::EmitWheel {
+                                            pypi_name: canonical_conda_name(&name),
+                                            version: metadata.version.clone(),
+                                            requires_dist: metadata.requires_dist.clone(),
+                                            local_path: None,
+                                            wheel_filename: crate::wheel::wheel_filename_from_url(
+                                                &r.url,
+                                            )
+                                            .unwrap_or_default(),
+                                            remote_url: Some(r.url),
+                                        },
+                                        extras,
+                                    ));
+                                }
+                                Err(e) => {
+                                    tracing::debug!(dep = %name, error = %format!("{e:#}"),
+                                                "blueprint sweep: metadata fetch failed");
+                                    return None;
+                                }
+                            }
+                        }
+                        Err(_) => continue,
+                    }
+                }
+                tracing::debug!(dep = %name, "blueprint sweep: unresolvable on all indexes");
+                None
+            }
+        })
+        .buffered(16)
+        .collect()
+        .await;
+        let mut next: Vec<(Vec<String>, Vec<String>)> = Vec::new();
+        for (w, extras) in resolved.into_iter().flatten() {
+            next.push((w.requires_dist.clone(), extras));
+            discovered.push(w);
+        }
+        for (requires, extras) in &next {
+            frontier.extend(collect_deps(requires, extras, &mut seen));
+        }
+        tracing::debug!(
+            round,
+            discovered = discovered.len(),
+            "blueprint sweep round"
+        );
+    }
+    tracing::info!(
+        discovered = discovered.len(),
+        "blueprint: PyPI closure sweep complete",
+    );
+    discovered
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn build_one(
     bundle: &Bundle,
@@ -3542,6 +3683,7 @@ async fn build_one(
     target_subdir: Platform,
     workspace_python_version: &str,
     source_dir: &Path,
+    workspace_dir: Option<&Path>,
     expected_build: Option<&str>,
     run_override: Option<&[String]>,
 ) -> Result<CondaBuildV1Result> {
@@ -3571,12 +3713,25 @@ async fn build_one(
             metadata: &w.metadata,
         })
         .collect();
+    // v1.7.0 `retread-blueprint = "only"`: the conda artifact is a
+    // protocol-compliance stub -- no wheel payload, no run-deps -- so
+    // packaging drops from minutes (zstd over ~15GB) to seconds. The
+    // blueprint side-channel below is the real product; environments
+    // that install the conda package itself get an empty no-op.
+    let payload = !config.blueprint.is_only();
+    if !payload {
+        tracing::info!(
+            output = %bundle.conda_name,
+            "blueprint=only: payload-skip conda artifact (real metadata + run-deps, no wheels)",
+        );
+    }
     let recipe = build_bundle_recipe(
         &bundle.conda_name,
         &sources,
         config,
         workspace_python_version,
         run_override,
+        payload,
     )?;
     let yaml = to_yaml(&recipe)?;
 
@@ -3605,7 +3760,7 @@ async fn build_one(
     // v1.6.0 (experimental): emit-pypi side-channel. Derived from the
     // exact same wheel set the recipe is built from; advisory output
     // like the audit, so failures are non-fatal.
-    if config.emit_pypi {
+    if config.emit_pypi || config.blueprint.is_on() {
         let emit_wheels: Vec<crate::emit_pypi::EmitWheel> = bundle
             .all_wheels()
             .zip(localized_urls.iter())
@@ -3621,8 +3776,43 @@ async fn build_one(
                     .and_then(|mut s| s.next_back())
                     .unwrap_or_default()
                     .to_string(),
+                remote_url: (url.scheme() != "file").then(|| (*url).clone()),
             })
             .collect();
+        // v1.7.0 blueprint: sweep the full PyPI dependency closure via
+        // (cheap, sidecar-preferring) metadata so the override mapper
+        // sees EVERY wheel uv could pull -- including deps the cascade
+        // routed conda-side. In the conda path those ride as conda
+        // run-deps; the blueprint has no conda vehicle, so uv resolves
+        // them from the index where their original caps (moviepy's
+        // pillow<12) conflict with conda-pinned versions. Closure
+        // members join emit_wheels as remote entries; emit fetches and
+        // rewrites only the ones whose pins actually need mapping.
+        let closure_wheels: Vec<crate::emit_pypi::EmitWheel> = if config.blueprint.is_on() {
+            let workspace_indexes: Vec<String> = workspace_dir
+                .and_then(crate::workspace::WorkspaceManifest::load)
+                .map(|m| m.all_pypi_index_urls())
+                .unwrap_or_default();
+            let entry_indexes: Vec<String> = config
+                .retread_wheels
+                .values()
+                .map(|e| e.index_url())
+                .collect();
+            let indexes = merge_index_chain(entry_indexes.into_iter(), &workspace_indexes);
+            let target = wheel_target_for(target_subdir, workspace_python_version);
+            let known: HashSet<String> = emit_wheels
+                .iter()
+                .map(|w| canonical_conda_name(&w.pypi_name))
+                .collect();
+            let seeds: Vec<(Vec<String>, Vec<String>)> = bundle
+                .all_wheels()
+                .map(|w| (w.metadata.requires_dist.clone(), w.extras_requested.clone()))
+                .collect();
+            blueprint_closure_sweep(seeds, &known, &indexes, &target, source_dir).await
+        } else {
+            Vec::new()
+        };
+
         // PyPI names conda can ship at all. These never get exact-pin
         // overrides: the consuming env's conda side may pin any
         // version of them and conda wins. Three sources, unioned:
@@ -3646,8 +3836,11 @@ async fn build_one(
         conda_capable.extend(load_pypi_to_conda_map().await.into_keys());
         if let Err(e) = crate::emit_pypi::emit(
             &recipe.package.name,
+            &recipe.package.version,
             source_dir,
+            workspace_dir,
             &emit_wheels,
+            &closure_wheels,
             &conda_capable,
             config,
         )

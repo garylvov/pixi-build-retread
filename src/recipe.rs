@@ -107,6 +107,7 @@ pub fn build_bundle_recipe(
     config: &RetreadConfig,
     workspace_python_version: &str,
     run_override: Option<&[String]>,
+    payload: bool,
 ) -> anyhow::Result<Recipe> {
     let primary = sources
         .first()
@@ -175,13 +176,26 @@ pub fn build_bundle_recipe(
         Some("python".to_string())
     };
 
-    let recipe_sources = sources
-        .iter()
-        .map(|s| Source {
-            url: s.url.to_string(),
-            sha256: Some(s.metadata.sha256.clone()),
-        })
-        .collect();
+    // v1.7.0 `retread-blueprint = "only"`: payload-skip mode. The
+    // recipe keeps its REAL shape -- version from the primary wheel,
+    // noarch/subdir derived from the actual wheel set, the solved
+    // run-deps -- so pixi's lock and identity checks (name/version/
+    // build/subdir) hold and consuming envs keep their conda
+    // transitives. Only the wheel payload is omitted: no sources, a
+    // no-op script, and therefore seconds of packaging instead of
+    // minutes of zstd. (An earlier empty-stub shape flipped noarch and
+    // zeroed run-deps; pixi rejected the artifact and the lock lied.)
+    let recipe_sources = if payload {
+        sources
+            .iter()
+            .map(|s| Source {
+                url: s.url.to_string(),
+                sha256: Some(s.metadata.sha256.clone()),
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     Ok(Recipe {
         schema_version: 1,
@@ -207,8 +221,13 @@ pub fn build_bundle_recipe(
             },
             // `--no-deps` is essential: conda solves deps from the run: list,
             // not from pip re-resolving Requires-Dist at install time.
-            script: "${{ PYTHON }} -m pip install *.whl -vv --no-deps --no-build-isolation"
-                .to_string(),
+            script: if payload {
+                "${{ PYTHON }} -m pip install *.whl -vv --no-deps --no-build-isolation".to_string()
+            } else {
+                // Payload-skip: the package carries metadata only; the
+                // content is consumed through the blueprint find-links.
+                "echo retread-blueprint=only: payload skipped".to_string()
+            },
         },
         requirements: Requirements { host, run },
         about: About {
@@ -241,6 +260,7 @@ mod tests {
             default_bundle: None,
             compression_level: None,
             emit_pypi: false,
+            blueprint: Default::default(),
             git_sources: std::collections::BTreeMap::new(),
             python: None,
         }
@@ -278,6 +298,7 @@ mod tests {
             &cfg(),
             "3.11",
             None,
+            true,
         )
         .unwrap();
         let yaml = to_yaml(&r).unwrap();
@@ -318,8 +339,8 @@ mod tests {
         let url = "https://example.com/pure-0.1.0-py3-none-any.whl"
             .parse()
             .unwrap();
-        let r =
-            build_bundle_recipe("pure", &one_source(&meta, &url), &cfg(), "3.11", None).unwrap();
+        let r = build_bundle_recipe("pure", &one_source(&meta, &url), &cfg(), "3.11", None, true)
+            .unwrap();
         assert_eq!(r.build.noarch.as_deref(), Some("python"));
         // noarch bundles have nothing to relocate -- don't emit the field
         // (and don't risk poisoning future rattler-build default changes).
@@ -362,7 +383,7 @@ mod tests {
                 metadata: &kernel,
             },
         ];
-        let r = build_bundle_recipe("isaacsim", &sources, &cfg(), "3.11", None).unwrap();
+        let r = build_bundle_recipe("isaacsim", &sources, &cfg(), "3.11", None, true).unwrap();
         let yaml = to_yaml(&r).unwrap();
 
         assert_eq!(r.source.len(), 2, "two sources in the recipe");
@@ -412,6 +433,7 @@ mod tests {
             &cfg(),
             "3.11",
             Some(&over),
+            true,
         )
         .unwrap();
         assert!(
