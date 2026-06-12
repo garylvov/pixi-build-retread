@@ -622,10 +622,23 @@ pub fn render_snippet_blueprint(
          {feature} = \"=={version}\"\n"
     );
     if !prerelease_pins.is_empty() {
-        // The ONE class overrides remain necessary for: pixi's uv only
-        // honors prerelease pins in DIRECT requirements (workspace
-        // overrides qualify; wheel METADATA does not), so the handful
-        // of prerelease-only deps ride here.
+        // The ONE class overrides remain necessary for -- and this is
+        // uv's architecture, not a retread gap: uv builds its
+        // explicit-prerelease set solely from direct workspace
+        // requirements + overrides (registry sources only;
+        // uv-resolver prerelease.rs from_mode). Constraints,
+        // find-links build tags, and a meta-wheel's Requires-Dist all
+        // get filtered before source selection
+        // (candidate_selector.rs), and a single stable upstream
+        // version (tinyobjloader 0.1) blocks the if-necessary
+        // fallback. The alternatives are strictly worse:
+        // prerelease-mode="allow" is env-wide (one dev build from an
+        // unsafe-best-match extra index away from a non-reproducible
+        // env), and re-versioning the wheel to a fake stable lies to
+        // pip freeze, collides with future upstream stables, and
+        // breaks consumer self-pins. One truthful line per
+        // prerelease-only floor is the minimum and the maximum; it
+        // changes only when the pack's prerelease-API floor changes.
         out.push_str(&format!(
             "\n[feature.{feature}.pypi-options.dependency-overrides]\n"
         ));
