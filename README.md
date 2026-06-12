@@ -151,11 +151,15 @@ registry originals at the same version), entry pins ride a generated
 manifest bytes. Sync modes (`retread-blueprint-sync`):
 
 - `"script"` (default): emits `retread-pypi/<bundle>/install.sh` +
-  `overrides.txt`. Add one task line by hand
-  (`setup = "bash <pack>/retread-pypi/<bundle>/install.sh"`) and run it
-  inside any activated env -- standalone uv reconciles against the live
-  conda env (it prefers installed dists), so conda torch/CUDA stay shared.
-  Re-run after recreating the env.
+  `overrides.txt`. The script is idempotent with a millisecond
+  filesystem fast-path, so the recommended hookup is your existing
+  `[activation]` script (one hand-written line, e.g.
+  `bash "$PIXI_PROJECT_ROOT/<pack>/retread-pypi/<bundle>/install.sh"`):
+  the overlay then self-heals automatically after env recreates or
+  pypi re-syncs (pixi prunes pypi packages it did not lock when it
+  reconciles an env). A `[tasks]` line works too if you prefer manual.
+  Standalone uv reconciles against the live conda env (it prefers
+  installed dists), so conda torch/CUDA stay shared.
 - `"fence"`: auto-syncs a small `[feature.<bundle>-pypi]` block into a
   fenced region of the workspace manifest (single pixi.lock, `pixi list`
   visibility, machine-written bytes).
