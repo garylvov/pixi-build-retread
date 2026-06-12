@@ -3798,7 +3798,7 @@ async fn build_one(
                 .values()
                 .map(|e| e.index_url())
                 .collect();
-            let indexes = merge_index_chain(entry_indexes.into_iter(), &workspace_indexes);
+            let indexes = merge_index_chain(entry_indexes, &workspace_indexes);
             let target = wheel_target_for(target_subdir, workspace_python_version);
             let known: HashSet<String> = emit_wheels
                 .iter()
