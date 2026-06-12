@@ -144,15 +144,33 @@ all of `wheels/` to force re-materialization on the next solve.
   workspace's conda pins, and prerelease floors double as uv's per-package
   prerelease opt-in).
 
+With `retread-blueprint = true` the side-channel becomes a full blueprint:
+override semantics are baked into build-tagged wheels (uv prefers them over
+registry originals at the same version), entry pins ride a generated
+`<bundle>-pypi` meta-wheel, and consumption needs ZERO machine-written
+manifest bytes. Sync modes (`retread-blueprint-sync`):
+
+- `"script"` (default): emits `retread-pypi/<bundle>/install.sh` +
+  `overrides.txt`. Add one task line by hand
+  (`setup = "bash <pack>/retread-pypi/<bundle>/install.sh"`) and run it
+  inside any activated env -- standalone uv reconciles against the live
+  conda env (it prefers installed dists), so conda torch/CUDA stay shared.
+  Re-run after recreating the env.
+- `"fence"`: auto-syncs a small `[feature.<bundle>-pypi]` block into a
+  fenced region of the workspace manifest (single pixi.lock, `pixi list`
+  visibility, machine-written bytes).
+
+`retread-blueprint = "only"` additionally payload-skips the conda artifact
+(real metadata and run-deps, no wheel payload -- packaging in seconds) for
+workspaces that consume only the blueprint.
+
 Why: pixi installs the conda artifact by decompress + content-validated
-relink, which is minutes for Isaac-scale packs; pixi's embedded uv installs
-wheels by hardlink from an uncompressed cache in seconds. The side-channel
-lets the same retread-fixed stack be consumed through `[pypi-dependencies]`
-for day-to-day iteration while the conda output remains the distributable
-artifact. Trade-offs: the env's PyPI side resolves with uv (conda interop
-holds only for packages your workspace pins conda-side, via pixi's
-conda-pypi mapping), and pixi locks the find-links path machine-locally.
-The snippet is regenerated every build — never hand-edit it.
+relink, which is minutes for Isaac-scale packs; uv installs wheels by
+hardlink from an uncompressed cache in seconds. Commit
+`retread-pypi/<bundle>/` (wheels via git-LFS) + `pixi.lock` and a cluster
+node initializes with `git clone && pixi install && install.sh` -- no
+backend execution. The artifacts are regenerated every build — never
+hand-edit them.
 
 ### Auto-injected checkout-root data
 

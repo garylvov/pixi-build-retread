@@ -368,6 +368,7 @@ fn pythons_for_rejects_bare_major_variant() {
         compression_level: None,
         emit_pypi: false,
         blueprint: Default::default(),
+        blueprint_sync: Default::default(),
         git_sources: std::collections::BTreeMap::new(),
         python: None,
     };
@@ -401,6 +402,7 @@ fn pythons_for_accepts_dotted_variant() {
         compression_level: None,
         emit_pypi: false,
         blueprint: Default::default(),
+        blueprint_sync: Default::default(),
         git_sources: std::collections::BTreeMap::new(),
         python: None,
     };
@@ -434,6 +436,7 @@ fn pythons_for_filters_bare_major_keeps_dotted() {
         compression_level: None,
         emit_pypi: false,
         blueprint: Default::default(),
+        blueprint_sync: Default::default(),
         git_sources: std::collections::BTreeMap::new(),
         python: None,
     };
@@ -777,6 +780,7 @@ fn cfg() -> RetreadConfig {
         compression_level: None,
         emit_pypi: false,
         blueprint: Default::default(),
+        blueprint_sync: Default::default(),
         git_sources: std::collections::BTreeMap::new(),
         python: None,
     }

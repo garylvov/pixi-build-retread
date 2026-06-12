@@ -94,6 +94,7 @@ async fn fetch_isaacsim_kernel_end_to_end() {
         compression_level: None,
         emit_pypi: false,
         blueprint: Default::default(),
+        blueprint_sync: Default::default(),
         git_sources: std::collections::BTreeMap::new(),
         python: None,
     };

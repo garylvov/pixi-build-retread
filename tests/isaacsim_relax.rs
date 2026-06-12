@@ -63,6 +63,7 @@ fn baseline_config() -> RetreadConfig {
         compression_level: None,
         emit_pypi: false,
         blueprint: Default::default(),
+        blueprint_sync: Default::default(),
         git_sources: std::collections::BTreeMap::new(),
         python: None,
     }

@@ -193,6 +193,17 @@ pub struct RetreadConfig {
     #[serde(default, rename = "retread-blueprint", alias = "blueprint")]
     pub blueprint: BlueprintMode,
 
+    /// v1.7.1: how the blueprint reaches the consumer. `"script"`
+    /// (default) emits a self-contained installer
+    /// (`retread-pypi/<bundle>/install.sh` + `overrides.txt`) driven by
+    /// standalone uv -- the workspace manifest is NEVER touched by the
+    /// backend; the user adds one task line by hand. `"fence"` instead
+    /// auto-syncs a `[feature.<bundle>-pypi]` block into a fenced
+    /// region of the workspace manifest (single pixi.lock, `pixi list`
+    /// visibility, at the cost of machine-written manifest bytes).
+    #[serde(default, rename = "retread-blueprint-sync", alias = "blueprint-sync")]
+    pub blueprint_sync: BlueprintSync,
+
     /// Python version(s) to build for, as a fallback when the workspace
     /// does not declare `[workspace.build-variants] python = [...]`.
     ///
@@ -206,6 +217,18 @@ pub struct RetreadConfig {
     /// The bare name `python` is also accepted as a legacy alias.
     #[serde(default, rename = "retread-python", alias = "python")]
     pub python: Option<PythonSpec>,
+}
+
+/// How the blueprint reaches the consumer workspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BlueprintSync {
+    /// Self-contained installer script; the workspace manifest is
+    /// never written by the backend.
+    #[default]
+    Script,
+    /// Auto-synced fenced feature block in the workspace manifest.
+    Fence,
 }
 
 /// `retread-blueprint` accepts `false` (off), `true` (blueprint +
@@ -623,6 +646,29 @@ mod tests {
         });
         let cfg: RetreadConfig = serde_json::from_value(json).unwrap();
         assert!(!cfg.emit_pypi, "unset defaults to off");
+    }
+
+    #[test]
+    fn parses_retread_blueprint_sync_key() {
+        // v1.7.1. Invariant #6: every new config field needs a serde
+        // test or stale binaries reject user pixi.toml with "unknown
+        // field" during upgrades.
+        let json = serde_json::json!({
+            "retread-wheels": { "foo": { "version": "==1.0" } },
+            "retread-blueprint-sync": "fence",
+        });
+        let cfg: RetreadConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.blueprint_sync, BlueprintSync::Fence);
+
+        let json = serde_json::json!({
+            "retread-wheels": { "foo": { "version": "==1.0" } },
+        });
+        let cfg: RetreadConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            cfg.blueprint_sync,
+            BlueprintSync::Script,
+            "script (zero manifest writes) is the default"
+        );
     }
 
     #[test]
