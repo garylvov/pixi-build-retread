@@ -193,16 +193,15 @@ pub struct RetreadConfig {
     #[serde(default, rename = "retread-blueprint", alias = "blueprint")]
     pub blueprint: BlueprintMode,
 
-    /// v1.7.1: how the blueprint reaches the consumer. `"script"`
-    /// (default) emits a self-contained installer
-    /// (`retread-pypi/<bundle>/install.sh` + `overrides.txt`) driven by
-    /// standalone uv -- the workspace manifest is NEVER touched by the
-    /// backend; the user adds one task line by hand. `"fence"` instead
-    /// auto-syncs a `[feature.<bundle>-pypi]` block into a fenced
-    /// region of the workspace manifest (single pixi.lock, `pixi list`
-    /// visibility, at the cost of machine-written manifest bytes).
+    /// DEPRECATED (v1.8.0), ignored. Was `retread-blueprint-sync`
+    /// (`"script"` | `"fence"`). The install-script path was removed;
+    /// fence sync is now the only way the blueprint reaches the consumer.
+    /// The field is retained ONLY so `deny_unknown_fields` does not reject
+    /// manifests that still carry the key -- it is parsed, warned about
+    /// (see `emit`), and otherwise unused. Remove the key (and any
+    /// `install.sh` task/activation line) from your manifest.
     #[serde(default, rename = "retread-blueprint-sync", alias = "blueprint-sync")]
-    pub blueprint_sync: BlueprintSync,
+    pub blueprint_sync: Option<String>,
 
     /// Python version(s) to build for, as a fallback when the workspace
     /// does not declare `[workspace.build-variants] python = [...]`.
@@ -217,18 +216,6 @@ pub struct RetreadConfig {
     /// The bare name `python` is also accepted as a legacy alias.
     #[serde(default, rename = "retread-python", alias = "python")]
     pub python: Option<PythonSpec>,
-}
-
-/// How the blueprint reaches the consumer workspace.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum BlueprintSync {
-    /// Self-contained installer script; the workspace manifest is
-    /// never written by the backend.
-    #[default]
-    Script,
-    /// Auto-synced fenced feature block in the workspace manifest.
-    Fence,
 }
 
 /// `retread-blueprint` accepts `false` (off), `true` (blueprint +
@@ -649,26 +636,24 @@ mod tests {
     }
 
     #[test]
-    fn parses_retread_blueprint_sync_key() {
-        // v1.7.1. Invariant #6: every new config field needs a serde
-        // test or stale binaries reject user pixi.toml with "unknown
-        // field" during upgrades.
+    fn deprecated_blueprint_sync_key_still_parses() {
+        // v1.8.0: the install-script path was removed and fence is the
+        // only sync path. The key is DEPRECATED + ignored, but must still
+        // parse -- `deny_unknown_fields` would otherwise reject existing
+        // manifests that carry it during an upgrade (Invariant #6). It is
+        // captured (and warned about in `emit`) rather than acted on.
         let json = serde_json::json!({
             "retread-wheels": { "foo": { "version": "==1.0" } },
-            "retread-blueprint-sync": "fence",
+            "retread-blueprint-sync": "script",
         });
         let cfg: RetreadConfig = serde_json::from_value(json).unwrap();
-        assert_eq!(cfg.blueprint_sync, BlueprintSync::Fence);
+        assert_eq!(cfg.blueprint_sync.as_deref(), Some("script"));
 
         let json = serde_json::json!({
             "retread-wheels": { "foo": { "version": "==1.0" } },
         });
         let cfg: RetreadConfig = serde_json::from_value(json).unwrap();
-        assert_eq!(
-            cfg.blueprint_sync,
-            BlueprintSync::Script,
-            "script (zero manifest writes) is the default"
-        );
+        assert_eq!(cfg.blueprint_sync, None, "absent by default");
     }
 
     #[test]

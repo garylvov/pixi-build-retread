@@ -146,35 +146,52 @@ all of `wheels/` to force re-materialization on the next solve.
 
 With `retread-blueprint = true` the side-channel becomes a full blueprint:
 override semantics are baked into build-tagged wheels (uv prefers them over
-registry originals at the same version), entry pins ride a generated
-`<bundle>-pypi` meta-wheel, and consumption needs ZERO machine-written
-manifest bytes. Sync modes (`retread-blueprint-sync`):
+registry originals at the same version), and entry pins ride a generated
+`<bundle>-pypi` meta-wheel, so the consuming workspace needs only a small
+static feature block.
 
-- `"script"` (default): emits `retread-pypi/<bundle>/install.sh` +
-  `overrides.txt`. The script is idempotent with a millisecond
-  filesystem fast-path, so the recommended hookup is your existing
-  `[activation]` script (one hand-written line, e.g.
-  `bash "$PIXI_PROJECT_ROOT/<pack>/retread-pypi/<bundle>/install.sh"`):
-  the overlay then self-heals automatically after env recreates or
-  pypi re-syncs (pixi prunes pypi packages it did not lock when it
-  reconciles an env). A `[tasks]` line works too if you prefer manual.
-  Standalone uv reconciles against the live conda env (it prefers
-  installed dists), so conda torch/CUDA stay shared.
-- `"fence"`: auto-syncs a small `[feature.<bundle>-pypi]` block into a
-  fenced region of the workspace manifest (single pixi.lock, `pixi list`
-  visibility, machine-written bytes).
+Delivery is **pixi-native fence sync**: retread auto-syncs a
+`[feature.<bundle>-pypi]` block into a fenced region of the workspace
+manifest, so the PyPI deps live in a single `pixi.lock` and show up in
+`pixi list`. Reference the `<bundle>-pypi` feature from an environment once;
+retread keeps the block current. The block is static -- find-links to the
+wheels, the meta-wheel pin, a `system-requirements.libc` floor, and a
+prerelease micro-table only if the pack pins any prereleases -- so it changes
+only when those change.
+
+After any pack change, re-lock (`pixi lock`) before installing: pixi's
+satisfiability check string-compares the find-links path and does NOT inspect
+directory contents, so a stale lock would silently install the old wheels.
+retread writes `retread-pypi/<bundle>/blueprint.lock` (a diffable marker) and
+logs a loud re-lock reminder on every build.
 
 `retread-blueprint = "only"` additionally payload-skips the conda artifact
 (real metadata and run-deps, no wheel payload -- packaging in seconds) for
 workspaces that consume only the blueprint.
 
+> **Anchor ABI-sensitive shared transitives as conda deps.** When you consume
+> a blueprint (especially `"only"` mode, where the conda artifact is dropped),
+> pin torch-family packages the pack's wheels pull in -- `torchaudio`,
+> `torchcodec`, ... -- as explicit conda dependencies in the consuming feature.
+> The blueprint's pypi closure resolves them from PyPI otherwise, at versions
+> that can skew against your conda `pytorch`/CUDA. The core
+> `pytorch`/`torchvision`/`pytorch-gpu`/`cuda-version` stay conda automatically
+> as long as they are declared (as in the `gigastrap` `gpu` feature).
+
 Why: pixi installs the conda artifact by decompress + content-validated
 relink, which is minutes for Isaac-scale packs; uv installs wheels by
 hardlink from an uncompressed cache in seconds. Commit
 `retread-pypi/<bundle>/` (wheels via git-LFS) + `pixi.lock` and a cluster
-node initializes with `git clone && pixi install && install.sh` -- no
-backend execution. The artifacts are regenerated every build — never
-hand-edit them.
+node initializes with `git clone && pixi install` -- no backend execution.
+The artifacts are regenerated every build — never hand-edit them.
+
+> **Upgrading from <= v1.7.x (script sync):** the generated `install.sh` +
+> `overrides.txt` and the `retread-blueprint-sync` key are gone -- fence is
+> the only path. Remove any hand-added `[tasks]`/`[activation]` line that ran
+> `install.sh` (it now points at a file retread no longer writes, which would
+> break `pixi shell`/`pixi run`), let the next build sync the fence block,
+> then `pixi lock && pixi install`. A leftover `retread-blueprint-sync` key is
+> ignored with a warning.
 
 ### Auto-injected checkout-root data
 
