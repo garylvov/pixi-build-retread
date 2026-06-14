@@ -8,6 +8,8 @@ pub mod config;
 pub mod conflict_classifier;
 pub mod emit_pypi;
 pub mod handler;
+pub mod installer;
+pub mod lock;
 pub mod probe;
 pub mod pypi;
 pub mod recipe;

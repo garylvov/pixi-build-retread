@@ -3848,6 +3848,93 @@ async fn build_one(
         {
             tracing::warn!(error = %format!("{e:#}"), "emit-pypi side-channel failed (non-fatal)");
         }
+
+        // v2.0.0 courier: write the committed install lock. Built wheels
+        // (file://, on no index) ship inside the conda package; index
+        // wheels (remote) install by fetching their URL at link time. The
+        // installer (`retread install`) is the sole reader. Additive +
+        // non-fatal, like the audit.
+        {
+            use crate::lock::{CondaDep, LockWheel, Origin, RetreadLock, SCHEMA};
+            // Origin: a wheel SHIPS in the conda package iff it was built by
+            // retread (git/path, `.injected`, on no index) -- `must_ship()`.
+            // Everything else is an INDEX wheel that installs by fetching its
+            // UPSTREAM url (the original `bundle.all_wheels()` url; the
+            // localized `file://` copy retread fetched for relax is not what
+            // the consumer fetches). TODO(courier): an index wheel whose
+            // metadata relax CHANGED must also ship (the blueprint's shadow
+            // wheels) -- fold that in when the courier emit replaces emit().
+            let wheels: Vec<LockWheel> = emit_wheels
+                .iter()
+                .zip(bundle.all_wheels())
+                .map(|(w, rw)| {
+                    let ship = w.must_ship();
+                    LockWheel {
+                        name: w.pypi_name.clone(),
+                        version: w.version.clone(),
+                        origin: if ship { Origin::Built } else { Origin::Index },
+                        filename: w.wheel_filename.clone(),
+                        url: (!ship).then(|| rw.url.to_string()),
+                    }
+                })
+                .collect();
+            let conda_run_deps: Vec<CondaDep> = recipe
+                .requirements
+                .run
+                .iter()
+                .filter_map(|s| {
+                    let s = s.trim();
+                    if s.is_empty() {
+                        return None;
+                    }
+                    let (name, spec) = match s.split_once(' ') {
+                        Some((n, sp)) => (n.to_string(), sp.trim().to_string()),
+                        None => (s.to_string(), String::new()),
+                    };
+                    Some(CondaDep { name, spec })
+                })
+                .collect();
+            let workspace_indexes: Vec<String> = workspace_dir
+                .and_then(crate::workspace::WorkspaceManifest::load)
+                .map(|m| m.all_pypi_index_urls())
+                .unwrap_or_default();
+            let entry_indexes: Vec<String> = config
+                .retread_wheels
+                .values()
+                .map(|e| e.index_url())
+                .collect();
+            let lock = RetreadLock {
+                schema: SCHEMA,
+                retread_version: env!("CARGO_PKG_VERSION").to_string(),
+                bundle: recipe.package.name.clone(),
+                version: recipe.package.version.clone(),
+                python: workspace_python_version.to_string(),
+                // TODO(courier Phase 3): populate with the bundle's entry
+                // requirements (or the generated meta-wheel pin) that uv
+                // installs; the courier emit owns this once it builds the
+                // meta-wheel + stages shipped wheels.
+                root_requirements: Vec::new(),
+                wheels,
+                conda_run_deps,
+                index_urls: merge_index_chain(entry_indexes, &workspace_indexes),
+                // TODO(courier Phase 2): carry collect_prerelease_pins so the
+                // installer can pass `--prerelease` overrides to uv.
+                prerelease: Default::default(),
+            };
+            match lock.to_pretty_json() {
+                Ok(json) => {
+                    let p = source_dir.join(RetreadLock::file_name(&recipe.package.name));
+                    if let Err(e) = tokio::fs::write(&p, json).await {
+                        tracing::warn!(path = %p.display(), error = %e, "failed to write retread lock (non-fatal)");
+                    } else {
+                        tracing::info!(path = %p.display(), wheels = lock.wheels.len(), "wrote retread lock");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"), "serializing retread lock failed (non-fatal)")
+                }
+            }
+        }
     }
 
     tokio::fs::create_dir_all(output_dir).await?;
