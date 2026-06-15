@@ -565,8 +565,15 @@ fn produce_output_reflects_overrides_for_refinement_widening() {
     rebuild_effective
         .overrides
         .insert(widened_name.to_string(), "*".to_string());
-    let widened =
-        produce_output(&bundle, &rebuild_effective, Platform::Linux64, "3.11", &[], None).unwrap();
+    let widened = produce_output(
+        &bundle,
+        &rebuild_effective,
+        Platform::Linux64,
+        "3.11",
+        &[],
+        None,
+    )
+    .unwrap();
     let widened_spec = widened
         .run_dependencies
         .depends
@@ -1041,7 +1048,8 @@ fn name_mapped_dep_dropped_by_pypi_name() {
         "isaac-pack-6",
         vec!["tinyobjloader==2.0.0rc13", "numpy==1.26.0"],
     );
-    let output = produce_output(&bundle, &dropped_cfg, Platform::Linux64, "3.12", &[], None).unwrap();
+    let output =
+        produce_output(&bundle, &dropped_cfg, Platform::Linux64, "3.12", &[], None).unwrap();
     let names: Vec<String> = output
         .run_dependencies
         .depends
@@ -1064,7 +1072,15 @@ fn name_mapped_dep_dropped_by_pypi_name() {
         "tinyobjloader",
         meta("tinyobjloader", "2.0.0rc13", vec![], true),
     ));
-    let output = produce_output(&vendored_bundle, &config, Platform::Linux64, "3.12", &[], None).unwrap();
+    let output = produce_output(
+        &vendored_bundle,
+        &config,
+        Platform::Linux64,
+        "3.12",
+        &[],
+        None,
+    )
+    .unwrap();
     let names: Vec<String> = output
         .run_dependencies
         .depends
