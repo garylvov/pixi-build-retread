@@ -239,15 +239,33 @@ pub async fn stage(
         let std_name = standard_wheel_filename(&w.wheel_filename);
 
         if w.must_ship() {
-            // Built-by-retread wheel (carries .injected infix): copy to
-            // staging_dir under the standard filename and record Origin::Built.
+            // Built-by-retread wheel (carries .injected infix): REWRITE (not
+            // copy) into staging under the standard filename, then record
+            // Origin::Built. Built wheels can carry transitive `name @ url`
+            // Requires-Dist lines (e.g. isaaclab-rl -> `rl-games @ git+...`)
+            // that uv REJECTS at install ("URL dependencies must be direct
+            // requirements or constraints"). The bundle provides those deps via
+            // find-links, and plan()'s Pass-1 puts a `name==<ver>` override in
+            // `emit_plan.overrides` for every in-bundle URL target, so the same
+            // override_line_map that rewrites index shadows also drops the URL
+            // here. It is a no-op for lines that need no change (already-relaxed
+            // built wheels re-rewrite idempotently), so this is safe for every
+            // built wheel -- copying verbatim was the bug that shipped a wheel
+            // uv could not resolve.
             let src = w.local_path.as_ref().ok_or_else(|| {
                 anyhow::anyhow!("must_ship wheel has no local_path: {}", w.pypi_name)
             })?;
             let dst = staging_dir.join(&std_name);
-            tokio::fs::copy(src, &dst).await.with_context(|| {
-                format!("staging built wheel {} -> {}", src.display(), dst.display())
-            })?;
+            let src_blocking = src.clone();
+            let dst_blocking = dst.clone();
+            let overrides_b = overrides_owned.clone();
+            let conda_cap_b = conda_cap_owned.clone();
+            tokio::task::spawn_blocking(move || {
+                let m = override_line_map(&overrides_b, &conda_cap_b);
+                crate::wheel_rewrite::rewrite_wheel_with(&src_blocking, &dst_blocking, &m)
+            })
+            .await
+            .with_context(|| format!("spawn_blocking rewrite of built wheel {}", w.pypi_name))??;
             source_urls.push(file_url(&dst)?);
             lock_wheels.push(LockWheel {
                 name: w.pypi_name.clone(),
