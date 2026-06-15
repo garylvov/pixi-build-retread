@@ -89,13 +89,19 @@ pub fn courier_input_specs(config: &RetreadConfig, bundle_name: &str) -> Vec<Str
 /// stale.
 ///
 /// Folds in: per-dep overrides, the PyPI->conda name-map, drop-deps,
-/// conda-deps, the auto-bundle toggle, and the build-number. Each of these
-/// changes the emitted conda specs or the conda/PyPI routing, so omitting any
-/// would let a manifest edit leave the hash unchanged and replay a stale,
-/// POISONED lock. (genesis's `retread-name-map` is the canonical regression
-/// case here.) Conda CHANNELS are a workspace input, not config; a channel
-/// change is a known smaller residual not covered here.
-pub fn config_fingerprint(config: &RetreadConfig) -> String {
+/// conda-deps, the auto-bundle toggle, the build-number, AND the conda channel
+/// list. Each of these changes the emitted conda specs or the conda/PyPI
+/// routing, so omitting any would let a manifest/workspace edit leave the hash
+/// unchanged and replay a stale, POISONED lock. (genesis's `retread-name-map`
+/// is the canonical config regression case; a workspace channel addition is
+/// the canonical channel case -- a newly-added channel can make a previously
+/// auto-bundled wheel conda-capable, flipping its lock classification.)
+///
+/// `conda_channels` is the channel set pixi forwards (`params.channels`,
+/// stringified). Order is SIGNIFICANT (conda channel priority), so it is NOT
+/// sorted -- exactly like the PyPI index chain. The producer (`build_one`) and
+/// the replayer (`conda_outputs`) MUST pass the same stringified channel list.
+pub fn config_fingerprint(config: &RetreadConfig, conda_channels: &[String]) -> String {
     // BTreeMaps iterate in sorted key order already; sort the Vecs explicitly
     // so ordering in the manifest never perturbs the digest.
     let mut parts: Vec<String> = Vec::new();
@@ -117,6 +123,9 @@ pub fn config_fingerprint(config: &RetreadConfig) -> String {
     }
     parts.push(format!("auto-bundle:{}", config.auto_bundle));
     parts.push(format!("build-number:{}", config.build_number));
+    for c in conda_channels {
+        parts.push(format!("channel:{c}"));
+    }
     parts.join("\n")
 }
 
@@ -163,6 +172,7 @@ pub async fn stage(
     conda_capable: &HashSet<String>,
     run_deps: &[String],
     index_urls: &[String],
+    config_fp: &str,
     source_dir: &Path,
     staging_dir: &Path,
 ) -> anyhow::Result<CourierStaged> {
@@ -366,7 +376,7 @@ pub async fn stage(
         &format!("{:?}", config.relax),
         python,
         env!("CARGO_PKG_VERSION"),
-        &config_fingerprint(config),
+        config_fp,
     );
 
     // B-8 invariant: every emitted wheel must be classified into the lock
@@ -492,6 +502,24 @@ mod tests {
         serde_json::from_value(json).unwrap()
     }
 
+    /// grizzly P1 regression: changing the conda channel list MUST change the
+    /// fingerprint (a newly-added channel can flip a wheel's lock
+    /// classification, so a stale lock must not replay). Channel ORDER also
+    /// matters (conda priority), like the PyPI index chain.
+    #[test]
+    fn fingerprint_covers_conda_channels() {
+        let cfg = minimal_config("b");
+        let base = config_fingerprint(&cfg, &["conda-forge".to_string()]);
+        let added = config_fingerprint(&cfg, &["conda-forge".to_string(), "nvidia".to_string()]);
+        assert_ne!(base, added, "adding a channel must change the fingerprint");
+        let reordered =
+            config_fingerprint(&cfg, &["nvidia".to_string(), "conda-forge".to_string()]);
+        assert_ne!(
+            added, reordered,
+            "channel order must change the fingerprint"
+        );
+    }
+
     /// Create a process-unique temp directory and return it. Caller must clean
     /// up manually (matches the pattern used elsewhere in this codebase).
     fn make_test_dir(slug: &str) -> std::path::PathBuf {
@@ -561,6 +589,7 @@ mod tests {
             &conda_capable,
             &[],
             &["https://pypi.org/simple/".to_string()],
+            "",
             &tmp,
             &staging,
         )
@@ -620,6 +649,7 @@ mod tests {
             &conda_capable,
             &[],
             &["https://pypi.org/simple/".to_string()],
+            "",
             &tmp,
             &staging,
         )
@@ -659,6 +689,7 @@ mod tests {
             &conda_capable,
             &[],
             &["https://pypi.org/simple/".to_string()],
+            "",
             &tmp,
             &staging,
         )

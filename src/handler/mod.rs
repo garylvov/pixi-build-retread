@@ -757,7 +757,14 @@ impl Handler {
                             &format!("{:?}", config.relax),
                             python_version,
                             env!("CARGO_PKG_VERSION"),
-                            &crate::courier::config_fingerprint(&config),
+                            &crate::courier::config_fingerprint(
+                                &config,
+                                &params
+                                    .channels
+                                    .iter()
+                                    .map(|c| c.to_string())
+                                    .collect::<Vec<_>>(),
+                            ),
                         );
                         let lock_path = source_dir
                             .join(crate::lock::RetreadLock::file_name(&bundle.conda_name));
@@ -1740,6 +1747,7 @@ impl Handler {
             .as_ref()
             .map(|deps| deps.iter().map(|d| d.spec.to_string()).collect());
 
+        let conda_channels: Vec<String> = params.channels.iter().map(|c| c.to_string()).collect();
         build_one(
             &bundle,
             &effective,
@@ -1751,6 +1759,7 @@ impl Handler {
             workspace_dir.as_deref(),
             params.output.build.as_deref(),
             run_override.as_deref(),
+            &conda_channels,
         )
         .await
         .map_err(|e| RpcError::internal(format!("build {}: {e:#}", bundle.conda_name)))
@@ -3629,6 +3638,10 @@ async fn build_one(
     workspace_dir: Option<&Path>,
     expected_build: Option<&str>,
     run_override: Option<&[String]>,
+    // Conda channel list pixi forwarded (stringified). Folded into the
+    // courier lock's inputs_hash so a channel change invalidates replay
+    // (B-4 / grizzly P1). Must match the replayer's `params.channels`.
+    conda_channels: &[String],
 ) -> Result<CondaBuildV1Result> {
     // Lay out one BundleSource per wheel (primary first), in BFS order.
     //
@@ -3736,6 +3749,9 @@ async fn build_one(
             )
         })?;
         let staging = work_dir.join(format!("courier-{}", bundle.conda_name));
+        // Fingerprint folds in the conda channel list (grizzly P1) alongside
+        // the config-derived inputs; the replayer computes it identically.
+        let config_fp = crate::courier::config_fingerprint(config, conda_channels);
         let staged = crate::courier::stage(
             config,
             &bundle.conda_name,
@@ -3745,6 +3761,7 @@ async fn build_one(
             &conda_capable,
             &run_deps,
             &index_urls,
+            &config_fp,
             source_dir,
             &staging,
         )
