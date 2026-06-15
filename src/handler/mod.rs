@@ -4018,7 +4018,13 @@ fn replay_from_lock(
     }
     // Replay only fires in courier mode -> uv must be in the replayed metadata
     // too (match produce_output). The installer binary ships in the package.
-    run_depends.push(spec_from_str("uv")?);
+    // Guard against a duplicate: `uv` may already be in the lock's
+    // conda_run_deps (pixi forwards it as a solved run-dep), so only add it if
+    // not already present -- otherwise the replayed output diverges from the
+    // cascade's (which emits uv once).
+    if seen_dep_names.insert("uv".to_string()) {
+        run_depends.push(spec_from_str("uv")?);
+    }
 
     let mut variant = std::collections::BTreeMap::new();
     variant.insert(
