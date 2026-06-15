@@ -166,25 +166,19 @@ suite and is safe to commit (the repo `.gitignore` does not exclude it).
 
 #### Loud failure when the toggle is missing
 
-If the `.pixi/config.toml` toggle is absent, pixi silently skips post-link
-scripts — the courier conda package links successfully but `retread install`
-never runs, leaving the PyPI closure uninstalled and imports broken. To make
-this failure loud rather than silent, the courier conda package ships an
-`activate.d` guard script. On every `pixi run` or `pixi shell` invocation the
-guard checks whether the retread installer has run for the active prefix; if not,
-it prints a banner to stderr:
+Without the toggle, pixi skips the post-link script: the package links but the
+wheels never install and imports break. The package ships an `activate.d` guard
+that, on every `pixi run` / `pixi shell`, warns when the wheels are missing —
+with the two fixes:
 
 ```
-[retread] WARNING: wheels not installed — post-link script did not run.
-Add the following file to your workspace root and re-run `pixi install`:
-
-  .pixi/config.toml
-  ──────────────────
-  run-post-link-scripts = "insecure"
+retread: '<pack>' PyPI wheels are NOT installed.
+  fast path: set run-post-link-scripts = "insecure" in <workspace>/.pixi/config.toml
+  safe mode: set retread-courier = false
 ```
 
-A forgotten toggle is therefore loud on first activation, not a silently broken
-environment that only fails at import time.
+So a forgotten toggle is loud on first activation, not a silent failure at
+import time.
 
 ### What's committed vs fetched
 
