@@ -20,6 +20,29 @@ use crate::lock::RetreadLock;
 /// Fallback primary index when the lock carries no index_urls.
 pub(crate) use crate::handler::PUBLIC_PYPI;
 
+/// PEP 503 normalized distribution name (lowercase; runs of `-`, `_`, `.`
+/// collapse to a single `-`). Used to compare names across uv's `pip list`
+/// output and the lock's wheel names when building the uv exclude set.
+pub(crate) fn normalize_dist_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut prev_sep = false;
+    for c in name.trim().chars() {
+        if c == '-' || c == '_' || c == '.' {
+            if !prev_sep && !out.is_empty() {
+                out.push('-');
+            }
+            prev_sep = true;
+        } else {
+            out.push(c.to_ascii_lowercase());
+            prev_sep = false;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    out
+}
+
 /// S1: build a uv constraints-file body from the conda-provided transitives,
 /// so uv cannot resolve a PyPI wheel OUTSIDE the version conda will install
 /// (e.g. bound `torchaudio>=2.7,<3` so the closure can't jump to 2.11 and
@@ -59,6 +82,7 @@ pub(crate) fn build_uv_args(
     wheels_dir: Option<&Path>,
     overrides_file: Option<&Path>,
     constraints_file: Option<&Path>,
+    excludes_file: Option<&Path>,
 ) -> Vec<OsString> {
     let mut args: Vec<OsString> = vec![
         "pip".into(),
@@ -96,6 +120,20 @@ pub(crate) fn build_uv_args(
     if let Some(c) = constraints_file {
         args.push("--constraints".into());
         args.push(c.into());
+    }
+
+    // Exclude the conda-populated set from uv's resolution. The courier
+    // contract is: conda provides the conda-capable transitives; uv only ADDS
+    // the bundle's PyPI-only wheels (+ their PyPI-only tail). Without this, uv
+    // re-resolves the FULL closure and tries to REPLACE conda dists -- which
+    // fails hard on any conda package uv can't uninstall (legacy egg-info /
+    // RECORD-less dist-info, e.g. vtk). The exclude set is uv's OWN view of the
+    // prefix (`uv pip list`), so names match the resolver and every packaging
+    // shape is covered -- no per-package logic, no conda/PyPI name-skew. Written
+    // by run() (minus the bundle's own wheels, which uv must still install).
+    if let Some(e) = excludes_file {
+        args.push("--excludes".into());
+        args.push(e.into());
     }
 
     // Prerelease overrides file (written before calling build_uv_args in run()).
@@ -185,12 +223,59 @@ pub fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
         None
     };
 
+    // Exclude the conda-populated set from uv's resolution (see build_uv_args).
+    // Source = uv's OWN view of the prefix, so names match the resolver and
+    // every packaging shape is covered. Subtract the bundle's own payload (the
+    // meta-wheel + each shipped/fetched wheel) so uv still installs those even
+    // if a conda package ever collided on the same normalized name.
+    let protect: std::collections::HashSet<String> = lock
+        .wheels
+        .iter()
+        .map(|w| normalize_dist_name(&w.name))
+        .chain(
+            lock.root_requirements
+                .iter()
+                .map(|r| normalize_dist_name(r.split("==").next().unwrap_or(r))),
+        )
+        .collect();
+    let exc_path = share.join(format!("{}.excludes.txt", lock.bundle));
+    let excludes_file = {
+        let out = Command::new(&uv)
+            .args(["pip", "list", "--format", "freeze", "--python"])
+            .arg(&python)
+            .output()
+            .with_context(|| "listing installed packages for the uv exclude set")?;
+        if out.status.success() {
+            let mut body = String::new();
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                let name = line.split("==").next().unwrap_or("").trim();
+                if name.is_empty() || protect.contains(&normalize_dist_name(name)) {
+                    continue;
+                }
+                body.push_str(name);
+                body.push('\n');
+            }
+            std::fs::create_dir_all(&share).ok();
+            std::fs::write(&exc_path, &body)
+                .with_context(|| format!("writing {}", exc_path.display()))?;
+            Some(exc_path.as_path())
+        } else {
+            tracing::warn!(
+                status = %out.status,
+                "uv pip list failed; proceeding without an exclude set (uv may try to \
+                 replace conda-provided packages)",
+            );
+            None
+        }
+    };
+
     let args = build_uv_args(
         &lock,
         prefix,
         wheels_dir_opt,
         overrides_file,
         constraints_file,
+        excludes_file,
     );
 
     eprintln!(
@@ -311,7 +396,7 @@ mod tests {
         let lock = make_lock(deps, vec![PUBLIC_PYPI.into()], BTreeMap::new());
         let prefix = PathBuf::from("/fake/prefix");
         let con = PathBuf::from("/fake/prefix/share/retread/test-bundle.constraints.txt");
-        let args = build_uv_args(&lock, &prefix, None, None, Some(con.as_path()));
+        let args = build_uv_args(&lock, &prefix, None, None, Some(con.as_path()), None);
         let strs = argv_strings(&args);
         assert_eq!(
             flag_values(&strs, "--constraints"),
@@ -326,9 +411,39 @@ mod tests {
     fn s1_no_constraints_no_flag() {
         let lock = make_lock(vec![], vec![PUBLIC_PYPI.into()], BTreeMap::new());
         let prefix = PathBuf::from("/fake/prefix");
-        let args = build_uv_args(&lock, &prefix, None, None, None);
+        let args = build_uv_args(&lock, &prefix, None, None, None, None);
         let strs = argv_strings(&args);
         assert!(!strs.contains(&"--constraints".to_string()));
+    }
+
+    // The exclude set (conda-populated packages) is threaded as --excludes when
+    // present, and absent otherwise.
+    #[test]
+    fn excludes_file_appears_in_argv() {
+        let lock = make_lock(vec![], vec![PUBLIC_PYPI.into()], BTreeMap::new());
+        let prefix = PathBuf::from("/fake/prefix");
+        let exc = PathBuf::from("/fake/prefix/share/retread/test-bundle.excludes.txt");
+        let args = build_uv_args(&lock, &prefix, None, None, None, Some(exc.as_path()));
+        let strs = argv_strings(&args);
+        assert_eq!(
+            flag_values(&strs, "--excludes"),
+            vec![exc.to_string_lossy().into_owned()]
+        );
+        // absent when not provided.
+        let args = build_uv_args(&lock, &prefix, None, None, None, None);
+        assert!(!argv_strings(&args).contains(&"--excludes".to_string()));
+    }
+
+    #[test]
+    fn normalize_dist_name_pep503() {
+        assert_eq!(normalize_dist_name("VTK"), "vtk");
+        assert_eq!(
+            normalize_dist_name("PyOpenGL_accelerate"),
+            "pyopengl-accelerate"
+        );
+        assert_eq!(normalize_dist_name("ruamel.yaml"), "ruamel-yaml");
+        assert_eq!(normalize_dist_name("foo__bar--baz"), "foo-bar-baz");
+        assert_eq!(normalize_dist_name("genesis-world"), "genesis-world");
     }
 
     // S3: index chain order matches lock.index_urls exactly, primary = index_urls[0].
@@ -343,7 +458,7 @@ mod tests {
             BTreeMap::new(),
         );
         let prefix = PathBuf::from("/fake/prefix");
-        let args = build_uv_args(&lock, &prefix, None, None, None);
+        let args = build_uv_args(&lock, &prefix, None, None, None, None);
         let strs = argv_strings(&args);
 
         let primary = flag_values(&strs, "--index-url");
@@ -365,7 +480,7 @@ mod tests {
             BTreeMap::new(),
         );
         let prefix = PathBuf::from("/fake/prefix");
-        let args = build_uv_args(&lock, &prefix, None, None, None);
+        let args = build_uv_args(&lock, &prefix, None, None, None, None);
         let strs = argv_strings(&args);
 
         let primary = flag_values(&strs, "--index-url");
@@ -382,7 +497,7 @@ mod tests {
     fn s3_empty_index_urls_fallback_to_public_pypi() {
         let lock = make_lock(vec![], vec![], BTreeMap::new());
         let prefix = PathBuf::from("/fake/prefix");
-        let args = build_uv_args(&lock, &prefix, None, None, None);
+        let args = build_uv_args(&lock, &prefix, None, None, None, None);
         let strs = argv_strings(&args);
 
         let primary = flag_values(&strs, "--index-url");
@@ -405,7 +520,7 @@ mod tests {
         let lock = make_lock(vec![], vec![PUBLIC_PYPI.into()], BTreeMap::new());
         let prefix = PathBuf::from("/fake/prefix");
         let ovr = PathBuf::from("/fake/prefix/share/retread/test-bundle.overrides.txt");
-        let args = build_uv_args(&lock, &prefix, None, Some(ovr.as_path()), None);
+        let args = build_uv_args(&lock, &prefix, None, Some(ovr.as_path()), None, None);
         let strs = argv_strings(&args);
         let ovr_vals = flag_values(&strs, "--overrides");
         assert_eq!(ovr_vals, vec![ovr.to_string_lossy().into_owned()]);
@@ -416,7 +531,7 @@ mod tests {
     fn root_requirements_in_argv() {
         let lock = make_lock(vec![], vec![PUBLIC_PYPI.into()], BTreeMap::new());
         let prefix = PathBuf::from("/fake/prefix");
-        let args = build_uv_args(&lock, &prefix, None, None, None);
+        let args = build_uv_args(&lock, &prefix, None, None, None, None);
         let strs = argv_strings(&args);
         assert!(
             strs.contains(&"mypackage==1.0.0".to_string()),
