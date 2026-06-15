@@ -3540,6 +3540,16 @@ fn produce_output(
         VariantValue::String(python_version.clone()),
     );
 
+    // Courier: the metadata pixi SOLVES + LOCKS must include `uv` (the
+    // post-link installer needs it), or it never lands in the consuming env.
+    // (The recipe adds it too, but pixi resolves against THIS conda/outputs
+    // metadata, not the recipe.) The retread installer binary itself SHIPS
+    // inside the courier package -- NOT a run-dep -- so the heavy backend
+    // never enters the consumer solve.
+    let mut depends_specs = depends_specs;
+    if config.courier {
+        depends_specs.push(spec_from_str("uv")?);
+    }
     Ok(CondaOutput {
         metadata: CondaOutputMetadata {
             name,
@@ -4323,6 +4333,9 @@ fn replay_from_lock(
             run_depends.push(spec_from_str(&format!("{sib_name} =={sib_version}"))?);
         }
     }
+    // Replay only fires in courier mode -> uv must be in the replayed metadata
+    // too (match produce_output). The installer binary ships in the package.
+    run_depends.push(spec_from_str("uv")?);
 
     let mut variant = std::collections::BTreeMap::new();
     variant.insert(

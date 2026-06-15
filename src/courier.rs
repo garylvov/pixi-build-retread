@@ -242,6 +242,24 @@ pub async fn stage(
         .with_context(|| format!("writing meta-wheel {}", meta_dst.display()))?;
     source_urls.push(file_url(&meta_dst)?);
 
+    // Step 4b: ship the static installer binary INSIDE the package (the
+    // currently-running backend == the static musl `pixi-build-retread`).
+    // The recipe copies it to `$PREFIX/bin/retread`; the post-link runs it.
+    // This avoids run-depping on the heavy backend conda package (which the
+    // consumer's solve check can't even see on a file:///non-default channel).
+    let self_exe = std::env::current_exe().context("locating retread backend binary")?;
+    let installer_dst = staging_dir.join("retread-installer");
+    tokio::fs::copy(&self_exe, &installer_dst)
+        .await
+        .with_context(|| {
+            format!(
+                "staging installer binary {} -> {}",
+                self_exe.display(),
+                installer_dst.display()
+            )
+        })?;
+    source_urls.push(file_url(&installer_dst)?);
+
     // Step 5: Collect prerelease pins and compute inputs_hash.
     let prerelease =
         collect_prerelease_pins(&emit_plan.overrides, emit_wheels, &emit_plan.ship, &entries);

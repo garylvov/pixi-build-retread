@@ -269,22 +269,23 @@ pub fn build_courier_recipe(
     {
         run.insert(0, python_pin.clone());
     }
-    // The installer binary + uv must be present in the consuming env for the
-    // post-link to run. Idempotent guards against duplicates.
-    for dep in ["uv", "pixi-build-retread"] {
-        if !run
-            .iter()
-            .any(|s| s == dep || s.starts_with(&format!("{dep} ")))
-        {
-            run.push(dep.to_string());
-        }
+    // Only `uv` is a conda run-dep (always on conda-forge -> the consumer's
+    // pre-emission solve check + lock find it). We do NOT run-dep on
+    // `pixi-build-retread`: that would drag the heavy backend (rattler-build,
+    // ...) into the consumer env AND the solve check can't see it on a
+    // file:// / non-default channel. Instead the static installer binary
+    // SHIPS inside this package (staged as `retread-installer`, copied to
+    // `$PREFIX/bin/retread` by the build script below).
+    if !run.iter().any(|s| s == "uv" || s.starts_with("uv ")) {
+        run.push("uv".to_string());
     }
 
-    // Build script: stage wheels + lock under $PREFIX/share/retread, then
-    // emit the conda post-link script (literal $PREFIX -- expanded at LINK
-    // time, not build time -- via the quoted heredoc). The post-link calls
-    // the installer; a failure is logged loudly but does not abort linking
-    // (the conda metadata is still valid; the user can re-run install).
+    // Build script: stage wheels + lock under $PREFIX/share/retread, install
+    // the shipped static `retread` binary into $PREFIX/bin, then emit the
+    // conda post-link script (literal $PREFIX -- expanded at LINK time, not
+    // build time -- via the quoted heredoc). The post-link runs the installer;
+    // a failure is logged loudly but does not abort linking (the conda
+    // metadata is still valid; the user can re-run `retread install`).
     let post_link = format!("$PREFIX/bin/.{conda_name}-post-link.sh");
     let script = format!(
         "set -euo pipefail\n\
@@ -293,9 +294,11 @@ pub fn build_courier_recipe(
          mkdir -p \"$WHEELS\" \"$PREFIX/bin\"\n\
          cp \"$SRC_DIR\"/*.whl \"$WHEELS\"/ 2>/dev/null || true\n\
          cp \"$SRC_DIR\"/{lock_filename} \"$SHARE\"/\n\
+         cp \"$SRC_DIR\"/retread-installer \"$PREFIX/bin/retread\"\n\
+         chmod +x \"$PREFIX/bin/retread\"\n\
          cat > \"{post_link}\" <<'POSTLINK'\n\
          #!/bin/bash\n\
-         \"$PREFIX/bin/pixi-build-retread\" install --lock \"$PREFIX/share/retread/{lock_filename}\" --prefix \"$PREFIX\" || echo 'retread: post-link install failed; run `pixi-build-retread install` manually' >&2\n\
+         \"$PREFIX/bin/retread\" install --lock \"$PREFIX/share/retread/{lock_filename}\" --prefix \"$PREFIX\" || echo 'retread: post-link install failed; run `retread install` manually' >&2\n\
          POSTLINK\n\
          chmod +x \"{post_link}\"\n"
     );
@@ -365,15 +368,26 @@ mod courier_tests {
                 .any(|s| s == "torchaudio >=2.7,<3")
         );
         assert!(r.requirements.run.iter().any(|s| s == "uv"));
-        assert!(r.requirements.run.iter().any(|s| s == "pixi-build-retread"));
+        // The installer binary SHIPS in the package (not a run-dep), so the
+        // heavy backend never pollutes the consumer env.
+        assert!(
+            !r.requirements.run.iter().any(|s| s == "pixi-build-retread"),
+            "courier must NOT run-dep on the backend"
+        );
         assert!(r.requirements.run.iter().any(|s| s.starts_with("python ")));
-        // no payload pip-install; ships wheels + lock as data + post-link.
+        // no payload pip-install; ships wheels + lock + the static binary as
+        // data + a post-link that runs the shipped `retread` installer.
         assert!(r.build.script.contains("share/retread"));
         assert!(r.build.script.contains(".isaac-pack-post-link.sh"));
         assert!(
+            r.build.script.contains("cp \"$SRC_DIR\"/retread-installer"),
+            "must stage the shipped installer binary"
+        );
+        assert!(
             r.build
                 .script
-                .contains("pixi-build-retread\" install --lock")
+                .contains("\"$PREFIX/bin/retread\" install --lock"),
+            "post-link must run the shipped installer"
         );
         assert!(
             r.build.script.contains("retread-isaac-pack.lock.json"),

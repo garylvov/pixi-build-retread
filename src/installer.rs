@@ -20,31 +20,45 @@ use crate::lock::RetreadLock;
 /// Fallback primary index when the lock carries no index_urls.
 pub(crate) use crate::handler::PUBLIC_PYPI;
 
-/// Build the argument list for `uv pip install` as a pure function (no I/O,
-/// no spawn). The returned vector does NOT include argv[0] (the uv binary
-/// itself) -- callers pass it directly to `Command::new`.
-///
-/// # S1 – conda-covered transitive shielding
-/// `lock.conda_run_deps` lists names whose wheels are provided by conda (e.g.
-/// torch, torchaudio). We pass `--no-install-package <name>` for each one.
-/// uv still *resolves* them (so it can compute the closure) but does NOT
-/// fetch or install a PyPI wheel for them, ensuring conda stays the
-/// authoritative source and no version skew is introduced.
-/// This is simpler and more correct than a constraints file: we don't need
-/// to express a version pin because conda is already authoritative -- we just
-/// need uv to leave those dists alone.
-///
-/// # S3 – index chain replay
-/// We replay `lock.index_urls` verbatim: first entry becomes `--index-url`,
-/// the rest become `--extra-index-url`. We do NOT hard-code public PyPI as
-/// the primary; it is used only when `index_urls` is empty. This preserves
-/// the resolution priority the backend recorded (e.g. pypi.nvidia.com is
-/// primary for isaac bundles).
+/// S1: build a uv constraints-file body from the conda-provided transitives,
+/// so uv cannot resolve a PyPI wheel OUTSIDE the version conda will install
+/// (e.g. bound `torchaudio>=2.7,<3` so the closure can't jump to 2.11 and
+/// skew against conda's torch). Only clean PEP 508 version specifiers are
+/// emitted: conda-only names (`python`, `python_abi`) and conda specs that
+/// carry a build string (a space, e.g. `3.11.* *_cp311`) or no comparison
+/// operator are skipped -- they are not valid uv constraints.
+pub(crate) fn conda_deps_to_constraints(deps: &[crate::lock::CondaDep]) -> String {
+    let mut out = String::new();
+    for d in deps {
+        let name = d.name.trim();
+        let spec = d.spec.trim();
+        if name.is_empty() || name == "python" || name == "python_abi" {
+            continue;
+        }
+        if spec.is_empty() || spec.contains(' ') {
+            continue;
+        }
+        if !spec.starts_with(['<', '>', '=', '!', '~']) {
+            continue;
+        }
+        out.push_str(name);
+        out.push_str(spec);
+        out.push('\n');
+    }
+    out
+}
+
+/// Build the `uv pip install` argument list (pure; no I/O, no spawn; no
+/// argv[0]). S1: a `--constraints` file bounds conda-provided transitives to
+/// conda's range. S3: `lock.index_urls` is replayed verbatim (first = primary
+/// `--index-url`, rest `--extra-index-url`; public PyPI only as the empty
+/// fallback) so the backend's recorded resolution priority is preserved.
 pub(crate) fn build_uv_args(
     lock: &RetreadLock,
     prefix: &Path,
     wheels_dir: Option<&Path>,
     overrides_file: Option<&Path>,
+    constraints_file: Option<&Path>,
 ) -> Vec<OsString> {
     let mut args: Vec<OsString> = vec![
         "pip".into(),
@@ -76,12 +90,12 @@ pub(crate) fn build_uv_args(
         }
     }
 
-    // S1: shield conda-provided names from uv installation.
-    // --no-install-package tells uv to resolve but skip fetching/installing
-    // those packages. Conda is already the authoritative install for them.
-    for dep in &lock.conda_run_deps {
-        args.push("--no-install-package".into());
-        args.push(dep.name.as_str().into());
+    // S1: bound conda-provided transitives to conda's version range via a
+    // constraints file, so uv's closure can't pick a PyPI wheel outside what
+    // conda installs (the torchaudio>=2.7,<3 vs 2.11 skew). Written by run().
+    if let Some(c) = constraints_file {
+        args.push("--constraints".into());
+        args.push(c.into());
     }
 
     // Prerelease overrides file (written before calling build_uv_args in run()).
@@ -159,7 +173,25 @@ pub fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
         None
     };
 
-    let args = build_uv_args(&lock, prefix, wheels_dir_opt, overrides_file);
+    // S1 constraints file: bound conda-provided transitives to conda's range.
+    let con_path = share.join(format!("{}.constraints.txt", lock.bundle));
+    let constraints_body = conda_deps_to_constraints(&lock.conda_run_deps);
+    let constraints_file = if !constraints_body.is_empty() {
+        std::fs::create_dir_all(&share).ok();
+        std::fs::write(&con_path, &constraints_body)
+            .with_context(|| format!("writing {}", con_path.display()))?;
+        Some(con_path.as_path())
+    } else {
+        None
+    };
+
+    let args = build_uv_args(
+        &lock,
+        prefix,
+        wheels_dir_opt,
+        overrides_file,
+        constraints_file,
+    );
 
     eprintln!(
         "retread install: {} -> {} ({} root reqs)",
@@ -235,55 +267,68 @@ mod tests {
             .collect()
     }
 
-    // S1: conda-covered names are excluded via --no-install-package.
+    // S1: conda-covered transitives become a uv constraints file bounding
+    // them to conda's range (so the closure can't skew, e.g. torchaudio 2.11).
     #[test]
-    fn s1_conda_run_deps_shielded() {
-        let lock = make_lock(
-            vec![
-                CondaDep {
-                    name: "torch".into(),
-                    spec: ">=2.7,<3".into(),
-                },
-                CondaDep {
-                    name: "torchaudio".into(),
-                    spec: ">=2.7,<3".into(),
-                },
-            ],
-            vec!["https://pypi.nvidia.com".into(), PUBLIC_PYPI.into()],
-            BTreeMap::new(),
+    fn s1_conda_run_deps_constraints() {
+        let deps = vec![
+            CondaDep {
+                name: "torch".into(),
+                spec: ">=2.7,<3".into(),
+            },
+            CondaDep {
+                name: "torchaudio".into(),
+                spec: ">=2.7,<3".into(),
+            },
+            // conda-only specs must be dropped (not valid uv constraints).
+            CondaDep {
+                name: "python_abi".into(),
+                spec: "3.11.* *_cp311".into(),
+            },
+            CondaDep {
+                name: "python".into(),
+                spec: "3.11.*".into(),
+            },
+        ];
+        let body = conda_deps_to_constraints(&deps);
+        assert!(
+            body.contains("torch>=2.7,<3"),
+            "torch bounded; got {body:?}"
         );
+        assert!(
+            body.contains("torchaudio>=2.7,<3"),
+            "torchaudio bounded; got {body:?}"
+        );
+        assert!(!body.contains("python_abi"), "build-string spec dropped");
+        assert!(
+            !body
+                .lines()
+                .any(|l| l.starts_with("python3") || l == "python3.11.*"),
+            "conda-only python dropped; got {body:?}"
+        );
+
+        // and the flag is threaded into argv when a constraints file is given.
+        let lock = make_lock(deps, vec![PUBLIC_PYPI.into()], BTreeMap::new());
         let prefix = PathBuf::from("/fake/prefix");
-        let args = build_uv_args(&lock, &prefix, None, None);
+        let con = PathBuf::from("/fake/prefix/share/retread/test-bundle.constraints.txt");
+        let args = build_uv_args(&lock, &prefix, None, None, Some(con.as_path()));
         let strs = argv_strings(&args);
-
-        let shielded = flag_values(&strs, "--no-install-package");
-        assert!(
-            shielded.contains(&"torch".to_string()),
-            "torch must be shielded; got {shielded:?}"
+        assert_eq!(
+            flag_values(&strs, "--constraints"),
+            vec![con.to_string_lossy().into_owned()]
         );
-        assert!(
-            shielded.contains(&"torchaudio".to_string()),
-            "torchaudio must be shielded; got {shielded:?}"
-        );
-
-        // Verify no --constraint flag (we use --no-install-package instead).
-        assert!(
-            !strs.contains(&"--constraint".to_string()),
-            "should not emit --constraint; S1 uses --no-install-package"
-        );
+        // never the invalid flag.
+        assert!(!strs.iter().any(|s| s == "--no-install-package"));
     }
 
-    // S1: when conda_run_deps is empty, no --no-install-package appears.
+    // S1: no constraints file -> no --constraints flag.
     #[test]
-    fn s1_no_conda_deps_no_shield_flags() {
+    fn s1_no_constraints_no_flag() {
         let lock = make_lock(vec![], vec![PUBLIC_PYPI.into()], BTreeMap::new());
         let prefix = PathBuf::from("/fake/prefix");
-        let args = build_uv_args(&lock, &prefix, None, None);
+        let args = build_uv_args(&lock, &prefix, None, None, None);
         let strs = argv_strings(&args);
-        assert!(
-            !strs.contains(&"--no-install-package".to_string()),
-            "no --no-install-package when conda_run_deps is empty"
-        );
+        assert!(!strs.contains(&"--constraints".to_string()));
     }
 
     // S3: index chain order matches lock.index_urls exactly, primary = index_urls[0].
@@ -298,7 +343,7 @@ mod tests {
             BTreeMap::new(),
         );
         let prefix = PathBuf::from("/fake/prefix");
-        let args = build_uv_args(&lock, &prefix, None, None);
+        let args = build_uv_args(&lock, &prefix, None, None, None);
         let strs = argv_strings(&args);
 
         let primary = flag_values(&strs, "--index-url");
@@ -320,7 +365,7 @@ mod tests {
             BTreeMap::new(),
         );
         let prefix = PathBuf::from("/fake/prefix");
-        let args = build_uv_args(&lock, &prefix, None, None);
+        let args = build_uv_args(&lock, &prefix, None, None, None);
         let strs = argv_strings(&args);
 
         let primary = flag_values(&strs, "--index-url");
@@ -337,7 +382,7 @@ mod tests {
     fn s3_empty_index_urls_fallback_to_public_pypi() {
         let lock = make_lock(vec![], vec![], BTreeMap::new());
         let prefix = PathBuf::from("/fake/prefix");
-        let args = build_uv_args(&lock, &prefix, None, None);
+        let args = build_uv_args(&lock, &prefix, None, None, None);
         let strs = argv_strings(&args);
 
         let primary = flag_values(&strs, "--index-url");
@@ -360,7 +405,7 @@ mod tests {
         let lock = make_lock(vec![], vec![PUBLIC_PYPI.into()], BTreeMap::new());
         let prefix = PathBuf::from("/fake/prefix");
         let ovr = PathBuf::from("/fake/prefix/share/retread/test-bundle.overrides.txt");
-        let args = build_uv_args(&lock, &prefix, None, Some(ovr.as_path()));
+        let args = build_uv_args(&lock, &prefix, None, Some(ovr.as_path()), None);
         let strs = argv_strings(&args);
         let ovr_vals = flag_values(&strs, "--overrides");
         assert_eq!(ovr_vals, vec![ovr.to_string_lossy().into_owned()]);
@@ -371,7 +416,7 @@ mod tests {
     fn root_requirements_in_argv() {
         let lock = make_lock(vec![], vec![PUBLIC_PYPI.into()], BTreeMap::new());
         let prefix = PathBuf::from("/fake/prefix");
-        let args = build_uv_args(&lock, &prefix, None, None);
+        let args = build_uv_args(&lock, &prefix, None, None, None);
         let strs = argv_strings(&args);
         assert!(
             strs.contains(&"mypackage==1.0.0".to_string()),
