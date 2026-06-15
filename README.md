@@ -78,9 +78,20 @@ run-post-link-scripts = "insecure"
 
 `git clone && pixi install` now resolves + links the courier package and its post-link runs `retread install` — hardlinking shipped wheels and fetching index wheels in seconds. No backend process or rebuild happens on the consumer. (Why the toggle, and the safe alternative: see **Courier** below.)
 
-## Courier
+## Courier — the fast path, and the safe alternative
 
-A retread pack is distributed as one standard conda package that bakes in the `retread` installer, the built/shadow wheels, and a committed `retread-<bundle>.lock.json`. At install time pixi links it and the post-link runs `$PREFIX/bin/retread install`, which uses `uv` to place the wheels into `$PREFIX`. The consumer's `pixi.toml` keeps exactly one conda declaration — **zero machine-written bytes** in it, **no wheels** in git. Courier is the default; set `retread-courier = false` to opt out to the legacy conda-artifact path.
+retread can deliver a pack two ways. **Courier is the default and the fast path; `retread-courier = false` is the safe path.** Pick based on whether you can enable post-link scripts in the consuming workspace.
+
+**Courier (default) — fast.** The pack is *one metadata-light conda package* that bakes in the `retread` installer, the built/shadow wheels, and a committed `retread-<bundle>.lock.json`. pixi links it like any conda package, then a post-link script runs `retread install`, which uses `uv` to hardlink the wheels into the env in **seconds**. Why prefer it:
+- the consumer `pixi.toml` keeps **one clean line** (zero machine-written bytes),
+- **no wheels in git** — the committed lock is kilobytes and the wheels ride inside the conda package,
+- **nothing rebuilds on the consumer** — no backend process, no source build, no solve (a matching lock just replays).
+
+The catch: pixi does not run post-link scripts by default, so the consumer must opt in with `run-post-link-scripts = "insecure"` — a real supply-chain tradeoff (it runs *every* package's post-link, not just retread's; see the toggle below). That's the price of the fast path.
+
+**Safe mode (`retread-courier = false`) — no unsafe toggle.** The legacy conda-artifact path builds an ordinary conda package with the wheels pip-installed *into it at build time*; conda then places them at link time like any package — so **no post-link script and no `insecure` toggle are needed**. The cost is a heavier conda artifact and a slower build, and the wheels live inside that (larger) package rather than being fetched/hardlinked on demand.
+
+Rule of thumb: use **courier** when you control the workspace and want fast, clean installs; use **safe mode** when enabling post-link scripts isn't acceptable in your environment.
 
 <details>
 <summary><b>The post-link toggle (fast path vs safe mode)</b></summary>
