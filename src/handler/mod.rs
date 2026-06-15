@@ -45,7 +45,7 @@ use uv_pep508::uv_pep440::VersionSpecifiers;
 
 use crate::config::{RelaxPolicy, RetreadConfig, WheelEntry};
 use crate::pypi::{self, WheelTarget};
-use crate::recipe::{BundleSource, build_bundle_recipe, to_yaml};
+use crate::recipe::{BundleSource, build_bundle_recipe, build_courier_recipe, to_yaml};
 use crate::relax::{canonical_conda_name, emit_python_version, marker_env_for};
 use crate::rpc::{RpcError, ok, parse_params};
 use crate::wheel::{WheelMetadata, fetch_wheel};
@@ -3797,14 +3797,109 @@ async fn build_one(
             "blueprint=only: payload-skip conda artifact (real metadata + run-deps, no wheels)",
         );
     }
-    let recipe = build_bundle_recipe(
-        &bundle.conda_name,
-        &sources,
-        config,
-        workspace_python_version,
-        run_override,
-        payload,
-    )?;
+    // WS-C: courier mode produces a metadata-only conda package. It must
+    // stage the bundle's wheels + write the committed lock BEFORE the recipe
+    // (the recipe's source list references the staged artifacts), so the
+    // courier path builds emit_wheels/conda_capable here rather than in the
+    // emit-pypi block below (which is skipped for courier). The non-courier
+    // path is byte-identical to before.
+    let recipe = if config.courier {
+        let python_version =
+            emit_python_version(&bundle.primary.metadata.filename, workspace_python_version);
+        let version = bundle.primary.metadata.version.clone();
+        let emit_wheels: Vec<crate::emit_pypi::EmitWheel> = bundle
+            .all_wheels()
+            .zip(localized_urls.iter())
+            .map(|(w, url)| crate::emit_pypi::EmitWheel {
+                pypi_name: w.pypi_name.clone(),
+                version: w.metadata.version.clone(),
+                requires_dist: w.metadata.requires_dist.clone(),
+                local_path: (url.scheme() == "file")
+                    .then(|| url.to_file_path().ok())
+                    .flatten(),
+                wheel_filename: url
+                    .path_segments()
+                    .and_then(|mut s| s.next_back())
+                    .unwrap_or_default()
+                    .to_string(),
+                remote_url: (url.scheme() != "file").then(|| (*url).clone()),
+            })
+            .collect();
+        let mut conda_capable: std::collections::HashSet<String> = bundle
+            .probe_decisions
+            .iter()
+            .filter(|d| d.matching_candidates > 0)
+            .map(|d| canonical_conda_name(&d.pypi_name))
+            .collect();
+        conda_capable.extend(config.name_map.keys().map(|k| canonical_conda_name(k)));
+        conda_capable.extend(load_pypi_to_conda_map().await.into_keys());
+        let workspace_indexes: Vec<String> = workspace_dir
+            .and_then(crate::workspace::WorkspaceManifest::load)
+            .map(|m| m.all_pypi_index_urls())
+            .unwrap_or_default();
+        let entry_indexes: Vec<String> = config
+            .retread_wheels
+            .values()
+            .map(|e| e.index_url())
+            .collect();
+        let index_urls = merge_index_chain(entry_indexes, &workspace_indexes);
+        let run_deps: Vec<String> = match run_override {
+            Some(o) => o.to_vec(),
+            None => {
+                build_bundle_recipe(
+                    &bundle.conda_name,
+                    &sources,
+                    config,
+                    workspace_python_version,
+                    None,
+                    true,
+                )?
+                .requirements
+                .run
+            }
+        };
+        let staging = work_dir.join(format!("courier-{}", bundle.conda_name));
+        let staged = crate::courier::stage(
+            config,
+            &bundle.conda_name,
+            &version,
+            &python_version,
+            &emit_wheels,
+            &conda_capable,
+            &run_deps,
+            &index_urls,
+            source_dir,
+            &staging,
+        )
+        .await
+        .context("courier staging")?;
+        // Write the committed install lock next to the pack manifest.
+        let lock_path = source_dir.join(crate::lock::RetreadLock::file_name(&bundle.conda_name));
+        tokio::fs::write(&lock_path, staged.lock.to_pretty_json()?)
+            .await
+            .with_context(|| format!("writing {}", lock_path.display()))?;
+        tracing::info!(
+            path = %lock_path.display(),
+            wheels = staged.lock.wheels.len(),
+            "courier: wrote install lock",
+        );
+        build_courier_recipe(
+            &bundle.conda_name,
+            &version,
+            &python_version,
+            &staged.run_deps,
+            &staged.source_urls,
+        )
+    } else {
+        build_bundle_recipe(
+            &bundle.conda_name,
+            &sources,
+            config,
+            workspace_python_version,
+            run_override,
+            payload,
+        )?
+    };
     let yaml = to_yaml(&recipe)?;
 
     let recipe_dir = work_dir.join(format!("recipe-{}", recipe.package.name));
@@ -3832,7 +3927,9 @@ async fn build_one(
     // v1.6.0 (experimental): emit-pypi side-channel. Derived from the
     // exact same wheel set the recipe is built from; advisory output
     // like the audit, so failures are non-fatal.
-    if config.emit_pypi || config.blueprint.is_on() {
+    // Courier mode handled its own staging + lock above; the fence/emit-pypi
+    // side-channel is the OTHER (mutually exclusive) delivery path.
+    if !config.courier && (config.emit_pypi || config.blueprint.is_on()) {
         let emit_wheels: Vec<crate::emit_pypi::EmitWheel> = bundle
             .all_wheels()
             .zip(localized_urls.iter())
