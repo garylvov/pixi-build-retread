@@ -153,20 +153,10 @@ pub struct RetreadConfig {
     )]
     pub compression_level: Option<u32>,
 
-    /// v1.6.0 (experimental): additionally write the emit-pypi
-    /// side-channel on every build -- `retread-pypi/<bundle>/` next to
-    /// the pack manifest, holding retread-built wheels under standard
-    /// filenames (a `find-links` source) plus a paste-ready
-    /// `pixi-snippet.toml` (`[pypi-dependencies]` + generated
-    /// `[pypi-options.dependency-overrides]`) so the same stack can be
-    /// consumed through pixi's native uv path with no conda
-    /// re-packaging. Purely additive: the conda output is built either
-    /// way.
-    ///
-    /// ```toml
-    /// [package.build.config]
-    /// retread-emit-pypi = true
-    /// ```
+    /// DEPRECATED (v2.0.0), parsed and ignored. Use `retread-courier`
+    /// instead. This field is retained so `deny_unknown_fields` does not
+    /// reject old manifests that still carry it -- it parses but has no
+    /// effect. Remove it from your `[package.build.config]`.
     #[serde(default, rename = "retread-emit-pypi", alias = "emit-pypi")]
     pub emit_pypi: bool,
 
@@ -186,36 +176,19 @@ pub struct RetreadConfig {
     #[serde(default, rename = "retread-courier", alias = "courier")]
     pub courier: bool,
 
-    /// v1.7.0 (experimental): blueprint sub-mode of emit-pypi. Instead
-    /// of a generated `[pypi-options.dependency-overrides]` table, the
-    /// override semantics are baked into REWRITTEN WHEELS shipped to
-    /// find-links under build-tagged filenames (uv prefers a
-    /// build-tagged wheel over the registry original at the same
-    /// version), and the pack's entry pins live in a generated
-    /// `<bundle>-pypi` meta-wheel. The synced workspace block shrinks
-    /// to a static handful of lines that never change across builds.
-    /// Implies `retread-emit-pypi`.
-    ///
-    /// ```toml
-    /// [package.build.config]
-    /// retread-blueprint = true
-    /// ```
-    /// `true` builds both the blueprint and the full conda artifact;
-    /// `"only"` additionally STUBS the conda artifact (no wheel
-    /// payload, no run-deps -- packaging drops from minutes to
-    /// seconds). Use "only" when every consuming environment uses the
-    /// `<bundle>-pypi` feature; environments that install the conda
-    /// package itself get an empty no-op package in that mode.
+    /// DEPRECATED (v2.0.0), parsed and ignored. Use `retread-courier`
+    /// instead. This field is retained so `deny_unknown_fields` does not
+    /// reject old manifests that still carry it -- it parses but has no
+    /// effect. Remove it from your `[package.build.config]`.
     #[serde(default, rename = "retread-blueprint", alias = "blueprint")]
     pub blueprint: BlueprintMode,
 
-    /// DEPRECATED (v1.8.0), ignored. Was `retread-blueprint-sync`
-    /// (`"script"` | `"fence"`). The install-script path was removed;
-    /// fence sync is now the only way the blueprint reaches the consumer.
-    /// The field is retained ONLY so `deny_unknown_fields` does not reject
-    /// manifests that still carry the key -- it is parsed, warned about
-    /// (see `emit`), and otherwise unused. Remove the key (and any
-    /// `install.sh` task/activation line) from your manifest.
+    /// DEPRECATED (v2.0.0), parsed and ignored. Was `retread-blueprint-sync`
+    /// (`"script"` | `"fence"`). Both the blueprint fence path and the
+    /// install-script path have been superseded by `retread-courier`. The
+    /// field is retained so `deny_unknown_fields` does not reject old
+    /// manifests -- it parses but has no effect. Remove it from your
+    /// `[package.build.config]`.
     #[serde(default, rename = "retread-blueprint-sync", alias = "blueprint-sync")]
     pub blueprint_sync: Option<String>,
 
@@ -634,9 +607,10 @@ mod tests {
 
     #[test]
     fn parses_retread_emit_pypi_key() {
-        // v1.6.0. Invariant #6: every new config field needs a serde
-        // test or stale binaries reject user pixi.toml with "unknown
-        // field" during upgrades.
+        // DEPRECATED (v2.0.0): the field is parsed-and-ignored so old
+        // manifests survive an upgrade without a "unknown field" rejection.
+        // Invariant #6: the field must still parse correctly.
+        // The value is now ignored; use `retread-courier` instead.
         let json = serde_json::json!({
             "retread-wheels": { "foo": { "version": "==1.0" } },
             "retread-emit-pypi": true,
@@ -671,11 +645,10 @@ mod tests {
 
     #[test]
     fn deprecated_blueprint_sync_key_still_parses() {
-        // v1.8.0: the install-script path was removed and fence is the
-        // only sync path. The key is DEPRECATED + ignored, but must still
-        // parse -- `deny_unknown_fields` would otherwise reject existing
-        // manifests that carry it during an upgrade (Invariant #6). It is
-        // captured (and warned about in `emit`) rather than acted on.
+        // DEPRECATED (v2.0.0): the field is parsed-and-ignored; the
+        // deprecation contract (Invariant #6) requires that old manifests
+        // carrying this key still parse rather than failing with "unknown
+        // field". The value is now ignored; use `retread-courier` instead.
         let json = serde_json::json!({
             "retread-wheels": { "foo": { "version": "==1.0" } },
             "retread-blueprint-sync": "script",
@@ -692,9 +665,11 @@ mod tests {
 
     #[test]
     fn parses_retread_blueprint_key() {
-        // v1.7.0. Invariant #6: every new config field needs a serde
-        // test or stale binaries reject user pixi.toml with "unknown
-        // field" during upgrades.
+        // DEPRECATED (v2.0.0): the field is parsed-and-ignored so old
+        // manifests survive an upgrade without a "unknown field" rejection
+        // (Invariant #6). The value is now ignored; use `retread-courier`
+        // instead. is_on() / is_only() are called here to keep the methods
+        // reachable (they are referenced from handler/mod.rs deprecation warn).
         let json = serde_json::json!({
             "retread-wheels": { "foo": { "version": "==1.0" } },
             "retread-blueprint": true,
