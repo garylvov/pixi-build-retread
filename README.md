@@ -128,14 +128,14 @@ file that lives next to the source pack manifest.
 
 ### Turning it on
 
-In the source pack `[package.build.config]`, set:
+Courier is the default as of v2.1.0. No config key is required. To opt out to
+the legacy conda-artifact path, set:
 
 ```toml
-retread-courier = true
+retread-courier = false
 ```
 
-That is the only required change. The backend builds the courier conda package
-instead of the default artifact.
+`retread-courier = true` is accepted for compatibility but is now a no-op.
 
 ### The committable `.pixi/config.toml`
 
@@ -163,6 +163,28 @@ suite and is safe to commit (the repo `.gitignore` does not exclude it).
 > channel could execute arbitrary code at install time. Enable this toggle only
 > for packs and workspaces you fully trust, in environments where that risk is
 > acceptable. The setting is opt-in and scoped per workspace.
+
+#### Loud failure when the toggle is missing
+
+If the `.pixi/config.toml` toggle is absent, pixi silently skips post-link
+scripts — the courier conda package links successfully but `retread install`
+never runs, leaving the PyPI closure uninstalled and imports broken. To make
+this failure loud rather than silent, the courier conda package ships an
+`activate.d` guard script. On every `pixi run` or `pixi shell` invocation the
+guard checks whether the retread installer has run for the active prefix; if not,
+it prints a banner to stderr:
+
+```
+[retread] WARNING: wheels not installed — post-link script did not run.
+Add the following file to your workspace root and re-run `pixi install`:
+
+  .pixi/config.toml
+  ──────────────────
+  run-post-link-scripts = "insecure"
+```
+
+A forgotten toggle is therefore loud on first activation, not a silently broken
+environment that only fails at import time.
 
 ### What's committed vs fetched
 
@@ -232,8 +254,8 @@ your source pack config.
 
 To migrate:
 
-1. Add `retread-courier = true` to `[package.build.config]` in the source pack
-   manifest.
+1. `retread-courier = true` is no longer required — courier is the default
+   (v2.1.0+). You may remove the line or leave it; it is a no-op either way.
 2. Remove any auto-synced `[feature.<bundle>-pypi]` fence block from the
    workspace `pixi.toml` — retread no longer writes or manages that block.
 3. Remove any `install.sh` task or activation line from the workspace `pixi.toml`

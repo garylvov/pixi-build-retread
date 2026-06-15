@@ -287,11 +287,19 @@ pub fn build_courier_recipe(
     // a failure is logged loudly but does not abort linking (the conda
     // metadata is still valid; the user can re-run `retread install`).
     let post_link = format!("$PREFIX/bin/.{conda_name}-post-link.sh");
+    // A4 loud-failure guard: courier is the default mode, so a consumer who
+    // forgets `run-post-link-scripts = "insecure"` would otherwise get a
+    // SILENTLY broken env (post-link never runs, wheels never installed). We
+    // also ship a conda activate.d script -- which runs on EVERY activation
+    // regardless of the post-link toggle -- that checks the installer's success
+    // marker and, if absent, prints a loud actionable banner. Turns an
+    // invisible failure into one the user sees on the next `pixi run`/`shell`.
+    let activate_guard = format!("$PREFIX/etc/conda/activate.d/zzz-retread-{conda_name}.sh");
     let script = format!(
         "set -euo pipefail\n\
          SHARE=\"$PREFIX/share/retread\"\n\
          WHEELS=\"$SHARE/{conda_name}/wheels\"\n\
-         mkdir -p \"$WHEELS\" \"$PREFIX/bin\"\n\
+         mkdir -p \"$WHEELS\" \"$PREFIX/bin\" \"$PREFIX/etc/conda/activate.d\"\n\
          cp \"$SRC_DIR\"/*.whl \"$WHEELS\"/ 2>/dev/null || true\n\
          cp \"$SRC_DIR\"/{lock_filename} \"$SHARE\"/\n\
          cp \"$SRC_DIR\"/retread-installer \"$PREFIX/bin/retread\"\n\
@@ -300,7 +308,25 @@ pub fn build_courier_recipe(
          #!/bin/bash\n\
          \"$PREFIX/bin/retread\" install --lock \"$PREFIX/share/retread/{lock_filename}\" --prefix \"$PREFIX\" || echo 'retread: post-link install failed; run `retread install` manually' >&2\n\
          POSTLINK\n\
-         chmod +x \"{post_link}\"\n"
+         chmod +x \"{post_link}\"\n\
+         cat > \"{activate_guard}\" <<'ACTIVATE'\n\
+         #!/bin/bash\n\
+         # retread courier guard ({conda_name}): warn loudly if the bundle's\n\
+         # PyPI wheels were never installed (post-link did not run -- almost\n\
+         # always run-post-link-scripts is not enabled in .pixi/config.toml).\n\
+         if [ ! -f \"$CONDA_PREFIX/share/retread/{conda_name}.installed\" ]; then\n\
+         echo \"######################################################################\" >&2\n\
+         echo \"# retread: bundle '{conda_name}' PyPI wheels are NOT installed.\" >&2\n\
+         echo \"# The post-link installer did not run. Almost always this means\" >&2\n\
+         echo \"# post-link scripts are disabled. Add to <workspace>/.pixi/config.toml:\" >&2\n\
+         echo '#     run-post-link-scripts = \"insecure\"' >&2\n\
+         echo \"# then re-run: pixi install   (see the pack README security note).\" >&2\n\
+         echo \"# Or install now:\" >&2\n\
+         echo \"#   retread install --lock \\\"$CONDA_PREFIX/share/retread/{lock_filename}\\\" --prefix \\\"$CONDA_PREFIX\\\"\" >&2\n\
+         echo \"######################################################################\" >&2\n\
+         fi\n\
+         ACTIVATE\n\
+         chmod +x \"{activate_guard}\"\n"
     );
 
     let source = source_urls
@@ -409,6 +435,30 @@ mod courier_tests {
         assert!(
             r.build.script.contains("\nPOSTLINK\n"),
             "heredoc terminator must be at column 0 to close the heredoc"
+        );
+        // A4 loud-failure guard: a conda activate.d script that warns on every
+        // activation when the wheels are not installed (missing toggle).
+        assert!(
+            r.build
+                .script
+                .contains("etc/conda/activate.d/zzz-retread-isaac-pack.sh"),
+            "must ship an activate.d guard"
+        );
+        assert!(
+            r.build
+                .script
+                .contains("$CONDA_PREFIX/share/retread/isaac-pack.installed"),
+            "guard must check the installer success marker"
+        );
+        assert!(
+            r.build
+                .script
+                .contains("run-post-link-scripts = \"insecure\""),
+            "guard banner must name the toggle the user must enable"
+        );
+        assert!(
+            r.build.script.contains("\nACTIVATE\n"),
+            "activate.d heredoc terminator must be at column 0"
         );
     }
 }

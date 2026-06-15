@@ -757,6 +757,7 @@ impl Handler {
                             &format!("{:?}", config.relax),
                             python_version,
                             env!("CARGO_PKG_VERSION"),
+                            &crate::courier::config_fingerprint(&config),
                         );
                         let lock_path = source_dir
                             .join(crate::lock::RetreadLock::file_name(&bundle.conda_name));
@@ -3671,6 +3672,13 @@ async fn build_one(
     // courier path builds emit_wheels/conda_capable here rather than in the
     // emit-pypi block below (which is skipped for courier). The non-courier
     // path is byte-identical to before.
+    // B-2 (lock-poisoning): the COMMITTED pack lock must only be written after
+    // rattler-build produces the package successfully. Writing it before the
+    // build (as before) left a committed lock on disk for an output that may
+    // never have built -- a later cold replay would reproduce a phantom. The
+    // courier branch records the pending write here; it is flushed (atomically)
+    // only past the rattler-build success gate below.
+    let mut courier_lock_to_commit: Option<(std::path::PathBuf, String)> = None;
     let recipe = if config.courier {
         let python_version =
             emit_python_version(&bundle.primary.metadata.filename, workspace_python_version);
@@ -3711,21 +3719,22 @@ async fn build_one(
             .map(|e| e.index_url())
             .collect();
         let index_urls = merge_index_chain(entry_indexes, &workspace_indexes);
-        let run_deps: Vec<String> = match run_override {
-            Some(o) => o.to_vec(),
-            None => {
-                build_bundle_recipe(
-                    &bundle.conda_name,
-                    &sources,
-                    config,
-                    workspace_python_version,
-                    None,
-                    true,
-                )?
-                .requirements
-                .run
-            }
-        };
+        // B-1 (lock-poisoning): in courier mode the committed lock's
+        // `conda_run_deps` MUST be the run-deps pixi actually solved and
+        // locked (forwarded as `run_override`). The legacy fallback re-derived
+        // them from the wheels' `requires_dist` via `build_bundle_recipe`,
+        // which can diverge from pixi's real solve -- a cold replay would then
+        // faithfully reproduce a POISONED lock. Refuse rather than guess.
+        let run_deps: Vec<String> = run_override.map(|o| o.to_vec()).ok_or_else(|| {
+            anyhow::anyhow!(
+                "courier: refusing to write a lock from a non-authoritative source. pixi did \
+                 not forward run_dependencies (run_override = None), so the only run-deps \
+                 available are re-derived from the wheels' Requires-Dist, which can diverge \
+                 from what pixi actually locked and poison the committed lock. Aborting the \
+                 courier build. (A normal `pixi install` forwards run_dependencies during \
+                 conda/build_v1; if you hit this, file a bug.)"
+            )
+        })?;
         let staging = work_dir.join(format!("courier-{}", bundle.conda_name));
         let staged = crate::courier::stage(
             config,
@@ -3741,16 +3750,11 @@ async fn build_one(
         )
         .await
         .context("courier staging")?;
-        // Write the committed install lock next to the pack manifest.
+        // Defer the committed install lock write until after a successful
+        // rattler-build (B-2). The staged copy inside `staging` is already in
+        // the recipe's source list; this is the authoritative pack-dir copy.
         let lock_path = source_dir.join(crate::lock::RetreadLock::file_name(&bundle.conda_name));
-        tokio::fs::write(&lock_path, staged.lock.to_pretty_json()?)
-            .await
-            .with_context(|| format!("writing {}", lock_path.display()))?;
-        tracing::info!(
-            path = %lock_path.display(),
-            wheels = staged.lock.wheels.len(),
-            "courier: wrote install lock",
-        );
+        courier_lock_to_commit = Some((lock_path, staged.lock.to_pretty_json()?));
         build_courier_recipe(
             &bundle.conda_name,
             &version,
@@ -3850,6 +3854,23 @@ async fn build_one(
         let stderr = String::from_utf8_lossy(&output.stderr);
         tracing::error!(stdout = %stdout, stderr = %stderr, "rattler-build failed");
         bail!("rattler-build exited with status {}", output.status);
+    }
+
+    // B-2/B-3: rattler-build succeeded -- NOW commit the courier lock, write-
+    // then-rename so a crash can't leave a torn file. Only ever reached past
+    // the success gate, so the committed lock always corresponds to a package
+    // that actually built.
+    if let Some((lock_path, lock_json)) = courier_lock_to_commit {
+        let lock_tmp = lock_path.with_extension("json.tmp");
+        tokio::fs::write(&lock_tmp, &lock_json)
+            .await
+            .with_context(|| format!("writing lock tmp {}", lock_tmp.display()))?;
+        tokio::fs::rename(&lock_tmp, &lock_path)
+            .await
+            .with_context(|| {
+                format!("atomically placing committed lock {}", lock_path.display())
+            })?;
+        tracing::info!(path = %lock_path.display(), "courier: wrote install lock (post-build)");
     }
 
     let subdir_dir = output_dir.join(&target_platform);
@@ -3960,6 +3981,15 @@ fn replay_from_lock(
         return Ok(None);
     }
     let lock = crate::lock::RetreadLock::load(lock_path)?;
+    // B-7: schema mismatch → a lock written by a different backend version
+    // whose fields/semantics may differ. Treat as a miss (cascade re-derives
+    // and rewrites at the next build) rather than risk mis-replaying a lock we
+    // don't fully understand. `inputs_hash` already folds in the retread
+    // version, so a binary upgrade invalidates replay too; this is the
+    // explicit, cheap backstop.
+    if lock.schema != crate::lock::SCHEMA {
+        return Ok(None);
+    }
     // Hash mismatch → inputs changed; must re-resolve.
     if lock.inputs_hash != current_inputs_hash {
         return Ok(None);

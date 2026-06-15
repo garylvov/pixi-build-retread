@@ -81,6 +81,45 @@ pub fn courier_input_specs(config: &RetreadConfig, bundle_name: &str) -> Vec<Str
     specs
 }
 
+/// Canonical fingerprint of the resolution-affecting config inputs that are
+/// NOT already folded into `compute_inputs_hash` via `courier_input_specs`
+/// (entry key/extras/version/git-rev/url), the index chain, relax, or python.
+/// Producer (`stage`) and replayer (`conda_outputs`) MUST build this
+/// identically or the inputs hash diverges and replay never fires / fires
+/// stale.
+///
+/// Folds in: per-dep overrides, the PyPI->conda name-map, drop-deps,
+/// conda-deps, the auto-bundle toggle, and the build-number. Each of these
+/// changes the emitted conda specs or the conda/PyPI routing, so omitting any
+/// would let a manifest edit leave the hash unchanged and replay a stale,
+/// POISONED lock. (genesis's `retread-name-map` is the canonical regression
+/// case here.) Conda CHANNELS are a workspace input, not config; a channel
+/// change is a known smaller residual not covered here.
+pub fn config_fingerprint(config: &RetreadConfig) -> String {
+    // BTreeMaps iterate in sorted key order already; sort the Vecs explicitly
+    // so ordering in the manifest never perturbs the digest.
+    let mut parts: Vec<String> = Vec::new();
+    for (k, v) in &config.overrides {
+        parts.push(format!("override:{k}={v}"));
+    }
+    for (k, v) in &config.name_map {
+        parts.push(format!("name-map:{k}={v}"));
+    }
+    let mut drop = config.drop_deps.clone();
+    drop.sort();
+    for d in &drop {
+        parts.push(format!("drop:{d}"));
+    }
+    let mut conda = config.conda_deps.clone();
+    conda.sort();
+    for c in &conda {
+        parts.push(format!("conda-dep:{c}"));
+    }
+    parts.push(format!("auto-bundle:{}", config.auto_bundle));
+    parts.push(format!("build-number:{}", config.build_number));
+    parts.join("\n")
+}
+
 /// Parse `"name spec"` lines (space-separated) into [`CondaDep`] values.
 /// Lines with no space (name only) get an empty spec. Blank lines are skipped.
 fn parse_conda_deps(run_deps: &[String]) -> Vec<CondaDep> {
@@ -221,18 +260,25 @@ pub async fn stage(
             } else {
                 // Remote-only wheel (sidecar metadata, bytes never downloaded).
                 // We cannot rewrite it here. If any of its Requires-Dist lines
-                // would change, log a B2 warning and treat as unchanged (the
-                // installer will fetch the original index bytes).
+                // WOULD change under relax, recording it as Origin::Index ships
+                // the wheel's ORIGINAL strict pins -- the exact breakage retread
+                // exists to prevent (AUDIT B2). That would silently POISON the
+                // lock. Refuse unless the conda side provably satisfies the
+                // changed dep (the wheel name is conda-capable), in which case
+                // the strict PyPI pins are harmless because conda wins.
                 let any_change = w
                     .requires_dist
                     .iter()
                     .any(|l| mapper_for_remote(l).is_some());
-                if any_change {
-                    tracing::warn!(
-                        wheel = %w.pypi_name,
-                        "courier: remote-only wheel has relax-changed Requires-Dist lines \
-                         but no local bytes; recording as Origin::Index (AUDIT B2 risk -- \
-                         ensure this wheel is conda-capable so the conda side satisfies it)",
+                if any_change && !conda_cap_owned.contains(&w.pypi_name) {
+                    anyhow::bail!(
+                        "courier: refusing to write a lock for remote-only wheel `{}` whose \
+                         Requires-Dist relax-changes but has no local bytes to rewrite. \
+                         Shipping it as Origin::Index would re-emit its original strict pins \
+                         and poison the lock. Fix: make this wheel a built/shipped wheel (so \
+                         retread can rewrite it), or add its conda equivalent to \
+                         `retread-conda-deps` so the conda solve satisfies the changed dep.",
+                        w.pypi_name,
                     );
                 }
                 false
@@ -320,7 +366,21 @@ pub async fn stage(
         &format!("{:?}", config.relax),
         python,
         env!("CARGO_PKG_VERSION"),
+        &config_fingerprint(config),
     );
+
+    // B-8 invariant: every emitted wheel must be classified into the lock
+    // (Built or Index). A dropped wheel means the consumer installs an
+    // incomplete set -- a poisoned lock. The only paths that skip a push are
+    // the hard `bail!`s above, so a count mismatch is a logic bug.
+    if lock_wheels.len() != emit_wheels.len() {
+        anyhow::bail!(
+            "courier: internal invariant violated -- staged {} lock wheels for {} emitted \
+             wheels; refusing to write an incomplete (poisoned) lock",
+            lock_wheels.len(),
+            emit_wheels.len(),
+        );
+    }
 
     // Step 6: Assemble the RetreadLock.
     let lock = RetreadLock {
@@ -337,13 +397,20 @@ pub async fn stage(
         prerelease,
     };
 
-    // Step 7: Write the lock JSON into staging_dir.
+    // Step 7: Write the lock JSON into staging_dir. Write-then-rename so a
+    // crash mid-write can never leave a torn lock (B-3): a partial file would
+    // either fail to parse (fail-safe, replay falls through) or, worse, parse
+    // into wrong data. The rename is atomic on the same filesystem.
     let lock_json = lock.to_pretty_json()?;
     let lock_filename = RetreadLock::file_name(bundle_name);
     let lock_dst = staging_dir.join(&lock_filename);
-    tokio::fs::write(&lock_dst, lock_json.as_bytes())
+    let lock_tmp = staging_dir.join(format!(".{lock_filename}.tmp"));
+    tokio::fs::write(&lock_tmp, lock_json.as_bytes())
         .await
-        .with_context(|| format!("writing lock {}", lock_dst.display()))?;
+        .with_context(|| format!("writing lock tmp {}", lock_tmp.display()))?;
+    tokio::fs::rename(&lock_tmp, &lock_dst)
+        .await
+        .with_context(|| format!("atomically placing lock {}", lock_dst.display()))?;
     source_urls.push(file_url(&lock_dst)?);
 
     tracing::info!(

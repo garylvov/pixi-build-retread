@@ -160,20 +160,31 @@ pub struct RetreadConfig {
     #[serde(default, rename = "retread-emit-pypi", alias = "emit-pypi")]
     pub emit_pypi: bool,
 
-    /// v2.0.0 (experimental): courier mode. Emit a metadata-only conda
+    /// v2.1.0: courier mode -- the DEFAULT. Emit a metadata-only conda
     /// package that ships the bundle's built/relax-changed wheels + a
     /// committed `retread-<bundle>.lock.json` as data, declares the solved
-    /// conda run-deps plus `uv` + `pixi-build-retread`, and installs the
-    /// PyPI wheels at env link time via a post-link `retread install` (uv
-    /// hardlink; index wheels fetched on demand). The consumer keeps ONE
-    /// clean conda line and zero machine-written manifest bytes; nothing is
-    /// committed to git. Mutually exclusive with the blueprint fence path.
+    /// conda run-deps plus `uv`, and installs the PyPI wheels at env link
+    /// time via a post-link `retread install` (uv hardlink; index wheels
+    /// fetched on demand). The consumer keeps ONE clean conda line and zero
+    /// machine-written manifest bytes; nothing is committed to git.
+    ///
+    /// Defaults to `true`. Set `retread-courier = false` to opt OUT to the
+    /// legacy conda-artifact path (a full conda package carrying the wheels
+    /// as a payload). Courier REQUIRES the consumer workspace to enable
+    /// post-link scripts (`<workspace>/.pixi/config.toml` with
+    /// `run-post-link-scripts = "insecure"`); without it the wheels are
+    /// never installed -- the shipped conda `activate.d` guard prints a loud
+    /// banner on every activation so this failure is never silent.
     ///
     /// ```toml
     /// [package.build.config]
-    /// retread-courier = true
+    /// retread-courier = false  # opt out (legacy artifact path)
     /// ```
-    #[serde(default, rename = "retread-courier", alias = "courier")]
+    #[serde(
+        default = "default_true",
+        rename = "retread-courier",
+        alias = "courier"
+    )]
     pub courier: bool,
 
     /// DEPRECATED (v2.0.0), parsed and ignored. Use `retread-courier`
@@ -627,8 +638,8 @@ mod tests {
 
     #[test]
     fn parses_retread_courier_key() {
-        // v2.0.0. Invariant #6: deny_unknown_fields rejects unknown keys,
-        // so the new courier flag needs a serde test.
+        // v2.1.0: courier is the DEFAULT. Invariant #6: deny_unknown_fields
+        // rejects unknown keys, so the flag needs a serde test.
         let json = serde_json::json!({
             "retread-wheels": { "foo": { "version": "==1.0" } },
             "retread-courier": true,
@@ -636,11 +647,20 @@ mod tests {
         let cfg: RetreadConfig = serde_json::from_value(json).unwrap();
         assert!(cfg.courier);
 
+        // unset -> defaults to ON (courier is the default mode, v2.1.0+).
         let json = serde_json::json!({
             "retread-wheels": { "foo": { "version": "==1.0" } },
         });
         let cfg: RetreadConfig = serde_json::from_value(json).unwrap();
-        assert!(!cfg.courier, "unset defaults to off");
+        assert!(cfg.courier, "unset defaults to courier");
+
+        // explicit opt-out to the legacy artifact path.
+        let json = serde_json::json!({
+            "retread-wheels": { "foo": { "version": "==1.0" } },
+            "retread-courier": false,
+        });
+        let cfg: RetreadConfig = serde_json::from_value(json).unwrap();
+        assert!(!cfg.courier, "explicit false opts out to legacy");
     }
 
     #[test]

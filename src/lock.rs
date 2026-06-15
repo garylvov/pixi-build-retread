@@ -95,7 +95,7 @@ pub struct RetreadLock {
     pub prerelease: BTreeMap<String, String>,
 }
 
-pub const SCHEMA: u32 = 3;
+pub const SCHEMA: u32 = 4;
 
 impl RetreadLock {
     /// File name for a bundle's lock next to the pack manifest.
@@ -109,18 +109,27 @@ impl RetreadLock {
     /// the two sides disagree and replay silently never fires (or fires
     /// stale). Entry specs are sorted so ordering is not significant; the
     /// index chain order IS significant (it is resolution priority).
+    ///
+    /// `config_fingerprint` folds in EVERY remaining resolution-affecting
+    /// manifest input that is not already covered above -- overrides,
+    /// name-map, drop-deps, conda-deps, auto-bundle, build-number, and the
+    /// conda channel list. Without it, editing any of those (e.g. genesis's
+    /// `retread-name-map`) would leave the hash unchanged and a stale,
+    /// POISONED lock would replay. It is produced by the shared
+    /// `courier::config_fingerprint` so producer and replayer always agree.
     pub fn compute_inputs_hash(
         entry_specs: &[String],
         index_urls: &[String],
         relax: &str,
         python: &str,
         retread_version: &str,
+        config_fingerprint: &str,
     ) -> String {
         use sha2::{Digest, Sha256};
         let mut sorted = entry_specs.to_vec();
         sorted.sort();
         let mut h = Sha256::new();
-        h.update(b"retread-inputs-v3\n");
+        h.update(b"retread-inputs-v4\n");
         for s in &sorted {
             h.update(s.as_bytes());
             h.update(b"\n");
@@ -136,6 +145,8 @@ impl RetreadLock {
         h.update(python.as_bytes());
         h.update(b"\n");
         h.update(retread_version.as_bytes());
+        h.update(b"\n--config--\n");
+        h.update(config_fingerprint.as_bytes());
         format!("{:x}", h.finalize())
     }
 
@@ -230,6 +241,7 @@ mod tests {
             "patch-then-minor",
             "3.11",
             "2.0.0",
+            "cfg",
         );
         // entry order does NOT matter (sorted)
         let h2 = RetreadLock::compute_inputs_hash(
@@ -241,6 +253,7 @@ mod tests {
             "patch-then-minor",
             "3.11",
             "2.0.0",
+            "cfg",
         );
         assert_eq!(h1, h2, "entry-spec order must not change the hash");
         // index order DOES matter (resolution priority)
@@ -253,7 +266,35 @@ mod tests {
             "patch-then-minor",
             "3.11",
             "2.0.0",
+            "cfg",
         );
         assert_ne!(h1, h3, "index chain order must change the hash");
+    }
+
+    #[test]
+    fn inputs_hash_covers_config_fingerprint() {
+        // The config fingerprint folds in name-map / overrides / drop-deps /
+        // conda-deps / build-number / auto-bundle / channels. Changing it
+        // MUST change the hash, or a manifest edit replays a poisoned lock.
+        let base = RetreadLock::compute_inputs_hash(
+            &["a==2".into()],
+            &["https://pypi.org/simple/".into()],
+            "patch-then-minor",
+            "3.11",
+            "2.0.0",
+            "name-map=opencv-python:py-opencv",
+        );
+        let changed = RetreadLock::compute_inputs_hash(
+            &["a==2".into()],
+            &["https://pypi.org/simple/".into()],
+            "patch-then-minor",
+            "3.11",
+            "2.0.0",
+            "name-map=opencv-python:opencv",
+        );
+        assert_ne!(
+            base, changed,
+            "config fingerprint change must change the inputs hash"
+        );
     }
 }

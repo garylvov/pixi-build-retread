@@ -17,9 +17,10 @@ version = "5.1.0"
 # file:// channel points at the locally built retread artifact so
 # iteration doesn't require a prefix.dev upload between rebuilds.
 # `bash ../../scripts/rebuild-local.sh` produces the .conda there.
-backend = { name = "pixi-build-retread", version = "*", channels = ["file:///home/garylvov/projects/pixi-build-retread/local-channel", "https://prefix.dev/conda-forge"] }
+backend = { name = "pixi-build-retread", version = "*", channels = ["file:///home/garylvov/projects/pixi-build-retread/local-channel", "https://prefix.dev/garylvov", "https://prefix.dev/conda-forge"] }
 
 [package.build.config]
+# courier mode is the default (v2.1.0+)
 # v0.30.0+ tiered cascade. Mirrors `Patch` at translate time; per-dep
 # escalates patch -> PyPI -> minor -> PyPI -> major -> PyPI -> `*`
 # when probes prove the current widening level is unsatisfiable on the
