@@ -101,7 +101,18 @@ pub fn courier_input_specs(config: &RetreadConfig, bundle_name: &str) -> Vec<Str
 /// stringified). Order is SIGNIFICANT (conda channel priority), so it is NOT
 /// sorted -- exactly like the PyPI index chain. The producer (`build_one`) and
 /// the replayer (`conda_outputs`) MUST pass the same stringified channel list.
-pub fn config_fingerprint(config: &RetreadConfig, conda_channels: &[String]) -> String {
+///
+/// `workspace_fp` is `WorkspaceManifest::solve_fingerprint()` (empty when there
+/// is no workspace manifest). It folds in the WORKSPACE solve environment --
+/// per-env conda dep pins, system-requirements, pypi-options, feature/env
+/// wiring (grizzly H1) -- which shape what pixi actually solves and forwards as
+/// the lock's conda run-deps. Without it, a workspace pixi.toml edit would
+/// replay a stale lock. Both sides load the same manifest, so the strings agree.
+pub fn config_fingerprint(
+    config: &RetreadConfig,
+    conda_channels: &[String],
+    workspace_fp: &str,
+) -> String {
     // BTreeMaps iterate in sorted key order already; sort the Vecs explicitly
     // so ordering in the manifest never perturbs the digest.
     let mut parts: Vec<String> = Vec::new();
@@ -125,6 +136,9 @@ pub fn config_fingerprint(config: &RetreadConfig, conda_channels: &[String]) -> 
     parts.push(format!("build-number:{}", config.build_number));
     for c in conda_channels {
         parts.push(format!("channel:{c}"));
+    }
+    if !workspace_fp.is_empty() {
+        parts.push(format!("--workspace--\n{workspace_fp}"));
     }
     parts.join("\n")
 }
@@ -244,10 +258,14 @@ pub async fn stage(
                 sha256: None,
             });
         } else {
-            // Index wheel. Check if rewriting its Requires-Dist changes anything
-            // (AUDIT B2 fix: relax-changed index wheels must ship as shadow
-            // wheels, not stay remote, or strict pins re-emerge at install time).
-            let changed = if let Some(src) = w.local_path.as_ref() {
+            // Index wheel. Decide whether to ship a relax-rewritten shadow
+            // (AUDIT B2: relax-changed index wheels must ship as shadows, not
+            // stay remote, or strict pins re-emerge at install time). Produce
+            // `(changed, shadow_src)`: when `changed`, `shadow_src` holds the
+            // local bytes to rewrite.
+            let (changed, shadow_src): (bool, Option<std::path::PathBuf>) = if let Some(src) =
+                w.local_path.as_ref()
+            {
                 // We have the bytes: run the rewrite into a temp file to
                 // determine whether the mapper changes any line.
                 let tmp_name = format!(".tmp-courier-{std_name}");
@@ -266,39 +284,56 @@ pub async fn stage(
                 .with_context(|| format!("spawn_blocking rewrite-check of {}", w.pypi_name))??;
                 // Remove the probe tmp -- we re-stage into the real dst below.
                 let _ = tokio::fs::remove_file(&tmp).await;
-                did_change
+                (did_change, did_change.then(|| src.clone()))
             } else {
-                // Remote-only wheel (sidecar metadata, bytes never downloaded).
-                // We cannot rewrite it here. If any of its Requires-Dist lines
-                // WOULD change under relax, recording it as Origin::Index ships
-                // the wheel's ORIGINAL strict pins -- the exact breakage retread
-                // exists to prevent (AUDIT B2). That would silently POISON the
-                // lock. Refuse unless the conda side provably satisfies the
-                // changed dep (the wheel name is conda-capable), in which case
-                // the strict PyPI pins are harmless because conda wins.
+                // Remote-only wheel (sidecar metadata, bytes never
+                // downloaded -- typically a small auto-bundled PyPI dep).
+                // If any Requires-Dist line WOULD relax-change, recording it
+                // as Origin::Index ships the ORIGINAL strict pins (AUDIT B2),
+                // which would POISON the lock. If conda satisfies it, Index
+                // is harmless (conda wins). Otherwise FORCE-DOWNLOAD the
+                // bytes so we can ship a relaxed shadow.
                 let any_change = w
                     .requires_dist
                     .iter()
                     .any(|l| mapper_for_remote(l).is_some());
                 if any_change && !conda_cap_owned.contains(&w.pypi_name) {
-                    anyhow::bail!(
-                        "courier: refusing to write a lock for remote-only wheel `{}` whose \
-                         Requires-Dist relax-changes but has no local bytes to rewrite. \
-                         Shipping it as Origin::Index would re-emit its original strict pins \
-                         and poison the lock. Fix: make this wheel a built/shipped wheel (so \
-                         retread can rewrite it), or add its conda equivalent to \
-                         `retread-conda-deps` so the conda solve satisfies the changed dep.",
-                        w.pypi_name,
+                    let url = w.remote_url.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "courier: remote-only relax-changed wheel {} has no remote_url \
+                                 to download for shadow rewrite",
+                            w.pypi_name
+                        )
+                    })?;
+                    let dl = staging_dir.join(format!(".dl-courier-{std_name}"));
+                    let bytes = reqwest::get(url.clone())
+                        .await
+                        .and_then(|r| r.error_for_status())
+                        .with_context(|| {
+                            format!("downloading {} ({url}) for shadow rewrite", w.pypi_name)
+                        })?
+                        .bytes()
+                        .await
+                        .with_context(|| format!("reading bytes of {}", w.pypi_name))?;
+                    tokio::fs::write(&dl, &bytes)
+                        .await
+                        .with_context(|| format!("writing downloaded {}", dl.display()))?;
+                    tracing::info!(
+                        wheel = %w.pypi_name,
+                        "courier: force-downloaded remote-only relax-changed wheel to ship \
+                         a rewritten shadow (B-5)",
                     );
+                    (true, Some(dl))
+                } else {
+                    (false, None)
                 }
-                false
             };
 
             if changed {
                 // Relax changed this index wheel's METADATA: ship it as a
                 // build-tagged shadow wheel so uv's find-links prefers it over
                 // the registry original (AUDIT B2 fix).
-                let src = w.local_path.as_ref().unwrap(); // guaranteed Some when changed=true
+                let src = shadow_src.expect("changed=true implies shadow_src is Some");
                 let shadow_name = insert_build_tag(&std_name, "999retread")?;
                 let dst = staging_dir.join(&shadow_name);
                 let dst_blocking = dst.clone();
@@ -509,15 +544,33 @@ mod tests {
     #[test]
     fn fingerprint_covers_conda_channels() {
         let cfg = minimal_config("b");
-        let base = config_fingerprint(&cfg, &["conda-forge".to_string()]);
-        let added = config_fingerprint(&cfg, &["conda-forge".to_string(), "nvidia".to_string()]);
+        let base = config_fingerprint(&cfg, &["conda-forge".to_string()], "");
+        let added =
+            config_fingerprint(&cfg, &["conda-forge".to_string(), "nvidia".to_string()], "");
         assert_ne!(base, added, "adding a channel must change the fingerprint");
         let reordered =
-            config_fingerprint(&cfg, &["nvidia".to_string(), "conda-forge".to_string()]);
+            config_fingerprint(&cfg, &["nvidia".to_string(), "conda-forge".to_string()], "");
         assert_ne!(
             added, reordered,
             "channel order must change the fingerprint"
         );
+    }
+
+    /// grizzly H1 regression: a workspace solve-env change (per-env conda dep
+    /// pins, system-requirements, pypi-options) must change the fingerprint, or
+    /// a workspace pixi.toml edit replays a stale lock.
+    #[test]
+    fn fingerprint_covers_workspace_solve_env() {
+        let cfg = minimal_config("b");
+        let chans = ["conda-forge".to_string()];
+        let base = config_fingerprint(&cfg, &chans, "ws-dep:numpy=>=1.24");
+        let changed = config_fingerprint(&cfg, &chans, "ws-dep:numpy===1.26.4");
+        assert_ne!(
+            base, changed,
+            "a workspace dep-pin change must change the fingerprint"
+        );
+        let empty = config_fingerprint(&cfg, &chans, "");
+        assert_ne!(base, empty, "presence of a workspace fp must matter");
     }
 
     /// Create a process-unique temp directory and return it. Caller must clean

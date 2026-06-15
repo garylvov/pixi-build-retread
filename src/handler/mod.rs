@@ -764,6 +764,10 @@ impl Handler {
                                     .iter()
                                     .map(|c| c.to_string())
                                     .collect::<Vec<_>>(),
+                                &workspace_manifest
+                                    .as_ref()
+                                    .map(|m| m.solve_fingerprint())
+                                    .unwrap_or_default(),
                             ),
                         );
                         let lock_path = source_dir
@@ -3722,9 +3726,15 @@ async fn build_one(
             .collect();
         conda_capable.extend(config.name_map.keys().map(|k| canonical_conda_name(k)));
         conda_capable.extend(load_pypi_to_conda_map().await.into_keys());
-        let workspace_indexes: Vec<String> = workspace_dir
-            .and_then(crate::workspace::WorkspaceManifest::load)
+        let ws_manifest = workspace_dir.and_then(crate::workspace::WorkspaceManifest::load);
+        let workspace_indexes: Vec<String> = ws_manifest
+            .as_ref()
             .map(|m| m.all_pypi_index_urls())
+            .unwrap_or_default();
+        // grizzly H1: fold the workspace solve environment into the hash.
+        let workspace_fp = ws_manifest
+            .as_ref()
+            .map(|m| m.solve_fingerprint())
             .unwrap_or_default();
         let entry_indexes: Vec<String> = config
             .retread_wheels
@@ -3749,9 +3759,10 @@ async fn build_one(
             )
         })?;
         let staging = work_dir.join(format!("courier-{}", bundle.conda_name));
-        // Fingerprint folds in the conda channel list (grizzly P1) alongside
-        // the config-derived inputs; the replayer computes it identically.
-        let config_fp = crate::courier::config_fingerprint(config, conda_channels);
+        // Fingerprint folds in the conda channel list (grizzly P1) and the
+        // workspace solve env (grizzly H1) alongside the config-derived
+        // inputs; the replayer computes it identically.
+        let config_fp = crate::courier::config_fingerprint(config, conda_channels, &workspace_fp);
         let staged = crate::courier::stage(
             config,
             &bundle.conda_name,
