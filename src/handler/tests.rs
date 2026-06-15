@@ -393,6 +393,7 @@ fn pythons_for_rejects_bare_major_variant() {
         blueprint_sync: Default::default(),
         git_sources: std::collections::BTreeMap::new(),
         python: None,
+        pin_version: false,
     };
     let result = pythons_for(&cfg, Some(&variants));
     assert_eq!(
@@ -428,6 +429,7 @@ fn pythons_for_accepts_dotted_variant() {
         blueprint_sync: Default::default(),
         git_sources: std::collections::BTreeMap::new(),
         python: None,
+        pin_version: false,
     };
     let result = pythons_for(&cfg, Some(&variants));
     assert_eq!(result, vec!["3.11".to_string()]);
@@ -463,6 +465,7 @@ fn pythons_for_filters_bare_major_keeps_dotted() {
         blueprint_sync: Default::default(),
         git_sources: std::collections::BTreeMap::new(),
         python: None,
+        pin_version: false,
     };
     let result = pythons_for(&cfg, Some(&variants));
     assert_eq!(result, vec!["3.11".to_string(), "3.12".to_string()]);
@@ -815,6 +818,7 @@ fn cfg() -> RetreadConfig {
         blueprint_sync: Default::default(),
         git_sources: std::collections::BTreeMap::new(),
         python: None,
+        pin_version: false,
     }
 }
 

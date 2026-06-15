@@ -67,6 +67,7 @@ fn baseline_config() -> RetreadConfig {
         blueprint_sync: Default::default(),
         git_sources: std::collections::BTreeMap::new(),
         python: None,
+        pin_version: false,
     }
 }
 

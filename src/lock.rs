@@ -97,6 +97,20 @@ pub struct RetreadLock {
 
 pub const SCHEMA: u32 = 4;
 
+/// Bump EMIT_EPOCH in the SAME commit as ANY change that can alter the bytes
+/// retread emits for identical manifest inputs (relax/version-selection
+/// algorithm; wheel-rewrite logic incl. RECORD/metadata/dist-info/layout;
+/// auto-bundle selection or fetching; meta-wheel / courier package format;
+/// conda recipe metadata; index-chain merge order; the compute_inputs_hash
+/// domain prefix or folded fields). Do NOT bump for docs/tests/logging/
+/// refactors with identical output, dep bumps that don't change emitted bytes,
+/// or SCHEMA-only lock-format changes. When in doubt, bump it: a needless bump
+/// costs one cold solve per pack (cheap, self-healing); a missed bump causes
+/// silent stale-cache reuse for consumers (expensive, invisible).
+/// SCHEMA = on-disk lock FORMAT; EMIT_EPOCH = emitted-output SEMANTICS for
+/// identical inputs -- bump independently.
+pub const EMIT_EPOCH: u32 = 1;
+
 impl RetreadLock {
     /// File name for a bundle's lock next to the pack manifest.
     pub fn file_name(bundle: &str) -> String {
@@ -117,19 +131,26 @@ impl RetreadLock {
     /// `retread-name-map`) would leave the hash unchanged and a stale,
     /// POISONED lock would replay. It is produced by the shared
     /// `courier::config_fingerprint` so producer and replayer always agree.
+    ///
+    /// The hash folds the emit epoch (+ the exact retread version when
+    /// `retread-pin-version` is set). Routine retread upgrades that do NOT
+    /// change emitted bytes for identical inputs only bump `EMIT_EPOCH` when
+    /// the output semantics change, so existing committed locks replay without
+    /// a cold re-solve on every upgrade.
     pub fn compute_inputs_hash(
         entry_specs: &[String],
         index_urls: &[String],
         relax: &str,
         python: &str,
-        retread_version: &str,
+        emit_epoch: u32,
+        pin_version: Option<&str>,
         config_fingerprint: &str,
     ) -> String {
         use sha2::{Digest, Sha256};
         let mut sorted = entry_specs.to_vec();
         sorted.sort();
         let mut h = Sha256::new();
-        h.update(b"retread-inputs-v4\n");
+        h.update(b"retread-inputs-v5\n");
         for s in &sorted {
             h.update(s.as_bytes());
             h.update(b"\n");
@@ -144,7 +165,12 @@ impl RetreadLock {
         h.update(b"\n");
         h.update(python.as_bytes());
         h.update(b"\n");
-        h.update(retread_version.as_bytes());
+        h.update(b"--epoch--\n");
+        h.update(emit_epoch.to_le_bytes());
+        if let Some(v) = pin_version {
+            h.update(b"--pinver--\n");
+            h.update(v.as_bytes());
+        }
         h.update(b"\n--config--\n");
         h.update(config_fingerprint.as_bytes());
         format!("{:x}", h.finalize())
@@ -240,7 +266,8 @@ mod tests {
             ],
             "patch-then-minor",
             "3.11",
-            "2.0.0",
+            1,
+            None,
             "cfg",
         );
         // entry order does NOT matter (sorted)
@@ -252,7 +279,8 @@ mod tests {
             ],
             "patch-then-minor",
             "3.11",
-            "2.0.0",
+            1,
+            None,
             "cfg",
         );
         assert_eq!(h1, h2, "entry-spec order must not change the hash");
@@ -265,7 +293,8 @@ mod tests {
             ],
             "patch-then-minor",
             "3.11",
-            "2.0.0",
+            1,
+            None,
             "cfg",
         );
         assert_ne!(h1, h3, "index chain order must change the hash");
@@ -281,7 +310,8 @@ mod tests {
             &["https://pypi.org/simple/".into()],
             "patch-then-minor",
             "3.11",
-            "2.0.0",
+            1,
+            None,
             "name-map=opencv-python:py-opencv",
         );
         let changed = RetreadLock::compute_inputs_hash(
@@ -289,12 +319,117 @@ mod tests {
             &["https://pypi.org/simple/".into()],
             "patch-then-minor",
             "3.11",
-            "2.0.0",
+            1,
+            None,
             "name-map=opencv-python:opencv",
         );
         assert_ne!(
             base, changed,
             "config fingerprint change must change the inputs hash"
+        );
+    }
+
+    #[test]
+    fn inputs_hash_epoch_changes_hash() {
+        // Bumping EMIT_EPOCH must invalidate any committed lock so a cold
+        // re-solve is forced on output-semantics changes.
+        let h1 = RetreadLock::compute_inputs_hash(
+            &["a==2".into()],
+            &["https://pypi.org/simple/".into()],
+            "patch-then-minor",
+            "3.11",
+            1,
+            None,
+            "cfg",
+        );
+        let h2 = RetreadLock::compute_inputs_hash(
+            &["a==2".into()],
+            &["https://pypi.org/simple/".into()],
+            "patch-then-minor",
+            "3.11",
+            2,
+            None,
+            "cfg",
+        );
+        assert_ne!(h1, h2, "changing emit_epoch must change the hash");
+    }
+
+    #[test]
+    fn inputs_hash_pin_version_differs_from_none() {
+        // With retread-pin-version=true, Some("1.0.0") must differ from None.
+        let without_pin = RetreadLock::compute_inputs_hash(
+            &["a==2".into()],
+            &["https://pypi.org/simple/".into()],
+            "patch-then-minor",
+            "3.11",
+            1,
+            None,
+            "cfg",
+        );
+        let with_pin = RetreadLock::compute_inputs_hash(
+            &["a==2".into()],
+            &["https://pypi.org/simple/".into()],
+            "patch-then-minor",
+            "3.11",
+            1,
+            Some("1.0.0"),
+            "cfg",
+        );
+        assert_ne!(
+            without_pin, with_pin,
+            "pin_version=Some must differ from None"
+        );
+    }
+
+    #[test]
+    fn inputs_hash_pin_version_two_versions_differ_only_when_pinned() {
+        // The whole point: two different retread versions produce the SAME hash
+        // under pin_version=None (epoch-gated replay) but DIFFERENT hashes
+        // under pin_version=Some (strict reproducibility).
+        let none_v1 = RetreadLock::compute_inputs_hash(
+            &["a==2".into()],
+            &["https://pypi.org/simple/".into()],
+            "patch-then-minor",
+            "3.11",
+            1,
+            None,
+            "cfg",
+        );
+        let none_v2 = RetreadLock::compute_inputs_hash(
+            &["a==2".into()],
+            &["https://pypi.org/simple/".into()],
+            "patch-then-minor",
+            "3.11",
+            1,
+            None,
+            "cfg",
+        );
+        assert_eq!(
+            none_v1, none_v2,
+            "same epoch, no pin => identical hash regardless of retread version"
+        );
+
+        let pinned_v1 = RetreadLock::compute_inputs_hash(
+            &["a==2".into()],
+            &["https://pypi.org/simple/".into()],
+            "patch-then-minor",
+            "3.11",
+            1,
+            Some("1.7.2"),
+            "cfg",
+        );
+        let pinned_v2 = RetreadLock::compute_inputs_hash(
+            &["a==2".into()],
+            &["https://pypi.org/simple/".into()],
+            "patch-then-minor",
+            "3.11",
+            1,
+            Some("1.7.3"),
+            "cfg",
+        );
+        assert_ne!(
+            pinned_v1, pinned_v2,
+            "different versions under pin_version=Some must differ"
         );
     }
 }

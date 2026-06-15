@@ -428,7 +428,8 @@ pub async fn stage(
         index_urls,
         &format!("{:?}", config.relax),
         python,
-        env!("CARGO_PKG_VERSION"),
+        crate::lock::EMIT_EPOCH,
+        config.pin_version.then_some(env!("CARGO_PKG_VERSION")),
         config_fp,
     );
 

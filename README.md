@@ -224,12 +224,26 @@ pixi install
 ### Cold-solve replay (fast cold solve)
 
 When the backend runs `conda/outputs`, it checks whether the pack inputs
-(retread-wheels entries, git revs, relax policy, workspace channels) match what
-was recorded in the committed lock. If they match, it replays the lock directly
-and skips the full cascade — no probe, no solve, no materialization. On a
-replay hit the cascade never runs, so `retread-probe-trace-<name>.json` is
-simply ABSENT for that build; the cascade (and the probe-trace) only appear
-when inputs genuinely changed.
+(retread-wheels entries, git revs, relax policy, python, workspace channels +
+per-env deps/system-requirements/pypi-options, and the per-dep config:
+overrides, name-map, drop-deps, conda-deps, auto-bundle, build-number) match
+what was recorded in the committed lock's `inputs_hash`. If they match, it
+replays the lock directly and skips the full cascade — no probe, no solve, no
+materialization. On a replay hit the cascade never runs, so
+`retread-probe-trace-<name>.json` is simply ABSENT for that build; the cascade
+(and the probe-trace) only appear when inputs genuinely changed.
+
+Replay is intentionally **not** keyed on the retread release version. The hash
+folds an internal `EMIT_EPOCH` — a number the backend bumps only when a release
+could change the bytes it emits for identical inputs — so routine retread
+upgrades (bugfixes, perf, docs) reuse the committed lock instead of forcing a
+cold solve. If you want strict reproducibility (re-solve on every retread
+version change), set `retread-pin-version = true` under `[package.build.config]`;
+the exact version then rides the hash. Either way, the courier conda package's
+build string is content-addressed on `inputs_hash`, so whenever the emitted
+content would differ, pixi sees a new package and re-extracts it — no stale
+cache. (One-time note: upgrading across a hash-scheme or `EMIT_EPOCH` change
+causes a single cold solve per pack, then replay resumes.)
 
 ### Honesty note
 
