@@ -98,6 +98,7 @@ async fn fetch_isaacsim_kernel_end_to_end() {
         blueprint_sync: Default::default(),
         git_sources: std::collections::BTreeMap::new(),
         python: None,
+        pin_version: false,
     };
     let recipe = build_bundle_recipe(
         "isaacsim-kernel",

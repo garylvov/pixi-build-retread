@@ -306,7 +306,8 @@ fn courier_inputs_hash(
         &index_urls,
         &format!("{:?}", config.relax),
         python_version,
-        env!("CARGO_PKG_VERSION"),
+        crate::lock::EMIT_EPOCH,
+        config.pin_version.then_some(env!("CARGO_PKG_VERSION")),
         &config_fp,
     )
 }

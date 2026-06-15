@@ -203,6 +203,13 @@ pub struct RetreadConfig {
     #[serde(default, rename = "retread-blueprint-sync", alias = "blueprint-sync")]
     pub blueprint_sync: Option<String>,
 
+    /// When true, fold the exact retread version into the courier inputs_hash
+    /// so EVERY retread release forces a cold re-solve (strict reproducibility).
+    /// Default false: replay is gated on EMIT_EPOCH, so routine retread upgrades
+    /// reuse the committed lock. See lock::EMIT_EPOCH.
+    #[serde(default, rename = "retread-pin-version", alias = "pin-version")]
+    pub pin_version: bool,
+
     /// Python version(s) to build for, as a fallback when the workspace
     /// does not declare `[workspace.build-variants] python = [...]`.
     ///
@@ -899,5 +906,34 @@ mod tests {
         assert_eq!(one.as_versions(), vec!["3.11"]);
         let many: PythonSpec = serde_json::from_value(serde_json::json!(["3.11", "3.12"])).unwrap();
         assert_eq!(many.as_versions(), vec!["3.11", "3.12"]);
+    }
+
+    #[test]
+    fn parses_retread_pin_version_key() {
+        // Invariant #6: every new config field needs a serde test or stale
+        // binaries reject user pixi.toml with "unknown field" during upgrades.
+
+        // unset -> false (default: epoch-gated replay, not strict per-version).
+        let json = serde_json::json!({
+            "retread-wheels": { "foo": { "version": "==1.0" } },
+        });
+        let cfg: RetreadConfig = serde_json::from_value(json).unwrap();
+        assert!(!cfg.pin_version, "unset defaults to false");
+
+        // explicit true -> strict per-version reproducibility.
+        let json = serde_json::json!({
+            "retread-wheels": { "foo": { "version": "==1.0" } },
+            "retread-pin-version": true,
+        });
+        let cfg: RetreadConfig = serde_json::from_value(json).unwrap();
+        assert!(cfg.pin_version, "explicit true must parse as true");
+
+        // alias "pin-version" also accepted.
+        let json = serde_json::json!({
+            "retread-wheels": { "foo": { "version": "==1.0" } },
+            "pin-version": true,
+        });
+        let cfg: RetreadConfig = serde_json::from_value(json).unwrap();
+        assert!(cfg.pin_version, "alias pin-version must parse as true");
     }
 }
