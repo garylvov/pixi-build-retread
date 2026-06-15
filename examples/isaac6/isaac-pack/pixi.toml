@@ -22,6 +22,7 @@ retread-python       = "3.12"
 # v1.4.0 pack-wide default bundle group (single entry today, but keeps
 # the shape identical to gigastrap's multi-entry pack).
 retread-bundle       = "isaac-pack-6"
+retread-courier      = true
 
 [package.build.config.retread-wheels]
 isaacsim = { version = "==6.0.0.1", index = "https://pypi.nvidia.com", extras = ["all", "extscache"] }
