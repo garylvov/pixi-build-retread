@@ -37,7 +37,7 @@ use pixi_build_types::{
     BackendCapabilities, BinaryPackageSpec, NamedSpec, PackageSpec, VariantValue,
 };
 use rattler_conda_types::{
-    ChannelUrl, NoArchType, PackageName, Platform, VersionSpec, VersionWithSource,
+    ChannelUrl, NoArchType, PackageName, Platform, StringMatcher, VersionSpec, VersionWithSource,
 };
 use serde_json::Value;
 use tokio::sync::RwLock;
@@ -45,7 +45,7 @@ use uv_pep508::uv_pep440::VersionSpecifiers;
 
 use crate::config::{RelaxPolicy, RetreadConfig, WheelEntry};
 use crate::pypi::{self, WheelTarget};
-use crate::recipe::{BundleSource, build_bundle_recipe, to_yaml};
+use crate::recipe::{BundleSource, build_bundle_recipe, build_courier_recipe, to_yaml};
 use crate::relax::{canonical_conda_name, emit_python_version, marker_env_for};
 use crate::rpc::{RpcError, ok, parse_params};
 use crate::wheel::{WheelMetadata, fetch_wheel};
@@ -242,6 +242,73 @@ pub(crate) fn merge_index_chain(
     }
     push_unique(&mut indexes, PUBLIC_PYPI.to_string());
     indexes
+}
+
+/// Build a content-addressed build string for courier packages.
+///
+/// Format: `py{py_short}_h{hash_prefix}_{build_number}` where `hash_prefix`
+/// is the first 10 hex chars of the courier inputs hash. This uniquely
+/// identifies the content of the courier package: any change to the lock
+/// inputs (wheel set, index chain, relax policy, python, retread version,
+/// config/channels/workspace fingerprint) yields a new string and pixi
+/// re-extracts instead of cache-hitting the stale artifact.
+///
+/// The `py{py_short}_` prefix is kept for human readability; pixi does NOT
+/// parse the build string for the python variant (it uses the variant map
+/// and `python X.Y.*` run-dep pins), so the suffix carries no semantic load.
+///
+/// This function MUST be the single source of truth for courier build string
+/// format -- `produce_output` and `replay_from_lock` both call it so the
+/// strings are guaranteed byte-identical.
+fn courier_build_string(py_short: &str, inputs_hash: &str, build_number: u64) -> String {
+    let prefix = &inputs_hash[..inputs_hash.len().min(10)];
+    format!("py{py_short}_h{prefix}_{build_number}")
+}
+
+/// Compute the courier inputs hash that uniquely identifies a courier build's
+/// content-affecting inputs. This is the single authoritative implementation
+/// called by:
+///
+/// 1. The replay gate (~line 754) — to compare against `lock.inputs_hash`.
+/// 2. `produce_output` — to embed in the `CondaOutputMetadata.build` string.
+///
+/// The hash folds in: entry specs (canonical wheel inputs), the merged index
+/// chain, relax policy, python version, retread binary version, and a config
+/// fingerprint (channels + workspace solve env). This mirrors exactly what
+/// `courier::stage` writes into `RetreadLock.inputs_hash`, guaranteeing that
+/// replay fires iff the hash matches.
+///
+/// IMPORTANT: the arguments must be constructed identically at every call
+/// site — see the inline notes in each caller.
+fn courier_inputs_hash(
+    config: &crate::config::RetreadConfig,
+    bundle_name: &str,
+    python_version: &str,
+    channels: &[String],
+    workspace_manifest: Option<&crate::workspace::WorkspaceManifest>,
+) -> String {
+    let entry_specs = crate::courier::courier_input_specs(config, bundle_name);
+    let ws_indexes: Vec<String> = workspace_manifest
+        .map(|m| m.all_pypi_index_urls())
+        .unwrap_or_default();
+    let entry_indexes: Vec<String> = config
+        .retread_wheels
+        .values()
+        .map(|e| e.index_url())
+        .collect();
+    let index_urls = merge_index_chain(entry_indexes, &ws_indexes);
+    let workspace_fp = workspace_manifest
+        .map(|m| m.solve_fingerprint())
+        .unwrap_or_default();
+    let config_fp = crate::courier::config_fingerprint(config, channels, &workspace_fp);
+    crate::lock::RetreadLock::compute_inputs_hash(
+        &entry_specs,
+        &index_urls,
+        &format!("{:?}", config.relax),
+        python_version,
+        env!("CARGO_PKG_VERSION"),
+        &config_fp,
+    )
 }
 
 const DEFAULT_PYTHON: &str = "3.11";
@@ -725,6 +792,72 @@ impl Handler {
                 for base_bundle in &materialized {
                     let (mut bundle, mut effective) =
                         apply_emission(base_bundle, &base_config, emission);
+                    // WS-B: cold-solve replay. When courier mode is active and
+                    // a committed lock exists whose inputs_hash matches the
+                    // current resolution inputs (resolved wheel set + index
+                    // chain + relax + python + retread version), reconstruct
+                    // the CondaOutput directly from the lock and skip the
+                    // entire probe cascade (pre_emit_widen_pass +
+                    // iterative_solve_refinement + post_emit_widen_pass).
+                    // This is a pure optimization: on any error or hash miss
+                    // the code falls through to the normal cascade path.
+                    //
+                    // Compute the courier inputs hash once here: it feeds both
+                    // the replay gate (hash-check) and produce_output (embedded
+                    // in the content-addressed build string). None for non-courier.
+                    let courier_build_hash: Option<String> = if config.courier {
+                        let channels: Vec<String> =
+                            params.channels.iter().map(|c| c.to_string()).collect();
+                        Some(courier_inputs_hash(
+                            &config,
+                            &base_bundle.conda_name,
+                            python_version,
+                            &channels,
+                            workspace_manifest.as_ref(),
+                        ))
+                    } else {
+                        None
+                    };
+                    if let Some(ref current_hash) = courier_build_hash {
+                        let lock_path = source_dir
+                            .join(crate::lock::RetreadLock::file_name(&bundle.conda_name));
+                        match replay_from_lock(
+                            &lock_path,
+                            current_hash,
+                            params.host_platform,
+                            config.build_number,
+                            &siblings,
+                        ) {
+                            Ok(Some(replayed)) => {
+                                tracing::info!(
+                                    bundle = %bundle.conda_name,
+                                    "WS-B: cold-solve replay hit -- \
+                                     skipping probe cascade",
+                                );
+                                crate::status::tty(&format!(
+                                    "courier replay: {} outputs reconstructed \
+                                     from committed lock (cascade skipped).",
+                                    bundle.conda_name,
+                                ));
+                                outputs.push(replayed);
+                                continue;
+                            }
+                            Ok(None) => {
+                                tracing::debug!(
+                                    bundle = %bundle.conda_name,
+                                    "WS-B: replay miss (hash mismatch / no lock) -- cascade",
+                                );
+                            }
+                            Err(e) => {
+                                tracing::debug!(
+                                    bundle = %bundle.conda_name,
+                                    error = %format!("{e:#}"),
+                                    "WS-B: replay error (non-fatal) -- \
+                                     falling through to cascade",
+                                );
+                            }
+                        }
+                    }
                     // v0.30.0+ pre-emit widen pass: now scoped to this env's
                     // channels + transitive overrides. Probes recorded
                     // regardless of policy; mutation gated by
@@ -750,6 +883,7 @@ impl Handler {
                         params.host_platform,
                         python_version,
                         &siblings,
+                        courier_build_hash.as_deref(),
                     )
                     .map_err(|e| {
                         RpcError::internal(format!("output for {}: {e:#}", bundle.conda_name))
@@ -1263,6 +1397,7 @@ impl Handler {
                             params.host_platform,
                             python_version,
                             &siblings,
+                            courier_build_hash.as_deref(),
                         )
                         .map_err(|e| {
                             RpcError::internal(format!(
@@ -1667,6 +1802,7 @@ impl Handler {
             .as_ref()
             .map(|deps| deps.iter().map(|d| d.spec.to_string()).collect());
 
+        let conda_channels: Vec<String> = params.channels.iter().map(|c| c.to_string()).collect();
         build_one(
             &bundle,
             &effective,
@@ -1678,6 +1814,7 @@ impl Handler {
             workspace_dir.as_deref(),
             params.output.build.as_deref(),
             run_override.as_deref(),
+            &conda_channels,
         )
         .await
         .map_err(|e| RpcError::internal(format!("build {}: {e:#}", bundle.conda_name)))
@@ -3280,12 +3417,19 @@ type EnvSolveResult = (
 /// skipped). Each non-self entry becomes a run-dep on this output so
 /// declaring any one output in the workspace pulls the whole pack via
 /// the conda solver.
+///
+/// `courier_build_hash`: when `Some`, this is the courier inputs hash
+/// (from [`courier_inputs_hash`]) and the build string is set to the
+/// content-addressed form `py{XY}_h{hash_prefix}_{build_number}`.
+/// When `None` (non-courier path), the legacy `py{XY}_{build_number}`
+/// string is emitted unchanged.
 fn produce_output(
     bundle: &Bundle,
     config: &RetreadConfig,
     host_platform: Platform,
     workspace_python_version: &str,
     siblings: &[(String, String)],
+    courier_build_hash: Option<&str>,
 ) -> Result<CondaOutput> {
     // Python version for the emitted variant/build/`python` dep. Shared with
     // the build recipe via `emit_python_version` so the metadata and the
@@ -3460,7 +3604,13 @@ fn produce_output(
         NoArchType::python()
     };
     let py_short = python_version.replace('.', "");
-    let build = format!("py{py_short}_{}", config.build_number);
+    // Courier: use the content-addressed build string so pixi cache-hits are
+    // invalidated whenever the inputs change (wheel set, indexes, config...).
+    // Non-courier: keep the legacy `py{XY}_{build_number}` string unchanged.
+    let build = match courier_build_hash {
+        Some(hash) => courier_build_string(&py_short, hash, config.build_number),
+        None => format!("py{py_short}_{}", config.build_number),
+    };
 
     let mut variant = std::collections::BTreeMap::new();
     variant.insert(
@@ -3468,6 +3618,16 @@ fn produce_output(
         VariantValue::String(python_version.clone()),
     );
 
+    // Courier: the metadata pixi SOLVES + LOCKS must include `uv` (the
+    // post-link installer needs it), or it never lands in the consuming env.
+    // (The recipe adds it too, but pixi resolves against THIS conda/outputs
+    // metadata, not the recipe.) The retread installer binary itself SHIPS
+    // inside the courier package -- NOT a run-dep -- so the heavy backend
+    // never enters the consumer solve.
+    let mut depends_specs = depends_specs;
+    if config.courier {
+        depends_specs.push(spec_from_str("uv")?);
+    }
     Ok(CondaOutput {
         metadata: CondaOutputMetadata {
             name,
@@ -3534,146 +3694,6 @@ fn localize_wheel_source(url: &url::Url, wheels_root: &Path) -> url::Url {
     url.clone()
 }
 
-/// v1.7.0 blueprint: discover the PyPI dependency closure REACHABLE
-/// from the bundle, metadata-only (PEP 658 sidecars where the index
-/// serves them). Marker- and extras-aware: each line is evaluated
-/// against the target python's marker environment with exactly the
-/// extras its requirer activated (an all-extras-active first cut
-/// swept 6027 packages / 3.5GB; this bounds it to what uv can reach).
-/// Returns the discovered wheels; the caller checks them against the
-/// bundle-derived override map and ships only those needing rewrites.
-/// Best-effort throughout -- an unresolvable name is logged and
-/// skipped (uv will surface it at solve time if it actually matters).
-async fn blueprint_closure_sweep(
-    seeds: Vec<(Vec<String>, Vec<String>)>,
-    known: &HashSet<String>,
-    indexes: &[String],
-    target: &crate::pypi::WheelTarget,
-    source_dir: &Path,
-) -> Vec<crate::emit_pypi::EmitWheel> {
-    use futures::stream::{self, StreamExt};
-    const MAX_ROUNDS: usize = 12;
-    let download_dir = source_dir.join("wheels");
-    let env = match crate::relax::default_marker_env(&target.python_version) {
-        Ok(e) => e,
-        Err(e) => {
-            tracing::warn!(error = %format!("{e:#}"), "blueprint sweep: no marker env; skipped");
-            return Vec::new();
-        }
-    };
-    let mut seen: HashSet<String> = known.clone();
-    seen.insert("python".to_string());
-
-    // (dep name, specifiers, extras the requirer activates on it)
-    type Item = (String, VersionSpecifiers, Vec<String>);
-    let collect_deps =
-        |requires: &[String], active_extras: &[String], seen: &mut HashSet<String>| -> Vec<Item> {
-            let extra_names: Vec<uv_normalize::ExtraName> = active_extras
-                .iter()
-                .filter_map(|e| uv_normalize::ExtraName::from_owned(e.clone()).ok())
-                .collect();
-            let mut out: Vec<Item> = Vec::new();
-            for raw in requires {
-                let req: uv_pep508::Requirement = match uv_pep508::Requirement::from_str(raw) {
-                    Ok(r) => r,
-                    Err(_) => continue,
-                };
-                if !req.marker.evaluate(&env, &extra_names) {
-                    continue;
-                }
-                let name = req.name.to_string();
-                if !seen.insert(canonical_conda_name(&name)) {
-                    continue;
-                }
-                let child_extras: Vec<String> = req.extras.iter().map(|e| e.to_string()).collect();
-                let specs = match req.version_or_url {
-                    Some(uv_pep508::VersionOrUrl::VersionSpecifier(s)) => s,
-                    Some(uv_pep508::VersionOrUrl::Url(_)) => continue,
-                    None => VersionSpecifiers::empty(),
-                };
-                out.push((name, specs, child_extras));
-            }
-            out
-        };
-
-    let mut frontier: Vec<Item> = Vec::new();
-    for (requires, extras) in &seeds {
-        frontier.extend(collect_deps(requires, extras, &mut seen));
-    }
-    let mut discovered: Vec<crate::emit_pypi::EmitWheel> = Vec::new();
-    for round in 0..MAX_ROUNDS {
-        if frontier.is_empty() {
-            break;
-        }
-        let resolved: Vec<Option<(crate::emit_pypi::EmitWheel, Vec<String>)>> = stream::iter(
-            frontier.drain(..),
-        )
-        .map(|(name, specs, extras)| {
-            let download_dir = download_dir.clone();
-            async move {
-                for index in indexes {
-                    match pypi::resolve(index, &name, &specs, target).await {
-                        Ok(r) => {
-                            match crate::handler::auto_bundle::metadata_preferring_sidecar(
-                                &r,
-                                &download_dir,
-                            )
-                            .await
-                            {
-                                Ok(metadata) => {
-                                    return Some((
-                                        crate::emit_pypi::EmitWheel {
-                                            pypi_name: canonical_conda_name(&name),
-                                            version: metadata.version.clone(),
-                                            requires_dist: metadata.requires_dist.clone(),
-                                            local_path: None,
-                                            wheel_filename: crate::wheel::wheel_filename_from_url(
-                                                &r.url,
-                                            )
-                                            .unwrap_or_default(),
-                                            remote_url: Some(r.url),
-                                        },
-                                        extras,
-                                    ));
-                                }
-                                Err(e) => {
-                                    tracing::debug!(dep = %name, error = %format!("{e:#}"),
-                                                "blueprint sweep: metadata fetch failed");
-                                    return None;
-                                }
-                            }
-                        }
-                        Err(_) => continue,
-                    }
-                }
-                tracing::debug!(dep = %name, "blueprint sweep: unresolvable on all indexes");
-                None
-            }
-        })
-        .buffered(16)
-        .collect()
-        .await;
-        let mut next: Vec<(Vec<String>, Vec<String>)> = Vec::new();
-        for (w, extras) in resolved.into_iter().flatten() {
-            next.push((w.requires_dist.clone(), extras));
-            discovered.push(w);
-        }
-        for (requires, extras) in &next {
-            frontier.extend(collect_deps(requires, extras, &mut seen));
-        }
-        tracing::debug!(
-            round,
-            discovered = discovered.len(),
-            "blueprint sweep round"
-        );
-    }
-    tracing::info!(
-        discovered = discovered.len(),
-        "blueprint: PyPI closure sweep complete",
-    );
-    discovered
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn build_one(
     bundle: &Bundle,
@@ -3686,6 +3706,10 @@ async fn build_one(
     workspace_dir: Option<&Path>,
     expected_build: Option<&str>,
     run_override: Option<&[String]>,
+    // Conda channel list pixi forwarded (stringified). Folded into the
+    // courier lock's inputs_hash so a channel change invalidates replay
+    // (B-4 / grizzly P1). Must match the replayer's `params.channels`.
+    conda_channels: &[String],
 ) -> Result<CondaBuildV1Result> {
     // Lay out one BundleSource per wheel (primary first), in BFS order.
     //
@@ -3713,26 +3737,138 @@ async fn build_one(
             metadata: &w.metadata,
         })
         .collect();
-    // v1.7.0 `retread-blueprint = "only"`: the conda artifact is a
-    // protocol-compliance stub -- no wheel payload, no run-deps -- so
-    // packaging drops from minutes (zstd over ~15GB) to seconds. The
-    // blueprint side-channel below is the real product; environments
-    // that install the conda package itself get an empty no-op.
-    let payload = !config.blueprint.is_only();
-    if !payload {
-        tracing::info!(
-            output = %bundle.conda_name,
-            "blueprint=only: payload-skip conda artifact (real metadata + run-deps, no wheels)",
+    // Deprecation gate: warn once when the old emit-pypi / blueprint
+    // keys are set. These were replaced by `retread-courier` (v2.0.0);
+    // the fields are retained only for backward-compat parsing.
+    if config.emit_pypi || config.blueprint.is_on() || config.blueprint_sync.is_some() {
+        tracing::warn!(
+            "`retread-emit-pypi`, `retread-blueprint`, and `retread-blueprint-sync` \
+             are DEPRECATED (v2.0.0) and ignored. Use `retread-courier = true` instead. \
+             Remove these keys from your `[package.build.config]`.",
         );
     }
-    let recipe = build_bundle_recipe(
-        &bundle.conda_name,
-        &sources,
-        config,
-        workspace_python_version,
-        run_override,
-        payload,
-    )?;
+    // WS-C: courier mode produces a metadata-only conda package. It must
+    // stage the bundle's wheels + write the committed lock BEFORE the recipe
+    // (the recipe's source list references the staged artifacts), so the
+    // courier path builds emit_wheels/conda_capable here rather than in the
+    // emit-pypi block below (which is skipped for courier). The non-courier
+    // path is byte-identical to before.
+    // B-2 (lock-poisoning): the COMMITTED pack lock must only be written after
+    // rattler-build produces the package successfully. Writing it before the
+    // build (as before) left a committed lock on disk for an output that may
+    // never have built -- a later cold replay would reproduce a phantom. The
+    // courier branch records the pending write here; it is flushed (atomically)
+    // only past the rattler-build success gate below.
+    let mut courier_lock_to_commit: Option<(std::path::PathBuf, String)> = None;
+    let recipe = if config.courier {
+        let python_version =
+            emit_python_version(&bundle.primary.metadata.filename, workspace_python_version);
+        let version = bundle.primary.metadata.version.clone();
+        let emit_wheels: Vec<crate::emit_pypi::EmitWheel> = bundle
+            .all_wheels()
+            .zip(localized_urls.iter())
+            .map(|(w, url)| crate::emit_pypi::EmitWheel {
+                pypi_name: w.pypi_name.clone(),
+                version: w.metadata.version.clone(),
+                requires_dist: w.metadata.requires_dist.clone(),
+                local_path: (url.scheme() == "file")
+                    .then(|| url.to_file_path().ok())
+                    .flatten(),
+                wheel_filename: url
+                    .path_segments()
+                    .and_then(|mut s| s.next_back())
+                    .unwrap_or_default()
+                    .to_string(),
+                remote_url: (url.scheme() != "file").then(|| (*url).clone()),
+            })
+            .collect();
+        let mut conda_capable: std::collections::HashSet<String> = bundle
+            .probe_decisions
+            .iter()
+            .filter(|d| d.matching_candidates > 0)
+            .map(|d| canonical_conda_name(&d.pypi_name))
+            .collect();
+        conda_capable.extend(config.name_map.keys().map(|k| canonical_conda_name(k)));
+        conda_capable.extend(load_pypi_to_conda_map().await.into_keys());
+        let ws_manifest = workspace_dir.and_then(crate::workspace::WorkspaceManifest::load);
+        let workspace_indexes: Vec<String> = ws_manifest
+            .as_ref()
+            .map(|m| m.all_pypi_index_urls())
+            .unwrap_or_default();
+        // grizzly H1: fold the workspace solve environment into the hash.
+        let workspace_fp = ws_manifest
+            .as_ref()
+            .map(|m| m.solve_fingerprint())
+            .unwrap_or_default();
+        let entry_indexes: Vec<String> = config
+            .retread_wheels
+            .values()
+            .map(|e| e.index_url())
+            .collect();
+        let index_urls = merge_index_chain(entry_indexes, &workspace_indexes);
+        // B-1 (lock-poisoning): in courier mode the committed lock's
+        // `conda_run_deps` MUST be the run-deps pixi actually solved and
+        // locked (forwarded as `run_override`). The legacy fallback re-derived
+        // them from the wheels' `requires_dist` via `build_bundle_recipe`,
+        // which can diverge from pixi's real solve -- a cold replay would then
+        // faithfully reproduce a POISONED lock. Refuse rather than guess.
+        let run_deps: Vec<String> = run_override.map(|o| o.to_vec()).ok_or_else(|| {
+            anyhow::anyhow!(
+                "courier: refusing to write a lock from a non-authoritative source. pixi did \
+                 not forward run_dependencies (run_override = None), so the only run-deps \
+                 available are re-derived from the wheels' Requires-Dist, which can diverge \
+                 from what pixi actually locked and poison the committed lock. Aborting the \
+                 courier build. (A normal `pixi install` forwards run_dependencies during \
+                 conda/build_v1; if you hit this, file a bug.)"
+            )
+        })?;
+        let staging = work_dir.join(format!("courier-{}", bundle.conda_name));
+        // Fingerprint folds in the conda channel list (grizzly P1) and the
+        // workspace solve env (grizzly H1) alongside the config-derived
+        // inputs; the replayer computes it identically.
+        let config_fp = crate::courier::config_fingerprint(config, conda_channels, &workspace_fp);
+        let staged = crate::courier::stage(
+            config,
+            &bundle.conda_name,
+            &version,
+            &python_version,
+            &emit_wheels,
+            &conda_capable,
+            &run_deps,
+            &index_urls,
+            &config_fp,
+            source_dir,
+            &staging,
+        )
+        .await
+        .context("courier staging")?;
+        // Defer the committed install lock write until after a successful
+        // rattler-build (B-2). The staged copy inside `staging` is already in
+        // the recipe's source list; this is the authoritative pack-dir copy.
+        let lock_path = source_dir.join(crate::lock::RetreadLock::file_name(&bundle.conda_name));
+        courier_lock_to_commit = Some((lock_path, staged.lock.to_pretty_json()?));
+        build_courier_recipe(
+            &bundle.conda_name,
+            &version,
+            &python_version,
+            &staged.run_deps,
+            &staged.source_urls,
+            // Thread the content-addressed build string into the recipe so
+            // the on-disk artifact name matches what conda/outputs advertised.
+            expected_build,
+        )
+    } else {
+        build_bundle_recipe(
+            &bundle.conda_name,
+            &sources,
+            config,
+            workspace_python_version,
+            run_override,
+            // blueprint="only" payload-skip is deprecated (v2.0.0); the
+            // non-courier conda path always carries its wheel payload.
+            true,
+        )?
+    };
     let yaml = to_yaml(&recipe)?;
 
     let recipe_dir = work_dir.join(format!("recipe-{}", recipe.package.name));
@@ -3755,99 +3891,6 @@ async fn build_one(
         tracing::warn!(path = %audit_path.display(), error = %e, "failed to write audit record (non-fatal)");
     } else {
         tracing::info!(path = %audit_path.display(), "wrote audit");
-    }
-
-    // v1.6.0 (experimental): emit-pypi side-channel. Derived from the
-    // exact same wheel set the recipe is built from; advisory output
-    // like the audit, so failures are non-fatal.
-    if config.emit_pypi || config.blueprint.is_on() {
-        let emit_wheels: Vec<crate::emit_pypi::EmitWheel> = bundle
-            .all_wheels()
-            .zip(localized_urls.iter())
-            .map(|(w, url)| crate::emit_pypi::EmitWheel {
-                pypi_name: w.pypi_name.clone(),
-                version: w.metadata.version.clone(),
-                requires_dist: w.metadata.requires_dist.clone(),
-                local_path: (url.scheme() == "file")
-                    .then(|| url.to_file_path().ok())
-                    .flatten(),
-                wheel_filename: url
-                    .path_segments()
-                    .and_then(|mut s| s.next_back())
-                    .unwrap_or_default()
-                    .to_string(),
-                remote_url: (url.scheme() != "file").then(|| (*url).clone()),
-            })
-            .collect();
-        // v1.7.0 blueprint: sweep the full PyPI dependency closure via
-        // (cheap, sidecar-preferring) metadata so the override mapper
-        // sees EVERY wheel uv could pull -- including deps the cascade
-        // routed conda-side. In the conda path those ride as conda
-        // run-deps; the blueprint has no conda vehicle, so uv resolves
-        // them from the index where their original caps (moviepy's
-        // pillow<12) conflict with conda-pinned versions. Closure
-        // members join emit_wheels as remote entries; emit fetches and
-        // rewrites only the ones whose pins actually need mapping.
-        let closure_wheels: Vec<crate::emit_pypi::EmitWheel> = if config.blueprint.is_on() {
-            let workspace_indexes: Vec<String> = workspace_dir
-                .and_then(crate::workspace::WorkspaceManifest::load)
-                .map(|m| m.all_pypi_index_urls())
-                .unwrap_or_default();
-            let entry_indexes: Vec<String> = config
-                .retread_wheels
-                .values()
-                .map(|e| e.index_url())
-                .collect();
-            let indexes = merge_index_chain(entry_indexes, &workspace_indexes);
-            let target = wheel_target_for(target_subdir, workspace_python_version);
-            let known: HashSet<String> = emit_wheels
-                .iter()
-                .map(|w| canonical_conda_name(&w.pypi_name))
-                .collect();
-            let seeds: Vec<(Vec<String>, Vec<String>)> = bundle
-                .all_wheels()
-                .map(|w| (w.metadata.requires_dist.clone(), w.extras_requested.clone()))
-                .collect();
-            blueprint_closure_sweep(seeds, &known, &indexes, &target, source_dir).await
-        } else {
-            Vec::new()
-        };
-
-        // PyPI names conda can ship at all. These never get exact-pin
-        // overrides: the consuming env's conda side may pin any
-        // version of them and conda wins. Three sources, unioned:
-        // the cascade's probe decisions (candidates > 0; empty for
-        // fully-cached builds since probes run in conda/outputs), the
-        // user's name-map (every entry is by definition conda-routed),
-        // and parselmouth's full PyPI->conda mapping -- the name-level
-        // "exists on conda" oracle that covers bundled deps the
-        // cascade never probed (requests). build_one's config is the
-        // RAW user config (resolve_all's parselmouth merge does not
-        // flow here), so the mapping is loaded explicitly; on network
-        // failure it degrades to the curated fallback entries and the
-        // probe set.
-        let mut conda_capable: std::collections::HashSet<String> = bundle
-            .probe_decisions
-            .iter()
-            .filter(|d| d.matching_candidates > 0)
-            .map(|d| canonical_conda_name(&d.pypi_name))
-            .collect();
-        conda_capable.extend(config.name_map.keys().map(|k| canonical_conda_name(k)));
-        conda_capable.extend(load_pypi_to_conda_map().await.into_keys());
-        if let Err(e) = crate::emit_pypi::emit(
-            &recipe.package.name,
-            &recipe.package.version,
-            source_dir,
-            workspace_dir,
-            &emit_wheels,
-            &closure_wheels,
-            &conda_capable,
-            config,
-        )
-        .await
-        {
-            tracing::warn!(error = %format!("{e:#}"), "emit-pypi side-channel failed (non-fatal)");
-        }
     }
 
     tokio::fs::create_dir_all(output_dir).await?;
@@ -3908,6 +3951,23 @@ async fn build_one(
         bail!("rattler-build exited with status {}", output.status);
     }
 
+    // B-2/B-3: rattler-build succeeded -- NOW commit the courier lock, write-
+    // then-rename so a crash can't leave a torn file. Only ever reached past
+    // the success gate, so the committed lock always corresponds to a package
+    // that actually built.
+    if let Some((lock_path, lock_json)) = courier_lock_to_commit {
+        let lock_tmp = lock_path.with_extension("json.tmp");
+        tokio::fs::write(&lock_tmp, &lock_json)
+            .await
+            .with_context(|| format!("writing lock tmp {}", lock_tmp.display()))?;
+        tokio::fs::rename(&lock_tmp, &lock_path)
+            .await
+            .with_context(|| {
+                format!("atomically placing committed lock {}", lock_path.display())
+            })?;
+        tracing::info!(path = %lock_path.display(), "courier: wrote install lock (post-build)");
+    }
+
     let subdir_dir = output_dir.join(&target_platform);
     let output_file =
         find_conda_artifact(&subdir_dir, &recipe.package.name, &recipe.package.version).await?;
@@ -3937,18 +3997,36 @@ fn spec_from_str(s: &str) -> Result<NamedSpec<PackageSpec>> {
         Some((n, r)) => (n.trim(), r.trim()),
         None => (s.trim(), ""),
     };
-    let version = if rest.is_empty() {
+    // `rest` is a conda matchspec tail: a version spec OPTIONALLY followed by a
+    // build string, e.g. `3.12.* *_cp312` (python_abi). Split them so the
+    // build string doesn't get fed to the version parser (which rejects it).
+    // This is load-bearing for cold-solve replay, which round-trips the
+    // emitted run-deps (incl. build-tagged python_abi) through this fn.
+    let (ver_part, build_part) = match rest.split_once(char::is_whitespace) {
+        Some((v, b)) => (v.trim(), b.trim()),
+        None => (rest, ""),
+    };
+    let version = if ver_part.is_empty() {
         None
     } else {
         Some(
-            VersionSpec::from_str(rest, rattler_conda_types::ParseStrictness::Lenient)
-                .map_err(|e| anyhow!("parsing version spec `{rest}` for `{name}`: {e}"))?,
+            VersionSpec::from_str(ver_part, rattler_conda_types::ParseStrictness::Lenient)
+                .map_err(|e| anyhow!("parsing version spec `{ver_part}` for `{name}`: {e}"))?,
+        )
+    };
+    let build = if build_part.is_empty() {
+        None
+    } else {
+        Some(
+            StringMatcher::from_str(build_part)
+                .map_err(|e| anyhow!("parsing build string `{build_part}` for `{name}`: {e}"))?,
         )
     };
     Ok(NamedSpec {
         name: name.to_string(),
         spec: PackageSpec::Binary(BinaryPackageSpec {
             version,
+            build,
             ..Default::default()
         }),
     })
@@ -3972,6 +4050,468 @@ async fn find_conda_artifact(dir: &Path, name: &str, version: &str) -> Result<Pa
         "no .conda artifact found in {} matching {prefix}*.conda",
         dir.display()
     )
+}
+
+/// WS-B: cold-solve replay helper.
+///
+/// Loads the committed lock at `lock_path` and, if its `inputs_hash`
+/// matches `current_inputs_hash`, reconstructs a [`CondaOutput`] from
+/// the lock's `conda_run_deps` -- bypassing the full probe cascade.
+///
+/// Returns:
+/// - `Ok(Some(output))` — hash matched; replay output is ready.
+/// - `Ok(None)` — hash mismatch, or file missing (fall through to
+///   cascade; this is not an error).
+/// - `Err(...)` — lock file exists but is malformed / unreadable. The
+///   caller treats this as a replay miss and falls through (non-fatal).
+fn replay_from_lock(
+    lock_path: &Path,
+    current_inputs_hash: &str,
+    host_platform: Platform,
+    build_number: u64,
+    siblings: &[(String, String)],
+) -> anyhow::Result<Option<CondaOutput>> {
+    // Missing lock → first build or lock not yet committed. Not an error.
+    if !lock_path.exists() {
+        return Ok(None);
+    }
+    let lock = crate::lock::RetreadLock::load(lock_path)?;
+    // B-7: schema mismatch → a lock written by a different backend version
+    // whose fields/semantics may differ. Treat as a miss (cascade re-derives
+    // and rewrites at the next build) rather than risk mis-replaying a lock we
+    // don't fully understand. `inputs_hash` already folds in the retread
+    // version, so a binary upgrade invalidates replay too; this is the
+    // explicit, cheap backstop.
+    if lock.schema != crate::lock::SCHEMA {
+        return Ok(None);
+    }
+    // Hash mismatch → inputs changed; must re-resolve.
+    if lock.inputs_hash != current_inputs_hash {
+        return Ok(None);
+    }
+
+    // ----- reconstruct CondaOutput from lock fields -----
+    let python_version = crate::relax::emit_python_version("", &lock.python);
+    let py_short = python_version.replace('.', "");
+    // Replay is always courier mode. Use the content-addressed string so
+    // the advertised build string is byte-identical to produce_output's.
+    // `current_inputs_hash` has already been verified to match `lock.inputs_hash`
+    // at this point, so either is the correct hash to embed.
+    let build = courier_build_string(&py_short, current_inputs_hash, build_number);
+
+    // Determine subdir from wheel filenames (same logic as produce_output).
+    let any_platform_specific = lock
+        .wheels
+        .iter()
+        .any(|w| !crate::wheel::is_pure_python_wheel_filename(&w.filename));
+    let subdir = if any_platform_specific {
+        host_platform
+    } else {
+        Platform::NoArch
+    };
+    let noarch = if any_platform_specific {
+        NoArchType::none()
+    } else {
+        NoArchType::python()
+    };
+
+    // Python host + run dep strings.
+    let python_dep = if python_version.contains('*') {
+        format!("python {python_version}")
+    } else {
+        format!("python {python_version}.*")
+    };
+
+    // Reconstruct run-dependencies from the lock's conda_run_deps.
+    let mut run_depends: Vec<NamedSpec<PackageSpec>> = vec![spec_from_str(&python_dep)?];
+    let mut seen_dep_names: HashSet<String> = HashSet::from(["python".to_string()]);
+    for dep in &lock.conda_run_deps {
+        let spec_str = if dep.spec.is_empty() {
+            dep.name.clone()
+        } else {
+            format!("{} {}", dep.name, dep.spec)
+        };
+        let ns = spec_from_str(&spec_str)?;
+        if seen_dep_names.insert(ns.name.clone()) {
+            run_depends.push(ns);
+        }
+    }
+    // Re-add sibling cross-links (same as produce_output).
+    for (sib_name, sib_version) in siblings {
+        if sib_name == &lock.bundle {
+            continue;
+        }
+        if seen_dep_names.insert(sib_name.clone()) {
+            run_depends.push(spec_from_str(&format!("{sib_name} =={sib_version}"))?);
+        }
+    }
+    // Replay only fires in courier mode -> uv must be in the replayed metadata
+    // too (match produce_output). The installer binary ships in the package.
+    // Guard against a duplicate: `uv` may already be in the lock's
+    // conda_run_deps (pixi forwards it as a solved run-dep), so only add it if
+    // not already present -- otherwise the replayed output diverges from the
+    // cascade's (which emits uv once).
+    if seen_dep_names.insert("uv".to_string()) {
+        run_depends.push(spec_from_str("uv")?);
+    }
+
+    let mut variant = std::collections::BTreeMap::new();
+    variant.insert(
+        "python".to_string(),
+        VariantValue::String(python_version.clone()),
+    );
+
+    Ok(Some(CondaOutput {
+        metadata: CondaOutputMetadata {
+            name: PackageName::new_unchecked(lock.bundle.clone()),
+            version: VersionWithSource::from_str(&lock.version)
+                .map_err(|e| anyhow!("replay: parsing version `{}`: {e}", lock.version))?,
+            build,
+            build_number,
+            subdir,
+            license: None,
+            license_family: None,
+            noarch,
+            purls: None,
+            python_site_packages_path: None,
+            variant,
+        },
+        build_dependencies: None,
+        host_dependencies: Some(CondaOutputDependencies {
+            depends: vec![spec_from_str(&python_dep)?, spec_from_str("pip")?],
+            constraints: Vec::new(),
+        }),
+        run_dependencies: CondaOutputDependencies {
+            depends: run_depends,
+            constraints: Vec::new(),
+        },
+        ignore_run_exports: CondaOutputIgnoreRunExports::default(),
+        run_exports: CondaOutputRunExports::default(),
+        input_globs: None,
+    }))
+}
+
+// -----------------------------------------------------------------
+// WS-B: unit tests for replay_from_lock.
+// Uses only std (no tempfile crate dependency) -- temp dirs are created
+// via std::env::temp_dir() with a unique subdirectory.
+// -----------------------------------------------------------------
+#[cfg(test)]
+mod replay_tests {
+    use std::collections::BTreeMap;
+
+    use rattler_conda_types::Platform;
+
+    use super::replay_from_lock;
+    use crate::lock::{CondaDep, LockWheel, Origin, RetreadLock, SCHEMA};
+
+    fn unique_tmp_dir() -> std::path::PathBuf {
+        let base = std::env::temp_dir();
+        // Use a unique sub-directory per test call to avoid collisions.
+        let unique = format!(
+            "retread-ws-b-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        );
+        let dir = base.join(unique);
+        std::fs::create_dir_all(&dir).expect("tmp dir creation should not fail");
+        dir
+    }
+
+    /// Build a minimal RetreadLock suitable for replay tests.
+    fn make_test_lock(
+        bundle: &str,
+        version: &str,
+        python: &str,
+        inputs_hash: &str,
+        pure_python: bool,
+    ) -> RetreadLock {
+        let filename = if pure_python {
+            format!("{bundle}-{version}-py3-none-any.whl")
+        } else {
+            format!("{bundle}-{version}-cp311-cp311-manylinux_2_17_x86_64.whl")
+        };
+        RetreadLock {
+            schema: SCHEMA,
+            retread_version: "0.0.1".into(),
+            bundle: bundle.into(),
+            version: version.into(),
+            python: python.into(),
+            inputs_hash: inputs_hash.into(),
+            root_requirements: Vec::new(),
+            wheels: vec![LockWheel {
+                name: bundle.into(),
+                version: version.into(),
+                origin: Origin::Index,
+                filename,
+                url: Some(format!("https://example.com/{bundle}-{version}.whl")),
+                sha256: None,
+            }],
+            conda_run_deps: vec![CondaDep {
+                name: "numpy".into(),
+                spec: ">=1.21".into(),
+            }],
+            index_urls: vec!["https://pypi.org/simple/".into()],
+            prerelease: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn matching_hash_returns_some_with_correct_fields() {
+        let dir = unique_tmp_dir();
+        let lock = make_test_lock("mypack", "1.2.3", "3.11", "abc123", true);
+        let json = lock.to_pretty_json().unwrap();
+        let lock_path = dir.join(RetreadLock::file_name("mypack"));
+        std::fs::write(&lock_path, &json).unwrap();
+
+        let result = replay_from_lock(&lock_path, "abc123", Platform::Linux64, 0, &[]);
+        assert!(result.is_ok(), "should not error: {result:?}");
+        let output = result.unwrap();
+        assert!(output.is_some(), "matching hash must return Some");
+        let out = output.unwrap();
+
+        // Name and version round-trip.
+        assert_eq!(out.metadata.name.as_normalized(), "mypack");
+        assert_eq!(out.metadata.version.version().to_string(), "1.2.3");
+        // Pure-python wheel -> noarch output.
+        assert_eq!(out.metadata.subdir, Platform::NoArch);
+        // run_dependencies includes python and the replayed conda dep.
+        let dep_names: Vec<&str> = out
+            .run_dependencies
+            .depends
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect();
+        assert!(
+            dep_names.contains(&"python"),
+            "run_deps must include python: {dep_names:?}"
+        );
+        assert!(
+            dep_names.contains(&"numpy"),
+            "run_deps must include numpy from lock: {dep_names:?}"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn hash_mismatch_returns_none() {
+        let dir = unique_tmp_dir();
+        let lock = make_test_lock("mypack", "1.2.3", "3.11", "stored-hash", true);
+        let json = lock.to_pretty_json().unwrap();
+        let lock_path = dir.join(RetreadLock::file_name("mypack"));
+        std::fs::write(&lock_path, &json).unwrap();
+
+        let result = replay_from_lock(&lock_path, "different-hash", Platform::Linux64, 0, &[]);
+        assert!(result.is_ok(), "mismatch must not error: {result:?}");
+        assert!(
+            result.unwrap().is_none(),
+            "hash mismatch must return None (fall through to cascade)"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn missing_file_returns_none() {
+        let dir = unique_tmp_dir();
+        let lock_path = dir.join("retread-missing.lock.json");
+
+        let result = replay_from_lock(&lock_path, "any-hash", Platform::Linux64, 0, &[]);
+        assert!(result.is_ok(), "missing file must not error: {result:?}");
+        assert!(
+            result.unwrap().is_none(),
+            "missing lock must return None (first-build path)"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn malformed_json_returns_err() {
+        let dir = unique_tmp_dir();
+        let lock_path = dir.join(RetreadLock::file_name("badpack"));
+        std::fs::write(&lock_path, b"not valid json{{{{").unwrap();
+
+        let result = replay_from_lock(&lock_path, "any-hash", Platform::Linux64, 0, &[]);
+        assert!(
+            result.is_err(),
+            "malformed JSON must return Err (caller falls through): {result:?}"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn platform_specific_wheel_sets_host_platform_subdir() {
+        let dir = unique_tmp_dir();
+        let lock = make_test_lock("mypack", "1.0.0", "3.11", "hash1", false /* arch */);
+        let json = lock.to_pretty_json().unwrap();
+        let lock_path = dir.join(RetreadLock::file_name("mypack"));
+        std::fs::write(&lock_path, &json).unwrap();
+
+        let result = replay_from_lock(&lock_path, "hash1", Platform::Linux64, 0, &[]);
+        let out = result.unwrap().unwrap();
+        assert_eq!(
+            out.metadata.subdir,
+            Platform::Linux64,
+            "platform-specific wheel must set subdir=host_platform"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn siblings_are_cross_linked_in_output() {
+        let dir = unique_tmp_dir();
+        let lock = make_test_lock("pack-a", "2.0.0", "3.11", "hash42", true);
+        let json = lock.to_pretty_json().unwrap();
+        let lock_path = dir.join(RetreadLock::file_name("pack-a"));
+        std::fs::write(&lock_path, &json).unwrap();
+
+        let siblings = vec![
+            ("pack-a".to_string(), "2.0.0".to_string()),
+            ("pack-b".to_string(), "2.0.0".to_string()),
+        ];
+        let result = replay_from_lock(&lock_path, "hash42", Platform::Linux64, 0, &siblings);
+        let out = result.unwrap().unwrap();
+        let dep_names: Vec<&str> = out
+            .run_dependencies
+            .depends
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect();
+        // pack-b should be cross-linked; pack-a is self and must not duplicate.
+        assert!(
+            dep_names.contains(&"pack-b"),
+            "sibling pack-b must be cross-linked: {dep_names:?}"
+        );
+        let pack_a_count = dep_names.iter().filter(|&&n| n == "pack-a").count();
+        assert_eq!(
+            pack_a_count, 0,
+            "self-sibling pack-a must not appear in run_deps: {dep_names:?}"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Verify that conda_run_deps with empty spec (name-only) round-trips.
+    #[test]
+    fn conda_dep_with_empty_spec_round_trips() {
+        let dir = unique_tmp_dir();
+        let mut lock = make_test_lock("mypack", "1.0.0", "3.11", "hash9", true);
+        lock.conda_run_deps.push(CondaDep {
+            name: "uv".into(),
+            spec: String::new(),
+        });
+        let json = lock.to_pretty_json().unwrap();
+        let lock_path = dir.join(RetreadLock::file_name("mypack"));
+        std::fs::write(&lock_path, &json).unwrap();
+
+        let result = replay_from_lock(&lock_path, "hash9", Platform::Linux64, 0, &[]);
+        let out = result.unwrap().unwrap();
+        let dep_names: Vec<&str> = out
+            .run_dependencies
+            .depends
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect();
+        assert!(
+            dep_names.contains(&"uv"),
+            "name-only conda dep must appear in run_deps: {dep_names:?}"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Requires real repodata/channels — skipped in normal CI.
+    /// Run manually to verify end-to-end replay in courier mode.
+    #[test]
+    #[ignore = "requires real repodata/channels; run manually for e2e replay validation"]
+    fn conda_outputs_replay_skips_cascade_with_committed_lock() {
+        // Integration test placeholder:
+        // 1. Write a valid lock file to source_dir.
+        // 2. Call conda_outputs with courier=true.
+        // 3. Assert the result is returned promptly (no solve cascade).
+    }
+
+    /// Verify that replay_from_lock emits the content-addressed build string.
+    #[test]
+    fn replay_emits_content_addressed_build_string() {
+        let dir = unique_tmp_dir();
+        // Use a 64-hex-char inputs_hash (typical sha256 hex output length).
+        let hash = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let lock = make_test_lock("mypack", "1.2.3", "3.11", hash, true);
+        let json = lock.to_pretty_json().unwrap();
+        let lock_path = dir.join(RetreadLock::file_name("mypack"));
+        std::fs::write(&lock_path, &json).unwrap();
+
+        let result = replay_from_lock(&lock_path, hash, Platform::Linux64, 0, &[]);
+        let out = result.unwrap().unwrap();
+        // Build string must be content-addressed: py311_h<first10>_0
+        assert_eq!(
+            out.metadata.build, "py311_habcdef0123_0",
+            "replay must emit content-addressed build string: got {}",
+            out.metadata.build
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+}
+
+// -----------------------------------------------------------------
+// Unit tests for courier build string helpers.
+// -----------------------------------------------------------------
+#[cfg(test)]
+mod courier_build_string_tests {
+    use super::courier_build_string;
+
+    #[test]
+    fn build_string_includes_hash_prefix() {
+        let hash = "abcdef0123456789";
+        let s = courier_build_string("311", hash, 0);
+        assert!(
+            s.contains("habcdef0123"),
+            "build string must contain h+first10 of hash: {s}"
+        );
+        assert!(
+            s.starts_with("py311_"),
+            "build string must start with py prefix: {s}"
+        );
+        assert!(
+            s.ends_with("_0"),
+            "build string must end with build number: {s}"
+        );
+    }
+
+    #[test]
+    fn different_hashes_give_different_build_strings() {
+        let s1 = courier_build_string("311", "aaaaaa0000111122", 0);
+        let s2 = courier_build_string("311", "bbbbbb9999888877", 0);
+        assert_ne!(
+            s1, s2,
+            "different inputs hashes must yield different build strings"
+        );
+    }
+
+    #[test]
+    fn same_hash_different_build_number_gives_different_string() {
+        let hash = "abcdef0123456789";
+        let s0 = courier_build_string("311", hash, 0);
+        let s1 = courier_build_string("311", hash, 1);
+        assert_ne!(
+            s0, s1,
+            "different build numbers must yield different strings"
+        );
+    }
+
+    #[test]
+    fn hash_shorter_than_10_chars_does_not_panic() {
+        // When the hash is shorter than 10 chars, min(len, 10) keeps all chars.
+        let s = courier_build_string("311", "abc", 0);
+        assert_eq!(s, "py311_habc_0");
+    }
+
+    #[test]
+    fn build_string_format_is_py_prefix_h_hash_number() {
+        // Exact format spec: py{py_short}_h{hash[..10]}_{build_number}
+        let s = courier_build_string("312", "1234567890abcdef", 2);
+        assert_eq!(s, "py312_h1234567890_2");
+    }
 }
 
 #[cfg(test)]

@@ -17,6 +17,7 @@ version = "0.3.0"
 backend = { name = "pixi-build-retread", version = "*", channels = ["file:///home/garylvov/projects/pixi-build-retread/local-channel", "https://prefix.dev/garylvov", "https://prefix.dev/conda-forge"] }
 
 [package.build.config]
+# courier mode is the default (v2.1.0+)
 retread-relax        = "patch-then-minor-then-major-then-last-resort"
 retread-build-number = 0
 retread-python       = "3.12"

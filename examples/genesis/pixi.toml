@@ -22,4 +22,7 @@ build-variants = { python = ["3.12"] }
 [dependencies]
 python = "==3.12"
 pip = "*"
+# Genesis requires torch at import; it intentionally does NOT pin it (the
+# user picks CPU/GPU). The CPU build from conda-forge is enough to import.
+pytorch = "*"
 genesis-pack = { path = "./genesis-pack" }

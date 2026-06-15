@@ -39,6 +39,12 @@ pub struct Source {
 #[derive(Debug, Serialize)]
 pub struct Build {
     pub number: u64,
+    /// Explicit build string. When set, rattler-build uses this verbatim
+    /// instead of synthesizing one from the variant + build number. Used by
+    /// the courier path to embed the content-addressed `inputs_hash` prefix
+    /// so pixi cache-hits are invalidated whenever content changes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub string: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub noarch: Option<String>,
     pub script: String,
@@ -206,6 +212,9 @@ pub fn build_bundle_recipe(
         source: recipe_sources,
         build: Build {
             number: config.build_number,
+            // Non-courier path: no content-addressed string; rattler-build
+            // synthesizes the standard `py{XY}_{build_number}` string.
+            string: None,
             noarch,
             // Vendor wheels (Omniverse, manylinux) ship pre-baked rpaths;
             // rattler-build's default relocation pass either overflows the
@@ -237,8 +246,266 @@ pub fn build_bundle_recipe(
     })
 }
 
+/// v2.0.0 courier: build the recipe for a metadata-only "courier" conda
+/// package. Unlike [`build_bundle_recipe`], the package carries NO installed
+/// wheel payload. Instead it ships the bundle's built/shadow wheels + the
+/// committed lock as data under `$PREFIX/share/retread/`, declares the
+/// solved conda run-deps (so shared transitives stay conda) plus `uv` and
+/// `pixi-build-retread` (the installer binary), and writes a conda
+/// **post-link** script that runs `retread install` at env link time to
+/// uv-hardlink the wheels in (fetching index wheels on demand). The huge
+/// index wheels never enter the conda package, so packaging is seconds and
+/// nothing is committed to git.
+///
+/// `source_urls` are file:// URLs to the staged wheels + the lock json
+/// (rattler-build copies them into `$SRC_DIR`); the build script stages
+/// them into the install prefix. `run_deps` is the solved conda run-dep
+/// list (uv + pixi-build-retread are appended here).
+pub fn build_courier_recipe(
+    conda_name: &str,
+    version: &str,
+    python_version: &str,
+    run_deps: &[String],
+    source_urls: &[String],
+    // Content-addressed build string to embed in the recipe. When `Some`,
+    // rattler-build records it verbatim so the on-disk artifact name matches
+    // what `conda/outputs` advertised to pixi. When `None` (direct tests
+    // without a pixi context), rattler-build synthesizes the string itself.
+    expected_build: Option<&str>,
+) -> Recipe {
+    let python_pin = format!("python {python_version}.*");
+    let lock_filename = crate::lock::RetreadLock::file_name(conda_name);
+
+    let mut run: Vec<String> = run_deps.to_vec();
+    if !run
+        .iter()
+        .any(|s| s == "python" || s.starts_with("python "))
+    {
+        run.insert(0, python_pin.clone());
+    }
+    // Only `uv` is a conda run-dep (always on conda-forge -> the consumer's
+    // pre-emission solve check + lock find it). We do NOT run-dep on
+    // `pixi-build-retread`: that would drag the heavy backend (rattler-build,
+    // ...) into the consumer env AND the solve check can't see it on a
+    // file:// / non-default channel. Instead the static installer binary
+    // SHIPS inside this package (staged as `retread-installer`, copied to
+    // `$PREFIX/bin/retread` by the build script below).
+    if !run.iter().any(|s| s == "uv" || s.starts_with("uv ")) {
+        run.push("uv".to_string());
+    }
+
+    // Build script: stage wheels + lock under $PREFIX/share/retread, install
+    // the shipped static `retread` binary into $PREFIX/bin, then emit the
+    // conda post-link script (literal $PREFIX -- expanded at LINK time, not
+    // build time -- via the quoted heredoc). The post-link runs the installer;
+    // a failure is logged loudly but does not abort linking (the conda
+    // metadata is still valid; the user can re-run `retread install`).
+    let post_link = format!("$PREFIX/bin/.{conda_name}-post-link.sh");
+    // A4 loud-failure guard: courier is the default mode, so a consumer who
+    // forgets `run-post-link-scripts = "insecure"` would otherwise get a
+    // SILENTLY broken env (post-link never runs, wheels never installed). We
+    // also ship a conda activate.d script -- which runs on EVERY activation
+    // regardless of the post-link toggle -- that checks the installer's success
+    // marker and, if absent, prints a loud actionable banner. Turns an
+    // invisible failure into one the user sees on the next `pixi run`/`shell`.
+    let activate_guard = format!("$PREFIX/etc/conda/activate.d/zzz-retread-{conda_name}.sh");
+    let script = format!(
+        "set -euo pipefail\n\
+         SHARE=\"$PREFIX/share/retread\"\n\
+         WHEELS=\"$SHARE/{conda_name}/wheels\"\n\
+         mkdir -p \"$WHEELS\" \"$PREFIX/bin\" \"$PREFIX/etc/conda/activate.d\"\n\
+         cp \"$SRC_DIR\"/*.whl \"$WHEELS\"/ 2>/dev/null || true\n\
+         cp \"$SRC_DIR\"/{lock_filename} \"$SHARE\"/\n\
+         cp \"$SRC_DIR\"/retread-installer \"$PREFIX/bin/retread\"\n\
+         chmod +x \"$PREFIX/bin/retread\"\n\
+         cat > \"{post_link}\" <<'POSTLINK'\n\
+         #!/bin/bash\n\
+         \"$PREFIX/bin/retread\" install --lock \"$PREFIX/share/retread/{lock_filename}\" --prefix \"$PREFIX\" || echo 'retread: post-link install failed; run `retread install` manually' >&2\n\
+         POSTLINK\n\
+         chmod +x \"{post_link}\"\n\
+         cat > \"{activate_guard}\" <<'ACTIVATE'\n\
+         #!/bin/bash\n\
+         # retread courier guard ({conda_name}): warn loudly if the bundle's\n\
+         # PyPI wheels were never installed (post-link did not run -- almost\n\
+         # always run-post-link-scripts is not enabled in .pixi/config.toml).\n\
+         if [ ! -f \"$CONDA_PREFIX/share/retread/{conda_name}.installed\" ]; then\n\
+         echo \"######################################################################\" >&2\n\
+         echo \"# retread: bundle '{conda_name}' PyPI wheels are NOT installed.\" >&2\n\
+         echo \"# The post-link installer did not run. Almost always this means\" >&2\n\
+         echo \"# post-link scripts are disabled. Add to <workspace>/.pixi/config.toml:\" >&2\n\
+         echo '#     run-post-link-scripts = \"insecure\"' >&2\n\
+         echo \"# then re-run: pixi install   (see the pack README security note).\" >&2\n\
+         echo \"# Or install now:\" >&2\n\
+         echo \"#   retread install --lock \\\"$CONDA_PREFIX/share/retread/{lock_filename}\\\" --prefix \\\"$CONDA_PREFIX\\\"\" >&2\n\
+         echo \"######################################################################\" >&2\n\
+         fi\n\
+         ACTIVATE\n\
+         chmod +x \"{activate_guard}\"\n"
+    );
+
+    let source = source_urls
+        .iter()
+        .map(|u| Source {
+            url: u.clone(),
+            sha256: None,
+        })
+        .collect();
+
+    Recipe {
+        schema_version: 1,
+        package: Package {
+            name: conda_name.to_string(),
+            version: version.to_string(),
+        },
+        source,
+        build: Build {
+            number: 0,
+            // Content-addressed string: embed so the on-disk artifact name
+            // matches what conda/outputs advertised to pixi (prevents stale
+            // cache hits when content changes but metadata stays the same).
+            string: expected_build.map(str::to_string),
+            // Platform + python specific: the staged wheels are cpXY/manylinux
+            // and the lock is python-specific, so the package must not be
+            // noarch (build string carries the python variant via the run pin).
+            noarch: None,
+            // Wheels ship as .whl zips (no extracted .so), so rattler-build's
+            // relocation pass has nothing to rewrite -- leave defaults.
+            dynamic_linking: None,
+            script,
+        },
+        requirements: Requirements {
+            host: vec![python_pin],
+            run,
+        },
+        about: About {
+            license: None,
+            summary: None,
+        },
+    }
+}
+
 pub fn to_yaml(recipe: &Recipe) -> anyhow::Result<String> {
     Ok(serde_yaml::to_string(recipe)?)
+}
+
+#[cfg(test)]
+mod courier_tests {
+    use super::*;
+
+    #[test]
+    fn courier_recipe_shape() {
+        let r = build_courier_recipe(
+            "isaac-pack",
+            "5.1.0",
+            "3.11",
+            &["torchaudio >=2.7,<3".to_string(), "numpy <2".to_string()],
+            &[
+                "file:///x/isaaclab-0.51.1-py3-none-any.whl".to_string(),
+                "file:///x/retread-isaac-pack.lock.json".to_string(),
+            ],
+            None,
+        );
+        // run-deps: solved deps + the installer essentials, no dup python.
+        assert!(
+            r.requirements
+                .run
+                .iter()
+                .any(|s| s == "torchaudio >=2.7,<3")
+        );
+        assert!(r.requirements.run.iter().any(|s| s == "uv"));
+        // The installer binary SHIPS in the package (not a run-dep), so the
+        // heavy backend never pollutes the consumer env.
+        assert!(
+            !r.requirements.run.iter().any(|s| s == "pixi-build-retread"),
+            "courier must NOT run-dep on the backend"
+        );
+        assert!(r.requirements.run.iter().any(|s| s.starts_with("python ")));
+        // no payload pip-install; ships wheels + lock + the static binary as
+        // data + a post-link that runs the shipped `retread` installer.
+        assert!(r.build.script.contains("share/retread"));
+        assert!(r.build.script.contains(".isaac-pack-post-link.sh"));
+        assert!(
+            r.build.script.contains("cp \"$SRC_DIR\"/retread-installer"),
+            "must stage the shipped installer binary"
+        );
+        assert!(
+            r.build
+                .script
+                .contains("\"$PREFIX/bin/retread\" install --lock"),
+            "post-link must run the shipped installer"
+        );
+        assert!(
+            r.build.script.contains("retread-isaac-pack.lock.json"),
+            "post-link must reference the bundle lock"
+        );
+        // sources are the staged wheels + lock (no sha pinning needed).
+        assert_eq!(r.source.len(), 2);
+        assert!(r.build.noarch.is_none());
+        // it must NOT pip-install a payload like the conda-artifact recipe.
+        assert!(!r.build.script.contains("pip install *.whl"));
+        // The quoted heredoc must be valid: body + terminator at column 0
+        // (Rust's `\` string-continuation eats the source indentation). A
+        // leading-space terminator would never close the heredoc and would
+        // swallow the rest of the build script.
+        assert!(
+            r.build.script.contains("\n#!/bin/bash\n"),
+            "post-link heredoc body must start at column 0"
+        );
+        assert!(
+            r.build.script.contains("\nPOSTLINK\n"),
+            "heredoc terminator must be at column 0 to close the heredoc"
+        );
+        // A4 loud-failure guard: a conda activate.d script that warns on every
+        // activation when the wheels are not installed (missing toggle).
+        assert!(
+            r.build
+                .script
+                .contains("etc/conda/activate.d/zzz-retread-isaac-pack.sh"),
+            "must ship an activate.d guard"
+        );
+        assert!(
+            r.build
+                .script
+                .contains("$CONDA_PREFIX/share/retread/isaac-pack.installed"),
+            "guard must check the installer success marker"
+        );
+        assert!(
+            r.build
+                .script
+                .contains("run-post-link-scripts = \"insecure\""),
+            "guard banner must name the toggle the user must enable"
+        );
+        assert!(
+            r.build.script.contains("\nACTIVATE\n"),
+            "activate.d heredoc terminator must be at column 0"
+        );
+    }
+
+    #[test]
+    fn courier_recipe_with_expected_build_sets_string_field() {
+        let r = build_courier_recipe(
+            "mypack",
+            "1.0.0",
+            "3.11",
+            &[],
+            &[],
+            Some("py311_habcdef0123_0"),
+        );
+        assert_eq!(
+            r.build.string.as_deref(),
+            Some("py311_habcdef0123_0"),
+            "expected_build must be forwarded to build.string"
+        );
+    }
+
+    #[test]
+    fn courier_recipe_without_expected_build_has_no_string_field() {
+        let r = build_courier_recipe("mypack", "1.0.0", "3.11", &[], &[], None);
+        assert!(
+            r.build.string.is_none(),
+            "None expected_build must leave build.string absent"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -260,6 +527,7 @@ mod tests {
             default_bundle: None,
             compression_level: None,
             emit_pypi: false,
+            courier: false,
             blueprint: Default::default(),
             blueprint_sync: Default::default(),
             git_sources: std::collections::BTreeMap::new(),

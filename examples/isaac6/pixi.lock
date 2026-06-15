@@ -256,6 +256,7 @@ environments:
       - conda: https://prefix.dev/conda-forge/linux-64/torchcodec-0.10.0-cpu_py312_h626cc08_3.conda
       - conda: https://prefix.dev/conda-forge/linux-64/torchvision-0.26.0-cpu_py312_hae9c06e_1.conda
       - conda: https://prefix.dev/conda-forge/linux-64/usd-exchange-2.2.2-py312h0b4010f_3.conda
+      - conda: https://prefix.dev/conda-forge/linux-64/uv-0.11.21-h26efc2c_0.conda
       - conda: https://prefix.dev/conda-forge/linux-64/uvicorn-0.29.0-py312h7900ff3_0.conda
       - conda: https://prefix.dev/conda-forge/linux-64/warp-lang-1.13.0-cpu_py312h303243a_0.conda
       - conda: https://prefix.dev/conda-forge/linux-64/watchdog-4.0.2-py312h7900ff3_1.conda
@@ -413,7 +414,7 @@ environments:
       - conda: https://prefix.dev/conda-forge/noarch/werkzeug-3.1.8-pyhcf101f3_0.conda
       - conda: https://prefix.dev/conda-forge/noarch/wheel-0.47.0-pyhd8ed1ab_0.conda
       - conda: https://prefix.dev/conda-forge/noarch/zipp-4.1.0-pyhcf101f3_0.conda
-      - conda_source: isaac-pack-6[c469048a] @ ./isaac-pack
+      - conda_source: isaac-pack-6[a1b596ce] @ ./isaac-pack
   gpu:
     channels:
     - url: https://prefix.dev/conda-forge/
@@ -668,6 +669,7 @@ environments:
       - conda: https://prefix.dev/conda-forge/linux-64/torchcodec-0.10.0-cpu_py312_h626cc08_3.conda
       - conda: https://prefix.dev/conda-forge/linux-64/torchvision-0.26.0-cpu_py312_hae9c06e_1.conda
       - conda: https://prefix.dev/conda-forge/linux-64/usd-exchange-2.2.2-py312h0b4010f_3.conda
+      - conda: https://prefix.dev/conda-forge/linux-64/uv-0.11.21-h26efc2c_0.conda
       - conda: https://prefix.dev/conda-forge/linux-64/uvicorn-0.29.0-py312h7900ff3_0.conda
       - conda: https://prefix.dev/conda-forge/linux-64/warp-lang-1.13.0-cpu_py312h303243a_0.conda
       - conda: https://prefix.dev/conda-forge/linux-64/watchdog-4.0.2-py312h7900ff3_1.conda
@@ -826,7 +828,7 @@ environments:
       - conda: https://prefix.dev/conda-forge/noarch/werkzeug-3.1.8-pyhcf101f3_0.conda
       - conda: https://prefix.dev/conda-forge/noarch/wheel-0.47.0-pyhd8ed1ab_0.conda
       - conda: https://prefix.dev/conda-forge/noarch/zipp-4.1.0-pyhcf101f3_0.conda
-      - conda_source: isaac-pack-6[c469048a] @ ./isaac-pack
+      - conda_source: isaac-pack-6[a1b596ce] @ ./isaac-pack
 packages:
 - conda: https://prefix.dev/conda-forge/linux-64/_openmp_mutex-4.5-20_gnu.conda
   build_number: 20
@@ -5045,6 +5047,19 @@ packages:
   run_exports: {}
   size: 460934
   timestamp: 1773836167660
+- conda: https://prefix.dev/conda-forge/linux-64/uv-0.11.21-h26efc2c_0.conda
+  sha256: c54d123d054b3f94af34efd1a2aac72dc46fcaad5d022aada7e111522f0cf045
+  md5: bc8a3f6c735e986f4d3048da2122c01d
+  depends:
+  - libstdcxx >=14
+  - libgcc >=14
+  - __glibc >=2.17,<3.0.a0
+  constrains:
+  - __glibc >=2.17
+  license: Apache-2.0 OR MIT
+  run_exports: {}
+  size: 19422208
+  timestamp: 1781209019310
 - conda: https://prefix.dev/conda-forge/linux-64/uvicorn-0.29.0-py312h7900ff3_0.conda
   sha256: e1f0c882f3b17b6d13f31b214ab87657f53d15cd7b221301104e293044986d8c
   md5: 5abb5cedead2c9a8d616a1b8e5503be8
@@ -7036,7 +7051,7 @@ packages:
   run_exports: {}
   size: 24190
   timestamp: 1779159948016
-- conda_source: isaac-pack-6[c469048a] @ ./isaac-pack
+- conda_source: isaac-pack-6[a1b596ce] @ ./isaac-pack
   variants:
     python: '3.12'
   depends:
@@ -7099,6 +7114,7 @@ packages:
   - markupsafe >=2.0
   - certifi >=2017.4.17
   - cffi >=2.0.0
+  - uv
   - python_abi 3.12.* *_cp312
   host_packages:
   - conda: https://prefix.dev/conda-forge/linux-64/_openmp_mutex-4.5-20_gnu.conda

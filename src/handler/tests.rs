@@ -27,6 +27,27 @@ fn pypi_map(pairs: &[(&str, &[&str])]) -> PypiToCondaMap {
 }
 
 #[test]
+fn spec_from_str_handles_build_string() {
+    // Cold-solve replay round-trips emitted conda run-deps (incl. a
+    // build-tagged python_abi like `3.12.* *_cp312`) through spec_from_str.
+    // It must split the build string from the version, not feed the whole
+    // tail to the version parser (which rejects it) -- the bug that made
+    // replay silently fall through to the cascade.
+    let ns = spec_from_str("python_abi 3.12.* *_cp312").expect("build-string spec must parse");
+    assert_eq!(ns.name, "python_abi");
+    match ns.spec {
+        PackageSpec::Binary(b) => {
+            assert!(b.version.is_some(), "version parsed");
+            assert!(b.build.is_some(), "build string parsed");
+        }
+        _ => panic!("expected binary spec"),
+    }
+    // plain "name version" and bare "name" still work.
+    assert!(spec_from_str("numpy >=1.26").is_ok());
+    assert!(spec_from_str("pip").is_ok());
+}
+
+#[test]
 fn pick_conda_target_name_map_wins_over_ambiguous_parselmouth() {
     // THE torch regression: parselmouth lists several conda
     // candidates for `torch` with NO identity match (torch != any).
@@ -367,6 +388,7 @@ fn pythons_for_rejects_bare_major_variant() {
         default_bundle: None,
         compression_level: None,
         emit_pypi: false,
+        courier: false,
         blueprint: Default::default(),
         blueprint_sync: Default::default(),
         git_sources: std::collections::BTreeMap::new(),
@@ -401,6 +423,7 @@ fn pythons_for_accepts_dotted_variant() {
         default_bundle: None,
         compression_level: None,
         emit_pypi: false,
+        courier: false,
         blueprint: Default::default(),
         blueprint_sync: Default::default(),
         git_sources: std::collections::BTreeMap::new(),
@@ -435,6 +458,7 @@ fn pythons_for_filters_bare_major_keeps_dotted() {
         default_bundle: None,
         compression_level: None,
         emit_pypi: false,
+        courier: false,
         blueprint: Default::default(),
         blueprint_sync: Default::default(),
         git_sources: std::collections::BTreeMap::new(),
@@ -513,7 +537,7 @@ fn produce_output_reflects_overrides_for_refinement_widening() {
     // Baseline rendering: no widening yet. The widened-name
     // dep lands at a non-wildcard spec (exact shape depends on
     // the configured relax policy; we only assert it's not `*`).
-    let narrow = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[]).unwrap();
+    let narrow = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None).unwrap();
     let narrow_widened_spec = narrow
         .run_dependencies
         .depends
@@ -542,7 +566,7 @@ fn produce_output_reflects_overrides_for_refinement_widening() {
         .overrides
         .insert(widened_name.to_string(), "*".to_string());
     let widened =
-        produce_output(&bundle, &rebuild_effective, Platform::Linux64, "3.11", &[]).unwrap();
+        produce_output(&bundle, &rebuild_effective, Platform::Linux64, "3.11", &[], None).unwrap();
     let widened_spec = widened
         .run_dependencies
         .depends
@@ -779,6 +803,7 @@ fn cfg() -> RetreadConfig {
         default_bundle: None,
         compression_level: None,
         emit_pypi: false,
+        courier: false,
         blueprint: Default::default(),
         blueprint_sync: Default::default(),
         git_sources: std::collections::BTreeMap::new(),
@@ -964,7 +989,7 @@ fn vendored_filter_matches_underscore_pypi_name() {
         "opencv_python",
         meta("opencv_python", "4.9.0", vec![], true),
     ));
-    let output = produce_output(&bundle, &cfg(), Platform::Linux64, "3.12", &[]).unwrap();
+    let output = produce_output(&bundle, &cfg(), Platform::Linux64, "3.12", &[], None).unwrap();
     let names: Vec<String> = output
         .run_dependencies
         .depends
@@ -1016,7 +1041,7 @@ fn name_mapped_dep_dropped_by_pypi_name() {
         "isaac-pack-6",
         vec!["tinyobjloader==2.0.0rc13", "numpy==1.26.0"],
     );
-    let output = produce_output(&bundle, &dropped_cfg, Platform::Linux64, "3.12", &[]).unwrap();
+    let output = produce_output(&bundle, &dropped_cfg, Platform::Linux64, "3.12", &[], None).unwrap();
     let names: Vec<String> = output
         .run_dependencies
         .depends
@@ -1039,7 +1064,7 @@ fn name_mapped_dep_dropped_by_pypi_name() {
         "tinyobjloader",
         meta("tinyobjloader", "2.0.0rc13", vec![], true),
     ));
-    let output = produce_output(&vendored_bundle, &config, Platform::Linux64, "3.12", &[]).unwrap();
+    let output = produce_output(&vendored_bundle, &config, Platform::Linux64, "3.12", &[], None).unwrap();
     let names: Vec<String> = output
         .run_dependencies
         .depends
@@ -1472,7 +1497,7 @@ fn built_in_win_only_dropped_on_linux() {
     // not appear in run-deps even though it has no explicit
     // `sys_platform == "win32"` marker.
     let bundle = solo_bundle("isaacsim", vec!["idna-ssl==1.1.0", "numpy==1.26.0"]);
-    let output = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[]).unwrap();
+    let output = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None).unwrap();
     let names: Vec<String> = output
         .run_dependencies
         .depends
@@ -1494,7 +1519,7 @@ fn built_in_win_only_kept_on_windows() {
     // Same input, win-64 target. The auto-drop is non-Windows-only,
     // so idna-ssl is expected to remain.
     let bundle = solo_bundle("isaacsim", vec!["idna-ssl==1.1.0"]);
-    let output = produce_output(&bundle, &cfg(), Platform::Win64, "3.11", &[]).unwrap();
+    let output = produce_output(&bundle, &cfg(), Platform::Win64, "3.11", &[], None).unwrap();
     let names: Vec<String> = output
         .run_dependencies
         .depends
@@ -1517,7 +1542,7 @@ fn explicit_override_beats_built_in_win_only() {
         .overrides
         .insert("idna-ssl".to_string(), "*".to_string());
     let bundle = solo_bundle("isaacsim", vec!["idna-ssl==1.1.0"]);
-    let output = produce_output(&bundle, &config, Platform::Linux64, "3.11", &[]).unwrap();
+    let output = produce_output(&bundle, &config, Platform::Linux64, "3.11", &[], None).unwrap();
     let names: Vec<String> = output
         .run_dependencies
         .depends
@@ -1538,7 +1563,7 @@ fn user_drop_deps_silently_drops() {
     let mut config = cfg();
     config.drop_deps.push("requests".to_string());
     let bundle = solo_bundle("foo", vec!["requests==2.32.0", "numpy==1.26.0"]);
-    let output = produce_output(&bundle, &config, Platform::Linux64, "3.11", &[]).unwrap();
+    let output = produce_output(&bundle, &config, Platform::Linux64, "3.11", &[], None).unwrap();
     let names: Vec<String> = output
         .run_dependencies
         .depends
@@ -1591,7 +1616,7 @@ fn vendored_sub_packages_dropped_from_run_deps() {
         solve_diagnostics: BTreeMap::new(),
     };
 
-    let output = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[]).unwrap();
+    let output = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None).unwrap();
     let dep_names: Vec<String> = output
         .run_dependencies
         .depends
@@ -1741,7 +1766,7 @@ fn bundle_field_groups_entries_into_one_output() {
         solve_diagnostics: BTreeMap::new(),
     };
 
-    let output = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[]).unwrap();
+    let output = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None).unwrap();
 
     // Output name is the bundle's conda_name, not any one entry name.
     assert_eq!(
@@ -1823,7 +1848,7 @@ fn relaxed_pure_python_primary_pins_python_to_workspace_variant() {
         solve_diagnostics: BTreeMap::new(),
     };
 
-    let output = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[]).unwrap();
+    let output = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None).unwrap();
 
     // The conda output's variant must be the workspace's 3.11, not the
     // bare-major "3" parsed from the py3 tag.
@@ -1882,7 +1907,7 @@ fn bare_major_python_emits_glob_not_strict_equals() {
     // = "3" via the pure-Python fallback (workspace_python_version)
     // -- pass "3" as the workspace_python_version arg.
     let bundle = solo_bundle("foo", vec![]);
-    let output = produce_output(&bundle, &cfg(), Platform::Linux64, "3", &[]).unwrap();
+    let output = produce_output(&bundle, &cfg(), Platform::Linux64, "3", &[], None).unwrap();
 
     // python must appear with a wildcard, NOT as strict equals.
     let python = output
@@ -1921,7 +1946,8 @@ fn cross_output_siblings_appear_as_run_deps() {
             "0.7.8+5043d15pt2.7.0cu128".to_string(),
         ),
     ];
-    let output = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &siblings).unwrap();
+    let output =
+        produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &siblings, None).unwrap();
 
     let dep_names: Vec<String> = output
         .run_dependencies

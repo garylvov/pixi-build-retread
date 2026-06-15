@@ -16,10 +16,10 @@ and a GPU pytorch stack) demonstrates this approach, which can be installed via 
 ## Requirements
 
 - **Pixi >= 0.63.0** — targets pixi-build API v4. Older Pixi → `pixi self-update`.
-- **rattler-build** and **uv** on `PATH` when Pixi invokes retread (both are
-  declared as runtime deps in the conda recipe, so a channel install handles
-  them). uv supplies the python for source builds on demand; retread ships no
-  python and pins to none.
+- **uv** on `PATH` when Pixi invokes the post-link script. uv is declared as a
+  conda run-dep in the courier package, so a channel install handles it.
+- The **`retread` installer binary** ships inside the courier conda package (built
+  by the backend). No separate install step; no glibc requirement.
 
 ## Use
 
@@ -59,11 +59,12 @@ name    = "isaac-pack"
 version = "5.1.0"
 
 [package.build]
-backend  = { name = "pixi-build-retread", version = ">=1.2.0" }
+backend  = { name = "pixi-build-retread", version = ">=2.0.0" }
 channels = ["https://prefix.dev/garylvov", "https://prefix.dev/conda-forge"]
 
 [package.build.config]
 retread-build-number = 0
+retread-courier      = true
 # Pack target python. Defaults to 3.11. A list (["3.11","3.12"]) needs every
 # entry to ship a wheel for every python -- see Multi-Python.
 retread-python       = "3.11"
@@ -102,18 +103,182 @@ isaaclab-arena  = { from = "isaaclab-arena" }   # subdirectory defaults to "."
 
 Worked example: [`examples/gigastrap/`](examples/gigastrap/).
 
+## Courier mode (the shipped path)
+
+Courier is how retread-built packs are distributed and consumed. The backend
+bakes the `retread` installer binary and all built/shadow wheels into a standard
+conda package. At install time, pixi links that package and its post-link script
+runs `$PREFIX/bin/retread install --lock ... --prefix $PREFIX`, which uses `uv`
+to hardlink shipped wheels and fetch unchanged index wheels in seconds. No
+backend process runs on the consumer machine; no source rebuild happens.
+
+### The clean consumer shape
+
+The consuming workspace needs exactly one conda declaration:
+
+```toml
+[dependencies]
+isaac-pack = { path = "./isaac-pack" }
+```
+
+Zero machine-written bytes land in the workspace `pixi.toml`. No wheels are
+stored in git. The entire PyPI closure — built wheels, shadow wheels, and the
+committed lock — is encapsulated in the conda package and the `retread-<bundle>.lock.json`
+file that lives next to the source pack manifest.
+
+### Turning it on
+
+Courier is the default as of v2.1.0. No config key is required. To opt out to
+the legacy conda-artifact path, set:
+
+```toml
+retread-courier = false
+```
+
+`retread-courier = true` is accepted for compatibility but is now a no-op.
+
+### The committable `.pixi/config.toml`
+
+Courier delivery relies on conda post-link scripts. Pixi does not run those by
+default. Add this file to your workspace:
+
+```
+<workspace>/.pixi/config.toml
+```
+
+containing exactly:
+
+```toml
+run-post-link-scripts = "insecure"
+```
+
+No `[pixi]` section header. This exact form is proven working in the e2e test
+suite and is safe to commit (the repo `.gitignore` does not exclude it).
+
+> **Security warning.** Enabling `run-post-link-scripts = "insecure"` makes
+> `git clone && pixi install` auto-execute the post-link scripts of **every**
+> conda package in the environment — not just retread's. Post-link scripts run
+> with the privileges of the installing user and are not sandboxed. This is a
+> supply-chain-shaped risk: a malicious or compromised conda package in any
+> channel could execute arbitrary code at install time. Enable this toggle only
+> for packs and workspaces you fully trust, in environments where that risk is
+> acceptable. The setting is opt-in and scoped per workspace.
+
+#### Loud failure when the toggle is missing
+
+If the `.pixi/config.toml` toggle is absent, pixi silently skips post-link
+scripts — the courier conda package links successfully but `retread install`
+never runs, leaving the PyPI closure uninstalled and imports broken. To make
+this failure loud rather than silent, the courier conda package ships an
+`activate.d` guard script. On every `pixi run` or `pixi shell` invocation the
+guard checks whether the retread installer has run for the active prefix; if not,
+it prints a banner to stderr:
+
+```
+[retread] WARNING: wheels not installed — post-link script did not run.
+Add the following file to your workspace root and re-run `pixi install`:
+
+  .pixi/config.toml
+  ──────────────────
+  run-post-link-scripts = "insecure"
+```
+
+A forgotten toggle is therefore loud on first activation, not a silently broken
+environment that only fails at import time.
+
+### What's committed vs fetched
+
+**Committed to git:**
+- `pixi.toml` files (workspace + source pack)
+- `.pixi/config.toml` (the post-link toggle)
+- `retread-<bundle>.lock.json` next to the source pack manifest — kilobytes; no wheel bytes
+
+**Ships inside the conda package (built by the backend, never stored in git):**
+- Retread-BUILT wheels (git/path sources, with checkout-root data injection)
+- Relax-CHANGED index wheels (shadow copies with rewritten METADATA, so the
+  consumer cannot silently re-fetch the strict-pinned originals from the index)
+
+**Fetched at install time by `retread install`:**
+- Unchanged index wheels from their recorded URLs (hardlinked from uv's cache if
+  already present; otherwise downloaded)
+
+Gitignore `wheels/` in the source pack directory — it is multi-GB for NVIDIA
+packs and is fully reproducible from the lock.
+
+### Cold-clone flow
+
+```
+git clone <repo>
+pixi install
+```
+
+1. Pixi resolves and links the courier conda package (fast; the conda metadata is
+   in `pixi.lock`).
+2. The post-link script inside the package runs:
+   `$PREFIX/bin/retread install --lock $PREFIX/share/retread/retread-<bundle>.lock.json --prefix $PREFIX`
+   (the post-link copies the committed lock into `$PREFIX/share/retread/` first).
+3. `retread install` hardlinks shipped wheels from the conda package into the
+   prefix and fetches any remaining index wheels via `uv`. Total time: seconds to
+   low minutes depending on index wheel count. No backend execution. No rebuild.
+
+### Cold-solve replay (fast cold solve)
+
+When the backend runs `conda/outputs`, it checks whether the pack inputs
+(retread-wheels entries, git revs, relax policy, workspace channels) match what
+was recorded in the committed lock. If they match, it replays the lock directly
+and skips the full cascade — no probe, no solve, no materialization. On a
+replay hit the cascade never runs, so `retread-probe-trace-<name>.json` is
+simply ABSENT for that build; the cascade (and the probe-trace) only appear
+when inputs genuinely changed.
+
+### Honesty note
+
+The uv-installed PyPI dists live in `$CONDA_PREFIX` but are **outside
+`pixi.lock`**. Consequences:
+
+- `pixi install --frozen` will not restore them (it does not invoke the post-link
+  script after an already-linked package).
+- `pixi list` will not show them.
+- The conda metadata side (the courier package itself) is in the lock and is
+  correctly replayed on re-install.
+
+After any pack change that alters the PyPI closure, re-lock
+(`pixi lock`) and re-install so the courier package version increments and pixi
+re-links it, triggering a fresh `retread install`.
+
+### Migration from v1.8 / fence / install.sh
+
+The `retread-emit-pypi`, `retread-blueprint`, and `retread-blueprint-sync` config
+keys are deprecated. They are parsed and ignored with a warning; remove them from
+your source pack config.
+
+To migrate:
+
+1. `retread-courier = true` is no longer required — courier is the default
+   (v2.1.0+). You may remove the line or leave it; it is a no-op either way.
+2. Remove any auto-synced `[feature.<bundle>-pypi]` fence block from the
+   workspace `pixi.toml` — retread no longer writes or manages that block.
+3. Remove any `install.sh` task or activation line from the workspace `pixi.toml`
+   — the file is no longer generated.
+4. Add `.pixi/config.toml` with `run-post-link-scripts = "insecure"` to the
+   workspace root (see above).
+5. Rebuild the pack and re-lock.
+
 ### Files retread writes into the pack (`<pack>/`)
 
 ```
 isaac-pack/ # or preferred name
 ├── pixi.toml
-├── retread-audit-<name>.json         # what was relaxed/emitted (after build)
-├── retread-probe-trace-<name>.json   # per-env probe + solve diagnostics (during conda/outputs)
-├── RETREAD-SOLVE-FAILED-<name>.md    # human summary, only when a solve is UNSAT
-├── wheels/<entry>/...                # materialized wheels + post-rewrite *.relaxed.whl
-└── retread-pypi/<bundle>/...         # emit-pypi side-channel (only with retread-emit-pypi = true)
+├── retread-<bundle>.lock.json            # committed courier lock (KB, no wheel bytes)
+├── retread-audit-<name>.json             # what was relaxed/emitted (after build)
+├── retread-probe-trace-<name>.json       # per-env probe + solve diagnostics (during conda/outputs)
+├── RETREAD-SOLVE-FAILED-<name>.md        # human summary, only when a solve is UNSAT
+└── wheels/<entry>/...                    # materialized wheels + post-rewrite *.relaxed.whl
 ```
 
+- **lock** (`retread-<bundle>.lock.json`): the committed courier lock. Records
+  every wheel's source, hash, and fetch URL. Replayed by cold-solve to skip the
+  cascade when inputs are unchanged. Kilobytes; safe and useful to commit.
 - **audit** (post-build): per-wheel pre/post `Requires-Dist`, emitted conda
   run-deps, copy-paste-ready TOML blocks, probe + solve diagnostics.
 - **probe-trace** (during `conda/outputs`, always written): per-dep routing
@@ -126,55 +291,6 @@ isaac-pack/ # or preferred name
 
 `wheels/` is multi-GB (NVIDIA) — gitignore it. Delete a per-entry folder or
 all of `wheels/` to force re-materialization on the next solve.
-
-### emit-pypi side-channel (v1.6.0, experimental)
-
-`retread-emit-pypi = true` makes every build additionally write
-`retread-pypi/<bundle>/` next to the pack manifest:
-
-- `wheels/` — the wheels retread BUILT (git/path sources, with the
-  checkout-root data injection that makes them importable) under standard
-  filenames, usable as a pixi `find-links` source. Index-origin wheels are
-  not duplicated here.
-- `pixi-snippet.toml` — a paste-ready feature block: `[pypi-dependencies]`
-  mirroring your `[retread-wheels]` entries, plus a generated
-  `[pypi-options.dependency-overrides]` table (floor-only envelopes —
-  `>=lowest pin seen` — of every lower-bounded `Requires-Dist` pin in the
-  bundle; deliberately uncapped because version discipline comes from the
-  workspace's conda pins, and prerelease floors double as uv's per-package
-  prerelease opt-in).
-
-With `retread-blueprint = true` the side-channel becomes a full blueprint:
-override semantics are baked into build-tagged wheels (uv prefers them over
-registry originals at the same version), entry pins ride a generated
-`<bundle>-pypi` meta-wheel, and consumption needs ZERO machine-written
-manifest bytes. Sync modes (`retread-blueprint-sync`):
-
-- `"script"` (default): emits `retread-pypi/<bundle>/install.sh` +
-  `overrides.txt`. The script is idempotent with a millisecond
-  filesystem fast-path, so the recommended hookup is your existing
-  `[activation]` script (one hand-written line, e.g.
-  `bash "$PIXI_PROJECT_ROOT/<pack>/retread-pypi/<bundle>/install.sh"`):
-  the overlay then self-heals automatically after env recreates or
-  pypi re-syncs (pixi prunes pypi packages it did not lock when it
-  reconciles an env). A `[tasks]` line works too if you prefer manual.
-  Standalone uv reconciles against the live conda env (it prefers
-  installed dists), so conda torch/CUDA stay shared.
-- `"fence"`: auto-syncs a small `[feature.<bundle>-pypi]` block into a
-  fenced region of the workspace manifest (single pixi.lock, `pixi list`
-  visibility, machine-written bytes).
-
-`retread-blueprint = "only"` additionally payload-skips the conda artifact
-(real metadata and run-deps, no wheel payload -- packaging in seconds) for
-workspaces that consume only the blueprint.
-
-Why: pixi installs the conda artifact by decompress + content-validated
-relink, which is minutes for Isaac-scale packs; uv installs wheels by
-hardlink from an uncompressed cache in seconds. Commit
-`retread-pypi/<bundle>/` (wheels via git-LFS) + `pixi.lock` and a cluster
-node initializes with `git clone && pixi install && install.sh` -- no
-backend execution. The artifacts are regenerated every build — never
-hand-edit them.
 
 ### Auto-injected checkout-root data
 
@@ -307,10 +423,11 @@ backend = { name = "pixi-build-retread", version = "*", channels = [
 ```
 
 `bash scripts/rebuild-local.sh` does the whole nuke-rebuild-verify dance (bump
-`Cargo.toml` + `recipe/recipe.yaml` to the same version first; it aborts on
-mismatch). `CONSUMER_PROJECT=/abs/path bash scripts/rebuild-local.sh` also
-clears that workspace's Pixi caches. The script exists because three caches
-otherwise serve a stale build: the channel's appended `repodata.json`, Pixi's
+`Cargo.toml` + `recipe/recipe.yaml` to the same version first, then run
+`cargo check` to refresh `Cargo.lock`; the script aborts on version mismatch).
+`CONSUMER_PROJECT=/abs/path bash scripts/rebuild-local.sh` also clears that
+workspace's Pixi caches. The script exists because three caches otherwise serve
+a stale build: the channel's appended `repodata.json`, Pixi's
 backend-executable cache (`~/.cache/rattler/cache/backends-v0/`), and retread's
 git-clone cache. Never delete `local-channel/noarch/repodata.json` —
 rattler-build needs that empty placeholder.

@@ -1,18 +1,30 @@
 /target
-.pixi
+# Ignore .pixi contents but keep the committable per-workspace config.toml
+# (the courier needs `run-post-link-scripts = "insecure"` committed so a fresh
+# clone runs the post-link installer). The .pixi dir itself is not excluded so
+# git can descend and honor the negation.
+**/.pixi/*
+!**/.pixi/config.toml
 /local-channel
-*.conda
-*.tar.bz2
-/output
 # Cargo.lock is committed (binary crate) for reproducible recipe builds with
 # `cargo build --locked`.
 *.conda
 *.tar.bz2
 /output
 examples/gigastrap/isaac-pack/*
+!examples/gigastrap/isaac-pack/pixi.toml
+!examples/gigastrap/isaac-pack/retread-isaac-pack.lock.json
+examples/gigastrap/isaac-pack/wheels/
+examples/gigastrap/isaac-pack/retread-audit-*.json
+examples/gigastrap/isaac-pack/retread-probe-trace-*.json
+examples/gigastrap/isaac-pack/RETREAD-SOLVE-FAILED-*.md
 examples/isaac6/isaac-pack/wheels/
 examples/isaac6/isaac-pack/retread-*.json
+# but DO commit the courier install lock (relaxed state, no wheels) so a cold
+# clone can replay + install without rebuilding.
+!examples/isaac6/isaac-pack/retread-*.lock.json
 examples/isaac6/isaac-pack/RETREAD-SOLVE-FAILED-*.md
 examples/genesis/genesis-pack/wheels/
 examples/genesis/genesis-pack/retread-*.json
+!examples/genesis/genesis-pack/retread-genesis-pack.lock.json
 examples/genesis/genesis-pack/RETREAD-SOLVE-FAILED-*.md

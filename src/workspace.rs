@@ -282,6 +282,65 @@ impl WorkspaceManifest {
         out
     }
 
+    /// Canonical fingerprint of every resolution-affecting field of the
+    /// workspace manifest, for the courier lock's inputs_hash (grizzly H1).
+    /// A cold-solve replay reconstructs the lock's conda run-deps verbatim
+    /// without re-solving, so if a WORKSPACE edit (per-env conda dep pins,
+    /// system-requirements, pypi-options, feature/env wiring) would change
+    /// what a fresh solve emits, that edit MUST change this fingerprint or a
+    /// stale (poisoned) lock would replay.
+    ///
+    /// Hashes the RAW declared fields (top-level + every feature) rather than
+    /// per-env effective values: the effective_* getters are pure functions
+    /// of these fields, so covering the inputs covers every derived env. All
+    /// containers are BTreeMap/ordered-Vec, so the output is deterministic.
+    /// Both producer (`build_one`) and replayer (`conda_outputs`) load the
+    /// same manifest and call this, so the two fingerprints always agree.
+    /// `path_dependencies` are intentionally excluded -- they route which
+    /// outputs exist, not how a given bundle resolves.
+    pub fn solve_fingerprint(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        for c in &self.channels {
+            parts.push(format!("ws-channel:{c}"));
+        }
+        if let Some(p) = &self.channel_priority {
+            parts.push(format!("ws-channel-priority:{p}"));
+        }
+        for (k, v) in &self.dependencies {
+            parts.push(format!("ws-dep:{k}={v}"));
+        }
+        for (k, v) in &self.system_requirements {
+            parts.push(format!("ws-sysreq:{k}={v}"));
+        }
+        for u in &self.pypi_index_urls {
+            parts.push(format!("ws-pypi-index:{u}"));
+        }
+        // environments: name -> ordered features + no_default_feature.
+        for (name, env) in &self.environments {
+            parts.push(format!(
+                "ws-env:{name}=[{}]nodefault={}",
+                env.features.join(","),
+                env.no_default_feature
+            ));
+        }
+        // features: name -> channels, deps, sysreqs, pypi indexes.
+        for (name, feat) in &self.features {
+            for c in &feat.channels {
+                parts.push(format!("ws-feat:{name}:channel:{c}"));
+            }
+            for (k, v) in &feat.dependencies {
+                parts.push(format!("ws-feat:{name}:dep:{k}={v}"));
+            }
+            for (k, v) in &feat.system_requirements {
+                parts.push(format!("ws-feat:{name}:sysreq:{k}={v}"));
+            }
+            for u in &feat.pypi_index_urls {
+                parts.push(format!("ws-feat:{name}:pypi-index:{u}"));
+            }
+        }
+        parts.join("\n")
+    }
+
     pub fn effective_system_requirements(&self, env_name: &str) -> BTreeMap<String, String> {
         let Some(env) = self.environments.get(env_name) else {
             return BTreeMap::new();
