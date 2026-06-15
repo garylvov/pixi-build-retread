@@ -384,6 +384,18 @@ mod courier_tests {
         assert!(r.build.noarch.is_none());
         // it must NOT pip-install a payload like the conda-artifact recipe.
         assert!(!r.build.script.contains("pip install *.whl"));
+        // The quoted heredoc must be valid: body + terminator at column 0
+        // (Rust's `\` string-continuation eats the source indentation). A
+        // leading-space terminator would never close the heredoc and would
+        // swallow the rest of the build script.
+        assert!(
+            r.build.script.contains("\n#!/bin/bash\n"),
+            "post-link heredoc body must start at column 0"
+        );
+        assert!(
+            r.build.script.contains("\nPOSTLINK\n"),
+            "heredoc terminator must be at column 0 to close the heredoc"
+        );
     }
 }
 
