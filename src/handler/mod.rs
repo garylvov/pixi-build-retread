@@ -725,6 +725,78 @@ impl Handler {
                 for base_bundle in &materialized {
                     let (mut bundle, mut effective) =
                         apply_emission(base_bundle, &base_config, emission);
+                    // WS-B: cold-solve replay. When courier mode is active and
+                    // a committed lock exists whose inputs_hash matches the
+                    // current resolution inputs (resolved wheel set + index
+                    // chain + relax + python + retread version), reconstruct
+                    // the CondaOutput directly from the lock and skip the
+                    // entire probe cascade (pre_emit_widen_pass +
+                    // iterative_solve_refinement + post_emit_widen_pass).
+                    // This is a pure optimization: on any error or hash miss
+                    // the code falls through to the normal cascade path.
+                    if config.courier {
+                        let entry_specs: Vec<String> = base_bundle
+                            .all_wheels()
+                            .map(|w| format!("{}=={}", w.pypi_name, w.metadata.version))
+                            .collect();
+                        let ws_indexes: Vec<String> = workspace_manifest
+                            .as_ref()
+                            .map(|m| m.all_pypi_index_urls())
+                            .unwrap_or_default();
+                        let entry_indexes: Vec<String> = config
+                            .retread_wheels
+                            .values()
+                            .map(|e| e.index_url())
+                            .collect();
+                        let replay_index_urls = merge_index_chain(entry_indexes, &ws_indexes);
+                        let current_hash = crate::lock::RetreadLock::compute_inputs_hash(
+                            &entry_specs,
+                            &replay_index_urls,
+                            &format!("{:?}", config.relax),
+                            python_version,
+                            env!("CARGO_PKG_VERSION"),
+                        );
+                        let lock_path = source_dir
+                            .join(crate::lock::RetreadLock::file_name(&bundle.conda_name));
+                        match replay_from_lock(
+                            &lock_path,
+                            &current_hash,
+                            params.host_platform,
+                            config.build_number,
+                            &siblings,
+                        ) {
+                            Ok(Some(replayed)) => {
+                                tracing::info!(
+                                    bundle = %bundle.conda_name,
+                                    "WS-B: cold-solve replay hit -- \
+                                     skipping probe cascade",
+                                );
+                                crate::status::tty(&format!(
+                                    "courier replay: {} outputs reconstructed \
+                                     from committed lock (cascade skipped).",
+                                    bundle.conda_name,
+                                ));
+                                outputs.push(replayed);
+                                continue;
+                            }
+                            Ok(None) => {
+                                tracing::debug!(
+                                    bundle = %bundle.conda_name,
+                                    lock = %lock_path.display(),
+                                    "WS-B: replay miss (hash mismatch or \
+                                     no lock) -- falling through to cascade",
+                                );
+                            }
+                            Err(e) => {
+                                tracing::debug!(
+                                    bundle = %bundle.conda_name,
+                                    error = %format!("{e:#}"),
+                                    "WS-B: replay error (non-fatal) -- \
+                                     falling through to cascade",
+                                );
+                            }
+                        }
+                    }
                     // v0.30.0+ pre-emit widen pass: now scoped to this env's
                     // channels + transitive overrides. Probes recorded
                     // regardless of policy; mutation gated by
@@ -4072,6 +4144,363 @@ async fn find_conda_artifact(dir: &Path, name: &str, version: &str) -> Result<Pa
         "no .conda artifact found in {} matching {prefix}*.conda",
         dir.display()
     )
+}
+
+/// WS-B: cold-solve replay helper.
+///
+/// Loads the committed lock at `lock_path` and, if its `inputs_hash`
+/// matches `current_inputs_hash`, reconstructs a [`CondaOutput`] from
+/// the lock's `conda_run_deps` -- bypassing the full probe cascade.
+///
+/// Returns:
+/// - `Ok(Some(output))` — hash matched; replay output is ready.
+/// - `Ok(None)` — hash mismatch, or file missing (fall through to
+///   cascade; this is not an error).
+/// - `Err(...)` — lock file exists but is malformed / unreadable. The
+///   caller treats this as a replay miss and falls through (non-fatal).
+fn replay_from_lock(
+    lock_path: &Path,
+    current_inputs_hash: &str,
+    host_platform: Platform,
+    build_number: u64,
+    siblings: &[(String, String)],
+) -> anyhow::Result<Option<CondaOutput>> {
+    // Missing lock → first build or lock not yet committed. Not an error.
+    if !lock_path.exists() {
+        return Ok(None);
+    }
+    let lock = crate::lock::RetreadLock::load(lock_path)?;
+    // Hash mismatch → inputs changed; must re-resolve.
+    if lock.inputs_hash != current_inputs_hash {
+        return Ok(None);
+    }
+
+    // ----- reconstruct CondaOutput from lock fields -----
+    let python_version = crate::relax::emit_python_version("", &lock.python);
+    let py_short = python_version.replace('.', "");
+    let build = format!("py{py_short}_{build_number}");
+
+    // Determine subdir from wheel filenames (same logic as produce_output).
+    let any_platform_specific = lock
+        .wheels
+        .iter()
+        .any(|w| !crate::wheel::is_pure_python_wheel_filename(&w.filename));
+    let subdir = if any_platform_specific {
+        host_platform
+    } else {
+        Platform::NoArch
+    };
+    let noarch = if any_platform_specific {
+        NoArchType::none()
+    } else {
+        NoArchType::python()
+    };
+
+    // Python host + run dep strings.
+    let python_dep = if python_version.contains('*') {
+        format!("python {python_version}")
+    } else {
+        format!("python {python_version}.*")
+    };
+
+    // Reconstruct run-dependencies from the lock's conda_run_deps.
+    let mut run_depends: Vec<NamedSpec<PackageSpec>> = vec![spec_from_str(&python_dep)?];
+    let mut seen_dep_names: HashSet<String> = HashSet::from(["python".to_string()]);
+    for dep in &lock.conda_run_deps {
+        let spec_str = if dep.spec.is_empty() {
+            dep.name.clone()
+        } else {
+            format!("{} {}", dep.name, dep.spec)
+        };
+        let ns = spec_from_str(&spec_str)?;
+        if seen_dep_names.insert(ns.name.clone()) {
+            run_depends.push(ns);
+        }
+    }
+    // Re-add sibling cross-links (same as produce_output).
+    for (sib_name, sib_version) in siblings {
+        if sib_name == &lock.bundle {
+            continue;
+        }
+        if seen_dep_names.insert(sib_name.clone()) {
+            run_depends.push(spec_from_str(&format!("{sib_name} =={sib_version}"))?);
+        }
+    }
+
+    let mut variant = std::collections::BTreeMap::new();
+    variant.insert(
+        "python".to_string(),
+        VariantValue::String(python_version.clone()),
+    );
+
+    Ok(Some(CondaOutput {
+        metadata: CondaOutputMetadata {
+            name: PackageName::new_unchecked(lock.bundle.clone()),
+            version: VersionWithSource::from_str(&lock.version)
+                .map_err(|e| anyhow!("replay: parsing version `{}`: {e}", lock.version))?,
+            build,
+            build_number,
+            subdir,
+            license: None,
+            license_family: None,
+            noarch,
+            purls: None,
+            python_site_packages_path: None,
+            variant,
+        },
+        build_dependencies: None,
+        host_dependencies: Some(CondaOutputDependencies {
+            depends: vec![spec_from_str(&python_dep)?, spec_from_str("pip")?],
+            constraints: Vec::new(),
+        }),
+        run_dependencies: CondaOutputDependencies {
+            depends: run_depends,
+            constraints: Vec::new(),
+        },
+        ignore_run_exports: CondaOutputIgnoreRunExports::default(),
+        run_exports: CondaOutputRunExports::default(),
+        input_globs: None,
+    }))
+}
+
+// -----------------------------------------------------------------
+// WS-B: unit tests for replay_from_lock.
+// Uses only std (no tempfile crate dependency) -- temp dirs are created
+// via std::env::temp_dir() with a unique subdirectory.
+// -----------------------------------------------------------------
+#[cfg(test)]
+mod replay_tests {
+    use std::collections::BTreeMap;
+
+    use rattler_conda_types::Platform;
+
+    use super::replay_from_lock;
+    use crate::lock::{CondaDep, LockWheel, Origin, RetreadLock, SCHEMA};
+
+    fn unique_tmp_dir() -> std::path::PathBuf {
+        let base = std::env::temp_dir();
+        // Use a unique sub-directory per test call to avoid collisions.
+        let unique = format!(
+            "retread-ws-b-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        );
+        let dir = base.join(unique);
+        std::fs::create_dir_all(&dir).expect("tmp dir creation should not fail");
+        dir
+    }
+
+    /// Build a minimal RetreadLock suitable for replay tests.
+    fn make_test_lock(
+        bundle: &str,
+        version: &str,
+        python: &str,
+        inputs_hash: &str,
+        pure_python: bool,
+    ) -> RetreadLock {
+        let filename = if pure_python {
+            format!("{bundle}-{version}-py3-none-any.whl")
+        } else {
+            format!("{bundle}-{version}-cp311-cp311-manylinux_2_17_x86_64.whl")
+        };
+        RetreadLock {
+            schema: SCHEMA,
+            retread_version: "0.0.1".into(),
+            bundle: bundle.into(),
+            version: version.into(),
+            python: python.into(),
+            inputs_hash: inputs_hash.into(),
+            root_requirements: Vec::new(),
+            wheels: vec![LockWheel {
+                name: bundle.into(),
+                version: version.into(),
+                origin: Origin::Index,
+                filename,
+                url: Some(format!("https://example.com/{bundle}-{version}.whl")),
+                sha256: None,
+            }],
+            conda_run_deps: vec![CondaDep {
+                name: "numpy".into(),
+                spec: ">=1.21".into(),
+            }],
+            index_urls: vec!["https://pypi.org/simple/".into()],
+            prerelease: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn matching_hash_returns_some_with_correct_fields() {
+        let dir = unique_tmp_dir();
+        let lock = make_test_lock("mypack", "1.2.3", "3.11", "abc123", true);
+        let json = lock.to_pretty_json().unwrap();
+        let lock_path = dir.join(RetreadLock::file_name("mypack"));
+        std::fs::write(&lock_path, &json).unwrap();
+
+        let result = replay_from_lock(&lock_path, "abc123", Platform::Linux64, 0, &[]);
+        assert!(result.is_ok(), "should not error: {result:?}");
+        let output = result.unwrap();
+        assert!(output.is_some(), "matching hash must return Some");
+        let out = output.unwrap();
+
+        // Name and version round-trip.
+        assert_eq!(out.metadata.name.as_normalized(), "mypack");
+        assert_eq!(out.metadata.version.version().to_string(), "1.2.3");
+        // Pure-python wheel -> noarch output.
+        assert_eq!(out.metadata.subdir, Platform::NoArch);
+        // run_dependencies includes python and the replayed conda dep.
+        let dep_names: Vec<&str> = out
+            .run_dependencies
+            .depends
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect();
+        assert!(
+            dep_names.contains(&"python"),
+            "run_deps must include python: {dep_names:?}"
+        );
+        assert!(
+            dep_names.contains(&"numpy"),
+            "run_deps must include numpy from lock: {dep_names:?}"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn hash_mismatch_returns_none() {
+        let dir = unique_tmp_dir();
+        let lock = make_test_lock("mypack", "1.2.3", "3.11", "stored-hash", true);
+        let json = lock.to_pretty_json().unwrap();
+        let lock_path = dir.join(RetreadLock::file_name("mypack"));
+        std::fs::write(&lock_path, &json).unwrap();
+
+        let result = replay_from_lock(&lock_path, "different-hash", Platform::Linux64, 0, &[]);
+        assert!(result.is_ok(), "mismatch must not error: {result:?}");
+        assert!(
+            result.unwrap().is_none(),
+            "hash mismatch must return None (fall through to cascade)"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn missing_file_returns_none() {
+        let dir = unique_tmp_dir();
+        let lock_path = dir.join("retread-missing.lock.json");
+
+        let result = replay_from_lock(&lock_path, "any-hash", Platform::Linux64, 0, &[]);
+        assert!(result.is_ok(), "missing file must not error: {result:?}");
+        assert!(
+            result.unwrap().is_none(),
+            "missing lock must return None (first-build path)"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn malformed_json_returns_err() {
+        let dir = unique_tmp_dir();
+        let lock_path = dir.join(RetreadLock::file_name("badpack"));
+        std::fs::write(&lock_path, b"not valid json{{{{").unwrap();
+
+        let result = replay_from_lock(&lock_path, "any-hash", Platform::Linux64, 0, &[]);
+        assert!(
+            result.is_err(),
+            "malformed JSON must return Err (caller falls through): {result:?}"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn platform_specific_wheel_sets_host_platform_subdir() {
+        let dir = unique_tmp_dir();
+        let lock = make_test_lock("mypack", "1.0.0", "3.11", "hash1", false /* arch */);
+        let json = lock.to_pretty_json().unwrap();
+        let lock_path = dir.join(RetreadLock::file_name("mypack"));
+        std::fs::write(&lock_path, &json).unwrap();
+
+        let result = replay_from_lock(&lock_path, "hash1", Platform::Linux64, 0, &[]);
+        let out = result.unwrap().unwrap();
+        assert_eq!(
+            out.metadata.subdir,
+            Platform::Linux64,
+            "platform-specific wheel must set subdir=host_platform"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn siblings_are_cross_linked_in_output() {
+        let dir = unique_tmp_dir();
+        let lock = make_test_lock("pack-a", "2.0.0", "3.11", "hash42", true);
+        let json = lock.to_pretty_json().unwrap();
+        let lock_path = dir.join(RetreadLock::file_name("pack-a"));
+        std::fs::write(&lock_path, &json).unwrap();
+
+        let siblings = vec![
+            ("pack-a".to_string(), "2.0.0".to_string()),
+            ("pack-b".to_string(), "2.0.0".to_string()),
+        ];
+        let result = replay_from_lock(&lock_path, "hash42", Platform::Linux64, 0, &siblings);
+        let out = result.unwrap().unwrap();
+        let dep_names: Vec<&str> = out
+            .run_dependencies
+            .depends
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect();
+        // pack-b should be cross-linked; pack-a is self and must not duplicate.
+        assert!(
+            dep_names.contains(&"pack-b"),
+            "sibling pack-b must be cross-linked: {dep_names:?}"
+        );
+        let pack_a_count = dep_names.iter().filter(|&&n| n == "pack-a").count();
+        assert_eq!(
+            pack_a_count, 0,
+            "self-sibling pack-a must not appear in run_deps: {dep_names:?}"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Verify that conda_run_deps with empty spec (name-only) round-trips.
+    #[test]
+    fn conda_dep_with_empty_spec_round_trips() {
+        let dir = unique_tmp_dir();
+        let mut lock = make_test_lock("mypack", "1.0.0", "3.11", "hash9", true);
+        lock.conda_run_deps.push(CondaDep {
+            name: "uv".into(),
+            spec: String::new(),
+        });
+        let json = lock.to_pretty_json().unwrap();
+        let lock_path = dir.join(RetreadLock::file_name("mypack"));
+        std::fs::write(&lock_path, &json).unwrap();
+
+        let result = replay_from_lock(&lock_path, "hash9", Platform::Linux64, 0, &[]);
+        let out = result.unwrap().unwrap();
+        let dep_names: Vec<&str> = out
+            .run_dependencies
+            .depends
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect();
+        assert!(
+            dep_names.contains(&"uv"),
+            "name-only conda dep must appear in run_deps: {dep_names:?}"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Requires real repodata/channels — skipped in normal CI.
+    /// Run manually to verify end-to-end replay in courier mode.
+    #[test]
+    #[ignore = "requires real repodata/channels; run manually for e2e replay validation"]
+    fn conda_outputs_replay_skips_cascade_with_committed_lock() {
+        // Integration test placeholder:
+        // 1. Write a valid lock file to source_dir.
+        // 2. Call conda_outputs with courier=true.
+        // 3. Assert the result is returned promptly (no solve cascade).
+    }
 }
 
 #[cfg(test)]
