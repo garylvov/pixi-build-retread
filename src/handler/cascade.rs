@@ -403,7 +403,9 @@ pub(crate) async fn iterative_solve_refinement(
             effective.overrides.insert(dep.clone(), spec.clone());
         }
         let seeded =
-            super::produce_output(bundle, effective, host_platform, python_version, siblings)?;
+            // Intermediate output for dep extraction only -- build string
+            // does not matter here; pass None (non-courier legacy form).
+            super::produce_output(bundle, effective, host_platform, python_version, siblings, None)?;
         current_run_deps = seeded
             .run_dependencies
             .depends
@@ -643,9 +645,16 @@ pub(crate) async fn iterative_solve_refinement(
             "widened {}",
             summarize_changes(&widened_this_round)
         ));
-        // Re-emit produce_output with the updated overrides.
-        let new_output =
-            super::produce_output(bundle, effective, host_platform, python_version, siblings)?;
+        // Re-emit produce_output with the updated overrides. Intermediate
+        // output for dep extraction only -- build string not relevant here.
+        let new_output = super::produce_output(
+            bundle,
+            effective,
+            host_platform,
+            python_version,
+            siblings,
+            None,
+        )?;
         current_run_deps = new_output
             .run_dependencies
             .depends

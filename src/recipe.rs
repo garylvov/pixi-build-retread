@@ -39,6 +39,12 @@ pub struct Source {
 #[derive(Debug, Serialize)]
 pub struct Build {
     pub number: u64,
+    /// Explicit build string. When set, rattler-build uses this verbatim
+    /// instead of synthesizing one from the variant + build number. Used by
+    /// the courier path to embed the content-addressed `inputs_hash` prefix
+    /// so pixi cache-hits are invalidated whenever content changes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub string: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub noarch: Option<String>,
     pub script: String,
@@ -206,6 +212,9 @@ pub fn build_bundle_recipe(
         source: recipe_sources,
         build: Build {
             number: config.build_number,
+            // Non-courier path: no content-addressed string; rattler-build
+            // synthesizes the standard `py{XY}_{build_number}` string.
+            string: None,
             noarch,
             // Vendor wheels (Omniverse, manylinux) ship pre-baked rpaths;
             // rattler-build's default relocation pass either overflows the
@@ -258,6 +267,11 @@ pub fn build_courier_recipe(
     python_version: &str,
     run_deps: &[String],
     source_urls: &[String],
+    // Content-addressed build string to embed in the recipe. When `Some`,
+    // rattler-build records it verbatim so the on-disk artifact name matches
+    // what `conda/outputs` advertised to pixi. When `None` (direct tests
+    // without a pixi context), rattler-build synthesizes the string itself.
+    expected_build: Option<&str>,
 ) -> Recipe {
     let python_pin = format!("python {python_version}.*");
     let lock_filename = crate::lock::RetreadLock::file_name(conda_name);
@@ -346,6 +360,10 @@ pub fn build_courier_recipe(
         source,
         build: Build {
             number: 0,
+            // Content-addressed string: embed so the on-disk artifact name
+            // matches what conda/outputs advertised to pixi (prevents stale
+            // cache hits when content changes but metadata stays the same).
+            string: expected_build.map(str::to_string),
             // Platform + python specific: the staged wheels are cpXY/manylinux
             // and the lock is python-specific, so the package must not be
             // noarch (build string carries the python variant via the run pin).
@@ -385,6 +403,7 @@ mod courier_tests {
                 "file:///x/isaaclab-0.51.1-py3-none-any.whl".to_string(),
                 "file:///x/retread-isaac-pack.lock.json".to_string(),
             ],
+            None,
         );
         // run-deps: solved deps + the installer essentials, no dup python.
         assert!(
@@ -459,6 +478,32 @@ mod courier_tests {
         assert!(
             r.build.script.contains("\nACTIVATE\n"),
             "activate.d heredoc terminator must be at column 0"
+        );
+    }
+
+    #[test]
+    fn courier_recipe_with_expected_build_sets_string_field() {
+        let r = build_courier_recipe(
+            "mypack",
+            "1.0.0",
+            "3.11",
+            &[],
+            &[],
+            Some("py311_habcdef0123_0"),
+        );
+        assert_eq!(
+            r.build.string.as_deref(),
+            Some("py311_habcdef0123_0"),
+            "expected_build must be forwarded to build.string"
+        );
+    }
+
+    #[test]
+    fn courier_recipe_without_expected_build_has_no_string_field() {
+        let r = build_courier_recipe("mypack", "1.0.0", "3.11", &[], &[], None);
+        assert!(
+            r.build.string.is_none(),
+            "None expected_build must leave build.string absent"
         );
     }
 }

@@ -244,6 +244,73 @@ pub(crate) fn merge_index_chain(
     indexes
 }
 
+/// Build a content-addressed build string for courier packages.
+///
+/// Format: `py{py_short}_h{hash_prefix}_{build_number}` where `hash_prefix`
+/// is the first 10 hex chars of the courier inputs hash. This uniquely
+/// identifies the content of the courier package: any change to the lock
+/// inputs (wheel set, index chain, relax policy, python, retread version,
+/// config/channels/workspace fingerprint) yields a new string and pixi
+/// re-extracts instead of cache-hitting the stale artifact.
+///
+/// The `py{py_short}_` prefix is kept for human readability; pixi does NOT
+/// parse the build string for the python variant (it uses the variant map
+/// and `python X.Y.*` run-dep pins), so the suffix carries no semantic load.
+///
+/// This function MUST be the single source of truth for courier build string
+/// format -- `produce_output` and `replay_from_lock` both call it so the
+/// strings are guaranteed byte-identical.
+fn courier_build_string(py_short: &str, inputs_hash: &str, build_number: u64) -> String {
+    let prefix = &inputs_hash[..inputs_hash.len().min(10)];
+    format!("py{py_short}_h{prefix}_{build_number}")
+}
+
+/// Compute the courier inputs hash that uniquely identifies a courier build's
+/// content-affecting inputs. This is the single authoritative implementation
+/// called by:
+///
+/// 1. The replay gate (~line 754) — to compare against `lock.inputs_hash`.
+/// 2. `produce_output` — to embed in the `CondaOutputMetadata.build` string.
+///
+/// The hash folds in: entry specs (canonical wheel inputs), the merged index
+/// chain, relax policy, python version, retread binary version, and a config
+/// fingerprint (channels + workspace solve env). This mirrors exactly what
+/// `courier::stage` writes into `RetreadLock.inputs_hash`, guaranteeing that
+/// replay fires iff the hash matches.
+///
+/// IMPORTANT: the arguments must be constructed identically at every call
+/// site — see the inline notes in each caller.
+fn courier_inputs_hash(
+    config: &crate::config::RetreadConfig,
+    bundle_name: &str,
+    python_version: &str,
+    channels: &[String],
+    workspace_manifest: Option<&crate::workspace::WorkspaceManifest>,
+) -> String {
+    let entry_specs = crate::courier::courier_input_specs(config, bundle_name);
+    let ws_indexes: Vec<String> = workspace_manifest
+        .map(|m| m.all_pypi_index_urls())
+        .unwrap_or_default();
+    let entry_indexes: Vec<String> = config
+        .retread_wheels
+        .values()
+        .map(|e| e.index_url())
+        .collect();
+    let index_urls = merge_index_chain(entry_indexes, &ws_indexes);
+    let workspace_fp = workspace_manifest
+        .map(|m| m.solve_fingerprint())
+        .unwrap_or_default();
+    let config_fp = crate::courier::config_fingerprint(config, channels, &workspace_fp);
+    crate::lock::RetreadLock::compute_inputs_hash(
+        &entry_specs,
+        &index_urls,
+        &format!("{:?}", config.relax),
+        python_version,
+        env!("CARGO_PKG_VERSION"),
+        &config_fp,
+    )
+}
+
 const DEFAULT_PYTHON: &str = "3.11";
 
 /// PyPI packages that are Windows-only and frequently declared as
@@ -734,47 +801,29 @@ impl Handler {
                     // iterative_solve_refinement + post_emit_widen_pass).
                     // This is a pure optimization: on any error or hash miss
                     // the code falls through to the normal cascade path.
-                    if config.courier {
-                        // MUST mirror courier::stage's inputs_hash exactly:
-                        // canonical PURE-input entry specs (not the resolved
-                        // wheel closure) + the same index chain, or replay
-                        // never fires.
-                        let entry_specs =
-                            crate::courier::courier_input_specs(&config, &base_bundle.conda_name);
-                        let ws_indexes: Vec<String> = workspace_manifest
-                            .as_ref()
-                            .map(|m| m.all_pypi_index_urls())
-                            .unwrap_or_default();
-                        let entry_indexes: Vec<String> = config
-                            .retread_wheels
-                            .values()
-                            .map(|e| e.index_url())
-                            .collect();
-                        let replay_index_urls = merge_index_chain(entry_indexes, &ws_indexes);
-                        let current_hash = crate::lock::RetreadLock::compute_inputs_hash(
-                            &entry_specs,
-                            &replay_index_urls,
-                            &format!("{:?}", config.relax),
+                    //
+                    // Compute the courier inputs hash once here: it feeds both
+                    // the replay gate (hash-check) and produce_output (embedded
+                    // in the content-addressed build string). None for non-courier.
+                    let courier_build_hash: Option<String> = if config.courier {
+                        let channels: Vec<String> =
+                            params.channels.iter().map(|c| c.to_string()).collect();
+                        Some(courier_inputs_hash(
+                            &config,
+                            &base_bundle.conda_name,
                             python_version,
-                            env!("CARGO_PKG_VERSION"),
-                            &crate::courier::config_fingerprint(
-                                &config,
-                                &params
-                                    .channels
-                                    .iter()
-                                    .map(|c| c.to_string())
-                                    .collect::<Vec<_>>(),
-                                &workspace_manifest
-                                    .as_ref()
-                                    .map(|m| m.solve_fingerprint())
-                                    .unwrap_or_default(),
-                            ),
-                        );
+                            &channels,
+                            workspace_manifest.as_ref(),
+                        ))
+                    } else {
+                        None
+                    };
+                    if let Some(ref current_hash) = courier_build_hash {
                         let lock_path = source_dir
                             .join(crate::lock::RetreadLock::file_name(&bundle.conda_name));
                         match replay_from_lock(
                             &lock_path,
-                            &current_hash,
+                            current_hash,
                             params.host_platform,
                             config.build_number,
                             &siblings,
@@ -834,6 +883,7 @@ impl Handler {
                         params.host_platform,
                         python_version,
                         &siblings,
+                        courier_build_hash.as_deref(),
                     )
                     .map_err(|e| {
                         RpcError::internal(format!("output for {}: {e:#}", bundle.conda_name))
@@ -1347,6 +1397,7 @@ impl Handler {
                             params.host_platform,
                             python_version,
                             &siblings,
+                            courier_build_hash.as_deref(),
                         )
                         .map_err(|e| {
                             RpcError::internal(format!(
@@ -3366,12 +3417,19 @@ type EnvSolveResult = (
 /// skipped). Each non-self entry becomes a run-dep on this output so
 /// declaring any one output in the workspace pulls the whole pack via
 /// the conda solver.
+///
+/// `courier_build_hash`: when `Some`, this is the courier inputs hash
+/// (from [`courier_inputs_hash`]) and the build string is set to the
+/// content-addressed form `py{XY}_h{hash_prefix}_{build_number}`.
+/// When `None` (non-courier path), the legacy `py{XY}_{build_number}`
+/// string is emitted unchanged.
 fn produce_output(
     bundle: &Bundle,
     config: &RetreadConfig,
     host_platform: Platform,
     workspace_python_version: &str,
     siblings: &[(String, String)],
+    courier_build_hash: Option<&str>,
 ) -> Result<CondaOutput> {
     // Python version for the emitted variant/build/`python` dep. Shared with
     // the build recipe via `emit_python_version` so the metadata and the
@@ -3546,7 +3604,13 @@ fn produce_output(
         NoArchType::python()
     };
     let py_short = python_version.replace('.', "");
-    let build = format!("py{py_short}_{}", config.build_number);
+    // Courier: use the content-addressed build string so pixi cache-hits are
+    // invalidated whenever the inputs change (wheel set, indexes, config...).
+    // Non-courier: keep the legacy `py{XY}_{build_number}` string unchanged.
+    let build = match courier_build_hash {
+        Some(hash) => courier_build_string(&py_short, hash, config.build_number),
+        None => format!("py{py_short}_{}", config.build_number),
+    };
 
     let mut variant = std::collections::BTreeMap::new();
     variant.insert(
@@ -3789,6 +3853,9 @@ async fn build_one(
             &python_version,
             &staged.run_deps,
             &staged.source_urls,
+            // Thread the content-addressed build string into the recipe so
+            // the on-disk artifact name matches what conda/outputs advertised.
+            expected_build,
         )
     } else {
         build_bundle_recipe(
@@ -4026,7 +4093,11 @@ fn replay_from_lock(
     // ----- reconstruct CondaOutput from lock fields -----
     let python_version = crate::relax::emit_python_version("", &lock.python);
     let py_short = python_version.replace('.', "");
-    let build = format!("py{py_short}_{build_number}");
+    // Replay is always courier mode. Use the content-addressed string so
+    // the advertised build string is byte-identical to produce_output's.
+    // `current_inputs_hash` has already been verified to match `lock.inputs_hash`
+    // at this point, so either is the correct hash to embed.
+    let build = courier_build_string(&py_short, current_inputs_hash, build_number);
 
     // Determine subdir from wheel filenames (same logic as produce_output).
     let any_platform_specific = lock
@@ -4357,6 +4428,89 @@ mod replay_tests {
         // 1. Write a valid lock file to source_dir.
         // 2. Call conda_outputs with courier=true.
         // 3. Assert the result is returned promptly (no solve cascade).
+    }
+
+    /// Verify that replay_from_lock emits the content-addressed build string.
+    #[test]
+    fn replay_emits_content_addressed_build_string() {
+        let dir = unique_tmp_dir();
+        // Use a 64-hex-char inputs_hash (typical sha256 hex output length).
+        let hash = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let lock = make_test_lock("mypack", "1.2.3", "3.11", hash, true);
+        let json = lock.to_pretty_json().unwrap();
+        let lock_path = dir.join(RetreadLock::file_name("mypack"));
+        std::fs::write(&lock_path, &json).unwrap();
+
+        let result = replay_from_lock(&lock_path, hash, Platform::Linux64, 0, &[]);
+        let out = result.unwrap().unwrap();
+        // Build string must be content-addressed: py311_h<first10>_0
+        assert_eq!(
+            out.metadata.build, "py311_habcdef0123_0",
+            "replay must emit content-addressed build string: got {}",
+            out.metadata.build
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+}
+
+// -----------------------------------------------------------------
+// Unit tests for courier build string helpers.
+// -----------------------------------------------------------------
+#[cfg(test)]
+mod courier_build_string_tests {
+    use super::courier_build_string;
+
+    #[test]
+    fn build_string_includes_hash_prefix() {
+        let hash = "abcdef0123456789";
+        let s = courier_build_string("311", hash, 0);
+        assert!(
+            s.contains("habcdef0123"),
+            "build string must contain h+first10 of hash: {s}"
+        );
+        assert!(
+            s.starts_with("py311_"),
+            "build string must start with py prefix: {s}"
+        );
+        assert!(
+            s.ends_with("_0"),
+            "build string must end with build number: {s}"
+        );
+    }
+
+    #[test]
+    fn different_hashes_give_different_build_strings() {
+        let s1 = courier_build_string("311", "aaaaaa0000111122", 0);
+        let s2 = courier_build_string("311", "bbbbbb9999888877", 0);
+        assert_ne!(
+            s1, s2,
+            "different inputs hashes must yield different build strings"
+        );
+    }
+
+    #[test]
+    fn same_hash_different_build_number_gives_different_string() {
+        let hash = "abcdef0123456789";
+        let s0 = courier_build_string("311", hash, 0);
+        let s1 = courier_build_string("311", hash, 1);
+        assert_ne!(
+            s0, s1,
+            "different build numbers must yield different strings"
+        );
+    }
+
+    #[test]
+    fn hash_shorter_than_10_chars_does_not_panic() {
+        // When the hash is shorter than 10 chars, min(len, 10) keeps all chars.
+        let s = courier_build_string("311", "abc", 0);
+        assert_eq!(s, "py311_habc_0");
+    }
+
+    #[test]
+    fn build_string_format_is_py_prefix_h_hash_number() {
+        // Exact format spec: py{py_short}_h{hash[..10]}_{build_number}
+        let s = courier_build_string("312", "1234567890abcdef", 2);
+        assert_eq!(s, "py312_h1234567890_2");
     }
 }
 
