@@ -34,6 +34,53 @@ pub struct CourierStaged {
     pub run_deps: Vec<String>,
 }
 
+/// Canonical resolution-INPUT specs for one bundle, used IDENTICALLY by the
+/// lock producer (`stage`) and the cold-solve replayer (`conda_outputs`) so
+/// their `inputs_hash` matches and replay actually fires. PURE manifest inputs
+/// only -- entry key + extras + (explicit version | git rev | url) -- NEVER a
+/// resolved version (the replayer runs BEFORE the cascade resolves anything,
+/// so a resolved version would make the two hashes diverge). Sorted; the order
+/// is not significant (compute_inputs_hash sorts too, but we sort here so this
+/// fn is a stable standalone contract).
+pub fn courier_input_specs(config: &RetreadConfig, bundle_name: &str) -> Vec<String> {
+    let mut specs: Vec<String> = config
+        .retread_wheels
+        .iter()
+        .filter(|(key, entry)| {
+            let group = entry.bundle.as_deref().or(config.default_bundle.as_deref());
+            match group {
+                Some(g) => g == bundle_name,
+                None => key.as_str() == bundle_name,
+            }
+        })
+        .map(|(key, entry)| {
+            let extras = if entry.extras.is_empty() {
+                String::new()
+            } else {
+                format!("[{}]", entry.extras.join(","))
+            };
+            // version proxy, pure-input precedence: explicit pin, then inline
+            // git rev, then named-git-source rev, then direct url, else bare.
+            let ver = entry
+                .normalized_version()
+                .map(|v| format!("=={v}"))
+                .or_else(|| entry.rev.clone().map(|r| format!("@git:{r}")))
+                .or_else(|| {
+                    entry
+                        .from
+                        .as_ref()
+                        .and_then(|f| config.git_sources.get(f))
+                        .map(|s| format!("@git:{}", s.rev))
+                })
+                .or_else(|| entry.url.as_ref().map(|u| format!("@url:{u}")))
+                .unwrap_or_default();
+            format!("{key}{extras}{ver}")
+        })
+        .collect();
+    specs.sort();
+    specs
+}
+
 /// Parse `"name spec"` lines (space-separated) into [`CondaDep`] values.
 /// Lines with no space (name only) get an empty spec. Blank lines are skipped.
 fn parse_conda_deps(run_deps: &[String]) -> Vec<CondaDep> {
@@ -264,27 +311,11 @@ pub async fn stage(
     let prerelease =
         collect_prerelease_pins(&emit_plan.overrides, emit_wheels, &emit_plan.ship, &entries);
 
-    // Entry specs for inputs_hash: each entry's pin as used in the meta-wheel,
-    // matching build_meta_wheel's pin precedence exactly.
-    let entry_specs: Vec<String> = entries
-        .iter()
-        .map(|(key, entry, resolved)| {
-            let extras = if entry.extras.is_empty() {
-                String::new()
-            } else {
-                format!("[{}]", entry.extras.join(","))
-            };
-            let pin = entry
-                .normalized_version()
-                .map(|v| format!("=={v}"))
-                .or_else(|| resolved.as_ref().map(|v| format!("=={v}")))
-                .unwrap_or_default();
-            format!("{key}{extras}{pin}")
-        })
-        .collect();
-
+    // inputs_hash over PURE manifest inputs (NOT resolved versions), via the
+    // canonical helper shared with the cold-solve replayer in conda_outputs --
+    // they MUST compute it identically or replay never fires.
     let inputs_hash = RetreadLock::compute_inputs_hash(
-        &entry_specs,
+        &courier_input_specs(config, bundle_name),
         index_urls,
         &format!("{:?}", config.relax),
         python,

@@ -37,7 +37,7 @@ use pixi_build_types::{
     BackendCapabilities, BinaryPackageSpec, NamedSpec, PackageSpec, VariantValue,
 };
 use rattler_conda_types::{
-    ChannelUrl, NoArchType, PackageName, Platform, VersionSpec, VersionWithSource,
+    ChannelUrl, NoArchType, PackageName, Platform, StringMatcher, VersionSpec, VersionWithSource,
 };
 use serde_json::Value;
 use tokio::sync::RwLock;
@@ -735,10 +735,12 @@ impl Handler {
                     // This is a pure optimization: on any error or hash miss
                     // the code falls through to the normal cascade path.
                     if config.courier {
-                        let entry_specs: Vec<String> = base_bundle
-                            .all_wheels()
-                            .map(|w| format!("{}=={}", w.pypi_name, w.metadata.version))
-                            .collect();
+                        // MUST mirror courier::stage's inputs_hash exactly:
+                        // canonical PURE-input entry specs (not the resolved
+                        // wheel closure) + the same index chain, or replay
+                        // never fires.
+                        let entry_specs =
+                            crate::courier::courier_input_specs(&config, &base_bundle.conda_name);
                         let ws_indexes: Vec<String> = workspace_manifest
                             .as_ref()
                             .map(|m| m.all_pypi_index_urls())
@@ -782,9 +784,7 @@ impl Handler {
                             Ok(None) => {
                                 tracing::debug!(
                                     bundle = %bundle.conda_name,
-                                    lock = %lock_path.display(),
-                                    "WS-B: replay miss (hash mismatch or \
-                                     no lock) -- falling through to cascade",
+                                    "WS-B: replay miss (hash mismatch / no lock) -- cascade",
                                 );
                             }
                             Err(e) => {
@@ -3881,18 +3881,36 @@ fn spec_from_str(s: &str) -> Result<NamedSpec<PackageSpec>> {
         Some((n, r)) => (n.trim(), r.trim()),
         None => (s.trim(), ""),
     };
-    let version = if rest.is_empty() {
+    // `rest` is a conda matchspec tail: a version spec OPTIONALLY followed by a
+    // build string, e.g. `3.12.* *_cp312` (python_abi). Split them so the
+    // build string doesn't get fed to the version parser (which rejects it).
+    // This is load-bearing for cold-solve replay, which round-trips the
+    // emitted run-deps (incl. build-tagged python_abi) through this fn.
+    let (ver_part, build_part) = match rest.split_once(char::is_whitespace) {
+        Some((v, b)) => (v.trim(), b.trim()),
+        None => (rest, ""),
+    };
+    let version = if ver_part.is_empty() {
         None
     } else {
         Some(
-            VersionSpec::from_str(rest, rattler_conda_types::ParseStrictness::Lenient)
-                .map_err(|e| anyhow!("parsing version spec `{rest}` for `{name}`: {e}"))?,
+            VersionSpec::from_str(ver_part, rattler_conda_types::ParseStrictness::Lenient)
+                .map_err(|e| anyhow!("parsing version spec `{ver_part}` for `{name}`: {e}"))?,
+        )
+    };
+    let build = if build_part.is_empty() {
+        None
+    } else {
+        Some(
+            StringMatcher::from_str(build_part)
+                .map_err(|e| anyhow!("parsing build string `{build_part}` for `{name}`: {e}"))?,
         )
     };
     Ok(NamedSpec {
         name: name.to_string(),
         spec: PackageSpec::Binary(BinaryPackageSpec {
             version,
+            build,
             ..Default::default()
         }),
     })

@@ -27,6 +27,27 @@ fn pypi_map(pairs: &[(&str, &[&str])]) -> PypiToCondaMap {
 }
 
 #[test]
+fn spec_from_str_handles_build_string() {
+    // Cold-solve replay round-trips emitted conda run-deps (incl. a
+    // build-tagged python_abi like `3.12.* *_cp312`) through spec_from_str.
+    // It must split the build string from the version, not feed the whole
+    // tail to the version parser (which rejects it) -- the bug that made
+    // replay silently fall through to the cascade.
+    let ns = spec_from_str("python_abi 3.12.* *_cp312").expect("build-string spec must parse");
+    assert_eq!(ns.name, "python_abi");
+    match ns.spec {
+        PackageSpec::Binary(b) => {
+            assert!(b.version.is_some(), "version parsed");
+            assert!(b.build.is_some(), "build string parsed");
+        }
+        _ => panic!("expected binary spec"),
+    }
+    // plain "name version" and bare "name" still work.
+    assert!(spec_from_str("numpy >=1.26").is_ok());
+    assert!(spec_from_str("pip").is_ok());
+}
+
+#[test]
 fn pick_conda_target_name_map_wins_over_ambiguous_parselmouth() {
     // THE torch regression: parselmouth lists several conda
     // candidates for `torch` with NO identity match (torch != any).
