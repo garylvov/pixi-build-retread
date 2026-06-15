@@ -79,3 +79,48 @@ jobs:
           if readelf -d "$BIN" | grep -qi needed; then
             echo "ERROR: binary has dynamic dependencies" >&2; exit 1
           fi
+
+  # If a change can alter the BYTES retread emits for identical inputs, it must
+  # bump lock::EMIT_EPOCH -- otherwise cold-solve replay reuses a stale lock and
+  # the content-addressed conda build string doesn't move, so pixi links a stale
+  # cached package. This guard fails when an emit-affecting source file changed
+  # without EMIT_EPOCH being touched. Override with `[emit-epoch-ok]` in a commit
+  # message when the change provably leaves emitted output unchanged.
+  emit-epoch-guard:
+    name: EMIT_EPOCH guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: EMIT_EPOCH bumped when emit-affecting code changes
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "pull_request" ]; then base="${PR_BASE:-}"; else base="${PUSH_BEFORE:-}"; fi
+          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+            echo "no usable diff base ($base); skipping EMIT_EPOCH guard."; exit 0
+          fi
+          changed="$(git diff --name-only "$base" HEAD)"
+          # Files whose change can alter retread's emitted bytes for identical inputs.
+          emit_re='^src/(relax|wheel_rewrite|wheel_inject|wheel_inject_data|emit_pypi|recipe|courier|lock)\.rs$|^src/handler/(auto_bundle|cascade)\.rs$'
+          if ! echo "$changed" | grep -Eq "$emit_re"; then
+            echo "no emit-affecting files changed; OK."; exit 0
+          fi
+          if git diff "$base" HEAD -- src/lock.rs | grep -Eq '^[-+].*EMIT_EPOCH'; then
+            echo "emit-affecting code changed and EMIT_EPOCH was touched; OK."; exit 0
+          fi
+          if git log "${base}..HEAD" --format=%B | grep -qiF '[emit-epoch-ok]'; then
+            echo "emit-affecting code changed; [emit-epoch-ok] override present; OK."; exit 0
+          fi
+          echo "::error::Emit-affecting files changed but src/lock.rs::EMIT_EPOCH was not bumped."
+          echo "Bump EMIT_EPOCH in src/lock.rs (see its doc) so cold-solve replay + the"
+          echo "content-addressed build string invalidate, OR add [emit-epoch-ok] to a"
+          echo "commit message if the emitted output is provably unchanged."
+          echo "Emit-affecting files changed:"
+          echo "$changed" | grep -E "$emit_re"
+          exit 1

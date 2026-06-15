@@ -301,13 +301,9 @@ pub fn build_courier_recipe(
     // a failure is logged loudly but does not abort linking (the conda
     // metadata is still valid; the user can re-run `retread install`).
     let post_link = format!("$PREFIX/bin/.{conda_name}-post-link.sh");
-    // A4 loud-failure guard: courier is the default mode, so a consumer who
-    // forgets `run-post-link-scripts = "insecure"` would otherwise get a
-    // SILENTLY broken env (post-link never runs, wheels never installed). We
-    // also ship a conda activate.d script -- which runs on EVERY activation
-    // regardless of the post-link toggle -- that checks the installer's success
-    // marker and, if absent, prints a loud actionable banner. Turns an
-    // invisible failure into one the user sees on the next `pixi run`/`shell`.
+    // Loud-failure guard: an activate.d script runs on every activation
+    // (regardless of the post-link toggle) and warns -- with the two fixes --
+    // when the wheels are not installed, so a missing toggle is never silent.
     let activate_guard = format!("$PREFIX/etc/conda/activate.d/zzz-retread-{conda_name}.sh");
     let script = format!(
         "set -euo pipefail\n\
@@ -325,19 +321,10 @@ pub fn build_courier_recipe(
          chmod +x \"{post_link}\"\n\
          cat > \"{activate_guard}\" <<'ACTIVATE'\n\
          #!/bin/bash\n\
-         # retread courier guard ({conda_name}): warn loudly if the bundle's\n\
-         # PyPI wheels were never installed (post-link did not run -- almost\n\
-         # always run-post-link-scripts is not enabled in .pixi/config.toml).\n\
          if [ ! -f \"$CONDA_PREFIX/share/retread/{conda_name}.installed\" ]; then\n\
-         echo \"######################################################################\" >&2\n\
-         echo \"# retread: bundle '{conda_name}' PyPI wheels are NOT installed.\" >&2\n\
-         echo \"# The post-link installer did not run. Almost always this means\" >&2\n\
-         echo \"# post-link scripts are disabled. Add to <workspace>/.pixi/config.toml:\" >&2\n\
-         echo '#     run-post-link-scripts = \"insecure\"' >&2\n\
-         echo \"# then re-run: pixi install   (see the pack README security note).\" >&2\n\
-         echo \"# Or install now:\" >&2\n\
-         echo \"#   retread install --lock \\\"$CONDA_PREFIX/share/retread/{lock_filename}\\\" --prefix \\\"$CONDA_PREFIX\\\"\" >&2\n\
-         echo \"######################################################################\" >&2\n\
+         echo \"retread: '{conda_name}' PyPI wheels are NOT installed.\" >&2\n\
+         echo '  fast path: set run-post-link-scripts = \"insecure\" in <workspace>/.pixi/config.toml' >&2\n\
+         echo '  safe mode: set retread-courier = false' >&2\n\
          fi\n\
          ACTIVATE\n\
          chmod +x \"{activate_guard}\"\n"
@@ -473,7 +460,11 @@ mod courier_tests {
             r.build
                 .script
                 .contains("run-post-link-scripts = \"insecure\""),
-            "guard banner must name the toggle the user must enable"
+            "guard banner must name the fast-path toggle"
+        );
+        assert!(
+            r.build.script.contains("retread-courier = false"),
+            "guard banner must name the safe-mode opt-out"
         );
         assert!(
             r.build.script.contains("\nACTIVATE\n"),
