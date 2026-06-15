@@ -3875,6 +3875,8 @@ async fn build_one(
                         origin: if ship { Origin::Built } else { Origin::Index },
                         filename: w.wheel_filename.clone(),
                         url: (!ship).then(|| rw.url.to_string()),
+                        // TODO(WS-A): record per-wheel sha256.
+                        sha256: None,
                     }
                 })
                 .collect();
@@ -3903,22 +3905,33 @@ async fn build_one(
                 .values()
                 .map(|e| e.index_url())
                 .collect();
+            let index_urls = merge_index_chain(entry_indexes, &workspace_indexes);
+            let entry_specs: Vec<String> = wheels
+                .iter()
+                .map(|w| format!("{}=={}", w.name, w.version))
+                .collect();
+            let inputs_hash = RetreadLock::compute_inputs_hash(
+                &entry_specs,
+                &index_urls,
+                &format!("{:?}", config.relax),
+                workspace_python_version,
+                env!("CARGO_PKG_VERSION"),
+            );
             let lock = RetreadLock {
                 schema: SCHEMA,
                 retread_version: env!("CARGO_PKG_VERSION").to_string(),
                 bundle: recipe.package.name.clone(),
                 version: recipe.package.version.clone(),
                 python: workspace_python_version.to_string(),
-                // TODO(courier Phase 3): populate with the bundle's entry
-                // requirements (or the generated meta-wheel pin) that uv
-                // installs; the courier emit owns this once it builds the
-                // meta-wheel + stages shipped wheels.
+                inputs_hash,
+                // TODO(WS-A/C): populate with the bundle's entry requirements
+                // (the generated meta-wheel pin) the courier installs; the
+                // courier emit owns this once it builds the meta-wheel.
                 root_requirements: Vec::new(),
                 wheels,
                 conda_run_deps,
-                index_urls: merge_index_chain(entry_indexes, &workspace_indexes),
-                // TODO(courier Phase 2): carry collect_prerelease_pins so the
-                // installer can pass `--prerelease` overrides to uv.
+                index_urls,
+                // TODO(WS-A): carry collect_prerelease_pins for the installer.
                 prerelease: Default::default(),
             };
             match lock.to_pretty_json() {

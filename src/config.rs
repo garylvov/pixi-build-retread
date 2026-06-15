@@ -170,6 +170,22 @@ pub struct RetreadConfig {
     #[serde(default, rename = "retread-emit-pypi", alias = "emit-pypi")]
     pub emit_pypi: bool,
 
+    /// v2.0.0 (experimental): courier mode. Emit a metadata-only conda
+    /// package that ships the bundle's built/relax-changed wheels + a
+    /// committed `retread-<bundle>.lock.json` as data, declares the solved
+    /// conda run-deps plus `uv` + `pixi-build-retread`, and installs the
+    /// PyPI wheels at env link time via a post-link `retread install` (uv
+    /// hardlink; index wheels fetched on demand). The consumer keeps ONE
+    /// clean conda line and zero machine-written manifest bytes; nothing is
+    /// committed to git. Mutually exclusive with the blueprint fence path.
+    ///
+    /// ```toml
+    /// [package.build.config]
+    /// retread-courier = true
+    /// ```
+    #[serde(default, rename = "retread-courier", alias = "courier")]
+    pub courier: bool,
+
     /// v1.7.0 (experimental): blueprint sub-mode of emit-pypi. Instead
     /// of a generated `[pypi-options.dependency-overrides]` table, the
     /// override semantics are baked into REWRITTEN WHEELS shipped to
@@ -633,6 +649,24 @@ mod tests {
         });
         let cfg: RetreadConfig = serde_json::from_value(json).unwrap();
         assert!(!cfg.emit_pypi, "unset defaults to off");
+    }
+
+    #[test]
+    fn parses_retread_courier_key() {
+        // v2.0.0. Invariant #6: deny_unknown_fields rejects unknown keys,
+        // so the new courier flag needs a serde test.
+        let json = serde_json::json!({
+            "retread-wheels": { "foo": { "version": "==1.0" } },
+            "retread-courier": true,
+        });
+        let cfg: RetreadConfig = serde_json::from_value(json).unwrap();
+        assert!(cfg.courier);
+
+        let json = serde_json::json!({
+            "retread-wheels": { "foo": { "version": "==1.0" } },
+        });
+        let cfg: RetreadConfig = serde_json::from_value(json).unwrap();
+        assert!(!cfg.courier, "unset defaults to off");
     }
 
     #[test]

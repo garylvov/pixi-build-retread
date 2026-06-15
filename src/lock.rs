@@ -44,6 +44,9 @@ pub struct LockWheel {
     /// Upstream URL for `Origin::Index` wheels; `None` for `Built`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    /// sha256 of the wheel file (index-wheel verification; reproducibility).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
 }
 
 /// A conda run-dep retread routed to the conda side (a shared transitive
@@ -64,6 +67,13 @@ pub struct RetreadLock {
     pub version: String,
     /// Target python (e.g. "3.11"); the wheel set is python-specific.
     pub python: String,
+    /// sha256 over the canonicalized resolution inputs (entry specs +
+    /// ordered index chain + relax policy + python + retread version).
+    /// Reproducibility gate (req #5) AND the cold-solve replay key (req #4):
+    /// `conda/outputs` replays this lock's emitted outputs (skipping the
+    /// probe cascade) iff a freshly computed inputs hash matches this.
+    #[serde(default)]
+    pub inputs_hash: String,
     /// The PEP 508 requirements `retread install` hands to uv (the meta
     /// requirement that drives the closure -- typically the bundle entries
     /// pinned to their resolved versions). uv resolves these against the
@@ -85,12 +95,48 @@ pub struct RetreadLock {
     pub prerelease: BTreeMap<String, String>,
 }
 
-pub const SCHEMA: u32 = 2;
+pub const SCHEMA: u32 = 3;
 
 impl RetreadLock {
     /// File name for a bundle's lock next to the pack manifest.
     pub fn file_name(bundle: &str) -> String {
         format!("retread-{bundle}.lock.json")
+    }
+
+    /// Canonical inputs hash. EVERY producer (the courier staging that
+    /// writes the lock) and replayer (`conda/outputs` deciding whether to
+    /// skip the cascade) MUST call this -- never hand-roll the digest, or
+    /// the two sides disagree and replay silently never fires (or fires
+    /// stale). Entry specs are sorted so ordering is not significant; the
+    /// index chain order IS significant (it is resolution priority).
+    pub fn compute_inputs_hash(
+        entry_specs: &[String],
+        index_urls: &[String],
+        relax: &str,
+        python: &str,
+        retread_version: &str,
+    ) -> String {
+        use sha2::{Digest, Sha256};
+        let mut sorted = entry_specs.to_vec();
+        sorted.sort();
+        let mut h = Sha256::new();
+        h.update(b"retread-inputs-v3\n");
+        for s in &sorted {
+            h.update(s.as_bytes());
+            h.update(b"\n");
+        }
+        h.update(b"--indexes--\n");
+        for u in index_urls {
+            h.update(u.as_bytes());
+            h.update(b"\n");
+        }
+        h.update(b"--meta--\n");
+        h.update(relax.as_bytes());
+        h.update(b"\n");
+        h.update(python.as_bytes());
+        h.update(b"\n");
+        h.update(retread_version.as_bytes());
+        format!("{:x}", h.finalize())
     }
 
     /// Read a lock back (consumer side / cold-start replay).
@@ -125,6 +171,7 @@ mod tests {
             bundle: "isaac-pack".into(),
             version: "5.1.0".into(),
             python: "3.11".into(),
+            inputs_hash: "deadbeef".into(),
             root_requirements: vec!["isaac-pack-pypi==5.1.0".into()],
             wheels: vec![
                 LockWheel {
@@ -133,6 +180,7 @@ mod tests {
                     origin: Origin::Built,
                     filename: "isaaclab-0.51.1-py3-none-any.whl".into(),
                     url: None,
+                    sha256: None,
                 },
                 LockWheel {
                     name: "isaacsim-core".into(),
@@ -140,6 +188,7 @@ mod tests {
                     origin: Origin::Index,
                     filename: "isaacsim_core-5.1.0.0-cp311-...whl".into(),
                     url: Some("https://pypi.nvidia.com/isaacsim-core/...whl".into()),
+                    sha256: Some("abc123".into()),
                 },
             ],
             conda_run_deps: vec![CondaDep {
@@ -166,5 +215,45 @@ mod tests {
             RetreadLock::file_name(&back.bundle),
             "retread-isaac-pack.lock.json"
         );
+        assert_eq!(back.inputs_hash, "deadbeef");
+        assert_eq!(back.wheels[1].sha256.as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn inputs_hash_stable_and_order_sensitive() {
+        let h1 = RetreadLock::compute_inputs_hash(
+            &["b==1".into(), "a==2".into()],
+            &[
+                "https://pypi.nvidia.com".into(),
+                "https://pypi.org/simple/".into(),
+            ],
+            "patch-then-minor",
+            "3.11",
+            "2.0.0",
+        );
+        // entry order does NOT matter (sorted)
+        let h2 = RetreadLock::compute_inputs_hash(
+            &["a==2".into(), "b==1".into()],
+            &[
+                "https://pypi.nvidia.com".into(),
+                "https://pypi.org/simple/".into(),
+            ],
+            "patch-then-minor",
+            "3.11",
+            "2.0.0",
+        );
+        assert_eq!(h1, h2, "entry-spec order must not change the hash");
+        // index order DOES matter (resolution priority)
+        let h3 = RetreadLock::compute_inputs_hash(
+            &["a==2".into(), "b==1".into()],
+            &[
+                "https://pypi.org/simple/".into(),
+                "https://pypi.nvidia.com".into(),
+            ],
+            "patch-then-minor",
+            "3.11",
+            "2.0.0",
+        );
+        assert_ne!(h1, h3, "index chain order must change the hash");
     }
 }
