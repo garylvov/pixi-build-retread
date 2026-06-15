@@ -1,10 +1,10 @@
 {
-  "schema": 3,
-  "retread_version": "2.0.0",
+  "schema": 4,
+  "retread_version": "2.1.0",
   "bundle": "isaac-pack-6",
   "version": "6.0.0.1",
   "python": "3.12",
-  "inputs_hash": "e6f8cb576b8dca651fc99d4859aea4b4b43f5e6372cc39e048bedc05fdf9768e",
+  "inputs_hash": "991427e05567aa5d7e97f380b3d286e8c123703f4e919387cdad84dc5120b1f4",
   "root_requirements": [
     "isaac-pack-6-pypi==6.0.0.1"
   ],
@@ -190,8 +190,9 @@
     {
       "name": "fastapi",
       "version": "0.120.4",
-      "origin": "built",
-      "filename": "fastapi-0.120.4-999retread-py3-none-any.whl"
+      "origin": "index",
+      "filename": "fastapi-0.120.4-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/ed/47/14a76b926edc3957c8a8258423db789d3fa925d2fed800102fce58959413/fastapi-0.120.4-py3-none-any.whl#sha256=9bdf192308676480d3593e10fd05094e56d6fdc7d9283db26053d8104d5f82a0"
     },
     {
       "name": "attrs",
