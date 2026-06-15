@@ -185,7 +185,12 @@ impl RetreadLock {
 
     /// Serialize to pretty JSON for committing.
     pub fn to_pretty_json(&self) -> Result<String> {
-        serde_json::to_string_pretty(self).context("serializing retread lock")
+        // Trailing newline: the committed lock is a normal text file, and the
+        // repo's end-of-file-fixer pre-commit hook requires one (a no-newline
+        // JSON tripped CI). serde_json::to_string_pretty omits it, so add it.
+        let mut s = serde_json::to_string_pretty(self).context("serializing retread lock")?;
+        s.push('\n');
+        Ok(s)
     }
 
     /// Idempotency marker file (under `<prefix>/share/retread/`). The
