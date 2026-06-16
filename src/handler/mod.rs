@@ -48,7 +48,7 @@ use crate::pypi::{self, WheelTarget};
 use crate::recipe::{BundleSource, build_bundle_recipe, build_courier_recipe, to_yaml};
 use crate::relax::{canonical_conda_name, emit_python_version, marker_env_for};
 use crate::rpc::{RpcError, ok, parse_params};
-use crate::wheel::{WheelMetadata, fetch_wheel};
+use crate::wheel::WheelMetadata;
 
 /// Process-global memo of `conda/outputs` results, keyed by the params
 /// that determine the outputs (host/build platform, sorted channels,
@@ -3163,9 +3163,14 @@ async fn materialize_and_rewrite(
         ));
         wheel
     } else if let Some(url) = &entry.url {
-        fetch_wheel(url, entry.sha256.as_deref(), download_dir)
-            .await
-            .with_context(|| format!("phase 1 URL fetch for entry `{entry_name}` (url=`{url}`)"))?
+        crate::wheel::fetch_wheel_cached(
+            url,
+            entry.sha256.as_deref(),
+            download_dir,
+            &crate::courier::retread_cache_root(),
+        )
+        .await
+        .with_context(|| format!("phase 1 URL fetch for entry `{entry_name}` (url=`{url}`)"))?
     } else if let Some(path) = &entry.path {
         let abs = if Path::new(path).is_absolute() {
             PathBuf::from(path)
@@ -3227,14 +3232,19 @@ async fn materialize_and_rewrite(
                     entry.index_url(),
                 )
             })?;
-        fetch_wheel(&resolved.url, resolved.sha256.as_deref(), download_dir)
-            .await
-            .with_context(|| {
-                format!(
-                    "phase 1 PyPI fetch for entry `{entry_name}` (url=`{}`)",
-                    resolved.url,
-                )
-            })?
+        crate::wheel::fetch_wheel_cached(
+            &resolved.url,
+            resolved.sha256.as_deref(),
+            download_dir,
+            &crate::courier::retread_cache_root(),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "phase 1 PyPI fetch for entry `{entry_name}` (url=`{}`)",
+                resolved.url,
+            )
+        })?
     };
 
     // Phase 1.5: for source-built wheels, top up the wheel with any
