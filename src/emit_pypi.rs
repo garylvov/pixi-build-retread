@@ -420,7 +420,10 @@ pub fn build_meta_wheel(
     {
         let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
         let opts = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Deflated);
+            .compression_method(zip::CompressionMethod::Deflated)
+            // Pin the timestamp (1980 DOS epoch) for byte-deterministic output
+            // regardless of the zip `time` feature -- see wheel_rewrite.rs.
+            .last_modified_time(zip::DateTime::default());
         for (name, body) in [
             (format!("{di}/METADATA"), metadata.as_slice()),
             (format!("{di}/WHEEL"), wheel_file.as_slice()),

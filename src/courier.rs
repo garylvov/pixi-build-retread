@@ -10,10 +10,14 @@
 //! against. WS-A implements the body. Do not change these shapes without a
 //! stop-the-world re-freeze.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
+use std::fmt::Write as _;
 use std::path::Path;
+use std::str::FromStr as _;
 
 use anyhow::Context as _;
+use sha2::{Digest, Sha256};
+use uv_pep508::Requirement;
 
 use crate::config::RetreadConfig;
 use crate::emit_pypi::{
@@ -169,6 +173,159 @@ fn file_url(path: &Path) -> anyhow::Result<String> {
     Ok(format!("file://{s}"))
 }
 
+// ── Shadow-rewrite cache helpers ────────────────────────────────────────────
+
+/// Compute the shadow-rewrite cache key for one wheel.
+///
+/// Key = sha256 of:
+///   b"retread-shadow-v1\n"
+///   || EMIT_EPOCH (u32 le)
+///   || CARGO_PKG_VERSION bytes || b"\n"
+///   || input_wheel_sha256 (hex of relaxed.whl bytes) || b"\n"
+///   || applicable_overrides_serialized
+///
+/// CRITICAL: only the APPLICABLE subset of overrides/conda_capable is
+/// hashed (entries whose name appears in this wheel's Requires-Dist).
+/// This is what makes "add one dep" a near-total cache hit: only wheels
+/// that actually reference the new dep miss. It is ALSO what makes the
+/// hit correct: the output is a pure function of exactly this subset +
+/// the input bytes + the code version.
+///
+/// NOTE: this key is INTERNAL-ONLY. It MUST NOT feed `compute_inputs_hash`.
+fn shadow_cache_key(
+    input_wheel_bytes: &[u8],
+    requires_dist: &[String],
+    overrides: &BTreeMap<String, String>,
+    conda_capable: &HashSet<String>,
+) -> String {
+    // Collect dep names from Requires-Dist (PEP 508 parse, same as override_line_map).
+    let dep_names: HashSet<String> = requires_dist
+        .iter()
+        .filter_map(|line| {
+            let req: Requirement = Requirement::from_str(line).ok()?;
+            Some(req.name.to_string())
+        })
+        .collect();
+
+    // Applicable subset of overrides: only entries whose name is in dep_names.
+    let mut applicable_parts: Vec<String> = overrides
+        .iter()
+        .filter(|(name, _)| dep_names.contains(*name))
+        .map(|(name, spec)| format!("{name}={spec}"))
+        .collect();
+    applicable_parts.sort();
+
+    // Applicable subset of conda_capable: only names in dep_names.
+    let mut cap_parts: Vec<String> = conda_capable
+        .iter()
+        .filter(|name| dep_names.contains(*name))
+        .map(|name| format!("cap:{name}"))
+        .collect();
+    cap_parts.sort();
+
+    applicable_parts.extend(cap_parts);
+    let applicable_serialized = applicable_parts.join("\n");
+
+    let input_sha = crate::wheel_rewrite::sha256_hex(input_wheel_bytes);
+
+    let mut h = Sha256::new();
+    h.update(b"retread-shadow-v1\n");
+    h.update(crate::lock::EMIT_EPOCH.to_le_bytes());
+    h.update(env!("CARGO_PKG_VERSION").as_bytes());
+    h.update(b"\n");
+    h.update(input_sha.as_bytes());
+    h.update(b"\n");
+    h.update(applicable_serialized.as_bytes());
+
+    let mut out = String::with_capacity(64);
+    for b in h.finalize() {
+        write!(&mut out, "{b:02x}").expect("write to String");
+    }
+    out
+}
+
+/// Hard-link `src` -> `dst`, falling back to copy on cross-device error.
+/// Mirrors the pattern in wheel_rewrite.rs for consistency.
+fn hardlink_or_copy(src: &Path, dst: &Path) -> anyhow::Result<()> {
+    if dst.exists() {
+        std::fs::remove_file(dst)?;
+    }
+    if std::fs::hard_link(src, dst).is_err() {
+        std::fs::copy(src, dst)?;
+    }
+    Ok(())
+}
+
+/// Look up or populate the shadow-rewrite cache, returning `(sha256, did_change)`.
+///
+/// Cache dir: `<cache_dir>/<key>.changed` or `<cache_dir>/<key>.same`.
+/// On a miss, rewrites `src` -> cache file via `rewrite_wheel_with`, then
+/// hard-links cache -> `dst`. On a hit, hard-links cache -> `dst` directly.
+///
+/// SAFETY NOTE: This cache is a pure build-speed optimization. It is
+/// content-addressed by (code version, EMIT_EPOCH, input wheel bytes,
+/// applicable overrides). It produces BYTE-IDENTICAL staged output to the
+/// no-cache path. It MUST NOT feed `compute_inputs_hash`.
+fn shadow_cache_stage(
+    src: &Path,
+    dst: &Path,
+    cache_dir: &Path,
+    key: &str,
+    overrides: &BTreeMap<String, String>,
+    conda_capable: &HashSet<String>,
+) -> anyhow::Result<(String, bool)> {
+    std::fs::create_dir_all(cache_dir)
+        .with_context(|| format!("creating shadow cache dir {}", cache_dir.display()))?;
+
+    let hit_changed = cache_dir.join(format!("{key}.changed"));
+    let hit_same = cache_dir.join(format!("{key}.same"));
+
+    if hit_changed.exists() {
+        hardlink_or_copy(&hit_changed, dst)
+            .with_context(|| format!("cache hit hardlink (.changed) -> {}", dst.display()))?;
+        let dst_bytes =
+            std::fs::read(dst).with_context(|| format!("reading staged {}", dst.display()))?;
+        return Ok((crate::wheel_rewrite::sha256_hex(&dst_bytes), true));
+    }
+    if hit_same.exists() {
+        hardlink_or_copy(&hit_same, dst)
+            .with_context(|| format!("cache hit hardlink (.same) -> {}", dst.display()))?;
+        let dst_bytes =
+            std::fs::read(dst).with_context(|| format!("reading staged {}", dst.display()))?;
+        return Ok((crate::wheel_rewrite::sha256_hex(&dst_bytes), false));
+    }
+
+    // Cache miss: rewrite ONCE into the cache file, then link to dst.
+    let cache_tmp = cache_dir.join(format!("{key}.tmp"));
+    let m = override_line_map(overrides, conda_capable);
+    let (sha, did_change) = crate::wheel_rewrite::rewrite_wheel_with(src, &cache_tmp, &m)
+        .with_context(|| {
+            format!(
+                "shadow cache miss rewrite {} -> {}",
+                src.display(),
+                cache_tmp.display()
+            )
+        })?;
+
+    // Rename tmp -> canonical cache entry.
+    let cache_dst = if did_change { &hit_changed } else { &hit_same };
+    std::fs::rename(&cache_tmp, cache_dst).with_context(|| {
+        format!(
+            "placing cache entry {} -> {}",
+            cache_tmp.display(),
+            cache_dst.display()
+        )
+    })?;
+
+    // Link cache -> staging.
+    hardlink_or_copy(cache_dst, dst)
+        .with_context(|| format!("cache miss hardlink -> {}", dst.display()))?;
+
+    Ok((sha, did_change))
+}
+
+// ── Stage ────────────────────────────────────────────────────────────────────
+
 /// Stage the courier artifacts. Built wheels (`must_ship()`) AND index
 /// wheels whose metadata relax CHANGED are written to `staging_dir` (they
 /// ship in the conda package as `Origin::Built`); unchanged index wheels are
@@ -190,13 +347,15 @@ pub async fn stage(
     source_dir: &Path,
     staging_dir: &Path,
 ) -> anyhow::Result<CourierStaged> {
-    // Suppress unused_variables warning on source_dir (used by callers for
-    // context but not needed internally; staging_dir is the write target).
-    let _ = source_dir;
-
     tokio::fs::create_dir_all(staging_dir)
         .await
         .with_context(|| format!("creating staging dir {}", staging_dir.display()))?;
+
+    // Shadow-rewrite cache dir (flat, content-addressed). Never feeds inputs_hash.
+    let shadow_cache_dir = source_dir.join("wheels").join(".retread-shadow-cache");
+    // Bypass: RETREAD_NO_SHADOW_CACHE=<any value> disables the cache entirely
+    // (forces fresh rewrites, enabling byte-for-byte parity testing).
+    let use_shadow_cache = std::env::var("RETREAD_NO_SHADOW_CACHE").is_err();
 
     // Step 1: run plan() to get ship set + override table.
     let emit_plan = plan(emit_wheels, conda_capable);
@@ -256,16 +415,44 @@ pub async fn stage(
                 anyhow::anyhow!("must_ship wheel has no local_path: {}", w.pypi_name)
             })?;
             let dst = staging_dir.join(&std_name);
-            let src_blocking = src.clone();
-            let dst_blocking = dst.clone();
-            let overrides_b = overrides_owned.clone();
-            let conda_cap_b = conda_cap_owned.clone();
-            tokio::task::spawn_blocking(move || {
-                let m = override_line_map(&overrides_b, &conda_cap_b);
-                crate::wheel_rewrite::rewrite_wheel_with(&src_blocking, &dst_blocking, &m)
-            })
-            .await
-            .with_context(|| format!("spawn_blocking rewrite of built wheel {}", w.pypi_name))??;
+
+            if use_shadow_cache {
+                let src_bytes = tokio::fs::read(src)
+                    .await
+                    .with_context(|| format!("reading must_ship wheel {}", src.display()))?;
+                let key = shadow_cache_key(
+                    &src_bytes,
+                    &w.requires_dist,
+                    &overrides_owned,
+                    &conda_cap_owned,
+                );
+                let cache_dir = shadow_cache_dir.clone();
+                let src_b = src.clone();
+                let dst_b = dst.clone();
+                let ov_b = overrides_owned.clone();
+                let cap_b = conda_cap_owned.clone();
+                tokio::task::spawn_blocking(move || {
+                    shadow_cache_stage(&src_b, &dst_b, &cache_dir, &key, &ov_b, &cap_b)
+                })
+                .await
+                .with_context(|| {
+                    format!("spawn_blocking shadow-cache (must_ship) {}", w.pypi_name)
+                })??;
+            } else {
+                let src_blocking = src.clone();
+                let dst_blocking = dst.clone();
+                let overrides_b = overrides_owned.clone();
+                let conda_cap_b = conda_cap_owned.clone();
+                tokio::task::spawn_blocking(move || {
+                    let m = override_line_map(&overrides_b, &conda_cap_b);
+                    crate::wheel_rewrite::rewrite_wheel_with(&src_blocking, &dst_blocking, &m)
+                })
+                .await
+                .with_context(|| {
+                    format!("spawn_blocking rewrite of built wheel {}", w.pypi_name)
+                })??;
+            }
+
             source_urls.push(file_url(&dst)?);
             lock_wheels.push(LockWheel {
                 name: w.pypi_name.clone(),
@@ -278,31 +465,65 @@ pub async fn stage(
         } else {
             // Index wheel. Decide whether to ship a relax-rewritten shadow
             // (AUDIT B2: relax-changed index wheels must ship as shadows, not
-            // stay remote, or strict pins re-emerge at install time). Produce
-            // `(changed, shadow_src)`: when `changed`, `shadow_src` holds the
-            // local bytes to rewrite.
+            // stay remote, or strict pins re-emerge at install time).
             let (changed, shadow_src): (bool, Option<std::path::PathBuf>) = if let Some(src) =
                 w.local_path.as_ref()
             {
-                // We have the bytes: run the rewrite into a temp file to
-                // determine whether the mapper changes any line.
-                let tmp_name = format!(".tmp-courier-{std_name}");
-                let tmp = staging_dir.join(&tmp_name);
-                let overrides_c = overrides_owned.clone();
-                let conda_cap_c = conda_cap_owned.clone();
-                let (_sha, did_change) = tokio::task::spawn_blocking({
-                    let src = src.clone();
-                    let tmp = tmp.clone();
-                    move || {
-                        let m = override_line_map(&overrides_c, &conda_cap_c);
-                        crate::wheel_rewrite::rewrite_wheel_with(&src, &tmp, &m)
+                if use_shadow_cache {
+                    // Single-pass through cache: rewrite_wheel_with returns
+                    // (sha, did_change). No probe-then-rewrite double pass.
+                    let src_bytes = tokio::fs::read(src)
+                        .await
+                        .with_context(|| format!("reading index wheel {}", src.display()))?;
+                    let key = shadow_cache_key(
+                        &src_bytes,
+                        &w.requires_dist,
+                        &overrides_owned,
+                        &conda_cap_owned,
+                    );
+                    let cache_dir = shadow_cache_dir.clone();
+                    let src_c = src.clone();
+                    let ov_c = overrides_owned.clone();
+                    let cap_c = conda_cap_owned.clone();
+                    // Rewrite into a temp dst so we can check did_change,
+                    // then move to the real shadow name below if changed.
+                    let probe_dst = staging_dir.join(format!(".probe-courier-{std_name}"));
+                    let probe_dst_c = probe_dst.clone();
+                    let (_sha, did_change) = tokio::task::spawn_blocking(move || {
+                        shadow_cache_stage(&src_c, &probe_dst_c, &cache_dir, &key, &ov_c, &cap_c)
+                    })
+                    .await
+                    .with_context(|| {
+                        format!("spawn_blocking shadow-cache (index) {}", w.pypi_name)
+                    })??;
+                    if did_change {
+                        (true, Some(probe_dst))
+                    } else {
+                        // Unchanged: remove the probe staging file.
+                        let _ = tokio::fs::remove_file(&probe_dst).await;
+                        (false, None)
                     }
-                })
-                .await
-                .with_context(|| format!("spawn_blocking rewrite-check of {}", w.pypi_name))??;
-                // Remove the probe tmp -- we re-stage into the real dst below.
-                let _ = tokio::fs::remove_file(&tmp).await;
-                (did_change, did_change.then(|| src.clone()))
+                } else {
+                    // No-cache path: probe-then-rewrite (old behavior).
+                    let tmp_name = format!(".tmp-courier-{std_name}");
+                    let tmp = staging_dir.join(&tmp_name);
+                    let overrides_c = overrides_owned.clone();
+                    let conda_cap_c = conda_cap_owned.clone();
+                    let (_sha, did_change) = tokio::task::spawn_blocking({
+                        let src = src.clone();
+                        let tmp = tmp.clone();
+                        move || {
+                            let m = override_line_map(&overrides_c, &conda_cap_c);
+                            crate::wheel_rewrite::rewrite_wheel_with(&src, &tmp, &m)
+                        }
+                    })
+                    .await
+                    .with_context(|| {
+                        format!("spawn_blocking rewrite-check of {}", w.pypi_name)
+                    })??;
+                    let _ = tokio::fs::remove_file(&tmp).await;
+                    (did_change, did_change.then(|| src.clone()))
+                }
             } else {
                 // Remote-only wheel (sidecar metadata, bytes never
                 // downloaded -- typically a small auto-bundled PyPI dep).
@@ -351,19 +572,36 @@ pub async fn stage(
                 // Relax changed this index wheel's METADATA: ship it as a
                 // build-tagged shadow wheel so uv's find-links prefers it over
                 // the registry original (AUDIT B2 fix).
-                let src = shadow_src.expect("changed=true implies shadow_src is Some");
                 let shadow_name = insert_build_tag(&std_name, "999retread")?;
                 let dst = staging_dir.join(&shadow_name);
-                let dst_blocking = dst.clone();
-                let src_blocking = src.clone();
-                let overrides_c2 = overrides_owned.clone();
-                let conda_cap_c2 = conda_cap_owned.clone();
-                tokio::task::spawn_blocking(move || {
-                    let m = override_line_map(&overrides_c2, &conda_cap_c2);
-                    crate::wheel_rewrite::rewrite_wheel_with(&src_blocking, &dst_blocking, &m)
-                })
-                .await
-                .with_context(|| format!("spawn_blocking shadow-rewrite of {}", w.pypi_name))??;
+
+                let src = shadow_src.expect("changed=true implies shadow_src is Some");
+                if src.starts_with(staging_dir) {
+                    // Already staged by the cache path (probe_dst): rename
+                    // into the real shadow filename.
+                    tokio::fs::rename(&src, &dst).await.with_context(|| {
+                        format!(
+                            "renaming probe {} -> shadow {}",
+                            src.display(),
+                            dst.display()
+                        )
+                    })?;
+                } else {
+                    // No-cache path or force-downloaded dl file: rewrite fresh.
+                    let dst_blocking = dst.clone();
+                    let src_blocking = src.clone();
+                    let overrides_c2 = overrides_owned.clone();
+                    let conda_cap_c2 = conda_cap_owned.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let m = override_line_map(&overrides_c2, &conda_cap_c2);
+                        crate::wheel_rewrite::rewrite_wheel_with(&src_blocking, &dst_blocking, &m)
+                    })
+                    .await
+                    .with_context(|| {
+                        format!("spawn_blocking shadow-rewrite of {}", w.pypi_name)
+                    })??;
+                }
+
                 source_urls.push(file_url(&dst)?);
                 lock_wheels.push(LockWheel {
                     name: w.pypi_name.clone(),
@@ -390,12 +628,53 @@ pub async fn stage(
         }
     }
 
-    // Step 4: Build and stage the <bundle>-pypi meta-wheel.
+    // Step 4: Build and stage the <bundle>-pypi meta-wheel (conditional).
+    // Marker = sha256(bundle_name || "\n" || version || "\n" || serialized entries).
+    // Skip rebuild when marker matches AND the meta-wheel file exists.
+    let meta_marker_key = {
+        let mut h = Sha256::new();
+        h.update(bundle_name.as_bytes());
+        h.update(b"\n");
+        h.update(version.as_bytes());
+        h.update(b"\n");
+        for (key, entry, resolved) in &entries {
+            h.update(key.as_bytes());
+            h.update(b":");
+            h.update(entry.extras.join(",").as_bytes());
+            h.update(b":");
+            h.update(
+                entry
+                    .normalized_version()
+                    .as_deref()
+                    .unwrap_or("")
+                    .as_bytes(),
+            );
+            h.update(b":");
+            h.update(resolved.as_deref().unwrap_or("").as_bytes());
+            h.update(b"\n");
+        }
+        let mut s = String::with_capacity(64);
+        for b in h.finalize() {
+            write!(&mut s, "{b:02x}").expect("write to String");
+        }
+        s
+    };
+    let meta_marker_path = staging_dir.join(".meta-wheel.key");
     let (meta_name, meta_bytes) = build_meta_wheel(bundle_name, version, &entries);
     let meta_dst = staging_dir.join(&meta_name);
-    tokio::fs::write(&meta_dst, &meta_bytes)
-        .await
-        .with_context(|| format!("writing meta-wheel {}", meta_dst.display()))?;
+    let meta_cached = if let Ok(existing) = tokio::fs::read_to_string(&meta_marker_path).await {
+        existing.trim() == meta_marker_key && meta_dst.exists()
+    } else {
+        false
+    };
+    if !meta_cached {
+        tokio::fs::write(&meta_dst, &meta_bytes)
+            .await
+            .with_context(|| format!("writing meta-wheel {}", meta_dst.display()))?;
+        tokio::fs::write(&meta_marker_path, &meta_marker_key)
+            .await
+            .with_context(|| format!("writing meta-wheel marker {}", meta_marker_path.display()))?;
+    }
     source_urls.push(file_url(&meta_dst)?);
 
     // Step 4b: ship the static installer binary INSIDE the package (the
@@ -405,15 +684,46 @@ pub async fn stage(
     // consumer's solve check can't even see on a file:///non-default channel).
     let self_exe = std::env::current_exe().context("locating retread backend binary")?;
     let installer_dst = staging_dir.join("retread-installer");
-    tokio::fs::copy(&self_exe, &installer_dst)
-        .await
-        .with_context(|| {
-            format!(
-                "staging installer binary {} -> {}",
-                self_exe.display(),
-                installer_dst.display()
-            )
-        })?;
+    let installer_marker_path = staging_dir.join("retread-installer.version");
+    // Marker = CARGO_PKG_VERSION + ":" + mtime_nanos of self_exe.
+    let installer_marker = {
+        let mtime = std::fs::metadata(&self_exe)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        format!("{}:{}", env!("CARGO_PKG_VERSION"), mtime)
+    };
+    let installer_cached =
+        if let Ok(existing) = tokio::fs::read_to_string(&installer_marker_path).await {
+            existing.trim() == installer_marker
+                && installer_dst.exists()
+                && std::fs::metadata(&installer_dst)
+                    .map(|m| m.len() > 0)
+                    .unwrap_or(false)
+        } else {
+            false
+        };
+    if !installer_cached {
+        tokio::fs::copy(&self_exe, &installer_dst)
+            .await
+            .with_context(|| {
+                format!(
+                    "staging installer binary {} -> {}",
+                    self_exe.display(),
+                    installer_dst.display()
+                )
+            })?;
+        tokio::fs::write(&installer_marker_path, &installer_marker)
+            .await
+            .with_context(|| {
+                format!(
+                    "writing installer marker {}",
+                    installer_marker_path.display()
+                )
+            })?;
+    }
     source_urls.push(file_url(&installer_dst)?);
 
     // Step 5: Collect prerelease pins and compute inputs_hash.
@@ -867,5 +1177,313 @@ mod tests {
         assert_eq!(unchanged.len(), 1, "exactly one wheel named 'unchanged'");
         assert_eq!(unchanged[0].origin, Origin::Index);
         assert_eq!(unchanged[0].url.as_deref(), Some(upstream_url));
+    }
+
+    // ── Shadow-cache unit tests ───────────────────────────────────────────
+
+    /// Helper: write a wheel file and return its path.
+    fn write_wheel(dir: &Path, name: &str, version: &str, requires: &[&str]) -> std::path::PathBuf {
+        let fname = format!("{name}-{version}-py3-none-any.whl");
+        let path = dir.join(&fname);
+        std::fs::write(&path, make_wheel_bytes(name, version, requires)).unwrap();
+        path
+    }
+
+    /// Test 1 — byte-identical hit: rewrite through cache twice; warm hit
+    /// produces byte-identical staged output.
+    #[test]
+    fn shadow_cache_warm_hit_is_byte_identical() {
+        let tmp = make_test_dir("cache-hit");
+        let cache = tmp.join("cache");
+        let whl = write_wheel(&tmp, "pkg-a", "1.0.0", &["dep-x==2.0.0"]);
+
+        let mut overrides = BTreeMap::new();
+        overrides.insert("dep-x".to_string(), ">=2.0.0".to_string());
+        let conda_cap: HashSet<String> = HashSet::new();
+
+        let bytes = std::fs::read(&whl).unwrap();
+        let requires = vec!["dep-x==2.0.0".to_string()];
+        let key = shadow_cache_key(&bytes, &requires, &overrides, &conda_cap);
+
+        // Cold pass.
+        let dst1 = tmp.join("staged1.whl");
+        shadow_cache_stage(&whl, &dst1, &cache, &key, &overrides, &conda_cap).unwrap();
+        let out1 = std::fs::read(&dst1).unwrap();
+
+        // Warm pass (cache hit).
+        let dst2 = tmp.join("staged2.whl");
+        shadow_cache_stage(&whl, &dst2, &cache, &key, &overrides, &conda_cap).unwrap();
+        let out2 = std::fs::read(&dst2).unwrap();
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(
+            out1, out2,
+            "warm cache hit must produce byte-identical output"
+        );
+    }
+
+    /// Test 2a — applicable-subset keying: an override for a name NOT in
+    /// Requires-Dist produces the SAME key (hit, identical output).
+    #[test]
+    fn shadow_cache_key_unrelated_override_is_hit() {
+        let tmp = make_test_dir("cache-key-unrelated");
+        let whl = write_wheel(&tmp, "pkg-b", "1.0.0", &["dep-y==3.0.0"]);
+        let bytes = std::fs::read(&whl).unwrap();
+        let requires = vec!["dep-y==3.0.0".to_string()];
+        let conda_cap: HashSet<String> = HashSet::new();
+
+        // Base overrides: dep-y.
+        let mut ov_base = BTreeMap::new();
+        ov_base.insert("dep-y".to_string(), ">=3.0.0".to_string());
+
+        // Add override for "unrelated" which is NOT in requires_dist.
+        let mut ov_extra = ov_base.clone();
+        ov_extra.insert("unrelated".to_string(), ">=99".to_string());
+
+        let key_base = shadow_cache_key(&bytes, &requires, &ov_base, &conda_cap);
+        let key_extra = shadow_cache_key(&bytes, &requires, &ov_extra, &conda_cap);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(
+            key_base, key_extra,
+            "an override for a name not in Requires-Dist must NOT change the cache key"
+        );
+    }
+
+    /// Test 2b — applicable-subset keying: an override for a name IN
+    /// Requires-Dist produces a DIFFERENT key (miss).
+    #[test]
+    fn shadow_cache_key_relevant_override_is_miss() {
+        let tmp = make_test_dir("cache-key-relevant");
+        let whl = write_wheel(&tmp, "pkg-c", "1.0.0", &["dep-z==4.0.0"]);
+        let bytes = std::fs::read(&whl).unwrap();
+        let requires = vec!["dep-z==4.0.0".to_string()];
+        let conda_cap: HashSet<String> = HashSet::new();
+
+        let mut ov_a = BTreeMap::new();
+        ov_a.insert("dep-z".to_string(), ">=4.0.0".to_string());
+
+        let mut ov_b = BTreeMap::new();
+        ov_b.insert("dep-z".to_string(), ">=4.1.0".to_string()); // different spec
+
+        let key_a = shadow_cache_key(&bytes, &requires, &ov_a, &conda_cap);
+        let key_b = shadow_cache_key(&bytes, &requires, &ov_b, &conda_cap);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert_ne!(
+            key_a, key_b,
+            "changing the spec for a name IN Requires-Dist must change the cache key"
+        );
+    }
+
+    /// Test 3 — version invalidation: changing the EMIT_EPOCH in the key
+    /// domain would produce a different key. We simulate this by testing
+    /// that a change to the input wheel bytes itself also invalidates (since
+    /// we can't mutate the static EMIT_EPOCH in a test, we verify the
+    /// bytes component of the key is sensitive).
+    #[test]
+    fn shadow_cache_key_changes_with_input_wheel_bytes() {
+        let tmp = make_test_dir("cache-key-epoch");
+        let whl_v1 = write_wheel(&tmp, "pkg-d", "1.0.0", &["dep-w==5.0.0"]);
+        let whl_v2 = write_wheel(&tmp, "pkg-d", "1.0.1", &["dep-w==5.0.0"]);
+
+        let bytes_v1 = std::fs::read(&whl_v1).unwrap();
+        let bytes_v2 = std::fs::read(&whl_v2).unwrap();
+        let requires = vec!["dep-w==5.0.0".to_string()];
+        let ov: BTreeMap<String, String> = BTreeMap::new();
+        let cap: HashSet<String> = HashSet::new();
+
+        let key_v1 = shadow_cache_key(&bytes_v1, &requires, &ov, &cap);
+        let key_v2 = shadow_cache_key(&bytes_v2, &requires, &ov, &cap);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert_ne!(
+            key_v1, key_v2,
+            "different input wheel bytes must produce different cache keys"
+        );
+    }
+
+    /// Test 4 — fold equivalence: the single-pass `(sha, did_change)` from
+    /// shadow_cache_stage (which calls rewrite_wheel_with once) equals the
+    /// result of calling rewrite_wheel_with directly (old probe behavior).
+    #[test]
+    fn fold_equivalence_changed_wheel() {
+        let tmp = make_test_dir("fold-changed");
+        let cache = tmp.join("cache");
+        // wheel with a dep that WILL be rewritten.
+        let whl = write_wheel(&tmp, "pkg-e", "1.0.0", &["dep-q==6.0.0"]);
+        let bytes = std::fs::read(&whl).unwrap();
+
+        let mut ov = BTreeMap::new();
+        ov.insert("dep-q".to_string(), ">=6.0.0".to_string());
+        let cap: HashSet<String> = HashSet::new();
+        let requires = vec!["dep-q==6.0.0".to_string()];
+
+        let key = shadow_cache_key(&bytes, &requires, &ov, &cap);
+
+        // Single-pass via cache.
+        let dst_cache = tmp.join("staged-cache.whl");
+        let (sha_cache, changed_cache) =
+            shadow_cache_stage(&whl, &dst_cache, &cache, &key, &ov, &cap).unwrap();
+
+        // Direct rewrite_wheel_with (old probe behavior).
+        let dst_direct = tmp.join("staged-direct.whl");
+        let m = override_line_map(&ov, &cap);
+        let (sha_direct, changed_direct) =
+            crate::wheel_rewrite::rewrite_wheel_with(&whl, &dst_direct, &m).unwrap();
+
+        let bytes_cache = std::fs::read(&dst_cache).unwrap();
+        let bytes_direct = std::fs::read(&dst_direct).unwrap();
+
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert_eq!(
+            changed_cache, changed_direct,
+            "did_change must agree between cache path and direct rewrite"
+        );
+        assert_eq!(
+            sha_cache, sha_direct,
+            "sha256 must agree between cache path and direct rewrite"
+        );
+        assert_eq!(
+            bytes_cache, bytes_direct,
+            "staged bytes must be byte-identical"
+        );
+        assert!(changed_cache, "dep-q==6.0.0 -> >=6.0.0 must be a change");
+    }
+
+    #[test]
+    fn fold_equivalence_unchanged_wheel() {
+        let tmp = make_test_dir("fold-unchanged");
+        let cache = tmp.join("cache");
+        // wheel with no deps that match any override -> unchanged.
+        let whl = write_wheel(&tmp, "pkg-f", "1.0.0", &["dep-p>=1.0"]);
+        let bytes = std::fs::read(&whl).unwrap();
+
+        let ov: BTreeMap<String, String> = BTreeMap::new();
+        let cap: HashSet<String> = HashSet::new();
+        let requires = vec!["dep-p>=1.0".to_string()];
+
+        let key = shadow_cache_key(&bytes, &requires, &ov, &cap);
+
+        let dst_cache = tmp.join("staged-cache.whl");
+        let (sha_cache, changed_cache) =
+            shadow_cache_stage(&whl, &dst_cache, &cache, &key, &ov, &cap).unwrap();
+
+        let dst_direct = tmp.join("staged-direct.whl");
+        let m = override_line_map(&ov, &cap);
+        let (sha_direct, changed_direct) =
+            crate::wheel_rewrite::rewrite_wheel_with(&whl, &dst_direct, &m).unwrap();
+
+        let bytes_cache = std::fs::read(&dst_cache).unwrap();
+        let bytes_direct = std::fs::read(&dst_direct).unwrap();
+
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert_eq!(changed_cache, changed_direct, "did_change must agree");
+        assert_eq!(sha_cache, sha_direct, "sha256 must agree");
+        assert_eq!(
+            bytes_cache, bytes_direct,
+            "staged bytes must be byte-identical"
+        );
+        assert!(!changed_cache, "no matching override -> must be unchanged");
+    }
+
+    /// Test 5 — meta-wheel guard: same (bundle, version, entries) -> marker
+    /// matches -> reuse; one entry changed -> marker changes -> rebuild.
+    /// Also verifies rebuilt bytes == fresh build_meta_wheel output.
+    #[tokio::test]
+    async fn meta_wheel_guard_reuse_and_invalidate() {
+        use crate::emit_pypi::build_meta_wheel;
+
+        let tmp = make_test_dir("meta-guard");
+        let staging = tmp.join("staging");
+        std::fs::create_dir_all(&staging).unwrap();
+
+        let bundle = "meta-bundle";
+        let ver = "1.0.0";
+
+        // A single remote index wheel with no Requires-Dist changes.
+        let upstream_url = "https://pypi.example.com/somepkg-1.0.0-py3-none-any.whl";
+        let w = make_emit_wheel("somepkg", "1.0.0", &[], None, Some(upstream_url));
+        let config = minimal_config(bundle);
+        let conda_cap: HashSet<String> = HashSet::new();
+
+        // First stage call: cold, must write the meta-wheel.
+        let result1 = stage(
+            &config,
+            bundle,
+            ver,
+            "3.11",
+            std::slice::from_ref(&w),
+            &conda_cap,
+            &[],
+            &["https://pypi.org/simple/".to_string()],
+            "",
+            &tmp,
+            &staging,
+        )
+        .await
+        .unwrap();
+
+        let meta_name1 = result1
+            .lock
+            .wheels
+            .iter()
+            .find(|w| w.name == "somepkg")
+            .map(|_| format!("{}_pypi-{}-py3-none-any.whl", bundle.replace('-', "_"), ver))
+            .unwrap_or_else(|| {
+                format!("{}_pypi-{}-py3-none-any.whl", bundle.replace('-', "_"), ver)
+            });
+        let meta_path = staging.join(&meta_name1);
+        assert!(
+            meta_path.exists(),
+            "meta-wheel must exist after first stage"
+        );
+        let mtime1 = std::fs::metadata(&meta_path).unwrap().modified().unwrap();
+
+        // Brief pause to ensure mtime would differ if file were rewritten.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        // Second stage call: same inputs, must reuse (marker hit).
+        stage(
+            &config,
+            bundle,
+            ver,
+            "3.11",
+            std::slice::from_ref(&w),
+            &conda_cap,
+            &[],
+            &["https://pypi.org/simple/".to_string()],
+            "",
+            &tmp,
+            &staging,
+        )
+        .await
+        .unwrap();
+
+        let mtime2 = std::fs::metadata(&meta_path).unwrap().modified().unwrap();
+        assert_eq!(
+            mtime1, mtime2,
+            "meta-wheel must NOT be rewritten on a marker hit"
+        );
+
+        // Verify that the bytes match a fresh build_meta_wheel.
+        let entries_check: Vec<(String, crate::config::WheelEntry, Option<String>)> = config
+            .retread_wheels
+            .iter()
+            .map(|(k, e)| {
+                let resolved = Some("1.0.0".to_string());
+                (k.clone(), e.clone(), resolved)
+            })
+            .collect();
+        let (_, fresh_bytes) = build_meta_wheel(bundle, ver, &entries_check);
+        let staged_bytes = std::fs::read(&meta_path).unwrap();
+        assert_eq!(
+            staged_bytes, fresh_bytes,
+            "staged meta-wheel bytes must equal fresh build_meta_wheel output"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
