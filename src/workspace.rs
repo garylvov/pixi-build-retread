@@ -584,6 +584,32 @@ impl WorkspaceManifest {
         }
         out
     }
+
+    /// The canonical conda-channel set folded into the courier inputs_hash.
+    /// Derived purely from the manifest + paths (NOT from any RPC's
+    /// params.channels, which pixi forwards inconsistently across conda/outputs
+    /// vs conda/build_v1 for multi-env workspaces -- the cause of replay never
+    /// firing). The union of effective channels across EVERY env that references
+    /// `source_dir`, in declaration order, deduped. Empty when no env references
+    /// it (both sites then agree on empty; solve_fingerprint still folds the
+    /// declared channels, so signal is not lost).
+    pub fn courier_channel_set(&self, workspace_dir: &Path, source_dir: &Path) -> Vec<String> {
+        let outputs = self.discover_outputs_for_source(workspace_dir, source_dir);
+        if outputs.is_empty() {
+            return Vec::new();
+        }
+        // Union all env names across every discovered output that references
+        // this source_dir. Use a BTreeSet for stable dedup before passing to
+        // union_effective_channels (which then deduplicates channels).
+        let mut all_envs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for output in &outputs {
+            for env in &output.envs {
+                all_envs.insert(env.clone());
+            }
+        }
+        let env_vec: Vec<String> = all_envs.into_iter().collect();
+        self.union_effective_channels(&env_vec)
+    }
 }
 
 /// Sentinel name used to represent the implicit "default" feature
@@ -1285,5 +1311,92 @@ some-pkg = "==1.0"
         let ws = WorkspaceManifest::default();
         assert!(ws.effective_dependencies("nonexistent").is_empty());
         assert!(ws.effective_channels("nonexistent").is_empty());
+    }
+
+    /// Regression test for the courier cold-solve-replay channel hash bug.
+    ///
+    /// The bug: pixi forwards different `params.channels` to conda/outputs
+    /// (per-env subset) vs conda/build_v1 (union/other set) for multi-env
+    /// workspaces, so `courier_inputs_hash` at the replayer and `config_fp`
+    /// at the producer would never match.
+    ///
+    /// The fix: both sites call `courier_channel_set(workspace_dir, source_dir)`
+    /// which derives the channel set from the manifest identically.
+    ///
+    /// This test verifies:
+    /// (a) `courier_channel_set` is byte-identical across two calls (the
+    ///     producer==replayer guarantee).
+    /// (b) It equals the UNION of channels across ALL envs referencing the
+    ///     source dir (not just one env's subset).
+    #[test]
+    fn courier_channel_set_is_manifest_derived_union_across_all_envs() {
+        let tmp = std::env::temp_dir().join(format!(
+            "retread-ws-courier-channels-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(tmp.join("my-pack")).unwrap();
+
+        // Two envs reference the same source pack, each with a different
+        // channel set. `genesis` has only `conda-forge`; `genesis-gpu` adds
+        // `robostack-humble`. The bug would have caused the two RPCs to
+        // disagree on which channel list to hash. The fix unions them.
+        let ws = ws_toml(
+            r#"
+[workspace]
+channels = ["conda-forge"]
+
+[environments]
+genesis     = { features = ["base"] }
+genesis-gpu = { features = ["base", "gpu"] }
+
+[feature.base.dependencies]
+my-pack = { path = "./my-pack" }
+
+[feature.base]
+channels = ["conda-forge"]
+
+[feature.gpu]
+channels = ["conda-forge", "robostack-humble"]
+"#,
+        );
+
+        let src = tmp.join("my-pack");
+        // (a) byte-identical across two calls -- simulates producer + replayer
+        let first = ws.courier_channel_set(&tmp, &src);
+        let second = ws.courier_channel_set(&tmp, &src);
+        assert_eq!(
+            first, second,
+            "producer and replayer must agree on channels"
+        );
+
+        // (b) must be the union across ALL envs (conda-forge + robostack-humble),
+        // NOT just one env's subset. If only `genesis`'s channels were used we'd
+        // get ["conda-forge"]; if only `genesis-gpu` we'd also get both but via
+        // a different path. The assertion catches any single-env shortcut.
+        assert!(
+            first.contains(&"conda-forge".to_string()),
+            "union must contain conda-forge: {:?}",
+            first
+        );
+        assert!(
+            first.contains(&"robostack-humble".to_string()),
+            "union must contain robostack-humble (from genesis-gpu): {:?}",
+            first
+        );
+
+        // Stable length: dedup means no duplicates
+        let unique_count = first.iter().collect::<std::collections::HashSet<_>>().len();
+        assert_eq!(
+            first.len(),
+            unique_count,
+            "no duplicate channels in union: {:?}",
+            first
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

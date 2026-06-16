@@ -807,13 +807,26 @@ impl Handler {
                     // the replay gate (hash-check) and produce_output (embedded
                     // in the content-addressed build string). None for non-courier.
                     let courier_build_hash: Option<String> = if config.courier {
-                        let channels: Vec<String> =
-                            params.channels.iter().map(|c| c.to_string()).collect();
+                        // Derive channels from the manifest (NOT from
+                        // params.channels, which pixi forwards differently
+                        // to conda/outputs vs conda/build_v1 for multi-env
+                        // workspaces, causing replay to never fire).
+                        // Must be byte-identical to the producer's derivation
+                        // in build_one.
+                        let courier_channels = workspace_manifest
+                            .as_ref()
+                            .map(|m| {
+                                m.courier_channel_set(
+                                    workspace_dir.as_deref().unwrap_or(source_dir.as_path()),
+                                    &source_dir,
+                                )
+                            })
+                            .unwrap_or_default();
                         Some(courier_inputs_hash(
                             &config,
                             &base_bundle.conda_name,
                             python_version,
-                            &channels,
+                            &courier_channels,
                             workspace_manifest.as_ref(),
                         ))
                     } else {
@@ -1803,10 +1816,10 @@ impl Handler {
             .as_ref()
             .map(|deps| deps.iter().map(|d| d.spec.to_string()).collect());
 
-        let conda_channels: Vec<String> = params.channels.iter().map(|c| c.to_string()).collect();
         build_one(
             &bundle,
             &effective,
+            &config,
             &params.work_directory,
             &output_dir,
             params.output.subdir,
@@ -1815,7 +1828,6 @@ impl Handler {
             workspace_dir.as_deref(),
             params.output.build.as_deref(),
             run_override.as_deref(),
-            &conda_channels,
         )
         .await
         .map_err(|e| RpcError::internal(format!("build {}: {e:#}", bundle.conda_name)))
@@ -3699,6 +3711,7 @@ fn localize_wheel_source(url: &url::Url, wheels_root: &Path) -> url::Url {
 async fn build_one(
     bundle: &Bundle,
     config: &RetreadConfig,
+    declared_config: &RetreadConfig,
     work_dir: &Path,
     output_dir: &Path,
     target_subdir: Platform,
@@ -3707,10 +3720,6 @@ async fn build_one(
     workspace_dir: Option<&Path>,
     expected_build: Option<&str>,
     run_override: Option<&[String]>,
-    // Conda channel list pixi forwarded (stringified). Folded into the
-    // courier lock's inputs_hash so a channel change invalidates replay
-    // (B-4 / grizzly P1). Must match the replayer's `params.channels`.
-    conda_channels: &[String],
 ) -> Result<CondaBuildV1Result> {
     // Lay out one BundleSource per wheel (primary first), in BFS order.
     //
@@ -3827,7 +3836,15 @@ async fn build_one(
         // Fingerprint folds in the conda channel list (grizzly P1) and the
         // workspace solve env (grizzly H1) alongside the config-derived
         // inputs; the replayer computes it identically.
-        let config_fp = crate::courier::config_fingerprint(config, conda_channels, &workspace_fp);
+        // Derive channels from the manifest (NOT from the RPC's params.channels,
+        // which pixi forwards differently to conda/build_v1 vs conda/outputs for
+        // multi-env workspaces, causing replay to never fire).
+        let courier_channels = ws_manifest
+            .as_ref()
+            .map(|m| m.courier_channel_set(workspace_dir.unwrap_or(source_dir), source_dir))
+            .unwrap_or_default();
+        let config_fp =
+            crate::courier::config_fingerprint(declared_config, &courier_channels, &workspace_fp);
         let staged = crate::courier::stage(
             config,
             &bundle.conda_name,

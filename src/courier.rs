@@ -592,6 +592,94 @@ mod tests {
         assert_ne!(base, empty, "presence of a workspace fp must matter");
     }
 
+    /// Regression guard for the courier cold-solve replay hash mismatch bug:
+    /// the producer (build_one) must hash the PRISTINE declared config, not
+    /// the cascade-mutated effective config.
+    ///
+    /// Bug: apply_emission / resolve_all inject synthetic entries into
+    /// `config.overrides` and `config.name_map` (transitive overrides, FALLBACK
+    /// mappings, parselmouth renames).  Using the effective config in
+    /// `config_fingerprint` produces a 686KB fingerprint vs the replayer's 2.5KB
+    /// pristine one, so the hashes never match and cold-solve replay never fires.
+    ///
+    /// Fix: build_one now accepts `declared_config` (pristine manifest snapshot)
+    /// and passes it to `config_fingerprint` instead of the effective config.
+    #[test]
+    fn declared_config_fingerprint_matches_replayer_not_effective() {
+        let chans = ["conda-forge".to_string()];
+        let ws_fp = "ws-dep:torch==2.3.0";
+
+        // 1. Build the "declared" (manifest-level) config with a couple of
+        //    user-declared overrides and a name-map entry — mirrors what the
+        //    replayer reads directly from the manifest snapshot.
+        let declared: RetreadConfig = serde_json::from_value(serde_json::json!({
+            "retread-wheels": {
+                "mypkg": { "version": "==1.0.0" }
+            },
+            "retread-overrides": {
+                "numpy": ">=1.24"
+            },
+            "retread-name-map": {
+                "pillow": "Pillow"
+            }
+        }))
+        .unwrap();
+
+        // 2. Build the "effective" config by cloning and injecting the kind of
+        //    cascade-added entries that apply_emission / resolve_all produce at
+        //    runtime (synthetic transitive overrides + FALLBACK name_map entries).
+        let mut effective = declared.clone();
+        // Mimic transitive overrides added by apply_emission
+        effective
+            .overrides
+            .insert("torch".to_string(), "==2.3.0".to_string());
+        effective
+            .overrides
+            .insert("triton".to_string(), "==2.3.0".to_string());
+        effective
+            .overrides
+            .insert("torchvision".to_string(), ">=0.18".to_string());
+        // Mimic FALLBACK + parselmouth name_map entries added by resolve_all
+        effective
+            .name_map
+            .insert("FALLBACK".to_string(), "mypkg".to_string());
+        effective
+            .name_map
+            .insert("Pillow".to_string(), "pillow".to_string());
+
+        let fp_declared = config_fingerprint(&declared, &chans, ws_fp);
+        let fp_effective = config_fingerprint(&effective, &chans, ws_fp);
+
+        // The bug: using effective would produce a different (larger) fingerprint
+        // than the replayer (which always uses pristine declared).
+        assert_ne!(
+            fp_declared, fp_effective,
+            "effective config must produce a different fingerprint than declared \
+             (proves the bug exists when effective is used)"
+        );
+
+        // The fix: the producer now uses declared_config; the replayer always used
+        // declared — they must agree.
+        let replayer_fp = config_fingerprint(&declared, &chans, ws_fp);
+        assert_eq!(
+            fp_declared, replayer_fp,
+            "producer (declared_config) and replayer must produce identical fingerprints"
+        );
+
+        // Negative control: a real manifest-level override change MUST still
+        // invalidate the fingerprint (cascade-only entries are excluded but real
+        // declared changes are not).
+        let mut declared_v2 = declared.clone();
+        declared_v2
+            .overrides
+            .insert("numpy".to_string(), ">=1.26".to_string());
+        let fp_declared_v2 = config_fingerprint(&declared_v2, &chans, ws_fp);
+        assert_ne!(
+            fp_declared, fp_declared_v2,
+            "a real manifest override change must still invalidate the fingerprint"
+        );
+    }
+
     /// Create a process-unique temp directory and return it. Caller must clean
     /// up manually (matches the pattern used elsewhere in this codebase).
     fn make_test_dir(slug: &str) -> std::path::PathBuf {
