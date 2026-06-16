@@ -1,10 +1,10 @@
 {
   "schema": 4,
-  "retread_version": "2.1.0",
+  "retread_version": "2.1.2",
   "bundle": "isaac-pack-6",
   "version": "6.0.0.1",
   "python": "3.12",
-  "inputs_hash": "991427e05567aa5d7e97f380b3d286e8c123703f4e919387cdad84dc5120b1f4",
+  "inputs_hash": "39ae3750b2ddec8bf933280b87dd1cdf695d9f8bec0a34eddb6c18e616d30b9f",
   "root_requirements": [
     "isaac-pack-6-pypi==6.0.0.1"
   ],
