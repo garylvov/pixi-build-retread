@@ -184,6 +184,11 @@ fn file_url(path: &Path) -> anyhow::Result<String> {
 ///
 /// The returned path may not exist yet; callers create it with
 /// `fs::create_dir_all` as needed.
+///
+/// EMIT-NEUTRAL: this location only governs WHERE content-addressed caches
+/// live, never WHAT bytes get emitted. The cache root never feeds
+/// `inputs_hash` and a cache hit is byte-identical to a fresh rewrite, so
+/// relocating it does not warrant an `EMIT_EPOCH` bump.
 pub fn retread_cache_root() -> std::path::PathBuf {
     if let Ok(dir) = std::env::var("RETREAD_CACHE_DIR") {
         return std::path::PathBuf::from(dir);
