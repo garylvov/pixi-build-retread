@@ -4287,6 +4287,8 @@ mod replay_tests {
                 filename,
                 url: Some(format!("https://example.com/{bundle}-{version}.whl")),
                 sha256: None,
+                requires_dist: vec![],
+                must_ship: false,
             }],
             conda_run_deps: vec![CondaDep {
                 name: "numpy".into(),
@@ -4294,6 +4296,7 @@ mod replay_tests {
             }],
             index_urls: vec!["https://pypi.org/simple/".into()],
             prerelease: BTreeMap::new(),
+            conda_capable: vec![],
         }
     }
 

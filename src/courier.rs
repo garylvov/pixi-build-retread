@@ -530,6 +530,8 @@ pub async fn stage(
                 filename: std_name,
                 url: None,
                 sha256: None,
+                requires_dist: w.requires_dist.clone(),
+                must_ship: w.must_ship(),
             });
         } else {
             // Index wheel. Decide whether to ship a relax-rewritten shadow
@@ -679,6 +681,8 @@ pub async fn stage(
                     filename: shadow_name,
                     url: None,
                     sha256: None,
+                    requires_dist: w.requires_dist.clone(),
+                    must_ship: w.must_ship(),
                 });
             } else {
                 // Unchanged index wheel: record with upstream url.
@@ -692,6 +696,8 @@ pub async fn stage(
                     filename: std_name,
                     url: upstream_url,
                     sha256: None,
+                    requires_dist: vec![],
+                    must_ship: false,
                 });
             }
         }
@@ -831,7 +837,32 @@ pub async fn stage(
         );
     }
 
+    // PRODUCER POISONING GUARD (schema 5): when a non-default relax policy
+    // caused an index wheel to be relax-changed into Origin::Built (the shadow
+    // path), its requires_dist MUST be non-empty -- the replay path needs them
+    // to detect requires_dist changes that would re-trigger a relax rewrite.
+    // An empty requires_dist on a relax-changed Built wheel means we cannot
+    // verify on replay that the wheel's metadata hasn't changed, which would
+    // silently propagate stale relax-rewrites. Bail rather than write a
+    // potentially poisoned lock.
+    if config.relax != crate::config::RelaxPolicy::default() {
+        for lw in &lock_wheels {
+            if lw.origin == Origin::Built && !lw.must_ship && lw.requires_dist.is_empty() {
+                anyhow::bail!(
+                    "courier: relax-changed wheel `{}` has empty requires_dist with \
+                     non-default relax policy `{:?}`; cannot write a safe lock (the \
+                     replay path needs requires_dist to detect stale relax-rewrites). \
+                     This is a retread bug -- please file an issue.",
+                    lw.name,
+                    config.relax,
+                );
+            }
+        }
+    }
+
     // Step 6: Assemble the RetreadLock.
+    let mut conda_capable_sorted: Vec<String> = conda_capable.iter().cloned().collect();
+    conda_capable_sorted.sort();
     let lock = RetreadLock {
         schema: SCHEMA,
         retread_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -844,6 +875,7 @@ pub async fn stage(
         conda_run_deps: parse_conda_deps(run_deps),
         index_urls: index_urls.to_vec(),
         prerelease,
+        conda_capable: conda_capable_sorted,
     };
 
     // Step 7: Write the lock JSON into staging_dir. Write-then-rename so a

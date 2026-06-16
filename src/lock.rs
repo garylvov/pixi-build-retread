@@ -47,6 +47,16 @@ pub struct LockWheel {
     /// sha256 of the wheel file (index-wheel verification; reproducibility).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
+    /// POST-relax Requires-Dist lines recorded for the replay poisoning guard
+    /// (schema 5+). Empty when the wheel is `Origin::Index` and unrelaxed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requires_dist: Vec<String>,
+    /// True iff this wheel must be shipped inside the conda package
+    /// (i.e. it carries the `.injected` infix — it exists on no index).
+    /// Recorded so the replay path can cross-check re-materialized wheels
+    /// without re-running the full must_ship() filename heuristic.
+    #[serde(default)]
+    pub must_ship: bool,
 }
 
 /// A conda run-dep retread routed to the conda side (a shared transitive
@@ -93,9 +103,16 @@ pub struct RetreadLock {
     /// overrides). Empty when the bundle pins no prereleases.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub prerelease: BTreeMap<String, String>,
+    /// PyPI package names (conda-normalized) that have a conda counterpart
+    /// and are therefore routed to the conda side rather than bundled in the
+    /// wheel set. Recorded for the build_v1 replay path so it can reconstruct
+    /// the correct conda_capable set without re-running the probe cascade.
+    /// Sorted for stable JSON output.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conda_capable: Vec<String>,
 }
 
-pub const SCHEMA: u32 = 4;
+pub const SCHEMA: u32 = 5;
 
 /// Bump EMIT_EPOCH in the SAME commit as ANY change that can alter the bytes
 /// retread emits for identical manifest inputs (relax/version-selection
@@ -228,6 +245,8 @@ mod tests {
                     filename: "isaaclab-0.51.1-py3-none-any.whl".into(),
                     url: None,
                     sha256: None,
+                    requires_dist: vec!["numpy>=1.21".into(), "torch>=2.0".into()],
+                    must_ship: true,
                 },
                 LockWheel {
                     name: "isaacsim-core".into(),
@@ -236,6 +255,8 @@ mod tests {
                     filename: "isaacsim_core-5.1.0.0-cp311-...whl".into(),
                     url: Some("https://pypi.nvidia.com/isaacsim-core/...whl".into()),
                     sha256: Some("abc123".into()),
+                    requires_dist: vec![],
+                    must_ship: false,
                 },
             ],
             conda_run_deps: vec![CondaDep {
@@ -247,13 +268,22 @@ mod tests {
                 "https://pypi.org/simple/".into(),
             ],
             prerelease: BTreeMap::from([("gmpy2".into(), "==2.1.0a4".into())]),
+            conda_capable: vec!["numpy".into(), "torch".into()],
         };
         let json = lock.to_pretty_json().unwrap();
         let back: RetreadLock = serde_json::from_str(&json).unwrap();
         assert_eq!(back.bundle, "isaac-pack");
+        assert_eq!(back.schema, 5);
         assert_eq!(back.wheels.len(), 2);
         assert_eq!(back.wheels[0].origin, Origin::Built);
+        assert!(back.wheels[0].must_ship);
+        assert_eq!(
+            back.wheels[0].requires_dist,
+            vec!["numpy>=1.21", "torch>=2.0"]
+        );
         assert_eq!(back.wheels[1].origin, Origin::Index);
+        assert!(!back.wheels[1].must_ship);
+        assert!(back.wheels[1].requires_dist.is_empty());
         assert_eq!(
             back.prerelease.get("gmpy2").map(String::as_str),
             Some("==2.1.0a4")
@@ -264,6 +294,39 @@ mod tests {
         );
         assert_eq!(back.inputs_hash, "deadbeef");
         assert_eq!(back.wheels[1].sha256.as_deref(), Some("abc123"));
+        assert_eq!(back.conda_capable, vec!["numpy", "torch"]);
+    }
+
+    /// Schema-4 JSON (no requires_dist / must_ship / conda_capable) must
+    /// still deserialize cleanly via serde defaults (backward-compat).
+    #[test]
+    fn schema4_lock_still_deserializes() {
+        let schema4_json = r#"{
+            "schema": 4,
+            "retread_version": "2.3.1",
+            "bundle": "old-pack",
+            "version": "1.0.0",
+            "python": "3.11",
+            "inputs_hash": "oldhash",
+            "root_requirements": ["old-pack-pypi==1.0.0"],
+            "wheels": [
+                {
+                    "name": "somewheel",
+                    "version": "1.0.0",
+                    "origin": "built",
+                    "filename": "somewheel-1.0.0-py3-none-any.whl"
+                }
+            ],
+            "conda_run_deps": [],
+            "index_urls": ["https://pypi.org/simple/"]
+        }"#;
+        let lock: RetreadLock = serde_json::from_str(schema4_json).unwrap();
+        assert_eq!(lock.schema, 4);
+        assert_eq!(lock.bundle, "old-pack");
+        // New fields default gracefully.
+        assert!(lock.wheels[0].requires_dist.is_empty());
+        assert!(!lock.wheels[0].must_ship);
+        assert!(lock.conda_capable.is_empty());
     }
 
     #[test]
