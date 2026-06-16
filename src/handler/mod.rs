@@ -3443,6 +3443,135 @@ type EnvSolveResult = (
     BTreeMap<String, String>,
 );
 
+/// Shared assembly helper: given the already-computed `run_dep_specs`
+/// (seeded with the python dep, siblings NOT yet added) and `seen_dep_names`
+/// (tracking which conda names were already added), assembles the final
+/// [`CondaOutput`] by:
+/// 1. Appending sibling cross-links (skipping self).
+/// 2. Appending `uv` when `courier` is true.
+/// 3. Building the subdir/noarch/build/variant metadata.
+///
+/// This is the single source of truth for output assembly — both the hot path
+/// (`produce_output` from live bundle data) and the replay path
+/// (`replay_from_lock` from lock fields) call this so the emitted
+/// [`CondaOutput`] is guaranteed byte-identical.
+#[allow(clippy::too_many_arguments)]
+fn assemble_conda_output(
+    bundle_name: &str,
+    version: &str,
+    python_version: &str,
+    courier: bool,
+    any_platform_specific: bool,
+    mut run_dep_specs: Vec<NamedSpec<PackageSpec>>,
+    mut seen_dep_names: HashSet<String>,
+    host_platform: Platform,
+    build_number: u64,
+    build_hash: Option<&str>,
+    siblings: &[(String, String)],
+) -> Result<CondaOutput> {
+    // Always emit the glob form (`python {ver}.*`). Without the `.*`,
+    // rattler-conda-types' VersionSpec under Lenient parsing interprets
+    // a bare `3` as exact-equals `==3`, and the rattler-build host
+    // solve then errors with "No candidates were found for python ==3"
+    // because no python package is at literally version 3. The glob is
+    // safe for both bare-major ("3" -> "3.*") and dotted ("3.11" ->
+    // "3.11.*") because rattler accepts trailing `.*` either way.
+    let python_dep = if python_version.contains('*') {
+        format!("python {python_version}")
+    } else {
+        format!("python {python_version}.*")
+    };
+
+    // Cross-output linking: pin each sibling output produced by the same
+    // conda/outputs call as an exact-version run-dep on this output. The
+    // workspace then only needs to declare ONE of the names from the
+    // pack -- conda solves the rest transitively. Without this, each
+    // [retread-wheels] entry needs its own line in the workspace
+    // pixi.toml, which gets verbose for stacks like IsaacLab (8 names).
+    for (sib_name, sib_version) in siblings {
+        if sib_name == bundle_name {
+            continue;
+        }
+        if seen_dep_names.insert(sib_name.clone()) {
+            run_dep_specs.push(spec_from_str(&format!("{sib_name} =={sib_version}"))?);
+        }
+    }
+
+    // Courier: the metadata pixi SOLVES + LOCKS must include `uv` (the
+    // post-link installer needs it), or it never lands in the consuming env.
+    // (The recipe adds it too, but pixi resolves against THIS conda/outputs
+    // metadata, not the recipe.) The retread installer binary itself SHIPS
+    // inside the courier package -- NOT a run-dep -- so the heavy backend
+    // never enters the consumer solve.
+    // Guard against a duplicate: `uv` may already be in run_dep_specs
+    // (pixi forwards it as a solved run-dep), so only add if not present.
+    if courier && seen_dep_names.insert("uv".to_string()) {
+        run_dep_specs.push(spec_from_str("uv")?);
+    }
+
+    // Courier is never noarch: it ships the native `retread` installer binary
+    // + a python-specific lock, and the courier recipe is `noarch: None`.
+    // Advertising noarch would make pixi request a noarch build that
+    // rattler-build rejects ("--target-platform noarch").
+    let subdir = if any_platform_specific || courier {
+        host_platform
+    } else {
+        Platform::NoArch
+    };
+    let noarch = if any_platform_specific || courier {
+        NoArchType::none()
+    } else {
+        NoArchType::python()
+    };
+
+    let py_short = python_version.replace('.', "");
+    // Courier: use the content-addressed build string so pixi cache-hits are
+    // invalidated whenever the inputs change (wheel set, indexes, config...).
+    // Non-courier: keep the legacy `py{XY}_{build_number}` string unchanged.
+    let build = match build_hash {
+        Some(hash) => courier_build_string(&py_short, hash, build_number),
+        None => format!("py{py_short}_{build_number}"),
+    };
+
+    let mut variant = std::collections::BTreeMap::new();
+    variant.insert(
+        "python".to_string(),
+        VariantValue::String(python_version.to_string()),
+    );
+
+    let name = PackageName::new_unchecked(bundle_name.to_string());
+    let version_parsed = VersionWithSource::from_str(version)
+        .map_err(|e| anyhow!("parsing version `{version}`: {e}"))?;
+
+    Ok(CondaOutput {
+        metadata: CondaOutputMetadata {
+            name,
+            version: version_parsed,
+            build,
+            build_number,
+            subdir,
+            license: None,
+            license_family: None,
+            noarch,
+            purls: None,
+            python_site_packages_path: None,
+            variant,
+        },
+        build_dependencies: None,
+        host_dependencies: Some(CondaOutputDependencies {
+            depends: vec![spec_from_str(&python_dep)?, spec_from_str("pip")?],
+            constraints: Vec::new(),
+        }),
+        run_dependencies: CondaOutputDependencies {
+            depends: run_dep_specs,
+            constraints: Vec::new(),
+        },
+        ignore_run_exports: CondaOutputIgnoreRunExports::default(),
+        run_exports: CondaOutputRunExports::default(),
+        input_globs: None,
+    })
+}
+
 /// `siblings`: every (conda_name, version) produced by the same
 /// `conda/outputs` call (including this bundle's own pair, which is
 /// skipped). Each non-self entry becomes a run-dep on this output so
@@ -3477,19 +3606,7 @@ fn produce_output(
     // `noarch: None`. Advertising noarch here would make pixi request a
     // noarch build that rattler-build rejects ("--target-platform noarch").
     let any_platform_specific = bundle.all_wheels().any(|w| !w.metadata.is_pure_python);
-    let subdir = if any_platform_specific || config.courier {
-        host_platform
-    } else {
-        Platform::NoArch
-    };
 
-    // Always emit the glob form (`python {ver}.*`). Without the `.*`,
-    // rattler-conda-types' VersionSpec under Lenient parsing interprets
-    // a bare `3` as exact-equals `==3`, and the rattler-build host
-    // solve then errors with "No candidates were found for python ==3"
-    // because no python package is at literally version 3. The glob is
-    // safe for both bare-major ("3" -> "3.*") and dotted ("3.11" ->
-    // "3.11.*") because rattler accepts trailing `.*` either way.
     let python_dep = if python_version.contains('*') {
         format!("python {python_version}")
     } else {
@@ -3543,7 +3660,7 @@ fn produce_output(
     // upstream disagreements (e.g. pillow 11.3 vs 12.0 in isaacsim) are the
     // user's responsibility to resolve via [build.config.overrides].
     let env = marker_env_for(&host_platform.to_string(), &python_version)?;
-    let mut depends_specs: Vec<NamedSpec<PackageSpec>> = vec![spec_from_str(&python_dep)?];
+    let mut run_dep_specs: Vec<NamedSpec<PackageSpec>> = vec![spec_from_str(&python_dep)?];
     let mut seen_dep_names: HashSet<String> = HashSet::from(["python".to_string()]);
     for wheel in bundle.all_wheels() {
         for raw in &wheel.metadata.requires_dist {
@@ -3599,31 +3716,15 @@ fn produce_output(
             if !seen_dep_names.insert(dep_name.clone()) {
                 continue;
             }
-            depends_specs.push(spec_from_str(&dep.to_string())?);
+            run_dep_specs.push(spec_from_str(&dep.to_string())?);
         }
-    }
-
-    // Cross-output linking: pin each sibling output produced by the same
-    // conda/outputs call as an exact-version run-dep on this output. The
-    // workspace then only needs to declare ONE of the names from the
-    // pack -- conda solves the rest transitively. Without this, each
-    // [retread-wheels] entry needs its own line in the workspace
-    // pixi.toml, which gets verbose for stacks like IsaacLab (8 names).
-    for (sib_name, sib_version) in siblings {
-        if sib_name == &bundle.conda_name {
-            continue;
-        }
-        if !seen_dep_names.insert(sib_name.clone()) {
-            continue;
-        }
-        depends_specs.push(spec_from_str(&format!("{sib_name} =={sib_version}"))?);
     }
 
     // Surface the final run-dep list at info level so users can spot
     // potentially-problematic deps before conda's solver complains.
     // Anything here that fails downstream is a candidate for
     // retread-drop-deps, retread-overrides, or retread-name-map.
-    let emitted: Vec<&str> = depends_specs.iter().map(|s| s.name.as_str()).collect();
+    let emitted: Vec<&str> = run_dep_specs.iter().map(|s| s.name.as_str()).collect();
     tracing::info!(
         bundle = %bundle.conda_name,
         run_deps = ?emitted,
@@ -3631,68 +3732,19 @@ fn produce_output(
          retread-drop-deps / retread-overrides / retread-name-map"
     );
 
-    let name = PackageName::new_unchecked(bundle.conda_name.clone());
-    let version = VersionWithSource::from_str(&bundle.primary.metadata.version)
-        .map_err(|e| anyhow!("parsing version `{}`: {e}", bundle.primary.metadata.version))?;
-    // Courier is never noarch (see the subdir note above): keep metadata
-    // consistent with the platform-specific courier recipe.
-    let noarch = if any_platform_specific || config.courier {
-        NoArchType::none()
-    } else {
-        NoArchType::python()
-    };
-    let py_short = python_version.replace('.', "");
-    // Courier: use the content-addressed build string so pixi cache-hits are
-    // invalidated whenever the inputs change (wheel set, indexes, config...).
-    // Non-courier: keep the legacy `py{XY}_{build_number}` string unchanged.
-    let build = match courier_build_hash {
-        Some(hash) => courier_build_string(&py_short, hash, config.build_number),
-        None => format!("py{py_short}_{}", config.build_number),
-    };
-
-    let mut variant = std::collections::BTreeMap::new();
-    variant.insert(
-        "python".to_string(),
-        VariantValue::String(python_version.clone()),
-    );
-
-    // Courier: the metadata pixi SOLVES + LOCKS must include `uv` (the
-    // post-link installer needs it), or it never lands in the consuming env.
-    // (The recipe adds it too, but pixi resolves against THIS conda/outputs
-    // metadata, not the recipe.) The retread installer binary itself SHIPS
-    // inside the courier package -- NOT a run-dep -- so the heavy backend
-    // never enters the consumer solve.
-    let mut depends_specs = depends_specs;
-    if config.courier {
-        depends_specs.push(spec_from_str("uv")?);
-    }
-    Ok(CondaOutput {
-        metadata: CondaOutputMetadata {
-            name,
-            version,
-            build,
-            build_number: config.build_number,
-            subdir,
-            license: None,
-            license_family: None,
-            noarch,
-            purls: None,
-            python_site_packages_path: None,
-            variant,
-        },
-        build_dependencies: None,
-        host_dependencies: Some(CondaOutputDependencies {
-            depends: vec![spec_from_str(&python_dep)?, spec_from_str("pip")?],
-            constraints: Vec::new(),
-        }),
-        run_dependencies: CondaOutputDependencies {
-            depends: depends_specs,
-            constraints: Vec::new(),
-        },
-        ignore_run_exports: CondaOutputIgnoreRunExports::default(),
-        run_exports: CondaOutputRunExports::default(),
-        input_globs: None,
-    })
+    assemble_conda_output(
+        &bundle.conda_name,
+        &bundle.primary.metadata.version,
+        &python_version,
+        config.courier,
+        any_platform_specific,
+        run_dep_specs,
+        seen_dep_names,
+        host_platform,
+        config.build_number,
+        courier_build_hash,
+        siblings,
+    )
 }
 
 /// v1.4.5: swap an http(s) wheel source for `file://` of retread's
@@ -4134,23 +4186,9 @@ fn replay_from_lock(
         return Ok(None);
     }
 
-    // ----- reconstruct CondaOutput from lock fields -----
+    // ----- reconstruct CondaOutput from lock fields via the shared helper -----
     let python_version = crate::relax::emit_python_version("", &lock.python);
-    let py_short = python_version.replace('.', "");
-    // Replay is always courier mode. Use the content-addressed string so
-    // the advertised build string is byte-identical to produce_output's.
-    // `current_inputs_hash` has already been verified to match `lock.inputs_hash`
-    // at this point, so either is the correct hash to embed.
-    let build = courier_build_string(&py_short, current_inputs_hash, build_number);
 
-    // Courier (replay is courier-only) is ALWAYS platform-specific: the
-    // package ships the native `retread` installer binary + a python-specific
-    // lock, and the recipe is `noarch: None`. Never advertise noarch -- pixi
-    // would request a noarch build that rattler-build rejects.
-    let subdir = host_platform;
-    let noarch = NoArchType::none();
-
-    // Python host + run dep strings.
     let python_dep = if python_version.contains('*') {
         format!("python {python_version}")
     } else {
@@ -4158,7 +4196,7 @@ fn replay_from_lock(
     };
 
     // Reconstruct run-dependencies from the lock's conda_run_deps.
-    let mut run_depends: Vec<NamedSpec<PackageSpec>> = vec![spec_from_str(&python_dep)?];
+    let mut run_dep_specs: Vec<NamedSpec<PackageSpec>> = vec![spec_from_str(&python_dep)?];
     let mut seen_dep_names: HashSet<String> = HashSet::from(["python".to_string()]);
     for dep in &lock.conda_run_deps {
         let spec_str = if dep.spec.is_empty() {
@@ -4168,62 +4206,28 @@ fn replay_from_lock(
         };
         let ns = spec_from_str(&spec_str)?;
         if seen_dep_names.insert(ns.name.clone()) {
-            run_depends.push(ns);
+            run_dep_specs.push(ns);
         }
-    }
-    // Re-add sibling cross-links (same as produce_output).
-    for (sib_name, sib_version) in siblings {
-        if sib_name == &lock.bundle {
-            continue;
-        }
-        if seen_dep_names.insert(sib_name.clone()) {
-            run_depends.push(spec_from_str(&format!("{sib_name} =={sib_version}"))?);
-        }
-    }
-    // Replay only fires in courier mode -> uv must be in the replayed metadata
-    // too (match produce_output). The installer binary ships in the package.
-    // Guard against a duplicate: `uv` may already be in the lock's
-    // conda_run_deps (pixi forwards it as a solved run-dep), so only add it if
-    // not already present -- otherwise the replayed output diverges from the
-    // cascade's (which emits uv once).
-    if seen_dep_names.insert("uv".to_string()) {
-        run_depends.push(spec_from_str("uv")?);
     }
 
-    let mut variant = std::collections::BTreeMap::new();
-    variant.insert(
-        "python".to_string(),
-        VariantValue::String(python_version.clone()),
-    );
-
-    Ok(Some(CondaOutput {
-        metadata: CondaOutputMetadata {
-            name: PackageName::new_unchecked(lock.bundle.clone()),
-            version: VersionWithSource::from_str(&lock.version)
-                .map_err(|e| anyhow!("replay: parsing version `{}`: {e}", lock.version))?,
-            build,
-            build_number,
-            subdir,
-            license: None,
-            license_family: None,
-            noarch,
-            purls: None,
-            python_site_packages_path: None,
-            variant,
-        },
-        build_dependencies: None,
-        host_dependencies: Some(CondaOutputDependencies {
-            depends: vec![spec_from_str(&python_dep)?, spec_from_str("pip")?],
-            constraints: Vec::new(),
-        }),
-        run_dependencies: CondaOutputDependencies {
-            depends: run_depends,
-            constraints: Vec::new(),
-        },
-        ignore_run_exports: CondaOutputIgnoreRunExports::default(),
-        run_exports: CondaOutputRunExports::default(),
-        input_globs: None,
-    }))
+    // Courier (replay is courier-only) is ALWAYS platform-specific: the
+    // package ships the native `retread` installer binary + a python-specific
+    // lock. any_platform_specific=false here because courier=true already
+    // forces the platform-specific path in assemble_conda_output.
+    let output = assemble_conda_output(
+        &lock.bundle,
+        &lock.version,
+        &python_version,
+        true,  // courier=true: replay is always courier mode
+        false, // any_platform_specific: courier=true already forces platform-specific
+        run_dep_specs,
+        seen_dep_names,
+        host_platform,
+        build_number,
+        Some(current_inputs_hash),
+        siblings,
+    )?;
+    Ok(Some(output))
 }
 
 // -----------------------------------------------------------------
