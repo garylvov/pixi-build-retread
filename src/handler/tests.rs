@@ -512,6 +512,54 @@ fn merge_looser_override_inserts_when_missing() {
 }
 
 #[test]
+fn courier_pure_python_bundle_is_platform_specific_not_noarch() {
+    // Regression (newton-pack-latest): a courier pack with ALL pure-python
+    // wheels must NOT be advertised noarch. It ships the native retread
+    // installer + a python-specific lock and the courier recipe is
+    // `noarch: None`; advertising noarch made pixi request a noarch build
+    // that rattler-build rejects ("target-platform cannot be noarch").
+    // Pure-python bundle: meta(.., platform_specific=false) -> is_pure_python.
+    let bundle = Bundle {
+        conda_name: "pure-py-pack".into(),
+        primary: rw(
+            "pure-py-pack",
+            meta("pure-py-pack", "1.0.0", vec!["numpy>=1.21"], false),
+        ),
+        extras: vec![],
+        probe_decisions: vec![],
+        solve_diagnostics: BTreeMap::new(),
+    };
+
+    let courier_cfg = RetreadConfig {
+        courier: true,
+        ..cfg()
+    };
+    let out = produce_output(
+        &bundle,
+        &courier_cfg,
+        Platform::Linux64,
+        "3.11",
+        &[],
+        Some("deadbeef"),
+    )
+    .unwrap();
+    assert_eq!(
+        out.metadata.subdir,
+        Platform::Linux64,
+        "courier output must be platform-specific, not noarch"
+    );
+    assert!(
+        out.metadata.noarch.is_none(),
+        "courier output must not be noarch"
+    );
+
+    // Control: the legacy (non-courier) path still emits noarch for a
+    // pure-python bundle.
+    let legacy = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None).unwrap();
+    assert_eq!(legacy.metadata.subdir, Platform::NoArch);
+}
+
+#[test]
 fn produce_output_reflects_overrides_for_refinement_widening() {
     // The regression: simulate what conda_outputs does post-
     // v0.36.4 — apply the union'd overrides into effective and
