@@ -347,6 +347,7 @@ pub async fn stage(
     source_dir: &Path,
     staging_dir: &Path,
 ) -> anyhow::Result<CourierStaged> {
+    crate::status::phase(source_dir, bundle_name, "staging: planning emit set");
     tokio::fs::create_dir_all(staging_dir)
         .await
         .with_context(|| format!("creating staging dir {}", staging_dir.display()))?;
@@ -393,6 +394,15 @@ pub async fn stage(
     // Step 3: Classify and stage each wheel.
     let mut lock_wheels: Vec<LockWheel> = Vec::new();
     let mut source_urls: Vec<String> = Vec::new();
+
+    crate::status::phase(
+        source_dir,
+        bundle_name,
+        &format!(
+            "staging: materializing {} wheels (large index wheels download here)",
+            emit_wheels.len()
+        ),
+    );
 
     for w in emit_wheels {
         let std_name = standard_wheel_filename(&w.wheel_filename);
@@ -627,6 +637,12 @@ pub async fn stage(
             }
         }
     }
+
+    crate::status::phase(
+        source_dir,
+        bundle_name,
+        &format!("staging: staged {} wheels", lock_wheels.len()),
+    );
 
     // Step 4: Build and stage the <bundle>-pypi meta-wheel (conditional).
     // Marker = sha256(bundle_name || "\n" || version || "\n" || serialized entries).

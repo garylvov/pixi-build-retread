@@ -163,7 +163,13 @@ pub fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
     if let Ok(have) = std::fs::read_to_string(&marker)
         && have.trim() == want
     {
-        eprintln!("retread install: {} already current; skipping", lock.bundle);
+        let msg = format!("retread install: {} already current; skipping", lock.bundle);
+        eprintln!("{msg}");
+        crate::status::phase(
+            lock_path.parent().unwrap_or(std::path::Path::new(".")),
+            &lock.bundle,
+            &msg,
+        );
         return Ok(());
     }
 
@@ -278,11 +284,17 @@ pub fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
         excludes_file,
     );
 
-    eprintln!(
+    let install_msg = format!(
         "retread install: {} -> {} ({} root reqs)",
         lock.bundle,
         prefix.display(),
         lock.root_requirements.len()
+    );
+    eprintln!("{install_msg}");
+    crate::status::phase(
+        lock_path.parent().unwrap_or(std::path::Path::new(".")),
+        &lock.bundle,
+        &install_msg,
     );
 
     let status = Command::new(&uv)
@@ -299,7 +311,13 @@ pub fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
     std::fs::create_dir_all(&share).ok();
     std::fs::write(&marker, want)
         .with_context(|| format!("writing marker {}", marker.display()))?;
-    eprintln!("retread install: {} installed", lock.bundle);
+    let done_msg = format!("retread install: {} installed", lock.bundle);
+    eprintln!("{done_msg}");
+    crate::status::phase(
+        lock_path.parent().unwrap_or(std::path::Path::new(".")),
+        &lock.bundle,
+        &done_msg,
+    );
     Ok(())
 }
 

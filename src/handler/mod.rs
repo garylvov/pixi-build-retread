@@ -286,6 +286,8 @@ fn courier_inputs_hash(
     python_version: &str,
     channels: &[String],
     workspace_manifest: Option<&crate::workspace::WorkspaceManifest>,
+    workspace_dir: &std::path::Path,
+    source_dir: &std::path::Path,
 ) -> String {
     let entry_specs = crate::courier::courier_input_specs(config, bundle_name);
     let ws_indexes: Vec<String> = workspace_manifest
@@ -298,7 +300,7 @@ fn courier_inputs_hash(
         .collect();
     let index_urls = merge_index_chain(entry_indexes, &ws_indexes);
     let workspace_fp = workspace_manifest
-        .map(|m| m.solve_fingerprint())
+        .map(|m| m.solve_fingerprint(workspace_dir, source_dir))
         .unwrap_or_default();
     let config_fp = crate::courier::config_fingerprint(config, channels, &workspace_fp);
     crate::lock::RetreadLock::compute_inputs_hash(
@@ -828,6 +830,8 @@ impl Handler {
                             python_version,
                             &courier_channels,
                             workspace_manifest.as_ref(),
+                            workspace_dir.as_deref().unwrap_or(source_dir.as_path()),
+                            &source_dir,
                         ))
                     } else {
                         None
@@ -848,11 +852,15 @@ impl Handler {
                                     "WS-B: cold-solve replay hit -- \
                                      skipping probe cascade",
                                 );
-                                crate::status::tty(&format!(
-                                    "courier replay: {} outputs reconstructed \
-                                     from committed lock (cascade skipped).",
-                                    bundle.conda_name,
-                                ));
+                                crate::status::phase(
+                                    &source_dir,
+                                    &bundle.conda_name,
+                                    &format!(
+                                        "courier replay: {} outputs reconstructed \
+                                         from committed lock (cascade skipped).",
+                                        bundle.conda_name,
+                                    ),
+                                );
                                 outputs.push(replayed);
                                 continue;
                             }
@@ -3806,9 +3814,10 @@ async fn build_one(
             .map(|m| m.all_pypi_index_urls())
             .unwrap_or_default();
         // grizzly H1: fold the workspace solve environment into the hash.
+        // Pack-scoped: only envs that reference source_dir are hashed.
         let workspace_fp = ws_manifest
             .as_ref()
-            .map(|m| m.solve_fingerprint())
+            .map(|m| m.solve_fingerprint(workspace_dir.unwrap_or(source_dir), source_dir))
             .unwrap_or_default();
         let entry_indexes: Vec<String> = config
             .retread_wheels
