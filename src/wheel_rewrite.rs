@@ -122,7 +122,14 @@ pub(crate) fn rewrite_wheel_with(
             CompressionMethod::Stored => CompressionMethod::Stored,
             _ => CompressionMethod::Deflated,
         };
-        let options = SimpleFileOptions::default().compression_method(compression);
+        // Pin the entry timestamp explicitly (the fixed 1980 DOS epoch) so the
+        // rewrite is byte-deterministic regardless of whether the `zip` crate's
+        // `time` feature ever gets unified on by a future dependency -- without
+        // this, `default()` would fall back to wall-clock time and silently
+        // break the shadow-rewrite cache's byte-identity guarantee.
+        let options = SimpleFileOptions::default()
+            .compression_method(compression)
+            .last_modified_time(zip::DateTime::default());
 
         writer.start_file(&name, options)?;
         if name == metadata_name {
@@ -370,7 +377,7 @@ fn update_record_line(
     Ok(out)
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     let mut out = String::with_capacity(64);
