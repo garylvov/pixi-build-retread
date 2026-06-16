@@ -839,9 +839,12 @@ impl Handler {
                     if let Some(ref current_hash) = courier_build_hash {
                         let lock_path = source_dir
                             .join(crate::lock::RetreadLock::file_name(&bundle.conda_name));
+                        let relax_is_default =
+                            config.relax == crate::config::RelaxPolicy::default();
                         match replay_from_lock(
                             &lock_path,
                             current_hash,
+                            relax_is_default,
                             params.host_platform,
                             config.build_number,
                             &siblings,
@@ -4148,25 +4151,35 @@ async fn find_conda_artifact(dir: &Path, name: &str, version: &str) -> Result<Pa
     )
 }
 
-/// WS-B: cold-solve replay helper.
+/// Authority gate for the courier replay path.
 ///
-/// Loads the committed lock at `lock_path` and, if its `inputs_hash`
-/// matches `current_inputs_hash`, reconstructs a [`CondaOutput`] from
-/// the lock's `conda_run_deps` -- bypassing the full probe cascade.
+/// Returns `Some(lock)` iff ALL of the following hold:
+/// 1. `lock_path` exists and parses as a valid [`RetreadLock`].
+/// 2. `lock.schema == SCHEMA` (no cross-version mis-replay).
+/// 3. `lock.inputs_hash == current_inputs_hash` (no stale-input replay).
+/// 4. REPLAY POISONING GUARD: if `!relax_is_default`, no relax-changed
+///    `Origin::Built` wheel (a wheel that was relax-changed from index,
+///    i.e. `origin == Built && !must_ship`) has an empty `requires_dist`.
+///    Such a wheel was born from a relax-rewrite of an index wheel whose
+///    Requires-Dist metadata retread changed; without that metadata we
+///    cannot detect if the upstream changed its Requires-Dist between
+///    lock writes, and the replay would silently propagate stale relax
+///    bytes. Warn and return `None` to fall through to full derivation.
 ///
-/// Returns:
-/// - `Ok(Some(output))` — hash matched; replay output is ready.
-/// - `Ok(None)` — hash mismatch, or file missing (fall through to
-///   cascade; this is not an error).
-/// - `Err(...)` — lock file exists but is malformed / unreadable. The
-///   caller treats this as a replay miss and falls through (non-fatal).
-fn replay_from_lock(
+/// Returns `None` (non-fatal miss) on any mismatch.
+/// Returns `Err` only when the file exists but is malformed.
+///
+/// `RETREAD_NO_REPLAY=1` unconditionally returns `None` (test knob;
+/// lets tests force cold-path exercising without touching the hash).
+fn load_replayable_lock(
     lock_path: &Path,
     current_inputs_hash: &str,
-    host_platform: Platform,
-    build_number: u64,
-    siblings: &[(String, String)],
-) -> anyhow::Result<Option<CondaOutput>> {
+    relax_is_default: bool,
+) -> anyhow::Result<Option<crate::lock::RetreadLock>> {
+    // Test knob: RETREAD_NO_REPLAY=1 disables replay entirely.
+    if std::env::var("RETREAD_NO_REPLAY").is_ok() {
+        return Ok(None);
+    }
     // Missing lock → first build or lock not yet committed. Not an error.
     if !lock_path.exists() {
         return Ok(None);
@@ -4185,6 +4198,52 @@ fn replay_from_lock(
     if lock.inputs_hash != current_inputs_hash {
         return Ok(None);
     }
+    // REPLAY POISONING GUARD: with a non-default relax policy, any relax-
+    // changed Built wheel (origin==Built, must_ship==false) MUST carry its
+    // requires_dist so the replay path can detect metadata drift. If
+    // requires_dist is empty the lock was written before schema 5 (or by a
+    // buggy producer) and we cannot safely replay it.
+    if !relax_is_default {
+        for lw in &lock.wheels {
+            if lw.origin == crate::lock::Origin::Built
+                && !lw.must_ship
+                && lw.requires_dist.is_empty()
+            {
+                tracing::warn!(
+                    wheel = %lw.name,
+                    "courier replay: relax-changed Built wheel has empty requires_dist \
+                     (pre-schema-5 lock or producer bug); falling through to full derivation",
+                );
+                return Ok(None);
+            }
+        }
+    }
+    Ok(Some(lock))
+}
+
+/// WS-B: cold-solve replay helper.
+///
+/// Loads the committed lock at `lock_path` and, if its `inputs_hash`
+/// matches `current_inputs_hash`, reconstructs a [`CondaOutput`] from
+/// the lock's `conda_run_deps` -- bypassing the full probe cascade.
+///
+/// Returns:
+/// - `Ok(Some(output))` — hash matched; replay output is ready.
+/// - `Ok(None)` — hash mismatch, or file missing (fall through to
+///   cascade; this is not an error).
+/// - `Err(...)` — lock file exists but is malformed / unreadable. The
+///   caller treats this as a replay miss and falls through (non-fatal).
+fn replay_from_lock(
+    lock_path: &Path,
+    current_inputs_hash: &str,
+    relax_is_default: bool,
+    host_platform: Platform,
+    build_number: u64,
+    siblings: &[(String, String)],
+) -> anyhow::Result<Option<CondaOutput>> {
+    let Some(lock) = load_replayable_lock(lock_path, current_inputs_hash, relax_is_default)? else {
+        return Ok(None);
+    };
 
     // ----- reconstruct CondaOutput from lock fields via the shared helper -----
     let python_version = crate::relax::emit_python_version("", &lock.python);
@@ -4231,7 +4290,7 @@ fn replay_from_lock(
 }
 
 // -----------------------------------------------------------------
-// WS-B: unit tests for replay_from_lock.
+// WS-B: unit tests for replay_from_lock and load_replayable_lock.
 // Uses only std (no tempfile crate dependency) -- temp dirs are created
 // via std::env::temp_dir() with a unique subdirectory.
 // -----------------------------------------------------------------
@@ -4241,7 +4300,7 @@ mod replay_tests {
 
     use rattler_conda_types::Platform;
 
-    use super::replay_from_lock;
+    use super::{load_replayable_lock, replay_from_lock};
     use crate::lock::{CondaDep, LockWheel, Origin, RetreadLock, SCHEMA};
 
     fn unique_tmp_dir() -> std::path::PathBuf {
@@ -4308,7 +4367,7 @@ mod replay_tests {
         let lock_path = dir.join(RetreadLock::file_name("mypack"));
         std::fs::write(&lock_path, &json).unwrap();
 
-        let result = replay_from_lock(&lock_path, "abc123", Platform::Linux64, 0, &[]);
+        let result = replay_from_lock(&lock_path, "abc123", true, Platform::Linux64, 0, &[]);
         assert!(result.is_ok(), "should not error: {result:?}");
         let output = result.unwrap();
         assert!(output.is_some(), "matching hash must return Some");
@@ -4346,7 +4405,14 @@ mod replay_tests {
         let lock_path = dir.join(RetreadLock::file_name("mypack"));
         std::fs::write(&lock_path, &json).unwrap();
 
-        let result = replay_from_lock(&lock_path, "different-hash", Platform::Linux64, 0, &[]);
+        let result = replay_from_lock(
+            &lock_path,
+            "different-hash",
+            true,
+            Platform::Linux64,
+            0,
+            &[],
+        );
         assert!(result.is_ok(), "mismatch must not error: {result:?}");
         assert!(
             result.unwrap().is_none(),
@@ -4360,7 +4426,7 @@ mod replay_tests {
         let dir = unique_tmp_dir();
         let lock_path = dir.join("retread-missing.lock.json");
 
-        let result = replay_from_lock(&lock_path, "any-hash", Platform::Linux64, 0, &[]);
+        let result = replay_from_lock(&lock_path, "any-hash", true, Platform::Linux64, 0, &[]);
         assert!(result.is_ok(), "missing file must not error: {result:?}");
         assert!(
             result.unwrap().is_none(),
@@ -4375,7 +4441,7 @@ mod replay_tests {
         let lock_path = dir.join(RetreadLock::file_name("badpack"));
         std::fs::write(&lock_path, b"not valid json{{{{").unwrap();
 
-        let result = replay_from_lock(&lock_path, "any-hash", Platform::Linux64, 0, &[]);
+        let result = replay_from_lock(&lock_path, "any-hash", true, Platform::Linux64, 0, &[]);
         assert!(
             result.is_err(),
             "malformed JSON must return Err (caller falls through): {result:?}"
@@ -4391,7 +4457,7 @@ mod replay_tests {
         let lock_path = dir.join(RetreadLock::file_name("mypack"));
         std::fs::write(&lock_path, &json).unwrap();
 
-        let result = replay_from_lock(&lock_path, "hash1", Platform::Linux64, 0, &[]);
+        let result = replay_from_lock(&lock_path, "hash1", true, Platform::Linux64, 0, &[]);
         let out = result.unwrap().unwrap();
         assert_eq!(
             out.metadata.subdir,
@@ -4413,7 +4479,7 @@ mod replay_tests {
             ("pack-a".to_string(), "2.0.0".to_string()),
             ("pack-b".to_string(), "2.0.0".to_string()),
         ];
-        let result = replay_from_lock(&lock_path, "hash42", Platform::Linux64, 0, &siblings);
+        let result = replay_from_lock(&lock_path, "hash42", true, Platform::Linux64, 0, &siblings);
         let out = result.unwrap().unwrap();
         let dep_names: Vec<&str> = out
             .run_dependencies
@@ -4447,7 +4513,7 @@ mod replay_tests {
         let lock_path = dir.join(RetreadLock::file_name("mypack"));
         std::fs::write(&lock_path, &json).unwrap();
 
-        let result = replay_from_lock(&lock_path, "hash9", Platform::Linux64, 0, &[]);
+        let result = replay_from_lock(&lock_path, "hash9", true, Platform::Linux64, 0, &[]);
         let out = result.unwrap().unwrap();
         let dep_names: Vec<&str> = out
             .run_dependencies
@@ -4484,13 +4550,134 @@ mod replay_tests {
         let lock_path = dir.join(RetreadLock::file_name("mypack"));
         std::fs::write(&lock_path, &json).unwrap();
 
-        let result = replay_from_lock(&lock_path, hash, Platform::Linux64, 0, &[]);
+        let result = replay_from_lock(&lock_path, hash, true, Platform::Linux64, 0, &[]);
         let out = result.unwrap().unwrap();
         // Build string must be content-addressed: py311_h<first10>_0
         assert_eq!(
             out.metadata.build, "py311_habcdef0123_0",
             "replay must emit content-addressed build string: got {}",
             out.metadata.build
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    // ---- load_replayable_lock tests ----
+
+    #[test]
+    fn load_replayable_returns_none_for_missing_file() {
+        let dir = unique_tmp_dir();
+        let path = dir.join("retread-no-such.lock.json");
+        let result = load_replayable_lock(&path, "anyhash", true);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none(), "missing file must return None");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn load_replayable_returns_none_for_schema_mismatch() {
+        let dir = unique_tmp_dir();
+        // Write a lock with schema 4 (old); current SCHEMA is 5.
+        let old_schema_json = r#"{
+            "schema": 4,
+            "retread_version": "2.0.0",
+            "bundle": "pack",
+            "version": "1.0.0",
+            "python": "3.11",
+            "inputs_hash": "correcthash",
+            "root_requirements": [],
+            "wheels": [],
+            "conda_run_deps": [],
+            "index_urls": []
+        }"#;
+        let path = dir.join(RetreadLock::file_name("pack"));
+        std::fs::write(&path, old_schema_json).unwrap();
+        let result = load_replayable_lock(&path, "correcthash", true);
+        assert!(result.is_ok());
+        assert!(
+            result.unwrap().is_none(),
+            "schema-4 lock must be a replay miss (schema mismatch)"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn load_replayable_returns_none_for_hash_mismatch() {
+        let dir = unique_tmp_dir();
+        let lock = make_test_lock("pack", "1.0.0", "3.11", "stored-hash", true);
+        let path = dir.join(RetreadLock::file_name("pack"));
+        std::fs::write(&path, lock.to_pretty_json().unwrap()).unwrap();
+        let result = load_replayable_lock(&path, "different-hash", true);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none(), "hash mismatch must return None");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn load_replayable_returns_none_for_empty_requires_dist_under_non_default_relax() {
+        let dir = unique_tmp_dir();
+        // Build a lock with a relax-changed Built wheel (must_ship=false, origin=Built)
+        // but empty requires_dist — this is the poison scenario.
+        let mut lock = make_test_lock("pack", "1.0.0", "3.11", "myhash", true);
+        lock.wheels.push(LockWheel {
+            name: "torchvision".into(),
+            version: "0.18.0".into(),
+            origin: Origin::Built,
+            filename: "torchvision-0.18.0-cp311-cp311-linux_x86_64.999retread.whl".into(),
+            url: None,
+            sha256: None,
+            requires_dist: vec![], // EMPTY — poison scenario
+            must_ship: false,      // relax-changed index wheel
+        });
+        let path = dir.join(RetreadLock::file_name("pack"));
+        std::fs::write(&path, lock.to_pretty_json().unwrap()).unwrap();
+        // relax_is_default=false triggers the poisoning guard
+        let result = load_replayable_lock(&path, "myhash", false);
+        assert!(result.is_ok());
+        assert!(
+            result.unwrap().is_none(),
+            "empty requires_dist on relax-changed Built wheel with non-default relax \
+             must return None (poisoning guard)"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn load_replayable_returns_some_when_all_checks_pass() {
+        let dir = unique_tmp_dir();
+        let lock = make_test_lock("pack", "1.0.0", "3.11", "goodhash", true);
+        let path = dir.join(RetreadLock::file_name("pack"));
+        std::fs::write(&path, lock.to_pretty_json().unwrap()).unwrap();
+        let result = load_replayable_lock(&path, "goodhash", true);
+        assert!(result.is_ok());
+        assert!(
+            result.unwrap().is_some(),
+            "valid lock with matching hash must return Some"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn load_replayable_returns_some_with_non_default_relax_when_requires_dist_nonempty() {
+        let dir = unique_tmp_dir();
+        let mut lock = make_test_lock("pack", "1.0.0", "3.11", "myhash", true);
+        // A relax-changed Built wheel WITH requires_dist — not poison.
+        lock.wheels.push(LockWheel {
+            name: "torchvision".into(),
+            version: "0.18.0".into(),
+            origin: Origin::Built,
+            filename: "torchvision-0.18.0-cp311-cp311-linux_x86_64.999retread.whl".into(),
+            url: None,
+            sha256: None,
+            requires_dist: vec!["torch>=2.0,<3".into()],
+            must_ship: false,
+        });
+        let path = dir.join(RetreadLock::file_name("pack"));
+        std::fs::write(&path, lock.to_pretty_json().unwrap()).unwrap();
+        let result = load_replayable_lock(&path, "myhash", false);
+        assert!(result.is_ok());
+        assert!(
+            result.unwrap().is_some(),
+            "relax-changed Built wheel with non-empty requires_dist is safe to replay"
         );
         std::fs::remove_dir_all(dir).ok();
     }
