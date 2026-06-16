@@ -1759,6 +1759,113 @@ impl Handler {
         };
         let target = wheel_target_for(params.output.subdir, &python_version);
 
+        // WS-B build_v1 replay gate: when courier mode is active, check the
+        // committed lock BEFORE running the expensive resolve_all / probe
+        // cascade. If the lock matches (same schema + inputs_hash), re-
+        // materialize bytes from disk and build directly -- no BFS, no
+        // auto_bundle, no solve. RETREAD_NO_REPLAY=1 disables this fast path.
+        let output_dir = params
+            .output_directory
+            .clone()
+            .unwrap_or_else(|| params.work_directory.join("output"));
+        if config.courier {
+            // Need workspace_manifest to compute the config fingerprint
+            // identically to how build_one does it (channel set + workspace
+            // solve env are both folded in).
+            let ws_manifest_for_replay = workspace_dir
+                .as_deref()
+                .and_then(crate::workspace::WorkspaceManifest::load);
+            let courier_channels = ws_manifest_for_replay
+                .as_ref()
+                .map(|m| {
+                    m.courier_channel_set(
+                        workspace_dir.as_deref().unwrap_or(&source_dir),
+                        &source_dir,
+                    )
+                })
+                .unwrap_or_default();
+            let workspace_fp = ws_manifest_for_replay
+                .as_ref()
+                .map(|m| {
+                    m.solve_fingerprint(
+                        workspace_dir.as_deref().unwrap_or(&source_dir),
+                        &source_dir,
+                    )
+                })
+                .unwrap_or_default();
+            let config_fp =
+                crate::courier::config_fingerprint(&config, &courier_channels, &workspace_fp);
+            // The bundle_name for the hash is the requested output name
+            // (params.output.name.as_normalized()), which equals bundle.conda_name
+            // and is what courier::stage uses as the lock key.
+            let bundle_name_for_hash = params.output.name.as_normalized().to_string();
+            let current_hash = courier_inputs_hash(
+                &config,
+                &bundle_name_for_hash,
+                &python_version,
+                &courier_channels,
+                ws_manifest_for_replay.as_ref(),
+                workspace_dir.as_deref().unwrap_or(&source_dir),
+                &source_dir,
+            );
+            let lock_path =
+                source_dir.join(crate::lock::RetreadLock::file_name(&bundle_name_for_hash));
+            let relax_is_default = config.relax == crate::config::RelaxPolicy::default();
+            match load_replayable_lock(&lock_path, &current_hash, relax_is_default) {
+                Ok(Some(lock)) => {
+                    tracing::info!(
+                        bundle = %bundle_name_for_hash,
+                        "WS-B build_v1 replay hit: re-materializing from lock \
+                         (resolve_all skipped)",
+                    );
+                    crate::status::tty(&format!(
+                        "building '{}': replay hit -- re-materializing from lock \
+                         (derivation skipped).",
+                        bundle_name_for_hash,
+                    ));
+                    let run_deps: Vec<String> = params
+                        .run_dependencies
+                        .as_ref()
+                        .map(|deps| deps.iter().map(|d| d.spec.to_string()).collect())
+                        .ok_or_else(|| {
+                            RpcError::internal(
+                                "courier replay: run_override is None; cannot replay without \
+                                 pixi-forwarded run_dependencies"
+                                    .to_string(),
+                            )
+                        })?;
+                    return materialize_from_lock(
+                        lock,
+                        &config,
+                        &params.work_directory,
+                        &output_dir,
+                        params.output.subdir,
+                        &source_dir,
+                        params.output.build.as_deref(),
+                        run_deps,
+                        &config_fp,
+                    )
+                    .await
+                    .map_err(|e| {
+                        RpcError::internal(format!("build_v1 replay {bundle_name_for_hash}: {e:#}"))
+                    });
+                }
+                Ok(None) => {
+                    tracing::debug!(
+                        bundle = %bundle_name_for_hash,
+                        "WS-B build_v1 replay miss (hash mismatch / no lock) -- full resolve",
+                    );
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        bundle = %bundle_name_for_hash,
+                        error = %format!("{e:#}"),
+                        "WS-B build_v1 replay error (non-fatal) -- full resolve",
+                    );
+                }
+            }
+        }
+
         // Re-resolve materialized bundles, then autodiscover emissions
         // and pick the one matching the requested output name.
         let (materialized, base_config) = resolve_all(
@@ -1808,11 +1915,6 @@ impl Handler {
             RpcError::invalid_params("no bundles produced; check [retread-wheels]".to_string())
         })?;
         let (bundle, effective) = apply_emission(base_bundle, &base_config, picked_emission);
-
-        let output_dir = params
-            .output_directory
-            .clone()
-            .unwrap_or_else(|| params.work_directory.join("output"));
 
         // Build the recipe's run-deps from the EXACT specs pixi solved and
         // locked with (forwarded in `params.run_dependencies`), not by
@@ -3787,6 +3889,112 @@ fn localize_wheel_source(url: &url::Url, wheels_root: &Path) -> url::Url {
     url.clone()
 }
 
+/// Reconstruct [`crate::emit_pypi::EmitWheel`] entries from a lock's wheel
+/// list for the `build_v1` replay path.
+///
+/// Mapping rules:
+/// - `Origin::Index` wheels with an `https://` URL → `remote_url` set, `local_path` = None.
+/// - `Origin::Index` wheels with a `file://` URL → `local_path` set (on-disk cache hit).
+/// - `Origin::Built` wheels (no `url`) → both None; `courier::stage` finds them
+///   in the `wheels/` directory left by the original cold build.
+fn lock_wheels_to_emit_wheels(
+    lock_wheels: &[crate::lock::LockWheel],
+) -> Vec<crate::emit_pypi::EmitWheel> {
+    lock_wheels
+        .iter()
+        .map(|lw| {
+            let remote_url = lw
+                .url
+                .as_deref()
+                .and_then(|u| url::Url::parse(u).ok())
+                .filter(|u| u.scheme() != "file");
+            let local_path = lw.url.as_deref().and_then(|u| {
+                url::Url::parse(u)
+                    .ok()
+                    .filter(|u| u.scheme() == "file")
+                    .and_then(|u| u.to_file_path().ok())
+            });
+            crate::emit_pypi::EmitWheel {
+                pypi_name: lw.name.clone(),
+                version: lw.version.clone(),
+                requires_dist: lw.requires_dist.clone(),
+                local_path,
+                wheel_filename: lw.filename.clone(),
+                remote_url,
+            }
+        })
+        .collect()
+}
+
+/// Re-materialize wheel bytes from the committed lock and run the shared
+/// courier pack tail, skipping derivation (BFS / auto_bundle / solve).
+///
+/// The replay path for `conda_build_v1` calls this when:
+/// - `config.courier` is true, AND
+/// - `load_replayable_lock` confirms schema + inputs_hash match, AND
+/// - `RETREAD_NO_REPLAY` is unset.
+///
+/// Wheel bytes are re-staged via `courier::stage` (which reads from disk if
+/// already present, or re-downloads as needed). The lock is re-written post-
+/// build (B-2) to refresh its mtime and verify content. `Origin::Built` wheels
+/// with `url: None` are handled by the source-build + inject + relax pipeline
+/// embedded in `courier::stage`; their bytes are already on disk in `wheels/`.
+///
+/// # Correctness
+/// `run_deps` MUST come from `params.run_dependencies` (the live pixi-forwarded
+/// deps), not from `lock.conda_run_deps`, so the rebuilt package's run-deps
+/// are authoritative even on replay.
+#[allow(clippy::too_many_arguments)]
+async fn materialize_from_lock(
+    lock: crate::lock::RetreadLock,
+    config: &RetreadConfig,
+    work_dir: &Path,
+    output_dir: &Path,
+    target_subdir: Platform,
+    source_dir: &Path,
+    expected_build: Option<&str>,
+    run_deps: Vec<String>,
+    config_fp: &str,
+) -> Result<CondaBuildV1Result> {
+    let bundle_name = lock.bundle.clone();
+    let version = lock.version.clone();
+    let python_version = crate::relax::emit_python_version("", &lock.python);
+
+    // Reconstruct EmitWheel entries from the lock.
+    let emit_wheels = lock_wheels_to_emit_wheels(&lock.wheels);
+
+    // Reconstruct conda_capable from the lock (recorded by the producer).
+    let conda_capable: std::collections::HashSet<String> =
+        lock.conda_capable.iter().cloned().collect();
+
+    let index_urls = lock.index_urls.clone();
+
+    tracing::info!(
+        bundle = %bundle_name,
+        wheels = emit_wheels.len(),
+        "courier build_v1 replay: re-materializing from lock (derivation skipped)",
+    );
+
+    materialize_and_pack(
+        None, // bundle=None: replay path, audit skipped
+        config,
+        &bundle_name,
+        &version,
+        &python_version,
+        emit_wheels,
+        conda_capable,
+        run_deps,
+        index_urls,
+        config_fp,
+        work_dir,
+        output_dir,
+        target_subdir,
+        source_dir,
+        expected_build,
+    )
+    .await
+}
+
 /// Shared courier pack tail: stage wheels, build the courier recipe, run
 /// rattler-build, flush the deferred committed lock, and return the
 /// [`CondaBuildV1Result`].
@@ -3798,7 +4006,8 @@ fn localize_wheel_source(url: &url::Url, wheels_root: &Path) -> url::Url {
 ///    from the committed lock.
 #[allow(clippy::too_many_arguments)]
 async fn materialize_and_pack(
-    bundle: &Bundle,
+    // `None` on the replay path (no Bundle was resolved; audit skipped).
+    bundle: Option<&Bundle>,
     config: &RetreadConfig,
     bundle_name: &str,
     version: &str,
@@ -3857,13 +4066,17 @@ async fn materialize_and_pack(
 
     // Audit: dump per-wheel pre-D Requires-Dist + post-translate
     // run-deps as JSON, plus copy-paste-friendly pixi.toml fragments.
-    let audit = build_bundle_audit(bundle, &recipe);
-    let audit_json = serde_json::to_string_pretty(&audit).context("serializing audit record")?;
-    let audit_path = source_dir.join(format!("retread-audit-{}.json", recipe.package.name));
-    if let Err(e) = tokio::fs::write(&audit_path, &audit_json).await {
-        tracing::warn!(path = %audit_path.display(), error = %e, "failed to write audit record (non-fatal)");
-    } else {
-        tracing::info!(path = %audit_path.display(), "wrote audit");
+    // On the replay path `bundle` is None (no resolve_all ran); skip audit.
+    if let Some(b) = bundle {
+        let audit = build_bundle_audit(b, &recipe);
+        let audit_json =
+            serde_json::to_string_pretty(&audit).context("serializing audit record")?;
+        let audit_path = source_dir.join(format!("retread-audit-{}.json", recipe.package.name));
+        if let Err(e) = tokio::fs::write(&audit_path, &audit_json).await {
+            tracing::warn!(path = %audit_path.display(), error = %e, "failed to write audit record (non-fatal)");
+        } else {
+            tracing::info!(path = %audit_path.display(), "wrote audit");
+        }
     }
 
     tokio::fs::create_dir_all(output_dir).await?;
@@ -4071,7 +4284,7 @@ async fn build_one(
         let config_fp =
             crate::courier::config_fingerprint(declared_config, &courier_channels, &workspace_fp);
         return materialize_and_pack(
-            bundle,
+            Some(bundle),
             config,
             &bundle.conda_name,
             &version,
@@ -4671,6 +4884,133 @@ mod replay_tests {
             out.metadata.build, "py311_habcdef0123_0",
             "replay must emit content-addressed build string: got {}",
             out.metadata.build
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    // ---- lock_wheels_to_emit_wheels tests ----
+
+    #[test]
+    fn index_wheel_with_https_url_becomes_remote_url() {
+        use super::lock_wheels_to_emit_wheels;
+        let lw = LockWheel {
+            name: "torch".into(),
+            version: "2.3.0".into(),
+            origin: Origin::Index,
+            filename: "torch-2.3.0-cp311-cp311-linux_x86_64.whl".into(),
+            url: Some("https://files.pythonhosted.org/torch-2.3.0.whl".into()),
+            sha256: None,
+            requires_dist: vec![],
+            must_ship: false,
+        };
+        let wheels = lock_wheels_to_emit_wheels(&[lw]);
+        assert_eq!(wheels.len(), 1);
+        let w = &wheels[0];
+        assert!(w.remote_url.is_some(), "https URL must map to remote_url");
+        assert!(
+            w.local_path.is_none(),
+            "https URL must NOT map to local_path"
+        );
+        assert_eq!(w.pypi_name, "torch");
+        assert_eq!(w.version, "2.3.0");
+    }
+
+    #[test]
+    fn built_wheel_with_no_url_produces_no_remote_or_local() {
+        use super::lock_wheels_to_emit_wheels;
+        let lw = LockWheel {
+            name: "mylib".into(),
+            version: "1.0.0".into(),
+            origin: Origin::Built,
+            filename: "mylib-1.0.0-cp311-cp311-linux_x86_64.injected.whl".into(),
+            url: None,
+            sha256: None,
+            requires_dist: vec!["numpy>=1.21".into()],
+            must_ship: true,
+        };
+        let wheels = lock_wheels_to_emit_wheels(&[lw]);
+        assert_eq!(wheels.len(), 1);
+        let w = &wheels[0];
+        assert!(
+            w.remote_url.is_none(),
+            "Built wheel with no url must have remote_url=None"
+        );
+        assert!(
+            w.local_path.is_none(),
+            "Built wheel with no url must have local_path=None"
+        );
+        assert_eq!(w.requires_dist, vec!["numpy>=1.21".to_string()]);
+        assert_eq!(
+            w.wheel_filename,
+            "mylib-1.0.0-cp311-cp311-linux_x86_64.injected.whl"
+        );
+    }
+
+    #[test]
+    fn mixed_wheel_list_reconstructs_correctly() {
+        use super::lock_wheels_to_emit_wheels;
+        let wheels_in = vec![
+            LockWheel {
+                name: "pkga".into(),
+                version: "1.0.0".into(),
+                origin: Origin::Index,
+                filename: "pkga-1.0.0-py3-none-any.whl".into(),
+                url: Some("https://pypi.org/simple/pkga-1.0.0.whl".into()),
+                sha256: None,
+                requires_dist: vec![],
+                must_ship: false,
+            },
+            LockWheel {
+                name: "pkgb".into(),
+                version: "2.0.0".into(),
+                origin: Origin::Built,
+                filename: "pkgb-2.0.0-cp311-cp311-linux.injected.whl".into(),
+                url: None,
+                sha256: None,
+                requires_dist: vec!["requests>=2".into()],
+                must_ship: true,
+            },
+        ];
+        let emit = lock_wheels_to_emit_wheels(&wheels_in);
+        assert_eq!(emit.len(), 2);
+        // pkga: remote_url set
+        assert!(emit[0].remote_url.is_some());
+        assert!(emit[0].local_path.is_none());
+        // pkgb: both None
+        assert!(emit[1].remote_url.is_none());
+        assert!(emit[1].local_path.is_none());
+        assert_eq!(emit[1].requires_dist, vec!["requests>=2".to_string()]);
+    }
+
+    // ---- RETREAD_NO_REPLAY env knob tests ----
+
+    #[test]
+    fn no_replay_env_knob_returns_none() {
+        // SAFETY: single-threaded test; set/unset env var atomically.
+        // Tests run in parallel so we use a unique env var name and
+        // restore state to avoid interfering with other tests.
+        // Note: std::env::set_var is thread-unsafe; this test must
+        // run in isolation (use `-- --test-threads=1` if flaky).
+        let dir = unique_tmp_dir();
+        let lock = make_test_lock("pack", "1.0.0", "3.11", "myhash", true);
+        let path = dir.join(RetreadLock::file_name("pack"));
+        std::fs::write(&path, lock.to_pretty_json().unwrap()).unwrap();
+
+        // Set the knob and verify replay is suppressed.
+        // SAFETY: This test is inherently racy in a multi-threaded test harness.
+        // It is marked as a best-effort check; if it fails intermittently,
+        // investigate test parallelism.
+        unsafe {
+            std::env::set_var("RETREAD_NO_REPLAY", "1");
+        }
+        let result = load_replayable_lock(&path, "myhash", true);
+        unsafe {
+            std::env::remove_var("RETREAD_NO_REPLAY");
+        }
+        assert!(result.is_ok());
+        assert!(
+            result.unwrap().is_none(),
+            "RETREAD_NO_REPLAY=1 must suppress replay (return None)"
         );
         std::fs::remove_dir_all(dir).ok();
     }
