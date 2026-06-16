@@ -28,3 +28,5 @@ examples/genesis/genesis-pack/wheels/
 examples/genesis/genesis-pack/retread-*.json
 !examples/genesis/genesis-pack/retread-genesis-pack.lock.json
 examples/genesis/genesis-pack/RETREAD-SOLVE-FAILED-*.md
+retread-progress-*.log
+examples/*/*/retread-progress-*.log

@@ -109,7 +109,12 @@ pub const SCHEMA: u32 = 4;
 /// silent stale-cache reuse for consumers (expensive, invisible).
 /// SCHEMA = on-disk lock FORMAT; EMIT_EPOCH = emitted-output SEMANTICS for
 /// identical inputs -- bump independently.
-pub const EMIT_EPOCH: u32 = 2;
+///
+/// Epoch 3: pack-scoped solve_fingerprint -- `inputs_hash` now hashes only the
+/// envs that reference the source pack (via discover_outputs_for_source) rather
+/// than all envs in the workspace, eliminating false cache misses when unrelated
+/// envs change.
+pub const EMIT_EPOCH: u32 = 3;
 
 impl RetreadLock {
     /// File name for a bundle's lock next to the pack manifest.

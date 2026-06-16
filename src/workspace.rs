@@ -282,60 +282,54 @@ impl WorkspaceManifest {
         out
     }
 
-    /// Canonical fingerprint of every resolution-affecting field of the
-    /// workspace manifest, for the courier lock's inputs_hash (grizzly H1).
-    /// A cold-solve replay reconstructs the lock's conda run-deps verbatim
-    /// without re-solving, so if a WORKSPACE edit (per-env conda dep pins,
-    /// system-requirements, pypi-options, feature/env wiring) would change
-    /// what a fresh solve emits, that edit MUST change this fingerprint or a
-    /// stale (poisoned) lock would replay.
+    /// Pack-scoped canonical fingerprint of every resolution-affecting workspace
+    /// solve input for the given source package, for the courier lock's
+    /// `inputs_hash` (grizzly H1).
     ///
-    /// Hashes the RAW declared fields (top-level + every feature) rather than
-    /// per-env effective values: the effective_* getters are pure functions
-    /// of these fields, so covering the inputs covers every derived env. All
-    /// containers are BTreeMap/ordered-Vec, so the output is deterministic.
-    /// Both producer (`build_one`) and replayer (`conda_outputs`) load the
-    /// same manifest and call this, so the two fingerprints always agree.
-    /// `path_dependencies` are intentionally excluded -- they route which
-    /// outputs exist, not how a given bundle resolves.
-    pub fn solve_fingerprint(&self) -> String {
-        let mut parts: Vec<String> = Vec::new();
-        for c in &self.channels {
-            parts.push(format!("ws-channel:{c}"));
+    /// Scoped to the envs that reference `source_dir` via
+    /// `discover_outputs_for_source`: only channels, deps, system-requirements,
+    /// and pypi-index-urls from those envs (computed via the per-env
+    /// `effective_*` getters) are folded. This eliminates over-coupling to
+    /// unrelated envs in the same workspace -- pixi solves each env
+    /// independently, so non-referencing envs cannot affect THIS pack's
+    /// resolution and should not invalidate its cached lock.
+    ///
+    /// Returns empty String when no env references the pack (symmetric with
+    /// `courier_channel_set`'s empty-Vec return; the caller guards
+    /// `if !workspace_fp.is_empty()`). Both producer (`build_one`) and
+    /// replayer (`conda_outputs`) call this with the same
+    /// `(workspace_dir, source_dir)` pair, so the fingerprints always agree.
+    pub fn solve_fingerprint(&self, workspace_dir: &Path, source_dir: &Path) -> String {
+        let outputs = self.discover_outputs_for_source(workspace_dir, source_dir);
+        if outputs.is_empty() {
+            return String::new();
         }
+        // Union all env names across every discovered output (stable sort via
+        // BTreeSet so parts order is deterministic).
+        let mut all_envs: BTreeSet<String> = BTreeSet::new();
+        for output in &outputs {
+            for env in &output.envs {
+                all_envs.insert(env.clone());
+            }
+        }
+        let env_vec: Vec<String> = all_envs.into_iter().collect();
+
+        let mut parts: Vec<String> = Vec::new();
         if let Some(p) = &self.channel_priority {
             parts.push(format!("ws-channel-priority:{p}"));
         }
-        for (k, v) in &self.dependencies {
-            parts.push(format!("ws-dep:{k}={v}"));
-        }
-        for (k, v) in &self.system_requirements {
-            parts.push(format!("ws-sysreq:{k}={v}"));
-        }
-        for u in &self.pypi_index_urls {
-            parts.push(format!("ws-pypi-index:{u}"));
-        }
-        // environments: name -> ordered features + no_default_feature.
-        for (name, env) in &self.environments {
-            parts.push(format!(
-                "ws-env:{name}=[{}]nodefault={}",
-                env.features.join(","),
-                env.no_default_feature
-            ));
-        }
-        // features: name -> channels, deps, sysreqs, pypi indexes.
-        for (name, feat) in &self.features {
-            for c in &feat.channels {
-                parts.push(format!("ws-feat:{name}:channel:{c}"));
+        for env in &env_vec {
+            for c in self.effective_channels(env) {
+                parts.push(format!("scoped-env:{env}:channel:{c}"));
             }
-            for (k, v) in &feat.dependencies {
-                parts.push(format!("ws-feat:{name}:dep:{k}={v}"));
+            for (k, v) in self.effective_dependencies(env) {
+                parts.push(format!("scoped-env:{env}:dep:{k}={v}"));
             }
-            for (k, v) in &feat.system_requirements {
-                parts.push(format!("ws-feat:{name}:sysreq:{k}={v}"));
+            for (k, v) in self.effective_system_requirements(env) {
+                parts.push(format!("scoped-env:{env}:sysreq:{k}={v}"));
             }
-            for u in &feat.pypi_index_urls {
-                parts.push(format!("ws-feat:{name}:pypi-index:{u}"));
+            for u in self.effective_pypi_index_urls(env) {
+                parts.push(format!("scoped-env:{env}:pypi-index:{u}"));
             }
         }
         parts.join("\n")
@@ -357,6 +351,36 @@ impl WorkspaceManifest {
             };
             for (k, v) in &feat.system_requirements {
                 out.insert(k.clone(), v.clone());
+            }
+        }
+        out
+    }
+
+    /// Effective PyPI index URLs for one env: top-level (unless
+    /// no-default-feature) then each active feature's, deduped first-seen.
+    /// Mirrors `effective_channels`'s default-inheritance + no-default-feature
+    /// semantics exactly.
+    pub fn effective_pypi_index_urls(&self, env_name: &str) -> Vec<String> {
+        let Some(env) = self.environments.get(env_name) else {
+            return Vec::new();
+        };
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        if !env.no_default_feature {
+            for u in &self.pypi_index_urls {
+                if seen.insert(u.clone()) {
+                    out.push(u.clone());
+                }
+            }
+        }
+        for feat_name in &env.features {
+            let Some(feat) = self.features.get(feat_name) else {
+                continue;
+            };
+            for u in &feat.pypi_index_urls {
+                if seen.insert(u.clone()) {
+                    out.push(u.clone());
+                }
             }
         }
         out
@@ -1311,6 +1335,199 @@ some-pkg = "==1.0"
         let ws = WorkspaceManifest::default();
         assert!(ws.effective_dependencies("nonexistent").is_empty());
         assert!(ws.effective_channels("nonexistent").is_empty());
+    }
+
+    #[test]
+    fn effective_pypi_index_urls_unions_features_with_top_level() {
+        let ws = ws_toml(
+            r#"
+[workspace]
+channels = ["conda-forge"]
+
+[pypi-options]
+index-url = "https://pypi.nvidia.com"
+extra-index-urls = ["https://download.pytorch.org/whl/cu128"]
+
+[environments]
+sim = { features = ["mujoco"] }
+
+[feature.mujoco.pypi-options]
+extra-index-urls = ["https://py.mujoco.org"]
+"#,
+        );
+        let urls = ws.effective_pypi_index_urls("sim");
+        assert_eq!(
+            urls,
+            vec![
+                "https://pypi.nvidia.com".to_string(),
+                "https://download.pytorch.org/whl/cu128".to_string(),
+                "https://py.mujoco.org".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn effective_pypi_index_urls_no_default_feature_skips_top_level() {
+        let ws = ws_toml(
+            r#"
+[workspace]
+channels = ["conda-forge"]
+
+[pypi-options]
+index-url = "https://pypi.nvidia.com"
+
+[environments]
+standalone = { features = ["f"], no-default-feature = true }
+
+[feature.f.pypi-options]
+extra-index-urls = ["https://py.mujoco.org"]
+"#,
+        );
+        let urls = ws.effective_pypi_index_urls("standalone");
+        // Top-level nvidia index skipped because no-default-feature.
+        assert!(!urls.contains(&"https://pypi.nvidia.com".to_string()));
+        assert_eq!(urls, vec!["https://py.mujoco.org".to_string()]);
+    }
+
+    #[test]
+    fn effective_pypi_index_urls_deduplicates() {
+        let ws = ws_toml(
+            r#"
+[workspace]
+channels = ["conda-forge"]
+
+[pypi-options]
+index-url = "https://pypi.nvidia.com"
+
+[environments]
+gpu = { features = ["g"] }
+
+[feature.g.pypi-options]
+index-url = "https://pypi.nvidia.com"
+"#,
+        );
+        let urls = ws.effective_pypi_index_urls("gpu");
+        // nvidia appears in both top-level and feature -- only first occurrence kept.
+        assert_eq!(urls.len(), 1);
+        assert_eq!(urls[0], "https://pypi.nvidia.com");
+    }
+
+    #[test]
+    fn solve_fingerprint_is_pack_scoped_to_referencing_envs() {
+        let tmp = std::env::temp_dir().join(format!(
+            "retread-ws-fp-scope-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(tmp.join("my-pack")).unwrap();
+        let src = tmp.join("my-pack");
+
+        // Manifest A: one env referencing the pack via feature.base.
+        let ws_a = ws_toml(
+            r#"
+[workspace]
+channels = ["conda-forge"]
+
+[environments]
+env-a = { features = ["base"] }
+
+[feature.base.dependencies]
+my-pack = { path = "./my-pack" }
+numpy = "==1.26.4"
+
+[feature.base]
+channels = ["conda-forge"]
+"#,
+        );
+        let fp_a = ws_a.solve_fingerprint(&tmp, &src);
+        assert!(
+            !fp_a.is_empty(),
+            "must be non-empty when an env references pack"
+        );
+
+        // Manifest B = A + an UNRELATED env (new feature, NO path-dep to src/).
+        // Adding an env that does NOT reference the pack must NOT change the fingerprint.
+        let ws_b = ws_toml(
+            r#"
+[workspace]
+channels = ["conda-forge"]
+
+[environments]
+env-a   = { features = ["base"] }
+env-unrelated = { features = ["other"] }
+
+[feature.base.dependencies]
+my-pack = { path = "./my-pack" }
+numpy = "==1.26.4"
+
+[feature.base]
+channels = ["conda-forge"]
+
+[feature.other.dependencies]
+torch = ">=2.7"
+
+[feature.other]
+channels = ["conda-forge", "pytorch"]
+"#,
+        );
+        let fp_b = ws_b.solve_fingerprint(&tmp, &src);
+        assert_eq!(
+            fp_a, fp_b,
+            "adding an unrelated env must not change the pack-scoped fingerprint"
+        );
+
+        // Manifest C = A but MUTATE the referencing env (add a dep to feature.base).
+        // This must change the fingerprint.
+        let ws_c = ws_toml(
+            r#"
+[workspace]
+channels = ["conda-forge"]
+
+[environments]
+env-a = { features = ["base"] }
+
+[feature.base.dependencies]
+my-pack = { path = "./my-pack" }
+numpy = "==1.26.4"
+pinocchio = ">=3.6"
+
+[feature.base]
+channels = ["conda-forge"]
+"#,
+        );
+        let fp_c = ws_c.solve_fingerprint(&tmp, &src);
+        assert_ne!(
+            fp_a, fp_c,
+            "mutating the referencing env must change the fingerprint"
+        );
+
+        // Determinism: two calls on same manifest are byte-identical.
+        let fp_a2 = ws_a.solve_fingerprint(&tmp, &src);
+        assert_eq!(fp_a, fp_a2, "solve_fingerprint must be deterministic");
+
+        // Empty: manifest where no env references src/ -> returns "".
+        let ws_empty = ws_toml(
+            r#"
+[workspace]
+channels = ["conda-forge"]
+
+[environments]
+env-a = { features = ["other"] }
+
+[feature.other.dependencies]
+torch = ">=2.7"
+"#,
+        );
+        let fp_empty = ws_empty.solve_fingerprint(&tmp, &src);
+        assert_eq!(
+            fp_empty, "",
+            "no env references the pack -> fingerprint must be empty"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// Regression test for the courier cold-solve-replay channel hash bug.

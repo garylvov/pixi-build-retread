@@ -13,6 +13,7 @@
 //! pollutes the JSON-RPC stdout channel.
 
 use std::io::Write;
+use std::path::Path;
 
 /// Write one status line to the controlling terminal, best-effort.
 ///
@@ -27,4 +28,33 @@ pub fn tty(msg: &str) {
         let _ = write!(f, "\r[retread] {msg}\n");
         let _ = f.flush();
     }
+}
+
+/// Append a timestamped line to `<source_dir>/retread-progress-<bundle>.log`.
+/// Best-effort: all errors are silently swallowed; this function never panics
+/// or returns an error. The log path is NOT folded into any fingerprint/hash.
+pub fn log(source_dir: &Path, bundle: &str, msg: &str) {
+    let path = source_dir.join(format!("retread-progress-{bundle}.log"));
+    // Best-effort: ignore all errors.
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    else {
+        return;
+    };
+    // Use wall-clock seconds since epoch for a simple, portable timestamp.
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let _ = writeln!(f, "[{ts}] {msg}");
+}
+
+/// Write one status line to both the controlling terminal (via `tty`) and
+/// the per-bundle progress log (via `log`). Use at phase boundaries only,
+/// not per-record. Never writes to stdout (that is the JSON-RPC channel).
+pub fn phase(source_dir: &Path, bundle: &str, msg: &str) {
+    tty(msg);
+    log(source_dir, bundle, msg);
 }
