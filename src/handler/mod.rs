@@ -3787,6 +3787,162 @@ fn localize_wheel_source(url: &url::Url, wheels_root: &Path) -> url::Url {
     url.clone()
 }
 
+/// Shared courier pack tail: stage wheels, build the courier recipe, run
+/// rattler-build, flush the deferred committed lock, and return the
+/// [`CondaBuildV1Result`].
+///
+/// Called from two sites:
+/// 1. `build_one` (cold path) — after deriving `emit_wheels`, `conda_capable`,
+///    `run_deps`, and `index_urls` from the full resolve.
+/// 2. `conda_build_v1` (replay path, commit 5) — after re-materializing bytes
+///    from the committed lock.
+#[allow(clippy::too_many_arguments)]
+async fn materialize_and_pack(
+    bundle: &Bundle,
+    config: &RetreadConfig,
+    bundle_name: &str,
+    version: &str,
+    python_version: &str,
+    emit_wheels: Vec<crate::emit_pypi::EmitWheel>,
+    conda_capable: std::collections::HashSet<String>,
+    run_deps: Vec<String>,
+    index_urls: Vec<String>,
+    config_fp: &str,
+    work_dir: &Path,
+    output_dir: &Path,
+    target_subdir: Platform,
+    source_dir: &Path,
+    expected_build: Option<&str>,
+) -> Result<CondaBuildV1Result> {
+    let staging = work_dir.join(format!("courier-{bundle_name}"));
+    let staged = crate::courier::stage(
+        config,
+        bundle_name,
+        version,
+        python_version,
+        &emit_wheels,
+        &conda_capable,
+        &run_deps,
+        &index_urls,
+        config_fp,
+        source_dir,
+        &staging,
+    )
+    .await
+    .context("courier staging")?;
+
+    // Defer the committed install lock write until after a successful
+    // rattler-build (B-2). The staged copy inside `staging` is already in
+    // the recipe's source list; this is the authoritative pack-dir copy.
+    let lock_path = source_dir.join(crate::lock::RetreadLock::file_name(bundle_name));
+    let courier_lock_to_commit = (lock_path, staged.lock.to_pretty_json()?);
+
+    let recipe = build_courier_recipe(
+        bundle_name,
+        version,
+        python_version,
+        &staged.run_deps,
+        &staged.source_urls,
+        // Thread the content-addressed build string into the recipe so
+        // the on-disk artifact name matches what conda/outputs advertised.
+        expected_build,
+    );
+    let yaml = to_yaml(&recipe)?;
+
+    let recipe_dir = work_dir.join(format!("recipe-{}", recipe.package.name));
+    tokio::fs::create_dir_all(&recipe_dir).await?;
+    let recipe_path = recipe_dir.join("recipe.yaml");
+    tokio::fs::write(&recipe_path, &yaml).await?;
+    tracing::info!(path = %recipe_path.display(), "wrote recipe.yaml");
+
+    // Audit: dump per-wheel pre-D Requires-Dist + post-translate
+    // run-deps as JSON, plus copy-paste-friendly pixi.toml fragments.
+    let audit = build_bundle_audit(bundle, &recipe);
+    let audit_json = serde_json::to_string_pretty(&audit).context("serializing audit record")?;
+    let audit_path = source_dir.join(format!("retread-audit-{}.json", recipe.package.name));
+    if let Err(e) = tokio::fs::write(&audit_path, &audit_json).await {
+        tracing::warn!(path = %audit_path.display(), error = %e, "failed to write audit record (non-fatal)");
+    } else {
+        tracing::info!(path = %audit_path.display(), "wrote audit");
+    }
+
+    tokio::fs::create_dir_all(output_dir).await?;
+
+    let target_platform = target_subdir.to_string();
+    let compression_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .to_string();
+    let mut cmd = tokio::process::Command::new("rattler-build");
+    cmd.arg("build")
+        .arg("--recipe")
+        .arg(&recipe_path)
+        .arg("--output-dir")
+        .arg(output_dir)
+        .arg("--target-platform")
+        .arg(&target_platform)
+        .arg("--compression-threads")
+        .arg(&compression_threads)
+        .arg("--no-test");
+    if let Some(level) = config.compression_level {
+        cmd.arg("--package-format").arg(format!("conda:{level}"));
+    }
+    let packaging_started = std::time::Instant::now();
+    let output = cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .await
+        .context("spawning rattler-build (is it on PATH?)")?;
+    tracing::info!(
+        output = %recipe.package.name,
+        elapsed_ms = packaging_started.elapsed().as_millis() as u64,
+        compression_threads = %compression_threads,
+        compression_level = ?config.compression_level,
+        "bench: rattler-build finished",
+    );
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        tracing::error!(stdout = %stdout, stderr = %stderr, "rattler-build failed");
+        bail!("rattler-build exited with status {}", output.status);
+    }
+
+    // B-2/B-3: rattler-build succeeded -- NOW commit the courier lock.
+    let (lock_commit_path, lock_json) = courier_lock_to_commit;
+    let lock_tmp = lock_commit_path.with_extension("json.tmp");
+    tokio::fs::write(&lock_tmp, &lock_json)
+        .await
+        .with_context(|| format!("writing lock tmp {}", lock_tmp.display()))?;
+    tokio::fs::rename(&lock_tmp, &lock_commit_path)
+        .await
+        .with_context(|| {
+            format!(
+                "atomically placing committed lock {}",
+                lock_commit_path.display()
+            )
+        })?;
+    tracing::info!(path = %lock_commit_path.display(), "courier: wrote install lock (post-build)");
+
+    let subdir_dir = output_dir.join(&target_platform);
+    let output_file =
+        find_conda_artifact(&subdir_dir, &recipe.package.name, &recipe.package.version).await?;
+
+    let build = expected_build.map(|s| s.to_string()).unwrap_or_else(|| {
+        let py_short = python_version.replace('.', "");
+        format!("py{py_short}_{}", config.build_number)
+    });
+    Ok(CondaBuildV1Result {
+        output_file,
+        input_globs: Default::default(),
+        name: recipe.package.name.clone(),
+        version: VersionWithSource::from_str(&recipe.package.version)?,
+        build,
+        subdir: target_subdir,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn build_one(
     bundle: &Bundle,
@@ -3837,20 +3993,9 @@ async fn build_one(
              Remove these keys from your `[package.build.config]`.",
         );
     }
-    // WS-C: courier mode produces a metadata-only conda package. It must
-    // stage the bundle's wheels + write the committed lock BEFORE the recipe
-    // (the recipe's source list references the staged artifacts), so the
-    // courier path builds emit_wheels/conda_capable here rather than in the
-    // emit-pypi block below (which is skipped for courier). The non-courier
-    // path is byte-identical to before.
-    // B-2 (lock-poisoning): the COMMITTED pack lock must only be written after
-    // rattler-build produces the package successfully. Writing it before the
-    // build (as before) left a committed lock on disk for an output that may
-    // never have built -- a later cold replay would reproduce a phantom. The
-    // courier branch records the pending write here; it is flushed (atomically)
-    // only past the rattler-build success gate below.
-    let mut courier_lock_to_commit: Option<(std::path::PathBuf, String)> = None;
-    let recipe = if config.courier {
+    // WS-C: courier mode — delegate to materialize_and_pack which handles
+    // the full courier staging + rattler-build + deferred lock flush pipeline.
+    if config.courier {
         let python_version =
             emit_python_version(&bundle.primary.metadata.filename, workspace_python_version);
         let version = bundle.primary.metadata.version.clone();
@@ -3913,7 +4058,6 @@ async fn build_one(
                  conda/build_v1; if you hit this, file a bug.)"
             )
         })?;
-        let staging = work_dir.join(format!("courier-{}", bundle.conda_name));
         // Fingerprint folds in the conda channel list (grizzly P1) and the
         // workspace solve env (grizzly H1) alongside the config-derived
         // inputs; the replayer computes it identically.
@@ -3926,48 +4070,38 @@ async fn build_one(
             .unwrap_or_default();
         let config_fp =
             crate::courier::config_fingerprint(declared_config, &courier_channels, &workspace_fp);
-        let staged = crate::courier::stage(
+        return materialize_and_pack(
+            bundle,
             config,
             &bundle.conda_name,
             &version,
             &python_version,
-            &emit_wheels,
-            &conda_capable,
-            &run_deps,
-            &index_urls,
+            emit_wheels,
+            conda_capable,
+            run_deps,
+            index_urls,
             &config_fp,
+            work_dir,
+            output_dir,
+            target_subdir,
             source_dir,
-            &staging,
-        )
-        .await
-        .context("courier staging")?;
-        // Defer the committed install lock write until after a successful
-        // rattler-build (B-2). The staged copy inside `staging` is already in
-        // the recipe's source list; this is the authoritative pack-dir copy.
-        let lock_path = source_dir.join(crate::lock::RetreadLock::file_name(&bundle.conda_name));
-        courier_lock_to_commit = Some((lock_path, staged.lock.to_pretty_json()?));
-        build_courier_recipe(
-            &bundle.conda_name,
-            &version,
-            &python_version,
-            &staged.run_deps,
-            &staged.source_urls,
-            // Thread the content-addressed build string into the recipe so
-            // the on-disk artifact name matches what conda/outputs advertised.
             expected_build,
         )
-    } else {
-        build_bundle_recipe(
-            &bundle.conda_name,
-            &sources,
-            config,
-            workspace_python_version,
-            run_override,
-            // blueprint="only" payload-skip is deprecated (v2.0.0); the
-            // non-courier conda path always carries its wheel payload.
-            true,
-        )?
-    };
+        .await
+        .context("courier materialize_and_pack");
+    }
+
+    // Non-courier path: build a bundled conda package with the wheel payload.
+    let recipe = build_bundle_recipe(
+        &bundle.conda_name,
+        &sources,
+        config,
+        workspace_python_version,
+        run_override,
+        // blueprint="only" payload-skip is deprecated (v2.0.0); the
+        // non-courier conda path always carries its wheel payload.
+        true,
+    )?;
     let yaml = to_yaml(&recipe)?;
 
     let recipe_dir = work_dir.join(format!("recipe-{}", recipe.package.name));
@@ -4024,10 +4158,7 @@ async fn build_one(
     if let Some(level) = config.compression_level {
         cmd.arg("--package-format").arg(format!("conda:{level}"));
     }
-    // v1.6.0: time the packaging stage explicitly. The 2026-06-11
-    // benchmark review flagged that the gap between "wrote audit" and
-    // pixi's own progress lines was unattributed; this is the number
-    // that proves (or disproves) where build wall-clock goes.
+    // v1.6.0: time the packaging stage explicitly.
     let packaging_started = std::time::Instant::now();
     let output = cmd
         .stdin(std::process::Stdio::null())
@@ -4048,23 +4179,6 @@ async fn build_one(
         let stderr = String::from_utf8_lossy(&output.stderr);
         tracing::error!(stdout = %stdout, stderr = %stderr, "rattler-build failed");
         bail!("rattler-build exited with status {}", output.status);
-    }
-
-    // B-2/B-3: rattler-build succeeded -- NOW commit the courier lock, write-
-    // then-rename so a crash can't leave a torn file. Only ever reached past
-    // the success gate, so the committed lock always corresponds to a package
-    // that actually built.
-    if let Some((lock_path, lock_json)) = courier_lock_to_commit {
-        let lock_tmp = lock_path.with_extension("json.tmp");
-        tokio::fs::write(&lock_tmp, &lock_json)
-            .await
-            .with_context(|| format!("writing lock tmp {}", lock_tmp.display()))?;
-        tokio::fs::rename(&lock_tmp, &lock_path)
-            .await
-            .with_context(|| {
-                format!("atomically placing committed lock {}", lock_path.display())
-            })?;
-        tracing::info!(path = %lock_path.display(), "courier: wrote install lock (post-build)");
     }
 
     let subdir_dir = output_dir.join(&target_platform);
