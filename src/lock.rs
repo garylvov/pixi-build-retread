@@ -109,7 +109,7 @@ pub const SCHEMA: u32 = 4;
 /// silent stale-cache reuse for consumers (expensive, invisible).
 /// SCHEMA = on-disk lock FORMAT; EMIT_EPOCH = emitted-output SEMANTICS for
 /// identical inputs -- bump independently.
-pub const EMIT_EPOCH: u32 = 1;
+pub const EMIT_EPOCH: u32 = 2;
 
 impl RetreadLock {
     /// File name for a bundle's lock next to the pack manifest.
