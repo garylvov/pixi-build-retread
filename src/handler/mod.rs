@@ -3471,8 +3471,13 @@ fn produce_output(
     let python_version =
         emit_python_version(&bundle.primary.metadata.filename, workspace_python_version);
     // If ANY wheel in the bundle is platform-specific, the output is too.
+    // Courier packages are ALWAYS platform-specific even with all-pure-python
+    // wheels: they ship the native `retread` installer binary + a
+    // python-specific committed lock, and the courier recipe is hardcoded
+    // `noarch: None`. Advertising noarch here would make pixi request a
+    // noarch build that rattler-build rejects ("--target-platform noarch").
     let any_platform_specific = bundle.all_wheels().any(|w| !w.metadata.is_pure_python);
-    let subdir = if any_platform_specific {
+    let subdir = if any_platform_specific || config.courier {
         host_platform
     } else {
         Platform::NoArch
@@ -3629,7 +3634,9 @@ fn produce_output(
     let name = PackageName::new_unchecked(bundle.conda_name.clone());
     let version = VersionWithSource::from_str(&bundle.primary.metadata.version)
         .map_err(|e| anyhow!("parsing version `{}`: {e}", bundle.primary.metadata.version))?;
-    let noarch = if any_platform_specific {
+    // Courier is never noarch (see the subdir note above): keep metadata
+    // consistent with the platform-specific courier recipe.
+    let noarch = if any_platform_specific || config.courier {
         NoArchType::none()
     } else {
         NoArchType::python()
@@ -4136,21 +4143,12 @@ fn replay_from_lock(
     // at this point, so either is the correct hash to embed.
     let build = courier_build_string(&py_short, current_inputs_hash, build_number);
 
-    // Determine subdir from wheel filenames (same logic as produce_output).
-    let any_platform_specific = lock
-        .wheels
-        .iter()
-        .any(|w| !crate::wheel::is_pure_python_wheel_filename(&w.filename));
-    let subdir = if any_platform_specific {
-        host_platform
-    } else {
-        Platform::NoArch
-    };
-    let noarch = if any_platform_specific {
-        NoArchType::none()
-    } else {
-        NoArchType::python()
-    };
+    // Courier (replay is courier-only) is ALWAYS platform-specific: the
+    // package ships the native `retread` installer binary + a python-specific
+    // lock, and the recipe is `noarch: None`. Never advertise noarch -- pixi
+    // would request a noarch build that rattler-build rejects.
+    let subdir = host_platform;
+    let noarch = NoArchType::none();
 
     // Python host + run dep strings.
     let python_dep = if python_version.contains('*') {
@@ -4312,8 +4310,9 @@ mod replay_tests {
         // Name and version round-trip.
         assert_eq!(out.metadata.name.as_normalized(), "mypack");
         assert_eq!(out.metadata.version.version().to_string(), "1.2.3");
-        // Pure-python wheel -> noarch output.
-        assert_eq!(out.metadata.subdir, Platform::NoArch);
+        // Courier replay is always platform-specific (ships the native
+        // installer + python-specific lock), even for pure-python wheels.
+        assert_eq!(out.metadata.subdir, Platform::Linux64);
         // run_dependencies includes python and the replayed conda dep.
         let dep_names: Vec<&str> = out
             .run_dependencies
