@@ -1,10 +1,10 @@
 {
   "schema": 4,
-  "retread_version": "2.1.2",
+  "retread_version": "2.2.0",
   "bundle": "isaac-pack-6",
   "version": "6.0.0.1",
   "python": "3.12",
-  "inputs_hash": "39ae3750b2ddec8bf933280b87dd1cdf695d9f8bec0a34eddb6c18e616d30b9f",
+  "inputs_hash": "05a92c7cb710c28fb27e081fc507f829dc9fbac3f73e09965276683c69f787cd",
   "root_requirements": [
     "isaac-pack-6-pypi==6.0.0.1"
   ],
@@ -380,8 +380,7 @@
       "name": "six",
       "version": "1.17.0",
       "origin": "index",
-      "filename": "six-1.17.0-py2.py3-none-any.whl",
-      "url": "https://files.pythonhosted.org/packages/b7/ce/149a00dd41f10bc29e5921b496af8b574d8413afcd5e30dfa0ed46c2cc5e/six-1.17.0-py2.py3-none-any.whl#sha256=4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274"
+      "filename": "six-1.17.0-py2.py3-none-any.whl"
     },
     {
       "name": "scipy",
@@ -693,6 +692,10 @@
     {
       "name": "uv",
       "spec": ""
+    },
+    {
+      "name": "python_abi",
+      "spec": "3.12.* *_cp312"
     },
     {
       "name": "python_abi",
