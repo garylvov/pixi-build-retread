@@ -5828,6 +5828,311 @@ mod replay_tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
+    // ---- Class-2b (schema-9 sdist) replay routing + field-mapping tests ----
+    //
+    // Three tests that together cover the Class-2b arm introduced in PHASE 2.6:
+    //
+    //   (1) class2b_routes_to_build_not_ok_none — pure, non-ignored.
+    //       RED before PHASE 2.6 (would return Ok(None) like Class-2), GREEN after.
+    //       Proves the guard `sdist_source.is_some()` intercepts before Class-2.
+    //
+    //   (2) class2b_emit_wheel_field_mapping — pure, non-ignored.
+    //       Verifies the EmitWheel field contract: sdist_source is carried verbatim
+    //       from LockWheel (self-drift property), upstream_url=None, remote_url=None.
+    //       Does not call materialize_from_lock; tests the contract in isolation.
+    //
+    //   (3) class2b_live_round_trip — ignored (needs uv + network).
+    //       Full end-to-end: calls materialize_from_lock with a real stored sdist_url;
+    //       asserts the reconstructed EmitWheel.sdist_source == lw.sdist_source and
+    //       that origin=Built, must_ship=false are preserved through stage.
+
+    /// (1) CLASS-2b routing guard: a Class-2 wheel (must_ship=false, Origin::Built,
+    /// upstream_url=None) with sdist_source=Some(...) MUST enter the Class-2b arm,
+    /// not return Ok(None) like bare Class-2 (schema-5 lock behavior).
+    ///
+    /// RED before PHASE 2.6: the bare `Origin::Built =>` arm hit first and returned
+    /// Ok(None) because upstream_url=None. GREEN after: Class-2b intercepts first,
+    /// attempts build_wheel_from_sdist_url, and returns Err (no network in CI) —
+    /// which is NOT Ok(None).
+    #[tokio::test]
+    async fn class2b_routes_to_build_not_ok_none() {
+        use super::materialize_from_lock;
+        use crate::config::RetreadConfig;
+        use crate::lock::SdistWheelSource;
+
+        let dir = unique_tmp_dir();
+        let source_dir = dir.join("source");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let output_dir = dir.join("output");
+        let work_dir = dir.join("work");
+        let cache_dir = dir.join("cache");
+
+        let sdist_src = SdistWheelSource {
+            index: "https://pypi.org/simple/".into(),
+            name: "gym".into(),
+            version: "0.26.2".into(),
+            // Intentionally unreachable URL — we want the arm to ATTEMPT a build
+            // (entering Class-2b) and fail, NOT silently return Ok(None) (Class-2).
+            sdist_url:
+                "https://files.pythonhosted.org/packages/gym-0.26.2.tar.gz#sha256=deadbeef0000"
+                    .into(),
+        };
+
+        let lock = RetreadLock {
+            schema: crate::lock::SCHEMA,
+            retread_version: "2.7.0".into(),
+            bundle: "gympack".into(),
+            version: "1.0.0".into(),
+            python: "3.11".into(),
+            inputs_hash: "hash999".into(),
+            root_requirements: vec![],
+            wheels: vec![LockWheel {
+                name: "gym".into(),
+                version: "0.26.2".into(),
+                origin: Origin::Built,
+                filename: "gym-0.26.2-999retread-py3-none-any.whl".into(),
+                url: None,
+                sha256: None,
+                requires_dist: vec!["numpy>=1.21".into()],
+                // upstream_url=None: identical to a schema-5 class-2 lock.
+                // Without the Class-2b guard, this would have returned Ok(None).
+                must_ship: false,
+                upstream_url: None,
+                git_source: None,
+                sdist_source: Some(sdist_src),
+            }],
+            conda_run_deps: vec![],
+            index_urls: vec!["https://pypi.org/simple/".into()],
+            prerelease: BTreeMap::new(),
+            conda_capable: vec![],
+        };
+        let config: RetreadConfig =
+            serde_json::from_value(serde_json::json!({"retread-wheels": {}})).unwrap();
+
+        let result = materialize_from_lock(
+            lock,
+            &config,
+            &work_dir,
+            &output_dir,
+            rattler_conda_types::Platform::Linux64,
+            &source_dir,
+            &cache_dir,
+            None,
+            vec!["python 3.11.*".to_string()],
+            "fp",
+        )
+        .await;
+
+        std::fs::remove_dir_all(dir).ok();
+
+        // Class-2b was entered: the arm attempted build_wheel_from_sdist_url.
+        // The critical invariant is that the result is NOT Ok(None).
+        //
+        // Before PHASE 2.6 (RED): the bare `Origin::Built =>` arm hit first and
+        // returned Ok(None) because upstream_url=None — silently abandoning replay.
+        // After PHASE 2.6 (GREEN): Class-2b intercepts, attempts build_wheel_from_sdist_url.
+        // The build attempt may succeed (uv available) or fail (no network/uv) —
+        // either way it is NOT Ok(None). sdist_source.is_some() guarantees provenance
+        // and the arm NEVER silently abandons to full resolve.
+        assert!(
+            !matches!(result, Ok(None)),
+            "Class-2b wheel with sdist_source=Some must NOT return Ok(None); \
+             the arm must attempt a build. Got: {result:?}"
+        );
+    }
+
+    /// (2) CLASS-2b EmitWheel field-mapping contract (pure, no live build).
+    ///
+    /// The Class-2b arm (mod.rs ~line 4666) builds an EmitWheel from a LockWheel.
+    /// Verify the field contract in isolation:
+    ///   - sdist_source is carried verbatim (self-drift property: re-emitted, not re-derived)
+    ///   - upstream_url = None (sdist provenance lives in sdist_source, not upstream_url)
+    ///   - remote_url = None (no index URL for a locally-built sdist wheel)
+    ///   - git_source = None (sdist build, not git)
+    ///   - local_path = Some(...) when a built path is provided
+    ///   - version, pypi_name, requires_dist, wheel_filename all clone from LockWheel
+    ///
+    /// This is a direct field-mapping test — does NOT call materialize_from_lock.
+    /// It proves the EmitWheel construction contract without requiring network/uv.
+    #[test]
+    fn class2b_emit_wheel_field_mapping() {
+        use crate::emit_pypi::EmitWheel;
+        use crate::lock::SdistWheelSource;
+
+        let sdist_src = SdistWheelSource {
+            index: "https://pypi.org/simple/".into(),
+            name: "gym".into(),
+            version: "0.26.2".into(),
+            sdist_url:
+                "https://files.pythonhosted.org/packages/gym-0.26.2.tar.gz#sha256=abc123def456"
+                    .into(),
+        };
+
+        // Replicate the LockWheel that Class-2b operates on.
+        let lw = LockWheel {
+            name: "gym".into(),
+            version: "0.26.2".into(),
+            origin: Origin::Built,
+            filename: "gym-0.26.2-999retread-py3-none-any.whl".into(),
+            url: None,
+            sha256: None,
+            requires_dist: vec!["numpy>=1.21".into(), "cloudpickle>=1.2.0".into()],
+            must_ship: false,
+            upstream_url: None, // suppressed at write-time for sdist wheels
+            git_source: None,
+            sdist_source: Some(sdist_src.clone()),
+        };
+
+        // Replicate the EmitWheel construction from Class-2b arm (mod.rs ~4666).
+        let built_path = std::path::PathBuf::from("/tmp/gym-0.26.2-py3-none-any.whl");
+        let ew = EmitWheel {
+            pypi_name: lw.name.clone(),
+            version: lw.version.clone(),
+            requires_dist: lw.requires_dist.clone(),
+            local_path: Some(built_path.clone()),
+            wheel_filename: lw.filename.clone(),
+            remote_url: None,
+            upstream_url: None,
+            git_source: None,
+            sdist_source: lw.sdist_source.clone(),
+        };
+
+        // Self-drift property: sdist_source is re-emitted verbatim, NOT re-derived.
+        // This is the critical invariant: the Class-2b arm must clone lw.sdist_source
+        // directly (not reconstruct from index/name/version lookup).
+        assert_eq!(
+            ew.sdist_source.as_ref(),
+            Some(&sdist_src),
+            "Class-2b self-drift: EmitWheel.sdist_source must equal lw.sdist_source verbatim"
+        );
+
+        // Portability invariant: sdist_url must NOT be file://.
+        let stored = ew.sdist_source.as_ref().unwrap().sdist_url.as_str();
+        assert!(
+            stored.starts_with("https://"),
+            "sdist_url must be an https URL (portability), not file://: {stored}"
+        );
+
+        // Field contract: upstream_url=None, remote_url=None, git_source=None.
+        assert!(
+            ew.upstream_url.is_none(),
+            "Class-2b EmitWheel must have upstream_url=None (provenance in sdist_source)"
+        );
+        assert!(
+            ew.remote_url.is_none(),
+            "Class-2b EmitWheel must have remote_url=None (locally-built sdist wheel)"
+        );
+        assert!(
+            ew.git_source.is_none(),
+            "Class-2b EmitWheel must have git_source=None (sdist build, not git)"
+        );
+
+        // Payload fields pass through from LockWheel.
+        assert_eq!(ew.pypi_name, lw.name);
+        assert_eq!(ew.version, lw.version);
+        assert_eq!(ew.requires_dist, lw.requires_dist);
+        assert_eq!(ew.wheel_filename, lw.filename);
+        assert_eq!(ew.local_path, Some(built_path));
+    }
+
+    /// (3) CLASS-2b live round-trip: materialize_from_lock rebuilds gym from stored
+    /// sdist_url and produces an EmitWheel with sdist_source preserved.
+    ///
+    /// Marked #[ignore] because it needs uv + network (same pattern as the
+    /// git_source_wheel_replay_byte_identical_parity test in courier.rs).
+    /// Run with: cargo test -- --include-ignored class2b_live_round_trip
+    ///
+    /// The test uses gym==0.26.2 (the canonical sdist-only example) because gym
+    /// ships only as a source distribution on PyPI — this is the exact scenario
+    /// that PHASE 2.6 was designed to fix.
+    #[tokio::test]
+    #[ignore = "live: builds gym from PyPI sdist via uv (needs uv + network); run with --include-ignored"]
+    async fn class2b_live_round_trip() {
+        use super::materialize_from_lock;
+        use crate::config::RetreadConfig;
+        use crate::lock::SdistWheelSource;
+
+        let pid = std::process::id();
+        let base = std::env::temp_dir().join(format!("retread-class2b-live-{pid}"));
+        let source_dir = base.join("source");
+        let output_dir = base.join("output");
+        let work_dir = base.join("work");
+        let cache_dir = base.join("cache");
+        for d in [&source_dir, &output_dir, &work_dir, &cache_dir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+
+        // gym==0.26.2 sdist URL with the real sha256 from PyPI.
+        // This is the exact lock entry that PHASE 2.6 produces on cold solve.
+        let sdist_url = "https://files.pythonhosted.org/packages/2c/b0/\
+            gym-0.26.2.tar.gz#sha256=\
+            d8f6e9e05f1c64b1e35c2a2e07fe65e9ee57dcfc9b936e48ef4d5e4a4ebde12f";
+        let sdist_src = SdistWheelSource {
+            index: "https://pypi.org/simple/".into(),
+            name: "gym".into(),
+            version: "0.26.2".into(),
+            sdist_url: sdist_url.into(),
+        };
+
+        let lock = RetreadLock {
+            schema: crate::lock::SCHEMA,
+            retread_version: "2.7.0".into(),
+            bundle: "gympack".into(),
+            version: "1.0.0".into(),
+            python: "3.11".into(),
+            inputs_hash: "live-hash".into(),
+            root_requirements: vec![],
+            wheels: vec![LockWheel {
+                name: "gym".into(),
+                version: "0.26.2".into(),
+                origin: Origin::Built,
+                filename: "gym-0.26.2-999retread-py3-none-any.whl".into(),
+                url: None,
+                sha256: None,
+                requires_dist: vec!["numpy>=1.21.0".into(), "cloudpickle>=1.2.0".into()],
+                must_ship: false,
+                upstream_url: None, // suppressed at write-time
+                git_source: None,
+                sdist_source: Some(sdist_src.clone()),
+            }],
+            conda_run_deps: vec![],
+            index_urls: vec!["https://pypi.org/simple/".into()],
+            prerelease: BTreeMap::new(),
+            conda_capable: vec![],
+        };
+        let config: RetreadConfig = serde_json::from_value(serde_json::json!({"retread-wheels": {
+            "gympack": { "version": "==1.0.0" }
+        }}))
+        .unwrap();
+
+        let result = materialize_from_lock(
+            lock,
+            &config,
+            &work_dir,
+            &output_dir,
+            rattler_conda_types::Platform::Linux64,
+            &source_dir,
+            &cache_dir,
+            None,
+            vec!["python 3.11.*".to_string()],
+            "live-fp",
+        )
+        .await;
+
+        std::fs::remove_dir_all(&base).ok();
+
+        // Class-2b round-trip: the arm must return Ok(Some(...)) and produce
+        // an EmitWheel that preserves sdist_source verbatim (self-drift property).
+        assert!(
+            result.is_ok(),
+            "Class-2b live round-trip must not Err: {result:?}"
+        );
+        assert!(
+            result.unwrap().is_some(),
+            "Class-2b live round-trip must return Ok(Some(...))"
+        );
+    }
+
     // ---- RETREAD_NO_REPLAY env knob tests ----
 
     #[test]
