@@ -4108,6 +4108,32 @@ async fn materialize_from_lock(
                     url = %remote_url,
                     "courier replay: re-fetching relax-changed shadow from upstream (class 2)"
                 );
+                // SAFETY INVARIANT: local_path is intentionally None here.
+                //
+                // A Class-2 shadow is an Origin::Built wheel whose upstream
+                // source was an index URL (the relax pass rewrote it, but no
+                // `.injected` infix was added). The byte-identity of the
+                // index-wheel replay therefore rests on the following invariant:
+                //
+                //   "An Origin::Index wheel, or a relax-changed index shadow
+                //    (Origin::Built && !must_ship), is NEVER the target of a
+                //    direct-URL Requires-Dist line."
+                //
+                // plan() in emit_pypi.rs reads local_path ONLY inside the
+                // direct-URL ship-set insert (the `target.local_path.is_some()`
+                // branch at the Pass-1 URL-target loop). Because index shadows
+                // are never direct-URL targets, their local_path is never
+                // consulted by plan(), so setting it to None here is safe: the
+                // wheel will be fetched from remote_url at install time and the
+                // emitted pixi manifest will carry the correct exact-pin from
+                // the `exact` map, not a bundled-file reference.
+                //
+                // A debug_assert in plan() (emit_pypi.rs) enforces this
+                // invariant at test time: when a wheel enters the ship set via
+                // the local_path gate, its remote_url must be None -- index
+                // shadows carry remote_url instead of local_path, so a wheel
+                // with both set would signal that a future code path
+                // accidentally made an index shadow a direct-URL target.
                 crate::emit_pypi::EmitWheel {
                     pypi_name: lw.name.clone(),
                     version: lw.version.clone(),

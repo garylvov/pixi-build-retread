@@ -225,6 +225,30 @@ pub fn plan(wheels: &[EmitWheel], conda_capable: &std::collections::HashSet<Stri
                 Some(target) => {
                     exact.insert(name.clone(), format!("=={}", target.version));
                     if target.local_path.is_some() {
+                        // Invariant: a wheel that enters the ship set via the
+                        // local_path gate must NOT simultaneously carry a
+                        // remote_url. Index-origin wheels and relax-changed
+                        // index shadows (Origin::Built && !must_ship) are
+                        // reconstructed with local_path:None and
+                        // remote_url:Some(...) in the Class-2 arm of
+                        // materialize_from_lock (handler/mod.rs), so they
+                        // never reach this branch. Wheels that ARE here have
+                        // either been retread-built (.injected, remote_url:None)
+                        // or locally materialized from a direct url= source
+                        // (also remote_url:None). If remote_url.is_some() here
+                        // it means a future code path set local_path on an
+                        // index-origin wheel and forgot to clear remote_url,
+                        // which would corrupt the manifest by bundling a wheel
+                        // the index should serve.
+                        debug_assert!(
+                            target.remote_url.is_none(),
+                            "emit-pypi invariant violated: wheel `{}` is a direct-URL \
+                             Requires-Dist target with local_path set but also has \
+                             remote_url set -- index-origin / relax-changed index shadows \
+                             must never be direct-URL targets (they carry remote_url \
+                             instead of local_path)",
+                            target.pypi_name
+                        );
                         ship.insert(name);
                     }
                 }
