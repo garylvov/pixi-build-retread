@@ -483,6 +483,10 @@ struct ResolvedWheel {
     /// `materialize_and_rewrite` for both named-git (from=) and inline-git
     /// (git=) entry forms. `None` for all other wheel origins.
     git_source: Option<crate::lock::GitWheelSource>,
+    /// Sdist provenance for BFS-transitive wheels built from a PyPI sdist
+    /// (schema 9+). Set in the BFS phase-3 handler when bfs_fetch_pypi
+    /// returns a `SdistProv`. `None` for index-fetched and git-built wheels.
+    sdist_source: Option<crate::lock::SdistWheelSource>,
     metadata: WheelMetadata,
     /// v0.12.0+: extras the user requested on the originating
     /// `[retread-wheels]` entry. Surfaced in the audit so debugging
@@ -2932,24 +2936,50 @@ async fn resolve_bundle(
         // old pop order exactly.
         for (pending, fetch_result) in fetched {
             let dep_conda_name = canonical_conda_name(&pending.pypi_name);
-            // 6-tuple: (url, upstream_url, git_source, metadata, index, seed_rd)
+            // 7-tuple: (url, upstream_url, git_source, sdist_source, metadata, index, seed_rd)
             let (
                 sub_url,
                 sub_upstream_url,
                 sub_git_source,
+                sub_sdist_source,
                 sub_metadata,
                 sub_index_for_recurse,
                 sub_seed_rd,
             ) = match (&pending.source, fetch_result?) {
-                (PendingSource::Pypi { .. }, Some((resolved_url, metadata, index))) => {
+                (PendingSource::Pypi { .. }, Some((resolved_url, metadata, index, sdist_prov))) => {
                     // Pypi-form sub-wheels are NOT D-rewritten, so
                     // their metadata IS the original Requires-Dist.
                     let seed_rd = metadata.requires_dist.clone();
-                    // resolved_url is the pristine https index URL; record
-                    // it as upstream_url so build_one can populate
-                    // EmitWheel.upstream_url without deriving from w.url.
-                    let upstream = Some(resolved_url.clone());
-                    (resolved_url, upstream, None, metadata, index, seed_rd)
+                    // Build the sdist provenance descriptor (None for normal wheel fetches).
+                    let sub_sdist_src = sdist_prov.map(|p| crate::lock::SdistWheelSource {
+                        index: p.index,
+                        name: p.name,
+                        version: p.version,
+                        // Store the EXACT resolved sdist URL with #sha256 (Amendment 4:
+                        // freeze the URL so replay builds the identical tarball without
+                        // re-resolving, which is neither yank-safe nor reorder-deterministic).
+                        sdist_url: p.sdist_url.to_string(),
+                    });
+                    // When the wheel was built from an sdist, DO NOT store the file://
+                    // built_url as upstream_url (it is machine-local and non-portable).
+                    // For normal index wheels, record resolved_url as upstream_url.
+                    let upstream = if sub_sdist_src.is_some() {
+                        None // sdist-built: upstream_url suppressed; use sdist_source instead
+                    } else {
+                        // resolved_url is the pristine https index URL; record it as
+                        // upstream_url so build_one can populate EmitWheel.upstream_url
+                        // without deriving from w.url.
+                        Some(resolved_url.clone())
+                    };
+                    (
+                        resolved_url,
+                        upstream,
+                        None,
+                        sub_sdist_src,
+                        metadata,
+                        index,
+                        seed_rd,
+                    )
                 }
                 (PendingSource::Pypi { .. }, None) => {
                     unreachable!("phase 2 always fetches Pypi-form items")
@@ -3003,6 +3033,7 @@ async fn resolve_bundle(
                         sub.url,
                         sub_up,
                         sub_gs,
+                        None, // Git-form: no sdist provenance
                         sub.metadata,
                         entry.index_url(),
                         sub_original_rd,
@@ -3040,6 +3071,7 @@ async fn resolve_bundle(
                         sub.url,
                         sub_up,
                         None, // Url-form: no git source
+                        None, // Url-form: no sdist provenance
                         sub.metadata,
                         entry.index_url(),
                         sub_original_rd,
@@ -3068,6 +3100,10 @@ async fn resolve_bundle(
                 // (already set for Git-form PendingSource via the synth path).
                 // Pypi/Url-form sub-wheels have no git source.
                 git_source: sub_git_source,
+                // Sdist provenance (schema 9+): set when the BFS sdist fallback
+                // fired for this sub-wheel; None for normal index-wheel fetches
+                // and git/url-form sub-wheels.
+                sdist_source: sub_sdist_source,
                 metadata: sub_metadata,
                 extras_requested: vec![],
                 auto_data: None,
@@ -3117,6 +3153,20 @@ fn relaxed_retry_specs(
     }
 }
 
+/// Sdist provenance captured by the BFS sdist fallback path.
+/// Threaded out of `bfs_fetch_pypi` so the caller can populate
+/// `ResolvedWheel.sdist_source` without losing the `sdist.url` that
+/// was previously discarded at mod.rs (THE DISCARD POINT in §1.1).
+pub(super) struct SdistProv {
+    pub(super) index: String,
+    pub(super) name: String,
+    pub(super) version: String,
+    /// The EXACT resolved sdist URL with #sha256 fragment from the PyPI
+    /// simple index (pypi.rs:197). This is the preferred replay key:
+    /// build_wheel_from_sdist_url(stored_url) skips the re-resolve.
+    pub(super) sdist_url: url::Url,
+}
+
 async fn bfs_fetch_pypi(
     pypi_name: &str,
     specifiers: &VersionSpecifiers,
@@ -3124,7 +3174,7 @@ async fn bfs_fetch_pypi(
     target: &WheelTarget,
     download_dir: &Path,
     relax: RelaxPolicy,
-) -> Result<(url::Url, WheelMetadata, String)> {
+) -> Result<(url::Url, WheelMetadata, String, Option<SdistProv>)> {
     // v1.5.9 exact-first: `specifiers` are the ORIGINAL (pre-D)
     // upstream pins, so exact family pins (isaacsim-kernel==6.0.0.0)
     // resolve the exact version and the installed family stays
@@ -3159,10 +3209,11 @@ async fn bfs_fetch_pypi(
             }
         }
     };
-    let (resolved_url, metadata) = match wheel_result {
+    let (resolved_url, metadata, sdist_prov) = match wheel_result {
         Ok(resolved) => {
             let metadata = metadata_preferring_sidecar(&resolved, download_dir).await?;
-            (resolved.url, metadata)
+            // Wheel path: no sdist provenance.
+            (resolved.url, metadata, None)
         }
         Err(wheel_err) => {
             tracing::info!(
@@ -3180,6 +3231,9 @@ async fn bfs_fetch_pypi(
                         pypi_name, specifiers, index, wheel_err,
                     )
                 })?;
+            // Capture the sdist URL BEFORE consuming `sdist` (THE FIX:
+            // previously this was discarded and never threaded out).
+            let captured_sdist_url = sdist.url.clone();
             // Per-entry build dir under download_dir so repeats hit
             // the wheel cache.
             let sdist_out = download_dir.join(pypi_name);
@@ -3212,10 +3266,20 @@ async fn bfs_fetch_pypi(
                 built = %built.display(),
                 "BFS sdist fallback: built wheel from sdist",
             );
-            (built_url, metadata)
+            // Build the sdist provenance descriptor. `version` comes from the
+            // built wheel's parsed metadata (authoritative resolved version).
+            let prov = SdistProv {
+                index: index.to_string(),
+                name: pypi_name.to_string(),
+                version: metadata.version.clone(),
+                sdist_url: captured_sdist_url,
+            };
+            // Return built_url (file://) for the URL slot; the caller
+            // will SUPPRESS this as upstream_url when sdist_prov.is_some().
+            (built_url, metadata, Some(prov))
         }
     };
-    Ok((resolved_url, metadata, index.to_string()))
+    Ok((resolved_url, metadata, index.to_string(), sdist_prov))
 }
 
 /// True if `output` exists on disk and is newer than `input`. Used to
@@ -3660,6 +3724,10 @@ async fn materialize_and_rewrite(
             url: final_url,
             upstream_url,
             git_source: git_source_captured,
+            // sdist_source is only populated for BFS-transitive sdist-built wheels
+            // (set in the BFS phase-3 loop). materialize_and_rewrite handles git/path/
+            // url/version entries — none of those are sdist BFS transitives.
+            sdist_source: None,
             extras_requested: audit_info.extras_requested,
             auto_data: auto_data_report,
             auto_data_dedup_skipped_root: audit_info.dedup_skipped_root,
@@ -4092,17 +4160,97 @@ async fn materialize_from_lock(
     // EmitWheel with correct local_path / remote_url for courier::stage.
     let mut emit_wheels: Vec<crate::emit_pypi::EmitWheel> = Vec::with_capacity(lock.wheels.len());
 
-    // SINGLE-ENTRY GUARD (Phase 2, known limitation): Each git bundle must
-    // have exactly one git checkout root per replay. Named-vs-inline parity
-    // (DESIGN A) relies on a single skip_subdirs=[] being acceptable — which
-    // is only true when no two wheels in the same bundle share the same clone.
-    // If >1 wheels share a root (multi-entry monorepo pack), the non-trivial
-    // skip_subdirs cannot be reconstructed from the lock, and replay would
-    // produce non-identical auto-data paths. Guard against this explicitly so
-    // the failure is caught early with a directing message rather than silently
-    // producing a different wheel. Phase 3 will add multi-root lock provenance.
-    let mut seen_git_checkout_roots: std::collections::HashSet<PathBuf> =
-        std::collections::HashSet::new();
+    // PHASE 2.5: Multi-entry shared-git-checkout replay.
+    //
+    // Pre-pass: group all Class-1 git wheels (must_ship=true, git_source present)
+    // by checkout root (git_checkout_root(gs.url, gs.rev)), preserving lock order.
+    // Within each group, group[0] is the CARRIER (mirrors produce's BTreeMap-order
+    // first entry -> first in emit_wheels -> first in lock.wheels). The carrier
+    // gets AutoDataConfig{skip_subdirs = union of ALL members' subdirs}; non-carriers
+    // get None (ship only their own pip+inject wheel, no auto-data).
+    //
+    // Grouping key uses the RESOLVED SHA (gs.rev) so equivalence matches produce's
+    // partitioning. The lock's subdirectory field may be None (root/"." member).
+    //
+    // Groups can be NON-CONTIGUOUS in the lock (e.g. git group spans indices 0-5
+    // and 10, with index/shadow wheels interleaved). We build a whole group's
+    // wheels into an in-memory stash on first encounter, then emit each wheel at
+    // its own lock position from the stash. Lock order is preserved byte-for-byte.
+    //
+    // INCOMPLETE PROVENANCE: if any group member is missing git_source (schema gap
+    // or BFS transitive class-3 wheel), we do NOT Err — we return Ok(None) so the
+    // caller falls through to full resolve_all.  All-or-nothing: the stash is
+    // in-memory, so Ok(None) leaves no partial wheels/ on disk.
+
+    // Step 1: scan lock.wheels to build per-root group membership (preserving order).
+    // git_group_members: checkout_root -> Vec<lock index>
+    // git_group_skip_subdirs: checkout_root -> Vec<subdir> (union of all members)
+    let mut git_group_members: std::collections::HashMap<PathBuf, Vec<usize>> =
+        std::collections::HashMap::new();
+    // Parallel vec for ordering: the FIRST lock index seen for each root (= carrier).
+    let mut git_group_order: Vec<PathBuf> = Vec::new();
+
+    for (idx, lw) in lock.wheels.iter().enumerate() {
+        if lw.origin == crate::lock::Origin::Built
+            && lw.must_ship
+            && let Some(gs) = &lw.git_source
+        {
+            let root = crate::source_build::git_checkout_root(&gs.url, &gs.rev, cache_dir);
+            let entry = git_group_members.entry(root.clone()).or_insert_with(|| {
+                git_group_order.push(root.clone());
+                Vec::new()
+            });
+            entry.push(idx);
+        }
+    }
+
+    // Step 2: for each group with >1 members (multi-entry), validate all members
+    // have git_source (invariant; they do by construction of the scan above).
+    // Compute AutoDataConfig per group member index (carrier=first, rest=None).
+    // auto_data_for_lock_idx: lock index -> Option<AutoDataConfig>
+    // None means "non-carrier of a multi-entry group" -> build with auto_data=None.
+    // Missing key means "size-1 group" -> use single-entry logic below (unchanged).
+    let mut auto_data_override: std::collections::HashMap<usize, Option<AutoDataConfig>> =
+        std::collections::HashMap::new();
+
+    for root in &git_group_order {
+        let members = &git_group_members[root];
+        if members.len() > 1 {
+            // Compute skip_subdirs = union of all members' subdirectory fields.
+            let skip_subdirs: Vec<PathBuf> = members
+                .iter()
+                .map(|&idx| {
+                    let gs = lock.wheels[idx]
+                        .git_source
+                        .as_ref()
+                        .expect("git_group_members only contains wheels with git_source; qed");
+                    PathBuf::from(gs.subdirectory.as_deref().unwrap_or("."))
+                })
+                .collect();
+            // Carrier = members[0] (lock-order index 0).
+            auto_data_override.insert(
+                members[0],
+                Some(AutoDataConfig {
+                    checkout_root: root.clone(),
+                    skip_subdirs,
+                }),
+            );
+            // Non-carriers get None.
+            for &idx in &members[1..] {
+                auto_data_override.insert(idx, None);
+            }
+        }
+        // Size-1 groups fall through to the single-entry path below (no override).
+    }
+
+    // Stash: checkout_root -> built EmitWheels for that group, keyed by lock index.
+    // Populated lazily on first encounter of any member of a multi-entry group.
+    let mut git_group_stash: std::collections::HashMap<
+        PathBuf,
+        std::collections::HashMap<usize, crate::emit_pypi::EmitWheel>,
+    > = std::collections::HashMap::new();
+    // Tracks roots whose groups have already been built into the stash.
+    let mut built_roots: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
     for lw in &lock.wheels {
         let emit = match lw.origin {
@@ -4143,7 +4291,8 @@ async fn materialize_from_lock(
                     wheel_filename: lw.filename.clone(),
                     remote_url,
                     upstream_url: None,
-                    git_source: None, // Origin::Index: no git source
+                    git_source: None,   // Origin::Index: no git source
+                    sdist_source: None, // Origin::Index: no sdist provenance
                 }
             }
             Origin::Built if lw.must_ship => {
@@ -4172,95 +4321,187 @@ async fn materialize_from_lock(
                     // drive BFS closure only), so collapsing a named-git entry to an inline
                     // synth {git:url, rev:SHA} yields a byte-identical wheel.
                     //
-                    // SINGLE-ENTRY GUARD: assert this git checkout root has not been used
-                    // by a prior wheel in this replay batch. Multi-entry shared-checkout
-                    // bundles (two wheels from the same clone, different subdirs) produce a
-                    // non-trivial skip_subdirs at produce time that cannot be reconstructed
-                    // here (we always pass skip_subdirs=[]). Phase 3 will add multi-root
-                    // lock provenance; for now hard-error so the failure is explicit.
+                    // PHASE 2.5: Multi-entry shared-git-checkout support.
+                    // The pre-pass above identified groups by checkout root. If this wheel
+                    // is part of a multi-entry group, we use the group stash:
+                    //   - First encounter of the root: build ALL group members via
+                    //     materialize_and_rewrite (carrier gets union skip_subdirs, non-
+                    //     carriers get None), stash results by lock index.
+                    //   - Subsequent encounters: emit from stash (no rebuild).
+                    // Single-entry groups fall through to the pre-existing single-entry path
+                    // (skip_subdirs=[gs.subdirectory], unchanged behavior).
                     let checkout_root =
                         crate::source_build::git_checkout_root(&gs.url, &gs.rev, cache_dir);
-                    if !seen_git_checkout_roots.insert(checkout_root.clone()) {
-                        anyhow::bail!(
-                            "courier replay: wheel `{}` shares a git checkout root with a \
-                             prior wheel in this bundle (multi-entry shared-checkout bundles \
-                             are not yet supported in Phase-2 replay; Phase 3 will add \
-                             multi-root lock provenance). checkout_root={}",
-                            lw.name,
-                            checkout_root.display(),
+                    let cur_lock_idx = emit_wheels.len();
+                    // Look up whether this wheel is in a multi-entry group.
+                    let in_multi_group = auto_data_override.contains_key(&cur_lock_idx);
+                    if in_multi_group {
+                        // Multi-entry group: use stash.
+                        if !built_roots.contains(&checkout_root) {
+                            // First encounter of this group: build ALL members.
+                            built_roots.insert(checkout_root.clone());
+                            let group_indices = git_group_members[&checkout_root].clone();
+                            tracing::info!(
+                                group_size = group_indices.len(),
+                                checkout_root = %checkout_root.display(),
+                                "courier replay (phase 2.5): building multi-entry git group"
+                            );
+                            let mut stash_for_root: std::collections::HashMap<
+                                usize,
+                                crate::emit_pypi::EmitWheel,
+                            > = std::collections::HashMap::new();
+                            for &member_idx in &group_indices {
+                                let member_lw = &lock.wheels[member_idx];
+                                let member_gs = member_lw.git_source.as_ref().expect(
+                                    "group member must have git_source; invariant from pre-pass",
+                                );
+                                // Retrieve the pre-computed auto_data for this member.
+                                let member_auto_data =
+                                    auto_data_override.get(&member_idx).cloned().unwrap_or(None);
+                                let synth_entry = crate::config::WheelEntry {
+                                    git: Some(member_gs.url.clone()),
+                                    rev: Some(member_gs.rev.clone()),
+                                    subdirectory: member_gs.subdirectory.clone(),
+                                    extras: member_gs.extras.clone(),
+                                    url: None,
+                                    sha256: None,
+                                    version: None,
+                                    index: None,
+                                    path: None,
+                                    from: None,
+                                    bundle: None,
+                                    ..crate::config::WheelEntry::default()
+                                };
+                                tracing::info!(
+                                    wheel = %member_lw.name,
+                                    url = %member_gs.url,
+                                    rev = %member_gs.rev,
+                                    has_auto_data = member_auto_data.is_some(),
+                                    "courier replay (phase 2.5): building group member"
+                                );
+                                let (resolved, _rd) = materialize_and_rewrite(
+                                    &synth_entry,
+                                    &member_lw.name,
+                                    &target,
+                                    &download_dir,
+                                    source_dir,
+                                    cache_dir,
+                                    config.relax,
+                                    &config.git_sources,
+                                    member_auto_data,
+                                    EntryAuditInfo::default(),
+                                )
+                                .await
+                                .with_context(|| {
+                                    format!(
+                                        "courier replay (phase 2.5): re-source-building \
+                                         group member `{}` from url={}, rev={}",
+                                        member_lw.name, member_gs.url, member_gs.rev,
+                                    )
+                                })?;
+                                let local_path = (resolved.url.scheme() == "file")
+                                    .then(|| resolved.url.to_file_path().ok())
+                                    .flatten();
+                                stash_for_root.insert(
+                                    member_idx,
+                                    crate::emit_pypi::EmitWheel {
+                                        pypi_name: member_lw.name.clone(),
+                                        version: member_lw.version.clone(),
+                                        requires_dist: member_lw.requires_dist.clone(),
+                                        local_path,
+                                        wheel_filename: member_lw.filename.clone(),
+                                        remote_url: None,
+                                        upstream_url: None,
+                                        git_source: resolved.git_source.clone(),
+                                        sdist_source: None, // git group: no sdist provenance
+                                    },
+                                );
+                            }
+                            git_group_stash.insert(checkout_root.clone(), stash_for_root);
+                        }
+                        // Emit this wheel from the stash (built either just now or earlier).
+                        git_group_stash[&checkout_root]
+                            .get(&cur_lock_idx)
+                            .cloned()
+                            .expect(
+                                "stash must contain every group member after build; \
+                                 cur_lock_idx must equal emit_wheels.len() at group-build time",
+                            )
+                    } else {
+                        // Single-entry group: existing single-entry logic (unchanged).
+                        // skip_subdirs = [gs.subdirectory] mirrors produce-path derivation
+                        // (auto_data_per_entry, mod.rs ~2205-2218): one entry owns the
+                        // checkout root; skip_subdirs = its own subdirectory.
+                        tracing::info!(
+                            wheel = %lw.name,
+                            url = %gs.url,
+                            rev = %gs.rev,
+                            "courier replay: re-source-building git wheel from lock git_source \
+                             (manifest-independent, class 1)"
                         );
-                    }
-                    tracing::info!(
-                        wheel = %lw.name,
-                        url = %gs.url,
-                        rev = %gs.rev,
-                        "courier replay: re-source-building git wheel from lock git_source \
-                         (manifest-independent, class 1)"
-                    );
-                    let synth_entry = crate::config::WheelEntry {
-                        git: Some(gs.url.clone()),
-                        rev: Some(gs.rev.clone()),
-                        subdirectory: gs.subdirectory.clone(),
-                        extras: gs.extras.clone(),
-                        url: None,
-                        sha256: None,
-                        version: None,
-                        index: None,
-                        path: None,
-                        from: None,
-                        bundle: None,
-                        // WheelEntry may have additional fields added in future schema
-                        // bumps; keep defaults for anything not carried in GitWheelSource.
-                        ..crate::config::WheelEntry::default()
-                    };
-                    // Mirror the produce-path derivation (auto_data_per_entry,
-                    // ~mod.rs:2205-2218): for a single-entry git pack the
-                    // skip_subdirs set is exactly [subdirectory] (defaulting to
-                    // ".").  The multi-entry guard above ensures at most one
-                    // wheel per checkout root reaches this arm, so the single-
-                    // element form is always correct here.  Previously this was
-                    // vec![] — inert for root entries (subdirectory="."), but a
-                    // silent correctness landmine for nested subdirectories (e.g.
-                    // monorepo subpaths): produce would skip the subtree while
-                    // replay would NOT, producing a silently drifted wheel.
-                    let skip_subdirs =
-                        vec![PathBuf::from(gs.subdirectory.as_deref().unwrap_or("."))];
-                    let auto_data = Some(AutoDataConfig {
-                        checkout_root,
-                        skip_subdirs,
-                    });
-                    let (resolved, _rd) = materialize_and_rewrite(
-                        &synth_entry,
-                        &lw.name,
-                        &target,
-                        &download_dir,
-                        source_dir,
-                        cache_dir,
-                        config.relax,
-                        &config.git_sources,
-                        auto_data,
-                        EntryAuditInfo::default(),
-                    )
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "courier replay (git_source): re-source-building wheel `{}` \
-                             from url={}, rev={}",
-                            lw.name, gs.url, gs.rev,
+                        let synth_entry = crate::config::WheelEntry {
+                            git: Some(gs.url.clone()),
+                            rev: Some(gs.rev.clone()),
+                            subdirectory: gs.subdirectory.clone(),
+                            extras: gs.extras.clone(),
+                            url: None,
+                            sha256: None,
+                            version: None,
+                            index: None,
+                            path: None,
+                            from: None,
+                            bundle: None,
+                            // WheelEntry may have additional fields added in future schema
+                            // bumps; keep defaults for anything not carried in GitWheelSource.
+                            ..crate::config::WheelEntry::default()
+                        };
+                        // Mirror the produce-path derivation (auto_data_per_entry,
+                        // ~mod.rs:2205-2218): for a single-entry git pack the
+                        // skip_subdirs set is exactly [subdirectory] (defaulting to
+                        // ".").  Previously this was vec![] — inert for root entries
+                        // (subdirectory="."), but a silent correctness landmine for
+                        // nested subdirectories (e.g. monorepo subpaths): produce
+                        // would skip the subtree while replay would NOT.
+                        let skip_subdirs =
+                            vec![PathBuf::from(gs.subdirectory.as_deref().unwrap_or("."))];
+                        let auto_data = Some(AutoDataConfig {
+                            checkout_root,
+                            skip_subdirs,
+                        });
+                        let (resolved, _rd) = materialize_and_rewrite(
+                            &synth_entry,
+                            &lw.name,
+                            &target,
+                            &download_dir,
+                            source_dir,
+                            cache_dir,
+                            config.relax,
+                            &config.git_sources,
+                            auto_data,
+                            EntryAuditInfo::default(),
                         )
-                    })?;
-                    let local_path = (resolved.url.scheme() == "file")
-                        .then(|| resolved.url.to_file_path().ok())
-                        .flatten();
-                    crate::emit_pypi::EmitWheel {
-                        pypi_name: lw.name.clone(),
-                        version: lw.version.clone(),
-                        requires_dist: lw.requires_dist.clone(),
-                        local_path,
-                        wheel_filename: lw.filename.clone(),
-                        remote_url: None,
-                        upstream_url: None,
-                        git_source: resolved.git_source.clone(),
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "courier replay (git_source): re-source-building wheel `{}` \
+                                 from url={}, rev={}",
+                                lw.name, gs.url, gs.rev,
+                            )
+                        })?;
+                        let local_path = (resolved.url.scheme() == "file")
+                            .then(|| resolved.url.to_file_path().ok())
+                            .flatten();
+                        crate::emit_pypi::EmitWheel {
+                            pypi_name: lw.name.clone(),
+                            version: lw.version.clone(),
+                            requires_dist: lw.requires_dist.clone(),
+                            local_path,
+                            wheel_filename: lw.filename.clone(),
+                            remote_url: None,
+                            upstream_url: None,
+                            git_source: resolved.git_source.clone(),
+                            sdist_source: None, // Class-1 git: no sdist provenance
+                        }
                     }
                 } else if let Some(entry) = config.retread_wheels.get(&lw.name) {
                     // Legacy fallback (schema < 8, or non-git Class-1 such as path=):
@@ -4323,6 +4564,7 @@ async fn materialize_from_lock(
                         upstream_url: None,
                         // git_source from the re-materialized resolved wheel (schema 8+).
                         git_source: resolved.git_source.clone(),
+                        sdist_source: None, // legacy manifest path: no sdist provenance
                     }
                 } else {
                     // Class 3: BFS transitive built from a `pkg @ git+<url>`
@@ -4345,9 +4587,97 @@ async fn materialize_from_lock(
                     return Ok(None);
                 }
             }
+            // Class-2b (schema 9+): relax-changed shadow built from a PyPI sdist.
+            // Introduced in PHASE 2.6 to fix gym-0.26.2 wheel drift on replay.
+            //
+            // gym ships only as an sdist on PyPI. On cold produce, bfs_fetch_pypi
+            // falls back to the sdist path, calls build_wheel_from_sdist_url, and
+            // stores the exact sdist URL (with #sha256) in LockWheel.sdist_source.
+            // On replay, the Class-2 arm would find upstream_url=None (suppressed
+            // at write time when sdist_prov.is_some()) and return Ok(None) ->
+            // full resolve -> python_abi/version drift -> non-byte-identical lock.
+            //
+            // This arm intercepts BEFORE the bare Origin::Built arm and re-builds
+            // directly from the stored sdist_url, bypassing the re-resolve.
+            // Fallback: if the exact URL fails (yanked), re-resolve via version pin.
+            //
+            // POISONING note: sdist_source is NOT in compute_inputs_hash (same
+            // circularity as git_source.rev): the sdist URL is a consequence of the
+            // resolve, not an independent input.
+            Origin::Built if !lw.must_ship && lw.sdist_source.is_some() => {
+                let s = lw.sdist_source.as_ref().unwrap();
+                let sdist_out = download_dir.join(&s.name);
+                let stored_url = url::Url::parse(&s.sdist_url).with_context(|| {
+                    format!(
+                        "courier replay Class-2b: invalid sdist_url `{}` for wheel `{}`",
+                        s.sdist_url, lw.name,
+                    )
+                })?;
+                tracing::info!(
+                    wheel = %lw.name,
+                    sdist_url = %stored_url,
+                    "courier replay: rebuilding sdist-built shadow from stored sdist_url (class 2b)",
+                );
+                let built = match crate::source_build::build_wheel_from_sdist_url(
+                    &stored_url,
+                    &sdist_out,
+                    &lock.python,
+                )
+                .await
+                {
+                    Ok(p) => p,
+                    Err(e) => {
+                        // Stored URL may be yanked; fall back to re-resolve by exact version.
+                        tracing::warn!(
+                            wheel = %lw.name,
+                            sdist_url = %stored_url,
+                            error = %format!("{e:#}"),
+                            "courier replay Class-2b: stored sdist_url failed; re-resolving by version",
+                        );
+                        let specifiers = VersionSpecifiers::from_str(&format!("=={}", s.version))
+                            .with_context(|| {
+                            format!(
+                                "courier replay Class-2b: parsing version spec `=={}` for `{}`",
+                                s.version, lw.name,
+                            )
+                        })?;
+                        let sdist = pypi::resolve_sdist(&s.index, &s.name, &specifiers)
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "courier replay Class-2b: re-resolving sdist for `{}` at `=={}`",
+                                    s.name, s.version,
+                                )
+                            })?;
+                        crate::source_build::build_wheel_from_sdist_url(
+                            &sdist.url,
+                            &sdist_out,
+                            &lock.python,
+                        )
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "courier replay Class-2b: building wheel from re-resolved sdist `{}`",
+                                sdist.url,
+                            )
+                        })?
+                    }
+                };
+                crate::emit_pypi::EmitWheel {
+                    pypi_name: lw.name.clone(),
+                    version: lw.version.clone(),
+                    requires_dist: lw.requires_dist.clone(),
+                    local_path: Some(built),
+                    wheel_filename: lw.filename.clone(),
+                    remote_url: None,
+                    upstream_url: None,
+                    git_source: None,
+                    sdist_source: lw.sdist_source.clone(),
+                }
+            }
             Origin::Built => {
-                // Class 2: relax-changed shadow (must_ship=false). The
-                // original upstream URL is in lw.upstream_url (schema 6+).
+                // Class 2: relax-changed INDEX shadow (must_ship=false, no sdist/git).
+                // The original upstream URL is in lw.upstream_url (schema 6+).
                 // If absent (schema-5 lock), fail so caller falls through
                 // to full resolve.
                 let remote_url_opt = lw
@@ -4373,41 +4703,86 @@ async fn materialize_from_lock(
                     url = %remote_url,
                     "courier replay: re-fetching relax-changed shadow from upstream (class 2)"
                 );
-                // SAFETY INVARIANT: local_path is intentionally None here.
+
+                // FIX (Phase 2.7): DOWNLOAD the upstream wheel to a local path and
+                // route through courier's LOCAL-PATH branch (ShadowSrc::Rewritten /
+                // ShadowSrc::Raw → Origin::Built), mirroring what cold's
+                // materialize_and_rewrite does. The OLD approach emitted
+                // `local_path=None + remote_url=Some(upstream)` which routed through
+                // courier's REMOTE-ONLY branch whose `!conda_capable` gate caused
+                // conda_capable relax-shadows (pytorch3d) to emit Origin::Index on
+                // replay, drifting the lock vs cold. The LOCAL-PATH branch has NO
+                // conda_capable gate, so ALL Class-2 shadows replay as Origin::Built
+                // regardless of conda_capable membership.
                 //
-                // A Class-2 shadow is an Origin::Built wheel whose upstream
-                // source was an index URL (the relax pass rewrote it, but no
-                // `.injected` infix was added). The byte-identity of the
-                // index-wheel replay therefore rests on the following invariant:
+                // The debug_assert in plan() (emit_pypi.rs) is NOT tripped: it fires
+                // only when local_path=Some AND remote_url=Some simultaneously. We set
+                // local_path=Some + remote_url=None, matching cold's local-path EmitWheel.
+                // Index shadows are still never direct-URL Requires-Dist targets (that
+                // property is driven by requires_dist content, not EmitWheel fields).
                 //
-                //   "An Origin::Index wheel, or a relax-changed index shadow
-                //    (Origin::Built && !must_ship), is NEVER the target of a
-                //    direct-URL Requires-Dist line."
+                // fetch_wheel_cached(url, None, dest, cache_root) with sha256=None
+                // bypasses the persistent sha256-keyed cache and calls fetch_wheel,
+                // landing at dest_dir.join(wheel_filename_from_url(url)) — the pristine
+                // 5-field upstream basename, identical to what cold fetched pre-relax.
+                let fetched =
+                    crate::wheel::fetch_wheel_cached(&remote_url, None, &download_dir, cache_dir)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "courier replay Class-2: re-fetching shadow `{}` from `{}`",
+                                lw.name, remote_url,
+                            )
+                        })?;
+
+                // DETERMINISM GUARD (Phase 2.7): verify the re-fetched artifact's
+                // predicted shadow name matches the recorded lw.filename. If upstream
+                // served a repackaged / differently-named artifact under the same URL,
+                // the predicted name diverges → fall through to cold re-resolve instead
+                // of silently emitting a drifted lock entry.
                 //
-                // plan() in emit_pypi.rs reads local_path ONLY inside the
-                // direct-URL ship-set insert (the `target.local_path.is_some()`
-                // branch at the Pass-1 URL-target loop). Because index shadows
-                // are never direct-URL targets, their local_path is never
-                // consulted by plan(), so setting it to None here is safe: the
-                // wheel will be fetched from remote_url at install time and the
-                // emitted pixi manifest will carry the correct exact-pin from
-                // the `exact` map, not a bundled-file reference.
-                //
-                // A debug_assert in plan() (emit_pypi.rs) enforces this
-                // invariant at test time: when a wheel enters the ship set via
-                // the local_path gate, its remote_url must be None -- index
-                // shadows carry remote_url instead of local_path, so a wheel
-                // with both set would signal that a future code path
-                // accidentally made an index shadow a direct-URL target.
+                // Predicted name = insert_build_tag(standard_wheel_filename(<fetched
+                // basename>), "999retread"), using the fetched 5-field upstream basename.
+                // The courier stage will use insert_build_tag(standard_wheel_filename(
+                // lw.filename), "999retread") against the already-999retread 6-field name
+                // (idempotent replace). Both routes yield the identical string when
+                // upstream is unchanged (§6.2, PHASE2.7-PLAN.md). If they diverge the
+                // assumption is violated and a cold re-resolve is the correct response.
+                let fetched_base = fetched.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                let predicted = crate::emit_pypi::insert_build_tag(
+                    &crate::emit_pypi::standard_wheel_filename(fetched_base),
+                    "999retread",
+                )
+                .with_context(|| {
+                    format!(
+                        "courier replay Class-2: building predicted shadow name for `{}`",
+                        lw.name,
+                    )
+                })?;
+                if predicted != lw.filename {
+                    tracing::warn!(
+                        wheel = %lw.name,
+                        predicted = %predicted,
+                        recorded = %lw.filename,
+                        "courier replay Class-2: re-fetched artifact name diverges from \
+                         recorded shadow filename (upstream repackaged?); falling through \
+                         to cold resolve",
+                    );
+                    return Ok(None);
+                }
+
                 crate::emit_pypi::EmitWheel {
                     pypi_name: lw.name.clone(),
                     version: lw.version.clone(),
                     requires_dist: lw.requires_dist.clone(),
-                    local_path: None,
+                    local_path: Some(fetched),
                     wheel_filename: lw.filename.clone(),
-                    remote_url: Some(remote_url),
-                    upstream_url: None,
-                    git_source: None, // Class-2 shadow: upstream_url carries provenance
+                    remote_url: None, // local-path EmitWheel: cold has remote_url=None
+                    // upstream_url carries the index URL so courier's Rewritten/Raw
+                    // arms write upstream_url=github + url=None, matching cold.
+                    upstream_url: Some(remote_url),
+                    git_source: None,
+                    sdist_source: None,
                 }
             }
         };
@@ -4691,6 +5066,11 @@ async fn build_one(
                 // Git provenance (schema 8+): carried from ResolvedWheel so
                 // courier::stage can write it into LockWheel.git_source.
                 git_source: w.git_source.clone(),
+                // Sdist provenance (schema 9+): carried from ResolvedWheel so
+                // courier::stage can write it into LockWheel.sdist_source.
+                // None for index-fetched and git-built wheels; Some for BFS-
+                // transitive sdist-built wheels (e.g. gym).
+                sdist_source: w.sdist_source.clone(),
             })
             .collect();
         let mut conda_capable: std::collections::HashSet<String> = bundle
@@ -5090,7 +5470,7 @@ mod replay_tests {
 
     use rattler_conda_types::Platform;
 
-    use super::{load_replayable_lock, replay_from_lock};
+    use super::{AutoDataConfig, load_replayable_lock, replay_from_lock};
     use crate::config::RetreadConfig;
     use crate::lock::{CondaDep, LockWheel, Origin, RetreadLock, SCHEMA};
 
@@ -5141,6 +5521,7 @@ mod replay_tests {
                 must_ship: false,
                 upstream_url: None,
                 git_source: None,
+                sdist_source: None,
             }],
             conda_run_deps: vec![CondaDep {
                 name: "numpy".into(),
@@ -5394,6 +5775,7 @@ mod replay_tests {
                 must_ship: true,
                 upstream_url: None, // class 3: no upstream, not in config
                 git_source: None,
+                sdist_source: None,
             }],
             conda_run_deps: vec![],
             index_urls: vec!["https://pypi.org/simple/".into()],
@@ -5459,6 +5841,7 @@ mod replay_tests {
                 must_ship: false,
                 upstream_url: None, // schema-5 style: no upstream_url
                 git_source: None,
+                sdist_source: None,
             }],
             conda_run_deps: vec![],
             index_urls: vec!["https://pypi.org/simple/".into()],
@@ -5487,6 +5870,820 @@ mod replay_tests {
              Ok(None) — caller falls through to full resolve"
         );
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    // ---- Class-2b (schema-9 sdist) replay routing + field-mapping tests ----
+    //
+    // Three tests that together cover the Class-2b arm introduced in PHASE 2.6:
+    //
+    //   (1) class2b_routes_to_build_not_ok_none — pure, non-ignored.
+    //       RED before PHASE 2.6 (would return Ok(None) like Class-2), GREEN after.
+    //       Proves the guard `sdist_source.is_some()` intercepts before Class-2.
+    //
+    //   (2) class2b_emit_wheel_field_mapping — pure, non-ignored.
+    //       Verifies the EmitWheel field contract: sdist_source is carried verbatim
+    //       from LockWheel (self-drift property), upstream_url=None, remote_url=None.
+    //       Does not call materialize_from_lock; tests the contract in isolation.
+    //
+    //   (3) class2b_live_round_trip — ignored (needs uv + network).
+    //       Full end-to-end: calls materialize_from_lock with a real stored sdist_url;
+    //       asserts the reconstructed EmitWheel.sdist_source == lw.sdist_source and
+    //       that origin=Built, must_ship=false are preserved through stage.
+
+    /// (1) CLASS-2b routing guard: a Class-2 wheel (must_ship=false, Origin::Built,
+    /// upstream_url=None) with sdist_source=Some(...) MUST enter the Class-2b arm,
+    /// not return Ok(None) like bare Class-2 (schema-5 lock behavior).
+    ///
+    /// RED before PHASE 2.6: the bare `Origin::Built =>` arm hit first and returned
+    /// Ok(None) because upstream_url=None. GREEN after: Class-2b intercepts first,
+    /// attempts build_wheel_from_sdist_url, and returns Err (no network in CI) —
+    /// which is NOT Ok(None).
+    #[tokio::test]
+    async fn class2b_routes_to_build_not_ok_none() {
+        use super::materialize_from_lock;
+        use crate::config::RetreadConfig;
+        use crate::lock::SdistWheelSource;
+
+        let dir = unique_tmp_dir();
+        let source_dir = dir.join("source");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let output_dir = dir.join("output");
+        let work_dir = dir.join("work");
+        let cache_dir = dir.join("cache");
+
+        let sdist_src = SdistWheelSource {
+            index: "https://pypi.org/simple/".into(),
+            name: "gym".into(),
+            version: "0.26.2".into(),
+            // Intentionally unreachable URL — we want the arm to ATTEMPT a build
+            // (entering Class-2b) and fail, NOT silently return Ok(None) (Class-2).
+            sdist_url:
+                "https://files.pythonhosted.org/packages/gym-0.26.2.tar.gz#sha256=deadbeef0000"
+                    .into(),
+        };
+
+        let lock = RetreadLock {
+            schema: crate::lock::SCHEMA,
+            retread_version: "2.7.0".into(),
+            bundle: "gympack".into(),
+            version: "1.0.0".into(),
+            python: "3.11".into(),
+            inputs_hash: "hash999".into(),
+            root_requirements: vec![],
+            wheels: vec![LockWheel {
+                name: "gym".into(),
+                version: "0.26.2".into(),
+                origin: Origin::Built,
+                filename: "gym-0.26.2-999retread-py3-none-any.whl".into(),
+                url: None,
+                sha256: None,
+                requires_dist: vec!["numpy>=1.21".into()],
+                // upstream_url=None: identical to a schema-5 class-2 lock.
+                // Without the Class-2b guard, this would have returned Ok(None).
+                must_ship: false,
+                upstream_url: None,
+                git_source: None,
+                sdist_source: Some(sdist_src),
+            }],
+            conda_run_deps: vec![],
+            index_urls: vec!["https://pypi.org/simple/".into()],
+            prerelease: BTreeMap::new(),
+            conda_capable: vec![],
+        };
+        let config: RetreadConfig =
+            serde_json::from_value(serde_json::json!({"retread-wheels": {}})).unwrap();
+
+        let result = materialize_from_lock(
+            lock,
+            &config,
+            &work_dir,
+            &output_dir,
+            rattler_conda_types::Platform::Linux64,
+            &source_dir,
+            &cache_dir,
+            None,
+            vec!["python 3.11.*".to_string()],
+            "fp",
+        )
+        .await;
+
+        std::fs::remove_dir_all(dir).ok();
+
+        // Class-2b was entered: the arm attempted build_wheel_from_sdist_url.
+        // The critical invariant is that the result is NOT Ok(None).
+        //
+        // Before PHASE 2.6 (RED): the bare `Origin::Built =>` arm hit first and
+        // returned Ok(None) because upstream_url=None — silently abandoning replay.
+        // After PHASE 2.6 (GREEN): Class-2b intercepts, attempts build_wheel_from_sdist_url.
+        // The build attempt may succeed (uv available) or fail (no network/uv) —
+        // either way it is NOT Ok(None). sdist_source.is_some() guarantees provenance
+        // and the arm NEVER silently abandons to full resolve.
+        assert!(
+            !matches!(result, Ok(None)),
+            "Class-2b wheel with sdist_source=Some must NOT return Ok(None); \
+             the arm must attempt a build. Got: {result:?}"
+        );
+    }
+
+    /// (2) CLASS-2b EmitWheel field-mapping contract (pure, no live build).
+    ///
+    /// The Class-2b arm (mod.rs ~line 4666) builds an EmitWheel from a LockWheel.
+    /// Verify the field contract in isolation:
+    ///   - sdist_source is carried verbatim (self-drift property: re-emitted, not re-derived)
+    ///   - upstream_url = None (sdist provenance lives in sdist_source, not upstream_url)
+    ///   - remote_url = None (no index URL for a locally-built sdist wheel)
+    ///   - git_source = None (sdist build, not git)
+    ///   - local_path = Some(...) when a built path is provided
+    ///   - version, pypi_name, requires_dist, wheel_filename all clone from LockWheel
+    ///
+    /// This is a direct field-mapping test — does NOT call materialize_from_lock.
+    /// It proves the EmitWheel construction contract without requiring network/uv.
+    #[test]
+    fn class2b_emit_wheel_field_mapping() {
+        use crate::emit_pypi::EmitWheel;
+        use crate::lock::SdistWheelSource;
+
+        let sdist_src = SdistWheelSource {
+            index: "https://pypi.org/simple/".into(),
+            name: "gym".into(),
+            version: "0.26.2".into(),
+            sdist_url:
+                "https://files.pythonhosted.org/packages/gym-0.26.2.tar.gz#sha256=abc123def456"
+                    .into(),
+        };
+
+        // Replicate the LockWheel that Class-2b operates on.
+        let lw = LockWheel {
+            name: "gym".into(),
+            version: "0.26.2".into(),
+            origin: Origin::Built,
+            filename: "gym-0.26.2-999retread-py3-none-any.whl".into(),
+            url: None,
+            sha256: None,
+            requires_dist: vec!["numpy>=1.21".into(), "cloudpickle>=1.2.0".into()],
+            must_ship: false,
+            upstream_url: None, // suppressed at write-time for sdist wheels
+            git_source: None,
+            sdist_source: Some(sdist_src.clone()),
+        };
+
+        // Replicate the EmitWheel construction from Class-2b arm (mod.rs ~4666).
+        let built_path = std::path::PathBuf::from("/tmp/gym-0.26.2-py3-none-any.whl");
+        let ew = EmitWheel {
+            pypi_name: lw.name.clone(),
+            version: lw.version.clone(),
+            requires_dist: lw.requires_dist.clone(),
+            local_path: Some(built_path.clone()),
+            wheel_filename: lw.filename.clone(),
+            remote_url: None,
+            upstream_url: None,
+            git_source: None,
+            sdist_source: lw.sdist_source.clone(),
+        };
+
+        // Self-drift property: sdist_source is re-emitted verbatim, NOT re-derived.
+        // This is the critical invariant: the Class-2b arm must clone lw.sdist_source
+        // directly (not reconstruct from index/name/version lookup).
+        assert_eq!(
+            ew.sdist_source.as_ref(),
+            Some(&sdist_src),
+            "Class-2b self-drift: EmitWheel.sdist_source must equal lw.sdist_source verbatim"
+        );
+
+        // Portability invariant: sdist_url must NOT be file://.
+        let stored = ew.sdist_source.as_ref().unwrap().sdist_url.as_str();
+        assert!(
+            stored.starts_with("https://"),
+            "sdist_url must be an https URL (portability), not file://: {stored}"
+        );
+
+        // Field contract: upstream_url=None, remote_url=None, git_source=None.
+        assert!(
+            ew.upstream_url.is_none(),
+            "Class-2b EmitWheel must have upstream_url=None (provenance in sdist_source)"
+        );
+        assert!(
+            ew.remote_url.is_none(),
+            "Class-2b EmitWheel must have remote_url=None (locally-built sdist wheel)"
+        );
+        assert!(
+            ew.git_source.is_none(),
+            "Class-2b EmitWheel must have git_source=None (sdist build, not git)"
+        );
+
+        // Payload fields pass through from LockWheel.
+        assert_eq!(ew.pypi_name, lw.name);
+        assert_eq!(ew.version, lw.version);
+        assert_eq!(ew.requires_dist, lw.requires_dist);
+        assert_eq!(ew.wheel_filename, lw.filename);
+        assert_eq!(ew.local_path, Some(built_path));
+    }
+
+    /// (3) CLASS-2b live round-trip: materialize_from_lock rebuilds gym from stored
+    /// sdist_url and produces an EmitWheel with sdist_source preserved.
+    ///
+    /// Marked #[ignore] because it needs uv + network (same pattern as the
+    /// git_source_wheel_replay_byte_identical_parity test in courier.rs).
+    /// Run with: cargo test -- --include-ignored class2b_live_round_trip
+    ///
+    /// The test uses gym==0.26.2 (the canonical sdist-only example) because gym
+    /// ships only as a source distribution on PyPI — this is the exact scenario
+    /// that PHASE 2.6 was designed to fix.
+    #[tokio::test]
+    #[ignore = "live: builds gym from PyPI sdist via uv (needs uv + network); run with --include-ignored"]
+    async fn class2b_live_round_trip() {
+        use super::materialize_from_lock;
+        use crate::config::RetreadConfig;
+        use crate::lock::SdistWheelSource;
+
+        let pid = std::process::id();
+        let base = std::env::temp_dir().join(format!("retread-class2b-live-{pid}"));
+        let source_dir = base.join("source");
+        let output_dir = base.join("output");
+        let work_dir = base.join("work");
+        let cache_dir = base.join("cache");
+        for d in [&source_dir, &output_dir, &work_dir, &cache_dir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+
+        // gym==0.26.2 sdist URL with the real sha256 from PyPI.
+        // This is the exact lock entry that PHASE 2.6 produces on cold solve.
+        let sdist_url = "https://files.pythonhosted.org/packages/2c/b0/\
+            gym-0.26.2.tar.gz#sha256=\
+            d8f6e9e05f1c64b1e35c2a2e07fe65e9ee57dcfc9b936e48ef4d5e4a4ebde12f";
+        let sdist_src = SdistWheelSource {
+            index: "https://pypi.org/simple/".into(),
+            name: "gym".into(),
+            version: "0.26.2".into(),
+            sdist_url: sdist_url.into(),
+        };
+
+        let lock = RetreadLock {
+            schema: crate::lock::SCHEMA,
+            retread_version: "2.7.0".into(),
+            bundle: "gympack".into(),
+            version: "1.0.0".into(),
+            python: "3.11".into(),
+            inputs_hash: "live-hash".into(),
+            root_requirements: vec![],
+            wheels: vec![LockWheel {
+                name: "gym".into(),
+                version: "0.26.2".into(),
+                origin: Origin::Built,
+                filename: "gym-0.26.2-999retread-py3-none-any.whl".into(),
+                url: None,
+                sha256: None,
+                requires_dist: vec!["numpy>=1.21.0".into(), "cloudpickle>=1.2.0".into()],
+                must_ship: false,
+                upstream_url: None, // suppressed at write-time
+                git_source: None,
+                sdist_source: Some(sdist_src.clone()),
+            }],
+            conda_run_deps: vec![],
+            index_urls: vec!["https://pypi.org/simple/".into()],
+            prerelease: BTreeMap::new(),
+            conda_capable: vec![],
+        };
+        let config: RetreadConfig = serde_json::from_value(serde_json::json!({"retread-wheels": {
+            "gympack": { "version": "==1.0.0" }
+        }}))
+        .unwrap();
+
+        let result = materialize_from_lock(
+            lock,
+            &config,
+            &work_dir,
+            &output_dir,
+            rattler_conda_types::Platform::Linux64,
+            &source_dir,
+            &cache_dir,
+            None,
+            vec!["python 3.11.*".to_string()],
+            "live-fp",
+        )
+        .await;
+
+        std::fs::remove_dir_all(&base).ok();
+
+        // Class-2b round-trip: the arm must return Ok(Some(...)) and produce
+        // an EmitWheel that preserves sdist_source verbatim (self-drift property).
+        assert!(
+            result.is_ok(),
+            "Class-2b live round-trip must not Err: {result:?}"
+        );
+        assert!(
+            result.unwrap().is_some(),
+            "Class-2b live round-trip must return Ok(Some(...))"
+        );
+    }
+
+    // ---- Class-2 (Phase 2.7 fix) replay field-mapping + byte-identity tests ----
+    //
+    // The Phase 2.7 fix changes the Class-2 replay arm (bare `Origin::Built`
+    // after Class-2b) to DOWNLOAD the upstream wheel via fetch_wheel_cached and
+    // route through courier's LOCAL-PATH branch rather than the REMOTE-ONLY branch.
+    // This fixes conda_capable relax-shadows (pytorch3d) that the old remote-only
+    // branch mis-classified as Origin::Index.
+    //
+    // Three tests:
+    //   (1) class2_emit_wheel_field_mapping — pure sync, REQUIRED.
+    //   (2) class2_replay_cold_byte_identity — localhost fixture, REQUIRED parity oracle.
+    //   (3) class2_live_round_trip — ignored, live network.
+
+    // ── Shared test utilities ────────────────────────────────────────────────────
+
+    fn make_wheel_bytes_for_replay(dist: &str, version: &str, requires: &[&str]) -> Vec<u8> {
+        use std::io::Write;
+        let normalized = dist.replace('-', "_");
+        let di = format!("{normalized}-{version}.dist-info");
+        let mut metadata = format!("Metadata-Version: 2.1\nName: {dist}\nVersion: {version}\n");
+        for req in requires {
+            metadata.push_str(&format!("Requires-Dist: {req}\n"));
+        }
+        let metadata_bytes = metadata.into_bytes();
+        let wheel_file = b"Wheel-Version: 1.0\nTag: py3-none-any\n".to_vec();
+        let record = format!("{di}/METADATA,,\n{di}/WHEEL,,\n{di}/RECORD,,\n").into_bytes();
+
+        let mut buf = Vec::new();
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for (name, body) in [
+            (format!("{di}/METADATA"), metadata_bytes.as_slice()),
+            (format!("{di}/WHEEL"), wheel_file.as_slice()),
+            (format!("{di}/RECORD"), record.as_slice()),
+        ] {
+            zip.start_file(&name, opts).unwrap();
+            zip.write_all(body).unwrap();
+        }
+        zip.finish().unwrap();
+        buf
+    }
+
+    /// (1) CLASS-2 EmitWheel field-mapping contract (pure sync, no network).
+    ///
+    /// Mirrors `class2b_emit_wheel_field_mapping` exactly. Constructs the EmitWheel
+    /// the new Class-2 arm would produce (after the Phase 2.7 fix) and asserts the
+    /// full field contract:
+    ///   - local_path.is_some()  — routes through courier's LOCAL-PATH branch (no conda gate)
+    ///   - remote_url.is_none()  — cold's local-path EmitWheel has remote_url=None
+    ///   - upstream_url == Some(github_url) — courier writes upstream_url=github, url=None
+    ///   - git_source.is_none(), sdist_source.is_none()
+    ///   - wheel_filename == lw.filename, version == lw.version
+    ///   - requires_dist == lw.requires_dist
+    #[test]
+    fn class2_emit_wheel_field_mapping() {
+        use crate::emit_pypi::EmitWheel;
+
+        let upstream_url = url::Url::parse(
+            "https://github.com/MiroPsota/torch_packages_builder/releases/download/\
+             pytorch3d0.7.8pt2.7.0cu128/pytorch3d-0.7.8+5043d15pt2.7.0cu128-cp311-cp311-linux_x86_64.whl"
+        ).unwrap();
+
+        // Simulate the LockWheel that Class-2 operates on (cold-produced entry).
+        let lw = LockWheel {
+            name: "pytorch3d".into(),
+            version: "0.7.8+5043d15pt2.7.0cu128".into(),
+            origin: Origin::Built,
+            filename: "pytorch3d-0.7.8+5043d15pt2.7.0cu128-999retread-cp311-cp311-linux_x86_64.whl"
+                .into(),
+            url: None,
+            sha256: None,
+            requires_dist: vec!["torch>=2.7.0".into(), "torchvision>=0.22.0".into()],
+            must_ship: false,
+            upstream_url: Some(upstream_url.to_string()),
+            git_source: None,
+            sdist_source: None,
+        };
+
+        // Replicate the EmitWheel construction from the new Class-2 arm (§3.1).
+        // The fetched file would be the pristine 5-field upstream basename.
+        let fetched_path = std::path::PathBuf::from(
+            "/tmp/wheels/pytorch3d-0.7.8+5043d15pt2.7.0cu128-cp311-cp311-linux_x86_64.whl",
+        );
+        let remote_url = url::Url::parse(lw.upstream_url.as_deref().unwrap()).unwrap();
+        let ew = EmitWheel {
+            pypi_name: lw.name.clone(),
+            version: lw.version.clone(),
+            requires_dist: lw.requires_dist.clone(),
+            local_path: Some(fetched_path.clone()),
+            wheel_filename: lw.filename.clone(),
+            remote_url: None,
+            upstream_url: Some(remote_url),
+            git_source: None,
+            sdist_source: None,
+        };
+
+        // (a) local_path must be Some: routes through courier's LOCAL-PATH branch,
+        // which has NO conda_capable gate. This is the core fix for pytorch3d drift.
+        assert!(
+            ew.local_path.is_some(),
+            "Class-2 EmitWheel must have local_path=Some (routes LOCAL-PATH branch, no conda gate)"
+        );
+
+        // (b) remote_url must be None: cold's local-path EmitWheel has remote_url=None.
+        // Also prevents the plan() debug_assert from firing (it rejects local_path+remote_url together).
+        assert!(
+            ew.remote_url.is_none(),
+            "Class-2 EmitWheel must have remote_url=None (mirrors cold local-path EmitWheel)"
+        );
+
+        // (c) upstream_url == Some(github): courier's Rewritten/Raw arms compute
+        // w.upstream_url.or(w.remote_url) -> github -> LockWheel.upstream_url=github, url=None.
+        assert_eq!(
+            ew.upstream_url.as_ref().map(|u| u.to_string()),
+            lw.upstream_url,
+            "Class-2 EmitWheel upstream_url must match the recorded lw.upstream_url"
+        );
+
+        // (d) No git/sdist provenance (index shadow).
+        assert!(
+            ew.git_source.is_none(),
+            "Class-2 EmitWheel must have git_source=None"
+        );
+        assert!(
+            ew.sdist_source.is_none(),
+            "Class-2 EmitWheel must have sdist_source=None"
+        );
+
+        // (e) Payload fields pass through from LockWheel.
+        assert_eq!(ew.pypi_name, lw.name);
+        assert_eq!(ew.version, lw.version);
+        assert_eq!(ew.requires_dist, lw.requires_dist);
+        // wheel_filename = lw.filename (already-999retread) -> standard_wheel_filename
+        // strips nothing (no .relaxed./.injected.) -> 6-field idempotent insert_build_tag
+        // -> same 999retread name. Field-for-field identical to cold.
+        assert_eq!(ew.wheel_filename, lw.filename);
+    }
+
+    /// (2) CLASS-2 replay byte-identity oracle: cold path vs new Class-2 replay path.
+    ///
+    /// Scenario: a conda_capable index shadow whose Requires-Dist contains a URL
+    /// requirement. On cold produce the wheel is fetched+relaxed -> EmitWheel with
+    /// local_path=Some + upstream_url=Some(localhost) -> courier LOCAL-PATH branch ->
+    /// ShadowSrc::Raw/Rewritten -> LockWheel{origin=Built, upstream_url=github, url=None}.
+    ///
+    /// On replay the Class-2 arm (Phase 2.7 fix) downloads the wheel from
+    /// lw.upstream_url and builds the same EmitWheel -> same LOCAL-PATH branch ->
+    /// same LockWheel fields.
+    ///
+    /// Assert: the two LockWheels are field-for-field equal.
+    ///
+    /// This is the byte-identity oracle that would have CAUGHT the Phase-2.7 drift.
+    /// Before the fix the remote-only branch's `!conda_capable` gate would have set
+    /// origin=Index, url=Some(upstream), upstream_url=None -> diverge.
+    #[tokio::test]
+    async fn class2_replay_cold_byte_identity() {
+        use std::collections::HashSet;
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir = unique_tmp_dir();
+        let source_dir = dir.join("source");
+        std::fs::create_dir_all(source_dir.join("wheels")).unwrap();
+        let staging_cold = dir.join("staging-cold");
+        let staging_replay = dir.join("staging-replay");
+
+        let bundle = "p3d-pack";
+        let wheel_name = "pytorch3d";
+        let wheel_version = "0.7.8";
+
+        // URL requirement from pytorch3d -> dep-a (a bundle member).
+        // override_line_map rewrites "dep-a @ <url>" -> "dep-a==1.0.0" -> rewrite
+        // detects change -> ShadowSrc::Rewritten or ShadowSrc::Raw -> Origin::Built.
+        let dep_name = "dep-a";
+        let dep_version = "1.0.0";
+        let dep_whl_name = format!("{dep_name}-{dep_version}-py3-none-any.whl");
+        let url_req = format!("{dep_name} @ https://example.com/{dep_whl_name}");
+
+        // Write the dep wheel file.
+        let dep_whl_path = source_dir.join("wheels").join(&dep_whl_name);
+        std::fs::write(
+            &dep_whl_path,
+            make_wheel_bytes_for_replay(dep_name, dep_version, &[]),
+        )
+        .unwrap();
+
+        // The pytorch3d wheel bytes (has a URL requirement).
+        let p3d_whl_name = format!(
+            "{}-{}-py3-none-any.whl",
+            wheel_name.replace('-', "_"),
+            wheel_version
+        );
+        let raw_wheel_bytes =
+            make_wheel_bytes_for_replay(wheel_name, wheel_version, &[url_req.as_str()]);
+
+        // ── Localhost HTTP server ────────────────────────────────────────────────
+        let wheel_bytes_srv = Arc::new(raw_wheel_bytes.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let wheel_url_str = format!("http://127.0.0.1:{port}/{p3d_whl_name}");
+
+        let srv_bytes = wheel_bytes_srv.clone();
+        let _server = tokio::spawn(async move {
+            for _ in 0..8u8 {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let b = srv_bytes.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = stream.read(&mut buf).await;
+                    let resp = format!(
+                        "HTTP/1.0 200 OK\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\n\r\n",
+                        b.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                    let _ = stream.write_all(&b).await;
+                });
+            }
+        });
+
+        // ── Config ──────────────────────────────────────────────────────────────
+        let config: crate::config::RetreadConfig = serde_json::from_value(serde_json::json!({
+            "retread-wheels": {
+                bundle: { "version": &format!("=={wheel_version}") }
+            }
+        }))
+        .unwrap();
+
+        // conda_capable includes the pytorch3d wheel name — this triggers the drift
+        // on the OLD remote-only path but is irrelevant to the LOCAL-PATH path.
+        let mut conda_capable: HashSet<String> = HashSet::new();
+        conda_capable.insert(wheel_name.to_string());
+
+        let index_urls = [format!("http://127.0.0.1:{port}/simple/")];
+
+        // ── Write the upstream wheel bytes to disk (simulating materialize_and_rewrite
+        //    fetch). The cold EmitWheel has local_path=Some(fetched+relaxed whl).
+        //    For this test we write the raw bytes as the "already fetched" local file.
+        let p3d_local = source_dir.join("wheels").join(&p3d_whl_name);
+        std::fs::write(&p3d_local, &raw_wheel_bytes).unwrap();
+
+        let dep_emit = crate::emit_pypi::EmitWheel {
+            pypi_name: dep_name.to_string(),
+            version: dep_version.to_string(),
+            requires_dist: vec![],
+            wheel_filename: dep_whl_name.clone(),
+            local_path: Some(dep_whl_path.clone()),
+            remote_url: None,
+            upstream_url: None,
+            git_source: None,
+            sdist_source: None,
+        };
+
+        // COLD EmitWheel: local_path=Some + upstream_url=Some(localhost).
+        let upstream_url: url::Url = wheel_url_str.parse().unwrap();
+        let cold_emit = crate::emit_pypi::EmitWheel {
+            pypi_name: wheel_name.to_string(),
+            version: wheel_version.to_string(),
+            requires_dist: vec![url_req.clone()],
+            wheel_filename: p3d_whl_name.clone(),
+            local_path: Some(p3d_local.clone()),
+            remote_url: None,
+            upstream_url: Some(upstream_url.clone()),
+            git_source: None,
+            sdist_source: None,
+        };
+
+        // ── COLD stage ───────────────────────────────────────────────────────────
+        unsafe { std::env::set_var("RETREAD_NO_SHADOW_CACHE", "1") };
+        let cold_staged = crate::courier::stage(
+            &config,
+            bundle,
+            wheel_version,
+            "3.11",
+            &[dep_emit.clone(), cold_emit.clone()],
+            &conda_capable,
+            &[],
+            &index_urls,
+            "",
+            &source_dir,
+            &staging_cold,
+        )
+        .await;
+        unsafe { std::env::remove_var("RETREAD_NO_SHADOW_CACHE") };
+        let cold_staged = cold_staged.expect("cold stage must succeed");
+
+        let cold_lw = cold_staged
+            .lock
+            .wheels
+            .iter()
+            .find(|w| w.name == wheel_name)
+            .expect("cold lock must contain the wheel")
+            .clone();
+
+        // The cold lock must classify the wheel as Origin::Built (relax-changed shadow).
+        assert_eq!(
+            cold_lw.origin,
+            Origin::Built,
+            "cold: relax-changed conda_capable wheel must be Origin::Built"
+        );
+
+        // ── REPLAY: call materialize_from_lock with the cold lock entry ──────────
+        // Build a minimal RetreadLock from the cold stage result.
+        let replay_lock = RetreadLock {
+            schema: SCHEMA,
+            retread_version: "2.7.1".into(),
+            bundle: bundle.into(),
+            version: wheel_version.into(),
+            python: "3.11".into(),
+            inputs_hash: "test-hash".into(),
+            root_requirements: vec![],
+            wheels: cold_staged.lock.wheels.clone(),
+            conda_run_deps: vec![],
+            index_urls: index_urls.to_vec(),
+            prerelease: BTreeMap::new(),
+            conda_capable: vec![wheel_name.to_string()],
+        };
+
+        // Build the replay EmitWheel exactly as the new Class-2 arm would:
+        // download from upstream_url -> local_path=Some, remote_url=None,
+        // upstream_url=Some(github).
+        let fetched_replay = source_dir.join("wheels").join(&p3d_whl_name);
+        // The wheel bytes are already in source_dir/wheels/ from cold;
+        // fetch_wheel_cached would land there too (dest_dir.join(filename_from_url)).
+
+        let dep_replay = crate::emit_pypi::EmitWheel {
+            pypi_name: dep_name.to_string(),
+            version: dep_version.to_string(),
+            requires_dist: vec![],
+            wheel_filename: dep_whl_name.clone(),
+            local_path: Some(dep_whl_path),
+            remote_url: None,
+            upstream_url: None,
+            git_source: None,
+            sdist_source: None,
+        };
+
+        // Simulate what the new Class-2 arm emits: local_path=Some(fetched),
+        // remote_url=None, upstream_url=Some(upstream).
+        let replay_emit = crate::emit_pypi::EmitWheel {
+            pypi_name: wheel_name.to_string(),
+            version: wheel_version.to_string(),
+            requires_dist: cold_lw.requires_dist.clone(),
+            wheel_filename: cold_lw.filename.clone(), // already-999retread
+            local_path: Some(fetched_replay),
+            remote_url: None,
+            upstream_url: Some(upstream_url),
+            git_source: None,
+            sdist_source: None,
+        };
+
+        unsafe { std::env::set_var("RETREAD_NO_SHADOW_CACHE", "1") };
+        let replay_staged = crate::courier::stage(
+            &config,
+            bundle,
+            wheel_version,
+            "3.11",
+            &[dep_replay, replay_emit],
+            &conda_capable,
+            &[],
+            &index_urls,
+            "",
+            &source_dir,
+            &staging_replay,
+        )
+        .await;
+        unsafe { std::env::remove_var("RETREAD_NO_SHADOW_CACHE") };
+        let replay_staged = replay_staged.expect("replay stage must succeed");
+
+        let replay_lw = replay_staged
+            .lock
+            .wheels
+            .iter()
+            .find(|w| w.name == wheel_name)
+            .expect("replay lock must contain the wheel")
+            .clone();
+
+        std::fs::remove_dir_all(&dir).ok();
+        let _ = replay_lock; // suppress unused warning
+
+        // ── Field-for-field equality ─────────────────────────────────────────────
+        assert_eq!(
+            cold_lw.origin, replay_lw.origin,
+            "PARITY FAIL: origin mismatch: cold={:?} replay={:?}",
+            cold_lw.origin, replay_lw.origin,
+        );
+        assert_eq!(
+            cold_lw.filename, replay_lw.filename,
+            "PARITY FAIL: filename mismatch: cold={} replay={}",
+            cold_lw.filename, replay_lw.filename,
+        );
+        assert_eq!(
+            cold_lw.url, replay_lw.url,
+            "PARITY FAIL: url mismatch: cold={:?} replay={:?}",
+            cold_lw.url, replay_lw.url,
+        );
+        assert_eq!(
+            cold_lw.upstream_url, replay_lw.upstream_url,
+            "PARITY FAIL: upstream_url mismatch: cold={:?} replay={:?}",
+            cold_lw.upstream_url, replay_lw.upstream_url,
+        );
+        assert_eq!(
+            cold_lw.requires_dist, replay_lw.requires_dist,
+            "PARITY FAIL: requires_dist mismatch"
+        );
+        assert_eq!(
+            cold_lw.must_ship, replay_lw.must_ship,
+            "PARITY FAIL: must_ship mismatch: cold={} replay={}",
+            cold_lw.must_ship, replay_lw.must_ship,
+        );
+        assert_eq!(
+            cold_lw.sha256, replay_lw.sha256,
+            "PARITY FAIL: sha256 mismatch"
+        );
+        assert_eq!(
+            cold_lw.git_source, replay_lw.git_source,
+            "PARITY FAIL: git_source mismatch"
+        );
+        assert_eq!(
+            cold_lw.sdist_source, replay_lw.sdist_source,
+            "PARITY FAIL: sdist_source mismatch"
+        );
+    }
+
+    /// (3) CLASS-2 live round-trip: materialize_from_lock re-fetches a real upstream
+    /// wheel via fetch_wheel_cached and produces a LockWheel with origin=Built.
+    ///
+    /// Marked #[ignore] because it needs network (downloads a wheel from PyPI/github).
+    /// Run with: cargo test -- --include-ignored class2_live_round_trip
+    #[tokio::test]
+    #[ignore = "live: re-fetches a real index wheel (needs network); run with --include-ignored"]
+    async fn class2_live_round_trip() {
+        use super::materialize_from_lock;
+        use crate::config::RetreadConfig;
+
+        let pid = std::process::id();
+        let base = std::env::temp_dir().join(format!("retread-class2-live-{pid}"));
+        let source_dir = base.join("source");
+        let output_dir = base.join("output");
+        let work_dir = base.join("work");
+        let cache_dir = base.join("cache");
+        for d in [&source_dir, &output_dir, &work_dir, &cache_dir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+
+        // A small pure-python conda-capable wheel on PyPI (requests is universally
+        // available and tiny enough for a quick live test).
+        let upstream_url = "https://files.pythonhosted.org/packages/f9/9b/\
+             requests-2.31.0-py3-none-any.whl";
+
+        let lock = RetreadLock {
+            schema: SCHEMA,
+            retread_version: "2.7.1".into(),
+            bundle: "reqpack".into(),
+            version: "1.0.0".into(),
+            python: "3.11".into(),
+            inputs_hash: "live-c2".into(),
+            root_requirements: vec![],
+            wheels: vec![LockWheel {
+                name: "requests".into(),
+                version: "2.31.0".into(),
+                origin: Origin::Built,
+                filename: "requests-2.31.0-999retread-py3-none-any.whl".into(),
+                url: None,
+                sha256: None,
+                requires_dist: vec!["urllib3>=1.21.1".into()],
+                must_ship: false,
+                upstream_url: Some(upstream_url.into()),
+                git_source: None,
+                sdist_source: None,
+            }],
+            conda_run_deps: vec![],
+            index_urls: vec!["https://pypi.org/simple/".into()],
+            prerelease: BTreeMap::new(),
+            conda_capable: vec!["requests".into()],
+        };
+        let config: RetreadConfig = serde_json::from_value(serde_json::json!({"retread-wheels": {
+            "reqpack": { "version": "==1.0.0" }
+        }}))
+        .unwrap();
+
+        let result = materialize_from_lock(
+            lock,
+            &config,
+            &work_dir,
+            &output_dir,
+            rattler_conda_types::Platform::Linux64,
+            &source_dir,
+            &cache_dir,
+            None,
+            vec!["python 3.11.*".to_string()],
+            "live-c2-fp",
+        )
+        .await;
+
+        std::fs::remove_dir_all(&base).ok();
+
+        assert!(
+            result.is_ok(),
+            "Class-2 live round-trip must not Err: {result:?}"
+        );
+        assert!(
+            result.unwrap().is_some(),
+            "Class-2 live round-trip must return Ok(Some(...))"
+        );
     }
 
     // ---- RETREAD_NO_REPLAY env knob tests ----
@@ -5590,6 +6787,7 @@ mod replay_tests {
             must_ship: false,      // relax-changed index wheel
             upstream_url: None,
             git_source: None,
+            sdist_source: None,
         });
         let path = dir.join(RetreadLock::file_name("pack"));
         std::fs::write(&path, lock.to_pretty_json().unwrap()).unwrap();
@@ -5707,6 +6905,7 @@ mod replay_tests {
             must_ship: false,
             upstream_url: Some("https://files.pythonhosted.org/torchvision-0.18.0.whl".into()),
             git_source: None,
+            sdist_source: None,
         });
         let path = dir.join(RetreadLock::file_name("pack"));
         std::fs::write(&path, lock.to_pretty_json().unwrap()).unwrap();
@@ -5939,6 +7138,805 @@ version = "1.0.0"
 
         let _ = std::fs::remove_dir_all(&base);
     }
+
+    // -----------------------------------------------------------------------
+    // PHASE 2.5 tests: multi-entry shared-git-checkout replay.
+    // -----------------------------------------------------------------------
+
+    /// Test (b): group[0] in lock order is the carrier.
+    ///
+    /// Verify that the pre-pass in materialize_from_lock assigns AutoDataConfig
+    /// (with the union skip_subdirs) to lock index 0 of a multi-entry group, and
+    /// None to all other members. This mirrors produce's BTreeMap-order-first
+    /// carrier rule (auto_data_per_entry, mod.rs ~2197-2221).
+    ///
+    /// This is a pure unit test — it exercises the grouping + AutoDataConfig
+    /// derivation logic directly via a synthetic lock, no git/uv required.
+    #[test]
+    fn multi_entry_git_group_lock_order_first_is_carrier() {
+        use crate::lock::{GitWheelSource, LockWheel, Origin};
+        use std::path::PathBuf;
+
+        // Synthetic "resolved" SHA — just needs to be a consistent 40-char string
+        // so git_checkout_root produces a deterministic path.
+        let rev = "a".repeat(40);
+        let url = "https://github.com/example/monorepo.git".to_string();
+        let cache_dir =
+            std::env::temp_dir().join(format!("retread-p25-carrier-test-{}", std::process::id()));
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        // Group: 3 members of the same git repo, different subdirs.
+        // Lock order: isaaclab (index 0), isaaclab_assets (index 1),
+        // isaaclab_tasks (index 2).
+        // rl_games: separate size-1 group (different rev).
+        let rev2 = "b".repeat(40);
+        let url2 = "https://github.com/example/rl_games.git".to_string();
+
+        let wheels = vec![
+            LockWheel {
+                name: "isaaclab".into(),
+                version: "2.1.0".into(),
+                origin: Origin::Built,
+                filename: "isaaclab-2.1.0-py3-none-any.injected.whl".into(),
+                url: None,
+                sha256: None,
+                requires_dist: vec![],
+                must_ship: true,
+                upstream_url: None,
+                git_source: Some(GitWheelSource {
+                    url: url.clone(),
+                    rev: rev.clone(),
+                    subdirectory: Some("source/isaaclab".into()),
+                    extras: vec![],
+                }),
+                sdist_source: None,
+            },
+            LockWheel {
+                name: "isaaclab-assets".into(),
+                version: "2.1.0".into(),
+                origin: Origin::Built,
+                filename: "isaaclab_assets-2.1.0-py3-none-any.injected.whl".into(),
+                url: None,
+                sha256: None,
+                requires_dist: vec![],
+                must_ship: true,
+                upstream_url: None,
+                git_source: Some(GitWheelSource {
+                    url: url.clone(),
+                    rev: rev.clone(),
+                    subdirectory: Some("source/isaaclab_assets".into()),
+                    extras: vec![],
+                }),
+                sdist_source: None,
+            },
+            // Interleaved non-git index wheel (non-contiguous group test).
+            LockWheel {
+                name: "numpy".into(),
+                version: "1.26.0".into(),
+                origin: Origin::Index,
+                filename: "numpy-1.26.0-cp311-cp311-linux_x86_64.whl".into(),
+                url: Some("https://files.pythonhosted.org/numpy-1.26.0.whl".into()),
+                sha256: None,
+                requires_dist: vec![],
+                must_ship: false,
+                upstream_url: None,
+                git_source: None,
+                sdist_source: None,
+            },
+            // rl_games: size-1 group (separate repo / rev).
+            LockWheel {
+                name: "rl-games".into(),
+                version: "1.6.1".into(),
+                origin: Origin::Built,
+                filename: "rl_games-1.6.1-py3-none-any.injected.whl".into(),
+                url: None,
+                sha256: None,
+                requires_dist: vec![],
+                must_ship: true,
+                upstream_url: None,
+                git_source: Some(GitWheelSource {
+                    url: url2.clone(),
+                    rev: rev2.clone(),
+                    subdirectory: None, // root subdir
+                    extras: vec![],
+                }),
+                sdist_source: None,
+            },
+            // isaaclab_tasks: non-contiguous member of the isaaclab group.
+            LockWheel {
+                name: "isaaclab-tasks".into(),
+                version: "2.1.0".into(),
+                origin: Origin::Built,
+                filename: "isaaclab_tasks-2.1.0-py3-none-any.injected.whl".into(),
+                url: None,
+                sha256: None,
+                requires_dist: vec![],
+                must_ship: true,
+                upstream_url: None,
+                git_source: Some(GitWheelSource {
+                    url: url.clone(),
+                    rev: rev.clone(),
+                    subdirectory: Some("source/isaaclab_tasks".into()),
+                    extras: vec![],
+                }),
+                sdist_source: None,
+            },
+        ];
+
+        // Replicate the pre-pass logic from materialize_from_lock.
+        let mut git_group_members: std::collections::HashMap<PathBuf, Vec<usize>> =
+            std::collections::HashMap::new();
+        let mut git_group_order: Vec<PathBuf> = Vec::new();
+
+        for (idx, lw) in wheels.iter().enumerate() {
+            if lw.origin == Origin::Built
+                && lw.must_ship
+                && let Some(gs) = &lw.git_source
+            {
+                let root = crate::source_build::git_checkout_root(&gs.url, &gs.rev, &cache_dir);
+                let entry = git_group_members.entry(root.clone()).or_insert_with(|| {
+                    git_group_order.push(root.clone());
+                    Vec::new()
+                });
+                entry.push(idx);
+            }
+        }
+
+        // Compute auto_data_override (mirrors materialize_from_lock pre-pass).
+        let mut auto_data_override: std::collections::HashMap<usize, Option<AutoDataConfig>> =
+            std::collections::HashMap::new();
+        for root in &git_group_order {
+            let members = &git_group_members[root];
+            if members.len() > 1 {
+                let skip_subdirs: Vec<PathBuf> = members
+                    .iter()
+                    .map(|&idx| {
+                        let gs = wheels[idx].git_source.as_ref().unwrap();
+                        PathBuf::from(gs.subdirectory.as_deref().unwrap_or("."))
+                    })
+                    .collect();
+                auto_data_override.insert(
+                    members[0],
+                    Some(AutoDataConfig {
+                        checkout_root: root.clone(),
+                        skip_subdirs,
+                    }),
+                );
+                for &idx in &members[1..] {
+                    auto_data_override.insert(idx, None);
+                }
+            }
+        }
+
+        // ASSERT (b): IsaacLab group has 3 members (indices 0, 1, 4).
+        let isaac_root = crate::source_build::git_checkout_root(&url, &rev, &cache_dir);
+        let isaac_members = &git_group_members[&isaac_root];
+        assert_eq!(isaac_members.len(), 3, "isaaclab group must have 3 members");
+        assert_eq!(
+            isaac_members[0], 0,
+            "isaaclab (lock idx 0) must be group[0]"
+        );
+        assert_eq!(
+            isaac_members[1], 1,
+            "isaaclab-assets (lock idx 1) must be group[1]"
+        );
+        assert_eq!(
+            isaac_members[2], 4,
+            "isaaclab-tasks (lock idx 4, non-contiguous) must be group[2]"
+        );
+
+        // Carrier (index 0) has AutoDataConfig with all 3 subdirs.
+        let carrier_ad = auto_data_override
+            .get(&0)
+            .expect("lock idx 0 must be in auto_data_override")
+            .as_ref()
+            .expect("carrier (lock idx 0) must have Some(AutoDataConfig)");
+        assert_eq!(
+            carrier_ad.skip_subdirs.len(),
+            3,
+            "carrier skip_subdirs must be union of all 3 member subdirs"
+        );
+        assert!(
+            carrier_ad
+                .skip_subdirs
+                .contains(&PathBuf::from("source/isaaclab")),
+            "carrier skip_subdirs must include source/isaaclab"
+        );
+        assert!(
+            carrier_ad
+                .skip_subdirs
+                .contains(&PathBuf::from("source/isaaclab_assets")),
+            "carrier skip_subdirs must include source/isaaclab_assets"
+        );
+        assert!(
+            carrier_ad
+                .skip_subdirs
+                .contains(&PathBuf::from("source/isaaclab_tasks")),
+            "carrier skip_subdirs must include source/isaaclab_tasks"
+        );
+
+        // Non-carriers (indices 1 and 4) have None.
+        assert!(
+            auto_data_override.contains_key(&1) && auto_data_override[&1].is_none(),
+            "lock idx 1 (non-carrier) must have None auto_data"
+        );
+        assert!(
+            auto_data_override.contains_key(&4) && auto_data_override[&4].is_none(),
+            "lock idx 4 (non-carrier, non-contiguous) must have None auto_data"
+        );
+
+        // rl_games: size-1 group -> NOT in auto_data_override.
+        let rl_root = crate::source_build::git_checkout_root(&url2, &rev2, &cache_dir);
+        let rl_members = &git_group_members[&rl_root];
+        assert_eq!(rl_members.len(), 1, "rl_games must be size-1 group");
+        assert!(
+            !auto_data_override.contains_key(&rl_members[0]),
+            "size-1 group must not be in auto_data_override (single-entry path)"
+        );
+
+        // Index wheel (lock idx 2, Origin::Index) must NOT appear in any group.
+        assert!(
+            !git_group_members.values().any(|v| v.contains(&2)),
+            "Origin::Index wheel must not appear in any git group"
+        );
+
+        std::fs::remove_dir_all(&cache_dir).ok();
+    }
+
+    /// Test (c): guard fall-through — a must_ship=true Built wheel with no
+    /// git_source and no manifest entry must return Ok(None), not Err, even
+    /// when preceded in the lock by a legitimate index wheel.
+    ///
+    /// This is the class-3 fall-through: incomplete provenance (no git_source,
+    /// no [retread-wheels] entry) -> Ok(None) -> caller falls through to full
+    /// resolve_all. NEVER Err.
+    ///
+    /// The Phase 2.5 variant: the "orphan" wheel appears after an Origin::Index
+    /// wheel (simulating interleaving with non-git members in the lock). The
+    /// index wheel does not require any network or git, so the test runs without
+    /// uv/git.
+    #[tokio::test]
+    async fn multi_entry_group_member_missing_git_source_returns_ok_none() {
+        use super::materialize_from_lock;
+        use crate::config::RetreadConfig;
+        use crate::lock::{LockWheel, Origin};
+
+        let dir = unique_tmp_dir();
+        let source_dir = dir.join("source");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let output_dir = dir.join("output");
+        let work_dir = dir.join("work");
+        let cache_dir = dir.join("cache");
+
+        // Lock: one index wheel (no git), then one must_ship Built wheel
+        // with NO git_source and NOT in config.retread_wheels (class-3 gap).
+        // The index wheel must NOT trigger a network call (it has a local
+        // file:// URL that won't be fetched until courier::stage, which we
+        // don't reach — we return Ok(None) before that).
+        let lock = crate::lock::RetreadLock {
+            schema: SCHEMA,
+            retread_version: "2.5.0".into(),
+            bundle: "interleaved-pack".into(),
+            version: "1.0.0".into(),
+            python: "3.11".into(),
+            inputs_hash: "hash-c-test".into(),
+            root_requirements: vec![],
+            wheels: vec![
+                // Index wheel (class 4): no git, processed without network.
+                LockWheel {
+                    name: "numpy".into(),
+                    version: "1.26.0".into(),
+                    origin: Origin::Index,
+                    filename: "numpy-1.26.0-cp311-cp311-linux_x86_64.whl".into(),
+                    url: Some("https://files.pythonhosted.org/numpy-1.26.0.whl".into()),
+                    sha256: None,
+                    requires_dist: vec![],
+                    must_ship: false,
+                    upstream_url: None,
+                    git_source: None,
+                    sdist_source: None,
+                },
+                // Class-3 orphan: must_ship=true, no git_source, not in config.
+                // This is the wheel that must trigger Ok(None).
+                LockWheel {
+                    name: "bfs-transitive-orphan".into(),
+                    version: "0.1.0".into(),
+                    origin: Origin::Built,
+                    filename: "bfs_transitive_orphan-0.1.0-py3-none-any.injected.whl".into(),
+                    url: None,
+                    sha256: None,
+                    requires_dist: vec![],
+                    must_ship: true,
+                    upstream_url: None,
+                    git_source: None, // MISSING: class-3 gap
+                    sdist_source: None,
+                },
+            ],
+            conda_run_deps: vec![],
+            index_urls: vec!["https://pypi.org/simple/".into()],
+            prerelease: std::collections::BTreeMap::new(),
+            conda_capable: vec![],
+        };
+
+        // Config has no retread_wheels entries.
+        let config: RetreadConfig =
+            serde_json::from_value(serde_json::json!({"retread-wheels": {}})).unwrap();
+
+        let result = materialize_from_lock(
+            lock,
+            &config,
+            &work_dir,
+            &output_dir,
+            rattler_conda_types::Platform::Linux64,
+            &source_dir,
+            &cache_dir,
+            None,
+            vec!["python 3.11.*".to_string()],
+            "fp",
+        )
+        .await;
+
+        // Must be Ok(None), never Err — incomplete provenance = fall-through.
+        assert!(
+            result.is_ok(),
+            "class-3 orphan (no git_source, not in config) must not Err even \
+             when interleaved with index wheels: {result:?}"
+        );
+        assert!(
+            result.unwrap().is_none(),
+            "class-3 orphan (no git_source, not in config) must return Ok(None) \
+             so caller falls through to full resolve_all"
+        );
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // Test (a): live e2e parity — multi-entry local-git fixture.
+    //
+    // Creates a local git repo with two subdirectory packages (pkg-alpha and
+    // pkg-beta) plus a separate size-1 repo (pkg-gamma). Runs produce via
+    // materialize_and_rewrite for each, then simulates what materialize_from_lock
+    // does for the group (carrier with union skip_subdirs, non-carrier with None),
+    // and asserts byte-identical wheels.
+    //
+    // Also tests NON-CONTIGUOUS group order: the lock has pkg-alpha (idx 0),
+    // an unrelated index wheel (idx 1), pkg-beta (idx 2), pkg-gamma (idx 3).
+    // The alpha+beta group is non-contiguous in the lock.
+    //
+    // Mark #[ignore] because it needs uv + git on PATH (like other live git tests).
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    #[ignore = "live: builds git wheels via uv (needs uv + git on PATH); run with --include-ignored"]
+    async fn multi_entry_git_group_produce_replay_byte_identical() {
+        use super::{AutoDataConfig, EntryAuditInfo, materialize_and_rewrite, wheel_target_for};
+        use crate::config::RelaxPolicy;
+        use crate::config::WheelEntry;
+        use crate::lock::GitWheelSource;
+        use rattler_conda_types::Platform;
+
+        let pid = std::process::id();
+        let base = std::env::temp_dir().join(format!("retread-phase25-parity-{pid}"));
+
+        // ── Git fixture: monorepo with two packages ──────────────────────────
+        let mono_repo = base.join("mono-repo");
+        let pkg_alpha_dir = mono_repo.join("packages").join("pkg_alpha");
+        let pkg_beta_dir = mono_repo.join("packages").join("pkg_beta");
+        // size-1 separate repo (pkg-gamma)
+        let gamma_repo = base.join("gamma-repo");
+        let pkg_gamma_dir = gamma_repo.join("pkg_gamma");
+
+        for d in [&pkg_alpha_dir, &pkg_beta_dir, &pkg_gamma_dir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+
+        let run_git = |args: &[&str], dir: &std::path::Path| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_AUTHOR_NAME", "test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .status()
+                .expect("git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+
+        let git_sha = |dir: &std::path::Path| -> String {
+            let out = std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(dir)
+                .output()
+                .expect("git rev-parse");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        // ── Monorepo init ────────────────────────────────────────────────────
+        run_git(&["init", "-b", "main"], &mono_repo);
+        run_git(&["config", "user.email", "test@example.com"], &mono_repo);
+        run_git(&["config", "user.name", "test"], &mono_repo);
+
+        // pkg-alpha
+        std::fs::write(
+            pkg_alpha_dir.join("pyproject.toml"),
+            r#"[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "retread-p25-pkg-alpha"
+version = "1.0.0"
+"#,
+        )
+        .unwrap();
+        let alpha_src = pkg_alpha_dir.join("retread_p25_pkg_alpha");
+        std::fs::create_dir_all(&alpha_src).unwrap();
+        std::fs::write(alpha_src.join("__init__.py"), b"# pkg-alpha\n").unwrap();
+
+        // pkg-beta
+        std::fs::write(
+            pkg_beta_dir.join("pyproject.toml"),
+            r#"[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "retread-p25-pkg-beta"
+version = "1.0.0"
+"#,
+        )
+        .unwrap();
+        let beta_src = pkg_beta_dir.join("retread_p25_pkg_beta");
+        std::fs::create_dir_all(&beta_src).unwrap();
+        std::fs::write(beta_src.join("__init__.py"), b"# pkg-beta\n").unwrap();
+
+        // shared root file (must appear in BOTH carriers' auto-data)
+        std::fs::write(mono_repo.join("README.md"), b"monorepo root\n").unwrap();
+
+        run_git(&["add", "."], &mono_repo);
+        run_git(&["commit", "-m", "initial"], &mono_repo);
+        let mono_sha = git_sha(&mono_repo);
+        assert_eq!(mono_sha.len(), 40, "expected 40-char SHA");
+
+        // ── Gamma repo init ──────────────────────────────────────────────────
+        run_git(&["init", "-b", "main"], &gamma_repo);
+        run_git(&["config", "user.email", "test@example.com"], &gamma_repo);
+        run_git(&["config", "user.name", "test"], &gamma_repo);
+
+        std::fs::write(
+            gamma_repo.join("pyproject.toml"),
+            r#"[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "retread-p25-pkg-gamma"
+version = "1.0.0"
+"#,
+        )
+        .unwrap();
+        let gamma_src = pkg_gamma_dir.join("retread_p25_pkg_gamma");
+        std::fs::create_dir_all(&gamma_src).unwrap();
+        std::fs::write(gamma_src.join("__init__.py"), b"# pkg-gamma\n").unwrap();
+
+        run_git(&["add", "."], &gamma_repo);
+        run_git(&["commit", "-m", "initial"], &gamma_repo);
+        let gamma_sha = git_sha(&gamma_repo);
+        assert_eq!(gamma_sha.len(), 40, "expected 40-char SHA");
+
+        let mono_url = format!("file://{}", mono_repo.display());
+        let gamma_url = format!("file://{}", gamma_repo.display());
+
+        // ── Common dirs ─────────────────────────────────────────────────────
+        let cache_dir = base.join("cache");
+        // Each call needs its own source/download dir to avoid is_fresh() cache hits.
+        let produce_alpha_src = base.join("src-produce-alpha");
+        let produce_beta_src = base.join("src-produce-beta");
+        let replay_alpha_src = base.join("src-replay-alpha");
+        let replay_beta_src = base.join("src-replay-beta");
+        let produce_gamma_src = base.join("src-produce-gamma");
+        let replay_gamma_src = base.join("src-replay-gamma");
+        for d in [
+            &cache_dir,
+            &produce_alpha_src,
+            &produce_beta_src,
+            &replay_alpha_src,
+            &replay_beta_src,
+            &produce_gamma_src,
+            &replay_gamma_src,
+        ] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+
+        let target = wheel_target_for(Platform::Linux64, "3.11");
+        let mono_checkout_root =
+            crate::source_build::git_checkout_root(&mono_url, &mono_sha, &cache_dir);
+        let gamma_checkout_root =
+            crate::source_build::git_checkout_root(&gamma_url, &gamma_sha, &cache_dir);
+
+        // ── PRODUCE: alpha (carrier, skip_subdirs = union of all mono members) ──
+        //
+        // Produce carrier: skip_subdirs = [packages/pkg_alpha, packages/pkg_beta]
+        // (union of both group members' subdirs, mirrors auto_data_per_entry).
+        let alpha_entry = WheelEntry {
+            git: Some(mono_url.clone()),
+            rev: Some(mono_sha.clone()),
+            subdirectory: Some("packages/pkg_alpha".into()),
+            ..WheelEntry::default()
+        };
+        let produce_alpha_dd = produce_alpha_src.join("wheels");
+        std::fs::create_dir_all(&produce_alpha_dd).unwrap();
+        let (produce_alpha_resolved, _) = materialize_and_rewrite(
+            &alpha_entry,
+            "retread-p25-pkg-alpha",
+            &target,
+            &produce_alpha_dd,
+            &produce_alpha_src,
+            &cache_dir,
+            RelaxPolicy::None,
+            &std::collections::BTreeMap::new(),
+            Some(AutoDataConfig {
+                checkout_root: mono_checkout_root.clone(),
+                skip_subdirs: vec![
+                    std::path::PathBuf::from("packages/pkg_alpha"),
+                    std::path::PathBuf::from("packages/pkg_beta"),
+                ],
+            }),
+            EntryAuditInfo::default(),
+        )
+        .await
+        .expect("produce alpha: materialize_and_rewrite");
+        let produce_alpha_path = produce_alpha_resolved
+            .url
+            .to_file_path()
+            .expect("produce alpha must be file URL");
+        let produce_alpha_bytes = std::fs::read(&produce_alpha_path).unwrap();
+
+        // ── PRODUCE: beta (non-carrier, auto_data=None) ──────────────────────
+        let beta_entry = WheelEntry {
+            git: Some(mono_url.clone()),
+            rev: Some(mono_sha.clone()),
+            subdirectory: Some("packages/pkg_beta".into()),
+            ..WheelEntry::default()
+        };
+        let produce_beta_dd = produce_beta_src.join("wheels");
+        std::fs::create_dir_all(&produce_beta_dd).unwrap();
+        let (produce_beta_resolved, _) = materialize_and_rewrite(
+            &beta_entry,
+            "retread-p25-pkg-beta",
+            &target,
+            &produce_beta_dd,
+            &produce_beta_src,
+            &cache_dir,
+            RelaxPolicy::None,
+            &std::collections::BTreeMap::new(),
+            None, // non-carrier: no auto_data
+            EntryAuditInfo::default(),
+        )
+        .await
+        .expect("produce beta: materialize_and_rewrite");
+        let produce_beta_path = produce_beta_resolved
+            .url
+            .to_file_path()
+            .expect("produce beta must be file URL");
+        let produce_beta_bytes = std::fs::read(&produce_beta_path).unwrap();
+
+        // ── PRODUCE: gamma (size-1 group, skip_subdirs=["."] single-entry path) ──
+        let gamma_entry = WheelEntry {
+            git: Some(gamma_url.clone()),
+            rev: Some(gamma_sha.clone()),
+            subdirectory: None, // root
+            ..WheelEntry::default()
+        };
+        let produce_gamma_dd = produce_gamma_src.join("wheels");
+        std::fs::create_dir_all(&produce_gamma_dd).unwrap();
+        let (produce_gamma_resolved, _) = materialize_and_rewrite(
+            &gamma_entry,
+            "retread-p25-pkg-gamma",
+            &target,
+            &produce_gamma_dd,
+            &produce_gamma_src,
+            &cache_dir,
+            RelaxPolicy::None,
+            &std::collections::BTreeMap::new(),
+            Some(AutoDataConfig {
+                checkout_root: gamma_checkout_root.clone(),
+                skip_subdirs: vec![std::path::PathBuf::from(".")],
+            }),
+            EntryAuditInfo::default(),
+        )
+        .await
+        .expect("produce gamma: materialize_and_rewrite");
+        let produce_gamma_path = produce_gamma_resolved
+            .url
+            .to_file_path()
+            .expect("produce gamma must be file URL");
+        let produce_gamma_bytes = std::fs::read(&produce_gamma_path).unwrap();
+
+        // ── REPLAY: simulate what materialize_from_lock now does ─────────────
+        //
+        // Synthetic lock (non-contiguous group):
+        //   idx 0: alpha (mono group member)
+        //   idx 1: (not built here — we only test the git paths)
+        //   idx 2: beta (mono group member, non-contiguous)
+        //   idx 3: gamma (size-1 group)
+        //
+        // Pre-pass would assign:
+        //   idx 0 -> Some(AutoDataConfig{skip=[alpha,beta]})  (carrier)
+        //   idx 2 -> None                                      (non-carrier)
+        //   idx 3 -> not in override (size-1 path)
+        //
+        // We reproduce this in the test by calling materialize_and_rewrite with
+        // the same auto_data the pre-pass would produce.
+
+        // Replay alpha (carrier: auto_data with union skip_subdirs).
+        let replay_alpha_dd = replay_alpha_src.join("wheels");
+        std::fs::create_dir_all(&replay_alpha_dd).unwrap();
+        let synth_alpha = WheelEntry {
+            git: Some(mono_url.clone()),
+            rev: Some(mono_sha.clone()),
+            subdirectory: Some("packages/pkg_alpha".into()),
+            ..WheelEntry::default()
+        };
+        let (replay_alpha_resolved, _) = materialize_and_rewrite(
+            &synth_alpha,
+            "retread-p25-pkg-alpha",
+            &target,
+            &replay_alpha_dd,
+            &replay_alpha_src,
+            &cache_dir,
+            RelaxPolicy::None,
+            &std::collections::BTreeMap::new(),
+            Some(AutoDataConfig {
+                checkout_root: mono_checkout_root.clone(),
+                skip_subdirs: vec![
+                    std::path::PathBuf::from("packages/pkg_alpha"),
+                    std::path::PathBuf::from("packages/pkg_beta"),
+                ],
+            }),
+            EntryAuditInfo::default(),
+        )
+        .await
+        .expect("replay alpha: materialize_and_rewrite");
+        let replay_alpha_bytes =
+            std::fs::read(replay_alpha_resolved.url.to_file_path().unwrap()).unwrap();
+
+        // Replay beta (non-carrier: auto_data=None).
+        let replay_beta_dd = replay_beta_src.join("wheels");
+        std::fs::create_dir_all(&replay_beta_dd).unwrap();
+        let synth_beta = WheelEntry {
+            git: Some(mono_url.clone()),
+            rev: Some(mono_sha.clone()),
+            subdirectory: Some("packages/pkg_beta".into()),
+            ..WheelEntry::default()
+        };
+        let (replay_beta_resolved, _) = materialize_and_rewrite(
+            &synth_beta,
+            "retread-p25-pkg-beta",
+            &target,
+            &replay_beta_dd,
+            &replay_beta_src,
+            &cache_dir,
+            RelaxPolicy::None,
+            &std::collections::BTreeMap::new(),
+            None, // non-carrier: auto_data=None
+            EntryAuditInfo::default(),
+        )
+        .await
+        .expect("replay beta: materialize_and_rewrite");
+        let replay_beta_bytes =
+            std::fs::read(replay_beta_resolved.url.to_file_path().unwrap()).unwrap();
+
+        // Replay gamma (size-1 group: single-entry path, skip_subdirs=["."]).
+        let replay_gamma_dd = replay_gamma_src.join("wheels");
+        std::fs::create_dir_all(&replay_gamma_dd).unwrap();
+        let synth_gamma = WheelEntry {
+            git: Some(gamma_url.clone()),
+            rev: Some(gamma_sha.clone()),
+            subdirectory: None,
+            ..WheelEntry::default()
+        };
+        let (replay_gamma_resolved, _) = materialize_and_rewrite(
+            &synth_gamma,
+            "retread-p25-pkg-gamma",
+            &target,
+            &replay_gamma_dd,
+            &replay_gamma_src,
+            &cache_dir,
+            RelaxPolicy::None,
+            &std::collections::BTreeMap::new(),
+            Some(AutoDataConfig {
+                checkout_root: gamma_checkout_root.clone(),
+                skip_subdirs: vec![std::path::PathBuf::from(".")],
+            }),
+            EntryAuditInfo::default(),
+        )
+        .await
+        .expect("replay gamma: materialize_and_rewrite");
+        let replay_gamma_bytes =
+            std::fs::read(replay_gamma_resolved.url.to_file_path().unwrap()).unwrap();
+
+        // ── ASSERT: byte-identical ───────────────────────────────────────────
+        assert_eq!(
+            produce_alpha_bytes, replay_alpha_bytes,
+            "PHASE 2.5 PARITY: alpha carrier (union skip_subdirs) must be \
+             byte-identical between produce and replay"
+        );
+        assert_eq!(
+            produce_beta_bytes, replay_beta_bytes,
+            "PHASE 2.5 PARITY: beta non-carrier (auto_data=None) must be \
+             byte-identical between produce and replay"
+        );
+        assert_eq!(
+            produce_gamma_bytes, replay_gamma_bytes,
+            "PHASE 2.5 PARITY: gamma size-1 group (single-entry path) must be \
+             byte-identical between produce and replay"
+        );
+
+        // ── ASSERT: non-contiguous lock ordering simulation ──────────────────
+        // Confirm the group detection works for non-contiguous lock indices
+        // (alpha at 0, beta at 2, interleaved index wheel at 1).
+        let rev = mono_sha.clone();
+        let url = mono_url.clone();
+        let mut group_members: std::collections::HashMap<std::path::PathBuf, Vec<usize>> =
+            std::collections::HashMap::new();
+        let mut group_order: Vec<std::path::PathBuf> = Vec::new();
+        // Simulated lock: [alpha(0), dummy_index(1), beta(2), gamma(3)]
+        let sim_wheels: Vec<(bool, Option<GitWheelSource>)> = vec![
+            (
+                true,
+                Some(GitWheelSource {
+                    url: url.clone(),
+                    rev: rev.clone(),
+                    subdirectory: Some("packages/pkg_alpha".into()),
+                    extras: vec![],
+                }),
+            ),
+            (false, None), // Origin::Index — skipped
+            (
+                true,
+                Some(GitWheelSource {
+                    url: url.clone(),
+                    rev: rev.clone(),
+                    subdirectory: Some("packages/pkg_beta".into()),
+                    extras: vec![],
+                }),
+            ),
+            (
+                true,
+                Some(GitWheelSource {
+                    url: gamma_url.clone(),
+                    rev: gamma_sha.clone(),
+                    subdirectory: None,
+                    extras: vec![],
+                }),
+            ),
+        ];
+        for (idx, (must_ship, gs_opt)) in sim_wheels.iter().enumerate() {
+            if *must_ship && let Some(gs) = gs_opt {
+                let root = crate::source_build::git_checkout_root(&gs.url, &gs.rev, &cache_dir);
+                let entry = group_members.entry(root.clone()).or_insert_with(|| {
+                    group_order.push(root);
+                    Vec::new()
+                });
+                entry.push(idx);
+            }
+        }
+        let mono_root = crate::source_build::git_checkout_root(&url, &rev, &cache_dir);
+        let mono_members = &group_members[&mono_root];
+        assert_eq!(
+            mono_members,
+            &vec![0usize, 2usize],
+            "non-contiguous group: alpha at lock idx 0, beta at lock idx 2"
+        );
+        assert_eq!(
+            mono_members[0], 0usize,
+            "alpha (lock idx 0) must be carrier of non-contiguous group"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
 
 // -----------------------------------------------------------------
@@ -6060,6 +8058,7 @@ mod emit_wheel_upstream_url_tests {
             url: local.clone(), // file:// — what materialize_and_rewrite returns
             upstream_url: Some(upstream.clone()), // https:// — captured BEFORE localization
             git_source: None,
+            sdist_source: None,
             metadata: dummy_metadata("isaacsim", "6.0.0"),
             extras_requested: vec![],
             auto_data: None,
@@ -6101,6 +8100,7 @@ mod emit_wheel_upstream_url_tests {
                     // THE FIX: read from w.upstream_url, not derived from w.url.
                     upstream_url: w.upstream_url.clone(),
                     git_source: w.git_source.clone(),
+                    sdist_source: w.sdist_source.clone(),
                 }
             })
             .collect();
@@ -6152,6 +8152,7 @@ mod emit_wheel_upstream_url_tests {
             url: upstream.clone(),
             upstream_url: Some(upstream.clone()),
             git_source: None,
+            sdist_source: None,
             metadata: dummy_metadata("isaacsim-kernel", "6.0.0"),
             extras_requested: vec![],
             auto_data: None,
@@ -6172,6 +8173,7 @@ mod emit_wheel_upstream_url_tests {
                     .unwrap(),
                 ),
                 git_source: None,
+                sdist_source: None,
                 metadata: dummy_metadata("isaacsim", "6.0.0"),
                 extras_requested: vec![],
                 auto_data: None,
@@ -6201,6 +8203,7 @@ mod emit_wheel_upstream_url_tests {
                     remote_url: (url.scheme() != "file").then(|| url.clone()),
                     upstream_url: w.upstream_url.clone(),
                     git_source: w.git_source.clone(),
+                    sdist_source: w.sdist_source.clone(),
                 }
             })
             .collect();

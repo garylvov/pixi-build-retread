@@ -1168,6 +1168,7 @@ pub(crate) async fn try_pypi_bundle(
                         url: resolved.url,
                         upstream_url: upstream,
                         git_source: None,
+                        sdist_source: None,
                         metadata,
                         extras_requested: vec![],
                         auto_data: None,

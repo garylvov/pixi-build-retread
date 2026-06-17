@@ -385,7 +385,7 @@ environments:
       - conda: https://prefix.dev/conda-forge/noarch/wslink-2.5.7-pyhd8ed1ab_0.conda
       - conda: https://prefix.dev/conda-forge/noarch/xacro-2.1.1-pyhcf101f3_0.conda
       - conda: https://prefix.dev/conda-forge/noarch/zipp-4.1.0-pyhcf101f3_0.conda
-      - conda_source: genesis-pack[6186d8b2] @ ./genesis-pack
+      - conda_source: genesis-pack[5818346d] @ ./genesis-pack
 packages:
 - conda: https://prefix.dev/conda-forge/linux-64/_openmp_mutex-4.5-20_gnu.conda
   build_number: 20
@@ -6288,7 +6288,7 @@ packages:
   run_exports: {}
   size: 24190
   timestamp: 1779159948016
-- conda_source: genesis-pack[6186d8b2] @ ./genesis-pack
+- conda_source: genesis-pack[5818346d] @ ./genesis-pack
   variants:
     python: '3.12'
   depends:
@@ -6327,6 +6327,7 @@ packages:
   - plotly >=5.24.1,<5.25
   - scipy
   - uv
+  - python_abi 3.12.* *_cp312
   - python_abi 3.12.* *_cp312
   host_packages:
   - conda: https://prefix.dev/conda-forge/linux-64/_openmp_mutex-4.5-20_gnu.conda

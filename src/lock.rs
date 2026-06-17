@@ -69,6 +69,40 @@ pub struct GitWheelSource {
     pub extras: Vec<String>,
 }
 
+/// Provenance for a wheel built locally from a PyPI sdist because the
+/// index ships no target-compatible wheel (e.g. gym). On replay,
+/// `materialize_from_lock` re-builds DIRECTLY from the recorded `sdist_url`
+/// (the exact resolved https tarball + #sha256), falling back to
+/// `resolve_sdist(index, name, version)` only if that URL 404s ->
+/// deterministic, portable, manifest-independent. `None` for index-fetched
+/// and git-built wheels.
+///
+/// ## POISONING note
+///
+/// Like `git_source.rev`, `sdist_source` is NOT folded into `inputs_hash`
+/// (same circularity argument: it is a RESULT of resolution, not an input to
+/// it; folding it would require resolving to compute the hash that gates
+/// resolution). Replay reproduces the RECORDED sdist artifact verbatim. With
+/// the stored https URL + #sha256, the only residual risk is "the artifact was
+/// deleted/yanked from PyPI" — the same documented pinning floor as every
+/// other replay-trusted upstream (git commit, index wheel). The #sha256 is a
+/// free integrity check on re-fetch and is likewise NOT in `inputs_hash`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SdistWheelSource {
+    /// PEP 503 simple index base URL the sdist was resolved from.
+    /// Human-readable provenance + fallback re-resolution key.
+    pub index: String,
+    /// PEP 503 normalized project name. Fallback re-resolution key.
+    pub name: String,
+    /// Resolved version (from the built wheel's METADATA). Fallback key.
+    pub version: String,
+    /// The EXACT resolved sdist URL (e.g.
+    /// `https://files.pythonhosted.org/.../<name>-<version>.tar.gz#sha256=<hex>`).
+    /// PREFERRED on replay: build straight from this, skipping a re-resolve.
+    /// Carries the PEP-503 #sha256 fragment when the index advertised one.
+    pub sdist_url: String,
+}
+
 /// How a wheel reaches the consumer at install time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -126,6 +160,14 @@ pub struct LockWheel {
     /// wheels and non-git source-built wheels (path/from/url forms).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_source: Option<GitWheelSource>,
+    /// Sdist provenance for wheels built from a PyPI sdist (schema 9+).
+    /// Present when this wheel was built from an sdist because the index
+    /// ships no target-compatible wheel (e.g. gym). Carries the exact
+    /// resolved sdist https URL + #sha256 so replay can re-build from the
+    /// same tarball manifest-independently. `None` for index-fetched and
+    /// git-built wheels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sdist_source: Option<SdistWheelSource>,
 }
 
 /// A conda run-dep retread routed to the conda side (a shared transitive
@@ -181,13 +223,16 @@ pub struct RetreadLock {
     pub conda_capable: Vec<String>,
 }
 
-/// Schema 8: git_source (GitWheelSource) field added to LockWheel (required
-/// for Class-1 git-wheel replay independent of the live manifest). Old schema-7
-/// and earlier locks are rejected by the != gate and fall through to full
-/// resolve (safe: committed genesis/newton locks are regenerated in commit 6).
-/// SCHEMA is NOT an epoch bump (the lock FORMAT changed, not the emitted-output
-/// SEMANTICS for identical inputs).
-pub const SCHEMA: u32 = 8;
+/// Schema 9: sdist_source (SdistWheelSource) field added to LockWheel (schema
+/// 8+). Required for Class-2b sdist-built BFS transitive replay (e.g. gym):
+/// records the exact resolved sdist https URL + #sha256 so replay can re-build
+/// from the identical tarball manifest-independently, without re-running the
+/// full BFS/solve. Old schema-8 and earlier locks are rejected by the != gate
+/// and fall through to full resolve (safe: committed locks must be regenerated
+/// under v2.7.0). SCHEMA is NOT an epoch bump (lock FORMAT change only; the
+/// emitted-output SEMANTICS for identical inputs are unchanged —
+/// sdist_source is not in compute_inputs_hash; [emit-epoch-ok]).
+pub const SCHEMA: u32 = 9;
 
 /// Bump EMIT_EPOCH in the SAME commit as ANY change that can alter the bytes
 /// retread emits for identical manifest inputs (relax/version-selection
@@ -331,6 +376,7 @@ mod tests {
                     must_ship: true,
                     upstream_url: None,
                     git_source: None,
+                    sdist_source: None,
                 },
                 LockWheel {
                     // relax-changed shadow: upstream_url records where to
@@ -345,6 +391,7 @@ mod tests {
                     must_ship: false,
                     upstream_url: Some("https://files.pythonhosted.org/skrl-2.1.0.whl".into()),
                     git_source: None,
+                    sdist_source: None,
                 },
                 LockWheel {
                     name: "isaacsim-core".into(),
@@ -357,6 +404,7 @@ mod tests {
                     must_ship: false,
                     upstream_url: None,
                     git_source: None,
+                    sdist_source: None,
                 },
             ],
             conda_run_deps: vec![CondaDep {
@@ -374,8 +422,8 @@ mod tests {
         let back: RetreadLock = serde_json::from_str(&json).unwrap();
         assert_eq!(back.bundle, "isaac-pack");
         assert_eq!(
-            back.schema, 8,
-            "SCHEMA must be 8 after git_source/GitWheelSource added for Class-1 git replay"
+            back.schema, 9,
+            "SCHEMA must be 9 after sdist_source/SdistWheelSource added for Class-2b sdist replay"
         );
         assert_eq!(back.wheels.len(), 3);
         // Wheel 0: must_ship source-built, no upstream_url.
@@ -692,6 +740,64 @@ mod tests {
         let back_minimal: GitWheelSource = serde_json::from_str(&minimal_json).unwrap();
         assert!(back_minimal.subdirectory.is_none());
         assert!(back_minimal.extras.is_empty());
+    }
+
+    /// `SdistWheelSource` serializes and deserializes correctly.
+    #[test]
+    fn sdist_wheel_source_serde_roundtrip() {
+        let src = SdistWheelSource {
+            index: "https://pypi.org/simple/".into(),
+            name: "gym".into(),
+            version: "0.26.2".into(),
+            sdist_url: "https://files.pythonhosted.org/packages/gym-0.26.2.tar.gz#sha256=abc"
+                .into(),
+        };
+        let json = serde_json::to_string(&src).unwrap();
+        let back: SdistWheelSource = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.index, src.index);
+        assert_eq!(back.name, src.name);
+        assert_eq!(back.version, src.version);
+        assert_eq!(back.sdist_url, src.sdist_url);
+        // sdist_url must NOT begin with file:// (portability invariant).
+        assert!(
+            back.sdist_url.starts_with("https://"),
+            "sdist_url must be an https URL, not file://"
+        );
+    }
+
+    /// A schema-8 lock (no sdist_source field) must deserialize cleanly
+    /// with sdist_source defaulting to None on each wheel.
+    #[test]
+    fn schema8_lock_sdist_source_defaults_to_none() {
+        let schema8_json = r#"{
+            "schema": 8,
+            "retread_version": "2.6.0",
+            "bundle": "gym-pack",
+            "version": "1.0.0",
+            "python": "3.11",
+            "inputs_hash": "oldhash8",
+            "root_requirements": ["gym-pack-pypi==1.0.0"],
+            "wheels": [
+                {
+                    "name": "gym",
+                    "version": "0.26.2",
+                    "origin": "built",
+                    "filename": "gym-0.26.2-999retread-py3-none-any.whl",
+                    "requires_dist": ["numpy>=1.21"],
+                    "must_ship": false
+                }
+            ],
+            "conda_run_deps": [],
+            "index_urls": ["https://pypi.org/simple/"]
+        }"#;
+        let lock: RetreadLock = serde_json::from_str(schema8_json).unwrap();
+        assert_eq!(lock.schema, 8);
+        // sdist_source added in schema 9 — must default to None for schema-8 locks.
+        assert!(
+            lock.wheels[0].sdist_source.is_none(),
+            "sdist_source must default to None when absent from schema-8 lock"
+        );
+        assert!(!lock.wheels[0].must_ship);
     }
 
     /// A schema-7 lock JSON (no git_source field) must deserialize cleanly

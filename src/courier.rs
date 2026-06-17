@@ -559,6 +559,9 @@ pub async fn stage(
                 // Git provenance (schema 8+): written from EmitWheel.git_source
                 // which was populated by materialize_and_rewrite for git entries.
                 git_source: w.git_source.clone(),
+                // Sdist provenance (schema 9+): None for source-built (.injected)
+                // wheels (these are git/path builds, not sdist BFS transitives).
+                sdist_source: None,
             });
         } else {
             // Index wheel. Decide whether to ship a relax-rewritten shadow
@@ -693,6 +696,7 @@ pub async fn stage(
                         must_ship: false,
                         upstream_url: None, // n/a for Index wheels; use `url` instead
                         git_source: None,   // Index wheels have no git source
+                        sdist_source: None, // n/a for Index wheels
                     });
                 }
                 ShadowSrc::Rewritten(probe_dst) => {
@@ -732,6 +736,10 @@ pub async fn stage(
                         must_ship: w.must_ship(),
                         upstream_url,
                         git_source: None, // Class-2 shadow: index wheel, no git source
+                        // Sdist provenance (schema 9+): thread from EmitWheel so
+                        // sdist-built BFS transitives (e.g. gym) carry their sdist_url
+                        // into the lock for Class-2b replay.
+                        sdist_source: w.sdist_source.clone(),
                     });
                 }
                 ShadowSrc::Raw(src) => {
@@ -771,6 +779,10 @@ pub async fn stage(
                         must_ship: w.must_ship(),
                         upstream_url,
                         git_source: None, // Class-2 shadow: index wheel, no git source
+                        // Sdist provenance (schema 9+): thread from EmitWheel so
+                        // sdist-built BFS transitives (e.g. gym) carry their sdist_url
+                        // into the lock for Class-2b replay.
+                        sdist_source: w.sdist_source.clone(),
                     });
                 }
             }
@@ -1038,6 +1050,7 @@ mod tests {
             remote_url: remote_url.and_then(|u| u.parse().ok()),
             upstream_url: None,
             git_source: None,
+            sdist_source: None,
         }
     }
 
@@ -2295,6 +2308,7 @@ version = "1.0.0"
                 subdirectory: None,
                 extras: vec![],
             }),
+            sdist_source: None, // git source: no sdist provenance
         };
 
         // Use a config with NO retread-wheels entry for pkg_name to prove
@@ -2438,6 +2452,7 @@ version = "1.0.0"
                 subdirectory: None,
                 extras: vec![],
             }),
+            sdist_source: None, // git source replay: no sdist provenance
         };
 
         unsafe { std::env::set_var("RETREAD_NO_SHADOW_CACHE", "1") };
@@ -2488,5 +2503,122 @@ version = "1.0.0"
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Phase-2.6 schema-9 test: sdist_source is carried from EmitWheel into LockWheel.
+    ///
+    /// Scenario: a BFS-transitive wheel (gym) was built from a PyPI sdist.
+    /// `build_one` populates `EmitWheel.sdist_source` with the captured sdist URL.
+    /// `courier::stage` must write it into `LockWheel.sdist_source` (schema 9+).
+    ///
+    /// We trigger the ShadowSrc::Raw path (rewrite_wheel_with detects a change)
+    /// so the wheel becomes `Origin::Built, must_ship=false` — the Class-2b arm's
+    /// target.  After staging, assert:
+    ///   (a) LockWheel.sdist_source == the EmitWheel's sdist_source
+    ///   (b) LockWheel.origin == Origin::Built && must_ship == false
+    ///   (c) LockWheel.upstream_url is None (suppressed at write time for sdist)
+    #[tokio::test]
+    async fn sdist_source_carried_into_lock() {
+        use crate::lock::{Origin, SdistWheelSource};
+        use std::collections::HashSet;
+
+        let tmp = make_test_dir("sdist-lock");
+        let staging = tmp.join("staging");
+
+        let bundle = "gymbundle";
+        let dep_name = "dep-sdist-target";
+        let dep_version = "2.0.0";
+
+        // dep wheel: a bundle member that is a URL-requirement target.
+        let dep_whl_name = format!("{dep_name}-{dep_version}-py3-none-any.whl");
+        let dep_whl = tmp.join(&dep_whl_name);
+        std::fs::write(&dep_whl, make_wheel_bytes(dep_name, dep_version, &[])).unwrap();
+
+        // gym wheel: has a URL Requires-Dist on dep-sdist-target -> relax will
+        // rewrite it to "dep-sdist-target==2.0.0" -> ShadowSrc::Raw -> Built.
+        let url_req = format!("{dep_name} @ https://example.com/{dep_whl_name}");
+        let gym_whl_name = format!("{bundle}-0.26.2-py3-none-any.whl");
+        let gym_whl = tmp.join(&gym_whl_name);
+        std::fs::write(
+            &gym_whl,
+            make_wheel_bytes(bundle, "0.26.2", &[url_req.as_str()]),
+        )
+        .unwrap();
+
+        let sdist_src = SdistWheelSource {
+            index: "https://pypi.org/simple/".into(),
+            name: bundle.into(),
+            version: "0.26.2".into(),
+            sdist_url: "https://files.pythonhosted.org/packages/gym-0.26.2.tar.gz#sha256=deadbeef"
+                .into(),
+        };
+
+        let dep_wheel = make_emit_wheel(dep_name, dep_version, &[], Some(&dep_whl), None);
+        let mut gym_wheel =
+            make_emit_wheel(bundle, "0.26.2", &[url_req.as_str()], Some(&gym_whl), None);
+        // Populate sdist_source on the EmitWheel (as build_one does from ResolvedWheel).
+        gym_wheel.sdist_source = Some(sdist_src.clone());
+
+        let config = minimal_config(bundle);
+        let conda_capable: HashSet<String> = HashSet::new();
+
+        unsafe { std::env::set_var("RETREAD_NO_SHADOW_CACHE", "1") };
+        let result = stage(
+            &config,
+            bundle,
+            "0.26.2",
+            "3.11",
+            &[dep_wheel, gym_wheel],
+            &conda_capable,
+            &[],
+            &["https://pypi.org/simple/".to_string()],
+            "",
+            &tmp,
+            &staging,
+        )
+        .await;
+        unsafe { std::env::remove_var("RETREAD_NO_SHADOW_CACHE") };
+
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let result = result.expect("stage must succeed");
+
+        let lw = result
+            .lock
+            .wheels
+            .iter()
+            .find(|w| w.name == bundle)
+            .expect("lock must contain gym wheel");
+
+        // (a) sdist_source round-trips verbatim.
+        assert_eq!(
+            lw.sdist_source.as_ref(),
+            Some(&sdist_src),
+            "sdist_source must round-trip from EmitWheel into LockWheel"
+        );
+
+        // (b) Classified as relax-changed shadow (not must_ship).
+        assert_eq!(
+            lw.origin,
+            Origin::Built,
+            "sdist-built shadow must be Origin::Built"
+        );
+        assert!(
+            !lw.must_ship,
+            "sdist-built relax-changed wheel must NOT be must_ship"
+        );
+
+        // (c) upstream_url suppressed (sdist wheels have no index URL to record).
+        assert!(
+            lw.upstream_url.is_none(),
+            "sdist-built shadow must have upstream_url=None (sdist provenance in sdist_source)"
+        );
+
+        // (d) Portability invariant: sdist_url must be an https URL, never file://.
+        let stored_url = lw.sdist_source.as_ref().unwrap().sdist_url.as_str();
+        assert!(
+            stored_url.starts_with("https://"),
+            "sdist_url must be portable https URL, got: {stored_url}"
+        );
     }
 }

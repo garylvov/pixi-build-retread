@@ -414,7 +414,7 @@ environments:
       - conda: https://prefix.dev/conda-forge/noarch/werkzeug-3.1.8-pyhcf101f3_0.conda
       - conda: https://prefix.dev/conda-forge/noarch/wheel-0.47.0-pyhd8ed1ab_0.conda
       - conda: https://prefix.dev/conda-forge/noarch/zipp-4.1.0-pyhcf101f3_0.conda
-      - conda_source: isaac-pack-6[a1b596ce] @ ./isaac-pack
+      - conda_source: isaac-pack-6[c16826fe] @ ./isaac-pack
   gpu:
     channels:
     - url: https://prefix.dev/conda-forge/
@@ -828,7 +828,7 @@ environments:
       - conda: https://prefix.dev/conda-forge/noarch/werkzeug-3.1.8-pyhcf101f3_0.conda
       - conda: https://prefix.dev/conda-forge/noarch/wheel-0.47.0-pyhd8ed1ab_0.conda
       - conda: https://prefix.dev/conda-forge/noarch/zipp-4.1.0-pyhcf101f3_0.conda
-      - conda_source: isaac-pack-6[a1b596ce] @ ./isaac-pack
+      - conda_source: isaac-pack-6[c16826fe] @ ./isaac-pack
 packages:
 - conda: https://prefix.dev/conda-forge/linux-64/_openmp_mutex-4.5-20_gnu.conda
   build_number: 20
@@ -7051,7 +7051,7 @@ packages:
   run_exports: {}
   size: 24190
   timestamp: 1779159948016
-- conda_source: isaac-pack-6[a1b596ce] @ ./isaac-pack
+- conda_source: isaac-pack-6[c16826fe] @ ./isaac-pack
   variants:
     python: '3.12'
   depends:
@@ -7115,6 +7115,7 @@ packages:
   - certifi >=2017.4.17
   - cffi >=2.0.0
   - uv
+  - python_abi 3.12.* *_cp312
   - python_abi 3.12.* *_cp312
   host_packages:
   - conda: https://prefix.dev/conda-forge/linux-64/_openmp_mutex-4.5-20_gnu.conda
