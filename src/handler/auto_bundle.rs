@@ -451,6 +451,7 @@ pub(crate) async fn auto_bundle_transitives(
                                                 url: resolved.url,
                                                 upstream_url: upstream,
                                                 git_source: None,
+                                                sdist_source: None,
                                                 metadata,
                                                 extras_requested: vec![],
                                                 auto_data: None,
@@ -563,9 +564,12 @@ fn pep508_loose_base_dep(raw: &str) -> Result<Option<(String, VersionSpecifiers)
     }
 }
 
-/// (wheel URL, parsed METADATA, index to recurse with) for one
-/// PyPI-form BFS item fetched in the level loop's phase 2.
-pub(crate) type BfsFetched = (url::Url, WheelMetadata, String);
+/// (wheel URL, parsed METADATA, index to recurse with, optional sdist
+/// provenance) for one PyPI-form BFS item fetched in the level loop's
+/// phase 2. The 4th element is `Some` only when the item was built from
+/// a PyPI sdist (no compatible wheel on the index); `None` for normal
+/// index-wheel fetches.
+pub(crate) type BfsFetched = (url::Url, WheelMetadata, String, Option<super::SdistProv>);
 
 /// One unit of pending work in the resolver BFS.
 #[derive(Debug, Clone)]

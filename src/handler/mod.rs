@@ -483,6 +483,12 @@ struct ResolvedWheel {
     /// `materialize_and_rewrite` for both named-git (from=) and inline-git
     /// (git=) entry forms. `None` for all other wheel origins.
     git_source: Option<crate::lock::GitWheelSource>,
+    /// Sdist provenance for BFS-transitive wheels built from a PyPI sdist
+    /// (schema 9+). Set in the BFS phase-3 handler when bfs_fetch_pypi
+    /// returns a `SdistProv`. `None` for index-fetched and git-built wheels.
+    // Dead-code suppressed: read by build_one (EmitWheel.sdist_source, commit 4).
+    #[allow(dead_code)]
+    sdist_source: Option<crate::lock::SdistWheelSource>,
     metadata: WheelMetadata,
     /// v0.12.0+: extras the user requested on the originating
     /// `[retread-wheels]` entry. Surfaced in the audit so debugging
@@ -2932,24 +2938,50 @@ async fn resolve_bundle(
         // old pop order exactly.
         for (pending, fetch_result) in fetched {
             let dep_conda_name = canonical_conda_name(&pending.pypi_name);
-            // 6-tuple: (url, upstream_url, git_source, metadata, index, seed_rd)
+            // 7-tuple: (url, upstream_url, git_source, sdist_source, metadata, index, seed_rd)
             let (
                 sub_url,
                 sub_upstream_url,
                 sub_git_source,
+                sub_sdist_source,
                 sub_metadata,
                 sub_index_for_recurse,
                 sub_seed_rd,
             ) = match (&pending.source, fetch_result?) {
-                (PendingSource::Pypi { .. }, Some((resolved_url, metadata, index))) => {
+                (PendingSource::Pypi { .. }, Some((resolved_url, metadata, index, sdist_prov))) => {
                     // Pypi-form sub-wheels are NOT D-rewritten, so
                     // their metadata IS the original Requires-Dist.
                     let seed_rd = metadata.requires_dist.clone();
-                    // resolved_url is the pristine https index URL; record
-                    // it as upstream_url so build_one can populate
-                    // EmitWheel.upstream_url without deriving from w.url.
-                    let upstream = Some(resolved_url.clone());
-                    (resolved_url, upstream, None, metadata, index, seed_rd)
+                    // Build the sdist provenance descriptor (None for normal wheel fetches).
+                    let sub_sdist_src = sdist_prov.map(|p| crate::lock::SdistWheelSource {
+                        index: p.index,
+                        name: p.name,
+                        version: p.version,
+                        // Store the EXACT resolved sdist URL with #sha256 (Amendment 4:
+                        // freeze the URL so replay builds the identical tarball without
+                        // re-resolving, which is neither yank-safe nor reorder-deterministic).
+                        sdist_url: p.sdist_url.to_string(),
+                    });
+                    // When the wheel was built from an sdist, DO NOT store the file://
+                    // built_url as upstream_url (it is machine-local and non-portable).
+                    // For normal index wheels, record resolved_url as upstream_url.
+                    let upstream = if sub_sdist_src.is_some() {
+                        None // sdist-built: upstream_url suppressed; use sdist_source instead
+                    } else {
+                        // resolved_url is the pristine https index URL; record it as
+                        // upstream_url so build_one can populate EmitWheel.upstream_url
+                        // without deriving from w.url.
+                        Some(resolved_url.clone())
+                    };
+                    (
+                        resolved_url,
+                        upstream,
+                        None,
+                        sub_sdist_src,
+                        metadata,
+                        index,
+                        seed_rd,
+                    )
                 }
                 (PendingSource::Pypi { .. }, None) => {
                     unreachable!("phase 2 always fetches Pypi-form items")
@@ -3003,6 +3035,7 @@ async fn resolve_bundle(
                         sub.url,
                         sub_up,
                         sub_gs,
+                        None, // Git-form: no sdist provenance
                         sub.metadata,
                         entry.index_url(),
                         sub_original_rd,
@@ -3040,6 +3073,7 @@ async fn resolve_bundle(
                         sub.url,
                         sub_up,
                         None, // Url-form: no git source
+                        None, // Url-form: no sdist provenance
                         sub.metadata,
                         entry.index_url(),
                         sub_original_rd,
@@ -3068,6 +3102,10 @@ async fn resolve_bundle(
                 // (already set for Git-form PendingSource via the synth path).
                 // Pypi/Url-form sub-wheels have no git source.
                 git_source: sub_git_source,
+                // Sdist provenance (schema 9+): set when the BFS sdist fallback
+                // fired for this sub-wheel; None for normal index-wheel fetches
+                // and git/url-form sub-wheels.
+                sdist_source: sub_sdist_source,
                 metadata: sub_metadata,
                 extras_requested: vec![],
                 auto_data: None,
@@ -3117,6 +3155,20 @@ fn relaxed_retry_specs(
     }
 }
 
+/// Sdist provenance captured by the BFS sdist fallback path.
+/// Threaded out of `bfs_fetch_pypi` so the caller can populate
+/// `ResolvedWheel.sdist_source` without losing the `sdist.url` that
+/// was previously discarded at mod.rs (THE DISCARD POINT in §1.1).
+pub(super) struct SdistProv {
+    pub(super) index: String,
+    pub(super) name: String,
+    pub(super) version: String,
+    /// The EXACT resolved sdist URL with #sha256 fragment from the PyPI
+    /// simple index (pypi.rs:197). This is the preferred replay key:
+    /// build_wheel_from_sdist_url(stored_url) skips the re-resolve.
+    pub(super) sdist_url: url::Url,
+}
+
 async fn bfs_fetch_pypi(
     pypi_name: &str,
     specifiers: &VersionSpecifiers,
@@ -3124,7 +3176,7 @@ async fn bfs_fetch_pypi(
     target: &WheelTarget,
     download_dir: &Path,
     relax: RelaxPolicy,
-) -> Result<(url::Url, WheelMetadata, String)> {
+) -> Result<(url::Url, WheelMetadata, String, Option<SdistProv>)> {
     // v1.5.9 exact-first: `specifiers` are the ORIGINAL (pre-D)
     // upstream pins, so exact family pins (isaacsim-kernel==6.0.0.0)
     // resolve the exact version and the installed family stays
@@ -3159,10 +3211,11 @@ async fn bfs_fetch_pypi(
             }
         }
     };
-    let (resolved_url, metadata) = match wheel_result {
+    let (resolved_url, metadata, sdist_prov) = match wheel_result {
         Ok(resolved) => {
             let metadata = metadata_preferring_sidecar(&resolved, download_dir).await?;
-            (resolved.url, metadata)
+            // Wheel path: no sdist provenance.
+            (resolved.url, metadata, None)
         }
         Err(wheel_err) => {
             tracing::info!(
@@ -3180,6 +3233,9 @@ async fn bfs_fetch_pypi(
                         pypi_name, specifiers, index, wheel_err,
                     )
                 })?;
+            // Capture the sdist URL BEFORE consuming `sdist` (THE FIX:
+            // previously this was discarded and never threaded out).
+            let captured_sdist_url = sdist.url.clone();
             // Per-entry build dir under download_dir so repeats hit
             // the wheel cache.
             let sdist_out = download_dir.join(pypi_name);
@@ -3212,10 +3268,20 @@ async fn bfs_fetch_pypi(
                 built = %built.display(),
                 "BFS sdist fallback: built wheel from sdist",
             );
-            (built_url, metadata)
+            // Build the sdist provenance descriptor. `version` comes from the
+            // built wheel's parsed metadata (authoritative resolved version).
+            let prov = SdistProv {
+                index: index.to_string(),
+                name: pypi_name.to_string(),
+                version: metadata.version.clone(),
+                sdist_url: captured_sdist_url,
+            };
+            // Return built_url (file://) for the URL slot; the caller
+            // will SUPPRESS this as upstream_url when sdist_prov.is_some().
+            (built_url, metadata, Some(prov))
         }
     };
-    Ok((resolved_url, metadata, index.to_string()))
+    Ok((resolved_url, metadata, index.to_string(), sdist_prov))
 }
 
 /// True if `output` exists on disk and is newer than `input`. Used to
@@ -3660,6 +3726,10 @@ async fn materialize_and_rewrite(
             url: final_url,
             upstream_url,
             git_source: git_source_captured,
+            // sdist_source is only populated for BFS-transitive sdist-built wheels
+            // (set in the BFS phase-3 loop). materialize_and_rewrite handles git/path/
+            // url/version entries — none of those are sdist BFS transitives.
+            sdist_source: None,
             extras_requested: audit_info.extras_requested,
             auto_data: auto_data_report,
             auto_data_dedup_skipped_root: audit_info.dedup_skipped_root,
@@ -7034,6 +7104,7 @@ mod emit_wheel_upstream_url_tests {
             url: local.clone(), // file:// — what materialize_and_rewrite returns
             upstream_url: Some(upstream.clone()), // https:// — captured BEFORE localization
             git_source: None,
+            sdist_source: None,
             metadata: dummy_metadata("isaacsim", "6.0.0"),
             extras_requested: vec![],
             auto_data: None,
@@ -7126,6 +7197,7 @@ mod emit_wheel_upstream_url_tests {
             url: upstream.clone(),
             upstream_url: Some(upstream.clone()),
             git_source: None,
+            sdist_source: None,
             metadata: dummy_metadata("isaacsim-kernel", "6.0.0"),
             extras_requested: vec![],
             auto_data: None,
@@ -7146,6 +7218,7 @@ mod emit_wheel_upstream_url_tests {
                     .unwrap(),
                 ),
                 git_source: None,
+                sdist_source: None,
                 metadata: dummy_metadata("isaacsim", "6.0.0"),
                 extras_requested: vec![],
                 auto_data: None,
