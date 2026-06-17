@@ -4213,9 +4213,21 @@ async fn materialize_from_lock(
                         // bumps; keep defaults for anything not carried in GitWheelSource.
                         ..crate::config::WheelEntry::default()
                     };
+                    // Mirror the produce-path derivation (auto_data_per_entry,
+                    // ~mod.rs:2205-2218): for a single-entry git pack the
+                    // skip_subdirs set is exactly [subdirectory] (defaulting to
+                    // ".").  The multi-entry guard above ensures at most one
+                    // wheel per checkout root reaches this arm, so the single-
+                    // element form is always correct here.  Previously this was
+                    // vec![] — inert for root entries (subdirectory="."), but a
+                    // silent correctness landmine for nested subdirectories (e.g.
+                    // monorepo subpaths): produce would skip the subtree while
+                    // replay would NOT, producing a silently drifted wheel.
+                    let skip_subdirs =
+                        vec![PathBuf::from(gs.subdirectory.as_deref().unwrap_or("."))];
                     let auto_data = Some(AutoDataConfig {
                         checkout_root,
-                        skip_subdirs: vec![],
+                        skip_subdirs,
                     });
                     let (resolved, _rd) = materialize_and_rewrite(
                         &synth_entry,
@@ -5705,6 +5717,226 @@ mod replay_tests {
             "relax-changed Built wheel with non-empty requires_dist is safe to replay"
         );
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // FIX-4: skip_subdirs parity for nested-subdirectory git entries.
+    //
+    // This test proves the correctness landmine fixed by FIX-1:
+    //   - PRODUCE path (auto_data_per_entry) computes skip_subdirs as
+    //     [subdirectory], e.g. ["packages/mypkg"] for a nested subdir entry.
+    //   - OLD REPLAY path (materialize_from_lock Class-1 arm, pre-fix) used
+    //     skip_subdirs=vec![], which for a nested subdir entry causes the
+    //     phase-1.6 checkout-root data inject to include Python source files
+    //     from packages/mypkg/ that the produce path correctly excluded ->
+    //     silently different wheel bytes.
+    //   - FIXED REPLAY path mirrors produce: skip_subdirs=[subdirectory].
+    //
+    // The test drives `materialize_and_rewrite` directly (the exact function
+    // that materialize_from_lock's Class-1 git arm calls after constructing
+    // auto_data). It:
+    //   (a) builds a produce wheel with auto_data{skip_subdirs=["packages/mypkg"]}
+    //   (b) builds a buggy-replay wheel with auto_data{skip_subdirs=[]}
+    //   (c) asserts (a) != (b) -- proving the regression
+    //   (d) builds a fixed-replay wheel with auto_data{skip_subdirs=["packages/mypkg"]}
+    //   (e) asserts (a) == (d) -- proving the fix restores parity
+    //
+    // Failure mode before FIX-1: step (c) would fail (produce == buggy-replay
+    // for root entries because path_is_under_any(".", rel) never matches a
+    // stripped relative path). For a NESTED subdir ("packages/mypkg"), buggy
+    // replay adds Python files from packages/mypkg/ into the wheel's
+    // .data/data/lib/ tree, making it larger and byte-distinct from produce.
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn nested_subdir_git_produce_replay_skip_subdirs_parity() {
+        use super::{AutoDataConfig, EntryAuditInfo, materialize_and_rewrite, wheel_target_for};
+        use crate::config::RelaxPolicy;
+        use crate::config::WheelEntry;
+        use rattler_conda_types::Platform;
+
+        let pid = std::process::id();
+        let base = std::env::temp_dir().join(format!("retread-nested-subdir-parity-{pid}"));
+        let repo = base.join("repo");
+        // Create the nested subdir: packages/mypkg/
+        let pkg_dir = repo.join("packages").join("mypkg");
+        std::fs::create_dir_all(&pkg_dir).expect("create pkg dir");
+
+        // ── Minimal git fixture ──────────────────────────────────────────────
+        let run_git = |args: &[&str], dir: &std::path::Path| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_AUTHOR_NAME", "test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .status()
+                .expect("git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+
+        run_git(&["init", "-b", "main"], &repo);
+        run_git(&["config", "user.email", "test@example.com"], &repo);
+        run_git(&["config", "user.name", "test"], &repo);
+
+        // Nested package: packages/mypkg/ — a real installable Python package.
+        std::fs::write(
+            pkg_dir.join("pyproject.toml"),
+            r#"[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "retread-nested-mypkg"
+version = "1.0.0"
+"#,
+        )
+        .expect("write pyproject");
+        let mypkg_src = pkg_dir.join("retread_nested_mypkg");
+        std::fs::create_dir_all(&mypkg_src).expect("create package src dir");
+        std::fs::write(mypkg_src.join("__init__.py"), b"# nested package fixture\n")
+            .expect("write __init__.py");
+
+        // Sibling non-package file at the repo root (should appear in ALL wheels
+        // regardless of skip_subdirs, because it's outside packages/mypkg/).
+        std::fs::write(repo.join("README.md"), b"monorepo root\n").expect("write README");
+
+        run_git(&["add", "."], &repo);
+        run_git(&["commit", "-m", "initial"], &repo);
+
+        let sha_out = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&repo)
+            .output()
+            .expect("git rev-parse");
+        let sha = String::from_utf8_lossy(&sha_out.stdout).trim().to_string();
+        assert_eq!(sha.len(), 40, "expected 40-char SHA");
+
+        let repo_url = format!("file://{}", repo.display());
+
+        // ── Common test dirs ─────────────────────────────────────────────────
+        let cache_dir = base.join("cache");
+        // Each materialize_and_rewrite call gets its own download_dir +
+        // source_dir to avoid the is_fresh() cache short-circuit that would
+        // serve the first call's output as the cached result for later calls.
+        let produce_src = base.join("src-produce");
+        let buggy_src = base.join("src-buggy");
+        let fixed_src = base.join("src-fixed");
+        for d in [&cache_dir, &produce_src, &buggy_src, &fixed_src] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+
+        // WheelEntry for the nested subdir entry.
+        let entry = WheelEntry {
+            git: Some(repo_url.clone()),
+            rev: Some(sha.clone()),
+            subdirectory: Some("packages/mypkg".to_string()),
+            ..WheelEntry::default()
+        };
+        let target = wheel_target_for(Platform::Linux64, "3.11");
+        let checkout_root = crate::source_build::git_checkout_root(&repo_url, &sha, &cache_dir);
+
+        // ── PRODUCE: auto_data with correct skip_subdirs=["packages/mypkg"] ──
+        let produce_dd = produce_src.join("wheels");
+        std::fs::create_dir_all(&produce_dd).unwrap();
+        let (produce_resolved, _) = materialize_and_rewrite(
+            &entry,
+            "retread-nested-mypkg",
+            &target,
+            &produce_dd,
+            &produce_src,
+            &cache_dir,
+            RelaxPolicy::None,
+            &std::collections::BTreeMap::new(),
+            Some(AutoDataConfig {
+                checkout_root: checkout_root.clone(),
+                skip_subdirs: vec![std::path::PathBuf::from("packages/mypkg")],
+            }),
+            EntryAuditInfo::default(),
+        )
+        .await
+        .expect("produce: materialize_and_rewrite");
+        let produce_wheel_path = produce_resolved
+            .url
+            .to_file_path()
+            .expect("produce wheel must be a file URL");
+        let produce_bytes =
+            std::fs::read(&produce_wheel_path).expect("produce wheel file must exist");
+
+        // ── BUGGY REPLAY: auto_data with skip_subdirs=[] (pre-fix regression) ─
+        let buggy_dd = buggy_src.join("wheels");
+        std::fs::create_dir_all(&buggy_dd).unwrap();
+        let (buggy_resolved, _) = materialize_and_rewrite(
+            &entry,
+            "retread-nested-mypkg",
+            &target,
+            &buggy_dd,
+            &buggy_src,
+            &cache_dir,
+            RelaxPolicy::None,
+            &std::collections::BTreeMap::new(),
+            Some(AutoDataConfig {
+                checkout_root: checkout_root.clone(),
+                skip_subdirs: vec![], // <-- pre-fix bug: empty skip
+            }),
+            EntryAuditInfo::default(),
+        )
+        .await
+        .expect("buggy-replay: materialize_and_rewrite");
+        let buggy_wheel_path = buggy_resolved
+            .url
+            .to_file_path()
+            .expect("buggy-replay wheel must be a file URL");
+        let buggy_bytes =
+            std::fs::read(&buggy_wheel_path).expect("buggy-replay wheel file must exist");
+
+        // (c) Produce and buggy-replay must DIFFER for a nested subdir entry.
+        // The buggy replay (skip_subdirs=[]) includes packages/mypkg/__init__.py
+        // in the .data/data/lib/ section (phase 1.6 checkout-root inject), while
+        // produce correctly skips it.  The wheels are therefore byte-distinct.
+        assert_ne!(
+            produce_bytes, buggy_bytes,
+            "REGRESSION PROOF: produce (skip_subdirs=[\"packages/mypkg\"]) must \
+             differ from buggy replay (skip_subdirs=[]) for a nested-subdir entry \
+             — the buggy replay includes extra Python source files in the wheel"
+        );
+
+        // ── FIXED REPLAY: auto_data mirrors produce (FIX-1) ─────────────────
+        let fixed_dd = fixed_src.join("wheels");
+        std::fs::create_dir_all(&fixed_dd).unwrap();
+        let (fixed_resolved, _) = materialize_and_rewrite(
+            &entry,
+            "retread-nested-mypkg",
+            &target,
+            &fixed_dd,
+            &fixed_src,
+            &cache_dir,
+            RelaxPolicy::None,
+            &std::collections::BTreeMap::new(),
+            Some(AutoDataConfig {
+                checkout_root: checkout_root.clone(),
+                // Fixed: mirror the produce-path derivation from gs.subdirectory
+                skip_subdirs: vec![std::path::PathBuf::from("packages/mypkg")],
+            }),
+            EntryAuditInfo::default(),
+        )
+        .await
+        .expect("fixed-replay: materialize_and_rewrite");
+        let fixed_wheel_path = fixed_resolved
+            .url
+            .to_file_path()
+            .expect("fixed-replay wheel must be a file URL");
+        let fixed_bytes =
+            std::fs::read(&fixed_wheel_path).expect("fixed-replay wheel file must exist");
+
+        // (e) Fixed replay must be byte-identical to produce.
+        assert_eq!(
+            produce_bytes, fixed_bytes,
+            "PARITY: fixed replay (skip_subdirs=[\"packages/mypkg\"]) must be \
+             byte-identical to produce — FIX-1 restores correctness"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
 
