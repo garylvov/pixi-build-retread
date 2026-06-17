@@ -7172,7 +7172,7 @@ version = "1.0.0"
         let rev2 = "b".repeat(40);
         let url2 = "https://github.com/example/rl_games.git".to_string();
 
-        let wheels = vec![
+        let wheels = [
             LockWheel {
                 name: "isaaclab".into(),
                 version: "2.1.0".into(),
