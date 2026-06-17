@@ -5311,6 +5311,7 @@ mod replay_tests {
                 must_ship: false,
                 upstream_url: None,
                 git_source: None,
+                sdist_source: None,
             }],
             conda_run_deps: vec![CondaDep {
                 name: "numpy".into(),
@@ -5564,6 +5565,7 @@ mod replay_tests {
                 must_ship: true,
                 upstream_url: None, // class 3: no upstream, not in config
                 git_source: None,
+                sdist_source: None,
             }],
             conda_run_deps: vec![],
             index_urls: vec!["https://pypi.org/simple/".into()],
@@ -5629,6 +5631,7 @@ mod replay_tests {
                 must_ship: false,
                 upstream_url: None, // schema-5 style: no upstream_url
                 git_source: None,
+                sdist_source: None,
             }],
             conda_run_deps: vec![],
             index_urls: vec!["https://pypi.org/simple/".into()],
@@ -5760,6 +5763,7 @@ mod replay_tests {
             must_ship: false,      // relax-changed index wheel
             upstream_url: None,
             git_source: None,
+            sdist_source: None,
         });
         let path = dir.join(RetreadLock::file_name("pack"));
         std::fs::write(&path, lock.to_pretty_json().unwrap()).unwrap();
@@ -5877,6 +5881,7 @@ mod replay_tests {
             must_ship: false,
             upstream_url: Some("https://files.pythonhosted.org/torchvision-0.18.0.whl".into()),
             git_source: None,
+            sdist_source: None,
         });
         let path = dir.join(RetreadLock::file_name("pack"));
         std::fs::write(&path, lock.to_pretty_json().unwrap()).unwrap();
@@ -6160,6 +6165,7 @@ version = "1.0.0"
                     subdirectory: Some("source/isaaclab".into()),
                     extras: vec![],
                 }),
+                sdist_source: None,
             },
             LockWheel {
                 name: "isaaclab-assets".into(),
@@ -6177,6 +6183,7 @@ version = "1.0.0"
                     subdirectory: Some("source/isaaclab_assets".into()),
                     extras: vec![],
                 }),
+                sdist_source: None,
             },
             // Interleaved non-git index wheel (non-contiguous group test).
             LockWheel {
@@ -6190,6 +6197,7 @@ version = "1.0.0"
                 must_ship: false,
                 upstream_url: None,
                 git_source: None,
+                sdist_source: None,
             },
             // rl_games: size-1 group (separate repo / rev).
             LockWheel {
@@ -6208,6 +6216,7 @@ version = "1.0.0"
                     subdirectory: None, // root subdir
                     extras: vec![],
                 }),
+                sdist_source: None,
             },
             // isaaclab_tasks: non-contiguous member of the isaaclab group.
             LockWheel {
@@ -6226,6 +6235,7 @@ version = "1.0.0"
                     subdirectory: Some("source/isaaclab_tasks".into()),
                     extras: vec![],
                 }),
+                sdist_source: None,
             },
         ];
 
@@ -6400,6 +6410,7 @@ version = "1.0.0"
                     must_ship: false,
                     upstream_url: None,
                     git_source: None,
+                    sdist_source: None,
                 },
                 // Class-3 orphan: must_ship=true, no git_source, not in config.
                 // This is the wheel that must trigger Ok(None).
@@ -6414,6 +6425,7 @@ version = "1.0.0"
                     must_ship: true,
                     upstream_url: None,
                     git_source: None, // MISSING: class-3 gap
+                    sdist_source: None,
                 },
             ],
             conda_run_deps: vec![],

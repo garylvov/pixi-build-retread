@@ -353,6 +353,7 @@ mod tests {
                 must_ship: true,
                 upstream_url: None,
                 git_source: None,
+                sdist_source: None,
             }],
             conda_run_deps,
             index_urls,

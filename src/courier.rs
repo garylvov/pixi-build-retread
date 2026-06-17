@@ -559,6 +559,9 @@ pub async fn stage(
                 // Git provenance (schema 8+): written from EmitWheel.git_source
                 // which was populated by materialize_and_rewrite for git entries.
                 git_source: w.git_source.clone(),
+                // Sdist provenance (schema 9+): None for source-built (.injected)
+                // wheels (these are git/path builds, not sdist BFS transitives).
+                sdist_source: None,
             });
         } else {
             // Index wheel. Decide whether to ship a relax-rewritten shadow
@@ -693,6 +696,7 @@ pub async fn stage(
                         must_ship: false,
                         upstream_url: None, // n/a for Index wheels; use `url` instead
                         git_source: None,   // Index wheels have no git source
+                        sdist_source: None, // n/a for Index wheels
                     });
                 }
                 ShadowSrc::Rewritten(probe_dst) => {
@@ -732,6 +736,8 @@ pub async fn stage(
                         must_ship: w.must_ship(),
                         upstream_url,
                         git_source: None, // Class-2 shadow: index wheel, no git source
+                        // sdist_source: threaded in commit 5 (schema 9).
+                        sdist_source: None,
                     });
                 }
                 ShadowSrc::Raw(src) => {
@@ -771,6 +777,8 @@ pub async fn stage(
                         must_ship: w.must_ship(),
                         upstream_url,
                         git_source: None, // Class-2 shadow: index wheel, no git source
+                        // sdist_source: threaded in commit 5 (schema 9).
+                        sdist_source: None,
                     });
                 }
             }
