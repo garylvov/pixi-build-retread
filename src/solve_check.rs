@@ -99,6 +99,14 @@ impl SolveOutcome {
 /// solve check and workspace transitive extraction so both reason
 /// about the SAME coherent solution instead of each inventing its own
 /// approximation.
+///
+/// `preferred` seeds rattler's `locked_packages` field (soft preference
+/// — the solver will pick the preferred variant when available but WILL
+/// deviate if constraints require it). Pass `&[]` for a cold solve.
+/// This is a pure speed/stability optimisation: the solver's SAT/UNSAT
+/// verdict and the diagnostic strings it emits are identical regardless
+/// of what is in `preferred` because `locked_packages` never hard-
+/// constrains a version.
 fn solve_selected_records_from_records(
     parsed_specs: Vec<MatchSpec>,
     all_records: &[RepoDataRecord],
@@ -106,11 +114,18 @@ fn solve_selected_records_from_records(
     channel_priority: ChannelPriority,
     system_requirements: &BTreeMap<String, String>,
     strategy: SolveStrategy,
+    preferred: Vec<RepoDataRecord>,
 ) -> std::result::Result<Vec<RepoDataRecord>, Vec<String>> {
     let virtual_packages = build_virtual_packages(target_python, system_requirements);
     let task = SolverTask {
         available_packages: vec![all_records],
-        locked_packages: Vec::new(),
+        // `locked_packages` = soft preference in rattler_solve: the solver
+        // prefers these versions but will deviate when forced by other
+        // constraints.  `pinned_packages` (NOT used here) is the hard field
+        // that forces a specific version even at the cost of downgrading
+        // other packages — too strong for a co-installability check that
+        // must never veto a build spuriously.
+        locked_packages: preferred,
         pinned_packages: Vec::new(),
         virtual_packages,
         specs: parsed_specs,
@@ -134,6 +149,10 @@ fn solve_selected_records_from_records(
 /// the async executor pinned a runtime worker for the duration of
 /// every solve (up to 40 per bundle across the refinement loop),
 /// starving concurrent probes and downloads.
+///
+/// `preferred` is forwarded directly to
+/// `solve_selected_records_from_records` as the warm-start seed (soft
+/// preference via `locked_packages`). Pass `Vec::new()` for a cold solve.
 async fn solve_on_blocking_pool(
     parsed_specs: Vec<MatchSpec>,
     records: Vec<RepoDataRecord>,
@@ -141,6 +160,7 @@ async fn solve_on_blocking_pool(
     channel_priority: ChannelPriority,
     system_requirements: BTreeMap<String, String>,
     strategy: SolveStrategy,
+    preferred: Vec<RepoDataRecord>,
 ) -> std::result::Result<Vec<RepoDataRecord>, Vec<String>> {
     let t_solve = std::time::Instant::now();
     let specs_count = parsed_specs.len();
@@ -153,6 +173,7 @@ async fn solve_on_blocking_pool(
             channel_priority,
             &system_requirements,
             strategy,
+            preferred,
         )
     })
     .await
@@ -391,6 +412,13 @@ pub async fn run_solve_check(
 
     let records_count = records.len();
     let specs_count = parsed_specs.len();
+    // `preferred` is empty: the cascade call sites hold only spec
+    // strings, not resolved RepoDataRecords, so there is no clean
+    // externally-known set to seed from without re-deriving.  The
+    // infrastructure (locked_packages seeding in
+    // solve_selected_records_from_records) is in place for callers
+    // that DO carry a prior resolved set (e.g. solve_selected_records
+    // results surfaced back through the cascade in the future).
     match solve_on_blocking_pool(
         parsed_specs,
         records,
@@ -398,6 +426,7 @@ pub async fn run_solve_check(
         channel_priority,
         system_requirements.clone(),
         SolveStrategy::Highest,
+        Vec::new(),
     )
     .await
     {
@@ -456,6 +485,7 @@ pub async fn solve_selected_records(
         channel_priority,
         system_requirements.clone(),
         strategy,
+        Vec::new(),
     )
     .await
 }
@@ -944,6 +974,7 @@ mod tests {
             ChannelPriority::Strict,
             &BTreeMap::new(),
             SolveStrategy::LowestVersionDirect,
+            Vec::new(),
         )
         .expect("torch family should solve coherently");
 
@@ -963,5 +994,144 @@ mod tests {
         assert_eq!(pytorch_gpu.package_record.version.as_str(), "2.7.1");
         assert_eq!(torchvision.package_record.version.as_str(), "0.22.0");
         assert_eq!(pytorch.package_record.version.as_str(), "2.7.0");
+    }
+
+    /// Warm-start seeding (locked_packages = soft preference) must be
+    /// emit-neutral: passing a previously-resolved set as `preferred`
+    /// must produce the SAME satisfiable/unsat result and the SAME
+    /// selected versions as a cold solve with `preferred = Vec::new()`.
+    ///
+    /// This is the load-bearing correctness invariant for the warm-start
+    /// optimisation: preferences bias version SELECTION (speed/stability)
+    /// but never change whether a solution EXISTS or which versions satisfy
+    /// the hard constraints the caller emits.
+    #[test]
+    fn warm_start_locked_packages_is_emit_neutral() {
+        let all_records = vec![
+            repo_record("python", "3.11.5", &[]),
+            repo_record("numpy", "1.24.0", &["python >=3.11,<3.12.0a0"]),
+            repo_record("numpy", "1.26.0", &["python >=3.11,<3.12.0a0"]),
+            repo_record(
+                "scipy",
+                "1.10.0",
+                &["numpy >=1.24,<2", "python >=3.11,<3.12.0a0"],
+            ),
+            repo_record(
+                "scipy",
+                "1.12.0",
+                &["numpy >=1.26,<2", "python >=3.11,<3.12.0a0"],
+            ),
+        ];
+        let specs =
+            parse_match_specs(&["numpy >=1.24.0".to_string(), "scipy >=1.10.0".to_string()]);
+
+        // Cold solve (no preferred packages).
+        let cold = solve_selected_records_from_records(
+            specs.clone(),
+            &all_records,
+            "3.11",
+            ChannelPriority::Strict,
+            &BTreeMap::new(),
+            SolveStrategy::Highest,
+            Vec::new(),
+        )
+        .expect("cold solve should succeed");
+
+        // Warm-start: seed with the cold result as preferred versions.
+        // The solver should produce the same SAT result.
+        let warm = solve_selected_records_from_records(
+            specs,
+            &all_records,
+            "3.11",
+            ChannelPriority::Strict,
+            &BTreeMap::new(),
+            SolveStrategy::Highest,
+            cold.clone(),
+        )
+        .expect("warm-start solve should succeed with same result");
+
+        // Both solves must agree on which packages are selected.
+        let mut cold_names: Vec<&str> = cold
+            .iter()
+            .map(|r| r.package_record.name.as_normalized())
+            .collect();
+        cold_names.sort_unstable();
+        let mut warm_names: Vec<&str> = warm
+            .iter()
+            .map(|r| r.package_record.name.as_normalized())
+            .collect();
+        warm_names.sort_unstable();
+        assert_eq!(
+            cold_names, warm_names,
+            "warm-start must select the same package set as cold solve"
+        );
+
+        // Versions must match too.
+        for cold_rec in &cold {
+            let warm_rec = warm
+                .iter()
+                .find(|r| r.package_record.name == cold_rec.package_record.name)
+                .expect("warm solve must include every package the cold solve selected");
+            assert_eq!(
+                cold_rec.package_record.version,
+                warm_rec.package_record.version,
+                "warm-start must select the same version for {}",
+                cold_rec.package_record.name.as_normalized(),
+            );
+        }
+    }
+
+    /// Warm-start must also be emit-neutral when the solve is UNSAT:
+    /// passing stale/irrelevant preferred records must not change the
+    /// UNSAT verdict (locked_packages cannot rescue an impossible solve).
+    #[test]
+    fn warm_start_does_not_rescue_unsat() {
+        let all_records = vec![
+            repo_record("python", "3.11.5", &[]),
+            // pkg-a 1.0 needs pkg-b ==1.0; forcing pkg-a ==1.0 and
+            // pkg-b ==2.0 simultaneously is irreconcilable.
+            repo_record("pkg-a", "1.0", &["pkg-b ==1.0"]),
+            repo_record("pkg-b", "1.0", &[]),
+            repo_record("pkg-a", "2.0", &["pkg-b ==2.0"]),
+            repo_record("pkg-b", "2.0", &[]),
+        ];
+        let conflicting_specs =
+            parse_match_specs(&["pkg-a ==1.0".to_string(), "pkg-b ==2.0".to_string()]);
+
+        // With pkg-a ==1.0 and pkg-b ==2.0: pkg-a 1.0 needs pkg-b ==1.0
+        // but we pin pkg-b ==2.0 — genuine conflict.
+        let cold_err = solve_selected_records_from_records(
+            conflicting_specs.clone(),
+            &all_records,
+            "3.11",
+            ChannelPriority::Strict,
+            &BTreeMap::new(),
+            SolveStrategy::Highest,
+            Vec::new(),
+        );
+        assert!(
+            cold_err.is_err(),
+            "cold solve of conflicting specs must be UNSAT"
+        );
+
+        // Warm-start with the records that DO exist — seeding preferences
+        // must NOT change the UNSAT verdict.
+        let stale_preferred = vec![
+            repo_record("pkg-a", "1.0", &["pkg-b ==1.0"]),
+            repo_record("pkg-b", "1.0", &[]),
+        ];
+        let warm_err = solve_selected_records_from_records(
+            conflicting_specs,
+            &all_records,
+            "3.11",
+            ChannelPriority::Strict,
+            &BTreeMap::new(),
+            SolveStrategy::Highest,
+            stale_preferred,
+        );
+        assert!(
+            warm_err.is_err(),
+            "warm-start must not rescue a genuinely-UNSAT solve"
+        );
     }
 }
