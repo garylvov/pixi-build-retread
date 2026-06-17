@@ -736,8 +736,10 @@ pub async fn stage(
                         must_ship: w.must_ship(),
                         upstream_url,
                         git_source: None, // Class-2 shadow: index wheel, no git source
-                        // sdist_source: threaded in commit 5 (schema 9).
-                        sdist_source: None,
+                        // Sdist provenance (schema 9+): thread from EmitWheel so
+                        // sdist-built BFS transitives (e.g. gym) carry their sdist_url
+                        // into the lock for Class-2b replay.
+                        sdist_source: w.sdist_source.clone(),
                     });
                 }
                 ShadowSrc::Raw(src) => {
@@ -777,8 +779,10 @@ pub async fn stage(
                         must_ship: w.must_ship(),
                         upstream_url,
                         git_source: None, // Class-2 shadow: index wheel, no git source
-                        // sdist_source: threaded in commit 5 (schema 9).
-                        sdist_source: None,
+                        // Sdist provenance (schema 9+): thread from EmitWheel so
+                        // sdist-built BFS transitives (e.g. gym) carry their sdist_url
+                        // into the lock for Class-2b replay.
+                        sdist_source: w.sdist_source.clone(),
                     });
                 }
             }
