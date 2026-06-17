@@ -4373,7 +4373,12 @@ async fn build_one(
                     .unwrap_or_default()
                     .to_string(),
                 remote_url: (url.scheme() != "file").then(|| (*url).clone()),
-                upstream_url: None,
+                // Pristine pre-localization index URL: read from w.url (the
+                // original unlocalized URL, BEFORE localize_wheel_source may
+                // have collapsed it to file://). Carried through to the lock
+                // so the replay path can re-fetch Class-2 shadows without a
+                // full BFS/solve. None for source-built wheels (file://-only).
+                upstream_url: (w.url.scheme() != "file").then(|| w.url.clone()),
             })
             .collect();
         let mut conda_capable: std::collections::HashSet<String> = bundle
