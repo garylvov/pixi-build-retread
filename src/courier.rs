@@ -640,7 +640,7 @@ pub async fn stage(
                 let any_change = w
                     .requires_dist
                     .iter()
-                    .any(|l| mapper_for_remote(l).is_some());
+                    .any(|l| mapper_for_remote(l) != crate::wheel_rewrite::LineAction::Keep);
                 if any_change && !conda_cap_owned.contains(&w.pypi_name) {
                     let url = w.remote_url.as_ref().ok_or_else(|| {
                         anyhow::anyhow!(

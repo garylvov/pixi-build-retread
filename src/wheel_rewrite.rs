@@ -25,6 +25,24 @@ use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 use crate::config::RelaxPolicy;
 
+/// 3-way outcome for the per-`Requires-Dist` mapper passed to
+/// [`rewrite_wheel_with`] / [`rewrite_metadata_text_with`].
+///
+/// - `Keep` — emit the original line unchanged (no rewrite cost).
+/// - `Replace(s)` — substitute `s` as the new requirement value; `s` MUST
+///   differ from the original line (never `Replace(identical-bytes)`; that
+///   would flip the `did_change` signal and drift courier's `ShadowSrc`
+///   decision for every wheel).
+/// - `Drop` — omit the line entirely from the emitted METADATA. Used by
+///   Phase 2.8 to strip orphan direct-URL `Requires-Dist` lines whose
+///   target is absent from the resolved bundle closure.
+#[derive(Debug, PartialEq, Eq)]
+pub enum LineAction {
+    Keep,
+    Replace(String),
+    Drop,
+}
+
 /// Read `src` (a `.whl`), apply `relax` to every `Requires-Dist:` line in
 /// the root-level `*.dist-info/METADATA` entry, and write the result to
 /// `dst`. The destination wheel's RECORD entry for METADATA is updated
@@ -33,19 +51,25 @@ use crate::config::RelaxPolicy;
 /// Returns the new sha256 of the rewritten wheel (useful for recipe
 /// generation).
 pub fn rewrite_wheel(src: &Path, dst: &Path, relax: RelaxPolicy) -> Result<String> {
-    rewrite_wheel_with(src, dst, &|line| relax_pep508(line, relax).ok()).map(|(sha, _)| sha)
+    rewrite_wheel_with(src, dst, &|line| match relax_pep508(line, relax).ok() {
+        None => LineAction::Keep,
+        Some(s) if s == line => LineAction::Keep,
+        Some(s) => LineAction::Replace(s),
+    })
+    .map(|(sha, _)| sha)
 }
 
 /// Generic core of [`rewrite_wheel`]: apply `map` to every
-/// `Requires-Dist:` value (returning `None` leaves a line unchanged).
-/// When no line changes, the output is a hard link to the input where
-/// possible (same filesystem) so isaac-scale wheels cost nothing to
-/// "ship"; falls back to a copy. v1.6.1: emit-pypi uses this to bake
-/// its override semantics directly into the shipped wheels' METADATA.
+/// `Requires-Dist:` value. [`LineAction::Keep`] leaves a line unchanged,
+/// [`LineAction::Replace`] substitutes, [`LineAction::Drop`] omits the line
+/// entirely. When no line changes or is dropped, the output is a hard link
+/// to the input where possible (same filesystem) so isaac-scale wheels cost
+/// nothing to "ship"; falls back to a copy. v1.6.1: emit-pypi uses this to
+/// bake its override semantics directly into the shipped wheels' METADATA.
 pub(crate) fn rewrite_wheel_with(
     src: &Path,
     dst: &Path,
-    map: &dyn Fn(&str) -> Option<String>,
+    map: &dyn Fn(&str) -> LineAction,
 ) -> Result<(String, bool)> {
     let bytes = std::fs::read(src).with_context(|| format!("reading {}", src.display()))?;
     let mut archive = ZipArchive::new(Cursor::new(&bytes))
@@ -147,13 +171,11 @@ pub(crate) fn rewrite_wheel_with(
     Ok((sha256_hex(&dst_bytes), true))
 }
 
-/// Generic form: apply `map` to every `Requires-Dist:` value. `None`
-/// (including for unparseable lines) keeps the original line, so a
-/// confusing line can never corrupt a wheel.
-fn rewrite_metadata_text_with(
-    content: &str,
-    map: &dyn Fn(&str) -> Option<String>,
-) -> Result<String> {
+/// Generic form: apply `map` to every `Requires-Dist:` value.
+/// [`LineAction::Keep`] (including for unparseable lines) keeps the
+/// original line, so a confusing line can never corrupt a wheel.
+/// [`LineAction::Drop`] omits the line entirely (used for orphan URL deps).
+fn rewrite_metadata_text_with(content: &str, map: &dyn Fn(&str) -> LineAction) -> Result<String> {
     let mut out = String::with_capacity(content.len());
     let mut in_headers = true;
     for line in content.split_inclusive('\n') {
@@ -163,16 +185,23 @@ fn rewrite_metadata_text_with(
         }
         if in_headers && let Some(value) = line.strip_prefix("Requires-Dist: ") {
             let trimmed = value.trim_end_matches(['\r', '\n']);
-            if let Some(rewritten) = map(trimmed) {
-                out.push_str("Requires-Dist: ");
-                out.push_str(&rewritten);
-                // Preserve the original line ending.
-                if line.ends_with("\r\n") {
-                    out.push_str("\r\n");
-                } else {
-                    out.push('\n');
+            match map(trimmed) {
+                LineAction::Keep => {}
+                LineAction::Replace(rewritten) => {
+                    out.push_str("Requires-Dist: ");
+                    out.push_str(&rewritten);
+                    // Preserve the original line ending.
+                    if line.ends_with("\r\n") {
+                        out.push_str("\r\n");
+                    } else {
+                        out.push('\n');
+                    }
+                    continue;
                 }
-                continue;
+                LineAction::Drop => {
+                    // Omit the line entirely (orphan URL dep strip).
+                    continue;
+                }
             }
         }
         out.push_str(line);
@@ -457,9 +486,15 @@ mod tests {
                  Requires-Dist: scipy==1.15.3\n\
                  \n\
                  Body line that mentions Requires-Dist: should not change\n";
-        let out =
-            rewrite_metadata_text_with(m, &|line| relax_pep508(line, RelaxPolicy::Minor).ok())
-                .unwrap();
+        let out = rewrite_metadata_text_with(
+            m,
+            &|line| match relax_pep508(line, RelaxPolicy::Minor).ok() {
+                None => LineAction::Keep,
+                Some(s) if s == line => LineAction::Keep,
+                Some(s) => LineAction::Replace(s),
+            },
+        )
+        .unwrap();
         assert!(out.contains("numpy>=1.26,<2"));
         assert!(out.contains("scipy>=1.15,<2"));
         assert!(out.contains("Body line that mentions Requires-Dist: should not change"));
@@ -515,6 +550,140 @@ mod tests {
         // `pyglet` with no version, marker preserved.
         assert!(out.starts_with("pyglet"));
         assert!(!out.contains("<2"));
+    }
+
+    /// Build a minimal in-memory wheel zip for test use.
+    fn make_test_wheel_bytes(dist: &str, version: &str, requires: &[&str]) -> Vec<u8> {
+        use std::io::Write as _;
+        let normalized = dist.replace('-', "_");
+        let di = format!("{normalized}-{version}.dist-info");
+        let mut metadata = format!("Metadata-Version: 2.1\nName: {dist}\nVersion: {version}\n");
+        for req in requires {
+            metadata.push_str(&format!("Requires-Dist: {req}\n"));
+        }
+        let metadata_bytes = metadata.into_bytes();
+        let wheel_file = b"Wheel-Version: 1.0\nTag: py3-none-any\n".to_vec();
+        let record = format!("{di}/METADATA,,\n{di}/WHEEL,,\n{di}/RECORD,,\n").into_bytes();
+        let mut buf = Vec::new();
+        let mut zip = ZipWriter::new(std::io::Cursor::new(&mut buf));
+        let opts = SimpleFileOptions::default()
+            .compression_method(CompressionMethod::Stored)
+            .last_modified_time(zip::DateTime::default());
+        for (name, body) in [
+            (format!("{di}/METADATA"), metadata_bytes.as_slice()),
+            (format!("{di}/WHEEL"), wheel_file.as_slice()),
+            (format!("{di}/RECORD"), record.as_slice()),
+        ] {
+            zip.start_file(&name, opts).unwrap();
+            zip.write_all(body).unwrap();
+        }
+        zip.finish().unwrap();
+        buf
+    }
+
+    /// Test 6 (Phase 2.8): `LineAction::Drop` omits exactly the targeted line.
+    ///
+    /// Three `Requires-Dist` lines; the mapper drops the middle one.
+    /// The output METADATA must contain the first and third lines byte-identically
+    /// and must omit the second entirely (not replace it with empty, not leave a
+    /// blank line).
+    #[test]
+    fn line_action_drop_omits_line() {
+        let metadata = "Metadata-Version: 2.1\n\
+                        Name: foo\n\
+                        Version: 1.0.0\n\
+                        Requires-Dist: aaa==1.0\n\
+                        Requires-Dist: robomimic @ git+https://github.com/example/robomimic.git@v0.4.0\n\
+                        Requires-Dist: zzz>=2\n\
+                        \n\
+                        Body text.\n";
+
+        // Drop the URL line (middle), keep the others.
+        let out = rewrite_metadata_text_with(metadata, &|line| {
+            if line.starts_with("robomimic @") {
+                LineAction::Drop
+            } else {
+                LineAction::Keep
+            }
+        })
+        .unwrap();
+
+        // The dropped line must not appear at all.
+        assert!(
+            !out.contains("robomimic"),
+            "dropped line still present: {out:?}"
+        );
+        // The kept lines must appear byte-identically.
+        assert!(
+            out.contains("Requires-Dist: aaa==1.0\n"),
+            "first line missing: {out:?}"
+        );
+        assert!(
+            out.contains("Requires-Dist: zzz>=2\n"),
+            "third line missing: {out:?}"
+        );
+        // Headers and body must survive.
+        assert!(out.contains("Metadata-Version: 2.1"));
+        assert!(out.contains("Body text."));
+        // Exactly two Requires-Dist lines remain.
+        assert_eq!(
+            out.matches("Requires-Dist: ").count(),
+            2,
+            "unexpected Requires-Dist count: {out:?}"
+        );
+    }
+
+    /// Test 7 (Amendment 3 / Phase 2.8): `LineAction` refactor is byte- AND
+    /// signal-identical to the old `Option<String>`-based path.
+    ///
+    /// Drive an UNCHANGED wheel (no override, no drop) through the refactored
+    /// `rewrite_wheel_with` and assert:
+    ///   - `did_change` is `false` (the ShadowSrc signal is unaffected).
+    ///   - The output sha256 equals the input sha256 (byte-identical).
+    ///
+    /// Then drive a CHANGED wheel (one line gets `Replace`) and confirm
+    /// `did_change` flips to `true`.
+    #[test]
+    fn line_action_refactor_unchanged_wheel_parity() {
+        let pid = std::process::id();
+        let tmp = std::env::temp_dir().join(format!("retread-wheel-rewrite-parity-{pid}"));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let src = tmp.join("src.whl");
+        let dst_unchanged = tmp.join("dst_unchanged.whl");
+        let dst_changed = tmp.join("dst_changed.whl");
+
+        let wheel_bytes = make_test_wheel_bytes("mylib", "1.0.0", &["requests>=2,<3"]);
+        std::fs::write(&src, &wheel_bytes).unwrap();
+        let src_sha = sha256_hex(&wheel_bytes);
+
+        // Mapper returns Keep for every line → no change expected.
+        let (sha_same, did_change_same) =
+            rewrite_wheel_with(&src, &dst_unchanged, &|_| LineAction::Keep).unwrap();
+        assert!(
+            !did_change_same,
+            "did_change must be false when mapper returns only Keep"
+        );
+        assert_eq!(
+            sha_same, src_sha,
+            "sha256 must be identical for an all-Keep mapper"
+        );
+
+        // Mapper returns Replace for the one Requires-Dist line → change expected.
+        let (_, did_change_rep) = rewrite_wheel_with(&src, &dst_changed, &|line| {
+            if line == "requests>=2,<3" {
+                LineAction::Replace("requests>=2".to_string())
+            } else {
+                LineAction::Keep
+            }
+        })
+        .unwrap();
+        assert!(
+            did_change_rep,
+            "did_change must be true when a line is replaced"
+        );
+
+        // Cleanup (best-effort, non-fatal if it fails).
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

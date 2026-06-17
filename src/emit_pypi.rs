@@ -342,7 +342,7 @@ pub fn plan(wheels: &[EmitWheel], conda_capable: &std::collections::HashSet<Stri
 /// [`crate::wheel_rewrite::rewrite_wheel_with`].
 ///
 /// - Name in `overrides`: rebuild the line with the override spec
-///   (`"*"` means drop the specifier entirely). Returns `None` when the
+///   (`"*"` means drop the specifier entirely). Returns `Keep` when the
 ///   rebuilt line equals the original (exact family pins stay
 ///   byte-identical -- no rewrite, no shadow wheel needed).
 /// - Direct-URL lines whose name has an exact override: rebuilt as a
@@ -356,12 +356,15 @@ pub fn plan(wheels: &[EmitWheel], conda_capable: &std::collections::HashSet<Stri
 pub fn override_line_map<'a>(
     overrides: &'a BTreeMap<String, String>,
     conda_capable: &'a std::collections::HashSet<String>,
-) -> impl Fn(&str) -> Option<String> + 'a {
+) -> impl Fn(&str) -> crate::wheel_rewrite::LineAction + 'a {
+    use crate::wheel_rewrite::LineAction;
     move |line: &str| {
-        let req: uv_pep508::Requirement = uv_pep508::Requirement::from_str(line).ok()?;
+        let Ok(req) = uv_pep508::Requirement::from_str(line) else {
+            return LineAction::Keep;
+        };
         let name = req.name.to_string();
         if name == "python" {
-            return None;
+            return LineAction::Keep;
         }
         if let Some(value) = overrides.get(&name) {
             let spec = if value == "*" {
@@ -370,7 +373,10 @@ pub fn override_line_map<'a>(
                 value.clone()
             };
             let rebuilt = crate::wheel_rewrite::rebuild_requirement(&req, &spec);
-            return (rebuilt != line).then_some(rebuilt);
+            if rebuilt != line {
+                return LineAction::Replace(rebuilt);
+            }
+            return LineAction::Keep;
         }
         // Cap-only handling for names without a table entry.
         if let Some(uv_pep508::VersionOrUrl::VersionSpecifier(specs)) = req.version_or_url.as_ref()
@@ -388,10 +394,13 @@ pub fn override_line_map<'a>(
                     .map(|s| s.to_string())
                     .collect();
                 let rebuilt = crate::wheel_rewrite::rebuild_requirement(&req, &kept.join(","));
-                return (rebuilt != line).then_some(rebuilt);
+                if rebuilt != line {
+                    return LineAction::Replace(rebuilt);
+                }
+                return LineAction::Keep;
             }
         }
-        None
+        LineAction::Keep
     }
 }
 
@@ -560,6 +569,7 @@ mod tests {
 
     #[test]
     fn line_map_applies_table_semantics() {
+        use crate::wheel_rewrite::LineAction;
         let mut overrides = BTreeMap::new();
         overrides.insert("pillow".into(), ">=8".into());
         overrides.insert("isaacsim-core".into(), "==6.0.0.0".into());
@@ -569,28 +579,31 @@ mod tests {
             ["psutil".to_string(), "pillow".to_string()].into();
         let map = override_line_map(&overrides, &capable);
         // Floor override rewrites the pin.
-        assert_eq!(map("pillow==12.1.1").as_deref(), Some("pillow>=8"));
+        assert_eq!(
+            map("pillow==12.1.1"),
+            LineAction::Replace("pillow>=8".to_string())
+        );
         // Exact override equal to the existing pin: no change -> no
         // shadow wheel (family pins stay byte-identical).
-        assert_eq!(map("isaacsim-core==6.0.0.0"), None);
+        assert_eq!(map("isaacsim-core==6.0.0.0"), LineAction::Keep);
         // URL requirement rerouted to the version pin.
         assert_eq!(
-            map("rl-games @ git+https://github.com/isaac-sim/rl_games.git@python3.11").as_deref(),
-            Some("rl-games==1.6.1")
+            map("rl-games @ git+https://github.com/isaac-sim/rl_games.git@python3.11"),
+            LineAction::Replace("rl-games==1.6.1".to_string())
         );
         // "*" drops the specifier; extras and markers survive.
         assert_eq!(
-            map("loose[fast]==1.0 ; sys_platform == \"linux\"").as_deref(),
-            Some("loose[fast] ; sys_platform == 'linux'")
+            map("loose[fast]==1.0 ; sys_platform == \"linux\""),
+            LineAction::Replace("loose[fast] ; sys_platform == 'linux'".to_string())
         );
         // Cap-only line on a conda-capable name: cap stripped (the v1.6
         // table was structurally blind to these).
-        assert_eq!(map("psutil<6").as_deref(), Some("psutil"));
+        assert_eq!(map("psutil<6"), LineAction::Replace("psutil".to_string()));
         // Cap-only on a non-capable name: left alone (cap is harmless,
         // conda can't pin above it).
-        assert_eq!(map("notconda<2"), None);
+        assert_eq!(map("notconda<2"), LineAction::Keep);
         // python is never touched.
-        assert_eq!(map("python>=3.10"), None);
+        assert_eq!(map("python>=3.10"), LineAction::Keep);
     }
 
     #[test]
