@@ -2943,10 +2943,20 @@ async fn resolve_bundle(
                     (PendingSource::Pypi { .. }, None) => {
                         unreachable!("phase 2 always fetches Pypi-form items")
                     }
-                    (PendingSource::Git { url, rev }, _) => {
+                    (
+                        PendingSource::Git {
+                            url,
+                            rev,
+                            subdirectory,
+                        },
+                        _,
+                    ) => {
                         let synth = WheelEntry {
                             git: Some(url.clone()),
                             rev: rev.clone().or_else(|| Some("HEAD".to_string())),
+                            // A-0 fix: thread the parsed subdirectory through so the
+                            // git checkout builds from the correct sub-package path.
+                            subdirectory: subdirectory.clone(),
                             ..Default::default()
                         };
                         let synth_name = pending.pypi_name.clone();
