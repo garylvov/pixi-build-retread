@@ -352,6 +352,7 @@ mod tests {
                 requires_dist: vec![],
                 must_ship: true,
                 upstream_url: None,
+                git_source: None,
             }],
             conda_run_deps,
             index_urls,

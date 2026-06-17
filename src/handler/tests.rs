@@ -893,6 +893,7 @@ fn rw(pypi: &str, m: WheelMetadata) -> ResolvedWheel {
     ResolvedWheel {
         pypi_name: pypi.to_string(),
         upstream_url: Some(url.clone()),
+        git_source: None,
         url,
         metadata: m,
         extras_requested: vec![],
@@ -1913,6 +1914,7 @@ fn relaxed_pure_python_primary_pins_python_to_workspace_variant() {
                     .parse()
                     .unwrap(),
             ),
+            git_source: None,
             metadata: primary,
             extras_requested: vec![],
             auto_data: None,

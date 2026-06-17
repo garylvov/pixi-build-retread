@@ -479,6 +479,10 @@ struct ResolvedWheel {
     /// This is the single source of truth read by `build_one` when populating
     /// `EmitWheel.upstream_url`; independent of `url` localization.
     upstream_url: Option<url::Url>,
+    /// Git provenance for source-built wheels (schema 8+). Set in
+    /// `materialize_and_rewrite` for both named-git (from=) and inline-git
+    /// (git=) entry forms. `None` for all other wheel origins.
+    git_source: Option<crate::lock::GitWheelSource>,
     metadata: WheelMetadata,
     /// v0.12.0+: extras the user requested on the originating
     /// `[retread-wheels]` entry. Surfaced in the audit so debugging
@@ -2928,110 +2932,120 @@ async fn resolve_bundle(
         // old pop order exactly.
         for (pending, fetch_result) in fetched {
             let dep_conda_name = canonical_conda_name(&pending.pypi_name);
-            let (sub_url, sub_upstream_url, sub_metadata, sub_index_for_recurse, sub_seed_rd) =
-                match (&pending.source, fetch_result?) {
-                    (PendingSource::Pypi { .. }, Some((resolved_url, metadata, index))) => {
-                        // Pypi-form sub-wheels are NOT D-rewritten, so
-                        // their metadata IS the original Requires-Dist.
-                        let seed_rd = metadata.requires_dist.clone();
-                        // resolved_url is the pristine https index URL; record
-                        // it as upstream_url so build_one can populate
-                        // EmitWheel.upstream_url without deriving from w.url.
-                        let upstream = Some(resolved_url.clone());
-                        (resolved_url, upstream, metadata, index, seed_rd)
-                    }
-                    (PendingSource::Pypi { .. }, None) => {
-                        unreachable!("phase 2 always fetches Pypi-form items")
-                    }
-                    (
-                        PendingSource::Git {
+            // 6-tuple: (url, upstream_url, git_source, metadata, index, seed_rd)
+            let (
+                sub_url,
+                sub_upstream_url,
+                sub_git_source,
+                sub_metadata,
+                sub_index_for_recurse,
+                sub_seed_rd,
+            ) = match (&pending.source, fetch_result?) {
+                (PendingSource::Pypi { .. }, Some((resolved_url, metadata, index))) => {
+                    // Pypi-form sub-wheels are NOT D-rewritten, so
+                    // their metadata IS the original Requires-Dist.
+                    let seed_rd = metadata.requires_dist.clone();
+                    // resolved_url is the pristine https index URL; record
+                    // it as upstream_url so build_one can populate
+                    // EmitWheel.upstream_url without deriving from w.url.
+                    let upstream = Some(resolved_url.clone());
+                    (resolved_url, upstream, None, metadata, index, seed_rd)
+                }
+                (PendingSource::Pypi { .. }, None) => {
+                    unreachable!("phase 2 always fetches Pypi-form items")
+                }
+                (
+                    PendingSource::Git {
+                        url,
+                        rev,
+                        subdirectory,
+                    },
+                    _,
+                ) => {
+                    let synth = WheelEntry {
+                        git: Some(url.clone()),
+                        rev: rev.clone().or_else(|| Some("HEAD".to_string())),
+                        // A-0 fix: thread the parsed subdirectory through so the
+                        // git checkout builds from the correct sub-package path.
+                        subdirectory: subdirectory.clone(),
+                        ..Default::default()
+                    };
+                    let synth_name = pending.pypi_name.clone();
+                    let (sub, sub_original_rd) = materialize_and_rewrite(
+                        &synth,
+                        &synth_name,
+                        target,
+                        download_dir,
+                        source_dir,
+                        cache_dir,
+                        relax,
+                        git_sources,
+                        None,
+                        EntryAuditInfo::default(),
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "materializing URL Requires-Dist `{} @ git+{}@{}`",
+                            pending.pypi_name,
                             url,
-                            rev,
-                            subdirectory,
-                        },
-                        _,
-                    ) => {
-                        let synth = WheelEntry {
-                            git: Some(url.clone()),
-                            rev: rev.clone().or_else(|| Some("HEAD".to_string())),
-                            // A-0 fix: thread the parsed subdirectory through so the
-                            // git checkout builds from the correct sub-package path.
-                            subdirectory: subdirectory.clone(),
-                            ..Default::default()
-                        };
-                        let synth_name = pending.pypi_name.clone();
-                        let (sub, sub_original_rd) = materialize_and_rewrite(
-                            &synth,
-                            &synth_name,
-                            target,
-                            download_dir,
-                            source_dir,
-                            cache_dir,
-                            relax,
-                            git_sources,
-                            None,
-                            EntryAuditInfo::default(),
+                            rev.as_deref().unwrap_or("HEAD"),
                         )
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "materializing URL Requires-Dist `{} @ git+{}@{}`",
-                                pending.pypi_name,
-                                url,
-                                rev.as_deref().unwrap_or("HEAD"),
-                            )
-                        })?;
-                        // For the recurse, use the parent ENTRY's index (not
-                        // `prefix` -- that's a name-prefix string, NOT a URL).
-                        // The recurse fires for Pypi-form Requires-Dist of the
-                        // sub-wheel; those go through pypi::resolve which needs
-                        // a real Simple index URL.
-                        let sub_up = sub.upstream_url.clone();
-                        (
-                            sub.url,
-                            sub_up,
-                            sub.metadata,
-                            entry.index_url(),
-                            sub_original_rd,
+                    })?;
+                    // For the recurse, use the parent ENTRY's index (not
+                    // `prefix` -- that's a name-prefix string, NOT a URL).
+                    // The recurse fires for Pypi-form Requires-Dist of the
+                    // sub-wheel; those go through pypi::resolve which needs
+                    // a real Simple index URL.
+                    let sub_gs = sub.git_source.clone();
+                    let sub_up = sub.upstream_url.clone();
+                    (
+                        sub.url,
+                        sub_up,
+                        sub_gs,
+                        sub.metadata,
+                        entry.index_url(),
+                        sub_original_rd,
+                    )
+                }
+                (PendingSource::Url { wheel_url }, _) => {
+                    let synth = WheelEntry {
+                        url: Some(wheel_url.clone()),
+                        ..Default::default()
+                    };
+                    let synth_name = pending.pypi_name.clone();
+                    let (sub, sub_original_rd) = materialize_and_rewrite(
+                        &synth,
+                        &synth_name,
+                        target,
+                        download_dir,
+                        source_dir,
+                        cache_dir,
+                        relax,
+                        git_sources,
+                        None,
+                        EntryAuditInfo::default(),
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "materializing URL Requires-Dist `{} @ {}`",
+                            pending.pypi_name, wheel_url,
                         )
-                    }
-                    (PendingSource::Url { wheel_url }, _) => {
-                        let synth = WheelEntry {
-                            url: Some(wheel_url.clone()),
-                            ..Default::default()
-                        };
-                        let synth_name = pending.pypi_name.clone();
-                        let (sub, sub_original_rd) = materialize_and_rewrite(
-                            &synth,
-                            &synth_name,
-                            target,
-                            download_dir,
-                            source_dir,
-                            cache_dir,
-                            relax,
-                            git_sources,
-                            None,
-                            EntryAuditInfo::default(),
-                        )
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "materializing URL Requires-Dist `{} @ {}`",
-                                pending.pypi_name, wheel_url,
-                            )
-                        })?;
-                        // Same fix as the Git arm: recurse uses the parent
-                        // entry's PyPI Simple index, not the name `prefix`.
-                        let sub_up = sub.upstream_url.clone();
-                        (
-                            sub.url,
-                            sub_up,
-                            sub.metadata,
-                            entry.index_url(),
-                            sub_original_rd,
-                        )
-                    }
-                };
+                    })?;
+                    // Same fix as the Git arm: recurse uses the parent
+                    // entry's PyPI Simple index, not the name `prefix`.
+                    let sub_up = sub.upstream_url.clone();
+                    (
+                        sub.url,
+                        sub_up,
+                        None, // Url-form: no git source
+                        sub.metadata,
+                        entry.index_url(),
+                        sub_original_rd,
+                    )
+                }
+            };
 
             // Recurse: this sub-wheel's own extras and prefix-matching base
             // deps also get pulled in. URL/git sub-wheels reuse the parent
@@ -3050,6 +3064,10 @@ async fn resolve_bundle(
                 pypi_name: dep_conda_name,
                 url: sub_url,
                 upstream_url: sub_upstream_url,
+                // BFS sub-wheels inherit git_source from materialize_and_rewrite
+                // (already set for Git-form PendingSource via the synth path).
+                // Pypi/Url-form sub-wheels have no git source.
+                git_source: sub_git_source,
                 metadata: sub_metadata,
                 extras_requested: vec![],
                 auto_data: None,
@@ -3305,6 +3323,9 @@ async fn materialize_and_rewrite(
     // Set for index (PyPI version-spec) and direct-URL entry forms only.
     // Source-built forms (git / path / from) leave this None.
     let mut upstream_url: Option<url::Url> = None;
+    // Git provenance (schema 8+): populated for named-git and inline-git
+    // entry forms. None for all other origins.
+    let mut git_source_captured: Option<crate::lock::GitWheelSource> = None;
     let raw_path: PathBuf = if let Some(from_name) = &entry.from {
         // Named git-source reference: look up url + rev from the
         // [retread-git-sources] table, treat subdirectory just like
@@ -3317,7 +3338,7 @@ async fn materialize_and_rewrite(
         })?;
         let subdir = entry.subdirectory.as_deref().unwrap_or(".");
         let out = download_dir.join(entry_name);
-        let (wheel, _resolved_sha) = crate::source_build::build_wheel_from_git(
+        let (wheel, resolved_sha) = crate::source_build::build_wheel_from_git(
             &src.url,
             &src.rev,
             subdir,
@@ -3339,6 +3360,20 @@ async fn materialize_and_rewrite(
         source_root = Some(crate::source_build::git_source_root(
             &src.url, &src.rev, subdir, cache_dir,
         ));
+        // Record git provenance with the RESOLVED SHA (not the config rev,
+        // which may be a branch/tag) so replay is manifest-independent.
+        // POISONING: the config rev IS in inputs_hash via courier_input_specs
+        // (courier.rs:77); changing the named-source rev invalidates the lock
+        // and forces a cascade. The resolved SHA here is NOT fed back into the
+        // hash — doing so would be circular (the SHA is an output of the build,
+        // not a pure input). Replay pins this SHA; a new branch tip is only
+        // picked up by a fresh cold solve.
+        git_source_captured = Some(crate::lock::GitWheelSource {
+            url: src.url.clone(),
+            rev: resolved_sha,
+            subdirectory: entry.subdirectory.clone(),
+            extras: entry.extras.clone(),
+        });
         wheel
     } else if let Some(url) = &entry.url {
         // Capture the direct URL as the upstream before fetch/localization.
@@ -3376,7 +3411,7 @@ async fn materialize_and_rewrite(
             .ok_or_else(|| anyhow!("git source `{entry_name}` missing rev"))?;
         let subdir = entry.subdirectory.as_deref().unwrap_or(".");
         let out = download_dir.join(entry_name);
-        let (wheel, _resolved_sha) = crate::source_build::build_wheel_from_git(
+        let (wheel, resolved_sha) = crate::source_build::build_wheel_from_git(
             git_url,
             rev,
             subdir,
@@ -3395,6 +3430,19 @@ async fn materialize_and_rewrite(
         source_root = Some(crate::source_build::git_source_root(
             git_url, rev, subdir, cache_dir,
         ));
+        // Record git provenance with the RESOLVED SHA (not the config rev,
+        // which may be a branch/tag) so replay is manifest-independent.
+        // POISONING: the config rev IS in inputs_hash via courier_input_specs
+        // (courier.rs:71); changing the inline rev invalidates the lock and
+        // forces a cascade. The resolved SHA is NOT fed back into the hash —
+        // doing so would be circular. Replay pins this SHA; a new branch tip
+        // is only picked up by a fresh cold solve.
+        git_source_captured = Some(crate::lock::GitWheelSource {
+            url: git_url.clone(),
+            rev: resolved_sha,
+            subdirectory: entry.subdirectory.clone(),
+            extras: entry.extras.clone(),
+        });
         wheel
     } else {
         // PyPI version spec form.
@@ -3611,6 +3659,7 @@ async fn materialize_and_rewrite(
             pypi_name,
             url: final_url,
             upstream_url,
+            git_source: git_source_captured,
             extras_requested: audit_info.extras_requested,
             auto_data: auto_data_report,
             auto_data_dedup_skipped_root: audit_info.dedup_skipped_root,
@@ -4082,6 +4131,7 @@ async fn materialize_from_lock(
                     wheel_filename: lw.filename.clone(),
                     remote_url,
                     upstream_url: None,
+                    git_source: None, // Origin::Index: no git source
                 }
             }
             Origin::Built if lw.must_ship => {
@@ -4136,6 +4186,10 @@ async fn materialize_from_lock(
                         wheel_filename: lw.filename.clone(),
                         remote_url: None,
                         upstream_url: None,
+                        // git_source from the re-materialized resolved wheel (schema 8+).
+                        // This is set when the Class-1 entry is a git source and the
+                        // materialize_and_rewrite ran build_wheel_from_git.
+                        git_source: resolved.git_source.clone(),
                     }
                 } else {
                     // Class 3: BFS transitive built from a `pkg @ git+<url>`
@@ -4213,6 +4267,7 @@ async fn materialize_from_lock(
                     wheel_filename: lw.filename.clone(),
                     remote_url: Some(remote_url),
                     upstream_url: None,
+                    git_source: None, // Class-2 shadow: upstream_url carries provenance
                 }
             }
         };
@@ -4493,6 +4548,9 @@ async fn build_one(
                 // file:// by the time build_one sees it, so deriving from
                 // w.url would always yield None and break Phase-1 replay.
                 upstream_url: w.upstream_url.clone(),
+                // Git provenance (schema 8+): carried from ResolvedWheel so
+                // courier::stage can write it into LockWheel.git_source.
+                git_source: w.git_source.clone(),
             })
             .collect();
         let mut conda_capable: std::collections::HashSet<String> = bundle
@@ -4942,6 +5000,7 @@ mod replay_tests {
                 requires_dist: vec![],
                 must_ship: false,
                 upstream_url: None,
+                git_source: None,
             }],
             conda_run_deps: vec![CondaDep {
                 name: "numpy".into(),
@@ -5194,6 +5253,7 @@ mod replay_tests {
                 requires_dist: vec![],
                 must_ship: true,
                 upstream_url: None, // class 3: no upstream, not in config
+                git_source: None,
             }],
             conda_run_deps: vec![],
             index_urls: vec!["https://pypi.org/simple/".into()],
@@ -5258,6 +5318,7 @@ mod replay_tests {
                 requires_dist: vec!["torch>=2.0,<3".into()],
                 must_ship: false,
                 upstream_url: None, // schema-5 style: no upstream_url
+                git_source: None,
             }],
             conda_run_deps: vec![],
             index_urls: vec!["https://pypi.org/simple/".into()],
@@ -5388,6 +5449,7 @@ mod replay_tests {
             requires_dist: vec![], // EMPTY — poison scenario
             must_ship: false,      // relax-changed index wheel
             upstream_url: None,
+            git_source: None,
         });
         let path = dir.join(RetreadLock::file_name("pack"));
         std::fs::write(&path, lock.to_pretty_json().unwrap()).unwrap();
@@ -5504,6 +5566,7 @@ mod replay_tests {
             requires_dist: vec!["torch>=2.0,<3".into()],
             must_ship: false,
             upstream_url: Some("https://files.pythonhosted.org/torchvision-0.18.0.whl".into()),
+            git_source: None,
         });
         let path = dir.join(RetreadLock::file_name("pack"));
         std::fs::write(&path, lock.to_pretty_json().unwrap()).unwrap();
@@ -5635,6 +5698,7 @@ mod emit_wheel_upstream_url_tests {
             pypi_name: "isaacsim".to_string(),
             url: local.clone(), // file:// — what materialize_and_rewrite returns
             upstream_url: Some(upstream.clone()), // https:// — captured BEFORE localization
+            git_source: None,
             metadata: dummy_metadata("isaacsim", "6.0.0"),
             extras_requested: vec![],
             auto_data: None,
@@ -5675,6 +5739,7 @@ mod emit_wheel_upstream_url_tests {
                     remote_url: (url.scheme() != "file").then(|| url.clone()),
                     // THE FIX: read from w.upstream_url, not derived from w.url.
                     upstream_url: w.upstream_url.clone(),
+                    git_source: w.git_source.clone(),
                 }
             })
             .collect();
@@ -5725,6 +5790,7 @@ mod emit_wheel_upstream_url_tests {
             pypi_name: "isaacsim-kernel".to_string(),
             url: upstream.clone(),
             upstream_url: Some(upstream.clone()),
+            git_source: None,
             metadata: dummy_metadata("isaacsim-kernel", "6.0.0"),
             extras_requested: vec![],
             auto_data: None,
@@ -5744,6 +5810,7 @@ mod emit_wheel_upstream_url_tests {
                     )
                     .unwrap(),
                 ),
+                git_source: None,
                 metadata: dummy_metadata("isaacsim", "6.0.0"),
                 extras_requested: vec![],
                 auto_data: None,
@@ -5772,6 +5839,7 @@ mod emit_wheel_upstream_url_tests {
                         .to_string(),
                     remote_url: (url.scheme() != "file").then(|| url.clone()),
                     upstream_url: w.upstream_url.clone(),
+                    git_source: w.git_source.clone(),
                 }
             })
             .collect();

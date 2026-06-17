@@ -450,6 +450,7 @@ pub(crate) async fn auto_bundle_transitives(
                                                 pypi_name: conda_name,
                                                 url: resolved.url,
                                                 upstream_url: upstream,
+                                                git_source: None,
                                                 metadata,
                                                 extras_requested: vec![],
                                                 auto_data: None,

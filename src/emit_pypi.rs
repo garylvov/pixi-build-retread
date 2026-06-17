@@ -89,6 +89,11 @@ pub struct EmitWheel {
     /// and for wheels that were only ever seen as remote (those use
     /// `remote_url` directly).
     pub upstream_url: Option<url::Url>,
+    /// Git provenance for source-built wheels (schema 8+). Populated by
+    /// `materialize_and_rewrite` for both named-git and inline-git entry
+    /// forms. Written into `LockWheel.git_source` by `courier::stage` so
+    /// the replay path can re-source-build manifest-independently.
+    pub git_source: Option<crate::lock::GitWheelSource>,
 }
 
 impl EmitWheel {
@@ -542,6 +547,7 @@ mod tests {
             local_path: local.map(PathBuf::from),
             remote_url: None,
             upstream_url: None,
+            git_source: None,
         }
     }
 

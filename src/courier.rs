@@ -552,9 +552,13 @@ pub async fn stage(
                 requires_dist: w.requires_dist.clone(),
                 must_ship: w.must_ship(),
                 // Source-built (.injected) wheels exist on no index; there is
-                // no upstream URL to record. Re-materialization uses the
-                // [retread-wheels] config entry (git/path/url source).
+                // no upstream URL to record. Re-materialization on replay uses
+                // git_source (when present, schema 8+) or the [retread-wheels]
+                // config entry as a legacy fallback.
                 upstream_url: None,
+                // Git provenance (schema 8+): written from EmitWheel.git_source
+                // which was populated by materialize_and_rewrite for git entries.
+                git_source: w.git_source.clone(),
             });
         } else {
             // Index wheel. Decide whether to ship a relax-rewritten shadow
@@ -688,6 +692,7 @@ pub async fn stage(
                         requires_dist: w.requires_dist.clone(),
                         must_ship: false,
                         upstream_url: None, // n/a for Index wheels; use `url` instead
+                        git_source: None,   // Index wheels have no git source
                     });
                 }
                 ShadowSrc::Rewritten(probe_dst) => {
@@ -726,6 +731,7 @@ pub async fn stage(
                         requires_dist: w.requires_dist.clone(),
                         must_ship: w.must_ship(),
                         upstream_url,
+                        git_source: None, // Class-2 shadow: index wheel, no git source
                     });
                 }
                 ShadowSrc::Raw(src) => {
@@ -764,6 +770,7 @@ pub async fn stage(
                         requires_dist: w.requires_dist.clone(),
                         must_ship: w.must_ship(),
                         upstream_url,
+                        git_source: None, // Class-2 shadow: index wheel, no git source
                     });
                 }
             }
@@ -1030,6 +1037,7 @@ mod tests {
             local_path: local_path.map(|p| p.to_path_buf()),
             remote_url: remote_url.and_then(|u| u.parse().ok()),
             upstream_url: None,
+            git_source: None,
         }
     }
 

@@ -1167,6 +1167,7 @@ pub(crate) async fn try_pypi_bundle(
                         pypi_name: canonical_conda_name(pypi_name),
                         url: resolved.url,
                         upstream_url: upstream,
+                        git_source: None,
                         metadata,
                         extras_requested: vec![],
                         auto_data: None,
