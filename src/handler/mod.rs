@@ -4092,6 +4092,18 @@ async fn materialize_from_lock(
     // EmitWheel with correct local_path / remote_url for courier::stage.
     let mut emit_wheels: Vec<crate::emit_pypi::EmitWheel> = Vec::with_capacity(lock.wheels.len());
 
+    // SINGLE-ENTRY GUARD (Phase 2, known limitation): Each git bundle must
+    // have exactly one git checkout root per replay. Named-vs-inline parity
+    // (DESIGN A) relies on a single skip_subdirs=[] being acceptable — which
+    // is only true when no two wheels in the same bundle share the same clone.
+    // If >1 wheels share a root (multi-entry monorepo pack), the non-trivial
+    // skip_subdirs cannot be reconstructed from the lock, and replay would
+    // produce non-identical auto-data paths. Guard against this explicitly so
+    // the failure is caught early with a directing message rather than silently
+    // producing a different wheel. Phase 3 will add multi-root lock provenance.
+    let mut seen_git_checkout_roots: std::collections::HashSet<PathBuf> =
+        std::collections::HashSet::new();
+
     for lw in &lock.wheels {
         let emit = match lw.origin {
             Origin::Index => {
@@ -4136,15 +4148,126 @@ async fn materialize_from_lock(
             }
             Origin::Built if lw.must_ship => {
                 // Class 1 or Class 3: `.injected` source-built wheel.
-                if let Some(entry) = config.retread_wheels.get(&lw.name) {
-                    // Class 1: top-level [retread-wheels] entry — re-run the
-                    // full materialize_and_rewrite pipeline (Phase 1 download/
-                    // source-build + Phase 1.5 inject + Phase 1.6 auto-data +
-                    // Phase 2 relax-rewrite). This repopulates wheels/<name>/
-                    // on disk even if the directory is empty (lukewarm box).
+                //
+                // PRIORITY: prefer lw.git_source (schema 8+) for manifest-independent
+                // replay. Legacy fallback to config.retread_wheels only when git_source
+                // is absent (schema < 8 lock or non-git Class-1 entry such as path=).
+                //
+                // POISONING note: config-entry git revs (inline rev + named-source rev)
+                // are already folded into inputs_hash via courier_input_specs
+                // (src/courier.rs: inline rev at ~line 71, named rev at ~line 77).
+                // That means a changed config rev invalidates the committed lock and
+                // forces a cold cascade — correct. The RESOLVED SHA stored in git_source
+                // is NOT fed back into inputs_hash to avoid a circular dependency
+                // (compute inputs_hash requires the SHA, but the SHA is only known after
+                // the build). The lock is the contract: replay pins the RECORDED SHA;
+                // only a cascade re-resolves a moving branch tip.
+                if let Some(gs) = &lw.git_source {
+                    // Schema-8+ Class-1 git replay: manifest-INDEPENDENT path.
+                    // Build a synthetic WheelEntry{git:url, rev:resolved-SHA, subdirectory,
+                    // extras} and hand it to materialize_and_rewrite exactly as the
+                    // produce path would. Named-vs-inline parity is pre-resolved (DESIGN A):
+                    // both arms call the identical build_wheel_from_git via
+                    // checkout_root_for_entry; extras do not reach the wheel build (they
+                    // drive BFS closure only), so collapsing a named-git entry to an inline
+                    // synth {git:url, rev:SHA} yields a byte-identical wheel.
+                    //
+                    // SINGLE-ENTRY GUARD: assert this git checkout root has not been used
+                    // by a prior wheel in this replay batch. Multi-entry shared-checkout
+                    // bundles (two wheels from the same clone, different subdirs) produce a
+                    // non-trivial skip_subdirs at produce time that cannot be reconstructed
+                    // here (we always pass skip_subdirs=[]). Phase 3 will add multi-root
+                    // lock provenance; for now hard-error so the failure is explicit.
+                    let checkout_root =
+                        crate::source_build::git_checkout_root(&gs.url, &gs.rev, cache_dir);
+                    if !seen_git_checkout_roots.insert(checkout_root.clone()) {
+                        anyhow::bail!(
+                            "courier replay: wheel `{}` shares a git checkout root with a \
+                             prior wheel in this bundle (multi-entry shared-checkout bundles \
+                             are not yet supported in Phase-2 replay; Phase 3 will add \
+                             multi-root lock provenance). checkout_root={}",
+                            lw.name,
+                            checkout_root.display(),
+                        );
+                    }
                     tracing::info!(
                         wheel = %lw.name,
-                        "courier replay: re-materializing source-built wheel (class 1)"
+                        url = %gs.url,
+                        rev = %gs.rev,
+                        "courier replay: re-source-building git wheel from lock git_source \
+                         (manifest-independent, class 1)"
+                    );
+                    let synth_entry = crate::config::WheelEntry {
+                        git: Some(gs.url.clone()),
+                        rev: Some(gs.rev.clone()),
+                        subdirectory: gs.subdirectory.clone(),
+                        extras: gs.extras.clone(),
+                        url: None,
+                        sha256: None,
+                        version: None,
+                        index: None,
+                        path: None,
+                        from: None,
+                        bundle: None,
+                        // WheelEntry may have additional fields added in future schema
+                        // bumps; keep defaults for anything not carried in GitWheelSource.
+                        ..crate::config::WheelEntry::default()
+                    };
+                    let auto_data = Some(AutoDataConfig {
+                        checkout_root,
+                        skip_subdirs: vec![],
+                    });
+                    let (resolved, _rd) = materialize_and_rewrite(
+                        &synth_entry,
+                        &lw.name,
+                        &target,
+                        &download_dir,
+                        source_dir,
+                        cache_dir,
+                        config.relax,
+                        &config.git_sources,
+                        auto_data,
+                        EntryAuditInfo::default(),
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "courier replay (git_source): re-source-building wheel `{}` \
+                             from url={}, rev={}",
+                            lw.name, gs.url, gs.rev,
+                        )
+                    })?;
+                    let local_path = (resolved.url.scheme() == "file")
+                        .then(|| resolved.url.to_file_path().ok())
+                        .flatten();
+                    crate::emit_pypi::EmitWheel {
+                        pypi_name: lw.name.clone(),
+                        version: lw.version.clone(),
+                        requires_dist: lw.requires_dist.clone(),
+                        local_path,
+                        wheel_filename: lw.filename.clone(),
+                        remote_url: None,
+                        upstream_url: None,
+                        git_source: resolved.git_source.clone(),
+                    }
+                } else if let Some(entry) = config.retread_wheels.get(&lw.name) {
+                    // Legacy fallback (schema < 8, or non-git Class-1 such as path=):
+                    // read the live manifest entry and re-run materialize_and_rewrite.
+                    // This path requires the manifest to be present and correct (NOT
+                    // manifest-independent). For git entries, git_source will be
+                    // populated by materialize_and_rewrite (the lock write-back path
+                    // in courier::stage will persist it for future replays).
+                    //
+                    // Residual fall-through note (sdist / direct-URL): neither sdist
+                    // nor direct-URL entries carry a git_source (they are not git
+                    // builds), so they reach this branch via the manifest. If the
+                    // manifest entry is a path= or url= form, materialize_and_rewrite
+                    // handles it the same as produce. If the manifest is absent, the
+                    // else-branch below returns Ok(None) -> full resolve_all.
+                    tracing::info!(
+                        wheel = %lw.name,
+                        "courier replay: re-materializing source-built wheel via manifest \
+                         (legacy / no git_source, class 1)"
                     );
                     // Reconstruct auto_data from the entry's git checkout root
                     // (same logic as resolve_bundle's auto_data_per_entry). For
@@ -4187,8 +4310,6 @@ async fn materialize_from_lock(
                         remote_url: None,
                         upstream_url: None,
                         // git_source from the re-materialized resolved wheel (schema 8+).
-                        // This is set when the Class-1 entry is a git source and the
-                        // materialize_and_rewrite ran build_wheel_from_git.
                         git_source: resolved.git_source.clone(),
                     }
                 } else {
@@ -4197,10 +4318,17 @@ async fn materialize_from_lock(
                     // (schema gap); cannot re-materialize without re-running
                     // the full BFS. Return Ok(None) so the caller falls through
                     // to full resolve_all.
+                    //
+                    // Residual sdist / direct-URL: same fall-through. Neither form
+                    // carries a git_source (they are not git builds) and neither has
+                    // a [retread-wheels] entry here (Class-3 BFS transitive). The
+                    // caller's full resolve_all handles them. Phase 3 may add lock
+                    // provenance for these forms, but for now Ok(None) is correct.
                     tracing::warn!(
                         wheel = %lw.name,
-                        "courier replay: wheel has no [retread-wheels] entry (class 3 / \
-                         BFS git transitive — schema gap); falling through to full resolve",
+                        "courier replay: wheel has no git_source and no [retread-wheels] \
+                         entry (class 3 / BFS git transitive, or sdist / direct-URL — \
+                         schema gap); falling through to full resolve",
                     );
                     return Ok(None);
                 }
