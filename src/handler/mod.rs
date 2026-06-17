@@ -3307,7 +3307,7 @@ async fn materialize_and_rewrite(
         })?;
         let subdir = entry.subdirectory.as_deref().unwrap_or(".");
         let out = download_dir.join(entry_name);
-        let wheel = crate::source_build::build_wheel_from_git(
+        let (wheel, _resolved_sha) = crate::source_build::build_wheel_from_git(
             &src.url,
             &src.rev,
             subdir,
@@ -3366,7 +3366,7 @@ async fn materialize_and_rewrite(
             .ok_or_else(|| anyhow!("git source `{entry_name}` missing rev"))?;
         let subdir = entry.subdirectory.as_deref().unwrap_or(".");
         let out = download_dir.join(entry_name);
-        let wheel = crate::source_build::build_wheel_from_git(
+        let (wheel, _resolved_sha) = crate::source_build::build_wheel_from_git(
             git_url,
             rev,
             subdir,
