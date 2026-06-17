@@ -3982,12 +3982,27 @@ async fn materialize_from_lock(
                     .as_deref()
                     .and_then(|u| url::Url::parse(u).ok())
                     .filter(|u| u.scheme() != "file");
-                let local_path = lw.url.as_deref().and_then(|u| {
-                    url::Url::parse(u)
-                        .ok()
-                        .filter(|u| u.scheme() == "file")
-                        .and_then(|u| u.to_file_path().ok())
-                });
+                // Reconstruct local_path if the wheel file already exists in
+                // source_dir/wheels/ (matches cold-produce, where
+                // localize_wheel_source collapses https:// to file:// when the
+                // file is present locally). This is a warm-box optimization
+                // (avoids re-download) AND a plan() parity fix: cold-produce
+                // builds EmitWheel with local_path=Some when the file is in
+                // wheels/, so plan()'s Pass-1 URL-target check sees the same
+                // local_path.is_some() value on both paths.
+                let candidate = download_dir.join(&lw.filename);
+                let local_path = if candidate.exists() {
+                    Some(candidate)
+                } else {
+                    // Fall through to file:// URL (unlikely for Index wheels,
+                    // but handle for completeness).
+                    lw.url.as_deref().and_then(|u| {
+                        url::Url::parse(u)
+                            .ok()
+                            .filter(|u| u.scheme() == "file")
+                            .and_then(|u| u.to_file_path().ok())
+                    })
+                };
                 crate::emit_pypi::EmitWheel {
                     pypi_name: lw.name.clone(),
                     version: lw.version.clone(),

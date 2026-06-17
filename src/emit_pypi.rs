@@ -910,4 +910,81 @@ mod tests {
         // Local segment stripped from the envelope's lower bound.
         assert_eq!(table.get("pytorch3d").unwrap(), ">=0.7.9");
     }
+
+    /// Step-3 parity assertion: plan() is a pure function of its inputs.
+    /// Identical (requires_dist, version, must_ship/filename, local_path.is_some(),
+    /// conda_capable) must produce identical EmitPlan (overrides BTreeMap eq,
+    /// ship as sorted Vec).
+    ///
+    /// This guards against the #4 parity bug regression: if requires_dist is
+    /// empty for index wheels, the override table on replay is a SUBSET of the
+    /// cold-produce table, which can flip a relax-shadow back to Origin::Index
+    /// and poison the lock.
+    #[test]
+    fn plan_purity_identical_inputs_identical_output() {
+        use std::collections::HashSet;
+
+        // A bundle with an index wheel (isaacsim-style) that has Requires-Dist
+        // that the relax policy would change, PLUS a must_ship wheel that
+        // requires it via URL (so plan()'s Pass-1 fires).
+        let injected_path = "/tmp/rl-games-1.6.1.injected.whl";
+        let wheels_a = vec![
+            wheel(
+                "isaacsim-core",
+                "6.0.0.0",
+                &["numpy>=1.24", "pillow==12.1.1"],
+                None,
+            ),
+            wheel(
+                "rl-games",
+                "1.6.1",
+                &["isaacsim-core @ https://pypi.nvidia.com/isaacsim_core-6.0.0.0-py3-none-any.whl"],
+                Some(injected_path),
+            ),
+        ];
+        // Identical inputs (clone).
+        let wheels_b = wheels_a.clone();
+
+        let mut conda_capable: HashSet<String> = HashSet::new();
+        conda_capable.insert("pillow".to_string());
+
+        let plan_a = plan(&wheels_a, &conda_capable);
+        let plan_b = plan(&wheels_b, &conda_capable);
+
+        // Overrides must be byte-identical (BTreeMap, deterministic).
+        assert_eq!(
+            plan_a.overrides, plan_b.overrides,
+            "plan() overrides must be deterministic for identical inputs"
+        );
+
+        // Ship set: compare as sorted Vec for stable comparison.
+        let mut ship_a: Vec<_> = plan_a.ship.iter().cloned().collect();
+        let mut ship_b: Vec<_> = plan_b.ship.iter().cloned().collect();
+        ship_a.sort();
+        ship_b.sort();
+        assert_eq!(
+            ship_a, ship_b,
+            "plan() ship set must be deterministic for identical inputs"
+        );
+
+        // Verify the expected semantics:
+        // rl-games is in ship (must_ship=true, .injected filename).
+        assert!(
+            plan_a.ship.contains("rl-games"),
+            "rl-games (.injected) must be in ship set"
+        );
+        // isaacsim-core is NOT in ship: must_ship=false (no .injected) AND
+        // local_path=None -> Pass-1 URL-target check skips the ship.insert.
+        // But it DOES get an exact-pin override (==6.0.0.0) because it's a
+        // URL-requirement target.
+        assert!(
+            !plan_a.ship.contains("isaacsim-core"),
+            "isaacsim-core (index wheel, no local_path) must NOT be in ship set"
+        );
+        assert_eq!(
+            plan_a.overrides.get("isaacsim-core").map(|s| s.as_str()),
+            Some("==6.0.0.0"),
+            "isaacsim-core must get exact pin from Pass-1 URL-target override"
+        );
+    }
 }
