@@ -193,7 +193,32 @@ pub async fn build_wheel_from_sdist_url(
         &sdist_path.display().to_string(),
     ])
     .await?;
-    find_built_wheel(out_dir).await
+    let wheel_path = find_built_wheel(out_dir).await?;
+
+    // DETERMINISM GUARD (Amendment 3): detect non-reproducible setuptools_scm
+    // versions, mirroring the identical guard in build_wheel_from_git.
+    // A wheel whose filename contains .devN, .dYYYYMMDD, or +g<sha> was built
+    // without a release tag — its version/filename will DRIFT across calendar
+    // days even when the sdist URL is pinned, causing lock drift on replay.
+    // For static released versions (e.g. gym 0.26.2) this is a silent no-op.
+    if wheel_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(is_nondeterministic_version)
+    {
+        tracing::warn!(
+            sdist_url = %sdist_url,
+            filename = %wheel_path.display(),
+            "sdist-built wheel has a non-reproducible setuptools_scm version \
+             (contains .devN, .dYYYYMMDD, or +g<sha>). The wheel filename \
+             will DRIFT across calendar days even when the sdist URL is \
+             pinned, causing lock drift on replay. Fix: ensure the sdist's \
+             build backend emits a static release version, or set \
+             SETUPTOOLS_SCM_PRETEND_VERSION=<version> in the build env.",
+        );
+    }
+
+    Ok(wheel_path)
 }
 
 /// Compute the on-disk source-tree directory that
@@ -672,6 +697,33 @@ mod tests {
         assert!(is_nondeterministic_version(
             "mylib-2.0.post0+g1234abc-py3-none-any.whl"
         ));
+    }
+
+    /// Determinism guard (Amendment 3): build_wheel_from_sdist_url must warn
+    /// on a non-reproducible version and be silent on a static one.
+    /// Tests the guard logic that was added to mirror build_wheel_from_git.
+    #[test]
+    fn sdist_determinism_guard_matches_git_guard() {
+        // Static released version (e.g. gym 0.26.2) — NO warn.
+        assert!(
+            !is_nondeterministic_version("gym-0.26.2-py3-none-any.whl"),
+            "gym 0.26.2 is a static version; determinism guard must NOT fire"
+        );
+        // .dYYYYMMDD date segment — MUST warn.
+        assert!(
+            is_nondeterministic_version("mypkg-1.0.dev4+g1234567.d20250101-py3-none-any.whl"),
+            "setuptools_scm date suffix must trigger determinism guard"
+        );
+        // .devN without date — MUST warn.
+        assert!(
+            is_nondeterministic_version("mypkg-0.1.dev5-py3-none-any.whl"),
+            ".devN suffix must trigger determinism guard"
+        );
+        // +g<sha> local version — MUST warn.
+        assert!(
+            is_nondeterministic_version("mypkg-1.0+gabcdef0-py3-none-any.whl"),
+            "+g<sha> local version must trigger determinism guard"
+        );
     }
 
     // ---------------------------------------------------------------------------
