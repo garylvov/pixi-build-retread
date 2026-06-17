@@ -486,8 +486,6 @@ struct ResolvedWheel {
     /// Sdist provenance for BFS-transitive wheels built from a PyPI sdist
     /// (schema 9+). Set in the BFS phase-3 handler when bfs_fetch_pypi
     /// returns a `SdistProv`. `None` for index-fetched and git-built wheels.
-    // Dead-code suppressed: read by build_one (EmitWheel.sdist_source, commit 4).
-    #[allow(dead_code)]
     sdist_source: Option<crate::lock::SdistWheelSource>,
     metadata: WheelMetadata,
     /// v0.12.0+: extras the user requested on the originating
@@ -4293,7 +4291,8 @@ async fn materialize_from_lock(
                     wheel_filename: lw.filename.clone(),
                     remote_url,
                     upstream_url: None,
-                    git_source: None, // Origin::Index: no git source
+                    git_source: None,   // Origin::Index: no git source
+                    sdist_source: None, // Origin::Index: no sdist provenance
                 }
             }
             Origin::Built if lw.must_ship => {
@@ -4414,6 +4413,7 @@ async fn materialize_from_lock(
                                         remote_url: None,
                                         upstream_url: None,
                                         git_source: resolved.git_source.clone(),
+                                        sdist_source: None, // git group: no sdist provenance
                                     },
                                 );
                             }
@@ -4500,6 +4500,7 @@ async fn materialize_from_lock(
                             remote_url: None,
                             upstream_url: None,
                             git_source: resolved.git_source.clone(),
+                            sdist_source: None, // Class-1 git: no sdist provenance
                         }
                     }
                 } else if let Some(entry) = config.retread_wheels.get(&lw.name) {
@@ -4563,6 +4564,7 @@ async fn materialize_from_lock(
                         upstream_url: None,
                         // git_source from the re-materialized resolved wheel (schema 8+).
                         git_source: resolved.git_source.clone(),
+                        sdist_source: None, // legacy manifest path: no sdist provenance
                     }
                 } else {
                     // Class 3: BFS transitive built from a `pkg @ git+<url>`
@@ -4648,6 +4650,7 @@ async fn materialize_from_lock(
                     remote_url: Some(remote_url),
                     upstream_url: None,
                     git_source: None, // Class-2 shadow: upstream_url carries provenance
+                    sdist_source: None, // Class-2: index wheel, no sdist provenance
                 }
             }
         };
@@ -4931,6 +4934,11 @@ async fn build_one(
                 // Git provenance (schema 8+): carried from ResolvedWheel so
                 // courier::stage can write it into LockWheel.git_source.
                 git_source: w.git_source.clone(),
+                // Sdist provenance (schema 9+): carried from ResolvedWheel so
+                // courier::stage can write it into LockWheel.sdist_source.
+                // None for index-fetched and git-built wheels; Some for BFS-
+                // transitive sdist-built wheels (e.g. gym).
+                sdist_source: w.sdist_source.clone(),
             })
             .collect();
         let mut conda_capable: std::collections::HashSet<String> = bundle
@@ -7146,6 +7154,7 @@ mod emit_wheel_upstream_url_tests {
                     // THE FIX: read from w.upstream_url, not derived from w.url.
                     upstream_url: w.upstream_url.clone(),
                     git_source: w.git_source.clone(),
+                    sdist_source: w.sdist_source.clone(),
                 }
             })
             .collect();
@@ -7248,6 +7257,7 @@ mod emit_wheel_upstream_url_tests {
                     remote_url: (url.scheme() != "file").then(|| url.clone()),
                     upstream_url: w.upstream_url.clone(),
                     git_source: w.git_source.clone(),
+                    sdist_source: w.sdist_source.clone(),
                 }
             })
             .collect();

@@ -94,6 +94,12 @@ pub struct EmitWheel {
     /// forms. Written into `LockWheel.git_source` by `courier::stage` so
     /// the replay path can re-source-build manifest-independently.
     pub git_source: Option<crate::lock::GitWheelSource>,
+    /// Sdist provenance for BFS-transitive wheels built from a PyPI sdist
+    /// (schema 9+). Populated by the BFS phase-3 loop when `bfs_fetch_pypi`
+    /// returns a `SdistProv`. Written into `LockWheel.sdist_source` by
+    /// `courier::stage` so the Class-2b replay path can re-build from the
+    /// stored sdist_url manifest-independently.
+    pub sdist_source: Option<crate::lock::SdistWheelSource>,
 }
 
 impl EmitWheel {
@@ -548,6 +554,7 @@ mod tests {
             remote_url: None,
             upstream_url: None,
             git_source: None,
+            sdist_source: None,
         }
     }
 

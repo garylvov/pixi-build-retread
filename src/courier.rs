@@ -1046,6 +1046,7 @@ mod tests {
             remote_url: remote_url.and_then(|u| u.parse().ok()),
             upstream_url: None,
             git_source: None,
+            sdist_source: None,
         }
     }
 
@@ -2303,6 +2304,7 @@ version = "1.0.0"
                 subdirectory: None,
                 extras: vec![],
             }),
+            sdist_source: None, // git source: no sdist provenance
         };
 
         // Use a config with NO retread-wheels entry for pkg_name to prove
@@ -2446,6 +2448,7 @@ version = "1.0.0"
                 subdirectory: None,
                 extras: vec![],
             }),
+            sdist_source: None, // git source replay: no sdist provenance
         };
 
         unsafe { std::env::set_var("RETREAD_NO_SHADOW_CACHE", "1") };
