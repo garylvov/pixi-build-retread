@@ -439,12 +439,18 @@ pub(crate) async fn auto_bundle_transitives(
                             Ok(resolved) => {
                                 match metadata_preferring_sidecar(&resolved, download_dir).await {
                                     Ok(metadata) => {
+                                        // resolved.url is the pristine index
+                                        // URL; clone it for upstream_url
+                                        // before moving into the struct.
+                                        let upstream = Some(resolved.url.clone());
                                         return Some((
                                             name,
                                             version,
                                             ResolvedWheel {
                                                 pypi_name: conda_name,
                                                 url: resolved.url,
+                                                upstream_url: upstream,
+                                                git_source: None,
                                                 metadata,
                                                 extras_requested: vec![],
                                                 auto_data: None,
@@ -582,9 +588,19 @@ pub(crate) enum PendingSource {
         specifiers: VersionSpecifiers,
         index: String,
     },
-    /// `Requires-Dist: <name> @ git+<scheme>://<host>/<path>@<rev>` --
+    /// `Requires-Dist: <name> @ git+<scheme>://<host>/<path>@<rev>[#subdirectory=<sub>]` --
     /// clone + `pip wheel --no-deps`.
-    Git { url: String, rev: Option<String> },
+    ///
+    /// `subdirectory` is parsed from the URL fragment `#subdirectory=<sub>`
+    /// (A-0 fix: previously the fragment was appended to `rev`, corrupting it
+    /// to `"rev#subdirectory=..."` which made the checkout key wrong and the
+    /// wheel build fail or produce a stale clone).
+    Git {
+        url: String,
+        rev: Option<String>,
+        /// Subdirectory within the repo to build the wheel from (default: root ".").
+        subdirectory: Option<String>,
+    },
     /// `Requires-Dist: <name> @ <scheme>://...` (direct wheel/sdist).
     Url { wheel_url: url::Url },
 }
@@ -641,7 +657,15 @@ fn extra_dep_source_to_pending(src: ExtraDepSource, default_index: &str) -> Pend
             specifiers,
             index: default_index.to_string(),
         },
-        ExtraDepSource::Git { url, rev } => PendingSource::Git { url, rev },
+        ExtraDepSource::Git {
+            url,
+            rev,
+            subdirectory,
+        } => PendingSource::Git {
+            url,
+            rev,
+            subdirectory,
+        },
         ExtraDepSource::Url(wheel_url) => PendingSource::Url { wheel_url },
     }
 }
@@ -682,18 +706,27 @@ fn pep508_base_dep_in_prefix(raw: &str, prefix: &str) -> Result<Option<ExtraDep>
 }
 
 /// Convert a PEP 508 URL Requires-Dist into one of our
-/// [`ExtraDepSource`] variants. Splits `git+<scheme>://...@<rev>` into
-/// `(base_url, Some(rev))`; plain `https://.../file.whl` becomes a
-/// direct-URL fetch.
+/// [`ExtraDepSource`] variants. Splits `git+<scheme>://...@<rev>[#subdirectory=<sub>]`
+/// into `(base_url, Some(rev), subdirectory)`; plain `https://.../file.whl`
+/// becomes a direct-URL fetch.
+///
+/// # A-0 fix: `#subdirectory=` stripping
+///
+/// PEP 508 / pip allow a URL fragment of the form `#subdirectory=<path>` to
+/// indicate which subdirectory of the repo contains the Python package. Without
+/// this fix, `rfind('@')` finds the `@` before `<rev>` but includes the
+/// `#subdirectory=<path>` suffix as part of `rev` (e.g. `rev` becomes
+/// `"ce11136#subdirectory=src/newton"`), corrupting the checkout cache key
+/// (which sha256-hashes url+rev) and the git checkout itself.
 pub(crate) fn extra_dep_source_from_url(raw_url: &url::Url) -> Result<ExtraDepSource> {
     let s = raw_url.as_str();
     if let Some(stripped) = s.strip_prefix("git+") {
         // PEP 508 doesn't say where the @<rev> lives but pip-compatible
-        // syntax is `git+<scheme>://<host>/<path>@<rev>`. Find the
-        // rightmost `@` that comes after `://` (skipping any in user-
+        // syntax is `git+<scheme>://<host>/<path>@<rev>[#subdirectory=<sub>]`.
+        // Find the rightmost `@` that comes after `://` (skipping any in user-
         // info, though those are rare for public git).
         let scheme_end = stripped.find("://").map(|i| i + 3).unwrap_or(0);
-        let (base, rev) = match stripped[scheme_end..].rfind('@') {
+        let (base, rev_with_fragment) = match stripped[scheme_end..].rfind('@') {
             Some(rel) => {
                 let abs = scheme_end + rel;
                 (
@@ -703,7 +736,35 @@ pub(crate) fn extra_dep_source_from_url(raw_url: &url::Url) -> Result<ExtraDepSo
             }
             None => (stripped.to_string(), None),
         };
-        Ok(ExtraDepSource::Git { url: base, rev })
+
+        // A-0 fix: split the fragment `#subdirectory=<sub>` out of the rev
+        // string. Without this, any `git+https://host/repo@<rev>#subdirectory=<sub>`
+        // URL corrupts `rev` to `"<rev>#subdirectory=<sub>"`, which:
+        //   (a) keys the git checkout cache on a hash that includes the junk suffix,
+        //   (b) passes the junk rev to `git checkout`, which fails or produces a
+        //       stale clone at a wrong cache path,
+        //   (c) stores the junk rev in the lock's GitWheelSource.rev (once that
+        //       field exists), making replay impossible.
+        let (rev, subdirectory) = match rev_with_fragment {
+            None => (None, None),
+            Some(rv) => {
+                if let Some(frag_pos) = rv.find('#') {
+                    let clean_rev = rv[..frag_pos].to_string();
+                    let fragment = &rv[frag_pos + 1..];
+                    // Parse `subdirectory=<path>` from the fragment.
+                    let subdir = fragment.strip_prefix("subdirectory=").map(str::to_string);
+                    (Some(clean_rev), subdir)
+                } else {
+                    (Some(rv), None)
+                }
+            }
+        };
+
+        Ok(ExtraDepSource::Git {
+            url: base,
+            rev,
+            subdirectory,
+        })
     } else {
         Ok(ExtraDepSource::Url(raw_url.clone()))
     }
@@ -776,7 +837,15 @@ pub(crate) struct ExtraDep {
 #[derive(Debug, Clone)]
 pub(crate) enum ExtraDepSource {
     Pypi(VersionSpecifiers),
-    Git { url: String, rev: Option<String> },
+    /// A `git+<url>@<rev>[#subdirectory=<sub>]` dependency.
+    ///
+    /// `subdirectory` carries the `#subdirectory=<sub>` fragment so it is
+    /// NOT corrupted into `rev` (A-0 fix).
+    Git {
+        url: String,
+        rev: Option<String>,
+        subdirectory: Option<String>,
+    },
     Url(url::Url),
 }
 

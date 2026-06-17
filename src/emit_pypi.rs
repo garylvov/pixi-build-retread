@@ -78,6 +78,22 @@ pub struct EmitWheel {
     /// (PEP 658 sidecar metadata). Blueprint mode fetches these on
     /// demand when their Requires-Dist needs rewriting.
     pub remote_url: Option<url::Url>,
+    /// Pristine pre-localization index URL for this wheel, populated at
+    /// cold-produce time from the unlocalized `w.url` (before
+    /// `localize_wheel_source` collapses it to `file://`). Used by the
+    /// courier's Class-2 shadow path to record the upstream URL in the
+    /// lock so the replay path can re-fetch and re-relax the shadow
+    /// without running the full BFS/solve.
+    ///
+    /// `None` for source-built `.injected` wheels (no upstream index URL)
+    /// and for wheels that were only ever seen as remote (those use
+    /// `remote_url` directly).
+    pub upstream_url: Option<url::Url>,
+    /// Git provenance for source-built wheels (schema 8+). Populated by
+    /// `materialize_and_rewrite` for both named-git and inline-git entry
+    /// forms. Written into `LockWheel.git_source` by `courier::stage` so
+    /// the replay path can re-source-build manifest-independently.
+    pub git_source: Option<crate::lock::GitWheelSource>,
 }
 
 impl EmitWheel {
@@ -214,6 +230,30 @@ pub fn plan(wheels: &[EmitWheel], conda_capable: &std::collections::HashSet<Stri
                 Some(target) => {
                     exact.insert(name.clone(), format!("=={}", target.version));
                     if target.local_path.is_some() {
+                        // Invariant: a wheel that enters the ship set via the
+                        // local_path gate must NOT simultaneously carry a
+                        // remote_url. Index-origin wheels and relax-changed
+                        // index shadows (Origin::Built && !must_ship) are
+                        // reconstructed with local_path:None and
+                        // remote_url:Some(...) in the Class-2 arm of
+                        // materialize_from_lock (handler/mod.rs), so they
+                        // never reach this branch. Wheels that ARE here have
+                        // either been retread-built (.injected, remote_url:None)
+                        // or locally materialized from a direct url= source
+                        // (also remote_url:None). If remote_url.is_some() here
+                        // it means a future code path set local_path on an
+                        // index-origin wheel and forgot to clear remote_url,
+                        // which would corrupt the manifest by bundling a wheel
+                        // the index should serve.
+                        debug_assert!(
+                            target.remote_url.is_none(),
+                            "emit-pypi invariant violated: wheel `{}` is a direct-URL \
+                             Requires-Dist target with local_path set but also has \
+                             remote_url set -- index-origin / relax-changed index shadows \
+                             must never be direct-URL targets (they carry remote_url \
+                             instead of local_path)",
+                            target.pypi_name
+                        );
                         ship.insert(name);
                     }
                 }
@@ -506,6 +546,8 @@ mod tests {
                 .unwrap_or_else(|| format!("{name}-{version}-py3-none-any.whl")),
             local_path: local.map(PathBuf::from),
             remote_url: None,
+            upstream_url: None,
+            git_source: None,
         }
     }
 
@@ -897,5 +939,82 @@ mod tests {
         assert_eq!(table.get("weird").unwrap(), "*", "epoch falls back to *");
         // Local segment stripped from the envelope's lower bound.
         assert_eq!(table.get("pytorch3d").unwrap(), ">=0.7.9");
+    }
+
+    /// Step-3 parity assertion: plan() is a pure function of its inputs.
+    /// Identical (requires_dist, version, must_ship/filename, local_path.is_some(),
+    /// conda_capable) must produce identical EmitPlan (overrides BTreeMap eq,
+    /// ship as sorted Vec).
+    ///
+    /// This guards against the #4 parity bug regression: if requires_dist is
+    /// empty for index wheels, the override table on replay is a SUBSET of the
+    /// cold-produce table, which can flip a relax-shadow back to Origin::Index
+    /// and poison the lock.
+    #[test]
+    fn plan_purity_identical_inputs_identical_output() {
+        use std::collections::HashSet;
+
+        // A bundle with an index wheel (isaacsim-style) that has Requires-Dist
+        // that the relax policy would change, PLUS a must_ship wheel that
+        // requires it via URL (so plan()'s Pass-1 fires).
+        let injected_path = "/tmp/rl-games-1.6.1.injected.whl";
+        let wheels_a = vec![
+            wheel(
+                "isaacsim-core",
+                "6.0.0.0",
+                &["numpy>=1.24", "pillow==12.1.1"],
+                None,
+            ),
+            wheel(
+                "rl-games",
+                "1.6.1",
+                &["isaacsim-core @ https://pypi.nvidia.com/isaacsim_core-6.0.0.0-py3-none-any.whl"],
+                Some(injected_path),
+            ),
+        ];
+        // Identical inputs (clone).
+        let wheels_b = wheels_a.clone();
+
+        let mut conda_capable: HashSet<String> = HashSet::new();
+        conda_capable.insert("pillow".to_string());
+
+        let plan_a = plan(&wheels_a, &conda_capable);
+        let plan_b = plan(&wheels_b, &conda_capable);
+
+        // Overrides must be byte-identical (BTreeMap, deterministic).
+        assert_eq!(
+            plan_a.overrides, plan_b.overrides,
+            "plan() overrides must be deterministic for identical inputs"
+        );
+
+        // Ship set: compare as sorted Vec for stable comparison.
+        let mut ship_a: Vec<_> = plan_a.ship.iter().cloned().collect();
+        let mut ship_b: Vec<_> = plan_b.ship.iter().cloned().collect();
+        ship_a.sort();
+        ship_b.sort();
+        assert_eq!(
+            ship_a, ship_b,
+            "plan() ship set must be deterministic for identical inputs"
+        );
+
+        // Verify the expected semantics:
+        // rl-games is in ship (must_ship=true, .injected filename).
+        assert!(
+            plan_a.ship.contains("rl-games"),
+            "rl-games (.injected) must be in ship set"
+        );
+        // isaacsim-core is NOT in ship: must_ship=false (no .injected) AND
+        // local_path=None -> Pass-1 URL-target check skips the ship.insert.
+        // But it DOES get an exact-pin override (==6.0.0.0) because it's a
+        // URL-requirement target.
+        assert!(
+            !plan_a.ship.contains("isaacsim-core"),
+            "isaacsim-core (index wheel, no local_path) must NOT be in ship set"
+        );
+        assert_eq!(
+            plan_a.overrides.get("isaacsim-core").map(|s| s.as_str()),
+            Some("==6.0.0.0"),
+            "isaacsim-core must get exact pin from Pass-1 URL-target override"
+        );
     }
 }

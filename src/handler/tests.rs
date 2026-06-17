@@ -889,9 +889,12 @@ fn meta(name: &str, version: &str, requires: Vec<&str>, platform_specific: bool)
 }
 
 fn rw(pypi: &str, m: WheelMetadata) -> ResolvedWheel {
+    let url: url::Url = format!("https://example.com/{pypi}.whl").parse().unwrap();
     ResolvedWheel {
         pypi_name: pypi.to_string(),
-        url: format!("https://example.com/{pypi}.whl").parse().unwrap(),
+        upstream_url: Some(url.clone()),
+        git_source: None,
+        url,
         metadata: m,
         extras_requested: vec![],
         auto_data: None,
@@ -1906,6 +1909,12 @@ fn relaxed_pure_python_primary_pins_python_to_workspace_variant() {
             url: "https://example.com/isaaclab-0.51.1-py3-none-any.relaxed.whl"
                 .parse()
                 .unwrap(),
+            upstream_url: Some(
+                "https://example.com/isaaclab-0.51.1-py3-none-any.relaxed.whl"
+                    .parse()
+                    .unwrap(),
+            ),
+            git_source: None,
             metadata: primary,
             extras_requested: vec![],
             auto_data: None,
@@ -2133,9 +2142,14 @@ fn pep508_extra_dep_handles_git_url() {
         .expect("extras-gated dep, got None");
     assert_eq!(dep.name, "rl-games");
     match dep.source {
-        ExtraDepSource::Git { url, rev } => {
+        ExtraDepSource::Git {
+            url,
+            rev,
+            subdirectory,
+        } => {
             assert_eq!(url, "https://github.com/isaac-sim/rl_games.git");
             assert_eq!(rev.as_deref(), Some("python3.11"));
+            assert_eq!(subdirectory, None, "no #subdirectory= in this URL");
         }
         other => panic!("expected Git source, got {other:?}"),
     }
@@ -2190,9 +2204,79 @@ fn pep508_extra_dep_handles_bare_name() {
 fn extra_dep_source_from_url_git_without_rev() {
     let url: url::Url = "git+https://github.com/foo/bar.git".parse().unwrap();
     match extra_dep_source_from_url(&url).expect("parse") {
-        ExtraDepSource::Git { url, rev } => {
+        ExtraDepSource::Git {
+            url,
+            rev,
+            subdirectory,
+        } => {
             assert_eq!(url, "https://github.com/foo/bar.git");
             assert_eq!(rev, None);
+            assert_eq!(subdirectory, None, "no #subdirectory= in this URL");
+        }
+        other => panic!("expected Git, got {other:?}"),
+    }
+}
+
+/// A-0 regression: `#subdirectory=<path>` fragment must be stripped from
+/// the rev string and surfaced as a separate `subdirectory` field.
+///
+/// Without this fix, `rfind('@')` returns the `@` before `<rev>` but
+/// includes `#subdirectory=src/foo` as part of `rev`, corrupting it to
+/// `"ce11136#subdirectory=src/foo"`. The checkout cache key (sha256 of
+/// url+"\0"+rev) then differs between the producer and a replay that
+/// correctly splits the fragment, and the git checkout itself fails
+/// because git doesn't recognize the junk rev.
+///
+/// This test is RED on the pre-fix tree (rev contains the fragment) and
+/// GREEN after the fix (rev and subdirectory are split correctly).
+#[test]
+fn extra_dep_source_from_url_git_subdirectory_fragment_is_stripped() {
+    // Typical format: git+https://host/repo@<rev>#subdirectory=<subdir>
+    let url: url::Url =
+        "git+https://github.com/newton-sim/newton.git@ce11136#subdirectory=src/newton"
+            .parse()
+            .unwrap();
+    match extra_dep_source_from_url(&url).expect("parse") {
+        ExtraDepSource::Git {
+            url,
+            rev,
+            subdirectory,
+        } => {
+            assert_eq!(url, "https://github.com/newton-sim/newton.git");
+            assert_eq!(
+                rev.as_deref(),
+                Some("ce11136"),
+                "rev must NOT contain #subdirectory= fragment"
+            );
+            assert_eq!(
+                subdirectory.as_deref(),
+                Some("src/newton"),
+                "subdirectory must be parsed from the fragment"
+            );
+        }
+        other => panic!("expected Git, got {other:?}"),
+    }
+}
+
+/// SHA-only rev with no #subdirectory= remains unaffected by the fix.
+#[test]
+fn extra_dep_source_from_url_git_sha_rev_no_fragment() {
+    let url: url::Url =
+        "git+https://github.com/newton-sim/newton.git@8de7e456deadbeef1234567890abcdef12345678"
+            .parse()
+            .unwrap();
+    match extra_dep_source_from_url(&url).expect("parse") {
+        ExtraDepSource::Git {
+            url,
+            rev,
+            subdirectory,
+        } => {
+            assert_eq!(url, "https://github.com/newton-sim/newton.git");
+            assert_eq!(
+                rev.as_deref(),
+                Some("8de7e456deadbeef1234567890abcdef12345678")
+            );
+            assert_eq!(subdirectory, None);
         }
         other => panic!("expected Git, got {other:?}"),
     }

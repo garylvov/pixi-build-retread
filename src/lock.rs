@@ -22,6 +22,53 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+/// Git provenance for a source-built wheel (schema 8+).
+///
+/// Stored in `LockWheel.git_source` for every wheel whose bytes were
+/// produced by `build_wheel_from_git`. Carries the RESOLVED 40-char commit
+/// SHA (never a branch name or "HEAD") so replay can re-clone the identical
+/// commit without reading the live `[retread-wheels]` manifest entry.
+///
+/// ## POISONING note
+///
+/// The `rev` field is the RESOLVED SHA at produce time. Replay pins this
+/// SHA and builds a byte-stable wheel from it. Only a cascade re-solve
+/// (full cold produce) picks up a new branch tip. This is correct: the
+/// lock is the contract; moving a branch ref does NOT invalidate the lock
+/// (the inputs_hash covers the config rev, not the resolved SHA — adding
+/// the resolved SHA to the hash would be circular).
+///
+/// ## Phase-2 limitation — single-entry per checkout root
+///
+/// This struct is safe for the Class-1 single-entry case (one
+/// `[retread-wheels]` entry per git checkout root). A future multi-entry
+/// shared-checkout bundle (e.g. two entries from the same repo at different
+/// subdirectories, which would produce a non-trivial `skip_subdirs` at
+/// produce time) is NOT covered: the replay synth uses `skip_subdirs=[]`
+/// and would produce a non-byte-identical wheel (it over-ships files the
+/// produce-time build excluded). This is guarded at replay time (see
+/// `materialize_from_lock`) and deferred to Phase 3.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitWheelSource {
+    /// Canonical git URL (without the `git+` prefix — the bare clone URL).
+    pub url: String,
+    /// RESOLVED 40-character commit SHA (never a branch/tag/HEAD ref).
+    /// This is `git rev-parse HEAD` after checkout, not the original
+    /// `rev` string from the config entry.
+    pub rev: String,
+    /// Subdirectory within the repo where the Python package lives,
+    /// relative to the repo root. `None` means the root (equiv. to ".").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subdirectory: Option<String>,
+    /// Extras requested on the originating `[retread-wheels]` entry
+    /// (e.g. `["sim"]` for `newton = { from="newton", extras=["sim"] }`).
+    /// Not passed to `build_wheel_from_git` (extras drive BFS closure
+    /// expansion only, not the wheel build), so the replay can safely
+    /// build the synth entry with these extras for BFS parity.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extras: Vec<String>,
+}
+
 /// How a wheel reaches the consumer at install time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -41,12 +88,44 @@ pub struct LockWheel {
     pub origin: Origin,
     /// Standardized wheel filename (the basename installed/shipped).
     pub filename: String,
-    /// Upstream URL for `Origin::Index` wheels; `None` for `Built`.
+    /// Fetch URL for `Origin::Index` wheels; `None` for `Origin::Built`.
+    /// (Index wheels fetch this at install time; Built wheels ship in-package.)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
     /// sha256 of the wheel file (index-wheel verification; reproducibility).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
+    /// POST-relax Requires-Dist lines recorded for the replay poisoning guard
+    /// (schema 5+). Empty when the wheel is `Origin::Index` and unrelaxed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requires_dist: Vec<String>,
+    /// True iff this wheel must be shipped inside the conda package
+    /// (i.e. it carries the `.injected` infix — it exists on no index).
+    /// Recorded so the replay path can cross-check re-materialized wheels
+    /// without re-running the full must_ship() filename heuristic.
+    #[serde(default)]
+    pub must_ship: bool,
+    /// Original upstream PyPI URL for `Origin::Built` relax-changed shadow
+    /// wheels (schema 6+). These are index wheels whose METADATA was rewritten
+    /// by the relax pipeline; they have no `.injected` infix and `must_ship`
+    /// is false, but their bytes are NOT available on the original index
+    /// (the rewritten shadow is shipped). On replay, `materialize_from_lock`
+    /// uses this URL to re-fetch the original bytes and re-apply the relax
+    /// rewrite, recreating the shadow without re-running the full BFS/solve.
+    ///
+    /// `None` for `Origin::Index` wheels (use `url`) and for `Origin::Built`
+    /// wheels with `must_ship=true` (source-built; re-materialized from
+    /// `[retread-wheels]` config entry or `git_source`, no upstream URL).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_url: Option<String>,
+    /// Git provenance for source-built wheels (schema 8+). Present when this
+    /// wheel was built from a git source (either a named `[retread-git-sources]`
+    /// entry or an inline `git=` entry in `[retread-wheels]`). Carries the
+    /// resolved 40-char commit SHA and the clone URL so replay can re-source-
+    /// build the wheel without reading the live manifest. `None` for index
+    /// wheels and non-git source-built wheels (path/from/url forms).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_source: Option<GitWheelSource>,
 }
 
 /// A conda run-dep retread routed to the conda side (a shared transitive
@@ -93,9 +172,22 @@ pub struct RetreadLock {
     /// overrides). Empty when the bundle pins no prereleases.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub prerelease: BTreeMap<String, String>,
+    /// PyPI package names (conda-normalized) that have a conda counterpart
+    /// and are therefore routed to the conda side rather than bundled in the
+    /// wheel set. Recorded for the build_v1 replay path so it can reconstruct
+    /// the correct conda_capable set without re-running the probe cascade.
+    /// Sorted for stable JSON output.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conda_capable: Vec<String>,
 }
 
-pub const SCHEMA: u32 = 4;
+/// Schema 8: git_source (GitWheelSource) field added to LockWheel (required
+/// for Class-1 git-wheel replay independent of the live manifest). Old schema-7
+/// and earlier locks are rejected by the != gate and fall through to full
+/// resolve (safe: committed genesis/newton locks are regenerated in commit 6).
+/// SCHEMA is NOT an epoch bump (the lock FORMAT changed, not the emitted-output
+/// SEMANTICS for identical inputs).
+pub const SCHEMA: u32 = 8;
 
 /// Bump EMIT_EPOCH in the SAME commit as ANY change that can alter the bytes
 /// retread emits for identical manifest inputs (relax/version-selection
@@ -114,7 +206,13 @@ pub const SCHEMA: u32 = 4;
 /// envs that reference the source pack (via discover_outputs_for_source) rather
 /// than all envs in the workspace, eliminating false cache misses when unrelated
 /// envs change.
-pub const EMIT_EPOCH: u32 = 3;
+///
+/// Epoch 4: force-downloaded remote-only relax-changed wheels now go through
+/// rewrite_wheel_with (relaxed bytes) instead of being renamed raw (the
+/// starts_with(staging_dir) heuristic bug fix). Any pack with a remote-only
+/// auto-bundled dep whose Requires-Dist the relax policy changes will emit
+/// different (correctly relaxed) shadow bytes.
+pub const EMIT_EPOCH: u32 = 4;
 
 impl RetreadLock {
     /// File name for a bundle's lock next to the pack manifest.
@@ -222,12 +320,31 @@ mod tests {
             root_requirements: vec!["isaac-pack-pypi==5.1.0".into()],
             wheels: vec![
                 LockWheel {
+                    // must_ship=true: source-built, no upstream URL.
                     name: "isaaclab".into(),
                     version: "0.51.1".into(),
                     origin: Origin::Built,
-                    filename: "isaaclab-0.51.1-py3-none-any.whl".into(),
+                    filename: "isaaclab-0.51.1-py3-none-any.injected.whl".into(),
                     url: None,
                     sha256: None,
+                    requires_dist: vec!["numpy>=1.21".into(), "torch>=2.0".into()],
+                    must_ship: true,
+                    upstream_url: None,
+                    git_source: None,
+                },
+                LockWheel {
+                    // relax-changed shadow: upstream_url records where to
+                    // re-fetch the original for replay re-materialization.
+                    name: "skrl".into(),
+                    version: "2.1.0".into(),
+                    origin: Origin::Built,
+                    filename: "skrl-2.1.0-999retread-py3-none-any.whl".into(),
+                    url: None,
+                    sha256: None,
+                    requires_dist: vec!["torch>=2.0,<3".into()],
+                    must_ship: false,
+                    upstream_url: Some("https://files.pythonhosted.org/skrl-2.1.0.whl".into()),
+                    git_source: None,
                 },
                 LockWheel {
                     name: "isaacsim-core".into(),
@@ -236,6 +353,10 @@ mod tests {
                     filename: "isaacsim_core-5.1.0.0-cp311-...whl".into(),
                     url: Some("https://pypi.nvidia.com/isaacsim-core/...whl".into()),
                     sha256: Some("abc123".into()),
+                    requires_dist: vec![],
+                    must_ship: false,
+                    upstream_url: None,
+                    git_source: None,
                 },
             ],
             conda_run_deps: vec![CondaDep {
@@ -247,13 +368,36 @@ mod tests {
                 "https://pypi.org/simple/".into(),
             ],
             prerelease: BTreeMap::from([("gmpy2".into(), "==2.1.0a4".into())]),
+            conda_capable: vec!["numpy".into(), "torch".into()],
         };
         let json = lock.to_pretty_json().unwrap();
         let back: RetreadLock = serde_json::from_str(&json).unwrap();
         assert_eq!(back.bundle, "isaac-pack");
-        assert_eq!(back.wheels.len(), 2);
+        assert_eq!(
+            back.schema, 8,
+            "SCHEMA must be 8 after git_source/GitWheelSource added for Class-1 git replay"
+        );
+        assert_eq!(back.wheels.len(), 3);
+        // Wheel 0: must_ship source-built, no upstream_url.
         assert_eq!(back.wheels[0].origin, Origin::Built);
-        assert_eq!(back.wheels[1].origin, Origin::Index);
+        assert!(back.wheels[0].must_ship);
+        assert!(back.wheels[0].upstream_url.is_none());
+        assert_eq!(
+            back.wheels[0].requires_dist,
+            vec!["numpy>=1.21", "torch>=2.0"]
+        );
+        // Wheel 1: relax-changed shadow, upstream_url recorded.
+        assert_eq!(back.wheels[1].origin, Origin::Built);
+        assert!(!back.wheels[1].must_ship);
+        assert_eq!(
+            back.wheels[1].upstream_url.as_deref(),
+            Some("https://files.pythonhosted.org/skrl-2.1.0.whl")
+        );
+        // Wheel 2: index wheel, no upstream_url.
+        assert_eq!(back.wheels[2].origin, Origin::Index);
+        assert!(!back.wheels[2].must_ship);
+        assert!(back.wheels[2].upstream_url.is_none());
+        assert!(back.wheels[2].requires_dist.is_empty());
         assert_eq!(
             back.prerelease.get("gmpy2").map(String::as_str),
             Some("==2.1.0a4")
@@ -263,7 +407,75 @@ mod tests {
             "retread-isaac-pack.lock.json"
         );
         assert_eq!(back.inputs_hash, "deadbeef");
-        assert_eq!(back.wheels[1].sha256.as_deref(), Some("abc123"));
+        assert_eq!(back.wheels[2].sha256.as_deref(), Some("abc123"));
+        assert_eq!(back.conda_capable, vec!["numpy", "torch"]);
+    }
+
+    /// Schema-4 JSON (no requires_dist / must_ship / conda_capable /
+    /// upstream_url) must still deserialize cleanly via serde defaults.
+    #[test]
+    fn schema4_lock_still_deserializes() {
+        let schema4_json = r#"{
+            "schema": 4,
+            "retread_version": "2.3.1",
+            "bundle": "old-pack",
+            "version": "1.0.0",
+            "python": "3.11",
+            "inputs_hash": "oldhash",
+            "root_requirements": ["old-pack-pypi==1.0.0"],
+            "wheels": [
+                {
+                    "name": "somewheel",
+                    "version": "1.0.0",
+                    "origin": "built",
+                    "filename": "somewheel-1.0.0-py3-none-any.whl"
+                }
+            ],
+            "conda_run_deps": [],
+            "index_urls": ["https://pypi.org/simple/"]
+        }"#;
+        let lock: RetreadLock = serde_json::from_str(schema4_json).unwrap();
+        assert_eq!(lock.schema, 4);
+        assert_eq!(lock.bundle, "old-pack");
+        // New fields default gracefully.
+        assert!(lock.wheels[0].requires_dist.is_empty());
+        assert!(!lock.wheels[0].must_ship);
+        assert!(lock.wheels[0].upstream_url.is_none());
+        assert!(lock.conda_capable.is_empty());
+    }
+
+    /// Schema-5 JSON (has requires_dist / must_ship / conda_capable but NOT
+    /// upstream_url) must deserialize cleanly — upstream_url defaults to None.
+    #[test]
+    fn schema5_lock_still_deserializes() {
+        let schema5_json = r#"{
+            "schema": 5,
+            "retread_version": "2.4.0",
+            "bundle": "pack",
+            "version": "1.0.0",
+            "python": "3.11",
+            "inputs_hash": "hash5",
+            "wheels": [
+                {
+                    "name": "skrl",
+                    "version": "2.1.0",
+                    "origin": "built",
+                    "filename": "skrl-2.1.0-999retread-py3-none-any.whl",
+                    "requires_dist": ["torch>=2.0"],
+                    "must_ship": false
+                }
+            ],
+            "conda_run_deps": [],
+            "index_urls": ["https://pypi.org/simple/"],
+            "conda_capable": ["torch"]
+        }"#;
+        let lock: RetreadLock = serde_json::from_str(schema5_json).unwrap();
+        assert_eq!(lock.schema, 5);
+        assert_eq!(lock.bundle, "pack");
+        // upstream_url added in schema 6 — defaults to None for schema-5 locks.
+        assert!(lock.wheels[0].upstream_url.is_none());
+        assert!(!lock.wheels[0].must_ship);
+        assert_eq!(lock.wheels[0].requires_dist, vec!["torch>=2.0"]);
     }
 
     #[test]
@@ -441,5 +653,80 @@ mod tests {
             pinned_v1, pinned_v2,
             "different versions under pin_version=Some must differ"
         );
+    }
+
+    /// GitWheelSource serializes and deserializes correctly with and without
+    /// the optional fields (subdirectory and extras).
+    #[test]
+    fn git_wheel_source_serde_roundtrip() {
+        // Full — with subdirectory and extras.
+        let full = GitWheelSource {
+            url: "https://github.com/acme/repo.git".into(),
+            rev: "abcdef1234567890abcdef1234567890abcdef12".into(),
+            subdirectory: Some("packages/core".into()),
+            extras: vec!["sim".into(), "dev".into()],
+        };
+        let json = serde_json::to_string(&full).unwrap();
+        let back: GitWheelSource = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.url, full.url);
+        assert_eq!(back.rev, full.rev);
+        assert_eq!(back.subdirectory.as_deref(), Some("packages/core"));
+        assert_eq!(back.extras, vec!["sim", "dev"]);
+
+        // Minimal — no subdirectory, no extras: those fields must be absent in JSON.
+        let minimal = GitWheelSource {
+            url: "https://github.com/acme/repo.git".into(),
+            rev: "abcdef1234567890abcdef1234567890abcdef12".into(),
+            subdirectory: None,
+            extras: vec![],
+        };
+        let minimal_json = serde_json::to_string(&minimal).unwrap();
+        assert!(
+            !minimal_json.contains("subdirectory"),
+            "subdirectory must be absent when None"
+        );
+        assert!(
+            !minimal_json.contains("extras"),
+            "extras must be absent when empty"
+        );
+        let back_minimal: GitWheelSource = serde_json::from_str(&minimal_json).unwrap();
+        assert!(back_minimal.subdirectory.is_none());
+        assert!(back_minimal.extras.is_empty());
+    }
+
+    /// A schema-7 lock JSON (no git_source field) must deserialize cleanly
+    /// with git_source defaulting to None on each wheel.
+    #[test]
+    fn schema7_lock_git_source_defaults_to_none() {
+        let schema7_json = r#"{
+            "schema": 7,
+            "retread_version": "2.5.0",
+            "bundle": "genesis-pack",
+            "version": "1.0.0",
+            "python": "3.11",
+            "inputs_hash": "oldhash7",
+            "root_requirements": ["genesis-pack-pypi==1.0.0"],
+            "wheels": [
+                {
+                    "name": "genesis-world",
+                    "version": "1.1.1",
+                    "origin": "built",
+                    "filename": "genesis_world-1.1.1-999retread-py3-none-any.whl",
+                    "requires_dist": ["torch>=2.0"],
+                    "must_ship": true
+                }
+            ],
+            "conda_run_deps": [],
+            "index_urls": ["https://pypi.org/simple/"]
+        }"#;
+        let lock: RetreadLock = serde_json::from_str(schema7_json).unwrap();
+        assert_eq!(lock.schema, 7);
+        assert_eq!(lock.bundle, "genesis-pack");
+        // git_source added in schema 8 — must default to None for schema-7 locks.
+        assert!(
+            lock.wheels[0].git_source.is_none(),
+            "git_source must default to None when absent from schema-7 lock"
+        );
+        assert!(lock.wheels[0].must_ship);
     }
 }

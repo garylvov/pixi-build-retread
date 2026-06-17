@@ -349,10 +349,15 @@ mod tests {
                 filename: "mypackage-1.0.0-py3-none-any.whl".into(),
                 url: None,
                 sha256: None,
+                requires_dist: vec![],
+                must_ship: true,
+                upstream_url: None,
+                git_source: None,
             }],
             conda_run_deps,
             index_urls,
             prerelease,
+            conda_capable: vec![],
         }
     }
 

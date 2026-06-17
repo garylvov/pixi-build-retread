@@ -249,6 +249,26 @@ pub fn git_checkout_root(url: &str, rev: &str, cache_dir: &Path) -> PathBuf {
 /// Clones are cached by (url, rev) so repeated `conda/outputs` calls
 /// for the same workspace don't re-clone. `rev` can be a commit SHA,
 /// tag, or branch name.
+///
+/// Returns `(wheel_path, resolved_sha)` where `resolved_sha` is the
+/// 40-character git SHA obtained from `git rev-parse HEAD` after
+/// checkout. This is the **canonical** commit identity that should be
+/// stored in `GitWheelSource.rev` so that a branch/tag/HEAD ref at
+/// produce time is pinned to a specific commit in the lock.
+///
+/// # Determinism guard
+///
+/// After the build, the emitted wheel filename is checked for markers
+/// that indicate a non-reproducible `setuptools_scm` version:
+/// - `.devN` segments (e.g. `1.0.dev4`)
+/// - `.dYYYYMMDD` date segments (e.g. `1.0.dev4+g1234567.d20250101`)
+/// - local `+g<sha>` segments
+///
+/// When detected, `tracing::warn!` is emitted. Such versions drift
+/// across calendar days even when the commit SHA is pinned, causing
+/// `lock drift` (the filename/version in the lock changes every day
+/// even though the inputs have not changed). To fix this the upstream
+/// project must tag a release or set `SETUPTOOLS_SCM_PRETEND_VERSION`.
 pub async fn build_wheel_from_git(
     url: &str,
     rev: &str,
@@ -256,7 +276,7 @@ pub async fn build_wheel_from_git(
     cache_dir: &Path,
     out_dir: &Path,
     python_version: &str,
-) -> Result<PathBuf> {
+) -> Result<(PathBuf, String)> {
     // Delegate to git_checkout_root so the layout stays in sync. (Was
     // duplicated here before v0.13.3 -- update both or the resolver
     // half stops finding the cached clone the cloner half just made.)
@@ -293,11 +313,15 @@ pub async fn build_wheel_from_git(
         )
         .await?;
         if !checkout_ok {
+            // Fetch the specific rev AND its reachable tags so that
+            // setuptools_scm can find a release tag and emit a static
+            // version (e.g. "1.1.1") rather than a drifting dev/date
+            // suffix (e.g. "1.1.1.dev4+g1234567.d20250101").
             run_silent(
                 Command::new("git")
-                    .args(["fetch", "origin", rev])
+                    .args(["fetch", "--tags", "origin", rev])
                     .current_dir(&clone_dir),
-                "git fetch",
+                "git fetch --tags",
             )
             .await?;
             run_silent(
@@ -319,7 +343,91 @@ pub async fn build_wheel_from_git(
             clone_dir.display()
         );
     }
-    build_wheel_from_path(&source_dir, out_dir, python_version).await
+
+    // Resolve the ACTUAL commit SHA after checkout. This converts branch
+    // names, tags, and "HEAD" to a stable 40-char SHA that the lock can
+    // store. Keying on the resolved SHA (rather than the original `rev`
+    // string) ensures a lukewarm replay clones the exact same commit even
+    // when the original rev was a moving ref like a branch name.
+    let resolved_sha = run_output(
+        Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&clone_dir),
+        "git rev-parse HEAD",
+    )
+    .await?;
+    let resolved_sha = resolved_sha.trim().to_string();
+
+    // DETERMINISM GUARD: detect non-reproducible setuptools_scm versions.
+    // A wheel whose version contains .devN, .dYYYYMMDD, or +g<sha> segments
+    // was built without a reachable tag at the pinned SHA. Its filename (and
+    // therefore the lock entry's `version` + `filename` fields) will DRIFT
+    // across calendar days even when the commit SHA is unchanged, producing
+    // a lock that is not byte-identical on replay. The `git fetch --tags`
+    // above is cheap insurance; this warn fires when it was not enough.
+    let wheel_path = build_wheel_from_path(&source_dir, out_dir, python_version).await?;
+    if wheel_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(is_nondeterministic_version)
+    {
+        tracing::warn!(
+            url = %url,
+            rev = %rev,
+            resolved_sha = %resolved_sha,
+            filename = %wheel_path.display(),
+            "git-source wheel has a non-reproducible setuptools_scm version \
+             (contains .devN, .dYYYYMMDD, or +g<sha>). The wheel filename \
+             will DRIFT across calendar days even when the commit SHA is \
+             pinned, causing lock drift on replay. Fix: ensure the upstream \
+             repo has a reachable tag at the pinned commit, or set \
+             SETUPTOOLS_SCM_PRETEND_VERSION=<version> in the build env.",
+        );
+    }
+
+    Ok((wheel_path, resolved_sha))
+}
+
+/// Returns `true` when a wheel filename contains markers of a
+/// non-reproducible `setuptools_scm`-style version:
+/// - `.devN` — development distance (e.g. `1.1.1.dev4`)
+/// - `.dYYYYMMDD` — local date segment (e.g. `+g1234.d20250101`)
+/// - `+g<hex>` — local git-hash segment
+///
+/// These cause the version/filename to change daily even for a pinned
+/// commit SHA, breaking byte-identical lock replay.
+pub fn is_nondeterministic_version(filename: &str) -> bool {
+    use std::sync::OnceLock;
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        // Matches any of:
+        //   .devN    (development distance)
+        //   .dYYYYMMDD  (local date in setuptools_scm local segment)
+        //   +g<hexchars>  (local git-hash segment)
+        regex::Regex::new(r"(?:\.dev\d+|\.d\d{8}|\+g[0-9a-f]+)").unwrap()
+    });
+    re.is_match(filename)
+}
+
+/// Run a command silently and return its trimmed stdout as a `String`.
+/// Fails if the command exits non-zero.
+async fn run_output(cmd: &mut Command, label: &str) -> Result<String> {
+    let output = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .with_context(|| format!("spawning {label}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "{label} failed (status {}): {}",
+            output.status,
+            stderr.trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// Invoke `uv` with the given args, capturing stdout + stderr so neither
@@ -509,5 +617,162 @@ mod tests {
         let a = git_checkout_root("https://example.com/r1.git", "main", cache);
         let b = git_checkout_root("https://example.com/r2.git", "main", cache);
         assert_ne!(a, b);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Determinism guard: is_nondeterministic_version
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn deterministic_version_not_flagged() {
+        // Static release versions must NOT trigger the guard.
+        assert!(!is_nondeterministic_version("mylib-1.1.1-py3-none-any.whl"));
+        assert!(!is_nondeterministic_version(
+            "newton-1.3.0-py3-none-any.whl"
+        ));
+        assert!(!is_nondeterministic_version(
+            "genesis_world-1.1.1-py3-none-any.whl"
+        ));
+        assert!(!is_nondeterministic_version(
+            "foo-2.0.0rc1-py3-none-any.whl"
+        ));
+        assert!(!is_nondeterministic_version(
+            "bar-0.1.0.post1-py3-none-any.whl"
+        ));
+    }
+
+    #[test]
+    fn dev_version_is_flagged() {
+        // .devN suffix (development distance without local segment).
+        assert!(is_nondeterministic_version(
+            "mylib-1.1.1.dev4-py3-none-any.whl"
+        ));
+        assert!(is_nondeterministic_version(
+            "mylib-0.1.dev123-py3-none-any.whl"
+        ));
+    }
+
+    #[test]
+    fn date_segment_is_flagged() {
+        // .dYYYYMMDD local date segment produced by setuptools_scm.
+        assert!(is_nondeterministic_version(
+            "mylib-1.0.dev4+g1234567.d20250101-py3-none-any.whl"
+        ));
+        assert!(is_nondeterministic_version(
+            "mylib-1.0.dev0+g0000000.d20991231-py3-none-any.whl"
+        ));
+    }
+
+    #[test]
+    fn local_git_sha_segment_is_flagged() {
+        // +g<hexchars> local git-hash segment.
+        assert!(is_nondeterministic_version(
+            "mylib-1.0+gabcdef0-py3-none-any.whl"
+        ));
+        assert!(is_nondeterministic_version(
+            "mylib-2.0.post0+g1234abc-py3-none-any.whl"
+        ));
+    }
+
+    // ---------------------------------------------------------------------------
+    // Local git fixture: build_wheel_from_git returns (path, resolved_sha)
+    // ---------------------------------------------------------------------------
+
+    /// Verifies that `build_wheel_from_git` returns a 40-character resolved
+    /// SHA and that the SHA is stable (calling again with the same rev returns
+    /// the same SHA). Uses a minimal local git repo so no network access is
+    /// required and CI stays fast.
+    #[tokio::test]
+    async fn build_wheel_from_git_returns_resolved_sha() {
+        let pid = std::process::id();
+        let base = std::env::temp_dir().join(format!("retread-gitfixture-{pid}"));
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).expect("create repo dir");
+
+        // Init git repo.
+        let run_git = |args: &[&str], dir: &std::path::Path| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_AUTHOR_NAME", "test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .status()
+                .expect("git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+
+        run_git(&["init", "-b", "main"], &repo);
+        run_git(&["config", "user.email", "test@example.com"], &repo);
+        run_git(&["config", "user.name", "test"], &repo);
+
+        // Write a minimal but buildable Python package.
+        std::fs::write(
+            repo.join("pyproject.toml"),
+            r#"[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "retread-test-fixture"
+version = "0.1.0"
+"#,
+        )
+        .expect("write pyproject");
+        std::fs::write(repo.join("README.md"), "test fixture").expect("write README");
+
+        run_git(&["add", "."], &repo);
+        run_git(&["commit", "-m", "initial"], &repo);
+
+        // Get the commit SHA directly.
+        let sha_output = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&repo)
+            .output()
+            .expect("git rev-parse");
+        let expected_sha = String::from_utf8_lossy(&sha_output.stdout)
+            .trim()
+            .to_string();
+        assert_eq!(
+            expected_sha.len(),
+            40,
+            "git rev-parse HEAD must be 40 chars"
+        );
+
+        let cache_dir = base.join("cache");
+        let out_dir = base.join("out");
+        std::fs::create_dir_all(&cache_dir).expect("cache dir");
+        std::fs::create_dir_all(&out_dir).expect("out dir");
+        let repo_url = format!("file://{}", repo.display());
+
+        let (wheel_path, resolved_sha) =
+            build_wheel_from_git(&repo_url, &expected_sha, ".", &cache_dir, &out_dir, "3.11")
+                .await
+                .expect("build_wheel_from_git");
+
+        // The returned SHA must match what git reports.
+        assert_eq!(
+            resolved_sha, expected_sha,
+            "resolved_sha must equal the commit SHA"
+        );
+        assert_eq!(resolved_sha.len(), 40, "resolved_sha must be 40 hex chars");
+        // A wheel must have been produced.
+        assert!(
+            wheel_path.extension().is_some_and(|e| e == "whl"),
+            "built file must be a .whl"
+        );
+        // The static version "0.1.0" must NOT be flagged as non-deterministic.
+        let filename = wheel_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("filename");
+        assert!(
+            !is_nondeterministic_version(filename),
+            "a static version should not be flagged: {filename}"
+        );
+
+        // Cleanup.
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
