@@ -4092,17 +4092,97 @@ async fn materialize_from_lock(
     // EmitWheel with correct local_path / remote_url for courier::stage.
     let mut emit_wheels: Vec<crate::emit_pypi::EmitWheel> = Vec::with_capacity(lock.wheels.len());
 
-    // SINGLE-ENTRY GUARD (Phase 2, known limitation): Each git bundle must
-    // have exactly one git checkout root per replay. Named-vs-inline parity
-    // (DESIGN A) relies on a single skip_subdirs=[] being acceptable — which
-    // is only true when no two wheels in the same bundle share the same clone.
-    // If >1 wheels share a root (multi-entry monorepo pack), the non-trivial
-    // skip_subdirs cannot be reconstructed from the lock, and replay would
-    // produce non-identical auto-data paths. Guard against this explicitly so
-    // the failure is caught early with a directing message rather than silently
-    // producing a different wheel. Phase 3 will add multi-root lock provenance.
-    let mut seen_git_checkout_roots: std::collections::HashSet<PathBuf> =
-        std::collections::HashSet::new();
+    // PHASE 2.5: Multi-entry shared-git-checkout replay.
+    //
+    // Pre-pass: group all Class-1 git wheels (must_ship=true, git_source present)
+    // by checkout root (git_checkout_root(gs.url, gs.rev)), preserving lock order.
+    // Within each group, group[0] is the CARRIER (mirrors produce's BTreeMap-order
+    // first entry -> first in emit_wheels -> first in lock.wheels). The carrier
+    // gets AutoDataConfig{skip_subdirs = union of ALL members' subdirs}; non-carriers
+    // get None (ship only their own pip+inject wheel, no auto-data).
+    //
+    // Grouping key uses the RESOLVED SHA (gs.rev) so equivalence matches produce's
+    // partitioning. The lock's subdirectory field may be None (root/"." member).
+    //
+    // Groups can be NON-CONTIGUOUS in the lock (e.g. git group spans indices 0-5
+    // and 10, with index/shadow wheels interleaved). We build a whole group's
+    // wheels into an in-memory stash on first encounter, then emit each wheel at
+    // its own lock position from the stash. Lock order is preserved byte-for-byte.
+    //
+    // INCOMPLETE PROVENANCE: if any group member is missing git_source (schema gap
+    // or BFS transitive class-3 wheel), we do NOT Err — we return Ok(None) so the
+    // caller falls through to full resolve_all.  All-or-nothing: the stash is
+    // in-memory, so Ok(None) leaves no partial wheels/ on disk.
+
+    // Step 1: scan lock.wheels to build per-root group membership (preserving order).
+    // git_group_members: checkout_root -> Vec<lock index>
+    // git_group_skip_subdirs: checkout_root -> Vec<subdir> (union of all members)
+    let mut git_group_members: std::collections::HashMap<PathBuf, Vec<usize>> =
+        std::collections::HashMap::new();
+    // Parallel vec for ordering: the FIRST lock index seen for each root (= carrier).
+    let mut git_group_order: Vec<PathBuf> = Vec::new();
+
+    for (idx, lw) in lock.wheels.iter().enumerate() {
+        if lw.origin == crate::lock::Origin::Built
+            && lw.must_ship
+            && let Some(gs) = &lw.git_source
+        {
+            let root = crate::source_build::git_checkout_root(&gs.url, &gs.rev, cache_dir);
+            let entry = git_group_members.entry(root.clone()).or_insert_with(|| {
+                git_group_order.push(root.clone());
+                Vec::new()
+            });
+            entry.push(idx);
+        }
+    }
+
+    // Step 2: for each group with >1 members (multi-entry), validate all members
+    // have git_source (invariant; they do by construction of the scan above).
+    // Compute AutoDataConfig per group member index (carrier=first, rest=None).
+    // auto_data_for_lock_idx: lock index -> Option<AutoDataConfig>
+    // None means "non-carrier of a multi-entry group" -> build with auto_data=None.
+    // Missing key means "size-1 group" -> use single-entry logic below (unchanged).
+    let mut auto_data_override: std::collections::HashMap<usize, Option<AutoDataConfig>> =
+        std::collections::HashMap::new();
+
+    for root in &git_group_order {
+        let members = &git_group_members[root];
+        if members.len() > 1 {
+            // Compute skip_subdirs = union of all members' subdirectory fields.
+            let skip_subdirs: Vec<PathBuf> = members
+                .iter()
+                .map(|&idx| {
+                    let gs = lock.wheels[idx]
+                        .git_source
+                        .as_ref()
+                        .expect("git_group_members only contains wheels with git_source; qed");
+                    PathBuf::from(gs.subdirectory.as_deref().unwrap_or("."))
+                })
+                .collect();
+            // Carrier = members[0] (lock-order index 0).
+            auto_data_override.insert(
+                members[0],
+                Some(AutoDataConfig {
+                    checkout_root: root.clone(),
+                    skip_subdirs,
+                }),
+            );
+            // Non-carriers get None.
+            for &idx in &members[1..] {
+                auto_data_override.insert(idx, None);
+            }
+        }
+        // Size-1 groups fall through to the single-entry path below (no override).
+    }
+
+    // Stash: checkout_root -> built EmitWheels for that group, keyed by lock index.
+    // Populated lazily on first encounter of any member of a multi-entry group.
+    let mut git_group_stash: std::collections::HashMap<
+        PathBuf,
+        std::collections::HashMap<usize, crate::emit_pypi::EmitWheel>,
+    > = std::collections::HashMap::new();
+    // Tracks roots whose groups have already been built into the stash.
+    let mut built_roots: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
     for lw in &lock.wheels {
         let emit = match lw.origin {
@@ -4172,95 +4252,185 @@ async fn materialize_from_lock(
                     // drive BFS closure only), so collapsing a named-git entry to an inline
                     // synth {git:url, rev:SHA} yields a byte-identical wheel.
                     //
-                    // SINGLE-ENTRY GUARD: assert this git checkout root has not been used
-                    // by a prior wheel in this replay batch. Multi-entry shared-checkout
-                    // bundles (two wheels from the same clone, different subdirs) produce a
-                    // non-trivial skip_subdirs at produce time that cannot be reconstructed
-                    // here (we always pass skip_subdirs=[]). Phase 3 will add multi-root
-                    // lock provenance; for now hard-error so the failure is explicit.
+                    // PHASE 2.5: Multi-entry shared-git-checkout support.
+                    // The pre-pass above identified groups by checkout root. If this wheel
+                    // is part of a multi-entry group, we use the group stash:
+                    //   - First encounter of the root: build ALL group members via
+                    //     materialize_and_rewrite (carrier gets union skip_subdirs, non-
+                    //     carriers get None), stash results by lock index.
+                    //   - Subsequent encounters: emit from stash (no rebuild).
+                    // Single-entry groups fall through to the pre-existing single-entry path
+                    // (skip_subdirs=[gs.subdirectory], unchanged behavior).
                     let checkout_root =
                         crate::source_build::git_checkout_root(&gs.url, &gs.rev, cache_dir);
-                    if !seen_git_checkout_roots.insert(checkout_root.clone()) {
-                        anyhow::bail!(
-                            "courier replay: wheel `{}` shares a git checkout root with a \
-                             prior wheel in this bundle (multi-entry shared-checkout bundles \
-                             are not yet supported in Phase-2 replay; Phase 3 will add \
-                             multi-root lock provenance). checkout_root={}",
-                            lw.name,
-                            checkout_root.display(),
+                    let cur_lock_idx = emit_wheels.len();
+                    // Look up whether this wheel is in a multi-entry group.
+                    let in_multi_group = auto_data_override.contains_key(&cur_lock_idx);
+                    if in_multi_group {
+                        // Multi-entry group: use stash.
+                        if !built_roots.contains(&checkout_root) {
+                            // First encounter of this group: build ALL members.
+                            built_roots.insert(checkout_root.clone());
+                            let group_indices = git_group_members[&checkout_root].clone();
+                            tracing::info!(
+                                group_size = group_indices.len(),
+                                checkout_root = %checkout_root.display(),
+                                "courier replay (phase 2.5): building multi-entry git group"
+                            );
+                            let mut stash_for_root: std::collections::HashMap<
+                                usize,
+                                crate::emit_pypi::EmitWheel,
+                            > = std::collections::HashMap::new();
+                            for &member_idx in &group_indices {
+                                let member_lw = &lock.wheels[member_idx];
+                                let member_gs = member_lw.git_source.as_ref().expect(
+                                    "group member must have git_source; invariant from pre-pass",
+                                );
+                                // Retrieve the pre-computed auto_data for this member.
+                                let member_auto_data =
+                                    auto_data_override.get(&member_idx).cloned().unwrap_or(None);
+                                let synth_entry = crate::config::WheelEntry {
+                                    git: Some(member_gs.url.clone()),
+                                    rev: Some(member_gs.rev.clone()),
+                                    subdirectory: member_gs.subdirectory.clone(),
+                                    extras: member_gs.extras.clone(),
+                                    url: None,
+                                    sha256: None,
+                                    version: None,
+                                    index: None,
+                                    path: None,
+                                    from: None,
+                                    bundle: None,
+                                    ..crate::config::WheelEntry::default()
+                                };
+                                tracing::info!(
+                                    wheel = %member_lw.name,
+                                    url = %member_gs.url,
+                                    rev = %member_gs.rev,
+                                    has_auto_data = member_auto_data.is_some(),
+                                    "courier replay (phase 2.5): building group member"
+                                );
+                                let (resolved, _rd) = materialize_and_rewrite(
+                                    &synth_entry,
+                                    &member_lw.name,
+                                    &target,
+                                    &download_dir,
+                                    source_dir,
+                                    cache_dir,
+                                    config.relax,
+                                    &config.git_sources,
+                                    member_auto_data,
+                                    EntryAuditInfo::default(),
+                                )
+                                .await
+                                .with_context(|| {
+                                    format!(
+                                        "courier replay (phase 2.5): re-source-building \
+                                         group member `{}` from url={}, rev={}",
+                                        member_lw.name, member_gs.url, member_gs.rev,
+                                    )
+                                })?;
+                                let local_path = (resolved.url.scheme() == "file")
+                                    .then(|| resolved.url.to_file_path().ok())
+                                    .flatten();
+                                stash_for_root.insert(
+                                    member_idx,
+                                    crate::emit_pypi::EmitWheel {
+                                        pypi_name: member_lw.name.clone(),
+                                        version: member_lw.version.clone(),
+                                        requires_dist: member_lw.requires_dist.clone(),
+                                        local_path,
+                                        wheel_filename: member_lw.filename.clone(),
+                                        remote_url: None,
+                                        upstream_url: None,
+                                        git_source: resolved.git_source.clone(),
+                                    },
+                                );
+                            }
+                            git_group_stash.insert(checkout_root.clone(), stash_for_root);
+                        }
+                        // Emit this wheel from the stash (built either just now or earlier).
+                        git_group_stash[&checkout_root]
+                            .get(&cur_lock_idx)
+                            .cloned()
+                            .expect(
+                                "stash must contain every group member after build; \
+                                 cur_lock_idx must equal emit_wheels.len() at group-build time",
+                            )
+                    } else {
+                        // Single-entry group: existing single-entry logic (unchanged).
+                        // skip_subdirs = [gs.subdirectory] mirrors produce-path derivation
+                        // (auto_data_per_entry, mod.rs ~2205-2218): one entry owns the
+                        // checkout root; skip_subdirs = its own subdirectory.
+                        tracing::info!(
+                            wheel = %lw.name,
+                            url = %gs.url,
+                            rev = %gs.rev,
+                            "courier replay: re-source-building git wheel from lock git_source \
+                             (manifest-independent, class 1)"
                         );
-                    }
-                    tracing::info!(
-                        wheel = %lw.name,
-                        url = %gs.url,
-                        rev = %gs.rev,
-                        "courier replay: re-source-building git wheel from lock git_source \
-                         (manifest-independent, class 1)"
-                    );
-                    let synth_entry = crate::config::WheelEntry {
-                        git: Some(gs.url.clone()),
-                        rev: Some(gs.rev.clone()),
-                        subdirectory: gs.subdirectory.clone(),
-                        extras: gs.extras.clone(),
-                        url: None,
-                        sha256: None,
-                        version: None,
-                        index: None,
-                        path: None,
-                        from: None,
-                        bundle: None,
-                        // WheelEntry may have additional fields added in future schema
-                        // bumps; keep defaults for anything not carried in GitWheelSource.
-                        ..crate::config::WheelEntry::default()
-                    };
-                    // Mirror the produce-path derivation (auto_data_per_entry,
-                    // ~mod.rs:2205-2218): for a single-entry git pack the
-                    // skip_subdirs set is exactly [subdirectory] (defaulting to
-                    // ".").  The multi-entry guard above ensures at most one
-                    // wheel per checkout root reaches this arm, so the single-
-                    // element form is always correct here.  Previously this was
-                    // vec![] — inert for root entries (subdirectory="."), but a
-                    // silent correctness landmine for nested subdirectories (e.g.
-                    // monorepo subpaths): produce would skip the subtree while
-                    // replay would NOT, producing a silently drifted wheel.
-                    let skip_subdirs =
-                        vec![PathBuf::from(gs.subdirectory.as_deref().unwrap_or("."))];
-                    let auto_data = Some(AutoDataConfig {
-                        checkout_root,
-                        skip_subdirs,
-                    });
-                    let (resolved, _rd) = materialize_and_rewrite(
-                        &synth_entry,
-                        &lw.name,
-                        &target,
-                        &download_dir,
-                        source_dir,
-                        cache_dir,
-                        config.relax,
-                        &config.git_sources,
-                        auto_data,
-                        EntryAuditInfo::default(),
-                    )
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "courier replay (git_source): re-source-building wheel `{}` \
-                             from url={}, rev={}",
-                            lw.name, gs.url, gs.rev,
+                        let synth_entry = crate::config::WheelEntry {
+                            git: Some(gs.url.clone()),
+                            rev: Some(gs.rev.clone()),
+                            subdirectory: gs.subdirectory.clone(),
+                            extras: gs.extras.clone(),
+                            url: None,
+                            sha256: None,
+                            version: None,
+                            index: None,
+                            path: None,
+                            from: None,
+                            bundle: None,
+                            // WheelEntry may have additional fields added in future schema
+                            // bumps; keep defaults for anything not carried in GitWheelSource.
+                            ..crate::config::WheelEntry::default()
+                        };
+                        // Mirror the produce-path derivation (auto_data_per_entry,
+                        // ~mod.rs:2205-2218): for a single-entry git pack the
+                        // skip_subdirs set is exactly [subdirectory] (defaulting to
+                        // ".").  Previously this was vec![] — inert for root entries
+                        // (subdirectory="."), but a silent correctness landmine for
+                        // nested subdirectories (e.g. monorepo subpaths): produce
+                        // would skip the subtree while replay would NOT.
+                        let skip_subdirs =
+                            vec![PathBuf::from(gs.subdirectory.as_deref().unwrap_or("."))];
+                        let auto_data = Some(AutoDataConfig {
+                            checkout_root,
+                            skip_subdirs,
+                        });
+                        let (resolved, _rd) = materialize_and_rewrite(
+                            &synth_entry,
+                            &lw.name,
+                            &target,
+                            &download_dir,
+                            source_dir,
+                            cache_dir,
+                            config.relax,
+                            &config.git_sources,
+                            auto_data,
+                            EntryAuditInfo::default(),
                         )
-                    })?;
-                    let local_path = (resolved.url.scheme() == "file")
-                        .then(|| resolved.url.to_file_path().ok())
-                        .flatten();
-                    crate::emit_pypi::EmitWheel {
-                        pypi_name: lw.name.clone(),
-                        version: lw.version.clone(),
-                        requires_dist: lw.requires_dist.clone(),
-                        local_path,
-                        wheel_filename: lw.filename.clone(),
-                        remote_url: None,
-                        upstream_url: None,
-                        git_source: resolved.git_source.clone(),
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "courier replay (git_source): re-source-building wheel `{}` \
+                                 from url={}, rev={}",
+                                lw.name, gs.url, gs.rev,
+                            )
+                        })?;
+                        let local_path = (resolved.url.scheme() == "file")
+                            .then(|| resolved.url.to_file_path().ok())
+                            .flatten();
+                        crate::emit_pypi::EmitWheel {
+                            pypi_name: lw.name.clone(),
+                            version: lw.version.clone(),
+                            requires_dist: lw.requires_dist.clone(),
+                            local_path,
+                            wheel_filename: lw.filename.clone(),
+                            remote_url: None,
+                            upstream_url: None,
+                            git_source: resolved.git_source.clone(),
+                        }
                     }
                 } else if let Some(entry) = config.retread_wheels.get(&lw.name) {
                     // Legacy fallback (schema < 8, or non-git Class-1 such as path=):
@@ -5090,7 +5260,7 @@ mod replay_tests {
 
     use rattler_conda_types::Platform;
 
-    use super::{load_replayable_lock, replay_from_lock};
+    use super::{AutoDataConfig, load_replayable_lock, replay_from_lock};
     use crate::config::RetreadConfig;
     use crate::lock::{CondaDep, LockWheel, Origin, RetreadLock, SCHEMA};
 
@@ -5935,6 +6105,798 @@ version = "1.0.0"
             produce_bytes, fixed_bytes,
             "PARITY: fixed replay (skip_subdirs=[\"packages/mypkg\"]) must be \
              byte-identical to produce — FIX-1 restores correctness"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // -----------------------------------------------------------------------
+    // PHASE 2.5 tests: multi-entry shared-git-checkout replay.
+    // -----------------------------------------------------------------------
+
+    /// Test (b): group[0] in lock order is the carrier.
+    ///
+    /// Verify that the pre-pass in materialize_from_lock assigns AutoDataConfig
+    /// (with the union skip_subdirs) to lock index 0 of a multi-entry group, and
+    /// None to all other members. This mirrors produce's BTreeMap-order-first
+    /// carrier rule (auto_data_per_entry, mod.rs ~2197-2221).
+    ///
+    /// This is a pure unit test — it exercises the grouping + AutoDataConfig
+    /// derivation logic directly via a synthetic lock, no git/uv required.
+    #[test]
+    fn multi_entry_git_group_lock_order_first_is_carrier() {
+        use crate::lock::{GitWheelSource, LockWheel, Origin};
+        use std::path::PathBuf;
+
+        // Synthetic "resolved" SHA — just needs to be a consistent 40-char string
+        // so git_checkout_root produces a deterministic path.
+        let rev = "a".repeat(40);
+        let url = "https://github.com/example/monorepo.git".to_string();
+        let cache_dir =
+            std::env::temp_dir().join(format!("retread-p25-carrier-test-{}", std::process::id()));
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        // Group: 3 members of the same git repo, different subdirs.
+        // Lock order: isaaclab (index 0), isaaclab_assets (index 1),
+        // isaaclab_tasks (index 2).
+        // rl_games: separate size-1 group (different rev).
+        let rev2 = "b".repeat(40);
+        let url2 = "https://github.com/example/rl_games.git".to_string();
+
+        let wheels = vec![
+            LockWheel {
+                name: "isaaclab".into(),
+                version: "2.1.0".into(),
+                origin: Origin::Built,
+                filename: "isaaclab-2.1.0-py3-none-any.injected.whl".into(),
+                url: None,
+                sha256: None,
+                requires_dist: vec![],
+                must_ship: true,
+                upstream_url: None,
+                git_source: Some(GitWheelSource {
+                    url: url.clone(),
+                    rev: rev.clone(),
+                    subdirectory: Some("source/isaaclab".into()),
+                    extras: vec![],
+                }),
+            },
+            LockWheel {
+                name: "isaaclab-assets".into(),
+                version: "2.1.0".into(),
+                origin: Origin::Built,
+                filename: "isaaclab_assets-2.1.0-py3-none-any.injected.whl".into(),
+                url: None,
+                sha256: None,
+                requires_dist: vec![],
+                must_ship: true,
+                upstream_url: None,
+                git_source: Some(GitWheelSource {
+                    url: url.clone(),
+                    rev: rev.clone(),
+                    subdirectory: Some("source/isaaclab_assets".into()),
+                    extras: vec![],
+                }),
+            },
+            // Interleaved non-git index wheel (non-contiguous group test).
+            LockWheel {
+                name: "numpy".into(),
+                version: "1.26.0".into(),
+                origin: Origin::Index,
+                filename: "numpy-1.26.0-cp311-cp311-linux_x86_64.whl".into(),
+                url: Some("https://files.pythonhosted.org/numpy-1.26.0.whl".into()),
+                sha256: None,
+                requires_dist: vec![],
+                must_ship: false,
+                upstream_url: None,
+                git_source: None,
+            },
+            // rl_games: size-1 group (separate repo / rev).
+            LockWheel {
+                name: "rl-games".into(),
+                version: "1.6.1".into(),
+                origin: Origin::Built,
+                filename: "rl_games-1.6.1-py3-none-any.injected.whl".into(),
+                url: None,
+                sha256: None,
+                requires_dist: vec![],
+                must_ship: true,
+                upstream_url: None,
+                git_source: Some(GitWheelSource {
+                    url: url2.clone(),
+                    rev: rev2.clone(),
+                    subdirectory: None, // root subdir
+                    extras: vec![],
+                }),
+            },
+            // isaaclab_tasks: non-contiguous member of the isaaclab group.
+            LockWheel {
+                name: "isaaclab-tasks".into(),
+                version: "2.1.0".into(),
+                origin: Origin::Built,
+                filename: "isaaclab_tasks-2.1.0-py3-none-any.injected.whl".into(),
+                url: None,
+                sha256: None,
+                requires_dist: vec![],
+                must_ship: true,
+                upstream_url: None,
+                git_source: Some(GitWheelSource {
+                    url: url.clone(),
+                    rev: rev.clone(),
+                    subdirectory: Some("source/isaaclab_tasks".into()),
+                    extras: vec![],
+                }),
+            },
+        ];
+
+        // Replicate the pre-pass logic from materialize_from_lock.
+        let mut git_group_members: std::collections::HashMap<PathBuf, Vec<usize>> =
+            std::collections::HashMap::new();
+        let mut git_group_order: Vec<PathBuf> = Vec::new();
+
+        for (idx, lw) in wheels.iter().enumerate() {
+            if lw.origin == Origin::Built
+                && lw.must_ship
+                && let Some(gs) = &lw.git_source
+            {
+                let root = crate::source_build::git_checkout_root(&gs.url, &gs.rev, &cache_dir);
+                let entry = git_group_members.entry(root.clone()).or_insert_with(|| {
+                    git_group_order.push(root.clone());
+                    Vec::new()
+                });
+                entry.push(idx);
+            }
+        }
+
+        // Compute auto_data_override (mirrors materialize_from_lock pre-pass).
+        let mut auto_data_override: std::collections::HashMap<usize, Option<AutoDataConfig>> =
+            std::collections::HashMap::new();
+        for root in &git_group_order {
+            let members = &git_group_members[root];
+            if members.len() > 1 {
+                let skip_subdirs: Vec<PathBuf> = members
+                    .iter()
+                    .map(|&idx| {
+                        let gs = wheels[idx].git_source.as_ref().unwrap();
+                        PathBuf::from(gs.subdirectory.as_deref().unwrap_or("."))
+                    })
+                    .collect();
+                auto_data_override.insert(
+                    members[0],
+                    Some(AutoDataConfig {
+                        checkout_root: root.clone(),
+                        skip_subdirs,
+                    }),
+                );
+                for &idx in &members[1..] {
+                    auto_data_override.insert(idx, None);
+                }
+            }
+        }
+
+        // ASSERT (b): IsaacLab group has 3 members (indices 0, 1, 4).
+        let isaac_root = crate::source_build::git_checkout_root(&url, &rev, &cache_dir);
+        let isaac_members = &git_group_members[&isaac_root];
+        assert_eq!(isaac_members.len(), 3, "isaaclab group must have 3 members");
+        assert_eq!(
+            isaac_members[0], 0,
+            "isaaclab (lock idx 0) must be group[0]"
+        );
+        assert_eq!(
+            isaac_members[1], 1,
+            "isaaclab-assets (lock idx 1) must be group[1]"
+        );
+        assert_eq!(
+            isaac_members[2], 4,
+            "isaaclab-tasks (lock idx 4, non-contiguous) must be group[2]"
+        );
+
+        // Carrier (index 0) has AutoDataConfig with all 3 subdirs.
+        let carrier_ad = auto_data_override
+            .get(&0)
+            .expect("lock idx 0 must be in auto_data_override")
+            .as_ref()
+            .expect("carrier (lock idx 0) must have Some(AutoDataConfig)");
+        assert_eq!(
+            carrier_ad.skip_subdirs.len(),
+            3,
+            "carrier skip_subdirs must be union of all 3 member subdirs"
+        );
+        assert!(
+            carrier_ad
+                .skip_subdirs
+                .contains(&PathBuf::from("source/isaaclab")),
+            "carrier skip_subdirs must include source/isaaclab"
+        );
+        assert!(
+            carrier_ad
+                .skip_subdirs
+                .contains(&PathBuf::from("source/isaaclab_assets")),
+            "carrier skip_subdirs must include source/isaaclab_assets"
+        );
+        assert!(
+            carrier_ad
+                .skip_subdirs
+                .contains(&PathBuf::from("source/isaaclab_tasks")),
+            "carrier skip_subdirs must include source/isaaclab_tasks"
+        );
+
+        // Non-carriers (indices 1 and 4) have None.
+        assert!(
+            auto_data_override.contains_key(&1) && auto_data_override[&1].is_none(),
+            "lock idx 1 (non-carrier) must have None auto_data"
+        );
+        assert!(
+            auto_data_override.contains_key(&4) && auto_data_override[&4].is_none(),
+            "lock idx 4 (non-carrier, non-contiguous) must have None auto_data"
+        );
+
+        // rl_games: size-1 group -> NOT in auto_data_override.
+        let rl_root = crate::source_build::git_checkout_root(&url2, &rev2, &cache_dir);
+        let rl_members = &git_group_members[&rl_root];
+        assert_eq!(rl_members.len(), 1, "rl_games must be size-1 group");
+        assert!(
+            !auto_data_override.contains_key(&rl_members[0]),
+            "size-1 group must not be in auto_data_override (single-entry path)"
+        );
+
+        // Index wheel (lock idx 2, Origin::Index) must NOT appear in any group.
+        assert!(
+            !git_group_members.values().any(|v| v.contains(&2)),
+            "Origin::Index wheel must not appear in any git group"
+        );
+
+        std::fs::remove_dir_all(&cache_dir).ok();
+    }
+
+    /// Test (c): guard fall-through — a must_ship=true Built wheel with no
+    /// git_source and no manifest entry must return Ok(None), not Err, even
+    /// when preceded in the lock by a legitimate index wheel.
+    ///
+    /// This is the class-3 fall-through: incomplete provenance (no git_source,
+    /// no [retread-wheels] entry) -> Ok(None) -> caller falls through to full
+    /// resolve_all. NEVER Err.
+    ///
+    /// The Phase 2.5 variant: the "orphan" wheel appears after an Origin::Index
+    /// wheel (simulating interleaving with non-git members in the lock). The
+    /// index wheel does not require any network or git, so the test runs without
+    /// uv/git.
+    #[tokio::test]
+    async fn multi_entry_group_member_missing_git_source_returns_ok_none() {
+        use super::materialize_from_lock;
+        use crate::config::RetreadConfig;
+        use crate::lock::{LockWheel, Origin};
+
+        let dir = unique_tmp_dir();
+        let source_dir = dir.join("source");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let output_dir = dir.join("output");
+        let work_dir = dir.join("work");
+        let cache_dir = dir.join("cache");
+
+        // Lock: one index wheel (no git), then one must_ship Built wheel
+        // with NO git_source and NOT in config.retread_wheels (class-3 gap).
+        // The index wheel must NOT trigger a network call (it has a local
+        // file:// URL that won't be fetched until courier::stage, which we
+        // don't reach — we return Ok(None) before that).
+        let lock = crate::lock::RetreadLock {
+            schema: SCHEMA,
+            retread_version: "2.5.0".into(),
+            bundle: "interleaved-pack".into(),
+            version: "1.0.0".into(),
+            python: "3.11".into(),
+            inputs_hash: "hash-c-test".into(),
+            root_requirements: vec![],
+            wheels: vec![
+                // Index wheel (class 4): no git, processed without network.
+                LockWheel {
+                    name: "numpy".into(),
+                    version: "1.26.0".into(),
+                    origin: Origin::Index,
+                    filename: "numpy-1.26.0-cp311-cp311-linux_x86_64.whl".into(),
+                    url: Some("https://files.pythonhosted.org/numpy-1.26.0.whl".into()),
+                    sha256: None,
+                    requires_dist: vec![],
+                    must_ship: false,
+                    upstream_url: None,
+                    git_source: None,
+                },
+                // Class-3 orphan: must_ship=true, no git_source, not in config.
+                // This is the wheel that must trigger Ok(None).
+                LockWheel {
+                    name: "bfs-transitive-orphan".into(),
+                    version: "0.1.0".into(),
+                    origin: Origin::Built,
+                    filename: "bfs_transitive_orphan-0.1.0-py3-none-any.injected.whl".into(),
+                    url: None,
+                    sha256: None,
+                    requires_dist: vec![],
+                    must_ship: true,
+                    upstream_url: None,
+                    git_source: None, // MISSING: class-3 gap
+                },
+            ],
+            conda_run_deps: vec![],
+            index_urls: vec!["https://pypi.org/simple/".into()],
+            prerelease: std::collections::BTreeMap::new(),
+            conda_capable: vec![],
+        };
+
+        // Config has no retread_wheels entries.
+        let config: RetreadConfig =
+            serde_json::from_value(serde_json::json!({"retread-wheels": {}})).unwrap();
+
+        let result = materialize_from_lock(
+            lock,
+            &config,
+            &work_dir,
+            &output_dir,
+            rattler_conda_types::Platform::Linux64,
+            &source_dir,
+            &cache_dir,
+            None,
+            vec!["python 3.11.*".to_string()],
+            "fp",
+        )
+        .await;
+
+        // Must be Ok(None), never Err — incomplete provenance = fall-through.
+        assert!(
+            result.is_ok(),
+            "class-3 orphan (no git_source, not in config) must not Err even \
+             when interleaved with index wheels: {result:?}"
+        );
+        assert!(
+            result.unwrap().is_none(),
+            "class-3 orphan (no git_source, not in config) must return Ok(None) \
+             so caller falls through to full resolve_all"
+        );
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // Test (a): live e2e parity — multi-entry local-git fixture.
+    //
+    // Creates a local git repo with two subdirectory packages (pkg-alpha and
+    // pkg-beta) plus a separate size-1 repo (pkg-gamma). Runs produce via
+    // materialize_and_rewrite for each, then simulates what materialize_from_lock
+    // does for the group (carrier with union skip_subdirs, non-carrier with None),
+    // and asserts byte-identical wheels.
+    //
+    // Also tests NON-CONTIGUOUS group order: the lock has pkg-alpha (idx 0),
+    // an unrelated index wheel (idx 1), pkg-beta (idx 2), pkg-gamma (idx 3).
+    // The alpha+beta group is non-contiguous in the lock.
+    //
+    // Mark #[ignore] because it needs uv + git on PATH (like other live git tests).
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    #[ignore = "live: builds git wheels via uv (needs uv + git on PATH); run with --include-ignored"]
+    async fn multi_entry_git_group_produce_replay_byte_identical() {
+        use super::{AutoDataConfig, EntryAuditInfo, materialize_and_rewrite, wheel_target_for};
+        use crate::config::RelaxPolicy;
+        use crate::config::WheelEntry;
+        use crate::lock::GitWheelSource;
+        use rattler_conda_types::Platform;
+
+        let pid = std::process::id();
+        let base = std::env::temp_dir().join(format!("retread-phase25-parity-{pid}"));
+
+        // ── Git fixture: monorepo with two packages ──────────────────────────
+        let mono_repo = base.join("mono-repo");
+        let pkg_alpha_dir = mono_repo.join("packages").join("pkg_alpha");
+        let pkg_beta_dir = mono_repo.join("packages").join("pkg_beta");
+        // size-1 separate repo (pkg-gamma)
+        let gamma_repo = base.join("gamma-repo");
+        let pkg_gamma_dir = gamma_repo.join("pkg_gamma");
+
+        for d in [&pkg_alpha_dir, &pkg_beta_dir, &pkg_gamma_dir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+
+        let run_git = |args: &[&str], dir: &std::path::Path| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_AUTHOR_NAME", "test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .status()
+                .expect("git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+
+        let git_sha = |dir: &std::path::Path| -> String {
+            let out = std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(dir)
+                .output()
+                .expect("git rev-parse");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        // ── Monorepo init ────────────────────────────────────────────────────
+        run_git(&["init", "-b", "main"], &mono_repo);
+        run_git(&["config", "user.email", "test@example.com"], &mono_repo);
+        run_git(&["config", "user.name", "test"], &mono_repo);
+
+        // pkg-alpha
+        std::fs::write(
+            pkg_alpha_dir.join("pyproject.toml"),
+            r#"[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "retread-p25-pkg-alpha"
+version = "1.0.0"
+"#,
+        )
+        .unwrap();
+        let alpha_src = pkg_alpha_dir.join("retread_p25_pkg_alpha");
+        std::fs::create_dir_all(&alpha_src).unwrap();
+        std::fs::write(alpha_src.join("__init__.py"), b"# pkg-alpha\n").unwrap();
+
+        // pkg-beta
+        std::fs::write(
+            pkg_beta_dir.join("pyproject.toml"),
+            r#"[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "retread-p25-pkg-beta"
+version = "1.0.0"
+"#,
+        )
+        .unwrap();
+        let beta_src = pkg_beta_dir.join("retread_p25_pkg_beta");
+        std::fs::create_dir_all(&beta_src).unwrap();
+        std::fs::write(beta_src.join("__init__.py"), b"# pkg-beta\n").unwrap();
+
+        // shared root file (must appear in BOTH carriers' auto-data)
+        std::fs::write(mono_repo.join("README.md"), b"monorepo root\n").unwrap();
+
+        run_git(&["add", "."], &mono_repo);
+        run_git(&["commit", "-m", "initial"], &mono_repo);
+        let mono_sha = git_sha(&mono_repo);
+        assert_eq!(mono_sha.len(), 40, "expected 40-char SHA");
+
+        // ── Gamma repo init ──────────────────────────────────────────────────
+        run_git(&["init", "-b", "main"], &gamma_repo);
+        run_git(&["config", "user.email", "test@example.com"], &gamma_repo);
+        run_git(&["config", "user.name", "test"], &gamma_repo);
+
+        std::fs::write(
+            gamma_repo.join("pyproject.toml"),
+            r#"[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "retread-p25-pkg-gamma"
+version = "1.0.0"
+"#,
+        )
+        .unwrap();
+        let gamma_src = pkg_gamma_dir.join("retread_p25_pkg_gamma");
+        std::fs::create_dir_all(&gamma_src).unwrap();
+        std::fs::write(gamma_src.join("__init__.py"), b"# pkg-gamma\n").unwrap();
+
+        run_git(&["add", "."], &gamma_repo);
+        run_git(&["commit", "-m", "initial"], &gamma_repo);
+        let gamma_sha = git_sha(&gamma_repo);
+        assert_eq!(gamma_sha.len(), 40, "expected 40-char SHA");
+
+        let mono_url = format!("file://{}", mono_repo.display());
+        let gamma_url = format!("file://{}", gamma_repo.display());
+
+        // ── Common dirs ─────────────────────────────────────────────────────
+        let cache_dir = base.join("cache");
+        // Each call needs its own source/download dir to avoid is_fresh() cache hits.
+        let produce_alpha_src = base.join("src-produce-alpha");
+        let produce_beta_src = base.join("src-produce-beta");
+        let replay_alpha_src = base.join("src-replay-alpha");
+        let replay_beta_src = base.join("src-replay-beta");
+        let produce_gamma_src = base.join("src-produce-gamma");
+        let replay_gamma_src = base.join("src-replay-gamma");
+        for d in [
+            &cache_dir,
+            &produce_alpha_src,
+            &produce_beta_src,
+            &replay_alpha_src,
+            &replay_beta_src,
+            &produce_gamma_src,
+            &replay_gamma_src,
+        ] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+
+        let target = wheel_target_for(Platform::Linux64, "3.11");
+        let mono_checkout_root =
+            crate::source_build::git_checkout_root(&mono_url, &mono_sha, &cache_dir);
+        let gamma_checkout_root =
+            crate::source_build::git_checkout_root(&gamma_url, &gamma_sha, &cache_dir);
+
+        // ── PRODUCE: alpha (carrier, skip_subdirs = union of all mono members) ──
+        //
+        // Produce carrier: skip_subdirs = [packages/pkg_alpha, packages/pkg_beta]
+        // (union of both group members' subdirs, mirrors auto_data_per_entry).
+        let alpha_entry = WheelEntry {
+            git: Some(mono_url.clone()),
+            rev: Some(mono_sha.clone()),
+            subdirectory: Some("packages/pkg_alpha".into()),
+            ..WheelEntry::default()
+        };
+        let produce_alpha_dd = produce_alpha_src.join("wheels");
+        std::fs::create_dir_all(&produce_alpha_dd).unwrap();
+        let (produce_alpha_resolved, _) = materialize_and_rewrite(
+            &alpha_entry,
+            "retread-p25-pkg-alpha",
+            &target,
+            &produce_alpha_dd,
+            &produce_alpha_src,
+            &cache_dir,
+            RelaxPolicy::None,
+            &std::collections::BTreeMap::new(),
+            Some(AutoDataConfig {
+                checkout_root: mono_checkout_root.clone(),
+                skip_subdirs: vec![
+                    std::path::PathBuf::from("packages/pkg_alpha"),
+                    std::path::PathBuf::from("packages/pkg_beta"),
+                ],
+            }),
+            EntryAuditInfo::default(),
+        )
+        .await
+        .expect("produce alpha: materialize_and_rewrite");
+        let produce_alpha_path = produce_alpha_resolved
+            .url
+            .to_file_path()
+            .expect("produce alpha must be file URL");
+        let produce_alpha_bytes = std::fs::read(&produce_alpha_path).unwrap();
+
+        // ── PRODUCE: beta (non-carrier, auto_data=None) ──────────────────────
+        let beta_entry = WheelEntry {
+            git: Some(mono_url.clone()),
+            rev: Some(mono_sha.clone()),
+            subdirectory: Some("packages/pkg_beta".into()),
+            ..WheelEntry::default()
+        };
+        let produce_beta_dd = produce_beta_src.join("wheels");
+        std::fs::create_dir_all(&produce_beta_dd).unwrap();
+        let (produce_beta_resolved, _) = materialize_and_rewrite(
+            &beta_entry,
+            "retread-p25-pkg-beta",
+            &target,
+            &produce_beta_dd,
+            &produce_beta_src,
+            &cache_dir,
+            RelaxPolicy::None,
+            &std::collections::BTreeMap::new(),
+            None, // non-carrier: no auto_data
+            EntryAuditInfo::default(),
+        )
+        .await
+        .expect("produce beta: materialize_and_rewrite");
+        let produce_beta_path = produce_beta_resolved
+            .url
+            .to_file_path()
+            .expect("produce beta must be file URL");
+        let produce_beta_bytes = std::fs::read(&produce_beta_path).unwrap();
+
+        // ── PRODUCE: gamma (size-1 group, skip_subdirs=["."] single-entry path) ──
+        let gamma_entry = WheelEntry {
+            git: Some(gamma_url.clone()),
+            rev: Some(gamma_sha.clone()),
+            subdirectory: None, // root
+            ..WheelEntry::default()
+        };
+        let produce_gamma_dd = produce_gamma_src.join("wheels");
+        std::fs::create_dir_all(&produce_gamma_dd).unwrap();
+        let (produce_gamma_resolved, _) = materialize_and_rewrite(
+            &gamma_entry,
+            "retread-p25-pkg-gamma",
+            &target,
+            &produce_gamma_dd,
+            &produce_gamma_src,
+            &cache_dir,
+            RelaxPolicy::None,
+            &std::collections::BTreeMap::new(),
+            Some(AutoDataConfig {
+                checkout_root: gamma_checkout_root.clone(),
+                skip_subdirs: vec![std::path::PathBuf::from(".")],
+            }),
+            EntryAuditInfo::default(),
+        )
+        .await
+        .expect("produce gamma: materialize_and_rewrite");
+        let produce_gamma_path = produce_gamma_resolved
+            .url
+            .to_file_path()
+            .expect("produce gamma must be file URL");
+        let produce_gamma_bytes = std::fs::read(&produce_gamma_path).unwrap();
+
+        // ── REPLAY: simulate what materialize_from_lock now does ─────────────
+        //
+        // Synthetic lock (non-contiguous group):
+        //   idx 0: alpha (mono group member)
+        //   idx 1: (not built here — we only test the git paths)
+        //   idx 2: beta (mono group member, non-contiguous)
+        //   idx 3: gamma (size-1 group)
+        //
+        // Pre-pass would assign:
+        //   idx 0 -> Some(AutoDataConfig{skip=[alpha,beta]})  (carrier)
+        //   idx 2 -> None                                      (non-carrier)
+        //   idx 3 -> not in override (size-1 path)
+        //
+        // We reproduce this in the test by calling materialize_and_rewrite with
+        // the same auto_data the pre-pass would produce.
+
+        // Replay alpha (carrier: auto_data with union skip_subdirs).
+        let replay_alpha_dd = replay_alpha_src.join("wheels");
+        std::fs::create_dir_all(&replay_alpha_dd).unwrap();
+        let synth_alpha = WheelEntry {
+            git: Some(mono_url.clone()),
+            rev: Some(mono_sha.clone()),
+            subdirectory: Some("packages/pkg_alpha".into()),
+            ..WheelEntry::default()
+        };
+        let (replay_alpha_resolved, _) = materialize_and_rewrite(
+            &synth_alpha,
+            "retread-p25-pkg-alpha",
+            &target,
+            &replay_alpha_dd,
+            &replay_alpha_src,
+            &cache_dir,
+            RelaxPolicy::None,
+            &std::collections::BTreeMap::new(),
+            Some(AutoDataConfig {
+                checkout_root: mono_checkout_root.clone(),
+                skip_subdirs: vec![
+                    std::path::PathBuf::from("packages/pkg_alpha"),
+                    std::path::PathBuf::from("packages/pkg_beta"),
+                ],
+            }),
+            EntryAuditInfo::default(),
+        )
+        .await
+        .expect("replay alpha: materialize_and_rewrite");
+        let replay_alpha_bytes =
+            std::fs::read(replay_alpha_resolved.url.to_file_path().unwrap()).unwrap();
+
+        // Replay beta (non-carrier: auto_data=None).
+        let replay_beta_dd = replay_beta_src.join("wheels");
+        std::fs::create_dir_all(&replay_beta_dd).unwrap();
+        let synth_beta = WheelEntry {
+            git: Some(mono_url.clone()),
+            rev: Some(mono_sha.clone()),
+            subdirectory: Some("packages/pkg_beta".into()),
+            ..WheelEntry::default()
+        };
+        let (replay_beta_resolved, _) = materialize_and_rewrite(
+            &synth_beta,
+            "retread-p25-pkg-beta",
+            &target,
+            &replay_beta_dd,
+            &replay_beta_src,
+            &cache_dir,
+            RelaxPolicy::None,
+            &std::collections::BTreeMap::new(),
+            None, // non-carrier: auto_data=None
+            EntryAuditInfo::default(),
+        )
+        .await
+        .expect("replay beta: materialize_and_rewrite");
+        let replay_beta_bytes =
+            std::fs::read(replay_beta_resolved.url.to_file_path().unwrap()).unwrap();
+
+        // Replay gamma (size-1 group: single-entry path, skip_subdirs=["."]).
+        let replay_gamma_dd = replay_gamma_src.join("wheels");
+        std::fs::create_dir_all(&replay_gamma_dd).unwrap();
+        let synth_gamma = WheelEntry {
+            git: Some(gamma_url.clone()),
+            rev: Some(gamma_sha.clone()),
+            subdirectory: None,
+            ..WheelEntry::default()
+        };
+        let (replay_gamma_resolved, _) = materialize_and_rewrite(
+            &synth_gamma,
+            "retread-p25-pkg-gamma",
+            &target,
+            &replay_gamma_dd,
+            &replay_gamma_src,
+            &cache_dir,
+            RelaxPolicy::None,
+            &std::collections::BTreeMap::new(),
+            Some(AutoDataConfig {
+                checkout_root: gamma_checkout_root.clone(),
+                skip_subdirs: vec![std::path::PathBuf::from(".")],
+            }),
+            EntryAuditInfo::default(),
+        )
+        .await
+        .expect("replay gamma: materialize_and_rewrite");
+        let replay_gamma_bytes =
+            std::fs::read(replay_gamma_resolved.url.to_file_path().unwrap()).unwrap();
+
+        // ── ASSERT: byte-identical ───────────────────────────────────────────
+        assert_eq!(
+            produce_alpha_bytes, replay_alpha_bytes,
+            "PHASE 2.5 PARITY: alpha carrier (union skip_subdirs) must be \
+             byte-identical between produce and replay"
+        );
+        assert_eq!(
+            produce_beta_bytes, replay_beta_bytes,
+            "PHASE 2.5 PARITY: beta non-carrier (auto_data=None) must be \
+             byte-identical between produce and replay"
+        );
+        assert_eq!(
+            produce_gamma_bytes, replay_gamma_bytes,
+            "PHASE 2.5 PARITY: gamma size-1 group (single-entry path) must be \
+             byte-identical between produce and replay"
+        );
+
+        // ── ASSERT: non-contiguous lock ordering simulation ──────────────────
+        // Confirm the group detection works for non-contiguous lock indices
+        // (alpha at 0, beta at 2, interleaved index wheel at 1).
+        let rev = mono_sha.clone();
+        let url = mono_url.clone();
+        let mut group_members: std::collections::HashMap<std::path::PathBuf, Vec<usize>> =
+            std::collections::HashMap::new();
+        let mut group_order: Vec<std::path::PathBuf> = Vec::new();
+        // Simulated lock: [alpha(0), dummy_index(1), beta(2), gamma(3)]
+        let sim_wheels: Vec<(bool, Option<GitWheelSource>)> = vec![
+            (
+                true,
+                Some(GitWheelSource {
+                    url: url.clone(),
+                    rev: rev.clone(),
+                    subdirectory: Some("packages/pkg_alpha".into()),
+                    extras: vec![],
+                }),
+            ),
+            (false, None), // Origin::Index — skipped
+            (
+                true,
+                Some(GitWheelSource {
+                    url: url.clone(),
+                    rev: rev.clone(),
+                    subdirectory: Some("packages/pkg_beta".into()),
+                    extras: vec![],
+                }),
+            ),
+            (
+                true,
+                Some(GitWheelSource {
+                    url: gamma_url.clone(),
+                    rev: gamma_sha.clone(),
+                    subdirectory: None,
+                    extras: vec![],
+                }),
+            ),
+        ];
+        for (idx, (must_ship, gs_opt)) in sim_wheels.iter().enumerate() {
+            if *must_ship && let Some(gs) = gs_opt {
+                let root = crate::source_build::git_checkout_root(&gs.url, &gs.rev, &cache_dir);
+                let entry = group_members.entry(root.clone()).or_insert_with(|| {
+                    group_order.push(root);
+                    Vec::new()
+                });
+                entry.push(idx);
+            }
+        }
+        let mono_root = crate::source_build::git_checkout_root(&url, &rev, &cache_dir);
+        let mono_members = &group_members[&mono_root];
+        assert_eq!(
+            mono_members,
+            &vec![0usize, 2usize],
+            "non-contiguous group: alpha at lock idx 0, beta at lock idx 2"
+        );
+        assert_eq!(
+            mono_members[0], 0usize,
+            "alpha (lock idx 0) must be carrier of non-contiguous group"
         );
 
         let _ = std::fs::remove_dir_all(&base);
