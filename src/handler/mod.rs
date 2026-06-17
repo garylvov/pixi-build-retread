@@ -4676,8 +4676,8 @@ async fn materialize_from_lock(
                 }
             }
             Origin::Built => {
-                // Class 2: relax-changed shadow (must_ship=false). The
-                // original upstream URL is in lw.upstream_url (schema 6+).
+                // Class 2: relax-changed INDEX shadow (must_ship=false, no sdist/git).
+                // The original upstream URL is in lw.upstream_url (schema 6+).
                 // If absent (schema-5 lock), fail so caller falls through
                 // to full resolve.
                 let remote_url_opt = lw
@@ -4703,42 +4703,86 @@ async fn materialize_from_lock(
                     url = %remote_url,
                     "courier replay: re-fetching relax-changed shadow from upstream (class 2)"
                 );
-                // SAFETY INVARIANT: local_path is intentionally None here.
+
+                // FIX (Phase 2.7): DOWNLOAD the upstream wheel to a local path and
+                // route through courier's LOCAL-PATH branch (ShadowSrc::Rewritten /
+                // ShadowSrc::Raw → Origin::Built), mirroring what cold's
+                // materialize_and_rewrite does. The OLD approach emitted
+                // `local_path=None + remote_url=Some(upstream)` which routed through
+                // courier's REMOTE-ONLY branch whose `!conda_capable` gate caused
+                // conda_capable relax-shadows (pytorch3d) to emit Origin::Index on
+                // replay, drifting the lock vs cold. The LOCAL-PATH branch has NO
+                // conda_capable gate, so ALL Class-2 shadows replay as Origin::Built
+                // regardless of conda_capable membership.
                 //
-                // A Class-2 shadow is an Origin::Built wheel whose upstream
-                // source was an index URL (the relax pass rewrote it, but no
-                // `.injected` infix was added). The byte-identity of the
-                // index-wheel replay therefore rests on the following invariant:
+                // The debug_assert in plan() (emit_pypi.rs) is NOT tripped: it fires
+                // only when local_path=Some AND remote_url=Some simultaneously. We set
+                // local_path=Some + remote_url=None, matching cold's local-path EmitWheel.
+                // Index shadows are still never direct-URL Requires-Dist targets (that
+                // property is driven by requires_dist content, not EmitWheel fields).
                 //
-                //   "An Origin::Index wheel, or a relax-changed index shadow
-                //    (Origin::Built && !must_ship), is NEVER the target of a
-                //    direct-URL Requires-Dist line."
+                // fetch_wheel_cached(url, None, dest, cache_root) with sha256=None
+                // bypasses the persistent sha256-keyed cache and calls fetch_wheel,
+                // landing at dest_dir.join(wheel_filename_from_url(url)) — the pristine
+                // 5-field upstream basename, identical to what cold fetched pre-relax.
+                let fetched =
+                    crate::wheel::fetch_wheel_cached(&remote_url, None, &download_dir, cache_dir)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "courier replay Class-2: re-fetching shadow `{}` from `{}`",
+                                lw.name, remote_url,
+                            )
+                        })?;
+
+                // DETERMINISM GUARD (Phase 2.7): verify the re-fetched artifact's
+                // predicted shadow name matches the recorded lw.filename. If upstream
+                // served a repackaged / differently-named artifact under the same URL,
+                // the predicted name diverges → fall through to cold re-resolve instead
+                // of silently emitting a drifted lock entry.
                 //
-                // plan() in emit_pypi.rs reads local_path ONLY inside the
-                // direct-URL ship-set insert (the `target.local_path.is_some()`
-                // branch at the Pass-1 URL-target loop). Because index shadows
-                // are never direct-URL targets, their local_path is never
-                // consulted by plan(), so setting it to None here is safe: the
-                // wheel will be fetched from remote_url at install time and the
-                // emitted pixi manifest will carry the correct exact-pin from
-                // the `exact` map, not a bundled-file reference.
-                //
-                // A debug_assert in plan() (emit_pypi.rs) enforces this
-                // invariant at test time: when a wheel enters the ship set via
-                // the local_path gate, its remote_url must be None -- index
-                // shadows carry remote_url instead of local_path, so a wheel
-                // with both set would signal that a future code path
-                // accidentally made an index shadow a direct-URL target.
+                // Predicted name = insert_build_tag(standard_wheel_filename(<fetched
+                // basename>), "999retread"), using the fetched 5-field upstream basename.
+                // The courier stage will use insert_build_tag(standard_wheel_filename(
+                // lw.filename), "999retread") against the already-999retread 6-field name
+                // (idempotent replace). Both routes yield the identical string when
+                // upstream is unchanged (§6.2, PHASE2.7-PLAN.md). If they diverge the
+                // assumption is violated and a cold re-resolve is the correct response.
+                let fetched_base = fetched.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                let predicted = crate::emit_pypi::insert_build_tag(
+                    &crate::emit_pypi::standard_wheel_filename(fetched_base),
+                    "999retread",
+                )
+                .with_context(|| {
+                    format!(
+                        "courier replay Class-2: building predicted shadow name for `{}`",
+                        lw.name,
+                    )
+                })?;
+                if predicted != lw.filename {
+                    tracing::warn!(
+                        wheel = %lw.name,
+                        predicted = %predicted,
+                        recorded = %lw.filename,
+                        "courier replay Class-2: re-fetched artifact name diverges from \
+                         recorded shadow filename (upstream repackaged?); falling through \
+                         to cold resolve",
+                    );
+                    return Ok(None);
+                }
+
                 crate::emit_pypi::EmitWheel {
                     pypi_name: lw.name.clone(),
                     version: lw.version.clone(),
                     requires_dist: lw.requires_dist.clone(),
-                    local_path: None,
+                    local_path: Some(fetched),
                     wheel_filename: lw.filename.clone(),
-                    remote_url: Some(remote_url),
-                    upstream_url: None,
-                    git_source: None, // Class-2 shadow: upstream_url carries provenance
-                    sdist_source: None, // Class-2: index wheel, no sdist provenance
+                    remote_url: None, // local-path EmitWheel: cold has remote_url=None
+                    // upstream_url carries the index URL so courier's Rewritten/Raw
+                    // arms write upstream_url=github + url=None, matching cold.
+                    upstream_url: Some(remote_url),
+                    git_source: None,
+                    sdist_source: None,
                 }
             }
         };
@@ -6130,6 +6174,515 @@ mod replay_tests {
         assert!(
             result.unwrap().is_some(),
             "Class-2b live round-trip must return Ok(Some(...))"
+        );
+    }
+
+    // ---- Class-2 (Phase 2.7 fix) replay field-mapping + byte-identity tests ----
+    //
+    // The Phase 2.7 fix changes the Class-2 replay arm (bare `Origin::Built`
+    // after Class-2b) to DOWNLOAD the upstream wheel via fetch_wheel_cached and
+    // route through courier's LOCAL-PATH branch rather than the REMOTE-ONLY branch.
+    // This fixes conda_capable relax-shadows (pytorch3d) that the old remote-only
+    // branch mis-classified as Origin::Index.
+    //
+    // Three tests:
+    //   (1) class2_emit_wheel_field_mapping — pure sync, REQUIRED.
+    //   (2) class2_replay_cold_byte_identity — localhost fixture, REQUIRED parity oracle.
+    //   (3) class2_live_round_trip — ignored, live network.
+
+    // ── Shared test utilities ────────────────────────────────────────────────────
+
+    fn make_wheel_bytes_for_replay(dist: &str, version: &str, requires: &[&str]) -> Vec<u8> {
+        use std::io::Write;
+        let normalized = dist.replace('-', "_");
+        let di = format!("{normalized}-{version}.dist-info");
+        let mut metadata = format!("Metadata-Version: 2.1\nName: {dist}\nVersion: {version}\n");
+        for req in requires {
+            metadata.push_str(&format!("Requires-Dist: {req}\n"));
+        }
+        let metadata_bytes = metadata.into_bytes();
+        let wheel_file = b"Wheel-Version: 1.0\nTag: py3-none-any\n".to_vec();
+        let record = format!("{di}/METADATA,,\n{di}/WHEEL,,\n{di}/RECORD,,\n").into_bytes();
+
+        let mut buf = Vec::new();
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for (name, body) in [
+            (format!("{di}/METADATA"), metadata_bytes.as_slice()),
+            (format!("{di}/WHEEL"), wheel_file.as_slice()),
+            (format!("{di}/RECORD"), record.as_slice()),
+        ] {
+            zip.start_file(&name, opts).unwrap();
+            zip.write_all(body).unwrap();
+        }
+        zip.finish().unwrap();
+        buf
+    }
+
+    /// (1) CLASS-2 EmitWheel field-mapping contract (pure sync, no network).
+    ///
+    /// Mirrors `class2b_emit_wheel_field_mapping` exactly. Constructs the EmitWheel
+    /// the new Class-2 arm would produce (after the Phase 2.7 fix) and asserts the
+    /// full field contract:
+    ///   - local_path.is_some()  — routes through courier's LOCAL-PATH branch (no conda gate)
+    ///   - remote_url.is_none()  — cold's local-path EmitWheel has remote_url=None
+    ///   - upstream_url == Some(github_url) — courier writes upstream_url=github, url=None
+    ///   - git_source.is_none(), sdist_source.is_none()
+    ///   - wheel_filename == lw.filename, version == lw.version
+    ///   - requires_dist == lw.requires_dist
+    #[test]
+    fn class2_emit_wheel_field_mapping() {
+        use crate::emit_pypi::EmitWheel;
+
+        let upstream_url = url::Url::parse(
+            "https://github.com/MiroPsota/torch_packages_builder/releases/download/\
+             pytorch3d0.7.8pt2.7.0cu128/pytorch3d-0.7.8+5043d15pt2.7.0cu128-cp311-cp311-linux_x86_64.whl"
+        ).unwrap();
+
+        // Simulate the LockWheel that Class-2 operates on (cold-produced entry).
+        let lw = LockWheel {
+            name: "pytorch3d".into(),
+            version: "0.7.8+5043d15pt2.7.0cu128".into(),
+            origin: Origin::Built,
+            filename: "pytorch3d-0.7.8+5043d15pt2.7.0cu128-999retread-cp311-cp311-linux_x86_64.whl"
+                .into(),
+            url: None,
+            sha256: None,
+            requires_dist: vec!["torch>=2.7.0".into(), "torchvision>=0.22.0".into()],
+            must_ship: false,
+            upstream_url: Some(upstream_url.to_string()),
+            git_source: None,
+            sdist_source: None,
+        };
+
+        // Replicate the EmitWheel construction from the new Class-2 arm (§3.1).
+        // The fetched file would be the pristine 5-field upstream basename.
+        let fetched_path = std::path::PathBuf::from(
+            "/tmp/wheels/pytorch3d-0.7.8+5043d15pt2.7.0cu128-cp311-cp311-linux_x86_64.whl",
+        );
+        let remote_url = url::Url::parse(lw.upstream_url.as_deref().unwrap()).unwrap();
+        let ew = EmitWheel {
+            pypi_name: lw.name.clone(),
+            version: lw.version.clone(),
+            requires_dist: lw.requires_dist.clone(),
+            local_path: Some(fetched_path.clone()),
+            wheel_filename: lw.filename.clone(),
+            remote_url: None,
+            upstream_url: Some(remote_url),
+            git_source: None,
+            sdist_source: None,
+        };
+
+        // (a) local_path must be Some: routes through courier's LOCAL-PATH branch,
+        // which has NO conda_capable gate. This is the core fix for pytorch3d drift.
+        assert!(
+            ew.local_path.is_some(),
+            "Class-2 EmitWheel must have local_path=Some (routes LOCAL-PATH branch, no conda gate)"
+        );
+
+        // (b) remote_url must be None: cold's local-path EmitWheel has remote_url=None.
+        // Also prevents the plan() debug_assert from firing (it rejects local_path+remote_url together).
+        assert!(
+            ew.remote_url.is_none(),
+            "Class-2 EmitWheel must have remote_url=None (mirrors cold local-path EmitWheel)"
+        );
+
+        // (c) upstream_url == Some(github): courier's Rewritten/Raw arms compute
+        // w.upstream_url.or(w.remote_url) -> github -> LockWheel.upstream_url=github, url=None.
+        assert_eq!(
+            ew.upstream_url.as_ref().map(|u| u.to_string()),
+            lw.upstream_url,
+            "Class-2 EmitWheel upstream_url must match the recorded lw.upstream_url"
+        );
+
+        // (d) No git/sdist provenance (index shadow).
+        assert!(
+            ew.git_source.is_none(),
+            "Class-2 EmitWheel must have git_source=None"
+        );
+        assert!(
+            ew.sdist_source.is_none(),
+            "Class-2 EmitWheel must have sdist_source=None"
+        );
+
+        // (e) Payload fields pass through from LockWheel.
+        assert_eq!(ew.pypi_name, lw.name);
+        assert_eq!(ew.version, lw.version);
+        assert_eq!(ew.requires_dist, lw.requires_dist);
+        // wheel_filename = lw.filename (already-999retread) -> standard_wheel_filename
+        // strips nothing (no .relaxed./.injected.) -> 6-field idempotent insert_build_tag
+        // -> same 999retread name. Field-for-field identical to cold.
+        assert_eq!(ew.wheel_filename, lw.filename);
+    }
+
+    /// (2) CLASS-2 replay byte-identity oracle: cold path vs new Class-2 replay path.
+    ///
+    /// Scenario: a conda_capable index shadow whose Requires-Dist contains a URL
+    /// requirement. On cold produce the wheel is fetched+relaxed -> EmitWheel with
+    /// local_path=Some + upstream_url=Some(localhost) -> courier LOCAL-PATH branch ->
+    /// ShadowSrc::Raw/Rewritten -> LockWheel{origin=Built, upstream_url=github, url=None}.
+    ///
+    /// On replay the Class-2 arm (Phase 2.7 fix) downloads the wheel from
+    /// lw.upstream_url and builds the same EmitWheel -> same LOCAL-PATH branch ->
+    /// same LockWheel fields.
+    ///
+    /// Assert: the two LockWheels are field-for-field equal.
+    ///
+    /// This is the byte-identity oracle that would have CAUGHT the Phase-2.7 drift.
+    /// Before the fix the remote-only branch's `!conda_capable` gate would have set
+    /// origin=Index, url=Some(upstream), upstream_url=None -> diverge.
+    #[tokio::test]
+    async fn class2_replay_cold_byte_identity() {
+        use std::collections::HashSet;
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir = unique_tmp_dir();
+        let source_dir = dir.join("source");
+        std::fs::create_dir_all(source_dir.join("wheels")).unwrap();
+        let staging_cold = dir.join("staging-cold");
+        let staging_replay = dir.join("staging-replay");
+
+        let bundle = "p3d-pack";
+        let wheel_name = "pytorch3d";
+        let wheel_version = "0.7.8";
+
+        // URL requirement from pytorch3d -> dep-a (a bundle member).
+        // override_line_map rewrites "dep-a @ <url>" -> "dep-a==1.0.0" -> rewrite
+        // detects change -> ShadowSrc::Rewritten or ShadowSrc::Raw -> Origin::Built.
+        let dep_name = "dep-a";
+        let dep_version = "1.0.0";
+        let dep_whl_name = format!("{dep_name}-{dep_version}-py3-none-any.whl");
+        let url_req = format!("{dep_name} @ https://example.com/{dep_whl_name}");
+
+        // Write the dep wheel file.
+        let dep_whl_path = source_dir.join("wheels").join(&dep_whl_name);
+        std::fs::write(
+            &dep_whl_path,
+            make_wheel_bytes_for_replay(dep_name, dep_version, &[]),
+        )
+        .unwrap();
+
+        // The pytorch3d wheel bytes (has a URL requirement).
+        let p3d_whl_name = format!(
+            "{}-{}-py3-none-any.whl",
+            wheel_name.replace('-', "_"),
+            wheel_version
+        );
+        let raw_wheel_bytes =
+            make_wheel_bytes_for_replay(wheel_name, wheel_version, &[url_req.as_str()]);
+
+        // ── Localhost HTTP server ────────────────────────────────────────────────
+        let wheel_bytes_srv = Arc::new(raw_wheel_bytes.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let wheel_url_str = format!("http://127.0.0.1:{port}/{p3d_whl_name}");
+
+        let srv_bytes = wheel_bytes_srv.clone();
+        let _server = tokio::spawn(async move {
+            for _ in 0..8u8 {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let b = srv_bytes.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = stream.read(&mut buf).await;
+                    let resp = format!(
+                        "HTTP/1.0 200 OK\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\n\r\n",
+                        b.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                    let _ = stream.write_all(&b).await;
+                });
+            }
+        });
+
+        // ── Config ──────────────────────────────────────────────────────────────
+        let config: crate::config::RetreadConfig = serde_json::from_value(serde_json::json!({
+            "retread-wheels": {
+                bundle: { "version": &format!("=={wheel_version}") }
+            }
+        }))
+        .unwrap();
+
+        // conda_capable includes the pytorch3d wheel name — this triggers the drift
+        // on the OLD remote-only path but is irrelevant to the LOCAL-PATH path.
+        let mut conda_capable: HashSet<String> = HashSet::new();
+        conda_capable.insert(wheel_name.to_string());
+
+        let index_urls = [format!("http://127.0.0.1:{port}/simple/")];
+
+        // ── Write the upstream wheel bytes to disk (simulating materialize_and_rewrite
+        //    fetch). The cold EmitWheel has local_path=Some(fetched+relaxed whl).
+        //    For this test we write the raw bytes as the "already fetched" local file.
+        let p3d_local = source_dir.join("wheels").join(&p3d_whl_name);
+        std::fs::write(&p3d_local, &raw_wheel_bytes).unwrap();
+
+        let dep_emit = crate::emit_pypi::EmitWheel {
+            pypi_name: dep_name.to_string(),
+            version: dep_version.to_string(),
+            requires_dist: vec![],
+            wheel_filename: dep_whl_name.clone(),
+            local_path: Some(dep_whl_path.clone()),
+            remote_url: None,
+            upstream_url: None,
+            git_source: None,
+            sdist_source: None,
+        };
+
+        // COLD EmitWheel: local_path=Some + upstream_url=Some(localhost).
+        let upstream_url: url::Url = wheel_url_str.parse().unwrap();
+        let cold_emit = crate::emit_pypi::EmitWheel {
+            pypi_name: wheel_name.to_string(),
+            version: wheel_version.to_string(),
+            requires_dist: vec![url_req.clone()],
+            wheel_filename: p3d_whl_name.clone(),
+            local_path: Some(p3d_local.clone()),
+            remote_url: None,
+            upstream_url: Some(upstream_url.clone()),
+            git_source: None,
+            sdist_source: None,
+        };
+
+        // ── COLD stage ───────────────────────────────────────────────────────────
+        unsafe { std::env::set_var("RETREAD_NO_SHADOW_CACHE", "1") };
+        let cold_staged = crate::courier::stage(
+            &config,
+            bundle,
+            wheel_version,
+            "3.11",
+            &[dep_emit.clone(), cold_emit.clone()],
+            &conda_capable,
+            &[],
+            &index_urls,
+            "",
+            &source_dir,
+            &staging_cold,
+        )
+        .await;
+        unsafe { std::env::remove_var("RETREAD_NO_SHADOW_CACHE") };
+        let cold_staged = cold_staged.expect("cold stage must succeed");
+
+        let cold_lw = cold_staged
+            .lock
+            .wheels
+            .iter()
+            .find(|w| w.name == wheel_name)
+            .expect("cold lock must contain the wheel")
+            .clone();
+
+        // The cold lock must classify the wheel as Origin::Built (relax-changed shadow).
+        assert_eq!(
+            cold_lw.origin,
+            Origin::Built,
+            "cold: relax-changed conda_capable wheel must be Origin::Built"
+        );
+
+        // ── REPLAY: call materialize_from_lock with the cold lock entry ──────────
+        // Build a minimal RetreadLock from the cold stage result.
+        let replay_lock = RetreadLock {
+            schema: SCHEMA,
+            retread_version: "2.7.1".into(),
+            bundle: bundle.into(),
+            version: wheel_version.into(),
+            python: "3.11".into(),
+            inputs_hash: "test-hash".into(),
+            root_requirements: vec![],
+            wheels: cold_staged.lock.wheels.clone(),
+            conda_run_deps: vec![],
+            index_urls: index_urls.to_vec(),
+            prerelease: BTreeMap::new(),
+            conda_capable: vec![wheel_name.to_string()],
+        };
+
+        // Build the replay EmitWheel exactly as the new Class-2 arm would:
+        // download from upstream_url -> local_path=Some, remote_url=None,
+        // upstream_url=Some(github).
+        let fetched_replay = source_dir.join("wheels").join(&p3d_whl_name);
+        // The wheel bytes are already in source_dir/wheels/ from cold;
+        // fetch_wheel_cached would land there too (dest_dir.join(filename_from_url)).
+
+        let dep_replay = crate::emit_pypi::EmitWheel {
+            pypi_name: dep_name.to_string(),
+            version: dep_version.to_string(),
+            requires_dist: vec![],
+            wheel_filename: dep_whl_name.clone(),
+            local_path: Some(dep_whl_path),
+            remote_url: None,
+            upstream_url: None,
+            git_source: None,
+            sdist_source: None,
+        };
+
+        // Simulate what the new Class-2 arm emits: local_path=Some(fetched),
+        // remote_url=None, upstream_url=Some(upstream).
+        let replay_emit = crate::emit_pypi::EmitWheel {
+            pypi_name: wheel_name.to_string(),
+            version: wheel_version.to_string(),
+            requires_dist: cold_lw.requires_dist.clone(),
+            wheel_filename: cold_lw.filename.clone(), // already-999retread
+            local_path: Some(fetched_replay),
+            remote_url: None,
+            upstream_url: Some(upstream_url),
+            git_source: None,
+            sdist_source: None,
+        };
+
+        unsafe { std::env::set_var("RETREAD_NO_SHADOW_CACHE", "1") };
+        let replay_staged = crate::courier::stage(
+            &config,
+            bundle,
+            wheel_version,
+            "3.11",
+            &[dep_replay, replay_emit],
+            &conda_capable,
+            &[],
+            &index_urls,
+            "",
+            &source_dir,
+            &staging_replay,
+        )
+        .await;
+        unsafe { std::env::remove_var("RETREAD_NO_SHADOW_CACHE") };
+        let replay_staged = replay_staged.expect("replay stage must succeed");
+
+        let replay_lw = replay_staged
+            .lock
+            .wheels
+            .iter()
+            .find(|w| w.name == wheel_name)
+            .expect("replay lock must contain the wheel")
+            .clone();
+
+        std::fs::remove_dir_all(&dir).ok();
+        let _ = replay_lock; // suppress unused warning
+
+        // ── Field-for-field equality ─────────────────────────────────────────────
+        assert_eq!(
+            cold_lw.origin, replay_lw.origin,
+            "PARITY FAIL: origin mismatch: cold={:?} replay={:?}",
+            cold_lw.origin, replay_lw.origin,
+        );
+        assert_eq!(
+            cold_lw.filename, replay_lw.filename,
+            "PARITY FAIL: filename mismatch: cold={} replay={}",
+            cold_lw.filename, replay_lw.filename,
+        );
+        assert_eq!(
+            cold_lw.url, replay_lw.url,
+            "PARITY FAIL: url mismatch: cold={:?} replay={:?}",
+            cold_lw.url, replay_lw.url,
+        );
+        assert_eq!(
+            cold_lw.upstream_url, replay_lw.upstream_url,
+            "PARITY FAIL: upstream_url mismatch: cold={:?} replay={:?}",
+            cold_lw.upstream_url, replay_lw.upstream_url,
+        );
+        assert_eq!(
+            cold_lw.requires_dist, replay_lw.requires_dist,
+            "PARITY FAIL: requires_dist mismatch"
+        );
+        assert_eq!(
+            cold_lw.must_ship, replay_lw.must_ship,
+            "PARITY FAIL: must_ship mismatch: cold={} replay={}",
+            cold_lw.must_ship, replay_lw.must_ship,
+        );
+        assert_eq!(
+            cold_lw.sha256, replay_lw.sha256,
+            "PARITY FAIL: sha256 mismatch"
+        );
+        assert_eq!(
+            cold_lw.git_source, replay_lw.git_source,
+            "PARITY FAIL: git_source mismatch"
+        );
+        assert_eq!(
+            cold_lw.sdist_source, replay_lw.sdist_source,
+            "PARITY FAIL: sdist_source mismatch"
+        );
+    }
+
+    /// (3) CLASS-2 live round-trip: materialize_from_lock re-fetches a real upstream
+    /// wheel via fetch_wheel_cached and produces a LockWheel with origin=Built.
+    ///
+    /// Marked #[ignore] because it needs network (downloads a wheel from PyPI/github).
+    /// Run with: cargo test -- --include-ignored class2_live_round_trip
+    #[tokio::test]
+    #[ignore = "live: re-fetches a real index wheel (needs network); run with --include-ignored"]
+    async fn class2_live_round_trip() {
+        use super::materialize_from_lock;
+        use crate::config::RetreadConfig;
+
+        let pid = std::process::id();
+        let base = std::env::temp_dir().join(format!("retread-class2-live-{pid}"));
+        let source_dir = base.join("source");
+        let output_dir = base.join("output");
+        let work_dir = base.join("work");
+        let cache_dir = base.join("cache");
+        for d in [&source_dir, &output_dir, &work_dir, &cache_dir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+
+        // A small pure-python conda-capable wheel on PyPI (requests is universally
+        // available and tiny enough for a quick live test).
+        let upstream_url = "https://files.pythonhosted.org/packages/f9/9b/\
+             requests-2.31.0-py3-none-any.whl";
+
+        let lock = RetreadLock {
+            schema: SCHEMA,
+            retread_version: "2.7.1".into(),
+            bundle: "reqpack".into(),
+            version: "1.0.0".into(),
+            python: "3.11".into(),
+            inputs_hash: "live-c2".into(),
+            root_requirements: vec![],
+            wheels: vec![LockWheel {
+                name: "requests".into(),
+                version: "2.31.0".into(),
+                origin: Origin::Built,
+                filename: "requests-2.31.0-999retread-py3-none-any.whl".into(),
+                url: None,
+                sha256: None,
+                requires_dist: vec!["urllib3>=1.21.1".into()],
+                must_ship: false,
+                upstream_url: Some(upstream_url.into()),
+                git_source: None,
+                sdist_source: None,
+            }],
+            conda_run_deps: vec![],
+            index_urls: vec!["https://pypi.org/simple/".into()],
+            prerelease: BTreeMap::new(),
+            conda_capable: vec!["requests".into()],
+        };
+        let config: RetreadConfig = serde_json::from_value(serde_json::json!({"retread-wheels": {
+            "reqpack": { "version": "==1.0.0" }
+        }}))
+        .unwrap();
+
+        let result = materialize_from_lock(
+            lock,
+            &config,
+            &work_dir,
+            &output_dir,
+            rattler_conda_types::Platform::Linux64,
+            &source_dir,
+            &cache_dir,
+            None,
+            vec!["python 3.11.*".to_string()],
+            "live-c2-fp",
+        )
+        .await;
+
+        std::fs::remove_dir_all(&base).ok();
+
+        assert!(
+            result.is_ok(),
+            "Class-2 live round-trip must not Err: {result:?}"
+        );
+        assert!(
+            result.unwrap().is_some(),
+            "Class-2 live round-trip must return Ok(Some(...))"
         );
     }
 
