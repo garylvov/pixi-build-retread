@@ -2718,7 +2718,7 @@ environments:
       - conda: https://prefix.dev/conda-forge/noarch/wheel-0.47.0-pyhd8ed1ab_0.conda
       - conda: https://prefix.dev/conda-forge/noarch/widgetsnbextension-4.0.15-pyhd8ed1ab_0.conda
       - conda: https://prefix.dev/conda-forge/noarch/zipp-4.1.0-pyhcf101f3_0.conda
-      - conda_source: isaac-pack[d7fe9adc] @ ./isaac-pack
+      - conda_source: isaac-pack[769e3b1c] @ ./isaac-pack
       - pypi: git+https://github.com/facebookresearch/vggt#a288dd0f14786c93483e45524328726ab7b1b4ce
       - pypi: git+https://github.com/nil0x9/flash-muon?rev=80ac87f#80ac87fb49afc792b84eccb393d051b1ed8eee32
       - pypi: https://files.pythonhosted.org/packages/01/c9/bd04a1f5773dfe97993b4148cf48b5e61032cd3fa33f38a783ca15a3979e/cmeel_boost-1.83.0-0-cp311-cp311-manylinux_2_28_x86_64.whl
@@ -3861,7 +3861,7 @@ environments:
       - conda: https://prefix.dev/robostack-humble/linux-64/ros-humble-yaml-cpp-vendor-8.0.2-np126py311hbc2a38a_13.conda
       - conda: https://prefix.dev/robostack-humble/linux-64/ros-humble-zstd-vendor-0.15.14-np126py311hbc2a38a_13.conda
       - conda: https://prefix.dev/robostack-humble/linux-64/ros2-distro-mutex-0.7.0-humble_13.conda
-      - conda_source: isaac-pack[d7fe9adc] @ ./isaac-pack
+      - conda_source: isaac-pack[769e3b1c] @ ./isaac-pack
       - pypi: git+https://github.com/facebookresearch/vggt#a288dd0f14786c93483e45524328726ab7b1b4ce
       - pypi: git+https://github.com/nil0x9/flash-muon?rev=80ac87f#80ac87fb49afc792b84eccb393d051b1ed8eee32
       - pypi: https://files.pythonhosted.org/packages/01/c9/bd04a1f5773dfe97993b4148cf48b5e61032cd3fa33f38a783ca15a3979e/cmeel_boost-1.83.0-0-cp311-cp311-manylinux_2_28_x86_64.whl
@@ -4714,7 +4714,7 @@ environments:
       - conda: https://prefix.dev/conda-forge/noarch/wheel-0.47.0-pyhd8ed1ab_0.conda
       - conda: https://prefix.dev/conda-forge/noarch/widgetsnbextension-4.0.15-pyhd8ed1ab_0.conda
       - conda: https://prefix.dev/conda-forge/noarch/zipp-4.1.0-pyhcf101f3_0.conda
-      - conda_source: isaac-pack[d7fe9adc] @ ./isaac-pack
+      - conda_source: isaac-pack[769e3b1c] @ ./isaac-pack
       - pypi: git+https://github.com/facebookresearch/vggt#a288dd0f14786c93483e45524328726ab7b1b4ce
       - pypi: git+https://github.com/nil0x9/flash-muon?rev=80ac87f#80ac87fb49afc792b84eccb393d051b1ed8eee32
       - pypi: https://files.pythonhosted.org/packages/01/c9/bd04a1f5773dfe97993b4148cf48b5e61032cd3fa33f38a783ca15a3979e/cmeel_boost-1.83.0-0-cp311-cp311-manylinux_2_28_x86_64.whl
@@ -5805,7 +5805,7 @@ environments:
       - conda: https://prefix.dev/conda-forge/noarch/wheel-0.47.0-pyhd8ed1ab_0.conda
       - conda: https://prefix.dev/conda-forge/noarch/widgetsnbextension-4.0.15-pyhd8ed1ab_0.conda
       - conda: https://prefix.dev/conda-forge/noarch/zipp-4.1.0-pyhcf101f3_0.conda
-      - conda_source: isaac-pack[d7fe9adc] @ ./isaac-pack
+      - conda_source: isaac-pack[769e3b1c] @ ./isaac-pack
       - pypi: git+https://github.com/facebookresearch/vggt#a288dd0f14786c93483e45524328726ab7b1b4ce
       - pypi: git+https://github.com/nil0x9/flash-muon?rev=80ac87f#80ac87fb49afc792b84eccb393d051b1ed8eee32
       - pypi: https://files.pythonhosted.org/packages/04/96/92447566d16df59b2a776c0fb82dbc4d9e07cd95062562af01e408583fc4/itsdangerous-2.2.0-py3-none-any.whl
@@ -29949,7 +29949,7 @@ packages:
     - ros2-distro-mutex >=0.7.0,<0.8.0a0
   size: 2318
   timestamp: 1753307768030
-- conda_source: isaac-pack[d7fe9adc] @ ./isaac-pack
+- conda_source: isaac-pack[769e3b1c] @ ./isaac-pack
   variants:
     python: '3.11'
   depends:
@@ -29985,15 +29985,15 @@ packages:
   - h5py >=3.13.0,<4
   - tensorboard >=2.20.0,<3
   - moviepy
-  - tqdm
+  - cloudpickle >=1.2.0
+  - gym-notices >=0.0.4
   - pyyaml >=6.0,<7.0
   - psutil >=5.9.0,<6.0.0
   - ray-core >=2.45.0,<3.0.0
   - setproctitle >=1.2.2,<2.0.0
   - tensorboardx >=2.5,<3.0
   - wandb >=0.13.11
-  - cloudpickle >=1.2.0
-  - gym-notices >=0.0.4
+  - tqdm
   - numba
   - pycares >=4.8.0,<4.9
   - websockets >=12.0.0,<12.1
