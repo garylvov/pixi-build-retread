@@ -126,7 +126,13 @@ pub struct RetreadLock {
     pub conda_capable: Vec<String>,
 }
 
-pub const SCHEMA: u32 = 6;
+/// Schema 7: upstream_url field added to LockWheel (required for Class-2
+/// relax-changed shadow replay); requires_dist now populated for all wheels
+/// including unchanged Origin::Index (required for #4 plan() parity). Old
+/// schema-6 locks are rejected by the != gate and fall through to full resolve
+/// (safe: they replay as schema-4 did). SCHEMA is NOT an epoch bump (the lock
+/// FORMAT changed, not the emitted-output SEMANTICS for identical inputs).
+pub const SCHEMA: u32 = 7;
 
 /// Bump EMIT_EPOCH in the SAME commit as ANY change that can alter the bytes
 /// retread emits for identical manifest inputs (relax/version-selection
@@ -310,8 +316,8 @@ mod tests {
         let back: RetreadLock = serde_json::from_str(&json).unwrap();
         assert_eq!(back.bundle, "isaac-pack");
         assert_eq!(
-            back.schema, 6,
-            "SCHEMA must be 6 after upstream_url addition"
+            back.schema, 7,
+            "SCHEMA must be 7 after requires_dist/upstream_url fields added for all wheel classes"
         );
         assert_eq!(back.wheels.len(), 3);
         // Wheel 0: must_ship source-built, no upstream_url.
