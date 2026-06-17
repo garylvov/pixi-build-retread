@@ -257,7 +257,14 @@ pub const SCHEMA: u32 = 9;
 /// starts_with(staging_dir) heuristic bug fix). Any pack with a remote-only
 /// auto-bundled dep whose Requires-Dist the relax policy changes will emit
 /// different (correctly relaxed) shadow bytes.
-pub const EMIT_EPOCH: u32 = 4;
+///
+/// Epoch 5: orphan direct-URL Requires-Dist lines (target absent from the
+/// resolved bundle closure) are now STRIPPED from emitted wheel METADATA.
+/// Fixes uv aborting on bundles that include a wheel with an unconditional
+/// git-URL dep not in the bundle (e.g. isaaclab_mimic 1.3.2 robomimic line).
+/// Any pack whose wheels carry such orphan URL lines (both isaac-pack and
+/// isaac-pack-latest) will emit different (correctly stripped) wheel bytes.
+pub const EMIT_EPOCH: u32 = 5;
 
 impl RetreadLock {
     /// File name for a bundle's lock next to the pack manifest.
