@@ -1834,21 +1834,38 @@ impl Handler {
                                     .to_string(),
                             )
                         })?;
-                    return materialize_from_lock(
+                    match materialize_from_lock(
                         lock,
                         &config,
                         &params.work_directory,
                         &output_dir,
                         params.output.subdir,
                         &source_dir,
+                        &cache_dir,
                         params.output.build.as_deref(),
                         run_deps,
                         &config_fp,
                     )
                     .await
-                    .map_err(|e| {
-                        RpcError::internal(format!("build_v1 replay {bundle_name_for_hash}: {e:#}"))
-                    });
+                    {
+                        Ok(Some(result)) => {
+                            return Ok(result);
+                        }
+                        Ok(None) => {
+                            // Provenance gap (class 3 / schema-5 class 2):
+                            // fall through to full resolve_all.
+                            tracing::debug!(
+                                bundle = %bundle_name_for_hash,
+                                "WS-B build_v1 replay: provenance gap -- \
+                                 falling through to full resolve",
+                            );
+                        }
+                        Err(e) => {
+                            return Err(RpcError::internal(format!(
+                                "build_v1 replay {bundle_name_for_hash}: {e:#}"
+                            )));
+                        }
+                    }
                 }
                 Ok(None) => {
                     tracing::debug!(
@@ -3889,56 +3906,42 @@ fn localize_wheel_source(url: &url::Url, wheels_root: &Path) -> url::Url {
     url.clone()
 }
 
-/// Reconstruct [`crate::emit_pypi::EmitWheel`] entries from a lock's wheel
-/// list for the `build_v1` replay path.
-///
-/// Mapping rules:
-/// - `Origin::Index` wheels with an `https://` URL → `remote_url` set, `local_path` = None.
-/// - `Origin::Index` wheels with a `file://` URL → `local_path` set (on-disk cache hit).
-/// - `Origin::Built` wheels (no `url`) → both None; `courier::stage` finds them
-///   in the `wheels/` directory left by the original cold build.
-fn lock_wheels_to_emit_wheels(
-    lock_wheels: &[crate::lock::LockWheel],
-) -> Vec<crate::emit_pypi::EmitWheel> {
-    lock_wheels
-        .iter()
-        .map(|lw| {
-            let remote_url = lw
-                .url
-                .as_deref()
-                .and_then(|u| url::Url::parse(u).ok())
-                .filter(|u| u.scheme() != "file");
-            let local_path = lw.url.as_deref().and_then(|u| {
-                url::Url::parse(u)
-                    .ok()
-                    .filter(|u| u.scheme() == "file")
-                    .and_then(|u| u.to_file_path().ok())
-            });
-            crate::emit_pypi::EmitWheel {
-                pypi_name: lw.name.clone(),
-                version: lw.version.clone(),
-                requires_dist: lw.requires_dist.clone(),
-                local_path,
-                wheel_filename: lw.filename.clone(),
-                remote_url,
-            }
-        })
-        .collect()
-}
-
 /// Re-materialize wheel bytes from the committed lock and run the shared
 /// courier pack tail, skipping derivation (BFS / auto_bundle / solve).
 ///
-/// The replay path for `conda_build_v1` calls this when:
-/// - `config.courier` is true, AND
-/// - `load_replayable_lock` confirms schema + inputs_hash match, AND
-/// - `RETREAD_NO_REPLAY` is unset.
+/// The replay path for `conda_build_v1` calls this when `config.courier` is
+/// true and `load_replayable_lock` confirms the lock is valid (schema +
+/// inputs_hash match, no poisoning). Skips DERIVATION only — the full
+/// materialization pipeline (download / source-build / inject / relax-rewrite)
+/// is re-run per wheel class:
 ///
-/// Wheel bytes are re-staged via `courier::stage` (which reads from disk if
-/// already present, or re-downloads as needed). The lock is re-written post-
-/// build (B-2) to refresh its mtime and verify content. `Origin::Built` wheels
-/// with `url: None` are handled by the source-build + inject + relax pipeline
-/// embedded in `courier::stage`; their bytes are already on disk in `wheels/`.
+/// **Class 1 — `must_ship=true`, name in `config.retread_wheels`**: the wheel
+/// was built from a git / path / url / named-git source. Re-run
+/// `materialize_and_rewrite` on the config entry to repopulate `wheels/<name>/`
+/// on disk, then pass the resulting `local_path` to `courier::stage`.
+///
+/// **Class 2 — `must_ship=false`, `origin=Built` (relax-changed shadow)**: the
+/// wheel was an index wheel whose Requires-Dist was rewritten by the relax
+/// pipeline. The original URL is recorded in `lock.upstream_url` (schema 6+).
+/// Pass `remote_url=upstream_url` to `courier::stage`; it will download the
+/// original from the index and re-apply the relax rewrite.  For schema-5 locks
+/// where `upstream_url` is absent, fall through to full re-resolve.
+///
+/// **Class 3 — `must_ship=true`, name NOT in `config.retread_wheels`**: the
+/// wheel was a BFS transitive built from a `pkg @ git+<url>@<rev>` line in a
+/// Requires-Dist. The lock carries insufficient provenance (no git url+rev) to
+/// re-build it. Returns `Ok(None)` so the caller falls through to full
+/// `resolve_all`.
+///
+/// **Class 4 — `origin=Index`**: unchanged index wheel. Pass `remote_url` from
+/// `lw.url`. `courier::stage` will record it as `Origin::Index` unchanged.
+///
+/// # Returns
+/// - `Ok(Some(result))` — all wheels re-materialized; pack completed.
+/// - `Ok(None)` — lock provenance insufficient for replay (class 3 / schema-5
+///   class-2 gap); caller should fall through to full `resolve_all`.
+/// - `Err(...)` — replay was attempted but failed (download error,
+///   rattler-build failure, etc.). Caller should propagate as a hard error.
 ///
 /// # Correctness
 /// `run_deps` MUST come from `params.run_dependencies` (the live pixi-forwarded
@@ -3952,16 +3955,154 @@ async fn materialize_from_lock(
     output_dir: &Path,
     target_subdir: Platform,
     source_dir: &Path,
+    cache_dir: &Path,
     expected_build: Option<&str>,
     run_deps: Vec<String>,
     config_fp: &str,
-) -> Result<CondaBuildV1Result> {
+) -> Result<Option<CondaBuildV1Result>> {
+    use crate::lock::Origin;
+
     let bundle_name = lock.bundle.clone();
     let version = lock.version.clone();
     let python_version = crate::relax::emit_python_version("", &lock.python);
+    let download_dir = source_dir.join("wheels");
+    let target = wheel_target_for(target_subdir, &python_version);
 
-    // Reconstruct EmitWheel entries from the lock.
-    let emit_wheels = lock_wheels_to_emit_wheels(&lock.wheels);
+    // Per-wheel re-materialization: classify each LockWheel and build the
+    // EmitWheel with correct local_path / remote_url for courier::stage.
+    let mut emit_wheels: Vec<crate::emit_pypi::EmitWheel> = Vec::with_capacity(lock.wheels.len());
+
+    for lw in &lock.wheels {
+        let emit = match lw.origin {
+            Origin::Index => {
+                // Class 4: unchanged index wheel — courier::stage will verify
+                // it is still unmodified and record Origin::Index.
+                let remote_url = lw
+                    .url
+                    .as_deref()
+                    .and_then(|u| url::Url::parse(u).ok())
+                    .filter(|u| u.scheme() != "file");
+                let local_path = lw.url.as_deref().and_then(|u| {
+                    url::Url::parse(u)
+                        .ok()
+                        .filter(|u| u.scheme() == "file")
+                        .and_then(|u| u.to_file_path().ok())
+                });
+                crate::emit_pypi::EmitWheel {
+                    pypi_name: lw.name.clone(),
+                    version: lw.version.clone(),
+                    requires_dist: lw.requires_dist.clone(),
+                    local_path,
+                    wheel_filename: lw.filename.clone(),
+                    remote_url,
+                }
+            }
+            Origin::Built if lw.must_ship => {
+                // Class 1 or Class 3: `.injected` source-built wheel.
+                if let Some(entry) = config.retread_wheels.get(&lw.name) {
+                    // Class 1: top-level [retread-wheels] entry — re-run the
+                    // full materialize_and_rewrite pipeline (Phase 1 download/
+                    // source-build + Phase 1.5 inject + Phase 1.6 auto-data +
+                    // Phase 2 relax-rewrite). This repopulates wheels/<name>/
+                    // on disk even if the directory is empty (lukewarm box).
+                    tracing::info!(
+                        wheel = %lw.name,
+                        "courier replay: re-materializing source-built wheel (class 1)"
+                    );
+                    // Reconstruct auto_data from the entry's git checkout root
+                    // (same logic as resolve_bundle's auto_data_per_entry). For
+                    // multi-entry packs, skip_subdirs is not available without
+                    // the full group; pass empty (acceptable for replay).
+                    let auto_data =
+                        checkout_root_for_entry(entry, &config.git_sources, source_dir, cache_dir)
+                            .map(|checkout_root| AutoDataConfig {
+                                checkout_root,
+                                skip_subdirs: vec![],
+                            });
+                    let (resolved, _rd) = materialize_and_rewrite(
+                        entry,
+                        &lw.name,
+                        &target,
+                        &download_dir,
+                        source_dir,
+                        cache_dir,
+                        config.relax,
+                        &config.git_sources,
+                        auto_data,
+                        EntryAuditInfo::default(),
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "courier replay: re-materializing source-built wheel `{}`",
+                            lw.name
+                        )
+                    })?;
+                    let local_path = (resolved.url.scheme() == "file")
+                        .then(|| resolved.url.to_file_path().ok())
+                        .flatten();
+                    crate::emit_pypi::EmitWheel {
+                        pypi_name: lw.name.clone(),
+                        version: lw.version.clone(),
+                        requires_dist: lw.requires_dist.clone(),
+                        local_path,
+                        wheel_filename: lw.filename.clone(),
+                        remote_url: None,
+                    }
+                } else {
+                    // Class 3: BFS transitive built from a `pkg @ git+<url>`
+                    // Requires-Dist line. The lock carries no git url+rev
+                    // (schema gap); cannot re-materialize without re-running
+                    // the full BFS. Return Ok(None) so the caller falls through
+                    // to full resolve_all.
+                    tracing::warn!(
+                        wheel = %lw.name,
+                        "courier replay: wheel has no [retread-wheels] entry (class 3 / \
+                         BFS git transitive — schema gap); falling through to full resolve",
+                    );
+                    return Ok(None);
+                }
+            }
+            Origin::Built => {
+                // Class 2: relax-changed shadow (must_ship=false). The
+                // original upstream URL is in lw.upstream_url (schema 6+).
+                // If absent (schema-5 lock), fail so caller falls through
+                // to full resolve.
+                let remote_url_opt = lw
+                    .upstream_url
+                    .as_deref()
+                    .and_then(|u| url::Url::parse(u).ok());
+                let remote_url = match remote_url_opt {
+                    Some(u) => u,
+                    None => {
+                        // Schema-5 lock: upstream_url absent for relax-changed
+                        // Built wheels. Cannot re-download without the URL.
+                        // Return Ok(None) to fall through to full resolve_all.
+                        tracing::warn!(
+                            wheel = %lw.name,
+                            "courier replay: relax-changed Built wheel has no upstream_url \
+                             (schema-5 lock); falling through to full resolve",
+                        );
+                        return Ok(None);
+                    }
+                };
+                tracing::info!(
+                    wheel = %lw.name,
+                    url = %remote_url,
+                    "courier replay: re-fetching relax-changed shadow from upstream (class 2)"
+                );
+                crate::emit_pypi::EmitWheel {
+                    pypi_name: lw.name.clone(),
+                    version: lw.version.clone(),
+                    requires_dist: lw.requires_dist.clone(),
+                    local_path: None,
+                    wheel_filename: lw.filename.clone(),
+                    remote_url: Some(remote_url),
+                }
+            }
+        };
+        emit_wheels.push(emit);
+    }
 
     // Reconstruct conda_capable from the lock (recorded by the producer).
     let conda_capable: std::collections::HashSet<String> =
@@ -3975,7 +4116,7 @@ async fn materialize_from_lock(
         "courier build_v1 replay: re-materializing from lock (derivation skipped)",
     );
 
-    materialize_and_pack(
+    let result = materialize_and_pack(
         None, // bundle=None: replay path, audit skipped
         config,
         &bundle_name,
@@ -3992,7 +4133,8 @@ async fn materialize_from_lock(
         source_dir,
         expected_build,
     )
-    .await
+    .await?;
+    Ok(Some(result))
 }
 
 /// Shared courier pack tail: stage wheels, build the courier recipe, run
@@ -4628,6 +4770,7 @@ mod replay_tests {
     use rattler_conda_types::Platform;
 
     use super::{load_replayable_lock, replay_from_lock};
+    use crate::config::RetreadConfig;
     use crate::lock::{CondaDep, LockWheel, Origin, RetreadLock, SCHEMA};
 
     fn unique_tmp_dir() -> std::path::PathBuf {
@@ -4675,6 +4818,7 @@ mod replay_tests {
                 sha256: None,
                 requires_dist: vec![],
                 must_ship: false,
+                upstream_url: None,
             }],
             conda_run_deps: vec![CondaDep {
                 name: "numpy".into(),
@@ -4888,98 +5032,137 @@ mod replay_tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
-    // ---- lock_wheels_to_emit_wheels tests ----
+    // ---- materialize_from_lock provenance classification tests ----
+    // These tests verify the wheel-class routing logic in materialize_from_lock
+    // by checking that Origin::Built wheels with upstream_url=None (class 3 /
+    // schema-5 class 2) return Ok(None) so the caller falls through to full
+    // resolve, while genuinely re-materializable wheels proceed.
 
-    #[test]
-    fn index_wheel_with_https_url_becomes_remote_url() {
-        use super::lock_wheels_to_emit_wheels;
-        let lw = LockWheel {
-            name: "torch".into(),
-            version: "2.3.0".into(),
-            origin: Origin::Index,
-            filename: "torch-2.3.0-cp311-cp311-linux_x86_64.whl".into(),
-            url: Some("https://files.pythonhosted.org/torch-2.3.0.whl".into()),
-            sha256: None,
-            requires_dist: vec![],
-            must_ship: false,
-        };
-        let wheels = lock_wheels_to_emit_wheels(&[lw]);
-        assert_eq!(wheels.len(), 1);
-        let w = &wheels[0];
-        assert!(w.remote_url.is_some(), "https URL must map to remote_url");
-        assert!(
-            w.local_path.is_none(),
-            "https URL must NOT map to local_path"
-        );
-        assert_eq!(w.pypi_name, "torch");
-        assert_eq!(w.version, "2.3.0");
-    }
+    /// A class-3 wheel (must_ship=true, name NOT in config.retread_wheels)
+    /// must cause materialize_from_lock to return Ok(None) — provenance gap.
+    #[tokio::test]
+    async fn materialize_from_lock_class3_returns_none() {
+        use super::materialize_from_lock;
+        use crate::config::RetreadConfig;
+        let dir = unique_tmp_dir();
+        let source_dir = dir.join("source");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let output_dir = dir.join("output");
+        let work_dir = dir.join("work");
+        let cache_dir = dir.join("cache");
 
-    #[test]
-    fn built_wheel_with_no_url_produces_no_remote_or_local() {
-        use super::lock_wheels_to_emit_wheels;
-        let lw = LockWheel {
-            name: "mylib".into(),
+        // Lock has a must_ship=true Built wheel whose name is NOT in
+        // config.retread_wheels -> class 3 schema gap.
+        let lock = RetreadLock {
+            schema: crate::lock::SCHEMA,
+            retread_version: "2.4.0".into(),
+            bundle: "mypack".into(),
             version: "1.0.0".into(),
-            origin: Origin::Built,
-            filename: "mylib-1.0.0-cp311-cp311-linux_x86_64.injected.whl".into(),
-            url: None,
-            sha256: None,
-            requires_dist: vec!["numpy>=1.21".into()],
-            must_ship: true,
-        };
-        let wheels = lock_wheels_to_emit_wheels(&[lw]);
-        assert_eq!(wheels.len(), 1);
-        let w = &wheels[0];
-        assert!(
-            w.remote_url.is_none(),
-            "Built wheel with no url must have remote_url=None"
-        );
-        assert!(
-            w.local_path.is_none(),
-            "Built wheel with no url must have local_path=None"
-        );
-        assert_eq!(w.requires_dist, vec!["numpy>=1.21".to_string()]);
-        assert_eq!(
-            w.wheel_filename,
-            "mylib-1.0.0-cp311-cp311-linux_x86_64.injected.whl"
-        );
-    }
-
-    #[test]
-    fn mixed_wheel_list_reconstructs_correctly() {
-        use super::lock_wheels_to_emit_wheels;
-        let wheels_in = vec![
-            LockWheel {
-                name: "pkga".into(),
+            python: "3.11".into(),
+            inputs_hash: "hash123".into(),
+            root_requirements: vec![],
+            wheels: vec![LockWheel {
+                name: "orphan-git-wheel".into(),
                 version: "1.0.0".into(),
-                origin: Origin::Index,
-                filename: "pkga-1.0.0-py3-none-any.whl".into(),
-                url: Some("https://pypi.org/simple/pkga-1.0.0.whl".into()),
-                sha256: None,
-                requires_dist: vec![],
-                must_ship: false,
-            },
-            LockWheel {
-                name: "pkgb".into(),
-                version: "2.0.0".into(),
                 origin: Origin::Built,
-                filename: "pkgb-2.0.0-cp311-cp311-linux.injected.whl".into(),
+                filename: "orphan_git_wheel-1.0.0-py3-none-any.injected.whl".into(),
                 url: None,
                 sha256: None,
-                requires_dist: vec!["requests>=2".into()],
+                requires_dist: vec![],
                 must_ship: true,
-            },
-        ];
-        let emit = lock_wheels_to_emit_wheels(&wheels_in);
-        assert_eq!(emit.len(), 2);
-        // pkga: remote_url set
-        assert!(emit[0].remote_url.is_some());
-        assert!(emit[0].local_path.is_none());
-        // pkgb: both None
-        assert!(emit[1].remote_url.is_none());
-        assert!(emit[1].local_path.is_none());
-        assert_eq!(emit[1].requires_dist, vec!["requests>=2".to_string()]);
+                upstream_url: None, // class 3: no upstream, not in config
+            }],
+            conda_run_deps: vec![],
+            index_urls: vec!["https://pypi.org/simple/".into()],
+            prerelease: BTreeMap::new(),
+            conda_capable: vec![],
+        };
+        // Config has no retread_wheels entries — wheel is a class-3 orphan.
+        // Use serde_json to construct a minimal config (RetreadConfig has no
+        // Default impl; a zero-entry [retread-wheels] table is valid).
+        let config: RetreadConfig =
+            serde_json::from_value(serde_json::json!({"retread-wheels": {}})).unwrap();
+        let result = materialize_from_lock(
+            lock,
+            &config,
+            &work_dir,
+            &output_dir,
+            rattler_conda_types::Platform::Linux64,
+            &source_dir,
+            &cache_dir,
+            None,
+            vec!["python 3.11.*".to_string()],
+            "fp",
+        )
+        .await;
+        assert!(result.is_ok(), "class-3 gap must not Err: {result:?}");
+        assert!(
+            result.unwrap().is_none(),
+            "class-3 gap (no config entry) must return Ok(None) so caller falls \
+             through to full resolve"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// A class-2 wheel (must_ship=false, origin=Built) with NO upstream_url
+    /// (schema-5 lock) must cause materialize_from_lock to return Ok(None).
+    #[tokio::test]
+    async fn materialize_from_lock_class2_schema5_returns_none() {
+        use super::materialize_from_lock;
+        let dir = unique_tmp_dir();
+        let source_dir = dir.join("source");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let output_dir = dir.join("output");
+        let work_dir = dir.join("work");
+        let cache_dir = dir.join("cache");
+
+        // Schema-5 style: relax-changed Built wheel, upstream_url=None.
+        let lock = RetreadLock {
+            schema: crate::lock::SCHEMA,
+            retread_version: "2.3.1".into(),
+            bundle: "mypack".into(),
+            version: "1.0.0".into(),
+            python: "3.11".into(),
+            inputs_hash: "hash456".into(),
+            root_requirements: vec![],
+            wheels: vec![LockWheel {
+                name: "skrl".into(),
+                version: "2.1.0".into(),
+                origin: Origin::Built,
+                filename: "skrl-2.1.0-999retread-py3-none-any.whl".into(),
+                url: None,
+                sha256: None,
+                requires_dist: vec!["torch>=2.0,<3".into()],
+                must_ship: false,
+                upstream_url: None, // schema-5 style: no upstream_url
+            }],
+            conda_run_deps: vec![],
+            index_urls: vec!["https://pypi.org/simple/".into()],
+            prerelease: BTreeMap::new(),
+            conda_capable: vec![],
+        };
+        let config: RetreadConfig =
+            serde_json::from_value(serde_json::json!({"retread-wheels": {}})).unwrap();
+        let result = materialize_from_lock(
+            lock,
+            &config,
+            &work_dir,
+            &output_dir,
+            rattler_conda_types::Platform::Linux64,
+            &source_dir,
+            &cache_dir,
+            None,
+            vec!["python 3.11.*".to_string()],
+            "fp",
+        )
+        .await;
+        assert!(result.is_ok(), "schema-5 class-2 must not Err: {result:?}");
+        assert!(
+            result.unwrap().is_none(),
+            "schema-5 relax-changed Built wheel (no upstream_url) must return \
+             Ok(None) — caller falls through to full resolve"
+        );
+        std::fs::remove_dir_all(dir).ok();
     }
 
     // ---- RETREAD_NO_REPLAY env knob tests ----
@@ -5081,6 +5264,7 @@ mod replay_tests {
             sha256: None,
             requires_dist: vec![], // EMPTY — poison scenario
             must_ship: false,      // relax-changed index wheel
+            upstream_url: None,
         });
         let path = dir.join(RetreadLock::file_name("pack"));
         std::fs::write(&path, lock.to_pretty_json().unwrap()).unwrap();
@@ -5124,6 +5308,7 @@ mod replay_tests {
             sha256: None,
             requires_dist: vec!["torch>=2.0,<3".into()],
             must_ship: false,
+            upstream_url: Some("https://files.pythonhosted.org/torchvision-0.18.0.whl".into()),
         });
         let path = dir.join(RetreadLock::file_name("pack"));
         std::fs::write(&path, lock.to_pretty_json().unwrap()).unwrap();

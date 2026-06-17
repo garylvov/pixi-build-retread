@@ -532,6 +532,10 @@ pub async fn stage(
                 sha256: None,
                 requires_dist: w.requires_dist.clone(),
                 must_ship: w.must_ship(),
+                // Source-built (.injected) wheels exist on no index; there is
+                // no upstream URL to record. Re-materialization uses the
+                // [retread-wheels] config entry (git/path/url source).
+                upstream_url: None,
             });
         } else {
             // Index wheel. Decide whether to ship a relax-rewritten shadow
@@ -674,6 +678,14 @@ pub async fn stage(
                 }
 
                 source_urls.push(file_url(&dst)?);
+                // Record the original index URL so the build_v1 replay path
+                // can re-fetch + re-relax this shadow without a full BFS/solve.
+                // For remote-only wheels (no local_path), w.remote_url carries
+                // the URL that was just downloaded; for locally-cached wheels
+                // (local_path set) the original upstream URL is not carried by
+                // EmitWheel, so upstream_url is None and the replay path will
+                // fall through to full re-resolve for this class.
+                let upstream_url = w.remote_url.as_ref().map(|u| u.to_string());
                 lock_wheels.push(LockWheel {
                     name: w.pypi_name.clone(),
                     version: w.version.clone(),
@@ -683,21 +695,23 @@ pub async fn stage(
                     sha256: None,
                     requires_dist: w.requires_dist.clone(),
                     must_ship: w.must_ship(),
+                    upstream_url,
                 });
             } else {
                 // Unchanged index wheel: record with upstream url.
                 // sha256 is not carried by EmitWheel; the installer verifies
                 // at fetch time from the index's sidecar hash.
-                let upstream_url = w.remote_url.as_ref().map(|u| u.to_string());
+                let index_url = w.remote_url.as_ref().map(|u| u.to_string());
                 lock_wheels.push(LockWheel {
                     name: w.pypi_name.clone(),
                     version: w.version.clone(),
                     origin: Origin::Index,
                     filename: std_name,
-                    url: upstream_url,
+                    url: index_url,
                     sha256: None,
                     requires_dist: vec![],
                     must_ship: false,
+                    upstream_url: None, // n/a for Index wheels; use `url` instead
                 });
             }
         }

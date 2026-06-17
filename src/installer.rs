@@ -351,6 +351,7 @@ mod tests {
                 sha256: None,
                 requires_dist: vec![],
                 must_ship: true,
+                upstream_url: None,
             }],
             conda_run_deps,
             index_urls,

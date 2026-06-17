@@ -41,7 +41,8 @@ pub struct LockWheel {
     pub origin: Origin,
     /// Standardized wheel filename (the basename installed/shipped).
     pub filename: String,
-    /// Upstream URL for `Origin::Index` wheels; `None` for `Built`.
+    /// Fetch URL for `Origin::Index` wheels; `None` for `Origin::Built`.
+    /// (Index wheels fetch this at install time; Built wheels ship in-package.)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
     /// sha256 of the wheel file (index-wheel verification; reproducibility).
@@ -57,6 +58,19 @@ pub struct LockWheel {
     /// without re-running the full must_ship() filename heuristic.
     #[serde(default)]
     pub must_ship: bool,
+    /// Original upstream PyPI URL for `Origin::Built` relax-changed shadow
+    /// wheels (schema 6+). These are index wheels whose METADATA was rewritten
+    /// by the relax pipeline; they have no `.injected` infix and `must_ship`
+    /// is false, but their bytes are NOT available on the original index
+    /// (the rewritten shadow is shipped). On replay, `materialize_from_lock`
+    /// uses this URL to re-fetch the original bytes and re-apply the relax
+    /// rewrite, recreating the shadow without re-running the full BFS/solve.
+    ///
+    /// `None` for `Origin::Index` wheels (use `url`) and for `Origin::Built`
+    /// wheels with `must_ship=true` (source-built; re-materialized from
+    /// `[retread-wheels]` config entry, no upstream URL).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_url: Option<String>,
 }
 
 /// A conda run-dep retread routed to the conda side (a shared transitive
@@ -112,7 +126,7 @@ pub struct RetreadLock {
     pub conda_capable: Vec<String>,
 }
 
-pub const SCHEMA: u32 = 5;
+pub const SCHEMA: u32 = 6;
 
 /// Bump EMIT_EPOCH in the SAME commit as ANY change that can alter the bytes
 /// retread emits for identical manifest inputs (relax/version-selection
@@ -239,14 +253,29 @@ mod tests {
             root_requirements: vec!["isaac-pack-pypi==5.1.0".into()],
             wheels: vec![
                 LockWheel {
+                    // must_ship=true: source-built, no upstream URL.
                     name: "isaaclab".into(),
                     version: "0.51.1".into(),
                     origin: Origin::Built,
-                    filename: "isaaclab-0.51.1-py3-none-any.whl".into(),
+                    filename: "isaaclab-0.51.1-py3-none-any.injected.whl".into(),
                     url: None,
                     sha256: None,
                     requires_dist: vec!["numpy>=1.21".into(), "torch>=2.0".into()],
                     must_ship: true,
+                    upstream_url: None,
+                },
+                LockWheel {
+                    // relax-changed shadow: upstream_url records where to
+                    // re-fetch the original for replay re-materialization.
+                    name: "skrl".into(),
+                    version: "2.1.0".into(),
+                    origin: Origin::Built,
+                    filename: "skrl-2.1.0-999retread-py3-none-any.whl".into(),
+                    url: None,
+                    sha256: None,
+                    requires_dist: vec!["torch>=2.0,<3".into()],
+                    must_ship: false,
+                    upstream_url: Some("https://files.pythonhosted.org/skrl-2.1.0.whl".into()),
                 },
                 LockWheel {
                     name: "isaacsim-core".into(),
@@ -257,6 +286,7 @@ mod tests {
                     sha256: Some("abc123".into()),
                     requires_dist: vec![],
                     must_ship: false,
+                    upstream_url: None,
                 },
             ],
             conda_run_deps: vec![CondaDep {
@@ -273,17 +303,31 @@ mod tests {
         let json = lock.to_pretty_json().unwrap();
         let back: RetreadLock = serde_json::from_str(&json).unwrap();
         assert_eq!(back.bundle, "isaac-pack");
-        assert_eq!(back.schema, 5);
-        assert_eq!(back.wheels.len(), 2);
+        assert_eq!(
+            back.schema, 6,
+            "SCHEMA must be 6 after upstream_url addition"
+        );
+        assert_eq!(back.wheels.len(), 3);
+        // Wheel 0: must_ship source-built, no upstream_url.
         assert_eq!(back.wheels[0].origin, Origin::Built);
         assert!(back.wheels[0].must_ship);
+        assert!(back.wheels[0].upstream_url.is_none());
         assert_eq!(
             back.wheels[0].requires_dist,
             vec!["numpy>=1.21", "torch>=2.0"]
         );
-        assert_eq!(back.wheels[1].origin, Origin::Index);
+        // Wheel 1: relax-changed shadow, upstream_url recorded.
+        assert_eq!(back.wheels[1].origin, Origin::Built);
         assert!(!back.wheels[1].must_ship);
-        assert!(back.wheels[1].requires_dist.is_empty());
+        assert_eq!(
+            back.wheels[1].upstream_url.as_deref(),
+            Some("https://files.pythonhosted.org/skrl-2.1.0.whl")
+        );
+        // Wheel 2: index wheel, no upstream_url.
+        assert_eq!(back.wheels[2].origin, Origin::Index);
+        assert!(!back.wheels[2].must_ship);
+        assert!(back.wheels[2].upstream_url.is_none());
+        assert!(back.wheels[2].requires_dist.is_empty());
         assert_eq!(
             back.prerelease.get("gmpy2").map(String::as_str),
             Some("==2.1.0a4")
@@ -293,12 +337,12 @@ mod tests {
             "retread-isaac-pack.lock.json"
         );
         assert_eq!(back.inputs_hash, "deadbeef");
-        assert_eq!(back.wheels[1].sha256.as_deref(), Some("abc123"));
+        assert_eq!(back.wheels[2].sha256.as_deref(), Some("abc123"));
         assert_eq!(back.conda_capable, vec!["numpy", "torch"]);
     }
 
-    /// Schema-4 JSON (no requires_dist / must_ship / conda_capable) must
-    /// still deserialize cleanly via serde defaults (backward-compat).
+    /// Schema-4 JSON (no requires_dist / must_ship / conda_capable /
+    /// upstream_url) must still deserialize cleanly via serde defaults.
     #[test]
     fn schema4_lock_still_deserializes() {
         let schema4_json = r#"{
@@ -326,7 +370,42 @@ mod tests {
         // New fields default gracefully.
         assert!(lock.wheels[0].requires_dist.is_empty());
         assert!(!lock.wheels[0].must_ship);
+        assert!(lock.wheels[0].upstream_url.is_none());
         assert!(lock.conda_capable.is_empty());
+    }
+
+    /// Schema-5 JSON (has requires_dist / must_ship / conda_capable but NOT
+    /// upstream_url) must deserialize cleanly — upstream_url defaults to None.
+    #[test]
+    fn schema5_lock_still_deserializes() {
+        let schema5_json = r#"{
+            "schema": 5,
+            "retread_version": "2.4.0",
+            "bundle": "pack",
+            "version": "1.0.0",
+            "python": "3.11",
+            "inputs_hash": "hash5",
+            "wheels": [
+                {
+                    "name": "skrl",
+                    "version": "2.1.0",
+                    "origin": "built",
+                    "filename": "skrl-2.1.0-999retread-py3-none-any.whl",
+                    "requires_dist": ["torch>=2.0"],
+                    "must_ship": false
+                }
+            ],
+            "conda_run_deps": [],
+            "index_urls": ["https://pypi.org/simple/"],
+            "conda_capable": ["torch"]
+        }"#;
+        let lock: RetreadLock = serde_json::from_str(schema5_json).unwrap();
+        assert_eq!(lock.schema, 5);
+        assert_eq!(lock.bundle, "pack");
+        // upstream_url added in schema 6 — defaults to None for schema-5 locks.
+        assert!(lock.wheels[0].upstream_url.is_none());
+        assert!(!lock.wheels[0].must_ship);
+        assert_eq!(lock.wheels[0].requires_dist, vec!["torch>=2.0"]);
     }
 
     #[test]
