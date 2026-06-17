@@ -1933,4 +1933,226 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
+
+    /// Step-5 parity test: byte-identical shadow + lock on empty-wheels replay.
+    ///
+    /// Uses a localhost one-shot HTTP server (reqwest::get rejects file://).
+    ///
+    /// Scenario: an index wheel with a URL Requires-Dist pointing to a bundle
+    /// member -> relax policy WILL change the line (URL -> exact pin) -> the
+    /// wheel becomes a Class-2 relax-changed shadow (Origin::Built, must_ship=false).
+    ///
+    /// Cold run: EmitWheel.local_path = Some(wheel_file), upstream_url = Some(url).
+    /// Replay run (empty wheels/): EmitWheel.local_path = None, remote_url = Some(url).
+    /// Both runs must produce byte-identical shadow files and lock JSON.
+    ///
+    /// RED before Steps 0+2+3: force-download path renamed raw bytes (Step 0 bug),
+    /// upstream_url was None for local-path shadows (Step 2 bug), requires_dist was
+    /// vec![] for index wheels (Step 2+3 bug). ALL THREE required for GREEN.
+    #[tokio::test]
+    async fn empty_wheels_byte_identical_parity() {
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let tmp = make_test_dir("parity");
+        let staging_cold = tmp.join("staging-cold");
+        let staging_replay = tmp.join("staging-replay");
+
+        // ── Fixture ──────────────────────────────────────────────────────────
+        let bundle = "paritytest";
+        let target_name = "dep-target";
+        let target_version = "1.0.0";
+
+        // dep-target: a bundle member that is a URL-requirement target.
+        let dep_target_whl_name = format!("{target_name}-{target_version}-py3-none-any.whl");
+        let dep_target_whl = tmp.join(&dep_target_whl_name);
+        std::fs::write(
+            &dep_target_whl,
+            make_wheel_bytes(target_name, target_version, &[]),
+        )
+        .unwrap();
+
+        // shadow-source wheel: has a URL requirement on dep-target.
+        // plan() will produce an exact override "dep-target==1.0.0" for this
+        // URL requirement, and override_line_map will rewrite the line ->
+        // the wheel becomes a Class-2 relax-changed shadow.
+        let url_req = format!("{target_name} @ https://example.com/{dep_target_whl_name}");
+        let shadow_src_name = format!("{bundle}-2.0.0-py3-none-any.whl");
+        let shadow_src_whl = tmp.join(&shadow_src_name);
+        let raw_wheel_bytes = make_wheel_bytes(bundle, "2.0.0", &[url_req.as_str()]);
+        std::fs::write(&shadow_src_whl, &raw_wheel_bytes).unwrap();
+
+        // ── Localhost one-shot HTTP server ────────────────────────────────────
+        // reqwest::get does not support file:// URLs; serve the wheel bytes
+        // via a minimal HTTP/1.0 server on a random port.
+        let wheel_bytes_shared = Arc::new(raw_wheel_bytes.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let wheel_url = format!("http://127.0.0.1:{port}/{shadow_src_name}");
+
+        // Spawn a task that accepts connections and serves the wheel bytes
+        // as HTTP/1.0 200 OK responses until explicitly stopped.
+        let wheel_bytes_srv = wheel_bytes_shared.clone();
+        let _server = tokio::spawn(async move {
+            // Serve multiple requests (cold + replay may each request once).
+            for _ in 0..4u8 {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let bytes = wheel_bytes_srv.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = stream.read(&mut buf).await;
+                    let resp = format!(
+                        "HTTP/1.0 200 OK\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\n\r\n",
+                        bytes.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                    let _ = stream.write_all(&bytes).await;
+                });
+            }
+        });
+
+        // ── Config ───────────────────────────────────────────────────────────
+        let config = minimal_config(bundle);
+        let conda_capable: HashSet<String> = HashSet::new();
+        let index_urls = ["https://pypi.org/simple/".to_string()];
+
+        // ── Cold produce ─────────────────────────────────────────────────────
+        // EmitWheel has local_path=Some (wheel is on disk) + upstream_url=Some
+        // (the pristine pre-localization URL). This is what build_one sets.
+        let dep_wheel = make_emit_wheel(
+            target_name,
+            target_version,
+            &[],
+            Some(&dep_target_whl),
+            None,
+        );
+        let mut shadow_wheel = make_emit_wheel(
+            bundle,
+            "2.0.0",
+            &[url_req.as_str()],
+            Some(&shadow_src_whl),
+            None,
+        );
+        shadow_wheel.upstream_url = wheel_url.parse().ok();
+
+        // Run cold produce with shadow cache disabled to use the Raw path
+        // (ensures the cold run exercises the same code path as replay).
+        unsafe { std::env::set_var("RETREAD_NO_SHADOW_CACHE", "1") };
+        let cold_result = stage(
+            &config,
+            bundle,
+            "2.0.0",
+            "3.11",
+            &[dep_wheel.clone(), shadow_wheel.clone()],
+            &conda_capable,
+            &[],
+            &index_urls,
+            "",
+            &tmp,
+            &staging_cold,
+        )
+        .await;
+        unsafe { std::env::remove_var("RETREAD_NO_SHADOW_CACHE") };
+        let cold_result = cold_result.unwrap();
+
+        // Find the shadow wheel (Origin::Built for the bundle wheel).
+        let cold_built: Vec<&LockWheel> = cold_result
+            .lock
+            .wheels
+            .iter()
+            .filter(|w| w.name == bundle)
+            .collect();
+        assert_eq!(
+            cold_built.len(),
+            1,
+            "cold: exactly one wheel for the bundle"
+        );
+        assert_eq!(
+            cold_built[0].origin,
+            Origin::Built,
+            "cold: relax-changed wheel must be Origin::Built"
+        );
+        let cold_shadow_filename = &cold_built[0].filename;
+        let cold_shadow_path = staging_cold.join(cold_shadow_filename);
+        let cold_shadow_bytes = std::fs::read(&cold_shadow_path).unwrap();
+        let cold_lock_json = cold_result.lock.to_pretty_json().unwrap();
+
+        // ── Replay (empty wheels) ─────────────────────────────────────────────
+        // Simulate materialize_from_lock's Class-2 reconstruction:
+        // local_path=None, remote_url=Some(upstream_url). This triggers the
+        // force-download path in stage().
+        let dep_wheel_replay = make_emit_wheel(
+            target_name,
+            target_version,
+            &[],
+            Some(&dep_target_whl),
+            None,
+        );
+        let shadow_wheel_replay = make_emit_wheel(
+            bundle,
+            "2.0.0",
+            &[url_req.as_str()],
+            None,             // no local path (wheels/ is empty)
+            Some(&wheel_url), // remote_url = upstream URL
+        );
+
+        unsafe { std::env::set_var("RETREAD_NO_SHADOW_CACHE", "1") };
+        let replay_result = stage(
+            &config,
+            bundle,
+            "2.0.0",
+            "3.11",
+            &[dep_wheel_replay, shadow_wheel_replay],
+            &conda_capable,
+            &[],
+            &index_urls,
+            "",
+            &tmp,
+            &staging_replay,
+        )
+        .await;
+        unsafe { std::env::remove_var("RETREAD_NO_SHADOW_CACHE") };
+        let replay_result = replay_result.unwrap();
+
+        // ── Assertions ────────────────────────────────────────────────────────
+        let replay_built: Vec<&LockWheel> = replay_result
+            .lock
+            .wheels
+            .iter()
+            .filter(|w| w.name == bundle)
+            .collect();
+        assert_eq!(
+            replay_built.len(),
+            1,
+            "replay: exactly one wheel for the bundle"
+        );
+        assert_eq!(
+            replay_built[0].origin,
+            Origin::Built,
+            "replay: relax-changed wheel must be Origin::Built"
+        );
+
+        let replay_shadow_filename = &replay_built[0].filename;
+        let replay_shadow_path = staging_replay.join(replay_shadow_filename);
+        let replay_shadow_bytes = std::fs::read(&replay_shadow_path).unwrap();
+        let replay_lock_json = replay_result.lock.to_pretty_json().unwrap();
+
+        // (a) Shadow bytes byte-identical (Step 0 makes this true: Raw path
+        // calls rewrite_wheel_with on identical raw bytes -> identical output).
+        assert_eq!(
+            cold_shadow_bytes, replay_shadow_bytes,
+            "PARITY FAIL: shadow bytes must be byte-identical on cold vs replay"
+        );
+
+        // (b) Lock JSON byte-identical (requires_dist + upstream_url populated
+        // by Steps 1-3; plan() produces identical overrides on both paths).
+        assert_eq!(
+            cold_lock_json, replay_lock_json,
+            "PARITY FAIL: lock JSON must be byte-identical on cold vs replay"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }
