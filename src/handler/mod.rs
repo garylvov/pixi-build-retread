@@ -5748,6 +5748,7 @@ mod replay_tests {
     // .data/data/lib/ tree, making it larger and byte-distinct from produce.
     // -----------------------------------------------------------------------
     #[tokio::test]
+    #[ignore = "live: builds a git wheel via uv (needs uv + git on PATH); run with --include-ignored"]
     async fn nested_subdir_git_produce_replay_skip_subdirs_parity() {
         use super::{AutoDataConfig, EntryAuditInfo, materialize_and_rewrite, wheel_target_for};
         use crate::config::RelaxPolicy;
