@@ -672,6 +672,11 @@ pub async fn stage(
                     // Unchanged index wheel: record with upstream url.
                     // sha256 is not carried by EmitWheel; the installer verifies
                     // at fetch time from the index's sidecar hash.
+                    // requires_dist is recorded in full (not vec![]) so plan()
+                    // on replay builds the same override table as cold-produce
+                    // (#4 parity fix: empty requires_dist causes plan() to miss
+                    // overrides for index wheels, potentially flipping a relax-
+                    // shadow to Index and poisoning the lock on replay).
                     let index_url = w.remote_url.as_ref().map(|u| u.to_string());
                     lock_wheels.push(LockWheel {
                         name: w.pypi_name.clone(),
@@ -680,7 +685,7 @@ pub async fn stage(
                         filename: std_name,
                         url: index_url,
                         sha256: None,
-                        requires_dist: vec![],
+                        requires_dist: w.requires_dist.clone(),
                         must_ship: false,
                         upstream_url: None, // n/a for Index wheels; use `url` instead
                     });
@@ -700,7 +705,17 @@ pub async fn stage(
                         )
                     })?;
                     source_urls.push(file_url(&dst)?);
-                    let upstream_url = w.remote_url.as_ref().map(|u| u.to_string());
+                    // Prefer upstream_url (pristine pre-localization index URL,
+                    // set for local-path shadows when EmitWheel was built from
+                    // the cold produce path) over remote_url (set only for
+                    // remote-only wheels that were never localized). This ensures
+                    // the replay path can re-fetch the wheel even when it was
+                    // originally local (downloaded to wheels/ on cold produce).
+                    let upstream_url = w
+                        .upstream_url
+                        .as_ref()
+                        .or(w.remote_url.as_ref())
+                        .map(|u| u.to_string());
                     lock_wheels.push(LockWheel {
                         name: w.pypi_name.clone(),
                         version: w.version.clone(),
@@ -732,7 +747,13 @@ pub async fn stage(
                         format!("spawn_blocking shadow-rewrite of {}", w.pypi_name)
                     })??;
                     source_urls.push(file_url(&dst)?);
-                    let upstream_url = w.remote_url.as_ref().map(|u| u.to_string());
+                    // Prefer upstream_url over remote_url (same rationale as
+                    // the Rewritten arm above).
+                    let upstream_url = w
+                        .upstream_url
+                        .as_ref()
+                        .or(w.remote_url.as_ref())
+                        .map(|u| u.to_string());
                     lock_wheels.push(LockWheel {
                         name: w.pypi_name.clone(),
                         version: w.version.clone(),
