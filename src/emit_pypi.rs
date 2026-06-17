@@ -78,6 +78,17 @@ pub struct EmitWheel {
     /// (PEP 658 sidecar metadata). Blueprint mode fetches these on
     /// demand when their Requires-Dist needs rewriting.
     pub remote_url: Option<url::Url>,
+    /// Pristine pre-localization index URL for this wheel, populated at
+    /// cold-produce time from the unlocalized `w.url` (before
+    /// `localize_wheel_source` collapses it to `file://`). Used by the
+    /// courier's Class-2 shadow path to record the upstream URL in the
+    /// lock so the replay path can re-fetch and re-relax the shadow
+    /// without running the full BFS/solve.
+    ///
+    /// `None` for source-built `.injected` wheels (no upstream index URL)
+    /// and for wheels that were only ever seen as remote (those use
+    /// `remote_url` directly).
+    pub upstream_url: Option<url::Url>,
 }
 
 impl EmitWheel {
@@ -506,6 +517,7 @@ mod tests {
                 .unwrap_or_else(|| format!("{name}-{version}-py3-none-any.whl")),
             local_path: local.map(PathBuf::from),
             remote_url: None,
+            upstream_url: None,
         }
     }
 

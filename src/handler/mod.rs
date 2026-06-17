@@ -3995,6 +3995,7 @@ async fn materialize_from_lock(
                     local_path,
                     wheel_filename: lw.filename.clone(),
                     remote_url,
+                    upstream_url: None,
                 }
             }
             Origin::Built if lw.must_ship => {
@@ -4048,6 +4049,7 @@ async fn materialize_from_lock(
                         local_path,
                         wheel_filename: lw.filename.clone(),
                         remote_url: None,
+                        upstream_url: None,
                     }
                 } else {
                     // Class 3: BFS transitive built from a `pkg @ git+<url>`
@@ -4098,6 +4100,7 @@ async fn materialize_from_lock(
                     local_path: None,
                     wheel_filename: lw.filename.clone(),
                     remote_url: Some(remote_url),
+                    upstream_url: None,
                 }
             }
         };
@@ -4370,6 +4373,7 @@ async fn build_one(
                     .unwrap_or_default()
                     .to_string(),
                 remote_url: (url.scheme() != "file").then(|| (*url).clone()),
+                upstream_url: None,
             })
             .collect();
         let mut conda_capable: std::collections::HashSet<String> = bundle

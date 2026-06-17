@@ -145,7 +145,13 @@ pub const SCHEMA: u32 = 6;
 /// envs that reference the source pack (via discover_outputs_for_source) rather
 /// than all envs in the workspace, eliminating false cache misses when unrelated
 /// envs change.
-pub const EMIT_EPOCH: u32 = 3;
+///
+/// Epoch 4: force-downloaded remote-only relax-changed wheels now go through
+/// rewrite_wheel_with (relaxed bytes) instead of being renamed raw (the
+/// starts_with(staging_dir) heuristic bug fix). Any pack with a remote-only
+/// auto-bundled dep whose Requires-Dist the relax policy changes will emit
+/// different (correctly relaxed) shadow bytes.
+pub const EMIT_EPOCH: u32 = 4;
 
 impl RetreadLock {
     /// File name for a bundle's lock next to the pack manifest.

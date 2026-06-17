@@ -379,6 +379,25 @@ fn shadow_cache_stage(
 
 // ── Stage ────────────────────────────────────────────────────────────────────
 
+/// Explicit provenance for the staged wheel bytes, distinguishing
+/// already-rewritten wheels (probe_dst from shadow_cache_stage) from raw
+/// un-relaxed bytes (no-cache src clone or force-downloaded .dl file).
+///
+/// Using an explicit enum eliminates the `src.starts_with(staging_dir)`
+/// heuristic that wrongly classified force-downloaded `.dl-courier-*` files
+/// as already-rewritten (they share the staging_dir prefix but carry RAW
+/// bytes that must still go through rewrite_wheel_with).
+enum ShadowSrc {
+    /// Wheel bytes were already rewritten by shadow_cache_stage into this
+    /// path. Only needs a rename to the final shadow filename.
+    Rewritten(std::path::PathBuf),
+    /// Wheel bytes are raw (un-relaxed). Must go through rewrite_wheel_with
+    /// before being written to the final shadow filename.
+    Raw(std::path::PathBuf),
+    /// Relax did not change this wheel; no shadow needed.
+    None,
+}
+
 /// Stage the courier artifacts. Built wheels (`must_ship()`) AND index
 /// wheels whose metadata relax CHANGED are written to `staging_dir` (they
 /// ship in the conda package as `Origin::Built`); unchanged index wheels are
@@ -541,9 +560,7 @@ pub async fn stage(
             // Index wheel. Decide whether to ship a relax-rewritten shadow
             // (AUDIT B2: relax-changed index wheels must ship as shadows, not
             // stay remote, or strict pins re-emerge at install time).
-            let (changed, shadow_src): (bool, Option<std::path::PathBuf>) = if let Some(src) =
-                w.local_path.as_ref()
-            {
+            let shadow_src: ShadowSrc = if let Some(src) = w.local_path.as_ref() {
                 if use_shadow_cache {
                     // Single-pass through cache: rewrite_wheel_with returns
                     // (sha, did_change). No probe-then-rewrite double pass.
@@ -572,11 +589,12 @@ pub async fn stage(
                         format!("spawn_blocking shadow-cache (index) {}", w.pypi_name)
                     })??;
                     if did_change {
-                        (true, Some(probe_dst))
+                        // probe_dst contains already-rewritten bytes: rename only.
+                        ShadowSrc::Rewritten(probe_dst)
                     } else {
                         // Unchanged: remove the probe staging file.
                         let _ = tokio::fs::remove_file(&probe_dst).await;
-                        (false, None)
+                        ShadowSrc::None
                     }
                 } else {
                     // No-cache path: probe-then-rewrite (old behavior).
@@ -597,7 +615,12 @@ pub async fn stage(
                         format!("spawn_blocking rewrite-check of {}", w.pypi_name)
                     })??;
                     let _ = tokio::fs::remove_file(&tmp).await;
-                    (did_change, did_change.then(|| src.clone()))
+                    // src contains raw (un-relaxed) bytes: rewrite_wheel_with needed.
+                    if did_change {
+                        ShadowSrc::Raw(src.clone())
+                    } else {
+                        ShadowSrc::None
+                    }
                 }
             } else {
                 // Remote-only wheel (sidecar metadata, bytes never
@@ -637,32 +660,65 @@ pub async fn stage(
                         "courier: force-downloaded remote-only relax-changed wheel to ship \
                          a rewritten shadow (B-5)",
                     );
-                    (true, Some(dl))
+                    // dl contains raw (un-relaxed) bytes: rewrite_wheel_with needed.
+                    ShadowSrc::Raw(dl)
                 } else {
-                    (false, None)
+                    ShadowSrc::None
                 }
             };
 
-            if changed {
-                // Relax changed this index wheel's METADATA: ship it as a
-                // build-tagged shadow wheel so uv's find-links prefers it over
-                // the registry original (AUDIT B2 fix).
-                let shadow_name = insert_build_tag(&std_name, "999retread")?;
-                let dst = staging_dir.join(&shadow_name);
-
-                let src = shadow_src.expect("changed=true implies shadow_src is Some");
-                if src.starts_with(staging_dir) {
-                    // Already staged by the cache path (probe_dst): rename
-                    // into the real shadow filename.
-                    tokio::fs::rename(&src, &dst).await.with_context(|| {
+            match shadow_src {
+                ShadowSrc::None => {
+                    // Unchanged index wheel: record with upstream url.
+                    // sha256 is not carried by EmitWheel; the installer verifies
+                    // at fetch time from the index's sidecar hash.
+                    let index_url = w.remote_url.as_ref().map(|u| u.to_string());
+                    lock_wheels.push(LockWheel {
+                        name: w.pypi_name.clone(),
+                        version: w.version.clone(),
+                        origin: Origin::Index,
+                        filename: std_name,
+                        url: index_url,
+                        sha256: None,
+                        requires_dist: vec![],
+                        must_ship: false,
+                        upstream_url: None, // n/a for Index wheels; use `url` instead
+                    });
+                }
+                ShadowSrc::Rewritten(probe_dst) => {
+                    // Relax changed this index wheel's METADATA (already rewritten
+                    // by shadow_cache_stage): ship it as a build-tagged shadow wheel
+                    // so uv's find-links prefers it over the registry original
+                    // (AUDIT B2 fix). Only a rename needed — bytes are already correct.
+                    let shadow_name = insert_build_tag(&std_name, "999retread")?;
+                    let dst = staging_dir.join(&shadow_name);
+                    tokio::fs::rename(&probe_dst, &dst).await.with_context(|| {
                         format!(
                             "renaming probe {} -> shadow {}",
-                            src.display(),
+                            probe_dst.display(),
                             dst.display()
                         )
                     })?;
-                } else {
-                    // No-cache path or force-downloaded dl file: rewrite fresh.
+                    source_urls.push(file_url(&dst)?);
+                    let upstream_url = w.remote_url.as_ref().map(|u| u.to_string());
+                    lock_wheels.push(LockWheel {
+                        name: w.pypi_name.clone(),
+                        version: w.version.clone(),
+                        origin: Origin::Built,
+                        filename: shadow_name,
+                        url: None,
+                        sha256: None,
+                        requires_dist: w.requires_dist.clone(),
+                        must_ship: w.must_ship(),
+                        upstream_url,
+                    });
+                }
+                ShadowSrc::Raw(src) => {
+                    // Relax changed this index wheel's METADATA (raw bytes, not yet
+                    // rewritten): ship it as a build-tagged shadow wheel, running
+                    // rewrite_wheel_with on the raw bytes first.
+                    let shadow_name = insert_build_tag(&std_name, "999retread")?;
+                    let dst = staging_dir.join(&shadow_name);
                     let dst_blocking = dst.clone();
                     let src_blocking = src.clone();
                     let overrides_c2 = overrides_owned.clone();
@@ -675,44 +731,20 @@ pub async fn stage(
                     .with_context(|| {
                         format!("spawn_blocking shadow-rewrite of {}", w.pypi_name)
                     })??;
+                    source_urls.push(file_url(&dst)?);
+                    let upstream_url = w.remote_url.as_ref().map(|u| u.to_string());
+                    lock_wheels.push(LockWheel {
+                        name: w.pypi_name.clone(),
+                        version: w.version.clone(),
+                        origin: Origin::Built,
+                        filename: shadow_name,
+                        url: None,
+                        sha256: None,
+                        requires_dist: w.requires_dist.clone(),
+                        must_ship: w.must_ship(),
+                        upstream_url,
+                    });
                 }
-
-                source_urls.push(file_url(&dst)?);
-                // Record the original index URL so the build_v1 replay path
-                // can re-fetch + re-relax this shadow without a full BFS/solve.
-                // For remote-only wheels (no local_path), w.remote_url carries
-                // the URL that was just downloaded; for locally-cached wheels
-                // (local_path set) the original upstream URL is not carried by
-                // EmitWheel, so upstream_url is None and the replay path will
-                // fall through to full re-resolve for this class.
-                let upstream_url = w.remote_url.as_ref().map(|u| u.to_string());
-                lock_wheels.push(LockWheel {
-                    name: w.pypi_name.clone(),
-                    version: w.version.clone(),
-                    origin: Origin::Built,
-                    filename: shadow_name,
-                    url: None,
-                    sha256: None,
-                    requires_dist: w.requires_dist.clone(),
-                    must_ship: w.must_ship(),
-                    upstream_url,
-                });
-            } else {
-                // Unchanged index wheel: record with upstream url.
-                // sha256 is not carried by EmitWheel; the installer verifies
-                // at fetch time from the index's sidecar hash.
-                let index_url = w.remote_url.as_ref().map(|u| u.to_string());
-                lock_wheels.push(LockWheel {
-                    name: w.pypi_name.clone(),
-                    version: w.version.clone(),
-                    origin: Origin::Index,
-                    filename: std_name,
-                    url: index_url,
-                    sha256: None,
-                    requires_dist: vec![],
-                    must_ship: false,
-                    upstream_url: None, // n/a for Index wheels; use `url` instead
-                });
             }
         }
     }
@@ -976,6 +1008,7 @@ mod tests {
             wheel_filename,
             local_path: local_path.map(|p| p.to_path_buf()),
             remote_url: remote_url.and_then(|u| u.parse().ok()),
+            upstream_url: None,
         }
     }
 
@@ -1775,5 +1808,108 @@ mod tests {
             use_cache_when_absent,
             "when RETREAD_NO_SHADOW_CACHE is absent, use_shadow_cache must be true"
         );
+    }
+
+    /// Step-0 regression guard: ShadowSrc::Raw (no-cache path and force-download
+    /// path) must go through rewrite_wheel_with, producing RELAXED bytes that
+    /// differ from the raw input.
+    ///
+    /// Previously the `starts_with(staging_dir)` heuristic wrongly classified
+    /// force-downloaded `.dl-courier-*` files as already-rewritten (they share
+    /// the staging_dir prefix) and renamed the raw bytes as-is, shipping
+    /// un-relaxed wheel bytes under the shadow name.
+    ///
+    /// This test drives the no-cache path (RETREAD_NO_SHADOW_CACHE env is not
+    /// touched; we just verify that when a local wheel is the source and the
+    /// rewrite changes it, the staged shadow bytes differ from the raw input).
+    #[tokio::test]
+    async fn raw_shadow_src_goes_through_rewrite() {
+        let tmp = make_test_dir("step0-raw");
+        let staging = tmp.join("staging");
+
+        let bundle = "rawpkg";
+        // A wheel with a Requires-Dist that the relax policy WILL change.
+        // dep-target is a bundle member -> plan() will produce an exact pin
+        // override "dep-target==1.0.0" -> override_line_map rewrites the
+        // URL requirement -> rewrite_wheel_with changes bytes.
+        let dep_target_name = "dep-target";
+        let dep_target_version = "1.0.0";
+
+        let dep_target_whl_name =
+            format!("{dep_target_name}-{dep_target_version}-py3-none-any.whl");
+        let dep_target_whl = tmp.join(&dep_target_whl_name);
+        std::fs::write(
+            &dep_target_whl,
+            make_wheel_bytes(dep_target_name, dep_target_version, &[]),
+        )
+        .unwrap();
+
+        // rawpkg has a URL requirement on dep-target that plan() will rewrite.
+        let url_req = format!("{dep_target_name} @ https://example.com/{dep_target_whl_name}");
+        let raw_whl_name = format!("{bundle}-2.0.0-py3-none-any.whl");
+        let raw_whl = tmp.join(&raw_whl_name);
+        let raw_bytes = make_wheel_bytes(bundle, "2.0.0", &[url_req.as_str()]);
+        std::fs::write(&raw_whl, &raw_bytes).unwrap();
+
+        let dep_wheel = make_emit_wheel(
+            dep_target_name,
+            dep_target_version,
+            &[],
+            Some(&dep_target_whl),
+            None,
+        );
+        let raw_wheel = make_emit_wheel(bundle, "2.0.0", &[url_req.as_str()], Some(&raw_whl), None);
+
+        let emit_wheels = vec![dep_wheel, raw_wheel];
+        let conda_capable: HashSet<String> = HashSet::new();
+        let config = minimal_config(bundle);
+
+        // Run with shadow cache disabled so we exercise the Raw(src) path.
+        // SAFETY: single-threaded test (tokio test runtime does not spawn
+        // threads for this unit test), no concurrent env access.
+        unsafe { std::env::set_var("RETREAD_NO_SHADOW_CACHE", "1") };
+        let result = stage(
+            &config,
+            bundle,
+            "2.0.0",
+            "3.11",
+            &emit_wheels,
+            &conda_capable,
+            &[],
+            &["https://pypi.org/simple/".to_string()],
+            "",
+            &tmp,
+            &staging,
+        )
+        .await;
+        unsafe { std::env::remove_var("RETREAD_NO_SHADOW_CACHE") };
+        let result = result.unwrap();
+
+        // The relax-changed wheel must be classified Origin::Built.
+        let built: Vec<&LockWheel> = result
+            .lock
+            .wheels
+            .iter()
+            .filter(|w| w.name == bundle)
+            .collect();
+        assert_eq!(built.len(), 1, "exactly one wheel for rawpkg");
+        assert_eq!(
+            built[0].origin,
+            Origin::Built,
+            "relax-changed wheel must be Origin::Built"
+        );
+
+        // The staged shadow bytes must DIFFER from the raw input (proving
+        // rewrite_wheel_with ran, not a raw rename).
+        let shadow_filename = &built[0].filename;
+        let shadow_path = staging.join(shadow_filename);
+        assert!(shadow_path.exists(), "shadow file must exist in staging");
+        let shadow_bytes = std::fs::read(&shadow_path).unwrap();
+        assert_ne!(
+            shadow_bytes, raw_bytes,
+            "shadow bytes must differ from raw input (rewrite_wheel_with must have run)"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
