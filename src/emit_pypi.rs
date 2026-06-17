@@ -201,6 +201,23 @@ pub struct EmitPlan {
     /// wheels plus local targets of direct-URL requirements.
     pub ship: std::collections::HashSet<String>,
     pub overrides: BTreeMap<String, String>,
+    /// PEP 503 names of DEAD/ORPHAN direct-URL Requires-Dist targets:
+    /// direct-URL (git/url) requirements whose target name is ABSENT from
+    /// the resolved bundle closure (`bundle_versions`). retread did not
+    /// follow them into the bundle — whether because the gating extra was
+    /// inactive (e.g. isaaclab_mimic 1.2.x marked form) OR because they are
+    /// unconditional deps retread chose not to bundle (e.g. isaaclab_mimic
+    /// 1.3.2, which carries NO `; extra==` marker and NO `Provides-Extra`).
+    /// The decision is MARKER-INDEPENDENT: bundle-membership is the sole
+    /// predicate. Their Requires-Dist lines are STRIPPED from emitted wheel
+    /// METADATA so uv does not see an orphan URL dependency and abort.
+    ///
+    /// This is bundle-MEMBERSHIP-based and does NOT consult `config.drop_deps`
+    /// (which feeds the auto_bundle_transitives skip set + emit conda-run-dep
+    /// filter, NOT the extras BFS `seen` set). A drop_deps name that is also
+    /// an active-extra URL target stays in the bundle and is pinned via the
+    /// Some-arm, not stripped (pre-existing behavior, out of scope). Phase 2.8.
+    pub drop_url: std::collections::HashSet<String>,
 }
 
 /// `conda_capable`: PyPI names (PEP 503) for which the cascade's probe
@@ -222,6 +239,7 @@ pub fn plan(wheels: &[EmitWheel], conda_capable: &std::collections::HashSet<Stri
         .map(|w| w.pypi_name.clone())
         .collect();
     let mut exact: BTreeMap<String, String> = BTreeMap::new();
+    let mut drop_url: std::collections::HashSet<String> = std::collections::HashSet::new();
     for w in wheels {
         for line in &w.requires_dist {
             let req: uv_pep508::Requirement = match uv_pep508::Requirement::from_str(line) {
@@ -264,14 +282,17 @@ pub fn plan(wheels: &[EmitWheel], conda_capable: &std::collections::HashSet<Stri
                     }
                 }
                 None => {
-                    tracing::warn!(
+                    // Orphan direct-URL dep: target absent from bundle closure.
+                    // Strip its Requires-Dist line so uv does not see an
+                    // unresolvable URL edge. Decision is MARKER-INDEPENDENT
+                    // (bundle-membership only; see EmitPlan.drop_url doc).
+                    tracing::info!(
                         requirer = %w.pypi_name,
                         requirement = %line,
-                        "emit-pypi: direct-URL requirement was not followed into the \
-                         bundle (extras-gated); uv rejects these transitively -- if a \
-                         requested extra pulls it, add it as a top-level \
-                         pypi-dependency by hand",
+                        "emit-pypi: stripping dead/orphan direct-URL requirement \
+                         (target absent from bundle closure)",
                     );
+                    drop_url.insert(name);
                 }
             }
         }
@@ -334,13 +355,19 @@ pub fn plan(wheels: &[EmitWheel], conda_capable: &std::collections::HashSet<Stri
         .collect();
     // Exact reroutes win over floor envelopes for the same name.
     overrides.extend(exact);
-    EmitPlan { ship, overrides }
+    EmitPlan {
+        ship,
+        overrides,
+        drop_url,
+    }
 }
 
 /// v1.7.0 blueprint mode: the override table's semantics as a
 /// Requires-Dist line mapper, baked into shipped wheel METADATA via
 /// [`crate::wheel_rewrite::rewrite_wheel_with`].
 ///
+/// - Name in `drop_url` (Phase 2.8): return `Drop` — strip the orphan
+///   direct-URL line. Checked FIRST so a dropped name is never also pinned.
 /// - Name in `overrides`: rebuild the line with the override spec
 ///   (`"*"` means drop the specifier entirely). Returns `Keep` when the
 ///   rebuilt line equals the original (exact family pins stay
@@ -356,6 +383,7 @@ pub fn plan(wheels: &[EmitWheel], conda_capable: &std::collections::HashSet<Stri
 pub fn override_line_map<'a>(
     overrides: &'a BTreeMap<String, String>,
     conda_capable: &'a std::collections::HashSet<String>,
+    drop_url: &'a std::collections::HashSet<String>,
 ) -> impl Fn(&str) -> crate::wheel_rewrite::LineAction + 'a {
     use crate::wheel_rewrite::LineAction;
     move |line: &str| {
@@ -365,6 +393,10 @@ pub fn override_line_map<'a>(
         let name = req.name.to_string();
         if name == "python" {
             return LineAction::Keep;
+        }
+        // Drop check BEFORE overrides so a dropped name is never double-handled.
+        if drop_url.contains(&name) {
+            return LineAction::Drop;
         }
         if let Some(value) = overrides.get(&name) {
             let spec = if value == "*" {
@@ -577,7 +609,8 @@ mod tests {
         overrides.insert("loose".into(), "*".into());
         let capable: std::collections::HashSet<String> =
             ["psutil".to_string(), "pillow".to_string()].into();
-        let map = override_line_map(&overrides, &capable);
+        let drop: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let map = override_line_map(&overrides, &capable, &drop);
         // Floor override rewrites the pin.
         assert_eq!(
             map("pillow==12.1.1"),
@@ -604,6 +637,164 @@ mod tests {
         assert_eq!(map("notconda<2"), LineAction::Keep);
         // python is never touched.
         assert_eq!(map("python>=3.10"), LineAction::Keep);
+    }
+
+    /// Helper: build a minimal EmitWheel with requires_dist and no local path.
+    fn remote_wheel(name: &str, version: &str, requires: &[&str]) -> EmitWheel {
+        EmitWheel {
+            pypi_name: name.into(),
+            version: version.into(),
+            requires_dist: requires.iter().map(|s| (*s).to_string()).collect(),
+            wheel_filename: format!("{name}-{version}-py3-none-any.whl"),
+            local_path: None,
+            remote_url: None,
+            upstream_url: None,
+            git_source: None,
+            sdist_source: None,
+        }
+    }
+
+    /// Test 1 (Phase 2.8 / Amendment 1): unconditional orphan URL dep is stripped.
+    ///
+    /// Mirrors the REAL isaaclab_mimic 1.3.2 bug: a `Requires-Dist` that is a
+    /// direct-URL git line with NO `; extra ==` marker, whose target (`robomimic`)
+    /// is NOT in the bundle. Confirms `drop_url` contains `robomimic`; the
+    /// `overrides`/`ship` sets do NOT contain it.
+    #[test]
+    fn drop_predicate_strips_unconditional_orphan_url() {
+        let mimic = remote_wheel(
+            "isaaclab-mimic",
+            "1.3.2",
+            &["robomimic @ git+https://github.com/ARISE-Initiative/robomimic.git@v0.4.0"],
+        );
+        // robomimic is NOT in the bundle.
+        let emit_plan = plan(&[mimic], &std::collections::HashSet::new());
+        assert!(
+            emit_plan.drop_url.contains("robomimic"),
+            "unconditional orphan URL dep must be in drop_url; got: {:?}",
+            emit_plan.drop_url
+        );
+        assert!(
+            !emit_plan.ship.contains("robomimic"),
+            "orphan must not be in ship"
+        );
+        assert!(
+            !emit_plan.overrides.contains_key("robomimic"),
+            "orphan must not be in overrides"
+        );
+    }
+
+    /// Test 2 (Phase 2.8): marked orphan URL dep is also stripped.
+    ///
+    /// The 1.2.x isaaclab_mimic form: `robomimic @ git+…@v0.4.0 ; extra == "robomimic"`.
+    /// Target absent from bundle → stripped. Confirms marker-independence: both
+    /// marked and unmarked orphans use the same bundle-membership predicate.
+    #[test]
+    fn drop_predicate_strips_marked_orphan_url() {
+        let mimic = remote_wheel(
+            "isaaclab-mimic",
+            "1.2.3",
+            &[
+                r#"robomimic @ git+https://github.com/ARISE-Initiative/robomimic.git@v0.4.0 ; extra == "robomimic""#,
+            ],
+        );
+        let emit_plan = plan(&[mimic], &std::collections::HashSet::new());
+        assert!(
+            emit_plan.drop_url.contains("robomimic"),
+            "marked orphan URL dep must be in drop_url; got: {:?}",
+            emit_plan.drop_url
+        );
+    }
+
+    /// Test 3 (Phase 2.8): active URL dep (target IN bundle) is NOT dropped.
+    ///
+    /// When the target `robomimic` IS in the bundle, it goes through the Some-arm
+    /// → exact pin in overrides; it is NOT in drop_url.
+    #[test]
+    fn drop_predicate_keeps_active_url() {
+        let robomimic = remote_wheel("robomimic", "0.4.0", &[]);
+        let mimic = remote_wheel(
+            "isaaclab-mimic",
+            "1.3.2",
+            &["robomimic @ git+https://github.com/ARISE-Initiative/robomimic.git@v0.4.0"],
+        );
+        let emit_plan = plan(&[robomimic, mimic], &std::collections::HashSet::new());
+        assert!(
+            !emit_plan.drop_url.contains("robomimic"),
+            "active URL dep must NOT be in drop_url; overrides: {:?}",
+            emit_plan.overrides
+        );
+        // It SHOULD be in overrides (exact pin from Some-arm).
+        assert!(
+            emit_plan.overrides.contains_key("robomimic"),
+            "active URL dep must be in overrides as an exact pin; got: {:?}",
+            emit_plan.overrides
+        );
+    }
+
+    /// Test 4 (Phase 2.8): non-URL extras dep is never dropped.
+    ///
+    /// `foo>=1 ; extra == "x"` is NOT a URL requirement → continues before the
+    /// bundle lookup → never enters drop_url.
+    #[test]
+    fn drop_predicate_ignores_non_url_extra_dep() {
+        let w = remote_wheel("pkg", "1.0.0", &[r#"foo>=1 ; extra == "x""#]);
+        // `foo` is NOT in the bundle.
+        let emit_plan = plan(&[w], &std::collections::HashSet::new());
+        assert!(
+            !emit_plan.drop_url.contains("foo"),
+            "non-URL dep must NOT be in drop_url; drop_url: {:?}",
+            emit_plan.drop_url
+        );
+    }
+
+    /// Test 5 (Phase 2.8): URL dep whose target IS a bundle entry is not dropped.
+    ///
+    /// A URL-named target that is also a top-level bundle entry hits the Some-arm
+    /// (bundle_versions hit) → NOT in drop_url; and is exact-pinned.
+    #[test]
+    fn drop_predicate_ignores_url_config_entry() {
+        // `special` is in the bundle as a top-level entry.
+        let special = remote_wheel("special", "2.0.0", &[]);
+        let requirer = remote_wheel(
+            "requirer",
+            "1.0.0",
+            &["special @ git+https://github.com/example/special.git@main"],
+        );
+        let emit_plan = plan(&[special, requirer], &std::collections::HashSet::new());
+        assert!(
+            !emit_plan.drop_url.contains("special"),
+            "URL dep whose target is a bundle entry must NOT be in drop_url; \
+             drop_url: {:?}",
+            emit_plan.drop_url
+        );
+        assert!(
+            emit_plan.overrides.contains_key("special"),
+            "URL dep whose target is a bundle entry must be exact-pinned; \
+             overrides: {:?}",
+            emit_plan.overrides
+        );
+    }
+
+    /// Test 8 (Phase 2.8): drop takes precedence over overrides.
+    ///
+    /// A name that is in BOTH `drop_url` and `overrides` resolves to
+    /// `LineAction::Drop` (drop wins; no double-handling).
+    #[test]
+    fn override_line_map_drop_precedence() {
+        use crate::wheel_rewrite::LineAction;
+        let mut overrides = BTreeMap::new();
+        overrides.insert("robomimic".into(), "==0.4.0".into());
+        let conda_capable: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut drop: std::collections::HashSet<String> = std::collections::HashSet::new();
+        drop.insert("robomimic".into());
+
+        let map = override_line_map(&overrides, &conda_capable, &drop);
+        assert_eq!(
+            map("robomimic @ git+https://github.com/ARISE-Initiative/robomimic.git@v0.4.0"),
+            LineAction::Drop,
+            "drop must win over overrides"
+        );
     }
 
     #[test]

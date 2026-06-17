@@ -303,6 +303,7 @@ fn shadow_cache_stage(
     key: &str,
     overrides: &BTreeMap<String, String>,
     conda_capable: &HashSet<String>,
+    drop_url: &HashSet<String>,
 ) -> anyhow::Result<(String, bool)> {
     std::fs::create_dir_all(cache_dir)
         .with_context(|| format!("creating shadow cache dir {}", cache_dir.display()))?;
@@ -350,7 +351,7 @@ fn shadow_cache_stage(
         std::process::id(),
         TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
-    let m = override_line_map(overrides, conda_capable);
+    let m = override_line_map(overrides, conda_capable, drop_url);
     let (sha, did_change) = crate::wheel_rewrite::rewrite_wheel_with(src, &cache_tmp, &m)
         .with_context(|| {
             format!(
@@ -439,11 +440,13 @@ pub async fn stage(
     // Step 1: run plan() to get ship set + override table.
     let emit_plan = plan(emit_wheels, conda_capable);
 
-    // Clone overrides + conda_capable so we can move them into spawn_blocking.
-    // The mapper itself cannot cross the `'static` boundary (it holds refs),
-    // so we re-derive it inside each blocking closure from owned copies.
+    // Clone overrides + conda_capable + drop_url so we can move them into
+    // spawn_blocking. The mapper itself cannot cross the `'static` boundary
+    // (it holds refs), so we re-derive it inside each blocking closure from
+    // owned copies.
     let overrides_owned = emit_plan.overrides.clone();
     let conda_cap_owned: HashSet<String> = conda_capable.clone();
+    let drop_url_owned: HashSet<String> = emit_plan.drop_url.clone();
 
     // Step 2: Build [retread-wheels] entries for this bundle (same filter as
     // emit's `entries` construction).
@@ -467,7 +470,7 @@ pub async fn stage(
         .collect();
 
     // Build a non-async mapper for the remote-only check (no spawn needed).
-    let mapper_for_remote = override_line_map(&overrides_owned, &conda_cap_owned);
+    let mapper_for_remote = override_line_map(&overrides_owned, &conda_cap_owned, &drop_url_owned);
 
     // Step 3: Classify and stage each wheel.
     let mut lock_wheels: Vec<LockWheel> = Vec::new();
@@ -519,8 +522,9 @@ pub async fn stage(
                 let dst_b = dst.clone();
                 let ov_b = overrides_owned.clone();
                 let cap_b = conda_cap_owned.clone();
+                let drop_b = drop_url_owned.clone();
                 tokio::task::spawn_blocking(move || {
-                    shadow_cache_stage(&src_b, &dst_b, &cache_dir, &key, &ov_b, &cap_b)
+                    shadow_cache_stage(&src_b, &dst_b, &cache_dir, &key, &ov_b, &cap_b, &drop_b)
                 })
                 .await
                 .with_context(|| {
@@ -531,8 +535,9 @@ pub async fn stage(
                 let dst_blocking = dst.clone();
                 let overrides_b = overrides_owned.clone();
                 let conda_cap_b = conda_cap_owned.clone();
+                let drop_b = drop_url_owned.clone();
                 tokio::task::spawn_blocking(move || {
-                    let m = override_line_map(&overrides_b, &conda_cap_b);
+                    let m = override_line_map(&overrides_b, &conda_cap_b, &drop_b);
                     crate::wheel_rewrite::rewrite_wheel_with(&src_blocking, &dst_blocking, &m)
                 })
                 .await
@@ -584,12 +589,21 @@ pub async fn stage(
                     let src_c = src.clone();
                     let ov_c = overrides_owned.clone();
                     let cap_c = conda_cap_owned.clone();
+                    let drop_c = drop_url_owned.clone();
                     // Rewrite into a temp dst so we can check did_change,
                     // then move to the real shadow name below if changed.
                     let probe_dst = staging_dir.join(format!(".probe-courier-{std_name}"));
                     let probe_dst_c = probe_dst.clone();
                     let (_sha, did_change) = tokio::task::spawn_blocking(move || {
-                        shadow_cache_stage(&src_c, &probe_dst_c, &cache_dir, &key, &ov_c, &cap_c)
+                        shadow_cache_stage(
+                            &src_c,
+                            &probe_dst_c,
+                            &cache_dir,
+                            &key,
+                            &ov_c,
+                            &cap_c,
+                            &drop_c,
+                        )
                     })
                     .await
                     .with_context(|| {
@@ -609,11 +623,12 @@ pub async fn stage(
                     let tmp = staging_dir.join(&tmp_name);
                     let overrides_c = overrides_owned.clone();
                     let conda_cap_c = conda_cap_owned.clone();
+                    let drop_c = drop_url_owned.clone();
                     let (_sha, did_change) = tokio::task::spawn_blocking({
                         let src = src.clone();
                         let tmp = tmp.clone();
                         move || {
-                            let m = override_line_map(&overrides_c, &conda_cap_c);
+                            let m = override_line_map(&overrides_c, &conda_cap_c, &drop_c);
                             crate::wheel_rewrite::rewrite_wheel_with(&src, &tmp, &m)
                         }
                     })
@@ -752,8 +767,9 @@ pub async fn stage(
                     let src_blocking = src.clone();
                     let overrides_c2 = overrides_owned.clone();
                     let conda_cap_c2 = conda_cap_owned.clone();
+                    let drop_c2 = drop_url_owned.clone();
                     tokio::task::spawn_blocking(move || {
-                        let m = override_line_map(&overrides_c2, &conda_cap_c2);
+                        let m = override_line_map(&overrides_c2, &conda_cap_c2, &drop_c2);
                         crate::wheel_rewrite::rewrite_wheel_with(&src_blocking, &dst_blocking, &m)
                     })
                     .await
@@ -1401,15 +1417,16 @@ mod tests {
         let bytes = std::fs::read(&whl).unwrap();
         let requires = vec!["dep-x==2.0.0".to_string()];
         let key = shadow_cache_key(&bytes, &requires, &overrides, &conda_cap);
+        let drop: HashSet<String> = HashSet::new();
 
         // Cold pass.
         let dst1 = tmp.join("staged1.whl");
-        shadow_cache_stage(&whl, &dst1, &cache, &key, &overrides, &conda_cap).unwrap();
+        shadow_cache_stage(&whl, &dst1, &cache, &key, &overrides, &conda_cap, &drop).unwrap();
         let out1 = std::fs::read(&dst1).unwrap();
 
         // Warm pass (cache hit).
         let dst2 = tmp.join("staged2.whl");
-        shadow_cache_stage(&whl, &dst2, &cache, &key, &overrides, &conda_cap).unwrap();
+        shadow_cache_stage(&whl, &dst2, &cache, &key, &overrides, &conda_cap, &drop).unwrap();
         let out2 = std::fs::read(&dst2).unwrap();
 
         let _ = std::fs::remove_dir_all(&tmp);
@@ -1518,14 +1535,16 @@ mod tests {
 
         let key = shadow_cache_key(&bytes, &requires, &ov, &cap);
 
+        let drop: HashSet<String> = HashSet::new();
+
         // Single-pass via cache.
         let dst_cache = tmp.join("staged-cache.whl");
         let (sha_cache, changed_cache) =
-            shadow_cache_stage(&whl, &dst_cache, &cache, &key, &ov, &cap).unwrap();
+            shadow_cache_stage(&whl, &dst_cache, &cache, &key, &ov, &cap, &drop).unwrap();
 
         // Direct rewrite_wheel_with (old probe behavior).
         let dst_direct = tmp.join("staged-direct.whl");
-        let m = override_line_map(&ov, &cap);
+        let m = override_line_map(&ov, &cap, &drop);
         let (sha_direct, changed_direct) =
             crate::wheel_rewrite::rewrite_wheel_with(&whl, &dst_direct, &m).unwrap();
 
@@ -1559,16 +1578,17 @@ mod tests {
 
         let ov: BTreeMap<String, String> = BTreeMap::new();
         let cap: HashSet<String> = HashSet::new();
+        let drop: HashSet<String> = HashSet::new();
         let requires = vec!["dep-p>=1.0".to_string()];
 
         let key = shadow_cache_key(&bytes, &requires, &ov, &cap);
 
         let dst_cache = tmp.join("staged-cache.whl");
         let (sha_cache, changed_cache) =
-            shadow_cache_stage(&whl, &dst_cache, &cache, &key, &ov, &cap).unwrap();
+            shadow_cache_stage(&whl, &dst_cache, &cache, &key, &ov, &cap, &drop).unwrap();
 
         let dst_direct = tmp.join("staged-direct.whl");
-        let m = override_line_map(&ov, &cap);
+        let m = override_line_map(&ov, &cap, &drop);
         let (sha_direct, changed_direct) =
             crate::wheel_rewrite::rewrite_wheel_with(&whl, &dst_direct, &m).unwrap();
 
@@ -1753,10 +1773,20 @@ mod tests {
         let bytes = std::fs::read(&whl).unwrap();
         let requires = vec!["dep-x==2.0.0".to_string()];
         let key = shadow_cache_key(&bytes, &requires, &overrides, &conda_cap);
+        let drop: HashSet<String> = HashSet::new();
 
         // Cold pass: populate the persistent cache.
         let dst1 = tmp.join("staged1.whl");
-        shadow_cache_stage(&whl, &dst1, &shadow_cache, &key, &overrides, &conda_cap).unwrap();
+        shadow_cache_stage(
+            &whl,
+            &dst1,
+            &shadow_cache,
+            &key,
+            &overrides,
+            &conda_cap,
+            &drop,
+        )
+        .unwrap();
         let out1 = std::fs::read(&dst1).unwrap();
 
         // Simulate `rm -rf wheels`: delete the wheels dir.
@@ -1767,8 +1797,16 @@ mod tests {
         // not tmp/wheels/), but the PERSISTENT cache is under persistent_cache/.
         // The key point is: even if wheels/ were gone, the persistent cache survives.
         let dst2 = tmp.join("staged2.whl");
-        let (_sha2, _changed2) =
-            shadow_cache_stage(&whl, &dst2, &shadow_cache, &key, &overrides, &conda_cap).unwrap();
+        let (_sha2, _changed2) = shadow_cache_stage(
+            &whl,
+            &dst2,
+            &shadow_cache,
+            &key,
+            &overrides,
+            &conda_cap,
+            &drop,
+        )
+        .unwrap();
         let out2 = std::fs::read(&dst2).unwrap();
 
         let _ = std::fs::remove_dir_all(&tmp);
@@ -1802,7 +1840,8 @@ mod tests {
         let requires = vec![];
         let key = shadow_cache_key(&src_bytes, &requires, &ov, &cap);
 
-        shadow_cache_stage(&whl, &dst, &cache, &key, &ov, &cap).unwrap();
+        let drop: HashSet<String> = HashSet::new();
+        shadow_cache_stage(&whl, &dst, &cache, &key, &ov, &cap, &drop).unwrap();
         let dst_bytes = std::fs::read(&dst).unwrap();
 
         let _ = std::fs::remove_dir_all(&tmp);
@@ -1814,7 +1853,7 @@ mod tests {
         let tmp2 = make_test_dir("p3-exdev-verify");
         let whl2 = write_wheel(&tmp2, "pkg-exdev", "1.0.0", &[]);
         let direct_dst = tmp2.join("direct.whl");
-        let m = override_line_map(&ov, &cap);
+        let m = override_line_map(&ov, &cap, &drop);
         let (_, _) = crate::wheel_rewrite::rewrite_wheel_with(&whl2, &direct_dst, &m).unwrap();
         let direct_bytes = std::fs::read(&direct_dst).unwrap();
         let _ = std::fs::remove_dir_all(&tmp2);
