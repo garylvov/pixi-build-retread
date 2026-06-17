@@ -889,9 +889,11 @@ fn meta(name: &str, version: &str, requires: Vec<&str>, platform_specific: bool)
 }
 
 fn rw(pypi: &str, m: WheelMetadata) -> ResolvedWheel {
+    let url: url::Url = format!("https://example.com/{pypi}.whl").parse().unwrap();
     ResolvedWheel {
         pypi_name: pypi.to_string(),
-        url: format!("https://example.com/{pypi}.whl").parse().unwrap(),
+        upstream_url: Some(url.clone()),
+        url,
         metadata: m,
         extras_requested: vec![],
         auto_data: None,
@@ -1906,6 +1908,11 @@ fn relaxed_pure_python_primary_pins_python_to_workspace_variant() {
             url: "https://example.com/isaaclab-0.51.1-py3-none-any.relaxed.whl"
                 .parse()
                 .unwrap(),
+            upstream_url: Some(
+                "https://example.com/isaaclab-0.51.1-py3-none-any.relaxed.whl"
+                    .parse()
+                    .unwrap(),
+            ),
             metadata: primary,
             extras_requested: vec![],
             auto_data: None,

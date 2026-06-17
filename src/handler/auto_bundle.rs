@@ -439,12 +439,17 @@ pub(crate) async fn auto_bundle_transitives(
                             Ok(resolved) => {
                                 match metadata_preferring_sidecar(&resolved, download_dir).await {
                                     Ok(metadata) => {
+                                        // resolved.url is the pristine index
+                                        // URL; clone it for upstream_url
+                                        // before moving into the struct.
+                                        let upstream = Some(resolved.url.clone());
                                         return Some((
                                             name,
                                             version,
                                             ResolvedWheel {
                                                 pypi_name: conda_name,
                                                 url: resolved.url,
+                                                upstream_url: upstream,
                                                 metadata,
                                                 extras_requested: vec![],
                                                 auto_data: None,

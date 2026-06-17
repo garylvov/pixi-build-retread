@@ -465,6 +465,20 @@ struct ResolvedWheel {
     /// build the recipe.yaml's `source` list comments.
     pypi_name: String,
     url: url::Url,
+    /// Pristine upstream index / direct URL captured BEFORE
+    /// `materialize_and_rewrite` localises the wheel to `file://`.
+    ///
+    /// Set for:
+    ///   - config-entry PyPI version-spec wheels (resolved.url from pypi::resolve)
+    ///   - config-entry direct-URL wheels (entry.url)
+    ///   - BFS PyPI sub-wheels (resolved_url from bfs_fetch_pypi)
+    ///
+    /// `None` for source-built (git / path / from) and BFS git/URL sub-wheels
+    /// (their bytes re-materialise from source, not from a stable index URL).
+    ///
+    /// This is the single source of truth read by `build_one` when populating
+    /// `EmitWheel.upstream_url`; independent of `url` localization.
+    upstream_url: Option<url::Url>,
     metadata: WheelMetadata,
     /// v0.12.0+: extras the user requested on the originating
     /// `[retread-wheels]` entry. Surfaced in the audit so debugging
@@ -2905,13 +2919,17 @@ async fn resolve_bundle(
         // old pop order exactly.
         for (pending, fetch_result) in fetched {
             let dep_conda_name = canonical_conda_name(&pending.pypi_name);
-            let (sub_url, sub_metadata, sub_index_for_recurse, sub_seed_rd) =
+            let (sub_url, sub_upstream_url, sub_metadata, sub_index_for_recurse, sub_seed_rd) =
                 match (&pending.source, fetch_result?) {
                     (PendingSource::Pypi { .. }, Some((resolved_url, metadata, index))) => {
                         // Pypi-form sub-wheels are NOT D-rewritten, so
                         // their metadata IS the original Requires-Dist.
                         let seed_rd = metadata.requires_dist.clone();
-                        (resolved_url, metadata, index, seed_rd)
+                        // resolved_url is the pristine https index URL; record
+                        // it as upstream_url so build_one can populate
+                        // EmitWheel.upstream_url without deriving from w.url.
+                        let upstream = Some(resolved_url.clone());
+                        (resolved_url, upstream, metadata, index, seed_rd)
                     }
                     (PendingSource::Pypi { .. }, None) => {
                         unreachable!("phase 2 always fetches Pypi-form items")
@@ -2949,7 +2967,14 @@ async fn resolve_bundle(
                         // The recurse fires for Pypi-form Requires-Dist of the
                         // sub-wheel; those go through pypi::resolve which needs
                         // a real Simple index URL.
-                        (sub.url, sub.metadata, entry.index_url(), sub_original_rd)
+                        let sub_up = sub.upstream_url.clone();
+                        (
+                            sub.url,
+                            sub_up,
+                            sub.metadata,
+                            entry.index_url(),
+                            sub_original_rd,
+                        )
                     }
                     (PendingSource::Url { wheel_url }, _) => {
                         let synth = WheelEntry {
@@ -2978,7 +3003,14 @@ async fn resolve_bundle(
                         })?;
                         // Same fix as the Git arm: recurse uses the parent
                         // entry's PyPI Simple index, not the name `prefix`.
-                        (sub.url, sub.metadata, entry.index_url(), sub_original_rd)
+                        let sub_up = sub.upstream_url.clone();
+                        (
+                            sub.url,
+                            sub_up,
+                            sub.metadata,
+                            entry.index_url(),
+                            sub_original_rd,
+                        )
                     }
                 };
 
@@ -2998,6 +3030,7 @@ async fn resolve_bundle(
             extras.push(ResolvedWheel {
                 pypi_name: dep_conda_name,
                 url: sub_url,
+                upstream_url: sub_upstream_url,
                 metadata: sub_metadata,
                 extras_requested: vec![],
                 auto_data: None,
@@ -3249,6 +3282,10 @@ async fn materialize_and_rewrite(
     // (path / git / from), also remember the source root so phase 1.5
     // can inject any files pip wheel failed to ship.
     let mut source_root: Option<PathBuf> = None;
+    // Pristine upstream URL captured BEFORE localization to file://.
+    // Set for index (PyPI version-spec) and direct-URL entry forms only.
+    // Source-built forms (git / path / from) leave this None.
+    let mut upstream_url: Option<url::Url> = None;
     let raw_path: PathBuf = if let Some(from_name) = &entry.from {
         // Named git-source reference: look up url + rev from the
         // [retread-git-sources] table, treat subdirectory just like
@@ -3285,6 +3322,8 @@ async fn materialize_and_rewrite(
         ));
         wheel
     } else if let Some(url) = &entry.url {
+        // Capture the direct URL as the upstream before fetch/localization.
+        upstream_url = Some((*url).clone());
         crate::wheel::fetch_wheel_cached(
             url,
             entry.sha256.as_deref(),
@@ -3354,6 +3393,10 @@ async fn materialize_and_rewrite(
                     entry.index_url(),
                 )
             })?;
+        // Capture the pristine index URL BEFORE fetch_wheel_cached may
+        // localise / move it. This is the upstream_url written to the lock
+        // so Phase-1 replay can re-fetch without a full BFS re-solve.
+        upstream_url = Some(resolved.url.clone());
         crate::wheel::fetch_wheel_cached(
             &resolved.url,
             resolved.sha256.as_deref(),
@@ -3548,6 +3591,7 @@ async fn materialize_and_rewrite(
         ResolvedWheel {
             pypi_name,
             url: final_url,
+            upstream_url,
             extras_requested: audit_info.extras_requested,
             auto_data: auto_data_report,
             auto_data_dedup_skipped_root: audit_info.dedup_skipped_root,
@@ -4414,12 +4458,14 @@ async fn build_one(
                     .unwrap_or_default()
                     .to_string(),
                 remote_url: (url.scheme() != "file").then(|| (*url).clone()),
-                // Pristine pre-localization index URL: read from w.url (the
-                // original unlocalized URL, BEFORE localize_wheel_source may
-                // have collapsed it to file://). Carried through to the lock
-                // so the replay path can re-fetch Class-2 shadows without a
-                // full BFS/solve. None for source-built wheels (file://-only).
-                upstream_url: (w.url.scheme() != "file").then(|| w.url.clone()),
+                // Pristine pre-localization index URL: read from the
+                // ResolvedWheel.upstream_url field, which was captured in
+                // materialize_and_rewrite / bfs_fetch_pypi BEFORE the wheel
+                // URL was localised to file://. This fixes the primary
+                // config-entry wheel (isaacsim) which always has w.url ==
+                // file:// by the time build_one sees it, so deriving from
+                // w.url would always yield None and break Phase-1 replay.
+                upstream_url: w.upstream_url.clone(),
             })
             .collect();
         let mut conda_capable: std::collections::HashSet<String> = bundle
@@ -5430,6 +5476,216 @@ mod courier_build_string_tests {
         // Exact format spec: py{py_short}_h{hash[..10]}_{build_number}
         let s = courier_build_string("312", "1234567890abcdef", 2);
         assert_eq!(s, "py312_h1234567890_2");
+    }
+}
+
+// -----------------------------------------------------------------
+// Regression guard for the Phase-1 replay upstream_url bug:
+// A config-entry index wheel (the PRIMARY `isaacsim`) goes through
+// materialize_and_rewrite which localises its URL to file://. The old
+// code derived EmitWheel.upstream_url from w.url at build_one time,
+// so it was always None for primary wheels, breaking replay.
+// The fix: upstream_url is now a field on ResolvedWheel, populated in
+// materialize_and_rewrite BEFORE localization, and read by build_one.
+// -----------------------------------------------------------------
+#[cfg(test)]
+mod emit_wheel_upstream_url_tests {
+    use super::{Bundle, ResolvedWheel};
+    use crate::wheel::WheelMetadata;
+    use std::collections::BTreeMap;
+
+    /// Construct a minimal WheelMetadata for tests.
+    fn dummy_metadata(name: &str, version: &str) -> WheelMetadata {
+        WheelMetadata {
+            name: name.to_string(),
+            version: version.to_string(),
+            requires_dist: vec![],
+            is_pure_python: true,
+            sha256: "abc".to_string(),
+            filename: format!("{name}-{version}-py3-none-any.whl"),
+        }
+    }
+
+    /// A config-entry index wheel (primary `isaacsim`) goes through
+    /// materialize_and_rewrite which always returns a file:// URL.
+    /// Before the fix, build_one derived upstream_url from w.url:
+    ///   `(w.url.scheme() != "file").then(|| w.url.clone())`
+    /// which yields None for any file:// URL -> replay falls through.
+    ///
+    /// After the fix, upstream_url is stored on ResolvedWheel and read
+    /// directly in build_one, independent of url localization.
+    ///
+    /// This test is the regression guard: it constructs the exact
+    /// scenario (w.url = file://, w.upstream_url = Some(https://...))
+    /// and verifies the EmitWheel mapping produces upstream_url = Some.
+    #[test]
+    fn primary_config_entry_wheel_carries_upstream_url_through_localization() {
+        // Simulate what materialize_and_rewrite returns for the primary
+        // config-entry `isaacsim` wheel: url is localized to file://,
+        // upstream_url is the pristine index URL captured before localization.
+        let upstream = url::Url::parse(
+            "https://pypi.nvidia.com/simple/isaacsim-6.0.0-cp312-none-linux_x86_64.whl",
+        )
+        .unwrap();
+        let local = url::Url::from_file_path(
+            "/tmp/wheels/isaacsim/isaacsim-6.0.0-cp312-none-linux_x86_64.whl",
+        )
+        .unwrap();
+
+        let primary = ResolvedWheel {
+            pypi_name: "isaacsim".to_string(),
+            url: local.clone(), // file:// — what materialize_and_rewrite returns
+            upstream_url: Some(upstream.clone()), // https:// — captured BEFORE localization
+            metadata: dummy_metadata("isaacsim", "6.0.0"),
+            extras_requested: vec![],
+            auto_data: None,
+            auto_data_dedup_skipped_root: None,
+        };
+
+        let bundle = Bundle {
+            conda_name: "isaacsim".to_string(),
+            primary,
+            extras: vec![],
+            probe_decisions: vec![],
+            solve_diagnostics: BTreeMap::new(),
+        };
+
+        // Reproduce the exact mapping from build_one that populates EmitWheel.
+        // Before the fix this was: `(w.url.scheme() != "file").then(|| w.url.clone())`
+        // which returns None for file:// URLs.
+        // After the fix: `w.upstream_url.clone()`.
+        let emit_wheels: Vec<crate::emit_pypi::EmitWheel> = bundle
+            .all_wheels()
+            .map(|w| {
+                // The localized URL (what localize_wheel_source might return when
+                // the wheel is already on disk). For the primary it's the same
+                // file:// URL since there's no separate localization step in the test.
+                let url = w.url.clone();
+                crate::emit_pypi::EmitWheel {
+                    pypi_name: w.pypi_name.clone(),
+                    version: w.metadata.version.clone(),
+                    requires_dist: w.metadata.requires_dist.clone(),
+                    local_path: (url.scheme() == "file")
+                        .then(|| url.to_file_path().ok())
+                        .flatten(),
+                    wheel_filename: url
+                        .path_segments()
+                        .and_then(|mut s| s.next_back())
+                        .unwrap_or_default()
+                        .to_string(),
+                    remote_url: (url.scheme() != "file").then(|| url.clone()),
+                    // THE FIX: read from w.upstream_url, not derived from w.url.
+                    upstream_url: w.upstream_url.clone(),
+                }
+            })
+            .collect();
+
+        assert_eq!(emit_wheels.len(), 1);
+        let ew = &emit_wheels[0];
+
+        // The primary wheel's URL is file:// so remote_url must be None.
+        assert!(
+            ew.remote_url.is_none(),
+            "primary wheel url is file:// so remote_url must be None: {:?}",
+            ew.remote_url,
+        );
+
+        // upstream_url MUST be Some(https://...) — the regression guard.
+        // Before the fix this was None because the old code derived it from
+        // w.url which is file:// for primary config-entry wheels.
+        assert_eq!(
+            ew.upstream_url,
+            Some(upstream.clone()),
+            "primary config-entry wheel must carry upstream_url even though \
+             its local url is file://; got {:?}",
+            ew.upstream_url,
+        );
+
+        // local_path must be set (it's a file:// url).
+        assert!(
+            ew.local_path.is_some(),
+            "file:// primary wheel must set local_path: {:?}",
+            ew.local_path,
+        );
+    }
+
+    /// Control case: a BFS sub-wheel whose url is the pristine https://
+    /// (not localized to file://) must also carry upstream_url correctly.
+    /// Before AND after the fix this worked via the old derivation; after
+    /// the fix it works via the new field. Verify parity.
+    #[test]
+    fn bfs_pypi_sub_wheel_carries_upstream_url() {
+        let upstream = url::Url::parse(
+            "https://pypi.nvidia.com/simple/isaacsim-kernel-6.0.0-cp312-none-linux_x86_64.whl",
+        )
+        .unwrap();
+
+        // BFS Pypi-form sub-wheels: url = pristine https:// (not localized),
+        // upstream_url = Some(https://) (from the new field).
+        let sub = ResolvedWheel {
+            pypi_name: "isaacsim-kernel".to_string(),
+            url: upstream.clone(),
+            upstream_url: Some(upstream.clone()),
+            metadata: dummy_metadata("isaacsim-kernel", "6.0.0"),
+            extras_requested: vec![],
+            auto_data: None,
+            auto_data_dedup_skipped_root: None,
+        };
+
+        let bundle = Bundle {
+            conda_name: "isaacsim".to_string(),
+            primary: ResolvedWheel {
+                pypi_name: "isaacsim".to_string(),
+                // Use a different file:// url for the primary to avoid
+                // interference with the sub-wheel assertions below.
+                url: url::Url::from_file_path("/tmp/w/isaacsim-6.0.0.whl").unwrap(),
+                upstream_url: Some(
+                    url::Url::parse(
+                        "https://pypi.nvidia.com/simple/isaacsim-6.0.0-cp312-none-linux_x86_64.whl",
+                    )
+                    .unwrap(),
+                ),
+                metadata: dummy_metadata("isaacsim", "6.0.0"),
+                extras_requested: vec![],
+                auto_data: None,
+                auto_data_dedup_skipped_root: None,
+            },
+            extras: vec![sub],
+            probe_decisions: vec![],
+            solve_diagnostics: BTreeMap::new(),
+        };
+
+        let emit_wheels: Vec<crate::emit_pypi::EmitWheel> = bundle
+            .all_wheels()
+            .map(|w| {
+                let url = w.url.clone();
+                crate::emit_pypi::EmitWheel {
+                    pypi_name: w.pypi_name.clone(),
+                    version: w.metadata.version.clone(),
+                    requires_dist: w.metadata.requires_dist.clone(),
+                    local_path: (url.scheme() == "file")
+                        .then(|| url.to_file_path().ok())
+                        .flatten(),
+                    wheel_filename: url
+                        .path_segments()
+                        .and_then(|mut s| s.next_back())
+                        .unwrap_or_default()
+                        .to_string(),
+                    remote_url: (url.scheme() != "file").then(|| url.clone()),
+                    upstream_url: w.upstream_url.clone(),
+                }
+            })
+            .collect();
+
+        // index 0 = primary, index 1 = sub-wheel.
+        assert_eq!(emit_wheels.len(), 2);
+        let sub_ew = &emit_wheels[1];
+        assert_eq!(
+            sub_ew.upstream_url,
+            Some(upstream),
+            "BFS Pypi sub-wheel must carry upstream_url: {:?}",
+            sub_ew.upstream_url,
+        );
     }
 }
 

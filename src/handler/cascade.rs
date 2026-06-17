@@ -1160,9 +1160,13 @@ pub(crate) async fn try_pypi_bundle(
                         url = %resolved.url,
                         "tiered-cascade: PyPI fallback bundled wheel; dropping conda emit",
                     );
+                    // resolved.url is the pristine index URL; clone it for
+                    // upstream_url before moving into the struct.
+                    let upstream = Some(resolved.url.clone());
                     bundle.extras.push(ResolvedWheel {
                         pypi_name: canonical_conda_name(pypi_name),
                         url: resolved.url,
+                        upstream_url: upstream,
                         metadata,
                         extras_requested: vec![],
                         auto_data: None,
