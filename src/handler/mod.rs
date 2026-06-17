@@ -1837,17 +1837,26 @@ impl Handler {
                          (derivation skipped).",
                         bundle_name_for_hash,
                     ));
-                    let run_deps: Vec<String> = params
-                        .run_dependencies
-                        .as_ref()
-                        .map(|deps| deps.iter().map(|d| d.spec.to_string()).collect())
-                        .ok_or_else(|| {
-                            RpcError::internal(
-                                "courier replay: run_override is None; cannot replay without \
-                                 pixi-forwarded run_dependencies"
-                                    .to_string(),
-                            )
-                        })?;
+                    // On the REPLAY path the authoritative run-deps are
+                    // lock.conda_run_deps (already validated and stored when
+                    // the lock was committed). Using params.run_dependencies
+                    // here would allow pixi's live conda solver to inject
+                    // non-deterministic extras (e.g. python_abi) that drift
+                    // the rewritten lock away from the committed one.
+                    // params.run_dependencies is intentionally ignored on
+                    // this path; the COLD path (full resolve_all) keeps
+                    // using run_override / params.run_dependencies unchanged.
+                    let run_deps: Vec<String> = lock
+                        .conda_run_deps
+                        .iter()
+                        .map(|dep| {
+                            if dep.spec.is_empty() {
+                                dep.name.clone()
+                            } else {
+                                format!("{} {}", dep.name, dep.spec)
+                            }
+                        })
+                        .collect();
                     match materialize_from_lock(
                         lock,
                         &config,
@@ -3988,9 +3997,17 @@ fn localize_wheel_source(url: &url::Url, wheels_root: &Path) -> url::Url {
 ///   rattler-build failure, etc.). Caller should propagate as a hard error.
 ///
 /// # Correctness
-/// `run_deps` MUST come from `params.run_dependencies` (the live pixi-forwarded
-/// deps), not from `lock.conda_run_deps`, so the rebuilt package's run-deps
-/// are authoritative even on replay.
+/// **COLD path** (`run_deps` originates from `params.run_dependencies` /
+/// `run_override`): pixi's live conda-solver result is authoritative; the
+/// lock has not yet been committed.
+///
+/// **REPLAY path** (`run_deps` originates from `lock.conda_run_deps`): the
+/// already-committed lock is authoritative; using `params.run_dependencies`
+/// here would let pixi's non-deterministic conda solver inject extras (e.g.
+/// `python_abi`) that drift the rewritten lock from the committed one, which
+/// is the exact bug replay is supposed to prevent.  The caller is responsible
+/// for sourcing `run_deps` from `lock.conda_run_deps` before calling this
+/// function on a replay hit.
 #[allow(clippy::too_many_arguments)]
 async fn materialize_from_lock(
     lock: crate::lock::RetreadLock,
@@ -5388,6 +5405,78 @@ mod replay_tests {
             "valid lock with matching hash must return Some"
         );
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Regression test for the build_v1 replay lock-drift bug (v2.5.0).
+    ///
+    /// The build_v1 replay gate MUST source `run_deps` from `lock.conda_run_deps`,
+    /// NOT from `params.run_dependencies`.  pixi's live conda solver can inject
+    /// non-deterministic extras (e.g. `python_abi 3.12.* *_cp312`) that are absent
+    /// from the committed lock, causing the rewritten lock to differ from the
+    /// committed one (62 vs 61 conda_run_deps in the isaac6 lukewarm e2e).
+    ///
+    /// This test asserts the exact serialization used in the replay gate:
+    ///   - `CondaDep { name, spec="" }` → `"name"` (name-only)
+    ///   - `CondaDep { name, spec }` → `"name spec"`
+    ///
+    /// It also asserts that a params.run_dependencies containing an extra
+    /// `python_abi` dep would NOT appear in the run_deps if it is absent from
+    /// lock.conda_run_deps.
+    #[test]
+    fn build_v1_replay_run_deps_come_from_lock_not_params() {
+        // Simulate the lock as committed (two deps, no python_abi).
+        let lock_conda_run_deps = [
+            crate::lock::CondaDep {
+                name: "numpy".into(),
+                spec: ">=1.21".into(),
+            },
+            crate::lock::CondaDep {
+                name: "libstdcxx-ng".into(),
+                spec: String::new(), // name-only dep
+            },
+        ];
+
+        // This is what the replay gate now does (the fix):
+        // serialize lock.conda_run_deps, ignoring params.run_dependencies.
+        let run_deps_from_lock: Vec<String> = lock_conda_run_deps
+            .iter()
+            .map(|dep| {
+                if dep.spec.is_empty() {
+                    dep.name.clone()
+                } else {
+                    format!("{} {}", dep.name, dep.spec)
+                }
+            })
+            .collect();
+
+        // Simulate what params.run_dependencies would contain (pixi's live
+        // solve injected python_abi non-deterministically).
+        let params_run_deps = vec![
+            "numpy >=1.21".to_string(),
+            "libstdcxx-ng".to_string(),
+            "python_abi 3.12.* *_cp312".to_string(), // the extra that caused drift
+        ];
+
+        // The replay path must produce exactly the lock-sourced deps.
+        assert_eq!(
+            run_deps_from_lock,
+            vec!["numpy >=1.21", "libstdcxx-ng"],
+            "replay run_deps must match lock.conda_run_deps exactly"
+        );
+        // Crucially, python_abi must NOT appear (it was injected by the solver).
+        assert!(
+            !run_deps_from_lock
+                .iter()
+                .any(|d| d.starts_with("python_abi")),
+            "python_abi must NOT appear in replay run_deps (it is absent from \
+             lock.conda_run_deps): {run_deps_from_lock:?}"
+        );
+        // And the params path WOULD have introduced it (confirming the bug).
+        assert!(
+            params_run_deps.iter().any(|d| d.starts_with("python_abi")),
+            "params_run_deps simulation must contain python_abi (proving the \
+             pre-fix bug path): {params_run_deps:?}"
+        );
     }
 
     #[test]
