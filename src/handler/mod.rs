@@ -4587,6 +4587,94 @@ async fn materialize_from_lock(
                     return Ok(None);
                 }
             }
+            // Class-2b (schema 9+): relax-changed shadow built from a PyPI sdist.
+            // Introduced in PHASE 2.6 to fix gym-0.26.2 wheel drift on replay.
+            //
+            // gym ships only as an sdist on PyPI. On cold produce, bfs_fetch_pypi
+            // falls back to the sdist path, calls build_wheel_from_sdist_url, and
+            // stores the exact sdist URL (with #sha256) in LockWheel.sdist_source.
+            // On replay, the Class-2 arm would find upstream_url=None (suppressed
+            // at write time when sdist_prov.is_some()) and return Ok(None) ->
+            // full resolve -> python_abi/version drift -> non-byte-identical lock.
+            //
+            // This arm intercepts BEFORE the bare Origin::Built arm and re-builds
+            // directly from the stored sdist_url, bypassing the re-resolve.
+            // Fallback: if the exact URL fails (yanked), re-resolve via version pin.
+            //
+            // POISONING note: sdist_source is NOT in compute_inputs_hash (same
+            // circularity as git_source.rev): the sdist URL is a consequence of the
+            // resolve, not an independent input.
+            Origin::Built if !lw.must_ship && lw.sdist_source.is_some() => {
+                let s = lw.sdist_source.as_ref().unwrap();
+                let sdist_out = download_dir.join(&s.name);
+                let stored_url = url::Url::parse(&s.sdist_url).with_context(|| {
+                    format!(
+                        "courier replay Class-2b: invalid sdist_url `{}` for wheel `{}`",
+                        s.sdist_url, lw.name,
+                    )
+                })?;
+                tracing::info!(
+                    wheel = %lw.name,
+                    sdist_url = %stored_url,
+                    "courier replay: rebuilding sdist-built shadow from stored sdist_url (class 2b)",
+                );
+                let built = match crate::source_build::build_wheel_from_sdist_url(
+                    &stored_url,
+                    &sdist_out,
+                    &lock.python,
+                )
+                .await
+                {
+                    Ok(p) => p,
+                    Err(e) => {
+                        // Stored URL may be yanked; fall back to re-resolve by exact version.
+                        tracing::warn!(
+                            wheel = %lw.name,
+                            sdist_url = %stored_url,
+                            error = %format!("{e:#}"),
+                            "courier replay Class-2b: stored sdist_url failed; re-resolving by version",
+                        );
+                        let specifiers = VersionSpecifiers::from_str(&format!("=={}", s.version))
+                            .with_context(|| {
+                            format!(
+                                "courier replay Class-2b: parsing version spec `=={}` for `{}`",
+                                s.version, lw.name,
+                            )
+                        })?;
+                        let sdist = pypi::resolve_sdist(&s.index, &s.name, &specifiers)
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "courier replay Class-2b: re-resolving sdist for `{}` at `=={}`",
+                                    s.name, s.version,
+                                )
+                            })?;
+                        crate::source_build::build_wheel_from_sdist_url(
+                            &sdist.url,
+                            &sdist_out,
+                            &lock.python,
+                        )
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "courier replay Class-2b: building wheel from re-resolved sdist `{}`",
+                                sdist.url,
+                            )
+                        })?
+                    }
+                };
+                crate::emit_pypi::EmitWheel {
+                    pypi_name: lw.name.clone(),
+                    version: lw.version.clone(),
+                    requires_dist: lw.requires_dist.clone(),
+                    local_path: Some(built),
+                    wheel_filename: lw.filename.clone(),
+                    remote_url: None,
+                    upstream_url: None,
+                    git_source: None,
+                    sdist_source: lw.sdist_source.clone(),
+                }
+            }
             Origin::Built => {
                 // Class 2: relax-changed shadow (must_ship=false). The
                 // original upstream URL is in lw.upstream_url (schema 6+).
