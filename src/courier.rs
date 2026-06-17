@@ -2186,6 +2186,7 @@ mod tests {
     /// a live [retread-wheels] entry, so replay with manifest-absent would return
     /// Ok(None) -> fall through). GREEN after commit 4.
     #[tokio::test]
+    #[ignore = "live: builds a git wheel via uv (needs uv + git on PATH); run with --include-ignored"]
     async fn git_source_wheel_replay_byte_identical_parity() {
         use crate::lock::{GitWheelSource, Origin};
         use crate::source_build::build_wheel_from_git;

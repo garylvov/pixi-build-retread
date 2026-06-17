@@ -683,6 +683,7 @@ mod tests {
     /// the same SHA). Uses a minimal local git repo so no network access is
     /// required and CI stays fast.
     #[tokio::test]
+    #[ignore = "live: builds a git wheel via uv (needs uv + git on PATH); run with --include-ignored"]
     async fn build_wheel_from_git_returns_resolved_sha() {
         let pid = std::process::id();
         let base = std::env::temp_dir().join(format!("retread-gitfixture-{pid}"));
