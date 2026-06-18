@@ -45,8 +45,7 @@
 // set the env var to use this path instead.  Both produce an identical `Bundle`.
 // Zero default risk.
 
-use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::{self, Display};
 use std::str::FromStr;
 
@@ -141,11 +140,6 @@ pub(crate) struct PypiDependencyProvider<'a> {
     /// Pre-evaluated PEP 508 marker environment (target-specific).
     marker_env: uv_pep508::MarkerEnvironment,
 
-    /// Side-channel: per-solvable list of (conda_target_name, spec) edges that
-    /// were omitted from resolvo's dependency graph because they are conda-routed.
-    /// Populated during `get_dependencies`; consumed during solution mapping.
-    pub conda_run_deps: RefCell<HashMap<SolvableId, Vec<(String, String)>>>,
-
     /// String ID for "unknown dependencies" error message.
     unknown_deps_sid: StringId,
 
@@ -197,7 +191,6 @@ impl<'a> PypiDependencyProvider<'a> {
             solvable_index,
             solvable_meta,
             marker_env,
-            conda_run_deps: RefCell::new(HashMap::new()),
             unknown_deps_sid,
             name_map,
             pypi_to_conda,
@@ -347,7 +340,6 @@ impl DependencyProvider for PypiDependencyProvider<'_> {
         };
 
         let mut requirements: Vec<ConditionalRequirement> = Vec::new();
-        let mut conda_edges: Vec<(String, String)> = Vec::new();
 
         for raw in &pool_record.metadata.requires_dist {
             let req: uv_pep508::Requirement = match uv_pep508::Requirement::from_str(raw) {
@@ -402,8 +394,7 @@ impl DependencyProvider for PypiDependencyProvider<'_> {
 
             match route {
                 Some(RouteDecision::KeepConda) => {
-                    // Omit from resolvo requirements; record as conda run-dep.
-                    conda_edges.push((child_conda_name, raw_spec));
+                    // Omit from resolvo requirements; this dep is conda-routed.
                     continue;
                 }
                 Some(RouteDecision::Bundle) | None => {
@@ -423,15 +414,6 @@ impl DependencyProvider for PypiDependencyProvider<'_> {
             });
             let vsid = self.pool.intern_version_set(child_name_id, vs);
             requirements.push(vsid.into());
-        }
-
-        // Record conda edges for this solvable.
-        if !conda_edges.is_empty() {
-            self.conda_run_deps
-                .borrow_mut()
-                .entry(solvable)
-                .or_default()
-                .extend(conda_edges);
         }
 
         Dependencies::Known(KnownDependencies {
@@ -455,9 +437,6 @@ pub(crate) struct SolvedWheel {
 /// Result of the sync solve.
 pub(crate) struct SolveResult {
     pub wheels: Vec<SolvedWheel>,
-    /// Conda run-deps accumulated during get_dependencies calls, deduplicated.
-    /// Each entry is (conda_name, spec_string).
-    pub conda_run_deps: Vec<(String, String)>,
 }
 
 /// Build a root requirement for `(pypi_name, specifiers_str)` against the
@@ -602,21 +581,7 @@ pub(crate) fn run_sync_solve(
         })
         .collect();
 
-    // Deduplicate conda run-deps across all solvables.
-    let mut seen_run_deps: HashSet<(String, String)> = HashSet::new();
-    let conda_run_deps: Vec<(String, String)> = provider
-        .conda_run_deps
-        .borrow()
-        .values()
-        .flatten()
-        .filter(|pair| seen_run_deps.insert((*pair).clone()))
-        .cloned()
-        .collect();
-
-    Ok(SolveResult {
-        wheels,
-        conda_run_deps,
-    })
+    Ok(SolveResult { wheels })
 }
 
 // ── Solution → Bundle extras mapping ─────────────────────────────────────────
@@ -986,12 +951,6 @@ mod tests {
             !names.contains(&"conda-pkg-transitive"),
             "conda-pkg-transitive must be pruned (conda subtree); got {names:?}"
         );
-
-        // The conda run-deps side-channel must record the conda-pkg edge.
-        // (It's keyed per solvable — check the flattened set.)
-        // Note: if conda-pkg itself is routed to conda by the root requirement
-        // handling, its transitive T is pruned in get_dependencies.  Either way T
-        // must not appear in wheels.
     }
 
     // ── Test 3: backtracking (the complete-solver advantage) ──────────────────

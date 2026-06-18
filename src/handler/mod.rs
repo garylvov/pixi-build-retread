@@ -3392,7 +3392,6 @@ async fn resolve_bundle_resolvo(
     tracing::debug!(
         conda_name = %conda_name,
         extras_count = extras.len(),
-        conda_run_deps_count = solve_result.conda_run_deps.len(),
         "resolvo: bundle assembled"
     );
 
