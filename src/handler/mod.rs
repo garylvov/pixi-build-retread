@@ -2697,7 +2697,29 @@ async fn resolve_bundle(
         )?;
         for pending in tmp_queue {
             let name = canonical_conda_name(&pending.pypi_name);
-            work.entry(name).or_insert(pending);
+            // FIX 2: merge specifiers when a second edge arrives for the same name
+            // in the same sweep, so the constraint is accumulated rather than dropped.
+            match work.entry(name) {
+                std::collections::btree_map::Entry::Vacant(e) => {
+                    e.insert(pending);
+                }
+                std::collections::btree_map::Entry::Occupied(mut e) => {
+                    if let PendingSource::Pypi {
+                        specifiers: new_s, ..
+                    } = pending.source
+                        && let PendingSource::Pypi {
+                            ref mut specifiers, ..
+                        } = e.get_mut().source
+                    {
+                        let merged: VersionSpecifiers = specifiers
+                            .iter()
+                            .cloned()
+                            .chain(new_s.iter().cloned())
+                            .collect();
+                        *specifiers = merged;
+                    }
+                }
+            }
         }
     }
 
@@ -3157,7 +3179,29 @@ async fn resolve_bundle(
                 )?;
                 for p in tmp_seed {
                     let name = canonical_conda_name(&p.pypi_name);
-                    work.entry(name).or_insert(p);
+                    // FIX 2: merge specifiers when a second edge arrives for the same
+                    // name in the same sweep (recurse drain), same as seed drain above.
+                    match work.entry(name) {
+                        std::collections::btree_map::Entry::Vacant(e) => {
+                            e.insert(p);
+                        }
+                        std::collections::btree_map::Entry::Occupied(mut e) => {
+                            if let PendingSource::Pypi {
+                                specifiers: new_s, ..
+                            } = p.source
+                                && let PendingSource::Pypi {
+                                    ref mut specifiers, ..
+                                } = e.get_mut().source
+                            {
+                                let merged: VersionSpecifiers = specifiers
+                                    .iter()
+                                    .cloned()
+                                    .chain(new_s.iter().cloned())
+                                    .collect();
+                                *specifiers = merged;
+                            }
+                        }
+                    }
                 }
             }
 

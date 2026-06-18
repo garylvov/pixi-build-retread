@@ -562,6 +562,29 @@ packs (assert ONLY canonical reorder, NO version change) + incremental e2e (add 
 resolves + lock == full cold) -> HOLD push, report to user in morning. Probe commit 52402dd is
 THROWAWAY (must be dropped/reverted before any real impl commits or merge).
 
+PART 1 IMPLEMENTED (dev/incremental-add, off b09f70a): PR-1 2d25673 (confluent ResolveState/observe_edge
++ name-sorted BFS + 4 sites + EMIT_EPOCH 5->6), PR-2 889daa5 (canonicalize + SCHEMA 9->10), PR-3 4e483c0
+(entry_specs). 362 tests green. GRIZZLY AUDIT = BLOCK (2 real latent bugs, masked today by 0-conflict
+packs -- exactly what the certainty bar is for):
+  BUG1 (re-resolve swallow): NeedsReResolve -> revoke_chosen + extras.retain + re-enqueue, but
+  observe_edge then returns AlreadySatisfied for the revoked-but-still-in-constraints name (resolve_
+  state.rs:142-145) -> tighter_pending never reaches frontier -> dep SILENTLY DELETED, never re-fetched.
+  The re-resolve mechanism (the whole point) is a no-op. Fix: revoked name must return a fetch-this
+  result (ReFetch variant or drop from constraints) + fetch with the FULL accumulated intersection +
+  re-add to extras.
+  BUG2 (same-level dup-edge drop): work.entry().or_insert (mod.rs:2700/3160) discards a 2nd Pending for
+  the same name BEFORE observe_edge -> its spec never intersected. Fix: observe both edges' specs.
+  BUG3 (test gap): tighten_triggers_reresolve only tests observe_edge in ISOLATION, not the BFS loop ->
+  missed BUG1. Add a back-pressure INTEGRATION test driving resolve_bundle (revoke->refetch->re-add).
+  SOUND (do not touch): termination cap (MAX_BFS_ITERATIONS=500 monotone), confluence sites 2/3/4 sorts,
+  carrier election M-1 (members[0] post-canonicalize, byte-identical replay), fail-closed conflict (empty
+  intersection -> pypi::resolve errors), gates (SCHEMA10/EPOCH6 fail-closed), entry_specs not in hash,
+  no schema bloat. Conservative-extension CONFIRMED for the no-conflict case (New uses first-requirer
+  spec = old BFS pick) -> G-1 will pass on the 7 packs.
+SWE FIXING bugs 1-3 + the integration test (a4915615...). Then grizzly RE-AUDIT -> G-1 (grizzly advises
+the CHEAP resolve-only {name:version} DUMP + exit, diff vs every committed lock's wheel versions, run
+twice for determinism; canonical reorder OK, ANY version change = STOP) + 2-pack replay-e2e seal.
+
 ## PHASE 2.8 (root-cause fix for isaac-pack-latest install) -- DONE + SHIPPED (see below); G-1 e2e was RUN
 User reopened the loop to fix the isaac-pack-latest import bug AT ROOT CAUSE (no manifest band-aid).
 ROOT CAUSE: isaaclab-mimic (built from IsaacLab git source) ships `Requires-Dist: robomimic @ git+...@v0.4.0`

@@ -161,8 +161,15 @@ impl ResolveState {
 
     /// Remove a dep from `chosen` when it needs to be re-resolved (tightened
     /// past its current version). The caller re-enqueues it with tighter specs.
+    ///
+    /// IMPORTANT: also removes from `constraints` so that when the re-enqueued
+    /// `tighter_pending` (which already carries the full intersected specifiers)
+    /// arrives at `observe_edge`, it hits the `New` branch and gets pushed to
+    /// the frontier for fetching. Without this, the constraint key still exists,
+    /// the `New` branch is skipped, and the dep silently vanishes (FIX 1).
     pub fn revoke_chosen(&mut self, canonical_name: &str) {
         self.chosen.remove(canonical_name);
+        self.constraints.remove(canonical_name);
     }
 
     /// Returns the accumulated constraint for a name, or `None` if bare.
@@ -294,6 +301,8 @@ pub(crate) fn specifiers_provably_conflict(a: &VersionSpecifiers, b: &VersionSpe
 mod tests {
     use super::*;
     use std::str::FromStr;
+
+    use crate::relax::canonical_conda_name;
 
     fn specs(s: &str) -> VersionSpecifiers {
         VersionSpecifiers::from_str(s).unwrap()
@@ -466,6 +475,155 @@ mod tests {
             matches!(result, ObserveEdgeResult::AlreadySatisfied),
             "compatible tighten must not trigger re-resolve, got {:?}",
             result
+        );
+    }
+
+    // ── FIX 3: revoke→re-enqueue→New back-pressure cycle ────────────────────
+
+    /// Simulates the BFS loop's revoke→re-enqueue→refetch cycle.
+    ///
+    /// Scenario:
+    ///   1. `foo` is observed with loose spec `>=2.0` → New (enqueued)
+    ///   2. `foo` is resolved and committed at version 2.5
+    ///   3. A tighter requirer arrives: `foo >=2.7` → NeedsReResolve(tighter)
+    ///   4. BFS loop: `revoke_chosen("foo")` then re-inserts tighter_pending
+    ///   5. Next observe_edge for the re-enqueued tighter_pending → must return
+    ///      New (not AlreadySatisfied), so the dep gets re-fetched.
+    ///
+    /// This test FAILS against the pre-fix code (where revoke_chosen only
+    /// removes from `chosen`, leaving `constraints["foo"]` set, so the re-
+    /// enqueued pending hits AlreadySatisfied → dep silently deleted).
+    #[test]
+    fn revoke_clears_constraints_so_reenqueue_hits_new() {
+        let mut state = ResolveState::default();
+
+        // Step 1: first loose observation
+        let p_loose = make_pypi_pending("foo", ">=2.0");
+        let r1 = state.observe_edge("foo", p_loose).unwrap();
+        assert!(
+            matches!(r1, ObserveEdgeResult::New(_)),
+            "step1: must be New"
+        );
+
+        // Step 2: commit chosen at 2.5
+        state.commit_chosen("foo".to_string(), "2.5".to_string());
+
+        // Step 3: tighter observation excludes 2.5
+        let p_tight = make_pypi_pending("foo", ">=2.7");
+        let r2 = state.observe_edge("foo", p_tight.clone()).unwrap();
+        let tighter_pending = match r2 {
+            ObserveEdgeResult::NeedsReResolve(p) => p,
+            other => panic!("step3: expected NeedsReResolve, got {:?}", other),
+        };
+
+        // Step 4: BFS loop calls revoke_chosen (FIX 1: also clears constraints)
+        state.revoke_chosen("foo");
+
+        // Step 5: re-enqueue the tighter_pending and observe_edge again.
+        // Pre-fix: constraints["foo"] still exists → hits AlreadySatisfied → dep lost.
+        // Post-fix: constraints["foo"] cleared → hits New → dep re-fetched.
+        let re_enqueued_name = canonical_conda_name(&tighter_pending.pypi_name);
+        let r3 = state
+            .observe_edge(&re_enqueued_name, tighter_pending)
+            .unwrap();
+        assert!(
+            matches!(r3, ObserveEdgeResult::New(_)),
+            "post-revoke re-enqueue must return New so the dep is re-fetched, got {:?}",
+            r3
+        );
+
+        // The re-fetched tighter_pending carries the intersected spec (>=2.0,>=2.7).
+        // Verify it rejects 2.5 and accepts 2.7.
+        let new_constraint = state.current_constraint("foo").cloned().unwrap_or_default();
+        let v25 = ver("2.5");
+        let v27 = ver("2.7");
+        assert!(
+            !new_constraint.contains(&v25),
+            "2.5 must be rejected by the re-resolved constraint"
+        );
+        assert!(
+            new_constraint.contains(&v27),
+            "2.7 must be accepted by the re-resolved constraint"
+        );
+    }
+
+    // ── FIX 4: multi-requirer constraint accumulation produces correct result ─
+
+    /// Three requirers constrain `foo`. Proves the accumulated intersection
+    /// actually changes the selected version range (not a no-op).
+    ///
+    /// Requirers:
+    ///   A: foo >=1.0          (loose)
+    ///   B: foo >=1.5,<2.0     (mid)
+    ///   C: foo >=1.8          (tightens lower bound within B's range)
+    ///
+    /// Intersection: foo >=1.8,<2.0 (only 1.8.x satisfies all three)
+    /// Version 1.9 is IN; version 1.5 is OUT (excluded by C); 2.0 is OUT (excluded by B).
+    #[test]
+    fn multi_requirer_constraint_accumulates_correctly() {
+        let mut state = ResolveState::default();
+
+        // Requirer A: foo >=1.0 (first observer → New)
+        let p_a = make_pypi_pending("foo", ">=1.0");
+        let r_a = state.observe_edge("foo", p_a).unwrap();
+        assert!(matches!(r_a, ObserveEdgeResult::New(_)));
+
+        // "Resolve" foo at version 1.5 (within A's loose constraint)
+        state.commit_chosen("foo".to_string(), "1.5".to_string());
+
+        // Requirer B: foo >=1.5,<2.0 (tighter; 1.5 is still in [1.5,2.0))
+        let p_b = make_pypi_pending("foo", ">=1.5,<2.0");
+        let r_b = state.observe_edge("foo", p_b).unwrap();
+        // 1.5 satisfies >=1.5,<2.0, so AlreadySatisfied
+        assert!(
+            matches!(r_b, ObserveEdgeResult::AlreadySatisfied),
+            "1.5 satisfies >=1.5,<2.0; expected AlreadySatisfied, got {:?}",
+            r_b
+        );
+
+        // Requirer C: foo >=1.8 (tightens past chosen 1.5 → NeedsReResolve)
+        let p_c = make_pypi_pending("foo", ">=1.8");
+        let r_c = state.observe_edge("foo", p_c).unwrap();
+        let tighter = match r_c {
+            ObserveEdgeResult::NeedsReResolve(p) => p,
+            other => panic!("expected NeedsReResolve from C, got {:?}", other),
+        };
+
+        // The tighter_pending must carry the FULL accumulated intersection:
+        // >=1.0 AND >=1.5,<2.0 AND >=1.8 → effectively >=1.8,<2.0
+        let tighter_specs = match &tighter.source {
+            PendingSource::Pypi { specifiers, .. } => specifiers.clone(),
+            _ => panic!("expected Pypi source"),
+        };
+        let v15 = ver("1.5");
+        let v18 = ver("1.8");
+        let v19 = ver("1.9");
+        let v20 = ver("2.0");
+        assert!(
+            !tighter_specs.contains(&v15),
+            "1.5 must be excluded by the intersected constraint (>=1.8 tightened it)"
+        );
+        assert!(
+            tighter_specs.contains(&v18),
+            "1.8 must be accepted by the intersected constraint"
+        );
+        assert!(
+            tighter_specs.contains(&v19),
+            "1.9 must be accepted by the intersected constraint"
+        );
+        assert!(
+            !tighter_specs.contains(&v20),
+            "2.0 must be excluded by the intersected constraint (<2.0 from B)"
+        );
+
+        // After revoke+re-enqueue, the dep hits New and gets re-fetched.
+        state.revoke_chosen("foo");
+        let re_name = canonical_conda_name(&tighter.pypi_name);
+        let r_requeue = state.observe_edge(&re_name, tighter).unwrap();
+        assert!(
+            matches!(r_requeue, ObserveEdgeResult::New(_)),
+            "after revoke, re-enqueued dep must be New, got {:?}",
+            r_requeue
         );
     }
 
