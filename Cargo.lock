@@ -1772,6 +1772,7 @@ dependencies = [
  "rattler_virtual_packages",
  "regex",
  "reqwest",
+ "resolvo",
  "serde",
  "serde_json",
  "serde_yaml",

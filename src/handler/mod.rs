@@ -3321,6 +3321,7 @@ async fn resolve_bundle(
             name_map,
             conda_channels,
             pypi_to_conda,
+            conda_deps_list,
         )
         .await;
     }
@@ -3351,99 +3352,41 @@ async fn resolve_bundle_resolvo(
     conda_channels: &[ChannelUrl],
     pypi_to_conda: &PypiToCondaMap,
 ) -> Result<Bundle> {
-    use crate::handler::resolvo_discovery::{DiscoveryParams, run_discovery};
     use crate::handler::resolvo_provider::{
-        self as resolvo_provider, PypiDependencyProvider, pool_record_to_resolved_wheel,
-        run_sync_solve,
+        SolveOutcome, pool_record_to_resolved_wheel, resolvo_solve_pool,
     };
 
-    let index = entry.index_url();
-
-    // Build the seed requires_dist: use the primary's metadata (post-rewrite),
-    // plus any user-requested extras expanded from the entry.
-    // For the resolvo path, extras are pre-expanded by the user listing them
-    // in the entry's `extras` field, which are handled during seed_worklist
-    // (BFS) or here as pre-expanded root requirements.
     let primary_rd = primary.metadata.requires_dist.clone();
 
-    // ── Phase 1: discovery fixpoint ─────────────────────────────────────────
-    let params = DiscoveryParams {
-        index: &index,
+    // ── Phases 1+2: discovery fixpoint + sync solve via shared harness ──────
+    // resolvo_solve_pool encapsulates discovery + spawn_blocking solve into one
+    // unit.  SolveOutcome::Unsolvable is mapped to Err here (the default path
+    // fails closed); the A/B oracle uses SolveOutcome directly via ab_diff_hook.
+    let (pool, outcome) = resolvo_solve_pool(
+        &primary_rd,
+        entry,
         target,
         download_dir,
         relax,
-        conda_channels,
         name_map,
+        conda_channels,
         pypi_to_conda,
-        max_iterations: DiscoveryParams::DEFAULT_MAX_ITERATIONS,
-    };
-
-    let discovery_pool = run_discovery(&primary_rd, &params)
-        .await
-        .context("resolvo discovery pass failed")?;
-
-    // ── Phase 2: sync solve (inside spawn_blocking) ──────────────────────────
-    let conda_subdir = target.conda_subdir.clone();
-    let python_version = target.python_version.clone();
-
-    // Pre-expand extras from the entry: fetch their edge deps from the primary's
-    // metadata and add as root requirements.
-    let entry_extras: Vec<String> = entry.extras.clone();
-
-    // Build root requirements for each dep in primary_rd.
-    // We build the provider here (in async context) and send it into spawn_blocking
-    // with an Arc.  Since PypiDependencyProvider borrows DiscoveryPool with a
-    // lifetime, we use an owned approach: clone the needed parts.
-    //
-    // Design: pass the DiscoveryPool into spawn_blocking as an Arc so the provider
-    // can borrow it safely inside the sync closure.
-    let discovery_pool_arc = std::sync::Arc::new(discovery_pool);
-    let primary_rd_clone = primary_rd.clone();
-    let entry_extras_clone = entry_extras.clone();
-    let name_map_clone = name_map.clone();
-    let pypi_to_conda_clone = pypi_to_conda.clone();
-
-    let solve_result = tokio::task::spawn_blocking({
-        let dp = discovery_pool_arc.clone();
-        move || {
-            // Build the provider inside the blocking thread.
-            let provider = PypiDependencyProvider::new(
-                &dp,
-                &conda_subdir,
-                &python_version,
-                name_map_clone,
-                pypi_to_conda_clone,
-            )?;
-
-            // Build root requirements from primary's requires_dist,
-            // routing-filtering conda deps (same logic as get_dependencies).
-            let marker_env = crate::relax::marker_env_for(&conda_subdir, &python_version)
-                .context("marker env for resolvo root reqs")?;
-
-            // Compute active extras from entry extras list.
-            let active_extras: Vec<uv_normalize::ExtraName> = entry_extras_clone
-                .iter()
-                .filter_map(|e| uv_normalize::ExtraName::from_owned(e.clone()).ok())
-                .collect();
-
-            let root_reqs = resolvo_provider::build_root_requirements_from_rd(
-                &provider,
-                &primary_rd_clone,
-                &marker_env,
-                &active_extras,
-            );
-
-            run_sync_solve(provider, root_reqs)
-        }
-    })
+        &[], // force-list not relevant on the RETREAD_RESOLVO=1 path
+    )
     .await
-    .context("resolvo solve thread panicked")?
-    .context("resolvo solve failed")?;
+    .context("resolvo discovery pass failed")?;
+
+    let solved_wheels = match outcome {
+        SolveOutcome::Solved(wheels) => wheels,
+        SolveOutcome::Unsolvable(msg) => {
+            return Err(anyhow::anyhow!("resolvo: dependency conflict:\n{msg}"));
+        }
+    };
 
     // ── Phase 3: map solution → Bundle extras ─────────────────────────────────
     let mut extras: Vec<ResolvedWheel> = Vec::new();
-    for solved_wheel in &solve_result.wheels {
-        match pool_record_to_resolved_wheel(solved_wheel, &discovery_pool_arc) {
+    for solved_wheel in &solved_wheels {
+        match pool_record_to_resolved_wheel(solved_wheel, &pool) {
             Ok(rw) => extras.push(rw),
             Err(e) => {
                 tracing::warn!(
@@ -3468,11 +3411,7 @@ async fn resolve_bundle_resolvo(
         extras,
         probe_decisions: vec![],
         solve_diagnostics: BTreeMap::new(),
-        conda_routed: discovery_pool_arc
-            .conda_routed_names
-            .iter()
-            .cloned()
-            .collect(),
+        conda_routed: pool.conda_routed_names.iter().cloned().collect(),
     })
 }
 

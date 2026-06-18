@@ -434,11 +434,6 @@ pub(crate) struct SolvedWheel {
     pub record_idx: usize,
 }
 
-/// Result of the sync solve.
-pub(crate) struct SolveResult {
-    pub wheels: Vec<SolvedWheel>,
-}
-
 /// PR-2: outcome of the resolvo sync solve, distinguishing a solved result
 /// from an unsolvable conflict. Returned as `Ok` so the A/B oracle can
 /// distinguish a measurement result from a genuine discovery I/O error.
@@ -559,43 +554,6 @@ pub(crate) fn build_root_requirements_from_rd(
     root_reqs
 }
 
-/// Run the sync solve.  Must be called inside `spawn_blocking` because
-/// resolvo's `NowOrNeverRuntime` is not compatible with Tokio's async executor.
-pub(crate) fn run_sync_solve(
-    provider: PypiDependencyProvider<'_>,
-    root_requirements: Vec<ConditionalRequirement>,
-) -> Result<SolveResult> {
-    let mut solver = resolvo::Solver::new(provider);
-
-    let problem = resolvo::Problem::new().requirements(root_requirements);
-
-    let solution = solver.solve(problem).map_err(|e| match e {
-        resolvo::UnsolvableOrCancelled::Unsolvable(conflict) => {
-            let msg = conflict.display_user_friendly(&solver).to_string();
-            anyhow!("resolvo: dependency conflict:\n{msg}")
-        }
-        resolvo::UnsolvableOrCancelled::Cancelled(_) => {
-            anyhow!("resolvo: solve cancelled unexpectedly")
-        }
-    })?;
-
-    let provider = solver.provider();
-
-    let wheels: Vec<SolvedWheel> = solution
-        .iter()
-        .map(|&sid| {
-            let record = &provider.pool.resolve_solvable(sid).record;
-            SolvedWheel {
-                pypi_name: record.pypi_name.clone(),
-                version_str: record.version_str.clone(),
-                record_idx: record.record_idx,
-            }
-        })
-        .collect();
-
-    Ok(SolveResult { wheels })
-}
-
 /// PR-2: sync solve that returns `SolveOutcome` instead of failing on Unsolvable.
 ///
 /// Called from `resolvo_solve_pool` inside `spawn_blocking`. The A/B oracle
@@ -650,6 +608,8 @@ pub(crate) async fn resolvo_solve_pool(
     name_map: &std::collections::BTreeMap<String, String>,
     conda_channels: &[rattler_conda_types::ChannelUrl],
     pypi_to_conda: &super::PypiToCondaMap,
+    // retread-conda-deps force-list for force-list symmetry in oracle.
+    conda_deps: &[String],
 ) -> Result<(DiscoveryPool, SolveOutcome)> {
     use crate::handler::resolvo_discovery::{DiscoveryParams, run_discovery};
 
@@ -664,6 +624,7 @@ pub(crate) async fn resolvo_solve_pool(
         name_map,
         pypi_to_conda,
         max_iterations: DiscoveryParams::DEFAULT_MAX_ITERATIONS,
+        conda_deps,
     };
 
     let discovery_pool = run_discovery(primary_rd, &params)
@@ -774,6 +735,11 @@ mod tests {
     use crate::handler::PypiToCondaMap;
     use crate::handler::resolvo_discovery::{DiscoveryParams, run_discovery};
     use crate::pypi::WheelTarget;
+
+    /// Result of the sync solve (test-only helper type).
+    struct SolveResult {
+        wheels: Vec<SolvedWheel>,
+    }
 
     // ── Shared fixture helpers ─────────────────────────────────────────────────
 
@@ -929,6 +895,7 @@ mod tests {
             name_map,
             pypi_to_conda,
             max_iterations: DiscoveryParams::DEFAULT_MAX_ITERATIONS,
+            conda_deps: &[],
         };
 
         let pool = run_discovery(&primary_rd, &params).await?;
@@ -946,9 +913,11 @@ mod tests {
             .expect("marker env");
         let root_reqs = build_root_requirements_from_rd(&provider, &primary_rd, &marker_env, &[]);
 
-        // Solve inside spawn_blocking (mirrors production path).
-        // We can call it directly in tests since tests are async.
-        run_sync_solve(provider, root_reqs)
+        let outcome = run_sync_solve_outcome(provider, root_reqs)?;
+        match outcome {
+            SolveOutcome::Solved(wheels) => Ok(SolveResult { wheels }),
+            SolveOutcome::Unsolvable(msg) => Err(anyhow!("resolvo: unsolvable:\n{msg}")),
+        }
     }
 
     // ── Test 1: basic resolve ──────────────────────────────────────────────────

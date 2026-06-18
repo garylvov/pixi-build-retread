@@ -199,33 +199,53 @@ fn build_version_set_diff(bfs_bundle: &Bundle, resolvo_wheels: &[ResolvedWheel])
 
 /// Build the `CondaRoutingDiff` from the two resolvers' conda-routed sets
 /// and the bundled sets.
+///
+/// All comparisons are done in canonical-conda-name space so raw PyPI name
+/// vs canonical conda name skew (Pillow/pillow, nvidia_x/nvidia-x,
+/// tinyobjloader/tinyobjloader-python) does not produce spurious RED.
 fn build_conda_routing_diff(
     bfs_bundle: &Bundle,
     bfs_bundled_set: &std::collections::HashSet<String>,
     resolvo_conda_routed: &[String],
     resolvo_bundled_set: &std::collections::HashSet<String>,
 ) -> CondaRoutingDiff {
+    // Canonicalize all sets to canonical_conda_name for apples-to-apples comparison.
+    let canon_bfs_bundled: std::collections::HashSet<String> = bfs_bundled_set
+        .iter()
+        .map(|n| canonical_conda_name(n))
+        .collect();
+    let canon_resolvo_bundled: std::collections::HashSet<String> = resolvo_bundled_set
+        .iter()
+        .map(|n| canonical_conda_name(n))
+        .collect();
+
     let bfs_conda_routed: Vec<String> = {
-        let mut v = bfs_bundle.conda_routed.clone();
+        let mut v: Vec<String> = bfs_bundle
+            .conda_routed
+            .iter()
+            .map(|n| canonical_conda_name(n))
+            .collect();
         v.sort();
+        v.dedup();
         v
     };
 
     let resolvo_conda_routed_sorted: Vec<String> = {
-        let mut v = resolvo_conda_routed.to_vec();
+        let mut v: Vec<String> = resolvo_conda_routed
+            .iter()
+            .map(|n| canonical_conda_name(n))
+            .collect();
         v.sort();
+        v.dedup();
         v
     };
 
-    // The bundled sets must match: same names, ignoring conda_routed
-    // (conda_routed is the "not bundled" set; bundled_set_matches checks
-    // that the POSITIVE bundled sets agree between the two solvers).
-    let bundled_set_matches = bfs_bundled_set == resolvo_bundled_set;
+    // bundled_set_matches: canonical bundled sets agree.
+    let bundled_set_matches = canon_bfs_bundled == canon_resolvo_bundled;
 
-    // Routing mismatch: names that appear in one solver's bundled-or-conda set
-    // but land in a different side in the other solver.
-    let mut all_names: std::collections::HashSet<String> = bfs_bundled_set.clone();
-    all_names.extend(resolvo_bundled_set.iter().cloned());
+    // Routing mismatch: names that land on different sides across the two solvers.
+    let mut all_names: std::collections::HashSet<String> = canon_bfs_bundled.clone();
+    all_names.extend(canon_resolvo_bundled.iter().cloned());
     all_names.extend(bfs_conda_routed.iter().cloned());
     all_names.extend(resolvo_conda_routed_sorted.iter().cloned());
 
@@ -238,14 +258,14 @@ fn build_conda_routing_diff(
     names_sorted.sort();
 
     for name in &names_sorted {
-        let bfs_side = if bfs_bundled_set.contains(name) {
+        let bfs_side = if canon_bfs_bundled.contains(name) {
             Side::Bundled
         } else if bfs_conda_set.contains(name) {
             Side::Conda
         } else {
             Side::Absent
         };
-        let resolvo_side = if resolvo_bundled_set.contains(name) {
+        let resolvo_side = if canon_resolvo_bundled.contains(name) {
             Side::Bundled
         } else if resolvo_conda_set.contains(name) {
             Side::Conda
@@ -289,8 +309,20 @@ fn build_provenance_diffs(
             continue;
         };
 
-        // Tier-1: url-derived filename, upstream_url, sdist_source, git_source.
+        // Tier-1: filename (from wheel metadata), upstream_url, sdist_source, git_source.
         let mut fields: Vec<ProvenanceFieldDiff> = Vec::new();
+
+        // filename — catches tag differences (cp311 vs cp312, abi3 vs cp-specific)
+        // on wheels at the same (name, version).
+        let bfs_filename = Some(bfs_wheel.metadata.filename.clone());
+        let resolvo_filename = Some(rw.metadata.filename.clone());
+        if bfs_filename != resolvo_filename {
+            fields.push(ProvenanceFieldDiff {
+                field: "filename".to_string(),
+                bfs: bfs_filename,
+                resolvo: resolvo_filename,
+            });
+        }
 
         // upstream_url
         let bfs_upstream = bfs_wheel.upstream_url.as_ref().map(|u| u.to_string());
@@ -353,13 +385,20 @@ fn build_provenance_diffs(
 
 /// Returns `true` ONLY in the narrow safe case: the Unsolvable message text
 /// references at least one excluded (name, version) pair AND no other
-/// hyphenated/underscored token that looks like a PyPI package name can be
-/// found outside the excluded set. Ambiguous cases return `false` (fail-to-RED).
+/// identifier-shaped token appears outside the excluded set.
+/// Ambiguous cases return `false` (fail-to-RED).
 ///
 /// This is best-effort-strengthen-only: resolvo's `Conflict` type has no
 /// structured name API, so we work from the display string.
-/// Package names in PyPI almost always contain a hyphen or underscore;
-/// plain English words without those separators are not treated as package names.
+///
+/// Every non-digit-leading alphabetic/identifier token is treated as a
+/// potential name candidate. English connectives (is/because/cannot/…) in
+/// resolvo's display_user_friendly output will each force RED — that is the
+/// INTENDED fail-to-RED-harder posture: over-report RED, never under-report.
+/// Single-word PyPI names (numpy, torch, scipy, gymnasium, pillow, …) that
+/// appear in a conflict message alongside an excluded hyphenated package MUST
+/// also force RED; the old hyphen/underscore short-circuit silently ignored
+/// them, allowing a genuine numpy conflict to be demoted to UNSOLVABLE-EXCLUDED.
 pub(crate) fn demote_to_excluded(
     msg: &str,
     excluded: &[crate::handler::resolvo_discovery::ExcludedCandidate],
@@ -377,13 +416,9 @@ pub(crate) fn demote_to_excluded(
         return false;
     }
 
-    // Fail-to-RED: if any other non-excluded package name appears in the
-    // conflict message, return false (ambiguous).
-    //
-    // Heuristic: a token is treated as a package-name candidate only if it
-    // contains a hyphen or underscore (the characteristic separator in PyPI
-    // names). Plain English words without those separators are ignored.
-    // This is conservative: when in doubt, RED.
+    // Fail-to-RED: if ANY identifier-shaped token appears that is not in the
+    // excluded set, return false (ambiguous => RED).
+    // Digit-starting tokens are skipped (version strings: "1.26.4", "3.11").
     let excluded_names: std::collections::HashSet<&str> =
         excluded.iter().map(|e| e.pypi_name.as_str()).collect();
 
@@ -392,15 +427,12 @@ pub(crate) fn demote_to_excluded(
         if cleaned.is_empty() {
             continue;
         }
-        // Only consider tokens with hyphens or underscores as potential PyPI names.
-        if !cleaned.contains('-') && !cleaned.contains('_') {
-            continue;
-        }
-        // Skip tokens that start with a digit (version strings like "2.0", "3.11").
+        // Skip version-like tokens (start with a digit).
         if cleaned.starts_with(|c: char| c.is_ascii_digit()) {
             continue;
         }
-        // If this looks like a package name and is NOT in excluded, ambiguous -> RED.
+        // Every other identifier token that is NOT in excluded_names is a
+        // potential conflict participant -> fail-to-RED.
         if !excluded_names.contains(cleaned) {
             return false;
         }
@@ -530,6 +562,7 @@ pub(crate) async fn ab_diff_hook(
     name_map: &std::collections::BTreeMap<String, String>,
     conda_channels: &[ChannelUrl],
     pypi_to_conda: &PypiToCondaMap,
+    conda_deps: &[String],
 ) {
     let target_str = format!("{}/{}", target.conda_subdir, target.python_version);
     let conda_name = bfs_bundle.conda_name.clone();
@@ -545,6 +578,7 @@ pub(crate) async fn ab_diff_hook(
         name_map,
         conda_channels,
         pypi_to_conda,
+        conda_deps,
     )
     .await;
 
@@ -832,8 +866,9 @@ mod tests {
 
     #[test]
     fn classify_unsolvable_excluded_when_demote_succeeds() {
-        // pkg-x 2.0 was excluded, and the message only references pkg-x 2.0.
-        let msg = "pkg-x 2.0 is required but excluded from the pool";
+        // Narrow safe case: message contains ONLY the excluded name+version.
+        // Any prose tokens (is/required/excluded/…) would force RED.
+        let msg = "pkg-x 2.0";
         let verdict = classify(
             &unsolvable(msg),
             None,
@@ -882,10 +917,27 @@ mod tests {
 
     #[test]
     fn demote_narrow_safe_returns_true() {
-        // Message references only pkg-x 2.0 which is in excluded.
-        let msg = "pkg-x 2.0 is not installable";
+        // Message contains ONLY the excluded name and a version token.
+        // Any English prose would force RED (fail-to-RED-harder posture).
+        let msg = "pkg-x 2.0";
         let exc = excluded("pkg-x", "2.0");
         assert!(demote_to_excluded(msg, &exc));
+    }
+
+    #[test]
+    fn demote_single_word_conflict_name_forces_red() {
+        // Regression: a genuine conflict over single-word "numpy" co-occurring
+        // with excluded "tinyobjloader-python" must NOT be demoted to
+        // UNSOLVABLE-EXCLUDED. The old hyphen/underscore short-circuit silently
+        // ignored "numpy" and returned true (false green). The fixed heuristic
+        // returns false -> RED.
+        let msg = "numpy 1.26.4, which conflicts with the versions reported above. \
+                   tinyobjloader-python 2.0 is excluded because sdist build failed";
+        let exc = excluded("tinyobjloader-python", "2.0");
+        assert!(!demote_to_excluded(msg, &exc));
+        // Verify the full classify path also returns RED.
+        let verdict = classify(&unsolvable(msg), None, None, None, &exc);
+        assert_eq!(verdict, "RED");
     }
 
     // ── derive_bundled_set symmetry ───────────────────────────────────────────

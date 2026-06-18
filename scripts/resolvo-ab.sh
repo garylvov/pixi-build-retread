@@ -14,7 +14,7 @@
 #   genesis  — genesis default env          (EXPECTED all-SKIPPED: source-form)
 #
 # VERDICT PRECEDENCE (rollup per entry)
-#   RED > UNSOLVABLE-CONFLICT > UNSOLVABLE-EXCLUDED > VERSION-DIFF > GREEN > SKIPPED
+#   RED > UNSOLVABLE-EXCLUDED > VERSION-DIFF > GREEN > SKIPPED
 #   all-skips => SKIPPED (never GREEN) per the "genesis documents scope boundary" rule.
 #
 # EXIT CODE
@@ -82,8 +82,7 @@ import sys, json, collections
 rollup_path, summary_path = sys.argv[1], sys.argv[2]
 
 # Verdict precedence (higher index = worse)
-PRECEDENCE = ["SKIPPED", "GREEN", "VERSION-DIFF", "UNSOLVABLE-EXCLUDED",
-              "UNSOLVABLE-CONFLICT", "RED"]
+PRECEDENCE = ["SKIPPED", "GREEN", "VERSION-DIFF", "UNSOLVABLE-EXCLUDED", "RED"]
 
 def precedence(v):
     try:

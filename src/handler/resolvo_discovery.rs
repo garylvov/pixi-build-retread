@@ -237,6 +237,11 @@ pub struct DiscoveryParams<'a> {
     /// Hard cap on BFS depth to prevent runaway fixpoints on pathological
     /// indexes.  Typical well-behaved packages resolve in < 10 levels.
     pub max_iterations: usize,
+    /// PR-2: retread-conda-deps force-list. Names canonicalized and intersected
+    /// with discovered requires_dist names to populate `conda_routed_names`
+    /// symmetrically with the BFS force-list union (mod.rs:3280-3300).
+    /// Pass `&[]` when not using the A/B oracle.
+    pub conda_deps: &'a [String],
 }
 
 impl<'a> DiscoveryParams<'a> {
@@ -628,6 +633,27 @@ pub async fn run_discovery(
         }
     }
 
+    // ── Force-list union (PR-2 symmetry) ─────────────────────────────────────
+    //
+    // The BFS force-list union (mod.rs) adds retread-conda-deps names to
+    // conda_routed_acc when they appear in any bundled wheel's transitive
+    // requires_dist.  Mirror that here: intersect the force-list with the set
+    // of names discovered in this fixpoint and add them to conda_routed_names.
+    if !params.conda_deps.is_empty() {
+        let force_conda: std::collections::HashSet<String> = params
+            .conda_deps
+            .iter()
+            .map(|n| canonical_conda_name(n))
+            .collect();
+        // All discovered pypi names (visited set), canonicalized.
+        for pn in &visited {
+            let canon = canonical_conda_name(pn);
+            if force_conda.contains(&canon) {
+                pool.conda_routed_names.insert(canon);
+            }
+        }
+    }
+
     tracing::debug!(
         candidates = pool.candidates.len(),
         total_records = pool.candidates.values().map(|v| v.len()).sum::<usize>(),
@@ -941,6 +967,7 @@ mod tests {
             name_map: &name_map,
             pypi_to_conda: &pypi_to_conda,
             max_iterations: DiscoveryParams::DEFAULT_MAX_ITERATIONS,
+            conda_deps: &[],
         };
 
         let pool = run_discovery(&primary_rd, &params)
@@ -1027,6 +1054,7 @@ mod tests {
             name_map: &name_map,
             pypi_to_conda: &pypi_to_conda,
             max_iterations: DiscoveryParams::DEFAULT_MAX_ITERATIONS,
+            conda_deps: &[],
         };
 
         let pool = run_discovery(&primary_rd, &params)
@@ -1104,6 +1132,7 @@ mod tests {
             name_map: &name_map,
             pypi_to_conda: &pypi_to_conda,
             max_iterations: DiscoveryParams::DEFAULT_MAX_ITERATIONS,
+            conda_deps: &[],
         };
 
         let pool = run_discovery(&primary_rd, &params)
@@ -1173,6 +1202,7 @@ mod tests {
             name_map: &name_map,
             pypi_to_conda: &pypi_to_conda,
             max_iterations: DiscoveryParams::DEFAULT_MAX_ITERATIONS,
+            conda_deps: &[],
         };
 
         let pool = run_discovery(&primary_rd, &params)
