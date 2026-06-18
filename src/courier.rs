@@ -963,6 +963,10 @@ pub async fn stage(
     }
 
     // Step 6: Assemble the RetreadLock and canonicalize for stable JSON output.
+    // entry_specs: the canonical resolution-input spec list for this bundle.
+    // Populated here so the Part-2 delta-detector can diff it against the
+    // current manifest without re-running the full resolve.
+    let entry_specs = courier_input_specs(config, bundle_name);
     let mut lock = RetreadLock {
         schema: SCHEMA,
         retread_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -976,6 +980,7 @@ pub async fn stage(
         index_urls: index_urls.to_vec(),
         prerelease,
         conda_capable: conda_capable.iter().cloned().collect(),
+        entry_specs,
     };
     lock.canonicalize();
 

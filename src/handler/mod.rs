@@ -5609,6 +5609,7 @@ mod replay_tests {
             index_urls: vec!["https://pypi.org/simple/".into()],
             prerelease: BTreeMap::new(),
             conda_capable: vec![],
+            entry_specs: vec![],
         }
     }
 
@@ -5860,6 +5861,7 @@ mod replay_tests {
             index_urls: vec!["https://pypi.org/simple/".into()],
             prerelease: BTreeMap::new(),
             conda_capable: vec![],
+            entry_specs: vec![],
         };
         // Config has no retread_wheels entries — wheel is a class-3 orphan.
         // Use serde_json to construct a minimal config (RetreadConfig has no
@@ -5926,6 +5928,7 @@ mod replay_tests {
             index_urls: vec!["https://pypi.org/simple/".into()],
             prerelease: BTreeMap::new(),
             conda_capable: vec![],
+            entry_specs: vec![],
         };
         let config: RetreadConfig =
             serde_json::from_value(serde_json::json!({"retread-wheels": {}})).unwrap();
@@ -6028,6 +6031,7 @@ mod replay_tests {
             index_urls: vec!["https://pypi.org/simple/".into()],
             prerelease: BTreeMap::new(),
             conda_capable: vec![],
+            entry_specs: vec![],
         };
         let config: RetreadConfig =
             serde_json::from_value(serde_json::json!({"retread-wheels": {}})).unwrap();
@@ -6222,6 +6226,7 @@ mod replay_tests {
             index_urls: vec!["https://pypi.org/simple/".into()],
             prerelease: BTreeMap::new(),
             conda_capable: vec![],
+            entry_specs: vec![],
         };
         let config: RetreadConfig = serde_json::from_value(serde_json::json!({"retread-wheels": {
             "gympack": { "version": "==1.0.0" }
@@ -6574,6 +6579,7 @@ mod replay_tests {
             index_urls: index_urls.to_vec(),
             prerelease: BTreeMap::new(),
             conda_capable: vec![wheel_name.to_string()],
+            entry_specs: vec![],
         };
 
         // Build the replay EmitWheel exactly as the new Class-2 arm would:
@@ -6733,6 +6739,7 @@ mod replay_tests {
             index_urls: vec!["https://pypi.org/simple/".into()],
             prerelease: BTreeMap::new(),
             conda_capable: vec!["requests".into()],
+            entry_specs: vec![],
         };
         let config: RetreadConfig = serde_json::from_value(serde_json::json!({"retread-wheels": {
             "reqpack": { "version": "==1.0.0" }
@@ -7535,6 +7542,7 @@ version = "1.0.0"
             index_urls: vec!["https://pypi.org/simple/".into()],
             prerelease: std::collections::BTreeMap::new(),
             conda_capable: vec![],
+            entry_specs: vec![],
         };
 
         // Config has no retread_wheels entries.

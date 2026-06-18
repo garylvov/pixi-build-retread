@@ -223,14 +223,35 @@ pub struct RetreadLock {
     /// Sorted for stable JSON output.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conda_capable: Vec<String>,
+    /// Canonical resolution-INPUT specs for this bundle, as produced by
+    /// `courier_input_specs(config, bundle_name)` — one sorted entry per
+    /// `[retread-wheels]` entry in this bundle (key + optional [extras] +
+    /// optional version/git-rev/url proxy). Written at lock-produce time;
+    /// read by the Part-2 incremental fast-path delta-detector to determine
+    /// whether the current manifest diff is a single-dep add.
+    ///
+    /// NOT in `compute_inputs_hash` (it is the thing the delta-detector
+    /// diffs; folding it would make the hash circular). Old schema-9 and
+    /// earlier locks lack this field — `#[serde(default)]` returns `vec![]`,
+    /// which the incremental path treats as "no prior entry_specs → can't
+    /// compute delta → fall back to full cold resolve" (safe).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entry_specs: Vec<String>,
 }
 
-/// Schema 10: canonical lock ordering via `RetreadLock::canonicalize()`.
+/// Schema 10: canonical lock ordering + `entry_specs` field.
+///
+/// Canonical ordering (`RetreadLock::canonicalize()`):
 /// `wheels[]` sorted by (canonical_conda_name, version, origin, filename);
 /// `conda_run_deps[]` by (name, spec); `root_requirements[]` and
 /// `conda_capable[]` lexicographically; nested `requires_dist[]` and
 /// `GitWheelSource.extras[]` lexicographically. This guarantees byte-identical
 /// JSON regardless of resolve/discovery order, making lock diffs meaningful.
+///
+/// New field: `entry_specs: Vec<String>` — the `courier_input_specs` snapshot
+/// for the Part-2 incremental delta-detector. `#[serde(default)]` so old locks
+/// parse (delta-detector falls back to full cold resolve on empty `entry_specs`).
+///
 /// Old schema-9 and earlier locks are rejected by the != gate and fall through
 /// to full resolve (safe: committed locks must be regenerated). SCHEMA is NOT
 /// an epoch bump (output SEMANTICS for identical inputs are unchanged;
@@ -411,6 +432,11 @@ impl RetreadLock {
         // Top-level: conda_capable lexicographic.
         self.conda_capable.sort();
 
+        // Top-level: entry_specs lexicographic (already sorted by
+        // courier_input_specs, but sort here defensively so the invariant
+        // is enforced in one place regardless of producer).
+        self.entry_specs.sort();
+
         // Nested A-1: requires_dist and GitWheelSource.extras per wheel.
         for wheel in &mut self.wheels {
             wheel.requires_dist.sort();
@@ -489,6 +515,7 @@ mod tests {
             ],
             prerelease: BTreeMap::from([("gmpy2".into(), "==2.1.0a4".into())]),
             conda_capable: vec!["numpy".into(), "torch".into()],
+            entry_specs: vec!["isaaclab==0.51.1".into()],
         };
         let json = lock.to_pretty_json().unwrap();
         let back: RetreadLock = serde_json::from_str(&json).unwrap();
@@ -529,6 +556,7 @@ mod tests {
         assert_eq!(back.inputs_hash, "deadbeef");
         assert_eq!(back.wheels[2].sha256.as_deref(), Some("abc123"));
         assert_eq!(back.conda_capable, vec!["numpy", "torch"]);
+        assert_eq!(back.entry_specs, vec!["isaaclab==0.51.1"]);
     }
 
     /// Schema-4 JSON (no requires_dist / must_ship / conda_capable /
@@ -963,7 +991,49 @@ mod tests {
             index_urls: vec!["https://pypi.org/simple/".into()],
             prerelease: BTreeMap::new(),
             conda_capable: vec!["zlib".into(), "blas".into()],
+            entry_specs: vec!["torch==2.0.0".into(), "numpy==1.26.0".into()],
         }
+    }
+
+    #[test]
+    fn entry_specs_roundtrip() {
+        // Verify entry_specs is present in JSON and round-trips correctly.
+        let mut lock = make_test_lock_unordered();
+        lock.canonicalize();
+        let json = lock.to_pretty_json().unwrap();
+        assert!(
+            json.contains("entry_specs"),
+            "entry_specs must appear in the JSON when non-empty"
+        );
+        let back: RetreadLock = serde_json::from_str(&json).unwrap();
+        // After canonicalize, entry_specs should be sorted.
+        assert_eq!(
+            back.entry_specs,
+            vec!["numpy==1.26.0", "torch==2.0.0"],
+            "entry_specs must be sorted by canonicalize"
+        );
+    }
+
+    #[test]
+    fn entry_specs_default_empty_on_old_lock() {
+        // A schema-9 JSON without entry_specs should deserialize with empty vec.
+        let old_json = r#"{
+            "schema": 9,
+            "retread_version": "2.8.0",
+            "bundle": "old-pack",
+            "version": "1.0.0",
+            "python": "3.11",
+            "inputs_hash": "abc",
+            "root_requirements": ["old-pack-pypi==1.0.0"],
+            "wheels": [],
+            "conda_run_deps": [],
+            "index_urls": ["https://pypi.org/simple/"]
+        }"#;
+        let lock: RetreadLock = serde_json::from_str(old_json).unwrap();
+        assert!(
+            lock.entry_specs.is_empty(),
+            "old locks without entry_specs must deserialize to empty vec"
+        );
     }
 
     #[test]
