@@ -439,6 +439,18 @@ pub(crate) struct SolveResult {
     pub wheels: Vec<SolvedWheel>,
 }
 
+/// PR-2: outcome of the resolvo sync solve, distinguishing a solved result
+/// from an unsolvable conflict. Returned as `Ok` so the A/B oracle can
+/// distinguish a measurement result from a genuine discovery I/O error.
+#[derive(Debug)]
+pub(crate) enum SolveOutcome {
+    /// The solver found a consistent assignment.
+    Solved(Vec<SolvedWheel>),
+    /// The solver returned Unsolvable; the string is the user-friendly
+    /// conflict message.
+    Unsolvable(String),
+}
+
 /// Build a root requirement for `(pypi_name, specifiers_str)` against the
 /// provider's pool.
 ///
@@ -582,6 +594,127 @@ pub(crate) fn run_sync_solve(
         .collect();
 
     Ok(SolveResult { wheels })
+}
+
+/// PR-2: sync solve that returns `SolveOutcome` instead of failing on Unsolvable.
+///
+/// Called from `resolvo_solve_pool` inside `spawn_blocking`. The A/B oracle
+/// uses this to distinguish a measurement result from a real discovery I/O error.
+pub(crate) fn run_sync_solve_outcome(
+    provider: PypiDependencyProvider<'_>,
+    root_requirements: Vec<ConditionalRequirement>,
+) -> Result<SolveOutcome> {
+    let mut solver = resolvo::Solver::new(provider);
+    let problem = resolvo::Problem::new().requirements(root_requirements);
+    match solver.solve(problem) {
+        Ok(solution) => {
+            let provider = solver.provider();
+            let wheels: Vec<SolvedWheel> = solution
+                .iter()
+                .map(|&sid| {
+                    let record = &provider.pool.resolve_solvable(sid).record;
+                    SolvedWheel {
+                        pypi_name: record.pypi_name.clone(),
+                        version_str: record.version_str.clone(),
+                        record_idx: record.record_idx,
+                    }
+                })
+                .collect();
+            Ok(SolveOutcome::Solved(wheels))
+        }
+        Err(resolvo::UnsolvableOrCancelled::Unsolvable(conflict)) => {
+            let msg = conflict.display_user_friendly(&solver).to_string();
+            Ok(SolveOutcome::Unsolvable(msg))
+        }
+        Err(resolvo::UnsolvableOrCancelled::Cancelled(_)) => {
+            Err(anyhow!("resolvo: solve cancelled unexpectedly"))
+        }
+    }
+}
+
+/// PR-2: async entry point for the A/B oracle. Runs the full resolvo pipeline
+/// (discovery + solve) and returns the `(DiscoveryPool, SolveOutcome)` pair.
+///
+/// Discovery I/O errors propagate as `Err`. Unsolvable is returned as
+/// `Ok(SolveOutcome::Unsolvable)` so the oracle can record it.
+///
+/// This is factored out of `resolve_bundle_resolvo` so the A/B hook can
+/// invoke resolvo independently of the authoritative BFS path.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn resolvo_solve_pool(
+    primary_rd: &[String],
+    entry: &crate::config::WheelEntry,
+    target: &crate::pypi::WheelTarget,
+    download_dir: &std::path::Path,
+    relax: crate::config::RelaxPolicy,
+    name_map: &std::collections::BTreeMap<String, String>,
+    conda_channels: &[rattler_conda_types::ChannelUrl],
+    pypi_to_conda: &super::PypiToCondaMap,
+) -> Result<(DiscoveryPool, SolveOutcome)> {
+    use crate::handler::resolvo_discovery::{DiscoveryParams, run_discovery};
+
+    let index = entry.index_url();
+
+    let params = DiscoveryParams {
+        index: &index,
+        target,
+        download_dir,
+        relax,
+        conda_channels,
+        name_map,
+        pypi_to_conda,
+        max_iterations: DiscoveryParams::DEFAULT_MAX_ITERATIONS,
+    };
+
+    let discovery_pool = run_discovery(primary_rd, &params)
+        .await
+        .context("resolvo discovery pass failed")?;
+
+    let conda_subdir = target.conda_subdir.clone();
+    let python_version = target.python_version.clone();
+    let entry_extras: Vec<String> = entry.extras.clone();
+    let primary_rd_clone = primary_rd.to_vec();
+    let name_map_clone = name_map.clone();
+    let pypi_to_conda_clone = pypi_to_conda.clone();
+
+    let discovery_pool_arc = std::sync::Arc::new(discovery_pool);
+
+    let outcome = tokio::task::spawn_blocking({
+        let dp = discovery_pool_arc.clone();
+        move || {
+            let provider = PypiDependencyProvider::new(
+                &dp,
+                &conda_subdir,
+                &python_version,
+                name_map_clone,
+                pypi_to_conda_clone,
+            )?;
+
+            let marker_env = crate::relax::marker_env_for(&conda_subdir, &python_version)
+                .context("marker env for resolvo root reqs")?;
+
+            let active_extras: Vec<uv_normalize::ExtraName> = entry_extras
+                .iter()
+                .filter_map(|e| uv_normalize::ExtraName::from_owned(e.clone()).ok())
+                .collect();
+
+            let root_reqs = build_root_requirements_from_rd(
+                &provider,
+                &primary_rd_clone,
+                &marker_env,
+                &active_extras,
+            );
+
+            run_sync_solve_outcome(provider, root_reqs)
+        }
+    })
+    .await
+    .context("resolvo solve thread panicked")??;
+
+    // Unwrap the Arc back to owned DiscoveryPool.
+    let pool = std::sync::Arc::try_unwrap(discovery_pool_arc).unwrap_or_else(|arc| (*arc).clone());
+
+    Ok((pool, outcome))
 }
 
 // ── Solution → Bundle extras mapping ─────────────────────────────────────────

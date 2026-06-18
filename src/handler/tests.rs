@@ -528,6 +528,7 @@ fn courier_pure_python_bundle_is_platform_specific_not_noarch() {
         extras: vec![],
         probe_decisions: vec![],
         solve_diagnostics: BTreeMap::new(),
+        conda_routed: vec![],
     };
 
     let courier_cfg = RetreadConfig {
@@ -910,6 +911,7 @@ fn solo_bundle(name: &str, requires: Vec<&str>) -> Bundle {
         extras: vec![],
         probe_decisions: vec![],
         solve_diagnostics: BTreeMap::new(),
+        conda_routed: vec![],
     }
 }
 
@@ -1686,6 +1688,7 @@ fn vendored_sub_packages_dropped_from_run_deps() {
         ],
         probe_decisions: vec![],
         solve_diagnostics: BTreeMap::new(),
+        conda_routed: vec![],
     };
 
     let output = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None).unwrap();
@@ -1836,6 +1839,7 @@ fn bundle_field_groups_entries_into_one_output() {
         ],
         probe_decisions: vec![],
         solve_diagnostics: BTreeMap::new(),
+        conda_routed: vec![],
     };
 
     let output = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None).unwrap();
@@ -1925,6 +1929,7 @@ fn relaxed_pure_python_primary_pins_python_to_workspace_variant() {
         extras: vec![],
         probe_decisions: vec![],
         solve_diagnostics: BTreeMap::new(),
+        conda_routed: vec![],
     };
 
     let output = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None).unwrap();
@@ -2365,6 +2370,7 @@ mod solve_failed_summary_guard {
             extras: vec![],
             probe_decisions: vec![],
             solve_diagnostics: diags,
+            conda_routed: vec![],
         }
     }
 

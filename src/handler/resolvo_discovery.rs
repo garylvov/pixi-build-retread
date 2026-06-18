@@ -88,7 +88,7 @@ use super::auto_bundle::{metadata_preferring_sidecar, pick_conda_target};
 /// Mirrors the BFS `routed_to_conda` flag: anything that is NOT
 /// `RouteDecision::Bundle` stays on the conda side and is recorded as a
 /// conda run-dep; `Bundle` deps are resolved by the PyPI solver.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteDecision {
     /// Conda probe was satisfied or indecisive (short-circuit): keep on conda.
     KeepConda,
@@ -154,7 +154,21 @@ pub type CondaRouteMemo = HashMap<(String, String), RouteDecision>;
 ///
 /// Passed to the resolvo `DependencyProvider` (PR-1c), which uses only O(1)
 /// in-memory lookups during the sync solve.
-#[derive(Debug, Default)]
+/// A candidate version that was excluded from the pool due to a build failure
+/// or because no versions were found on the index. Used by the A/B oracle to
+/// distinguish resolvo Unsolvable caused by build-failure exclusions vs.
+/// genuine version conflicts.
+#[derive(Debug, Clone)]
+pub struct ExcludedCandidate {
+    /// PEP 503-normalised PyPI project name.
+    pub pypi_name: String,
+    /// Version string of the excluded candidate.
+    pub version: String,
+    /// Human-readable reason for exclusion.
+    pub reason: String,
+}
+
+#[derive(Debug, Default, Clone)]
 pub struct DiscoveryPool {
     /// All discovered `(name, version)` candidates, ordered by
     /// `(pypi_name, version desc)` for deterministic iteration.
@@ -169,6 +183,12 @@ pub struct DiscoveryPool {
     /// Canonical names that were identified as conda-routed AND not recursed
     /// into.  The solver records these as conda run-deps.
     pub conda_routed_names: HashSet<String>,
+
+    /// PR-2: candidates excluded from the pool due to sdist build failures or
+    /// no available versions. The A/B oracle uses this to demote resolvo
+    /// Unsolvable errors that are caused by these exclusions rather than
+    /// genuine version conflicts.
+    pub excluded_sdist_builds: Vec<ExcludedCandidate>,
 }
 
 impl DiscoveryPool {
@@ -310,6 +330,11 @@ pub async fn run_discovery(
 
             if all_versions.is_empty() {
                 tracing::debug!(name = %pypi_name, "discovery: no versions found on index; skipping");
+                pool.excluded_sdist_builds.push(ExcludedCandidate {
+                    pypi_name: pypi_name.clone(),
+                    version: String::new(),
+                    reason: "no versions found on index".to_string(),
+                });
                 continue;
             }
 
@@ -444,6 +469,11 @@ pub async fn run_discovery(
                                             error = %format!("{e:#}"),
                                             "discovery: sdist build failed; candidate excluded from pool",
                                         );
+                                        pool.excluded_sdist_builds.push(ExcludedCandidate {
+                                            pypi_name: pypi_name.clone(),
+                                            version: version.to_string(),
+                                            reason: format!("sdist build failed: {e:#}"),
+                                        });
                                         (None, vec![])
                                     }
                                 }

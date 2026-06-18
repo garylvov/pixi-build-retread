@@ -21,6 +21,7 @@ use cascade::{
 mod resolve_state;
 use resolve_state::{ObserveEdgeResult, ResolveState};
 
+mod resolvo_ab;
 mod resolvo_discovery;
 mod resolvo_provider;
 
@@ -545,6 +546,11 @@ struct Bundle {
     /// don't actually pull in all features still inherit those
     /// features' transitives in the union).
     solve_diagnostics: BTreeMap<String, crate::audit::SolveDiagnostics>,
+    /// PR-2: canonical conda names that the BFS (or resolvo) routed to
+    /// conda rather than bundling. Used exclusively by the A/B oracle
+    /// (RETREAD_RESOLVO_DIFF) and never serialized to a lock.
+    #[allow(dead_code)]
+    conda_routed: Vec<String>,
 }
 
 impl Bundle {
@@ -2245,6 +2251,7 @@ async fn resolve_all(
                 &pypi_to_conda,
                 &effective.name_map,
                 conda_channels,
+                &effective.conda_deps,
             )
             .await
             .with_context(|| {
@@ -2599,6 +2606,9 @@ async fn resolve_bundle(
     // this map; the BFS now matches it.
     name_map: &std::collections::BTreeMap<String, String>,
     conda_channels: &[ChannelUrl],
+    // PR-2: retread-conda-deps names (force-list). Used only by the A/B
+    // oracle to capture the auto_bundle skip-set route; never affects BFS logic.
+    conda_deps_list: &[String],
 ) -> Result<Bundle> {
     let conda_name = canonical_conda_name(entry_name);
     let mut state = ResolveState::default();
@@ -2658,12 +2668,18 @@ async fn resolve_bundle(
     // metapackage's namespace convention.
     let is_source_form = entry.is_path() || entry.is_git() || entry.is_named_git();
     if is_source_form && entry.extras.is_empty() {
+        // PR-2: emit SKIPPED AbReport when the diff hook is active.
+        if let Ok(report_path) = std::env::var("RETREAD_RESOLVO_DIFF") {
+            resolvo_ab::ab_skip_hook(&report_path, entry_name, target, "source-form-no-extras")
+                .await;
+        }
         return Ok(Bundle {
             conda_name,
             primary,
             extras: vec![],
             probe_decisions: vec![],
             solve_diagnostics: BTreeMap::new(),
+            conda_routed: vec![],
         });
     }
 
@@ -2753,6 +2769,9 @@ async fn resolve_bundle(
     // sub-wheels propagate their own extras but NOT prefix-base-dep
     // matching (they're project code, same rule as primary).
     let mut extras = Vec::new();
+    // PR-2: canonical conda names routed to conda (not bundled) during BFS.
+    // Used only by the A/B oracle; never serialized.
+    let mut conda_routed_acc: Vec<String> = Vec::new();
     // v1.4.3: process the BFS level by level. A child's existence is
     // only known after its parent's METADATA is parsed, but items at
     // the SAME depth never read each other's results -- so each
@@ -2999,6 +3018,8 @@ async fn resolve_bundle(
                 }
             }
             if routed_to_conda {
+                // PR-2: record the routed conda name for the A/B oracle.
+                conda_routed_acc.push(dep_conda_name.clone());
                 continue;
             }
             to_materialize.push(pending);
@@ -3252,13 +3273,59 @@ async fn resolve_bundle(
         }
     }
 
-    Ok(Bundle {
+    // PR-2: union in force-list names (retread-conda-deps) that appear as
+    // transitive requires_dist entries in the bundled wheels. auto_bundle_transitives
+    // skips these silently (no ProbeDecision pushed); we mirror that here so the
+    // A/B oracle sees the same effective conda-routed set.
+    {
+        let force_conda: std::collections::HashSet<String> = conda_deps_list
+            .iter()
+            .map(|n| canonical_conda_name(n))
+            .collect();
+        // Collect all transitive Requires-Dist names from bundled wheels.
+        let bundled_rd_names: std::collections::HashSet<String> = std::iter::once(&primary)
+            .chain(extras.iter())
+            .flat_map(|w| w.metadata.requires_dist.iter())
+            .filter_map(|raw| {
+                uv_pep508::Requirement::from_str(raw.as_str())
+                    .ok()
+                    .map(|r: uv_pep508::Requirement| canonical_conda_name(r.name.as_ref()))
+            })
+            .collect();
+        for name in force_conda.intersection(&bundled_rd_names) {
+            if !conda_routed_acc.contains(name) {
+                conda_routed_acc.push(name.clone());
+            }
+        }
+    }
+
+    let bfs_bundle = Bundle {
         conda_name,
         primary,
         extras,
         probe_decisions,
         solve_diagnostics: BTreeMap::new(),
-    })
+        conda_routed: conda_routed_acc,
+    };
+
+    // PR-2: A/B oracle hook (RETREAD_RESOLVO_DIFF=<path>).
+    if let Ok(report_path) = std::env::var("RETREAD_RESOLVO_DIFF") {
+        resolvo_ab::ab_diff_hook(
+            &report_path,
+            entry_name,
+            target,
+            &bfs_bundle,
+            entry,
+            download_dir,
+            relax,
+            name_map,
+            conda_channels,
+            pypi_to_conda,
+        )
+        .await;
+    }
+
+    Ok(bfs_bundle)
 }
 
 /// resolvo path for `resolve_bundle` (gated on `RETREAD_RESOLVO=1`).
@@ -3401,6 +3468,11 @@ async fn resolve_bundle_resolvo(
         extras,
         probe_decisions: vec![],
         solve_diagnostics: BTreeMap::new(),
+        conda_routed: discovery_pool_arc
+            .conda_routed_names
+            .iter()
+            .cloned()
+            .collect(),
     })
 }
 
@@ -8367,6 +8439,7 @@ mod emit_wheel_upstream_url_tests {
             extras: vec![],
             probe_decisions: vec![],
             solve_diagnostics: BTreeMap::new(),
+            conda_routed: vec![],
         };
 
         // Reproduce the exact mapping from build_one that populates EmitWheel.
@@ -8478,6 +8551,7 @@ mod emit_wheel_upstream_url_tests {
             extras: vec![sub],
             probe_decisions: vec![],
             solve_diagnostics: BTreeMap::new(),
+            conda_routed: vec![],
         };
 
         let emit_wheels: Vec<crate::emit_pypi::EmitWheel> = bundle
@@ -8767,6 +8841,7 @@ mod resolve_bundle_bfs_tests {
             &pypi_to_conda,
             &name_map,
             &conda_channels,
+            &[], // conda_deps_list
         )
         .await
         .expect("resolve_bundle must succeed");
@@ -8919,6 +8994,7 @@ mod resolve_bundle_bfs_tests {
             &pypi_to_conda,
             &name_map,
             &conda_channels,
+            &[], // conda_deps_list
         )
         .await
         .expect("resolve_bundle must succeed");
