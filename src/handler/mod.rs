@@ -8643,6 +8643,159 @@ mod resolve_bundle_bfs_tests {
             "transitive dep must be at version {sub_version}"
         );
     }
+
+    /// TASK 1 (seal Part 1): BFS-loop constraint-merge picks the correct
+    /// version when two Requires-Dist lines for the same dep arrive from
+    /// the same primary wheel.
+    ///
+    /// Scenario
+    /// --------
+    ///   - Primary `rtest-pkg 1.0` has TWO Requires-Dist lines for the
+    ///     sub-dep, both matching the `rtest-pkg-` prefix:
+    ///       Requires-Dist: rtest-pkg-sub>=1.0
+    ///       Requires-Dist: rtest-pkg-sub<2.0
+    ///   - The localhost index serves `rtest-pkg-sub` at BOTH 1.0 and 2.0.
+    ///
+    /// What the BFS must do
+    /// --------------------
+    ///   The initial seed drain (before the BFS loop) calls `seed_worklist`
+    ///   with an empty `seen` set.  Because `seen` is NOT updated between
+    ///   lines inside `seed_worklist`, both `>=1.0` and `<2.0` edges for
+    ///   `rtest-pkg-sub` are pushed to `tmp_queue`.
+    ///
+    ///   FIX 2's merge step in the drain loop INTERSECTS them into a single
+    ///   `Pending(rtest-pkg-sub, >=1.0,<2.0)` entry in `work`.
+    ///
+    ///   `pypi::resolve` with `>=1.0,<2.0` from the two-version server
+    ///   returns 1.0 (the highest satisfying version; 2.0 is excluded).
+    ///
+    /// Regression guards
+    /// -----------------
+    ///   FIX 2 regression: reverting the `Occupied` merge arm back to a
+    ///   plain `or_insert` causes only the FIRST edge (`>=1.0`) to be
+    ///   recorded.  `pypi::resolve(>=1.0)` then picks the highest candidate
+    ///   = 2.0, and the assertion `version == "1.0"` FAILS.
+    ///
+    ///   FIX 1 (revoke_chosen / NeedsReResolve path): the BFS observe-all-
+    ///   first design means the sub-dep is added to `constraints` during the
+    ///   observe_edge loop — BEFORE any phase-3 seed runs — making a
+    ///   cross-level NeedsReResolve structurally unreachable in this scenario.
+    ///   FIX 1 is therefore covered at the unit level by
+    ///   `resolve_state::tests::revoke_clears_constraints_so_reenqueue_hits_new`.
+    #[tokio::test]
+    async fn resolve_bundle_bfs_constraint_merge_picks_correct_version() {
+        let dir = unique_tmp_dir();
+        let download_dir = dir.join("download");
+        let source_dir = dir.join("source");
+        let cache_dir = dir.join("cache");
+        std::fs::create_dir_all(&download_dir).unwrap();
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        let primary_name = "rtest-pkg";
+        let primary_version = "1.0";
+        let sub_name = "rtest-pkg-sub";
+
+        // Primary has TWO separate Requires-Dist lines for the same dep:
+        // one sets a floor (>=1.0) and the other a ceiling (<2.0).
+        // FIX 2 must merge these into a single >=1.0,<2.0 constraint.
+        let primary_bytes = make_wheel_bytes(
+            primary_name,
+            primary_version,
+            &[&format!("{sub_name}>=1.0"), &format!("{sub_name}<2.0")],
+        );
+
+        // Serve sub at BOTH 1.0 AND 2.0 so the constraint determines which
+        // version is picked (not the absence of an alternative).
+        let sub_10_bytes = make_wheel_bytes(sub_name, "1.0", &[]);
+        let sub_20_bytes = make_wheel_bytes(sub_name, "2.0", &[]);
+
+        let port = spawn_index_server(
+            vec![
+                (
+                    primary_name.to_string(),
+                    primary_version.to_string(),
+                    primary_bytes,
+                ),
+                (sub_name.to_string(), "1.0".to_string(), sub_10_bytes),
+                (sub_name.to_string(), "2.0".to_string(), sub_20_bytes),
+            ],
+            32,
+        )
+        .await;
+
+        let index_url = format!("http://127.0.0.1:{port}/simple/");
+
+        let entry = WheelEntry {
+            version: Some(primary_version.to_string()),
+            index: Some(index_url),
+            ..Default::default()
+        };
+        let target = WheelTarget {
+            python_version: "3.11".to_string(),
+            conda_subdir: "linux-64".to_string(),
+        };
+        let pypi_to_conda: PypiToCondaMap = HashMap::new();
+        let name_map: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        let git_sources: std::collections::BTreeMap<String, crate::config::NamedGitSource> =
+            std::collections::BTreeMap::new();
+        let conda_channels: Vec<rattler_conda_types::ChannelUrl> = vec![];
+
+        let bundle = resolve_bundle(
+            primary_name,
+            &entry,
+            &target,
+            &download_dir,
+            &source_dir,
+            &cache_dir,
+            RelaxPolicy::default(),
+            &git_sources,
+            None, // auto_data
+            &pypi_to_conda,
+            &name_map,
+            &conda_channels,
+        )
+        .await
+        .expect("resolve_bundle must succeed");
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        // Primary check.
+        assert_eq!(
+            bundle.primary.pypi_name, primary_name,
+            "bundle primary must be {primary_name}"
+        );
+
+        // Sub must be present.
+        let extras_names: Vec<&str> = bundle.extras.iter().map(|w| w.pypi_name.as_str()).collect();
+        assert!(
+            extras_names.contains(&sub_name),
+            "transitive dep '{sub_name}' must be present in bundle.extras; got: {extras_names:?}"
+        );
+
+        // Core assertion: sub must be at 1.0 (NOT 2.0).
+        //
+        // With FIX 2 the two edges (>=1.0 and <2.0) are merged into
+        // >=1.0,<2.0 before the first BFS level runs.  pypi::resolve with
+        // that constraint picks the highest satisfying version = 1.0.
+        //
+        // Without FIX 2 (or_insert only), only the first edge (>=1.0) is
+        // kept, pypi::resolve picks 2.0, and this assertion FAILS.
+        let sub_wheel = bundle
+            .extras
+            .iter()
+            .find(|w| w.pypi_name == sub_name)
+            .unwrap();
+        assert_eq!(
+            sub_wheel.metadata.version, "1.0",
+            "'{sub_name}' must resolve to 1.0 (highest version satisfying >=1.0,<2.0 = the \
+             FIX 2 merged constraint); got {} — if this fails, FIX 2 constraint-merge \
+             was not applied (the two separate Requires-Dist edges were not intersected \
+             and the unconstrained >=1.0 resolved to 2.0 instead)",
+            sub_wheel.metadata.version,
+        );
+    }
 }
 
 #[cfg(test)]
