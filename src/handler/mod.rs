@@ -2303,6 +2303,50 @@ async fn resolve_all(
         // constraints.
         bundles.push(bundle);
     }
+
+    // [g1-dump] throwaway resolved-version dump -- NOT for merge.
+    // Gate: RETREAD_DUMP_RESOLVED=<path>.
+    // After full resolution (all bundles + auto-bundle), APPEND one line per
+    // resolved wheel (primary + extras) across ALL bundles to the file at
+    // <path>:
+    //   RESOLVED <canonical_name> <version>
+    // Then exit 0 cleanly so materialization is skipped (fast: seconds --
+    // resolve_bundle already fetched all transitive wheels via bfs_fetch_pypi).
+    // APPEND mode: if resolve_all is called more than once in a process, lines
+    // accumulate; the harness truncates the file before each pack run.
+    if let Ok(dump_path) = std::env::var("RETREAD_DUMP_RESOLVED")
+        && !dump_path.is_empty()
+    {
+        use std::io::Write as _;
+        let mut lines = String::new();
+        for bundle in &bundles {
+            for wheel in bundle.all_wheels() {
+                lines.push_str(&format!(
+                    "RESOLVED {} {}\n",
+                    crate::relax::canonical_conda_name(&wheel.pypi_name),
+                    wheel.metadata.version
+                ));
+            }
+        }
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&dump_path)
+        {
+            Ok(mut f) => {
+                if let Err(e) = f.write_all(lines.as_bytes()).and_then(|_| f.flush()) {
+                    eprintln!("[g1-dump] ERROR: write to {dump_path} failed: {e}");
+                    eprint!("{lines}");
+                }
+            }
+            Err(e) => {
+                eprintln!("[g1-dump] ERROR: open {dump_path} failed: {e}");
+                eprint!("{lines}");
+            }
+        }
+        std::process::exit(0);
+    }
+
     Ok((bundles, effective))
 }
 
