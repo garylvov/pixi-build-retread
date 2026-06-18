@@ -610,13 +610,19 @@ pub(crate) async fn resolvo_solve_pool(
     pypi_to_conda: &super::PypiToCondaMap,
     // retread-conda-deps force-list for force-list symmetry in oracle.
     conda_deps: &[String],
+    // workspace PyPI index chain for transitive dep discovery.
+    workspace_indexes: &[String],
 ) -> Result<(DiscoveryPool, SolveOutcome)> {
     use crate::handler::resolvo_discovery::{DiscoveryParams, run_discovery};
 
     let index = entry.index_url();
+    // Build transitive chain: entry index first, then workspace indexes, then public PyPI.
+    let transitive_indexes =
+        super::merge_index_chain(std::iter::once(index.clone()), workspace_indexes);
 
     let params = DiscoveryParams {
         index: &index,
+        transitive_indexes: &transitive_indexes,
         target,
         download_dir,
         relax,
@@ -886,8 +892,11 @@ mod tests {
         name_map: &BTreeMap<String, String>,
         pypi_to_conda: &PypiToCondaMap,
     ) -> Result<SolveResult> {
+        // In tests all packages (direct and transitive) are on the same fixture server.
+        let transitive_indexes_vec = vec![index.to_string()];
         let params = DiscoveryParams {
             index,
+            transitive_indexes: &transitive_indexes_vec,
             target,
             download_dir: dir,
             relax: RelaxPolicy::default(),

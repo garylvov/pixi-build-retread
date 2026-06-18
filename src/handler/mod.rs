@@ -2252,6 +2252,7 @@ async fn resolve_all(
                 &effective.name_map,
                 conda_channels,
                 &effective.conda_deps,
+                &workspace_pypi_indexes,
             )
             .await
             .with_context(|| {
@@ -2609,6 +2610,9 @@ async fn resolve_bundle(
     // PR-2: retread-conda-deps names (force-list). Used only by the A/B
     // oracle to capture the auto_bundle skip-set route; never affects BFS logic.
     conda_deps_list: &[String],
+    // PR-2: workspace PyPI index chain for transitive resolvo discovery.
+    // Mirrors the chain auto_bundle_transitives uses. Build with merge_index_chain.
+    workspace_indexes: &[String],
 ) -> Result<Bundle> {
     let conda_name = canonical_conda_name(entry_name);
     let mut state = ResolveState::default();
@@ -2697,6 +2701,7 @@ async fn resolve_bundle(
             name_map,
             conda_channels,
             pypi_to_conda,
+            workspace_indexes,
         )
         .await;
     }
@@ -3322,6 +3327,7 @@ async fn resolve_bundle(
             conda_channels,
             pypi_to_conda,
             conda_deps_list,
+            workspace_indexes,
         )
         .await;
     }
@@ -3351,6 +3357,7 @@ async fn resolve_bundle_resolvo(
     name_map: &std::collections::BTreeMap<String, String>,
     conda_channels: &[ChannelUrl],
     pypi_to_conda: &PypiToCondaMap,
+    workspace_indexes: &[String],
 ) -> Result<Bundle> {
     use crate::handler::resolvo_provider::{
         SolveOutcome, pool_record_to_resolved_wheel, resolvo_solve_pool,
@@ -3372,6 +3379,7 @@ async fn resolve_bundle_resolvo(
         conda_channels,
         pypi_to_conda,
         &[], // force-list not relevant on the RETREAD_RESOLVO=1 path
+        workspace_indexes,
     )
     .await
     .context("resolvo discovery pass failed")?;
@@ -8781,6 +8789,7 @@ mod resolve_bundle_bfs_tests {
             &name_map,
             &conda_channels,
             &[], // conda_deps_list
+            &[], // workspace_indexes
         )
         .await
         .expect("resolve_bundle must succeed");
@@ -8934,6 +8943,7 @@ mod resolve_bundle_bfs_tests {
             &name_map,
             &conda_channels,
             &[], // conda_deps_list
+            &[], // workspace_indexes
         )
         .await
         .expect("resolve_bundle must succeed");

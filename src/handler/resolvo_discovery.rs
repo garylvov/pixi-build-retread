@@ -242,6 +242,15 @@ pub struct DiscoveryParams<'a> {
     /// symmetrically with the BFS force-list union (mod.rs:3280-3300).
     /// Pass `&[]` when not using the A/B oracle.
     pub conda_deps: &'a [String],
+    /// Index chain for transitive (non-direct) dependency fetches.
+    ///
+    /// Mirrors `auto_bundle_transitives`: direct deps use `index` (single entry
+    /// index, accepts sdist, hard-error on miss); transitive deps scan this chain
+    /// wheel-only, skipping sdist-only / empty / error results and continuing to
+    /// the next index before giving up.  Build with `merge_index_chain`.
+    /// Pass `&[]` (or a slice containing only `index`) to keep the old single-
+    /// index behaviour for callers that do not yet have the chain.
+    pub transitive_indexes: &'a [String],
 }
 
 impl<'a> DiscoveryParams<'a> {
@@ -306,6 +315,12 @@ pub async fn run_discovery(
         params,
     );
 
+    // Snapshot the frontier immediately after seeding from the primary.
+    // These are the DIRECT deps (one hop from primary).  Names added to
+    // `frontier` in subsequent iterations (from discovered children) are
+    // TRANSITIVE by construction and are NOT in this set.
+    let direct_names: HashSet<String> = frontier.iter().cloned().collect();
+
     // ── Fixpoint loop ─────────────────────────────────────────────────────────
     let mut iterations = 0usize;
     while !frontier.is_empty() {
@@ -328,10 +343,32 @@ pub async fn run_discovery(
             }
             visited.insert(pypi_name.clone());
 
-            // Fetch all versions for this name.
-            let all_versions = pypi::list_all_versions(params.index, pypi_name, params.target)
-                .await
-                .with_context(|| format!("discovery: list_all_versions for `{pypi_name}`"))?;
+            let is_direct = direct_names.contains(pypi_name.as_str());
+
+            // DIRECT deps: single entry index, accept sdist, hard-error on miss.
+            // TRANSITIVE deps: scan transitive_indexes chain, wheel-only, skip
+            // sdist-only / empty / error results, give up at chain-exhaust.
+            // This mirrors bfs_fetch_pypi (direct) vs auto_bundle_transitives (transitive).
+            let all_versions: Vec<pypi::PyPiCandidate> = if is_direct {
+                pypi::list_all_versions(params.index, pypi_name, params.target)
+                    .await
+                    .with_context(|| {
+                        format!("discovery: list_all_versions for `{pypi_name}` (direct)")
+                    })?
+            } else {
+                let mut found: Vec<pypi::PyPiCandidate> = Vec::new();
+                for index in params.transitive_indexes {
+                    match pypi::list_all_versions(index, pypi_name, params.target).await {
+                        Ok(v) if v.iter().any(|c| c.wheel.is_some()) => {
+                            found = v;
+                            break;
+                        }
+                        Ok(_) => continue, // empty or sdist-only -> try next index
+                        Err(_) => continue, // 404 / transport -> try next index
+                    }
+                }
+                found
+            };
 
             if all_versions.is_empty() {
                 tracing::debug!(name = %pypi_name, "discovery: no versions found on index; skipping");
@@ -968,6 +1005,7 @@ mod tests {
             pypi_to_conda: &pypi_to_conda,
             max_iterations: DiscoveryParams::DEFAULT_MAX_ITERATIONS,
             conda_deps: &[],
+            transitive_indexes: std::slice::from_ref(&index),
         };
 
         let pool = run_discovery(&primary_rd, &params)
@@ -1055,6 +1093,7 @@ mod tests {
             pypi_to_conda: &pypi_to_conda,
             max_iterations: DiscoveryParams::DEFAULT_MAX_ITERATIONS,
             conda_deps: &[],
+            transitive_indexes: std::slice::from_ref(&index),
         };
 
         let pool = run_discovery(&primary_rd, &params)
@@ -1133,6 +1172,7 @@ mod tests {
             pypi_to_conda: &pypi_to_conda,
             max_iterations: DiscoveryParams::DEFAULT_MAX_ITERATIONS,
             conda_deps: &[],
+            transitive_indexes: std::slice::from_ref(&index),
         };
 
         let pool = run_discovery(&primary_rd, &params)
@@ -1203,6 +1243,7 @@ mod tests {
             pypi_to_conda: &pypi_to_conda,
             max_iterations: DiscoveryParams::DEFAULT_MAX_ITERATIONS,
             conda_deps: &[],
+            transitive_indexes: std::slice::from_ref(&index),
         };
 
         let pool = run_discovery(&primary_rd, &params)

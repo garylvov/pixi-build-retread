@@ -563,6 +563,7 @@ pub(crate) async fn ab_diff_hook(
     conda_channels: &[ChannelUrl],
     pypi_to_conda: &PypiToCondaMap,
     conda_deps: &[String],
+    workspace_indexes: &[String],
 ) {
     let target_str = format!("{}/{}", target.conda_subdir, target.python_version);
     let conda_name = bfs_bundle.conda_name.clone();
@@ -579,6 +580,7 @@ pub(crate) async fn ab_diff_hook(
         conda_channels,
         pypi_to_conda,
         conda_deps,
+        workspace_indexes,
     )
     .await;
 
@@ -653,22 +655,33 @@ pub(crate) async fn ab_diff_hook(
     };
 
     // Build diff components.
+    //
+    // The resolvo side omits the primary: resolvo_solve_pool discovers
+    // *transitive* deps only (the primary is already materialised by the
+    // caller and stored in bfs_bundle.primary unchanged).  Add it back so
+    // both sides are compared on an equal footing: primary + extras.
+    let resolvo_with_primary: Vec<ResolvedWheel> = std::iter::once(bfs_bundle.primary.clone())
+        .chain(resolvo_wheels.iter().cloned())
+        .collect();
+
     let bfs_bundled_set = derive_bundled_set(bfs_bundle);
-    let resolvo_bundled_set: std::collections::HashSet<String> =
-        resolvo_wheels.iter().map(|w| w.pypi_name.clone()).collect();
+    let resolvo_bundled_set: std::collections::HashSet<String> = resolvo_with_primary
+        .iter()
+        .map(|w| w.pypi_name.clone())
+        .collect();
 
     let resolvo_conda_routed: Vec<String> = pool.conda_routed_names.iter().cloned().collect();
 
     let (version_set, conda_routing, provenance) = match &resolvo_outcome {
         ResolvoOutcome::Solved => {
-            let vs = build_version_set_diff(bfs_bundle, &resolvo_wheels);
+            let vs = build_version_set_diff(bfs_bundle, &resolvo_with_primary);
             let cr = build_conda_routing_diff(
                 bfs_bundle,
                 &bfs_bundled_set,
                 &resolvo_conda_routed,
                 &resolvo_bundled_set,
             );
-            let prov = build_provenance_diffs(bfs_bundle, &resolvo_wheels);
+            let prov = build_provenance_diffs(bfs_bundle, &resolvo_with_primary);
             (Some(vs), Some(cr), Some(prov))
         }
         ResolvoOutcome::Unsolvable { .. } => (None, None, None),
@@ -938,6 +951,79 @@ mod tests {
         // Verify the full classify path also returns RED.
         let verdict = classify(&unsolvable(msg), None, None, None, &exc);
         assert_eq!(verdict, "RED");
+    }
+
+    // ── primary-in-resolvo-with-primary regression ────────────────────────────
+    //
+    // Before PR-2-fix2, ab_diff_hook built resolvo_bundled_set from
+    // resolvo_wheels ONLY (extras), omitting the primary.  Every entry
+    // false-REDed on its own primary being "only_in_bfs".  This test
+    // verifies that an entry with no extras (resolvo_wheels=vec![]) and a
+    // matching primary classifies as GREEN.
+
+    #[test]
+    fn classify_green_when_resolvo_extras_empty_primary_matches() {
+        let mk_wheel = |name: &str, version: &str| -> ResolvedWheel {
+            let normalized = name.replace('-', "_");
+            ResolvedWheel {
+                pypi_name: name.to_string(),
+                url: url::Url::parse("file:///tmp/fake.whl").unwrap(),
+                upstream_url: None,
+                git_source: None,
+                sdist_source: None,
+                metadata: crate::wheel::WheelMetadata {
+                    name: name.to_string(),
+                    version: version.to_string(),
+                    requires_dist: vec![],
+                    is_pure_python: true,
+                    sha256: String::new(),
+                    filename: format!("{normalized}-{version}-py3-none-any.whl"),
+                },
+                extras_requested: vec![],
+                auto_data: None,
+                auto_data_dedup_skipped_root: None,
+            }
+        };
+
+        // BFS bundle: primary only, no extras.
+        let bundle = Bundle {
+            conda_name: "my-pkg".to_string(),
+            primary: mk_wheel("my-pkg", "1.0"),
+            extras: vec![],
+            probe_decisions: vec![],
+            solve_diagnostics: std::collections::BTreeMap::new(),
+            conda_routed: vec![],
+        };
+
+        // resolvo_wheels = vec![] (no extras; primary already in bfs_bundle.primary).
+        // resolvo_with_primary = [primary].  Both sides have {"my-pkg" -> "1.0"}.
+        let resolvo_wheels: Vec<ResolvedWheel> = vec![];
+        let resolvo_with_primary: Vec<ResolvedWheel> = std::iter::once(bundle.primary.clone())
+            .chain(resolvo_wheels.iter().cloned())
+            .collect();
+
+        let bfs_bundled_set = derive_bundled_set(&bundle);
+        let resolvo_bundled_set: std::collections::HashSet<String> = resolvo_with_primary
+            .iter()
+            .map(|w| w.pypi_name.clone())
+            .collect();
+
+        let version_set = build_version_set_diff(&bundle, &resolvo_with_primary);
+        let conda_routing =
+            build_conda_routing_diff(&bundle, &bfs_bundled_set, &[], &resolvo_bundled_set);
+        let provenance = build_provenance_diffs(&bundle, &resolvo_with_primary);
+
+        let verdict = classify(
+            &solved(),
+            Some(&version_set),
+            Some(&conda_routing),
+            Some(&provenance),
+            &no_excluded(),
+        );
+        assert_eq!(
+            verdict, "GREEN",
+            "primary-only bundle with matching versions must be GREEN"
+        );
     }
 
     // ── derive_bundled_set symmetry ───────────────────────────────────────────
