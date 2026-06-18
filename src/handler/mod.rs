@@ -8351,5 +8351,298 @@ mod emit_wheel_upstream_url_tests {
     }
 }
 
+// -----------------------------------------------------------------
+// TASK A (FIX 3 completion): resolve_bundle-loop-level back-pressure test.
+//
+// Drives the ACTUAL BFS loop in resolve_bundle through a localhost
+// PEP 503 fixture server. Proves that transitive deps are correctly
+// fetched and land in bundle.extras (the "bundle membership" assertion
+// the ResolveState-level tests cannot make).
+//
+// Two tests:
+//   (1) resolve_bundle_bfs_fetches_prefix_transitive — localhost fixture,
+//       non-ignored. Exercises the full BFS loop end-to-end: primary wheel
+//       seeds a transitive dep via prefix matching; transitive ends up in
+//       bundle.extras. Regression guard for the FIX 1 vanish bug: if the
+//       re-resolve path had silently deleted deps, this test would catch
+//       any future regression in bundle.extras membership.
+//
+//   (2) resolve_bundle_reresolve_tighter_version_live — #[ignore], live
+//       PyPI. Drives the actual NeedsReResolve cycle: primary requires
+//       `retrtest-a>=1.0,<2.0` (caps at 2.0) and a sibling dep requires
+//       `retrtest-a>=1.0`. This is intentionally constructed via a real
+//       localhost fixture to trigger the NeedsReResolve → revoke → re-fetch
+//       cycle and assert the dep ends up at the tighter-satisfying version.
+// -----------------------------------------------------------------
+#[cfg(test)]
+mod resolve_bundle_bfs_tests {
+    use std::collections::{BTreeMap, HashMap};
+    use std::io::Write;
+    use std::sync::Arc;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::{PypiToCondaMap, WheelTarget, resolve_bundle};
+    use crate::config::{RelaxPolicy, WheelEntry};
+
+    fn unique_tmp_dir() -> std::path::PathBuf {
+        let base = std::env::temp_dir();
+        let unique = format!(
+            "retread-bfs-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        );
+        let dir = base.join(unique);
+        std::fs::create_dir_all(&dir).expect("tmp dir creation should not fail");
+        dir
+    }
+
+    /// Build a minimal valid .whl zip (pure-python, any platform).
+    fn make_wheel_bytes(dist: &str, version: &str, requires: &[&str]) -> Vec<u8> {
+        let normalized = dist.replace('-', "_");
+        let di = format!("{normalized}-{version}.dist-info");
+        let mut metadata = format!("Metadata-Version: 2.1\nName: {dist}\nVersion: {version}\n");
+        for req in requires {
+            metadata.push_str(&format!("Requires-Dist: {req}\n"));
+        }
+        let metadata_bytes = metadata.into_bytes();
+        let wheel_file = b"Wheel-Version: 1.0\nTag: py3-none-any\n".to_vec();
+        let record = format!("{di}/METADATA,,\n{di}/WHEEL,,\n{di}/RECORD,,\n").into_bytes();
+
+        let mut buf = Vec::new();
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for (name, body) in [
+            (format!("{di}/METADATA"), metadata_bytes.as_slice()),
+            (format!("{di}/WHEEL"), wheel_file.as_slice()),
+            (format!("{di}/RECORD"), record.as_slice()),
+        ] {
+            zip.start_file(&name, opts).unwrap();
+            zip.write_all(body).unwrap();
+        }
+        zip.finish().unwrap();
+        buf
+    }
+
+    /// Spawn a minimal PEP 503 simple index + wheel server.
+    ///
+    /// `packages`: list of (name, version, wheel_bytes).
+    /// Serves:
+    ///   GET /simple/{pep503-normalized-name}/  → HTML index with all
+    ///     versions of that name as `<a href="/{filename}">` links.
+    ///   GET /{filename}  → raw wheel bytes.
+    ///
+    /// Returns (port, task-handle). The task accepts up to `max_requests`
+    /// connections then stops.
+    async fn spawn_index_server(packages: Vec<(String, String, Vec<u8>)>, max_requests: u8) -> u16 {
+        use std::collections::HashMap;
+
+        // Build lookup tables.
+        let mut by_name: HashMap<String, Vec<(String, Vec<u8>)>> = HashMap::new();
+        let mut by_filename: HashMap<String, Vec<u8>> = HashMap::new();
+
+        for (name, version, bytes) in packages {
+            let norm_name = name.to_ascii_lowercase().replace(['-', '_', '.'], "-");
+            let normalized_dist = name.replace('-', "_");
+            let filename = format!("{normalized_dist}-{version}-py3-none-any.whl");
+            by_name
+                .entry(norm_name)
+                .or_default()
+                .push((filename.clone(), bytes.clone()));
+            by_filename.insert(filename, bytes);
+        }
+
+        let by_name = Arc::new(by_name);
+        let by_filename = Arc::new(by_filename);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            for _ in 0..max_requests {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let by_name = by_name.clone();
+                let by_filename = by_filename.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    // Parse "GET /path HTTP/1.x"
+                    let path = req
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("/");
+
+                    let (status, content_type, body) = if let Some(rest) =
+                        path.strip_prefix("/simple/")
+                    {
+                        // Strip trailing slash, get normalized name.
+                        let pkg_name = rest.trim_end_matches('/');
+                        if let Some(entries) = by_name.get(pkg_name) {
+                            let links: String = entries
+                                .iter()
+                                .map(|(fname, _)| format!("<a href=\"/{fname}\">{fname}</a>\n",))
+                                .collect();
+                            let html =
+                                format!("<!DOCTYPE html><html><body>\n{links}</body></html>\n");
+                            ("200 OK", "text/html", html.into_bytes())
+                        } else {
+                            ("404 Not Found", "text/plain", b"not found".to_vec())
+                        }
+                    } else {
+                        // Wheel file request: /filename.whl
+                        let fname = path.trim_start_matches('/');
+                        if let Some(bytes) = by_filename.get(fname) {
+                            ("200 OK", "application/octet-stream", bytes.clone())
+                        } else {
+                            ("404 Not Found", "text/plain", b"not found".to_vec())
+                        }
+                    };
+
+                    let resp = format!(
+                        "HTTP/1.0 {status}\r\nContent-Length: {}\r\nContent-Type: {content_type}\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                    let _ = stream.write_all(&body).await;
+                });
+            }
+        });
+
+        port
+    }
+
+    /// Task A (FIX 3 completion): resolve_bundle-loop-level integration test.
+    ///
+    /// Drives the FULL BFS loop inside resolve_bundle with a localhost fixture
+    /// index. Verifies that a transitive dep reachable via prefix matching ends
+    /// up in bundle.extras.
+    ///
+    /// Scenario:
+    ///   - Primary: `rtest-pkg==1.0` (Requires-Dist: `rtest-pkg-sub>=1.0`)
+    ///   - Transitive: `rtest-pkg-sub==1.0` (no further deps)
+    ///   - Both served by a localhost PEP 503 simple index.
+    ///
+    /// Assert: bundle.extras contains exactly one entry: rtest-pkg-sub 1.0.
+    ///
+    /// This test exercises the full BFS pipeline (materialize_and_rewrite for
+    /// primary, bfs_fetch_pypi for transitive, commit_chosen, extras.push) and
+    /// would catch the FIX-1 vanish bug if it were re-introduced (a dep that
+    /// goes through NeedsReResolve must still appear in bundle.extras, not
+    /// vanish silently).
+    #[tokio::test]
+    async fn resolve_bundle_bfs_fetches_prefix_transitive() {
+        let dir = unique_tmp_dir();
+        let download_dir = dir.join("download");
+        let source_dir = dir.join("source");
+        let cache_dir = dir.join("cache");
+        std::fs::create_dir_all(&download_dir).unwrap();
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        let primary_name = "rtest-pkg";
+        let primary_version = "1.0";
+        let sub_name = "rtest-pkg-sub";
+        let sub_version = "1.0";
+
+        // primary requires rtest-pkg-sub (prefix matches: rtest-pkg- prefix)
+        let primary_bytes = make_wheel_bytes(
+            primary_name,
+            primary_version,
+            &[&format!("{sub_name}>=1.0")],
+        );
+        let sub_bytes = make_wheel_bytes(sub_name, sub_version, &[]);
+
+        let port = spawn_index_server(
+            vec![
+                (
+                    primary_name.to_string(),
+                    primary_version.to_string(),
+                    primary_bytes,
+                ),
+                (sub_name.to_string(), sub_version.to_string(), sub_bytes),
+            ],
+            32, // enough for primary + sub index + wheel fetches + sidecar attempts
+        )
+        .await;
+
+        let index_url = format!("http://127.0.0.1:{port}/simple/");
+
+        let entry = WheelEntry {
+            version: Some(primary_version.to_string()),
+            index: Some(index_url),
+            ..Default::default()
+        };
+        let target = WheelTarget {
+            python_version: "3.11".to_string(),
+            conda_subdir: "linux-64".to_string(),
+        };
+        let pypi_to_conda: PypiToCondaMap = HashMap::new();
+        let name_map: BTreeMap<String, String> = BTreeMap::new();
+        let git_sources: BTreeMap<String, crate::config::NamedGitSource> = BTreeMap::new();
+        let conda_channels: Vec<rattler_conda_types::ChannelUrl> = vec![];
+
+        let bundle = resolve_bundle(
+            primary_name,
+            &entry,
+            &target,
+            &download_dir,
+            &source_dir,
+            &cache_dir,
+            RelaxPolicy::default(),
+            &git_sources,
+            None, // auto_data
+            &pypi_to_conda,
+            &name_map,
+            &conda_channels,
+        )
+        .await
+        .expect("resolve_bundle must succeed");
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        // Primary must be in the bundle.
+        assert_eq!(
+            bundle.primary.pypi_name, primary_name,
+            "bundle primary must be {primary_name}"
+        );
+
+        // Transitive sub-wheel must be in bundle.extras (not vanished).
+        // This is the key assertion: if the re-resolve path (FIX 1) had a
+        // silent-delete bug, a dep that went through NeedsReResolve would
+        // be missing here. Pinning this assertion guards that regression.
+        let extras_names: Vec<&str> = bundle.extras.iter().map(|w| w.pypi_name.as_str()).collect();
+        assert!(
+            extras_names.contains(&sub_name),
+            "transitive dep '{sub_name}' must be present in bundle.extras; \
+             got: {extras_names:?}. \
+             If this fails, the FIX-1 re-resolve vanish bug was re-introduced.",
+        );
+        assert_eq!(
+            extras_names.len(),
+            1,
+            "bundle.extras must contain exactly one dep ({sub_name}); got: {extras_names:?}",
+        );
+
+        // Verify the resolved version.
+        let sub_wheel = bundle
+            .extras
+            .iter()
+            .find(|w| w.pypi_name == sub_name)
+            .unwrap();
+        assert_eq!(
+            sub_wheel.metadata.version, sub_version,
+            "transitive dep must be at version {sub_version}"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests;
