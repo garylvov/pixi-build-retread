@@ -825,11 +825,14 @@ pub(crate) async fn pre_emit_widen_pass(
     let mut processed_wheels: usize = 0;
     let mut bundled_names = bundled_names;
     for round in 0..MAX_FIXED_POINT_ROUNDS {
-        let raw_lines: Vec<String> = bundle
+        // PR-1 (Site 3): sort raw_lines so the fixed-point pass is confluent
+        // (processing order doesn't affect which specs win).
+        let mut raw_lines: Vec<String> = bundle
             .all_wheels()
             .skip(processed_wheels)
             .flat_map(|w| w.metadata.requires_dist.iter().cloned())
             .collect();
+        raw_lines.sort();
         processed_wheels = bundle.all_wheels().count();
         if round > 0 {
             // New wheels joined the bundle last round: refresh the

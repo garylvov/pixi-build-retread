@@ -264,7 +264,13 @@ pub const SCHEMA: u32 = 9;
 /// git-URL dep not in the bundle (e.g. isaaclab_mimic 1.3.2 robomimic line).
 /// Any pack whose wheels carry such orphan URL lines (both isaac-pack and
 /// isaac-pack-latest) will emit different (correctly stripped) wheel bytes.
-pub const EMIT_EPOCH: u32 = 5;
+///
+/// Epoch 6: confluent constraint-accumulating BFS resolver (Part 1, amendment B):
+/// all four version-picking sites now accumulate AND-intersect specifiers and
+/// iterate to a name-sorted fixpoint. For the committed locks this produces
+/// identical resolved versions (pre-probe: 0 divergences), but the algorithm
+/// change is semantically different and gets its own epoch for safety.
+pub const EMIT_EPOCH: u32 = 6;
 
 impl RetreadLock {
     /// File name for a bundle's lock next to the pack manifest.

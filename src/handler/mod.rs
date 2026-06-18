@@ -18,6 +18,9 @@ use cascade::{
     pypi_fallback_indexes,
 };
 
+mod resolve_state;
+use resolve_state::{ObserveEdgeResult, ResolveState};
+
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -2594,8 +2597,8 @@ async fn resolve_bundle(
     conda_channels: &[ChannelUrl],
 ) -> Result<Bundle> {
     let conda_name = canonical_conda_name(entry_name);
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut work: VecDeque<Pending> = VecDeque::new();
+    let mut state = ResolveState::default();
+    let mut work: BTreeMap<String, Pending> = BTreeMap::new();
     // v0.14.1+: collect every probe + routing decision so the audit
     // can persist them to disk. Flushed in resolve_all at the end of
     // conda/outputs (so failed conda solves still leave the trace).
@@ -2635,7 +2638,12 @@ async fn resolve_bundle(
     // P2 (grizzly #2): canonical seed -- the BFS dedups candidates in
     // canonical form (see the `canonical_conda_name(&pending.pypi_name)`
     // drain below), so the primary must be seeded the same way.
-    seen.insert(canonical_conda_name(&primary.pypi_name));
+    // PR-1: seed_chosen records the primary's version into ResolveState so
+    // future observe_edge calls can check constraint compatibility.
+    state.seed_chosen(
+        canonical_conda_name(&primary.pypi_name),
+        primary.metadata.version.clone(),
+    );
 
     // path/git/from sources are authored project code, not metapackages
     // with extras-gated transitives. SKIP the BFS entirely unless the
@@ -2675,14 +2683,23 @@ async fn resolve_bundle(
     };
     // v1.5.9: seed from the ORIGINAL (pre-D) Requires-Dist so exact
     // family pins resolve exact-first (see materialize_and_rewrite).
-    seed_worklist(
-        &primary_original_rd,
-        &entry.extras,
-        &entry.index_url(),
-        &prefix,
-        &seen,
-        &mut work,
-    )?;
+    // PR-1: use a temp VecDeque for seed_worklist compat, then drain into BTreeMap.
+    {
+        let mut tmp_queue: VecDeque<Pending> = VecDeque::new();
+        let seen_set: HashSet<String> = state.constraints.keys().cloned().collect();
+        seed_worklist(
+            &primary_original_rd,
+            &entry.extras,
+            &entry.index_url(),
+            &prefix,
+            &seen_set,
+            &mut tmp_queue,
+        )?;
+        for pending in tmp_queue {
+            let name = canonical_conda_name(&pending.pypi_name);
+            work.entry(name).or_insert(pending);
+        }
+    }
 
     // BFS, accumulating sub-wheels. v0.12.0+: PyPI-Simple deps go
     // through the existing `pypi::resolve` path; URL/git deps from
@@ -2703,20 +2720,63 @@ async fn resolve_bundle(
     // one-item-at-a-time BFS. Git/URL-form deps are also fetched
     // serially: two materializations of the same repo would race the
     // git-clone cache.
+    //
+    // PR-1: work is now a BTreeMap<name, Pending>; iteration is
+    // canonical-name-sorted (Pillar 3). ResolveState replaces
+    // seen: HashSet and accumulates AND-intersection constraints.
+    const MAX_BFS_ITERATIONS: usize = 500;
+    let mut bfs_iter = 0usize;
     'levels: loop {
-        // Drain the current frontier, deduping at drain time. (The old
-        // loop deduped at pop time -- equivalent, since seed_worklist
-        // also consults `seen` before enqueuing.)
+        bfs_iter += 1;
+        if bfs_iter > MAX_BFS_ITERATIONS {
+            bail!(
+                "resolve_bundle: BFS iteration cap ({MAX_BFS_ITERATIONS}) exceeded for bundle \
+                 `{conda_name}`. This indicates a circular re-resolve in constraint \
+                 accumulation (a conflict the resolver failed to detect early)."
+            );
+        }
+        if work.is_empty() {
+            break 'levels;
+        }
+        // Drain work into frontier in canonical (name-sorted) order.
+        // The BTreeMap guarantees name-sorted iteration (Pillar 3).
+        let current_work: Vec<Pending> = std::mem::take(&mut work).into_values().collect();
         let mut frontier: Vec<Pending> = Vec::new();
-        while let Some(pending) = work.pop_front() {
+        let mut reresolve_queue: Vec<Pending> = Vec::new();
+
+        for pending in current_work {
             let dep_conda_name = canonical_conda_name(&pending.pypi_name);
-            if !seen.insert(dep_conda_name) {
-                continue;
+            match state.observe_edge(&dep_conda_name, pending)? {
+                ObserveEdgeResult::New(p) => {
+                    frontier.push(p);
+                }
+                ObserveEdgeResult::AlreadySatisfied | ObserveEdgeResult::NonPypiAlreadySeen => {
+                    // Already resolved; constraint was accumulated. Skip.
+                }
+                ObserveEdgeResult::NeedsReResolve(tighter_pending) => {
+                    // Must re-resolve this dep with tighter constraints.
+                    // Revoke the chosen version so it gets re-resolved.
+                    state.revoke_chosen(&dep_conda_name);
+                    // Remove from extras (it will be re-added after re-resolution).
+                    extras.retain(|w: &ResolvedWheel| {
+                        canonical_conda_name(&w.pypi_name) != dep_conda_name
+                    });
+                    reresolve_queue.push(tighter_pending);
+                }
             }
-            frontier.push(pending);
+        }
+
+        // Re-enqueue items that need re-resolution into the next level's work.
+        for p in reresolve_queue {
+            let name = canonical_conda_name(&p.pypi_name);
+            work.insert(name, p);
+        }
+
+        if frontier.is_empty() && work.is_empty() {
+            break 'levels;
         }
         if frontier.is_empty() {
-            break 'levels;
+            continue 'levels; // still have re-resolve work
         }
 
         // Phase 1: routing (prefer-conda short-circuit), serial.
@@ -3083,17 +3143,28 @@ async fn resolve_bundle(
             // deps also get pulled in. URL/git sub-wheels reuse the parent
             // bundle's `prefix` (often empty for source-form parents) so
             // they don't pull random siblings.
-            seed_worklist(
-                &sub_seed_rd,
-                &pending.extras,
-                &sub_index_for_recurse,
-                &prefix,
-                &seen,
-                &mut work,
-            )?;
+            // PR-1: use a temp VecDeque for seed_worklist compat, then drain into BTreeMap.
+            {
+                let mut tmp_seed: VecDeque<Pending> = VecDeque::new();
+                let seen_set: HashSet<String> = state.constraints.keys().cloned().collect();
+                seed_worklist(
+                    &sub_seed_rd,
+                    &pending.extras,
+                    &sub_index_for_recurse,
+                    &prefix,
+                    &seen_set,
+                    &mut tmp_seed,
+                )?;
+                for p in tmp_seed {
+                    let name = canonical_conda_name(&p.pypi_name);
+                    work.entry(name).or_insert(p);
+                }
+            }
 
+            // PR-1: capture version before sub_metadata is moved into the struct.
+            let sub_version = sub_metadata.version.clone();
             extras.push(ResolvedWheel {
-                pypi_name: dep_conda_name,
+                pypi_name: dep_conda_name.clone(),
                 url: sub_url,
                 upstream_url: sub_upstream_url,
                 // BFS sub-wheels inherit git_source from materialize_and_rewrite
@@ -3109,6 +3180,9 @@ async fn resolve_bundle(
                 auto_data: None,
                 auto_data_dedup_skipped_root: None,
             });
+            // PR-1: commit the resolved version so future observe_edge calls
+            // can check constraint compatibility (re-resolve-on-tighten).
+            state.commit_chosen(dep_conda_name, sub_version);
         }
     }
 
@@ -3961,10 +4035,15 @@ fn produce_output(
     // when two wheels disagree, the first-encountered spec wins. Genuine
     // upstream disagreements (e.g. pillow 11.3 vs 12.0 in isaacsim) are the
     // user's responsibility to resolve via [build.config.overrides].
+    //
+    // PR-1 (Site 4): iterate wheels in canonical-name order so the
+    // first-encountered dedup is confluent (order-independent).
     let env = marker_env_for(&host_platform.to_string(), &python_version)?;
     let mut run_dep_specs: Vec<NamedSpec<PackageSpec>> = vec![spec_from_str(&python_dep)?];
     let mut seen_dep_names: HashSet<String> = HashSet::from(["python".to_string()]);
-    for wheel in bundle.all_wheels() {
+    let mut sorted_wheels: Vec<&ResolvedWheel> = bundle.all_wheels().collect();
+    sorted_wheels.sort_by_key(|w| canonical_conda_name(&w.pypi_name));
+    for wheel in sorted_wheels {
         for raw in &wheel.metadata.requires_dist {
             let Some(dep) = crate::relax::translate(
                 raw,
