@@ -21,6 +21,8 @@ use cascade::{
 mod resolve_state;
 use resolve_state::{ObserveEdgeResult, ResolveState};
 
+mod resolvo_discovery;
+
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
