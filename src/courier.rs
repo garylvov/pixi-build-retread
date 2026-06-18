@@ -962,10 +962,8 @@ pub async fn stage(
         }
     }
 
-    // Step 6: Assemble the RetreadLock.
-    let mut conda_capable_sorted: Vec<String> = conda_capable.iter().cloned().collect();
-    conda_capable_sorted.sort();
-    let lock = RetreadLock {
+    // Step 6: Assemble the RetreadLock and canonicalize for stable JSON output.
+    let mut lock = RetreadLock {
         schema: SCHEMA,
         retread_version: env!("CARGO_PKG_VERSION").to_string(),
         bundle: bundle_name.to_string(),
@@ -977,8 +975,9 @@ pub async fn stage(
         conda_run_deps: parse_conda_deps(run_deps),
         index_urls: index_urls.to_vec(),
         prerelease,
-        conda_capable: conda_capable_sorted,
+        conda_capable: conda_capable.iter().cloned().collect(),
     };
+    lock.canonicalize();
 
     // Step 7: Write the lock JSON into staging_dir. Write-then-rename so a
     // crash mid-write can never leave a torn lock (B-3): a partial file would

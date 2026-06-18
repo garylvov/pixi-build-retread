@@ -22,6 +22,8 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::relax::canonical_conda_name;
+
 /// Git provenance for a source-built wheel (schema 8+).
 ///
 /// Stored in `LockWheel.git_source` for every wheel whose bytes were
@@ -223,16 +225,17 @@ pub struct RetreadLock {
     pub conda_capable: Vec<String>,
 }
 
-/// Schema 9: sdist_source (SdistWheelSource) field added to LockWheel (schema
-/// 8+). Required for Class-2b sdist-built BFS transitive replay (e.g. gym):
-/// records the exact resolved sdist https URL + #sha256 so replay can re-build
-/// from the identical tarball manifest-independently, without re-running the
-/// full BFS/solve. Old schema-8 and earlier locks are rejected by the != gate
-/// and fall through to full resolve (safe: committed locks must be regenerated
-/// under v2.7.0). SCHEMA is NOT an epoch bump (lock FORMAT change only; the
-/// emitted-output SEMANTICS for identical inputs are unchanged —
-/// sdist_source is not in compute_inputs_hash; [emit-epoch-ok]).
-pub const SCHEMA: u32 = 9;
+/// Schema 10: canonical lock ordering via `RetreadLock::canonicalize()`.
+/// `wheels[]` sorted by (canonical_conda_name, version, origin, filename);
+/// `conda_run_deps[]` by (name, spec); `root_requirements[]` and
+/// `conda_capable[]` lexicographically; nested `requires_dist[]` and
+/// `GitWheelSource.extras[]` lexicographically. This guarantees byte-identical
+/// JSON regardless of resolve/discovery order, making lock diffs meaningful.
+/// Old schema-9 and earlier locks are rejected by the != gate and fall through
+/// to full resolve (safe: committed locks must be regenerated). SCHEMA is NOT
+/// an epoch bump (output SEMANTICS for identical inputs are unchanged;
+/// [emit-epoch-ok]).
+pub const SCHEMA: u32 = 10;
 
 /// Bump EMIT_EPOCH in the SAME commit as ANY change that can alter the bytes
 /// retread emits for identical manifest inputs (relax/version-selection
@@ -360,6 +363,62 @@ impl RetreadLock {
     pub fn marker_name(&self) -> String {
         format!("{}.installed", self.bundle)
     }
+
+    /// Sort all vectors in the lock to their canonical (order-independent)
+    /// form so serialized JSON is byte-identical regardless of resolve order.
+    /// Called once at serialize time in `courier::stage` (the only write path).
+    /// Idempotent: `canonicalize(canonicalize(x)) == canonicalize(x)`.
+    ///
+    /// Top-level sorts:
+    /// - `wheels[]`: (canonical_conda_name(name), version, origin, filename)
+    /// - `conda_run_deps[]`: (name, spec)
+    /// - `root_requirements[]`: lexicographic
+    /// - `conda_capable[]`: lexicographic (supersedes the inline sort in courier::stage)
+    /// - `index_urls[]`: NOT sorted — chain order is semantically significant.
+    /// - `prerelease`: BTreeMap — already key-ordered.
+    ///
+    /// Nested sorts (A-1):
+    /// - `LockWheel.requires_dist[]`: lexicographic (order-insensitive per §A.5)
+    /// - `GitWheelSource.extras[]`: lexicographic
+    pub fn canonicalize(&mut self) {
+        // Top-level: wheels sorted by (canonical name, version, origin, filename).
+        self.wheels.sort_by(|a, b| {
+            canonical_conda_name(&a.name)
+                .cmp(&canonical_conda_name(&b.name))
+                .then_with(|| a.version.cmp(&b.version))
+                .then_with(|| {
+                    // Origin discriminant: Built < Index for stable ordering.
+                    let ord_a = match a.origin {
+                        Origin::Built => 0u8,
+                        Origin::Index => 1u8,
+                    };
+                    let ord_b = match b.origin {
+                        Origin::Built => 0u8,
+                        Origin::Index => 1u8,
+                    };
+                    ord_a.cmp(&ord_b)
+                })
+                .then_with(|| a.filename.cmp(&b.filename))
+        });
+
+        // Top-level: conda_run_deps sorted by (name, spec).
+        self.conda_run_deps
+            .sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.spec.cmp(&b.spec)));
+
+        // Top-level: root_requirements lexicographic.
+        self.root_requirements.sort();
+
+        // Top-level: conda_capable lexicographic.
+        self.conda_capable.sort();
+
+        // Nested A-1: requires_dist and GitWheelSource.extras per wheel.
+        for wheel in &mut self.wheels {
+            wheel.requires_dist.sort();
+            if let Some(gs) = &mut wheel.git_source {
+                gs.extras.sort();
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -435,8 +494,8 @@ mod tests {
         let back: RetreadLock = serde_json::from_str(&json).unwrap();
         assert_eq!(back.bundle, "isaac-pack");
         assert_eq!(
-            back.schema, 9,
-            "SCHEMA must be 9 after sdist_source/SdistWheelSource added for Class-2b sdist replay"
+            back.schema, 10,
+            "SCHEMA must be 10 after canonical lock ordering (canonicalize) added"
         );
         assert_eq!(back.wheels.len(), 3);
         // Wheel 0: must_ship source-built, no upstream_url.
@@ -847,5 +906,141 @@ mod tests {
             "git_source must default to None when absent from schema-7 lock"
         );
         assert!(lock.wheels[0].must_ship);
+    }
+
+    fn make_test_lock_unordered() -> RetreadLock {
+        RetreadLock {
+            schema: SCHEMA,
+            retread_version: "2.0.0".into(),
+            bundle: "test-pack".into(),
+            version: "1.0.0".into(),
+            python: "3.11".into(),
+            inputs_hash: "abc123".into(),
+            root_requirements: vec!["torch-req".into(), "numpy-req".into()],
+            wheels: vec![
+                LockWheel {
+                    name: "torch".into(),
+                    version: "2.0.0".into(),
+                    origin: Origin::Index,
+                    filename: "torch-2.0.0-py3-none-any.whl".into(),
+                    url: Some("https://pypi.org/torch.whl".into()),
+                    sha256: None,
+                    requires_dist: vec!["nvidia-cuda>=11.0".into(), "filelock>=3.0".into()],
+                    must_ship: false,
+                    upstream_url: None,
+                    git_source: None,
+                    sdist_source: None,
+                },
+                LockWheel {
+                    name: "numpy".into(),
+                    version: "1.26.0".into(),
+                    origin: Origin::Built,
+                    filename: "numpy-1.26.0-py3-none-any.whl".into(),
+                    url: None,
+                    sha256: None,
+                    requires_dist: vec!["packaging".into()],
+                    must_ship: true,
+                    upstream_url: None,
+                    git_source: Some(GitWheelSource {
+                        url: "https://github.com/numpy/numpy".into(),
+                        rev: "abc123".into(),
+                        subdirectory: None,
+                        extras: vec!["test".into(), "dev".into()],
+                    }),
+                    sdist_source: None,
+                },
+            ],
+            conda_run_deps: vec![
+                CondaDep {
+                    name: "zlib".into(),
+                    spec: ">=1.2".into(),
+                },
+                CondaDep {
+                    name: "blas".into(),
+                    spec: "*".into(),
+                },
+            ],
+            index_urls: vec!["https://pypi.org/simple/".into()],
+            prerelease: BTreeMap::new(),
+            conda_capable: vec!["zlib".into(), "blas".into()],
+        }
+    }
+
+    #[test]
+    fn canonicalize_is_idempotent() {
+        let mut lock = make_test_lock_unordered();
+        lock.canonicalize();
+        let json1 = lock.to_pretty_json().unwrap();
+        lock.canonicalize();
+        let json2 = lock.to_pretty_json().unwrap();
+        assert_eq!(json1, json2, "canonicalize must be idempotent");
+    }
+
+    #[test]
+    fn canonicalize_is_permutation_invariant() {
+        let mut lock_a = make_test_lock_unordered();
+        // Reverse the wheels order.
+        lock_a.wheels.reverse();
+        lock_a.conda_run_deps.reverse();
+        lock_a.canonicalize();
+
+        let mut lock_b = make_test_lock_unordered();
+        lock_b.canonicalize();
+
+        assert_eq!(
+            lock_b.to_pretty_json().unwrap(),
+            lock_a.to_pretty_json().unwrap(),
+            "canonicalize must produce identical JSON regardless of input order"
+        );
+    }
+
+    #[test]
+    fn canonicalize_nested_requires_dist() {
+        let mut lock = make_test_lock_unordered();
+        // Set requires_dist in non-canonical order on the torch wheel (index 0 pre-sort).
+        lock.wheels[0].requires_dist = vec!["torch>=2.0".into(), "numpy>=1.21".into()];
+        lock.canonicalize();
+        // After canonicalize, wheels are sorted by canonical name: numpy < torch.
+        // Find the torch wheel by name to check its requires_dist.
+        let torch_wheel = lock
+            .wheels
+            .iter()
+            .find(|w| w.name == "torch")
+            .expect("torch wheel must exist");
+        assert_eq!(
+            torch_wheel.requires_dist,
+            vec!["numpy>=1.21", "torch>=2.0"],
+            "requires_dist must be sorted lexicographically after canonicalize"
+        );
+    }
+
+    #[test]
+    fn canonicalize_inputs_hash_invariant() {
+        // Reordering vectors must NOT change inputs_hash.
+        let mut lock_a = make_test_lock_unordered();
+        lock_a.wheels.reverse();
+        let hash_before = RetreadLock::compute_inputs_hash(
+            &lock_a.root_requirements,
+            &lock_a.index_urls,
+            "allow",
+            &lock_a.python,
+            crate::lock::EMIT_EPOCH,
+            None,
+            "fingerprint",
+        );
+        lock_a.canonicalize();
+        let hash_after = RetreadLock::compute_inputs_hash(
+            &lock_a.root_requirements,
+            &lock_a.index_urls,
+            "allow",
+            &lock_a.python,
+            crate::lock::EMIT_EPOCH,
+            None,
+            "fingerprint",
+        );
+        assert_eq!(
+            hash_before, hash_after,
+            "inputs_hash must be invariant under vector reordering"
+        );
     }
 }
