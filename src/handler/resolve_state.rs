@@ -109,8 +109,7 @@ impl ResolveState {
             // Insert ==V pinned constraint.
             let pin_str = format!("=={}", version);
             let pinned = VersionSpecifiers::from_str(&pin_str).ok();
-            self.constraints
-                .insert(canonical_name.clone(), pinned);
+            self.constraints.insert(canonical_name.clone(), pinned);
             self.chosen.insert(
                 canonical_name.clone(),
                 ChosenEntry {
@@ -702,7 +701,10 @@ mod tests {
 
         assert!(state.is_locked("pkg-x"));
         // The ==1.0 constraint must be present.
-        let c = state.current_constraint("pkg-x").cloned().unwrap_or_default();
+        let c = state
+            .current_constraint("pkg-x")
+            .cloned()
+            .unwrap_or_default();
         let v10 = ver("1.0");
         let v20 = ver("2.0");
         assert!(c.contains(&v10), "1.0 must satisfy ==1.0 constraint");
@@ -755,6 +757,9 @@ mod tests {
         // ==2.0 conflicts with locked ==1.0 (provably_conflict detects ==V clash).
         let p = make_pypi_pending("pkg-x", "==2.0");
         let result = state.observe_edge("pkg-x", p);
-        assert!(result.is_err(), "==2.0 vs locked ==1.0 must produce a conflict error");
+        assert!(
+            result.is_err(),
+            "==2.0 vs locked ==1.0 must produce a conflict error"
+        );
     }
 }

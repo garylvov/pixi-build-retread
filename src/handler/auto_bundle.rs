@@ -17,8 +17,8 @@ use crate::pypi;
 use crate::relax::{canonical_conda_name, default_marker_env};
 use crate::wheel::WheelMetadata;
 
-use super::{Bundle, DEFAULT_PYTHON, PypiToCondaMap, ResolvedWheel};
 use super::resolve_state::ResolveState;
+use super::{Bundle, DEFAULT_PYTHON, PypiToCondaMap, ResolvedWheel};
 
 /// Sentinel error returned when the incremental-add BFS detects that a new
 /// dep's transitive subtree would force a version change on a dep already
@@ -687,10 +687,7 @@ pub(crate) fn seed_worklist(
                         }
                         Ok(super::resolve_state::ObserveEdgeResult::NeedsReResolve(_)) => {
                             return Err(anyhow::Error::new(IncrementalRipple {
-                                reason: format!(
-                                    "locked dep `{}` would need re-resolution",
-                                    $dn
-                                ),
+                                reason: format!("locked dep `{}` would need re-resolution", $dn),
                             }));
                         }
                         Ok(super::resolve_state::ObserveEdgeResult::New(_)) => {
@@ -700,10 +697,7 @@ pub(crate) fn seed_worklist(
                         }
                         Err(e) => {
                             return Err(anyhow::Error::new(IncrementalRipple {
-                                reason: format!(
-                                    "locked dep `{}` conflicts: {e}",
-                                    $dn
-                                ),
+                                reason: format!("locked dep `{}` conflicts: {e}", $dn),
                             }));
                         }
                     }

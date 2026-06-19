@@ -1929,7 +1929,6 @@ impl Handler {
             // and the current manifest diff is a pure dep addition, attempt a
             // localized resolve that reuses the locked closure.  Falls through
             // to cold resolve_all on any gate failure, ripple, or conflict.
-            // STEP 5 will implement the actual localized resolve driver.
             {
                 let ws_indexes: Vec<String> = ws_manifest_for_replay
                     .as_ref()
@@ -1940,10 +1939,9 @@ impl Handler {
                     .values()
                     .map(|e| e.index_url())
                     .collect();
-                let incr_index_urls =
-                    merge_index_chain(entry_indexes.into_iter(), &ws_indexes);
+                let incr_index_urls = merge_index_chain(entry_indexes.into_iter(), &ws_indexes);
                 let relax_str = format!("{:?}", config.relax);
-                if let Some(_incr) = detect_incremental_add(
+                if let Some(incr) = detect_incremental_add(
                     &lock_path,
                     &config,
                     &bundle_name_for_hash,
@@ -1952,13 +1950,43 @@ impl Handler {
                     &python_version,
                     &config_fp,
                 ) {
-                    tracing::info!(
-                        bundle = %bundle_name_for_hash,
-                        "incremental-add: detected (RETREAD_INCREMENTAL=1) -- \
-                         localized resolve driver (STEP 5) not yet implemented; \
-                         falling through to cold resolve"
-                    );
-                    // STEP 5 will use `_incr` to run the localized resolve.
+                    match resolve_incremental_add(
+                        incr,
+                        &config,
+                        &target,
+                        &download_dir,
+                        &source_dir,
+                        &cache_dir,
+                        &params.channels,
+                        workspace_dir.as_deref(),
+                        &params.work_directory,
+                        &output_dir,
+                        params.output.subdir,
+                        params.output.build.as_deref(),
+                        &config_fp,
+                    )
+                    .await
+                    {
+                        Ok(Some(result)) => {
+                            tracing::info!(
+                                bundle = %bundle_name_for_hash,
+                                "incremental-add: localized resolve succeeded"
+                            );
+                            return Ok(result);
+                        }
+                        Ok(None) => {
+                            tracing::debug!(
+                                bundle = %bundle_name_for_hash,
+                                "incremental-add: escalated to cold resolve"
+                            );
+                            // fall through to resolve_all
+                        }
+                        Err(e) => {
+                            return Err(RpcError::internal(format!(
+                                "incremental-add {bundle_name_for_hash}: {e:#}"
+                            )));
+                        }
+                    }
                 }
             }
         }
@@ -2884,13 +2912,9 @@ async fn resolve_bundle(
             // error, escalate to IncrementalRipple instead of failing hard.
             let edge_result = match edge_result {
                 Err(e) if dep_is_locked => {
-                    return Err(anyhow::Error::new(
-                        auto_bundle::IncrementalRipple {
-                            reason: format!(
-                                "locked dep `{dep_conda_name}` constraint conflict: {e:#}"
-                            ),
-                        },
-                    ));
+                    return Err(anyhow::Error::new(auto_bundle::IncrementalRipple {
+                        reason: format!("locked dep `{dep_conda_name}` constraint conflict: {e:#}"),
+                    }));
                 }
                 other => other?,
             };
@@ -2906,14 +2930,12 @@ async fn resolve_bundle(
                     // new dep's subtree wants to change the locked version →
                     // ripple detected, escalate to cold resolve.
                     if dep_is_locked {
-                        return Err(anyhow::Error::new(
-                            auto_bundle::IncrementalRipple {
-                                reason: format!(
-                                    "locked dep `{dep_conda_name}` would need re-resolution \
+                        return Err(anyhow::Error::new(auto_bundle::IncrementalRipple {
+                            reason: format!(
+                                "locked dep `{dep_conda_name}` would need re-resolution \
                                      (current lock version excluded by incoming constraint)"
-                                ),
-                            },
-                        ));
+                            ),
+                        }));
                     }
                     // Must re-resolve this dep with tighter constraints.
                     // Revoke the chosen version so it gets re-resolved.
@@ -5402,6 +5424,306 @@ async fn materialize_and_pack(
     })
 }
 
+/// Localized incremental-add resolver (STEP 5).
+///
+/// Reuses the committed lock's closure for unchanged entries and resolves
+/// ONLY the newly-added entries' subtrees, guarded by the ripple-detection
+/// machinery from STEPs 2+3.  Calls `materialize_and_pack` to write the
+/// merged lock and build the courier package.
+///
+/// Returns `Ok(Some(result))` if the incremental resolve succeeded and the
+/// courier package was built.  Returns `Ok(None)` if any escalation condition
+/// was met (ripple, conflict, provenance gap, A5 dedup violation) — caller
+/// falls through to full `resolve_all`.  Returns `Err` on hard errors.
+///
+/// # A6 write-last guarantee
+/// The committed lock is written ONLY after ALL ripple/dedup checks pass.
+/// On any escalation `Ok(None)`, no lock is written.
+#[allow(clippy::too_many_arguments)]
+async fn resolve_incremental_add(
+    incr: IncrementalAdd,
+    config: &RetreadConfig,
+    target: &WheelTarget,
+    download_dir: &Path,
+    source_dir: &Path,
+    cache_dir: &Path,
+    conda_channels: &[ChannelUrl],
+    workspace_dir: Option<&Path>,
+    work_dir: &Path,
+    output_dir: &Path,
+    target_subdir: Platform,
+    expected_build: Option<&str>,
+    config_fp: &str,
+) -> Result<Option<CondaBuildV1Result>> {
+    let IncrementalAdd { added_specs, lock } = incr;
+
+    // ── Build locked_closure: name → version from lock.wheels ─────────────
+    let locked_closure: std::collections::BTreeMap<String, String> = lock
+        .wheels
+        .iter()
+        .map(|w| (canonical_conda_name(&w.name), w.version.clone()))
+        .collect();
+
+    // ── Step A: re-materialize locked wheels (emit_wheels_from_lock) ──────
+    let python_version = crate::relax::emit_python_version("", &lock.python);
+    let locked_emit =
+        match emit_wheels_from_lock(&lock, config, target, download_dir, source_dir, cache_dir)
+            .await?
+        {
+            Some(w) => w,
+            None => {
+                tracing::debug!(
+                    "incremental-add: emit_wheels_from_lock returned None (provenance gap); \
+                 escalating to cold resolve"
+                );
+                return Ok(None); // A6: no lock written
+            }
+        };
+
+    // ── Setup: replicate the parselmouth + name_map setup from resolve_all ─
+    let workspace_pypi_indexes: Vec<String> = workspace_dir
+        .and_then(crate::workspace::WorkspaceManifest::load)
+        .map(|m| m.all_pypi_index_urls())
+        .unwrap_or_default();
+    let pypi_to_conda = if config.auto_bundle {
+        load_pypi_to_conda_map().await
+    } else {
+        Default::default()
+    };
+    let mut effective = config.clone();
+    for (pypi, conda) in FALLBACK_PYPI_TO_CONDA {
+        let key = canonical_conda_name(pypi);
+        effective
+            .name_map
+            .entry(key)
+            .or_insert_with(|| (*conda).to_string());
+    }
+    for (pypi, conda_names) in &pypi_to_conda {
+        if conda_names.len() == 1 {
+            effective
+                .name_map
+                .entry(pypi.clone())
+                .or_insert_with(|| conda_names[0].clone());
+        }
+    }
+
+    // ── Step B: resolve each added entry ──────────────────────────────────
+    let mut new_emit: Vec<crate::emit_pypi::EmitWheel> = Vec::new();
+    let mut new_conda_capable: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // Match added_specs back to config entries.
+    // courier_input_specs produces "<key>[extras]<ver>" — we find entries
+    // whose spec string appears in added_specs.
+    let added_set: std::collections::HashSet<&str> =
+        added_specs.iter().map(|s| s.as_str()).collect();
+    let mut matched_entries: Vec<(String, WheelEntry)> = Vec::new();
+    for (key, entry) in &effective.retread_wheels {
+        let extras = if entry.extras.is_empty() {
+            String::new()
+        } else {
+            format!("[{}]", entry.extras.join(","))
+        };
+        let ver = entry
+            .normalized_version()
+            .map(|v| format!("=={v}"))
+            .or_else(|| entry.rev.clone().map(|r| format!("@git:{r}")))
+            .or_else(|| {
+                entry
+                    .from
+                    .as_ref()
+                    .and_then(|f| config.git_sources.get(f))
+                    .map(|s| format!("@git:{}", s.rev))
+            })
+            .or_else(|| entry.url.as_ref().map(|u| format!("@url:{u}")))
+            .unwrap_or_default();
+        let spec = format!("{key}{extras}{ver}");
+        if added_set.contains(spec.as_str()) {
+            matched_entries.push((key.clone(), entry.clone()));
+        }
+    }
+    if matched_entries.len() != added_specs.len() {
+        tracing::debug!(
+            matched = matched_entries.len(),
+            added = added_specs.len(),
+            "incremental-add: could not match all added_specs to config entries; escalating"
+        );
+        return Ok(None);
+    }
+
+    // auto_data_per_entry for group dedup (use None for simplicity — each
+    // new entry is treated as a standalone single-entry group).
+    for (entry_name, entry) in &matched_entries {
+        let auto_data =
+            checkout_root_for_entry(entry, &effective.git_sources, source_dir, cache_dir).map(
+                |checkout_root| AutoDataConfig {
+                    checkout_root,
+                    skip_subdirs: entry
+                        .subdirectory
+                        .as_deref()
+                        .map(|s| vec![PathBuf::from(s)])
+                        .unwrap_or_else(|| vec![PathBuf::from(".")]),
+                },
+            );
+
+        let bundle_result = resolve_bundle(
+            entry_name,
+            entry,
+            target,
+            download_dir,
+            source_dir,
+            cache_dir,
+            effective.relax,
+            &effective.git_sources,
+            auto_data,
+            &pypi_to_conda,
+            &effective.name_map,
+            conda_channels,
+            &effective.conda_deps,
+            &workspace_pypi_indexes,
+            Some(&locked_closure),
+        )
+        .await;
+
+        let bundle = match bundle_result {
+            Ok(b) => b,
+            Err(e) => {
+                // Check if this is an IncrementalRipple.
+                if e.downcast_ref::<auto_bundle::IncrementalRipple>().is_some() {
+                    tracing::debug!(
+                        entry = %entry_name,
+                        "incremental-add: ripple detected; escalating to cold resolve"
+                    );
+                    return Ok(None); // A6: no lock written
+                }
+                return Err(e);
+            }
+        };
+
+        // Convert Bundle → EmitWheel (same logic as build_one, lines 5461-5494).
+        let wheels_root = source_dir.join("wheels");
+        for w in bundle.all_wheels() {
+            let url = localize_wheel_source(&w.url, &wheels_root);
+            new_emit.push(crate::emit_pypi::EmitWheel {
+                pypi_name: w.pypi_name.clone(),
+                version: w.metadata.version.clone(),
+                requires_dist: w.metadata.requires_dist.clone(),
+                local_path: (url.scheme() == "file")
+                    .then(|| url.to_file_path().ok())
+                    .flatten(),
+                wheel_filename: url
+                    .path_segments()
+                    .and_then(|mut s| s.next_back())
+                    .unwrap_or_default()
+                    .to_string(),
+                remote_url: (url.scheme() != "file").then_some(url),
+                upstream_url: w.upstream_url.clone(),
+                git_source: w.git_source.clone(),
+                sdist_source: w.sdist_source.clone(),
+            });
+        }
+
+        // Collect conda_capable from probe decisions.
+        new_conda_capable.extend(
+            bundle
+                .probe_decisions
+                .iter()
+                .filter(|d| d.matching_candidates > 0)
+                .map(|d| canonical_conda_name(&d.pypi_name)),
+        );
+        new_conda_capable.extend(effective.name_map.keys().map(|k| canonical_conda_name(k)));
+        new_conda_capable.extend(load_pypi_to_conda_map().await.into_keys());
+    }
+
+    // ── Step C: auto_bundle_transitives for each new bundle (if applicable) ─
+    // NOTE: for simplicity we skip auto_bundle in the incremental path for now.
+    // auto_bundle would need to be run AFTER the new entries are resolved, but
+    // its results are already pre-filled via locked_closure in seen_candidate.
+
+    // ── A5 merge + dedup guard ────────────────────────────────────────────
+    // Start with locked_emit; merge in new_emit.
+    // Build a name→(version, index) map from locked_emit.
+    let mut merged: Vec<crate::emit_pypi::EmitWheel> = locked_emit;
+    let mut seen_versions: std::collections::HashMap<String, String> = merged
+        .iter()
+        .map(|w| (canonical_conda_name(&w.pypi_name), w.version.clone()))
+        .collect();
+
+    let new_count = new_emit.len();
+    for w in new_emit {
+        let canon = canonical_conda_name(&w.pypi_name);
+        if let Some(existing_ver) = seen_versions.get(&canon) {
+            if *existing_ver != w.version {
+                // Same name, different version — missed ripple; ESCALATE.
+                tracing::warn!(
+                    name = %canon,
+                    locked_ver = %existing_ver,
+                    new_ver = %w.version,
+                    "incremental-add A5: same name with different versions in merged closure; \
+                     escalating (missed ripple)"
+                );
+                return Ok(None); // A6: no lock written
+            }
+            // Same name + same version: skip (dedup).
+        } else {
+            seen_versions.insert(canon, w.version.clone());
+            merged.push(w);
+        }
+    }
+
+    // ── conda_capable + run_deps (union) ──────────────────────────────────
+    let mut conda_capable: std::collections::HashSet<String> =
+        lock.conda_capable.iter().cloned().collect();
+    conda_capable.extend(new_conda_capable);
+
+    // run_deps: locked run_deps (the locked set is authoritative for the
+    // unchanged closure; new pure-PyPI-only deps typically have no conda
+    // run-deps in the incremental path).
+    let run_deps: Vec<String> = lock
+        .conda_run_deps
+        .iter()
+        .map(|dep| {
+            if dep.spec.is_empty() {
+                dep.name.clone()
+            } else {
+                format!("{} {}", dep.name, dep.spec)
+            }
+        })
+        .collect();
+
+    let index_urls = lock.index_urls.clone();
+    let bundle_name = lock.bundle.clone();
+    let version = lock.version.clone();
+
+    tracing::info!(
+        bundle = %bundle_name,
+        locked = merged.len() - new_count,
+        new = new_count,
+        "incremental-add: localized resolve succeeded; building courier package"
+    );
+
+    // ── A6: write lock only after ALL checks pass ─────────────────────────
+    let result = materialize_and_pack(
+        None, // bundle=None: incremental path, no full Bundle available
+        config,
+        &bundle_name,
+        &version,
+        &python_version,
+        merged,
+        conda_capable,
+        run_deps,
+        index_urls,
+        config_fp,
+        work_dir,
+        output_dir,
+        target_subdir,
+        source_dir,
+        expected_build,
+    )
+    .await?;
+
+    Ok(Some(result))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn build_one(
     bundle: &Bundle,
@@ -5881,7 +6203,10 @@ fn detect_incremental_add(
         ?added,
         "incremental-add: pure add detected; will attempt localized resolve"
     );
-    Some(IncrementalAdd { added_specs: added, lock })
+    Some(IncrementalAdd {
+        added_specs: added,
+        lock,
+    })
 }
 
 /// Authority gate for the courier replay path.
@@ -9044,8 +9369,8 @@ mod resolve_bundle_bfs_tests {
             &pypi_to_conda,
             &name_map,
             &conda_channels,
-            &[], // conda_deps_list
-            &[], // workspace_indexes
+            &[],  // conda_deps_list
+            &[],  // workspace_indexes
             None, // cold path: no locked closure
         )
         .await
@@ -9199,8 +9524,8 @@ mod resolve_bundle_bfs_tests {
             &pypi_to_conda,
             &name_map,
             &conda_channels,
-            &[], // conda_deps_list
-            &[], // workspace_indexes
+            &[],  // conda_deps_list
+            &[],  // workspace_indexes
             None, // cold path: no locked closure
         )
         .await
@@ -9258,11 +9583,7 @@ mod incremental_add_tests {
     use crate::config::RetreadConfig;
     use crate::lock::{RetreadLock, SCHEMA};
 
-    fn make_lock_at(
-        path: &std::path::Path,
-        entry_specs: Vec<String>,
-        inputs_hash: &str,
-    ) {
+    fn make_lock_at(path: &std::path::Path, entry_specs: Vec<String>, inputs_hash: &str) {
         let lock = RetreadLock {
             schema: SCHEMA,
             retread_version: "0.0.1".into(),
@@ -9313,7 +9634,10 @@ mod incremental_add_tests {
             "3.11",
             "fp",
         );
-        assert!(result.is_none(), "RETREAD_INCREMENTAL unset must return None");
+        assert!(
+            result.is_none(),
+            "RETREAD_INCREMENTAL unset must return None"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -9325,15 +9649,8 @@ mod incremental_add_tests {
 
         // SAFETY: single-threaded test context; no concurrent env access.
         unsafe { std::env::set_var("RETREAD_INCREMENTAL", "1") };
-        let result = detect_incremental_add(
-            &missing,
-            &config,
-            "test-bundle",
-            &[],
-            "Eager",
-            "3.11",
-            "fp",
-        );
+        let result =
+            detect_incremental_add(&missing, &config, "test-bundle", &[], "Eager", "3.11", "fp");
         unsafe { std::env::remove_var("RETREAD_INCREMENTAL") };
         assert!(result.is_none(), "missing lock must return None");
     }
@@ -9366,7 +9683,8 @@ mod incremental_add_tests {
             conda_capable: vec![],
             entry_specs: vec!["test-bundle==1.0".into()],
         };
-        let mut json: serde_json::Value = serde_json::from_str(&lock.to_pretty_json().unwrap()).unwrap();
+        let mut json: serde_json::Value =
+            serde_json::from_str(&lock.to_pretty_json().unwrap()).unwrap();
         json["schema"] = serde_json::json!(SCHEMA + 1);
         std::fs::write(&lock_path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
 
