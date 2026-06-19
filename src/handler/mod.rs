@@ -1924,6 +1924,43 @@ impl Handler {
                     );
                 }
             }
+
+            // WS-B incremental-add fast path (STEP 4): if RETREAD_INCREMENTAL=1
+            // and the current manifest diff is a pure dep addition, attempt a
+            // localized resolve that reuses the locked closure.  Falls through
+            // to cold resolve_all on any gate failure, ripple, or conflict.
+            // STEP 5 will implement the actual localized resolve driver.
+            {
+                let ws_indexes: Vec<String> = ws_manifest_for_replay
+                    .as_ref()
+                    .map(|m| m.all_pypi_index_urls())
+                    .unwrap_or_default();
+                let entry_indexes: Vec<String> = config
+                    .retread_wheels
+                    .values()
+                    .map(|e| e.index_url())
+                    .collect();
+                let incr_index_urls =
+                    merge_index_chain(entry_indexes.into_iter(), &ws_indexes);
+                let relax_str = format!("{:?}", config.relax);
+                if let Some(_incr) = detect_incremental_add(
+                    &lock_path,
+                    &config,
+                    &bundle_name_for_hash,
+                    &incr_index_urls,
+                    &relax_str,
+                    &python_version,
+                    &config_fp,
+                ) {
+                    tracing::info!(
+                        bundle = %bundle_name_for_hash,
+                        "incremental-add: detected (RETREAD_INCREMENTAL=1) -- \
+                         localized resolve driver (STEP 5) not yet implemented; \
+                         falling through to cold resolve"
+                    );
+                    // STEP 5 will use `_incr` to run the localized resolve.
+                }
+            }
         }
 
         // Re-resolve materialized bundles, then autodiscover emissions
@@ -5703,6 +5740,150 @@ async fn find_conda_artifact(dir: &Path, name: &str, version: &str) -> Result<Pa
     )
 }
 
+/// Carry-forward for an incremental-add detected by [`detect_incremental_add`].
+// Fields read by STEP 5 (`resolve_incremental_add`); allow dead_code until
+// the driver is wired up.
+#[allow(dead_code)]
+struct IncrementalAdd {
+    /// The PEP 508–like spec strings for the NEWLY added entries only
+    /// (current_specs − lock.entry_specs). Each is guaranteed to be an exact
+    /// `==pin`, `@git:…`, or `@url:…` form (STEP 4's spec-form gate).
+    added_specs: Vec<String>,
+    /// The committed lock whose closure is the reuse base.
+    lock: crate::lock::RetreadLock,
+}
+
+/// Determine whether the current manifest diff is a pure incremental add.
+///
+/// Returns `Some(IncrementalAdd)` when ALL of the following hold:
+/// 1. `RETREAD_INCREMENTAL=1` env is set.
+/// 2. Lock exists, parses, `schema == SCHEMA`, `entry_specs` non-empty.
+/// 3. **A2 BLOCKER** — recompute inputs_hash using locked `entry_specs`
+///    (substituted for current); must equal `lock.inputs_hash`. This closes
+///    the config-knob blind spot: a change to relax/overrides/name_map/channels
+///    feeds non-entry_specs inputs and produces a DIFFERENT hash, so the gate
+///    fails and we fall through to cold resolve.
+/// 4. `added = current_specs − lock.entry_specs` is non-empty.
+///    `removed = lock.entry_specs − current_specs` is empty.
+/// 5. Every added spec is an exact pin (`==`), `@git:` or `@url:` form.
+///    Bare/range specs are rejected (they have multiple solutions → not safe
+///    to combine with a frozen closure).
+///
+/// Returns `None` on any gate failure (always safe: cold resolve follows).
+#[allow(clippy::too_many_arguments)]
+fn detect_incremental_add(
+    lock_path: &Path,
+    config: &RetreadConfig,
+    bundle_name: &str,
+    // Non-entry_specs hash inputs — same values used in courier_inputs_hash.
+    index_urls: &[String],
+    relax_str: &str,
+    python_version: &str,
+    config_fp: &str,
+) -> Option<IncrementalAdd> {
+    // Gate 1: feature flag.
+    if std::env::var("RETREAD_INCREMENTAL").as_deref() != Ok("1") {
+        return None;
+    }
+
+    // Gate 2: load and basic schema check.
+    if !lock_path.exists() {
+        return None;
+    }
+    let lock = match crate::lock::RetreadLock::load(lock_path) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::debug!(error = %format!("{e:#}"), "incremental-add: lock load failed; skipping");
+            return None;
+        }
+    };
+    if lock.schema != crate::lock::SCHEMA {
+        tracing::debug!(
+            lock_schema = lock.schema,
+            expected = crate::lock::SCHEMA,
+            "incremental-add: schema mismatch; skipping"
+        );
+        return None;
+    }
+    if lock.entry_specs.is_empty() {
+        tracing::debug!("incremental-add: lock has no entry_specs (old schema); skipping");
+        return None;
+    }
+
+    // Gate 3: A2 BLOCKER — recompute hash with LOCKED entry_specs to verify
+    // no config-knob change slipped in undetected.
+    let recomputed_hash = crate::lock::RetreadLock::compute_inputs_hash(
+        &lock.entry_specs,
+        index_urls,
+        relax_str,
+        python_version,
+        crate::lock::EMIT_EPOCH,
+        None, // pin_version matches the lock that was stored (non-circular)
+        config_fp,
+    );
+    if recomputed_hash != lock.inputs_hash {
+        tracing::debug!(
+            "incremental-add: config-knob gate failed (locked entry_specs + current \
+             non-entry inputs hash mismatch); skipping"
+        );
+        return None;
+    }
+
+    // Gate 4: pure-add delta.
+    let current_specs: std::collections::BTreeSet<String> =
+        crate::courier::courier_input_specs(config, bundle_name)
+            .into_iter()
+            .collect();
+    let locked_specs: std::collections::BTreeSet<String> =
+        lock.entry_specs.iter().cloned().collect();
+
+    let added: Vec<String> = current_specs.difference(&locked_specs).cloned().collect();
+    let removed: Vec<String> = locked_specs.difference(&current_specs).cloned().collect();
+
+    if !removed.is_empty() {
+        tracing::debug!(
+            ?removed,
+            "incremental-add: removed specs detected; not a pure add; skipping"
+        );
+        return None;
+    }
+    if added.is_empty() {
+        tracing::debug!("incremental-add: no added specs; skipping");
+        return None;
+    }
+
+    // Gate 5: every added spec must be exact pin / @git / @url.
+    // Bare or range specs have multiple solutions and cannot be safely
+    // combined with a frozen closure without a full re-solve.
+    for spec in &added {
+        // A spec string looks like "<key>[<extras>]<ver_proxy>" where ver_proxy
+        // starts with "==", "@git:", or "@url:" for exact/pinned forms.
+        let after_bracket = if let Some(close) = spec.rfind(']') {
+            &spec[close + 1..]
+        } else {
+            // No extras bracket: ver_proxy starts after the key name.
+            // Find the first non-identifier char.
+            spec.trim_start_matches(|c: char| c.is_alphanumeric() || c == '-' || c == '_')
+        };
+        let is_exact = after_bracket.starts_with("==")
+            || after_bracket.starts_with("@git:")
+            || after_bracket.starts_with("@url:");
+        if !is_exact {
+            tracing::debug!(
+                spec = %spec,
+                "incremental-add: added spec is not exact pin/git/url; skipping"
+            );
+            return None;
+        }
+    }
+
+    tracing::info!(
+        ?added,
+        "incremental-add: pure add detected; will attempt localized resolve"
+    );
+    Some(IncrementalAdd { added_specs: added, lock })
+}
+
 /// Authority gate for the courier replay path.
 ///
 /// Returns `Some(lock)` iff ALL of the following hold:
@@ -9061,6 +9242,180 @@ mod resolve_bundle_bfs_tests {
              and the unconstrained >=1.0 resolved to 2.0 instead)",
             sub_wheel.metadata.version,
         );
+    }
+}
+
+// -----------------------------------------------------------------
+// Unit tests for detect_incremental_add.
+// These test the gate logic in isolation (no network, no resolve).
+// -----------------------------------------------------------------
+#[cfg(test)]
+mod incremental_add_tests {
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    use super::detect_incremental_add;
+    use crate::config::RetreadConfig;
+    use crate::lock::{RetreadLock, SCHEMA};
+
+    fn make_lock_at(
+        path: &std::path::Path,
+        entry_specs: Vec<String>,
+        inputs_hash: &str,
+    ) {
+        let lock = RetreadLock {
+            schema: SCHEMA,
+            retread_version: "0.0.1".into(),
+            bundle: "test-bundle".into(),
+            version: "1.0".into(),
+            python: "3.11".into(),
+            inputs_hash: inputs_hash.into(),
+            root_requirements: vec![],
+            wheels: vec![],
+            conda_run_deps: vec![],
+            index_urls: vec!["https://pypi.org/simple".into()],
+            prerelease: BTreeMap::new(),
+            conda_capable: vec![],
+            entry_specs,
+        };
+        let json = lock.to_pretty_json().unwrap();
+        std::fs::write(path, json).unwrap();
+    }
+
+    fn empty_config() -> RetreadConfig {
+        serde_json::from_value(serde_json::json!({"retread-wheels": {}})).unwrap()
+    }
+
+    /// Gate 1: RETREAD_INCREMENTAL not set → always None.
+    #[test]
+    fn no_env_var_returns_none() {
+        let dir = std::env::temp_dir().join(format!(
+            "retread-incr-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).ok();
+        let lock_path = dir.join("retread-test-bundle.lock.json");
+        make_lock_at(&lock_path, vec!["test-bundle==1.0".into()], "dummy-hash");
+        let config = empty_config();
+
+        // Ensure RETREAD_INCREMENTAL is NOT set.
+        // SAFETY: single-threaded test context; no concurrent env access.
+        unsafe { std::env::remove_var("RETREAD_INCREMENTAL") };
+        let result = detect_incremental_add(
+            &lock_path,
+            &config,
+            "test-bundle",
+            &["https://pypi.org/simple".into()],
+            "Eager",
+            "3.11",
+            "fp",
+        );
+        assert!(result.is_none(), "RETREAD_INCREMENTAL unset must return None");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Gate 2: missing lock → None.
+    #[test]
+    fn missing_lock_returns_none() {
+        let missing = PathBuf::from("/tmp/retread-test-does-not-exist-xyz.json");
+        let config = empty_config();
+
+        // SAFETY: single-threaded test context; no concurrent env access.
+        unsafe { std::env::set_var("RETREAD_INCREMENTAL", "1") };
+        let result = detect_incremental_add(
+            &missing,
+            &config,
+            "test-bundle",
+            &[],
+            "Eager",
+            "3.11",
+            "fp",
+        );
+        unsafe { std::env::remove_var("RETREAD_INCREMENTAL") };
+        assert!(result.is_none(), "missing lock must return None");
+    }
+
+    /// Gate 2: lock with wrong schema → None.
+    #[test]
+    fn wrong_schema_returns_none() {
+        let dir = std::env::temp_dir().join(format!(
+            "retread-incr-schema-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).ok();
+        let lock_path = dir.join("retread-test-bundle.lock.json");
+        // Write a lock with wrong schema by patching the JSON directly.
+        let lock = RetreadLock {
+            schema: SCHEMA,
+            retread_version: "0.0.1".into(),
+            bundle: "test-bundle".into(),
+            version: "1.0".into(),
+            python: "3.11".into(),
+            inputs_hash: "dummy".into(),
+            root_requirements: vec![],
+            wheels: vec![],
+            conda_run_deps: vec![],
+            index_urls: vec![],
+            prerelease: BTreeMap::new(),
+            conda_capable: vec![],
+            entry_specs: vec!["test-bundle==1.0".into()],
+        };
+        let mut json: serde_json::Value = serde_json::from_str(&lock.to_pretty_json().unwrap()).unwrap();
+        json["schema"] = serde_json::json!(SCHEMA + 1);
+        std::fs::write(&lock_path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+
+        let config = empty_config();
+        // SAFETY: single-threaded test context; no concurrent env access.
+        unsafe { std::env::set_var("RETREAD_INCREMENTAL", "1") };
+        let result = detect_incremental_add(
+            &lock_path,
+            &config,
+            "test-bundle",
+            &[],
+            "Eager",
+            "3.11",
+            "fp",
+        );
+        unsafe { std::env::remove_var("RETREAD_INCREMENTAL") };
+        assert!(result.is_none(), "wrong schema must return None");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Gate 2: lock with empty entry_specs → None (old schema).
+    #[test]
+    fn empty_entry_specs_returns_none() {
+        let dir = std::env::temp_dir().join(format!(
+            "retread-incr-empty-specs-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).ok();
+        let lock_path = dir.join("retread-test-bundle.lock.json");
+        make_lock_at(&lock_path, vec![], "dummy-hash"); // empty entry_specs
+
+        let config = empty_config();
+        // SAFETY: single-threaded test context; no concurrent env access.
+        unsafe { std::env::set_var("RETREAD_INCREMENTAL", "1") };
+        let result = detect_incremental_add(
+            &lock_path,
+            &config,
+            "test-bundle",
+            &[],
+            "Eager",
+            "3.11",
+            "fp",
+        );
+        unsafe { std::env::remove_var("RETREAD_INCREMENTAL") };
+        assert!(result.is_none(), "empty entry_specs must return None");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
