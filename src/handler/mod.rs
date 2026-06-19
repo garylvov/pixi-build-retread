@@ -5721,7 +5721,82 @@ async fn resolve_incremental_add(
     )
     .await?;
 
+    // ── Optional validity oracle ───────────────────────────────────────────
+    if std::env::var("RETREAD_VERIFY_LOCALADD").as_deref() == Ok("1") {
+        let lock_path = source_dir.join(format!("{bundle_name}.retread-lock.json"));
+        verify_localadd_hook(&lock_path, &added_specs, &bundle_name);
+    }
+
     Ok(Some(result))
+}
+
+/// Validity oracle for the incremental-add path, gated on `RETREAD_VERIFY_LOCALADD=1`.
+///
+/// Reads the just-written lock from disk and checks that every added spec has a
+/// corresponding wheel entry. Never aborts — only logs warnings so the caller's
+/// result (the successfully built package) is unaffected.
+fn verify_localadd_hook(lock_path: &Path, added_specs: &[String], bundle_name: &str) {
+    let bytes = match std::fs::read(lock_path) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(
+                bundle = %bundle_name,
+                path = %lock_path.display(),
+                err = %e,
+                "RETREAD_VERIFY_LOCALADD: could not read written lock; skipping check"
+            );
+            return;
+        }
+    };
+    let lock: crate::lock::RetreadLock = match serde_json::from_slice(&bytes) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!(
+                bundle = %bundle_name,
+                err = %e,
+                "RETREAD_VERIFY_LOCALADD: written lock failed to parse; check for corruption"
+            );
+            return;
+        }
+    };
+
+    // Build a set of canonical names present in the written lock.
+    let wheel_names: std::collections::HashSet<String> = lock
+        .wheels
+        .iter()
+        .map(|w| canonical_conda_name(&w.name))
+        .collect();
+
+    let mut missing: Vec<&str> = Vec::new();
+    for spec in added_specs {
+        // Extract the package name portion (before any extras/version marker).
+        let name_part = spec
+            .split(['[', '=', '!', '<', '>', '~', '@', ' '])
+            .next()
+            .unwrap_or(spec.as_str())
+            .trim();
+        let canon = canonical_conda_name(name_part);
+        if !wheel_names.contains(&canon) {
+            missing.push(spec.as_str());
+        }
+    }
+
+    if missing.is_empty() {
+        tracing::info!(
+            bundle = %bundle_name,
+            added = added_specs.len(),
+            wheels = lock.wheels.len(),
+            "RETREAD_VERIFY_LOCALADD: ok — all added specs found in written lock"
+        );
+    } else {
+        tracing::warn!(
+            bundle = %bundle_name,
+            ?missing,
+            "RETREAD_VERIFY_LOCALADD: WARNING — {} added spec(s) not found in written lock; \
+             this may indicate a missed ripple or name-mapping gap",
+            missing.len()
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9734,6 +9809,100 @@ mod incremental_add_tests {
         unsafe { std::env::remove_var("RETREAD_INCREMENTAL") };
         assert!(result.is_none(), "empty entry_specs must return None");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── verify_localadd_hook tests ─────────────────────────────────────────
+
+    fn make_lock_with_wheels_at(path: &std::path::Path, wheel_names: &[&str]) {
+        use crate::lock::{LockWheel, Origin};
+        let wheels: Vec<LockWheel> = wheel_names
+            .iter()
+            .map(|n| LockWheel {
+                name: n.to_string(),
+                version: "1.0".into(),
+                origin: Origin::Index,
+                filename: format!("{n}-1.0-py3-none-any.whl"),
+                url: Some(format!(
+                    "https://pypi.org/packages/{n}-1.0-py3-none-any.whl"
+                )),
+                sha256: None,
+                requires_dist: vec![],
+                must_ship: false,
+                upstream_url: None,
+                git_source: None,
+                sdist_source: None,
+            })
+            .collect();
+        let lock = RetreadLock {
+            schema: SCHEMA,
+            retread_version: "0.0.1".into(),
+            bundle: "test-bundle".into(),
+            version: "1.0".into(),
+            python: "3.11".into(),
+            inputs_hash: "dummy".into(),
+            root_requirements: vec![],
+            wheels,
+            conda_run_deps: vec![],
+            index_urls: vec!["https://pypi.org/simple".into()],
+            prerelease: BTreeMap::new(),
+            conda_capable: vec![],
+            entry_specs: vec!["test-bundle==1.0".into()],
+        };
+        let json = lock.to_pretty_json().unwrap();
+        std::fs::write(path, json).unwrap();
+    }
+
+    /// verify_localadd_hook: all added specs found → no panic, hook is a no-op.
+    #[test]
+    fn verify_hook_ok_when_all_specs_in_lock() {
+        let dir = std::env::temp_dir().join(format!(
+            "retread-verify-ok-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).ok();
+        let lock_path = dir.join("test-bundle.retread-lock.json");
+        make_lock_with_wheels_at(&lock_path, &["requests", "certifi"]);
+
+        // Both added specs are present in the lock.
+        super::verify_localadd_hook(&lock_path, &["requests==2.32.0".to_string()], "test-bundle");
+        // No panic = pass.
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// verify_localadd_hook: missing spec is detected (hook logs warning, no panic).
+    #[test]
+    fn verify_hook_warns_when_spec_missing_from_lock() {
+        let dir = std::env::temp_dir().join(format!(
+            "retread-verify-missing-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).ok();
+        let lock_path = dir.join("test-bundle.retread-lock.json");
+        // Lock only has "requests", NOT "numpy".
+        make_lock_with_wheels_at(&lock_path, &["requests"]);
+
+        // "numpy==1.26.0" is NOT in the lock — hook should warn but not panic.
+        super::verify_localadd_hook(&lock_path, &["numpy==1.26.0".to_string()], "test-bundle");
+        // No panic = pass (warning is logged to tracing, not returned).
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// verify_localadd_hook: missing lock file → logs warning, no panic.
+    #[test]
+    fn verify_hook_handles_missing_lock_gracefully() {
+        let missing_path = std::path::PathBuf::from("/tmp/retread-verify-nonexistent-xyz.json");
+        // Should not panic.
+        super::verify_localadd_hook(
+            &missing_path,
+            &["requests==2.32.0".to_string()],
+            "test-bundle",
+        );
     }
 }
 
