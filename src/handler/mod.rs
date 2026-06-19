@@ -1934,18 +1934,12 @@ impl Handler {
                     .as_ref()
                     .map(|m| m.all_pypi_index_urls())
                     .unwrap_or_default();
-                let entry_indexes: Vec<String> = config
-                    .retread_wheels
-                    .values()
-                    .map(|e| e.index_url())
-                    .collect();
-                let incr_index_urls = merge_index_chain(entry_indexes.into_iter(), &ws_indexes);
                 let relax_str = format!("{:?}", config.relax);
                 if let Some(incr) = detect_incremental_add(
                     &lock_path,
                     &config,
                     &bundle_name_for_hash,
-                    &incr_index_urls,
+                    &ws_indexes,
                     &relax_str,
                     &python_version,
                     &config_fp,
@@ -5518,25 +5512,7 @@ async fn resolve_incremental_add(
         added_specs.iter().map(|s| s.as_str()).collect();
     let mut matched_entries: Vec<(String, WheelEntry)> = Vec::new();
     for (key, entry) in &effective.retread_wheels {
-        let extras = if entry.extras.is_empty() {
-            String::new()
-        } else {
-            format!("[{}]", entry.extras.join(","))
-        };
-        let ver = entry
-            .normalized_version()
-            .map(|v| format!("=={v}"))
-            .or_else(|| entry.rev.clone().map(|r| format!("@git:{r}")))
-            .or_else(|| {
-                entry
-                    .from
-                    .as_ref()
-                    .and_then(|f| config.git_sources.get(f))
-                    .map(|s| format!("@git:{}", s.rev))
-            })
-            .or_else(|| entry.url.as_ref().map(|u| format!("@url:{u}")))
-            .unwrap_or_default();
-        let spec = format!("{key}{extras}{ver}");
+        let spec = crate::courier::spec_for_entry(key, entry, &config.git_sources);
         if added_set.contains(spec.as_str()) {
             matched_entries.push((key.clone(), entry.clone()));
         }
@@ -6274,11 +6250,21 @@ struct IncrementalAdd {
 /// Returns `Some(IncrementalAdd)` when ALL of the following hold:
 /// 1. `RETREAD_INCREMENTAL=1` env is set.
 /// 2. Lock exists, parses, `schema == SCHEMA`, `entry_specs` non-empty.
-/// 3. **A2 BLOCKER** — recompute inputs_hash using locked `entry_specs`
-///    (substituted for current); must equal `lock.inputs_hash`. This closes
-///    the config-knob blind spot: a change to relax/overrides/name_map/channels
-///    feeds non-entry_specs inputs and produces a DIFFERENT hash, so the gate
-///    fails and we fall through to cold resolve.
+/// 3. **Two-step index + external-input gate** (replaces old single A2 gate):
+///
+///    **STEP A** — locked-chain check: build the index chain for all
+///    `config.retread_wheels` entries whose spec string is NOT in `added`
+///    (i.e. existing entries only; added entries may introduce a new index),
+///    then compare to `lock.index_urls`. Mismatch → cold. This catches:
+///    an existing entry's index change, a workspace-index add/remove/reorder,
+///    an implicit→explicit `pypi.org` position change — none of which are
+///    encoded in entry spec strings.
+///
+///    **STEP B** — external-input hash check: recompute `inputs_hash` using
+///    `lock.entry_specs` + `lock.index_urls` (STEP A proved locked chain still
+///    matches) + current relax/python/epoch/pin/config_fp. Mismatch → cold.
+///    This catches relax, python, config-knob, or channel changes.
+///
 /// 4. `added = current_specs − lock.entry_specs` is non-empty.
 ///    `removed = lock.entry_specs − current_specs` is empty.
 /// 5. Every added spec is an exact pin (`==`), `@git:` or `@url:` form.
@@ -6286,13 +6272,11 @@ struct IncrementalAdd {
 ///    to combine with a frozen closure).
 ///
 /// Returns `None` on any gate failure (always safe: cold resolve follows).
-#[allow(clippy::too_many_arguments)]
 fn detect_incremental_add(
     lock_path: &Path,
     config: &RetreadConfig,
     bundle_name: &str,
-    // Non-entry_specs hash inputs — same values used in courier_inputs_hash.
-    index_urls: &[String],
+    ws_indexes: &[String],
     relax_str: &str,
     python_version: &str,
     config_fp: &str,
@@ -6326,26 +6310,7 @@ fn detect_incremental_add(
         return None;
     }
 
-    // Gate 3: A2 BLOCKER — recompute hash with LOCKED entry_specs to verify
-    // no config-knob change slipped in undetected.
-    let recomputed_hash = crate::lock::RetreadLock::compute_inputs_hash(
-        &lock.entry_specs,
-        index_urls,
-        relax_str,
-        python_version,
-        crate::lock::EMIT_EPOCH,
-        None, // pin_version matches the lock that was stored (non-circular)
-        config_fp,
-    );
-    if recomputed_hash != lock.inputs_hash {
-        tracing::debug!(
-            "incremental-add: config-knob gate failed (locked entry_specs + current \
-             non-entry inputs hash mismatch); skipping"
-        );
-        return None;
-    }
-
-    // Gate 4: pure-add delta.
+    // Gate 4 (computed first — STEP A needs `added` to exclude new entries).
     let current_specs: std::collections::BTreeSet<String> =
         crate::courier::courier_input_specs(config, bundle_name)
             .into_iter()
@@ -6365,6 +6330,57 @@ fn detect_incremental_add(
     }
     if added.is_empty() {
         tracing::debug!("incremental-add: no added specs; skipping");
+        return None;
+    }
+
+    // Gate 3 — STEP A: locked-chain check.
+    // Build the index chain from all EXISTING entries (current entries minus
+    // the newly added ones) and compare to lock.index_urls.
+    // We use ALL config.retread_wheels entries (pack-wide, not bundle-filtered)
+    // because lock.index_urls is also written pack-wide in courier::stage.
+    // The `added` set holds spec strings (key+extras+ver); exclude entries
+    // whose spec_for_entry is in `added`.
+    {
+        let added_set: std::collections::HashSet<&str> = added.iter().map(|s| s.as_str()).collect();
+        let locked_entry_indexes: Vec<String> = config
+            .retread_wheels
+            .iter()
+            .filter(|(key, entry)| {
+                let spec = crate::courier::spec_for_entry(key, entry, &config.git_sources);
+                !added_set.contains(spec.as_str())
+            })
+            .map(|(_, entry)| entry.index_url())
+            .collect();
+        let locked_chain = merge_index_chain(locked_entry_indexes, ws_indexes);
+        if locked_chain != lock.index_urls {
+            tracing::debug!(
+                ?locked_chain,
+                lock_index_urls = ?lock.index_urls,
+                "incremental-add: STEP A locked-chain mismatch (existing entry index \
+                 or ws-index changed); skipping"
+            );
+            return None;
+        }
+    }
+
+    // Gate 3 — STEP B: external-input hash check.
+    // STEP A proved lock.index_urls == current locked chain, so it is safe to
+    // use lock.index_urls as the index term (reproduces the original chain
+    // order exactly, including implicit PUBLIC_PYPI position).
+    let recomputed_hash = crate::lock::RetreadLock::compute_inputs_hash(
+        &lock.entry_specs,
+        &lock.index_urls,
+        relax_str,
+        python_version,
+        crate::lock::EMIT_EPOCH,
+        None, // pin_version matches the lock that was stored (non-circular)
+        config_fp,
+    );
+    if recomputed_hash != lock.inputs_hash {
+        tracing::debug!(
+            "incremental-add: STEP B external-input hash mismatch (relax/python/config \
+             changed); skipping"
+        );
         return None;
     }
 
@@ -9823,7 +9839,7 @@ mod incremental_add_tests {
             &lock_path,
             &config,
             "test-bundle",
-            &["https://pypi.org/simple".into()],
+            &[], // no workspace indexes
             "Eager",
             "3.11",
             "fp",
@@ -9843,8 +9859,15 @@ mod incremental_add_tests {
 
         // SAFETY: single-threaded test context; no concurrent env access.
         unsafe { std::env::set_var("RETREAD_INCREMENTAL", "1") };
-        let result =
-            detect_incremental_add(&missing, &config, "test-bundle", &[], "Eager", "3.11", "fp");
+        let result = detect_incremental_add(
+            &missing,
+            &config,
+            "test-bundle",
+            &[], // no workspace indexes
+            "Eager",
+            "3.11",
+            "fp",
+        );
         unsafe { std::env::remove_var("RETREAD_INCREMENTAL") };
         assert!(result.is_none(), "missing lock must return None");
     }
@@ -9927,6 +9950,534 @@ mod incremental_add_tests {
         );
         unsafe { std::env::remove_var("RETREAD_INCREMENTAL") };
         assert!(result.is_none(), "empty entry_specs must return None");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── Two-step gate tests (a)-(i) ────────────────────────────────────────
+    //
+    // Helper: write a lock with explicit index_urls + entry_specs + hash.
+    fn make_lock_with_indexes(
+        path: &std::path::Path,
+        entry_specs: Vec<String>,
+        index_urls: Vec<String>,
+        inputs_hash: &str,
+    ) {
+        let lock = RetreadLock {
+            schema: SCHEMA,
+            retread_version: "0.0.1".into(),
+            bundle: "test-bundle".into(),
+            version: "1.0".into(),
+            python: "3.11".into(),
+            inputs_hash: inputs_hash.into(),
+            root_requirements: vec![],
+            wheels: vec![],
+            conda_run_deps: vec![],
+            index_urls,
+            prerelease: BTreeMap::new(),
+            conda_capable: vec![],
+            entry_specs,
+        };
+        let json = lock.to_pretty_json().unwrap();
+        std::fs::write(path, json).unwrap();
+    }
+
+    // Compute the correct inputs_hash for a lock. Uses the same algorithm as
+    // courier::stage so the STEP B check passes.
+    fn correct_hash(
+        entry_specs: &[String],
+        index_urls: &[String],
+        relax: &str,
+        python: &str,
+        config_fp: &str,
+    ) -> String {
+        RetreadLock::compute_inputs_hash(
+            entry_specs,
+            index_urls,
+            relax,
+            python,
+            crate::lock::EMIT_EPOCH,
+            None, // no pin_version
+            config_fp,
+        )
+    }
+
+    fn tmp_incr(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "retread-incr-{label}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).ok();
+        dir
+    }
+
+    // The "nvidia" entry index used in isaac tests.
+    const NVIDIA_INDEX: &str = "https://pypi.nvidia.com/simple/";
+    // PUBLIC_PYPI as stored by merge_index_chain.
+    const PYPI: &str = "https://pypi.org/simple/";
+
+    /// (a) isaac case: add a dep with a NEW index while existing entries keep
+    /// their indexes → STEP A passes, STEP B passes → ENGAGE (Some returned).
+    #[test]
+    fn step_a_new_index_entry_engages() {
+        let dir = tmp_incr("a");
+        let lock_path = dir.join(RetreadLock::file_name("test-bundle"));
+
+        // Lock: single existing entry isaacsim (nvidia index).
+        // lock.index_urls = pack-wide chain for [isaacsim] = [nvidia, pypi].
+        let existing_spec = "isaacsim==4.0.0";
+        let lock_index_urls = vec![NVIDIA_INDEX.to_string(), PYPI.to_string()];
+        let h = correct_hash(
+            &[existing_spec.to_string()],
+            &lock_index_urls,
+            "Eager",
+            "3.11",
+            "fp",
+        );
+        make_lock_with_indexes(
+            &lock_path,
+            vec![existing_spec.to_string()],
+            lock_index_urls,
+            &h,
+        );
+
+        // Config: isaacsim (nvidia) + new iniconfig==2.0.0 (pypi.org, no explicit index).
+        let config: RetreadConfig = serde_json::from_value(serde_json::json!({
+            "retread-bundle": "test-bundle",
+            "retread-wheels": {
+                "isaacsim": {"version": "4.0.0", "index": NVIDIA_INDEX},
+                "iniconfig": {"version": "2.0.0"}
+            }
+        }))
+        .unwrap();
+
+        // SAFETY: single-threaded test context.
+        unsafe { std::env::set_var("RETREAD_INCREMENTAL", "1") };
+        let result = detect_incremental_add(
+            &lock_path,
+            &config,
+            "test-bundle",
+            &[], // no workspace indexes
+            "Eager",
+            "3.11",
+            "fp",
+        );
+        unsafe { std::env::remove_var("RETREAD_INCREMENTAL") };
+        let incr = result.expect("(a) should ENGAGE on add-dep-new-index");
+        assert_eq!(
+            incr.added_specs,
+            vec!["iniconfig==2.0.0"],
+            "added_specs must contain only the new entry"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (b) COLD when an EXISTING entry's index changes.
+    #[test]
+    fn step_a_changed_existing_entry_index_is_cold() {
+        let dir = tmp_incr("b");
+        let lock_path = dir.join(RetreadLock::file_name("test-bundle"));
+
+        // Lock: isaacsim was on nvidia index.
+        let lock_index_urls = vec![NVIDIA_INDEX.to_string(), PYPI.to_string()];
+        let h = correct_hash(
+            &["isaacsim==4.0.0".to_string()],
+            &lock_index_urls,
+            "Eager",
+            "3.11",
+            "fp",
+        );
+        make_lock_with_indexes(
+            &lock_path,
+            vec!["isaacsim==4.0.0".to_string()],
+            lock_index_urls,
+            &h,
+        );
+
+        // Config: isaacsim now on pypi (changed!), same version.
+        let config: RetreadConfig = serde_json::from_value(serde_json::json!({
+            "retread-bundle": "test-bundle",
+            "retread-wheels": {
+                "isaacsim": {"version": "4.0.0"},
+                "iniconfig": {"version": "2.0.0"}
+            }
+        }))
+        .unwrap();
+
+        // STEP A: locked chain for [isaacsim] (pypi now) = [pypi] ≠ [nvidia, pypi] → COLD.
+        unsafe { std::env::set_var("RETREAD_INCREMENTAL", "1") };
+        let result = detect_incremental_add(
+            &lock_path,
+            &config,
+            "test-bundle",
+            &[],
+            "Eager",
+            "3.11",
+            "fp",
+        );
+        unsafe { std::env::remove_var("RETREAD_INCREMENTAL") };
+        assert!(
+            result.is_none(),
+            "(b) changed existing entry index must be COLD"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (c) COLD when a workspace extra-index is added (STEP A catches it).
+    #[test]
+    fn step_a_new_ws_index_is_cold() {
+        let dir = tmp_incr("c");
+        let lock_path = dir.join(RetreadLock::file_name("test-bundle"));
+
+        // Lock: single entry, no ws index. index_urls = [pypi].
+        let lock_index_urls = vec![PYPI.to_string()];
+        let h = correct_hash(
+            &["pkga==1.0".to_string()],
+            &lock_index_urls,
+            "Eager",
+            "3.11",
+            "fp",
+        );
+        make_lock_with_indexes(
+            &lock_path,
+            vec!["pkga==1.0".to_string()],
+            lock_index_urls,
+            &h,
+        );
+
+        let config: RetreadConfig = serde_json::from_value(serde_json::json!({
+            "retread-bundle": "test-bundle",
+            "retread-wheels": {
+                "pkga": {"version": "1.0"},
+                "pkgb": {"version": "2.0"}
+            }
+        }))
+        .unwrap();
+
+        // ws_indexes now has an extra index → locked_chain differs from lock.index_urls.
+        let new_ws = vec!["https://extra.example.com/simple/".to_string()];
+        unsafe { std::env::set_var("RETREAD_INCREMENTAL", "1") };
+        let result = detect_incremental_add(
+            &lock_path,
+            &config,
+            "test-bundle",
+            &new_ws,
+            "Eager",
+            "3.11",
+            "fp",
+        );
+        unsafe { std::env::remove_var("RETREAD_INCREMENTAL") };
+        assert!(result.is_none(), "(c) new ws index must be COLD");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (d) COLD when relax changes (STEP B hash mismatch), even though STEP A passes.
+    #[test]
+    fn step_b_changed_relax_is_cold() {
+        let dir = tmp_incr("d");
+        let lock_path = dir.join(RetreadLock::file_name("test-bundle"));
+
+        // Lock built with relax="Eager".
+        let lock_index_urls = vec![PYPI.to_string()];
+        let h = correct_hash(
+            &["pkga==1.0".to_string()],
+            &lock_index_urls,
+            "Eager", // ← original relax
+            "3.11",
+            "fp",
+        );
+        make_lock_with_indexes(
+            &lock_path,
+            vec!["pkga==1.0".to_string()],
+            lock_index_urls,
+            &h,
+        );
+
+        let config: RetreadConfig = serde_json::from_value(serde_json::json!({
+            "retread-bundle": "test-bundle",
+            "retread-wheels": {
+                "pkga": {"version": "1.0"},
+                "pkgb": {"version": "2.0"}
+            }
+        }))
+        .unwrap();
+
+        // Relax changed to "Conservative" → STEP B hash mismatch.
+        unsafe { std::env::set_var("RETREAD_INCREMENTAL", "1") };
+        let result = detect_incremental_add(
+            &lock_path,
+            &config,
+            "test-bundle",
+            &[],
+            "Conservative", // ← changed
+            "3.11",
+            "fp",
+        );
+        unsafe { std::env::remove_var("RETREAD_INCREMENTAL") };
+        assert!(
+            result.is_none(),
+            "(d) changed relax must be COLD via STEP B"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (e) genesis-style add (single pypi.org entry, add another pypi dep) → ENGAGE.
+    /// Regression guard: must still work when no new index is involved.
+    #[test]
+    fn genesis_style_add_engages() {
+        let dir = tmp_incr("e");
+        let lock_path = dir.join(RetreadLock::file_name("test-bundle"));
+
+        let lock_index_urls = vec![PYPI.to_string()];
+        let h = correct_hash(
+            &["pkga==1.0".to_string()],
+            &lock_index_urls,
+            "Eager",
+            "3.11",
+            "fp",
+        );
+        make_lock_with_indexes(
+            &lock_path,
+            vec!["pkga==1.0".to_string()],
+            lock_index_urls,
+            &h,
+        );
+
+        let config: RetreadConfig = serde_json::from_value(serde_json::json!({
+            "retread-bundle": "test-bundle",
+            "retread-wheels": {
+                "pkga": {"version": "1.0"},
+                "pkgb": {"version": "2.0"}  // added, also pypi
+            }
+        }))
+        .unwrap();
+
+        unsafe { std::env::set_var("RETREAD_INCREMENTAL", "1") };
+        let result = detect_incremental_add(
+            &lock_path,
+            &config,
+            "test-bundle",
+            &[],
+            "Eager",
+            "3.11",
+            "fp",
+        );
+        unsafe { std::env::remove_var("RETREAD_INCREMENTAL") };
+        let incr = result.expect("(e) genesis-style same-index add must ENGAGE");
+        assert_eq!(incr.added_specs, vec!["pkgb==2.0"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (f) COLD when an added spec is bare/range (Gate 5).
+    #[test]
+    fn gate5_bare_added_spec_is_cold() {
+        let dir = tmp_incr("f");
+        let lock_path = dir.join(RetreadLock::file_name("test-bundle"));
+
+        let lock_index_urls = vec![PYPI.to_string()];
+        let h = correct_hash(
+            &["pkga==1.0".to_string()],
+            &lock_index_urls,
+            "Eager",
+            "3.11",
+            "fp",
+        );
+        make_lock_with_indexes(
+            &lock_path,
+            vec!["pkga==1.0".to_string()],
+            lock_index_urls,
+            &h,
+        );
+
+        // pkgb has no version → bare spec "pkgb" → Gate 5 rejects.
+        let config: RetreadConfig = serde_json::from_value(serde_json::json!({
+            "retread-bundle": "test-bundle",
+            "retread-wheels": {
+                "pkga": {"version": "1.0"},
+                "pkgb": {}
+            }
+        }))
+        .unwrap();
+
+        unsafe { std::env::set_var("RETREAD_INCREMENTAL", "1") };
+        let result = detect_incremental_add(
+            &lock_path,
+            &config,
+            "test-bundle",
+            &[],
+            "Eager",
+            "3.11",
+            "fp",
+        );
+        unsafe { std::env::remove_var("RETREAD_INCREMENTAL") };
+        assert!(
+            result.is_none(),
+            "(f) bare added spec must be COLD via Gate 5"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (g) MULTI-BUNDLE: two bundles, two indexes; add a pinned dep to bundle B.
+    /// STEP A must use all-entries-minus-added (NOT bundle-filtered entry_specs)
+    /// so the pack-wide chain still matches lock.index_urls → ENGAGE.
+    #[test]
+    fn multi_bundle_step_a_uses_pack_wide_entries() {
+        let dir = tmp_incr("g");
+        let lock_path = dir.join(RetreadLock::file_name("test-bundle"));
+
+        // Pack has two entries from different indexes:
+        //   pkga (bundle A) → nvidia_index
+        //   pkgb (bundle B) → pypi
+        // lock.index_urls = pack-wide chain = [nvidia, pypi]
+        let lock_index_urls = vec![NVIDIA_INDEX.to_string(), PYPI.to_string()];
+        // entry_specs is BUNDLE-FILTERED (only bundle B entries in this lock).
+        // (In reality, each bundle writes its own lock — this simulates bundle B's lock.)
+        let lock_entry_specs = vec!["pkgb==1.0".to_string()];
+        let h = correct_hash(&lock_entry_specs, &lock_index_urls, "Eager", "3.11", "fp");
+        make_lock_with_indexes(&lock_path, lock_entry_specs, lock_index_urls, &h);
+
+        // Config: pkga (nvidia, bundle A) + pkgb (pypi, bundle B) + new pkgc (pypi, bundle B).
+        // STEP A: locked entries = all entries MINUS added = pkga + pkgb (both).
+        // locked_chain = merge([nvidia, pypi], []) = [nvidia, pypi] == lock.index_urls → PASS.
+        let config: RetreadConfig = serde_json::from_value(serde_json::json!({
+            "retread-wheels": {
+                "pkga": {"version": "1.0", "index": NVIDIA_INDEX, "bundle": "bundle-a"},
+                "pkgb": {"version": "1.0", "bundle": "test-bundle"},
+                "pkgc": {"version": "2.0", "bundle": "test-bundle"}  // added
+            }
+        }))
+        .unwrap();
+
+        unsafe { std::env::set_var("RETREAD_INCREMENTAL", "1") };
+        let result = detect_incremental_add(
+            &lock_path,
+            &config,
+            "test-bundle",
+            &[],
+            "Eager",
+            "3.11",
+            "fp",
+        );
+        unsafe { std::env::remove_var("RETREAD_INCREMENTAL") };
+        let incr = result.expect(
+            "(g) multi-bundle: STEP A must use pack-wide (not bundle-filtered) entries -> ENGAGE",
+        );
+        assert_eq!(incr.added_specs, vec!["pkgc==2.0"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (h) spec byte-identity: spec_for_entry, courier_input_specs, and the
+    /// matched_entries encoding all produce the same string for the same entry.
+    #[test]
+    fn spec_for_entry_byte_identity() {
+        use crate::config::WheelEntry;
+        use std::collections::BTreeMap;
+
+        let git_sources = BTreeMap::new();
+
+        // Plain pinned entry (the common case).
+        let entry = WheelEntry {
+            version: Some("1.2.3".to_string()),
+            ..Default::default()
+        };
+        let s = crate::courier::spec_for_entry("mylib", &entry, &git_sources);
+        assert_eq!(s, "mylib==1.2.3", "plain pinned entry");
+
+        // Entry with extras.
+        let entry_extras = WheelEntry {
+            version: Some("2.0".to_string()),
+            extras: vec!["sim".to_string(), "render".to_string()],
+            ..Default::default()
+        };
+        let s2 = crate::courier::spec_for_entry("mylib", &entry_extras, &git_sources);
+        assert_eq!(s2, "mylib[sim,render]==2.0", "entry with extras");
+
+        // URL entry (no version).
+        let entry_url = WheelEntry {
+            url: Some(url::Url::parse("https://example.com/mylib-1.0.whl").unwrap()),
+            ..Default::default()
+        };
+        let s3 = crate::courier::spec_for_entry("mylib", &entry_url, &git_sources);
+        assert_eq!(
+            s3, "mylib@url:https://example.com/mylib-1.0.whl",
+            "url entry"
+        );
+
+        // Bare entry (no version/git/url).
+        let entry_bare = WheelEntry::default();
+        let s4 = crate::courier::spec_for_entry("mylib", &entry_bare, &git_sources);
+        assert_eq!(s4, "mylib", "bare entry");
+
+        // courier_input_specs calls spec_for_entry — verify via a config round-trip.
+        let config: RetreadConfig = serde_json::from_value(serde_json::json!({
+            "retread-wheels": {
+                "mylib": {"version": "1.2.3"}
+            }
+        }))
+        .unwrap();
+        let specs = crate::courier::courier_input_specs(&config, "mylib");
+        assert_eq!(
+            specs,
+            vec!["mylib==1.2.3"],
+            "courier_input_specs via spec_for_entry"
+        );
+    }
+
+    /// (i) dedup/order-masking: a locked entry's index moves from implicit
+    /// PUBLIC_PYPI (appended last by merge_index_chain) to explicit-entry-inserted
+    /// (same set, different ORDER) → STEP A detects the position change → COLD.
+    #[test]
+    fn step_a_index_position_change_is_cold() {
+        let dir = tmp_incr("i");
+        let lock_path = dir.join(RetreadLock::file_name("test-bundle"));
+
+        // Lock had: entry A (nvidia) + entry B (implicit pypi appended last).
+        // lock.index_urls = [nvidia, pypi] (nvidia first, pypi appended).
+        let lock_index_urls = vec![NVIDIA_INDEX.to_string(), PYPI.to_string()];
+        let h = correct_hash(
+            &["pkga==1.0".to_string()],
+            &lock_index_urls,
+            "Eager",
+            "3.11",
+            "fp",
+        );
+        make_lock_with_indexes(
+            &lock_path,
+            vec!["pkga==1.0".to_string()],
+            lock_index_urls,
+            &h,
+        );
+
+        // Now: entry A (pypi, switched!) + entry C added (nvidia, explicit).
+        // locked_entry_indexes for existing entries (all minus added) = [pypi].
+        // locked_chain = merge([pypi], []) = [pypi, nvidia? No — nvidia not in locked].
+        // Actually: locked chain = [pypi] ≠ [nvidia, pypi] → COLD.
+        let config: RetreadConfig = serde_json::from_value(serde_json::json!({
+            "retread-bundle": "test-bundle",
+            "retread-wheels": {
+                "pkga": {"version": "1.0"},            // now on pypi (no explicit index)
+                "pkgb": {"version": "2.0", "index": NVIDIA_INDEX}  // added, explicit nvidia
+            }
+        }))
+        .unwrap();
+
+        unsafe { std::env::set_var("RETREAD_INCREMENTAL", "1") };
+        let result = detect_incremental_add(
+            &lock_path,
+            &config,
+            "test-bundle",
+            &[],
+            "Eager",
+            "3.11",
+            "fp",
+        );
+        unsafe { std::env::remove_var("RETREAD_INCREMENTAL") };
+        assert!(
+            result.is_none(),
+            "(i) index position change (order-sensitive) must be COLD"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
