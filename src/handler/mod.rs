@@ -5723,7 +5723,7 @@ async fn resolve_incremental_add(
 
     // ── Optional validity oracle ───────────────────────────────────────────
     if std::env::var("RETREAD_VERIFY_LOCALADD").as_deref() == Ok("1") {
-        let lock_path = source_dir.join(format!("{bundle_name}.retread-lock.json"));
+        let lock_path = source_dir.join(crate::lock::RetreadLock::file_name(&bundle_name));
         verify_localadd_hook(
             &lock_path,
             &added_specs,
