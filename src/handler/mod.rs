@@ -2737,6 +2737,7 @@ async fn resolve_bundle(
             &prefix,
             &seen_set,
             &mut tmp_queue,
+            None, // cold path: no locked-closure ripple detection
         )?;
         for pending in tmp_queue {
             let name = canonical_conda_name(&pending.pypi_name);
@@ -2814,7 +2815,26 @@ async fn resolve_bundle(
 
         for pending in current_work {
             let dep_conda_name = canonical_conda_name(&pending.pypi_name);
-            match state.observe_edge(&dep_conda_name, pending)? {
+            // Pre-check: is this dep locked (incremental-add path only)?
+            // We capture it BEFORE the mutable observe_edge borrow so we can
+            // use it in match arms below without a second mutable borrow.
+            let dep_is_locked = state.is_locked(&dep_conda_name);
+            let edge_result = state.observe_edge(&dep_conda_name, pending);
+            // 2c: if the dep is locked and observe_edge returns a conflict
+            // error, escalate to IncrementalRipple instead of failing hard.
+            let edge_result = match edge_result {
+                Err(e) if dep_is_locked => {
+                    return Err(anyhow::Error::new(
+                        auto_bundle::IncrementalRipple {
+                            reason: format!(
+                                "locked dep `{dep_conda_name}` constraint conflict: {e:#}"
+                            ),
+                        },
+                    ));
+                }
+                other => other?,
+            };
+            match edge_result {
                 ObserveEdgeResult::New(p) => {
                     frontier.push(p);
                 }
@@ -2822,6 +2842,19 @@ async fn resolve_bundle(
                     // Already resolved; constraint was accumulated. Skip.
                 }
                 ObserveEdgeResult::NeedsReResolve(tighter_pending) => {
+                    // 2c: if this is a locked dep, a NeedsReResolve means the
+                    // new dep's subtree wants to change the locked version →
+                    // ripple detected, escalate to cold resolve.
+                    if dep_is_locked {
+                        return Err(anyhow::Error::new(
+                            auto_bundle::IncrementalRipple {
+                                reason: format!(
+                                    "locked dep `{dep_conda_name}` would need re-resolution \
+                                     (current lock version excluded by incoming constraint)"
+                                ),
+                            },
+                        ));
+                    }
                     // Must re-resolve this dep with tighter constraints.
                     // Revoke the chosen version so it gets re-resolved.
                     state.revoke_chosen(&dep_conda_name);
@@ -3224,6 +3257,7 @@ async fn resolve_bundle(
                     &prefix,
                     &seen_set,
                     &mut tmp_seed,
+                    None, // cold path: no locked-closure ripple detection
                 )?;
                 for p in tmp_seed {
                     let name = canonical_conda_name(&p.pypi_name);

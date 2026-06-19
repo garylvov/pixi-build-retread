@@ -14,6 +14,7 @@
 //! `DependencyProvider` (B-β). All version-selection logic lives here.
 
 use std::collections::HashMap;
+use std::str::FromStr;
 
 use anyhow::{Result, bail};
 use uv_pep508::uv_pep440::{Version, VersionSpecifier, VersionSpecifiers};
@@ -64,6 +65,11 @@ pub(crate) struct ResolveState {
     pub constraints: HashMap<String, Option<VersionSpecifiers>>,
     /// Resolved versions for deps that have been fetched and committed.
     pub chosen: HashMap<String, ChosenEntry>,
+    /// Names seeded from the committed lock closure (incremental-add path only).
+    /// When non-empty, BFS uses this to detect ripples: a `NeedsReResolve` for
+    /// a locked name means the new dep's subtree conflicts with the closure →
+    /// escalate to cold resolve.
+    locked: std::collections::HashSet<String>,
 }
 
 impl ResolveState {
@@ -84,6 +90,51 @@ impl ResolveState {
                 },
             );
         }
+    }
+
+    /// Seed a name from the committed lock closure (incremental-add path).
+    ///
+    /// Differs from `seed_chosen` in two ways:
+    /// 1. Seeds a `==V` pinned constraint so any incoming `>=V2` (V2 ≠ V) from
+    ///    the new dep's subtree will be detected as a conflict via
+    ///    `intersect_specifiers` / `specifiers_provably_conflict`.
+    /// 2. Marks `name` in `self.locked` so `is_locked` returns true and the BFS
+    ///    drain can escalate to `IncrementalRipple` rather than re-resolving.
+    ///
+    /// This is a no-op when `version_str` cannot be parsed (same fallback as
+    /// `seed_chosen`).
+    // Used by the incremental-add path (STEP 3); wired up once locked_closure is
+    // threaded through resolve_bundle.
+    #[allow(dead_code)]
+    pub fn seed_locked(&mut self, canonical_name: String, version_str: String) {
+        // Build the ==V constraint string.
+        if let Ok(version) = version_str.parse::<Version>() {
+            // Insert ==V pinned constraint.
+            let pin_str = format!("=={}", version);
+            let pinned = VersionSpecifiers::from_str(&pin_str).ok();
+            self.constraints
+                .insert(canonical_name.clone(), pinned);
+            self.chosen.insert(
+                canonical_name.clone(),
+                ChosenEntry {
+                    version,
+                    version_str,
+                },
+            );
+            self.locked.insert(canonical_name);
+        } else {
+            // Unparseable version: fall back to bare seed (no pin constraint).
+            self.constraints
+                .entry(canonical_name.clone())
+                .or_insert(None);
+        }
+    }
+
+    /// Returns `true` if `canonical_name` was seeded from the committed lock
+    /// closure via `seed_locked`.  Used by the BFS drain to escalate
+    /// `NeedsReResolve` on locked names to `IncrementalRipple`.
+    pub fn is_locked(&self, canonical_name: &str) -> bool {
+        self.locked.contains(canonical_name)
     }
 
     /// Observe a new requirement edge `pending` for `canonical_name` with the
@@ -641,5 +692,72 @@ mod tests {
         let a = specs("==1.0");
         let b = specs("==1.0");
         assert!(!specifiers_provably_conflict(&a, &b));
+    }
+
+    // ── seed_locked / is_locked ──────────────────────────────────────────────
+
+    /// seed_locked inserts a ==V constraint so incoming >=V2 (V2 != V) is
+    /// detected as a conflict by intersect_specifiers.
+    #[test]
+    fn seed_locked_pins_exact_version() {
+        let mut state = ResolveState::default();
+        state.seed_locked("pkg-x".to_string(), "1.0".to_string());
+
+        assert!(state.is_locked("pkg-x"));
+        // The ==1.0 constraint must be present.
+        let c = state.current_constraint("pkg-x").cloned().unwrap_or_default();
+        let v10 = ver("1.0");
+        let v20 = ver("2.0");
+        assert!(c.contains(&v10), "1.0 must satisfy ==1.0 constraint");
+        assert!(!c.contains(&v20), "2.0 must NOT satisfy ==1.0 constraint");
+    }
+
+    /// Non-locked deps are not reported as locked.
+    #[test]
+    fn seed_chosen_not_locked() {
+        let mut state = ResolveState::default();
+        state.seed_chosen("pkg-y".to_string(), "2.0".to_string());
+        assert!(!state.is_locked("pkg-y"));
+    }
+
+    /// locked X@1.0 + incoming >=2.0 → NeedsReResolve (ripple detected).
+    #[test]
+    fn locked_dep_incoming_tighter_spec_needs_reresolve() {
+        let mut state = ResolveState::default();
+        state.seed_locked("pkg-x".to_string(), "1.0".to_string());
+
+        // Simulate a new dep requiring >=2.0 (which excludes 1.0).
+        let p = make_pypi_pending("pkg-x", ">=2.0");
+        let result = state.observe_edge("pkg-x", p).unwrap();
+        assert!(
+            matches!(result, ObserveEdgeResult::NeedsReResolve(_)),
+            "locked dep at 1.0 with incoming >=2.0 should trigger NeedsReResolve"
+        );
+    }
+
+    /// locked X@1.0 + incoming ==1.0 → AlreadySatisfied (no ripple).
+    #[test]
+    fn locked_dep_same_version_already_satisfied() {
+        let mut state = ResolveState::default();
+        state.seed_locked("pkg-x".to_string(), "1.0".to_string());
+
+        let p = make_pypi_pending("pkg-x", "==1.0");
+        let result = state.observe_edge("pkg-x", p).unwrap();
+        assert!(
+            matches!(result, ObserveEdgeResult::AlreadySatisfied),
+            "locked dep at 1.0 with incoming ==1.0 should be AlreadySatisfied"
+        );
+    }
+
+    /// locked X@1.0 + incoming ==2.0 → conflict Err (provably empty).
+    #[test]
+    fn locked_dep_conflict_pin_returns_err() {
+        let mut state = ResolveState::default();
+        state.seed_locked("pkg-x".to_string(), "1.0".to_string());
+
+        // ==2.0 conflicts with locked ==1.0 (provably_conflict detects ==V clash).
+        let p = make_pypi_pending("pkg-x", "==2.0");
+        let result = state.observe_edge("pkg-x", p);
+        assert!(result.is_err(), "==2.0 vs locked ==1.0 must produce a conflict error");
     }
 }

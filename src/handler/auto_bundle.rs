@@ -18,6 +18,28 @@ use crate::relax::{canonical_conda_name, default_marker_env};
 use crate::wheel::WheelMetadata;
 
 use super::{Bundle, DEFAULT_PYTHON, PypiToCondaMap, ResolvedWheel};
+use super::resolve_state::ResolveState;
+
+/// Sentinel error returned when the incremental-add BFS detects that a new
+/// dep's transitive subtree would force a version change on a dep already
+/// committed in the lock closure (a "ripple").  The caller must escalate to a
+/// full cold `resolve_all` rather than writing a partial lock.
+///
+/// Constructed via [`anyhow::Error::new`] so callers can detect it with
+/// `e.downcast_ref::<IncrementalRipple>().is_some()`.
+#[derive(Debug)]
+pub(crate) struct IncrementalRipple {
+    /// Human-readable description of which locked dep triggered the ripple.
+    pub reason: String,
+}
+
+impl std::fmt::Display for IncrementalRipple {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "incremental-add ripple: {}", self.reason)
+    }
+}
+
+impl std::error::Error for IncrementalRipple {}
 
 /// Returns `true` if `conda_normalized_pypi_name` has an unambiguous conda
 /// equivalent in the effective name_map (parselmouth + FALLBACK + user
@@ -618,6 +640,13 @@ pub(crate) enum PendingSource {
 
 /// Add extras-gated and prefix-matched base deps from `metadata` to `work`.
 /// Skips entries already in `seen` so the BFS terminates.
+///
+/// `state`: when `Some`, locked deps that appear in `seen` are NOT silently
+/// skipped — they are routed through `state.observe_edge` to detect ripples.
+/// `AlreadySatisfied` → continue; `NeedsReResolve` or conflict `Err` →
+/// returns [`IncrementalRipple`].  Non-locked deps in `seen` are silently
+/// skipped as before.  When `state` is `None` (cold path), behavior is
+/// identical to the previous unconditional `continue`.
 pub(crate) fn seed_worklist(
     requires_dist: &[String],
     extras_requested: &[String],
@@ -625,7 +654,59 @@ pub(crate) fn seed_worklist(
     bundle_prefix: &str,
     seen: &HashSet<String>,
     work: &mut VecDeque<Pending>,
+    state: Option<&mut ResolveState>,
 ) -> Result<()> {
+    // Helper: check whether a dep that's already in `seen` should trigger a
+    // ripple check (incremental path, dep is locked).
+    //
+    // We take `state` by value here (moved in), then return it so the loop
+    // can reuse it across iterations.  Using a closure would require a mutable
+    // borrow of `state` that conflicts with the `work.push_back` borrow below,
+    // so we do the logic inline via a separate inner function.
+    //
+    // Note: `state` is `Option<&mut ResolveState>` — reborrow it as needed.
+
+    macro_rules! check_locked_seen {
+        ($dn:expr, $pending:expr, $state:expr) => {{
+            if let Some(ref mut st) = $state {
+                if st.is_locked($dn) {
+                    match st.observe_edge($dn, $pending) {
+                        Ok(
+                            super::resolve_state::ObserveEdgeResult::AlreadySatisfied
+                            | super::resolve_state::ObserveEdgeResult::NonPypiAlreadySeen,
+                        ) => {
+                            continue;
+                        }
+                        Ok(super::resolve_state::ObserveEdgeResult::NeedsReResolve(_)) => {
+                            return Err(anyhow::Error::new(IncrementalRipple {
+                                reason: format!(
+                                    "locked dep `{}` would need re-resolution",
+                                    $dn
+                                ),
+                            }));
+                        }
+                        Ok(super::resolve_state::ObserveEdgeResult::New(_)) => {
+                            // Locked dep appeared as New — shouldn't happen if
+                            // seed_locked was called; treat as AlreadySatisfied.
+                            continue;
+                        }
+                        Err(e) => {
+                            return Err(anyhow::Error::new(IncrementalRipple {
+                                reason: format!(
+                                    "locked dep `{}` conflicts: {e}",
+                                    $dn
+                                ),
+                            }));
+                        }
+                    }
+                }
+            }
+            // Non-locked or cold path: fall through to the existing `continue`.
+            continue;
+        }};
+    }
+
+    let mut state = state;
     for raw in requires_dist {
         // 1. Extras-gated lines for each requested extra.
         let mut added = false;
@@ -633,7 +714,12 @@ pub(crate) fn seed_worklist(
             if let Some(dep) = pep508_extra_dep(raw, extra)? {
                 let dn = canonical_conda_name(&dep.name);
                 if seen.contains(&dn) {
-                    continue;
+                    let pending = Pending {
+                        pypi_name: dep.name.clone(),
+                        source: extra_dep_source_to_pending(dep.source.clone(), index),
+                        extras: dep.extras.clone(),
+                    };
+                    check_locked_seen!(&dn, pending, state);
                 }
                 work.push_back(Pending {
                     pypi_name: dep.name,
@@ -650,7 +736,12 @@ pub(crate) fn seed_worklist(
         if let Some(dep) = pep508_base_dep_in_prefix(raw, bundle_prefix)? {
             let dn = canonical_conda_name(&dep.name);
             if seen.contains(&dn) {
-                continue;
+                let pending = Pending {
+                    pypi_name: dep.name.clone(),
+                    source: extra_dep_source_to_pending(dep.source.clone(), index),
+                    extras: dep.extras.clone(),
+                };
+                check_locked_seen!(&dn, pending, state);
             }
             work.push_back(Pending {
                 pypi_name: dep.name,
