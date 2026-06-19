@@ -4396,75 +4396,29 @@ fn localize_wheel_source(url: &url::Url, wheels_root: &Path) -> url::Url {
     url.clone()
 }
 
-/// Re-materialize wheel bytes from the committed lock and run the shared
-/// courier pack tail, skipping derivation (BFS / auto_bundle / solve).
+/// Reconstruct the per-wheel [`crate::emit_pypi::EmitWheel`] list from a
+/// committed lock without re-running the full BFS resolve.
 ///
-/// The replay path for `conda_build_v1` calls this when `config.courier` is
-/// true and `load_replayable_lock` confirms the lock is valid (schema +
-/// inputs_hash match, no poisoning). Skips DERIVATION only — the full
-/// materialization pipeline (download / source-build / inject / relax-rewrite)
-/// is re-run per wheel class:
+/// Returns:
+/// - `Ok(Some(wheels))` — all wheels re-materialized successfully.
+/// - `Ok(None)` — provenance gap (class-3 / schema-5 class-2); caller must
+///   fall through to `resolve_all`.
+/// - `Err(...)` — hard error during re-materialization.
 ///
-/// **Class 1 — `must_ship=true`, name in `config.retread_wheels`**: the wheel
-/// was built from a git / path / url / named-git source. Re-run
-/// `materialize_and_rewrite` on the config entry to repopulate `wheels/<name>/`
-/// on disk, then pass the resulting `local_path` to `courier::stage`.
-///
-/// **Class 2 — `must_ship=false`, `origin=Built` (relax-changed shadow)**: the
-/// wheel was an index wheel whose Requires-Dist was rewritten by the relax
-/// pipeline. The original URL is recorded in `lock.upstream_url` (schema 6+).
-/// Pass `remote_url=upstream_url` to `courier::stage`; it will download the
-/// original from the index and re-apply the relax rewrite.  For schema-5 locks
-/// where `upstream_url` is absent, fall through to full re-resolve.
-///
-/// **Class 3 — `must_ship=true`, name NOT in `config.retread_wheels`**: the
-/// wheel was a BFS transitive built from a `pkg @ git+<url>@<rev>` line in a
-/// Requires-Dist. The lock carries insufficient provenance (no git url+rev) to
-/// re-build it. Returns `Ok(None)` so the caller falls through to full
-/// `resolve_all`.
-///
-/// **Class 4 — `origin=Index`**: unchanged index wheel. Pass `remote_url` from
-/// `lw.url`. `courier::stage` will record it as `Origin::Index` unchanged.
-///
-/// # Returns
-/// - `Ok(Some(result))` — all wheels re-materialized; pack completed.
-/// - `Ok(None)` — lock provenance insufficient for replay (class 3 / schema-5
-///   class-2 gap); caller should fall through to full `resolve_all`.
-/// - `Err(...)` — replay was attempted but failed (download error,
-///   rattler-build failure, etc.). Caller should propagate as a hard error.
-///
-/// # Correctness
-/// **COLD path** (`run_deps` originates from `params.run_dependencies` /
-/// `run_override`): pixi's live conda-solver result is authoritative; the
-/// lock has not yet been committed.
-///
-/// **REPLAY path** (`run_deps` originates from `lock.conda_run_deps`): the
-/// already-committed lock is authoritative; using `params.run_dependencies`
-/// here would let pixi's non-deterministic conda solver inject extras (e.g.
-/// `python_abi`) that drift the rewritten lock from the committed one, which
-/// is the exact bug replay is supposed to prevent.  The caller is responsible
-/// for sourcing `run_deps` from `lock.conda_run_deps` before calling this
-/// function on a replay hit.
-#[allow(clippy::too_many_arguments)]
-async fn materialize_from_lock(
-    lock: crate::lock::RetreadLock,
+/// Owns the PHASE 2.5 pre-pass (git group membership), the 6 loop-local
+/// accumulators (`git_group_members`, `git_group_order`, `auto_data_override`,
+/// `git_group_stash`, `built_roots`, `emit_wheels`), and the main
+/// per-`LockWheel` classification loop.  The caller retains responsibility for
+/// deriving `conda_capable` and `index_urls` from the lock after this returns.
+async fn emit_wheels_from_lock(
+    lock: &crate::lock::RetreadLock,
     config: &RetreadConfig,
-    work_dir: &Path,
-    output_dir: &Path,
-    target_subdir: Platform,
+    target: &WheelTarget,
+    download_dir: &Path,
     source_dir: &Path,
     cache_dir: &Path,
-    expected_build: Option<&str>,
-    run_deps: Vec<String>,
-    config_fp: &str,
-) -> Result<Option<CondaBuildV1Result>> {
+) -> Result<Option<Vec<crate::emit_pypi::EmitWheel>>> {
     use crate::lock::Origin;
-
-    let bundle_name = lock.bundle.clone();
-    let version = lock.version.clone();
-    let python_version = crate::relax::emit_python_version("", &lock.python);
-    let download_dir = source_dir.join("wheels");
-    let target = wheel_target_for(target_subdir, &python_version);
 
     // Per-wheel re-materialization: classify each LockWheel and build the
     // EmitWheel with correct local_path / remote_url for courier::stage.
@@ -4692,8 +4646,8 @@ async fn materialize_from_lock(
                                 let (resolved, _rd) = materialize_and_rewrite(
                                     &synth_entry,
                                     &member_lw.name,
-                                    &target,
-                                    &download_dir,
+                                    target,
+                                    download_dir,
                                     source_dir,
                                     cache_dir,
                                     config.relax,
@@ -4781,8 +4735,8 @@ async fn materialize_from_lock(
                         let (resolved, _rd) = materialize_and_rewrite(
                             &synth_entry,
                             &lw.name,
-                            &target,
-                            &download_dir,
+                            target,
+                            download_dir,
                             source_dir,
                             cache_dir,
                             config.relax,
@@ -4845,8 +4799,8 @@ async fn materialize_from_lock(
                     let (resolved, _rd) = materialize_and_rewrite(
                         entry,
                         &lw.name,
-                        &target,
-                        &download_dir,
+                        target,
+                        download_dir,
                         source_dir,
                         cache_dir,
                         config.relax,
@@ -5045,7 +4999,7 @@ async fn materialize_from_lock(
                 // landing at dest_dir.join(wheel_filename_from_url(url)) — the pristine
                 // 5-field upstream basename, identical to what cold fetched pre-relax.
                 let fetched =
-                    crate::wheel::fetch_wheel_cached(&remote_url, None, &download_dir, cache_dir)
+                    crate::wheel::fetch_wheel_cached(&remote_url, None, download_dir, cache_dir)
                         .await
                         .with_context(|| {
                             format!(
@@ -5107,6 +5061,58 @@ async fn materialize_from_lock(
         };
         emit_wheels.push(emit);
     }
+
+    Ok(Some(emit_wheels))
+}
+
+/// Replay a committed courier lock: re-materialize all wheels and run
+/// `materialize_and_pack`.
+///
+/// Returns:
+/// - `Ok(Some(result))` — all wheels re-materialized; pack completed.
+/// - `Ok(None)` — lock provenance insufficient for replay (class 3 / schema-5
+///   class-2 gap); caller should fall through to full `resolve_all`.
+/// - `Err(...)` — replay was attempted but failed (download error,
+///   rattler-build failure, etc.). Caller should propagate as a hard error.
+///
+/// # Correctness
+/// **COLD path** (`run_deps` originates from `params.run_dependencies` /
+/// `run_override`): pixi's live conda-solver result is authoritative; the
+/// lock has not yet been committed.
+///
+/// **REPLAY path** (`run_deps` originates from `lock.conda_run_deps`): the
+/// already-committed lock is authoritative; using `params.run_dependencies`
+/// here would let pixi's non-deterministic conda solver inject extras (e.g.
+/// `python_abi`) that drift the rewritten lock from the committed one, which
+/// is the exact bug replay is supposed to prevent.  The caller is responsible
+/// for sourcing `run_deps` from `lock.conda_run_deps` before calling this
+/// function on a replay hit.
+#[allow(clippy::too_many_arguments)]
+async fn materialize_from_lock(
+    lock: crate::lock::RetreadLock,
+    config: &RetreadConfig,
+    work_dir: &Path,
+    output_dir: &Path,
+    target_subdir: Platform,
+    source_dir: &Path,
+    cache_dir: &Path,
+    expected_build: Option<&str>,
+    run_deps: Vec<String>,
+    config_fp: &str,
+) -> Result<Option<CondaBuildV1Result>> {
+    let bundle_name = lock.bundle.clone();
+    let version = lock.version.clone();
+    let python_version = crate::relax::emit_python_version("", &lock.python);
+    let download_dir = source_dir.join("wheels");
+    let target = wheel_target_for(target_subdir, &python_version);
+
+    let emit_wheels =
+        match emit_wheels_from_lock(&lock, config, &target, &download_dir, source_dir, cache_dir)
+            .await?
+        {
+            Some(w) => w,
+            None => return Ok(None),
+        };
 
     // Reconstruct conda_capable from the lock (recorded by the producer).
     let conda_capable: std::collections::HashSet<String> =
