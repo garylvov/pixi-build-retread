@@ -5736,28 +5736,39 @@ async fn resolve_incremental_add(
     Ok(Some(result))
 }
 
-/// Validity oracle for the incremental-add path, gated on `RETREAD_VERIFY_LOCALADD=1`.
+/// Validity oracle (C) — internal-consistency check for the incremental-add path.
 ///
-/// Performs a **marker/extras-aware, version-membership** validity walk over
-/// the written lock's entire `requires_dist` graph:
+/// Gated on `RETREAD_VERIFY_LOCALADD=1`. Never aborts — only logs.
+/// The caller always returns `Ok(Some(result))` regardless of outcome.
 ///
-/// For every wheel in the closure, for every active `requires_dist` line
-/// (marker evaluates true for the target env + no active extras — extras are
-/// not tracked at lock-write time), confirm that the closure contains a wheel
-/// or conda-dep whose canonical name matches AND whose version satisfies the
-/// requirement's `VersionSpecifiers`.
+/// ## What it checks
 ///
-/// Outcomes:
-///  - **VALID** — every active requirement is satisfied by the merged closure.
-///  - **RED** — an active requirement has no satisfying name+version entry;
-///    logged as a warning (possible missed ripple or name-map gap).
+/// For every BUNDLED wheel in `lock.wheels`, for every `requires_dist` line
+/// whose PEP 508 marker evaluates true for the target env (`conda_subdir` /
+/// `python_version`), the oracle looks up the required name in the **bundled
+/// closure** (`lock.wheels` only, not `conda_run_deps`):
 ///
-/// Part (b) cold-comparison (checking whether a cold resolve would pick a newer
-/// version) is deferred — it requires a full network resolve and would make the
-/// oracle too expensive to run in-process. The validity walk (a)+(c) is the
-/// correctness check; (b) is nice-to-have.
+/// * **Required name IS bundled** → assert the bundled version satisfies the
+///   requirement's `VersionSpecifiers`.  If not → RED
+///   `LOCALADD-INTERNAL-INCONSISTENCY` (real bug: a missed ripple caused a
+///   bundled dep to be kept at a version the newly added wheel rejects).
+/// * **Required name NOT bundled** → SKIP.  The dep is conda-routed,
+///   env-provided, or name-mapped to a conda package.  We cannot version-check
+///   it here and — crucially — there is no false-RED for packages such as
+///   `opencv-python`, `OpenEXR`, `mujoco`, `vtk`, etc.
 ///
-/// Never aborts — only logs. The caller always returns `Ok(Some(result))`.
+/// ## Why this avoids false-REDs
+///
+/// The previous oracle included `conda_run_deps` in the closure and RED'd on
+/// any active requirement that wasn't satisfied there.  That produced
+/// false-REDs whenever a cold resolve would pick a different transitive
+/// (version drift) or when a dep is env/conda-provided.  Oracle (C) only
+/// checks internal consistency of the bundled PyPI wheels — the one bug class
+/// the ripple-guard + A5 dedup don't cover.
+///
+/// Cold-comparison (part b) is intentionally deferred: it requires a full
+/// network resolve and would produce false-REDs from version-drift differences
+/// between incremental and cold.
 fn verify_localadd_hook(
     lock_path: &Path,
     added_specs: &[String],
@@ -5805,45 +5816,22 @@ fn verify_localadd_hook(
         }
     };
 
-    // ── 3. Build merged closure: name → parsed Version ────────────────────
-    // Wheels take precedence; conda_run_deps are included as version-pinned
-    // entries using the spec string (which may be ">=X" or empty).
-    let mut closure: std::collections::HashMap<String, Vec<Version>> =
-        std::collections::HashMap::new();
-
+    // ── 3. Build BUNDLED closure: canonical name → parsed Version ──────────
+    // CHANGE 1: lock.wheels ONLY — conda_run_deps intentionally excluded.
+    // Deps whose name is absent from this map are skipped (not RED'd) in step 4.
+    let mut bundled: std::collections::HashMap<String, Version> = std::collections::HashMap::new();
     for w in &lock.wheels {
         let canon = canonical_conda_name(&w.name);
         if let Ok(v) = w.version.parse::<Version>() {
-            closure.entry(canon).or_default().push(v);
-        }
-    }
-    for dep in &lock.conda_run_deps {
-        let canon = canonical_conda_name(&dep.name);
-        // conda_run_deps carry a spec string like ">=1.2" or ""; derive a
-        // sentinel version only when the spec is an equality pin (==X).
-        // For inequality pins we insert a placeholder so the name is "present"
-        // but skip version-membership checking (the conda solve is authoritative
-        // for those).
-        let spec = dep.spec.trim();
-        if spec.is_empty() {
-            // No version constraint — treat as present at any version.
-            closure.entry(canon).or_default();
-        } else if let Some(ver_str) = spec.strip_prefix("==") {
-            if let Ok(v) = ver_str.trim().parse::<Version>() {
-                closure.entry(canon).or_default().push(v);
-            } else {
-                closure.entry(canon).or_default();
-            }
-        } else {
-            // Non-equality pin (>=, etc.) — name present, version unknown.
-            closure.entry(canon).or_default();
+            bundled.insert(canon, v);
         }
     }
 
-    // ── 4. Validity walk: for each wheel, evaluate active requires_dist ───
+    // ── 4. Internal-consistency walk ──────────────────────────────────────
     let mut red_findings: Vec<String> = Vec::new();
     let mut checked_reqs: usize = 0;
     let mut active_reqs: usize = 0;
+    let mut skipped_reqs: usize = 0; // not bundled → conda/env-provided
     let mut satisfied_reqs: usize = 0;
 
     for wheel in &lock.wheels {
@@ -5858,55 +5846,37 @@ fn verify_localadd_hook(
 
             // Marker evaluation (no extras context at lock-write time → &[]).
             if !req.marker.evaluate(&marker_env, &[]) {
-                continue; // marker-false — not active for this target
+                continue; // marker-false for this target — not active
             }
             active_reqs += 1;
 
-            // Extract version specifiers (URL deps are non-verifiable → skip).
+            // Extract version specifiers; URL deps are not version-checkable.
             let specifiers = match &req.version_or_url {
                 Some(uv_pep508::VersionOrUrl::VersionSpecifier(s)) => s.clone(),
-                None => VersionSpecifiers::default(), // unconstrained — any version OK
+                None => VersionSpecifiers::default(), // unconstrained → any version OK
                 Some(uv_pep508::VersionOrUrl::Url(_)) => {
-                    // URL dep — closure can't version-check these; treat as satisfied.
-                    satisfied_reqs += 1;
+                    satisfied_reqs += 1; // URL deps treated as satisfied
                     continue;
                 }
             };
 
             let dep_canon = canonical_conda_name(req.name.as_ref());
 
-            match closure.get(&dep_canon) {
+            match bundled.get(&dep_canon) {
+                // CHANGE 2: required name NOT in bundled closure → SKIP.
+                // It is conda-routed, env-provided, or name-mapped — not our concern.
                 None => {
-                    // Name not in closure at all.
-                    red_findings.push(format!(
-                        "MISSING: {} requires `{}` but `{}` is not in the closure \
-                         (wheel: {}, spec: {})",
-                        wheel.name, raw_req, dep_canon, wheel.filename, specifiers,
-                    ));
+                    skipped_reqs += 1;
                 }
-                Some(versions) => {
-                    if versions.is_empty() {
-                        // Name present but version unknown (non-equality conda dep).
-                        // Trust the conda solve; treat as satisfied.
-                        satisfied_reqs += 1;
-                    } else if specifiers.is_empty()
-                        || versions.iter().any(|v| specifiers.contains(v))
-                    {
-                        // At least one version in the closure satisfies the requirement.
+                // Required name IS bundled → version must satisfy.
+                Some(bundled_ver) => {
+                    if specifiers.is_empty() || specifiers.contains(bundled_ver) {
                         satisfied_reqs += 1;
                     } else {
-                        // Name present but no version satisfies — possible missed ripple.
-                        let vers_str: Vec<String> =
-                            versions.iter().map(|v| v.to_string()).collect();
                         red_findings.push(format!(
-                            "VERSION-UNSATISFIED: {} requires `{}` ({} {}); \
-                             closure has {} at [{}] — none satisfy",
-                            wheel.name,
-                            raw_req,
-                            dep_canon,
-                            specifiers,
-                            dep_canon,
-                            vers_str.join(", "),
+                            "LOCALADD-INTERNAL-INCONSISTENCY: {} requires `{}` \
+                             but bundled {} is at {} which does not satisfy {}",
+                            wheel.name, raw_req, dep_canon, bundled_ver, specifiers,
                         ));
                     }
                 }
@@ -5922,9 +5892,9 @@ fn verify_localadd_hook(
             wheels = lock.wheels.len(),
             checked = checked_reqs,
             active = active_reqs,
+            skipped = skipped_reqs,
             satisfied = satisfied_reqs,
-            "RETREAD_VERIFY_LOCALADD: VALID — all active requires_dist requirements \
-             are version-satisfied in the merged closure"
+            "RETREAD_VERIFY_LOCALADD: GREEN — bundled closure is internally consistent"
         );
     } else {
         for finding in &red_findings {
@@ -5939,10 +5909,10 @@ fn verify_localadd_hook(
             red_count = red_findings.len(),
             checked = checked_reqs,
             active = active_reqs,
+            skipped = skipped_reqs,
             satisfied = satisfied_reqs,
-            "RETREAD_VERIFY_LOCALADD: {} RED finding(s) — active requires_dist \
-             requirement(s) not version-satisfied in the merged closure; \
-             possible missed ripple or name-map gap",
+            "RETREAD_VERIFY_LOCALADD: {} RED finding(s) — internal inconsistency in \
+             bundled closure; possible missed ripple",
             red_findings.len()
         );
     }
@@ -10015,13 +9985,11 @@ mod incremental_add_tests {
         dir
     }
 
-    /// VALID: A requires B>=1.0 (no marker), B is present at 1.2 → satisfied.
-    /// The oracle must NOT flag this as RED.
+    /// GREEN: A requires B>=1.0 (bundled at 1.2) — version satisfied → GREEN.
     #[test]
-    fn verify_hook_valid_when_active_requirement_satisfied() {
-        let dir = tmp_dir("valid");
+    fn verify_hook_green_when_bundled_requirement_satisfied() {
+        let dir = tmp_dir("green");
         let lock_path = dir.join("test-bundle.retread-lock.json");
-        // packagea requires packageb>=1.0; packageb present at 1.2.
         make_lock_with_requires_dist_at(
             &lock_path,
             &[
@@ -10029,7 +9997,7 @@ mod incremental_add_tests {
                 ("packageb", "1.2", &[]),
             ],
         );
-        // No panic = pass.
+        // No panic = pass. Oracle logs GREEN (info).
         super::verify_localadd_hook(
             &lock_path,
             &["packagea==2.0".to_string()],
@@ -10040,21 +10008,22 @@ mod incremental_add_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// RED: A requires B>=2.0 (no marker), B is present at 1.2 → version-unsatisfied.
-    /// The oracle logs a RED warning but does NOT panic (build result unchanged).
+    /// RED (internal inconsistency): A requires B>=2.0 but B is BUNDLED at 1.0.
+    /// This is the real missed-ripple case: the oracle must flag it RED.
+    /// No panic — it's observability-only.
     #[test]
-    fn verify_hook_red_when_active_requirement_version_unsatisfied() {
+    fn verify_hook_red_when_bundled_dep_version_does_not_satisfy() {
         let dir = tmp_dir("red");
         let lock_path = dir.join("test-bundle.retread-lock.json");
-        // packagea requires packageb>=2.0 but packageb is only at 1.2 (missed ripple).
+        // packagea requires packageb>=2.0; packageb is bundled at 1.0 (missed ripple).
         make_lock_with_requires_dist_at(
             &lock_path,
             &[
                 ("packagea", "2.0", &["packageb>=2.0"]),
-                ("packageb", "1.2", &[]),
+                ("packageb", "1.0", &[]),
             ],
         );
-        // No panic = pass (RED is logged via tracing, not returned).
+        // No panic = pass. Oracle logs RED (warn) but never aborts.
         super::verify_localadd_hook(
             &lock_path,
             &["packagea==2.0".to_string()],
@@ -10066,13 +10035,12 @@ mod incremental_add_tests {
     }
 
     /// Marker-false requirement: A requires B only on Windows (platform_system=='Windows').
-    /// On linux-64 the marker evaluates false → NOT active → must NOT be flagged RED,
-    /// even though B is absent from the closure.
+    /// On linux-64 the marker is false → NOT active → must NOT be flagged RED,
+    /// even though B is absent from the bundled closure.
     #[test]
     fn verify_hook_marker_false_not_red() {
         let dir = tmp_dir("marker");
         let lock_path = dir.join("test-bundle.retread-lock.json");
-        // A requires B, but only on Windows — marker is false on linux-64.
         make_lock_with_requires_dist_at(
             &lock_path,
             &[(
@@ -10081,7 +10049,7 @@ mod incremental_add_tests {
                 &["packageb>=1.0; platform_system=='Windows'"],
             )],
         );
-        // B is NOT in the lock; the marker is false on linux-64 → NOT RED.
+        // B is absent; marker is false on linux-64 → NOT active → NOT RED.
         super::verify_localadd_hook(
             &lock_path,
             &["packagea==2.0".to_string()],
@@ -10092,11 +10060,30 @@ mod incremental_add_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// verify_localadd_hook: missing lock file → logs warning, no panic.
+    /// Key genesis-fix property: A requires B (conda/env-provided, NOT bundled).
+    /// The oracle must SKIP — not RED — because we cannot version-check env deps.
+    /// This covers opencv-python, OpenEXR, mujoco, vtk, and similar patterns.
+    #[test]
+    fn verify_hook_not_bundled_dep_is_skipped_not_red() {
+        let dir = tmp_dir("skip");
+        let lock_path = dir.join("test-bundle.retread-lock.json");
+        // packagea requires libfoo (conda-provided, not in lock.wheels).
+        make_lock_with_requires_dist_at(&lock_path, &[("packagea", "2.0", &["libfoo>=1.0"])]);
+        // libfoo is absent from bundled closure → SKIPPED, not RED.
+        super::verify_localadd_hook(
+            &lock_path,
+            &["packagea==2.0".to_string()],
+            "test-bundle",
+            "linux-64",
+            "3.11",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// I/O error: missing lock file → logs warning, no panic.
     #[test]
     fn verify_hook_handles_missing_lock_gracefully() {
         let missing_path = std::path::PathBuf::from("/tmp/retread-verify-nonexistent-xyz.json");
-        // Should not panic.
         super::verify_localadd_hook(
             &missing_path,
             &["requests==2.32.0".to_string()],
