@@ -3525,7 +3525,7 @@ async fn bfs_fetch_pypi(
                 error = %format!("{wheel_err:#}"),
                 "BFS PyPI wheel resolve failed; attempting sdist fallback",
             );
-            let sdist = pypi::resolve_sdist(index, pypi_name, specifiers)
+            let (sdist_version, sdist) = pypi::resolve_sdist(index, pypi_name, specifiers)
                 .await
                 .with_context(|| {
                     format!(
@@ -3536,9 +3536,12 @@ async fn bfs_fetch_pypi(
             // Capture the sdist URL BEFORE consuming `sdist` (THE FIX:
             // previously this was discarded and never threaded out).
             let captured_sdist_url = sdist.url.clone();
-            // Per-entry build dir under download_dir so repeats hit
-            // the wheel cache.
-            let sdist_out = download_dir.join(pypi_name);
+            // Unified sdist build cache dir keyed on (name, version) so BFS,
+            // discovery, and replay all share the same output directory and
+            // never rebuild the same (name, version) twice.
+            let sdist_out = download_dir
+                .join("sdist-builds")
+                .join(format!("{pypi_name}-{sdist_version}"));
             let built = crate::source_build::build_wheel_from_sdist_url(
                 &sdist.url,
                 &sdist_out,
@@ -4913,7 +4916,12 @@ async fn materialize_from_lock(
             // resolve, not an independent input.
             Origin::Built if !lw.must_ship && lw.sdist_source.is_some() => {
                 let s = lw.sdist_source.as_ref().unwrap();
-                let sdist_out = download_dir.join(&s.name);
+                // Unified sdist build cache dir: same key as BFS and discovery
+                // so whichever path runs first populates it and the others hit
+                // the cache without rebuilding.
+                let sdist_out = download_dir
+                    .join("sdist-builds")
+                    .join(format!("{}-{}", s.name, s.version));
                 let stored_url = url::Url::parse(&s.sdist_url).with_context(|| {
                     format!(
                         "courier replay Class-2b: invalid sdist_url `{}` for wheel `{}`",
@@ -4948,14 +4956,18 @@ async fn materialize_from_lock(
                                 s.version, lw.name,
                             )
                         })?;
-                        let sdist = pypi::resolve_sdist(&s.index, &s.name, &specifiers)
-                            .await
-                            .with_context(|| {
-                                format!(
-                                    "courier replay Class-2b: re-resolving sdist for `{}` at `=={}`",
-                                    s.name, s.version,
-                                )
-                            })?;
+                        let (_sdist_version, sdist) = pypi::resolve_sdist(
+                            &s.index,
+                            &s.name,
+                            &specifiers,
+                        )
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "courier replay Class-2b: re-resolving sdist for `{}` at `=={}`",
+                                s.name, s.version,
+                            )
+                        })?;
                         crate::source_build::build_wheel_from_sdist_url(
                             &sdist.url,
                             &sdist_out,

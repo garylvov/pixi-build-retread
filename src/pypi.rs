@@ -129,11 +129,16 @@ pub async fn resolve(
 /// wheels). The caller pipes the returned sdist URL through
 /// `source_build::build_wheel_from_sdist_url` -> uv build --wheel,
 /// then the produced wheel reenters the normal bundle pipeline.
+/// Resolve the best sdist URL for `(name, specifiers)` on `index`.
+///
+/// Returns `(resolved_version, wheel)` so callers can key the sdist build
+/// cache dir on the exact resolved version and avoid rebuilding the same
+/// `(name, version)` from divergent directories.
 pub async fn resolve_sdist(
     index: &str,
     name: &str,
     specifiers: &VersionSpecifiers,
-) -> Result<ResolvedWheel> {
+) -> Result<(uv_pep440::Version, ResolvedWheel)> {
     let index_url = build_index_url(index, name)?;
     tracing::info!(url = %index_url, "sdist fallback: fetching simple index");
     let html = reqwest::get(index_url.clone())
@@ -178,7 +183,8 @@ pub async fn resolve_sdist(
         bail!("no sdist for {name} {specifiers} at {index_url}");
     }
     versioned.sort_by(|a, b| b.0.cmp(&a.0));
-    Ok(versioned.into_iter().next().unwrap().1)
+    let (version, wheel) = versioned.into_iter().next().unwrap();
+    Ok((version, wheel))
 }
 
 // ── PR-1a: all-versions discovery for the resolvo DependencyProvider ─────────
