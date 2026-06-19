@@ -2253,6 +2253,7 @@ async fn resolve_all(
                 conda_channels,
                 &effective.conda_deps,
                 &workspace_pypi_indexes,
+                None, // cold path: no locked closure
             )
             .await
             .with_context(|| {
@@ -2303,6 +2304,7 @@ async fn resolve_all(
                 download_dir,
                 &effective,
                 conda_channels,
+                None, // cold path: no locked closure
             )
             .await?;
         }
@@ -2613,6 +2615,11 @@ async fn resolve_bundle(
     // PR-2: workspace PyPI index chain for transitive resolvo discovery.
     // Mirrors the chain auto_bundle_transitives uses. Build with merge_index_chain.
     workspace_indexes: &[String],
+    // incremental-add path: locked closure from the committed lock
+    // (name → version_str for every wheel EXCEPT the new dep being added).
+    // When Some, seeds ResolveState with ==V pinned constraints so ripples
+    // become visible to intersect_specifiers.  Cold path: None.
+    locked_closure: Option<&std::collections::BTreeMap<String, String>>,
 ) -> Result<Bundle> {
     let conda_name = canonical_conda_name(entry_name);
     let mut state = ResolveState::default();
@@ -2662,6 +2669,22 @@ async fn resolve_bundle(
         canonical_conda_name(&primary.pypi_name),
         primary.metadata.version.clone(),
     );
+
+    // incremental-add: seed locked closure as ==V pinned constraints so any
+    // incoming edge from the new dep's subtree that would require a different
+    // version is detected as a ripple by intersect_specifiers / observe_edge.
+    // The primary itself is already seeded via seed_chosen above; skip it here
+    // to avoid overwriting with a locked constraint.
+    if let Some(closure) = locked_closure {
+        let primary_canon = canonical_conda_name(&primary.pypi_name);
+        for (name, version_str) in closure {
+            let canon = canonical_conda_name(name);
+            if canon == primary_canon {
+                continue; // primary already seeded
+            }
+            state.seed_locked(canon, version_str.clone());
+        }
+    }
 
     // path/git/from sources are authored project code, not metapackages
     // with extras-gated transitives. SKIP the BFS entirely unless the
@@ -8842,6 +8865,7 @@ mod resolve_bundle_bfs_tests {
             &conda_channels,
             &[], // conda_deps_list
             &[], // workspace_indexes
+            None, // cold path: no locked closure
         )
         .await
         .expect("resolve_bundle must succeed");
@@ -8996,6 +9020,7 @@ mod resolve_bundle_bfs_tests {
             &conda_channels,
             &[], // conda_deps_list
             &[], // workspace_indexes
+            None, // cold path: no locked closure
         )
         .await
         .expect("resolve_bundle must succeed");

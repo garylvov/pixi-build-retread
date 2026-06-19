@@ -111,6 +111,7 @@ fn probe_spec_for(version_str: &str, policy: RelaxPolicy) -> String {
 ///
 /// Best-effort: a resolve failure logs at debug and leaves the dep to be
 /// emitted as a conda run-dep (current fallback behavior).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn auto_bundle_transitives(
     bundle: &mut Bundle,
     entry_index: &str,
@@ -119,6 +120,9 @@ pub(crate) async fn auto_bundle_transitives(
     download_dir: &Path,
     config: &RetreadConfig,
     conda_channels: &[ChannelUrl],
+    // incremental-add path: pre-fill seen_candidate with locked names so
+    // auto_bundle_transitives does not try to re-bundle them. Cold path: None.
+    locked_closure: Option<&std::collections::BTreeMap<String, String>>,
 ) -> Result<()> {
     // Build the skip set: anything already in the bundle, plus the user's
     // `retread-conda-deps` allowlist (deps that should stay as conda
@@ -157,6 +161,10 @@ pub(crate) async fn auto_bundle_transitives(
     // wheels are added. Cycle-detected via seen_candidate, which
     // accumulates across iterations.
     let mut seen_candidate: HashSet<String> = skip.clone();
+    // incremental-add: pre-fill with locked names so we don't re-bundle them.
+    if let Some(closure) = locked_closure {
+        seen_candidate.extend(closure.keys().map(|n| canonical_conda_name(n)));
+    }
     let mut processed_wheel_count = 0;
     loop {
         // Collect new candidates from wheels we haven't scanned yet.

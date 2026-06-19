@@ -103,9 +103,6 @@ impl ResolveState {
     ///
     /// This is a no-op when `version_str` cannot be parsed (same fallback as
     /// `seed_chosen`).
-    // Used by the incremental-add path (STEP 3); wired up once locked_closure is
-    // threaded through resolve_bundle.
-    #[allow(dead_code)]
     pub fn seed_locked(&mut self, canonical_name: String, version_str: String) {
         // Build the ==V constraint string.
         if let Ok(version) = version_str.parse::<Version>() {
