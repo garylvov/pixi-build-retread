@@ -359,6 +359,7 @@ mod tests {
             index_urls,
             prerelease,
             conda_capable: vec![],
+            entry_specs: vec![],
         }
     }
 

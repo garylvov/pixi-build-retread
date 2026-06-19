@@ -528,6 +528,7 @@ fn courier_pure_python_bundle_is_platform_specific_not_noarch() {
         extras: vec![],
         probe_decisions: vec![],
         solve_diagnostics: BTreeMap::new(),
+        conda_routed: vec![],
     };
 
     let courier_cfg = RetreadConfig {
@@ -541,6 +542,7 @@ fn courier_pure_python_bundle_is_platform_specific_not_noarch() {
         "3.11",
         &[],
         Some("deadbeef"),
+        None,
     )
     .unwrap();
     assert_eq!(
@@ -555,7 +557,8 @@ fn courier_pure_python_bundle_is_platform_specific_not_noarch() {
 
     // Control: the legacy (non-courier) path still emits noarch for a
     // pure-python bundle.
-    let legacy = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None).unwrap();
+    let legacy =
+        produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
     assert_eq!(legacy.metadata.subdir, Platform::NoArch);
 }
 
@@ -588,7 +591,8 @@ fn produce_output_reflects_overrides_for_refinement_widening() {
     // Baseline rendering: no widening yet. The widened-name
     // dep lands at a non-wildcard spec (exact shape depends on
     // the configured relax policy; we only assert it's not `*`).
-    let narrow = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None).unwrap();
+    let narrow =
+        produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
     let narrow_widened_spec = narrow
         .run_dependencies
         .depends
@@ -622,6 +626,7 @@ fn produce_output_reflects_overrides_for_refinement_widening() {
         Platform::Linux64,
         "3.11",
         &[],
+        None,
         None,
     )
     .unwrap();
@@ -910,6 +915,7 @@ fn solo_bundle(name: &str, requires: Vec<&str>) -> Bundle {
         extras: vec![],
         probe_decisions: vec![],
         solve_diagnostics: BTreeMap::new(),
+        conda_routed: vec![],
     }
 }
 
@@ -1052,7 +1058,8 @@ fn vendored_filter_matches_underscore_pypi_name() {
         "opencv_python",
         meta("opencv_python", "4.9.0", vec![], true),
     ));
-    let output = produce_output(&bundle, &cfg(), Platform::Linux64, "3.12", &[], None).unwrap();
+    let output =
+        produce_output(&bundle, &cfg(), Platform::Linux64, "3.12", &[], None, None).unwrap();
     let names: Vec<String> = output
         .run_dependencies
         .depends
@@ -1104,8 +1111,16 @@ fn name_mapped_dep_dropped_by_pypi_name() {
         "isaac-pack-6",
         vec!["tinyobjloader==2.0.0rc13", "numpy==1.26.0"],
     );
-    let output =
-        produce_output(&bundle, &dropped_cfg, Platform::Linux64, "3.12", &[], None).unwrap();
+    let output = produce_output(
+        &bundle,
+        &dropped_cfg,
+        Platform::Linux64,
+        "3.12",
+        &[],
+        None,
+        None,
+    )
+    .unwrap();
     let names: Vec<String> = output
         .run_dependencies
         .depends
@@ -1134,6 +1149,7 @@ fn name_mapped_dep_dropped_by_pypi_name() {
         Platform::Linux64,
         "3.12",
         &[],
+        None,
         None,
     )
     .unwrap();
@@ -1569,7 +1585,8 @@ fn built_in_win_only_dropped_on_linux() {
     // not appear in run-deps even though it has no explicit
     // `sys_platform == "win32"` marker.
     let bundle = solo_bundle("isaacsim", vec!["idna-ssl==1.1.0", "numpy==1.26.0"]);
-    let output = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None).unwrap();
+    let output =
+        produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
     let names: Vec<String> = output
         .run_dependencies
         .depends
@@ -1591,7 +1608,7 @@ fn built_in_win_only_kept_on_windows() {
     // Same input, win-64 target. The auto-drop is non-Windows-only,
     // so idna-ssl is expected to remain.
     let bundle = solo_bundle("isaacsim", vec!["idna-ssl==1.1.0"]);
-    let output = produce_output(&bundle, &cfg(), Platform::Win64, "3.11", &[], None).unwrap();
+    let output = produce_output(&bundle, &cfg(), Platform::Win64, "3.11", &[], None, None).unwrap();
     let names: Vec<String> = output
         .run_dependencies
         .depends
@@ -1614,7 +1631,8 @@ fn explicit_override_beats_built_in_win_only() {
         .overrides
         .insert("idna-ssl".to_string(), "*".to_string());
     let bundle = solo_bundle("isaacsim", vec!["idna-ssl==1.1.0"]);
-    let output = produce_output(&bundle, &config, Platform::Linux64, "3.11", &[], None).unwrap();
+    let output =
+        produce_output(&bundle, &config, Platform::Linux64, "3.11", &[], None, None).unwrap();
     let names: Vec<String> = output
         .run_dependencies
         .depends
@@ -1635,7 +1653,8 @@ fn user_drop_deps_silently_drops() {
     let mut config = cfg();
     config.drop_deps.push("requests".to_string());
     let bundle = solo_bundle("foo", vec!["requests==2.32.0", "numpy==1.26.0"]);
-    let output = produce_output(&bundle, &config, Platform::Linux64, "3.11", &[], None).unwrap();
+    let output =
+        produce_output(&bundle, &config, Platform::Linux64, "3.11", &[], None, None).unwrap();
     let names: Vec<String> = output
         .run_dependencies
         .depends
@@ -1686,9 +1705,11 @@ fn vendored_sub_packages_dropped_from_run_deps() {
         ],
         probe_decisions: vec![],
         solve_diagnostics: BTreeMap::new(),
+        conda_routed: vec![],
     };
 
-    let output = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None).unwrap();
+    let output =
+        produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
     let dep_names: Vec<String> = output
         .run_dependencies
         .depends
@@ -1836,9 +1857,11 @@ fn bundle_field_groups_entries_into_one_output() {
         ],
         probe_decisions: vec![],
         solve_diagnostics: BTreeMap::new(),
+        conda_routed: vec![],
     };
 
-    let output = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None).unwrap();
+    let output =
+        produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
 
     // Output name is the bundle's conda_name, not any one entry name.
     assert_eq!(
@@ -1925,9 +1948,11 @@ fn relaxed_pure_python_primary_pins_python_to_workspace_variant() {
         extras: vec![],
         probe_decisions: vec![],
         solve_diagnostics: BTreeMap::new(),
+        conda_routed: vec![],
     };
 
-    let output = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None).unwrap();
+    let output =
+        produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
 
     // The conda output's variant must be the workspace's 3.11, not the
     // bare-major "3" parsed from the py3 tag.
@@ -1986,7 +2011,7 @@ fn bare_major_python_emits_glob_not_strict_equals() {
     // = "3" via the pure-Python fallback (workspace_python_version)
     // -- pass "3" as the workspace_python_version arg.
     let bundle = solo_bundle("foo", vec![]);
-    let output = produce_output(&bundle, &cfg(), Platform::Linux64, "3", &[], None).unwrap();
+    let output = produce_output(&bundle, &cfg(), Platform::Linux64, "3", &[], None, None).unwrap();
 
     // python must appear with a wildcard, NOT as strict equals.
     let python = output
@@ -2025,8 +2050,16 @@ fn cross_output_siblings_appear_as_run_deps() {
             "0.7.8+5043d15pt2.7.0cu128".to_string(),
         ),
     ];
-    let output =
-        produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &siblings, None).unwrap();
+    let output = produce_output(
+        &bundle,
+        &cfg(),
+        Platform::Linux64,
+        "3.11",
+        &siblings,
+        None,
+        None,
+    )
+    .unwrap();
 
     let dep_names: Vec<String> = output
         .run_dependencies
@@ -2365,6 +2398,7 @@ mod solve_failed_summary_guard {
             extras: vec![],
             probe_decisions: vec![],
             solve_diagnostics: diags,
+            conda_routed: vec![],
         }
     }
 
@@ -2586,5 +2620,81 @@ fn cache_key_changes_when_manifest_mtime_changes() {
     assert_eq!(
         key0, key0_dup,
         "same params+mtime must produce identical key"
+    );
+}
+
+// ── Pack-version mismatch fix: metadata-phase version_override ─────────────
+//
+// When an incremental-add is in flight, bundle.primary is the BTreeMap-first
+// entry (e.g. iniconfig==2.0.0 sorts before isaacsim==6.0.0.1).  Without
+// the override the metadata would promise "2.0.0" while the build would
+// produce "6.0.0.1" → pixi rejects the package.  With the override
+// (lock.version) both phases agree on "6.0.0.1".
+
+/// produce_output with version_override=None returns bundle.primary version.
+#[test]
+fn produce_output_without_override_uses_primary_version() {
+    // Bundle whose primary is "iniconfig" (sorts first alphabetically).
+    let bundle = solo_bundle("iniconfig", vec![]);
+    // primary.metadata.version == "1.0.0" (solo_bundle default)
+    let out = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
+    assert_eq!(
+        out.metadata.version.to_string(),
+        "1.0.0",
+        "no override: version must equal bundle.primary.metadata.version"
+    );
+}
+
+/// produce_output with version_override=Some("6.0.0.1") returns the override.
+#[test]
+fn produce_output_with_override_uses_lock_version() {
+    // Bundle whose primary is "iniconfig" (as if BTreeMap-first after adding it
+    // alongside isaacsim==6.0.0.1).  primary.metadata.version == "1.0.0".
+    let bundle = solo_bundle("iniconfig", vec![]);
+    let out = produce_output(
+        &bundle,
+        &cfg(),
+        Platform::Linux64,
+        "3.11",
+        &[],
+        None,
+        Some("6.0.0.1"),
+    )
+    .unwrap();
+    assert_eq!(
+        out.metadata.version.to_string(),
+        "6.0.0.1",
+        "version_override must win over bundle.primary.metadata.version"
+    );
+}
+
+/// version_override propagates into the siblings list: the sibling entry
+/// for a bundle whose version was overridden must use the lock version.
+#[test]
+fn siblings_with_override_use_lock_version() {
+    // Two bundles: isaacsim (primary, version "6.0.0.1") and iniconfig
+    // (BTreeMap-first, primary version "2.0.0").
+    let main_bundle = solo_bundle("isaacsim", vec![]);
+    // siblings list: override iniconfig to "6.0.0.1" (the lock version) so
+    // the cross-link run-dep tracks the correct version.
+    let siblings: Vec<(String, String)> = vec![
+        ("isaacsim".to_string(), "6.0.0.1".to_string()),
+        ("iniconfig".to_string(), "6.0.0.1".to_string()),
+    ];
+    // main bundle's produce_output should embed the sibling version correctly.
+    let out = produce_output(
+        &main_bundle,
+        &cfg(),
+        Platform::Linux64,
+        "3.11",
+        &siblings,
+        None,
+        Some("6.0.0.1"),
+    )
+    .unwrap();
+    assert_eq!(
+        out.metadata.version.to_string(),
+        "6.0.0.1",
+        "version_override must be reflected in the emitted metadata version"
     );
 }

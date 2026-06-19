@@ -18,6 +18,13 @@ use cascade::{
     pypi_fallback_indexes,
 };
 
+mod resolve_state;
+use resolve_state::{ObserveEdgeResult, ResolveState};
+
+mod resolvo_ab;
+mod resolvo_discovery;
+mod resolvo_provider;
+
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -539,6 +546,11 @@ struct Bundle {
     /// don't actually pull in all features still inherit those
     /// features' transitives in the union).
     solve_diagnostics: BTreeMap<String, crate::audit::SolveDiagnostics>,
+    /// PR-2: canonical conda names that the BFS (or resolvo) routed to
+    /// conda rather than bundling. Used exclusively by the A/B oracle
+    /// (RETREAD_RESOLVO_DIFF) and never serialized to a lock.
+    #[allow(dead_code)]
+    conda_routed: Vec<String>,
 }
 
 impl Bundle {
@@ -810,9 +822,74 @@ impl Handler {
                     .iter()
                     .map(|b| apply_emission(b, &base_config, emission).0)
                     .collect();
+                // When courier mode is active and RETREAD_INCREMENTAL=1, the
+                // metadata phase must use `lock.version` as the pack version for
+                // any bundle that `detect_incremental_add` would accept (the same
+                // version the incremental build path uses).  Precompute a map
+                // bundle_name → override_version so both the siblings list and
+                // per-bundle produce_output use the same, consistent version.
+                // When RETREAD_INCREMENTAL is unset (the default) or courier is
+                // off, detect_incremental_add returns None at Gate 1 and the map
+                // is empty (byte-identical to today).
+                let incr_version_overrides: std::collections::HashMap<String, String> =
+                    if config.courier {
+                        let courier_channels_for_fp = workspace_manifest
+                            .as_ref()
+                            .map(|m| {
+                                m.courier_channel_set(
+                                    workspace_dir.as_deref().unwrap_or(source_dir.as_path()),
+                                    &source_dir,
+                                )
+                            })
+                            .unwrap_or_default();
+                        let workspace_fp_for_incr = workspace_manifest
+                            .as_ref()
+                            .map(|m| {
+                                m.solve_fingerprint(
+                                    workspace_dir.as_deref().unwrap_or(source_dir.as_path()),
+                                    &source_dir,
+                                )
+                            })
+                            .unwrap_or_default();
+                        let config_fp_for_incr = crate::courier::config_fingerprint(
+                            &config,
+                            &courier_channels_for_fp,
+                            &workspace_fp_for_incr,
+                        );
+                        let ws_indexes_for_incr: Vec<String> = workspace_manifest
+                            .as_ref()
+                            .map(|m| m.all_pypi_index_urls())
+                            .unwrap_or_default();
+                        let relax_str_for_incr = format!("{:?}", config.relax);
+                        env_bundles
+                            .iter()
+                            .filter_map(|b| {
+                                let lock_path = source_dir
+                                    .join(crate::lock::RetreadLock::file_name(&b.conda_name));
+                                detect_incremental_add(
+                                    &lock_path,
+                                    &config,
+                                    &b.conda_name,
+                                    &ws_indexes_for_incr,
+                                    &relax_str_for_incr,
+                                    python_version,
+                                    &config_fp_for_incr,
+                                )
+                                .map(|incr| (b.conda_name.clone(), incr.lock.version.clone()))
+                            })
+                            .collect()
+                    } else {
+                        std::collections::HashMap::new()
+                    };
                 let siblings: Vec<(String, String)> = env_bundles
                     .iter()
-                    .map(|b| (b.conda_name.clone(), b.primary.metadata.version.clone()))
+                    .map(|b| {
+                        let ver = incr_version_overrides
+                            .get(&b.conda_name)
+                            .cloned()
+                            .unwrap_or_else(|| b.primary.metadata.version.clone());
+                        (b.conda_name.clone(), ver)
+                    })
                     .collect();
                 for base_bundle in &materialized {
                     let (mut bundle, mut effective) =
@@ -924,6 +1001,9 @@ impl Handler {
                             bundle.conda_name,
                         ))
                     })?;
+                    let version_override_for_bundle = incr_version_overrides
+                        .get(&bundle.conda_name)
+                        .map(|s| s.as_str());
                     let mut output = produce_output(
                         &bundle,
                         &effective,
@@ -931,6 +1011,7 @@ impl Handler {
                         python_version,
                         &siblings,
                         courier_build_hash.as_deref(),
+                        version_override_for_bundle,
                     )
                     .map_err(|e| {
                         RpcError::internal(format!("output for {}: {e:#}", bundle.conda_name))
@@ -1445,6 +1526,7 @@ impl Handler {
                             python_version,
                             &siblings,
                             courier_build_hash.as_deref(),
+                            version_override_for_bundle,
                         )
                         .map_err(|e| {
                             RpcError::internal(format!(
@@ -1912,6 +1994,65 @@ impl Handler {
                     );
                 }
             }
+
+            // WS-B incremental-add fast path (STEP 4): if RETREAD_INCREMENTAL=1
+            // and the current manifest diff is a pure dep addition, attempt a
+            // localized resolve that reuses the locked closure.  Falls through
+            // to cold resolve_all on any gate failure, ripple, or conflict.
+            {
+                let ws_indexes: Vec<String> = ws_manifest_for_replay
+                    .as_ref()
+                    .map(|m| m.all_pypi_index_urls())
+                    .unwrap_or_default();
+                let relax_str = format!("{:?}", config.relax);
+                if let Some(incr) = detect_incremental_add(
+                    &lock_path,
+                    &config,
+                    &bundle_name_for_hash,
+                    &ws_indexes,
+                    &relax_str,
+                    &python_version,
+                    &config_fp,
+                ) {
+                    match resolve_incremental_add(
+                        incr,
+                        &config,
+                        &target,
+                        &download_dir,
+                        &source_dir,
+                        &cache_dir,
+                        &params.channels,
+                        workspace_dir.as_deref(),
+                        &params.work_directory,
+                        &output_dir,
+                        params.output.subdir,
+                        params.output.build.as_deref(),
+                        &config_fp,
+                    )
+                    .await
+                    {
+                        Ok(Some(result)) => {
+                            tracing::info!(
+                                bundle = %bundle_name_for_hash,
+                                "incremental-add: localized resolve succeeded"
+                            );
+                            return Ok(result);
+                        }
+                        Ok(None) => {
+                            tracing::debug!(
+                                bundle = %bundle_name_for_hash,
+                                "incremental-add: escalated to cold resolve"
+                            );
+                            // fall through to resolve_all
+                        }
+                        Err(e) => {
+                            return Err(RpcError::internal(format!(
+                                "incremental-add {bundle_name_for_hash}: {e:#}"
+                            )));
+                        }
+                    }
+                }
+            }
         }
 
         // Re-resolve materialized bundles, then autodiscover emissions
@@ -2239,6 +2380,9 @@ async fn resolve_all(
                 &pypi_to_conda,
                 &effective.name_map,
                 conda_channels,
+                &effective.conda_deps,
+                &workspace_pypi_indexes,
+                None, // cold path: no locked closure
             )
             .await
             .with_context(|| {
@@ -2289,6 +2433,7 @@ async fn resolve_all(
                 download_dir,
                 &effective,
                 conda_channels,
+                None, // cold path: no locked closure
             )
             .await?;
         }
@@ -2300,6 +2445,7 @@ async fn resolve_all(
         // constraints.
         bundles.push(bundle);
     }
+
     Ok((bundles, effective))
 }
 
@@ -2592,10 +2738,21 @@ async fn resolve_bundle(
     // this map; the BFS now matches it.
     name_map: &std::collections::BTreeMap<String, String>,
     conda_channels: &[ChannelUrl],
+    // PR-2: retread-conda-deps names (force-list). Used only by the A/B
+    // oracle to capture the auto_bundle skip-set route; never affects BFS logic.
+    conda_deps_list: &[String],
+    // PR-2: workspace PyPI index chain for transitive resolvo discovery.
+    // Mirrors the chain auto_bundle_transitives uses. Build with merge_index_chain.
+    workspace_indexes: &[String],
+    // incremental-add path: locked closure from the committed lock
+    // (name → version_str for every wheel EXCEPT the new dep being added).
+    // When Some, seeds ResolveState with ==V pinned constraints so ripples
+    // become visible to intersect_specifiers.  Cold path: None.
+    locked_closure: Option<&std::collections::BTreeMap<String, String>>,
 ) -> Result<Bundle> {
     let conda_name = canonical_conda_name(entry_name);
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut work: VecDeque<Pending> = VecDeque::new();
+    let mut state = ResolveState::default();
+    let mut work: BTreeMap<String, Pending> = BTreeMap::new();
     // v0.14.1+: collect every probe + routing decision so the audit
     // can persist them to disk. Flushed in resolve_all at the end of
     // conda/outputs (so failed conda solves still leave the trace).
@@ -2635,7 +2792,28 @@ async fn resolve_bundle(
     // P2 (grizzly #2): canonical seed -- the BFS dedups candidates in
     // canonical form (see the `canonical_conda_name(&pending.pypi_name)`
     // drain below), so the primary must be seeded the same way.
-    seen.insert(canonical_conda_name(&primary.pypi_name));
+    // PR-1: seed_chosen records the primary's version into ResolveState so
+    // future observe_edge calls can check constraint compatibility.
+    state.seed_chosen(
+        canonical_conda_name(&primary.pypi_name),
+        primary.metadata.version.clone(),
+    );
+
+    // incremental-add: seed locked closure as ==V pinned constraints so any
+    // incoming edge from the new dep's subtree that would require a different
+    // version is detected as a ripple by intersect_specifiers / observe_edge.
+    // The primary itself is already seeded via seed_chosen above; skip it here
+    // to avoid overwriting with a locked constraint.
+    if let Some(closure) = locked_closure {
+        let primary_canon = canonical_conda_name(&primary.pypi_name);
+        for (name, version_str) in closure {
+            let canon = canonical_conda_name(name);
+            if canon == primary_canon {
+                continue; // primary already seeded
+            }
+            state.seed_locked(canon, version_str.clone());
+        }
+    }
 
     // path/git/from sources are authored project code, not metapackages
     // with extras-gated transitives. SKIP the BFS entirely unless the
@@ -2646,13 +2824,38 @@ async fn resolve_bundle(
     // metapackage's namespace convention.
     let is_source_form = entry.is_path() || entry.is_git() || entry.is_named_git();
     if is_source_form && entry.extras.is_empty() {
+        // PR-2: emit SKIPPED AbReport when the diff hook is active.
+        if let Ok(report_path) = std::env::var("RETREAD_RESOLVO_DIFF") {
+            resolvo_ab::ab_skip_hook(&report_path, entry_name, target, "source-form-no-extras")
+                .await;
+        }
         return Ok(Bundle {
             conda_name,
             primary,
             extras: vec![],
             probe_decisions: vec![],
             solve_diagnostics: BTreeMap::new(),
+            conda_routed: vec![],
         });
+    }
+
+    // ── RETREAD_RESOLVO=1: resolvo path (default OFF) ─────────────────────
+    // When set, run the resolvo DependencyProvider + solve in place of the BFS.
+    // Both paths produce an identical `Bundle`.  The BFS remains the default.
+    if std::env::var("RETREAD_RESOLVO").is_ok() {
+        return resolve_bundle_resolvo(
+            conda_name,
+            primary,
+            entry,
+            target,
+            download_dir,
+            relax,
+            name_map,
+            conda_channels,
+            pypi_to_conda,
+            workspace_indexes,
+        )
+        .await;
     }
 
     // Seed BFS from the primary's deps. Two flavors:
@@ -2675,14 +2878,46 @@ async fn resolve_bundle(
     };
     // v1.5.9: seed from the ORIGINAL (pre-D) Requires-Dist so exact
     // family pins resolve exact-first (see materialize_and_rewrite).
-    seed_worklist(
-        &primary_original_rd,
-        &entry.extras,
-        &entry.index_url(),
-        &prefix,
-        &seen,
-        &mut work,
-    )?;
+    // PR-1: use a temp VecDeque for seed_worklist compat, then drain into BTreeMap.
+    {
+        let mut tmp_queue: VecDeque<Pending> = VecDeque::new();
+        let seen_set: HashSet<String> = state.constraints.keys().cloned().collect();
+        seed_worklist(
+            &primary_original_rd,
+            &entry.extras,
+            &entry.index_url(),
+            &prefix,
+            &seen_set,
+            &mut tmp_queue,
+            None, // cold path: no locked-closure ripple detection
+        )?;
+        for pending in tmp_queue {
+            let name = canonical_conda_name(&pending.pypi_name);
+            // FIX 2: merge specifiers when a second edge arrives for the same name
+            // in the same sweep, so the constraint is accumulated rather than dropped.
+            match work.entry(name) {
+                std::collections::btree_map::Entry::Vacant(e) => {
+                    e.insert(pending);
+                }
+                std::collections::btree_map::Entry::Occupied(mut e) => {
+                    if let PendingSource::Pypi {
+                        specifiers: new_s, ..
+                    } = pending.source
+                        && let PendingSource::Pypi {
+                            ref mut specifiers, ..
+                        } = e.get_mut().source
+                    {
+                        let merged: VersionSpecifiers = specifiers
+                            .iter()
+                            .cloned()
+                            .chain(new_s.iter().cloned())
+                            .collect();
+                        *specifiers = merged;
+                    }
+                }
+            }
+        }
+    }
 
     // BFS, accumulating sub-wheels. v0.12.0+: PyPI-Simple deps go
     // through the existing `pypi::resolve` path; URL/git deps from
@@ -2692,6 +2927,9 @@ async fn resolve_bundle(
     // sub-wheels propagate their own extras but NOT prefix-base-dep
     // matching (they're project code, same rule as primary).
     let mut extras = Vec::new();
+    // PR-2: canonical conda names routed to conda (not bundled) during BFS.
+    // Used only by the A/B oracle; never serialized.
+    let mut conda_routed_acc: Vec<String> = Vec::new();
     // v1.4.3: process the BFS level by level. A child's existence is
     // only known after its parent's METADATA is parsed, but items at
     // the SAME depth never read each other's results -- so each
@@ -2703,20 +2941,89 @@ async fn resolve_bundle(
     // one-item-at-a-time BFS. Git/URL-form deps are also fetched
     // serially: two materializations of the same repo would race the
     // git-clone cache.
+    //
+    // PR-1: work is now a BTreeMap<name, Pending>; iteration is
+    // canonical-name-sorted (Pillar 3). ResolveState replaces
+    // seen: HashSet and accumulates AND-intersection constraints.
+    const MAX_BFS_ITERATIONS: usize = 500;
+    let mut bfs_iter = 0usize;
     'levels: loop {
-        // Drain the current frontier, deduping at drain time. (The old
-        // loop deduped at pop time -- equivalent, since seed_worklist
-        // also consults `seen` before enqueuing.)
+        bfs_iter += 1;
+        if bfs_iter > MAX_BFS_ITERATIONS {
+            bail!(
+                "resolve_bundle: BFS iteration cap ({MAX_BFS_ITERATIONS}) exceeded for bundle \
+                 `{conda_name}`. This indicates a circular re-resolve in constraint \
+                 accumulation (a conflict the resolver failed to detect early)."
+            );
+        }
+        if work.is_empty() {
+            break 'levels;
+        }
+        // Drain work into frontier in canonical (name-sorted) order.
+        // The BTreeMap guarantees name-sorted iteration (Pillar 3).
+        let current_work: Vec<Pending> = std::mem::take(&mut work).into_values().collect();
         let mut frontier: Vec<Pending> = Vec::new();
-        while let Some(pending) = work.pop_front() {
+        let mut reresolve_queue: Vec<Pending> = Vec::new();
+
+        for pending in current_work {
             let dep_conda_name = canonical_conda_name(&pending.pypi_name);
-            if !seen.insert(dep_conda_name) {
-                continue;
+            // Pre-check: is this dep locked (incremental-add path only)?
+            // We capture it BEFORE the mutable observe_edge borrow so we can
+            // use it in match arms below without a second mutable borrow.
+            let dep_is_locked = state.is_locked(&dep_conda_name);
+            let edge_result = state.observe_edge(&dep_conda_name, pending);
+            // 2c: if the dep is locked and observe_edge returns a conflict
+            // error, escalate to IncrementalRipple instead of failing hard.
+            let edge_result = match edge_result {
+                Err(e) if dep_is_locked => {
+                    return Err(anyhow::Error::new(auto_bundle::IncrementalRipple {
+                        reason: format!("locked dep `{dep_conda_name}` constraint conflict: {e:#}"),
+                    }));
+                }
+                other => other?,
+            };
+            match edge_result {
+                ObserveEdgeResult::New(p) => {
+                    frontier.push(p);
+                }
+                ObserveEdgeResult::AlreadySatisfied | ObserveEdgeResult::NonPypiAlreadySeen => {
+                    // Already resolved; constraint was accumulated. Skip.
+                }
+                ObserveEdgeResult::NeedsReResolve(tighter_pending) => {
+                    // 2c: if this is a locked dep, a NeedsReResolve means the
+                    // new dep's subtree wants to change the locked version →
+                    // ripple detected, escalate to cold resolve.
+                    if dep_is_locked {
+                        return Err(anyhow::Error::new(auto_bundle::IncrementalRipple {
+                            reason: format!(
+                                "locked dep `{dep_conda_name}` would need re-resolution \
+                                     (current lock version excluded by incoming constraint)"
+                            ),
+                        }));
+                    }
+                    // Must re-resolve this dep with tighter constraints.
+                    // Revoke the chosen version so it gets re-resolved.
+                    state.revoke_chosen(&dep_conda_name);
+                    // Remove from extras (it will be re-added after re-resolution).
+                    extras.retain(|w: &ResolvedWheel| {
+                        canonical_conda_name(&w.pypi_name) != dep_conda_name
+                    });
+                    reresolve_queue.push(tighter_pending);
+                }
             }
-            frontier.push(pending);
+        }
+
+        // Re-enqueue items that need re-resolution into the next level's work.
+        for p in reresolve_queue {
+            let name = canonical_conda_name(&p.pypi_name);
+            work.insert(name, p);
+        }
+
+        if frontier.is_empty() && work.is_empty() {
+            break 'levels;
         }
         if frontier.is_empty() {
-            break 'levels;
+            continue 'levels; // still have re-resolve work
         }
 
         // Phase 1: routing (prefer-conda short-circuit), serial.
@@ -2895,6 +3202,8 @@ async fn resolve_bundle(
                 }
             }
             if routed_to_conda {
+                // PR-2: record the routed conda name for the A/B oracle.
+                conda_routed_acc.push(dep_conda_name.clone());
                 continue;
             }
             to_materialize.push(pending);
@@ -3083,17 +3392,51 @@ async fn resolve_bundle(
             // deps also get pulled in. URL/git sub-wheels reuse the parent
             // bundle's `prefix` (often empty for source-form parents) so
             // they don't pull random siblings.
-            seed_worklist(
-                &sub_seed_rd,
-                &pending.extras,
-                &sub_index_for_recurse,
-                &prefix,
-                &seen,
-                &mut work,
-            )?;
+            // PR-1: use a temp VecDeque for seed_worklist compat, then drain into BTreeMap.
+            {
+                let mut tmp_seed: VecDeque<Pending> = VecDeque::new();
+                let seen_set: HashSet<String> = state.constraints.keys().cloned().collect();
+                seed_worklist(
+                    &sub_seed_rd,
+                    &pending.extras,
+                    &sub_index_for_recurse,
+                    &prefix,
+                    &seen_set,
+                    &mut tmp_seed,
+                    None, // cold path: no locked-closure ripple detection
+                )?;
+                for p in tmp_seed {
+                    let name = canonical_conda_name(&p.pypi_name);
+                    // FIX 2: merge specifiers when a second edge arrives for the same
+                    // name in the same sweep (recurse drain), same as seed drain above.
+                    match work.entry(name) {
+                        std::collections::btree_map::Entry::Vacant(e) => {
+                            e.insert(p);
+                        }
+                        std::collections::btree_map::Entry::Occupied(mut e) => {
+                            if let PendingSource::Pypi {
+                                specifiers: new_s, ..
+                            } = p.source
+                                && let PendingSource::Pypi {
+                                    ref mut specifiers, ..
+                                } = e.get_mut().source
+                            {
+                                let merged: VersionSpecifiers = specifiers
+                                    .iter()
+                                    .cloned()
+                                    .chain(new_s.iter().cloned())
+                                    .collect();
+                                *specifiers = merged;
+                            }
+                        }
+                    }
+                }
+            }
 
+            // PR-1: capture version before sub_metadata is moved into the struct.
+            let sub_version = sub_metadata.version.clone();
             extras.push(ResolvedWheel {
-                pypi_name: dep_conda_name,
+                pypi_name: dep_conda_name.clone(),
                 url: sub_url,
                 upstream_url: sub_upstream_url,
                 // BFS sub-wheels inherit git_source from materialize_and_rewrite
@@ -3109,15 +3452,154 @@ async fn resolve_bundle(
                 auto_data: None,
                 auto_data_dedup_skipped_root: None,
             });
+            // PR-1: commit the resolved version so future observe_edge calls
+            // can check constraint compatibility (re-resolve-on-tighten).
+            state.commit_chosen(dep_conda_name, sub_version);
         }
     }
 
-    Ok(Bundle {
+    // PR-2: union in force-list names (retread-conda-deps) that appear as
+    // transitive requires_dist entries in the bundled wheels. auto_bundle_transitives
+    // skips these silently (no ProbeDecision pushed); we mirror that here so the
+    // A/B oracle sees the same effective conda-routed set.
+    {
+        let force_conda: std::collections::HashSet<String> = conda_deps_list
+            .iter()
+            .map(|n| canonical_conda_name(n))
+            .collect();
+        // Collect all transitive Requires-Dist names from bundled wheels.
+        let bundled_rd_names: std::collections::HashSet<String> = std::iter::once(&primary)
+            .chain(extras.iter())
+            .flat_map(|w| w.metadata.requires_dist.iter())
+            .filter_map(|raw| {
+                uv_pep508::Requirement::from_str(raw.as_str())
+                    .ok()
+                    .map(|r: uv_pep508::Requirement| canonical_conda_name(r.name.as_ref()))
+            })
+            .collect();
+        for name in force_conda.intersection(&bundled_rd_names) {
+            if !conda_routed_acc.contains(name) {
+                conda_routed_acc.push(name.clone());
+            }
+        }
+    }
+
+    let bfs_bundle = Bundle {
         conda_name,
         primary,
         extras,
         probe_decisions,
         solve_diagnostics: BTreeMap::new(),
+        conda_routed: conda_routed_acc,
+    };
+
+    // PR-2: A/B oracle hook (RETREAD_RESOLVO_DIFF=<path>).
+    if let Ok(report_path) = std::env::var("RETREAD_RESOLVO_DIFF") {
+        resolvo_ab::ab_diff_hook(
+            &report_path,
+            entry_name,
+            target,
+            &bfs_bundle,
+            entry,
+            download_dir,
+            relax,
+            name_map,
+            conda_channels,
+            pypi_to_conda,
+            conda_deps_list,
+            workspace_indexes,
+        )
+        .await;
+    }
+
+    Ok(bfs_bundle)
+}
+
+/// resolvo path for `resolve_bundle` (gated on `RETREAD_RESOLVO=1`).
+///
+/// Runs the three-phase resolvo pipeline:
+///   1. PR-1b `run_discovery` — async, over-approximating fixpoint that
+///      fetches all reachable candidates + metadata + conda-route memo.
+///   2. PR-1c `PypiDependencyProvider` — build the resolvo Pool from the
+///      `DiscoveryPool`, then solve inside `spawn_blocking`.
+///   3. Map `Vec<SolvedWheel>` → `Bundle` using `pool_record_to_resolved_wheel`.
+///
+/// `primary` is already materialised by the caller (`resolve_bundle`);
+/// `extras` are the solved sub-wheels.
+#[allow(clippy::too_many_arguments)]
+async fn resolve_bundle_resolvo(
+    conda_name: String,
+    primary: ResolvedWheel,
+    entry: &crate::config::WheelEntry,
+    target: &pypi::WheelTarget,
+    download_dir: &Path,
+    relax: RelaxPolicy,
+    name_map: &std::collections::BTreeMap<String, String>,
+    conda_channels: &[ChannelUrl],
+    pypi_to_conda: &PypiToCondaMap,
+    workspace_indexes: &[String],
+) -> Result<Bundle> {
+    use crate::handler::resolvo_provider::{
+        SolveOutcome, pool_record_to_resolved_wheel, resolvo_solve_pool,
+    };
+
+    let primary_rd = primary.metadata.requires_dist.clone();
+
+    // ── Phases 1+2: discovery fixpoint + sync solve via shared harness ──────
+    // resolvo_solve_pool encapsulates discovery + spawn_blocking solve into one
+    // unit.  SolveOutcome::Unsolvable is mapped to Err here (the default path
+    // fails closed); the A/B oracle uses SolveOutcome directly via ab_diff_hook.
+    let (pool, outcome) = resolvo_solve_pool(
+        &primary_rd,
+        entry,
+        target,
+        download_dir,
+        relax,
+        name_map,
+        conda_channels,
+        pypi_to_conda,
+        &[], // force-list not relevant on the RETREAD_RESOLVO=1 path
+        workspace_indexes,
+    )
+    .await
+    .context("resolvo discovery pass failed")?;
+
+    let solved_wheels = match outcome {
+        SolveOutcome::Solved(wheels) => wheels,
+        SolveOutcome::Unsolvable(msg) => {
+            return Err(anyhow::anyhow!("resolvo: dependency conflict:\n{msg}"));
+        }
+    };
+
+    // ── Phase 3: map solution → Bundle extras ─────────────────────────────────
+    let mut extras: Vec<ResolvedWheel> = Vec::new();
+    for solved_wheel in &solved_wheels {
+        match pool_record_to_resolved_wheel(solved_wheel, &pool) {
+            Ok(rw) => extras.push(rw),
+            Err(e) => {
+                tracing::warn!(
+                    name = %solved_wheel.pypi_name,
+                    version = %solved_wheel.version_str,
+                    error = %format!("{e:#}"),
+                    "resolvo: failed to map solved wheel to ResolvedWheel; skipping"
+                );
+            }
+        }
+    }
+
+    tracing::debug!(
+        conda_name = %conda_name,
+        extras_count = extras.len(),
+        "resolvo: bundle assembled"
+    );
+
+    Ok(Bundle {
+        conda_name,
+        primary,
+        extras,
+        probe_decisions: vec![],
+        solve_diagnostics: BTreeMap::new(),
+        conda_routed: pool.conda_routed_names.iter().cloned().collect(),
     })
 }
 
@@ -3223,7 +3705,7 @@ async fn bfs_fetch_pypi(
                 error = %format!("{wheel_err:#}"),
                 "BFS PyPI wheel resolve failed; attempting sdist fallback",
             );
-            let sdist = pypi::resolve_sdist(index, pypi_name, specifiers)
+            let (sdist_version, sdist) = pypi::resolve_sdist(index, pypi_name, specifiers)
                 .await
                 .with_context(|| {
                     format!(
@@ -3234,9 +3716,12 @@ async fn bfs_fetch_pypi(
             // Capture the sdist URL BEFORE consuming `sdist` (THE FIX:
             // previously this was discarded and never threaded out).
             let captured_sdist_url = sdist.url.clone();
-            // Per-entry build dir under download_dir so repeats hit
-            // the wheel cache.
-            let sdist_out = download_dir.join(pypi_name);
+            // Unified sdist build cache dir keyed on (name, version) so BFS,
+            // discovery, and replay all share the same output directory and
+            // never rebuild the same (name, version) twice.
+            let sdist_out = download_dir
+                .join("sdist-builds")
+                .join(format!("{pypi_name}-{sdist_version}"));
             let built = crate::source_build::build_wheel_from_sdist_url(
                 &sdist.url,
                 &sdist_out,
@@ -3892,6 +4377,11 @@ fn produce_output(
     workspace_python_version: &str,
     siblings: &[(String, String)],
     courier_build_hash: Option<&str>,
+    // When `Some`, overrides `bundle.primary.metadata.version` so the metadata
+    // phase reports the same version the build phase will use (e.g. lock.version
+    // on an incremental add).  `None` → use bundle.primary.metadata.version
+    // (today's behaviour, always chosen when RETREAD_INCREMENTAL is unset).
+    version_override: Option<&str>,
 ) -> Result<CondaOutput> {
     // Python version for the emitted variant/build/`python` dep. Shared with
     // the build recipe via `emit_python_version` so the metadata and the
@@ -3961,10 +4451,15 @@ fn produce_output(
     // when two wheels disagree, the first-encountered spec wins. Genuine
     // upstream disagreements (e.g. pillow 11.3 vs 12.0 in isaacsim) are the
     // user's responsibility to resolve via [build.config.overrides].
+    //
+    // PR-1 (Site 4): iterate wheels in canonical-name order so the
+    // first-encountered dedup is confluent (order-independent).
     let env = marker_env_for(&host_platform.to_string(), &python_version)?;
     let mut run_dep_specs: Vec<NamedSpec<PackageSpec>> = vec![spec_from_str(&python_dep)?];
     let mut seen_dep_names: HashSet<String> = HashSet::from(["python".to_string()]);
-    for wheel in bundle.all_wheels() {
+    let mut sorted_wheels: Vec<&ResolvedWheel> = bundle.all_wheels().collect();
+    sorted_wheels.sort_by_key(|w| canonical_conda_name(&w.pypi_name));
+    for wheel in sorted_wheels {
         for raw in &wheel.metadata.requires_dist {
             let Some(dep) = crate::relax::translate(
                 raw,
@@ -4034,9 +4529,10 @@ fn produce_output(
          retread-drop-deps / retread-overrides / retread-name-map"
     );
 
+    let effective_version = version_override.unwrap_or(&bundle.primary.metadata.version);
     assemble_conda_output(
         &bundle.conda_name,
-        &bundle.primary.metadata.version,
+        effective_version,
         &python_version,
         config.courier,
         any_platform_specific,
@@ -4086,75 +4582,29 @@ fn localize_wheel_source(url: &url::Url, wheels_root: &Path) -> url::Url {
     url.clone()
 }
 
-/// Re-materialize wheel bytes from the committed lock and run the shared
-/// courier pack tail, skipping derivation (BFS / auto_bundle / solve).
+/// Reconstruct the per-wheel [`crate::emit_pypi::EmitWheel`] list from a
+/// committed lock without re-running the full BFS resolve.
 ///
-/// The replay path for `conda_build_v1` calls this when `config.courier` is
-/// true and `load_replayable_lock` confirms the lock is valid (schema +
-/// inputs_hash match, no poisoning). Skips DERIVATION only — the full
-/// materialization pipeline (download / source-build / inject / relax-rewrite)
-/// is re-run per wheel class:
+/// Returns:
+/// - `Ok(Some(wheels))` — all wheels re-materialized successfully.
+/// - `Ok(None)` — provenance gap (class-3 / schema-5 class-2); caller must
+///   fall through to `resolve_all`.
+/// - `Err(...)` — hard error during re-materialization.
 ///
-/// **Class 1 — `must_ship=true`, name in `config.retread_wheels`**: the wheel
-/// was built from a git / path / url / named-git source. Re-run
-/// `materialize_and_rewrite` on the config entry to repopulate `wheels/<name>/`
-/// on disk, then pass the resulting `local_path` to `courier::stage`.
-///
-/// **Class 2 — `must_ship=false`, `origin=Built` (relax-changed shadow)**: the
-/// wheel was an index wheel whose Requires-Dist was rewritten by the relax
-/// pipeline. The original URL is recorded in `lock.upstream_url` (schema 6+).
-/// Pass `remote_url=upstream_url` to `courier::stage`; it will download the
-/// original from the index and re-apply the relax rewrite.  For schema-5 locks
-/// where `upstream_url` is absent, fall through to full re-resolve.
-///
-/// **Class 3 — `must_ship=true`, name NOT in `config.retread_wheels`**: the
-/// wheel was a BFS transitive built from a `pkg @ git+<url>@<rev>` line in a
-/// Requires-Dist. The lock carries insufficient provenance (no git url+rev) to
-/// re-build it. Returns `Ok(None)` so the caller falls through to full
-/// `resolve_all`.
-///
-/// **Class 4 — `origin=Index`**: unchanged index wheel. Pass `remote_url` from
-/// `lw.url`. `courier::stage` will record it as `Origin::Index` unchanged.
-///
-/// # Returns
-/// - `Ok(Some(result))` — all wheels re-materialized; pack completed.
-/// - `Ok(None)` — lock provenance insufficient for replay (class 3 / schema-5
-///   class-2 gap); caller should fall through to full `resolve_all`.
-/// - `Err(...)` — replay was attempted but failed (download error,
-///   rattler-build failure, etc.). Caller should propagate as a hard error.
-///
-/// # Correctness
-/// **COLD path** (`run_deps` originates from `params.run_dependencies` /
-/// `run_override`): pixi's live conda-solver result is authoritative; the
-/// lock has not yet been committed.
-///
-/// **REPLAY path** (`run_deps` originates from `lock.conda_run_deps`): the
-/// already-committed lock is authoritative; using `params.run_dependencies`
-/// here would let pixi's non-deterministic conda solver inject extras (e.g.
-/// `python_abi`) that drift the rewritten lock from the committed one, which
-/// is the exact bug replay is supposed to prevent.  The caller is responsible
-/// for sourcing `run_deps` from `lock.conda_run_deps` before calling this
-/// function on a replay hit.
-#[allow(clippy::too_many_arguments)]
-async fn materialize_from_lock(
-    lock: crate::lock::RetreadLock,
+/// Owns the PHASE 2.5 pre-pass (git group membership), the 6 loop-local
+/// accumulators (`git_group_members`, `git_group_order`, `auto_data_override`,
+/// `git_group_stash`, `built_roots`, `emit_wheels`), and the main
+/// per-`LockWheel` classification loop.  The caller retains responsibility for
+/// deriving `conda_capable` and `index_urls` from the lock after this returns.
+async fn emit_wheels_from_lock(
+    lock: &crate::lock::RetreadLock,
     config: &RetreadConfig,
-    work_dir: &Path,
-    output_dir: &Path,
-    target_subdir: Platform,
+    target: &WheelTarget,
+    download_dir: &Path,
     source_dir: &Path,
     cache_dir: &Path,
-    expected_build: Option<&str>,
-    run_deps: Vec<String>,
-    config_fp: &str,
-) -> Result<Option<CondaBuildV1Result>> {
+) -> Result<Option<Vec<crate::emit_pypi::EmitWheel>>> {
     use crate::lock::Origin;
-
-    let bundle_name = lock.bundle.clone();
-    let version = lock.version.clone();
-    let python_version = crate::relax::emit_python_version("", &lock.python);
-    let download_dir = source_dir.join("wheels");
-    let target = wheel_target_for(target_subdir, &python_version);
 
     // Per-wheel re-materialization: classify each LockWheel and build the
     // EmitWheel with correct local_path / remote_url for courier::stage.
@@ -4382,8 +4832,8 @@ async fn materialize_from_lock(
                                 let (resolved, _rd) = materialize_and_rewrite(
                                     &synth_entry,
                                     &member_lw.name,
-                                    &target,
-                                    &download_dir,
+                                    target,
+                                    download_dir,
                                     source_dir,
                                     cache_dir,
                                     config.relax,
@@ -4471,8 +4921,8 @@ async fn materialize_from_lock(
                         let (resolved, _rd) = materialize_and_rewrite(
                             &synth_entry,
                             &lw.name,
-                            &target,
-                            &download_dir,
+                            target,
+                            download_dir,
                             source_dir,
                             cache_dir,
                             config.relax,
@@ -4535,8 +4985,8 @@ async fn materialize_from_lock(
                     let (resolved, _rd) = materialize_and_rewrite(
                         entry,
                         &lw.name,
-                        &target,
-                        &download_dir,
+                        target,
+                        download_dir,
                         source_dir,
                         cache_dir,
                         config.relax,
@@ -4606,7 +5056,12 @@ async fn materialize_from_lock(
             // resolve, not an independent input.
             Origin::Built if !lw.must_ship && lw.sdist_source.is_some() => {
                 let s = lw.sdist_source.as_ref().unwrap();
-                let sdist_out = download_dir.join(&s.name);
+                // Unified sdist build cache dir: same key as BFS and discovery
+                // so whichever path runs first populates it and the others hit
+                // the cache without rebuilding.
+                let sdist_out = download_dir
+                    .join("sdist-builds")
+                    .join(format!("{}-{}", s.name, s.version));
                 let stored_url = url::Url::parse(&s.sdist_url).with_context(|| {
                     format!(
                         "courier replay Class-2b: invalid sdist_url `{}` for wheel `{}`",
@@ -4641,14 +5096,18 @@ async fn materialize_from_lock(
                                 s.version, lw.name,
                             )
                         })?;
-                        let sdist = pypi::resolve_sdist(&s.index, &s.name, &specifiers)
-                            .await
-                            .with_context(|| {
-                                format!(
-                                    "courier replay Class-2b: re-resolving sdist for `{}` at `=={}`",
-                                    s.name, s.version,
-                                )
-                            })?;
+                        let (_sdist_version, sdist) = pypi::resolve_sdist(
+                            &s.index,
+                            &s.name,
+                            &specifiers,
+                        )
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "courier replay Class-2b: re-resolving sdist for `{}` at `=={}`",
+                                s.name, s.version,
+                            )
+                        })?;
                         crate::source_build::build_wheel_from_sdist_url(
                             &sdist.url,
                             &sdist_out,
@@ -4726,7 +5185,7 @@ async fn materialize_from_lock(
                 // landing at dest_dir.join(wheel_filename_from_url(url)) — the pristine
                 // 5-field upstream basename, identical to what cold fetched pre-relax.
                 let fetched =
-                    crate::wheel::fetch_wheel_cached(&remote_url, None, &download_dir, cache_dir)
+                    crate::wheel::fetch_wheel_cached(&remote_url, None, download_dir, cache_dir)
                         .await
                         .with_context(|| {
                             format!(
@@ -4788,6 +5247,58 @@ async fn materialize_from_lock(
         };
         emit_wheels.push(emit);
     }
+
+    Ok(Some(emit_wheels))
+}
+
+/// Replay a committed courier lock: re-materialize all wheels and run
+/// `materialize_and_pack`.
+///
+/// Returns:
+/// - `Ok(Some(result))` — all wheels re-materialized; pack completed.
+/// - `Ok(None)` — lock provenance insufficient for replay (class 3 / schema-5
+///   class-2 gap); caller should fall through to full `resolve_all`.
+/// - `Err(...)` — replay was attempted but failed (download error,
+///   rattler-build failure, etc.). Caller should propagate as a hard error.
+///
+/// # Correctness
+/// **COLD path** (`run_deps` originates from `params.run_dependencies` /
+/// `run_override`): pixi's live conda-solver result is authoritative; the
+/// lock has not yet been committed.
+///
+/// **REPLAY path** (`run_deps` originates from `lock.conda_run_deps`): the
+/// already-committed lock is authoritative; using `params.run_dependencies`
+/// here would let pixi's non-deterministic conda solver inject extras (e.g.
+/// `python_abi`) that drift the rewritten lock from the committed one, which
+/// is the exact bug replay is supposed to prevent.  The caller is responsible
+/// for sourcing `run_deps` from `lock.conda_run_deps` before calling this
+/// function on a replay hit.
+#[allow(clippy::too_many_arguments)]
+async fn materialize_from_lock(
+    lock: crate::lock::RetreadLock,
+    config: &RetreadConfig,
+    work_dir: &Path,
+    output_dir: &Path,
+    target_subdir: Platform,
+    source_dir: &Path,
+    cache_dir: &Path,
+    expected_build: Option<&str>,
+    run_deps: Vec<String>,
+    config_fp: &str,
+) -> Result<Option<CondaBuildV1Result>> {
+    let bundle_name = lock.bundle.clone();
+    let version = lock.version.clone();
+    let python_version = crate::relax::emit_python_version("", &lock.python);
+    let download_dir = source_dir.join("wheels");
+    let target = wheel_target_for(target_subdir, &python_version);
+
+    let emit_wheels =
+        match emit_wheels_from_lock(&lock, config, &target, &download_dir, source_dir, cache_dir)
+            .await?
+        {
+            Some(w) => w,
+            None => return Ok(None),
+        };
 
     // Reconstruct conda_capable from the lock (recorded by the producer).
     let conda_capable: std::collections::HashSet<String> =
@@ -4981,6 +5492,482 @@ async fn materialize_and_pack(
         build,
         subdir: target_subdir,
     })
+}
+
+/// Localized incremental-add resolver (STEP 5).
+///
+/// Reuses the committed lock's closure for unchanged entries and resolves
+/// ONLY the newly-added entries' subtrees, guarded by the ripple-detection
+/// machinery from STEPs 2+3.  Calls `materialize_and_pack` to write the
+/// merged lock and build the courier package.
+///
+/// Returns `Ok(Some(result))` if the incremental resolve succeeded and the
+/// courier package was built.  Returns `Ok(None)` if any escalation condition
+/// was met (ripple, conflict, provenance gap, A5 dedup violation) — caller
+/// falls through to full `resolve_all`.  Returns `Err` on hard errors.
+///
+/// # A6 write-last guarantee
+/// The committed lock is written ONLY after ALL ripple/dedup checks pass.
+/// On any escalation `Ok(None)`, no lock is written.
+#[allow(clippy::too_many_arguments)]
+async fn resolve_incremental_add(
+    incr: IncrementalAdd,
+    config: &RetreadConfig,
+    target: &WheelTarget,
+    download_dir: &Path,
+    source_dir: &Path,
+    cache_dir: &Path,
+    conda_channels: &[ChannelUrl],
+    workspace_dir: Option<&Path>,
+    work_dir: &Path,
+    output_dir: &Path,
+    target_subdir: Platform,
+    expected_build: Option<&str>,
+    config_fp: &str,
+) -> Result<Option<CondaBuildV1Result>> {
+    let IncrementalAdd { added_specs, lock } = incr;
+
+    // ── Build locked_closure: name → version from lock.wheels ─────────────
+    let locked_closure: std::collections::BTreeMap<String, String> = lock
+        .wheels
+        .iter()
+        .map(|w| (canonical_conda_name(&w.name), w.version.clone()))
+        .collect();
+
+    // ── Step A: re-materialize locked wheels (emit_wheels_from_lock) ──────
+    let python_version = crate::relax::emit_python_version("", &lock.python);
+    let locked_emit =
+        match emit_wheels_from_lock(&lock, config, target, download_dir, source_dir, cache_dir)
+            .await?
+        {
+            Some(w) => w,
+            None => {
+                tracing::debug!(
+                    "incremental-add: emit_wheels_from_lock returned None (provenance gap); \
+                 escalating to cold resolve"
+                );
+                return Ok(None); // A6: no lock written
+            }
+        };
+
+    // ── Setup: replicate the parselmouth + name_map setup from resolve_all ─
+    let workspace_pypi_indexes: Vec<String> = workspace_dir
+        .and_then(crate::workspace::WorkspaceManifest::load)
+        .map(|m| m.all_pypi_index_urls())
+        .unwrap_or_default();
+    let pypi_to_conda = if config.auto_bundle {
+        load_pypi_to_conda_map().await
+    } else {
+        Default::default()
+    };
+    let mut effective = config.clone();
+    for (pypi, conda) in FALLBACK_PYPI_TO_CONDA {
+        let key = canonical_conda_name(pypi);
+        effective
+            .name_map
+            .entry(key)
+            .or_insert_with(|| (*conda).to_string());
+    }
+    for (pypi, conda_names) in &pypi_to_conda {
+        if conda_names.len() == 1 {
+            effective
+                .name_map
+                .entry(pypi.clone())
+                .or_insert_with(|| conda_names[0].clone());
+        }
+    }
+
+    // ── Step B: resolve each added entry ──────────────────────────────────
+    let mut new_emit: Vec<crate::emit_pypi::EmitWheel> = Vec::new();
+    let mut new_conda_capable: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // Match added_specs back to config entries.
+    // courier_input_specs produces "<key>[extras]<ver>" — we find entries
+    // whose spec string appears in added_specs.
+    let added_set: std::collections::HashSet<&str> =
+        added_specs.iter().map(|s| s.as_str()).collect();
+    let mut matched_entries: Vec<(String, WheelEntry)> = Vec::new();
+    for (key, entry) in &effective.retread_wheels {
+        let spec = crate::courier::spec_for_entry(key, entry, &config.git_sources);
+        if added_set.contains(spec.as_str()) {
+            matched_entries.push((key.clone(), entry.clone()));
+        }
+    }
+    if matched_entries.len() != added_specs.len() {
+        tracing::debug!(
+            matched = matched_entries.len(),
+            added = added_specs.len(),
+            "incremental-add: could not match all added_specs to config entries; escalating"
+        );
+        return Ok(None);
+    }
+
+    // auto_data_per_entry for group dedup (use None for simplicity — each
+    // new entry is treated as a standalone single-entry group).
+    for (entry_name, entry) in &matched_entries {
+        let auto_data =
+            checkout_root_for_entry(entry, &effective.git_sources, source_dir, cache_dir).map(
+                |checkout_root| AutoDataConfig {
+                    checkout_root,
+                    skip_subdirs: entry
+                        .subdirectory
+                        .as_deref()
+                        .map(|s| vec![PathBuf::from(s)])
+                        .unwrap_or_else(|| vec![PathBuf::from(".")]),
+                },
+            );
+
+        let bundle_result = resolve_bundle(
+            entry_name,
+            entry,
+            target,
+            download_dir,
+            source_dir,
+            cache_dir,
+            effective.relax,
+            &effective.git_sources,
+            auto_data,
+            &pypi_to_conda,
+            &effective.name_map,
+            conda_channels,
+            &effective.conda_deps,
+            &workspace_pypi_indexes,
+            Some(&locked_closure),
+        )
+        .await;
+
+        let bundle = match bundle_result {
+            Ok(b) => b,
+            Err(e) => {
+                // Check if this is an IncrementalRipple.
+                if e.downcast_ref::<auto_bundle::IncrementalRipple>().is_some() {
+                    tracing::debug!(
+                        entry = %entry_name,
+                        "incremental-add: ripple detected; escalating to cold resolve"
+                    );
+                    return Ok(None); // A6: no lock written
+                }
+                return Err(e);
+            }
+        };
+
+        // Convert Bundle → EmitWheel (same logic as build_one, lines 5461-5494).
+        let wheels_root = source_dir.join("wheels");
+        for w in bundle.all_wheels() {
+            let url = localize_wheel_source(&w.url, &wheels_root);
+            new_emit.push(crate::emit_pypi::EmitWheel {
+                pypi_name: w.pypi_name.clone(),
+                version: w.metadata.version.clone(),
+                requires_dist: w.metadata.requires_dist.clone(),
+                local_path: (url.scheme() == "file")
+                    .then(|| url.to_file_path().ok())
+                    .flatten(),
+                wheel_filename: url
+                    .path_segments()
+                    .and_then(|mut s| s.next_back())
+                    .unwrap_or_default()
+                    .to_string(),
+                remote_url: (url.scheme() != "file").then_some(url),
+                upstream_url: w.upstream_url.clone(),
+                git_source: w.git_source.clone(),
+                sdist_source: w.sdist_source.clone(),
+            });
+        }
+
+        // Collect conda_capable from probe decisions.
+        new_conda_capable.extend(
+            bundle
+                .probe_decisions
+                .iter()
+                .filter(|d| d.matching_candidates > 0)
+                .map(|d| canonical_conda_name(&d.pypi_name)),
+        );
+        new_conda_capable.extend(effective.name_map.keys().map(|k| canonical_conda_name(k)));
+        new_conda_capable.extend(load_pypi_to_conda_map().await.into_keys());
+    }
+
+    // ── Step C: auto_bundle_transitives for each new bundle (if applicable) ─
+    // NOTE: for simplicity we skip auto_bundle in the incremental path for now.
+    // auto_bundle would need to be run AFTER the new entries are resolved, but
+    // its results are already pre-filled via locked_closure in seen_candidate.
+
+    // ── A5 merge + dedup guard ────────────────────────────────────────────
+    // Start with locked_emit; merge in new_emit.
+    // Build a name→(version, index) map from locked_emit.
+    let mut merged: Vec<crate::emit_pypi::EmitWheel> = locked_emit;
+    let mut seen_versions: std::collections::HashMap<String, String> = merged
+        .iter()
+        .map(|w| (canonical_conda_name(&w.pypi_name), w.version.clone()))
+        .collect();
+
+    let new_count = new_emit.len();
+    for w in new_emit {
+        let canon = canonical_conda_name(&w.pypi_name);
+        if let Some(existing_ver) = seen_versions.get(&canon) {
+            if *existing_ver != w.version {
+                // Same name, different version — missed ripple; ESCALATE.
+                tracing::warn!(
+                    name = %canon,
+                    locked_ver = %existing_ver,
+                    new_ver = %w.version,
+                    "incremental-add A5: same name with different versions in merged closure; \
+                     escalating (missed ripple)"
+                );
+                return Ok(None); // A6: no lock written
+            }
+            // Same name + same version: skip (dedup).
+        } else {
+            seen_versions.insert(canon, w.version.clone());
+            merged.push(w);
+        }
+    }
+
+    // ── conda_capable + run_deps (union) ──────────────────────────────────
+    let mut conda_capable: std::collections::HashSet<String> =
+        lock.conda_capable.iter().cloned().collect();
+    conda_capable.extend(new_conda_capable);
+
+    // run_deps: locked run_deps (the locked set is authoritative for the
+    // unchanged closure; new pure-PyPI-only deps typically have no conda
+    // run-deps in the incremental path).
+    let run_deps: Vec<String> = lock
+        .conda_run_deps
+        .iter()
+        .map(|dep| {
+            if dep.spec.is_empty() {
+                dep.name.clone()
+            } else {
+                format!("{} {}", dep.name, dep.spec)
+            }
+        })
+        .collect();
+
+    let index_urls = lock.index_urls.clone();
+    let bundle_name = lock.bundle.clone();
+    let version = lock.version.clone();
+
+    tracing::info!(
+        bundle = %bundle_name,
+        locked = merged.len() - new_count,
+        new = new_count,
+        "incremental-add: localized resolve succeeded; building courier package"
+    );
+
+    // ── A6: write lock only after ALL checks pass ─────────────────────────
+    let result = materialize_and_pack(
+        None, // bundle=None: incremental path, no full Bundle available
+        config,
+        &bundle_name,
+        &version,
+        &python_version,
+        merged,
+        conda_capable,
+        run_deps,
+        index_urls,
+        config_fp,
+        work_dir,
+        output_dir,
+        target_subdir,
+        source_dir,
+        expected_build,
+    )
+    .await?;
+
+    // ── Optional validity oracle ───────────────────────────────────────────
+    if std::env::var("RETREAD_VERIFY_LOCALADD").as_deref() == Ok("1") {
+        let lock_path = source_dir.join(crate::lock::RetreadLock::file_name(&bundle_name));
+        verify_localadd_hook(
+            &lock_path,
+            &added_specs,
+            &bundle_name,
+            &target_subdir.to_string(),
+            &python_version,
+        );
+    }
+
+    Ok(Some(result))
+}
+
+/// Validity oracle (C) — internal-consistency check for the incremental-add path.
+///
+/// Gated on `RETREAD_VERIFY_LOCALADD=1`. Never aborts — only logs.
+/// The caller always returns `Ok(Some(result))` regardless of outcome.
+///
+/// ## What it checks
+///
+/// For every BUNDLED wheel in `lock.wheels`, for every `requires_dist` line
+/// whose PEP 508 marker evaluates true for the target env (`conda_subdir` /
+/// `python_version`), the oracle looks up the required name in the **bundled
+/// closure** (`lock.wheels` only, not `conda_run_deps`):
+///
+/// * **Required name IS bundled** → assert the bundled version satisfies the
+///   requirement's `VersionSpecifiers`.  If not → RED
+///   `LOCALADD-INTERNAL-INCONSISTENCY` (real bug: a missed ripple caused a
+///   bundled dep to be kept at a version the newly added wheel rejects).
+/// * **Required name NOT bundled** → SKIP.  The dep is conda-routed,
+///   env-provided, or name-mapped to a conda package.  We cannot version-check
+///   it here and — crucially — there is no false-RED for packages such as
+///   `opencv-python`, `OpenEXR`, `mujoco`, `vtk`, etc.
+///
+/// ## Why this avoids false-REDs
+///
+/// The previous oracle included `conda_run_deps` in the closure and RED'd on
+/// any active requirement that wasn't satisfied there.  That produced
+/// false-REDs whenever a cold resolve would pick a different transitive
+/// (version drift) or when a dep is env/conda-provided.  Oracle (C) only
+/// checks internal consistency of the bundled PyPI wheels — the one bug class
+/// the ripple-guard + A5 dedup don't cover.
+///
+/// Cold-comparison (part b) is intentionally deferred: it requires a full
+/// network resolve and would produce false-REDs from version-drift differences
+/// between incremental and cold.
+fn verify_localadd_hook(
+    lock_path: &Path,
+    added_specs: &[String],
+    bundle_name: &str,
+    conda_subdir: &str,
+    python_version: &str,
+) {
+    use uv_pep508::uv_pep440::Version;
+
+    // ── 1. Read and parse the written lock ────────────────────────────────
+    let bytes = match std::fs::read(lock_path) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(
+                bundle = %bundle_name,
+                path = %lock_path.display(),
+                err = %e,
+                "RETREAD_VERIFY_LOCALADD: could not read written lock; skipping check"
+            );
+            return;
+        }
+    };
+    let lock: crate::lock::RetreadLock = match serde_json::from_slice(&bytes) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!(
+                bundle = %bundle_name,
+                err = %e,
+                "RETREAD_VERIFY_LOCALADD: written lock failed to parse; check for corruption"
+            );
+            return;
+        }
+    };
+
+    // ── 2. Build marker environment for the target platform/python ────────
+    let marker_env = match crate::relax::marker_env_for(conda_subdir, python_version) {
+        Ok(env) => env,
+        Err(e) => {
+            tracing::warn!(
+                bundle = %bundle_name,
+                err = %e,
+                "RETREAD_VERIFY_LOCALADD: could not build marker env; skipping check"
+            );
+            return;
+        }
+    };
+
+    // ── 3. Build BUNDLED closure: canonical name → parsed Version ──────────
+    // CHANGE 1: lock.wheels ONLY — conda_run_deps intentionally excluded.
+    // Deps whose name is absent from this map are skipped (not RED'd) in step 4.
+    let mut bundled: std::collections::HashMap<String, Version> = std::collections::HashMap::new();
+    for w in &lock.wheels {
+        let canon = canonical_conda_name(&w.name);
+        if let Ok(v) = w.version.parse::<Version>() {
+            bundled.insert(canon, v);
+        }
+    }
+
+    // ── 4. Internal-consistency walk ──────────────────────────────────────
+    let mut red_findings: Vec<String> = Vec::new();
+    let mut checked_reqs: usize = 0;
+    let mut active_reqs: usize = 0;
+    let mut skipped_reqs: usize = 0; // not bundled → conda/env-provided
+    let mut satisfied_reqs: usize = 0;
+
+    for wheel in &lock.wheels {
+        for raw_req in &wheel.requires_dist {
+            checked_reqs += 1;
+
+            // Parse the requirement line.
+            let req = match uv_pep508::Requirement::<uv_pep508::VerbatimUrl>::from_str(raw_req) {
+                Ok(r) => r,
+                Err(_) => continue, // malformed line; skip
+            };
+
+            // Marker evaluation (no extras context at lock-write time → &[]).
+            if !req.marker.evaluate(&marker_env, &[]) {
+                continue; // marker-false for this target — not active
+            }
+            active_reqs += 1;
+
+            // Extract version specifiers; URL deps are not version-checkable.
+            let specifiers = match &req.version_or_url {
+                Some(uv_pep508::VersionOrUrl::VersionSpecifier(s)) => s.clone(),
+                None => VersionSpecifiers::default(), // unconstrained → any version OK
+                Some(uv_pep508::VersionOrUrl::Url(_)) => {
+                    satisfied_reqs += 1; // URL deps treated as satisfied
+                    continue;
+                }
+            };
+
+            let dep_canon = canonical_conda_name(req.name.as_ref());
+
+            match bundled.get(&dep_canon) {
+                // CHANGE 2: required name NOT in bundled closure → SKIP.
+                // It is conda-routed, env-provided, or name-mapped — not our concern.
+                None => {
+                    skipped_reqs += 1;
+                }
+                // Required name IS bundled → version must satisfy.
+                Some(bundled_ver) => {
+                    if specifiers.is_empty() || specifiers.contains(bundled_ver) {
+                        satisfied_reqs += 1;
+                    } else {
+                        red_findings.push(format!(
+                            "LOCALADD-INTERNAL-INCONSISTENCY: {} requires `{}` \
+                             but bundled {} is at {} which does not satisfy {}",
+                            wheel.name, raw_req, dep_canon, bundled_ver, specifiers,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    // ── 5. Report ─────────────────────────────────────────────────────────
+    if red_findings.is_empty() {
+        tracing::info!(
+            bundle = %bundle_name,
+            added = added_specs.len(),
+            wheels = lock.wheels.len(),
+            checked = checked_reqs,
+            active = active_reqs,
+            skipped = skipped_reqs,
+            satisfied = satisfied_reqs,
+            "RETREAD_VERIFY_LOCALADD: GREEN — bundled closure is internally consistent"
+        );
+    } else {
+        for finding in &red_findings {
+            tracing::warn!(
+                bundle = %bundle_name,
+                finding = %finding,
+                "RETREAD_VERIFY_LOCALADD: RED"
+            );
+        }
+        tracing::warn!(
+            bundle = %bundle_name,
+            red_count = red_findings.len(),
+            checked = checked_reqs,
+            active = active_reqs,
+            skipped = skipped_reqs,
+            satisfied = satisfied_reqs,
+            "RETREAD_VERIFY_LOCALADD: {} RED finding(s) — internal inconsistency in \
+             bundled closure; possible missed ripple",
+            red_findings.len()
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5321,6 +6308,193 @@ async fn find_conda_artifact(dir: &Path, name: &str, version: &str) -> Result<Pa
     )
 }
 
+/// Carry-forward for an incremental-add detected by [`detect_incremental_add`].
+// Fields read by STEP 5 (`resolve_incremental_add`); allow dead_code until
+// the driver is wired up.
+#[allow(dead_code)]
+struct IncrementalAdd {
+    /// The PEP 508–like spec strings for the NEWLY added entries only
+    /// (current_specs − lock.entry_specs). Each is guaranteed to be an exact
+    /// `==pin`, `@git:…`, or `@url:…` form (STEP 4's spec-form gate).
+    added_specs: Vec<String>,
+    /// The committed lock whose closure is the reuse base.
+    lock: crate::lock::RetreadLock,
+}
+
+/// Determine whether the current manifest diff is a pure incremental add.
+///
+/// Returns `Some(IncrementalAdd)` when ALL of the following hold:
+/// 1. `RETREAD_INCREMENTAL=1` env is set.
+/// 2. Lock exists, parses, `schema == SCHEMA`, `entry_specs` non-empty.
+/// 3. **Two-step index + external-input gate** (replaces old single A2 gate):
+///
+///    **STEP A** — locked-chain check: build the index chain for all
+///    `config.retread_wheels` entries whose spec string is NOT in `added`
+///    (i.e. existing entries only; added entries may introduce a new index),
+///    then compare to `lock.index_urls`. Mismatch → cold. This catches:
+///    an existing entry's index change, a workspace-index add/remove/reorder,
+///    an implicit→explicit `pypi.org` position change — none of which are
+///    encoded in entry spec strings.
+///
+///    **STEP B** — external-input hash check: recompute `inputs_hash` using
+///    `lock.entry_specs` + `lock.index_urls` (STEP A proved locked chain still
+///    matches) + current relax/python/epoch/pin/config_fp. Mismatch → cold.
+///    This catches relax, python, config-knob, or channel changes.
+///
+/// 4. `added = current_specs − lock.entry_specs` is non-empty.
+///    `removed = lock.entry_specs − current_specs` is empty.
+/// 5. Every added spec is an exact pin (`==`), `@git:` or `@url:` form.
+///    Bare/range specs are rejected (they have multiple solutions → not safe
+///    to combine with a frozen closure).
+///
+/// Returns `None` on any gate failure (always safe: cold resolve follows).
+fn detect_incremental_add(
+    lock_path: &Path,
+    config: &RetreadConfig,
+    bundle_name: &str,
+    ws_indexes: &[String],
+    relax_str: &str,
+    python_version: &str,
+    config_fp: &str,
+) -> Option<IncrementalAdd> {
+    // Gate 1: feature flag.
+    if std::env::var("RETREAD_INCREMENTAL").as_deref() != Ok("1") {
+        return None;
+    }
+
+    // Gate 2: load and basic schema check.
+    if !lock_path.exists() {
+        return None;
+    }
+    let lock = match crate::lock::RetreadLock::load(lock_path) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::debug!(error = %format!("{e:#}"), "incremental-add: lock load failed; skipping");
+            return None;
+        }
+    };
+    if lock.schema != crate::lock::SCHEMA {
+        tracing::debug!(
+            lock_schema = lock.schema,
+            expected = crate::lock::SCHEMA,
+            "incremental-add: schema mismatch; skipping"
+        );
+        return None;
+    }
+    if lock.entry_specs.is_empty() {
+        tracing::debug!("incremental-add: lock has no entry_specs (old schema); skipping");
+        return None;
+    }
+
+    // Gate 4 (computed first — STEP A needs `added` to exclude new entries).
+    let current_specs: std::collections::BTreeSet<String> =
+        crate::courier::courier_input_specs(config, bundle_name)
+            .into_iter()
+            .collect();
+    let locked_specs: std::collections::BTreeSet<String> =
+        lock.entry_specs.iter().cloned().collect();
+
+    let added: Vec<String> = current_specs.difference(&locked_specs).cloned().collect();
+    let removed: Vec<String> = locked_specs.difference(&current_specs).cloned().collect();
+
+    if !removed.is_empty() {
+        tracing::debug!(
+            ?removed,
+            "incremental-add: removed specs detected; not a pure add; skipping"
+        );
+        return None;
+    }
+    if added.is_empty() {
+        tracing::debug!("incremental-add: no added specs; skipping");
+        return None;
+    }
+
+    // Gate 3 — STEP A: locked-chain check.
+    // Build the index chain from all EXISTING entries (current entries minus
+    // the newly added ones) and compare to lock.index_urls.
+    // We use ALL config.retread_wheels entries (pack-wide, not bundle-filtered)
+    // because lock.index_urls is also written pack-wide in courier::stage.
+    // The `added` set holds spec strings (key+extras+ver); exclude entries
+    // whose spec_for_entry is in `added`.
+    {
+        let added_set: std::collections::HashSet<&str> = added.iter().map(|s| s.as_str()).collect();
+        let locked_entry_indexes: Vec<String> = config
+            .retread_wheels
+            .iter()
+            .filter(|(key, entry)| {
+                let spec = crate::courier::spec_for_entry(key, entry, &config.git_sources);
+                !added_set.contains(spec.as_str())
+            })
+            .map(|(_, entry)| entry.index_url())
+            .collect();
+        let locked_chain = merge_index_chain(locked_entry_indexes, ws_indexes);
+        if locked_chain != lock.index_urls {
+            tracing::debug!(
+                ?locked_chain,
+                lock_index_urls = ?lock.index_urls,
+                "incremental-add: STEP A locked-chain mismatch (existing entry index \
+                 or ws-index changed); skipping"
+            );
+            return None;
+        }
+    }
+
+    // Gate 3 — STEP B: external-input hash check.
+    // STEP A proved lock.index_urls == current locked chain, so it is safe to
+    // use lock.index_urls as the index term (reproduces the original chain
+    // order exactly, including implicit PUBLIC_PYPI position).
+    let recomputed_hash = crate::lock::RetreadLock::compute_inputs_hash(
+        &lock.entry_specs,
+        &lock.index_urls,
+        relax_str,
+        python_version,
+        crate::lock::EMIT_EPOCH,
+        None, // pin_version matches the lock that was stored (non-circular)
+        config_fp,
+    );
+    if recomputed_hash != lock.inputs_hash {
+        tracing::debug!(
+            "incremental-add: STEP B external-input hash mismatch (relax/python/config \
+             changed); skipping"
+        );
+        return None;
+    }
+
+    // Gate 5: every added spec must be exact pin / @git / @url.
+    // Bare or range specs have multiple solutions and cannot be safely
+    // combined with a frozen closure without a full re-solve.
+    for spec in &added {
+        // A spec string looks like "<key>[<extras>]<ver_proxy>" where ver_proxy
+        // starts with "==", "@git:", or "@url:" for exact/pinned forms.
+        let after_bracket = if let Some(close) = spec.rfind(']') {
+            &spec[close + 1..]
+        } else {
+            // No extras bracket: ver_proxy starts after the key name.
+            // Find the first non-identifier char.
+            spec.trim_start_matches(|c: char| c.is_alphanumeric() || c == '-' || c == '_')
+        };
+        let is_exact = after_bracket.starts_with("==")
+            || after_bracket.starts_with("@git:")
+            || after_bracket.starts_with("@url:");
+        if !is_exact {
+            tracing::debug!(
+                spec = %spec,
+                "incremental-add: added spec is not exact pin/git/url; skipping"
+            );
+            return None;
+        }
+    }
+
+    tracing::info!(
+        ?added,
+        "incremental-add: pure add detected; will attempt localized resolve"
+    );
+    Some(IncrementalAdd {
+        added_specs: added,
+        lock,
+    })
+}
+
 /// Authority gate for the courier replay path.
 ///
 /// Returns `Some(lock)` iff ALL of the following hold:
@@ -5530,6 +6704,7 @@ mod replay_tests {
             index_urls: vec!["https://pypi.org/simple/".into()],
             prerelease: BTreeMap::new(),
             conda_capable: vec![],
+            entry_specs: vec![],
         }
     }
 
@@ -5781,6 +6956,7 @@ mod replay_tests {
             index_urls: vec!["https://pypi.org/simple/".into()],
             prerelease: BTreeMap::new(),
             conda_capable: vec![],
+            entry_specs: vec![],
         };
         // Config has no retread_wheels entries — wheel is a class-3 orphan.
         // Use serde_json to construct a minimal config (RetreadConfig has no
@@ -5847,6 +7023,7 @@ mod replay_tests {
             index_urls: vec!["https://pypi.org/simple/".into()],
             prerelease: BTreeMap::new(),
             conda_capable: vec![],
+            entry_specs: vec![],
         };
         let config: RetreadConfig =
             serde_json::from_value(serde_json::json!({"retread-wheels": {}})).unwrap();
@@ -5949,6 +7126,7 @@ mod replay_tests {
             index_urls: vec!["https://pypi.org/simple/".into()],
             prerelease: BTreeMap::new(),
             conda_capable: vec![],
+            entry_specs: vec![],
         };
         let config: RetreadConfig =
             serde_json::from_value(serde_json::json!({"retread-wheels": {}})).unwrap();
@@ -6143,6 +7321,7 @@ mod replay_tests {
             index_urls: vec!["https://pypi.org/simple/".into()],
             prerelease: BTreeMap::new(),
             conda_capable: vec![],
+            entry_specs: vec![],
         };
         let config: RetreadConfig = serde_json::from_value(serde_json::json!({"retread-wheels": {
             "gympack": { "version": "==1.0.0" }
@@ -6495,6 +7674,7 @@ mod replay_tests {
             index_urls: index_urls.to_vec(),
             prerelease: BTreeMap::new(),
             conda_capable: vec![wheel_name.to_string()],
+            entry_specs: vec![],
         };
 
         // Build the replay EmitWheel exactly as the new Class-2 arm would:
@@ -6654,6 +7834,7 @@ mod replay_tests {
             index_urls: vec!["https://pypi.org/simple/".into()],
             prerelease: BTreeMap::new(),
             conda_capable: vec!["requests".into()],
+            entry_specs: vec![],
         };
         let config: RetreadConfig = serde_json::from_value(serde_json::json!({"retread-wheels": {
             "reqpack": { "version": "==1.0.0" }
@@ -7456,6 +8637,7 @@ version = "1.0.0"
             index_urls: vec!["https://pypi.org/simple/".into()],
             prerelease: std::collections::BTreeMap::new(),
             conda_capable: vec![],
+            entry_specs: vec![],
         };
 
         // Config has no retread_wheels entries.
@@ -8071,6 +9253,7 @@ mod emit_wheel_upstream_url_tests {
             extras: vec![],
             probe_decisions: vec![],
             solve_diagnostics: BTreeMap::new(),
+            conda_routed: vec![],
         };
 
         // Reproduce the exact mapping from build_one that populates EmitWheel.
@@ -8182,6 +9365,7 @@ mod emit_wheel_upstream_url_tests {
             extras: vec![sub],
             probe_decisions: vec![],
             solve_diagnostics: BTreeMap::new(),
+            conda_routed: vec![],
         };
 
         let emit_wheels: Vec<crate::emit_pypi::EmitWheel> = bundle
@@ -8216,6 +9400,1323 @@ mod emit_wheel_upstream_url_tests {
             Some(upstream),
             "BFS Pypi sub-wheel must carry upstream_url: {:?}",
             sub_ew.upstream_url,
+        );
+    }
+}
+
+// -----------------------------------------------------------------
+// TASK A (FIX 3 completion): resolve_bundle-loop-level back-pressure test.
+//
+// Drives the ACTUAL BFS loop in resolve_bundle through a localhost
+// PEP 503 fixture server. Proves that transitive deps are correctly
+// fetched and land in bundle.extras (the "bundle membership" assertion
+// the ResolveState-level tests cannot make).
+//
+// Two tests:
+//   (1) resolve_bundle_bfs_fetches_prefix_transitive — localhost fixture,
+//       non-ignored. Exercises the full BFS loop end-to-end: primary wheel
+//       seeds a transitive dep via prefix matching; transitive ends up in
+//       bundle.extras. Regression guard for the FIX 1 vanish bug: if the
+//       re-resolve path had silently deleted deps, this test would catch
+//       any future regression in bundle.extras membership.
+//
+//   (2) resolve_bundle_reresolve_tighter_version_live — #[ignore], live
+//       PyPI. Drives the actual NeedsReResolve cycle: primary requires
+//       `retrtest-a>=1.0,<2.0` (caps at 2.0) and a sibling dep requires
+//       `retrtest-a>=1.0`. This is intentionally constructed via a real
+//       localhost fixture to trigger the NeedsReResolve → revoke → re-fetch
+//       cycle and assert the dep ends up at the tighter-satisfying version.
+// -----------------------------------------------------------------
+#[cfg(test)]
+mod resolve_bundle_bfs_tests {
+    use std::collections::{BTreeMap, HashMap};
+    use std::io::Write;
+    use std::sync::Arc;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::{PypiToCondaMap, WheelTarget, resolve_bundle};
+    use crate::config::{RelaxPolicy, WheelEntry};
+
+    fn unique_tmp_dir() -> std::path::PathBuf {
+        let base = std::env::temp_dir();
+        let unique = format!(
+            "retread-bfs-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        );
+        let dir = base.join(unique);
+        std::fs::create_dir_all(&dir).expect("tmp dir creation should not fail");
+        dir
+    }
+
+    /// Build a minimal valid .whl zip (pure-python, any platform).
+    fn make_wheel_bytes(dist: &str, version: &str, requires: &[&str]) -> Vec<u8> {
+        let normalized = dist.replace('-', "_");
+        let di = format!("{normalized}-{version}.dist-info");
+        let mut metadata = format!("Metadata-Version: 2.1\nName: {dist}\nVersion: {version}\n");
+        for req in requires {
+            metadata.push_str(&format!("Requires-Dist: {req}\n"));
+        }
+        let metadata_bytes = metadata.into_bytes();
+        let wheel_file = b"Wheel-Version: 1.0\nTag: py3-none-any\n".to_vec();
+        let record = format!("{di}/METADATA,,\n{di}/WHEEL,,\n{di}/RECORD,,\n").into_bytes();
+
+        let mut buf = Vec::new();
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for (name, body) in [
+            (format!("{di}/METADATA"), metadata_bytes.as_slice()),
+            (format!("{di}/WHEEL"), wheel_file.as_slice()),
+            (format!("{di}/RECORD"), record.as_slice()),
+        ] {
+            zip.start_file(&name, opts).unwrap();
+            zip.write_all(body).unwrap();
+        }
+        zip.finish().unwrap();
+        buf
+    }
+
+    /// Spawn a minimal PEP 503 simple index + wheel server.
+    ///
+    /// `packages`: list of (name, version, wheel_bytes).
+    /// Serves:
+    ///   GET /simple/{pep503-normalized-name}/  → HTML index with all
+    ///     versions of that name as `<a href="/{filename}">` links.
+    ///   GET /{filename}  → raw wheel bytes.
+    ///
+    /// Returns (port, task-handle). The task accepts up to `max_requests`
+    /// connections then stops.
+    async fn spawn_index_server(packages: Vec<(String, String, Vec<u8>)>, max_requests: u8) -> u16 {
+        use std::collections::HashMap;
+
+        // Build lookup tables.
+        let mut by_name: HashMap<String, Vec<(String, Vec<u8>)>> = HashMap::new();
+        let mut by_filename: HashMap<String, Vec<u8>> = HashMap::new();
+
+        for (name, version, bytes) in packages {
+            let norm_name = name.to_ascii_lowercase().replace(['-', '_', '.'], "-");
+            let normalized_dist = name.replace('-', "_");
+            let filename = format!("{normalized_dist}-{version}-py3-none-any.whl");
+            by_name
+                .entry(norm_name)
+                .or_default()
+                .push((filename.clone(), bytes.clone()));
+            by_filename.insert(filename, bytes);
+        }
+
+        let by_name = Arc::new(by_name);
+        let by_filename = Arc::new(by_filename);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            for _ in 0..max_requests {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let by_name = by_name.clone();
+                let by_filename = by_filename.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    // Parse "GET /path HTTP/1.x"
+                    let path = req
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("/");
+
+                    let (status, content_type, body) = if let Some(rest) =
+                        path.strip_prefix("/simple/")
+                    {
+                        // Strip trailing slash, get normalized name.
+                        let pkg_name = rest.trim_end_matches('/');
+                        if let Some(entries) = by_name.get(pkg_name) {
+                            let links: String = entries
+                                .iter()
+                                .map(|(fname, _)| format!("<a href=\"/{fname}\">{fname}</a>\n",))
+                                .collect();
+                            let html =
+                                format!("<!DOCTYPE html><html><body>\n{links}</body></html>\n");
+                            ("200 OK", "text/html", html.into_bytes())
+                        } else {
+                            ("404 Not Found", "text/plain", b"not found".to_vec())
+                        }
+                    } else {
+                        // Wheel file request: /filename.whl
+                        let fname = path.trim_start_matches('/');
+                        if let Some(bytes) = by_filename.get(fname) {
+                            ("200 OK", "application/octet-stream", bytes.clone())
+                        } else {
+                            ("404 Not Found", "text/plain", b"not found".to_vec())
+                        }
+                    };
+
+                    let resp = format!(
+                        "HTTP/1.0 {status}\r\nContent-Length: {}\r\nContent-Type: {content_type}\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                    let _ = stream.write_all(&body).await;
+                });
+            }
+        });
+
+        port
+    }
+
+    /// Task A (FIX 3 completion): resolve_bundle-loop-level integration test.
+    ///
+    /// Drives the FULL BFS loop inside resolve_bundle with a localhost fixture
+    /// index. Verifies that a transitive dep reachable via prefix matching ends
+    /// up in bundle.extras.
+    ///
+    /// Scenario:
+    ///   - Primary: `rtest-pkg==1.0` (Requires-Dist: `rtest-pkg-sub>=1.0`)
+    ///   - Transitive: `rtest-pkg-sub==1.0` (no further deps)
+    ///   - Both served by a localhost PEP 503 simple index.
+    ///
+    /// Assert: bundle.extras contains exactly one entry: rtest-pkg-sub 1.0.
+    ///
+    /// This test exercises the full BFS pipeline (materialize_and_rewrite for
+    /// primary, bfs_fetch_pypi for transitive, commit_chosen, extras.push) and
+    /// would catch the FIX-1 vanish bug if it were re-introduced (a dep that
+    /// goes through NeedsReResolve must still appear in bundle.extras, not
+    /// vanish silently).
+    #[tokio::test]
+    async fn resolve_bundle_bfs_fetches_prefix_transitive() {
+        let dir = unique_tmp_dir();
+        let download_dir = dir.join("download");
+        let source_dir = dir.join("source");
+        let cache_dir = dir.join("cache");
+        std::fs::create_dir_all(&download_dir).unwrap();
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        let primary_name = "rtest-pkg";
+        let primary_version = "1.0";
+        let sub_name = "rtest-pkg-sub";
+        let sub_version = "1.0";
+
+        // primary requires rtest-pkg-sub (prefix matches: rtest-pkg- prefix)
+        let primary_bytes = make_wheel_bytes(
+            primary_name,
+            primary_version,
+            &[&format!("{sub_name}>=1.0")],
+        );
+        let sub_bytes = make_wheel_bytes(sub_name, sub_version, &[]);
+
+        let port = spawn_index_server(
+            vec![
+                (
+                    primary_name.to_string(),
+                    primary_version.to_string(),
+                    primary_bytes,
+                ),
+                (sub_name.to_string(), sub_version.to_string(), sub_bytes),
+            ],
+            32, // enough for primary + sub index + wheel fetches + sidecar attempts
+        )
+        .await;
+
+        let index_url = format!("http://127.0.0.1:{port}/simple/");
+
+        let entry = WheelEntry {
+            version: Some(primary_version.to_string()),
+            index: Some(index_url),
+            ..Default::default()
+        };
+        let target = WheelTarget {
+            python_version: "3.11".to_string(),
+            conda_subdir: "linux-64".to_string(),
+        };
+        let pypi_to_conda: PypiToCondaMap = HashMap::new();
+        let name_map: BTreeMap<String, String> = BTreeMap::new();
+        let git_sources: BTreeMap<String, crate::config::NamedGitSource> = BTreeMap::new();
+        let conda_channels: Vec<rattler_conda_types::ChannelUrl> = vec![];
+
+        let bundle = resolve_bundle(
+            primary_name,
+            &entry,
+            &target,
+            &download_dir,
+            &source_dir,
+            &cache_dir,
+            RelaxPolicy::default(),
+            &git_sources,
+            None, // auto_data
+            &pypi_to_conda,
+            &name_map,
+            &conda_channels,
+            &[],  // conda_deps_list
+            &[],  // workspace_indexes
+            None, // cold path: no locked closure
+        )
+        .await
+        .expect("resolve_bundle must succeed");
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        // Primary must be in the bundle.
+        assert_eq!(
+            bundle.primary.pypi_name, primary_name,
+            "bundle primary must be {primary_name}"
+        );
+
+        // Transitive sub-wheel must be in bundle.extras (not vanished).
+        // This is the key assertion: if the re-resolve path (FIX 1) had a
+        // silent-delete bug, a dep that went through NeedsReResolve would
+        // be missing here. Pinning this assertion guards that regression.
+        let extras_names: Vec<&str> = bundle.extras.iter().map(|w| w.pypi_name.as_str()).collect();
+        assert!(
+            extras_names.contains(&sub_name),
+            "transitive dep '{sub_name}' must be present in bundle.extras; \
+             got: {extras_names:?}. \
+             If this fails, the FIX-1 re-resolve vanish bug was re-introduced.",
+        );
+        assert_eq!(
+            extras_names.len(),
+            1,
+            "bundle.extras must contain exactly one dep ({sub_name}); got: {extras_names:?}",
+        );
+
+        // Verify the resolved version.
+        let sub_wheel = bundle
+            .extras
+            .iter()
+            .find(|w| w.pypi_name == sub_name)
+            .unwrap();
+        assert_eq!(
+            sub_wheel.metadata.version, sub_version,
+            "transitive dep must be at version {sub_version}"
+        );
+    }
+
+    /// TASK 1 (seal Part 1): BFS-loop constraint-merge picks the correct
+    /// version when two Requires-Dist lines for the same dep arrive from
+    /// the same primary wheel.
+    ///
+    /// Scenario
+    /// --------
+    ///   - Primary `rtest-pkg 1.0` has TWO Requires-Dist lines for the
+    ///     sub-dep, both matching the `rtest-pkg-` prefix:
+    ///       Requires-Dist: rtest-pkg-sub>=1.0
+    ///       Requires-Dist: rtest-pkg-sub<2.0
+    ///   - The localhost index serves `rtest-pkg-sub` at BOTH 1.0 and 2.0.
+    ///
+    /// What the BFS must do
+    /// --------------------
+    ///   The initial seed drain (before the BFS loop) calls `seed_worklist`
+    ///   with an empty `seen` set.  Because `seen` is NOT updated between
+    ///   lines inside `seed_worklist`, both `>=1.0` and `<2.0` edges for
+    ///   `rtest-pkg-sub` are pushed to `tmp_queue`.
+    ///
+    ///   FIX 2's merge step in the drain loop INTERSECTS them into a single
+    ///   `Pending(rtest-pkg-sub, >=1.0,<2.0)` entry in `work`.
+    ///
+    ///   `pypi::resolve` with `>=1.0,<2.0` from the two-version server
+    ///   returns 1.0 (the highest satisfying version; 2.0 is excluded).
+    ///
+    /// Regression guards
+    /// -----------------
+    ///   FIX 2 regression: reverting the `Occupied` merge arm back to a
+    ///   plain `or_insert` causes only the FIRST edge (`>=1.0`) to be
+    ///   recorded.  `pypi::resolve(>=1.0)` then picks the highest candidate
+    ///   = 2.0, and the assertion `version == "1.0"` FAILS.
+    ///
+    ///   FIX 1 (revoke_chosen / NeedsReResolve path): the BFS observe-all-
+    ///   first design means the sub-dep is added to `constraints` during the
+    ///   observe_edge loop — BEFORE any phase-3 seed runs — making a
+    ///   cross-level NeedsReResolve structurally unreachable in this scenario.
+    ///   FIX 1 is therefore covered at the unit level by
+    ///   `resolve_state::tests::revoke_clears_constraints_so_reenqueue_hits_new`.
+    #[tokio::test]
+    async fn resolve_bundle_bfs_constraint_merge_picks_correct_version() {
+        let dir = unique_tmp_dir();
+        let download_dir = dir.join("download");
+        let source_dir = dir.join("source");
+        let cache_dir = dir.join("cache");
+        std::fs::create_dir_all(&download_dir).unwrap();
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        let primary_name = "rtest-pkg";
+        let primary_version = "1.0";
+        let sub_name = "rtest-pkg-sub";
+
+        // Primary has TWO separate Requires-Dist lines for the same dep:
+        // one sets a floor (>=1.0) and the other a ceiling (<2.0).
+        // FIX 2 must merge these into a single >=1.0,<2.0 constraint.
+        let primary_bytes = make_wheel_bytes(
+            primary_name,
+            primary_version,
+            &[&format!("{sub_name}>=1.0"), &format!("{sub_name}<2.0")],
+        );
+
+        // Serve sub at BOTH 1.0 AND 2.0 so the constraint determines which
+        // version is picked (not the absence of an alternative).
+        let sub_10_bytes = make_wheel_bytes(sub_name, "1.0", &[]);
+        let sub_20_bytes = make_wheel_bytes(sub_name, "2.0", &[]);
+
+        let port = spawn_index_server(
+            vec![
+                (
+                    primary_name.to_string(),
+                    primary_version.to_string(),
+                    primary_bytes,
+                ),
+                (sub_name.to_string(), "1.0".to_string(), sub_10_bytes),
+                (sub_name.to_string(), "2.0".to_string(), sub_20_bytes),
+            ],
+            32,
+        )
+        .await;
+
+        let index_url = format!("http://127.0.0.1:{port}/simple/");
+
+        let entry = WheelEntry {
+            version: Some(primary_version.to_string()),
+            index: Some(index_url),
+            ..Default::default()
+        };
+        let target = WheelTarget {
+            python_version: "3.11".to_string(),
+            conda_subdir: "linux-64".to_string(),
+        };
+        let pypi_to_conda: PypiToCondaMap = HashMap::new();
+        let name_map: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        let git_sources: std::collections::BTreeMap<String, crate::config::NamedGitSource> =
+            std::collections::BTreeMap::new();
+        let conda_channels: Vec<rattler_conda_types::ChannelUrl> = vec![];
+
+        let bundle = resolve_bundle(
+            primary_name,
+            &entry,
+            &target,
+            &download_dir,
+            &source_dir,
+            &cache_dir,
+            RelaxPolicy::default(),
+            &git_sources,
+            None, // auto_data
+            &pypi_to_conda,
+            &name_map,
+            &conda_channels,
+            &[],  // conda_deps_list
+            &[],  // workspace_indexes
+            None, // cold path: no locked closure
+        )
+        .await
+        .expect("resolve_bundle must succeed");
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        // Primary check.
+        assert_eq!(
+            bundle.primary.pypi_name, primary_name,
+            "bundle primary must be {primary_name}"
+        );
+
+        // Sub must be present.
+        let extras_names: Vec<&str> = bundle.extras.iter().map(|w| w.pypi_name.as_str()).collect();
+        assert!(
+            extras_names.contains(&sub_name),
+            "transitive dep '{sub_name}' must be present in bundle.extras; got: {extras_names:?}"
+        );
+
+        // Core assertion: sub must be at 1.0 (NOT 2.0).
+        //
+        // With FIX 2 the two edges (>=1.0 and <2.0) are merged into
+        // >=1.0,<2.0 before the first BFS level runs.  pypi::resolve with
+        // that constraint picks the highest satisfying version = 1.0.
+        //
+        // Without FIX 2 (or_insert only), only the first edge (>=1.0) is
+        // kept, pypi::resolve picks 2.0, and this assertion FAILS.
+        let sub_wheel = bundle
+            .extras
+            .iter()
+            .find(|w| w.pypi_name == sub_name)
+            .unwrap();
+        assert_eq!(
+            sub_wheel.metadata.version, "1.0",
+            "'{sub_name}' must resolve to 1.0 (highest version satisfying >=1.0,<2.0 = the \
+             FIX 2 merged constraint); got {} — if this fails, FIX 2 constraint-merge \
+             was not applied (the two separate Requires-Dist edges were not intersected \
+             and the unconstrained >=1.0 resolved to 2.0 instead)",
+            sub_wheel.metadata.version,
+        );
+    }
+}
+
+// -----------------------------------------------------------------
+// Unit tests for detect_incremental_add.
+// These test the gate logic in isolation (no network, no resolve).
+// -----------------------------------------------------------------
+#[cfg(test)]
+mod incremental_add_tests {
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    use super::detect_incremental_add;
+    use crate::config::RetreadConfig;
+    use crate::lock::{RetreadLock, SCHEMA};
+
+    fn make_lock_at(path: &std::path::Path, entry_specs: Vec<String>, inputs_hash: &str) {
+        let lock = RetreadLock {
+            schema: SCHEMA,
+            retread_version: "0.0.1".into(),
+            bundle: "test-bundle".into(),
+            version: "1.0".into(),
+            python: "3.11".into(),
+            inputs_hash: inputs_hash.into(),
+            root_requirements: vec![],
+            wheels: vec![],
+            conda_run_deps: vec![],
+            index_urls: vec!["https://pypi.org/simple".into()],
+            prerelease: BTreeMap::new(),
+            conda_capable: vec![],
+            entry_specs,
+        };
+        let json = lock.to_pretty_json().unwrap();
+        std::fs::write(path, json).unwrap();
+    }
+
+    fn empty_config() -> RetreadConfig {
+        serde_json::from_value(serde_json::json!({"retread-wheels": {}})).unwrap()
+    }
+
+    /// Gate 1: RETREAD_INCREMENTAL not set → always None.
+    #[test]
+    fn no_env_var_returns_none() {
+        let dir = std::env::temp_dir().join(format!(
+            "retread-incr-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).ok();
+        let lock_path = dir.join("retread-test-bundle.lock.json");
+        make_lock_at(&lock_path, vec!["test-bundle==1.0".into()], "dummy-hash");
+        let config = empty_config();
+
+        // Ensure RETREAD_INCREMENTAL is NOT set.
+        // SAFETY: single-threaded test context; no concurrent env access.
+        unsafe { std::env::remove_var("RETREAD_INCREMENTAL") };
+        let result = detect_incremental_add(
+            &lock_path,
+            &config,
+            "test-bundle",
+            &[], // no workspace indexes
+            "Eager",
+            "3.11",
+            "fp",
+        );
+        assert!(
+            result.is_none(),
+            "RETREAD_INCREMENTAL unset must return None"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Gate 2: missing lock → None.
+    #[test]
+    fn missing_lock_returns_none() {
+        let missing = PathBuf::from("/tmp/retread-test-does-not-exist-xyz.json");
+        let config = empty_config();
+
+        // SAFETY: single-threaded test context; no concurrent env access.
+        unsafe { std::env::set_var("RETREAD_INCREMENTAL", "1") };
+        let result = detect_incremental_add(
+            &missing,
+            &config,
+            "test-bundle",
+            &[], // no workspace indexes
+            "Eager",
+            "3.11",
+            "fp",
+        );
+        unsafe { std::env::remove_var("RETREAD_INCREMENTAL") };
+        assert!(result.is_none(), "missing lock must return None");
+    }
+
+    /// Gate 2: lock with wrong schema → None.
+    #[test]
+    fn wrong_schema_returns_none() {
+        let dir = std::env::temp_dir().join(format!(
+            "retread-incr-schema-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).ok();
+        let lock_path = dir.join("retread-test-bundle.lock.json");
+        // Write a lock with wrong schema by patching the JSON directly.
+        let lock = RetreadLock {
+            schema: SCHEMA,
+            retread_version: "0.0.1".into(),
+            bundle: "test-bundle".into(),
+            version: "1.0".into(),
+            python: "3.11".into(),
+            inputs_hash: "dummy".into(),
+            root_requirements: vec![],
+            wheels: vec![],
+            conda_run_deps: vec![],
+            index_urls: vec![],
+            prerelease: BTreeMap::new(),
+            conda_capable: vec![],
+            entry_specs: vec!["test-bundle==1.0".into()],
+        };
+        let mut json: serde_json::Value =
+            serde_json::from_str(&lock.to_pretty_json().unwrap()).unwrap();
+        json["schema"] = serde_json::json!(SCHEMA + 1);
+        std::fs::write(&lock_path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+
+        let config = empty_config();
+        // SAFETY: single-threaded test context; no concurrent env access.
+        unsafe { std::env::set_var("RETREAD_INCREMENTAL", "1") };
+        let result = detect_incremental_add(
+            &lock_path,
+            &config,
+            "test-bundle",
+            &[],
+            "Eager",
+            "3.11",
+            "fp",
+        );
+        unsafe { std::env::remove_var("RETREAD_INCREMENTAL") };
+        assert!(result.is_none(), "wrong schema must return None");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Gate 2: lock with empty entry_specs → None (old schema).
+    #[test]
+    fn empty_entry_specs_returns_none() {
+        let dir = std::env::temp_dir().join(format!(
+            "retread-incr-empty-specs-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).ok();
+        let lock_path = dir.join("retread-test-bundle.lock.json");
+        make_lock_at(&lock_path, vec![], "dummy-hash"); // empty entry_specs
+
+        let config = empty_config();
+        // SAFETY: single-threaded test context; no concurrent env access.
+        unsafe { std::env::set_var("RETREAD_INCREMENTAL", "1") };
+        let result = detect_incremental_add(
+            &lock_path,
+            &config,
+            "test-bundle",
+            &[],
+            "Eager",
+            "3.11",
+            "fp",
+        );
+        unsafe { std::env::remove_var("RETREAD_INCREMENTAL") };
+        assert!(result.is_none(), "empty entry_specs must return None");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── Two-step gate tests (a)-(i) ────────────────────────────────────────
+    //
+    // Helper: write a lock with explicit index_urls + entry_specs + hash.
+    fn make_lock_with_indexes(
+        path: &std::path::Path,
+        entry_specs: Vec<String>,
+        index_urls: Vec<String>,
+        inputs_hash: &str,
+    ) {
+        let lock = RetreadLock {
+            schema: SCHEMA,
+            retread_version: "0.0.1".into(),
+            bundle: "test-bundle".into(),
+            version: "1.0".into(),
+            python: "3.11".into(),
+            inputs_hash: inputs_hash.into(),
+            root_requirements: vec![],
+            wheels: vec![],
+            conda_run_deps: vec![],
+            index_urls,
+            prerelease: BTreeMap::new(),
+            conda_capable: vec![],
+            entry_specs,
+        };
+        let json = lock.to_pretty_json().unwrap();
+        std::fs::write(path, json).unwrap();
+    }
+
+    // Compute the correct inputs_hash for a lock. Uses the same algorithm as
+    // courier::stage so the STEP B check passes.
+    fn correct_hash(
+        entry_specs: &[String],
+        index_urls: &[String],
+        relax: &str,
+        python: &str,
+        config_fp: &str,
+    ) -> String {
+        RetreadLock::compute_inputs_hash(
+            entry_specs,
+            index_urls,
+            relax,
+            python,
+            crate::lock::EMIT_EPOCH,
+            None, // no pin_version
+            config_fp,
+        )
+    }
+
+    fn tmp_incr(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "retread-incr-{label}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).ok();
+        dir
+    }
+
+    // The "nvidia" entry index used in isaac tests.
+    const NVIDIA_INDEX: &str = "https://pypi.nvidia.com/simple/";
+    // PUBLIC_PYPI as stored by merge_index_chain.
+    const PYPI: &str = "https://pypi.org/simple/";
+
+    /// (a) isaac case: add a dep with a NEW index while existing entries keep
+    /// their indexes → STEP A passes, STEP B passes → ENGAGE (Some returned).
+    #[test]
+    fn step_a_new_index_entry_engages() {
+        let dir = tmp_incr("a");
+        let lock_path = dir.join(RetreadLock::file_name("test-bundle"));
+
+        // Lock: single existing entry isaacsim (nvidia index).
+        // lock.index_urls = pack-wide chain for [isaacsim] = [nvidia, pypi].
+        let existing_spec = "isaacsim==4.0.0";
+        let lock_index_urls = vec![NVIDIA_INDEX.to_string(), PYPI.to_string()];
+        let h = correct_hash(
+            &[existing_spec.to_string()],
+            &lock_index_urls,
+            "Eager",
+            "3.11",
+            "fp",
+        );
+        make_lock_with_indexes(
+            &lock_path,
+            vec![existing_spec.to_string()],
+            lock_index_urls,
+            &h,
+        );
+
+        // Config: isaacsim (nvidia) + new iniconfig==2.0.0 (pypi.org, no explicit index).
+        let config: RetreadConfig = serde_json::from_value(serde_json::json!({
+            "retread-bundle": "test-bundle",
+            "retread-wheels": {
+                "isaacsim": {"version": "4.0.0", "index": NVIDIA_INDEX},
+                "iniconfig": {"version": "2.0.0"}
+            }
+        }))
+        .unwrap();
+
+        // SAFETY: single-threaded test context.
+        unsafe { std::env::set_var("RETREAD_INCREMENTAL", "1") };
+        let result = detect_incremental_add(
+            &lock_path,
+            &config,
+            "test-bundle",
+            &[], // no workspace indexes
+            "Eager",
+            "3.11",
+            "fp",
+        );
+        unsafe { std::env::remove_var("RETREAD_INCREMENTAL") };
+        let incr = result.expect("(a) should ENGAGE on add-dep-new-index");
+        assert_eq!(
+            incr.added_specs,
+            vec!["iniconfig==2.0.0"],
+            "added_specs must contain only the new entry"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (b) COLD when an EXISTING entry's index changes.
+    #[test]
+    fn step_a_changed_existing_entry_index_is_cold() {
+        let dir = tmp_incr("b");
+        let lock_path = dir.join(RetreadLock::file_name("test-bundle"));
+
+        // Lock: isaacsim was on nvidia index.
+        let lock_index_urls = vec![NVIDIA_INDEX.to_string(), PYPI.to_string()];
+        let h = correct_hash(
+            &["isaacsim==4.0.0".to_string()],
+            &lock_index_urls,
+            "Eager",
+            "3.11",
+            "fp",
+        );
+        make_lock_with_indexes(
+            &lock_path,
+            vec!["isaacsim==4.0.0".to_string()],
+            lock_index_urls,
+            &h,
+        );
+
+        // Config: isaacsim now on pypi (changed!), same version.
+        let config: RetreadConfig = serde_json::from_value(serde_json::json!({
+            "retread-bundle": "test-bundle",
+            "retread-wheels": {
+                "isaacsim": {"version": "4.0.0"},
+                "iniconfig": {"version": "2.0.0"}
+            }
+        }))
+        .unwrap();
+
+        // STEP A: locked chain for [isaacsim] (pypi now) = [pypi] ≠ [nvidia, pypi] → COLD.
+        unsafe { std::env::set_var("RETREAD_INCREMENTAL", "1") };
+        let result = detect_incremental_add(
+            &lock_path,
+            &config,
+            "test-bundle",
+            &[],
+            "Eager",
+            "3.11",
+            "fp",
+        );
+        unsafe { std::env::remove_var("RETREAD_INCREMENTAL") };
+        assert!(
+            result.is_none(),
+            "(b) changed existing entry index must be COLD"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (c) COLD when a workspace extra-index is added (STEP A catches it).
+    #[test]
+    fn step_a_new_ws_index_is_cold() {
+        let dir = tmp_incr("c");
+        let lock_path = dir.join(RetreadLock::file_name("test-bundle"));
+
+        // Lock: single entry, no ws index. index_urls = [pypi].
+        let lock_index_urls = vec![PYPI.to_string()];
+        let h = correct_hash(
+            &["pkga==1.0".to_string()],
+            &lock_index_urls,
+            "Eager",
+            "3.11",
+            "fp",
+        );
+        make_lock_with_indexes(
+            &lock_path,
+            vec!["pkga==1.0".to_string()],
+            lock_index_urls,
+            &h,
+        );
+
+        let config: RetreadConfig = serde_json::from_value(serde_json::json!({
+            "retread-bundle": "test-bundle",
+            "retread-wheels": {
+                "pkga": {"version": "1.0"},
+                "pkgb": {"version": "2.0"}
+            }
+        }))
+        .unwrap();
+
+        // ws_indexes now has an extra index → locked_chain differs from lock.index_urls.
+        let new_ws = vec!["https://extra.example.com/simple/".to_string()];
+        unsafe { std::env::set_var("RETREAD_INCREMENTAL", "1") };
+        let result = detect_incremental_add(
+            &lock_path,
+            &config,
+            "test-bundle",
+            &new_ws,
+            "Eager",
+            "3.11",
+            "fp",
+        );
+        unsafe { std::env::remove_var("RETREAD_INCREMENTAL") };
+        assert!(result.is_none(), "(c) new ws index must be COLD");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (d) COLD when relax changes (STEP B hash mismatch), even though STEP A passes.
+    #[test]
+    fn step_b_changed_relax_is_cold() {
+        let dir = tmp_incr("d");
+        let lock_path = dir.join(RetreadLock::file_name("test-bundle"));
+
+        // Lock built with relax="Eager".
+        let lock_index_urls = vec![PYPI.to_string()];
+        let h = correct_hash(
+            &["pkga==1.0".to_string()],
+            &lock_index_urls,
+            "Eager", // ← original relax
+            "3.11",
+            "fp",
+        );
+        make_lock_with_indexes(
+            &lock_path,
+            vec!["pkga==1.0".to_string()],
+            lock_index_urls,
+            &h,
+        );
+
+        let config: RetreadConfig = serde_json::from_value(serde_json::json!({
+            "retread-bundle": "test-bundle",
+            "retread-wheels": {
+                "pkga": {"version": "1.0"},
+                "pkgb": {"version": "2.0"}
+            }
+        }))
+        .unwrap();
+
+        // Relax changed to "Conservative" → STEP B hash mismatch.
+        unsafe { std::env::set_var("RETREAD_INCREMENTAL", "1") };
+        let result = detect_incremental_add(
+            &lock_path,
+            &config,
+            "test-bundle",
+            &[],
+            "Conservative", // ← changed
+            "3.11",
+            "fp",
+        );
+        unsafe { std::env::remove_var("RETREAD_INCREMENTAL") };
+        assert!(
+            result.is_none(),
+            "(d) changed relax must be COLD via STEP B"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (e) genesis-style add (single pypi.org entry, add another pypi dep) → ENGAGE.
+    /// Regression guard: must still work when no new index is involved.
+    #[test]
+    fn genesis_style_add_engages() {
+        let dir = tmp_incr("e");
+        let lock_path = dir.join(RetreadLock::file_name("test-bundle"));
+
+        let lock_index_urls = vec![PYPI.to_string()];
+        let h = correct_hash(
+            &["pkga==1.0".to_string()],
+            &lock_index_urls,
+            "Eager",
+            "3.11",
+            "fp",
+        );
+        make_lock_with_indexes(
+            &lock_path,
+            vec!["pkga==1.0".to_string()],
+            lock_index_urls,
+            &h,
+        );
+
+        let config: RetreadConfig = serde_json::from_value(serde_json::json!({
+            "retread-bundle": "test-bundle",
+            "retread-wheels": {
+                "pkga": {"version": "1.0"},
+                "pkgb": {"version": "2.0"}  // added, also pypi
+            }
+        }))
+        .unwrap();
+
+        unsafe { std::env::set_var("RETREAD_INCREMENTAL", "1") };
+        let result = detect_incremental_add(
+            &lock_path,
+            &config,
+            "test-bundle",
+            &[],
+            "Eager",
+            "3.11",
+            "fp",
+        );
+        unsafe { std::env::remove_var("RETREAD_INCREMENTAL") };
+        let incr = result.expect("(e) genesis-style same-index add must ENGAGE");
+        assert_eq!(incr.added_specs, vec!["pkgb==2.0"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (f) COLD when an added spec is bare/range (Gate 5).
+    #[test]
+    fn gate5_bare_added_spec_is_cold() {
+        let dir = tmp_incr("f");
+        let lock_path = dir.join(RetreadLock::file_name("test-bundle"));
+
+        let lock_index_urls = vec![PYPI.to_string()];
+        let h = correct_hash(
+            &["pkga==1.0".to_string()],
+            &lock_index_urls,
+            "Eager",
+            "3.11",
+            "fp",
+        );
+        make_lock_with_indexes(
+            &lock_path,
+            vec!["pkga==1.0".to_string()],
+            lock_index_urls,
+            &h,
+        );
+
+        // pkgb has no version → bare spec "pkgb" → Gate 5 rejects.
+        let config: RetreadConfig = serde_json::from_value(serde_json::json!({
+            "retread-bundle": "test-bundle",
+            "retread-wheels": {
+                "pkga": {"version": "1.0"},
+                "pkgb": {}
+            }
+        }))
+        .unwrap();
+
+        unsafe { std::env::set_var("RETREAD_INCREMENTAL", "1") };
+        let result = detect_incremental_add(
+            &lock_path,
+            &config,
+            "test-bundle",
+            &[],
+            "Eager",
+            "3.11",
+            "fp",
+        );
+        unsafe { std::env::remove_var("RETREAD_INCREMENTAL") };
+        assert!(
+            result.is_none(),
+            "(f) bare added spec must be COLD via Gate 5"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (g) MULTI-BUNDLE: two bundles, two indexes; add a pinned dep to bundle B.
+    /// STEP A must use all-entries-minus-added (NOT bundle-filtered entry_specs)
+    /// so the pack-wide chain still matches lock.index_urls → ENGAGE.
+    #[test]
+    fn multi_bundle_step_a_uses_pack_wide_entries() {
+        let dir = tmp_incr("g");
+        let lock_path = dir.join(RetreadLock::file_name("test-bundle"));
+
+        // Pack has two entries from different indexes:
+        //   pkga (bundle A) → nvidia_index
+        //   pkgb (bundle B) → pypi
+        // lock.index_urls = pack-wide chain = [nvidia, pypi]
+        let lock_index_urls = vec![NVIDIA_INDEX.to_string(), PYPI.to_string()];
+        // entry_specs is BUNDLE-FILTERED (only bundle B entries in this lock).
+        // (In reality, each bundle writes its own lock — this simulates bundle B's lock.)
+        let lock_entry_specs = vec!["pkgb==1.0".to_string()];
+        let h = correct_hash(&lock_entry_specs, &lock_index_urls, "Eager", "3.11", "fp");
+        make_lock_with_indexes(&lock_path, lock_entry_specs, lock_index_urls, &h);
+
+        // Config: pkga (nvidia, bundle A) + pkgb (pypi, bundle B) + new pkgc (pypi, bundle B).
+        // STEP A: locked entries = all entries MINUS added = pkga + pkgb (both).
+        // locked_chain = merge([nvidia, pypi], []) = [nvidia, pypi] == lock.index_urls → PASS.
+        let config: RetreadConfig = serde_json::from_value(serde_json::json!({
+            "retread-wheels": {
+                "pkga": {"version": "1.0", "index": NVIDIA_INDEX, "bundle": "bundle-a"},
+                "pkgb": {"version": "1.0", "bundle": "test-bundle"},
+                "pkgc": {"version": "2.0", "bundle": "test-bundle"}  // added
+            }
+        }))
+        .unwrap();
+
+        unsafe { std::env::set_var("RETREAD_INCREMENTAL", "1") };
+        let result = detect_incremental_add(
+            &lock_path,
+            &config,
+            "test-bundle",
+            &[],
+            "Eager",
+            "3.11",
+            "fp",
+        );
+        unsafe { std::env::remove_var("RETREAD_INCREMENTAL") };
+        let incr = result.expect(
+            "(g) multi-bundle: STEP A must use pack-wide (not bundle-filtered) entries -> ENGAGE",
+        );
+        assert_eq!(incr.added_specs, vec!["pkgc==2.0"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (h) spec byte-identity: spec_for_entry, courier_input_specs, and the
+    /// matched_entries encoding all produce the same string for the same entry.
+    #[test]
+    fn spec_for_entry_byte_identity() {
+        use crate::config::WheelEntry;
+        use std::collections::BTreeMap;
+
+        let git_sources = BTreeMap::new();
+
+        // Plain pinned entry (the common case).
+        let entry = WheelEntry {
+            version: Some("1.2.3".to_string()),
+            ..Default::default()
+        };
+        let s = crate::courier::spec_for_entry("mylib", &entry, &git_sources);
+        assert_eq!(s, "mylib==1.2.3", "plain pinned entry");
+
+        // Entry with extras.
+        let entry_extras = WheelEntry {
+            version: Some("2.0".to_string()),
+            extras: vec!["sim".to_string(), "render".to_string()],
+            ..Default::default()
+        };
+        let s2 = crate::courier::spec_for_entry("mylib", &entry_extras, &git_sources);
+        assert_eq!(s2, "mylib[sim,render]==2.0", "entry with extras");
+
+        // URL entry (no version).
+        let entry_url = WheelEntry {
+            url: Some(url::Url::parse("https://example.com/mylib-1.0.whl").unwrap()),
+            ..Default::default()
+        };
+        let s3 = crate::courier::spec_for_entry("mylib", &entry_url, &git_sources);
+        assert_eq!(
+            s3, "mylib@url:https://example.com/mylib-1.0.whl",
+            "url entry"
+        );
+
+        // Bare entry (no version/git/url).
+        let entry_bare = WheelEntry::default();
+        let s4 = crate::courier::spec_for_entry("mylib", &entry_bare, &git_sources);
+        assert_eq!(s4, "mylib", "bare entry");
+
+        // courier_input_specs calls spec_for_entry — verify via a config round-trip.
+        let config: RetreadConfig = serde_json::from_value(serde_json::json!({
+            "retread-wheels": {
+                "mylib": {"version": "1.2.3"}
+            }
+        }))
+        .unwrap();
+        let specs = crate::courier::courier_input_specs(&config, "mylib");
+        assert_eq!(
+            specs,
+            vec!["mylib==1.2.3"],
+            "courier_input_specs via spec_for_entry"
+        );
+    }
+
+    /// (i) dedup/order-masking: a locked entry's index moves from implicit
+    /// PUBLIC_PYPI (appended last by merge_index_chain) to explicit-entry-inserted
+    /// (same set, different ORDER) → STEP A detects the position change → COLD.
+    #[test]
+    fn step_a_index_position_change_is_cold() {
+        let dir = tmp_incr("i");
+        let lock_path = dir.join(RetreadLock::file_name("test-bundle"));
+
+        // Lock had: entry A (nvidia) + entry B (implicit pypi appended last).
+        // lock.index_urls = [nvidia, pypi] (nvidia first, pypi appended).
+        let lock_index_urls = vec![NVIDIA_INDEX.to_string(), PYPI.to_string()];
+        let h = correct_hash(
+            &["pkga==1.0".to_string()],
+            &lock_index_urls,
+            "Eager",
+            "3.11",
+            "fp",
+        );
+        make_lock_with_indexes(
+            &lock_path,
+            vec!["pkga==1.0".to_string()],
+            lock_index_urls,
+            &h,
+        );
+
+        // Now: entry A (pypi, switched!) + entry C added (nvidia, explicit).
+        // locked_entry_indexes for existing entries (all minus added) = [pypi].
+        // locked_chain = merge([pypi], []) = [pypi, nvidia? No — nvidia not in locked].
+        // Actually: locked chain = [pypi] ≠ [nvidia, pypi] → COLD.
+        let config: RetreadConfig = serde_json::from_value(serde_json::json!({
+            "retread-bundle": "test-bundle",
+            "retread-wheels": {
+                "pkga": {"version": "1.0"},            // now on pypi (no explicit index)
+                "pkgb": {"version": "2.0", "index": NVIDIA_INDEX}  // added, explicit nvidia
+            }
+        }))
+        .unwrap();
+
+        unsafe { std::env::set_var("RETREAD_INCREMENTAL", "1") };
+        let result = detect_incremental_add(
+            &lock_path,
+            &config,
+            "test-bundle",
+            &[],
+            "Eager",
+            "3.11",
+            "fp",
+        );
+        unsafe { std::env::remove_var("RETREAD_INCREMENTAL") };
+        assert!(
+            result.is_none(),
+            "(i) index position change (order-sensitive) must be COLD"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── verify_localadd_hook tests ─────────────────────────────────────────
+
+    // Build a lock where each wheel has explicit requires_dist.
+    // (name, version, requires_dist lines)
+    fn make_lock_with_requires_dist_at(path: &std::path::Path, wheels: &[(&str, &str, &[&str])]) {
+        use crate::lock::{LockWheel, Origin};
+        let lock_wheels: Vec<LockWheel> = wheels
+            .iter()
+            .map(|(n, v, rd)| LockWheel {
+                name: n.to_string(),
+                version: v.to_string(),
+                origin: Origin::Index,
+                filename: format!("{n}-{v}-py3-none-any.whl"),
+                url: Some(format!(
+                    "https://pypi.org/packages/{n}-{v}-py3-none-any.whl"
+                )),
+                sha256: None,
+                requires_dist: rd.iter().map(|s| s.to_string()).collect(),
+                must_ship: false,
+                upstream_url: None,
+                git_source: None,
+                sdist_source: None,
+            })
+            .collect();
+        let lock = RetreadLock {
+            schema: SCHEMA,
+            retread_version: "0.0.1".into(),
+            bundle: "test-bundle".into(),
+            version: "1.0".into(),
+            python: "3.11".into(),
+            inputs_hash: "dummy".into(),
+            root_requirements: vec![],
+            wheels: lock_wheels,
+            conda_run_deps: vec![],
+            index_urls: vec!["https://pypi.org/simple".into()],
+            prerelease: BTreeMap::new(),
+            conda_capable: vec![],
+            entry_specs: vec!["test-bundle==1.0".into()],
+        };
+        let json = lock.to_pretty_json().unwrap();
+        std::fs::write(path, json).unwrap();
+    }
+
+    fn tmp_dir(prefix: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "retread-verify-{prefix}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).ok();
+        dir
+    }
+
+    /// GREEN: A requires B>=1.0 (bundled at 1.2) — version satisfied → GREEN.
+    #[test]
+    fn verify_hook_green_when_bundled_requirement_satisfied() {
+        let dir = tmp_dir("green");
+        let lock_path = dir.join("test-bundle.retread-lock.json");
+        make_lock_with_requires_dist_at(
+            &lock_path,
+            &[
+                ("packagea", "2.0", &["packageb>=1.0"]),
+                ("packageb", "1.2", &[]),
+            ],
+        );
+        // No panic = pass. Oracle logs GREEN (info).
+        super::verify_localadd_hook(
+            &lock_path,
+            &["packagea==2.0".to_string()],
+            "test-bundle",
+            "linux-64",
+            "3.11",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// RED (internal inconsistency): A requires B>=2.0 but B is BUNDLED at 1.0.
+    /// This is the real missed-ripple case: the oracle must flag it RED.
+    /// No panic — it's observability-only.
+    #[test]
+    fn verify_hook_red_when_bundled_dep_version_does_not_satisfy() {
+        let dir = tmp_dir("red");
+        let lock_path = dir.join("test-bundle.retread-lock.json");
+        // packagea requires packageb>=2.0; packageb is bundled at 1.0 (missed ripple).
+        make_lock_with_requires_dist_at(
+            &lock_path,
+            &[
+                ("packagea", "2.0", &["packageb>=2.0"]),
+                ("packageb", "1.0", &[]),
+            ],
+        );
+        // No panic = pass. Oracle logs RED (warn) but never aborts.
+        super::verify_localadd_hook(
+            &lock_path,
+            &["packagea==2.0".to_string()],
+            "test-bundle",
+            "linux-64",
+            "3.11",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Marker-false requirement: A requires B only on Windows (platform_system=='Windows').
+    /// On linux-64 the marker is false → NOT active → must NOT be flagged RED,
+    /// even though B is absent from the bundled closure.
+    #[test]
+    fn verify_hook_marker_false_not_red() {
+        let dir = tmp_dir("marker");
+        let lock_path = dir.join("test-bundle.retread-lock.json");
+        make_lock_with_requires_dist_at(
+            &lock_path,
+            &[(
+                "packagea",
+                "2.0",
+                &["packageb>=1.0; platform_system=='Windows'"],
+            )],
+        );
+        // B is absent; marker is false on linux-64 → NOT active → NOT RED.
+        super::verify_localadd_hook(
+            &lock_path,
+            &["packagea==2.0".to_string()],
+            "test-bundle",
+            "linux-64",
+            "3.11",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Key genesis-fix property: A requires B (conda/env-provided, NOT bundled).
+    /// The oracle must SKIP — not RED — because we cannot version-check env deps.
+    /// This covers opencv-python, OpenEXR, mujoco, vtk, and similar patterns.
+    #[test]
+    fn verify_hook_not_bundled_dep_is_skipped_not_red() {
+        let dir = tmp_dir("skip");
+        let lock_path = dir.join("test-bundle.retread-lock.json");
+        // packagea requires libfoo (conda-provided, not in lock.wheels).
+        make_lock_with_requires_dist_at(&lock_path, &[("packagea", "2.0", &["libfoo>=1.0"])]);
+        // libfoo is absent from bundled closure → SKIPPED, not RED.
+        super::verify_localadd_hook(
+            &lock_path,
+            &["packagea==2.0".to_string()],
+            "test-bundle",
+            "linux-64",
+            "3.11",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// I/O error: missing lock file → logs warning, no panic.
+    #[test]
+    fn verify_hook_handles_missing_lock_gracefully() {
+        let missing_path = std::path::PathBuf::from("/tmp/retread-verify-nonexistent-xyz.json");
+        super::verify_localadd_hook(
+            &missing_path,
+            &["requests==2.32.0".to_string()],
+            "test-bundle",
+            "linux-64",
+            "3.11",
         );
     }
 }

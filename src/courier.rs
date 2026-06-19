@@ -19,7 +19,7 @@ use anyhow::Context as _;
 use sha2::{Digest, Sha256};
 use uv_pep508::Requirement;
 
-use crate::config::RetreadConfig;
+use crate::config::{NamedGitSource, RetreadConfig, WheelEntry};
 use crate::emit_pypi::{
     EmitWheel, build_meta_wheel, collect_prerelease_pins, insert_build_tag, override_line_map,
     plan, standard_wheel_filename,
@@ -46,6 +46,46 @@ pub struct CourierStaged {
 /// so a resolved version would make the two hashes diverge). Sorted; the order
 /// is not significant (compute_inputs_hash sorts too, but we sort here so this
 /// fn is a stable standalone contract).
+/// Canonical spec string for a single `[retread-wheels]` entry.
+///
+/// Format: `<key>[<extras>]<ver_proxy>` where `ver_proxy` is one of:
+/// - `==<version>` for an explicit pin
+/// - `@git:<rev>` for an inline or named git source
+/// - `@url:<url>` for a direct URL
+/// - `""` (empty) for a bare/range entry
+///
+/// All three encoding sites that build spec strings for gate comparison
+/// (`courier_input_specs`, `detect_incremental_add` STEP A, and the
+/// `matched_entries` block in `resolve_incremental_add`) must call this
+/// function so that the encodings never drift.
+pub fn spec_for_entry(
+    key: &str,
+    entry: &WheelEntry,
+    git_sources: &BTreeMap<String, NamedGitSource>,
+) -> String {
+    let extras = if entry.extras.is_empty() {
+        String::new()
+    } else {
+        format!("[{}]", entry.extras.join(","))
+    };
+    // version proxy, pure-input precedence: explicit pin, then inline
+    // git rev, then named-git-source rev, then direct url, else bare.
+    let ver = entry
+        .normalized_version()
+        .map(|v| format!("=={v}"))
+        .or_else(|| entry.rev.clone().map(|r| format!("@git:{r}")))
+        .or_else(|| {
+            entry
+                .from
+                .as_ref()
+                .and_then(|f| git_sources.get(f))
+                .map(|s| format!("@git:{}", s.rev))
+        })
+        .or_else(|| entry.url.as_ref().map(|u| format!("@url:{u}")))
+        .unwrap_or_default();
+    format!("{key}{extras}{ver}")
+}
+
 pub fn courier_input_specs(config: &RetreadConfig, bundle_name: &str) -> Vec<String> {
     let mut specs: Vec<String> = config
         .retread_wheels
@@ -57,29 +97,7 @@ pub fn courier_input_specs(config: &RetreadConfig, bundle_name: &str) -> Vec<Str
                 None => key.as_str() == bundle_name,
             }
         })
-        .map(|(key, entry)| {
-            let extras = if entry.extras.is_empty() {
-                String::new()
-            } else {
-                format!("[{}]", entry.extras.join(","))
-            };
-            // version proxy, pure-input precedence: explicit pin, then inline
-            // git rev, then named-git-source rev, then direct url, else bare.
-            let ver = entry
-                .normalized_version()
-                .map(|v| format!("=={v}"))
-                .or_else(|| entry.rev.clone().map(|r| format!("@git:{r}")))
-                .or_else(|| {
-                    entry
-                        .from
-                        .as_ref()
-                        .and_then(|f| config.git_sources.get(f))
-                        .map(|s| format!("@git:{}", s.rev))
-                })
-                .or_else(|| entry.url.as_ref().map(|u| format!("@url:{u}")))
-                .unwrap_or_default();
-            format!("{key}{extras}{ver}")
-        })
+        .map(|(key, entry)| spec_for_entry(key, entry, &config.git_sources))
         .collect();
     specs.sort();
     specs
@@ -962,10 +980,12 @@ pub async fn stage(
         }
     }
 
-    // Step 6: Assemble the RetreadLock.
-    let mut conda_capable_sorted: Vec<String> = conda_capable.iter().cloned().collect();
-    conda_capable_sorted.sort();
-    let lock = RetreadLock {
+    // Step 6: Assemble the RetreadLock and canonicalize for stable JSON output.
+    // entry_specs: the canonical resolution-input spec list for this bundle.
+    // Populated here so the Part-2 delta-detector can diff it against the
+    // current manifest without re-running the full resolve.
+    let entry_specs = courier_input_specs(config, bundle_name);
+    let mut lock = RetreadLock {
         schema: SCHEMA,
         retread_version: env!("CARGO_PKG_VERSION").to_string(),
         bundle: bundle_name.to_string(),
@@ -977,8 +997,10 @@ pub async fn stage(
         conda_run_deps: parse_conda_deps(run_deps),
         index_urls: index_urls.to_vec(),
         prerelease,
-        conda_capable: conda_capable_sorted,
+        conda_capable: conda_capable.iter().cloned().collect(),
+        entry_specs,
     };
+    lock.canonicalize();
 
     // Step 7: Write the lock JSON into staging_dir. Write-then-rename so a
     // crash mid-write can never leave a torn lock (B-3): a partial file would
