@@ -405,7 +405,7 @@ pub(crate) async fn iterative_solve_refinement(
         let seeded =
             // Intermediate output for dep extraction only -- build string
             // does not matter here; pass None (non-courier legacy form).
-            super::produce_output(bundle, effective, host_platform, python_version, siblings, None)?;
+            super::produce_output(bundle, effective, host_platform, python_version, siblings, None, None)?;
         current_run_deps = seeded
             .run_dependencies
             .depends
@@ -653,6 +653,7 @@ pub(crate) async fn iterative_solve_refinement(
             host_platform,
             python_version,
             siblings,
+            None,
             None,
         )?;
         current_run_deps = new_output

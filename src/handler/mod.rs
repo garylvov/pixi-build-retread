@@ -822,9 +822,74 @@ impl Handler {
                     .iter()
                     .map(|b| apply_emission(b, &base_config, emission).0)
                     .collect();
+                // When courier mode is active and RETREAD_INCREMENTAL=1, the
+                // metadata phase must use `lock.version` as the pack version for
+                // any bundle that `detect_incremental_add` would accept (the same
+                // version the incremental build path uses).  Precompute a map
+                // bundle_name → override_version so both the siblings list and
+                // per-bundle produce_output use the same, consistent version.
+                // When RETREAD_INCREMENTAL is unset (the default) or courier is
+                // off, detect_incremental_add returns None at Gate 1 and the map
+                // is empty (byte-identical to today).
+                let incr_version_overrides: std::collections::HashMap<String, String> =
+                    if config.courier {
+                        let courier_channels_for_fp = workspace_manifest
+                            .as_ref()
+                            .map(|m| {
+                                m.courier_channel_set(
+                                    workspace_dir.as_deref().unwrap_or(source_dir.as_path()),
+                                    &source_dir,
+                                )
+                            })
+                            .unwrap_or_default();
+                        let workspace_fp_for_incr = workspace_manifest
+                            .as_ref()
+                            .map(|m| {
+                                m.solve_fingerprint(
+                                    workspace_dir.as_deref().unwrap_or(source_dir.as_path()),
+                                    &source_dir,
+                                )
+                            })
+                            .unwrap_or_default();
+                        let config_fp_for_incr = crate::courier::config_fingerprint(
+                            &config,
+                            &courier_channels_for_fp,
+                            &workspace_fp_for_incr,
+                        );
+                        let ws_indexes_for_incr: Vec<String> = workspace_manifest
+                            .as_ref()
+                            .map(|m| m.all_pypi_index_urls())
+                            .unwrap_or_default();
+                        let relax_str_for_incr = format!("{:?}", config.relax);
+                        env_bundles
+                            .iter()
+                            .filter_map(|b| {
+                                let lock_path = source_dir
+                                    .join(crate::lock::RetreadLock::file_name(&b.conda_name));
+                                detect_incremental_add(
+                                    &lock_path,
+                                    &config,
+                                    &b.conda_name,
+                                    &ws_indexes_for_incr,
+                                    &relax_str_for_incr,
+                                    python_version,
+                                    &config_fp_for_incr,
+                                )
+                                .map(|incr| (b.conda_name.clone(), incr.lock.version.clone()))
+                            })
+                            .collect()
+                    } else {
+                        std::collections::HashMap::new()
+                    };
                 let siblings: Vec<(String, String)> = env_bundles
                     .iter()
-                    .map(|b| (b.conda_name.clone(), b.primary.metadata.version.clone()))
+                    .map(|b| {
+                        let ver = incr_version_overrides
+                            .get(&b.conda_name)
+                            .cloned()
+                            .unwrap_or_else(|| b.primary.metadata.version.clone());
+                        (b.conda_name.clone(), ver)
+                    })
                     .collect();
                 for base_bundle in &materialized {
                     let (mut bundle, mut effective) =
@@ -936,6 +1001,9 @@ impl Handler {
                             bundle.conda_name,
                         ))
                     })?;
+                    let version_override_for_bundle = incr_version_overrides
+                        .get(&bundle.conda_name)
+                        .map(|s| s.as_str());
                     let mut output = produce_output(
                         &bundle,
                         &effective,
@@ -943,6 +1011,7 @@ impl Handler {
                         python_version,
                         &siblings,
                         courier_build_hash.as_deref(),
+                        version_override_for_bundle,
                     )
                     .map_err(|e| {
                         RpcError::internal(format!("output for {}: {e:#}", bundle.conda_name))
@@ -1457,6 +1526,7 @@ impl Handler {
                             python_version,
                             &siblings,
                             courier_build_hash.as_deref(),
+                            version_override_for_bundle,
                         )
                         .map_err(|e| {
                             RpcError::internal(format!(
@@ -4307,6 +4377,11 @@ fn produce_output(
     workspace_python_version: &str,
     siblings: &[(String, String)],
     courier_build_hash: Option<&str>,
+    // When `Some`, overrides `bundle.primary.metadata.version` so the metadata
+    // phase reports the same version the build phase will use (e.g. lock.version
+    // on an incremental add).  `None` → use bundle.primary.metadata.version
+    // (today's behaviour, always chosen when RETREAD_INCREMENTAL is unset).
+    version_override: Option<&str>,
 ) -> Result<CondaOutput> {
     // Python version for the emitted variant/build/`python` dep. Shared with
     // the build recipe via `emit_python_version` so the metadata and the
@@ -4454,9 +4529,10 @@ fn produce_output(
          retread-drop-deps / retread-overrides / retread-name-map"
     );
 
+    let effective_version = version_override.unwrap_or(&bundle.primary.metadata.version);
     assemble_conda_output(
         &bundle.conda_name,
-        &bundle.primary.metadata.version,
+        effective_version,
         &python_version,
         config.courier,
         any_platform_specific,
