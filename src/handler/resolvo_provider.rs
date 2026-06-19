@@ -623,6 +623,7 @@ pub(crate) async fn resolvo_solve_pool(
     let params = DiscoveryParams {
         index: &index,
         transitive_indexes: &transitive_indexes,
+        primary_extras: &entry.extras,
         target,
         download_dir,
         relax,
@@ -897,6 +898,7 @@ mod tests {
         let params = DiscoveryParams {
             index,
             transitive_indexes: &transitive_indexes_vec,
+            primary_extras: &[],
             target,
             download_dir: dir,
             relax: RelaxPolicy::default(),

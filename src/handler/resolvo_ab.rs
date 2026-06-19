@@ -243,7 +243,26 @@ fn build_conda_routing_diff(
     // bundled_set_matches: canonical bundled sets agree.
     let bundled_set_matches = canon_bfs_bundled == canon_resolvo_bundled;
 
-    // Routing mismatch: names that land on different sides across the two solvers.
+    // Routing mismatch: names where one resolver bundled and the other conda-routed.
+    //
+    // Only emit a RoutingMismatch entry when BOTH sides are either Bundled or Conda
+    // (i.e. neither side is Absent).  Cases involving Absent are excluded:
+    //
+    //   bfs=Absent / resolvo=Conda  — PR-1b over-discovery property: resolvo discovers
+    //     the full graph including pruned conda subtrees, then correctly routes them to
+    //     conda.  The BUNDLE is identical (neither resolver includes that dep).  Not a
+    //     real divergence.
+    //
+    //   bfs=Absent / resolvo=Bundled — resolvo bundled something BFS never saw.  This IS
+    //     a real divergence, but it is ALREADY captured by version_set.only_in_resolvo,
+    //     so we do not double-count it here.
+    //
+    //   bfs=Conda / resolvo=Absent  — resolvo didn't discover a name BFS conda-routed
+    //     (e.g. very deep transitive that resolvo missed).  Bundle is unaffected (neither
+    //     installs it).  Not a real divergence.
+    //
+    // This means routing_mismatch = { Bundled↔Conda flips where neither side is Absent }.
+    // The only_in_bfs / only_in_resolvo lists own the Absent cases.
     let mut all_names: std::collections::HashSet<String> = canon_bfs_bundled.clone();
     all_names.extend(canon_resolvo_bundled.iter().cloned());
     all_names.extend(bfs_conda_routed.iter().cloned());
@@ -272,6 +291,10 @@ fn build_conda_routing_diff(
         } else {
             Side::Absent
         };
+        // Skip Absent-side cases: those are owned by only_in_bfs/only_in_resolvo.
+        if bfs_side == Side::Absent || resolvo_side == Side::Absent {
+            continue;
+        }
         if bfs_side != resolvo_side {
             routing_mismatch.push(RoutingMismatch {
                 name: name.clone(),
@@ -851,6 +874,142 @@ mod tests {
             &no_excluded(),
         );
         assert_eq!(verdict, "RED");
+    }
+
+    // ── Routing mismatch Absent-filter tests ──────────────────────────────────
+    //
+    // PR-1b over-discovery: resolvo discovers the full graph including conda-
+    // pruned subtrees, then correctly conda-routes those deep transitives.
+    // The BFS never saw them (Absent).  The bundle is identical on both sides
+    // (neither includes the dep), so this must NOT be RED.
+
+    #[test]
+    fn routing_absent_resolvo_conda_not_a_mismatch() {
+        // aiobotocore: bfs=Absent (pruned), resolvo=Conda (over-discovered + routed).
+        // bundled_set_matches=true (both sides bundle exactly the same wheels).
+        // routing_mismatch must be EMPTY after the Absent-filter.
+        use std::collections::HashSet;
+
+        let bfs_bundled: HashSet<String> = ["pkg-main".to_string()].into_iter().collect();
+        // resolvo over-discovered aiobotocore but correctly routed it to conda.
+        let resolvo_bundled: HashSet<String> = ["pkg-main".to_string()].into_iter().collect();
+        let bfs_conda_routed = vec!["some-conda-dep".to_string()];
+        let resolvo_conda_routed = vec![
+            "some-conda-dep".to_string(),
+            "aiobotocore".to_string(), // over-discovered deep transitive
+        ];
+
+        // Build a minimal Bundle to satisfy the signature.
+        let mk_rw = |name: &str| -> super::super::ResolvedWheel {
+            super::super::ResolvedWheel {
+                pypi_name: name.to_string(),
+                url: url::Url::parse("file:///tmp/fake.whl").unwrap(),
+                upstream_url: None,
+                git_source: None,
+                sdist_source: None,
+                metadata: crate::wheel::WheelMetadata {
+                    name: name.to_string(),
+                    version: "1.0".to_string(),
+                    requires_dist: vec![],
+                    is_pure_python: true,
+                    sha256: String::new(),
+                    filename: format!("{}-1.0-py3-none-any.whl", name.replace('-', "_")),
+                },
+                extras_requested: vec![],
+                auto_data: None,
+                auto_data_dedup_skipped_root: None,
+            }
+        };
+        let bundle = super::super::Bundle {
+            conda_name: "pkg-main".to_string(),
+            primary: mk_rw("pkg-main"),
+            extras: vec![],
+            probe_decisions: vec![],
+            solve_diagnostics: std::collections::BTreeMap::new(),
+            conda_routed: bfs_conda_routed,
+        };
+
+        let diff = build_conda_routing_diff(
+            &bundle,
+            &bfs_bundled,
+            &resolvo_conda_routed,
+            &resolvo_bundled,
+        );
+
+        assert!(
+            diff.bundled_set_matches,
+            "bundled_set_matches must be true when both bundle the same wheels"
+        );
+        assert!(
+            diff.routing_mismatch.is_empty(),
+            "routing_mismatch must be EMPTY: bfs=Absent/resolvo=Conda is not a real mismatch; \
+             got: {:?}",
+            diff.routing_mismatch
+        );
+    }
+
+    #[test]
+    fn routing_bundled_vs_conda_is_still_red() {
+        // A genuine Bundled<->Conda flip (both sides considered the name) IS a mismatch.
+        use std::collections::HashSet;
+
+        let bfs_bundled: HashSet<String> = ["pkg-main".to_string(), "flip-pkg".to_string()]
+            .into_iter()
+            .collect();
+        // resolvo conda-routed flip-pkg instead of bundling it.
+        let resolvo_bundled: HashSet<String> = ["pkg-main".to_string()].into_iter().collect();
+        let bfs_conda_routed: Vec<String> = vec![];
+        let resolvo_conda_routed = vec!["flip-pkg".to_string()];
+
+        let mk_rw = |name: &str| -> super::super::ResolvedWheel {
+            super::super::ResolvedWheel {
+                pypi_name: name.to_string(),
+                url: url::Url::parse("file:///tmp/fake.whl").unwrap(),
+                upstream_url: None,
+                git_source: None,
+                sdist_source: None,
+                metadata: crate::wheel::WheelMetadata {
+                    name: name.to_string(),
+                    version: "1.0".to_string(),
+                    requires_dist: vec![],
+                    is_pure_python: true,
+                    sha256: String::new(),
+                    filename: format!("{}-1.0-py3-none-any.whl", name.replace('-', "_")),
+                },
+                extras_requested: vec![],
+                auto_data: None,
+                auto_data_dedup_skipped_root: None,
+            }
+        };
+        let bundle = super::super::Bundle {
+            conda_name: "pkg-main".to_string(),
+            primary: mk_rw("pkg-main"),
+            extras: vec![mk_rw("flip-pkg")],
+            probe_decisions: vec![],
+            solve_diagnostics: std::collections::BTreeMap::new(),
+            conda_routed: bfs_conda_routed,
+        };
+
+        let diff = build_conda_routing_diff(
+            &bundle,
+            &bfs_bundled,
+            &resolvo_conda_routed,
+            &resolvo_bundled,
+        );
+
+        assert!(
+            !diff.bundled_set_matches,
+            "bundled_set_matches must be false: flip-pkg is in bfs_bundled but not resolvo_bundled"
+        );
+        assert_eq!(
+            diff.routing_mismatch.len(),
+            1,
+            "must have exactly 1 routing_mismatch for flip-pkg; got: {:?}",
+            diff.routing_mismatch
+        );
+        assert_eq!(diff.routing_mismatch[0].name, "flip-pkg");
+        assert_eq!(diff.routing_mismatch[0].bfs, Side::Bundled);
+        assert_eq!(diff.routing_mismatch[0].resolvo, Side::Conda);
     }
 
     #[test]

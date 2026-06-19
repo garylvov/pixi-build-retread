@@ -251,6 +251,15 @@ pub struct DiscoveryParams<'a> {
     /// Pass `&[]` (or a slice containing only `index`) to keep the old single-
     /// index behaviour for callers that do not yet have the chain.
     pub transitive_indexes: &'a [String],
+    /// Extras active on the PRIMARY entry (e.g. `["all", "extscache"]` from
+    /// `isaacsim = {extras=["all","extscache"]}`).
+    ///
+    /// These are passed to the PRIMARY seed call so that extra-gated
+    /// `Requires-Dist` lines (`foo; extra=="all"`) evaluate to true and `foo`
+    /// enters the discovery frontier.  TRANSITIVE re-seeds always use `&[]`
+    /// (transitive wheels don't activate extras — mirrors BFS `auto_bundle`).
+    /// Pass `&[]` when there are no entry extras.
+    pub primary_extras: &'a [String],
 }
 
 impl<'a> DiscoveryParams<'a> {
@@ -305,9 +314,13 @@ pub async fn run_discovery(
     // The primary wheel itself is NOT added to the pool here (it's already
     // materialised upstream and carried as `Bundle.primary`); we only need its
     // dependency edges to seed the frontier.
+    //
+    // Pass params.primary_extras so that extra-gated Requires-Dist lines
+    // (e.g. `foo; extra=="all"`) evaluate to true for the requested extras.
+    // This mirrors BFS seed_worklist which also applies entry.extras here.
     seed_frontier_from_requires_dist(
         primary_requires_dist,
-        &[],
+        params.primary_extras,
         &marker_env,
         &visited,
         &mut frontier,
@@ -1006,6 +1019,7 @@ mod tests {
             max_iterations: DiscoveryParams::DEFAULT_MAX_ITERATIONS,
             conda_deps: &[],
             transitive_indexes: std::slice::from_ref(&index),
+            primary_extras: &[],
         };
 
         let pool = run_discovery(&primary_rd, &params)
@@ -1094,6 +1108,7 @@ mod tests {
             max_iterations: DiscoveryParams::DEFAULT_MAX_ITERATIONS,
             conda_deps: &[],
             transitive_indexes: std::slice::from_ref(&index),
+            primary_extras: &[],
         };
 
         let pool = run_discovery(&primary_rd, &params)
@@ -1173,6 +1188,7 @@ mod tests {
             max_iterations: DiscoveryParams::DEFAULT_MAX_ITERATIONS,
             conda_deps: &[],
             transitive_indexes: std::slice::from_ref(&index),
+            primary_extras: &[],
         };
 
         let pool = run_discovery(&primary_rd, &params)
@@ -1244,6 +1260,7 @@ mod tests {
             max_iterations: DiscoveryParams::DEFAULT_MAX_ITERATIONS,
             conda_deps: &[],
             transitive_indexes: std::slice::from_ref(&index),
+            primary_extras: &[],
         };
 
         let pool = run_discovery(&primary_rd, &params)
@@ -1278,5 +1295,107 @@ mod tests {
             "must have at least 2 spec shapes for conda-spec-dep (raw edge + widened version); \
              got: {all_specs_for_target:?}"
         );
+    }
+
+    // ── Test E: primary_extras gates extra-gated Requires-Dist ───────────────
+    //
+    // primary has `Requires-Dist: ext-dep==1.0; extra == "x"`.
+    // With primary_extras=["x"]  -> ext-dep enters the frontier -> in pool.
+    // With primary_extras=[]     -> marker evaluates false       -> NOT in pool.
+
+    #[tokio::test]
+    async fn discovery_primary_extras_gates_extra_deps() {
+        let dir = unique_tmp_dir();
+
+        // Primary wheel: base dep (no marker) + extras-gated dep.
+        let primary_bytes = make_wheel_bytes(
+            "extras-primary",
+            "1.0",
+            &["base-dep==1.0", "ext-dep==1.0; extra == \"x\""],
+        );
+        let base_dep_bytes = make_wheel_bytes("base-dep", "1.0", &[]);
+        let ext_dep_bytes = make_wheel_bytes("ext-dep", "1.0", &[]);
+
+        let port = spawn_fixture_server(
+            vec![
+                (
+                    "extras_primary-1.0-py3-none-any.whl".to_string(),
+                    primary_bytes,
+                ),
+                ("base_dep-1.0-py3-none-any.whl".to_string(), base_dep_bytes),
+                ("ext_dep-1.0-py3-none-any.whl".to_string(), ext_dep_bytes),
+            ],
+            64,
+        )
+        .await;
+
+        let index = format!("http://127.0.0.1:{port}/simple/");
+        let target = linux64_target();
+        let name_map: BTreeMap<String, String> = BTreeMap::new();
+        let pypi_to_conda: PypiToCondaMap = HashMap::new();
+        let primary_rd = vec![
+            "base-dep==1.0".to_string(),
+            "ext-dep==1.0; extra == \"x\"".to_string(),
+        ];
+
+        // ── With primary_extras=["x"]: ext-dep should be discovered ────────────
+        let params_with_extra = DiscoveryParams {
+            index: &index,
+            transitive_indexes: std::slice::from_ref(&index),
+            primary_extras: &["x".to_string()],
+            target: &target,
+            download_dir: &dir,
+            relax: RelaxPolicy::default(),
+            conda_channels: &[],
+            name_map: &name_map,
+            pypi_to_conda: &pypi_to_conda,
+            max_iterations: DiscoveryParams::DEFAULT_MAX_ITERATIONS,
+            conda_deps: &[],
+        };
+
+        let pool_with = run_discovery(&primary_rd, &params_with_extra)
+            .await
+            .expect("discovery with primary_extras must succeed");
+
+        assert!(
+            pool_with.candidates.contains_key("ext-dep"),
+            "ext-dep must be in pool when primary_extras=[\"x\"]; got {:?}",
+            pool_with.candidates.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            pool_with.candidates.contains_key("base-dep"),
+            "base-dep must always be in pool"
+        );
+
+        // ── With primary_extras=[]: ext-dep should NOT be discovered ───────────
+        let params_no_extra = DiscoveryParams {
+            index: &index,
+            transitive_indexes: std::slice::from_ref(&index),
+            primary_extras: &[],
+            target: &target,
+            download_dir: &dir,
+            relax: RelaxPolicy::default(),
+            conda_channels: &[],
+            name_map: &name_map,
+            pypi_to_conda: &pypi_to_conda,
+            max_iterations: DiscoveryParams::DEFAULT_MAX_ITERATIONS,
+            conda_deps: &[],
+        };
+
+        let pool_without = run_discovery(&primary_rd, &params_no_extra)
+            .await
+            .expect("discovery without primary_extras must succeed");
+
+        assert!(
+            !pool_without.candidates.contains_key("ext-dep"),
+            "ext-dep must NOT be in pool when primary_extras=[]; got {:?}",
+            pool_without.candidates.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            pool_without.candidates.contains_key("base-dep"),
+            "base-dep must still be in pool without extras"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
