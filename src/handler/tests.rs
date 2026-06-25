@@ -1368,6 +1368,7 @@ fn tiered_cascade_indecisive_probe_never_reroutes() {
         None,
         "isaacsim-kernel",
         &BTreeMap::new(),
+        None, // favor-lock: cold path in tests
     ))
     .unwrap();
     assert!(
@@ -1536,6 +1537,7 @@ fn tiered_cascade_step8_bundles_pypi_only_dep_live() {
         None,
         "nvidia-cuda-nvrtc-cu12",
         &BTreeMap::new(),
+        None, // favor-lock: cold path in tests
     ))
     .unwrap();
     assert_eq!(

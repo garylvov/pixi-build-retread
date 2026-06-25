@@ -53,6 +53,43 @@ pub async fn resolve(
     specifiers: &VersionSpecifiers,
     target: &WheelTarget,
 ) -> Result<ResolvedWheel> {
+    resolve_inner(index, name, specifiers, target, None).await
+}
+
+/// Like [`resolve`] but prefers `prefer_version` when it satisfies `specifiers`
+/// and a target-compatible wheel exists for it. Falls back to highest-version
+/// selection when the preferred version has no compatible wheel or does not
+/// satisfy `specifiers`.
+///
+/// Used by the favor-lock path (`RETREAD_FAVOR_LOCK=1`) so cold re-resolves
+/// that have a committed lock prefer the locked version, keeping the closure
+/// stable across routine re-resolves (e.g. a pack with an unlocked range spec
+/// stays pinned to the version the last engineer verified).
+pub async fn resolve_preferring(
+    index: &str,
+    name: &str,
+    specifiers: &VersionSpecifiers,
+    target: &WheelTarget,
+    prefer_version: &str,
+) -> Result<ResolvedWheel> {
+    resolve_inner(index, name, specifiers, target, Some(prefer_version)).await
+}
+
+/// Shared implementation for [`resolve`] and [`resolve_preferring`].
+///
+/// `prefer_version`: when `Some(v)` and `v` satisfies `specifiers`, the
+/// grouped pass tries the preferred-version group FIRST.  If it has a
+/// target-compatible wheel that wheel is returned immediately.  Otherwise
+/// selection falls back to the normal highest-version sweep (no error is
+/// raised because the locked version may simply not be on this index, or may
+/// lack a compatible wheel for the current target).
+async fn resolve_inner(
+    index: &str,
+    name: &str,
+    specifiers: &VersionSpecifiers,
+    target: &WheelTarget,
+    prefer_version: Option<&str>,
+) -> Result<ResolvedWheel> {
     let index_url = build_index_url(index, name)?;
     tracing::info!(url = %index_url, "fetching simple index");
     let html = reqwest::get(index_url.clone())
@@ -109,6 +146,36 @@ pub async fn resolve(
             _ => grouped.push((v, vec![w])),
         }
     }
+
+    // favor-lock: if a preferred version was supplied AND it satisfies
+    // `specifiers` AND a target-compatible wheel exists for it, return that
+    // wheel immediately (before the normal highest-version sweep).  This
+    // keeps re-resolves stable when a range spec (e.g. `>=5`) could legally
+    // pick a newer version -- we keep the one that was previously verified.
+    if let Some(pref_str) = prefer_version
+        && let Ok(pref_ver) = Version::from_str(pref_str)
+        && specifiers.contains(&pref_ver)
+    {
+        if let Some((_, group)) = grouped.iter().find(|(v, _)| *v == pref_ver)
+            && let Some(picked) = pick_best(group.clone(), target)
+        {
+            tracing::debug!(
+                dep = %name,
+                preferred = %pref_str,
+                wheel = %picked.filename,
+                "favor-lock: using preferred locked version instead of latest",
+            );
+            return Ok(picked);
+        }
+        // Preferred version not on index or no compatible wheel; fall through to
+        // normal highest-version selection (logged as trace so it's auditable).
+        tracing::trace!(
+            dep = %name,
+            preferred = %pref_str,
+            "favor-lock: preferred version absent or no compatible wheel; using latest",
+        );
+    }
+
     for (_v, group) in grouped {
         if let Some(picked) = pick_best(group, target) {
             return Ok(picked);
@@ -1232,6 +1299,117 @@ mod tests {
             "only 1.0 with wrong arch + no sdist must be excluded; got {candidates:?}"
         );
         assert_eq!(candidates[0].version.to_string(), "2.0");
+    }
+
+    // ── favor-lock: resolve_preferring tests ─────────────────────────────────
+
+    /// When the preferred version is on the index and a compatible wheel exists,
+    /// `resolve_preferring` must return that version rather than the latest.
+    #[tokio::test]
+    async fn resolve_preferring_returns_preferred_not_latest() {
+        let entries = vec![
+            ("mylib-1.0-py3-none-any.whl".to_string(), b"v10".to_vec()),
+            ("mylib-2.0-py3-none-any.whl".to_string(), b"v20".to_vec()),
+            ("mylib-3.0-py3-none-any.whl".to_string(), b"v30".to_vec()),
+        ];
+        let port = spawn_fixture_server(entries, 4).await;
+        let index = format!("http://127.0.0.1:{port}/simple/");
+        let target = WheelTarget {
+            python_version: "3.11".into(),
+            conda_subdir: "linux-64".into(),
+        };
+        let specs: VersionSpecifiers = ">=1.0".parse().unwrap();
+
+        let picked = resolve_preferring(&index, "mylib", &specs, &target, "2.0")
+            .await
+            .expect("resolve_preferring must succeed");
+
+        assert_eq!(
+            picked.filename, "mylib-2.0-py3-none-any.whl",
+            "must return the preferred version 2.0, not the latest 3.0"
+        );
+    }
+
+    /// When the preferred version is NOT on the index, `resolve_preferring`
+    /// falls back to the highest matching version (normal behavior).
+    #[tokio::test]
+    async fn resolve_preferring_falls_back_when_preferred_absent() {
+        let entries = vec![
+            ("mylib-1.0-py3-none-any.whl".to_string(), b"v10".to_vec()),
+            ("mylib-3.0-py3-none-any.whl".to_string(), b"v30".to_vec()),
+        ];
+        let port = spawn_fixture_server(entries, 4).await;
+        let index = format!("http://127.0.0.1:{port}/simple/");
+        let target = WheelTarget {
+            python_version: "3.11".into(),
+            conda_subdir: "linux-64".into(),
+        };
+        let specs: VersionSpecifiers = ">=1.0".parse().unwrap();
+
+        // Prefer 2.0, which does not exist on this index.
+        let picked = resolve_preferring(&index, "mylib", &specs, &target, "2.0")
+            .await
+            .expect("resolve_preferring must fall back without error");
+
+        assert_eq!(
+            picked.filename, "mylib-3.0-py3-none-any.whl",
+            "must fall back to the highest matching version (3.0) when preferred 2.0 absent"
+        );
+    }
+
+    /// When the preferred version does NOT satisfy `specifiers`,
+    /// `resolve_preferring` ignores it and returns the highest matching version.
+    #[tokio::test]
+    async fn resolve_preferring_ignores_preferred_outside_specifiers() {
+        let entries = vec![
+            ("mylib-1.0-py3-none-any.whl".to_string(), b"v10".to_vec()),
+            ("mylib-2.0-py3-none-any.whl".to_string(), b"v20".to_vec()),
+        ];
+        let port = spawn_fixture_server(entries, 4).await;
+        let index = format!("http://127.0.0.1:{port}/simple/");
+        let target = WheelTarget {
+            python_version: "3.11".into(),
+            conda_subdir: "linux-64".into(),
+        };
+        // Specifiers only allow >=2.0, but we prefer 1.0 (outside the range).
+        let specs: VersionSpecifiers = ">=2.0".parse().unwrap();
+
+        let picked = resolve_preferring(&index, "mylib", &specs, &target, "1.0")
+            .await
+            .expect("resolve_preferring must succeed");
+
+        assert_eq!(
+            picked.filename, "mylib-2.0-py3-none-any.whl",
+            "must ignore preferred 1.0 (outside >=2.0) and return 2.0"
+        );
+    }
+
+    /// `resolve` (no preferred version) still picks the highest matching version.
+    /// This guards the default code path against regressions from the
+    /// `resolve_inner` refactor.
+    #[tokio::test]
+    async fn resolve_without_preference_picks_highest() {
+        let entries = vec![
+            ("mylib-1.0-py3-none-any.whl".to_string(), b"v10".to_vec()),
+            ("mylib-2.0-py3-none-any.whl".to_string(), b"v20".to_vec()),
+            ("mylib-3.0-py3-none-any.whl".to_string(), b"v30".to_vec()),
+        ];
+        let port = spawn_fixture_server(entries, 4).await;
+        let index = format!("http://127.0.0.1:{port}/simple/");
+        let target = WheelTarget {
+            python_version: "3.11".into(),
+            conda_subdir: "linux-64".into(),
+        };
+        let specs: VersionSpecifiers = ">=1.0".parse().unwrap();
+
+        let picked = resolve(&index, "mylib", &specs, &target)
+            .await
+            .expect("resolve must succeed");
+
+        assert_eq!(
+            picked.filename, "mylib-3.0-py3-none-any.whl",
+            "plain resolve must pick the highest version (3.0)"
+        );
     }
 
     /// The #sha256=<hex> fragment on wheel index links must be parsed into

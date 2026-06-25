@@ -123,6 +123,11 @@ pub(crate) async fn auto_bundle_transitives(
     // incremental-add path: pre-fill seen_candidate with locked names so
     // auto_bundle_transitives does not try to re-bundle them. Cold path: None.
     locked_closure: Option<&std::collections::BTreeMap<String, String>>,
+    // favor-lock: preferred versions for PyPI auto-bundle resolution.
+    // When RETREAD_FAVOR_LOCK=1 and a dep has a committed lock version,
+    // use resolve_preferring so the re-resolve prefers that version.
+    // Cold path (RETREAD_FAVOR_LOCK unset or first build): None.
+    favor_lock_prefs: Option<&std::collections::BTreeMap<String, String>>,
 ) -> Result<()> {
     // Build the skip set: anything already in the bundle, plus the user's
     // `retread-conda-deps` allowlist (deps that should stay as conda
@@ -254,7 +259,9 @@ pub(crate) async fn auto_bundle_transitives(
         let mut added_any = false;
         // Candidates routed to PyPI this round; fetched concurrently
         // after the (serial, mutating) routing decisions below.
-        let mut to_fetch: Vec<(String, String, String, VersionSpecifiers)> = Vec::new();
+        // The 5th field is the favor-lock preferred version (if any) for that dep.
+        let mut to_fetch: Vec<(String, String, String, VersionSpecifiers, Option<String>)> =
+            Vec::new();
         for (name, version) in candidates {
             let conda_name = canonical_conda_name(&name);
             if prefer_conda_match(&conda_name, &config.name_map) {
@@ -385,7 +392,11 @@ pub(crate) async fn auto_bundle_transitives(
                     continue;
                 }
             };
-            to_fetch.push((name, version, conda_name, specifiers));
+            // favor-lock: look up preferred version for this dep by canonical name.
+            let preferred_ver = favor_lock_prefs
+                .and_then(|m| m.get(&canonical_conda_name(&conda_name)))
+                .cloned();
+            to_fetch.push((name, version, conda_name, specifiers, preferred_ver));
         }
 
         // Loose (bare/ranged) candidates: the step-8 gate. A name-level
@@ -454,7 +465,11 @@ pub(crate) async fn auto_bundle_transitives(
                 specs = %specs,
                 "auto-bundle: bare/ranged dep has zero conda candidates; bundling from PyPI",
             );
-            to_fetch.push((name, specs.to_string(), conda_name, specs));
+            // favor-lock: look up preferred version for this dep by canonical name.
+            let preferred_ver = favor_lock_prefs
+                .and_then(|m| m.get(&canonical_conda_name(&conda_name)))
+                .cloned();
+            to_fetch.push((name, specs.to_string(), conda_name, specs, preferred_ver));
         }
 
         // v1.4.0: fetch this round's PyPI-bound wheels concurrently
@@ -469,61 +484,75 @@ pub(crate) async fn auto_bundle_transitives(
             use futures::stream::{self, StreamExt};
             let indexes_ref = &indexes;
             stream::iter(to_fetch)
-                .map(|(name, version, conda_name, specifiers)| async move {
-                    for index in indexes_ref {
-                        match pypi::resolve(index, &name, &specifiers, target).await {
-                            Ok(resolved) => {
-                                match metadata_preferring_sidecar(&resolved, download_dir).await {
-                                    Ok(metadata) => {
-                                        // resolved.url is the pristine index
-                                        // URL; clone it for upstream_url
-                                        // before moving into the struct.
-                                        let upstream = Some(resolved.url.clone());
-                                        return Some((
-                                            name,
-                                            version,
-                                            ResolvedWheel {
-                                                pypi_name: conda_name,
-                                                url: resolved.url,
-                                                upstream_url: upstream,
-                                                git_source: None,
-                                                sdist_source: None,
-                                                metadata,
-                                                extras_requested: vec![],
-                                                auto_data: None,
-                                                auto_data_dedup_skipped_root: None,
-                                            },
-                                        ));
-                                    }
-                                    Err(e) => {
-                                        tracing::debug!(
-                                            dep = %name,
-                                            error = %format!("{e:#}"),
-                                            "auto-bundle fetch failed; leaving as conda dep"
-                                        );
-                                        return None;
+                .map(
+                    |(name, version, conda_name, specifiers, preferred_ver)| async move {
+                        // favor-lock: if a committed lock version exists for this dep,
+                        // prefer it over the highest satisfying version on PyPI.
+                        // `preferred_ver` is pre-looked-up before the async block to
+                        // avoid capturing a reference to the prefs map.
+                        let preferred: Option<&str> = preferred_ver.as_deref();
+                        for index in indexes_ref {
+                            let resolved_result = if let Some(pv) = preferred {
+                                pypi::resolve_preferring(index, &name, &specifiers, target, pv)
+                                    .await
+                            } else {
+                                pypi::resolve(index, &name, &specifiers, target).await
+                            };
+                            match resolved_result {
+                                Ok(resolved) => {
+                                    match metadata_preferring_sidecar(&resolved, download_dir).await
+                                    {
+                                        Ok(metadata) => {
+                                            // resolved.url is the pristine index
+                                            // URL; clone it for upstream_url
+                                            // before moving into the struct.
+                                            let upstream = Some(resolved.url.clone());
+                                            return Some((
+                                                name,
+                                                version,
+                                                ResolvedWheel {
+                                                    pypi_name: conda_name,
+                                                    url: resolved.url,
+                                                    upstream_url: upstream,
+                                                    git_source: None,
+                                                    sdist_source: None,
+                                                    metadata,
+                                                    extras_requested: vec![],
+                                                    auto_data: None,
+                                                    auto_data_dedup_skipped_root: None,
+                                                },
+                                            ));
+                                        }
+                                        Err(e) => {
+                                            tracing::debug!(
+                                                dep = %name,
+                                                error = %format!("{e:#}"),
+                                                "auto-bundle fetch failed; leaving as conda dep"
+                                            );
+                                            return None;
+                                        }
                                     }
                                 }
-                            }
-                            Err(e) => {
-                                tracing::debug!(
-                                    dep = %name,
-                                    version = %version,
-                                    index = %index,
-                                    error = %format!("{e:#}"),
-                                    "auto-bundle resolve failed on this index"
-                                );
+                                Err(e) => {
+                                    tracing::debug!(
+                                        dep = %name,
+                                        version = %version,
+                                        index = %index,
+                                        error = %format!("{e:#}"),
+                                        "auto-bundle resolve failed on this index"
+                                    );
+                                }
                             }
                         }
-                    }
-                    tracing::debug!(
-                        dep = %name,
-                        version = %version,
-                        "auto-bundle exhausted all indexes; leaving as conda dep. \
-                         If conda can't satisfy it, add to retread-drop-deps."
-                    );
-                    None
-                })
+                        tracing::debug!(
+                            dep = %name,
+                            version = %version,
+                            "auto-bundle exhausted all indexes; leaving as conda dep. \
+                             If conda can't satisfy it, add to retread-drop-deps."
+                        );
+                        None
+                    },
+                )
                 .buffered(8)
                 .collect()
                 .await

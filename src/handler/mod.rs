@@ -2365,6 +2365,16 @@ async fn resolve_all(
             })
             .collect();
 
+        // favor-lock: load preferred versions from the committed lock file for
+        // this bundle.  The lock file is named after the bundle's canonical
+        // conda name (same key used by the lock writer and replay path).
+        // load_favored_versions returns an empty map when RETREAD_FAVOR_LOCK is
+        // unset (the default), so this is a no-op on the cold / default path
+        // and produces byte-identical output to today.
+        let bundle_conda_name = canonical_conda_name(&group_name);
+        let lock_path = source_dir.join(crate::lock::RetreadLock::file_name(&bundle_conda_name));
+        let favored = load_favored_versions(&lock_path);
+
         let mut sub_bundles: Vec<Bundle> = Vec::with_capacity(group_entries.len());
         for ((entry_name, entry), auto_data) in group_entries.iter().zip(auto_data_per_entry) {
             let sub = resolve_bundle(
@@ -2382,7 +2392,8 @@ async fn resolve_all(
                 conda_channels,
                 &effective.conda_deps,
                 &workspace_pypi_indexes,
-                None, // cold path: no locked closure
+                None,                   // cold path: no locked closure
+                Some(&favored).filter(|m| !m.is_empty()), // favor-lock prefs (empty map → None)
             )
             .await
             .with_context(|| {
@@ -2433,7 +2444,8 @@ async fn resolve_all(
                 download_dir,
                 &effective,
                 conda_channels,
-                None, // cold path: no locked closure
+                None,                                     // cold path: no locked closure
+                Some(&favored).filter(|m| !m.is_empty()), // favor-lock prefs
             )
             .await?;
         }
@@ -2749,6 +2761,13 @@ async fn resolve_bundle(
     // When Some, seeds ResolveState with ==V pinned constraints so ripples
     // become visible to intersect_specifiers.  Cold path: None.
     locked_closure: Option<&std::collections::BTreeMap<String, String>>,
+    // favor-lock path: preferred versions for transitive deps (name → version_str).
+    // When RETREAD_FAVOR_LOCK=1 and Some, the BFS will prefer these versions during
+    // PyPI resolution instead of always picking the highest satisfying version.
+    // Unlike `locked_closure`, these deps are NOT pinned as constraints and DO go
+    // through the BFS fetch; we just hint the resolver to pick the given version.
+    // Cold path (or RETREAD_FAVOR_LOCK unset): None (or ignored).
+    favor_lock_prefs: Option<&std::collections::BTreeMap<String, String>>,
 ) -> Result<Bundle> {
     let conda_name = canonical_conda_name(entry_name);
     let mut state = ResolveState::default();
@@ -3216,21 +3235,50 @@ async fn resolve_bundle(
         // arm: wheel resolve -> fetch, with sdist fallback on
         // wheel-resolve failure; the first error fails the whole
         // bundle exactly as `?` did.
+        // favor-lock: build a snapshot of the preferred versions for this fetch
+        // sweep.  We only look versions up (no mutation), so a cheap reference
+        // to the caller's BTreeMap is enough -- but async closures capture by
+        // value, so clone the prefs map if provided.  On the cold path (None
+        // prefs, which is what resolve_all builds when RETREAD_FAVOR_LOCK is
+        // unset) `favor_lock_snap` is empty and all `prefer_version` lookups
+        // return None, reproducing the original highest-version behavior.
+        //
+        // The RETREAD_FAVOR_LOCK env gate is ONLY enforced at load_favored_versions
+        // (called by resolve_all).  By the time we reach resolve_bundle the param
+        // already reflects the caller's intent -- using the param directly avoids
+        // process-wide env mutation leaking across parallel tests.
+        //
+        // NOTE: `favor_lock_prefs` is SEPARATE from `locked_closure`. The locked
+        // closure pins deps as ==V constraints (blocking BFS fetch); the prefs map
+        // only hints the resolver to prefer a version, without blocking the fetch.
+        let favor_lock_snap: std::collections::BTreeMap<String, String> =
+            favor_lock_prefs.cloned().unwrap_or_default();
         let fetched: Vec<(Pending, Result<Option<BfsFetched>>)> = {
             use futures::stream::{self, StreamExt};
+            let favor_lock_snap_ref = &favor_lock_snap;
             stream::iter(to_materialize)
                 .map(|pending| async move {
                     let result = match &pending.source {
-                        PendingSource::Pypi { specifiers, index } => bfs_fetch_pypi(
-                            &pending.pypi_name,
-                            specifiers,
-                            index,
-                            target,
-                            download_dir,
-                            relax,
-                        )
-                        .await
-                        .map(Some),
+                        PendingSource::Pypi { specifiers, index } => {
+                            // Look up the preferred locked version for this
+                            // dep (canonical-normalized name).  Returns None
+                            // on the cold path (empty snapshot) so bfs_fetch_pypi
+                            // falls back to the normal highest-version selection.
+                            let dep_canon = crate::relax::canonical_conda_name(&pending.pypi_name);
+                            let prefer_version: Option<&str> =
+                                favor_lock_snap_ref.get(&dep_canon).map(String::as_str);
+                            bfs_fetch_pypi(
+                                &pending.pypi_name,
+                                specifiers,
+                                index,
+                                target,
+                                download_dir,
+                                relax,
+                                prefer_version,
+                            )
+                            .await
+                            .map(Some)
+                        }
                         _ => Ok(None),
                     };
                     (pending, result)
@@ -3656,6 +3704,10 @@ async fn bfs_fetch_pypi(
     target: &WheelTarget,
     download_dir: &Path,
     relax: RelaxPolicy,
+    // favor-lock: when Some, prefer this version on the index before falling
+    // back to highest-version selection. Propagated from favor_lock_prefs by the
+    // BFS phase-2 fetch loop when RETREAD_FAVOR_LOCK=1. None on the cold path.
+    prefer_version: Option<&str>,
 ) -> Result<(url::Url, WheelMetadata, String, Option<SdistProv>)> {
     // v1.5.9 exact-first: `specifiers` are the ORIGINAL (pre-D)
     // upstream pins, so exact family pins (isaacsim-kernel==6.0.0.0)
@@ -3665,7 +3717,11 @@ async fn bfs_fetch_pypi(
     // that is precisely the patch-drift condition that broke Kit
     // extension resolution (6.0.0.0 experience files requiring
     // extensions the 6.0.0.1 sensor wheel renamed).
-    let wheel_result = match pypi::resolve(index, pypi_name, specifiers, target).await {
+    let wheel_result = match if let Some(pv) = prefer_version {
+        pypi::resolve_preferring(index, pypi_name, specifiers, target, pv).await
+    } else {
+        pypi::resolve(index, pypi_name, specifiers, target).await
+    } {
         Ok(resolved) => Ok(resolved),
         Err(exact_err) => {
             if let Some(relaxed) = relaxed_retry_specs(pypi_name, specifiers, relax) {
@@ -5633,6 +5689,7 @@ async fn resolve_incremental_add(
             &effective.conda_deps,
             &workspace_pypi_indexes,
             Some(&locked_closure),
+            None, // favor-lock prefs: not used on the incremental-add path (locked closure handles version pinning)
         )
         .await;
 
@@ -6495,6 +6552,35 @@ fn detect_incremental_add(
     })
 }
 
+/// Build a map of `canonical_conda_name(wheel.name) → wheel.version` from the
+/// committed lock file at `lock_path`, to be used as "favor-lock" soft
+/// preferences during re-resolve.
+///
+/// **Gated behind `RETREAD_FAVOR_LOCK`** (any non-empty value).  Returns an
+/// empty map when the env var is unset, the lock file is missing, or the lock
+/// cannot be parsed.  Errors are silently discarded so a corrupt lock does not
+/// break the build -- the caller will just cold-resolve as usual.
+///
+/// Unlike [`load_replayable_lock`], this function loads the lock even when the
+/// `inputs_hash` does not match -- favor-lock REQUIRES a deliberate hash
+/// mismatch (it is designed for the re-resolve-after-manifest-change case).
+fn load_favored_versions(lock_path: &Path) -> std::collections::BTreeMap<String, String> {
+    if std::env::var_os("RETREAD_FAVOR_LOCK").is_none() {
+        return std::collections::BTreeMap::new();
+    }
+    let Ok(lock) = crate::lock::RetreadLock::load(lock_path) else {
+        return std::collections::BTreeMap::new();
+    };
+    let mut m = std::collections::BTreeMap::new();
+    for w in &lock.wheels {
+        // Skip wheels with empty version strings; those are malformed.
+        if !w.version.is_empty() {
+            m.insert(canonical_conda_name(&w.name), w.version.clone());
+        }
+    }
+    m
+}
+
 /// Authority gate for the courier replay path.
 ///
 /// Returns `Some(lock)` iff ALL of the following hold:
@@ -6634,6 +6720,18 @@ fn replay_from_lock(
 }
 
 // -----------------------------------------------------------------
+// Shared test-only mutex: serialises all tests that mutate process-wide env
+// vars (RETREAD_NO_REPLAY, RETREAD_FAVOR_LOCK, RETREAD_INCREMENTAL, …).
+//
+// `std::env::set_var` / `remove_var` are not thread-safe; parallel Rust tests
+// that touch env vars can see each others' changes.  Each env-sensitive test
+// acquires this lock for the duration of its env-mutation window.  Tests that
+// never touch env vars (the majority) do NOT need the lock.
+// -----------------------------------------------------------------
+#[cfg(test)]
+static TEST_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+// -----------------------------------------------------------------
 // WS-B: unit tests for replay_from_lock and load_replayable_lock.
 // Uses only std (no tempfile crate dependency) -- temp dirs are created
 // via std::env::temp_dir() with a unique subdirectory.
@@ -6710,6 +6808,8 @@ mod replay_tests {
 
     #[test]
     fn matching_hash_returns_some_with_correct_fields() {
+        // Hold env-lock: prevents RETREAD_NO_REPLAY=1 from returning None here.
+        let _env_guard = super::TEST_ENV_MUTEX.lock().unwrap();
         let dir = unique_tmp_dir();
         let lock = make_test_lock("mypack", "1.2.3", "3.11", "abc123", true);
         let json = lock.to_pretty_json().unwrap();
@@ -6800,6 +6900,8 @@ mod replay_tests {
 
     #[test]
     fn platform_specific_wheel_sets_host_platform_subdir() {
+        // Hold env-lock: prevents RETREAD_NO_REPLAY=1 from returning None here.
+        let _env_guard = super::TEST_ENV_MUTEX.lock().unwrap();
         let dir = unique_tmp_dir();
         let lock = make_test_lock("mypack", "1.0.0", "3.11", "hash1", false /* arch */);
         let json = lock.to_pretty_json().unwrap();
@@ -6818,6 +6920,8 @@ mod replay_tests {
 
     #[test]
     fn siblings_are_cross_linked_in_output() {
+        // Hold env-lock: prevents RETREAD_NO_REPLAY=1 from returning None here.
+        let _env_guard = super::TEST_ENV_MUTEX.lock().unwrap();
         let dir = unique_tmp_dir();
         let lock = make_test_lock("pack-a", "2.0.0", "3.11", "hash42", true);
         let json = lock.to_pretty_json().unwrap();
@@ -6852,6 +6956,8 @@ mod replay_tests {
     /// Verify that conda_run_deps with empty spec (name-only) round-trips.
     #[test]
     fn conda_dep_with_empty_spec_round_trips() {
+        // Hold env-lock: prevents RETREAD_NO_REPLAY=1 from returning None here.
+        let _env_guard = super::TEST_ENV_MUTEX.lock().unwrap();
         let dir = unique_tmp_dir();
         let mut lock = make_test_lock("mypack", "1.0.0", "3.11", "hash9", true);
         lock.conda_run_deps.push(CondaDep {
@@ -6891,6 +6997,9 @@ mod replay_tests {
     /// Verify that replay_from_lock emits the content-addressed build string.
     #[test]
     fn replay_emits_content_addressed_build_string() {
+        // Hold env-lock: prevents RETREAD_NO_REPLAY=1 (set by
+        // no_replay_env_knob_returns_none) from returning None here.
+        let _env_guard = super::TEST_ENV_MUTEX.lock().unwrap();
         let dir = unique_tmp_dir();
         // Use a 64-hex-char inputs_hash (typical sha256 hex output length).
         let hash = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
@@ -7871,20 +7980,16 @@ mod replay_tests {
 
     #[test]
     fn no_replay_env_knob_returns_none() {
-        // SAFETY: single-threaded test; set/unset env var atomically.
-        // Tests run in parallel so we use a unique env var name and
-        // restore state to avoid interfering with other tests.
-        // Note: std::env::set_var is thread-unsafe; this test must
-        // run in isolation (use `-- --test-threads=1` if flaky).
+        // Acquire the shared env-mutation lock so that concurrent tests cannot
+        // observe RETREAD_NO_REPLAY=1 set here (and vice-versa).
+        let _env_guard = super::TEST_ENV_MUTEX.lock().unwrap();
+
         let dir = unique_tmp_dir();
         let lock = make_test_lock("pack", "1.0.0", "3.11", "myhash", true);
         let path = dir.join(RetreadLock::file_name("pack"));
         std::fs::write(&path, lock.to_pretty_json().unwrap()).unwrap();
 
-        // Set the knob and verify replay is suppressed.
-        // SAFETY: This test is inherently racy in a multi-threaded test harness.
-        // It is marked as a best-effort check; if it fails intermittently,
-        // investigate test parallelism.
+        // SAFETY: serialised by TEST_ENV_MUTEX; no concurrent env access.
         unsafe {
             std::env::set_var("RETREAD_NO_REPLAY", "1");
         }
@@ -7985,6 +8090,8 @@ mod replay_tests {
 
     #[test]
     fn load_replayable_returns_some_when_all_checks_pass() {
+        // Hold env-lock: prevents RETREAD_NO_REPLAY=1 from returning None here.
+        let _env_guard = super::TEST_ENV_MUTEX.lock().unwrap();
         let dir = unique_tmp_dir();
         let lock = make_test_lock("pack", "1.0.0", "3.11", "goodhash", true);
         let path = dir.join(RetreadLock::file_name("pack"));
@@ -8072,6 +8179,8 @@ mod replay_tests {
 
     #[test]
     fn load_replayable_returns_some_with_non_default_relax_when_requires_dist_nonempty() {
+        // Hold env-lock: prevents RETREAD_NO_REPLAY=1 from returning None here.
+        let _env_guard = super::TEST_ENV_MUTEX.lock().unwrap();
         let dir = unique_tmp_dir();
         let mut lock = make_test_lock("pack", "1.0.0", "3.11", "myhash", true);
         // A relax-changed Built wheel WITH requires_dist — not poison.
@@ -9405,6 +9514,181 @@ mod emit_wheel_upstream_url_tests {
 }
 
 // -----------------------------------------------------------------
+// load_favored_versions unit tests.
+//
+// Tests the RETREAD_FAVOR_LOCK gating and lock-loading behavior in isolation
+// (no network; reads/writes local temp files only).
+// -----------------------------------------------------------------
+#[cfg(test)]
+mod load_favored_versions_tests {
+    use std::collections::BTreeMap;
+
+    use super::{TEST_ENV_MUTEX, load_favored_versions};
+    use crate::lock::{CondaDep, LockWheel, Origin, RetreadLock, SCHEMA};
+
+    fn unique_tmp_dir() -> std::path::PathBuf {
+        let base = std::env::temp_dir();
+        let unique = format!(
+            "retread-favored-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        );
+        let dir = base.join(unique);
+        std::fs::create_dir_all(&dir).expect("tmp dir creation should not fail");
+        dir
+    }
+
+    fn write_lock(
+        dir: &std::path::Path,
+        bundle: &str,
+        wheels: Vec<LockWheel>,
+    ) -> std::path::PathBuf {
+        let lock = RetreadLock {
+            schema: SCHEMA,
+            retread_version: "0.0.1".into(),
+            bundle: bundle.into(),
+            version: "1.0.0".into(),
+            python: "3.11".into(),
+            inputs_hash: "testhash".into(),
+            root_requirements: vec![],
+            wheels,
+            conda_run_deps: vec![CondaDep {
+                name: "numpy".into(),
+                spec: ">=1.0".into(),
+            }],
+            index_urls: vec!["https://pypi.org/simple/".into()],
+            prerelease: BTreeMap::new(),
+            conda_capable: vec![],
+            entry_specs: vec![],
+        };
+        let json = lock.to_pretty_json().unwrap();
+        let path = dir.join(RetreadLock::file_name(bundle));
+        std::fs::write(&path, json).unwrap();
+        path
+    }
+
+    fn make_wheel(name: &str, version: &str) -> LockWheel {
+        LockWheel {
+            name: name.into(),
+            version: version.into(),
+            origin: Origin::Index,
+            filename: format!("{name}-{version}-py3-none-any.whl"),
+            url: Some(format!("https://example.com/{name}-{version}.whl")),
+            sha256: None,
+            requires_dist: vec![],
+            must_ship: false,
+            upstream_url: None,
+            git_source: None,
+            sdist_source: None,
+        }
+    }
+
+    /// RETREAD_FAVOR_LOCK unset → always empty, regardless of lock file content.
+    #[test]
+    fn flag_unset_returns_empty() {
+        let _guard = TEST_ENV_MUTEX.lock().unwrap();
+        let dir = unique_tmp_dir();
+        let lock_path = write_lock(
+            &dir,
+            "mypkg",
+            vec![make_wheel("mypkg", "1.2.3"), make_wheel("dep-a", "0.5.0")],
+        );
+        // Ensure the flag is NOT set.
+        // SAFETY: serialised by TEST_ENV_MUTEX; no concurrent env access.
+        unsafe { std::env::remove_var("RETREAD_FAVOR_LOCK") };
+
+        let result = load_favored_versions(&lock_path);
+        assert!(
+            result.is_empty(),
+            "RETREAD_FAVOR_LOCK unset must return empty map; got {result:?}"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Missing lock file → empty map (non-fatal; first build has no lock yet).
+    #[test]
+    fn missing_file_returns_empty() {
+        let _guard = TEST_ENV_MUTEX.lock().unwrap();
+        let dir = unique_tmp_dir();
+        let lock_path = dir.join("retread-nonexistent.lock.json");
+        // SAFETY: serialised by TEST_ENV_MUTEX; no concurrent env access.
+        unsafe { std::env::set_var("RETREAD_FAVOR_LOCK", "1") };
+
+        let result = load_favored_versions(&lock_path);
+        assert!(
+            result.is_empty(),
+            "missing lock must return empty map; got {result:?}"
+        );
+        unsafe { std::env::remove_var("RETREAD_FAVOR_LOCK") };
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Valid lock + flag set → canonical-keyed map with correct versions.
+    #[test]
+    fn valid_lock_returns_canonical_keyed_map() {
+        let _guard = TEST_ENV_MUTEX.lock().unwrap();
+        let dir = unique_tmp_dir();
+        // Wheel names use PyPI casing; canonical_conda_name normalises to
+        // lowercase with hyphens replaced by hyphens (and underscores by
+        // hyphens). Use a name that exercises the normalisation.
+        let lock_path = write_lock(
+            &dir,
+            "my-bundle",
+            vec![
+                make_wheel("MyPkg", "1.2.3"),
+                make_wheel("dep_alpha", "0.5.0"),
+            ],
+        );
+        // SAFETY: serialised by TEST_ENV_MUTEX; no concurrent env access.
+        unsafe { std::env::set_var("RETREAD_FAVOR_LOCK", "1") };
+
+        let result = load_favored_versions(&lock_path);
+
+        // canonical_conda_name("MyPkg") = "mypkg" etc.
+        assert_eq!(
+            result.get("mypkg").map(String::as_str),
+            Some("1.2.3"),
+            "mypkg must be keyed under canonical name; map={result:?}"
+        );
+        assert_eq!(
+            result.get("dep-alpha").map(String::as_str),
+            Some("0.5.0"),
+            "dep_alpha must be keyed as dep-alpha (underscore→hyphen); map={result:?}"
+        );
+        unsafe { std::env::remove_var("RETREAD_FAVOR_LOCK") };
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Wheel with empty version string → that entry dropped, rest kept.
+    #[test]
+    fn empty_version_entry_dropped() {
+        let _guard = TEST_ENV_MUTEX.lock().unwrap();
+        let dir = unique_tmp_dir();
+        let mut bad_wheel = make_wheel("broken-dep", "");
+        bad_wheel.version = String::new();
+        let lock_path = write_lock(&dir, "mypkg", vec![make_wheel("mypkg", "2.0.0"), bad_wheel]);
+        // SAFETY: serialised by TEST_ENV_MUTEX; no concurrent env access.
+        unsafe { std::env::set_var("RETREAD_FAVOR_LOCK", "1") };
+
+        let result = load_favored_versions(&lock_path);
+        assert!(
+            !result.contains_key("broken-dep"),
+            "wheel with empty version must be dropped; map={result:?}"
+        );
+        assert_eq!(
+            result.get("mypkg").map(String::as_str),
+            Some("2.0.0"),
+            "valid entry must still be present; map={result:?}"
+        );
+        unsafe { std::env::remove_var("RETREAD_FAVOR_LOCK") };
+        std::fs::remove_dir_all(dir).ok();
+    }
+}
+
+// -----------------------------------------------------------------
 // TASK A (FIX 3 completion): resolve_bundle-loop-level back-pressure test.
 //
 // Drives the ACTUAL BFS loop in resolve_bundle through a localhost
@@ -9658,6 +9942,7 @@ mod resolve_bundle_bfs_tests {
             &[],  // conda_deps_list
             &[],  // workspace_indexes
             None, // cold path: no locked closure
+            None, // cold path: no favor-lock prefs
         )
         .await
         .expect("resolve_bundle must succeed");
@@ -9813,6 +10098,7 @@ mod resolve_bundle_bfs_tests {
             &[],  // conda_deps_list
             &[],  // workspace_indexes
             None, // cold path: no locked closure
+            None, // cold path: no favor-lock prefs
         )
         .await
         .expect("resolve_bundle must succeed");
@@ -9851,6 +10137,230 @@ mod resolve_bundle_bfs_tests {
              FIX 2 merged constraint); got {} — if this fails, FIX 2 constraint-merge \
              was not applied (the two separate Requires-Dist edges were not intersected \
              and the unconstrained >=1.0 resolved to 2.0 instead)",
+            sub_wheel.metadata.version,
+        );
+    }
+
+    /// favor-lock: when favor_lock_prefs contains a version for a transitive
+    /// dep, the BFS must fetch THAT version instead of the latest.
+    ///
+    /// Scenario:
+    ///   - Primary `flpkg==1.0` has `Requires-Dist: flpkg-sub>=1.0`.
+    ///     (prefix `flpkg-` matches `flpkg-sub` → seed_worklist picks it up)
+    ///   - Index serves flpkg-sub at 1.0 and 2.0 (2.0 is the latest).
+    ///   - favor_lock_prefs = {"flpkg-sub": "1.0"} (prefer the older version).
+    ///
+    /// Expected: bundle.extras contains flpkg-sub at 1.0 (not 2.0).
+    ///
+    /// Without favor-lock: pypi::resolve(>=1.0) picks 2.0 (highest).
+    /// With favor-lock: resolve_preferring("flpkg-sub", >=1.0, prefer=1.0) picks 1.0.
+    ///
+    /// Marked #[ignore] because it runs a full BFS loop with a localhost fixture
+    /// server; running it in parallel with other BFS tests can cause Tokio thread
+    /// pool exhaustion and flaky failures in unrelated tests.
+    /// Run with: `cargo test -- --include-ignored favor_lock_prefers`
+    #[tokio::test]
+    #[ignore = "bfs: runs full BFS with localhost fixture; run with --include-ignored"]
+    async fn favor_lock_prefers_locked_transitive_version() {
+        let dir = unique_tmp_dir();
+        let download_dir = dir.join("download");
+        let source_dir = dir.join("source");
+        let cache_dir = dir.join("cache");
+        std::fs::create_dir_all(&download_dir).unwrap();
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        // Primary name: `flpkg`. Prefix: `flpkg-`. Sub: `flpkg-sub` (matches).
+        let primary_name = "flpkg";
+        let primary_version = "1.0";
+        let sub_name = "flpkg-sub";
+
+        let primary_bytes = make_wheel_bytes(
+            primary_name,
+            primary_version,
+            &[&format!("{sub_name}>=1.0")],
+        );
+        let sub_v1_bytes = make_wheel_bytes(sub_name, "1.0", &[]);
+        let sub_v2_bytes = make_wheel_bytes(sub_name, "2.0", &[]);
+
+        // Serve both 1.0 and 2.0 for the sub-package.
+        let port = spawn_index_server(
+            vec![
+                (
+                    primary_name.to_string(),
+                    primary_version.to_string(),
+                    primary_bytes,
+                ),
+                (sub_name.to_string(), "1.0".to_string(), sub_v1_bytes),
+                (sub_name.to_string(), "2.0".to_string(), sub_v2_bytes),
+            ],
+            48,
+        )
+        .await;
+
+        let index_url = format!("http://127.0.0.1:{port}/simple/");
+
+        let entry = WheelEntry {
+            version: Some(primary_version.to_string()),
+            index: Some(index_url),
+            ..Default::default()
+        };
+        let target = WheelTarget {
+            python_version: "3.11".to_string(),
+            conda_subdir: "linux-64".to_string(),
+        };
+        let pypi_to_conda: PypiToCondaMap = HashMap::new();
+        let name_map: BTreeMap<String, String> = BTreeMap::new();
+        let git_sources: BTreeMap<String, crate::config::NamedGitSource> = BTreeMap::new();
+        let conda_channels: Vec<rattler_conda_types::ChannelUrl> = vec![];
+
+        // Build the favor-lock prefs: hint BFS to prefer flpkg-sub @ 1.0.
+        // resolve_bundle uses the prefs param directly without reading
+        // RETREAD_FAVOR_LOCK -- the env-var gate lives only in load_favored_versions
+        // (resolve_all entry point). Avoids process-wide env mutation that would
+        // leak across parallel tests.
+        let mut favor_lock_prefs: BTreeMap<String, String> = BTreeMap::new();
+        favor_lock_prefs.insert("flpkg-sub".to_string(), "1.0".to_string());
+
+        let bundle = resolve_bundle(
+            primary_name,
+            &entry,
+            &target,
+            &download_dir,
+            &source_dir,
+            &cache_dir,
+            RelaxPolicy::default(),
+            &git_sources,
+            None, // auto_data
+            &pypi_to_conda,
+            &name_map,
+            &conda_channels,
+            &[],                     // conda_deps_list
+            &[],                     // workspace_indexes
+            None,                    // no incremental-add locked closure (deps must go through BFS)
+            Some(&favor_lock_prefs), // favor-lock prefs: hint BFS to prefer flpkg-sub @ 1.0
+        )
+        .await
+        .expect("resolve_bundle must succeed");
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        // Sub must be present.
+        let sub_wheel = bundle
+            .extras
+            .iter()
+            .find(|w| w.pypi_name == sub_name)
+            .unwrap_or_else(|| panic!("'{sub_name}' must be present in bundle.extras"));
+
+        assert_eq!(
+            sub_wheel.metadata.version, "1.0",
+            "favor-lock must pin the transitive dep to the locked version 1.0 (not the \
+             latest 2.0); got {}. If this fails, RETREAD_FAVOR_LOCK=1 is not wired through \
+             to bfs_fetch_pypi / resolve_preferring.",
+            sub_wheel.metadata.version,
+        );
+    }
+
+    /// favor-lock cold path: without favor_lock_prefs, the BFS picks the
+    /// highest matching version (standard behavior unchanged).
+    ///
+    /// Ensures the base highest-version selection is still the default when
+    /// no favor-lock preferences are passed in.  Avoids env-var manipulation
+    /// to prevent parallel-test interference.
+    ///
+    /// Marked #[ignore] because it runs a full BFS loop with a localhost fixture
+    /// server; running it in parallel with other BFS tests can cause Tokio thread
+    /// pool exhaustion and flaky failures in unrelated tests.
+    /// Run with: `cargo test -- --include-ignored favor_lock_cold`
+    #[tokio::test]
+    #[ignore = "bfs: runs full BFS with localhost fixture; run with --include-ignored"]
+    async fn favor_lock_cold_picks_latest_without_prefs() {
+        let dir = unique_tmp_dir();
+        let download_dir = dir.join("download");
+        let source_dir = dir.join("source");
+        let cache_dir = dir.join("cache");
+        std::fs::create_dir_all(&download_dir).unwrap();
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        // Primary: `flcold`. Sub: `flcold-sub` (matches prefix `flcold-`).
+        let primary_name = "flcold";
+        let primary_version = "1.0";
+        let sub_name = "flcold-sub";
+
+        let primary_bytes = make_wheel_bytes(
+            primary_name,
+            primary_version,
+            &[&format!("{sub_name}>=1.0")],
+        );
+        let sub_v1_bytes = make_wheel_bytes(sub_name, "1.0", &[]);
+        let sub_v2_bytes = make_wheel_bytes(sub_name, "2.0", &[]);
+
+        let port = spawn_index_server(
+            vec![
+                (
+                    primary_name.to_string(),
+                    primary_version.to_string(),
+                    primary_bytes,
+                ),
+                (sub_name.to_string(), "1.0".to_string(), sub_v1_bytes),
+                (sub_name.to_string(), "2.0".to_string(), sub_v2_bytes),
+            ],
+            48,
+        )
+        .await;
+
+        let index_url = format!("http://127.0.0.1:{port}/simple/");
+
+        let entry = WheelEntry {
+            version: Some(primary_version.to_string()),
+            index: Some(index_url),
+            ..Default::default()
+        };
+        let target = WheelTarget {
+            python_version: "3.11".to_string(),
+            conda_subdir: "linux-64".to_string(),
+        };
+        let pypi_to_conda: PypiToCondaMap = HashMap::new();
+        let name_map: BTreeMap<String, String> = BTreeMap::new();
+        let git_sources: BTreeMap<String, crate::config::NamedGitSource> = BTreeMap::new();
+        let conda_channels: Vec<rattler_conda_types::ChannelUrl> = vec![];
+
+        // No favor-lock prefs provided: the BFS must pick the highest version
+        // satisfying the specifier regardless of any env var state.
+        let bundle = resolve_bundle(
+            primary_name,
+            &entry,
+            &target,
+            &download_dir,
+            &source_dir,
+            &cache_dir,
+            RelaxPolicy::default(),
+            &git_sources,
+            None, // auto_data
+            &pypi_to_conda,
+            &name_map,
+            &conda_channels,
+            &[],  // conda_deps_list
+            &[],  // workspace_indexes
+            None, // no incremental-add locked closure
+            None, // no favor-lock prefs → cold path, picks latest
+        )
+        .await
+        .expect("resolve_bundle must succeed");
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        let sub_wheel = bundle
+            .extras
+            .iter()
+            .find(|w| w.pypi_name == sub_name)
+            .unwrap_or_else(|| panic!("'{sub_name}' must be present in bundle.extras"));
+
+        assert_eq!(
+            sub_wheel.metadata.version, "2.0",
+            "without favor-lock prefs, BFS must pick the LATEST version (2.0), not 1.0; \
+             got {}. If this fails, the default highest-version selection is broken.",
             sub_wheel.metadata.version,
         );
     }
