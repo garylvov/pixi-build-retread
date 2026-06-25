@@ -199,9 +199,8 @@ pub(crate) async fn auto_bundle_transitives(
         // PR-1 (Site 2): sort candidates by canonical name so routing is
         // confluent (processing order doesn't affect which spec wins when
         // the same dep appears in multiple wheels).
-        candidates.sort_by(|(a, _), (b, _)| canonical_conda_name(a).cmp(&canonical_conda_name(b)));
-        loose_candidates
-            .sort_by(|(a, _), (b, _)| canonical_conda_name(a).cmp(&canonical_conda_name(b)));
+        candidates.sort_by_key(|(a, _)| canonical_conda_name(a));
+        loose_candidates.sort_by_key(|(a, _)| canonical_conda_name(a));
 
         // Policy: prefer conda. If parselmouth (or our FALLBACK or the
         // user's retread-name-map) knows an unambiguous conda equivalent
