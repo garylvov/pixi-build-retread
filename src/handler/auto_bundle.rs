@@ -677,12 +677,18 @@ pub(crate) enum PendingSource {
 /// Add extras-gated and prefix-matched base deps from `metadata` to `work`.
 /// Skips entries already in `seen` so the BFS terminates.
 ///
+/// `sibling_names`: canonical conda names of OTHER entries in the same bundle
+/// group.  A dep whose canonical name is in this set is a "sibling" — it is
+/// provided at install time by the sibling's wheel and must NOT be resolved
+/// from PyPI or conda.  Such deps are silently dropped without being enqueued.
+///
 /// `state`: when `Some`, locked deps that appear in `seen` are NOT silently
 /// skipped — they are routed through `state.observe_edge` to detect ripples.
 /// `AlreadySatisfied` → continue; `NeedsReResolve` or conflict `Err` →
 /// returns [`IncrementalRipple`].  Non-locked deps in `seen` are silently
 /// skipped as before.  When `state` is `None` (cold path), behavior is
 /// identical to the previous unconditional `continue`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn seed_worklist(
     requires_dist: &[String],
     extras_requested: &[String],
@@ -691,6 +697,7 @@ pub(crate) fn seed_worklist(
     seen: &HashSet<String>,
     work: &mut VecDeque<Pending>,
     state: Option<&mut ResolveState>,
+    sibling_names: &HashSet<String>,
 ) -> Result<()> {
     // Helper: check whether a dep that's already in `seen` should trigger a
     // ripple check (incremental path, dep is locked).
@@ -743,6 +750,18 @@ pub(crate) fn seed_worklist(
         for extra in extras_requested {
             if let Some(dep) = pep508_extra_dep(raw, extra)? {
                 let dn = canonical_conda_name(&dep.name);
+                // Sibling check: a dep naming another entry in the same bundle
+                // group is provided by that sibling's wheel at install time.
+                // Do NOT resolve it from PyPI — drop it silently.
+                if sibling_names.contains(&dn) {
+                    tracing::debug!(
+                        dep = %dep.name,
+                        sibling_canon = %dn,
+                        "seed_worklist: skipping sibling dep (extras-gated) — provided by sibling bundle entry",
+                    );
+                    added = true;
+                    continue;
+                }
                 if seen.contains(&dn) {
                     let pending = Pending {
                         pypi_name: dep.name.clone(),
@@ -765,6 +784,16 @@ pub(crate) fn seed_worklist(
         // 2. Base deps (no marker) whose PyPI name matches the bundle prefix.
         if let Some(dep) = pep508_base_dep_in_prefix(raw, bundle_prefix)? {
             let dn = canonical_conda_name(&dep.name);
+            // Sibling check: same as extras path above — a base dep that names
+            // another bundle entry must not be fetched from PyPI.
+            if sibling_names.contains(&dn) {
+                tracing::debug!(
+                    dep = %dep.name,
+                    sibling_canon = %dn,
+                    "seed_worklist: skipping sibling dep (base) — provided by sibling bundle entry",
+                );
+                continue;
+            }
             if seen.contains(&dn) {
                 let pending = Pending {
                     pypi_name: dep.name.clone(),
@@ -1021,4 +1050,143 @@ pub(crate) fn pep508_extra_dep(raw: &str, extra: &str) -> Result<Option<ExtraDep
         source,
         extras: req.extras.iter().map(|e| e.to_string()).collect(),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// v2.10.0: seed_worklist must NOT enqueue a dep whose canonical name is
+    /// in `sibling_names`, but MUST enqueue a dep that is NOT in the set.
+    ///
+    /// Scenario: "isaaclab-visualizers" (extras=["all"]) has two Requires-Dist:
+    ///   - `isaaclab`         → sibling (same bundle group) → must NOT be enqueued
+    ///   - `matplotlib`       → normal dep                  → MUST be enqueued
+    ///
+    /// The prefix is empty (source-form entry), so pep508_base_dep_in_prefix
+    /// would normally pick up ANY base dep.
+    #[test]
+    fn seed_worklist_skips_sibling_base_dep() {
+        let requires_dist = vec!["isaaclab".to_string(), "matplotlib".to_string()];
+        // extras_requested is empty → only base-dep path runs.
+        let mut siblings = HashSet::new();
+        siblings.insert("isaaclab".to_string()); // canonical_conda_name("isaaclab") = "isaaclab"
+
+        let seen: HashSet<String> = HashSet::new();
+        let mut work: VecDeque<Pending> = VecDeque::new();
+
+        seed_worklist(
+            &requires_dist,
+            &[], // no extras requested
+            "https://pypi.org/simple/",
+            "", // empty prefix: all base deps match
+            &seen,
+            &mut work,
+            None, // no state
+            &siblings,
+        )
+        .expect("seed_worklist must not error");
+
+        let enqueued: Vec<&str> = work.iter().map(|p| p.pypi_name.as_str()).collect();
+
+        assert!(
+            !enqueued.contains(&"isaaclab"),
+            "sibling 'isaaclab' must NOT be enqueued; enqueued={enqueued:?}"
+        );
+        assert!(
+            enqueued.contains(&"matplotlib"),
+            "non-sibling 'matplotlib' MUST be enqueued; enqueued={enqueued:?}"
+        );
+        assert_eq!(
+            enqueued.len(),
+            1,
+            "exactly one dep (matplotlib) should be enqueued; got {enqueued:?}"
+        );
+    }
+
+    /// v2.10.0: seed_worklist must NOT enqueue an extras-gated dep whose
+    /// canonical name is in `sibling_names`.
+    ///
+    /// Scenario: "isaaclab-visualizers" requests extra "all", which gate-deps:
+    ///   - `isaaclab; extra == "all"`   → sibling → must NOT be enqueued
+    ///   - `numpy; extra == "all"`      → normal  → MUST be enqueued
+    #[test]
+    fn seed_worklist_skips_sibling_extra_dep() {
+        let requires_dist = vec![
+            "isaaclab; extra == \"all\"".to_string(),
+            "numpy; extra == \"all\"".to_string(),
+        ];
+        let extras_requested = vec!["all".to_string()];
+
+        let mut siblings = HashSet::new();
+        siblings.insert("isaaclab".to_string());
+
+        let seen: HashSet<String> = HashSet::new();
+        let mut work: VecDeque<Pending> = VecDeque::new();
+
+        seed_worklist(
+            &requires_dist,
+            &extras_requested,
+            "https://pypi.org/simple/",
+            "", // empty prefix
+            &seen,
+            &mut work,
+            None,
+            &siblings,
+        )
+        .expect("seed_worklist must not error");
+
+        let enqueued: Vec<&str> = work.iter().map(|p| p.pypi_name.as_str()).collect();
+
+        assert!(
+            !enqueued.contains(&"isaaclab"),
+            "extras-gated sibling 'isaaclab' must NOT be enqueued; enqueued={enqueued:?}"
+        );
+        assert!(
+            enqueued.contains(&"numpy"),
+            "non-sibling extras dep 'numpy' MUST be enqueued; enqueued={enqueued:?}"
+        );
+        assert_eq!(
+            enqueued.len(),
+            1,
+            "exactly one dep (numpy) should be enqueued; got {enqueued:?}"
+        );
+    }
+
+    /// v2.10.0: when `sibling_names` is empty, seed_worklist behaves exactly
+    /// as before — all matching deps are enqueued.
+    #[test]
+    fn seed_worklist_empty_siblings_enqueues_all() {
+        let requires_dist = vec!["isaaclab".to_string(), "matplotlib".to_string()];
+        let seen: HashSet<String> = HashSet::new();
+        let mut work: VecDeque<Pending> = VecDeque::new();
+
+        seed_worklist(
+            &requires_dist,
+            &[],
+            "https://pypi.org/simple/",
+            "",
+            &seen,
+            &mut work,
+            None,
+            &HashSet::new(), // empty siblings → no-op
+        )
+        .expect("seed_worklist must not error");
+
+        let enqueued: Vec<&str> = work.iter().map(|p| p.pypi_name.as_str()).collect();
+
+        assert!(
+            enqueued.contains(&"isaaclab"),
+            "isaaclab must be enqueued when siblings is empty; enqueued={enqueued:?}"
+        );
+        assert!(
+            enqueued.contains(&"matplotlib"),
+            "matplotlib must be enqueued when siblings is empty; enqueued={enqueued:?}"
+        );
+        assert_eq!(
+            enqueued.len(),
+            2,
+            "both deps should be enqueued; got {enqueued:?}"
+        );
+    }
 }

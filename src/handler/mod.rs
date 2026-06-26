@@ -2375,8 +2375,27 @@ async fn resolve_all(
         let lock_path = source_dir.join(crate::lock::RetreadLock::file_name(&bundle_conda_name));
         let favored = load_favored_versions(&lock_path);
 
+        // v2.10.0: build the full sibling name set for this group once.
+        // For each entry in the group we compute a sibling set = all OTHER
+        // entries' canonical names, so resolve_bundle can skip deps that name
+        // a sibling (they're provided by the sibling's wheel at install time).
+        let all_entry_canonical: Vec<String> = group_entries
+            .iter()
+            .map(|(n, _)| canonical_conda_name(n))
+            .collect();
+
         let mut sub_bundles: Vec<Bundle> = Vec::with_capacity(group_entries.len());
-        for ((entry_name, entry), auto_data) in group_entries.iter().zip(auto_data_per_entry) {
+        for (idx, ((entry_name, entry), auto_data)) in
+            group_entries.iter().zip(auto_data_per_entry).enumerate()
+        {
+            // Sibling set: every OTHER entry's canonical name in this group.
+            let sibling_names: std::collections::HashSet<String> = all_entry_canonical
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != idx)
+                .map(|(_, n)| n.clone())
+                .collect();
+
             let sub = resolve_bundle(
                 entry_name,
                 entry,
@@ -2394,6 +2413,7 @@ async fn resolve_all(
                 &workspace_pypi_indexes,
                 None,                   // cold path: no locked closure
                 Some(&favored).filter(|m| !m.is_empty()), // favor-lock prefs (empty map → None)
+                &sibling_names,
             )
             .await
             .with_context(|| {
@@ -2768,6 +2788,11 @@ async fn resolve_bundle(
     // through the BFS fetch; we just hint the resolver to pick the given version.
     // Cold path (or RETREAD_FAVOR_LOCK unset): None (or ignored).
     favor_lock_prefs: Option<&std::collections::BTreeMap<String, String>>,
+    // v2.10.0: canonical conda names of OTHER entries in the same bundle group.
+    // A dep that names a sibling is provided by that sibling's wheel at install
+    // time; retread must NOT resolve it from PyPI.  Callers outside a bundle
+    // group (incremental-add, tests) pass `&HashSet::new()`.
+    sibling_names: &std::collections::HashSet<String>,
 ) -> Result<Bundle> {
     let conda_name = canonical_conda_name(entry_name);
     let mut state = ResolveState::default();
@@ -2909,6 +2934,7 @@ async fn resolve_bundle(
             &seen_set,
             &mut tmp_queue,
             None, // cold path: no locked-closure ripple detection
+            sibling_names,
         )?;
         for pending in tmp_queue {
             let name = canonical_conda_name(&pending.pypi_name);
@@ -3225,6 +3251,20 @@ async fn resolve_bundle(
                 conda_routed_acc.push(dep_conda_name.clone());
                 continue;
             }
+            // v2.10.0 defense-in-depth: a sibling dep that reached the BFS
+            // frontier (e.g. via a transitive observe_edge path rather than
+            // seed_worklist) must still be suppressed.  The primary guard is
+            // in seed_worklist, but any dep that snuck through (e.g. a sibling
+            // referenced transitively by another transitive dep) is caught here
+            // before the PyPI fetch.
+            if sibling_names.contains(&dep_conda_name) {
+                tracing::debug!(
+                    dep = %pending.pypi_name,
+                    sibling_canon = %dep_conda_name,
+                    "BFS frontier: skipping sibling dep — provided by sibling bundle entry",
+                );
+                continue;
+            }
             to_materialize.push(pending);
         }
 
@@ -3452,6 +3492,7 @@ async fn resolve_bundle(
                     &seen_set,
                     &mut tmp_seed,
                     None, // cold path: no locked-closure ripple detection
+                    sibling_names,
                 )?;
                 for p in tmp_seed {
                     let name = canonical_conda_name(&p.pypi_name);
@@ -5690,6 +5731,7 @@ async fn resolve_incremental_add(
             &workspace_pypi_indexes,
             Some(&locked_closure),
             None, // favor-lock prefs: not used on the incremental-add path (locked closure handles version pinning)
+            &std::collections::HashSet::new(), // incremental-add: no sibling context available
         )
         .await;
 
@@ -9939,10 +9981,11 @@ mod resolve_bundle_bfs_tests {
             &pypi_to_conda,
             &name_map,
             &conda_channels,
-            &[],  // conda_deps_list
-            &[],  // workspace_indexes
-            None, // cold path: no locked closure
-            None, // cold path: no favor-lock prefs
+            &[],                               // conda_deps_list
+            &[],                               // workspace_indexes
+            None,                              // cold path: no locked closure
+            None,                              // cold path: no favor-lock prefs
+            &std::collections::HashSet::new(), // no sibling context
         )
         .await
         .expect("resolve_bundle must succeed");
@@ -10095,10 +10138,11 @@ mod resolve_bundle_bfs_tests {
             &pypi_to_conda,
             &name_map,
             &conda_channels,
-            &[],  // conda_deps_list
-            &[],  // workspace_indexes
-            None, // cold path: no locked closure
-            None, // cold path: no favor-lock prefs
+            &[],                               // conda_deps_list
+            &[],                               // workspace_indexes
+            None,                              // cold path: no locked closure
+            None,                              // cold path: no favor-lock prefs
+            &std::collections::HashSet::new(), // no sibling context
         )
         .await
         .expect("resolve_bundle must succeed");
@@ -10235,10 +10279,11 @@ mod resolve_bundle_bfs_tests {
             &pypi_to_conda,
             &name_map,
             &conda_channels,
-            &[],                     // conda_deps_list
-            &[],                     // workspace_indexes
-            None,                    // no incremental-add locked closure (deps must go through BFS)
+            &[],                               // conda_deps_list
+            &[],                               // workspace_indexes
+            None, // no incremental-add locked closure (deps must go through BFS)
             Some(&favor_lock_prefs), // favor-lock prefs: hint BFS to prefer flpkg-sub @ 1.0
+            &std::collections::HashSet::new(), // no sibling context
         )
         .await
         .expect("resolve_bundle must succeed");
@@ -10341,10 +10386,11 @@ mod resolve_bundle_bfs_tests {
             &pypi_to_conda,
             &name_map,
             &conda_channels,
-            &[],  // conda_deps_list
-            &[],  // workspace_indexes
-            None, // no incremental-add locked closure
-            None, // no favor-lock prefs → cold path, picks latest
+            &[],                               // conda_deps_list
+            &[],                               // workspace_indexes
+            None,                              // no incremental-add locked closure
+            None,                              // no favor-lock prefs → cold path, picks latest
+            &std::collections::HashSet::new(), // no sibling context
         )
         .await
         .expect("resolve_bundle must succeed");

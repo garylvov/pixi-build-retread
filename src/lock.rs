@@ -294,7 +294,16 @@ pub const SCHEMA: u32 = 10;
 /// iterate to a name-sorted fixpoint. For the committed locks this produces
 /// identical resolved versions (pre-probe: 0 divergences), but the algorithm
 /// change is semantically different and gets its own epoch for safety.
-pub const EMIT_EPOCH: u32 = 6;
+///
+/// Epoch 7: sibling-aware resolution.  A dep whose canonical name matches
+/// another entry in the same bundle group is a "sibling" — provided by that
+/// sibling's wheel at install time.  Such deps are now silently dropped in
+/// seed_worklist and defended against in the BFS frontier, so they are neither
+/// fetched from PyPI nor emitted as run-deps.  This changes resolution
+/// semantics for packs with multiple git-source entries (e.g. isaaclab +
+/// isaaclab-visualizers from the same repo) where a sibling happens to be
+/// listed in Requires-Dist.
+pub const EMIT_EPOCH: u32 = 7;
 
 impl RetreadLock {
     /// File name for a bundle's lock next to the pack manifest.
