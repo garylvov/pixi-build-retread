@@ -6598,16 +6598,16 @@ fn detect_incremental_add(
 /// committed lock file at `lock_path`, to be used as "favor-lock" soft
 /// preferences during re-resolve.
 ///
-/// **Gated behind `RETREAD_FAVOR_LOCK`** (any non-empty value).  Returns an
-/// empty map when the env var is unset, the lock file is missing, or the lock
-/// cannot be parsed.  Errors are silently discarded so a corrupt lock does not
-/// break the build -- the caller will just cold-resolve as usual.
+/// **Default-on; opt out with `RETREAD_NO_FAVOR_LOCK`** (any non-empty value).
+/// Returns an empty map when favor-lock is disabled, the lock file is missing,
+/// or the lock cannot be parsed.  Errors are silently discarded so a corrupt
+/// lock does not break the build -- the caller will just cold-resolve as usual.
 ///
 /// Unlike [`load_replayable_lock`], this function loads the lock even when the
 /// `inputs_hash` does not match -- favor-lock REQUIRES a deliberate hash
 /// mismatch (it is designed for the re-resolve-after-manifest-change case).
 fn load_favored_versions(lock_path: &Path) -> std::collections::BTreeMap<String, String> {
-    if std::env::var_os("RETREAD_FAVOR_LOCK").is_none() {
+    if std::env::var_os("RETREAD_NO_FAVOR_LOCK").is_some() {
         return std::collections::BTreeMap::new();
     }
     let Ok(lock) = crate::lock::RetreadLock::load(lock_path) else {
@@ -9628,9 +9628,9 @@ mod load_favored_versions_tests {
         }
     }
 
-    /// RETREAD_FAVOR_LOCK unset → always empty, regardless of lock file content.
+    /// Default-on: with no opt-out env var, a valid lock populates the map.
     #[test]
-    fn flag_unset_returns_empty() {
+    fn default_on_unset_returns_populated() {
         let _guard = TEST_ENV_MUTEX.lock().unwrap();
         let dir = unique_tmp_dir();
         let lock_path = write_lock(
@@ -9638,15 +9638,38 @@ mod load_favored_versions_tests {
             "mypkg",
             vec![make_wheel("mypkg", "1.2.3"), make_wheel("dep-a", "0.5.0")],
         );
-        // Ensure the flag is NOT set.
+        // Ensure favor-lock is NOT disabled (default-on).
         // SAFETY: serialised by TEST_ENV_MUTEX; no concurrent env access.
-        unsafe { std::env::remove_var("RETREAD_FAVOR_LOCK") };
+        unsafe { std::env::remove_var("RETREAD_NO_FAVOR_LOCK") };
+
+        let result = load_favored_versions(&lock_path);
+        assert_eq!(
+            result.get("mypkg").map(String::as_str),
+            Some("1.2.3"),
+            "favor-lock is default-on; a valid lock must populate the map; got {result:?}"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Opt-out: RETREAD_NO_FAVOR_LOCK set → always empty, regardless of lock.
+    #[test]
+    fn opt_out_returns_empty() {
+        let _guard = TEST_ENV_MUTEX.lock().unwrap();
+        let dir = unique_tmp_dir();
+        let lock_path = write_lock(
+            &dir,
+            "mypkg",
+            vec![make_wheel("mypkg", "1.2.3"), make_wheel("dep-a", "0.5.0")],
+        );
+        // SAFETY: serialised by TEST_ENV_MUTEX; no concurrent env access.
+        unsafe { std::env::set_var("RETREAD_NO_FAVOR_LOCK", "1") };
 
         let result = load_favored_versions(&lock_path);
         assert!(
             result.is_empty(),
-            "RETREAD_FAVOR_LOCK unset must return empty map; got {result:?}"
+            "RETREAD_NO_FAVOR_LOCK set must return empty map; got {result:?}"
         );
+        unsafe { std::env::remove_var("RETREAD_NO_FAVOR_LOCK") };
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -9657,14 +9680,13 @@ mod load_favored_versions_tests {
         let dir = unique_tmp_dir();
         let lock_path = dir.join("retread-nonexistent.lock.json");
         // SAFETY: serialised by TEST_ENV_MUTEX; no concurrent env access.
-        unsafe { std::env::set_var("RETREAD_FAVOR_LOCK", "1") };
+        unsafe { std::env::remove_var("RETREAD_NO_FAVOR_LOCK") };
 
         let result = load_favored_versions(&lock_path);
         assert!(
             result.is_empty(),
             "missing lock must return empty map; got {result:?}"
         );
-        unsafe { std::env::remove_var("RETREAD_FAVOR_LOCK") };
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -9685,7 +9707,7 @@ mod load_favored_versions_tests {
             ],
         );
         // SAFETY: serialised by TEST_ENV_MUTEX; no concurrent env access.
-        unsafe { std::env::set_var("RETREAD_FAVOR_LOCK", "1") };
+        unsafe { std::env::remove_var("RETREAD_NO_FAVOR_LOCK") };
 
         let result = load_favored_versions(&lock_path);
 
@@ -9700,7 +9722,6 @@ mod load_favored_versions_tests {
             Some("0.5.0"),
             "dep_alpha must be keyed as dep-alpha (underscore→hyphen); map={result:?}"
         );
-        unsafe { std::env::remove_var("RETREAD_FAVOR_LOCK") };
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -9713,7 +9734,7 @@ mod load_favored_versions_tests {
         bad_wheel.version = String::new();
         let lock_path = write_lock(&dir, "mypkg", vec![make_wheel("mypkg", "2.0.0"), bad_wheel]);
         // SAFETY: serialised by TEST_ENV_MUTEX; no concurrent env access.
-        unsafe { std::env::set_var("RETREAD_FAVOR_LOCK", "1") };
+        unsafe { std::env::remove_var("RETREAD_NO_FAVOR_LOCK") };
 
         let result = load_favored_versions(&lock_path);
         assert!(
@@ -9725,7 +9746,6 @@ mod load_favored_versions_tests {
             Some("2.0.0"),
             "valid entry must still be present; map={result:?}"
         );
-        unsafe { std::env::remove_var("RETREAD_FAVOR_LOCK") };
         std::fs::remove_dir_all(dir).ok();
     }
 }
