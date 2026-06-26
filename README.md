@@ -183,6 +183,15 @@ The default cascade starts at the narrowest safe rewrite, runs a real `rattler_s
 </details>
 
 <details>
+<summary><b>Lock stability (favor-lock) &amp; same-repo siblings</b></summary>
+
+**favor-lock** (default-on since 2.10.0): on a re-resolve after a manifest change, retread *prefers each version already in the committed lock* when it still satisfies all constraints, and only deviates when a new dep forces it — minimal-change re-resolves, like pixi's own `favored` solver hint, over a fully-validated graph. Replay (unchanged inputs) and first resolves are unaffected. Disable with `RETREAD_NO_FAVOR_LOCK=1` to always pick highest-compatible.
+
+**Siblings**: when several `retread-wheels` entries are built from one `retread-git-sources` repo in the same bundle, a dep naming a fellow entry (e.g. `isaaclab_visualizers` → `isaaclab`) is satisfied by that sibling wheel — never fetched from PyPI, never emitted as a run-dep. Missing subpackages a broken `setup.py` omits (`packages=[...]` instead of `find_packages()`) are recovered from the source tree automatically.
+
+</details>
+
+<details>
 <summary><b>Multi-Python &amp; pytorch/CUDA</b></summary>
 
 One artifact per platform; python-agnostic. retread builds wheels via `uv pip wheel --python <ver>`, fans `conda/outputs` over each requested python, and picks the matching wheel — so a multi-python pack works **only if every entry ships a wheel for every requested python**. Declare it (high→low precedence):

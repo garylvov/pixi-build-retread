@@ -123,6 +123,11 @@ pub(crate) async fn auto_bundle_transitives(
     // incremental-add path: pre-fill seen_candidate with locked names so
     // auto_bundle_transitives does not try to re-bundle them. Cold path: None.
     locked_closure: Option<&std::collections::BTreeMap<String, String>>,
+    // favor-lock: preferred versions for PyPI auto-bundle resolution.
+    // When RETREAD_FAVOR_LOCK=1 and a dep has a committed lock version,
+    // use resolve_preferring so the re-resolve prefers that version.
+    // Cold path (RETREAD_FAVOR_LOCK unset or first build): None.
+    favor_lock_prefs: Option<&std::collections::BTreeMap<String, String>>,
 ) -> Result<()> {
     // Build the skip set: anything already in the bundle, plus the user's
     // `retread-conda-deps` allowlist (deps that should stay as conda
@@ -254,7 +259,9 @@ pub(crate) async fn auto_bundle_transitives(
         let mut added_any = false;
         // Candidates routed to PyPI this round; fetched concurrently
         // after the (serial, mutating) routing decisions below.
-        let mut to_fetch: Vec<(String, String, String, VersionSpecifiers)> = Vec::new();
+        // The 5th field is the favor-lock preferred version (if any) for that dep.
+        let mut to_fetch: Vec<(String, String, String, VersionSpecifiers, Option<String>)> =
+            Vec::new();
         for (name, version) in candidates {
             let conda_name = canonical_conda_name(&name);
             if prefer_conda_match(&conda_name, &config.name_map) {
@@ -385,7 +392,11 @@ pub(crate) async fn auto_bundle_transitives(
                     continue;
                 }
             };
-            to_fetch.push((name, version, conda_name, specifiers));
+            // favor-lock: look up preferred version for this dep by canonical name.
+            let preferred_ver = favor_lock_prefs
+                .and_then(|m| m.get(&canonical_conda_name(&conda_name)))
+                .cloned();
+            to_fetch.push((name, version, conda_name, specifiers, preferred_ver));
         }
 
         // Loose (bare/ranged) candidates: the step-8 gate. A name-level
@@ -454,7 +465,11 @@ pub(crate) async fn auto_bundle_transitives(
                 specs = %specs,
                 "auto-bundle: bare/ranged dep has zero conda candidates; bundling from PyPI",
             );
-            to_fetch.push((name, specs.to_string(), conda_name, specs));
+            // favor-lock: look up preferred version for this dep by canonical name.
+            let preferred_ver = favor_lock_prefs
+                .and_then(|m| m.get(&canonical_conda_name(&conda_name)))
+                .cloned();
+            to_fetch.push((name, specs.to_string(), conda_name, specs, preferred_ver));
         }
 
         // v1.4.0: fetch this round's PyPI-bound wheels concurrently
@@ -469,61 +484,75 @@ pub(crate) async fn auto_bundle_transitives(
             use futures::stream::{self, StreamExt};
             let indexes_ref = &indexes;
             stream::iter(to_fetch)
-                .map(|(name, version, conda_name, specifiers)| async move {
-                    for index in indexes_ref {
-                        match pypi::resolve(index, &name, &specifiers, target).await {
-                            Ok(resolved) => {
-                                match metadata_preferring_sidecar(&resolved, download_dir).await {
-                                    Ok(metadata) => {
-                                        // resolved.url is the pristine index
-                                        // URL; clone it for upstream_url
-                                        // before moving into the struct.
-                                        let upstream = Some(resolved.url.clone());
-                                        return Some((
-                                            name,
-                                            version,
-                                            ResolvedWheel {
-                                                pypi_name: conda_name,
-                                                url: resolved.url,
-                                                upstream_url: upstream,
-                                                git_source: None,
-                                                sdist_source: None,
-                                                metadata,
-                                                extras_requested: vec![],
-                                                auto_data: None,
-                                                auto_data_dedup_skipped_root: None,
-                                            },
-                                        ));
-                                    }
-                                    Err(e) => {
-                                        tracing::debug!(
-                                            dep = %name,
-                                            error = %format!("{e:#}"),
-                                            "auto-bundle fetch failed; leaving as conda dep"
-                                        );
-                                        return None;
+                .map(
+                    |(name, version, conda_name, specifiers, preferred_ver)| async move {
+                        // favor-lock: if a committed lock version exists for this dep,
+                        // prefer it over the highest satisfying version on PyPI.
+                        // `preferred_ver` is pre-looked-up before the async block to
+                        // avoid capturing a reference to the prefs map.
+                        let preferred: Option<&str> = preferred_ver.as_deref();
+                        for index in indexes_ref {
+                            let resolved_result = if let Some(pv) = preferred {
+                                pypi::resolve_preferring(index, &name, &specifiers, target, pv)
+                                    .await
+                            } else {
+                                pypi::resolve(index, &name, &specifiers, target).await
+                            };
+                            match resolved_result {
+                                Ok(resolved) => {
+                                    match metadata_preferring_sidecar(&resolved, download_dir).await
+                                    {
+                                        Ok(metadata) => {
+                                            // resolved.url is the pristine index
+                                            // URL; clone it for upstream_url
+                                            // before moving into the struct.
+                                            let upstream = Some(resolved.url.clone());
+                                            return Some((
+                                                name,
+                                                version,
+                                                ResolvedWheel {
+                                                    pypi_name: conda_name,
+                                                    url: resolved.url,
+                                                    upstream_url: upstream,
+                                                    git_source: None,
+                                                    sdist_source: None,
+                                                    metadata,
+                                                    extras_requested: vec![],
+                                                    auto_data: None,
+                                                    auto_data_dedup_skipped_root: None,
+                                                },
+                                            ));
+                                        }
+                                        Err(e) => {
+                                            tracing::debug!(
+                                                dep = %name,
+                                                error = %format!("{e:#}"),
+                                                "auto-bundle fetch failed; leaving as conda dep"
+                                            );
+                                            return None;
+                                        }
                                     }
                                 }
-                            }
-                            Err(e) => {
-                                tracing::debug!(
-                                    dep = %name,
-                                    version = %version,
-                                    index = %index,
-                                    error = %format!("{e:#}"),
-                                    "auto-bundle resolve failed on this index"
-                                );
+                                Err(e) => {
+                                    tracing::debug!(
+                                        dep = %name,
+                                        version = %version,
+                                        index = %index,
+                                        error = %format!("{e:#}"),
+                                        "auto-bundle resolve failed on this index"
+                                    );
+                                }
                             }
                         }
-                    }
-                    tracing::debug!(
-                        dep = %name,
-                        version = %version,
-                        "auto-bundle exhausted all indexes; leaving as conda dep. \
-                         If conda can't satisfy it, add to retread-drop-deps."
-                    );
-                    None
-                })
+                        tracing::debug!(
+                            dep = %name,
+                            version = %version,
+                            "auto-bundle exhausted all indexes; leaving as conda dep. \
+                             If conda can't satisfy it, add to retread-drop-deps."
+                        );
+                        None
+                    },
+                )
                 .buffered(8)
                 .collect()
                 .await
@@ -648,12 +677,18 @@ pub(crate) enum PendingSource {
 /// Add extras-gated and prefix-matched base deps from `metadata` to `work`.
 /// Skips entries already in `seen` so the BFS terminates.
 ///
+/// `sibling_names`: canonical conda names of OTHER entries in the same bundle
+/// group.  A dep whose canonical name is in this set is a "sibling" — it is
+/// provided at install time by the sibling's wheel and must NOT be resolved
+/// from PyPI or conda.  Such deps are silently dropped without being enqueued.
+///
 /// `state`: when `Some`, locked deps that appear in `seen` are NOT silently
 /// skipped — they are routed through `state.observe_edge` to detect ripples.
 /// `AlreadySatisfied` → continue; `NeedsReResolve` or conflict `Err` →
 /// returns [`IncrementalRipple`].  Non-locked deps in `seen` are silently
 /// skipped as before.  When `state` is `None` (cold path), behavior is
 /// identical to the previous unconditional `continue`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn seed_worklist(
     requires_dist: &[String],
     extras_requested: &[String],
@@ -662,6 +697,7 @@ pub(crate) fn seed_worklist(
     seen: &HashSet<String>,
     work: &mut VecDeque<Pending>,
     state: Option<&mut ResolveState>,
+    sibling_names: &HashSet<String>,
 ) -> Result<()> {
     // Helper: check whether a dep that's already in `seen` should trigger a
     // ripple check (incremental path, dep is locked).
@@ -714,6 +750,18 @@ pub(crate) fn seed_worklist(
         for extra in extras_requested {
             if let Some(dep) = pep508_extra_dep(raw, extra)? {
                 let dn = canonical_conda_name(&dep.name);
+                // Sibling check: a dep naming another entry in the same bundle
+                // group is provided by that sibling's wheel at install time.
+                // Do NOT resolve it from PyPI — drop it silently.
+                if sibling_names.contains(&dn) {
+                    tracing::debug!(
+                        dep = %dep.name,
+                        sibling_canon = %dn,
+                        "seed_worklist: skipping sibling dep (extras-gated) — provided by sibling bundle entry",
+                    );
+                    added = true;
+                    continue;
+                }
                 if seen.contains(&dn) {
                     let pending = Pending {
                         pypi_name: dep.name.clone(),
@@ -736,6 +784,16 @@ pub(crate) fn seed_worklist(
         // 2. Base deps (no marker) whose PyPI name matches the bundle prefix.
         if let Some(dep) = pep508_base_dep_in_prefix(raw, bundle_prefix)? {
             let dn = canonical_conda_name(&dep.name);
+            // Sibling check: same as extras path above — a base dep that names
+            // another bundle entry must not be fetched from PyPI.
+            if sibling_names.contains(&dn) {
+                tracing::debug!(
+                    dep = %dep.name,
+                    sibling_canon = %dn,
+                    "seed_worklist: skipping sibling dep (base) — provided by sibling bundle entry",
+                );
+                continue;
+            }
             if seen.contains(&dn) {
                 let pending = Pending {
                     pypi_name: dep.name.clone(),
@@ -992,4 +1050,143 @@ pub(crate) fn pep508_extra_dep(raw: &str, extra: &str) -> Result<Option<ExtraDep
         source,
         extras: req.extras.iter().map(|e| e.to_string()).collect(),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// v2.10.0: seed_worklist must NOT enqueue a dep whose canonical name is
+    /// in `sibling_names`, but MUST enqueue a dep that is NOT in the set.
+    ///
+    /// Scenario: "isaaclab-visualizers" (extras=["all"]) has two Requires-Dist:
+    ///   - `isaaclab`         → sibling (same bundle group) → must NOT be enqueued
+    ///   - `matplotlib`       → normal dep                  → MUST be enqueued
+    ///
+    /// The prefix is empty (source-form entry), so pep508_base_dep_in_prefix
+    /// would normally pick up ANY base dep.
+    #[test]
+    fn seed_worklist_skips_sibling_base_dep() {
+        let requires_dist = vec!["isaaclab".to_string(), "matplotlib".to_string()];
+        // extras_requested is empty → only base-dep path runs.
+        let mut siblings = HashSet::new();
+        siblings.insert("isaaclab".to_string()); // canonical_conda_name("isaaclab") = "isaaclab"
+
+        let seen: HashSet<String> = HashSet::new();
+        let mut work: VecDeque<Pending> = VecDeque::new();
+
+        seed_worklist(
+            &requires_dist,
+            &[], // no extras requested
+            "https://pypi.org/simple/",
+            "", // empty prefix: all base deps match
+            &seen,
+            &mut work,
+            None, // no state
+            &siblings,
+        )
+        .expect("seed_worklist must not error");
+
+        let enqueued: Vec<&str> = work.iter().map(|p| p.pypi_name.as_str()).collect();
+
+        assert!(
+            !enqueued.contains(&"isaaclab"),
+            "sibling 'isaaclab' must NOT be enqueued; enqueued={enqueued:?}"
+        );
+        assert!(
+            enqueued.contains(&"matplotlib"),
+            "non-sibling 'matplotlib' MUST be enqueued; enqueued={enqueued:?}"
+        );
+        assert_eq!(
+            enqueued.len(),
+            1,
+            "exactly one dep (matplotlib) should be enqueued; got {enqueued:?}"
+        );
+    }
+
+    /// v2.10.0: seed_worklist must NOT enqueue an extras-gated dep whose
+    /// canonical name is in `sibling_names`.
+    ///
+    /// Scenario: "isaaclab-visualizers" requests extra "all", which gate-deps:
+    ///   - `isaaclab; extra == "all"`   → sibling → must NOT be enqueued
+    ///   - `numpy; extra == "all"`      → normal  → MUST be enqueued
+    #[test]
+    fn seed_worklist_skips_sibling_extra_dep() {
+        let requires_dist = vec![
+            "isaaclab; extra == \"all\"".to_string(),
+            "numpy; extra == \"all\"".to_string(),
+        ];
+        let extras_requested = vec!["all".to_string()];
+
+        let mut siblings = HashSet::new();
+        siblings.insert("isaaclab".to_string());
+
+        let seen: HashSet<String> = HashSet::new();
+        let mut work: VecDeque<Pending> = VecDeque::new();
+
+        seed_worklist(
+            &requires_dist,
+            &extras_requested,
+            "https://pypi.org/simple/",
+            "", // empty prefix
+            &seen,
+            &mut work,
+            None,
+            &siblings,
+        )
+        .expect("seed_worklist must not error");
+
+        let enqueued: Vec<&str> = work.iter().map(|p| p.pypi_name.as_str()).collect();
+
+        assert!(
+            !enqueued.contains(&"isaaclab"),
+            "extras-gated sibling 'isaaclab' must NOT be enqueued; enqueued={enqueued:?}"
+        );
+        assert!(
+            enqueued.contains(&"numpy"),
+            "non-sibling extras dep 'numpy' MUST be enqueued; enqueued={enqueued:?}"
+        );
+        assert_eq!(
+            enqueued.len(),
+            1,
+            "exactly one dep (numpy) should be enqueued; got {enqueued:?}"
+        );
+    }
+
+    /// v2.10.0: when `sibling_names` is empty, seed_worklist behaves exactly
+    /// as before — all matching deps are enqueued.
+    #[test]
+    fn seed_worklist_empty_siblings_enqueues_all() {
+        let requires_dist = vec!["isaaclab".to_string(), "matplotlib".to_string()];
+        let seen: HashSet<String> = HashSet::new();
+        let mut work: VecDeque<Pending> = VecDeque::new();
+
+        seed_worklist(
+            &requires_dist,
+            &[],
+            "https://pypi.org/simple/",
+            "",
+            &seen,
+            &mut work,
+            None,
+            &HashSet::new(), // empty siblings → no-op
+        )
+        .expect("seed_worklist must not error");
+
+        let enqueued: Vec<&str> = work.iter().map(|p| p.pypi_name.as_str()).collect();
+
+        assert!(
+            enqueued.contains(&"isaaclab"),
+            "isaaclab must be enqueued when siblings is empty; enqueued={enqueued:?}"
+        );
+        assert!(
+            enqueued.contains(&"matplotlib"),
+            "matplotlib must be enqueued when siblings is empty; enqueued={enqueued:?}"
+        );
+        assert_eq!(
+            enqueued.len(),
+            2,
+            "both deps should be enqueued; got {enqueued:?}"
+        );
+    }
 }

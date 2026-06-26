@@ -1009,6 +1009,11 @@ pub(crate) async fn pre_emit_widen_pass(
                     pypi_specs.as_ref(),
                     &conda_name,
                     &workspace_pins,
+                    // favor-lock: refinement path does not receive the prefs map;
+                    // the cold-path None means we always pick the highest version
+                    // here. Full threading through iterative_solve_refinement is
+                    // left as future work.
+                    None,
                 )
                 .await?;
             } else {
@@ -1142,9 +1147,25 @@ pub(crate) async fn try_pypi_bundle(
     specs: &VersionSpecifiers,
     stage: &str,
     success_routing: &str,
+    // favor-lock: when Some and the entry has a version hint, prefer that
+    // version on PyPI instead of always picking the highest compatible wheel.
+    // When RETREAD_FAVOR_LOCK is unset, callers pass an empty map which
+    // produces None on lookup and falls back to `pypi::resolve`.
+    favor_lock_prefs: Option<&std::collections::BTreeMap<String, String>>,
 ) -> bool {
+    // Look up the preferred version for this dep ONCE (before the index
+    // fallback loop) so we don't repeat the canonical normalisation on
+    // every index iteration.
+    let want: Option<&str> = favor_lock_prefs
+        .and_then(|m| m.get(&crate::relax::canonical_conda_name(pypi_name)))
+        .map(String::as_str);
     for index in pypi_indexes {
-        match pypi::resolve(index, pypi_name, specs, target).await {
+        let resolved_result = if let Some(pv) = want {
+            pypi::resolve_preferring(index, pypi_name, specs, target, pv).await
+        } else {
+            pypi::resolve(index, pypi_name, specs, target).await
+        };
+        match resolved_result {
             Ok(resolved) => match metadata_preferring_sidecar(&resolved, download_dir).await {
                 Ok(metadata) => {
                     bundle.probe_decisions.push(crate::audit::ProbeDecision {
@@ -1253,6 +1274,10 @@ pub(crate) async fn tiered_cascade_for_dep(
     pypi_specs: Option<&VersionSpecifiers>,
     conda_name: &str,
     workspace_pins: &std::collections::BTreeMap<String, String>,
+    // favor-lock: forwarded from resolve_bundle to try_pypi_bundle so the
+    // cascade's PyPI fallback also prefers the committed lock version.
+    // None on the cold path (RETREAD_FAVOR_LOCK unset or first build).
+    favor_lock_prefs: Option<&std::collections::BTreeMap<String, String>>,
 ) -> Result<()> {
     use crate::relax::translate;
     use std::collections::BTreeMap;
@@ -1363,6 +1388,7 @@ pub(crate) async fn tiered_cascade_for_dep(
                 specs,
                 pypi_stage,
                 "pypi-bundled-dropping-conda-emit",
+                favor_lock_prefs, // favor-lock: prefer committed lock version
             )
             .await
             {
@@ -1501,6 +1527,7 @@ pub(crate) async fn tiered_cascade_for_dep(
             &any_specs,
             "tiered-cascade-step8-pypi-last-resort",
             "auto-pypi-no-conda-candidates",
+            favor_lock_prefs, // favor-lock: prefer committed lock version
         )
         .await
         {
