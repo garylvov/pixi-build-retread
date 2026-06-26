@@ -24,5 +24,16 @@ retread-python       = "3.12"
 retread-bundle       = "isaac-pack-6"
 retread-courier      = true
 
+# Same-repo siblings built from one git source (v2.10.0+): isaaclab_visualizers'
+# upstream setup.py declares `install_requires = ["isaaclab", ...]`. Since
+# `isaaclab` is a sibling wheel in this same bundle (not on PyPI), retread
+# satisfies it from the sibling instead of dying on a PyPI 404, and recovers the
+# kit/newton/rerun/viser subpackages its `packages=[...]` setup.py omits.
+[package.build.config.retread-git-sources.isaaclab]
+url = "https://github.com/isaac-sim/IsaacLab.git"
+rev = "28a37cecdd433c22d9eabd6a5954add9f13a8951"
+
 [package.build.config.retread-wheels]
 isaacsim = { version = "==6.0.0.1", index = "https://pypi.nvidia.com", extras = ["all", "extscache"] }
+isaaclab = { from = "isaaclab", subdirectory = "source/isaaclab" }
+isaaclab-visualizers = { from = "isaaclab", subdirectory = "source/isaaclab_visualizers", extras = ["all"] }
