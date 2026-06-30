@@ -71,6 +71,139 @@ pub(crate) fn conda_deps_to_constraints(deps: &[crate::lock::CondaDep]) -> Strin
     out
 }
 
+/// True if uv's output shows a wheel rejected purely for an unsatisfied
+/// manylinux platform tag -- the one failure mode the `--python-platform`
+/// glibc relaxation is allowed to recover from. uv phrases it as
+/// "has no wheels with a matching platform tag (e.g., `manylinux_2_34_x86_64`)".
+/// Matched conservatively so unrelated solve/network/link failures are never
+/// silently "relaxed" past.
+pub(crate) fn is_platform_tag_conflict(text: &str) -> bool {
+    let t = text.to_ascii_lowercase();
+    t.contains("matching platform tag") || (t.contains("platform tag") && t.contains("manylinux"))
+}
+
+/// Parse a glibc version banner into `(major, minor)`. Reads the FIRST line
+/// only (so `ldd --version`'s copyright tail can't leak a stray `x.y`) and
+/// returns the first `<digits>.<digits>` token it can parse. Handles
+/// `getconf GNU_LIBC_VERSION` ("glibc 2.34") and `ldd --version`
+/// ("ldd (GNU libc) 2.34") and a three-part micro ("2.34.9000" -> (2, 34)).
+pub(crate) fn parse_glibc_version(s: &str) -> Option<(u32, u32)> {
+    let line = s.lines().next().unwrap_or("");
+    for tok in line.split(|c: char| !(c.is_ascii_digit() || c == '.')) {
+        if let Some((maj, rest)) = tok.split_once('.') {
+            let min: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let (Ok(maj), Ok(min)) = (maj.parse::<u32>(), min.parse::<u32>()) {
+                return Some((maj, min));
+            }
+        }
+    }
+    None
+}
+
+/// Detect the host's glibc `(major, minor)` the way uv does for manylinux
+/// tagging: `CS_GNU_LIBC_VERSION` (== `getconf GNU_LIBC_VERSION`), with
+/// `ldd --version` as a fallback. Absolute paths are tried first because a
+/// conda env on `PATH` can shadow (or omit) these tools. Returns `None` if
+/// neither is available -- the caller then declines to relax (fail-safe).
+/// retread ships as a static musl binary, so reading glibc symbols in-process
+/// is not an option; we shell out to the host's own tools.
+fn host_glibc() -> Option<(u32, u32)> {
+    for (prog, arg) in [
+        ("/usr/bin/getconf", "GNU_LIBC_VERSION"),
+        ("getconf", "GNU_LIBC_VERSION"),
+        ("/usr/bin/ldd", "--version"),
+        ("ldd", "--version"),
+    ] {
+        if let Ok(out) = Command::new(prog).arg(arg).output() {
+            // getconf prints to stdout; some ldd builds print to stderr.
+            let text = if out.stdout.is_empty() {
+                String::from_utf8_lossy(&out.stderr).into_owned()
+            } else {
+                String::from_utf8_lossy(&out.stdout).into_owned()
+            };
+            if let Some(v) = parse_glibc_version(&text) {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+/// Decide whether to AUTO-relax the glibc/manylinux host gate after a uv
+/// install failure. Re-runs the resolve as a cheap captured `--dry-run` (no
+/// downloads -- a manylinux rejection fails at the resolve stage) and, only if
+/// uv rejected a wheel purely for its platform tag, returns the relaxed
+/// `--python-platform` target: the host glibc plus EXACTLY ONE minor (never
+/// major, never more than one). Emits a loud warning when it relaxes. Returns
+/// `None` for any other failure (the caller then surfaces the original error
+/// unchanged) or when the host glibc can't be detected.
+fn relax_platform_on_conflict(uv: &OsString, base_args: &[OsString]) -> Option<String> {
+    let mut probe: Vec<OsString> = base_args.to_vec();
+    probe.push("--dry-run".into());
+    let out = Command::new(uv).args(&probe).output().ok()?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    if !is_platform_tag_conflict(&text) {
+        return None;
+    }
+    match host_glibc() {
+        Some((maj, min)) => {
+            // uv's arch token matches Rust's for the manylinux arches that ship
+            // binary index wheels (x86_64, aarch64).
+            let target = format!("{}-manylinux_{}_{}", std::env::consts::ARCH, maj, min + 1);
+            emit_glibc_relax_warning(maj, min, &target);
+            Some(target)
+        }
+        None => {
+            tracing::warn!(
+                "manylinux platform-tag conflict detected, but the host glibc \
+                 could not be detected (getconf/ldd unavailable); cannot \
+                 auto-relax the platform tag"
+            );
+            eprintln!(
+                "retread: manylinux platform-tag conflict detected, but host \
+                 glibc is undetectable; not relaxing"
+            );
+            None
+        }
+    }
+}
+
+/// Emit a VERY loud, unmissable warning that retread is relaxing uv's
+/// manylinux host gate. Glibc relaxation is genuinely unsafe unless the
+/// active conda env ships a newer sysroot glibc, so this must never be quiet.
+fn emit_glibc_relax_warning(host_maj: u32, host_min: u32, target: &str) {
+    let relaxed_min = host_min + 1;
+    let bar = "!".repeat(78);
+    eprintln!("\n{bar}");
+    eprintln!("!!  retread WARNING: AUTO-RELAXING glibc / manylinux PLATFORM TAG");
+    eprintln!("!!  uv rejected a wheel for its manylinux tag; retrying relaxed.");
+    eprintln!("!!");
+    eprintln!("!!  Host glibc detected: {host_maj}.{host_min}");
+    eprintln!("!!  Relaxing by EXACTLY ONE minor -> uv --python-platform {target}");
+    eprintln!("!!");
+    eprintln!(
+        "!!  uv will now accept wheels built for glibc up to {host_maj}.{relaxed_min} on this"
+    );
+    eprintln!(
+        "!!  glibc {host_maj}.{host_min} host. This is ONLY safe because the active conda env"
+    );
+    eprintln!(
+        "!!  ships its OWN newer sysroot glibc (>= {host_maj}.{relaxed_min}). If it does not, the"
+    );
+    eprintln!("!!  installed wheels WILL crash at import with `GLIBC_x.y not found`.");
+    eprintln!("!!  retread relaxes by one minor ONLY -- never major, never more than one.");
+    eprintln!("{bar}\n");
+    tracing::warn!(
+        host_glibc = %format!("{host_maj}.{host_min}"),
+        target_platform = %target,
+        "RETREAD_RELAX_GLIBC: relaxing uv's manylinux host gate by one glibc minor",
+    );
+}
+
 /// Build the `uv pip install` argument list (pure; no I/O, no spawn; no
 /// argv[0]). S1: a `--constraints` file bounds conda-provided transitives to
 /// conda's range. S3: `lock.index_urls` is replayed verbatim (first = primary
@@ -83,6 +216,7 @@ pub(crate) fn build_uv_args(
     overrides_file: Option<&Path>,
     constraints_file: Option<&Path>,
     excludes_file: Option<&Path>,
+    python_platform: Option<&str>,
 ) -> Vec<OsString> {
     let mut args: Vec<OsString> = vec![
         "pip".into(),
@@ -90,6 +224,20 @@ pub(crate) fn build_uv_args(
         "--python".into(),
         prefix.join("bin").join("python").into(),
     ];
+
+    // HOTFIX (v2.10.1): glibc / manylinux platform-tag relaxation.
+    // uv derives manylinux compatibility from the HOST glibc and rejects any
+    // binary index wheel whose manylinux floor exceeds it -- even when the
+    // active conda env ships its OWN newer sysroot glibc that can actually run
+    // the wheel (e.g. Isaac Sim 6 publishes only `manylinux_2_35` but the host
+    // is glibc 2.34). `--python-platform` tells uv to resolve wheel
+    // compatibility against a target platform ONE glibc minor above the host
+    // floor. Computed + gated (RETREAD_RELAX_GLIBC) + warned-about in run();
+    // None in the common case leaves uv's host-tag gate untouched.
+    if let Some(plat) = python_platform {
+        args.push("--python-platform".into());
+        args.push(plat.into());
+    }
 
     // Optional find-links directory for locally-shipped wheels.
     if let Some(dir) = wheels_dir {
@@ -275,6 +423,8 @@ pub fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
         }
     };
 
+    // First attempt: uv's manylinux host gate untouched. Streamed live so
+    // multi-GB index-wheel download progress is visible.
     let args = build_uv_args(
         &lock,
         prefix,
@@ -282,6 +432,7 @@ pub fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
         overrides_file,
         constraints_file,
         excludes_file,
+        None,
     );
 
     let install_msg = format!(
@@ -302,10 +453,43 @@ pub fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
         .status()
         .with_context(|| format!("spawning uv ({uv:?})"))?;
     if !status.success() {
-        bail!(
-            "uv pip install failed for bundle {} (status {status})",
-            lock.bundle
-        );
+        // AUTO-RELAX on a manylinux platform-tag conflict ONLY. uv rejects a
+        // binary index wheel (e.g. Isaac Sim 6's `manylinux_2_35`) when its
+        // floor exceeds the host glibc -- even though the conda env ships its
+        // own newer sysroot glibc that can run it. Classify the failure with a
+        // cheap captured `--dry-run` resolve; if it's purely the platform tag,
+        // retry ONCE targeting exactly one glibc minor above the host. Any
+        // other failure surfaces unchanged.
+        match relax_platform_on_conflict(&uv, &args) {
+            Some(platform) => {
+                let relaxed = build_uv_args(
+                    &lock,
+                    prefix,
+                    wheels_dir_opt,
+                    overrides_file,
+                    constraints_file,
+                    excludes_file,
+                    Some(&platform),
+                );
+                let status = Command::new(&uv)
+                    .args(&relaxed)
+                    .status()
+                    .with_context(|| format!("spawning uv ({uv:?}) with relaxed platform"))?;
+                if !status.success() {
+                    bail!(
+                        "uv pip install failed for bundle {} even after relaxing the \
+                         manylinux platform tag to {platform} (status {status})",
+                        lock.bundle
+                    );
+                }
+            }
+            None => {
+                bail!(
+                    "uv pip install failed for bundle {} (status {status})",
+                    lock.bundle
+                );
+            }
+        }
     }
 
     std::fs::create_dir_all(&share).ok();
@@ -421,7 +605,7 @@ mod tests {
         let lock = make_lock(deps, vec![PUBLIC_PYPI.into()], BTreeMap::new());
         let prefix = PathBuf::from("/fake/prefix");
         let con = PathBuf::from("/fake/prefix/share/retread/test-bundle.constraints.txt");
-        let args = build_uv_args(&lock, &prefix, None, None, Some(con.as_path()), None);
+        let args = build_uv_args(&lock, &prefix, None, None, Some(con.as_path()), None, None);
         let strs = argv_strings(&args);
         assert_eq!(
             flag_values(&strs, "--constraints"),
@@ -436,7 +620,7 @@ mod tests {
     fn s1_no_constraints_no_flag() {
         let lock = make_lock(vec![], vec![PUBLIC_PYPI.into()], BTreeMap::new());
         let prefix = PathBuf::from("/fake/prefix");
-        let args = build_uv_args(&lock, &prefix, None, None, None, None);
+        let args = build_uv_args(&lock, &prefix, None, None, None, None, None);
         let strs = argv_strings(&args);
         assert!(!strs.contains(&"--constraints".to_string()));
     }
@@ -448,14 +632,14 @@ mod tests {
         let lock = make_lock(vec![], vec![PUBLIC_PYPI.into()], BTreeMap::new());
         let prefix = PathBuf::from("/fake/prefix");
         let exc = PathBuf::from("/fake/prefix/share/retread/test-bundle.excludes.txt");
-        let args = build_uv_args(&lock, &prefix, None, None, None, Some(exc.as_path()));
+        let args = build_uv_args(&lock, &prefix, None, None, None, Some(exc.as_path()), None);
         let strs = argv_strings(&args);
         assert_eq!(
             flag_values(&strs, "--excludes"),
             vec![exc.to_string_lossy().into_owned()]
         );
         // absent when not provided.
-        let args = build_uv_args(&lock, &prefix, None, None, None, None);
+        let args = build_uv_args(&lock, &prefix, None, None, None, None, None);
         assert!(!argv_strings(&args).contains(&"--excludes".to_string()));
     }
 
@@ -483,7 +667,7 @@ mod tests {
             BTreeMap::new(),
         );
         let prefix = PathBuf::from("/fake/prefix");
-        let args = build_uv_args(&lock, &prefix, None, None, None, None);
+        let args = build_uv_args(&lock, &prefix, None, None, None, None, None);
         let strs = argv_strings(&args);
 
         let primary = flag_values(&strs, "--index-url");
@@ -505,7 +689,7 @@ mod tests {
             BTreeMap::new(),
         );
         let prefix = PathBuf::from("/fake/prefix");
-        let args = build_uv_args(&lock, &prefix, None, None, None, None);
+        let args = build_uv_args(&lock, &prefix, None, None, None, None, None);
         let strs = argv_strings(&args);
 
         let primary = flag_values(&strs, "--index-url");
@@ -522,7 +706,7 @@ mod tests {
     fn s3_empty_index_urls_fallback_to_public_pypi() {
         let lock = make_lock(vec![], vec![], BTreeMap::new());
         let prefix = PathBuf::from("/fake/prefix");
-        let args = build_uv_args(&lock, &prefix, None, None, None, None);
+        let args = build_uv_args(&lock, &prefix, None, None, None, None, None);
         let strs = argv_strings(&args);
 
         let primary = flag_values(&strs, "--index-url");
@@ -545,7 +729,7 @@ mod tests {
         let lock = make_lock(vec![], vec![PUBLIC_PYPI.into()], BTreeMap::new());
         let prefix = PathBuf::from("/fake/prefix");
         let ovr = PathBuf::from("/fake/prefix/share/retread/test-bundle.overrides.txt");
-        let args = build_uv_args(&lock, &prefix, None, Some(ovr.as_path()), None, None);
+        let args = build_uv_args(&lock, &prefix, None, Some(ovr.as_path()), None, None, None);
         let strs = argv_strings(&args);
         let ovr_vals = flag_values(&strs, "--overrides");
         assert_eq!(ovr_vals, vec![ovr.to_string_lossy().into_owned()]);
@@ -556,11 +740,70 @@ mod tests {
     fn root_requirements_in_argv() {
         let lock = make_lock(vec![], vec![PUBLIC_PYPI.into()], BTreeMap::new());
         let prefix = PathBuf::from("/fake/prefix");
-        let args = build_uv_args(&lock, &prefix, None, None, None, None);
+        let args = build_uv_args(&lock, &prefix, None, None, None, None, None);
         let strs = argv_strings(&args);
         assert!(
             strs.contains(&"mypackage==1.0.0".to_string()),
             "root requirements must appear in argv"
         );
+    }
+
+    // HOTFIX v2.10.1: --python-platform is threaded through when Some, and
+    // absent (uv's host gate untouched) when None.
+    #[test]
+    fn python_platform_flag_appears_in_argv() {
+        let lock = make_lock(vec![], vec![PUBLIC_PYPI.into()], BTreeMap::new());
+        let prefix = PathBuf::from("/fake/prefix");
+        let args = build_uv_args(
+            &lock,
+            &prefix,
+            None,
+            None,
+            None,
+            None,
+            Some("x86_64-manylinux_2_35"),
+        );
+        let strs = argv_strings(&args);
+        assert_eq!(
+            flag_values(&strs, "--python-platform"),
+            vec!["x86_64-manylinux_2_35".to_string()]
+        );
+        // absent when None -> uv's manylinux host gate is left untouched.
+        let args = build_uv_args(&lock, &prefix, None, None, None, None, None);
+        assert!(!argv_strings(&args).contains(&"--python-platform".to_string()));
+    }
+
+    // glibc banner parsing: getconf, ldd, and a 3-part micro all yield the
+    // (major, minor) pair; copyright noise on later lines is ignored.
+    #[test]
+    fn parses_glibc_version_banners() {
+        assert_eq!(parse_glibc_version("glibc 2.34\n"), Some((2, 34)));
+        assert_eq!(
+            parse_glibc_version("ldd (GNU libc) 2.34\nCopyright (C) 2021 ...\n"),
+            Some((2, 34))
+        );
+        assert_eq!(parse_glibc_version("glibc 2.34.9000"), Some((2, 34)));
+        assert_eq!(parse_glibc_version("no version here"), None);
+    }
+
+    // Only a genuine manylinux platform-tag rejection triggers auto-relax;
+    // unrelated solve/network failures must NOT be silently relaxed past.
+    #[test]
+    fn detects_platform_tag_conflict_only() {
+        // uv's real rejection text (from the issue report).
+        let uv_err = "× No solution found when resolving dependencies:\n  \
+            Because isaacsim[all]==6.0.0.1 has no wheels with a matching platform \
+            tag (e.g., `manylinux_2_34_x86_64`) and isaac-pack depends on \
+            isaacsim[all]==6.0.0.1, we can conclude that the requirements are \
+            unsatisfiable.";
+        assert!(is_platform_tag_conflict(uv_err));
+        // An unrelated version conflict must NOT count.
+        let version_err = "× No solution found: because foo==1 depends on bar>=2 \
+            and only bar==1 is available, resolution failed.";
+        assert!(!is_platform_tag_conflict(version_err));
+        // A network failure must NOT count.
+        assert!(!is_platform_tag_conflict(
+            "error: Failed to fetch: connection timed out"
+        ));
     }
 }

@@ -192,6 +192,20 @@ The default cascade starts at the narrowest safe rewrite, runs a real `rattler_s
 </details>
 
 <details>
+<summary><b>glibc / manylinux auto-relax</b></summary>
+
+A binary index wheel can be published with a manylinux floor newer than the install host's glibc — e.g. Isaac Sim 6 ships only `manylinux_2_35`, but a RHEL 9 host is glibc `2.34`. uv derives manylinux compatibility from the **host** glibc and rejects the only available wheel, even though the pixi/conda env ships its own newer sysroot glibc that runs it fine:
+
+```
+× No solution found ... isaacsim[all]==6.0.0.1 has no wheels with a matching
+  platform tag (e.g., `manylinux_2_34_x86_64`) ...
+```
+
+`retread install` recovers automatically: on an install failure it classifies the cause with a cheap `--dry-run` resolve, and **only** for a platform-tag rejection retries once with uv `--python-platform` targeting **exactly one glibc minor above the host** (`2.34` → `2.35`). It relaxes by one minor only — never major, never more — and prints a loud warning each time, since this is safe **only** because the conda env provides the newer sysroot glibc. No flag, no config: unrelated solve/network failures surface unchanged.
+
+</details>
+
+<details>
 <summary><b>Multi-Python &amp; pytorch/CUDA</b></summary>
 
 One artifact per platform; python-agnostic. retread builds wheels via `uv pip wheel --python <ver>`, fans `conda/outputs` over each requested python, and picks the matching wheel — so a multi-python pack works **only if every entry ships a wheel for every requested python**. Declare it (high→low precedence):
