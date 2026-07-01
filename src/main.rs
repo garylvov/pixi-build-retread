@@ -14,8 +14,11 @@ async fn main() -> anyhow::Result<()> {
     // the bundle's PyPI wheels into the active env. It is NOT the JSON-RPC
     // build-backend path -- handle it before the transport starts. Prefix
     // defaults to $PREFIX (set by conda post-link) then $CONDA_PREFIX.
+    // `retread verify` is the cheap activate.d guard: marker + installed
+    // distribution metadata only, no network or mutation.
     let argv: Vec<String> = std::env::args().collect();
-    if argv.get(1).map(String::as_str) == Some("install") {
+    if matches!(argv.get(1).map(String::as_str), Some("install" | "verify")) {
+        let cmd = argv[1].as_str();
         let mut lock: Option<String> = None;
         let mut prefix: Option<String> = None;
         let mut it = argv[2..].iter();
@@ -23,18 +26,23 @@ async fn main() -> anyhow::Result<()> {
             match a.as_str() {
                 "--lock" => lock = it.next().cloned(),
                 "--prefix" => prefix = it.next().cloned(),
-                other => anyhow::bail!("retread install: unknown arg {other}"),
+                other => anyhow::bail!("retread {cmd}: unknown arg {other}"),
             }
         }
-        let lock =
-            lock.ok_or_else(|| anyhow::anyhow!("retread install: --lock <path> required"))?;
+        let lock = lock.ok_or_else(|| anyhow::anyhow!("retread {cmd}: --lock <path> required"))?;
         let prefix = prefix
             .or_else(|| std::env::var("PREFIX").ok())
             .or_else(|| std::env::var("CONDA_PREFIX").ok())
             .ok_or_else(|| {
-                anyhow::anyhow!("retread install: --prefix <p> or $PREFIX/$CONDA_PREFIX required")
+                anyhow::anyhow!("retread {cmd}: --prefix <p> or $PREFIX/$CONDA_PREFIX required")
             })?;
-        return installer::run(std::path::Path::new(&lock), std::path::Path::new(&prefix));
+        let lock = std::path::Path::new(&lock);
+        let prefix = std::path::Path::new(&prefix);
+        return match cmd {
+            "install" => installer::run(lock, prefix),
+            "verify" => installer::verify(lock, prefix),
+            _ => unreachable!("matched above"),
+        };
     }
 
     // Log to stderr only — stdout is reserved for the JSON-RPC transport.

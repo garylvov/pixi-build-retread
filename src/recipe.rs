@@ -297,13 +297,13 @@ pub fn build_courier_recipe(
     // Build script: stage wheels + lock under $PREFIX/share/retread, install
     // the shipped static `retread` binary into $PREFIX/bin, then emit the
     // conda post-link script (literal $PREFIX -- expanded at LINK time, not
-    // build time -- via the quoted heredoc). The post-link runs the installer;
-    // a failure is logged loudly but does not abort linking (the conda
-    // metadata is still valid; the user can re-run `retread install`).
+    // build time -- via the quoted heredoc). The post-link runs the installer
+    // and must fail the conda link if the PyPI payload cannot be installed;
+    // otherwise pixi can report success for an incomplete environment.
     let post_link = format!("$PREFIX/bin/.{conda_name}-post-link.sh");
     // Loud-failure guard: an activate.d script runs on every activation
-    // (regardless of the post-link toggle) and warns -- with the two fixes --
-    // when the wheels are not installed, so a missing toggle is never silent.
+    // (regardless of the post-link toggle) and warns when the marker is absent
+    // or no longer matches the actual installed wheel state.
     let activate_guard = format!("$PREFIX/etc/conda/activate.d/zzz-retread-{conda_name}.sh");
     let script = format!(
         "set -euo pipefail\n\
@@ -316,13 +316,17 @@ pub fn build_courier_recipe(
          chmod +x \"$PREFIX/bin/retread\"\n\
          cat > \"{post_link}\" <<'POSTLINK'\n\
          #!/bin/bash\n\
-         \"$PREFIX/bin/retread\" install --lock \"$PREFIX/share/retread/{lock_filename}\" --prefix \"$PREFIX\" || echo 'retread: post-link install failed; run `retread install` manually' >&2\n\
+         set -euo pipefail\n\
+         \"$PREFIX/bin/retread\" install --lock \"$PREFIX/share/retread/{lock_filename}\" --prefix \"$PREFIX\"\n\
          POSTLINK\n\
          chmod +x \"{post_link}\"\n\
          cat > \"{activate_guard}\" <<'ACTIVATE'\n\
          #!/bin/bash\n\
-         if [ ! -f \"$CONDA_PREFIX/share/retread/{conda_name}.installed\" ]; then\n\
+         if ! RETREAD_VERIFY_OUTPUT=\"$(\"$CONDA_PREFIX/bin/retread\" verify --lock \"$CONDA_PREFIX/share/retread/{lock_filename}\" --prefix \"$CONDA_PREFIX\" 2>&1)\"; then\n\
          echo \"retread: '{conda_name}' PyPI wheels are NOT installed.\" >&2\n\
+         if [ -n \"$RETREAD_VERIFY_OUTPUT\" ]; then\n\
+         echo \"$RETREAD_VERIFY_OUTPUT\" | sed 's/^/  /' >&2\n\
+         fi\n\
          echo '  fast path: set run-post-link-scripts = \"insecure\" in <workspace>/.pixi/config.toml' >&2\n\
          echo '  safe mode: set retread-courier = false' >&2\n\
          fi\n\
@@ -422,6 +426,15 @@ mod courier_tests {
             "post-link must run the shipped installer"
         );
         assert!(
+            r.build.script.contains("set -euo pipefail"),
+            "post-link must fail closed when the installer fails"
+        );
+        assert!(
+            !r.build.script.contains("post-link install failed")
+                && !r.build.script.contains("|| echo"),
+            "post-link must not downgrade installer failure to success"
+        );
+        assert!(
             r.build.script.contains("retread-isaac-pack.lock.json"),
             "post-link must reference the bundle lock"
         );
@@ -453,8 +466,12 @@ mod courier_tests {
         assert!(
             r.build
                 .script
-                .contains("$CONDA_PREFIX/share/retread/isaac-pack.installed"),
-            "guard must check the installer success marker"
+                .contains("\"$CONDA_PREFIX/bin/retread\" verify --lock"),
+            "guard must verify marker plus installed wheel metadata"
+        );
+        assert!(
+            r.build.script.contains("retread-isaac-pack.lock.json"),
+            "guard must verify against the bundle lock"
         );
         assert!(
             r.build

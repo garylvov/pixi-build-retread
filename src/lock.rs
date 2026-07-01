@@ -303,7 +303,12 @@ pub const SCHEMA: u32 = 10;
 /// semantics for packs with multiple git-source entries (e.g. isaaclab +
 /// isaaclab-visualizers from the same repo) where a sibling happens to be
 /// listed in Requires-Dist.
-pub const EMIT_EPOCH: u32 = 7;
+///
+/// Epoch 8: courier post-link failures are fatal, and the activate guard now
+/// verifies both the success marker and installed wheel metadata. Identical
+/// manifests emit different post-link/activate scripts, so stale courier
+/// packages must be rebuilt.
+pub const EMIT_EPOCH: u32 = 8;
 
 impl RetreadLock {
     /// File name for a bundle's lock next to the pack manifest.

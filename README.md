@@ -100,7 +100,7 @@ Courier installs via conda post-link scripts, which pixi does not run by default
 
 > **Security.** This makes `pixi install` auto-run the post-link scripts of **every** conda package in the env, not just retread's — unsandboxed, with your privileges. A supply-chain-shaped risk; enable only for workspaces you trust.
 
-If the toggle is missing, pixi skips the post-link and the wheels never install. The package ships an `activate.d` guard that warns on every `pixi run` / `pixi shell` so this is never silent:
+If the toggle is enabled and `retread install` fails, the post-link fails the `pixi install` instead of leaving a half-installed env. If the toggle is missing, pixi skips the post-link and the wheels never install. The package ships an `activate.d` guard that verifies the marker and installed wheel metadata on every `pixi run` / `pixi shell`, so a missing or stale install is not silent:
 
 ```
 retread: '<pack>' PyPI wheels are NOT installed.

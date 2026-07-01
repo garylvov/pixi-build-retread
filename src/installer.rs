@@ -8,8 +8,9 @@
 //! chain, into the conda env so shared transitives stay conda-provided.
 //! Idempotent: a content-hash marker makes a re-link a no-op.
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
@@ -204,6 +205,222 @@ fn emit_glibc_relax_warning(host_maj: u32, host_min: u32, target: &str) {
     );
 }
 
+fn lock_digest(raw: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(raw))
+}
+
+fn site_packages_dir(prefix: &Path, python: &str) -> PathBuf {
+    prefix
+        .join("lib")
+        .join(format!("python{python}"))
+        .join("site-packages")
+}
+
+fn parse_metadata_name_version(text: &str) -> Option<(String, String)> {
+    let mut name: Option<String> = None;
+    let mut version: Option<String> = None;
+
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            break;
+        }
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        match key.trim().to_ascii_lowercase().as_str() {
+            "name" => name = Some(normalize_dist_name(value)),
+            "version" => version = Some(value.trim().to_string()),
+            _ => {}
+        }
+        if name.is_some() && version.is_some() {
+            break;
+        }
+    }
+
+    Some((name?, version?))
+}
+
+fn read_metadata_file(path: &Path) -> Option<(String, String)> {
+    let text = std::fs::read_to_string(path).ok()?;
+    parse_metadata_name_version(&text)
+}
+
+fn installed_distributions(
+    site_packages: &Path,
+) -> Result<BTreeMap<String, BTreeMap<String, PathBuf>>> {
+    let mut out: BTreeMap<String, BTreeMap<String, PathBuf>> = BTreeMap::new();
+    if !site_packages.is_dir() {
+        return Ok(out);
+    }
+
+    for entry in std::fs::read_dir(site_packages)
+        .with_context(|| format!("reading site-packages {}", site_packages.display()))?
+    {
+        let entry =
+            entry.with_context(|| format!("reading entry in {}", site_packages.display()))?;
+        let path = entry.path();
+        let file_name = entry.file_name().to_string_lossy().into_owned();
+        let (metadata, dist_root) = if file_name.ends_with(".dist-info") {
+            (path.join("METADATA"), path.clone())
+        } else if file_name.ends_with(".egg-info") {
+            if path.is_dir() {
+                (path.join("PKG-INFO"), path.clone())
+            } else {
+                (path.clone(), path.clone())
+            }
+        } else {
+            continue;
+        };
+
+        if let Some((name, version)) = read_metadata_file(&metadata) {
+            out.entry(name).or_default().insert(version, dist_root);
+        }
+    }
+
+    Ok(out)
+}
+
+pub(crate) fn missing_locked_wheels_from_installed(
+    lock: &RetreadLock,
+    installed: &BTreeMap<String, BTreeMap<String, PathBuf>>,
+) -> Vec<String> {
+    let mut missing: Vec<String> = lock
+        .wheels
+        .iter()
+        .filter_map(|wheel| {
+            let name = normalize_dist_name(&wheel.name);
+            let present = installed
+                .get(&name)
+                .is_some_and(|versions| versions.contains_key(&wheel.version));
+            (!present).then(|| format!("{}=={}", wheel.name, wheel.version))
+        })
+        .collect();
+    missing.sort();
+    missing.dedup();
+    missing
+}
+
+fn record_path_token(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some(rest) = trimmed.strip_prefix('"') {
+        let mut out = String::new();
+        let mut chars = rest.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '"' {
+                if chars.peek() == Some(&'"') {
+                    chars.next();
+                    out.push('"');
+                    continue;
+                }
+                break;
+            }
+            out.push(c);
+        }
+        (!out.is_empty()).then_some(out)
+    } else {
+        let raw = trimmed.split(',').next()?.trim();
+        (!raw.is_empty()).then(|| raw.to_string())
+    }
+}
+
+fn verify_record_payload(site_packages: &Path, dist_root: &Path) -> Result<()> {
+    if !dist_root
+        .file_name()
+        .and_then(|s| s.to_str())
+        .is_some_and(|name| name.ends_with(".dist-info"))
+    {
+        bail!(
+            "installed distribution metadata at {} has no wheel RECORD",
+            dist_root.display()
+        );
+    }
+
+    let record = dist_root.join("RECORD");
+    let body = std::fs::read_to_string(&record)
+        .with_context(|| format!("reading wheel RECORD {}", record.display()))?;
+    let mut checked = 0usize;
+    for line in body.lines() {
+        let Some(token) = record_path_token(line) else {
+            continue;
+        };
+        let path = site_packages.join(token);
+        if !path.exists() {
+            bail!(
+                "wheel RECORD {} references missing installed file {}",
+                record.display(),
+                path.display()
+            );
+        }
+        checked += 1;
+    }
+    if checked == 0 {
+        bail!("wheel RECORD {} has no file entries", record.display());
+    }
+    Ok(())
+}
+
+fn verify_payload_installed(lock: &RetreadLock, prefix: &Path) -> Result<()> {
+    let site_packages = site_packages_dir(prefix, &lock.python);
+    let installed = installed_distributions(&site_packages)?;
+    let missing = missing_locked_wheels_from_installed(lock, &installed);
+    if !missing.is_empty() {
+        bail!(
+            "retread verify: bundle {} is missing {} locked wheel(s) in {}: {}",
+            lock.bundle,
+            missing.len(),
+            site_packages.display(),
+            missing.join(", ")
+        );
+    }
+
+    for wheel in &lock.wheels {
+        let name = normalize_dist_name(&wheel.name);
+        let dist_root = installed
+            .get(&name)
+            .and_then(|versions| versions.get(&wheel.version))
+            .expect("missing list already checked");
+        verify_record_payload(&site_packages, dist_root).with_context(|| {
+            format!(
+                "retread verify: {}=={} payload check failed",
+                wheel.name, wheel.version
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn marker_matches(marker: &Path, want: &str) -> bool {
+    std::fs::read_to_string(marker).is_ok_and(|have| have.trim() == want)
+}
+
+/// Verify that the marker belongs to this lock AND the target prefix still
+/// contains the locked wheel payload. Used by activate.d and by `run()` before
+/// trusting an existing marker.
+pub fn verify(lock_path: &Path, prefix: &Path) -> Result<()> {
+    let raw = std::fs::read(lock_path)
+        .with_context(|| format!("reading lock {}", lock_path.display()))?;
+    let lock: RetreadLock = serde_json::from_slice(&raw)
+        .with_context(|| format!("parsing lock {}", lock_path.display()))?;
+
+    let share = prefix.join("share").join("retread");
+    let marker = share.join(lock.marker_name());
+    let want = lock_digest(&raw);
+    let have = std::fs::read_to_string(&marker)
+        .with_context(|| format!("reading marker {}", marker.display()))?;
+    if have.trim() != want {
+        bail!(
+            "retread verify: marker {} does not match {}",
+            marker.display(),
+            lock_path.display()
+        );
+    }
+    verify_payload_installed(&lock, prefix)
+}
+
 /// Build the `uv pip install` argument list (pure; no I/O, no spawn; no
 /// argv[0]). S1: a `--constraints` file bounds conda-provided transitives to
 /// conda's range. S3: `lock.index_urls` is replayed verbatim (first = primary
@@ -307,18 +524,27 @@ pub fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
 
     let share = prefix.join("share").join("retread");
     let marker = share.join(lock.marker_name());
-    let want = format!("{:x}", Sha256::digest(&raw));
-    if let Ok(have) = std::fs::read_to_string(&marker)
-        && have.trim() == want
-    {
-        let msg = format!("retread install: {} already current; skipping", lock.bundle);
-        eprintln!("{msg}");
-        crate::status::phase(
-            lock_path.parent().unwrap_or(std::path::Path::new(".")),
-            &lock.bundle,
-            &msg,
-        );
-        return Ok(());
+    let want = lock_digest(&raw);
+    if marker_matches(&marker, &want) {
+        match verify_payload_installed(&lock, prefix) {
+            Ok(()) => {
+                let msg = format!("retread install: {} already current; skipping", lock.bundle);
+                eprintln!("{msg}");
+                crate::status::phase(
+                    lock_path.parent().unwrap_or(std::path::Path::new(".")),
+                    &lock.bundle,
+                    &msg,
+                );
+                return Ok(());
+            }
+            Err(err) => {
+                eprintln!(
+                    "retread install: {} marker exists but payload verification failed; \
+                     reinstalling ({err:#})",
+                    lock.bundle
+                );
+            }
+        }
     }
 
     if lock.root_requirements.is_empty() {
@@ -492,6 +718,12 @@ pub fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
         }
     }
 
+    verify_payload_installed(&lock, prefix).with_context(|| {
+        format!(
+            "retread install: {} post-install verification failed",
+            lock.bundle
+        )
+    })?;
     std::fs::create_dir_all(&share).ok();
     std::fs::write(&marker, want)
         .with_context(|| format!("writing marker {}", marker.display()))?;
@@ -805,5 +1037,155 @@ mod tests {
         assert!(!is_platform_tag_conflict(
             "error: Failed to fetch: connection timed out"
         ));
+    }
+
+    fn tempdir(label: &str) -> PathBuf {
+        let mut dir = std::env::temp_dir();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        dir.push(format!(
+            "pixi-build-retread-installer-{label}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn verify_requires_marker_and_installed_wheel_metadata() {
+        let root = tempdir("verify-marker");
+        let prefix = root.join("prefix");
+        let share = prefix.join("share").join("retread");
+        std::fs::create_dir_all(&share).unwrap();
+
+        let lock = make_lock(vec![], vec![PUBLIC_PYPI.into()], BTreeMap::new());
+        let raw = serde_json::to_vec(&lock).unwrap();
+        let lock_path = share.join(lock.marker_name().replace(".installed", ".lock.json"));
+        std::fs::write(&lock_path, &raw).unwrap();
+        std::fs::write(share.join(lock.marker_name()), lock_digest(&raw)).unwrap();
+
+        let err = verify(&lock_path, &prefix).expect_err("marker alone must not verify");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("missing 1 locked wheel") && msg.contains("mypackage==1.0.0"),
+            "unexpected verifier error: {msg}"
+        );
+
+        let site_packages = site_packages_dir(&prefix, &lock.python);
+        let dist_info = site_packages.join("mypackage-1.0.0.dist-info");
+        std::fs::create_dir_all(&dist_info).unwrap();
+        std::fs::write(
+            dist_info.join("METADATA"),
+            "Metadata-Version: 2.1\nName: MyPackage\nVersion: 1.0.0\n",
+        )
+        .unwrap();
+
+        let err = verify(&lock_path, &prefix).expect_err("metadata without RECORD must not verify");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("RECORD") && msg.contains("payload check failed"),
+            "unexpected verifier error: {msg}"
+        );
+
+        std::fs::create_dir_all(site_packages.join("mypackage")).unwrap();
+        std::fs::write(site_packages.join("mypackage/__init__.py"), "").unwrap();
+        std::fs::write(
+            dist_info.join("RECORD"),
+            "mypackage/__init__.py,,\nmypackage-1.0.0.dist-info/METADATA,,\nmypackage-1.0.0.dist-info/RECORD,,\n",
+        )
+        .unwrap();
+
+        verify(&lock_path, &prefix).expect("matching marker plus metadata should verify");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn verify_rejects_stale_marker_even_when_payload_exists() {
+        let root = tempdir("verify-stale-marker");
+        let prefix = root.join("prefix");
+        let share = prefix.join("share").join("retread");
+        std::fs::create_dir_all(&share).unwrap();
+
+        let lock = make_lock(vec![], vec![PUBLIC_PYPI.into()], BTreeMap::new());
+        let raw = serde_json::to_vec(&lock).unwrap();
+        let lock_path = share.join("retread-test-bundle.lock.json");
+        std::fs::write(&lock_path, &raw).unwrap();
+        std::fs::write(share.join(lock.marker_name()), "not-the-lock-hash").unwrap();
+
+        let site_packages = site_packages_dir(&prefix, &lock.python);
+        let dist_info = site_packages.join("mypackage-1.0.0.dist-info");
+        std::fs::create_dir_all(&dist_info).unwrap();
+        std::fs::write(
+            dist_info.join("METADATA"),
+            "Metadata-Version: 2.1\nName: mypackage\nVersion: 1.0.0\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(site_packages.join("mypackage")).unwrap();
+        std::fs::write(site_packages.join("mypackage/__init__.py"), "").unwrap();
+        std::fs::write(
+            dist_info.join("RECORD"),
+            "mypackage/__init__.py,,\nmypackage-1.0.0.dist-info/METADATA,,\nmypackage-1.0.0.dist-info/RECORD,,\n",
+        )
+        .unwrap();
+
+        let err = verify(&lock_path, &prefix).expect_err("stale marker must not verify");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("does not match"), "unexpected error: {msg}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn verify_rejects_metadata_when_record_payload_is_missing() {
+        let root = tempdir("verify-missing-record-payload");
+        let prefix = root.join("prefix");
+        let share = prefix.join("share").join("retread");
+        std::fs::create_dir_all(&share).unwrap();
+
+        let lock = make_lock(vec![], vec![PUBLIC_PYPI.into()], BTreeMap::new());
+        let raw = serde_json::to_vec(&lock).unwrap();
+        let lock_path = share.join("retread-test-bundle.lock.json");
+        std::fs::write(&lock_path, &raw).unwrap();
+        std::fs::write(share.join(lock.marker_name()), lock_digest(&raw)).unwrap();
+
+        let site_packages = site_packages_dir(&prefix, &lock.python);
+        let dist_info = site_packages.join("mypackage-1.0.0.dist-info");
+        std::fs::create_dir_all(&dist_info).unwrap();
+        std::fs::write(
+            dist_info.join("METADATA"),
+            "Metadata-Version: 2.1\nName: mypackage\nVersion: 1.0.0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dist_info.join("RECORD"),
+            "mypackage/__init__.py,,\nmypackage-1.0.0.dist-info/METADATA,,\nmypackage-1.0.0.dist-info/RECORD,,\n",
+        )
+        .unwrap();
+
+        let err = verify(&lock_path, &prefix).expect_err("missing RECORD payload must not verify");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("missing installed file") && msg.contains("mypackage/__init__.py"),
+            "unexpected error: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn record_path_token_handles_csv_quoted_commas_and_quotes() {
+        assert_eq!(
+            record_path_token("\"pkg/data,part.txt\",sha256=abc,123").as_deref(),
+            Some("pkg/data,part.txt")
+        );
+        assert_eq!(
+            record_path_token("\"pkg/data\"\"part.txt\",,").as_deref(),
+            Some("pkg/data\"part.txt")
+        );
+        assert_eq!(
+            record_path_token("pkg/__init__.py,,").as_deref(),
+            Some("pkg/__init__.py")
+        );
+        assert_eq!(record_path_token(",,").as_deref(), None);
     }
 }
