@@ -322,13 +322,24 @@ pub fn build_courier_recipe(
          chmod +x \"{post_link}\"\n\
          cat > \"{activate_guard}\" <<'ACTIVATE'\n\
          #!/bin/bash\n\
-         if ! RETREAD_VERIFY_OUTPUT=\"$(\"$CONDA_PREFIX/bin/retread\" verify --lock \"$CONDA_PREFIX/share/retread/{lock_filename}\" --prefix \"$CONDA_PREFIX\" 2>&1)\"; then\n\
-         echo \"retread: '{conda_name}' PyPI wheels are NOT installed.\" >&2\n\
-         if [ -n \"$RETREAD_VERIFY_OUTPUT\" ]; then\n\
-         echo \"$RETREAD_VERIFY_OUTPUT\" | sed 's/^/  /' >&2\n\
+         # SELF-HEAL guard, sourced on every activation. The bundle's PyPI wheels\n\
+         # are installed by the post-link as a side effect that conda/pixi does\n\
+         # NOT track, so any loss of that payload -- env moved, node-local /tmp\n\
+         # env wiped while conda-meta survived, or pixi treating the package as\n\
+         # already-satisfied and skipping the post-link on relink -- is invisible\n\
+         # to pixi and never repaired. On activation, if the payload no longer\n\
+         # verifies, re-run the installer to restore it into the CURRENT prefix\n\
+         # from the conda-tracked lock + shipped wheels + shipped retread binary\n\
+         # (all of which survive the payload loss). Cheap no-op when healthy\n\
+         # (verify is marker + stat checks). This file is SOURCED into the\n\
+         # user's interactive shell, so it must never enable errexit or\n\
+         # terminate the shell -- a failed repair only warns.\n\
+         if ! \"$CONDA_PREFIX/bin/retread\" verify --lock \"$CONDA_PREFIX/share/retread/{lock_filename}\" --prefix \"$CONDA_PREFIX\" >/dev/null 2>&1; then\n\
+         echo \"retread: '{conda_name}' PyPI wheels missing from this env; repairing...\" >&2\n\
+         if ! \"$CONDA_PREFIX/bin/retread\" install --lock \"$CONDA_PREFIX/share/retread/{lock_filename}\" --prefix \"$CONDA_PREFIX\" >&2; then\n\
+         echo \"retread: '{conda_name}' auto-repair FAILED; env is incomplete. Retry manually:\" >&2\n\
+         echo \"  \\\"$CONDA_PREFIX/bin/retread\\\" install --lock \\\"$CONDA_PREFIX/share/retread/{lock_filename}\\\" --prefix \\\"$CONDA_PREFIX\\\"\" >&2\n\
          fi\n\
-         echo '  fast path: set run-post-link-scripts = \"insecure\" in <workspace>/.pixi/config.toml' >&2\n\
-         echo '  safe mode: set retread-courier = false' >&2\n\
          fi\n\
          ACTIVATE\n\
          chmod +x \"{activate_guard}\"\n"
@@ -455,8 +466,8 @@ mod courier_tests {
             r.build.script.contains("\nPOSTLINK\n"),
             "heredoc terminator must be at column 0 to close the heredoc"
         );
-        // A4 loud-failure guard: a conda activate.d script that warns on every
-        // activation when the wheels are not installed (missing toggle).
+        // Self-heal guard: a conda activate.d script that verifies the payload
+        // on every activation and repairs it when missing.
         assert!(
             r.build
                 .script
@@ -473,20 +484,157 @@ mod courier_tests {
             r.build.script.contains("retread-isaac-pack.lock.json"),
             "guard must verify against the bundle lock"
         );
+        // Self-heal: on a failed verify the guard must RUN the installer to
+        // repair the payload (not merely warn), so an env whose non-conda-
+        // tracked wheels were lost (moved / node-local /tmp wiped / post-link
+        // skipped on relink) is restored on next activation.
         assert!(
             r.build
                 .script
-                .contains("run-post-link-scripts = \"insecure\""),
-            "guard banner must name the fast-path toggle"
+                .contains("\"$CONDA_PREFIX/bin/retread\" install --lock"),
+            "guard must self-heal by running the installer when verify fails"
         );
         assert!(
-            r.build.script.contains("retread-courier = false"),
-            "guard banner must name the safe-mode opt-out"
+            r.build.script.contains("repairing..."),
+            "guard should announce the repair"
+        );
+        // Sourced into the user's shell -> must not carry set -e / exit that
+        // would abort activation on a repair failure.
+        let activate_body = r
+            .build
+            .script
+            .split("<<'ACTIVATE'\n")
+            .nth(1)
+            .and_then(|s| s.split("\nACTIVATE\n").next())
+            .expect("activate.d heredoc body");
+        assert!(
+            !activate_body.contains("set -e") && !activate_body.contains("\nexit "),
+            "activate.d guard is sourced; it must not set -e or exit"
         );
         assert!(
             r.build.script.contains("\nACTIVATE\n"),
             "activate.d heredoc terminator must be at column 0"
         );
+    }
+
+    // End-to-end: render the REAL courier build script, run it with bash to
+    // materialize a prefix, then drive the generated activate.d guard against a
+    // STUB `retread` binary to prove the self-heal control flow: when the
+    // payload is missing (verify fails) the guard actually RUNS the installer
+    // and restores it; when the payload is present (verify passes) the guard is
+    // a no-op and never invokes install. This reproduces "marker absent, lock
+    // present, prefix has no payload" (issue #9 / detached-/tmp Scenario B).
+    #[test]
+    fn courier_activate_guard_self_heals_missing_payload_and_noops_when_present() {
+        use std::process::Command;
+
+        let bash = match which("bash") {
+            Some(b) => b,
+            None => {
+                eprintln!("skipping: bash not on PATH");
+                return;
+            }
+        };
+
+        let root = std::env::temp_dir().join(format!(
+            "retread-selfheal-e2e-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let src = root.join("src");
+        let prefix = root.join("prefix");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&prefix).unwrap();
+        // Build script cp's the lock + installer under set -euo pipefail.
+        std::fs::write(src.join("retread-isaac-pack.lock.json"), "{}").unwrap();
+        std::fs::write(src.join("retread-installer"), "#!/bin/sh\n").unwrap();
+
+        let recipe = build_courier_recipe("isaac-pack", "5.1.0", "3.11", &[], &[], None);
+        let build = Command::new(&bash)
+            .arg("-c")
+            .arg(&recipe.build.script)
+            .env("SRC_DIR", &src)
+            .env("PREFIX", &prefix)
+            .output()
+            .expect("run build script");
+        assert!(
+            build.status.success(),
+            "build script failed: {}",
+            String::from_utf8_lossy(&build.stderr)
+        );
+
+        // Overwrite the shipped binary with a stub: `verify` succeeds iff the
+        // payload sentinel exists; `install` creates the sentinel and logs.
+        let stub = "#!/bin/bash\n\
+             log=\"$CONDA_PREFIX/retread-stub.log\"\n\
+             payload=\"$CONDA_PREFIX/lib/python3.11/site-packages/isaaclab/__init__.py\"\n\
+             case \"$1\" in\n\
+             verify) [ -f \"$payload\" ] ;;\n\
+             install) echo \"install $(date +%s.%N)\" >> \"$log\"; mkdir -p \"$(dirname \"$payload\")\"; echo x > \"$payload\" ;;\n\
+             *) exit 0 ;;\n\
+             esac\n";
+        std::fs::write(prefix.join("bin/retread"), stub).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                prefix.join("bin/retread"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+
+        let guard = prefix.join("etc/conda/activate.d/zzz-retread-isaac-pack.sh");
+        assert!(guard.is_file(), "activate.d guard not shipped");
+        let source_guard = || {
+            Command::new(&bash)
+                .arg("-c")
+                .arg(format!(". \"{}\"", guard.display()))
+                .env("CONDA_PREFIX", &prefix)
+                .output()
+                .expect("source guard")
+        };
+        let log = prefix.join("retread-stub.log");
+        let payload = prefix.join("lib/python3.11/site-packages/isaaclab/__init__.py");
+
+        // Payload absent -> guard must self-heal: invoke install, restore it.
+        assert!(!payload.exists(), "payload should start absent");
+        let out = source_guard();
+        assert!(payload.exists(), "self-heal must restore the payload");
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap_or_default().lines().count(),
+            1,
+            "self-heal must invoke install exactly once"
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("repairing"),
+            "self-heal should announce the repair"
+        );
+
+        // Payload present -> guard is a no-op: verify passes, install NOT called.
+        let out2 = source_guard();
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap_or_default().lines().count(),
+            1,
+            "healthy env must not trigger another install (no wasted uv run)"
+        );
+        assert!(
+            !String::from_utf8_lossy(&out2.stderr).contains("repairing"),
+            "healthy env must be silent"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    fn which(bin: &str) -> Option<std::path::PathBuf> {
+        std::env::var_os("PATH").and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|d| d.join(bin))
+                .find(|p| p.is_file())
+        })
     }
 
     #[test]

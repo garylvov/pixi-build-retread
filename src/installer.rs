@@ -530,6 +530,24 @@ pub fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
         .with_context(|| format!("parsing lock {}", lock_path.display()))?;
 
     let share = prefix.join("share").join("retread");
+
+    // Serialize concurrent installs into the same prefix. The self-heal
+    // activate.d guard runs `retread install` on activation, so parallel
+    // `pixi run`s can race two uv installs into one env. Hold an advisory
+    // exclusive lock for the whole run; a second waiter then sees the marker
+    // already current and no-ops. Best-effort: if the lock can't be taken we
+    // proceed unlocked rather than block the repair.
+    std::fs::create_dir_all(&share).ok();
+    let _install_lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(share.join(format!(".{}.install.lock", lock.bundle)))
+        .inspect(|f| {
+            let _ = fs4::fs_std::FileExt::lock_exclusive(f);
+        })
+        .ok();
+
     let marker = share.join(lock.marker_name());
     let want = lock_digest(&raw);
     if marker_matches(&marker, &want) {
