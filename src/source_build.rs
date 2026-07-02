@@ -267,6 +267,55 @@ pub fn git_checkout_root(url: &str, rev: &str, cache_dir: &Path) -> PathBuf {
     cache_dir.join("retread-git-clones").join(slug).join(sha12)
 }
 
+/// Ensure `clone_dir` is a git clone of `url` checked out at `rev`.
+/// Clones (with `--no-checkout`) only if `clone_dir` doesn't exist yet;
+/// otherwise reuses it. Always runs the checkout dance regardless --
+/// see the v3.0.2 comment at the call site for why an existing
+/// clone_dir can't be trusted blindly. Callers hold the per-clone_dir
+/// lock for the duration; this function does not lock.
+async fn clone_and_checkout(clone_dir: &Path, url: &str, rev: &str) -> Result<()> {
+    if !clone_dir.exists() {
+        tracing::info!(url = %url, rev = %rev, "cloning git source");
+        // Clone shallow without checkout. Use a two-step fetch so we can
+        // target arbitrary commits (not just branch/tag tips).
+        run_silent(
+            Command::new("git")
+                .arg("clone")
+                .arg("--filter=blob:none")
+                .arg("--no-checkout")
+                .arg(url)
+                .arg(clone_dir),
+            "git clone",
+        )
+        .await?;
+    } else {
+        tracing::debug!(path = %clone_dir.display(), "git source already cached");
+    }
+
+    if checkout_rev_robust(clone_dir, rev).await? {
+        return Ok(());
+    }
+    // Fetch the specific rev AND its reachable tags so that
+    // setuptools_scm can find a release tag and emit a static version
+    // (e.g. "1.1.1") rather than a drifting dev/date suffix (e.g.
+    // "1.1.1.dev4+g1234567.d20250101").
+    run_silent(
+        Command::new("git")
+            .args(["fetch", "--tags", "origin", rev])
+            .current_dir(clone_dir),
+        "git fetch --tags",
+    )
+    .await?;
+    if !checkout_rev_robust(clone_dir, "FETCH_HEAD").await? {
+        bail!(
+            "git checkout FETCH_HEAD failed even after cleaning the working \
+             tree, in clone at {}",
+            clone_dir.display()
+        );
+    }
+    Ok(())
+}
+
 /// Clone a git URL at a specific revision into `cache_dir`, then build
 /// the wheel for `subdirectory` (relative to the repo root, defaulting
 /// to ".").
@@ -351,59 +400,44 @@ pub async fn build_wheel_from_git(
         .context("git-clone lock task panicked")??
     };
 
-    if !clone_dir.exists() {
-        tracing::info!(url = %url, rev = %rev, "cloning git source");
-        // Clone shallow without checkout. Use a two-step fetch so we can
-        // target arbitrary commits (not just branch/tag tips).
-        run_silent(
-            Command::new("git")
-                .arg("clone")
-                .arg("--filter=blob:none")
-                .arg("--no-checkout")
-                .arg(url)
-                .arg(&clone_dir),
-            "git clone",
-        )
-        .await?;
-    } else {
-        tracing::debug!(path = %clone_dir.display(), "git source already cached");
-    }
-
-    // v3.0.2 (#8 follow-up): ALWAYS run the checkout dance, even when
-    // clone_dir already existed. A directory that survived a pre-v3.0.0
-    // race (fetched `rev` but never actually checked it out, or checked
-    // out an unrelated commit, or left untracked files mid-checkout that
-    // block any future `git checkout`) previously slipped past the old
-    // `else` branch untouched -- every subsequent run reused that broken
-    // checkout forever, since `clone_dir.exists()` alone can't tell a
-    // healthy checkout from a corrupted one. `checkout_rev_robust` is a
-    // cheap, safe no-op when the tree is already correct (common case),
-    // and self-heals a corrupted tree -- including #8's "untracked
-    // working tree files would be overwritten" symptom -- without a
-    // network round trip when `rev`'s object is already present locally
-    // (the exact state #8 found: "git cat-file -t <rev> confirmed the
-    // pinned commit was fetched" but HEAD was parked elsewhere / blocked
-    // by stray files). Only falls through to `git fetch` when `rev`
-    // truly isn't resolvable locally yet.
-    if !checkout_rev_robust(&clone_dir, rev).await? {
-        // Fetch the specific rev AND its reachable tags so that
-        // setuptools_scm can find a release tag and emit a static
-        // version (e.g. "1.1.1") rather than a drifting dev/date
-        // suffix (e.g. "1.1.1.dev4+g1234567.d20250101").
-        run_silent(
-            Command::new("git")
-                .args(["fetch", "--tags", "origin", rev])
-                .current_dir(&clone_dir),
-            "git fetch --tags",
-        )
-        .await?;
-        if !checkout_rev_robust(&clone_dir, "FETCH_HEAD").await? {
-            bail!(
-                "git checkout FETCH_HEAD failed even after cleaning the working \
-                 tree, in clone at {}",
-                clone_dir.display()
-            );
-        }
+    // v3.0.2 (#8 follow-up): ALWAYS run the full clone-if-missing +
+    // checkout dance, even when clone_dir already existed. A directory
+    // that survived a pre-v3.0.0 race (fetched `rev` but never actually
+    // checked it out, checked out an unrelated commit, or left untracked
+    // files mid-checkout that block any future `git checkout`)
+    // previously slipped past unrepaired -- every subsequent run reused
+    // that broken checkout forever, since `clone_dir.exists()` alone
+    // can't tell a healthy checkout from a corrupted one.
+    // `clone_and_checkout` is a cheap, safe no-op when the tree is
+    // already correct (common case), and self-heals a corrupted
+    // WORKING TREE via `checkout_rev_robust`'s `git clean -fdx` retry.
+    //
+    // v3.0.3: `git clean -fdx` only repairs the working tree -- it can't
+    // fix a corrupted `.git` itself (bad refs, missing objects, a stale
+    // `index.lock`), which is what #8 hit next: "git checkout FETCH_HEAD
+    // failed even after cleaning the working tree." A clone_dir that
+    // took concurrent hits from multiple pre-lock resolvers over its
+    // lifetime can end up broken at that deeper level. When the
+    // working-tree-level repair still isn't enough, wipe clone_dir
+    // entirely and re-clone from scratch once -- the only fix that's
+    // correct regardless of what kind of corruption is actually there.
+    if let Err(e) = clone_and_checkout(&clone_dir, url, rev).await {
+        tracing::warn!(
+            url = %url, rev = %rev, error = %format!("{e:#}"),
+            path = %clone_dir.display(),
+            "git clone/checkout failed even after working-tree repair; \
+             wiping the clone dir and re-cloning from scratch",
+        );
+        tokio::fs::remove_dir_all(&clone_dir)
+            .await
+            .with_context(|| format!("wiping corrupted clone dir {}", clone_dir.display()))?;
+        clone_and_checkout(&clone_dir, url, rev)
+            .await
+            .with_context(|| {
+                format!(
+                    "re-clone after wiping corrupted dir still failed for {url}@{rev}"
+                )
+            })?;
     }
 
     // Release the lock now that the clone_dir holds a complete checkout;
@@ -1031,6 +1065,96 @@ version = "0.1.0"
             std::fs::read_to_string(clone_dir.join("extra.txt")).expect("read extra.txt"),
             "tracked-content",
             "the stray untracked file must be replaced by the tracked one, not left in place"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// v3.0.3 regression (#8): when a clone_dir is corrupted at the
+    /// `.git` level (not just the working tree), `checkout_rev_robust`'s
+    /// working-tree-only repair (`git clean -fdx`) can't fix it and
+    /// every checkout attempt keeps failing -- exactly what #8 hit next:
+    /// "git checkout FETCH_HEAD failed even after cleaning the working
+    /// tree." `build_wheel_from_git` must fall back to wiping clone_dir
+    /// and re-cloning from scratch rather than erroring out forever.
+    /// Simulated here with a stale `.git/index.lock` (a realistic
+    /// leftover from a process killed mid-checkout before the flock fix
+    /// existed): git refuses EVERY checkout while it's present, and
+    /// `git clean` doesn't touch `.git/` at all, so only a full wipe
+    /// recovers.
+    #[tokio::test]
+    #[ignore = "live: builds a git wheel via uv (needs uv + git on PATH); run with --include-ignored"]
+    async fn build_wheel_from_git_recovers_from_corrupted_git_dir_by_recloning() {
+        let pid = std::process::id();
+        let base = std::env::temp_dir().join(format!("retread-gitrecover-{pid}"));
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).expect("create repo dir");
+
+        let run_git = |args: &[&str], dir: &std::path::Path| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_AUTHOR_NAME", "test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .status()
+                .expect("git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+
+        run_git(&["init", "-b", "main"], &repo);
+        run_git(&["config", "user.email", "test@example.com"], &repo);
+        run_git(&["config", "user.name", "test"], &repo);
+        std::fs::write(
+            repo.join("pyproject.toml"),
+            r#"[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "retread-test-fixture"
+version = "0.1.0"
+"#,
+        )
+        .expect("write pyproject");
+        run_git(&["add", "."], &repo);
+        run_git(&["commit", "-m", "initial"], &repo);
+        let sha_output = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&repo)
+            .output()
+            .expect("git rev-parse");
+        let rev = String::from_utf8_lossy(&sha_output.stdout)
+            .trim()
+            .to_string();
+
+        let cache_dir = base.join("cache");
+        let out_dir = base.join("out");
+        std::fs::create_dir_all(&cache_dir).expect("cache dir");
+        std::fs::create_dir_all(&out_dir).expect("out dir");
+        let repo_url = format!("file://{}", repo.display());
+
+        // First resolve: populates clone_dir correctly.
+        build_wheel_from_git(&repo_url, &rev, ".", &cache_dir, &out_dir, "3.11")
+            .await
+            .expect("initial build_wheel_from_git");
+        let clone_dir = git_checkout_root(&repo_url, &rev, &cache_dir);
+
+        // Corrupt at the .git level: a stale index.lock blocks EVERY
+        // checkout attempt, and `git clean` never touches `.git/`, so
+        // checkout_rev_robust's working-tree repair cannot fix this --
+        // only wiping clone_dir and recloning can.
+        std::fs::write(clone_dir.join(".git").join("index.lock"), "")
+            .expect("write stale index.lock");
+
+        let (_, resolved_sha) = build_wheel_from_git(&repo_url, &rev, ".", &cache_dir, &out_dir, "3.11")
+            .await
+            .expect("must recover by wiping and re-cloning, not error out");
+        assert_eq!(resolved_sha, rev);
+        assert!(
+            !clone_dir.join(".git").join("index.lock").exists(),
+            "the fresh clone must not carry over the stale lock file"
         );
 
         let _ = std::fs::remove_dir_all(&base);
