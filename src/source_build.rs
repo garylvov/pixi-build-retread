@@ -365,36 +365,45 @@ pub async fn build_wheel_from_git(
             "git clone",
         )
         .await?;
-        // First-try checkout; if it fails (server doesn't expose arbitrary
-        // commits) fetch the rev explicitly and try again.
-        let checkout_ok = try_run_silent(
-            Command::new("git")
-                .args(["checkout", rev])
-                .current_dir(&clone_dir),
-        )
-        .await?;
-        if !checkout_ok {
-            // Fetch the specific rev AND its reachable tags so that
-            // setuptools_scm can find a release tag and emit a static
-            // version (e.g. "1.1.1") rather than a drifting dev/date
-            // suffix (e.g. "1.1.1.dev4+g1234567.d20250101").
-            run_silent(
-                Command::new("git")
-                    .args(["fetch", "--tags", "origin", rev])
-                    .current_dir(&clone_dir),
-                "git fetch --tags",
-            )
-            .await?;
-            run_silent(
-                Command::new("git")
-                    .args(["checkout", "FETCH_HEAD"])
-                    .current_dir(&clone_dir),
-                "git checkout FETCH_HEAD",
-            )
-            .await?;
-        }
     } else {
         tracing::debug!(path = %clone_dir.display(), "git source already cached");
+    }
+
+    // v3.0.2 (#8 follow-up): ALWAYS run the checkout dance, even when
+    // clone_dir already existed. A directory that survived a pre-v3.0.0
+    // race (fetched `rev` but never actually checked it out, or checked
+    // out an unrelated commit, or left untracked files mid-checkout that
+    // block any future `git checkout`) previously slipped past the old
+    // `else` branch untouched -- every subsequent run reused that broken
+    // checkout forever, since `clone_dir.exists()` alone can't tell a
+    // healthy checkout from a corrupted one. `checkout_rev_robust` is a
+    // cheap, safe no-op when the tree is already correct (common case),
+    // and self-heals a corrupted tree -- including #8's "untracked
+    // working tree files would be overwritten" symptom -- without a
+    // network round trip when `rev`'s object is already present locally
+    // (the exact state #8 found: "git cat-file -t <rev> confirmed the
+    // pinned commit was fetched" but HEAD was parked elsewhere / blocked
+    // by stray files). Only falls through to `git fetch` when `rev`
+    // truly isn't resolvable locally yet.
+    if !checkout_rev_robust(&clone_dir, rev).await? {
+        // Fetch the specific rev AND its reachable tags so that
+        // setuptools_scm can find a release tag and emit a static
+        // version (e.g. "1.1.1") rather than a drifting dev/date
+        // suffix (e.g. "1.1.1.dev4+g1234567.d20250101").
+        run_silent(
+            Command::new("git")
+                .args(["fetch", "--tags", "origin", rev])
+                .current_dir(&clone_dir),
+            "git fetch --tags",
+        )
+        .await?;
+        if !checkout_rev_robust(&clone_dir, "FETCH_HEAD").await? {
+            bail!(
+                "git checkout FETCH_HEAD failed even after cleaning the working \
+                 tree, in clone at {}",
+                clone_dir.display()
+            );
+        }
     }
 
     // Release the lock now that the clone_dir holds a complete checkout;
@@ -595,6 +604,47 @@ async fn try_run_silent(cmd: &mut Command) -> Result<bool> {
         .await
         .context("spawning subprocess")?;
     Ok(output.status.success())
+}
+
+/// Check out `target` (a rev, tag, branch, or `FETCH_HEAD`) in `clone_dir`,
+/// self-healing the two corruption modes a pre-v3.0.0 concurrent-resolve
+/// race could leave behind (#8): stray untracked files blocking the
+/// checkout ("untracked working tree files would be overwritten"), or a
+/// previous checkout simply parked on the wrong commit. A plain `git
+/// checkout` on an already-correct tree is a fast no-op, so this is safe
+/// to call unconditionally rather than only on a fresh clone.
+///
+/// Returns `Ok(false)` (not an error) when `target` isn't resolvable at
+/// all in this clone_dir -- the caller's fallback is to `git fetch` first.
+async fn checkout_rev_robust(clone_dir: &Path, target: &str) -> Result<bool> {
+    if try_run_silent(
+        Command::new("git")
+            .args(["checkout", target])
+            .current_dir(clone_dir),
+    )
+    .await?
+    {
+        return Ok(true);
+    }
+    // First attempt failed -- most likely stray untracked files left by a
+    // prior corrupted run. `git clean -fdx` clears untracked AND
+    // gitignored files (safe here: clone_dir only ever holds the
+    // checkout itself, wheel output lands in a separate out_dir), then
+    // retry once. If `target` still isn't resolvable locally, this
+    // second attempt fails the same way a doomed checkout always would.
+    run_silent(
+        Command::new("git")
+            .args(["clean", "-fdx"])
+            .current_dir(clone_dir),
+        "git clean -fdx (repairing a corrupted checkout)",
+    )
+    .await?;
+    try_run_silent(
+        Command::new("git")
+            .args(["checkout", target])
+            .current_dir(clone_dir),
+    )
+    .await
 }
 
 async fn find_built_wheel(dir: &Path) -> Result<PathBuf> {
@@ -871,6 +921,118 @@ version = "0.1.0"
         );
 
         // Cleanup.
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// v3.0.2 regression (#8): a clone_dir that survived a prior
+    /// corrupted run -- e.g. one left an UNTRACKED file at a path the
+    /// target commit also tracks -- must self-heal on the next
+    /// `build_wheel_from_git` call instead of failing forever with
+    /// "untracked working tree files would be overwritten by checkout."
+    #[tokio::test]
+    #[ignore = "live: builds a git wheel via uv (needs uv + git on PATH); run with --include-ignored"]
+    async fn build_wheel_from_git_self_heals_untracked_file_conflict() {
+        let pid = std::process::id();
+        let base = std::env::temp_dir().join(format!("retread-githeal-{pid}"));
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).expect("create repo dir");
+
+        let run_git = |args: &[&str], dir: &std::path::Path| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_AUTHOR_NAME", "test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .status()
+                .expect("git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        let rev_parse_head = |dir: &std::path::Path| -> String {
+            let out = std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(dir)
+                .output()
+                .expect("git rev-parse");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        run_git(&["init", "-b", "main"], &repo);
+        run_git(&["config", "user.email", "test@example.com"], &repo);
+        run_git(&["config", "user.name", "test"], &repo);
+        std::fs::write(
+            repo.join("pyproject.toml"),
+            r#"[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "retread-test-fixture"
+version = "0.1.0"
+"#,
+        )
+        .expect("write pyproject");
+        run_git(&["add", "."], &repo);
+        run_git(&["commit", "-m", "initial"], &repo);
+        let rev1 = rev_parse_head(&repo);
+
+        // Second commit adds a TRACKED "extra.txt". This is the rev every
+        // resolve below asks for -- matching the real bug, where every
+        // racing [retread-wheels] entry names the exact SAME `rev`, so
+        // they all hash to the exact same clone_dir (git_checkout_root
+        // keys on url+rev; different revs never collide, which is correct
+        // and is NOT what's under test here).
+        std::fs::write(repo.join("extra.txt"), "tracked-content").expect("write extra.txt");
+        run_git(&["add", "."], &repo);
+        run_git(&["commit", "-m", "add extra.txt"], &repo);
+        let rev2 = rev_parse_head(&repo);
+
+        let cache_dir = base.join("cache");
+        let out_dir = base.join("out");
+        std::fs::create_dir_all(&cache_dir).expect("cache dir");
+        std::fs::create_dir_all(&out_dir).expect("out dir");
+        let repo_url = format!("file://{}", repo.display());
+
+        // First resolve: populates clone_dir at rev2 (the rev every call
+        // below will keep asking for).
+        build_wheel_from_git(&repo_url, &rev2, ".", &cache_dir, &out_dir, "3.11")
+            .await
+            .expect("initial build_wheel_from_git");
+        let clone_dir = git_checkout_root(&repo_url, &rev2, &cache_dir);
+
+        // Simulate the corruption a pre-v3.0.2 race could leave behind:
+        // HEAD parked on an EARLIER commit (rev1, which lacks extra.txt)
+        // plus a stray UNTRACKED extra.txt with different content sitting
+        // in the working tree. `git checkout rev2` from this state must
+        // create extra.txt (rev1 -> rev2 changes it), but an untracked
+        // file already occupies that path -- exactly reproducing "The
+        // following untracked working tree files would be overwritten by
+        // checkout: extra.txt" from issue #8, without needing real
+        // concurrency to trigger it.
+        run_git(&["checkout", "--force", &rev1], &clone_dir);
+        assert_eq!(
+            rev_parse_head(&clone_dir),
+            rev1,
+            "setup: clone_dir must be parked on rev1"
+        );
+        std::fs::write(clone_dir.join("extra.txt"), "stray-untracked-content")
+            .expect("write stray untracked file");
+
+        // Resolving rev2 again now must self-heal (clean + checkout)
+        // rather than failing with "untracked working tree files would be
+        // overwritten".
+        let (_, resolved_sha) =
+            build_wheel_from_git(&repo_url, &rev2, ".", &cache_dir, &out_dir, "3.11")
+                .await
+                .expect("self-healing build_wheel_from_git must succeed");
+        assert_eq!(resolved_sha, rev2);
+        assert_eq!(
+            std::fs::read_to_string(clone_dir.join("extra.txt")).expect("read extra.txt"),
+            "tracked-content",
+            "the stray untracked file must be replaced by the tracked one, not left in place"
+        );
+
         let _ = std::fs::remove_dir_all(&base);
     }
 }
