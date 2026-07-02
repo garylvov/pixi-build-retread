@@ -306,16 +306,52 @@ pub async fn build_wheel_from_git(
     // duplicated here before v0.13.3 -- update both or the resolver
     // half stops finding the cached clone the cloner half just made.)
     let clone_dir = git_checkout_root(url, rev, cache_dir);
+    let parent = clone_dir.parent().unwrap();
+    tokio::fs::create_dir_all(parent).await.with_context(|| {
+        format!(
+            "creating git-clone parent dir {} (for url={url}, rev={rev}, target={})",
+            parent.display(),
+            clone_dir.display(),
+        )
+    })?;
+
+    // Multiple [retread-wheels] entries commonly share one (url, rev) --
+    // e.g. IsaacLab's 14+ `from = "isaaclab"` entries that differ only by
+    // `subdirectory` -- and clone into the SAME clone_dir. Without a lock,
+    // concurrent resolves (either multiple retread backend processes
+    // solving different environments in parallel, since one retread
+    // process only serializes RPCs within itself, or overlapping
+    // sibling-entry resolves) race on that one shared working tree:
+    // one's `git checkout` can land mid-way through another's `git
+    // fetch`, leaving HEAD parked on the wrong commit or aborting with
+    // "untracked working tree files would be overwritten". A per-(url,
+    // rev) exclusive file lock (same mechanism rattler_cache uses to
+    // guard its package cache dir) serializes clone/fetch/checkout so
+    // only one resolver ever mutates a given clone_dir at a time; the
+    // rest block on the lock, then see the completed checkout below.
+    let lock_path = clone_dir.with_extension("lock");
+    let lock_file = {
+        let lock_path = lock_path.clone();
+        tokio::task::spawn_blocking(move || -> Result<std::fs::File> {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&lock_path)
+                .with_context(|| format!("opening git-clone lock file {}", lock_path.display()))?;
+            // fs4's lock_exclusive is a blocking syscall (flock/LockFileEx)
+            // regardless of file type, so it must run on a blocking thread
+            // rather than the async executor -- same pattern rattler_cache
+            // uses for its own package-cache global lock.
+            fs4::fs_std::FileExt::lock_exclusive(&file)
+                .with_context(|| format!("locking git-clone lock file {}", lock_path.display()))?;
+            Ok(file)
+        })
+        .await
+        .context("git-clone lock task panicked")??
+    };
 
     if !clone_dir.exists() {
-        let parent = clone_dir.parent().unwrap();
-        tokio::fs::create_dir_all(parent).await.with_context(|| {
-            format!(
-                "creating git-clone parent dir {} (for url={url}, rev={rev}, target={})",
-                parent.display(),
-                clone_dir.display(),
-            )
-        })?;
         tracing::info!(url = %url, rev = %rev, "cloning git source");
         // Clone shallow without checkout. Use a two-step fetch so we can
         // target arbitrary commits (not just branch/tag tips).
@@ -360,6 +396,15 @@ pub async fn build_wheel_from_git(
     } else {
         tracing::debug!(path = %clone_dir.display(), "git source already cached");
     }
+
+    // Release the lock now that the clone_dir holds a complete checkout;
+    // the remaining work (reading subdirectory, `git rev-parse`, building
+    // the wheel) only reads the tree and is safe to run concurrently with
+    // other entries once the checkout itself is settled.
+    tokio::task::spawn_blocking(move || fs4::fs_std::FileExt::unlock(&lock_file))
+        .await
+        .context("git-clone unlock task panicked")?
+        .with_context(|| format!("unlocking git-clone lock file {}", lock_path.display()))?;
 
     let source_dir = clone_dir.join(subdirectory);
     if !source_dir.exists() {

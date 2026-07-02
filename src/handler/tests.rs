@@ -2625,6 +2625,65 @@ fn cache_key_changes_when_manifest_mtime_changes() {
     );
 }
 
+// -----------------------------------------------------------------
+// v2.11.0: cross-process conda/outputs disk cache. Two DIFFERENT
+// "processes" (simulated here by two independent calls, since the
+// on-disk cache is exactly what lets a fresh process avoid a cold
+// recompute) round-trip a CondaOutputsResult through
+// write_conda_outputs_disk_cache / read_conda_outputs_disk_cache.
+// -----------------------------------------------------------------
+
+#[tokio::test]
+async fn conda_outputs_disk_cache_round_trips() {
+    use pixi_build_types::procedures::conda_outputs::CondaOutputsResult;
+
+    let cache_dir = std::env::temp_dir().join(format!(
+        "retread-conda-outputs-disk-cache-test-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&cache_dir).unwrap();
+    let cache_key = "linux-64|linux-64|https://conda.anaconda.org/conda-forge|None|123456";
+    let path = conda_outputs_disk_cache_path(&cache_dir, cache_key);
+
+    // Nothing written yet -- a fresh process must fall back to cold compute.
+    assert!(read_conda_outputs_disk_cache(&path).await.is_none());
+
+    let result = CondaOutputsResult {
+        outputs: Default::default(),
+        input_globs: Default::default(),
+    };
+    write_conda_outputs_disk_cache(&path, &result).await;
+
+    let loaded = read_conda_outputs_disk_cache(&path)
+        .await
+        .expect("a second process must be able to load what the first one wrote");
+    assert_eq!(loaded.outputs.len(), result.outputs.len());
+
+    // No leftover .tmp file from the atomic write-then-rename.
+    let leftovers: Vec<_> = std::fs::read_dir(&cache_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "temp file must be renamed away, not left behind"
+    );
+
+    let _ = std::fs::remove_dir_all(&cache_dir);
+}
+
+#[test]
+fn conda_outputs_disk_cache_path_differs_by_key() {
+    let cache_dir = std::env::temp_dir().join(format!(
+        "retread-conda-outputs-disk-cache-path-test-{}",
+        std::process::id()
+    ));
+    let p1 = conda_outputs_disk_cache_path(&cache_dir, "key-a");
+    let p2 = conda_outputs_disk_cache_path(&cache_dir, "key-b");
+    assert_ne!(p1, p2, "distinct cache keys must not collide on disk");
+}
+
 // ── Pack-version mismatch fix: metadata-phase version_override ─────────────
 //
 // When an incremental-add is in flight, bundle.primary is the BTreeMap-first

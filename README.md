@@ -206,6 +206,16 @@ A binary index wheel can be published with a manylinux floor newer than the inst
 </details>
 
 <details>
+<summary><b>Cross-process solve dedup &amp; shared-git-source locking (3.0.0)</b></summary>
+
+pixi solves separate top-level environments that reference the same source package (e.g. `isaaclab-gpu` and `isaaclab-gpu-latest`, or `gsi` and `gsi-ros2`) with **separate** retread backend processes. Two fixes landed for the resulting cross-process contention:
+
+- **Duplicated solve-checks on cold**: each process previously started with an empty in-memory memo and reran the *entire* multi-env solve (every widening attempt, every env) from scratch even when a sibling process had just solved the identical `(params, workspace mtime)` key — burning minutes of repodata-parse + resolvo work per process and leaving other cores idle while it ran serially. `conda/outputs` results are now also memoized to disk under `<cache_dir>/retread-conda-outputs-cache/` (atomic write, best-effort — a read/write failure just falls back to a cold compute), so a process solving a sibling environment reuses the finished result instead of recomputing it.
+- **Corrupted git checkouts under concurrent resolves**: `[retread-wheels]` entries that share one `(url, rev)` (e.g. IsaacLab's 14+ `from = "isaaclab"` entries differing only by `subdirectory`) clone into the same on-disk clone dir. Without coordination, concurrent resolves — across wheel entries or across the separate processes above — could race on that one shared working tree, aborting with `git checkout FETCH_HEAD failed ... untracked working tree files would be overwritten` or leaving `HEAD` parked on the wrong commit. Cloning/fetching/checking out now holds an exclusive `flock` on a lock file per clone dir (same mechanism `rattler_cache` uses for its own package cache) so only one resolver mutates a given clone dir at a time.
+
+</details>
+
+<details>
 <summary><b>Multi-Python &amp; pytorch/CUDA</b></summary>
 
 One artifact per platform; python-agnostic. retread builds wheels via `uv pip wheel --python <ver>`, fans `conda/outputs` over each requested python, and picks the matching wheel — so a multi-python pack works **only if every entry ships a wheel for every requested python**. Declare it (high→low precedence):

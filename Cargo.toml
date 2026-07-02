@@ -1,6 +1,6 @@
 [package]
 name = "pixi-build-retread"
-version = "2.10.2"
+version = "3.0.0"
 edition = "2024"
 description = "Retread PyPI wheels as conda packages, with dep versions loosened and shared deps preferred from conda"
 license = "BSD-3-Clause"
@@ -39,6 +39,16 @@ ordermap = { version = "1.0.0", features = ["serde"] }
 tokio = { version = "1.43.0", features = ["macros", "rt-multi-thread", "io-std", "io-util", "sync", "fs", "process"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 futures = "0.3"
+# Cross-process advisory file locks. Already pulled in transitively via
+# rattler_cache (which uses it the same way, to serialize concurrent
+# access to its package cache dir); used here to serialize concurrent
+# `git clone`/`checkout` into the same shared (url, rev) clone dir when
+# multiple wheel entries -- or multiple retread backend processes solving
+# different environments in parallel -- share a git source. flock is a
+# blocking syscall regardless of file type, so we use the std (not
+# tokio) file-ext and run it via spawn_blocking -- same pattern
+# rattler_cache uses for its own package-cache global lock.
+fs4 = "0.13.1"
 
 # Wheel fetching + parsing.
 reqwest = { version = "0.12.12", default-features = false, features = ["rustls-tls", "json", "stream"] }

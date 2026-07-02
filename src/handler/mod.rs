@@ -118,6 +118,62 @@ fn conda_outputs_cache_key(
     )
 }
 
+/// On-disk path for the cross-process `conda/outputs` memo (see the
+/// v2.11.0 comment at the `conda_outputs` call site). Keyed by the same
+/// string [`conda_outputs_cache_key`] uses, hashed to a filesystem-safe
+/// name since the key contains channel URLs (`/`, `:`).
+fn conda_outputs_disk_cache_path(cache_dir: &std::path::Path, cache_key: &str) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(cache_key.as_bytes());
+    let digest = hasher.finalize();
+    let hex: String = digest.iter().take(16).map(|b| format!("{b:02x}")).collect();
+    cache_dir
+        .join("retread-conda-outputs-cache")
+        .join(format!("{hex}.json"))
+}
+
+/// Load a memoized [`CondaOutputsResult`] from disk. Returns `None` on
+/// any failure (missing file, unreadable, stale schema) so the caller
+/// always has a safe cold-compute fallback -- this is a pure speed
+/// optimization, never a source of truth.
+async fn read_conda_outputs_disk_cache(path: &std::path::Path) -> Option<CondaOutputsResult> {
+    let bytes = tokio::fs::read(path).await.ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Persist a computed [`CondaOutputsResult`] to disk for reuse by a
+/// future retread process solving a different environment with the
+/// same params. Failures are logged at debug and otherwise ignored --
+/// this must never fail the RPC that just successfully computed outputs.
+async fn write_conda_outputs_disk_cache(path: &std::path::Path, result: &CondaOutputsResult) {
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if let Err(e) = tokio::fs::create_dir_all(parent).await {
+        tracing::debug!(error = %e, path = %parent.display(), "conda/outputs disk-cache: could not create cache dir");
+        return;
+    }
+    let bytes = match serde_json::to_vec(result) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::debug!(error = %e, "conda/outputs disk-cache: serialize failed");
+            return;
+        }
+    };
+    // Write to a per-process temp file then rename, so a concurrent
+    // reader in another process never observes a partially-written file.
+    let tmp_path = path.with_extension(format!("json.tmp.{}", std::process::id()));
+    if let Err(e) = tokio::fs::write(&tmp_path, &bytes).await {
+        tracing::debug!(error = %e, path = %tmp_path.display(), "conda/outputs disk-cache: write failed");
+        return;
+    }
+    if let Err(e) = tokio::fs::rename(&tmp_path, path).await {
+        tracing::debug!(error = %e, path = %path.display(), "conda/outputs disk-cache: rename failed");
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+    }
+}
+
 /// Read the modification time of `workspace_dir/pixi.toml` for use in
 /// the `CONDA_OUTPUTS_CACHE` key. Returns `None` when the file is absent
 /// or metadata is unavailable (network-offline, read error). That causes
@@ -682,13 +738,49 @@ impl Handler {
             );
             return Ok(cached);
         }
+        // Fetched early (cheap: just clones handler state) so the DISK
+        // cache below can be consulted before the expensive solve.
+        let (config, download_dir, source_dir, cache_dir, workspace_dir) =
+            self.snapshot(&params.work_directory).await?;
+        // v2.11.0: cross-PROCESS memo. CONDA_OUTPUTS_CACHE only dedupes
+        // repeat conda/outputs calls served by the SAME retread process.
+        // pixi solves separate top-level environments (e.g. `isaaclab-gpu`
+        // vs `isaaclab-gpu-latest`, or `gsi` vs `gsi-ros2`) with SEPARATE
+        // backend processes even when both need this exact same source
+        // package with identical params -- each such process starts with
+        // an empty in-memory cache and reruns the ENTIRE multi-env solve
+        // (all widening attempts, for every env) from scratch. This is
+        // "solver duplication on cold": the same solve-check attempts for
+        // the same envs appear twice (or more) in the log, one full block
+        // per process, wasting the minutes-long repodata-parse + resolvo
+        // solve cost and leaving other cores idle waiting on it serially.
+        // Persisting the result to disk keyed by the same cache_key lets
+        // a fresh process reuse an already-computed result instead of
+        // redoing the work. Best-effort: read/write failures fall back to
+        // a normal cold compute, never fail the RPC.
+        let disk_cache_path = conda_outputs_disk_cache_path(&cache_dir, &cache_key);
+        if let Some(cached) = read_conda_outputs_disk_cache(&disk_cache_path).await {
+            tracing::info!(
+                path = %disk_cache_path.display(),
+                "retread: conda/outputs disk-cache hit -- reusing a prior process's result \
+                 (this environment shares the source package + params with one already solved)",
+            );
+            crate::status::tty(
+                "reusing a previously-computed solve for this source package \
+                 (another environment already solved it with the same inputs).",
+            );
+            CONDA_OUTPUTS_CACHE
+                .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+                .lock()
+                .unwrap()
+                .insert(cache_key, cached.clone());
+            return Ok(cached);
+        }
         tracing::info!(
             retread_version = env!("CARGO_PKG_VERSION"),
             "retread: computing conda outputs (resolving wheels + probing channels; large wheels may download here)",
         );
         let phase_start = std::time::Instant::now();
-        let (config, download_dir, source_dir, cache_dir, workspace_dir) =
-            self.snapshot(&params.work_directory).await?;
         // tracing -> stderr is invisible during pixi's solve phase (pixi hides
         // backend stderr behind its "updating lock-file" spinner, even at -vv).
         // Mirror the key status to /dev/tty so the user sees retread is alive.
@@ -1795,6 +1887,12 @@ impl Handler {
             .lock()
             .unwrap()
             .insert(cache_key, result.clone());
+        // Cross-process: persist so a DIFFERENT retread process solving
+        // another environment that shares this exact (params, workspace
+        // mtime) key can skip the recompute too. Best-effort -- a write
+        // failure (read-only cache dir, disk full) just means the next
+        // process falls back to a cold compute, same as today.
+        write_conda_outputs_disk_cache(&disk_cache_path, &result).await;
         Ok(result)
     }
 
