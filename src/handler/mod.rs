@@ -119,13 +119,37 @@ fn conda_outputs_cache_key(
 }
 
 /// On-disk path for the cross-process `conda/outputs` memo (see the
-/// v2.11.0 comment at the `conda_outputs` call site). Keyed by the same
-/// string [`conda_outputs_cache_key`] uses, hashed to a filesystem-safe
-/// name since the key contains channel URLs (`/`, `:`).
-fn conda_outputs_disk_cache_path(cache_dir: &std::path::Path, cache_key: &str) -> PathBuf {
+/// v2.11.0 comment at the `conda_outputs` call site). Keyed by
+/// [`conda_outputs_cache_key`] PLUS `source_dir`, hashed to a
+/// filesystem-safe name since the key contains channel URLs (`/`, `:`).
+///
+/// v3.0.1 CORRECTNESS FIX: `CondaOutputsParams` carries no package
+/// identity at all (no manifest path, no source dir) -- it's just
+/// platform/channels/variant. The in-memory `CONDA_OUTPUTS_CACHE` got
+/// away with keying on that alone because pixi runs ONE retread process
+/// per source package, so within a process "same params" already meant
+/// "same package." The disk cache is visible across EVERY process on
+/// the machine, so two DIFFERENT sibling packages in the same workspace
+/// (e.g. `isaaclab-viral-pack` and `isaaclab-unitree-pack`, same
+/// platform/channels/variant/workspace mtime) hashed to the identical
+/// cache file, and one process loaded the other's cached outputs --
+/// surfacing as pixi's "the package 'isaaclab-viral-pack' is not
+/// provided by the project located at './pypi-packs/isaaclab-viral-pack'
+/// (did you mean 'isaaclab-unitree-pack'?)" (#8). `source_dir` (each
+/// package's own on-disk directory, set once at `initialize` time) is
+/// the missing package identity; folding it into the disk key's hash
+/// input (but NOT the in-memory key, which doesn't need it) fixes the
+/// collision without touching the already-correct in-process cache.
+fn conda_outputs_disk_cache_path(
+    cache_dir: &std::path::Path,
+    cache_key: &str,
+    source_dir: &std::path::Path,
+) -> PathBuf {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(cache_key.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(source_dir.to_string_lossy().as_bytes());
     let digest = hasher.finalize();
     let hex: String = digest.iter().take(16).map(|b| format!("{b:02x}")).collect();
     cache_dir
@@ -758,7 +782,7 @@ impl Handler {
         // a fresh process reuse an already-computed result instead of
         // redoing the work. Best-effort: read/write failures fall back to
         // a normal cold compute, never fail the RPC.
-        let disk_cache_path = conda_outputs_disk_cache_path(&cache_dir, &cache_key);
+        let disk_cache_path = conda_outputs_disk_cache_path(&cache_dir, &cache_key, &source_dir);
         if let Some(cached) = read_conda_outputs_disk_cache(&disk_cache_path).await {
             tracing::info!(
                 path = %disk_cache_path.display(),

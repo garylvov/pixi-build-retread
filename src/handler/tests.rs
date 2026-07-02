@@ -2643,7 +2643,8 @@ async fn conda_outputs_disk_cache_round_trips() {
     ));
     std::fs::create_dir_all(&cache_dir).unwrap();
     let cache_key = "linux-64|linux-64|https://conda.anaconda.org/conda-forge|None|123456";
-    let path = conda_outputs_disk_cache_path(&cache_dir, cache_key);
+    let source_dir = std::path::Path::new("/workspace/pypi-packs/some-pack");
+    let path = conda_outputs_disk_cache_path(&cache_dir, cache_key, source_dir);
 
     // Nothing written yet -- a fresh process must fall back to cold compute.
     assert!(read_conda_outputs_disk_cache(&path).await.is_none());
@@ -2679,9 +2680,41 @@ fn conda_outputs_disk_cache_path_differs_by_key() {
         "retread-conda-outputs-disk-cache-path-test-{}",
         std::process::id()
     ));
-    let p1 = conda_outputs_disk_cache_path(&cache_dir, "key-a");
-    let p2 = conda_outputs_disk_cache_path(&cache_dir, "key-b");
+    let source_dir = std::path::Path::new("/workspace/pypi-packs/some-pack");
+    let p1 = conda_outputs_disk_cache_path(&cache_dir, "key-a", source_dir);
+    let p2 = conda_outputs_disk_cache_path(&cache_dir, "key-b", source_dir);
     assert_ne!(p1, p2, "distinct cache keys must not collide on disk");
+}
+
+// v3.0.1 regression (#8): two DIFFERENT source packages (e.g.
+// isaaclab-viral-pack and isaaclab-unitree-pack) built in the same
+// workspace can share an IDENTICAL conda_outputs_cache_key (same
+// platform/channels/variant/workspace-mtime), because CondaOutputsParams
+// carries no package identity at all. Without source_dir folded into the
+// disk-cache path, package B's process would load package A's cached
+// CondaOutputsResult -- surfacing as pixi's "the package '<B>' is not
+// provided by the project located at '<B's path>' (did you mean '<A>'?)".
+#[test]
+fn conda_outputs_disk_cache_path_differs_by_source_dir_even_with_identical_cache_key() {
+    let cache_dir = std::env::temp_dir().join(format!(
+        "retread-conda-outputs-disk-cache-collision-test-{}",
+        std::process::id()
+    ));
+    let same_cache_key = "linux-64|linux-64|https://prefix.dev/conda-forge|None|123456";
+    let viral = conda_outputs_disk_cache_path(
+        &cache_dir,
+        same_cache_key,
+        std::path::Path::new("/workspace/pypi-packs/isaaclab-viral-pack"),
+    );
+    let unitree = conda_outputs_disk_cache_path(
+        &cache_dir,
+        same_cache_key,
+        std::path::Path::new("/workspace/pypi-packs/isaaclab-unitree-pack"),
+    );
+    assert_ne!(
+        viral, unitree,
+        "sibling packages with identical params must not collide on the disk cache"
+    );
 }
 
 // ── Pack-version mismatch fix: metadata-phase version_override ─────────────
