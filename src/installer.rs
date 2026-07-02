@@ -141,6 +141,13 @@ fn host_glibc() -> Option<(u32, u32)> {
 fn relax_platform_on_conflict(uv: &OsString, base_args: &[OsString]) -> Option<String> {
     let mut probe: Vec<OsString> = base_args.to_vec();
     probe.push("--dry-run".into());
+    // This output is parsed (is_platform_tag_conflict), not shown to the
+    // user -- force plain text so a FORCE_COLOR/CLICOLOR_FORCE in the
+    // caller's environment can't taint it with ANSI codes that break the
+    // substring match. See the identical fix on the `uv pip list` call in
+    // `install` for the concrete failure this class of bug causes.
+    probe.push("--color".into());
+    probe.push("never".into());
     let out = Command::new(uv).args(&probe).output().ok()?;
     let text = format!(
         "{}{}",
@@ -620,8 +627,17 @@ pub fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
         .collect();
     let exc_path = share.join(format!("{}.excludes.txt", lock.bundle));
     let excludes_file = {
+        // v3.0.4: this output is parsed line-by-line and the result is
+        // written VERBATIM to excludes.txt, which a later `uv pip install
+        // -r excludes.txt` call re-parses as a requirements file. uv
+        // respects FORCE_COLOR/CLICOLOR_FORCE from the environment even
+        // when stdout is piped (not a tty), so without `--color never` a
+        // colorized caller environment corrupts every package name with
+        // raw ANSI escapes (`\x1b[1mabsl-py\x1b[0m`), and uv's requirements
+        // parser then fails with "Unexpected '', expected '-c', '-e', '-r'
+        // or the start of a requirement" on the very first byte.
         let out = Command::new(&uv)
-            .args(["pip", "list", "--format", "freeze", "--python"])
+            .args(["pip", "list", "--color", "never", "--format", "freeze", "--python"])
             .arg(&python)
             .output()
             .with_context(|| "listing installed packages for the uv exclude set")?;
@@ -1170,6 +1186,46 @@ mod tests {
             "unexpected error: {msg}"
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    // v3.0.4 regression: `uv pip list` output is parsed line-by-line and the
+    // result is written VERBATIM to excludes.txt, which a later `uv pip
+    // install -r excludes.txt` re-parses as a requirements file. uv respects
+    // FORCE_COLOR/CLICOLOR_FORCE from the environment even when stdout is
+    // piped (not a tty) -- without `--color never` a colorized caller
+    // environment corrupts every package name with raw ANSI escapes
+    // (`\x1b[1mabsl-py\x1b[0m`), and uv's requirements parser then fails
+    // with "Unexpected '', expected '-c', '-e', '-r' or the start of a
+    // requirement" on the very first byte. This is the exact subprocess
+    // invocation `install`'s excludes.txt generation uses (see the `uv pip
+    // list` call there) -- asserting no ESC bytes appear even under
+    // FORCE_COLOR locks in the fix.
+    #[test]
+    #[ignore = "live: needs uv on PATH; run with --include-ignored"]
+    fn uv_pip_list_color_never_survives_force_color() {
+        let python = std::process::Command::new("which")
+            .arg("python3")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_else(|| "python3".to_string());
+
+        let out = std::process::Command::new("uv")
+            .args(["pip", "list", "--color", "never", "--format", "freeze", "--python"])
+            .arg(&python)
+            .env("FORCE_COLOR", "3")
+            .env("CLICOLOR_FORCE", "1")
+            .output()
+            .expect("spawning uv");
+        assert!(out.status.success(), "uv pip list failed: {out:?}");
+        assert!(
+            !out.stdout.contains(&0x1b),
+            "uv pip list --color never must not emit ANSI escapes even with \
+             FORCE_COLOR/CLICOLOR_FORCE set in the environment (found ESC byte \
+             in output, which would corrupt excludes.txt exactly as in #8's \
+             follow-up bug)"
+        );
     }
 
     #[test]
