@@ -469,6 +469,18 @@ pub(crate) fn build_uv_args(
         args.push(dir.into());
     }
 
+    // Search ALL indexes for the best-compatible wheel instead of uv's default
+    // `first-index` (stop at the first index that lists the name). Bundles like
+    // Isaac Sim publish the real binary wheel ONLY on a secondary index
+    // (pypi.nvidia.com) while a stub of the same name sits on public PyPI;
+    // first-index then locks onto the stub and reports "no wheels with a
+    // matching platform tag", which no amount of glibc relaxation can fix
+    // because the usable wheel was never considered. This mirrors the index
+    // strategy pixi/uv workspaces already set (and the documented manual
+    // recovery command) so the post-link resolves the same wheel the solve did.
+    args.push("--index-strategy".into());
+    args.push("unsafe-best-match".into());
+
     // S3: replay index chain verbatim.
     // find-links suppresses uv's implicit default index, so always set one
     // explicitly. First lock entry = primary; subsequent = extras. If the lock
@@ -1037,6 +1049,27 @@ mod tests {
         // absent when None -> uv's manylinux host gate is left untouched.
         let args = build_uv_args(&lock, &prefix, None, None, None, None, None);
         assert!(!argv_strings(&args).contains(&"--python-platform".to_string()));
+    }
+
+    // Multi-index bundles (Isaac Sim's real wheel is on pypi.nvidia.com, a
+    // stub of the same name on public PyPI) require uv to weigh ALL indexes,
+    // not stop at the first that lists the name. Without this the post-link
+    // resolves the stub and dies with a platform-tag error the glibc relax
+    // can't recover from.
+    #[test]
+    fn index_strategy_is_unsafe_best_match() {
+        let lock = make_lock(
+            vec![],
+            vec![PUBLIC_PYPI.into(), "https://pypi.nvidia.com".into()],
+            BTreeMap::new(),
+        );
+        let args = build_uv_args(&lock, &PathBuf::from("/fake/prefix"), None, None, None, None, None);
+        let strs = argv_strings(&args);
+        assert_eq!(
+            flag_values(&strs, "--index-strategy"),
+            vec!["unsafe-best-match".to_string()],
+            "installer must search all indexes for the best-compatible wheel"
+        );
     }
 
     // glibc banner parsing: getconf, ldd, and a 3-part micro all yield the
