@@ -1,0 +1,16 @@
+readelf: Warning: Gap in build notes detected.
+
+File: /tmp/private.so
+
+Version needs section '.gnu.version_r' contains 1 entry:
+  000000: Version: 1  File: libc.so.6  Cnt: 4
+  0x0010:   Name: GLIBC_PRIVATE  Flags: none  Version: 6
+  0x0020:   Name: GLIBC_ABI_DT_RELR  Flags: none  Version: 5
+  0x0030:   Name: GLIBC_2.34  Flags: none  Version: 4
+
+File: /tmp/glibcxx-only.so
+
+Version needs section '.gnu.version_r' contains 1 entry:
+  000000: Version: 1  File: libstdc++.so.6  Cnt: 2
+  0x0010:   Name: GLIBCXX_3.4.29  Flags: none  Version: 3
+  0x0020:   Name: CXXABI_1.3.13  Flags: none  Version: 2

@@ -216,6 +216,16 @@ pub struct RetreadLock {
     /// overrides). Empty when the bundle pins no prereleases.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub prerelease: BTreeMap<String, String>,
+    /// Site-packages-relative shared-library replacement contract applied by
+    /// the installer before the GLIBC symbol audit. Values are policy strings;
+    /// schema 11 supports `conda-lib`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub shadow_libs: BTreeMap<String, String>,
+    /// Declared glibc floor recorded from the producer workspace. The installer
+    /// uses this only as a fallback when the live consumer workspace manifest is
+    /// unavailable during post-link.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declared_glibc: Option<String>,
     /// PyPI package names (conda-normalized) that have a conda counterpart
     /// and are therefore routed to the conda side rather than bundled in the
     /// wheel set. Recorded for the build_v1 replay path so it can reconstruct
@@ -239,6 +249,12 @@ pub struct RetreadLock {
     pub entry_specs: Vec<String>,
 }
 
+/// Schema 11: GLIBC runtime contract fields.
+///
+/// New fields: `shadow_libs` and `declared_glibc`, both serde-defaulted so old
+/// locks deserialize. The schema bump forces committed courier locks to rebuild
+/// and carry the declared runtime contract explicitly.
+///
 /// Schema 10: canonical lock ordering + `entry_specs` field.
 ///
 /// Canonical ordering (`RetreadLock::canonicalize()`):
@@ -256,7 +272,7 @@ pub struct RetreadLock {
 /// to full resolve (safe: committed locks must be regenerated). SCHEMA is NOT
 /// an epoch bump (output SEMANTICS for identical inputs are unchanged;
 /// [emit-epoch-ok]).
-pub const SCHEMA: u32 = 10;
+pub const SCHEMA: u32 = 11;
 
 /// Bump EMIT_EPOCH in the SAME commit as ANY change that can alter the bytes
 /// retread emits for identical manifest inputs (relax/version-selection
@@ -308,7 +324,11 @@ pub const SCHEMA: u32 = 10;
 /// verifies both the success marker and installed wheel metadata. Identical
 /// manifests emit different post-link/activate scripts, so stale courier
 /// packages must be rebuilt.
-pub const EMIT_EPOCH: u32 = 8;
+///
+/// Epoch 9: courier packages now ship activate/deactivate LD_LIBRARY_PATH
+/// management, guard broken-sentinel logic, and GLIBC shadow-lib metadata.
+/// Identical manifests emit different lock JSON and hook scripts.
+pub const EMIT_EPOCH: u32 = 9;
 
 impl RetreadLock {
     /// File name for a bundle's lock next to the pack manifest.
@@ -528,6 +548,8 @@ mod tests {
                 "https://pypi.org/simple/".into(),
             ],
             prerelease: BTreeMap::from([("gmpy2".into(), "==2.1.0a4".into())]),
+            shadow_libs: BTreeMap::new(),
+            declared_glibc: None,
             conda_capable: vec!["numpy".into(), "torch".into()],
             entry_specs: vec!["isaaclab==0.51.1".into()],
         };
@@ -535,8 +557,8 @@ mod tests {
         let back: RetreadLock = serde_json::from_str(&json).unwrap();
         assert_eq!(back.bundle, "isaac-pack");
         assert_eq!(
-            back.schema, 10,
-            "SCHEMA must be 10 after canonical lock ordering (canonicalize) added"
+            back.schema, 11,
+            "SCHEMA must be 11 after GLIBC runtime contract fields were added"
         );
         assert_eq!(back.wheels.len(), 3);
         // Wheel 0: must_ship source-built, no upstream_url.
@@ -602,6 +624,8 @@ mod tests {
         // New fields default gracefully.
         assert!(lock.wheels[0].requires_dist.is_empty());
         assert!(!lock.wheels[0].must_ship);
+        assert!(lock.shadow_libs.is_empty());
+        assert!(lock.declared_glibc.is_none());
         assert!(lock.wheels[0].upstream_url.is_none());
         assert!(lock.conda_capable.is_empty());
     }
@@ -948,6 +972,8 @@ mod tests {
             "git_source must default to None when absent from schema-7 lock"
         );
         assert!(lock.wheels[0].must_ship);
+        assert!(lock.shadow_libs.is_empty());
+        assert!(lock.declared_glibc.is_none());
     }
 
     fn make_test_lock_unordered() -> RetreadLock {
@@ -1004,6 +1030,8 @@ mod tests {
             ],
             index_urls: vec!["https://pypi.org/simple/".into()],
             prerelease: BTreeMap::new(),
+            shadow_libs: BTreeMap::new(),
+            declared_glibc: None,
             conda_capable: vec!["zlib".into(), "blas".into()],
             entry_specs: vec!["torch==2.0.0".into(), "numpy==1.26.0".into()],
         }

@@ -21,11 +21,13 @@ async fn main() -> anyhow::Result<()> {
         let cmd = argv[1].as_str();
         let mut lock: Option<String> = None;
         let mut prefix: Option<String> = None;
+        let mut full = false;
         let mut it = argv[2..].iter();
         while let Some(a) = it.next() {
             match a.as_str() {
                 "--lock" => lock = it.next().cloned(),
                 "--prefix" => prefix = it.next().cloned(),
+                "--full" if cmd == "verify" => full = true,
                 other => anyhow::bail!("retread {cmd}: unknown arg {other}"),
             }
         }
@@ -40,7 +42,7 @@ async fn main() -> anyhow::Result<()> {
         let prefix = std::path::Path::new(&prefix);
         return match cmd {
             "install" => installer::run(lock, prefix),
-            "verify" => installer::verify(lock, prefix),
+            "verify" => installer::verify(lock, prefix, full),
             _ => unreachable!("matched above"),
         };
     }

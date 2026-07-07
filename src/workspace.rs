@@ -50,6 +50,9 @@ pub struct WorkspaceManifest {
     /// solve_check boundary so retread's solve matches pixi's instead
     /// of defaulting to the build host's detected virtual packages.
     pub system_requirements: BTreeMap<String, String>,
+    /// pixi 0.71+ rich platform declarations from `[workspace].platforms`,
+    /// keyed by pixi platform string (`linux-64`, `linux-aarch64`, ...).
+    pub platform_glibc: BTreeMap<String, String>,
     /// v1.3.0: top-level `[pypi-options]` index URLs -- `index-url`
     /// first, then `extra-index-urls` in declaration order. Feeds the
     /// cascade's PyPI fallback chain so workspace-declared private
@@ -140,6 +143,13 @@ impl WorkspaceManifest {
                 .or_else(|| workspace.get("channel_priority"))
                 .and_then(|v| v.as_str())
                 .map(String::from);
+            if let Some(platforms) = workspace.get("platforms").and_then(|v| v.as_array()) {
+                for platform in platforms {
+                    if let Some((name, glibc)) = parse_rich_platform_glibc(platform) {
+                        out.platform_glibc.insert(name, glibc);
+                    }
+                }
+            }
         }
 
         if let Some(deps) = parsed.get("dependencies").and_then(|v| v.as_table()) {
@@ -166,7 +176,7 @@ impl WorkspaceManifest {
             .and_then(|v| v.as_table())
         {
             for (k, v) in sysreqs {
-                if let Some(s) = parse_system_requirement_value(v) {
+                if let Some(s) = parse_system_requirement_value(k, v) {
                     out.system_requirements.insert(k.clone(), s);
                 }
             }
@@ -213,7 +223,7 @@ impl WorkspaceManifest {
                         .and_then(|v| v.as_table())
                     {
                         for (k, v) in sysreqs {
-                            if let Some(s) = parse_system_requirement_value(v) {
+                            if let Some(s) = parse_system_requirement_value(k, v) {
                                 def.system_requirements.insert(k.clone(), s);
                             }
                         }
@@ -354,6 +364,46 @@ impl WorkspaceManifest {
             }
         }
         out
+    }
+
+    /// Declared glibc floor for installer manylinux relaxation. pixi 0.71+
+    /// rich `[workspace].platforms` entries win over legacy
+    /// `[system-requirements]`; when `env_name` is unknown, union the legacy
+    /// top-level and feature declarations and take the max.
+    pub fn declared_glibc(&self, env_name: Option<&str>) -> Option<(u32, u32)> {
+        if let Some(v) = self
+            .platform_glibc
+            .get(crate::glibc::current_pixi_platform())
+            .and_then(|s| crate::glibc::parse_glibc_version(s))
+        {
+            return Some(v);
+        }
+
+        if let Some(env_name) = env_name {
+            return self
+                .effective_system_requirements(env_name)
+                .get("libc")
+                .and_then(|s| crate::glibc::parse_glibc_version(s));
+        }
+
+        let mut versions = Vec::new();
+        if let Some(v) = self
+            .system_requirements
+            .get("libc")
+            .and_then(|s| crate::glibc::parse_glibc_version(s))
+        {
+            versions.push(v);
+        }
+        for feature in self.features.values() {
+            if let Some(v) = feature
+                .system_requirements
+                .get("libc")
+                .and_then(|s| crate::glibc::parse_glibc_version(s))
+            {
+                versions.push(v);
+            }
+        }
+        versions.into_iter().max()
     }
 
     /// Effective PyPI index URLs for one env: top-level (unless
@@ -811,7 +861,7 @@ fn parse_pypi_index_urls(container: &toml::Value) -> Vec<String> {
     out
 }
 
-fn parse_system_requirement_value(v: &toml::Value) -> Option<String> {
+fn parse_system_requirement_value(key: &str, v: &toml::Value) -> Option<String> {
     if let Some(s) = v.as_str() {
         return Some(s.to_string());
     }
@@ -821,10 +871,47 @@ fn parse_system_requirement_value(v: &toml::Value) -> Option<String> {
     if let Some(f) = v.as_float() {
         return Some(f.to_string());
     }
-    if let Some(t) = v.as_table()
-        && let Some(ver) = t.get("version").and_then(|x| x.as_str())
-    {
-        return Some(ver.to_string());
+    if let Some(t) = v.as_table() {
+        if key == "libc"
+            && let Some(family) = t.get("family").and_then(|x| x.as_str())
+            && family != "glibc"
+        {
+            return None;
+        }
+        if let Some(ver) = t.get("version").and_then(|x| x.as_str()) {
+            return Some(ver.to_string());
+        }
+    }
+    None
+}
+
+fn parse_rich_platform_glibc(v: &toml::Value) -> Option<(String, String)> {
+    let t = v.as_table()?;
+    let platform = t.get("platform")?.as_str()?.to_string();
+    let glibc = parse_glibc_value(t.get("glibc")?)?;
+    Some((platform, glibc))
+}
+
+fn parse_glibc_value(v: &toml::Value) -> Option<String> {
+    if let Some(s) = v.as_str() {
+        return Some(s.to_string());
+    }
+    if let Some(f) = v.as_float() {
+        return Some(f.to_string());
+    }
+    if let Some(i) = v.as_integer() {
+        return Some(i.to_string());
+    }
+    if let Some(t) = v.as_table() {
+        let major = t
+            .get("major")
+            .or_else(|| t.get("maj"))
+            .and_then(|x| x.as_integer())?;
+        let minor = t
+            .get("minor")
+            .or_else(|| t.get("min"))
+            .and_then(|x| x.as_integer())?;
+        return Some(format!("{major}.{minor}"));
     }
     None
 }
@@ -1044,6 +1131,85 @@ libc = "2.39"
         let sr = ws.effective_system_requirements("standalone");
         assert_eq!(sr.get("libc").map(String::as_str), Some("2.39"));
         assert!(!sr.contains_key("cuda")); // top-level skipped
+    }
+
+    #[test]
+    fn declared_glibc_parses_legacy_scalar_and_table_forms() {
+        let ws = ws_toml(
+            r#"
+[system-requirements]
+libc = "2.34"
+
+[feature.newer.system-requirements]
+libc = { family = "glibc", version = "2.35" }
+"#,
+        );
+        assert_eq!(ws.declared_glibc(None), Some((2, 35)));
+    }
+
+    #[test]
+    fn declared_glibc_ignores_legacy_musl_family() {
+        let ws = ws_toml(
+            r#"
+[system-requirements]
+libc = { family = "musl", version = "1.2" }
+"#,
+        );
+        assert_eq!(ws.system_requirements.get("libc"), None);
+        assert_eq!(ws.declared_glibc(None), None);
+    }
+
+    #[test]
+    fn declared_glibc_parses_rich_platforms_and_ignores_wrong_platform() {
+        let other = if crate::glibc::current_pixi_platform() == "linux-64" {
+            "linux-aarch64"
+        } else {
+            "linux-64"
+        };
+        let ws = ws_toml(&format!(
+            r#"
+[workspace]
+platforms = [
+  "{other}",
+  {{ platform = "{other}", glibc = "2.39" }},
+  {{ platform = "{}", glibc = "2.35", cuda = "12" }},
+]
+"#,
+            crate::glibc::current_pixi_platform()
+        ));
+        assert_eq!(ws.declared_glibc(None), Some((2, 35)));
+    }
+
+    #[test]
+    fn declared_glibc_rich_platform_wins_over_legacy() {
+        let ws = ws_toml(&format!(
+            r#"
+[workspace]
+platforms = [{{ platform = "{}", glibc = "2.35" }}]
+
+[system-requirements]
+libc = "2.50"
+"#,
+            crate::glibc::current_pixi_platform()
+        ));
+        assert_eq!(ws.declared_glibc(None), Some((2, 35)));
+    }
+
+    #[test]
+    fn declared_glibc_env_scope_uses_effective_legacy_requirements() {
+        let ws = ws_toml(
+            r#"
+[system-requirements]
+libc = "2.34"
+
+[environments]
+gpu = { features = ["sim"] }
+
+[feature.sim.system-requirements]
+libc = "2.36"
+"#,
+        );
+        assert_eq!(ws.declared_glibc(Some("gpu")), Some((2, 36)));
     }
 
     #[test]

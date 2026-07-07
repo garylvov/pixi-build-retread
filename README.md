@@ -126,7 +126,7 @@ Gitignore `wheels/` in the pack dir — it's multi-GB for NVIDIA packs and fully
 <details>
 <summary><b>Cold-solve replay & versioning (EMIT_EPOCH)</b></summary>
 
-On `conda/outputs` the backend compares an `inputs_hash` (the `[retread-wheels]` entries, git revs, relax policy, python, workspace channels + per-env deps/system-requirements/pypi-options, and the per-dep config: overrides, name-map, drop-deps, conda-deps, auto-bundle, build-number) against the committed lock. On a match it replays the lock and skips the cascade entirely (no probe-trace is written).
+On `conda/outputs` the backend compares an `inputs_hash` (the `[retread-wheels]` entries, git revs, relax policy, python, workspace channels + per-env deps/system-requirements/pypi-options, and the per-dep config: overrides, name-map, shadow-libs, drop-deps, conda-deps, auto-bundle, build-number) against the committed lock. On a match it replays the lock and skips the cascade entirely (no probe-trace is written).
 
 Replay is **not** keyed on the retread release version — the hash folds an internal `EMIT_EPOCH` that only bumps when a release could change emitted output, so routine retread upgrades reuse the lock instead of cold-solving. For strict reproducibility (re-solve on every retread version), set `retread-pin-version = true`. The courier package's build string is content-addressed on `inputs_hash`, so any content change makes pixi re-extract — no stale cache. (Upgrading across an `EMIT_EPOCH`/scheme change costs one cold solve per pack, then replay resumes.)
 
@@ -194,14 +194,16 @@ The default cascade starts at the narrowest safe rewrite, runs a real `rattler_s
 <details>
 <summary><b>glibc / manylinux auto-relax</b></summary>
 
-A binary index wheel can be published with a manylinux floor newer than the install host's glibc — e.g. Isaac Sim 6 ships only `manylinux_2_35`, but a RHEL 9 host is glibc `2.34`. uv derives manylinux compatibility from the **host** glibc and rejects the only available wheel, even though the pixi/conda env ships its own newer sysroot glibc that runs it fine:
+A binary index wheel can be published with a manylinux floor newer than the install host's glibc — e.g. Isaac Sim 6 ships only `manylinux_2_35`, but a RHEL 9 host is glibc `2.34`. uv derives manylinux compatibility from the **host** glibc and rejects the only available wheel:
 
 ```
 × No solution found ... isaacsim[all]==6.0.0.1 has no wheels with a matching
   platform tag (e.g., `manylinux_2_34_x86_64`) ...
 ```
 
-`retread install` recovers automatically: on an install failure it classifies the cause with a cheap `--dry-run` resolve, and **only** for a platform-tag rejection retries once with uv `--python-platform` targeting **exactly one glibc minor above the host** (`2.34` → `2.35`). It relaxes by one minor only — never major, never more — and prints a loud warning each time, since this is safe **only** because the conda env provides the newer sysroot glibc. No flag, no config: unrelated solve/network failures surface unchanged.
+`retread install` recovers only when the workspace or pack declares the glibc floor it is willing to honor, for example `libc = "2.35"` in `[system-requirements]` or `platforms = [{ platform = "linux-64", glibc = "2.35" }]` under `[workspace]`. The retry target is exactly that declaration, not a host+1 heuristic. The declaration is load-bearing: after uv installs, retread applies configured `[package.build.config.retread-shadow-libs]` replacements, prepends `$CONDA_PREFIX/lib` from the shipped activate.d hook, and runs a readelf GLIBC symbol audit. The audit records its result in the `.installed` marker; `retread verify --full` reruns it.
+
+The shipped activation guard verifies and self-heals the uv-installed payload on activation. A failed heal writes `$CONDA_PREFIX/share/retread/<pack>.broken` and backs off for 300 seconds; `retread verify` treats that sentinel as failure. Pixi's experimental `use-environment-activation-cache` can cache activate.d output and skip per-activation verification, so workspaces that enable it should run `retread verify --lock ... --prefix ...` in CI or task preflight.
 
 </details>
 

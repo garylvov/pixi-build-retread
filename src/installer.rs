@@ -83,62 +83,14 @@ pub(crate) fn is_platform_tag_conflict(text: &str) -> bool {
     t.contains("matching platform tag") || (t.contains("platform tag") && t.contains("manylinux"))
 }
 
-/// Parse a glibc version banner into `(major, minor)`. Reads the FIRST line
-/// only (so `ldd --version`'s copyright tail can't leak a stray `x.y`) and
-/// returns the first `<digits>.<digits>` token it can parse. Handles
-/// `getconf GNU_LIBC_VERSION` ("glibc 2.34") and `ldd --version`
-/// ("ldd (GNU libc) 2.34") and a three-part micro ("2.34.9000" -> (2, 34)).
-pub(crate) fn parse_glibc_version(s: &str) -> Option<(u32, u32)> {
-    let line = s.lines().next().unwrap_or("");
-    for tok in line.split(|c: char| !(c.is_ascii_digit() || c == '.')) {
-        if let Some((maj, rest)) = tok.split_once('.') {
-            let min: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-            if let (Ok(maj), Ok(min)) = (maj.parse::<u32>(), min.parse::<u32>()) {
-                return Some((maj, min));
-            }
-        }
-    }
-    None
-}
-
-/// Detect the host's glibc `(major, minor)` the way uv does for manylinux
-/// tagging: `CS_GNU_LIBC_VERSION` (== `getconf GNU_LIBC_VERSION`), with
-/// `ldd --version` as a fallback. Absolute paths are tried first because a
-/// conda env on `PATH` can shadow (or omit) these tools. Returns `None` if
-/// neither is available -- the caller then declines to relax (fail-safe).
-/// retread ships as a static musl binary, so reading glibc symbols in-process
-/// is not an option; we shell out to the host's own tools.
-fn host_glibc() -> Option<(u32, u32)> {
-    for (prog, arg) in [
-        ("/usr/bin/getconf", "GNU_LIBC_VERSION"),
-        ("getconf", "GNU_LIBC_VERSION"),
-        ("/usr/bin/ldd", "--version"),
-        ("ldd", "--version"),
-    ] {
-        if let Ok(out) = Command::new(prog).arg(arg).output() {
-            // getconf prints to stdout; some ldd builds print to stderr.
-            let text = if out.stdout.is_empty() {
-                String::from_utf8_lossy(&out.stderr).into_owned()
-            } else {
-                String::from_utf8_lossy(&out.stdout).into_owned()
-            };
-            if let Some(v) = parse_glibc_version(&text) {
-                return Some(v);
-            }
-        }
-    }
-    None
-}
-
-/// Decide whether to AUTO-relax the glibc/manylinux host gate after a uv
-/// install failure. Re-runs the resolve as a cheap captured `--dry-run` (no
-/// downloads -- a manylinux rejection fails at the resolve stage) and, only if
-/// uv rejected a wheel purely for its platform tag, returns the relaxed
-/// `--python-platform` target: the host glibc plus EXACTLY ONE minor (never
-/// major, never more than one). Emits a loud warning when it relaxes. Returns
-/// `None` for any other failure (the caller then surfaces the original error
-/// unchanged) or when the host glibc can't be detected.
-fn relax_platform_on_conflict(uv: &OsString, base_args: &[OsString]) -> Option<String> {
+/// Decide whether to relax the glibc/manylinux host gate after a uv install
+/// failure. Relaxation is allowed only for a genuine platform-tag rejection
+/// and only up to a glibc floor declared by the live workspace or lock.
+fn relax_platform_on_conflict(
+    uv: &OsString,
+    base_args: &[OsString],
+    lock: &RetreadLock,
+) -> Result<Option<crate::glibc::RelaxOutcome>> {
     let mut probe: Vec<OsString> = base_args.to_vec();
     probe.push("--dry-run".into());
     // This output is parsed (is_platform_tag_conflict), not shown to the
@@ -148,24 +100,59 @@ fn relax_platform_on_conflict(uv: &OsString, base_args: &[OsString]) -> Option<S
     // `install` for the concrete failure this class of bug causes.
     probe.push("--color".into());
     probe.push("never".into());
-    let out = Command::new(uv).args(&probe).output().ok()?;
+    let out = Command::new(uv).args(&probe).output().ok();
+    let Some(out) = out else {
+        return Ok(None);
+    };
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
     );
     if !is_platform_tag_conflict(&text) {
-        return None;
+        return Ok(None);
     }
-    match host_glibc() {
-        Some((maj, min)) => {
-            // uv's arch token matches Rust's for the manylinux arches that ship
-            // binary index wheels (x86_64, aarch64).
-            let target = format!("{}-manylinux_{}_{}", std::env::consts::ARCH, maj, min + 1);
-            emit_glibc_relax_warning(maj, min, &target);
-            Some(target)
+
+    let host = crate::glibc::host_glibc();
+    let declared = crate::glibc::resolve_declared_glibc(lock);
+    match crate::glibc::relax_decision(declared.as_ref().map(|d| d.version), host) {
+        crate::glibc::RelaxDecision::Relax { target } => {
+            let declared = declared.expect("decision had declared version");
+            let platform = format!(
+                "{}-manylinux_{}_{}",
+                std::env::consts::ARCH,
+                target.0,
+                target.1
+            );
+            crate::glibc::emit_glibc_relax_warning(
+                host.expect("decision had host"),
+                declared.version,
+                declared.source,
+                &platform,
+            );
+            Ok(Some(crate::glibc::RelaxOutcome {
+                platform,
+                declared: declared.version,
+                declaration_source: declared.source,
+            }))
         }
-        None => {
+        crate::glibc::RelaxDecision::NotNeeded => {
+            if let (Some(host), Some(declared)) = (host, declared) {
+                eprintln!(
+                    "retread: platform-tag conflict detected, but declared glibc {} <= host {}; not a glibc-floor problem",
+                    crate::glibc::format_glibc(declared.version),
+                    crate::glibc::format_glibc(host)
+                );
+            }
+            Ok(None)
+        }
+        crate::glibc::RelaxDecision::Undeclared => {
+            bail!(
+                "{}",
+                crate::glibc::undeclared_glibc_error(host, crate::glibc::extract_manylinux_floor(&text))
+            );
+        }
+        crate::glibc::RelaxDecision::HostUnknown => {
             tracing::warn!(
                 "manylinux platform-tag conflict detected, but the host glibc \
                  could not be detected (getconf/ldd unavailable); cannot \
@@ -175,41 +162,9 @@ fn relax_platform_on_conflict(uv: &OsString, base_args: &[OsString]) -> Option<S
                 "retread: manylinux platform-tag conflict detected, but host \
                  glibc is undetectable; not relaxing"
             );
-            None
+            Ok(None)
         }
     }
-}
-
-/// Emit a VERY loud, unmissable warning that retread is relaxing uv's
-/// manylinux host gate. Glibc relaxation is genuinely unsafe unless the
-/// active conda env ships a newer sysroot glibc, so this must never be quiet.
-fn emit_glibc_relax_warning(host_maj: u32, host_min: u32, target: &str) {
-    let relaxed_min = host_min + 1;
-    let bar = "!".repeat(78);
-    eprintln!("\n{bar}");
-    eprintln!("!!  retread WARNING: AUTO-RELAXING glibc / manylinux PLATFORM TAG");
-    eprintln!("!!  uv rejected a wheel for its manylinux tag; retrying relaxed.");
-    eprintln!("!!");
-    eprintln!("!!  Host glibc detected: {host_maj}.{host_min}");
-    eprintln!("!!  Relaxing by EXACTLY ONE minor -> uv --python-platform {target}");
-    eprintln!("!!");
-    eprintln!(
-        "!!  uv will now accept wheels built for glibc up to {host_maj}.{relaxed_min} on this"
-    );
-    eprintln!(
-        "!!  glibc {host_maj}.{host_min} host. This is ONLY safe because the active conda env"
-    );
-    eprintln!(
-        "!!  ships its OWN newer sysroot glibc (>= {host_maj}.{relaxed_min}). If it does not, the"
-    );
-    eprintln!("!!  installed wheels WILL crash at import with `GLIBC_x.y not found`.");
-    eprintln!("!!  retread relaxes by one minor ONLY -- never major, never more than one.");
-    eprintln!("{bar}\n");
-    tracing::warn!(
-        host_glibc = %format!("{host_maj}.{host_min}"),
-        target_platform = %target,
-        "RETREAD_RELAX_GLIBC: relaxing uv's manylinux host gate by one glibc minor",
-    );
 }
 
 fn lock_digest(raw: &[u8]) -> String {
@@ -401,13 +356,61 @@ fn verify_payload_installed(lock: &RetreadLock, prefix: &Path) -> Result<()> {
 }
 
 fn marker_matches(marker: &Path, want: &str) -> bool {
-    std::fs::read_to_string(marker).is_ok_and(|have| have.trim() == want)
+    crate::glibc::marker_digest_matches(marker, want)
+}
+
+fn is_shared_library_record_path(path: &str) -> bool {
+    Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|name| name.ends_with(".so") || name.contains(".so."))
+}
+
+fn installed_payload_libraries(
+    lock: &RetreadLock,
+    prefix: &Path,
+) -> Result<(PathBuf, Vec<crate::glibc::PayloadLib>)> {
+    let site_packages = site_packages_dir(prefix, &lock.python);
+    let installed = installed_distributions(&site_packages)?;
+    let mut out: BTreeMap<String, crate::glibc::PayloadLib> = BTreeMap::new();
+    for wheel in &lock.wheels {
+        let name = normalize_dist_name(&wheel.name);
+        let dist_root = installed
+            .get(&name)
+            .and_then(|versions| versions.get(&wheel.version))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "retread audit: {}=={} is not installed in {}",
+                    wheel.name,
+                    wheel.version,
+                    site_packages.display()
+                )
+            })?;
+        let record = dist_root.join("RECORD");
+        let body = std::fs::read_to_string(&record)
+            .with_context(|| format!("reading wheel RECORD {}", record.display()))?;
+        for line in body.lines() {
+            let Some(token) = record_path_token(line) else {
+                continue;
+            };
+            if !is_shared_library_record_path(&token) {
+                continue;
+            }
+            let abs_path = site_packages.join(&token);
+            out.entry(token.clone())
+                .or_insert(crate::glibc::PayloadLib {
+                    rel_path: token,
+                    abs_path,
+                });
+        }
+    }
+    Ok((site_packages, out.into_values().collect()))
 }
 
 /// Verify that the marker belongs to this lock AND the target prefix still
 /// contains the locked wheel payload. Used by activate.d and by `run()` before
 /// trusting an existing marker.
-pub fn verify(lock_path: &Path, prefix: &Path) -> Result<()> {
+pub fn verify(lock_path: &Path, prefix: &Path, full: bool) -> Result<()> {
     let raw = std::fs::read(lock_path)
         .with_context(|| format!("reading lock {}", lock_path.display()))?;
     let lock: RetreadLock = serde_json::from_slice(&raw)
@@ -418,14 +421,26 @@ pub fn verify(lock_path: &Path, prefix: &Path) -> Result<()> {
     let want = lock_digest(&raw);
     let have = std::fs::read_to_string(&marker)
         .with_context(|| format!("reading marker {}", marker.display()))?;
-    if have.trim() != want {
+    if have.lines().next().map(str::trim) != Some(want.as_str()) {
         bail!(
             "retread verify: marker {} does not match {}",
             marker.display(),
             lock_path.display()
         );
     }
-    verify_payload_installed(&lock, prefix)
+    verify_payload_installed(&lock, prefix)?;
+    let audit = crate::glibc::verify_marker_state(&lock, prefix, &have)?;
+    if full {
+        let (site_packages, libs) = installed_payload_libraries(&lock, prefix)?;
+        let _ = crate::glibc::full_verify_audit(
+            &lock,
+            prefix,
+            &site_packages,
+            &libs,
+            Some(&audit),
+        )?;
+    }
+    Ok(())
 }
 
 /// Build the `uv pip install` argument list (pure; no I/O, no spawn; no
@@ -449,15 +464,11 @@ pub(crate) fn build_uv_args(
         prefix.join("bin").join("python").into(),
     ];
 
-    // HOTFIX (v2.10.1): glibc / manylinux platform-tag relaxation.
-    // uv derives manylinux compatibility from the HOST glibc and rejects any
-    // binary index wheel whose manylinux floor exceeds it -- even when the
-    // active conda env ships its OWN newer sysroot glibc that can actually run
-    // the wheel (e.g. Isaac Sim 6 publishes only `manylinux_2_35` but the host
-    // is glibc 2.34). `--python-platform` tells uv to resolve wheel
-    // compatibility against a target platform ONE glibc minor above the host
-    // floor. Computed + gated (RETREAD_RELAX_GLIBC) + warned-about in run();
-    // None in the common case leaves uv's host-tag gate untouched.
+    // Gated glibc / manylinux platform-tag relaxation.
+    // uv derives manylinux compatibility from the host glibc. When the
+    // workspace declares a higher glibc runtime contract, retread may retry
+    // once with that exact declared `--python-platform`; None leaves uv's host
+    // tag gate untouched.
     if let Some(plat) = python_platform {
         args.push("--python-platform".into());
         args.push(plat.into());
@@ -565,14 +576,52 @@ pub fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
     if marker_matches(&marker, &want) {
         match verify_payload_installed(&lock, prefix) {
             Ok(()) => {
-                let msg = format!("retread install: {} already current; skipping", lock.bundle);
-                eprintln!("{msg}");
-                crate::status::phase(
-                    lock_path.parent().unwrap_or(std::path::Path::new(".")),
-                    &lock.bundle,
-                    &msg,
-                );
-                return Ok(());
+                let marker_text = std::fs::read_to_string(&marker).unwrap_or_default();
+                match crate::glibc::verify_marker_state(&lock, prefix, &marker_text) {
+                    Ok(_) => {
+                        let msg = format!("retread install: {} already current; skipping", lock.bundle);
+                        eprintln!("{msg}");
+                        crate::status::phase(
+                            lock_path.parent().unwrap_or(std::path::Path::new(".")),
+                            &lock.bundle,
+                            &msg,
+                        );
+                        return Ok(());
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "retread install: {} marker exists but GLIBC audit verification failed; \
+                             reapplying fixups/audit ({err:#})",
+                            lock.bundle
+                        );
+                        let (site_packages, libs) = installed_payload_libraries(&lock, prefix)?;
+                        let previous = crate::glibc::parse_marker_audit(&marker_text);
+                        let previous_relaxed =
+                            previous.as_ref().and_then(|p| p.relaxed_platform.clone());
+                        let previous_declaration =
+                            previous.as_ref().and_then(|p| p.declaration_source.clone());
+                        let audit = crate::glibc::install_audit(
+                            &lock,
+                            prefix,
+                            &site_packages,
+                            &libs,
+                            previous.as_ref(),
+                            previous_relaxed,
+                            previous_declaration,
+                        )?;
+                        std::fs::write(&marker, crate::glibc::marker_body(&want, &audit)?)
+                            .with_context(|| format!("writing marker {}", marker.display()))?;
+                        let _ = std::fs::remove_file(share.join(format!("{}.broken", lock.bundle)));
+                        let msg = format!("retread install: {} audit refreshed", lock.bundle);
+                        eprintln!("{msg}");
+                        crate::status::phase(
+                            lock_path.parent().unwrap_or(std::path::Path::new(".")),
+                            &lock.bundle,
+                            &msg,
+                        );
+                        return Ok(());
+                    }
+                }
             }
             Err(err) => {
                 eprintln!(
@@ -724,16 +773,15 @@ pub fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
         .args(&args)
         .status()
         .with_context(|| format!("spawning uv ({uv:?})"))?;
+    let mut relaxed_platform: Option<String> = None;
+    let mut declaration_source: Option<String> = None;
     if !status.success() {
-        // AUTO-RELAX on a manylinux platform-tag conflict ONLY. uv rejects a
-        // binary index wheel (e.g. Isaac Sim 6's `manylinux_2_35`) when its
-        // floor exceeds the host glibc -- even though the conda env ships its
-        // own newer sysroot glibc that can run it. Classify the failure with a
-        // cheap captured `--dry-run` resolve; if it's purely the platform tag,
-        // retry ONCE targeting exactly one glibc minor above the host. Any
-        // other failure surfaces unchanged.
-        match relax_platform_on_conflict(&uv, &args) {
-            Some(platform) => {
+        // Relax on a manylinux platform-tag conflict only. Classify the failure
+        // with a captured `--dry-run` resolve; if it is purely the platform tag
+        // and a libc declaration authorizes a higher floor, retry once targeting
+        // exactly that declaration. Any other failure surfaces unchanged.
+        match relax_platform_on_conflict(&uv, &args, &lock)? {
+            Some(outcome) => {
                 let relaxed = build_uv_args(
                     &lock,
                     prefix,
@@ -741,7 +789,7 @@ pub fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
                     overrides_file,
                     constraints_file,
                     excludes_file,
-                    Some(&platform),
+                    Some(&outcome.platform),
                 );
                 let status = Command::new(&uv)
                     .args(&relaxed)
@@ -750,10 +798,13 @@ pub fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
                 if !status.success() {
                     bail!(
                         "uv pip install failed for bundle {} even after relaxing the \
-                         manylinux platform tag to {platform} (status {status})",
-                        lock.bundle
+                         manylinux platform tag to {} (status {status})",
+                        lock.bundle,
+                        outcome.platform
                     );
                 }
+                relaxed_platform = Some(outcome.platform);
+                declaration_source = Some(outcome.declaration_source.to_string());
             }
             None => {
                 bail!(
@@ -770,9 +821,21 @@ pub fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
             lock.bundle
         )
     })?;
+    let (site_packages, libs) = installed_payload_libraries(&lock, prefix)?;
+    let previous = crate::glibc::marker_audit(&marker);
+    let audit = crate::glibc::install_audit(
+        &lock,
+        prefix,
+        &site_packages,
+        &libs,
+        previous.as_ref(),
+        relaxed_platform,
+        declaration_source,
+    )?;
     std::fs::create_dir_all(&share).ok();
-    std::fs::write(&marker, want)
+    std::fs::write(&marker, crate::glibc::marker_body(&want, &audit)?)
         .with_context(|| format!("writing marker {}", marker.display()))?;
+    let _ = std::fs::remove_file(share.join(format!("{}.broken", lock.bundle)));
     let done_msg = format!("retread install: {} installed", lock.bundle);
     eprintln!("{done_msg}");
     crate::status::phase(
@@ -820,9 +883,25 @@ mod tests {
             conda_run_deps,
             index_urls,
             prerelease,
+            shadow_libs: BTreeMap::new(),
+            declared_glibc: None,
             conda_capable: vec![],
             entry_specs: vec![],
         }
+    }
+
+    fn marker_with_audit(digest: &str) -> String {
+        let audit = crate::glibc::InstalledMarkerAudit {
+            schema: 1,
+            host_glibc: None,
+            relaxed_platform: None,
+            declaration_source: None,
+            audit: crate::glibc::AuditStatus::Passed,
+            fixups: Vec::new(),
+            offenders: Vec::new(),
+            file_cache: Vec::new(),
+        };
+        crate::glibc::marker_body(digest, &audit).unwrap()
     }
 
     fn argv_strings(args: &[OsString]) -> Vec<String> {
@@ -1076,13 +1155,13 @@ mod tests {
     // (major, minor) pair; copyright noise on later lines is ignored.
     #[test]
     fn parses_glibc_version_banners() {
-        assert_eq!(parse_glibc_version("glibc 2.34\n"), Some((2, 34)));
+        assert_eq!(crate::glibc::parse_glibc_version("glibc 2.34\n"), Some((2, 34)));
         assert_eq!(
-            parse_glibc_version("ldd (GNU libc) 2.34\nCopyright (C) 2021 ...\n"),
+            crate::glibc::parse_glibc_version("ldd (GNU libc) 2.34\nCopyright (C) 2021 ...\n"),
             Some((2, 34))
         );
-        assert_eq!(parse_glibc_version("glibc 2.34.9000"), Some((2, 34)));
-        assert_eq!(parse_glibc_version("no version here"), None);
+        assert_eq!(crate::glibc::parse_glibc_version("glibc 2.34.9000"), Some((2, 34)));
+        assert_eq!(crate::glibc::parse_glibc_version("no version here"), None);
     }
 
     // Only a genuine manylinux platform-tag rejection triggers auto-relax;
@@ -1131,9 +1210,9 @@ mod tests {
         let raw = serde_json::to_vec(&lock).unwrap();
         let lock_path = share.join(lock.marker_name().replace(".installed", ".lock.json"));
         std::fs::write(&lock_path, &raw).unwrap();
-        std::fs::write(share.join(lock.marker_name()), lock_digest(&raw)).unwrap();
+        std::fs::write(share.join(lock.marker_name()), marker_with_audit(&lock_digest(&raw))).unwrap();
 
-        let err = verify(&lock_path, &prefix).expect_err("marker alone must not verify");
+        let err = verify(&lock_path, &prefix, false).expect_err("marker alone must not verify");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("missing 1 locked wheel") && msg.contains("mypackage==1.0.0"),
@@ -1149,7 +1228,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = verify(&lock_path, &prefix).expect_err("metadata without RECORD must not verify");
+        let err = verify(&lock_path, &prefix, false).expect_err("metadata without RECORD must not verify");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("RECORD") && msg.contains("payload check failed"),
@@ -1164,7 +1243,7 @@ mod tests {
         )
         .unwrap();
 
-        verify(&lock_path, &prefix).expect("matching marker plus metadata should verify");
+        verify(&lock_path, &prefix, false).expect("matching marker plus metadata should verify");
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1197,15 +1276,15 @@ mod tests {
         )
         .unwrap();
 
-        let err = verify(&lock_path, &prefix).expect_err("stale marker must not verify");
+        let err = verify(&lock_path, &prefix, false).expect_err("stale marker must not verify");
         let msg = format!("{err:#}");
         assert!(msg.contains("does not match"), "unexpected error: {msg}");
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
-    fn verify_rejects_metadata_when_record_payload_is_missing() {
-        let root = tempdir("verify-missing-record-payload");
+    fn verify_rejects_bare_digest_marker_even_when_payload_exists() {
+        let root = tempdir("verify-bare-marker");
         let prefix = root.join("prefix");
         let share = prefix.join("share").join("retread");
         std::fs::create_dir_all(&share).unwrap();
@@ -1224,13 +1303,49 @@ mod tests {
             "Metadata-Version: 2.1\nName: mypackage\nVersion: 1.0.0\n",
         )
         .unwrap();
+        std::fs::create_dir_all(site_packages.join("mypackage")).unwrap();
+        std::fs::write(site_packages.join("mypackage/__init__.py"), "").unwrap();
         std::fs::write(
             dist_info.join("RECORD"),
             "mypackage/__init__.py,,\nmypackage-1.0.0.dist-info/METADATA,,\nmypackage-1.0.0.dist-info/RECORD,,\n",
         )
         .unwrap();
 
-        let err = verify(&lock_path, &prefix).expect_err("missing RECORD payload must not verify");
+        let err = verify(&lock_path, &prefix, false)
+            .expect_err("bare digest marker must trigger audit refresh");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no glibc audit record"), "unexpected error: {msg}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn verify_rejects_metadata_when_record_payload_is_missing() {
+        let root = tempdir("verify-missing-record-payload");
+        let prefix = root.join("prefix");
+        let share = prefix.join("share").join("retread");
+        std::fs::create_dir_all(&share).unwrap();
+
+        let lock = make_lock(vec![], vec![PUBLIC_PYPI.into()], BTreeMap::new());
+        let raw = serde_json::to_vec(&lock).unwrap();
+        let lock_path = share.join("retread-test-bundle.lock.json");
+        std::fs::write(&lock_path, &raw).unwrap();
+        std::fs::write(share.join(lock.marker_name()), marker_with_audit(&lock_digest(&raw))).unwrap();
+
+        let site_packages = site_packages_dir(&prefix, &lock.python);
+        let dist_info = site_packages.join("mypackage-1.0.0.dist-info");
+        std::fs::create_dir_all(&dist_info).unwrap();
+        std::fs::write(
+            dist_info.join("METADATA"),
+            "Metadata-Version: 2.1\nName: mypackage\nVersion: 1.0.0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dist_info.join("RECORD"),
+            "mypackage/__init__.py,,\nmypackage-1.0.0.dist-info/METADATA,,\nmypackage-1.0.0.dist-info/RECORD,,\n",
+        )
+        .unwrap();
+
+        let err = verify(&lock_path, &prefix, false).expect_err("missing RECORD payload must not verify");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("missing installed file") && msg.contains("mypackage/__init__.py"),

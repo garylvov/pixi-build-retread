@@ -37,3 +37,7 @@ rev = "28a37cecdd433c22d9eabd6a5954add9f13a8951"
 isaacsim = { version = "==6.0.0.1", index = "https://pypi.nvidia.com", extras = ["all", "extscache"] }
 isaaclab = { from = "isaaclab", subdirectory = "source/isaaclab" }
 isaaclab-visualizers = { from = "isaaclab", subdirectory = "source/isaaclab_visualizers", extras = ["all"] }
+
+[package.build.config.retread-shadow-libs]
+"isaacsim/kit/kernel/plugins/libpython3.12.so.1.0" = "conda-lib"
+"isaacsim/kit/kernel/plugins/libpython3.12.so" = "conda-lib"
