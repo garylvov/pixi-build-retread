@@ -1396,46 +1396,24 @@ impl Handler {
                     // through unchanged.
                     let mut accumulated_overrides: BTreeMap<String, String> =
                         effective_snapshot.overrides.clone();
-                    // v1.4.3: group the (ascending-dep-count-sorted)
-                    // envs into levels of equal count and solve each
-                    // level's envs CONCURRENTLY. The v0.44 parent-first
-                    // seed contract orders base -> superset envs, and a
-                    // strict superset always has strictly more
-                    // effective deps -- so two envs with EQUAL counts
-                    // cannot be a base/superset pair (equal sets gain
-                    // nothing from seeding anyway). Each env still runs
-                    // on its own clone of the post-pre-emit snapshot
-                    // (the v0.36.1/.2 isolation contract), every
-                    // iteration still runs a real run_solve_check, and
-                    // the merge below runs serially in env order so
-                    // accumulated_overrides stays a deterministic
-                    // monotonic union.
-                    let env_levels: Vec<Vec<String>> = {
-                        let count_of = |n: &str| -> usize {
-                            match (&manifest_for_solve, n) {
-                                (Some(m), n) if n != "__default__" => {
-                                    m.effective_dependencies(n).len()
-                                }
-                                _ => 0,
-                            }
-                        };
-                        let mut levels: Vec<Vec<String>> = Vec::new();
-                        let mut last_count: Option<usize> = None;
-                        for n in &env_names {
-                            let c = count_of(n);
-                            if last_count == Some(c) {
-                                levels.last_mut().unwrap().push(n.clone());
-                            } else {
-                                levels.push(vec![n.clone()]);
-                                last_count = Some(c);
-                            }
-                        }
-                        levels
-                    };
-                    for level in &env_levels {
-                        // Per-level seed snapshot: every env in this
-                        // level sees the widenings of all COMPLETED
-                        // levels, never a same-level sibling's.
+                    // v1.4.3 solved envs in equal-dep-count LEVELS with a
+                    // barrier between levels; flattened here: solve ALL envs
+                    // concurrently in one bounded fan-out. The level barrier
+                    // only warm-started later (superset) envs with earlier
+                    // levels' widenings -- a convergence accelerator, not a
+                    // correctness dependency: every env still runs its own
+                    // full iterative refinement on its own clone of the
+                    // post-pre-emit snapshot (the v0.36.1/.2 isolation
+                    // contract), and the shipped CondaOutput is rebuilt from
+                    // the loosest-per-dep UNION of every env's widenings,
+                    // which is order-independent. Envs that hit
+                    // MAX_REFINEMENT without the warm seed are caught by the
+                    // P3 sibling-seeded re-run below, which now spans ALL
+                    // envs instead of one level. Concurrency is bounded by a
+                    // semaphore (max(2, ncpu/2)); the merge below still runs
+                    // serially in env order so accumulated_overrides stays a
+                    // deterministic monotonic union.
+                    {
                         let level_seed = accumulated_overrides.clone();
                         // One env's full seeded refinement, reusable by
                         // both the parallel level fan-out and the P3
@@ -1545,10 +1523,36 @@ impl Handler {
                                 }
                             }
                         };
+                        // Bounded fan-out over ALL envs. Note the clones
+                        // inside solve_env happen eagerly at closure-call
+                        // time (before the inner async block), so each env
+                        // still snapshots its inputs BEFORE any sibling
+                        // runs; the semaphore only gates the awaited solve
+                        // work. join_all preserves input order, so
+                        // level_results is in env_names order regardless of
+                        // completion order.
+                        let max_solve_concurrency = std::cmp::max(
+                            2,
+                            std::thread::available_parallelism()
+                                .map(|n| n.get())
+                                .unwrap_or(4)
+                                / 2,
+                        );
+                        let solve_sem = std::sync::Arc::new(
+                            tokio::sync::Semaphore::new(max_solve_concurrency),
+                        );
                         let level_results: Vec<Result<EnvSolveResult, RpcError>> =
-                            futures::future::join_all(
-                                level.iter().map(|e| solve_env(e, &level_seed)),
-                            )
+                            futures::future::join_all(env_names.iter().map(|e| {
+                                let sem = solve_sem.clone();
+                                let fut = solve_env(e, &level_seed);
+                                async move {
+                                    let _permit = sem
+                                        .acquire()
+                                        .await
+                                        .expect("solve semaphore never closed");
+                                    fut.await
+                                }
+                            }))
                             .await;
 
                         // Unwrap all results first (fail fast on RPC errors).
@@ -1557,14 +1561,15 @@ impl Handler {
                             level_outcomes.push(result?);
                         }
 
-                        // P3 (grizzly #4): same-level siblings can't
-                        // cross-seed during the parallel solve. When an
-                        // env hit MAX_REFINEMENT while a sibling in the
-                        // SAME level converged, give it exactly ONE
-                        // re-run with a fresh full budget, seeded with
-                        // every sibling's widenings (snapshot/restore +
-                        // union accumulator; levels stay parallel). A
-                        // second cap is final: warn loudly and classify.
+                        // P3 (grizzly #4): siblings can't cross-seed
+                        // during the parallel solve. When an env hit
+                        // MAX_REFINEMENT while any sibling converged,
+                        // give it exactly ONE re-run with a fresh full
+                        // budget, seeded with every sibling's widenings
+                        // (snapshot/restore + union accumulator). With
+                        // the flattened fan-out this spans ALL envs, so
+                        // it also replaces the old cross-level seeding.
+                        // A second cap is final: warn loudly and classify.
                         let capped_idx = capped_envs_eligible_for_rerun(
                             level_outcomes
                                 .iter()
