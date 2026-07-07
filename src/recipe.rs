@@ -89,6 +89,12 @@ pub struct About {
     pub summary: Option<String>,
 }
 
+fn shell_ident(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect()
+}
+
 /// Input to [`build_bundle_recipe`]: one wheel that should appear in the
 /// recipe's `source:` list. The metadata feeds run-deps and platform
 /// detection.
@@ -305,11 +311,13 @@ pub fn build_courier_recipe(
     // (regardless of the post-link toggle) and warns when the marker is absent
     // or no longer matches the actual installed wheel state.
     let activate_guard = format!("$PREFIX/etc/conda/activate.d/zzz-retread-{conda_name}.sh");
+    let deactivate_guard = format!("$PREFIX/etc/conda/deactivate.d/zzz-retread-{conda_name}.sh");
+    let var_pack = shell_ident(conda_name);
     let script = format!(
         "set -euo pipefail\n\
          SHARE=\"$PREFIX/share/retread\"\n\
          WHEELS=\"$SHARE/{conda_name}/wheels\"\n\
-         mkdir -p \"$WHEELS\" \"$PREFIX/bin\" \"$PREFIX/etc/conda/activate.d\"\n\
+         mkdir -p \"$WHEELS\" \"$PREFIX/bin\" \"$PREFIX/etc/conda/activate.d\" \"$PREFIX/etc/conda/deactivate.d\"\n\
          cp \"$SRC_DIR\"/*.whl \"$WHEELS\"/ 2>/dev/null || true\n\
          cp \"$SRC_DIR\"/{lock_filename} \"$SHARE\"/\n\
          cp \"$SRC_DIR\"/retread-installer \"$PREFIX/bin/retread\"\n\
@@ -332,17 +340,53 @@ pub fn build_courier_recipe(
          # from the conda-tracked lock + shipped wheels + shipped retread binary\n\
          # (all of which survive the payload loss). Cheap no-op when healthy\n\
          # (verify is marker + stat checks). This file is SOURCED into the\n\
-         # user's interactive shell, so it must never enable errexit or\n\
-         # terminate the shell -- a failed repair only warns.\n\
-         if ! \"$CONDA_PREFIX/bin/retread\" verify --lock \"$CONDA_PREFIX/share/retread/{lock_filename}\" --prefix \"$CONDA_PREFIX\" >/dev/null 2>&1; then\n\
+         # user's interactive shell, so by default it must never enable errexit,\n\
+         # exit, or return nonzero. RETREAD_GUARD_STRICT=1 opts into return 1.\n\
+         case \":${{LD_LIBRARY_PATH:-}}:\" in\n\
+         *\":$CONDA_PREFIX/lib:\"*) ;;\n\
+         *) export _RETREAD_SAVED_LDLP_{var_pack}=\"${{LD_LIBRARY_PATH-__unset__}}\"\n\
+            export LD_LIBRARY_PATH=\"$CONDA_PREFIX/lib${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}\" ;;\n\
+         esac\n\
+         RETREAD_LOCK=\"$CONDA_PREFIX/share/retread/{lock_filename}\"\n\
+         RETREAD_BROKEN_FILE=\"$CONDA_PREFIX/share/retread/{conda_name}.broken\"\n\
+         RETREAD_REPAIR_LOG=\"$CONDA_PREFIX/share/retread/{conda_name}.repair.log\"\n\
+         RETREAD_SKIP_HEAL=0\n\
+         if [ -f \"$RETREAD_BROKEN_FILE\" ]; then\n\
+         now=$(date +%s 2>/dev/null || echo 0)\n\
+         mtime=$(date -r \"$RETREAD_BROKEN_FILE\" +%s 2>/dev/null || echo 0)\n\
+         age=$((now - mtime))\n\
+         if [ \"$age\" -lt 300 ]; then RETREAD_SKIP_HEAL=1; fi\n\
+         fi\n\
+         if [ \"$RETREAD_SKIP_HEAL\" = \"1\" ]; then\n\
+         echo \"retread: '{conda_name}' is marked broken; skipping auto-repair during 300s backoff. Retry manually:\" >&2\n\
+         echo \"  \\\"$CONDA_PREFIX/bin/retread\\\" install --lock \\\"$RETREAD_LOCK\\\" --prefix \\\"$CONDA_PREFIX\\\"\" >&2\n\
+         export RETREAD_BROKEN_{var_pack}=1\n\
+         elif ! \"$CONDA_PREFIX/bin/retread\" verify --lock \"$RETREAD_LOCK\" --prefix \"$CONDA_PREFIX\" >/dev/null 2>&1; then\n\
          echo \"retread: '{conda_name}' PyPI wheels missing from this env; repairing...\" >&2\n\
-         if ! \"$CONDA_PREFIX/bin/retread\" install --lock \"$CONDA_PREFIX/share/retread/{lock_filename}\" --prefix \"$CONDA_PREFIX\" >&2; then\n\
+         if \"$CONDA_PREFIX/bin/retread\" install --lock \"$RETREAD_LOCK\" --prefix \"$CONDA_PREFIX\" >\"$RETREAD_REPAIR_LOG\" 2>&1; then\n\
+         rm -f \"$RETREAD_BROKEN_FILE\" \"$RETREAD_REPAIR_LOG\"\n\
+         unset RETREAD_BROKEN_{var_pack}\n\
+         else\n\
+         tail -n 80 \"$RETREAD_REPAIR_LOG\" >&2 2>/dev/null || true\n\
+         mkdir -p \"$(dirname \"$RETREAD_BROKEN_FILE\")\"\n\
+         {{ date -u 2>/dev/null || date; tail -n 80 \"$RETREAD_REPAIR_LOG\" 2>/dev/null || true; }} > \"$RETREAD_BROKEN_FILE\"\n\
+         export RETREAD_BROKEN_{var_pack}=1\n\
          echo \"retread: '{conda_name}' auto-repair FAILED; env is incomplete. Retry manually:\" >&2\n\
-         echo \"  \\\"$CONDA_PREFIX/bin/retread\\\" install --lock \\\"$CONDA_PREFIX/share/retread/{lock_filename}\\\" --prefix \\\"$CONDA_PREFIX\\\"\" >&2\n\
+         echo \"  \\\"$CONDA_PREFIX/bin/retread\\\" install --lock \\\"$RETREAD_LOCK\\\" --prefix \\\"$CONDA_PREFIX\\\"\" >&2\n\
+         if [ \"${{RETREAD_GUARD_STRICT:-0}}\" = \"1\" ]; then return 1 2>/dev/null || true; fi\n\
          fi\n\
          fi\n\
          ACTIVATE\n\
-         chmod +x \"{activate_guard}\"\n"
+         chmod +x \"{activate_guard}\"\n\
+         cat > \"{deactivate_guard}\" <<'DEACTIVATE'\n\
+         #!/bin/bash\n\
+         if [ \"${{_RETREAD_SAVED_LDLP_{var_pack}-}}\" = \"__unset__\" ]; then unset LD_LIBRARY_PATH\n\
+         elif [ -n \"${{_RETREAD_SAVED_LDLP_{var_pack}+x}}\" ]; then\n\
+         export LD_LIBRARY_PATH=\"$_RETREAD_SAVED_LDLP_{var_pack}\"\n\
+         fi\n\
+         unset _RETREAD_SAVED_LDLP_{var_pack}\n\
+         DEACTIVATE\n\
+         chmod +x \"{deactivate_guard}\"\n"
     );
 
     let source = source_urls
@@ -477,6 +521,20 @@ mod courier_tests {
         assert!(
             r.build
                 .script
+                .contains("etc/conda/deactivate.d/zzz-retread-isaac-pack.sh"),
+            "must ship a matching deactivate.d hook"
+        );
+        assert!(
+            r.build.script.contains("LD_LIBRARY_PATH=\"$CONDA_PREFIX/lib"),
+            "activate.d must prepend $CONDA_PREFIX/lib to LD_LIBRARY_PATH"
+        );
+        assert!(
+            r.build.script.contains("_RETREAD_SAVED_LDLP_isaac_pack"),
+            "activate/deactivate hooks must use a sanitized pack-specific saved variable"
+        );
+        assert!(
+            r.build
+                .script
                 .contains("\"$CONDA_PREFIX/bin/retread\" verify --lock"),
             "guard must verify marker plus installed wheel metadata"
         );
@@ -512,8 +570,16 @@ mod courier_tests {
             "activate.d guard is sourced; it must not set -e or exit"
         );
         assert!(
+            activate_body.contains("RETREAD_GUARD_STRICT"),
+            "return 1 must be strict-mode-only"
+        );
+        assert!(
             r.build.script.contains("\nACTIVATE\n"),
             "activate.d heredoc terminator must be at column 0"
+        );
+        assert!(
+            r.build.script.contains("\nDEACTIVATE\n"),
+            "deactivate.d heredoc terminator must be at column 0"
         );
     }
 
@@ -588,7 +654,9 @@ mod courier_tests {
         }
 
         let guard = prefix.join("etc/conda/activate.d/zzz-retread-isaac-pack.sh");
+        let deactivate = prefix.join("etc/conda/deactivate.d/zzz-retread-isaac-pack.sh");
         assert!(guard.is_file(), "activate.d guard not shipped");
+        assert!(deactivate.is_file(), "deactivate.d hook not shipped");
         let source_guard = || {
             Command::new(&bash)
                 .arg("-c")
@@ -624,6 +692,153 @@ mod courier_tests {
         assert!(
             !String::from_utf8_lossy(&out2.stderr).contains("repairing"),
             "healthy env must be silent"
+        );
+
+        let ldlp = Command::new(&bash)
+            .arg("-c")
+            .arg(format!(
+                ". \"{}\" >/dev/null 2>&1; . \"{}\" >/dev/null 2>&1; printf '%s' \"$LD_LIBRARY_PATH\"",
+                guard.display(),
+                guard.display()
+            ))
+            .env("CONDA_PREFIX", &prefix)
+            .env("LD_LIBRARY_PATH", "/already")
+            .output()
+            .expect("double-source guard");
+        assert!(ldlp.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&ldlp.stdout),
+            format!("{}:/already", prefix.join("lib").display()),
+            "activate.d must prepend prefix/lib exactly once"
+        );
+
+        let restored = Command::new(&bash)
+            .arg("-c")
+            .arg(format!(
+                ". \"{}\" >/dev/null 2>&1; . \"{}\"; printf '%s' \"${{LD_LIBRARY_PATH-__unset__}}\"",
+                guard.display(),
+                deactivate.display()
+            ))
+            .env("CONDA_PREFIX", &prefix)
+            .env("LD_LIBRARY_PATH", "/before")
+            .output()
+            .expect("source deactivate");
+        assert!(restored.status.success());
+        assert_eq!(String::from_utf8_lossy(&restored.stdout), "/before");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn courier_activate_guard_broken_sentinel_backoff_and_strict_status() {
+        use std::process::Command;
+
+        let bash = match which("bash") {
+            Some(b) => b,
+            None => {
+                eprintln!("skipping: bash not on PATH");
+                return;
+            }
+        };
+
+        let root = std::env::temp_dir().join(format!(
+            "retread-broken-e2e-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let src = root.join("src");
+        let prefix = root.join("prefix");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&prefix).unwrap();
+        std::fs::write(src.join("retread-isaac-pack.lock.json"), "{}").unwrap();
+        std::fs::write(src.join("retread-installer"), "#!/bin/sh\n").unwrap();
+
+        let recipe = build_courier_recipe("isaac-pack", "5.1.0", "3.11", &[], &[], None);
+        let build = Command::new(&bash)
+            .arg("-c")
+            .arg(&recipe.build.script)
+            .env("SRC_DIR", &src)
+            .env("PREFIX", &prefix)
+            .output()
+            .expect("run build script");
+        assert!(
+            build.status.success(),
+            "build script failed: {}",
+            String::from_utf8_lossy(&build.stderr)
+        );
+
+        let stub = "#!/bin/bash\n\
+             log=\"$CONDA_PREFIX/retread-stub.log\"\n\
+             case \"$1\" in\n\
+             verify) exit 1 ;;\n\
+             install) echo install >> \"$log\"; echo failed repair >&2; exit 42 ;;\n\
+             *) exit 0 ;;\n\
+             esac\n";
+        std::fs::write(prefix.join("bin/retread"), stub).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                prefix.join("bin/retread"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+
+        let guard = prefix.join("etc/conda/activate.d/zzz-retread-isaac-pack.sh");
+        let source = |strict: bool| {
+            let mut cmd = Command::new(&bash);
+            cmd.arg("-c")
+                .arg(format!(". \"{}\"; printf 'status:%s broken:%s' \"$?\" \"${{RETREAD_BROKEN_isaac_pack-0}}\"", guard.display()))
+                .env("CONDA_PREFIX", &prefix);
+            if strict {
+                cmd.env("RETREAD_GUARD_STRICT", "1");
+            }
+            cmd.output().expect("source guard")
+        };
+
+        let first = source(false);
+        assert!(first.status.success(), "default guard must not fail activation");
+        assert!(
+            String::from_utf8_lossy(&first.stdout).contains("status:0 broken:1"),
+            "default failure should set broken env and return zero: {}",
+            String::from_utf8_lossy(&first.stdout)
+        );
+        let broken = prefix.join("share/retread/isaac-pack.broken");
+        assert!(broken.is_file(), "failed heal must write .broken sentinel");
+        assert_eq!(
+            std::fs::read_to_string(prefix.join("retread-stub.log"))
+                .unwrap_or_default()
+                .lines()
+                .count(),
+            1,
+            "first failure invokes installer once"
+        );
+
+        let second = source(false);
+        assert!(second.status.success());
+        assert_eq!(
+            std::fs::read_to_string(prefix.join("retread-stub.log"))
+                .unwrap_or_default()
+                .lines()
+                .count(),
+            1,
+            "second activation within backoff must not invoke installer again"
+        );
+        assert!(
+            String::from_utf8_lossy(&second.stderr).contains("backoff"),
+            "backoff should be announced"
+        );
+
+        std::fs::remove_file(&broken).unwrap();
+        let strict = source(true);
+        assert!(
+            String::from_utf8_lossy(&strict.stdout).contains("status:1 broken:1"),
+            "strict mode should make the sourced guard return 1: {}",
+            String::from_utf8_lossy(&strict.stdout)
         );
 
         std::fs::remove_dir_all(&root).ok();
@@ -676,6 +891,7 @@ mod tests {
             relax: RelaxPolicy::Minor,
             overrides: BTreeMap::new(),
             name_map: BTreeMap::new(),
+            shadow_libs: BTreeMap::new(),
             build_number: 0,
             drop_deps: Vec::new(),
             auto_bundle: false,

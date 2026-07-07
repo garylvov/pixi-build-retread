@@ -1,0 +1,9 @@
+File: /prefix/lib/libpython3.12.so.1.0
+
+Version needs section '.gnu.version_r' contains 1 entry:
+ Addr: 0x0000000000000000  Offset: 0x000000  Link: 4 (.dynstr)
+  000000: Version: 1  File: libc.so.6  Cnt: 4
+  0x0010:   Name: GLIBC_2.2.5  Flags: none  Version: 8
+  0x0020:   Name: GLIBC_2.3  Flags: none  Version: 7
+  0x0030:   Name: GLIBC_2.4  Flags: none  Version: 6
+  0x0040:   Name: GLIBC_2.10  Flags: none  Version: 5

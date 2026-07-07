@@ -7046,6 +7046,8 @@ mod replay_tests {
             }],
             index_urls: vec!["https://pypi.org/simple/".into()],
             prerelease: BTreeMap::new(),
+            shadow_libs: BTreeMap::new(),
+            declared_glibc: None,
             conda_capable: vec![],
             entry_specs: vec![],
         }
@@ -7309,6 +7311,8 @@ mod replay_tests {
             conda_run_deps: vec![],
             index_urls: vec!["https://pypi.org/simple/".into()],
             prerelease: BTreeMap::new(),
+            shadow_libs: BTreeMap::new(),
+            declared_glibc: None,
             conda_capable: vec![],
             entry_specs: vec![],
         };
@@ -7376,6 +7380,8 @@ mod replay_tests {
             conda_run_deps: vec![],
             index_urls: vec!["https://pypi.org/simple/".into()],
             prerelease: BTreeMap::new(),
+            shadow_libs: BTreeMap::new(),
+            declared_glibc: None,
             conda_capable: vec![],
             entry_specs: vec![],
         };
@@ -7479,6 +7485,8 @@ mod replay_tests {
             conda_run_deps: vec![],
             index_urls: vec!["https://pypi.org/simple/".into()],
             prerelease: BTreeMap::new(),
+            shadow_libs: BTreeMap::new(),
+            declared_glibc: None,
             conda_capable: vec![],
             entry_specs: vec![],
         };
@@ -7674,6 +7682,8 @@ mod replay_tests {
             conda_run_deps: vec![],
             index_urls: vec!["https://pypi.org/simple/".into()],
             prerelease: BTreeMap::new(),
+            shadow_libs: BTreeMap::new(),
+            declared_glibc: None,
             conda_capable: vec![],
             entry_specs: vec![],
         };
@@ -8027,6 +8037,8 @@ mod replay_tests {
             conda_run_deps: vec![],
             index_urls: index_urls.to_vec(),
             prerelease: BTreeMap::new(),
+            shadow_libs: BTreeMap::new(),
+            declared_glibc: None,
             conda_capable: vec![wheel_name.to_string()],
             entry_specs: vec![],
         };
@@ -8187,6 +8199,8 @@ mod replay_tests {
             conda_run_deps: vec![],
             index_urls: vec!["https://pypi.org/simple/".into()],
             prerelease: BTreeMap::new(),
+            shadow_libs: BTreeMap::new(),
+            declared_glibc: None,
             conda_capable: vec!["requests".into()],
             entry_specs: vec![],
         };
@@ -9806,6 +9820,8 @@ mod load_favored_versions_tests {
             }],
             index_urls: vec!["https://pypi.org/simple/".into()],
             prerelease: BTreeMap::new(),
+            shadow_libs: BTreeMap::new(),
+            declared_glibc: None,
             conda_capable: vec![],
             entry_specs: vec![],
         };
@@ -10661,6 +10677,8 @@ mod incremental_add_tests {
             conda_run_deps: vec![],
             index_urls: vec!["https://pypi.org/simple".into()],
             prerelease: BTreeMap::new(),
+            shadow_libs: BTreeMap::new(),
+            declared_glibc: None,
             conda_capable: vec![],
             entry_specs,
         };
@@ -10752,6 +10770,8 @@ mod incremental_add_tests {
             conda_run_deps: vec![],
             index_urls: vec![],
             prerelease: BTreeMap::new(),
+            shadow_libs: BTreeMap::new(),
+            declared_glibc: None,
             conda_capable: vec![],
             entry_specs: vec!["test-bundle==1.0".into()],
         };
@@ -10829,6 +10849,8 @@ mod incremental_add_tests {
             conda_run_deps: vec![],
             index_urls,
             prerelease: BTreeMap::new(),
+            shadow_libs: BTreeMap::new(),
+            declared_glibc: None,
             conda_capable: vec![],
             entry_specs,
         };
@@ -11372,6 +11394,8 @@ mod incremental_add_tests {
             conda_run_deps: vec![],
             index_urls: vec!["https://pypi.org/simple".into()],
             prerelease: BTreeMap::new(),
+            shadow_libs: BTreeMap::new(),
+            declared_glibc: None,
             conda_capable: vec![],
             entry_specs: vec!["test-bundle==1.0".into()],
         };

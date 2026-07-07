@@ -1,0 +1,12 @@
+File: /env/site/isaacsim/kit/kernel/plugins/libpython3.12.so.1.0
+
+Version needs section '.gnu.version_r' contains 1 entry:
+ Addr: 0x0000000000000000  Offset: 0x000000  Link: 4 (.dynstr)
+  000000: Version: 1  File: libc.so.6  Cnt: 7
+  0x0010:   Name: GLIBC_2.2.5  Flags: none  Version: 10
+  0x0020:   Name: GLIBC_2.4  Flags: none  Version: 9
+  0x0030:   Name: GLIBC_2.10  Flags: none  Version: 8
+  0x0040:   Name: GLIBC_2.17  Flags: none  Version: 7
+  0x0050:   Name: GLIBC_2.28  Flags: none  Version: 6
+  0x0060:   Name: GLIBC_2.34  Flags: none  Version: 5
+  0x0070:   Name: GLIBC_2.35  Flags: none  Version: 4

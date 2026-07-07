@@ -144,6 +144,9 @@ pub fn config_fingerprint(
     for (k, v) in &config.name_map {
         parts.push(format!("name-map:{k}={v}"));
     }
+    for (k, v) in &config.shadow_libs {
+        parts.push(format!("shadow-lib:{k}={}", v.as_lock_value()));
+    }
     let mut drop = config.drop_deps.clone();
     drop.sort();
     for d in &drop {
@@ -985,6 +988,13 @@ pub async fn stage(
     // Populated here so the Part-2 delta-detector can diff it against the
     // current manifest without re-running the full resolve.
     let entry_specs = courier_input_specs(config, bundle_name);
+    let shadow_libs: BTreeMap<String, String> = config
+        .shadow_libs
+        .iter()
+        .map(|(path, policy)| (path.clone(), policy.as_lock_value().to_string()))
+        .collect();
+    let declared_glibc = crate::glibc::resolve_workspace_declared_glibc()
+        .map(crate::glibc::format_glibc);
     let mut lock = RetreadLock {
         schema: SCHEMA,
         retread_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -997,6 +1007,8 @@ pub async fn stage(
         conda_run_deps: parse_conda_deps(run_deps),
         index_urls: index_urls.to_vec(),
         prerelease,
+        shadow_libs,
+        declared_glibc,
         conda_capable: conda_capable.iter().cloned().collect(),
         entry_specs,
     };

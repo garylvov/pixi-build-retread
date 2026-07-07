@@ -56,6 +56,18 @@ pub struct RetreadConfig {
     )]
     pub name_map: BTreeMap<String, String>,
 
+    /// Shared-library payload replacements applied by the courier installer
+    /// after uv installs the wheel payload. Keys are site-packages-relative
+    /// path patterns; v1 supports exactly `conda-lib`, meaning replace the
+    /// vendored file with a relative symlink to `$PREFIX/lib/<SONAME>`.
+    #[serde(
+        default,
+        rename = "retread-shadow-libs",
+        alias = "shadow-libs",
+        alias = "shadow_libs"
+    )]
+    pub shadow_libs: BTreeMap<String, ShadowPolicy>,
+
     /// PyPI names to drop from the conda run-deps entirely. Use for
     /// upstream-pinned deps that don't exist on the target conda channel
     /// (Windows-only shims like `idna-ssl`, `pywin32`) or otherwise can't
@@ -281,6 +293,20 @@ impl PythonSpec {
         match self {
             Self::One(v) => vec![v.clone()],
             Self::Many(v) => v.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ShadowPolicy {
+    CondaLib,
+}
+
+impl ShadowPolicy {
+    pub fn as_lock_value(self) -> &'static str {
+        match self {
+            ShadowPolicy::CondaLib => "conda-lib",
         }
     }
 }
@@ -621,6 +647,35 @@ mod tests {
         });
         let cfg: RetreadConfig = serde_json::from_value(json).unwrap();
         assert_eq!(cfg.compression_level, None);
+    }
+
+    #[test]
+    fn parses_retread_shadow_libs_key() {
+        let json = serde_json::json!({
+            "retread-wheels": { "isaacsim": { "version": "==6.0.0.1" } },
+            "retread-shadow-libs": {
+                "isaacsim/kit/kernel/plugins/libpython3.12.so.1.0": "conda-lib"
+            },
+        });
+        let cfg: RetreadConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            cfg.shadow_libs
+                .get("isaacsim/kit/kernel/plugins/libpython3.12.so.1.0")
+                .copied(),
+            Some(ShadowPolicy::CondaLib)
+        );
+
+        let json = serde_json::json!({
+            "retread-wheels": { "isaacsim": { "version": "==6.0.0.1" } },
+            "retread-shadow-libs": {
+                "x.so": "copy-from-somewhere"
+            },
+        });
+        let err = serde_json::from_value::<RetreadConfig>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("copy-from-somewhere"),
+            "unknown shadow policy should be a hard config error: {err}"
+        );
     }
 
     #[test]

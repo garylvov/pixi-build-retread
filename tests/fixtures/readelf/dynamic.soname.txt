@@ -1,0 +1,12 @@
+File: /env/site/isaacsim/kit/kernel/plugins/libpython3.12.so.1.0
+
+Dynamic section at offset 0x1 contains 29 entries:
+  Tag        Type                         Name/Value
+ 0x000000000000000e (SONAME)             Library soname: [libpython3.12.so.1.0]
+ 0x000000000000001d (RUNPATH)            Library runpath: [$ORIGIN/../..]
+
+File: /env/site/pkg/no-soname.so
+
+Dynamic section at offset 0x2 contains 3 entries:
+  Tag        Type                         Name/Value
+ 0x000000000000001d (RUNPATH)            Library runpath: [$ORIGIN]

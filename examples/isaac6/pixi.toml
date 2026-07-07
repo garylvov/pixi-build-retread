@@ -30,6 +30,7 @@ isaac-pack-6 = { path = "./isaac-pack" }
 
 [feature.gpu.system-requirements]
 cuda = "12"
+libc = "2.35"
 
 [feature.gpu.dependencies]
 cuda-version = "==12.8"
