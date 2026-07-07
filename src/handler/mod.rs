@@ -2578,6 +2578,32 @@ async fn resolve_all(
         let lock_path = source_dir.join(crate::lock::RetreadLock::file_name(&bundle_conda_name));
         let favored = load_favored_versions(&lock_path);
 
+        // spec-uv-restructure M1: uv-backed closure computation. When the
+        // pack selects `retread-resolver = "uv"`, this group's closure is
+        // computed by a uv subprocess (ephemeral project + `uv lock` +
+        // `uv export --format pylock.toml`) and the legacy materialization
+        // below is PINNED to uv's picks via the locked-closure seam.
+        // Packaging / courier / lock-write downstream are unchanged.
+        // `Ok(None)` = no uv-resolvable roots (all source-built entries);
+        // the legacy path then runs unpinned exactly as before.
+        let uv_closure: Option<crate::uv_closure::UvClosure> =
+            if effective.resolver == crate::config::ResolverKind::Uv {
+                uv_group_closure(
+                    &group_name,
+                    &group_entries,
+                    &effective,
+                    target,
+                    cache_dir,
+                    workspace_dir,
+                    &workspace_pypi_indexes,
+                )
+                .await
+                .with_context(|| format!("computing uv closure for bundle `{group_name}`"))?
+            } else {
+                None
+            };
+        let uv_pins: Option<&BTreeMap<String, String>> = uv_closure.as_ref().map(|c| &c.pins);
+
         // v2.10.0: build the full sibling name set for this group once.
         // For each entry in the group we compute a sibling set = all OTHER
         // entries' canonical names, so resolve_bundle can skip deps that name
@@ -2614,7 +2640,7 @@ async fn resolve_all(
                 conda_channels,
                 &effective.conda_deps,
                 &workspace_pypi_indexes,
-                None,                   // cold path: no locked closure
+                uv_pins, // uv resolver: pin to uv's closure; legacy: None (cold path)
                 Some(&favored).filter(|m| !m.is_empty()), // favor-lock prefs (empty map → None)
                 &sibling_names,
             )
@@ -2667,7 +2693,7 @@ async fn resolve_all(
                 download_dir,
                 &effective,
                 conda_channels,
-                None,                                     // cold path: no locked closure
+                uv_pins, // uv resolver: pin to uv's closure; legacy: None (cold path)
                 Some(&favored).filter(|m| !m.is_empty()), // favor-lock prefs
             )
             .await?;
@@ -2682,6 +2708,149 @@ async fn resolve_all(
     }
 
     Ok((bundles, effective))
+}
+
+/// spec-uv-restructure M1: build + solve one bundle group's closure via uv.
+///
+/// Roots are the group's uv-resolvable entries (PyPI spec-form entries as
+/// `name[extras]==version`, direct-URL entries as `name @ url`). Conda pins
+/// from the workspace manifest become `constraint-dependencies` (with
+/// provenance back to their conda source, spec §2.2); `retread-overrides`
+/// map to `override-dependencies`; `retread-drop-deps` become unmatchable
+/// override markers (AMENDMENT A3); `retread-conda-deps` names are excluded
+/// from the exported closure.
+///
+/// Returns `Ok(None)` when the group has no uv-resolvable roots (all
+/// entries source-built) — the caller then runs the legacy path unpinned.
+///
+/// Milestone-1 limits (see spec for the M2/M3 follow-ups):
+/// - conda pins read from the manifest's `default` env only (no
+///   `pixi.lock`-gated read, no per-env constraint sets yet);
+/// - source-built (path/git/from) entries are not fed to uv as
+///   `tool.uv.sources` — they resolve via the legacy path;
+/// - routing is force-list only (`retread-conda-deps`); the probe-driven
+///   post-resolution filter is M2.
+async fn uv_group_closure(
+    group_name: &str,
+    group_entries: &[(String, WheelEntry)],
+    effective: &RetreadConfig,
+    target: &WheelTarget,
+    cache_dir: &Path,
+    workspace_dir: Option<&Path>,
+    workspace_pypi_indexes: &[String],
+) -> Result<Option<crate::uv_closure::UvClosure>> {
+    let mut roots: Vec<String> = Vec::new();
+    for (name, entry) in group_entries {
+        if entry.is_spec() {
+            let extras = if entry.extras.is_empty() {
+                String::new()
+            } else {
+                format!("[{}]", entry.extras.join(","))
+            };
+            let version = entry.version.as_deref().unwrap_or("").trim();
+            let spec = if version.is_empty() || version == "*" {
+                String::new()
+            } else if version.starts_with(['<', '>', '=', '!', '~']) {
+                version.to_string()
+            } else {
+                format!("=={version}")
+            };
+            roots.push(format!("{name}{extras}{spec}"));
+        } else if let Some(url) = &entry.url {
+            roots.push(format!("{name} @ {url}"));
+        } else {
+            tracing::info!(
+                entry = %name,
+                bundle = %group_name,
+                "uv closure: source-built entry is not a uv root; it resolves \
+                 via the legacy materialization path (milestone-1 limit)",
+            );
+        }
+    }
+    if roots.is_empty() {
+        tracing::info!(
+            bundle = %group_name,
+            "uv closure: no uv-resolvable roots in this bundle; \
+             running the legacy closure path unpinned",
+        );
+        return Ok(None);
+    }
+
+    // Conda pins -> uv constraints, with provenance (spec §2.2 fallback
+    // path: the manifest's effective deps; pixi.lock-gated read is M2+).
+    let constraints = match workspace_dir.and_then(crate::workspace::WorkspaceManifest::load) {
+        Some(manifest) => {
+            let deps = manifest.effective_dependencies("default");
+            crate::uv_closure::build_constraints(&deps, &effective.name_map, "manifest", "default")
+        }
+        None => Default::default(),
+    };
+
+    // retread-overrides -> override-dependencies where PEP 440-representable.
+    let mut overrides: Vec<String> = Vec::new();
+    for (name, spec) in &effective.overrides {
+        let spec = spec.trim();
+        if spec.is_empty() || spec == "*" {
+            overrides.push(name.clone());
+        } else if let Some(pep) = crate::uv_closure::conda_spec_to_pep440(spec) {
+            overrides.push(format!("{name}{pep}"));
+        } else {
+            tracing::warn!(
+                name = %name,
+                spec = %spec,
+                "uv closure: retread-overrides spec is not PEP 440-representable; skipped",
+            );
+        }
+    }
+    // retread-drop-deps -> unmatchable-marker overrides (AMENDMENT A3):
+    // removes the name from uv's graph so broken Requires-Dist edges
+    // can't fail the lock; the parse-time exclude filter stays as
+    // belt-and-braces.
+    for name in &effective.drop_deps {
+        overrides.push(format!("{name} ; {}", crate::uv_closure::DROP_MARKER));
+    }
+
+    // Index chain: entry indexes in group order, then workspace
+    // [pypi-options] indexes, then public PyPI. Deduped, order-preserving.
+    let mut index_urls: Vec<String> = Vec::new();
+    for url in group_entries
+        .iter()
+        .filter(|(_, e)| e.url.is_none())
+        .map(|(_, e)| e.index_url())
+        .chain(workspace_pypi_indexes.iter().cloned())
+        .chain(std::iter::once(PUBLIC_PYPI.to_string()))
+    {
+        if !index_urls.contains(&url) {
+            index_urls.push(url);
+        }
+    }
+
+    // retread-drop-deps also excluded from the parsed closure.
+    let mut no_emit: Vec<String> = effective.conda_deps.clone();
+    no_emit.extend(effective.drop_deps.iter().cloned());
+
+    let req = crate::uv_closure::UvClosureRequest {
+        bundle: group_name.to_string(),
+        python_version: target.python_version.clone(),
+        conda_subdir: target.conda_subdir.clone(),
+        dependencies: roots,
+        constraints,
+        overrides,
+        no_emit_packages: no_emit,
+        index_urls,
+        built_wheel_sources: BTreeMap::new(), // M1: source-built entries stay legacy
+        offline: false,
+    };
+    let project_dir = cache_dir.join("uv-projects").join(format!(
+        "{}-py{}-{}",
+        canonical_conda_name(group_name),
+        target.python_version,
+        target.conda_subdir,
+    ));
+    let uv_cache_dir = cache_dir.join("uv-cache");
+    let closure =
+        crate::uv_closure::compute_closure(&req, &project_dir, &uv_cache_dir, None).await?;
+    Ok(Some(closure))
 }
 
 /// One emission targeting a specific discovered output name. The

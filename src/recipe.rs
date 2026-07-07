@@ -889,6 +889,7 @@ mod tests {
 
     fn cfg() -> RetreadConfig {
         RetreadConfig {
+            resolver: Default::default(),
             retread_wheels: BTreeMap::new(),
             relax: RelaxPolicy::Minor,
             overrides: BTreeMap::new(),
