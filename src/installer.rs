@@ -679,19 +679,62 @@ pub(crate) fn build_uv_replay_args(
     args
 }
 
+/// Atomically replace the install marker (temp file + rename). The
+/// lock-free fast path in `run()` reads the marker without holding the
+/// install lock, so a plain `std::fs::write` (truncate-then-write) could
+/// expose a torn marker to a concurrent reader; rename is atomic on POSIX.
+fn write_marker_atomic(marker: &Path, body: &str) -> Result<()> {
+    let tmp = marker.with_extension(format!("tmp.{}", std::process::id()));
+    std::fs::write(&tmp, body)
+        .with_context(|| format!("writing marker temp {}", tmp.display()))?;
+    std::fs::rename(&tmp, marker).with_context(|| {
+        format!("renaming marker {} -> {}", tmp.display(), marker.display())
+    })
+}
+
 /// Install (or no-op) the bundle described by `lock_path` into `prefix`.
 pub async fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
     let (raw, lock) = read_validated_lock(lock_path)?;
 
     let share = prefix.join("share").join("retread");
-
-    // Serialize concurrent installs into the same prefix. The self-heal
-    // activate.d guard runs `retread install` on activation, so parallel
-    // `pixi run`s can race two uv installs into one env. Hold an advisory
-    // exclusive lock for the whole run; a second waiter then sees the marker
-    // already current and no-ops. Best-effort: if the lock can't be taken we
-    // proceed unlocked rather than block the repair.
     std::fs::create_dir_all(&share).ok();
+
+    let marker = share.join(lock.marker_name());
+    let want = lock_digest(&raw);
+
+    // ── Lock-free fast path ──────────────────────────────────────────────
+    // The self-heal activate.d guard runs `retread install` on EVERY
+    // activation, so parallel `pixi run`s into a healthy env used to
+    // serialize on an exclusive install lock just to read the marker and
+    // no-op. The check below is read-only (marker read + payload/audit
+    // verification), and marker writes are atomic temp+rename, so a
+    // lock-free reader sees either the old or the new marker, never a
+    // torn one. Any mismatch (including a race with an in-flight writer)
+    // just falls through to the locked slow path, which re-evaluates.
+    if marker_matches(&marker, &want) && verify_payload_installed(&lock, prefix).is_ok() {
+        let marker_text = std::fs::read_to_string(&marker).unwrap_or_default();
+        if crate::glibc::verify_marker_state(&lock, prefix, &marker_text).is_ok() {
+            let msg = format!("retread install: {} already current; skipping", lock.bundle);
+            eprintln!("{msg}");
+            crate::status::phase(
+                lock_path.parent().unwrap_or(std::path::Path::new(".")),
+                &lock.bundle,
+                &msg,
+            );
+            return Ok(());
+        }
+    }
+
+    // ── Locked slow path: repair or install is (probably) needed ────────
+    // Concurrency semantics for two concurrent activations of the SAME
+    // prefix + bundle: the second WAITS here on the per-bundle advisory
+    // exclusive lock while the first installs, then re-evaluates the
+    // marker below (double-checked locking) and NO-OPS via the "already
+    // current" branch. The lock is per-bundle, so different bundles
+    // installing into the same prefix don't serialize on it; their uv
+    // invocations are serialized separately by the per-prefix uv guard
+    // taken just before spawning uv. Best-effort: if the lock can't be
+    // taken we proceed unlocked rather than block the repair.
     let _install_lock = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -701,9 +744,6 @@ pub async fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
             let _ = fs4::fs_std::FileExt::lock_exclusive(f);
         })
         .ok();
-
-    let marker = share.join(lock.marker_name());
-    let want = lock_digest(&raw);
     let marker_current = marker_matches(&marker, &want);
     let mut force_reinstall = !marker_current;
     if marker_current {
@@ -742,8 +782,7 @@ pub async fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
                             previous_relaxed,
                             previous_declaration,
                         )?;
-                        std::fs::write(&marker, crate::glibc::marker_body(&want, &audit)?)
-                            .with_context(|| format!("writing marker {}", marker.display()))?;
+                        write_marker_atomic(&marker, &crate::glibc::marker_body(&want, &audit)?)?;
                         let _ = std::fs::remove_file(share.join(format!("{}.broken", lock.bundle)));
                         let msg = format!("retread install: {} audit refreshed", lock.bundle);
                         eprintln!("{msg}");
@@ -814,6 +853,24 @@ pub async fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
         &install_msg,
     );
 
+    // Per-PREFIX uv guard: the per-bundle install lock above only
+    // serializes same-bundle installs, so two DIFFERENT bundles can reach
+    // here concurrently for one prefix. uv mutates shared site-packages
+    // state (RECORD files, console scripts, overlapping dist-infos)
+    // non-transactionally, so serialize the uv invocation (and the
+    // verify/audit that reads the freshly installed payload -- the guard
+    // is held until this function returns). Best-effort, like the
+    // install lock.
+    let _uv_guard = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(share.join(".uv.install.lock"))
+        .inspect(|f| {
+            let _ = fs4::fs_std::FileExt::lock_exclusive(f);
+        })
+        .ok();
+
     let status = Command::new(&uv)
         .args(&args)
         .status()
@@ -875,8 +932,7 @@ pub async fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
         declaration_source,
     )?;
     std::fs::create_dir_all(&share).ok();
-    std::fs::write(&marker, crate::glibc::marker_body(&want, &audit)?)
-        .with_context(|| format!("writing marker {}", marker.display()))?;
+    write_marker_atomic(&marker, &crate::glibc::marker_body(&want, &audit)?)?;
     let _ = std::fs::remove_file(share.join(format!("{}.broken", lock.bundle)));
     let done_msg = format!("retread install: {} installed", lock.bundle);
     eprintln!("{done_msg}");
@@ -934,6 +990,28 @@ mod tests {
             conda_capable: vec![],
             entry_specs: vec![],
         }
+    }
+
+    #[test]
+    fn write_marker_atomic_replaces_and_leaves_no_temp() {
+        let dir = std::env::temp_dir().join(format!(
+            "retread-marker-atomic-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("retread-test.installed");
+        write_marker_atomic(&marker, "first\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "first\n");
+        write_marker_atomic(&marker, "second\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "second\n");
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "stray marker temps: {leftovers:?}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     fn marker_with_audit(digest: &str) -> String {
