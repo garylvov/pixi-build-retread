@@ -552,6 +552,7 @@ async fn run_capturing_uv(args: &[&str]) -> Result<()> {
     for arg in args {
         cmd.arg(arg);
     }
+    crate::fasttmp::apply_backend_env(&mut cmd);
     let output = cmd
         .env("UV_PYTHON_DOWNLOADS", "automatic")
         .stdin(Stdio::null())

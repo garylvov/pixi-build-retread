@@ -223,6 +223,12 @@ fn workspace_manifest_mtime(
 fn ensure_pixi_bld_symlink_target(
     workspace_dir: Option<&std::path::Path>,
 ) -> Result<(), RpcError> {
+    if crate::fasttmp::in_slurm_job() {
+        tracing::info!(
+            "retread fast-tmp: SLURM job context; not repairing shared workspace .pixi/bld symlink"
+        );
+        return Ok(());
+    }
     let Some(workspace_dir) = pixi_workspace_dir(workspace_dir) else {
         return Ok(());
     };
@@ -622,6 +628,16 @@ pub struct Handler {
     state: Arc<RwLock<State>>,
 }
 
+struct Snapshot {
+    config: RetreadConfig,
+    download_dir: PathBuf,
+    source_dir: PathBuf,
+    cache_dir: PathBuf,
+    workspace_dir: Option<PathBuf>,
+    fast_cfg: crate::fasttmp::FastTmpConfig,
+    fast_tmp: Option<crate::fasttmp::EngagedFastTmp>,
+}
+
 /// One wheel after full resolution: URL is concrete, metadata parsed.
 #[derive(Debug, Clone)]
 struct ResolvedWheel {
@@ -845,8 +861,15 @@ impl Handler {
         }
         // Fetched early (cheap: just clones handler state) so the DISK
         // cache below can be consulted before the expensive solve.
-        let (config, download_dir, source_dir, cache_dir, workspace_dir) =
-            self.snapshot(&params.work_directory).await?;
+        let Snapshot {
+            config,
+            download_dir,
+            source_dir,
+            cache_dir,
+            workspace_dir,
+            fast_cfg: _fast_cfg,
+            fast_tmp: _fast_tmp,
+        } = self.snapshot(&params.work_directory).await?;
         // v2.11.0: cross-PROCESS memo. CONDA_OUTPUTS_CACHE only dedupes
         // repeat conda/outputs calls served by the SAME retread process.
         // pixi solves separate top-level environments (e.g. `isaaclab-gpu`
@@ -2017,8 +2040,15 @@ impl Handler {
             "building '{}': materializing wheels, then rattler-build (slow on first build).",
             params.output.name.as_normalized()
         ));
-        let (config, download_dir, source_dir, cache_dir, workspace_dir) =
-            self.snapshot(&params.work_directory).await?;
+        let Snapshot {
+            config,
+            download_dir,
+            source_dir,
+            cache_dir,
+            workspace_dir,
+            fast_cfg,
+            fast_tmp,
+        } = self.snapshot(&params.work_directory).await?;
         // conda/build_v1 doesn't carry the variant set; the chosen variant
         // is encoded in params.output.variant. Look up `python` there;
         // fall back to the default if absent.
@@ -2075,6 +2105,26 @@ impl Handler {
             .output_directory
             .clone()
             .unwrap_or_else(|| params.work_directory.join("output"));
+        let stage_output_dir = fast_tmp.as_ref().and_then(|fast| {
+            let output_check = crate::fasttmp::fs_check_path(&output_dir);
+            crate::fasttmp::is_slow(&output_check, &fast_cfg).then(|| {
+                let output_token = params.output.name.as_normalized().to_string();
+                crate::fasttmp::stage_dir(
+                    &fast.ns,
+                    &output_token,
+                )
+            })
+        });
+        if let Some(stage) = &stage_output_dir {
+            tracing::info!(
+                final_output_dir = %output_dir.display(),
+                stage_output_dir = %stage.display(),
+                "retread fast-tmp: staging conda build output on fast tmp with verified copy-back"
+            );
+        }
+        let build_output_dir = stage_output_dir
+            .clone()
+            .unwrap_or_else(|| output_dir.clone());
         if config.courier {
             // Need workspace_manifest to compute the config fingerprint
             // identically to how build_one does it (channel set + workspace
@@ -2154,7 +2204,7 @@ impl Handler {
                         lock,
                         &config,
                         &params.work_directory,
-                        &output_dir,
+                        &build_output_dir,
                         params.output.subdir,
                         &source_dir,
                         &cache_dir,
@@ -2165,7 +2215,12 @@ impl Handler {
                     .await
                     {
                         Ok(Some(result)) => {
-                            return Ok(result);
+                            return finalize_fasttmp_build_output(
+                                result,
+                                stage_output_dir.as_deref(),
+                                &output_dir,
+                            )
+                            .await;
                         }
                         Ok(None) => {
                             // Provenance gap (class 3 / schema-5 class 2):
@@ -2227,7 +2282,7 @@ impl Handler {
                         &params.channels,
                         workspace_dir.as_deref(),
                         &params.work_directory,
-                        &output_dir,
+                        &build_output_dir,
                         params.output.subdir,
                         params.output.build.as_deref(),
                         &config_fp,
@@ -2239,7 +2294,12 @@ impl Handler {
                                 bundle = %bundle_name_for_hash,
                                 "incremental-add: localized resolve succeeded"
                             );
-                            return Ok(result);
+                            return finalize_fasttmp_build_output(
+                                result,
+                                stage_output_dir.as_deref(),
+                                &output_dir,
+                            )
+                            .await;
                         }
                         Ok(None) => {
                             tracing::debug!(
@@ -2321,12 +2381,12 @@ impl Handler {
             .as_ref()
             .map(|deps| deps.iter().map(|d| d.spec.to_string()).collect());
 
-        build_one(
+        let result = build_one(
             &bundle,
             &effective,
             &config,
             &params.work_directory,
-            &output_dir,
+            &build_output_dir,
             params.output.subdir,
             &python_version,
             &source_dir,
@@ -2335,34 +2395,91 @@ impl Handler {
             run_override.as_deref(),
         )
         .await
-        .map_err(|e| RpcError::internal(format!("build {}: {e:#}", bundle.conda_name)))
+        .map_err(|e| RpcError::internal(format!("build {}: {e:#}", bundle.conda_name)))?;
+        finalize_fasttmp_build_output(result, stage_output_dir.as_deref(), &output_dir).await
     }
 
     async fn snapshot(
         &self,
         work_dir: &Path,
-    ) -> Result<(RetreadConfig, PathBuf, PathBuf, PathBuf, Option<PathBuf>), RpcError> {
-        let state = self.state.read().await;
-        let config = state
-            .config
-            .clone()
-            .ok_or_else(|| RpcError::internal("initialize was not called"))?;
-        let cache_dir = state
-            .cache_dir
-            .clone()
-            .unwrap_or_else(|| work_dir.join("cache"));
-        let source_dir = state
-            .source_dir
-            .clone()
-            .unwrap_or_else(|| work_dir.to_path_buf());
+    ) -> Result<Snapshot, RpcError> {
+        let (config, state_cache_dir, source_dir, workspace_dir) = {
+            let state = self.state.read().await;
+            let config = state
+                .config
+                .clone()
+                .ok_or_else(|| RpcError::internal("initialize was not called"))?;
+            let source_dir = state
+                .source_dir
+                .clone()
+                .unwrap_or_else(|| work_dir.to_path_buf());
+            (
+                config,
+                state.cache_dir.clone(),
+                source_dir,
+                state.workspace_dir.clone(),
+            )
+        };
         // Materialized wheels (downloads, source-builds, and relaxed copies)
         // live inside the pack folder so they're visible alongside the
         // pack's pixi.toml instead of buried in pixi's opaque cache.
         // cache_dir remains the scratch root for git clones.
         let download_dir = source_dir.join("wheels");
-        let workspace_dir = state.workspace_dir.clone();
-        Ok((config, download_dir, source_dir, cache_dir, workspace_dir))
+        let workspace_root = workspace_dir
+            .as_deref()
+            .filter(|dir| dir.join("pixi.toml").is_file())
+            .unwrap_or(source_dir.as_path());
+        let fast_cfg = crate::fasttmp::FastTmpConfig::load(workspace_root);
+        let fast_tmp = crate::fasttmp::engage_backend(workspace_root, &fast_cfg)
+            .map_err(|e| RpcError::internal(format!("fast-tmp backend engage: {e:#}")))?;
+        let mut cache_dir = state_cache_dir
+            .clone()
+            .unwrap_or_else(|| work_dir.join("cache"));
+        if let Some(fast) = &fast_tmp {
+            let cache_check = crate::fasttmp::fs_check_path(&cache_dir);
+            if state_cache_dir.is_none() || crate::fasttmp::is_slow(&cache_check, &fast_cfg) {
+                cache_dir = fast.ns.retread_cache_dir();
+            }
+        }
+        Ok(Snapshot {
+            config,
+            download_dir,
+            source_dir,
+            cache_dir,
+            workspace_dir,
+            fast_cfg,
+            fast_tmp,
+        })
     }
+}
+
+async fn finalize_fasttmp_build_output(
+    mut result: CondaBuildV1Result,
+    stage_dir: Option<&Path>,
+    output_dir: &Path,
+) -> Result<CondaBuildV1Result, RpcError> {
+    let Some(stage_dir) = stage_dir else {
+        return Ok(result);
+    };
+    let stage = stage_dir.to_path_buf();
+    let final_output = output_dir.to_path_buf();
+    let returned_output_file = result.output_file.clone();
+    let final_file = tokio::task::spawn_blocking(move || {
+        crate::fasttmp::copy_back_artifacts(&stage, &final_output, &returned_output_file)
+    })
+    .await
+    .map_err(|e| RpcError::internal(format!("fast-tmp copy-back task panicked: {e}")))?
+    .map_err(|e| RpcError::internal(format!("fast-tmp copy-back: {e:#}")))?;
+
+    result.output_file = final_file;
+    if let Err(e) = tokio::fs::remove_dir_all(stage_dir).await {
+        tracing::warn!(
+            stage_dir = %stage_dir.display(),
+            error = %e,
+            "retread fast-tmp: failed to remove staged output dir after successful copy-back"
+        );
+    }
+    Ok(result)
 }
 
 /// Pick the Python versions to fan outputs over. Precedence:
@@ -5735,6 +5852,7 @@ async fn materialize_and_pack(
         .arg("--compression-threads")
         .arg(&compression_threads)
         .arg("--no-test");
+    crate::fasttmp::apply_backend_env(&mut cmd);
     if let Some(level) = config.compression_level {
         cmd.arg("--package-format").arg(format!("conda:{level}"));
     }
@@ -6498,6 +6616,7 @@ async fn build_one(
         .arg("--compression-threads")
         .arg(&compression_threads)
         .arg("--no-test");
+    crate::fasttmp::apply_backend_env(&mut cmd);
     // v1.5.8: user-tunable zstd level (retread-compression-level).
     // Unset keeps rattler-build's default.
     if let Some(level) = config.compression_level {
