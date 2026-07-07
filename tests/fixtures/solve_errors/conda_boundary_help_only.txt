@@ -1,0 +1,3 @@
+failed to solve pypi dependencies
+help: numpy is pinned by the conda solve
+      numpy==1.26.4

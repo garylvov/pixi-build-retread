@@ -1,0 +1,4 @@
+failed to solve pypi dependencies
+help: torch is pinned by the conda solve
+      torch==2.7.1
+we know from (1) that another pypi package needs the same candidate

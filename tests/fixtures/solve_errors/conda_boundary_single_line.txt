@@ -1,0 +1,4 @@
+failed to solve pypi dependencies
+help: some package is pinned by the conda solve and cannot be changed:
+      numpy==1.26.4
+because isaacsim-core depends on numpy==2.3.1 and numpy==1.26.4

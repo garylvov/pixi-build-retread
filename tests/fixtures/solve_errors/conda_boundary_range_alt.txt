@@ -1,0 +1,4 @@
+failed to solve pypi dependencies
+help: foo is pinned by the conda solve
+      foo==2.9.0
+foo > 2.10.3 is needed by bar

@@ -1,0 +1,4 @@
+failed to solve pypi dependencies
+help: mujoco is pinned by the conda solve
+      mujoco==3.5.0
+depends on mujoco >= 3.10.3

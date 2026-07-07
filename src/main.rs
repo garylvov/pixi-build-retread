@@ -4,7 +4,7 @@
 //! Speaks line-delimited JSON-RPC 2.0 over stdin/stdout, per the pixi build
 //! protocol (`crates/pixi_build_types`, API version 4).
 
-use pixi_build_retread::{handler, installer, rpc};
+use pixi_build_retread::{handler, installer, rpc, solve};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -17,8 +17,16 @@ async fn main() -> anyhow::Result<()> {
     // `retread verify` is the cheap activate.d guard: marker + installed
     // distribution metadata only, no network or mutation.
     let argv: Vec<String> = std::env::args().collect();
-    if matches!(argv.get(1).map(String::as_str), Some("install" | "verify")) {
+    if matches!(
+        argv.get(1).map(String::as_str),
+        Some("install" | "verify" | "solve")
+    ) {
         let cmd = argv[1].as_str();
+        if cmd == "solve" {
+            let args = solve::args::parse(&argv[2..])?;
+            let code = solve::run(args).await?;
+            std::process::exit(code);
+        }
         let mut lock: Option<String> = None;
         let mut prefix: Option<String> = None;
         let mut it = argv[2..].iter();

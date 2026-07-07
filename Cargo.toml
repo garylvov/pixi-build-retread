@@ -36,7 +36,7 @@ ordermap = { version = "1.0.0", features = ["serde"] }
 
 # Async runtime. JSON-RPC 2.0 is hand-framed over line-delimited stdio (matches
 # pixi's transport in crates/pixi_build_frontend/src/jsonrpc/stdio.rs).
-tokio = { version = "1.43.0", features = ["macros", "rt-multi-thread", "io-std", "io-util", "sync", "fs", "process"] }
+tokio = { version = "1.43.0", features = ["macros", "rt-multi-thread", "io-std", "io-util", "sync", "fs", "process", "signal", "time"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 futures = "0.3"
 # Cross-process advisory file locks. Already pulled in transitively via
@@ -91,6 +91,7 @@ zstd = "0.13"
 # its `[dependencies]` pins in the cascade's last-resort step (instead
 # of emitting `*`). Best-effort lookup; falls back to `*` if missing.
 toml = "0.8"
+toml_edit = "0.22"
 
 [profile.release]
 lto = "thin"

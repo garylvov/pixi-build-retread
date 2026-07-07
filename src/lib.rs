@@ -17,6 +17,7 @@ pub mod recipe;
 pub mod relax;
 pub mod repodata;
 pub mod rpc;
+pub mod solve;
 pub mod solve_check;
 pub mod source_build;
 pub mod status;
