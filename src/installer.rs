@@ -331,6 +331,14 @@ fn record_path_token(line: &str) -> Option<String> {
     }
 }
 
+fn is_pycache_pyc_entry(token: &str) -> bool {
+    token.ends_with(".pyc")
+        && token
+            .rsplit('/')
+            .nth(1)
+            .is_some_and(|dir| dir == "__pycache__")
+}
+
 fn verify_record_payload(site_packages: &Path, dist_root: &Path) -> Result<()> {
     if !dist_root
         .file_name()
@@ -351,6 +359,12 @@ fn verify_record_payload(site_packages: &Path, dist_root: &Path) -> Result<()> {
         let Some(token) = record_path_token(line) else {
             continue;
         };
+        // Byte-compiled artifacts are interpreter-version-specific and
+        // regenerated at runtime; a RECORD produced under a different Python
+        // minor version references .pyc files with the wrong cpython tag.
+        if is_pycache_pyc_entry(&token) {
+            continue;
+        }
         let path = site_packages.join(token);
         if !path.exists() {
             bail!(
@@ -1412,6 +1426,67 @@ mod tests {
 
         verify(&lock_path, &prefix, false).expect("matching marker plus metadata should verify");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    // A wheel built under Python 3.10 ships a RECORD referencing
+    // __pycache__/*.cpython-310.pyc; under a 3.12 interpreter those files are
+    // never materialized (3.12 writes cpython-312.pyc instead). Verification
+    // must skip pyc RECORD entries rather than flag the install as broken.
+    #[test]
+    fn verify_ignores_stale_pycache_pyc_record_entries() {
+        let root = tempdir("verify-pyc");
+        let prefix = root.join("prefix");
+        let share = prefix.join("share").join("retread");
+        std::fs::create_dir_all(&share).unwrap();
+
+        let mut lock = make_lock(vec![], vec![PUBLIC_PYPI.into()], BTreeMap::new());
+        lock.python = "3.12".into();
+        let raw = serde_json::to_vec(&lock).unwrap();
+        let lock_path = share.join(lock.marker_name().replace(".installed", ".lock.json"));
+        std::fs::write(&lock_path, &raw).unwrap();
+        std::fs::write(share.join(lock.marker_name()), marker_with_audit(&lock_digest(&raw))).unwrap();
+
+        let site_packages = site_packages_dir(&prefix, &lock.python);
+        let dist_info = site_packages.join("mypackage-1.0.0.dist-info");
+        std::fs::create_dir_all(&dist_info).unwrap();
+        std::fs::write(
+            dist_info.join("METADATA"),
+            "Metadata-Version: 2.1\nName: MyPackage\nVersion: 1.0.0\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(site_packages.join("mypackage")).unwrap();
+        std::fs::write(site_packages.join("mypackage/__init__.py"), "").unwrap();
+        // RECORD lists a 3.10 pyc that does not (and will never) exist here.
+        std::fs::write(
+            dist_info.join("RECORD"),
+            "mypackage/__init__.py,,\n\
+             mypackage/__pycache__/__init__.cpython-310.pyc,,\n\
+             mypackage-1.0.0.dist-info/METADATA,,\n\
+             mypackage-1.0.0.dist-info/RECORD,,\n",
+        )
+        .unwrap();
+
+        verify(&lock_path, &prefix, false)
+            .expect("stale interpreter-specific pyc RECORD entries must not fail verify");
+
+        // A missing real (non-pyc) file must still fail.
+        std::fs::remove_file(site_packages.join("mypackage/__init__.py")).unwrap();
+        let err = verify(&lock_path, &prefix, false)
+            .expect_err("missing real payload file must still fail verify");
+        assert!(format!("{err:#}").contains("__init__.py"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pycache_pyc_entry_detection() {
+        assert!(is_pycache_pyc_entry(
+            "aiobotocore/__pycache__/__init__.cpython-310.pyc"
+        ));
+        assert!(is_pycache_pyc_entry("__pycache__/mod.cpython-312.pyc"));
+        // Not in a __pycache__ dir, or not a .pyc: must still be checked.
+        assert!(!is_pycache_pyc_entry("pkg/module.pyc"));
+        assert!(!is_pycache_pyc_entry("pkg/__pycache__/data.txt"));
+        assert!(!is_pycache_pyc_entry("pkg/__init__.py"));
     }
 
     #[test]
