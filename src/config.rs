@@ -235,6 +235,30 @@ pub struct RetreadConfig {
     /// The bare name `python` is also accepted as a legacy alias.
     #[serde(default, rename = "retread-python", alias = "python")]
     pub python: Option<PythonSpec>,
+
+    /// v4.0.0-pre (spec-uv-restructure M1): which engine computes the
+    /// bundle's wheel closure.
+    ///
+    /// - `"legacy"` (default): the in-backend cascade/resolvo mirror-solver.
+    /// - `"uv"`: synthesize an ephemeral uv project (conda pins become
+    ///   `constraint-dependencies` with provenance), `uv lock` + `uv export
+    ///   --format pylock.toml`, and pin the legacy materialization to uv's
+    ///   picks. Requires `uv` on PATH (override with `$RETREAD_UV`).
+    ///   Only closure computation changes; packaging/courier/lock-write
+    ///   downstream are unchanged.
+    #[serde(default, rename = "retread-resolver", alias = "resolver")]
+    pub resolver: ResolverKind,
+}
+
+/// Engine selection for closure computation (`retread-resolver`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResolverKind {
+    /// The historical cascade/resolvo mirror-solver (default).
+    #[default]
+    Legacy,
+    /// uv-subprocess closure computation (spec-uv-restructure.md).
+    Uv,
 }
 
 /// `retread-blueprint` accepts `false` (off), `true` (blueprint +

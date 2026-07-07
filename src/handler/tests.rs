@@ -416,6 +416,7 @@ fn pythons_for_rejects_bare_major_variant() {
         vec![VariantValue::String("3".to_string())],
     );
     let cfg = RetreadConfig {
+        resolver: Default::default(),
         retread_wheels: BTreeMap::new(),
         relax: RelaxPolicy::Minor,
         overrides: BTreeMap::new(),
@@ -453,6 +454,7 @@ fn pythons_for_accepts_dotted_variant() {
         vec![VariantValue::String("3.11".to_string())],
     );
     let cfg = RetreadConfig {
+        resolver: Default::default(),
         retread_wheels: BTreeMap::new(),
         relax: RelaxPolicy::Minor,
         overrides: BTreeMap::new(),
@@ -490,6 +492,7 @@ fn pythons_for_filters_bare_major_keeps_dotted() {
         ],
     );
     let cfg = RetreadConfig {
+        resolver: Default::default(),
         retread_wheels: BTreeMap::new(),
         relax: RelaxPolicy::Minor,
         overrides: BTreeMap::new(),
@@ -574,6 +577,7 @@ fn courier_pure_python_bundle_is_platform_specific_not_noarch() {
     };
 
     let courier_cfg = RetreadConfig {
+        resolver: Default::default(),
         courier: true,
         ..cfg()
     };
@@ -897,6 +901,7 @@ fn refinement_loop_never_widens_python_even_if_verdict_says_so() {
 
 fn cfg() -> RetreadConfig {
     RetreadConfig {
+        resolver: Default::default(),
         retread_wheels: BTreeMap::new(),
         relax: RelaxPolicy::Minor,
         overrides: BTreeMap::new(),

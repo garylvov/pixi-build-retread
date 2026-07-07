@@ -591,7 +591,7 @@ fn pick_best(mut candidates: Vec<ResolvedWheel>, target: &WheelTarget) -> Option
 
 /// Returns a non-negative score for a compatible wheel, -1 otherwise.
 /// Larger means "more preferred" for this target.
-fn score_wheel(filename: &str, target: &WheelTarget) -> i64 {
+pub(crate) fn score_wheel(filename: &str, target: &WheelTarget) -> i64 {
     let parts = match parse_wheel_tags(filename) {
         Some(t) => t,
         None => return -1,
