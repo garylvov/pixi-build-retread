@@ -349,7 +349,7 @@ async fn run_pixi_install(project_dir: &Path, env: Option<&str>) -> std::result:
         cmd.arg("-e").arg(env);
     }
     cmd.arg("--color=never")
-        .cwd(project_dir)
+        .current_dir(project_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -410,7 +410,7 @@ async fn run_pixi_install(project_dir: &Path, env: Option<&str>) -> std::result:
 async fn pixi_version(project_dir: &Path) -> Option<String> {
     let out = Command::new("pixi")
         .arg("--version")
-        .cwd(project_dir)
+        .current_dir(project_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

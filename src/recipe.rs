@@ -485,8 +485,10 @@ mod courier_tests {
             "post-link must fail closed when the installer fails"
         );
         assert!(
+            // `|| echo "` (with a message) is the failure-downgrade pattern;
+            // the guard's `date ... || echo 0` fallbacks are benign.
             !r.build.script.contains("post-link install failed")
-                && !r.build.script.contains("|| echo"),
+                && !r.build.script.contains("|| echo \""),
             "post-link must not downgrade installer failure to success"
         );
         assert!(

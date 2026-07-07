@@ -8963,6 +8963,8 @@ version = "1.0.0"
         // file:// URL that won't be fetched until courier::stage, which we
         // don't reach — we return Ok(None) before that).
         let lock = crate::lock::RetreadLock {
+            shadow_libs: std::collections::BTreeMap::new(),
+            declared_glibc: None,
             schema: SCHEMA,
             retread_version: "2.5.0".into(),
             bundle: "interleaved-pack".into(),

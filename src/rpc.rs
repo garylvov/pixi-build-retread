@@ -21,6 +21,7 @@ pub const METHOD_NOT_FOUND: i32 = -32601;
 pub const INVALID_PARAMS: i32 = -32602;
 pub const INTERNAL_ERROR: i32 = -32603;
 
+#[derive(Debug)]
 pub struct RpcError {
     pub code: i32,
     pub message: String,

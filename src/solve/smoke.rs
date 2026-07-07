@@ -36,7 +36,7 @@ pub async fn run_smoke(project_dir: &Path, env: Option<&str>, modules: &[String]
         .arg("python")
         .arg("-c")
         .arg(code)
-        .cwd(project_dir)
+        .current_dir(project_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
