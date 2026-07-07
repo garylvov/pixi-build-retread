@@ -5,10 +5,11 @@
 //! Reads the committed lock and installs the bundle's PyPI wheels into the
 //! active conda env via uv (fast hardlink), resolving the root
 //! requirements against the shipped find-links wheels + the recorded index
-//! chain, into the conda env so shared transitives stay conda-provided.
+//! chain while constraining every locked wheel to its exact recorded version,
+//! into the conda env so shared transitives stay conda-provided.
 //! Idempotent: a content-hash marker makes a re-link a no-op.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -70,6 +71,32 @@ pub(crate) fn conda_deps_to_constraints(deps: &[crate::lock::CondaDep]) -> Strin
         out.push('\n');
     }
     out
+}
+
+/// Build a uv constraints-file body from the lock's payload wheels. This is the
+/// courier replay contract: every PyPI wheel selected at lock-produce time is
+/// replayed as an exact `name==version` resolver pin, so uv may fetch/build the
+/// wheel bytes but may not fresh-resolve to a newer compatible release.
+pub(crate) fn lock_wheels_to_constraints(wheels: &[crate::lock::LockWheel]) -> Result<String> {
+    let mut lines = BTreeSet::new();
+    for wheel in wheels {
+        let name = wheel.name.trim();
+        let version = wheel.version.trim();
+        if name.is_empty() || version.is_empty() {
+            bail!(
+                "retread lock contains a wheel with an empty name or version: {}",
+                wheel.filename
+            );
+        }
+        lines.insert(format!("{name}=={version}"));
+    }
+
+    let mut out = String::new();
+    for line in lines {
+        out.push_str(&line);
+        out.push('\n');
+    }
+    Ok(out)
 }
 
 /// True if uv's output shows a wheel rejected purely for an unsatisfied
@@ -460,15 +487,18 @@ pub fn verify(lock_path: &Path, prefix: &Path, full: bool) -> Result<()> {
 
 /// Build the `uv pip install` argument list (pure; no I/O, no spawn; no
 /// argv[0]). S1: a `--constraints` file bounds conda-provided transitives to
-/// conda's range. S3: `lock.index_urls` is replayed verbatim (first = primary
-/// `--index-url`, rest `--extra-index-url`; public PyPI only as the empty
-/// fallback) so the backend's recorded resolution priority is preserved.
+/// conda's range. Replay: a second constraints file pins every locked payload
+/// wheel to its exact locked version. S3: `lock.index_urls` is replayed verbatim
+/// (first = primary `--index-url`, rest `--extra-index-url`; public PyPI only as
+/// the empty fallback) so the backend's recorded resolution priority is
+/// preserved.
 pub(crate) fn build_uv_args(
     lock: &RetreadLock,
     prefix: &Path,
     wheels_dir: Option<&Path>,
     overrides_file: Option<&Path>,
     constraints_file: Option<&Path>,
+    lock_pins_file: Option<&Path>,
     excludes_file: Option<&Path>,
     python_platform: Option<&str>,
 ) -> Vec<OsString> {
@@ -528,6 +558,15 @@ pub(crate) fn build_uv_args(
     // constraints file, so uv's closure can't pick a PyPI wheel outside what
     // conda installs (the torchaudio>=2.7,<3 vs 2.11 skew). Written by run().
     if let Some(c) = constraints_file {
+        args.push("--constraints".into());
+        args.push(c.into());
+    }
+
+    // Replay pins: exact versions for every wheel recorded in the lock. This is
+    // deliberately separate from the conda constraints file so range constraints
+    // for conda-provided packages and exact payload pins can be inspected
+    // independently while uv applies both.
+    if let Some(c) = lock_pins_file {
         args.push("--constraints".into());
         args.push(c.into());
     }
@@ -704,6 +743,20 @@ pub fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
         None
     };
 
+    // Replay constraints file: exact pins for every payload wheel in the lock.
+    // Root requirements still drive the closure, but these pins make the lock a
+    // hard replay contract instead of a fresh resolve against live indexes.
+    let lock_pin_path = share.join(format!("{}.lock-pins.constraints.txt", lock.bundle));
+    let lock_pins_body = lock_wheels_to_constraints(&lock.wheels)?;
+    let lock_pins_file = if !lock_pins_body.is_empty() {
+        std::fs::create_dir_all(&share).ok();
+        std::fs::write(&lock_pin_path, &lock_pins_body)
+            .with_context(|| format!("writing {}", lock_pin_path.display()))?;
+        Some(lock_pin_path.as_path())
+    } else {
+        None
+    };
+
     // Exclude the conda-populated set from uv's resolution (see build_uv_args).
     // Source = uv's OWN view of the prefix, so names match the resolver and
     // every packaging shape is covered. Subtract the bundle's own payload (the
@@ -767,6 +820,7 @@ pub fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
         wheels_dir_opt,
         overrides_file,
         constraints_file,
+        lock_pins_file,
         excludes_file,
         None,
     );
@@ -803,6 +857,7 @@ pub fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
                     wheels_dir_opt,
                     overrides_file,
                     constraints_file,
+                    lock_pins_file,
                     excludes_file,
                     Some(&outcome.platform),
                 );
@@ -869,6 +924,22 @@ mod tests {
     use super::*;
     use crate::lock::{CondaDep, LockWheel, Origin};
 
+    fn lock_wheel(name: &str, version: &str) -> LockWheel {
+        LockWheel {
+            name: name.into(),
+            version: version.into(),
+            origin: Origin::Built,
+            filename: format!("{}-{version}-py3-none-any.whl", name.replace('-', "_")),
+            url: None,
+            sha256: None,
+            requires_dist: vec![],
+            must_ship: true,
+            upstream_url: None,
+            git_source: None,
+            sdist_source: None,
+        }
+    }
+
     fn make_lock(
         conda_run_deps: Vec<CondaDep>,
         index_urls: Vec<String>,
@@ -882,19 +953,7 @@ mod tests {
             python: "3.11".into(),
             inputs_hash: "abc".into(),
             root_requirements: vec!["mypackage==1.0.0".into()],
-            wheels: vec![LockWheel {
-                name: "mypackage".into(),
-                version: "1.0.0".into(),
-                origin: Origin::Built,
-                filename: "mypackage-1.0.0-py3-none-any.whl".into(),
-                url: None,
-                sha256: None,
-                requires_dist: vec![],
-                must_ship: true,
-                upstream_url: None,
-                git_source: None,
-                sdist_source: None,
-            }],
+            wheels: vec![lock_wheel("mypackage", "1.0.0")],
             conda_run_deps,
             index_urls,
             prerelease,
@@ -977,7 +1036,16 @@ mod tests {
         let lock = make_lock(deps, vec![PUBLIC_PYPI.into()], BTreeMap::new());
         let prefix = PathBuf::from("/fake/prefix");
         let con = PathBuf::from("/fake/prefix/share/retread/test-bundle.constraints.txt");
-        let args = build_uv_args(&lock, &prefix, None, None, Some(con.as_path()), None, None);
+        let args = build_uv_args(
+            &lock,
+            &prefix,
+            None,
+            None,
+            Some(con.as_path()),
+            None,
+            None,
+            None,
+        );
         let strs = argv_strings(&args);
         assert_eq!(
             flag_values(&strs, "--constraints"),
@@ -987,12 +1055,68 @@ mod tests {
         assert!(!strs.iter().any(|s| s == "--no-install-package"));
     }
 
+    #[test]
+    fn locked_wheels_constraints_pin_every_locked_wheel_exactly() {
+        let mut lock = make_lock(vec![], vec![PUBLIC_PYPI.into()], BTreeMap::new());
+        lock.wheels
+            .push(lock_wheel("omniverseclient", "2.71.1.7015"));
+        lock.wheels.push(lock_wheel("pytz", "2024.1"));
+
+        let body = lock_wheels_to_constraints(&lock.wheels).unwrap();
+        let lines: Vec<_> = body.lines().collect();
+        assert_eq!(
+            lines,
+            vec![
+                "mypackage==1.0.0",
+                "omniverseclient==2.71.1.7015",
+                "pytz==2024.1",
+            ]
+        );
+    }
+
+    #[test]
+    fn relaxed_retry_args_preserve_lock_pin_constraints_file() {
+        let lock = make_lock(vec![], vec![PUBLIC_PYPI.into()], BTreeMap::new());
+        let prefix = PathBuf::from("/fake/prefix");
+        let con = PathBuf::from("/fake/prefix/share/retread/test-bundle.constraints.txt");
+        let pins =
+            PathBuf::from("/fake/prefix/share/retread/test-bundle.lock-pins.constraints.txt");
+        let exc = PathBuf::from("/fake/prefix/share/retread/test-bundle.excludes.txt");
+        let args = build_uv_args(
+            &lock,
+            &prefix,
+            None,
+            None,
+            Some(con.as_path()),
+            Some(pins.as_path()),
+            Some(exc.as_path()),
+            Some("x86_64-manylinux_2_35"),
+        );
+        let strs = argv_strings(&args);
+
+        assert_eq!(
+            flag_values(&strs, "--constraints"),
+            vec![
+                con.to_string_lossy().into_owned(),
+                pins.to_string_lossy().into_owned(),
+            ]
+        );
+        assert_eq!(
+            flag_values(&strs, "--python-platform"),
+            vec!["x86_64-manylinux_2_35".to_string()]
+        );
+        assert_eq!(
+            flag_values(&strs, "--excludes"),
+            vec![exc.to_string_lossy().into_owned()]
+        );
+    }
+
     // S1: no constraints file -> no --constraints flag.
     #[test]
     fn s1_no_constraints_no_flag() {
         let lock = make_lock(vec![], vec![PUBLIC_PYPI.into()], BTreeMap::new());
         let prefix = PathBuf::from("/fake/prefix");
-        let args = build_uv_args(&lock, &prefix, None, None, None, None, None);
+        let args = build_uv_args(&lock, &prefix, None, None, None, None, None, None);
         let strs = argv_strings(&args);
         assert!(!strs.contains(&"--constraints".to_string()));
     }
@@ -1004,14 +1128,23 @@ mod tests {
         let lock = make_lock(vec![], vec![PUBLIC_PYPI.into()], BTreeMap::new());
         let prefix = PathBuf::from("/fake/prefix");
         let exc = PathBuf::from("/fake/prefix/share/retread/test-bundle.excludes.txt");
-        let args = build_uv_args(&lock, &prefix, None, None, None, Some(exc.as_path()), None);
+        let args = build_uv_args(
+            &lock,
+            &prefix,
+            None,
+            None,
+            None,
+            None,
+            Some(exc.as_path()),
+            None,
+        );
         let strs = argv_strings(&args);
         assert_eq!(
             flag_values(&strs, "--excludes"),
             vec![exc.to_string_lossy().into_owned()]
         );
         // absent when not provided.
-        let args = build_uv_args(&lock, &prefix, None, None, None, None, None);
+        let args = build_uv_args(&lock, &prefix, None, None, None, None, None, None);
         assert!(!argv_strings(&args).contains(&"--excludes".to_string()));
     }
 
@@ -1039,7 +1172,7 @@ mod tests {
             BTreeMap::new(),
         );
         let prefix = PathBuf::from("/fake/prefix");
-        let args = build_uv_args(&lock, &prefix, None, None, None, None, None);
+        let args = build_uv_args(&lock, &prefix, None, None, None, None, None, None);
         let strs = argv_strings(&args);
 
         let primary = flag_values(&strs, "--index-url");
@@ -1061,7 +1194,7 @@ mod tests {
             BTreeMap::new(),
         );
         let prefix = PathBuf::from("/fake/prefix");
-        let args = build_uv_args(&lock, &prefix, None, None, None, None, None);
+        let args = build_uv_args(&lock, &prefix, None, None, None, None, None, None);
         let strs = argv_strings(&args);
 
         let primary = flag_values(&strs, "--index-url");
@@ -1078,7 +1211,7 @@ mod tests {
     fn s3_empty_index_urls_fallback_to_public_pypi() {
         let lock = make_lock(vec![], vec![], BTreeMap::new());
         let prefix = PathBuf::from("/fake/prefix");
-        let args = build_uv_args(&lock, &prefix, None, None, None, None, None);
+        let args = build_uv_args(&lock, &prefix, None, None, None, None, None, None);
         let strs = argv_strings(&args);
 
         let primary = flag_values(&strs, "--index-url");
@@ -1101,7 +1234,16 @@ mod tests {
         let lock = make_lock(vec![], vec![PUBLIC_PYPI.into()], BTreeMap::new());
         let prefix = PathBuf::from("/fake/prefix");
         let ovr = PathBuf::from("/fake/prefix/share/retread/test-bundle.overrides.txt");
-        let args = build_uv_args(&lock, &prefix, None, Some(ovr.as_path()), None, None, None);
+        let args = build_uv_args(
+            &lock,
+            &prefix,
+            None,
+            Some(ovr.as_path()),
+            None,
+            None,
+            None,
+            None,
+        );
         let strs = argv_strings(&args);
         let ovr_vals = flag_values(&strs, "--overrides");
         assert_eq!(ovr_vals, vec![ovr.to_string_lossy().into_owned()]);
@@ -1112,7 +1254,7 @@ mod tests {
     fn root_requirements_in_argv() {
         let lock = make_lock(vec![], vec![PUBLIC_PYPI.into()], BTreeMap::new());
         let prefix = PathBuf::from("/fake/prefix");
-        let args = build_uv_args(&lock, &prefix, None, None, None, None, None);
+        let args = build_uv_args(&lock, &prefix, None, None, None, None, None, None);
         let strs = argv_strings(&args);
         assert!(
             strs.contains(&"mypackage==1.0.0".to_string()),
@@ -1133,6 +1275,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Some("x86_64-manylinux_2_35"),
         );
         let strs = argv_strings(&args);
@@ -1141,7 +1284,7 @@ mod tests {
             vec!["x86_64-manylinux_2_35".to_string()]
         );
         // absent when None -> uv's manylinux host gate is left untouched.
-        let args = build_uv_args(&lock, &prefix, None, None, None, None, None);
+        let args = build_uv_args(&lock, &prefix, None, None, None, None, None, None);
         assert!(!argv_strings(&args).contains(&"--python-platform".to_string()));
     }
 
@@ -1157,7 +1300,16 @@ mod tests {
             vec![PUBLIC_PYPI.into(), "https://pypi.nvidia.com".into()],
             BTreeMap::new(),
         );
-        let args = build_uv_args(&lock, &PathBuf::from("/fake/prefix"), None, None, None, None, None);
+        let args = build_uv_args(
+            &lock,
+            &PathBuf::from("/fake/prefix"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         let strs = argv_strings(&args);
         assert_eq!(
             flag_values(&strs, "--index-strategy"),
