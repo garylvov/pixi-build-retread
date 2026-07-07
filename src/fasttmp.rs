@@ -10,7 +10,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -20,6 +20,13 @@ use sha2::{Digest, Sha256};
 const DEFAULT_TMP_ROOT: &str = "/tmp";
 const DEFAULT_ESTIMATE_BYTES: u64 = 80 * 1024 * 1024 * 1024;
 const PROBE_THRESHOLD_MS: f64 = 5.0;
+/// Relative (to workspace root) default location of NFS-persisted env snapshots.
+const DEFAULT_PERSIST_DIR: &str = ".pixi/envs-persist";
+/// Hash file written alongside each snapshot; contains the sha256 hex of the
+/// workspace lock(s) the snapshot was built from.
+const ENV_HASH_FILE: &str = ".retread-env-hash";
+/// Cap on parallel copy workers (benchmarked sweet spot on NFS: ~60).
+const MAX_COPY_WORKERS: usize = 60;
 
 const FAST_ENV_KEYS: &[&str] = &[
     "PIXI_CACHE_DIR",
@@ -58,6 +65,11 @@ pub struct FastTmpConfig {
     pub budget_bytes: Option<u64>,
     pub blob_caches: BlobCacheMode,
     pub shared_cache_dir: Option<PathBuf>,
+    /// Where env snapshots persist on the shared/NFS side. Relative paths are
+    /// resolved against the workspace root. Default: `.pixi/envs-persist`.
+    pub persist_dir: Option<PathBuf>,
+    /// Worker count for parallel env copies. Default: min(60, 4*ncpu).
+    pub copy_workers: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -111,6 +123,8 @@ impl Default for FastTmpConfig {
             budget_bytes: None,
             blob_caches: BlobCacheMode::Shared,
             shared_cache_dir: None,
+            persist_dir: None,
+            copy_workers: None,
         }
     }
 }
@@ -150,6 +164,17 @@ impl FastTmpConfig {
         }
         if let Ok(shared) = std::env::var("RETREAD_SHARED_CACHE_DIR") {
             cfg.shared_cache_dir = Some(PathBuf::from(shared));
+        }
+        if let Ok(dir) = std::env::var("RETREAD_FAST_TMP_PERSIST_DIR") {
+            cfg.persist_dir = Some(PathBuf::from(dir));
+        }
+        if let Ok(workers) = std::env::var("RETREAD_FAST_TMP_COPY_WORKERS") {
+            match workers.trim().parse::<usize>() {
+                Ok(n) if n > 0 => cfg.copy_workers = Some(n),
+                _ => warn_msg(&format!(
+                    "retread fast-tmp: ignoring invalid RETREAD_FAST_TMP_COPY_WORKERS={workers:?}"
+                )),
+            }
         }
         cfg
     }
@@ -216,6 +241,29 @@ impl FastTmpConfig {
                 warn_msg(
                     "retread fast-tmp: ignoring invalid tool.retread.fast-tmp.shared-cache-dir",
                 );
+            }
+        }
+        if let Some(v) = table
+            .get("persist-dir")
+            .or_else(|| table.get("persist_dir"))
+        {
+            if let Some(s) = v.as_str() {
+                self.persist_dir = Some(PathBuf::from(s));
+            } else {
+                warn_msg("retread fast-tmp: ignoring invalid tool.retread.fast-tmp.persist-dir");
+            }
+        }
+        if let Some(v) = table
+            .get("copy-workers")
+            .or_else(|| table.get("copy_workers"))
+        {
+            match v.as_integer() {
+                Some(n) if n > 0 => self.copy_workers = Some(n as usize),
+                _ => {
+                    warn_msg(
+                        "retread fast-tmp: ignoring invalid tool.retread.fast-tmp.copy-workers",
+                    );
+                }
             }
         }
     }
@@ -812,8 +860,433 @@ pub fn check_env_eviction(workspace_root: &Path, ns: &Namespace) {
     }
 }
 
-pub fn run_frozen_install_if_slurm(workspace_root: &Path, env: &[(String, String)]) -> Result<()> {
+// ---------------------------------------------------------------------------
+// Env materialization fast path (parallel NFS copy) + persist-back.
+//
+// PREFIX IDENTITY INVARIANT: a snapshot under `envs-persist` was produced from
+// an env whose baked-in prefix (shebangs, activation scripts, conda-meta,
+// text-relocated paths) is the workspace's `<workspace>/.pixi/envs/<env>` NFS
+// path identity. Copying those bytes into the job-local namespace
+// (`ns.envs_dir()/<env>`) is only correct because the engage path points
+// `<workspace>/.pixi/envs` (a symlink) at `ns.envs_dir()` — i.e. the env is
+// always *reached through* the identical `<workspace>/.pixi/envs/<env>` path
+// on every node. Never hand out the raw job-tmp path as the env prefix, and
+// never materialize a snapshot somewhere that is not behind that symlink.
+// ---------------------------------------------------------------------------
+
+/// Stats from one parallel tree copy.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CopyStats {
+    pub files: u64,
+    pub bytes: u64,
+    pub dirs: u64,
+    pub symlinks: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntryKind {
+    File,
+    Symlink,
+}
+
+/// Resolved persist dir for this workspace (config or `.pixi/envs-persist`).
+pub fn persist_dir(cfg: &FastTmpConfig, workspace_root: &Path) -> PathBuf {
+    match &cfg.persist_dir {
+        Some(dir) if dir.is_absolute() => dir.clone(),
+        Some(dir) => workspace_root.join(dir),
+        None => workspace_root.join(DEFAULT_PERSIST_DIR),
+    }
+}
+
+/// Worker count: config wins, else min(60, 4*ncpu).
+pub fn effective_copy_workers(cfg: &FastTmpConfig) -> usize {
+    if let Some(n) = cfg.copy_workers {
+        return n.max(1);
+    }
+    let ncpu = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    MAX_COPY_WORKERS.min(4 * ncpu).max(1)
+}
+
+/// sha256 hex over the workspace lock(s) a snapshot is keyed by. Currently
+/// this is `pixi.lock`; if the retread lock format grows sibling lock files
+/// they must be hashed here too (sorted, concatenated) so snapshots invalidate.
+pub fn current_lock_hash(workspace_root: &Path) -> Option<String> {
+    let lock = workspace_root.join("pixi.lock");
+    let bytes = fs::read(&lock).ok()?;
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    Some(
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect(),
+    )
+}
+
+fn snapshot_hash(snapshot: &Path) -> Option<String> {
+    fs::read_to_string(snapshot.join(ENV_HASH_FILE))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Test hook: fail the copy of any entry whose relative path contains the
+/// value of RETREAD_FAST_TMP_COPY_FAIL_SUBSTR. Used to exercise the
+/// partial-failure fallback without real I/O errors.
+fn maybe_inject_copy_failure(rel: &Path) -> Result<()> {
+    if let Ok(needle) = std::env::var("RETREAD_FAST_TMP_COPY_FAIL_SUBSTR")
+        && !needle.is_empty()
+        && rel.to_string_lossy().contains(&needle)
+    {
+        bail!(
+            "retread fast-tmp: injected copy failure for {} (test hook)",
+            rel.display()
+        );
+    }
+    Ok(())
+}
+
+/// Copy `src` tree to `dst` with `workers` threads. Pre-creates the directory
+/// tree first (so workers never race on mkdir), then fans file/symlink copies
+/// out over a shared work queue. Permissions are preserved: `fs::copy` carries
+/// file modes, symlinks are recreated as symlinks (targets untouched), and
+/// directory modes are applied deepest-first after the file pass so read-only
+/// dirs cannot block their own population. On any worker error the copy stops
+/// and the error is returned; the caller owns cleanup of the partial `dst`.
+pub fn parallel_copy_tree(src: &Path, dst: &Path, workers: usize) -> Result<CopyStats> {
+    let mut dirs: Vec<(PathBuf, u32)> = Vec::new();
+    let mut entries: Vec<(PathBuf, EntryKind)> = Vec::new();
+    walk_tree(src, Path::new(""), &mut dirs, &mut entries)?;
+
+    fs::create_dir_all(dst).with_context(|| format!("creating {}", dst.display()))?;
+    for (rel, _mode) in &dirs {
+        let dir = dst.join(rel);
+        fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+
+    let next = AtomicUsize::new(0);
+    let bytes = AtomicU64::new(0);
+    let failed: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+    let workers = workers.max(1).min(entries.len().max(1));
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= entries.len() || failed.lock().unwrap().is_some() {
+                        break;
+                    }
+                    let (rel, kind) = &entries[i];
+                    match copy_entry(src, dst, rel, *kind) {
+                        Ok(copied) => {
+                            bytes.fetch_add(copied, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            let mut slot = failed.lock().unwrap();
+                            if slot.is_none() {
+                                *slot = Some(e);
+                            }
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    if let Some(e) = failed.into_inner().unwrap() {
+        return Err(e);
+    }
+
+    // Directory modes last, deepest-first (walk order is parent-before-child).
+    for (rel, mode) in dirs.iter().rev() {
+        set_mode(&dst.join(rel), *mode);
+    }
+
+    let (files, symlinks) = entries.iter().fold((0_u64, 0_u64), |(f, s), (_, k)| {
+        match k {
+            EntryKind::File => (f + 1, s),
+            EntryKind::Symlink => (f, s + 1),
+        }
+    });
+    Ok(CopyStats {
+        files,
+        bytes: bytes.into_inner(),
+        dirs: dirs.len() as u64,
+        symlinks,
+    })
+}
+
+fn walk_tree(
+    root: &Path,
+    rel: &Path,
+    dirs: &mut Vec<(PathBuf, u32)>,
+    entries: &mut Vec<(PathBuf, EntryKind)>,
+) -> Result<()> {
+    let abs = root.join(rel);
+    for entry in fs::read_dir(&abs).with_context(|| format!("reading {}", abs.display()))? {
+        let entry = entry.with_context(|| format!("reading entry in {}", abs.display()))?;
+        let child_rel = rel.join(entry.file_name());
+        let ft = entry
+            .file_type()
+            .with_context(|| format!("file type of {}", entry.path().display()))?;
+        if ft.is_symlink() {
+            entries.push((child_rel, EntryKind::Symlink));
+        } else if ft.is_dir() {
+            let mode = entry.metadata().map(unix_mode).unwrap_or(0o755);
+            dirs.push((child_rel.clone(), mode));
+            walk_tree(root, &child_rel, dirs, entries)?;
+        } else {
+            entries.push((child_rel, EntryKind::File));
+        }
+    }
+    Ok(())
+}
+
+fn copy_entry(src: &Path, dst: &Path, rel: &Path, kind: EntryKind) -> Result<u64> {
+    maybe_inject_copy_failure(rel)?;
+    let from = src.join(rel);
+    let to = dst.join(rel);
+    match kind {
+        EntryKind::Symlink => {
+            let target = fs::read_link(&from)
+                .with_context(|| format!("reading symlink {}", from.display()))?;
+            if fs::symlink_metadata(&to).is_ok() {
+                fs::remove_file(&to)
+                    .with_context(|| format!("removing stale {}", to.display()))?;
+            }
+            make_symlink(&target, &to)?;
+            Ok(0)
+        }
+        EntryKind::File => fs::copy(&from, &to)
+            .with_context(|| format!("copying {} -> {}", from.display(), to.display())),
+    }
+}
+
+#[cfg(unix)]
+fn make_symlink(target: &Path, link: &Path) -> Result<()> {
+    std::os::unix::fs::symlink(target, link).with_context(|| {
+        format!("creating symlink {} -> {}", link.display(), target.display())
+    })
+}
+
+#[cfg(not(unix))]
+fn make_symlink(_target: &Path, link: &Path) -> Result<()> {
+    bail!(
+        "retread fast-tmp: symlink materialization is only supported on Unix ({})",
+        link.display()
+    )
+}
+
+#[cfg(unix)]
+fn unix_mode(meta: fs::Metadata) -> u32 {
+    use std::os::unix::fs::MetadataExt;
+    meta.mode() & 0o7777
+}
+
+#[cfg(not(unix))]
+fn unix_mode(_meta: fs::Metadata) -> u32 {
+    0o755
+}
+
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode));
+}
+
+#[cfg(not(unix))]
+fn set_mode(_path: &Path, _mode: u32) {}
+
+/// Try to materialize all persisted env snapshots into the job-local
+/// namespace. Returns `true` only when every snapshot present in the persist
+/// dir carried a hash matching the current lock and was copied (or already
+/// present) — in that case the frozen `pixi install` can be skipped entirely.
+/// Any hash miss/absence, or any copy failure (partial dest is deleted),
+/// returns `false` so the caller falls back to the existing install path.
+pub fn materialize_persisted_envs(
+    workspace_root: &Path,
+    cfg: &FastTmpConfig,
+    ns: &Namespace,
+) -> bool {
+    let Some(lock_hash) = current_lock_hash(workspace_root) else {
+        return false;
+    };
+    let pdir = persist_dir(cfg, workspace_root);
+    let Ok(read) = fs::read_dir(&pdir) else {
+        return false;
+    };
+    let workers = effective_copy_workers(cfg);
+    let mut materialized_any = false;
+    for entry in read.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        // Skip in-flight tmp/old swap dirs and stray dotfiles.
+        if name_str.starts_with('.') {
+            continue;
+        }
+        let snapshot = entry.path();
+        if !snapshot.is_dir() {
+            continue;
+        }
+        match snapshot_hash(&snapshot) {
+            Some(hash) if hash == lock_hash => {}
+            other => {
+                warn_msg(&format!(
+                    "retread fast-tmp: snapshot {} {}; falling back to frozen install",
+                    snapshot.display(),
+                    if other.is_none() {
+                        "has no .retread-env-hash"
+                    } else {
+                        "lock hash does not match current lock"
+                    },
+                ));
+                return false;
+            }
+        }
+        let dest = ns.envs_dir().join(&name);
+        if fs::read_dir(&dest)
+            .ok()
+            .and_then(|mut it| it.next())
+            .is_some()
+        {
+            // Already materialized in this job namespace.
+            materialized_any = true;
+            continue;
+        }
+        let started = Instant::now();
+        match parallel_copy_tree(&snapshot, &dest, workers) {
+            Ok(stats) => {
+                // The hash file is snapshot metadata, not env content.
+                let _ = fs::remove_file(dest.join(ENV_HASH_FILE));
+                log_copy_timing("materialized", &name_str, &stats, started.elapsed());
+                materialized_any = true;
+            }
+            Err(e) => {
+                warn_msg(&format!(
+                    "retread fast-tmp: parallel materialization of {} failed ({e:#}); removing partial dest and falling back to frozen install",
+                    snapshot.display()
+                ));
+                let _ = fs::remove_dir_all(&dest);
+                return false;
+            }
+        }
+    }
+    materialized_any
+}
+
+/// `retread fast --persist <env>`: parallel-copy the job-local env back to the
+/// NFS persist dir and stamp it with the current lock hash. Atomic: copies to
+/// `persist-dir/.tmp-<pid>-<nonce>` then rename-swaps into place; a previous
+/// snapshot is renamed aside first and removed after the swap.
+pub fn persist_env(
+    workspace_root: &Path,
+    cfg: &FastTmpConfig,
+    ns: &Namespace,
+    env_name: &str,
+) -> Result<()> {
+    if env_name.is_empty()
+        || env_name.starts_with('.')
+        || env_name.contains('/')
+        || env_name.contains("..")
+    {
+        bail!("retread fast --persist: invalid env name {env_name:?}");
+    }
+    let src = ns.envs_dir().join(env_name);
+    if !src.is_dir() {
+        bail!(
+            "retread fast --persist: job-local env not found at {}",
+            src.display()
+        );
+    }
+    let lock_hash = current_lock_hash(workspace_root).ok_or_else(|| {
+        anyhow!(
+            "retread fast --persist: no readable pixi.lock in {}; refusing to persist an unkeyed snapshot",
+            workspace_root.display()
+        )
+    })?;
+    let pdir = persist_dir(cfg, workspace_root);
+    fs::create_dir_all(&pdir)
+        .with_context(|| format!("creating persist dir {}", pdir.display()))?;
+    let tmp = pdir.join(format!(".tmp-{}-{}", std::process::id(), unique_nonce()));
+    let workers = effective_copy_workers(cfg);
+    let started = Instant::now();
+    let stats = match parallel_copy_tree(&src, &tmp, workers) {
+        Ok(stats) => stats,
+        Err(e) => {
+            let _ = fs::remove_dir_all(&tmp);
+            return Err(e).with_context(|| {
+                format!(
+                    "retread fast --persist: parallel copy {} -> {} failed; partial tmp removed",
+                    src.display(),
+                    tmp.display()
+                )
+            });
+        }
+    };
+    fs::write(tmp.join(ENV_HASH_FILE), format!("{lock_hash}\n"))
+        .with_context(|| format!("writing {}", tmp.join(ENV_HASH_FILE).display()))?;
+
+    let dest = pdir.join(env_name);
+    let old = pdir.join(format!(".old-{}-{}", std::process::id(), unique_nonce()));
+    let had_old = match fs::rename(&dest, &old) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => {
+            let _ = fs::remove_dir_all(&tmp);
+            return Err(e).with_context(|| {
+                format!("moving previous snapshot {} aside", dest.display())
+            });
+        }
+    };
+    if let Err(e) = fs::rename(&tmp, &dest) {
+        // Best effort: restore the old snapshot, drop the tmp copy.
+        if had_old {
+            let _ = fs::rename(&old, &dest);
+        }
+        let _ = fs::remove_dir_all(&tmp);
+        return Err(e).with_context(|| {
+            format!(
+                "swapping snapshot {} -> {}",
+                tmp.display(),
+                dest.display()
+            )
+        });
+    }
+    if had_old {
+        let _ = fs::remove_dir_all(&old);
+    }
+    log_copy_timing("persisted", env_name, &stats, started.elapsed());
+    Ok(())
+}
+
+fn log_copy_timing(verb: &str, env_name: &str, stats: &CopyStats, elapsed: Duration) {
+    let secs = elapsed.as_secs_f64();
+    let total = stats.files + stats.symlinks;
+    let rate = if secs > 0.0 { total as f64 / secs } else { 0.0 };
+    let msg = format!(
+        "retread fast-tmp: {verb} env {env_name}: {total} files ({} symlinks, {} dirs), {} bytes, {secs:.2} s, {rate:.0} files/s",
+        stats.symlinks, stats.dirs, stats.bytes
+    );
+    eprintln!("{msg}");
+    tracing::info!("{msg}");
+}
+
+pub fn run_frozen_install_if_slurm(
+    workspace_root: &Path,
+    cfg: &FastTmpConfig,
+    ns: &Namespace,
+    env: &[(String, String)],
+) -> Result<()> {
     if !in_slurm_job() {
+        return Ok(());
+    }
+    // Fast path: byte-for-byte parallel copy of persisted snapshots keyed by
+    // the current lock hash. When it fully succeeds the frozen install (and
+    // its lock check) is redundant — the snapshot was built from this lock.
+    if materialize_persisted_envs(workspace_root, cfg, ns) {
         return Ok(());
     }
     let lock_status = Command::new("pixi")
@@ -1464,6 +1937,9 @@ mod tests {
             "RETREAD_FAST_TMP_FORCE_FS",
             "RETREAD_FAST_TMP_PROBE_THRESHOLD_MS",
             "RETREAD_FAST_TMP_CORRUPT_COPYBACK",
+            "RETREAD_FAST_TMP_PERSIST_DIR",
+            "RETREAD_FAST_TMP_COPY_WORKERS",
+            "RETREAD_FAST_TMP_COPY_FAIL_SUBSTR",
             "SLURM_JOB_ID",
             "SLURM_MEM_PER_NODE",
             "SLURM_MEM_PER_CPU",
@@ -1661,5 +2137,243 @@ blob-caches = "tmp"
         assert_eq!(fs::read(&final_path).unwrap(), b"conda bytes");
         assert_eq!(final_path, out.join("linux-64").join("pkg-1.0-0.conda"));
         fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    fn write_fixture_env(env_dir: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::create_dir_all(env_dir.join("bin")).unwrap();
+        fs::create_dir_all(env_dir.join("lib").join("python3.11").join("pkg")).unwrap();
+        fs::create_dir_all(env_dir.join("empty")).unwrap();
+        fs::write(env_dir.join("bin").join("tool"), b"#!/bin/sh\necho hi\n").unwrap();
+        fs::set_permissions(
+            env_dir.join("bin").join("tool"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        fs::write(
+            env_dir.join("lib").join("python3.11").join("pkg").join("mod.py"),
+            b"x = 1\n",
+        )
+        .unwrap();
+        fs::set_permissions(
+            env_dir.join("lib").join("python3.11").join("pkg").join("mod.py"),
+            fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        // Relative symlink (like lib/libfoo.so -> libfoo.so.1) and a dangling
+        // absolute one (conda envs contain both; both must copy as symlinks).
+        std::os::unix::fs::symlink("tool", env_dir.join("bin").join("tool-alias")).unwrap();
+        std::os::unix::fs::symlink(
+            "/definitely/not/a/real/target",
+            env_dir.join("lib").join("dangling"),
+        )
+        .unwrap();
+        fs::set_permissions(env_dir.join("empty"), fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parallel_copy_preserves_tree_perms_and_symlinks() {
+        use std::os::unix::fs::PermissionsExt;
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _guard = EnvGuard::new(&fasttmp_env_keys());
+        let root = tmp_dir("pcopy");
+        let src = root.join("src");
+        write_fixture_env(&src);
+        let dst = root.join("dst");
+
+        let stats = parallel_copy_tree(&src, &dst, 8).unwrap();
+        assert_eq!(stats.files, 2);
+        assert_eq!(stats.symlinks, 2);
+        assert_eq!(stats.dirs, 5);
+        assert_eq!(stats.bytes, fs::metadata(src.join("bin").join("tool")).unwrap().len()
+            + fs::metadata(src.join("lib").join("python3.11").join("pkg").join("mod.py")).unwrap().len());
+
+        assert_eq!(fs::read(dst.join("bin").join("tool")).unwrap(), b"#!/bin/sh\necho hi\n");
+        assert_eq!(
+            fs::metadata(dst.join("bin").join("tool")).unwrap().permissions().mode() & 0o7777,
+            0o755
+        );
+        assert_eq!(
+            fs::metadata(dst.join("empty")).unwrap().permissions().mode() & 0o7777,
+            0o700
+        );
+        let alias = dst.join("bin").join("tool-alias");
+        assert!(fs::symlink_metadata(&alias).unwrap().file_type().is_symlink());
+        assert_eq!(fs::read_link(&alias).unwrap(), PathBuf::from("tool"));
+        let dangling = dst.join("lib").join("dangling");
+        assert!(fs::symlink_metadata(&dangling).unwrap().file_type().is_symlink());
+        assert_eq!(
+            fs::read_link(&dangling).unwrap(),
+            PathBuf::from("/definitely/not/a/real/target")
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    struct PersistFixture {
+        root: PathBuf,
+        ws: PathBuf,
+        ns: Namespace,
+        cfg: FastTmpConfig,
+    }
+
+    #[cfg(unix)]
+    fn persist_fixture(label: &str) -> PersistFixture {
+        let root = tmp_dir(label);
+        let ws = root.join("workspace");
+        write_workspace(&ws);
+        fs::write(ws.join("pixi.lock"), b"version: 6\npackages: []\n").unwrap();
+        let ns = Namespace {
+            root: root.join("nsroot"),
+        };
+        fs::create_dir_all(ns.envs_dir()).unwrap();
+        let cfg = FastTmpConfig {
+            persist_dir: Some(root.join("persist")),
+            copy_workers: Some(4),
+            ..FastTmpConfig::default()
+        };
+        PersistFixture { root, ws, ns, cfg }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialize_gates_on_lock_hash() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _guard = EnvGuard::new(&fasttmp_env_keys());
+        let fx = persist_fixture("hashgate");
+        let snap = persist_dir(&fx.cfg, &fx.ws).join("default");
+        write_fixture_env(&snap);
+        let hash = current_lock_hash(&fx.ws).unwrap();
+
+        // No hash file -> miss -> no materialization.
+        assert!(!materialize_persisted_envs(&fx.ws, &fx.cfg, &fx.ns));
+        assert!(!fx.ns.envs_dir().join("default").exists());
+
+        // Wrong hash -> miss.
+        fs::write(snap.join(ENV_HASH_FILE), "deadbeef\n").unwrap();
+        assert!(!materialize_persisted_envs(&fx.ws, &fx.cfg, &fx.ns));
+        assert!(!fx.ns.envs_dir().join("default").exists());
+
+        // Matching hash -> materialized, hash metadata file not copied along.
+        fs::write(snap.join(ENV_HASH_FILE), format!("{hash}\n")).unwrap();
+        assert!(materialize_persisted_envs(&fx.ws, &fx.cfg, &fx.ns));
+        let dest = fx.ns.envs_dir().join("default");
+        assert_eq!(fs::read(dest.join("bin").join("tool")).unwrap(), b"#!/bin/sh\necho hi\n");
+        assert!(!dest.join(ENV_HASH_FILE).exists());
+        assert!(dest.join("bin").join("tool-alias").is_symlink());
+
+        // Idempotent: second call sees a warm dest and still reports success.
+        assert!(materialize_persisted_envs(&fx.ws, &fx.cfg, &fx.ns));
+        fs::remove_dir_all(fx.root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialize_partial_failure_cleans_dest_and_falls_back() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let guard = EnvGuard::new(&fasttmp_env_keys());
+        let fx = persist_fixture("partial");
+        let snap = persist_dir(&fx.cfg, &fx.ws).join("default");
+        write_fixture_env(&snap);
+        let hash = current_lock_hash(&fx.ws).unwrap();
+        fs::write(snap.join(ENV_HASH_FILE), format!("{hash}\n")).unwrap();
+
+        guard.set("RETREAD_FAST_TMP_COPY_FAIL_SUBSTR", "mod.py");
+        assert!(!materialize_persisted_envs(&fx.ws, &fx.cfg, &fx.ns));
+        assert!(
+            !fx.ns.envs_dir().join("default").exists(),
+            "partial dest must be deleted so the frozen install starts clean"
+        );
+
+        guard.remove("RETREAD_FAST_TMP_COPY_FAIL_SUBSTR");
+        assert!(materialize_persisted_envs(&fx.ws, &fx.cfg, &fx.ns));
+        fs::remove_dir_all(fx.root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persist_env_swaps_atomically_and_stamps_hash() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let guard = EnvGuard::new(&fasttmp_env_keys());
+        let fx = persist_fixture("persist");
+        let local = fx.ns.envs_dir().join("default");
+        write_fixture_env(&local);
+
+        persist_env(&fx.ws, &fx.cfg, &fx.ns, "default").unwrap();
+        let pdir = persist_dir(&fx.cfg, &fx.ws);
+        let snap = pdir.join("default");
+        let hash = current_lock_hash(&fx.ws).unwrap();
+        assert_eq!(
+            fs::read_to_string(snap.join(ENV_HASH_FILE)).unwrap().trim(),
+            hash
+        );
+        assert_eq!(fs::read(snap.join("bin").join("tool")).unwrap(), b"#!/bin/sh\necho hi\n");
+        assert!(snap.join("bin").join("tool-alias").is_symlink());
+
+        // Re-persist replaces the old snapshot and leaves no tmp/old debris.
+        fs::write(local.join("bin").join("extra"), b"new").unwrap();
+        persist_env(&fx.ws, &fx.cfg, &fx.ns, "default").unwrap();
+        assert_eq!(fs::read(snap.join("bin").join("extra")).unwrap(), b"new");
+        let leftovers: Vec<String> = fs::read_dir(&pdir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with(".tmp-") || n.starts_with(".old-"))
+            .collect();
+        assert!(leftovers.is_empty(), "swap debris left behind: {leftovers:?}");
+
+        // Failed persist removes the tmp dir and keeps the old snapshot.
+        guard.set("RETREAD_FAST_TMP_COPY_FAIL_SUBSTR", "mod.py");
+        assert!(persist_env(&fx.ws, &fx.cfg, &fx.ns, "default").is_err());
+        assert!(snap.join("bin").join("extra").exists());
+        let tmp_left = fs::read_dir(&pdir)
+            .unwrap()
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().starts_with(".tmp-"));
+        assert!(!tmp_left, "failed persist must remove its tmp dir");
+
+        assert!(persist_env(&fx.ws, &fx.cfg, &fx.ns, "../evil").is_err());
+        fs::remove_dir_all(fx.root).ok();
+    }
+
+    #[test]
+    fn copy_workers_config_and_default() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let guard = EnvGuard::new(&fasttmp_env_keys());
+        let ws = tmp_dir("workers");
+        fs::write(
+            ws.join("pixi.toml"),
+            r#"
+[workspace]
+channels = []
+
+[tool.retread.fast-tmp]
+persist-dir = "/nfs/persist"
+copy-workers = 12
+"#,
+        )
+        .unwrap();
+        let cfg = FastTmpConfig::load(&ws);
+        assert_eq!(cfg.persist_dir, Some(PathBuf::from("/nfs/persist")));
+        assert_eq!(cfg.copy_workers, Some(12));
+        assert_eq!(effective_copy_workers(&cfg), 12);
+        assert_eq!(persist_dir(&cfg, &ws), PathBuf::from("/nfs/persist"));
+
+        guard.set("RETREAD_FAST_TMP_COPY_WORKERS", "3");
+        guard.set("RETREAD_FAST_TMP_PERSIST_DIR", "rel/persist");
+        let cfg = FastTmpConfig::load(&ws);
+        assert_eq!(cfg.copy_workers, Some(3));
+        assert_eq!(persist_dir(&cfg, &ws), ws.join("rel/persist"));
+
+        let default_cfg = FastTmpConfig::default();
+        let n = effective_copy_workers(&default_cfg);
+        assert!(n >= 1 && n <= MAX_COPY_WORKERS);
+        assert_eq!(
+            persist_dir(&default_cfg, &ws),
+            ws.join(".pixi/envs-persist")
+        );
+        fs::remove_dir_all(ws).ok();
     }
 }

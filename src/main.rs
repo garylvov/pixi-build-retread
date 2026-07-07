@@ -94,6 +94,7 @@ struct FastCli {
     print_env: bool,
     preflight_locks: Option<PathBuf>,
     preflight_lock_helper: Option<PathBuf>,
+    persist: Option<String>,
     cmd: Vec<String>,
 }
 
@@ -124,9 +125,18 @@ fn run_fast(args: &[String]) -> anyhow::Result<()> {
         }
         return Ok(());
     }
+    if let Some(env_name) = parsed.persist.as_deref() {
+        let Some(engaged) = engaged.as_ref() else {
+            anyhow::bail!(
+                "retread fast --persist: fast-tmp is disengaged for {} (mode off or filesystem not slow); nothing job-local to persist",
+                workspace.display()
+            );
+        };
+        return fasttmp::persist_env(&workspace, &cfg, &engaged.ns, env_name);
+    }
     if parsed.cmd.is_empty() {
         anyhow::bail!(
-            "retread fast: expected command after `--` (or use --print-env / --preflight-locks)"
+            "retread fast: expected command after `--` (or use --print-env / --persist / --preflight-locks)"
         );
     }
 
@@ -134,7 +144,7 @@ fn run_fast(args: &[String]) -> anyhow::Result<()> {
         Some(engaged) => {
             fasttmp::check_env_eviction(&workspace, &engaged.ns);
             fasttmp::print_mapping(engaged);
-            fasttmp::run_frozen_install_if_slurm(&workspace, &engaged.env)?;
+            fasttmp::run_frozen_install_if_slurm(&workspace, &cfg, &engaged.ns, &engaged.env)?;
             exec_fast_command(&parsed.cmd, Some(&engaged.env), false)
         }
         None => {
@@ -153,6 +163,7 @@ fn parse_fast_args(args: &[String]) -> anyhow::Result<FastCli> {
         print_env: false,
         preflight_locks: None,
         preflight_lock_helper: None,
+        persist: None,
         cmd: Vec::new(),
     };
     let mut i = 0;
@@ -170,6 +181,13 @@ fn parse_fast_args(args: &[String]) -> anyhow::Result<FastCli> {
                 out.workspace = Some(PathBuf::from(value.as_str()));
             }
             "--print-env" => out.print_env = true,
+            "--persist" => {
+                i += 1;
+                let Some(value) = args.get(i) else {
+                    anyhow::bail!("retread fast: --persist requires an env name");
+                };
+                out.persist = Some(value.clone());
+            }
             "--preflight-locks" => {
                 i += 1;
                 let Some(value) = args.get(i) else {
