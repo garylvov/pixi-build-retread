@@ -111,7 +111,20 @@ pub async fn fetch_wheel(
     // multi-minute SILENT gap (one log line, then nothing -- looks frozen).
     // Streaming caps memory at one chunk, hashes incrementally, and logs
     // steady progress so the download is visibly alive in pixi's output.
-    let part = dest_dir.join(format!("{filename}.part"));
+    // Unique-per-attempt temp name: with entry resolves running concurrently,
+    // two BFS walks can race to download the SAME transitive wheel. A shared
+    // `<filename>.part` would interleave both streams into one file; a unique
+    // temp + the atomic rename below make the race last-writer-wins with
+    // identical bytes instead.
+    let part = {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static PART_SEQ: AtomicU64 = AtomicU64::new(0);
+        dest_dir.join(format!(
+            "{filename}.{}.{}.part",
+            std::process::id(),
+            PART_SEQ.fetch_add(1, Ordering::Relaxed)
+        ))
+    };
     let mut file = fs::File::create(&part)
         .await
         .with_context(|| format!("creating {}", part.display()))?;

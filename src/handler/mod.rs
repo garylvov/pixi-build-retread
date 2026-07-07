@@ -2730,7 +2730,19 @@ async fn resolve_all(
             .map(|(n, _)| canonical_conda_name(n))
             .collect();
 
-        let mut sub_bundles: Vec<Bundle> = Vec::with_capacity(group_entries.len());
+        // Parallel entry builds: collect all per-entry inputs FIRST (the
+        // sibling sets below are pure derivations of the entry list), then
+        // run the resolve_bundle futures concurrently with a bounded window.
+        // `buffered(N)` (not buffer_unordered) yields results in ENTRY ORDER,
+        // so `sub_bundles` — and therefore the carrier-bundle merge, the
+        // extras order, and the probe-decision order — stay byte-identical
+        // to the old serial loop. resolve_bundle takes only shared &refs
+        // (no shared &mut); the two cross-entry filesystem touch points are
+        // already concurrency-safe: git clone/checkout is serialized by the
+        // per-(url,rev) lock in source_build.rs, and wheel downloads land
+        // via unique-temp + atomic rename (wheel.rs).
+        const ENTRY_BUILD_CONCURRENCY: usize = 6;
+        let mut entry_futures = Vec::with_capacity(group_entries.len());
         for (idx, ((entry_name, entry), auto_data)) in
             group_entries.iter().zip(auto_data_per_entry).enumerate()
         {
@@ -2741,42 +2753,57 @@ async fn resolve_all(
                 .filter(|(i, _)| *i != idx)
                 .map(|(_, n)| n.clone())
                 .collect();
-
-            let sub = resolve_bundle(
-                entry_name,
-                entry,
-                target,
-                download_dir,
-                source_dir,
-                cache_dir,
-                effective.relax,
-                &effective.git_sources,
-                auto_data,
-                &pypi_to_conda,
-                &effective.name_map,
-                conda_channels,
-                &effective.conda_deps,
-                &workspace_pypi_indexes,
-                uv_pins, // uv resolver: pin to uv's closure; legacy: None (cold path)
-                Some(&favored).filter(|m| !m.is_empty()), // favor-lock prefs (empty map → None)
-                &sibling_names,
-            )
-            .await
-            .with_context(|| {
-                if group_entries.len() == 1 {
-                    format!(
-                        "resolving wheel entry `{entry_name}` (one of {} in [retread-wheels])",
-                        effective.retread_wheels.len(),
+            // Reference bindings so `async move` moves only the &refs,
+            // not the outer values (same pattern as solve_env above).
+            let favored = &favored;
+            let effective = &effective;
+            let group_name = &group_name;
+            let group_entries = &group_entries;
+            let pypi_to_conda = &pypi_to_conda;
+            let workspace_pypi_indexes = &workspace_pypi_indexes;
+            entry_futures.push(async move {
+                    resolve_bundle(
+                        entry_name,
+                        entry,
+                        target,
+                        download_dir,
+                        source_dir,
+                        cache_dir,
+                        effective.relax,
+                        &effective.git_sources,
+                        auto_data,
+                        &pypi_to_conda,
+                        &effective.name_map,
+                        conda_channels,
+                        &effective.conda_deps,
+                        &workspace_pypi_indexes,
+                        uv_pins, // uv resolver: pin to uv's closure; legacy: None (cold path)
+                        Some(favored).filter(|m| !m.is_empty()), // favor-lock prefs (empty map → None)
+                        &sibling_names,
                     )
-                } else {
-                    format!(
-                        "resolving wheel entry `{entry_name}` (bundle `{group_name}`, one of {} in [retread-wheels])",
-                        effective.retread_wheels.len(),
-                    )
-                }
-            })?;
-            sub_bundles.push(sub);
+                    .await
+                    .with_context(|| {
+                        if group_entries.len() == 1 {
+                            format!(
+                                "resolving wheel entry `{entry_name}` (one of {} in [retread-wheels])",
+                                effective.retread_wheels.len(),
+                            )
+                        } else {
+                            format!(
+                                "resolving wheel entry `{entry_name}` (bundle `{group_name}`, one of {} in [retread-wheels])",
+                                effective.retread_wheels.len(),
+                            )
+                        }
+                    })
+            });
         }
+        let mut sub_bundles: Vec<Bundle> = {
+            use futures::stream::{self, StreamExt, TryStreamExt};
+            stream::iter(entry_futures)
+                .buffered(ENTRY_BUILD_CONCURRENCY)
+                .try_collect()
+                .await?
+        };
         let mut bundle = sub_bundles.remove(0);
         bundle.conda_name = canonical_conda_name(&group_name);
         for sub in sub_bundles {
