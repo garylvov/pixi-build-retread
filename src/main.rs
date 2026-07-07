@@ -56,7 +56,7 @@ async fn main() -> anyhow::Result<()> {
         let lock = std::path::Path::new(&lock);
         let prefix = std::path::Path::new(&prefix);
         return match cmd {
-            "install" => installer::run(lock, prefix),
+            "install" => installer::run(lock, prefix).await,
             "verify" => installer::verify(lock, prefix, full),
             _ => unreachable!("matched above"),
         };

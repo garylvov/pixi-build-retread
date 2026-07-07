@@ -259,9 +259,10 @@ pub fn build_bundle_recipe(
 /// solved conda run-deps (so shared transitives stay conda) plus `uv` and
 /// `pixi-build-retread` (the installer binary), and writes a conda
 /// **post-link** script that runs `retread install` at env link time to
-/// uv-hardlink the wheels in (fetching index wheels on demand). The huge
-/// index wheels never enter the conda package, so packaging is seconds and
-/// nothing is committed to git.
+/// install exact wheel files with `uv --no-deps --offline`. Missing
+/// unchanged index wheels are direct-fetched from the lock's URL+hash; the
+/// huge index wheels never enter the conda package, so packaging is seconds
+/// and nothing is committed to git.
 ///
 /// `source_urls` are file:// URLs to the staged wheels + the lock json
 /// (rattler-build copies them into `$SRC_DIR`); the build script stages

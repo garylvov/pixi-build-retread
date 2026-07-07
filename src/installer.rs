@@ -2,29 +2,25 @@
 //!
 //! Invoked from the courier conda package's post-link script at env link
 //! time: `pixi-build-retread install --lock <lock> --prefix <prefix>`.
-//! Reads the committed lock and installs the bundle's PyPI wheels into the
-//! active conda env via uv (fast hardlink), resolving the root
-//! requirements against the shipped find-links wheels + the recorded index
-//! chain while constraining every locked wheel to its exact recorded version,
-//! into the conda env so shared transitives stay conda-provided.
+//! Reads the committed lock and installs the bundle's exact PyPI wheel files
+//! into the active conda env via uv (fast hardlink), without dependency
+//! resolution or index metadata access.
 //! Idempotent: a content-hash marker makes a re-link a no-op.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 
-use crate::lock::RetreadLock;
-
-/// Fallback primary index when the lock carries no index_urls.
-pub(crate) use crate::handler::PUBLIC_PYPI;
+use crate::lock::{Origin, RetreadLock};
 
 /// PEP 503 normalized distribution name (lowercase; runs of `-`, `_`, `.`
-/// collapse to a single `-`). Used to compare names across uv's `pip list`
-/// output and the lock's wheel names when building the uv exclude set.
+/// collapse to a single `-`). Used to compare installed metadata with the
+/// lock's wheel names during verification.
 pub(crate) fn normalize_dist_name(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     let mut prev_sep = false;
@@ -43,60 +39,6 @@ pub(crate) fn normalize_dist_name(name: &str) -> String {
         out.pop();
     }
     out
-}
-
-/// S1: build a uv constraints-file body from the conda-provided transitives,
-/// so uv cannot resolve a PyPI wheel OUTSIDE the version conda will install
-/// (e.g. bound `torchaudio>=2.7,<3` so the closure can't jump to 2.11 and
-/// skew against conda's torch). Only clean PEP 508 version specifiers are
-/// emitted: conda-only names (`python`, `python_abi`) and conda specs that
-/// carry a build string (a space, e.g. `3.11.* *_cp311`) or no comparison
-/// operator are skipped -- they are not valid uv constraints.
-pub(crate) fn conda_deps_to_constraints(deps: &[crate::lock::CondaDep]) -> String {
-    let mut out = String::new();
-    for d in deps {
-        let name = d.name.trim();
-        let spec = d.spec.trim();
-        if name.is_empty() || name == "python" || name == "python_abi" {
-            continue;
-        }
-        if spec.is_empty() || spec.contains(' ') {
-            continue;
-        }
-        if !spec.starts_with(['<', '>', '=', '!', '~']) {
-            continue;
-        }
-        out.push_str(name);
-        out.push_str(spec);
-        out.push('\n');
-    }
-    out
-}
-
-/// Build a uv constraints-file body from the lock's payload wheels. This is the
-/// courier replay contract: every PyPI wheel selected at lock-produce time is
-/// replayed as an exact `name==version` resolver pin, so uv may fetch/build the
-/// wheel bytes but may not fresh-resolve to a newer compatible release.
-pub(crate) fn lock_wheels_to_constraints(wheels: &[crate::lock::LockWheel]) -> Result<String> {
-    let mut lines = BTreeSet::new();
-    for wheel in wheels {
-        let name = wheel.name.trim();
-        let version = wheel.version.trim();
-        if name.is_empty() || version.is_empty() {
-            bail!(
-                "retread lock contains a wheel with an empty name or version: {}",
-                wheel.filename
-            );
-        }
-        lines.insert(format!("{name}=={version}"));
-    }
-
-    let mut out = String::new();
-    for line in lines {
-        out.push_str(&line);
-        out.push('\n');
-    }
-    Ok(out)
 }
 
 /// True if uv's output shows a wheel rejected purely for an unsatisfied
@@ -129,8 +71,7 @@ fn relax_platform_on_conflict(
     // This output is parsed (is_platform_tag_conflict), not shown to the
     // user -- force plain text so a FORCE_COLOR/CLICOLOR_FORCE in the
     // caller's environment can't taint it with ANSI codes that break the
-    // substring match. See the identical fix on the `uv pip list` call in
-    // `install` for the concrete failure this class of bug causes.
+    // substring match.
     probe.push("--color".into());
     probe.push("never".into());
     let out = match Command::new(uv).args(&probe).output() {
@@ -211,6 +152,209 @@ fn relax_platform_on_conflict(
 
 fn lock_digest(raw: &[u8]) -> String {
     format!("{:x}", Sha256::digest(raw))
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 1024 * 1024];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .with_context(|| format!("hashing {}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn verify_sha256(path: &Path, expected: &str) -> Result<()> {
+    let actual = sha256_file(path)?;
+    if actual.eq_ignore_ascii_case(expected) {
+        Ok(())
+    } else {
+        bail!(
+            "SHA-256 mismatch for {}: expected {}, got {}",
+            path.display(),
+            expected,
+            actual
+        );
+    }
+}
+
+fn validate_install_lock(lock_path: &Path, lock: &RetreadLock) -> Result<()> {
+    if lock.schema != crate::lock::SCHEMA {
+        bail!(
+            "retread install: lock {} has schema {}, but this retread requires schema {} \
+             for zero-resolution replay. Rebuild the courier pack so the lock records \
+             direct wheel URLs and hashes.",
+            lock_path.display(),
+            lock.schema,
+            crate::lock::SCHEMA
+        );
+    }
+    for wheel in &lock.wheels {
+        if wheel.name.trim().is_empty()
+            || wheel.version.trim().is_empty()
+            || wheel.filename.trim().is_empty()
+        {
+            bail!(
+                "retread install: lock {} contains an incomplete wheel entry; rebuild the courier pack",
+                lock_path.display()
+            );
+        }
+        if wheel.origin == Origin::Index && (wheel.url.is_none() || wheel.sha256.is_none()) {
+            bail!(
+                "retread install: lock {} cannot replay {}=={} without resolution: \
+                 Origin::Index entries require both url and sha256. Rebuild the courier pack.",
+                lock_path.display(),
+                wheel.name,
+                wheel.version
+            );
+        }
+    }
+    Ok(())
+}
+
+fn read_validated_lock(lock_path: &Path) -> Result<(Vec<u8>, RetreadLock)> {
+    let raw = std::fs::read(lock_path).with_context(|| {
+        format!(
+            "reading lock {}. Rebuild the courier pack so install replay has a valid lock.",
+            lock_path.display()
+        )
+    })?;
+    let lock: RetreadLock = serde_json::from_slice(&raw).with_context(|| {
+        format!(
+            "parsing lock {}. Rebuild the courier pack so install replay has a valid lock.",
+            lock_path.display()
+        )
+    })?;
+    validate_install_lock(lock_path, &lock)?;
+    Ok((raw, lock))
+}
+
+async fn materialize_index_wheel(
+    lock: &RetreadLock,
+    wheel: &crate::lock::LockWheel,
+    fetch_dir: &Path,
+    cache_root: &Path,
+) -> Result<PathBuf> {
+    let url_text = wheel.url.as_deref().expect("validated index url");
+    let expected_sha = wheel.sha256.as_deref().expect("validated index sha256");
+    let url = url::Url::parse(url_text).with_context(|| {
+        format!(
+            "retread install: invalid locked URL for {}=={}: {}",
+            wheel.name, wheel.version, url_text
+        )
+    })?;
+    let url_filename = crate::wheel::wheel_filename_from_url(&url)?;
+    if url_filename != wheel.filename {
+        bail!(
+            "retread install: locked URL filename for {}=={} is {}, but lock records {}; \
+             rebuild the courier pack",
+            wheel.name,
+            wheel.version,
+            url_filename,
+            wheel.filename
+        );
+    }
+
+    if url.scheme() == "file" {
+        let path = url.to_file_path().map_err(|_| {
+            anyhow::anyhow!(
+                "retread install: locked file URL for {}=={} is not a valid path: {}",
+                wheel.name,
+                wheel.version,
+                url
+            )
+        })?;
+        verify_sha256(&path, expected_sha)?;
+        return Ok(path);
+    }
+
+    let store_path = cache_root
+        .join("wheels")
+        .join(expected_sha)
+        .join(&wheel.filename);
+    if store_path.is_file() {
+        match verify_sha256(&store_path, expected_sha) {
+            Ok(()) => return Ok(store_path),
+            Err(err) => {
+                tracing::warn!(
+                    path = %store_path.display(),
+                    error = %format!("{err:#}"),
+                    "retread install: cached wheel hash mismatch; refetching locked URL"
+                );
+                let _ = std::fs::remove_file(&store_path);
+            }
+        }
+    }
+
+    let fetched = crate::wheel::fetch_wheel_cached(&url, Some(expected_sha), fetch_dir, cache_root)
+        .await
+        .with_context(|| {
+            format!(
+                "retread install: fetching locked wheel {}=={} from {}",
+                wheel.name, wheel.version, url
+            )
+        })?;
+    verify_sha256(&fetched, expected_sha)?;
+    tracing::info!(
+        bundle = %lock.bundle,
+        wheel = %wheel.filename,
+        "retread install: fetched locked wheel bytes"
+    );
+    Ok(fetched)
+}
+
+async fn materialize_locked_wheels(
+    lock: &RetreadLock,
+    prefix: &Path,
+    shipped_wheels_dir: &Path,
+) -> Result<Vec<PathBuf>> {
+    let cache_root = crate::courier::retread_cache_root();
+    let fetch_dir = prefix
+        .join("share")
+        .join("retread")
+        .join(&lock.bundle)
+        .join("fetched");
+    let mut files = Vec::with_capacity(lock.wheels.len());
+    for wheel in &lock.wheels {
+        let shipped = shipped_wheels_dir.join(&wheel.filename);
+        if shipped.is_file() {
+            if let Some(expected) = wheel.sha256.as_deref() {
+                verify_sha256(&shipped, expected).with_context(|| {
+                    format!(
+                        "retread install: shipped wheel {}=={} failed hash verification",
+                        wheel.name, wheel.version
+                    )
+                })?;
+            }
+            files.push(shipped);
+            continue;
+        }
+
+        match wheel.origin {
+            Origin::Index => {
+                files.push(materialize_index_wheel(lock, wheel, &fetch_dir, &cache_root).await?);
+            }
+            Origin::Built => {
+                bail!(
+                    "retread install: locked wheel {}=={} is not present at {}. \
+                     This wheel class is shipped inside the courier package (source-built, \
+                     local-only, sdist-built, or relax-rewritten shadow) and cannot be \
+                     recovered without pack rebuild/reinstall.",
+                    wheel.name,
+                    wheel.version,
+                    shipped.display()
+                );
+            }
+        }
+    }
+    Ok(files)
 }
 
 fn site_packages_dir(prefix: &Path, python: &str) -> PathBuf {
@@ -467,10 +611,7 @@ fn installed_payload_libraries(
 /// contains the locked wheel payload. Used by activate.d and by `run()` before
 /// trusting an existing marker.
 pub fn verify(lock_path: &Path, prefix: &Path, full: bool) -> Result<()> {
-    let raw = std::fs::read(lock_path)
-        .with_context(|| format!("reading lock {}", lock_path.display()))?;
-    let lock: RetreadLock = serde_json::from_slice(&raw)
-        .with_context(|| format!("parsing lock {}", lock_path.display()))?;
+    let (raw, lock) = read_validated_lock(lock_path)?;
 
     let share = prefix.join("share").join("retread");
     let marker = share.join(lock.marker_name());
@@ -499,22 +640,14 @@ pub fn verify(lock_path: &Path, prefix: &Path, full: bool) -> Result<()> {
     Ok(())
 }
 
-/// Build the `uv pip install` argument list (pure; no I/O, no spawn; no
-/// argv[0]). S1: a `--constraints` file bounds conda-provided transitives to
-/// conda's range. Replay: a second constraints file pins every locked payload
-/// wheel to its exact locked version. S3: `lock.index_urls` is replayed verbatim
-/// (first = primary `--index-url`, rest `--extra-index-url`; public PyPI only as
-/// the empty fallback) so the backend's recorded resolution priority is
-/// preserved.
-pub(crate) fn build_uv_args(
-    lock: &RetreadLock,
+/// Build the `uv pip install` replay argument list (pure; no I/O, no spawn; no
+/// argv[0]). The only install targets are explicit wheel files; `--no-deps` and
+/// `--offline` make uv a wheel installer, not a resolver.
+pub(crate) fn build_uv_replay_args(
     prefix: &Path,
-    wheels_dir: Option<&Path>,
-    overrides_file: Option<&Path>,
-    constraints_file: Option<&Path>,
-    lock_pins_file: Option<&Path>,
-    excludes_file: Option<&Path>,
+    wheel_files: &[PathBuf],
     python_platform: Option<&str>,
+    reinstall: bool,
 ) -> Vec<OsString> {
     let mut args: Vec<OsString> = vec![
         "pip".into(),
@@ -533,92 +666,22 @@ pub(crate) fn build_uv_args(
         args.push(plat.into());
     }
 
-    // Optional find-links directory for locally-shipped wheels.
-    if let Some(dir) = wheels_dir {
-        args.push("--find-links".into());
-        args.push(dir.into());
+    args.push("--no-deps".into());
+    args.push("--offline".into());
+    if reinstall {
+        args.push("--reinstall".into());
     }
 
-    // Search ALL indexes for the best-compatible wheel instead of uv's default
-    // `first-index` (stop at the first index that lists the name). Bundles like
-    // Isaac Sim publish the real binary wheel ONLY on a secondary index
-    // (pypi.nvidia.com) while a stub of the same name sits on public PyPI;
-    // first-index then locks onto the stub and reports "no wheels with a
-    // matching platform tag", which no amount of glibc relaxation can fix
-    // because the usable wheel was never considered. This mirrors the index
-    // strategy pixi/uv workspaces already set (and the documented manual
-    // recovery command) so the post-link resolves the same wheel the solve did.
-    args.push("--index-strategy".into());
-    args.push("unsafe-best-match".into());
-
-    // S3: replay index chain verbatim.
-    // find-links suppresses uv's implicit default index, so always set one
-    // explicitly. First lock entry = primary; subsequent = extras. If the lock
-    // carries no indexes at all, fall back to public PyPI as the sole primary.
-    if lock.index_urls.is_empty() {
-        args.push("--index-url".into());
-        args.push(PUBLIC_PYPI.into());
-    } else {
-        let mut it = lock.index_urls.iter();
-        args.push("--index-url".into());
-        args.push(it.next().expect("non-empty").into());
-        for u in it {
-            args.push("--extra-index-url".into());
-            args.push(u.into());
-        }
-    }
-
-    // S1: bound conda-provided transitives to conda's version range via a
-    // constraints file, so uv's closure can't pick a PyPI wheel outside what
-    // conda installs (the torchaudio>=2.7,<3 vs 2.11 skew). Written by run().
-    if let Some(c) = constraints_file {
-        args.push("--constraints".into());
-        args.push(c.into());
-    }
-
-    // Replay pins: exact versions for every wheel recorded in the lock. This is
-    // deliberately separate from the conda constraints file so range constraints
-    // for conda-provided packages and exact payload pins can be inspected
-    // independently while uv applies both.
-    if let Some(c) = lock_pins_file {
-        args.push("--constraints".into());
-        args.push(c.into());
-    }
-
-    // Exclude the conda-populated set from uv's resolution. The courier
-    // contract is: conda provides the conda-capable transitives; uv only ADDS
-    // the bundle's PyPI-only wheels (+ their PyPI-only tail). Without this, uv
-    // re-resolves the FULL closure and tries to REPLACE conda dists -- which
-    // fails hard on any conda package uv can't uninstall (legacy egg-info /
-    // RECORD-less dist-info, e.g. vtk). The exclude set is uv's OWN view of the
-    // prefix (`uv pip list`), so names match the resolver and every packaging
-    // shape is covered -- no per-package logic, no conda/PyPI name-skew. Written
-    // by run() (minus the bundle's own wheels, which uv must still install).
-    if let Some(e) = excludes_file {
-        args.push("--excludes".into());
-        args.push(e.into());
-    }
-
-    // Prerelease overrides file (written before calling build_uv_args in run()).
-    if let Some(ovr) = overrides_file {
-        args.push("--overrides".into());
-        args.push(ovr.into());
-    }
-
-    // Root requirements drive the closure.
-    for r in &lock.root_requirements {
-        args.push(r.as_str().into());
+    for wheel in wheel_files {
+        args.push(wheel.as_os_str().into());
     }
 
     args
 }
 
 /// Install (or no-op) the bundle described by `lock_path` into `prefix`.
-pub fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
-    let raw = std::fs::read(lock_path)
-        .with_context(|| format!("reading lock {}", lock_path.display()))?;
-    let lock: RetreadLock = serde_json::from_slice(&raw)
-        .with_context(|| format!("parsing lock {}", lock_path.display()))?;
+pub async fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
+    let (raw, lock) = read_validated_lock(lock_path)?;
 
     let share = prefix.join("share").join("retread");
 
@@ -641,7 +704,9 @@ pub fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
 
     let marker = share.join(lock.marker_name());
     let want = lock_digest(&raw);
-    if marker_matches(&marker, &want) {
+    let marker_current = marker_matches(&marker, &want);
+    let mut force_reinstall = !marker_current;
+    if marker_current {
         match verify_payload_installed(&lock, prefix) {
             Ok(()) => {
                 let marker_text = std::fs::read_to_string(&marker).unwrap_or_default();
@@ -692,18 +757,23 @@ pub fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
                 }
             }
             Err(err) => {
+                // The digest marker is only trusted together with installed
+                // wheel metadata. A payload miss invalidates it for replay, so
+                // uv must replace the locked wheel set rather than skip
+                // already-installed distributions.
                 eprintln!(
                     "retread install: {} marker exists but payload verification failed; \
                      reinstalling ({err:#})",
                     lock.bundle
                 );
+                force_reinstall = true;
             }
         }
     }
 
-    if lock.root_requirements.is_empty() {
+    if lock.wheels.is_empty() {
         eprintln!(
-            "retread install: {} has no root requirements; nothing to do",
+            "retread install: {} has no locked wheels; nothing to do",
             lock.bundle
         );
         return Ok(());
@@ -718,7 +788,6 @@ pub fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
     }
     // Shipped (built/changed) wheels live next to the lock, under the env.
     let wheels_dir = share.join(&lock.bundle).join("wheels");
-    let wheels_dir_opt = wheels_dir.is_dir().then_some(wheels_dir.as_path());
 
     let uv: OsString = {
         let p = prefix.join("bin").join("uv");
@@ -729,121 +798,14 @@ pub fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
         }
     };
 
-    // Prerelease: uv only honors prereleases from direct reqs + overrides,
-    // so pass the micro-table as an overrides file.
-    let ovr_path = share.join(format!("{}.overrides.txt", lock.bundle));
-    let overrides_file = if !lock.prerelease.is_empty() {
-        std::fs::create_dir_all(&share).ok();
-        let mut body = String::new();
-        for (name, spec) in &lock.prerelease {
-            body.push_str(&format!("{name}{spec}\n"));
-        }
-        std::fs::write(&ovr_path, &body)
-            .with_context(|| format!("writing {}", ovr_path.display()))?;
-        Some(ovr_path.as_path())
-    } else {
-        None
-    };
-
-    // S1 constraints file: bound conda-provided transitives to conda's range.
-    let con_path = share.join(format!("{}.constraints.txt", lock.bundle));
-    let constraints_body = conda_deps_to_constraints(&lock.conda_run_deps);
-    let constraints_file = if !constraints_body.is_empty() {
-        std::fs::create_dir_all(&share).ok();
-        std::fs::write(&con_path, &constraints_body)
-            .with_context(|| format!("writing {}", con_path.display()))?;
-        Some(con_path.as_path())
-    } else {
-        None
-    };
-
-    // Replay constraints file: exact pins for every payload wheel in the lock.
-    // Root requirements still drive the closure, but these pins make the lock a
-    // hard replay contract instead of a fresh resolve against live indexes.
-    let lock_pin_path = share.join(format!("{}.lock-pins.constraints.txt", lock.bundle));
-    let lock_pins_body = lock_wheels_to_constraints(&lock.wheels)?;
-    let lock_pins_file = if !lock_pins_body.is_empty() {
-        std::fs::create_dir_all(&share).ok();
-        std::fs::write(&lock_pin_path, &lock_pins_body)
-            .with_context(|| format!("writing {}", lock_pin_path.display()))?;
-        Some(lock_pin_path.as_path())
-    } else {
-        None
-    };
-
-    // Exclude the conda-populated set from uv's resolution (see build_uv_args).
-    // Source = uv's OWN view of the prefix, so names match the resolver and
-    // every packaging shape is covered. Subtract the bundle's own payload (the
-    // meta-wheel + each shipped/fetched wheel) so uv still installs those even
-    // if a conda package ever collided on the same normalized name.
-    let protect: std::collections::HashSet<String> = lock
-        .wheels
-        .iter()
-        .map(|w| normalize_dist_name(&w.name))
-        .chain(
-            lock.root_requirements
-                .iter()
-                .map(|r| normalize_dist_name(r.split("==").next().unwrap_or(r))),
-        )
-        .collect();
-    let exc_path = share.join(format!("{}.excludes.txt", lock.bundle));
-    let excludes_file = {
-        // v3.0.4: this output is parsed line-by-line and the result is
-        // written VERBATIM to excludes.txt, which a later `uv pip install
-        // -r excludes.txt` call re-parses as a requirements file. uv
-        // respects FORCE_COLOR/CLICOLOR_FORCE from the environment even
-        // when stdout is piped (not a tty), so without `--color never` a
-        // colorized caller environment corrupts every package name with
-        // raw ANSI escapes (`\x1b[1mabsl-py\x1b[0m`), and uv's requirements
-        // parser then fails with "Unexpected '', expected '-c', '-e', '-r'
-        // or the start of a requirement" on the very first byte.
-        let out = Command::new(&uv)
-            .args(["pip", "list", "--color", "never", "--format", "freeze", "--python"])
-            .arg(&python)
-            .output()
-            .with_context(|| "listing installed packages for the uv exclude set")?;
-        if out.status.success() {
-            let mut body = String::new();
-            for line in String::from_utf8_lossy(&out.stdout).lines() {
-                let name = line.split("==").next().unwrap_or("").trim();
-                if name.is_empty() || protect.contains(&normalize_dist_name(name)) {
-                    continue;
-                }
-                body.push_str(name);
-                body.push('\n');
-            }
-            std::fs::create_dir_all(&share).ok();
-            std::fs::write(&exc_path, &body)
-                .with_context(|| format!("writing {}", exc_path.display()))?;
-            Some(exc_path.as_path())
-        } else {
-            tracing::warn!(
-                status = %out.status,
-                "uv pip list failed; proceeding without an exclude set (uv may try to \
-                 replace conda-provided packages)",
-            );
-            None
-        }
-    };
-
-    // First attempt: uv's manylinux host gate untouched. Streamed live so
-    // multi-GB index-wheel download progress is visible.
-    let args = build_uv_args(
-        &lock,
-        prefix,
-        wheels_dir_opt,
-        overrides_file,
-        constraints_file,
-        lock_pins_file,
-        excludes_file,
-        None,
-    );
+    let wheel_files = materialize_locked_wheels(&lock, prefix, &wheels_dir).await?;
+    let args = build_uv_replay_args(prefix, &wheel_files, None, force_reinstall);
 
     let install_msg = format!(
-        "retread install: {} -> {} ({} root reqs)",
+        "retread install: {} -> {} ({} wheels, zero-resolution replay)",
         lock.bundle,
         prefix.display(),
-        lock.root_requirements.len()
+        wheel_files.len()
     );
     eprintln!("{install_msg}");
     crate::status::phase(
@@ -865,15 +827,11 @@ pub fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
         // exactly that declaration. Any other failure surfaces unchanged.
         match relax_platform_on_conflict(&uv, &args, &lock)? {
             Some(outcome) => {
-                let relaxed = build_uv_args(
-                    &lock,
+                let relaxed = build_uv_replay_args(
                     prefix,
-                    wheels_dir_opt,
-                    overrides_file,
-                    constraints_file,
-                    lock_pins_file,
-                    excludes_file,
+                    &wheel_files,
                     Some(&outcome.platform),
+                    force_reinstall,
                 );
                 let status = Command::new(&uv)
                     .args(&relaxed)
@@ -933,7 +891,7 @@ pub fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use super::*;
     use crate::lock::{CondaDep, LockWheel, Origin};
@@ -1006,160 +964,242 @@ mod tests {
             .collect()
     }
 
-    // S1: conda-covered transitives become a uv constraints file bounding
-    // them to conda's range (so the closure can't skew, e.g. torchaudio 2.11).
+    fn hex_sha256(bytes: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(bytes))
+    }
+
+    fn index_lock_wheel(name: &str, version: &str, url: &str, sha256: &str) -> LockWheel {
+        LockWheel {
+            name: name.into(),
+            version: version.into(),
+            origin: Origin::Index,
+            filename: crate::wheel::wheel_filename_from_url(&url::Url::parse(url).unwrap()).unwrap(),
+            url: Some(url.into()),
+            sha256: Some(sha256.into()),
+            requires_dist: vec![],
+            must_ship: false,
+            upstream_url: None,
+            git_source: None,
+            sdist_source: None,
+        }
+    }
+
     #[test]
-    fn s1_conda_run_deps_constraints() {
-        let deps = vec![
-            CondaDep {
-                name: "torch".into(),
-                spec: ">=2.7,<3".into(),
-            },
-            CondaDep {
-                name: "torchaudio".into(),
-                spec: ">=2.7,<3".into(),
-            },
-            // conda-only specs must be dropped (not valid uv constraints).
-            CondaDep {
-                name: "python_abi".into(),
-                spec: "3.11.* *_cp311".into(),
-            },
-            CondaDep {
-                name: "python".into(),
-                spec: "3.11.*".into(),
-            },
+    fn replay_args_are_explicit_wheel_files_only() {
+        let prefix = PathBuf::from("/fake/prefix");
+        let wheels = vec![
+            PathBuf::from("/cache/a-1.0-py3-none-any.whl"),
+            PathBuf::from("/prefix/share/retread/b/wheels/b-2.0-py3-none-any.whl"),
         ];
-        let body = conda_deps_to_constraints(&deps);
-        assert!(
-            body.contains("torch>=2.7,<3"),
-            "torch bounded; got {body:?}"
-        );
-        assert!(
-            body.contains("torchaudio>=2.7,<3"),
-            "torchaudio bounded; got {body:?}"
-        );
-        assert!(!body.contains("python_abi"), "build-string spec dropped");
-        assert!(
-            !body
-                .lines()
-                .any(|l| l.starts_with("python3") || l == "python3.11.*"),
-            "conda-only python dropped; got {body:?}"
-        );
-
-        // and the flag is threaded into argv when a constraints file is given.
-        let lock = make_lock(deps, vec![PUBLIC_PYPI.into()], BTreeMap::new());
-        let prefix = PathBuf::from("/fake/prefix");
-        let con = PathBuf::from("/fake/prefix/share/retread/test-bundle.constraints.txt");
-        let args = build_uv_args(
-            &lock,
-            &prefix,
-            None,
-            None,
-            Some(con.as_path()),
-            None,
-            None,
-            None,
-        );
+        let args = build_uv_replay_args(&prefix, &wheels, None, false);
         let strs = argv_strings(&args);
-        assert_eq!(
-            flag_values(&strs, "--constraints"),
-            vec![con.to_string_lossy().into_owned()]
+
+        assert_eq!(strs[0], "pip");
+        assert_eq!(strs[1], "install");
+        assert_eq!(strs[2], "--python");
+        assert_eq!(strs[3], "/fake/prefix/bin/python");
+        assert!(strs.contains(&"--no-deps".to_string()));
+        assert!(strs.contains(&"--offline".to_string()));
+        assert!(!strs.contains(&"--reinstall".to_string()));
+        for forbidden in [
+            "--index-url",
+            "--extra-index-url",
+            "--find-links",
+            "--constraints",
+            "--overrides",
+            "--excludes",
+            "--index-strategy",
+        ] {
+            assert!(
+                !strs.contains(&forbidden.to_string()),
+                "forbidden resolver flag {forbidden}"
+            );
+        }
+        assert!(strs.contains(&"/cache/a-1.0-py3-none-any.whl".to_string()));
+        assert!(
+            strs.contains(&"/prefix/share/retread/b/wheels/b-2.0-py3-none-any.whl".to_string())
         );
-        // never the invalid flag.
-        assert!(!strs.iter().any(|s| s == "--no-install-package"));
+        assert!(
+            !strs.iter().any(|s| s == "mypackage==1.0.0"),
+            "root requirements must not drive install replay"
+        );
     }
 
     #[test]
-    fn locked_wheels_constraints_pin_every_locked_wheel_exactly() {
-        let mut lock = make_lock(vec![], vec![PUBLIC_PYPI.into()], BTreeMap::new());
-        lock.wheels
-            .push(lock_wheel("omniverseclient", "2.71.1.7015"));
-        lock.wheels.push(lock_wheel("pytz", "2024.1"));
-
-        let body = lock_wheels_to_constraints(&lock.wheels).unwrap();
-        let lines: Vec<_> = body.lines().collect();
-        assert_eq!(
-            lines,
-            vec![
-                "mypackage==1.0.0",
-                "omniverseclient==2.71.1.7015",
-                "pytz==2024.1",
-            ]
-        );
-    }
-
-    #[test]
-    fn relaxed_retry_args_preserve_lock_pin_constraints_file() {
-        let lock = make_lock(vec![], vec![PUBLIC_PYPI.into()], BTreeMap::new());
+    fn replay_args_preserve_python_platform_and_reinstall_only_when_requested() {
         let prefix = PathBuf::from("/fake/prefix");
-        let con = PathBuf::from("/fake/prefix/share/retread/test-bundle.constraints.txt");
-        let pins =
-            PathBuf::from("/fake/prefix/share/retread/test-bundle.lock-pins.constraints.txt");
-        let exc = PathBuf::from("/fake/prefix/share/retread/test-bundle.excludes.txt");
-        let args = build_uv_args(
-            &lock,
+        let wheels = vec![PathBuf::from("/cache/a-1.0-py3-none-any.whl")];
+        let args = build_uv_replay_args(
             &prefix,
-            None,
-            None,
-            Some(con.as_path()),
-            Some(pins.as_path()),
-            Some(exc.as_path()),
+            &wheels,
             Some("x86_64-manylinux_2_35"),
+            true,
         );
         let strs = argv_strings(&args);
 
-        assert_eq!(
-            flag_values(&strs, "--constraints"),
-            vec![
-                con.to_string_lossy().into_owned(),
-                pins.to_string_lossy().into_owned(),
-            ]
-        );
         assert_eq!(
             flag_values(&strs, "--python-platform"),
             vec!["x86_64-manylinux_2_35".to_string()]
         );
-        assert_eq!(
-            flag_values(&strs, "--excludes"),
-            vec![exc.to_string_lossy().into_owned()]
-        );
+        assert!(strs.contains(&"--reinstall".to_string()));
+
+        let args = build_uv_replay_args(&prefix, &wheels, None, false);
+        let strs = argv_strings(&args);
+        assert!(!strs.contains(&"--python-platform".to_string()));
+        assert!(!strs.contains(&"--reinstall".to_string()));
     }
 
-    // S1: no constraints file -> no --constraints flag.
     #[test]
-    fn s1_no_constraints_no_flag() {
-        let lock = make_lock(vec![], vec![PUBLIC_PYPI.into()], BTreeMap::new());
-        let prefix = PathBuf::from("/fake/prefix");
-        let args = build_uv_args(&lock, &prefix, None, None, None, None, None, None);
-        let strs = argv_strings(&args);
-        assert!(!strs.contains(&"--constraints".to_string()));
+    fn validate_rejects_old_schema_and_index_without_hash() {
+        let mut lock = make_lock(vec![], vec!["https://pypi.org/simple/".into()], BTreeMap::new());
+        lock.schema = crate::lock::SCHEMA - 1;
+        let err = validate_install_lock(Path::new("/lock.json"), &lock).unwrap_err();
+        assert!(format!("{err:#}").contains("requires schema"));
+
+        let mut lock = make_lock(vec![], vec!["https://pypi.org/simple/".into()], BTreeMap::new());
+        lock.wheels = vec![LockWheel {
+            name: "remote".into(),
+            version: "1.0.0".into(),
+            origin: Origin::Index,
+            filename: "remote-1.0.0-py3-none-any.whl".into(),
+            url: Some("https://example.com/remote-1.0.0-py3-none-any.whl".into()),
+            sha256: None,
+            requires_dist: vec![],
+            must_ship: false,
+            upstream_url: None,
+            git_source: None,
+            sdist_source: None,
+        }];
+        let err = validate_install_lock(Path::new("/lock.json"), &lock).unwrap_err();
+        assert!(format!("{err:#}").contains("require both url and sha256"));
     }
 
-    // The exclude set (conda-populated packages) is threaded as --excludes when
-    // present, and absent otherwise.
     #[test]
-    fn excludes_file_appears_in_argv() {
-        let lock = make_lock(vec![], vec![PUBLIC_PYPI.into()], BTreeMap::new());
-        let prefix = PathBuf::from("/fake/prefix");
-        let exc = PathBuf::from("/fake/prefix/share/retread/test-bundle.excludes.txt");
-        let args = build_uv_args(
-            &lock,
-            &prefix,
-            None,
-            None,
-            None,
-            None,
-            Some(exc.as_path()),
-            None,
+    fn read_validated_lock_reports_rebuild_for_missing_or_corrupt_lock() {
+        let root = tempdir("invalid-lock");
+        let missing = root.join("missing.lock.json");
+        let err = read_validated_lock(&missing).unwrap_err();
+        assert!(format!("{err:#}").contains("Rebuild the courier pack"));
+
+        let corrupt = root.join("corrupt.lock.json");
+        std::fs::write(&corrupt, b"not json").unwrap();
+        let err = read_validated_lock(&corrupt).unwrap_err();
+        assert!(format!("{err:#}").contains("Rebuild the courier pack"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn materialize_index_wheel_uses_sha_cache_without_network() {
+        let root = tempdir("index-cache");
+        let cache_root = root.join("cache");
+        let fetch_dir = root.join("fetch");
+        let bytes = b"cached wheel bytes";
+        let sha = hex_sha256(bytes);
+        let filename = "remote-1.0.0-py3-none-any.whl";
+        let cached = cache_root.join("wheels").join(&sha).join(filename);
+        std::fs::create_dir_all(cached.parent().unwrap()).unwrap();
+        std::fs::write(&cached, bytes).unwrap();
+
+        let lock = make_lock(vec![], vec![], BTreeMap::new());
+        let wheel = index_lock_wheel(
+            "remote",
+            "1.0.0",
+            &format!("http://127.0.0.1:9/{filename}"),
+            &sha,
         );
-        let strs = argv_strings(&args);
-        assert_eq!(
-            flag_values(&strs, "--excludes"),
-            vec![exc.to_string_lossy().into_owned()]
+        let path = materialize_index_wheel(&lock, &wheel, &fetch_dir, &cache_root)
+            .await
+            .unwrap();
+        assert_eq!(path, cached);
+        assert!(
+            !fetch_dir.exists(),
+            "cache hit must not create fetch dir or touch network"
         );
-        // absent when not provided.
-        let args = build_uv_args(&lock, &prefix, None, None, None, None, None, None);
-        assert!(!argv_strings(&args).contains(&"--excludes".to_string()));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn materialize_locked_wheels_uses_shipped_file_offline() {
+        let root = tempdir("offline-shipped");
+        let prefix = root.join("prefix");
+        let wheels_dir = root.join("wheels");
+        let bytes = b"already shipped wheel bytes";
+        let sha = hex_sha256(bytes);
+        let filename = "remote-1.0.0-py3-none-any.whl";
+        let shipped = wheels_dir.join(filename);
+        std::fs::create_dir_all(&wheels_dir).unwrap();
+        std::fs::write(&shipped, bytes).unwrap();
+
+        let mut lock = make_lock(vec![], vec![], BTreeMap::new());
+        lock.wheels = vec![index_lock_wheel(
+            "remote",
+            "1.0.0",
+            &format!("http://127.0.0.1:9/{filename}"),
+            &sha,
+        )];
+
+        let files = materialize_locked_wheels(&lock, &prefix, &wheels_dir)
+            .await
+            .unwrap();
+        assert_eq!(files, vec![shipped]);
+        assert!(
+            !prefix
+                .join("share")
+                .join("retread")
+                .join(&lock.bundle)
+                .join("fetched")
+                .exists(),
+            "shipped offline replay must not create fetch dir"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn materialize_index_wheel_fetches_locked_url_and_verifies_hash() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let root = tempdir("index-fetch");
+        let cache_root = root.join("cache");
+        let fetch_dir = root.join("fetch");
+        let filename = "remote-1.0.0-py3-none-any.whl";
+        let bytes = b"downloaded locked wheel bytes".to_vec();
+        let sha = hex_sha256(&bytes);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let serve = tokio::spawn({
+            let bytes = bytes.clone();
+            async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.0 200 OK\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\n\r\n",
+                    bytes.len()
+                );
+                stream.write_all(resp.as_bytes()).await.unwrap();
+                stream.write_all(&bytes).await.unwrap();
+            }
+        });
+
+        let lock = make_lock(vec![], vec![], BTreeMap::new());
+        let wheel = index_lock_wheel(
+            "remote",
+            "1.0.0",
+            &format!("http://127.0.0.1:{port}/{filename}"),
+            &sha,
+        );
+        let path = materialize_index_wheel(&lock, &wheel, &fetch_dir, &cache_root)
+            .await
+            .unwrap();
+        serve.await.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(sha256_file(&path).unwrap(), sha);
+        assert!(
+            cache_root.join("wheels").join(&sha).join(filename).exists(),
+            "fetch must populate sha-addressed cache"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1172,164 +1212,6 @@ mod tests {
         assert_eq!(normalize_dist_name("ruamel.yaml"), "ruamel-yaml");
         assert_eq!(normalize_dist_name("foo__bar--baz"), "foo-bar-baz");
         assert_eq!(normalize_dist_name("genesis-world"), "genesis-world");
-    }
-
-    // S3: index chain order matches lock.index_urls exactly, primary = index_urls[0].
-    #[test]
-    fn s3_index_chain_matches_lock_order() {
-        let lock = make_lock(
-            vec![],
-            vec![
-                "https://pypi.nvidia.com".into(),
-                "https://pypi.org/simple/".into(),
-            ],
-            BTreeMap::new(),
-        );
-        let prefix = PathBuf::from("/fake/prefix");
-        let args = build_uv_args(&lock, &prefix, None, None, None, None, None, None);
-        let strs = argv_strings(&args);
-
-        let primary = flag_values(&strs, "--index-url");
-        let extras = flag_values(&strs, "--extra-index-url");
-
-        assert_eq!(primary, vec!["https://pypi.nvidia.com"]);
-        assert_eq!(extras, vec!["https://pypi.org/simple/"]);
-    }
-
-    // S3: public PyPI is NOT forced as primary when lock names a different primary.
-    #[test]
-    fn s3_no_forced_public_pypi_primary() {
-        let lock = make_lock(
-            vec![],
-            vec![
-                "https://pypi.nvidia.com".into(),
-                "https://pypi.org/simple/".into(),
-            ],
-            BTreeMap::new(),
-        );
-        let prefix = PathBuf::from("/fake/prefix");
-        let args = build_uv_args(&lock, &prefix, None, None, None, None, None, None);
-        let strs = argv_strings(&args);
-
-        let primary = flag_values(&strs, "--index-url");
-        assert!(
-            !primary
-                .iter()
-                .any(|u| u.trim_end_matches('/') == PUBLIC_PYPI.trim_end_matches('/')),
-            "public PyPI must not be the primary when lock specifies a different primary; got {primary:?}"
-        );
-    }
-
-    // S3: empty index_urls falls back to PUBLIC_PYPI as sole primary.
-    #[test]
-    fn s3_empty_index_urls_fallback_to_public_pypi() {
-        let lock = make_lock(vec![], vec![], BTreeMap::new());
-        let prefix = PathBuf::from("/fake/prefix");
-        let args = build_uv_args(&lock, &prefix, None, None, None, None, None, None);
-        let strs = argv_strings(&args);
-
-        let primary = flag_values(&strs, "--index-url");
-        let extras = flag_values(&strs, "--extra-index-url");
-
-        assert_eq!(
-            primary,
-            vec![PUBLIC_PYPI],
-            "empty index_urls must fall back to public PyPI as primary"
-        );
-        assert!(
-            extras.is_empty(),
-            "no extra indexes when lock has none; got {extras:?}"
-        );
-    }
-
-    // Overrides file is passed through when provided.
-    #[test]
-    fn overrides_file_appears_in_argv() {
-        let lock = make_lock(vec![], vec![PUBLIC_PYPI.into()], BTreeMap::new());
-        let prefix = PathBuf::from("/fake/prefix");
-        let ovr = PathBuf::from("/fake/prefix/share/retread/test-bundle.overrides.txt");
-        let args = build_uv_args(
-            &lock,
-            &prefix,
-            None,
-            Some(ovr.as_path()),
-            None,
-            None,
-            None,
-            None,
-        );
-        let strs = argv_strings(&args);
-        let ovr_vals = flag_values(&strs, "--overrides");
-        assert_eq!(ovr_vals, vec![ovr.to_string_lossy().into_owned()]);
-    }
-
-    // Root requirements appear in argv.
-    #[test]
-    fn root_requirements_in_argv() {
-        let lock = make_lock(vec![], vec![PUBLIC_PYPI.into()], BTreeMap::new());
-        let prefix = PathBuf::from("/fake/prefix");
-        let args = build_uv_args(&lock, &prefix, None, None, None, None, None, None);
-        let strs = argv_strings(&args);
-        assert!(
-            strs.contains(&"mypackage==1.0.0".to_string()),
-            "root requirements must appear in argv"
-        );
-    }
-
-    // HOTFIX v2.10.1: --python-platform is threaded through when Some, and
-    // absent (uv's host gate untouched) when None.
-    #[test]
-    fn python_platform_flag_appears_in_argv() {
-        let lock = make_lock(vec![], vec![PUBLIC_PYPI.into()], BTreeMap::new());
-        let prefix = PathBuf::from("/fake/prefix");
-        let args = build_uv_args(
-            &lock,
-            &prefix,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some("x86_64-manylinux_2_35"),
-        );
-        let strs = argv_strings(&args);
-        assert_eq!(
-            flag_values(&strs, "--python-platform"),
-            vec!["x86_64-manylinux_2_35".to_string()]
-        );
-        // absent when None -> uv's manylinux host gate is left untouched.
-        let args = build_uv_args(&lock, &prefix, None, None, None, None, None, None);
-        assert!(!argv_strings(&args).contains(&"--python-platform".to_string()));
-    }
-
-    // Multi-index bundles (Isaac Sim's real wheel is on pypi.nvidia.com, a
-    // stub of the same name on public PyPI) require uv to weigh ALL indexes,
-    // not stop at the first that lists the name. Without this the post-link
-    // resolves the stub and dies with a platform-tag error the glibc relax
-    // can't recover from.
-    #[test]
-    fn index_strategy_is_unsafe_best_match() {
-        let lock = make_lock(
-            vec![],
-            vec![PUBLIC_PYPI.into(), "https://pypi.nvidia.com".into()],
-            BTreeMap::new(),
-        );
-        let args = build_uv_args(
-            &lock,
-            &PathBuf::from("/fake/prefix"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
-        let strs = argv_strings(&args);
-        assert_eq!(
-            flag_values(&strs, "--index-strategy"),
-            vec!["unsafe-best-match".to_string()],
-            "installer must search all indexes for the best-compatible wheel"
-        );
     }
 
     // glibc banner parsing: getconf, ldd, and a 3-part micro all yield the
@@ -1387,7 +1269,7 @@ mod tests {
         let share = prefix.join("share").join("retread");
         std::fs::create_dir_all(&share).unwrap();
 
-        let lock = make_lock(vec![], vec![PUBLIC_PYPI.into()], BTreeMap::new());
+        let lock = make_lock(vec![], vec!["https://pypi.org/simple/".into()], BTreeMap::new());
         let raw = serde_json::to_vec(&lock).unwrap();
         let lock_path = share.join(lock.marker_name().replace(".installed", ".lock.json"));
         std::fs::write(&lock_path, &raw).unwrap();
@@ -1439,7 +1321,7 @@ mod tests {
         let share = prefix.join("share").join("retread");
         std::fs::create_dir_all(&share).unwrap();
 
-        let mut lock = make_lock(vec![], vec![PUBLIC_PYPI.into()], BTreeMap::new());
+        let mut lock = make_lock(vec![], vec!["https://pypi.org/simple/".into()], BTreeMap::new());
         lock.python = "3.12".into();
         let raw = serde_json::to_vec(&lock).unwrap();
         let lock_path = share.join(lock.marker_name().replace(".installed", ".lock.json"));
@@ -1496,7 +1378,7 @@ mod tests {
         let share = prefix.join("share").join("retread");
         std::fs::create_dir_all(&share).unwrap();
 
-        let lock = make_lock(vec![], vec![PUBLIC_PYPI.into()], BTreeMap::new());
+        let lock = make_lock(vec![], vec!["https://pypi.org/simple/".into()], BTreeMap::new());
         let raw = serde_json::to_vec(&lock).unwrap();
         let lock_path = share.join("retread-test-bundle.lock.json");
         std::fs::write(&lock_path, &raw).unwrap();
@@ -1531,7 +1413,7 @@ mod tests {
         let share = prefix.join("share").join("retread");
         std::fs::create_dir_all(&share).unwrap();
 
-        let lock = make_lock(vec![], vec![PUBLIC_PYPI.into()], BTreeMap::new());
+        let lock = make_lock(vec![], vec!["https://pypi.org/simple/".into()], BTreeMap::new());
         let raw = serde_json::to_vec(&lock).unwrap();
         let lock_path = share.join("retread-test-bundle.lock.json");
         std::fs::write(&lock_path, &raw).unwrap();
@@ -1567,7 +1449,7 @@ mod tests {
         let share = prefix.join("share").join("retread");
         std::fs::create_dir_all(&share).unwrap();
 
-        let lock = make_lock(vec![], vec![PUBLIC_PYPI.into()], BTreeMap::new());
+        let lock = make_lock(vec![], vec!["https://pypi.org/simple/".into()], BTreeMap::new());
         let raw = serde_json::to_vec(&lock).unwrap();
         let lock_path = share.join("retread-test-bundle.lock.json");
         std::fs::write(&lock_path, &raw).unwrap();
@@ -1594,46 +1476,6 @@ mod tests {
             "unexpected error: {msg}"
         );
         let _ = std::fs::remove_dir_all(root);
-    }
-
-    // v3.0.4 regression: `uv pip list` output is parsed line-by-line and the
-    // result is written VERBATIM to excludes.txt, which a later `uv pip
-    // install -r excludes.txt` re-parses as a requirements file. uv respects
-    // FORCE_COLOR/CLICOLOR_FORCE from the environment even when stdout is
-    // piped (not a tty) -- without `--color never` a colorized caller
-    // environment corrupts every package name with raw ANSI escapes
-    // (`\x1b[1mabsl-py\x1b[0m`), and uv's requirements parser then fails
-    // with "Unexpected '', expected '-c', '-e', '-r' or the start of a
-    // requirement" on the very first byte. This is the exact subprocess
-    // invocation `install`'s excludes.txt generation uses (see the `uv pip
-    // list` call there) -- asserting no ESC bytes appear even under
-    // FORCE_COLOR locks in the fix.
-    #[test]
-    #[ignore = "live: needs uv on PATH; run with --include-ignored"]
-    fn uv_pip_list_color_never_survives_force_color() {
-        let python = std::process::Command::new("which")
-            .arg("python3")
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .unwrap_or_else(|| "python3".to_string());
-
-        let out = std::process::Command::new("uv")
-            .args(["pip", "list", "--color", "never", "--format", "freeze", "--python"])
-            .arg(&python)
-            .env("FORCE_COLOR", "3")
-            .env("CLICOLOR_FORCE", "1")
-            .output()
-            .expect("spawning uv");
-        assert!(out.status.success(), "uv pip list failed: {out:?}");
-        assert!(
-            !out.stdout.contains(&0x1b),
-            "uv pip list --color never must not emit ANSI escapes even with \
-             FORCE_COLOR/CLICOLOR_FORCE set in the environment (found ESC byte \
-             in output, which would corrupt excludes.txt exactly as in #8's \
-             follow-up bug)"
-        );
     }
 
     #[test]

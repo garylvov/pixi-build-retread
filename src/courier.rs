@@ -715,28 +715,77 @@ pub async fn stage(
 
             match shadow_src {
                 ShadowSrc::None => {
-                    // Unchanged index wheel: record with upstream url.
-                    // sha256 is not carried by EmitWheel; the installer verifies
-                    // at fetch time from the index's sidecar hash.
+                    // Unchanged index wheel: record with direct artifact URL + hash.
+                    // Install-time replay fetches this exact URL only; it never asks
+                    // an index for metadata. If no URL exists, the wheel must ship
+                    // inside the courier package instead.
                     // requires_dist is recorded in full (not vec![]) so plan()
                     // on replay builds the same override table as cold-produce
                     // (#4 parity fix: empty requires_dist causes plan() to miss
                     // overrides for index wheels, potentially flipping a relax-
                     // shadow to Index and poisoning the lock on replay).
-                    let index_url = w.remote_url.as_ref().map(|u| u.to_string());
-                    lock_wheels.push(LockWheel {
-                        name: w.pypi_name.clone(),
-                        version: w.version.clone(),
-                        origin: Origin::Index,
-                        filename: std_name,
-                        url: index_url,
-                        sha256: None,
-                        requires_dist: w.requires_dist.clone(),
-                        must_ship: false,
-                        upstream_url: None, // n/a for Index wheels; use `url` instead
-                        git_source: None,   // Index wheels have no git source
-                        sdist_source: None, // n/a for Index wheels
-                    });
+                    let index_url = w
+                        .upstream_url
+                        .as_ref()
+                        .or(w.remote_url.as_ref())
+                        .map(|u| u.to_string());
+                    if let Some(index_url) = index_url {
+                        let sha256 = w.sha256.clone().ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "courier: cannot write replayable lock for unchanged index wheel \
+                                 `{}`: missing sha256 for direct artifact URL `{}`. Rebuild the \
+                                 pack from a resolver path that downloads the wheel or reads a \
+                                 PEP 658 sidecar with a hash.",
+                                w.pypi_name,
+                                index_url
+                            )
+                        })?;
+                        lock_wheels.push(LockWheel {
+                            name: w.pypi_name.clone(),
+                            version: w.version.clone(),
+                            origin: Origin::Index,
+                            filename: std_name,
+                            url: Some(index_url),
+                            sha256: Some(sha256),
+                            requires_dist: w.requires_dist.clone(),
+                            must_ship: false,
+                            upstream_url: None, // n/a for Index wheels; use `url` instead
+                            git_source: None,   // Index wheels have no git source
+                            sdist_source: None, // n/a for Index wheels
+                        });
+                    } else {
+                        let src = w.local_path.as_ref().ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "courier: unchanged wheel `{}` has neither a local file nor a \
+                                 direct artifact URL; cannot write a replayable lock",
+                                w.pypi_name
+                            )
+                        })?;
+                        let dst = staging_dir.join(&std_name);
+                        crate::wheel::hardlink_or_copy_async(src, &dst)
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "shipping unchanged local-only wheel {} from {}",
+                                    w.pypi_name,
+                                    src.display()
+                                )
+                            })?;
+                        source_urls.push(file_url(&dst)?);
+                        lock_wheels.push(LockWheel {
+                            name: w.pypi_name.clone(),
+                            version: w.version.clone(),
+                            origin: Origin::Built,
+                            filename: std_name,
+                            url: None,
+                            sha256: w.sha256.clone(),
+                            requires_dist: w.requires_dist.clone(),
+                            must_ship: false,
+                            upstream_url: None,
+                            git_source: None,
+                            sdist_source: None,
+                        });
+                    }
                 }
                 ShadowSrc::Rewritten(probe_dst) => {
                     // Relax changed this index wheel's METADATA (already rewritten
@@ -1099,6 +1148,7 @@ mod tests {
             version: version.to_string(),
             requires_dist: requires.iter().map(|s| s.to_string()).collect(),
             wheel_filename,
+            sha256: remote_url.map(|_| "0".repeat(64)),
             local_path: local_path.map(|p| p.to_path_buf()),
             remote_url: remote_url.and_then(|u| u.parse().ok()),
             upstream_url: None,
@@ -1427,6 +1477,10 @@ mod tests {
         assert_eq!(unchanged.len(), 1, "exactly one wheel named 'unchanged'");
         assert_eq!(unchanged[0].origin, Origin::Index);
         assert_eq!(unchanged[0].url.as_deref(), Some(upstream_url));
+        assert_eq!(
+            unchanged[0].sha256.as_deref(),
+            Some("0000000000000000000000000000000000000000000000000000000000000000")
+        );
     }
 
     // ── Shadow-cache unit tests ───────────────────────────────────────────
@@ -2375,6 +2429,7 @@ version = "1.0.0"
             version: pkg_version.to_string(),
             requires_dist: vec![],
             wheel_filename: injected_wheel_filename.clone(),
+            sha256: None,
             local_path: Some(injected_wheel_path.clone()),
             remote_url: None,
             upstream_url: None,
@@ -2519,6 +2574,7 @@ version = "1.0.0"
             version: pkg_version.to_string(),
             requires_dist: vec![],
             wheel_filename: replay_injected_filename,
+            sha256: None,
             local_path: Some(replay_injected_path),
             remote_url: None,
             upstream_url: None,

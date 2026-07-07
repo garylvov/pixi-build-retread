@@ -74,6 +74,10 @@ pub struct EmitWheel {
     /// platform tags. Index wheels keep their upstream name; local
     /// wheels carry retread's infixes (harmless for tag parsing).
     pub wheel_filename: String,
+    /// SHA-256 of the exact wheel bytes when known. Index wheels must carry
+    /// this into the courier lock so install-time replay can fetch the locked
+    /// artifact URL directly without consulting index metadata.
+    pub sha256: Option<String>,
     /// Upstream URL when the wheel was never materialized locally
     /// (PEP 658 sidecar metadata). Blueprint mode fetches these on
     /// demand when their Requires-Dist needs rewriting.
@@ -591,6 +595,7 @@ mod tests {
                         .into_owned()
                 })
                 .unwrap_or_else(|| format!("{name}-{version}-py3-none-any.whl")),
+            sha256: None,
             local_path: local.map(PathBuf::from),
             remote_url: None,
             upstream_url: None,
@@ -646,6 +651,7 @@ mod tests {
             version: version.into(),
             requires_dist: requires.iter().map(|s| (*s).to_string()).collect(),
             wheel_filename: format!("{name}-{version}-py3-none-any.whl"),
+            sha256: None,
             local_path: None,
             remote_url: None,
             upstream_url: None,

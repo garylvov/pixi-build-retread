@@ -219,11 +219,19 @@ pub async fn fetch_wheel_cached(
 
     // Early return: already in dest_dir.
     if dest.exists() {
+        let actual = sha256_file(&dest).await?;
+        if actual.eq_ignore_ascii_case(sha256) {
+            tracing::debug!(
+                wheel = %filename,
+                "wheel cache: already in dest_dir (no fetch needed)",
+            );
+            return Ok(dest);
+        }
         tracing::debug!(
             wheel = %filename,
-            "wheel cache: already in dest_dir (no fetch needed)",
+            "wheel cache: dest_dir hash mismatch; removing stale wheel",
         );
-        return Ok(dest);
+        fs::remove_file(&dest).await.ok();
     }
 
     // Check the persistent store.

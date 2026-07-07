@@ -76,13 +76,13 @@ Then add **`<workspace>/.pixi/config.toml`** for the fast install path:
 run-post-link-scripts = "insecure"
 ```
 
-`git clone && pixi install` now resolves + links the courier package and its post-link runs `retread install` — hardlinking shipped wheels and fetching index wheels in seconds. No backend process or rebuild happens on the consumer. (Why the toggle, and the safe alternative: see **Courier** below.)
+`git clone && pixi install` now resolves + links the courier package and its post-link runs `retread install` — installing exact locked wheel files with `uv --no-deps --offline`, hardlinking shipped/cache hits and direct-fetching only missing URL+hash wheels. No backend process, dependency resolution, or index metadata lookup happens on the consumer. (Why the toggle, and the safe alternative: see **Courier** below.)
 
 ## Courier — the fast path, and the safe alternative
 
 retread can deliver a pack two ways. **Courier is the default and the fast path; `retread-courier = false` is the safe path.** Pick based on whether you can enable post-link scripts in the consuming workspace.
 
-**Courier (default) — fast.** The pack is *one metadata-light conda package* that bakes in the `retread` installer, the built/shadow wheels, and a committed `retread-<bundle>.lock.json`. pixi links it like any conda package, then a post-link script runs `retread install`, which uses `uv` to hardlink the wheels into the env in **seconds**. Why prefer it:
+**Courier (default) — fast.** The pack is *one metadata-light conda package* that bakes in the `retread` installer, the built/shadow wheels, and a committed `retread-<bundle>.lock.json`. pixi links it like any conda package, then a post-link script runs `retread install`, which hands uv the exact wheel file list with `--no-deps --offline` and hardlinks the wheels into the env in **seconds**. Why prefer it:
 - the consumer `pixi.toml` keeps **one clean line** (zero machine-written bytes),
 - **no wheels in git** — the committed lock is kilobytes and the wheels ride inside the conda package,
 - **nothing rebuilds on the consumer** — no backend process, no source build, no solve (a matching lock just replays).
@@ -114,10 +114,10 @@ retread: '<pack>' PyPI wheels are NOT installed.
 <summary><b>What's committed vs fetched</b></summary>
 
 - **Git** (KB, no wheel bytes): the two `pixi.toml`s, `.pixi/config.toml`, and `retread-<bundle>.lock.json` next to the source pack.
-- **Inside the conda package** (built by the backend, never in git): retread-built wheels (git/path sources) and relax-changed index wheels (shadow copies with rewritten METADATA, so the strict-pinned originals can't sneak back in).
-- **Fetched at install** by `retread install`: unchanged index wheels from their recorded URLs (hardlinked from uv's cache when present).
+- **Inside the conda package** (built by the backend, never in git): retread-built wheels (git/path sources), local-only wheels, sdist-built wheels, and relax-changed index wheels (shadow copies with rewritten METADATA, so the strict-pinned originals can't sneak back in).
+- **Fetched at install** by `retread install`: unchanged index wheels from their recorded direct artifact URLs, verified against the lock's `sha256`, then installed from local files. If the sha-addressed cache already has the file, replay is fully offline.
 
-Gitignore `wheels/` in the pack dir — it's multi-GB for NVIDIA packs and fully reproducible from the lock.
+Gitignore `wheels/` in the pack dir — it's multi-GB for NVIDIA packs and fully reproducible from the lock during pack build. At install time, shipped-only wheel classes cannot be recovered if the courier package payload under `$CONDA_PREFIX/share/retread/<pack>/wheels` is missing; reinstall or rebuild the courier package. Missing unchanged index wheels are recoverable from their locked URL+hash without consulting index metadata.
 
 > The uv-installed PyPI dists live in `$CONDA_PREFIX` but are outside `pixi.lock`, so `pixi list` / `pixi install --frozen` won't show or restore them. After a pack change, `pixi lock` + re-install so pixi re-links the package and re-runs `retread install`.
 
@@ -201,7 +201,7 @@ A binary index wheel can be published with a manylinux floor newer than the inst
   platform tag (e.g., `manylinux_2_34_x86_64`) ...
 ```
 
-`retread install` recovers only when the workspace or pack declares the glibc floor it is willing to honor, for example `libc = "2.35"` in `[system-requirements]` or `platforms = [{ platform = "linux-64", glibc = "2.35" }]` under `[workspace]`. The retry target is exactly that declaration, not a host+1 heuristic. The declaration is load-bearing: after uv installs, retread applies configured `[package.build.config.retread-shadow-libs]` replacements, prepends `$CONDA_PREFIX/lib` from the shipped activate.d hook, and runs a readelf GLIBC symbol audit. The audit records its result in the `.installed` marker; `retread verify --full` reruns it.
+`retread install` recovers only when the workspace or pack declares the glibc floor it is willing to honor, for example `libc = "2.35"` in `[system-requirements]` or `platforms = [{ platform = "linux-64", glibc = "2.35" }]` under `[workspace]`. The retry target is exactly that declaration, not a host+1 heuristic. The declaration is load-bearing: uv still installs explicit wheel files with `--no-deps --offline`, but the retry adds `--python-platform` so uv's wheel tag check honors the declared floor. After uv installs, retread applies configured `[package.build.config.retread-shadow-libs]` replacements, prepends `$CONDA_PREFIX/lib` from the shipped activate.d hook, and runs a readelf GLIBC symbol audit. The audit records its result in the `.installed` marker; `retread verify --full` reruns it.
 
 The shipped activation guard verifies and self-heals the uv-installed payload on activation. A failed heal writes `$CONDA_PREFIX/share/retread/<pack>.broken` and backs off for 300 seconds; `retread verify` treats that sentinel as failure. Pixi's experimental `use-environment-activation-cache` can cache activate.d output and skip per-activation verification, so workspaces that enable it should run `retread verify --lock ... --prefix ...` in CI or task preflight.
 

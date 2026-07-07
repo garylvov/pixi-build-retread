@@ -5156,6 +5156,7 @@ async fn emit_wheels_from_lock(
                     requires_dist: lw.requires_dist.clone(),
                     local_path,
                     wheel_filename: lw.filename.clone(),
+                    sha256: lw.sha256.clone(),
                     remote_url,
                     upstream_url: None,
                     git_source: None,   // Origin::Index: no git source
@@ -5277,6 +5278,7 @@ async fn emit_wheels_from_lock(
                                         requires_dist: member_lw.requires_dist.clone(),
                                         local_path,
                                         wheel_filename: member_lw.filename.clone(),
+                                        sha256: member_lw.sha256.clone(),
                                         remote_url: None,
                                         upstream_url: None,
                                         git_source: resolved.git_source.clone(),
@@ -5364,6 +5366,7 @@ async fn emit_wheels_from_lock(
                             requires_dist: lw.requires_dist.clone(),
                             local_path,
                             wheel_filename: lw.filename.clone(),
+                            sha256: lw.sha256.clone(),
                             remote_url: None,
                             upstream_url: None,
                             git_source: resolved.git_source.clone(),
@@ -5427,6 +5430,7 @@ async fn emit_wheels_from_lock(
                         requires_dist: lw.requires_dist.clone(),
                         local_path,
                         wheel_filename: lw.filename.clone(),
+                        sha256: lw.sha256.clone(),
                         remote_url: None,
                         upstream_url: None,
                         // git_source from the re-materialized resolved wheel (schema 8+).
@@ -5545,6 +5549,7 @@ async fn emit_wheels_from_lock(
                     requires_dist: lw.requires_dist.clone(),
                     local_path: Some(built),
                     wheel_filename: lw.filename.clone(),
+                    sha256: lw.sha256.clone(),
                     remote_url: None,
                     upstream_url: None,
                     git_source: None,
@@ -5653,6 +5658,7 @@ async fn emit_wheels_from_lock(
                     requires_dist: lw.requires_dist.clone(),
                     local_path: Some(fetched),
                     wheel_filename: lw.filename.clone(),
+                    sha256: lw.sha256.clone(),
                     remote_url: None, // local-path EmitWheel: cold has remote_url=None
                     // upstream_url carries the index URL so courier's Rewritten/Raw
                     // arms write upstream_url=github + url=None, matching cold.
@@ -6079,6 +6085,7 @@ async fn resolve_incremental_add(
                 pypi_name: w.pypi_name.clone(),
                 version: w.metadata.version.clone(),
                 requires_dist: w.metadata.requires_dist.clone(),
+                sha256: Some(w.metadata.sha256.clone()),
                 local_path: (url.scheme() == "file")
                     .then(|| url.to_file_path().ok())
                     .flatten(),
@@ -6453,6 +6460,7 @@ async fn build_one(
                 pypi_name: w.pypi_name.clone(),
                 version: w.metadata.version.clone(),
                 requires_dist: w.metadata.requires_dist.clone(),
+                sha256: Some(w.metadata.sha256.clone()),
                 local_path: (url.scheme() == "file")
                     .then(|| url.to_file_path().ok())
                     .flatten(),
@@ -7694,6 +7702,7 @@ mod replay_tests {
             requires_dist: lw.requires_dist.clone(),
             local_path: Some(built_path.clone()),
             wheel_filename: lw.filename.clone(),
+            sha256: lw.sha256.clone(),
             remote_url: None,
             upstream_url: None,
             git_source: None,
@@ -7930,6 +7939,7 @@ mod replay_tests {
             requires_dist: lw.requires_dist.clone(),
             local_path: Some(fetched_path.clone()),
             wheel_filename: lw.filename.clone(),
+            sha256: lw.sha256.clone(),
             remote_url: None,
             upstream_url: Some(remote_url),
             git_source: None,
@@ -8087,6 +8097,7 @@ mod replay_tests {
             version: dep_version.to_string(),
             requires_dist: vec![],
             wheel_filename: dep_whl_name.clone(),
+            sha256: None,
             local_path: Some(dep_whl_path.clone()),
             remote_url: None,
             upstream_url: None,
@@ -8101,6 +8112,7 @@ mod replay_tests {
             version: wheel_version.to_string(),
             requires_dist: vec![url_req.clone()],
             wheel_filename: p3d_whl_name.clone(),
+            sha256: None,
             local_path: Some(p3d_local.clone()),
             remote_url: None,
             upstream_url: Some(upstream_url.clone()),
@@ -8174,6 +8186,7 @@ mod replay_tests {
             version: dep_version.to_string(),
             requires_dist: vec![],
             wheel_filename: dep_whl_name.clone(),
+            sha256: None,
             local_path: Some(dep_whl_path),
             remote_url: None,
             upstream_url: None,
@@ -8188,6 +8201,7 @@ mod replay_tests {
             version: wheel_version.to_string(),
             requires_dist: cold_lw.requires_dist.clone(),
             wheel_filename: cold_lw.filename.clone(), // already-999retread
+            sha256: cold_lw.sha256.clone(),
             local_path: Some(fetched_replay),
             remote_url: None,
             upstream_url: Some(upstream_url),
@@ -9760,6 +9774,7 @@ mod emit_wheel_upstream_url_tests {
                     pypi_name: w.pypi_name.clone(),
                     version: w.metadata.version.clone(),
                     requires_dist: w.metadata.requires_dist.clone(),
+                    sha256: Some(w.metadata.sha256.clone()),
                     local_path: (url.scheme() == "file")
                         .then(|| url.to_file_path().ok())
                         .flatten(),
@@ -9865,6 +9880,7 @@ mod emit_wheel_upstream_url_tests {
                     pypi_name: w.pypi_name.clone(),
                     version: w.metadata.version.clone(),
                     requires_dist: w.metadata.requires_dist.clone(),
+                    sha256: Some(w.metadata.sha256.clone()),
                     local_path: (url.scheme() == "file")
                         .then(|| url.to_file_path().ok())
                         .flatten(),

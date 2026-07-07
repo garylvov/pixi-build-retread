@@ -9,8 +9,8 @@
 //!   package under `share/retread/wheels/<filename>` and install from
 //!   there.
 //! - `index` wheels (isaacsim, nvidia, ... -- the multi-GB bulk) are NOT
-//!   shipped; they install by fetching their recorded `url` at link time,
-//!   on uv's fast hardlink path.
+//!   shipped; they install by fetching their recorded direct artifact `url`
+//!   and verifying the recorded `sha256`, never by consulting index metadata.
 //!
 //! The lock is small (KB), human-diffable, and committed next to the pack
 //! manifest as `retread-<bundle>.lock.json`. It is the single source of
@@ -124,11 +124,12 @@ pub struct LockWheel {
     pub origin: Origin,
     /// Standardized wheel filename (the basename installed/shipped).
     pub filename: String,
-    /// Fetch URL for `Origin::Index` wheels; `None` for `Origin::Built`.
-    /// (Index wheels fetch this at install time; Built wheels ship in-package.)
+    /// Direct artifact URL for `Origin::Index` wheels; `None` for `Origin::Built`.
+    /// Index wheels fetch this exact URL at install time without index metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
-    /// sha256 of the wheel file (index-wheel verification; reproducibility).
+    /// sha256 of the exact wheel file. Required for `Origin::Index` so
+    /// install-time replay can direct-fetch and verify without resolving.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
     /// POST-relax Requires-Dist lines recorded for the replay poisoning guard
@@ -197,19 +198,17 @@ pub struct RetreadLock {
     /// probe cascade) iff a freshly computed inputs hash matches this.
     #[serde(default)]
     pub inputs_hash: String,
-    /// The PEP 508 requirements `retread install` hands to uv (the meta
-    /// requirement that drives the closure -- typically the bundle entries
-    /// pinned to their resolved versions). uv resolves these against the
-    /// shipped find-links wheels + `index_urls`, into the active conda env
-    /// (preferring conda-installed dists, so shared transitives stay conda).
+    /// Producer-side meta requirements retained for lock/build parity. Install
+    /// replay no longer hands these to uv; it installs `wheels` as explicit
+    /// files with `--no-deps`.
     #[serde(default)]
     pub root_requirements: Vec<String>,
     /// Wheels to install at link time (built ship in pkg + index fetched).
     pub wheels: Vec<LockWheel>,
     /// Shared transitives routed to conda (the courier package's run-deps).
     pub conda_run_deps: Vec<CondaDep>,
-    /// Index chain for fetching `Origin::Index` wheels + any prerelease
-    /// deps, in priority order (entry indexes, then public PyPI).
+    /// Producer-side index chain used during pack build/solve. Install replay
+    /// uses per-wheel direct artifact URLs and never consults this chain.
     pub index_urls: Vec<String>,
     /// Prerelease pins (`name` -> `==X`) uv needs to opt those deps into
     /// prerelease resolution (it only honors them from direct reqs +
@@ -249,6 +248,13 @@ pub struct RetreadLock {
     pub entry_specs: Vec<String>,
 }
 
+/// Schema 12: install-time pure replay metadata.
+///
+/// New invariant: every `Origin::Index` wheel must carry a direct artifact
+/// `url` and `sha256`; unchanged wheels without a direct URL are shipped as
+/// `Origin::Built`. The installer rejects older schemas rather than falling
+/// back to resolver-backed uv installs.
+///
 /// Schema 11: GLIBC runtime contract fields.
 ///
 /// New fields: `shadow_libs` and `declared_glibc`, both serde-defaulted so old
@@ -268,11 +274,12 @@ pub struct RetreadLock {
 /// for the Part-2 incremental delta-detector. `#[serde(default)]` so old locks
 /// parse (delta-detector falls back to full cold resolve on empty `entry_specs`).
 ///
-/// Old schema-9 and earlier locks are rejected by the != gate and fall through
-/// to full resolve (safe: committed locks must be regenerated). SCHEMA is NOT
-/// an epoch bump (output SEMANTICS for identical inputs are unchanged;
-/// [emit-epoch-ok]).
-pub const SCHEMA: u32 = 11;
+/// On the producer-side `conda/outputs` replay path, old schema-9 and earlier
+/// locks are rejected by the != gate and the pack build performs a fresh solve.
+/// On the consumer-side install path, old schemas are hard errors: install
+/// replay must not fall back to resolver-backed uv. SCHEMA is NOT an epoch bump
+/// (output SEMANTICS for identical inputs are unchanged; [emit-epoch-ok]).
+pub const SCHEMA: u32 = 12;
 
 /// Bump EMIT_EPOCH in the SAME commit as ANY change that can alter the bytes
 /// retread emits for identical manifest inputs (relax/version-selection
@@ -328,7 +335,12 @@ pub const SCHEMA: u32 = 11;
 /// Epoch 9: courier packages now ship activate/deactivate LD_LIBRARY_PATH
 /// management, guard broken-sentinel logic, and GLIBC shadow-lib metadata.
 /// Identical manifests emit different lock JSON and hook scripts.
-pub const EMIT_EPOCH: u32 = 9;
+///
+/// Epoch 10: courier locks now carry url+sha256 for every unchanged index
+/// wheel, and install-time replay uses explicit wheel files with --no-deps
+/// instead of resolver-backed root requirements. Existing packs must cold
+/// rebuild once so their locks contain direct-fetch hashes.
+pub const EMIT_EPOCH: u32 = 10;
 
 impl RetreadLock {
     /// File name for a bundle's lock next to the pack manifest.
@@ -557,8 +569,8 @@ mod tests {
         let back: RetreadLock = serde_json::from_str(&json).unwrap();
         assert_eq!(back.bundle, "isaac-pack");
         assert_eq!(
-            back.schema, 11,
-            "SCHEMA must be 11 after GLIBC runtime contract fields were added"
+            back.schema, 12,
+            "SCHEMA must be 12 after pure replay url+sha256 metadata was required"
         );
         assert_eq!(back.wheels.len(), 3);
         // Wheel 0: must_ship source-built, no upstream_url.
