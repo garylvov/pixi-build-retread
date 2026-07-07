@@ -79,7 +79,13 @@ pub(crate) fn conda_deps_to_constraints(deps: &[crate::lock::CondaDep]) -> Strin
 /// Matched conservatively so unrelated solve/network/link failures are never
 /// silently "relaxed" past.
 pub(crate) fn is_platform_tag_conflict(text: &str) -> bool {
-    let t = text.to_ascii_lowercase();
+    // uv line-wraps its resolver errors ("...matching platform\n      tag..."),
+    // so collapse all whitespace runs to single spaces before matching.
+    let t = text
+        .to_ascii_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     t.contains("matching platform tag") || (t.contains("platform tag") && t.contains("manylinux"))
 }
 
@@ -148,13 +154,25 @@ fn relax_platform_on_conflict(uv: &OsString, base_args: &[OsString]) -> Option<S
     // `install` for the concrete failure this class of bug causes.
     probe.push("--color".into());
     probe.push("never".into());
-    let out = Command::new(uv).args(&probe).output().ok()?;
+    let out = match Command::new(uv).args(&probe).output() {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("retread: relax probe failed to spawn uv: {e}");
+            return None;
+        }
+    };
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
     );
     if !is_platform_tag_conflict(&text) {
+        eprintln!(
+            "retread: relax probe: no platform-tag conflict detected (probe status {}, {} bytes): {}",
+            out.status,
+            text.len(),
+            text.chars().take(2000).collect::<String>()
+        );
         return None;
     }
     match host_glibc() {
