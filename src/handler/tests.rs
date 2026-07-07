@@ -10,6 +10,45 @@ use crate::config::RelaxPolicy;
 use crate::relax::default_marker_env;
 use std::collections::BTreeMap;
 
+#[cfg(unix)]
+fn unique_test_dir(label: &str) -> std::path::PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "retread-{label}-{}-{nanos}",
+        std::process::id()
+    ))
+}
+
+#[cfg(unix)]
+#[test]
+fn initialize_preflight_repairs_dangling_pixi_bld_symlink_target() {
+    let root = unique_test_dir("pixi-bld-symlink");
+    let workspace = root.join("workspace");
+    let pixi = workspace.join(".pixi");
+    let target = root.join("tmp-build").join("pixi-bld");
+    std::fs::create_dir_all(&pixi).unwrap();
+    std::fs::write(workspace.join("pixi.toml"), "[workspace]\nchannels = []\n").unwrap();
+    std::os::unix::fs::symlink(&target, pixi.join("bld")).unwrap();
+
+    assert!(!target.exists(), "test setup must start with a dangling symlink");
+    ensure_pixi_bld_symlink_target(Some(&workspace)).unwrap();
+
+    assert!(target.is_dir(), "preflight should create only the symlink target");
+    assert!(
+        std::fs::symlink_metadata(pixi.join("bld"))
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "preflight must not replace the .pixi/bld symlink"
+    );
+    assert_eq!(std::fs::read_link(pixi.join("bld")).unwrap(), target);
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
 // -----------------------------------------------------------------
 // v0.46.0: BFS prefer-conda picker. Regression coverage for the bug
 // where `torch` (whose parselmouth inverted map is ambiguous) fell

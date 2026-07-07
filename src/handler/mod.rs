@@ -213,6 +213,84 @@ fn workspace_manifest_mtime(
         .and_then(|m| m.modified().ok())
 }
 
+/// Pixi 0.70.2 starts the backend before it prepares the per-source build
+/// directory. If a workspace keeps `.pixi/bld` as a symlink to a tmp-backed
+/// build root and that tmp root was cleaned, Pixi's next mkdir under
+/// `.pixi/bld` hits the dangling symlink itself and returns EEXIST before it
+/// ever sends `conda/outputs` to this backend. Repair only that invariant:
+/// the symlink stays unchanged, and only its missing target directory is
+/// created.
+fn ensure_pixi_bld_symlink_target(
+    workspace_dir: Option<&std::path::Path>,
+) -> Result<(), RpcError> {
+    let Some(workspace_dir) = pixi_workspace_dir(workspace_dir) else {
+        return Ok(());
+    };
+    let bld = workspace_dir.join(".pixi").join("bld");
+    let meta = match std::fs::symlink_metadata(&bld) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(RpcError::internal(format!(
+                "checking pixi build dir {}: {e}",
+                bld.display()
+            )));
+        }
+    };
+    if !meta.file_type().is_symlink() {
+        return Ok(());
+    }
+
+    let raw_target = std::fs::read_link(&bld).map_err(|e| {
+        RpcError::internal(format!(
+            "reading pixi build-dir symlink {}: {e}",
+            bld.display()
+        ))
+    })?;
+    let target = if raw_target.is_absolute() {
+        raw_target
+    } else {
+        bld.parent()
+            .unwrap_or(workspace_dir.as_path())
+            .join(raw_target)
+    };
+    if target.exists() {
+        if target.is_dir() {
+            return Ok(());
+        }
+        return Err(RpcError::internal(format!(
+            "pixi build-dir symlink {} points to existing non-directory {}",
+            bld.display(),
+            target.display()
+        )));
+    }
+
+    std::fs::create_dir_all(&target).map_err(|e| {
+        RpcError::internal(format!(
+            "pixi build-dir symlink {} points to missing target {}, and retread \
+             could not create it: {e}",
+            bld.display(),
+            target.display()
+        ))
+    })?;
+    tracing::warn!(
+        workspace = %workspace_dir.display(),
+        symlink = %bld.display(),
+        target = %target.display(),
+        "retread repaired missing Pixi build-dir symlink target before source build"
+    );
+    Ok(())
+}
+
+fn pixi_workspace_dir(workspace_dir: Option<&std::path::Path>) -> Option<PathBuf> {
+    if let Some(dir) = workspace_dir.filter(|dir| dir.join("pixi.toml").is_file()) {
+        return Some(dir.to_path_buf());
+    }
+    std::env::current_dir()
+        .ok()
+        .filter(|dir| dir.join("pixi.toml").is_file())
+}
+
 /// Outcome classification after all environments have been solved.
 ///
 /// Used to drive BOTH the stderr abstention banner AND the MD-deletion
@@ -715,6 +793,9 @@ impl Handler {
             );
         }
 
+        let workspace_dir = params.workspace_directory;
+        ensure_pixi_bld_symlink_target(workspace_dir.as_deref())?;
+
         let mut state = self.state.write().await;
         state.config = Some(config);
         state.cache_dir = params.cache_directory;
@@ -722,7 +803,7 @@ impl Handler {
         state.source_dir = params
             .source_directory
             .or_else(|| params.manifest_path.parent().map(PathBuf::from));
-        state.workspace_dir = params.workspace_directory;
+        state.workspace_dir = workspace_dir;
         Ok(InitializeResult {})
     }
 
