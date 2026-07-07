@@ -211,6 +211,9 @@ fn file_url(path: &Path) -> anyhow::Result<String> {
 /// `inputs_hash` and a cache hit is byte-identical to a fresh rewrite, so
 /// relocating it does not warrant an `EMIT_EPOCH` bump.
 pub fn retread_cache_root() -> std::path::PathBuf {
+    if let Some(dir) = crate::fasttmp::backend_env_value("RETREAD_CACHE_DIR") {
+        return std::path::PathBuf::from(dir);
+    }
     if let Ok(dir) = std::env::var("RETREAD_CACHE_DIR") {
         return std::path::PathBuf::from(dir);
     }
