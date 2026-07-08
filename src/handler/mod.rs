@@ -2281,13 +2281,49 @@ async fn uv_group_closure(
     // Conda pins -> uv constraints, with provenance (spec §2.2 fallback
     // path: the manifest's effective deps; pixi.lock-gated read is M2+).
     let manifest_opt = workspace_dir.and_then(crate::workspace::WorkspaceManifest::load);
-    let constraints = match manifest_opt.as_ref() {
+    let mut constraints = match manifest_opt.as_ref() {
         Some(manifest) => {
             let deps = manifest.effective_dependencies("default");
             crate::uv_closure::build_constraints(&deps, &effective.name_map, "manifest", "default")
         }
         None => Default::default(),
     };
+    // Proactive cuda-major capping (belt to the auto-route co-install
+    // check's suspenders): derive this pack's actual consuming env(s)'
+    // `cuda-version` anchor via `consuming_env_dependencies` (env-scoped,
+    // NOT just the `default` env above — a GPU-only feature like
+    // `[feature.gpu]` is invisible to `effective_dependencies("default")`
+    // but IS what the consuming env solves against) and cap the known
+    // cuda-major-tracked PyPI families to that line up front, so uv
+    // never independently picks a cuda-(X+1) release the conda side
+    // can't co-install.
+    if let (Some(manifest), Some(ws_dir)) = (manifest_opt.as_ref(), workspace_dir) {
+        let workspace_deps = manifest.consuming_env_dependencies(ws_dir, source_dir);
+        if let Some(specs) = workspace_deps.get("cuda-version")
+            && let Some(major) = crate::uv_closure::cuda_major_from_specs(specs)
+        {
+            for (name, spec) in crate::uv_closure::cuda_family_constraints(major) {
+                if constraints.provenance.contains_key(name) {
+                    // An explicit conda dep already constrains this
+                    // family by name (rare, but an explicit pin wins
+                    // over the curated default) -- don't override it.
+                    continue;
+                }
+                let line = format!("{name}{spec}");
+                constraints.constraints.push(line.clone());
+                constraints.provenance.insert(
+                    name.to_string(),
+                    crate::uv_closure::ConstraintProvenance {
+                        constraint: line,
+                        conda_name: "cuda-version".to_string(),
+                        conda_version: format!("{major}.*"),
+                        source: "cuda-major-table".to_string(),
+                        env: "consuming-envs".to_string(),
+                    },
+                );
+            }
+        }
+    }
 
     // retread-overrides -> override-dependencies where PEP 440-representable.
     let mut overrides: Vec<String> = Vec::new();

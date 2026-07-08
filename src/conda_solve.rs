@@ -504,6 +504,88 @@ mod tests {
         assert_eq!(pytorch.package_record.version.as_str(), "2.7.0");
     }
 
+    /// The cuda-bindings incident, reproduced at the record level: an
+    /// auto-routed exact pin (`cuda-bindings ==13.3.1`) whose conda
+    /// variant requires `cuda-version >=13,<14` is fed into the SAME
+    /// solve as the consuming env's explicit `cuda-version ==12.9`
+    /// spec (as `consuming_env_dependencies` would surface it). The
+    /// two together must be genuinely UNSAT — proving the transitive
+    /// conflict is caught by a real solve, not a by-name range check,
+    /// even though `cuda-bindings` never appears in any env's declared
+    /// dependency table (only `cuda-version` does).
+    #[test]
+    fn cuda_bindings_transitive_conflict_is_unsat_against_pinned_cuda_version() {
+        let all_records = vec![
+            repo_record("python", "3.12.0", &[]),
+            repo_record("cuda-version", "12.9", &[]),
+            repo_record("cuda-version", "13.0", &[]),
+            repo_record(
+                "cuda-bindings",
+                "13.3.1",
+                &["cuda-version >=13,<14.0a0", "python"],
+            ),
+        ];
+        let specs = parse_match_specs(&[
+            "cuda-bindings ==13.3.1".to_string(),
+            "cuda-version ==12.9".to_string(),
+            "python 3.12.*".to_string(),
+        ]);
+        let result = solve_selected_records_from_records(
+            specs,
+            &all_records,
+            "3.12",
+            ChannelPriority::Strict,
+            &BTreeMap::new(),
+            SolveStrategy::Highest,
+            Vec::new(),
+        );
+        let reasons = result.expect_err("cuda-bindings 13.3.1 must conflict with cuda-version ==12.9");
+        assert!(
+            reasons.iter().any(|r| unsat_mentions(r, "cuda-bindings")),
+            "unsat reasons should name cuda-bindings: {reasons:?}"
+        );
+    }
+
+    /// Sat counterpart: dropping the auto-routed cuda-bindings pin (the
+    /// un-route outcome) lets the same consuming-env cuda-version spec
+    /// solve cleanly — confirms the conflict is specific to the exact
+    /// pin, not the fixture itself.
+    #[test]
+    fn cuda_version_alone_solves_once_cuda_bindings_is_unrouted() {
+        let all_records = vec![
+            repo_record("python", "3.12.0", &[]),
+            repo_record("cuda-version", "12.9", &[]),
+            repo_record("cuda-version", "13.0", &[]),
+        ];
+        let specs = parse_match_specs(&[
+            "cuda-version ==12.9".to_string(),
+            "python 3.12.*".to_string(),
+        ]);
+        let solved = solve_selected_records_from_records(
+            specs,
+            &all_records,
+            "3.12",
+            ChannelPriority::Strict,
+            &BTreeMap::new(),
+            SolveStrategy::Highest,
+            Vec::new(),
+        )
+        .expect("cuda-version alone must solve");
+        assert!(
+            solved
+                .iter()
+                .any(|r| r.package_record.name.as_normalized() == "cuda-version"
+                    && r.package_record.version.as_str() == "12.9")
+        );
+    }
+
+    /// Simple substring check mirroring `uv_closure::unsat_reason_names_package`'s
+    /// core intent, kept local so this test module doesn't need to
+    /// depend on `uv_closure`.
+    fn unsat_mentions(reason: &str, name: &str) -> bool {
+        reason.to_ascii_lowercase().contains(name)
+    }
+
     /// Warm-start seeding (locked_packages = soft preference) must be
     /// emit-neutral: passing a previously-resolved set as `preferred`
     /// must produce the SAME satisfiable/unsat result and the SAME

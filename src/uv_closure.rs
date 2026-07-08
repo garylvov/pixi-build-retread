@@ -534,11 +534,74 @@ where
                 // re-plan next iteration with the blocked set in force.
                 continue;
             }
+            // The unsat report names none of the routed candidates
+            // directly — the cuda-bindings/cuda-version shape: the
+            // solver's phrasing can point at a shared TRANSITIVE
+            // anchor (`cuda-version >=13,<14, for which no candidates
+            // were found`) rather than the routed package that pulled
+            // it in, so text-matching alone finds nothing to blame.
+            // Fall back to a greedy retry-solve: drop routed
+            // candidates one at a time and re-check; the first
+            // single-candidate removal that turns the verdict
+            // Sat/Skipped is blamed and un-routed, repeated until
+            // fixpoint or the candidate set is exhausted. This is the
+            // same co_solve the name-match path already uses — just
+            // driven by outcome instead of by string search — so it
+            // catches conflicts whose unsat text never mentions an
+            // auto-routed name at all.
+            let mut greedy: Vec<AutoRoutedPackage> = Vec::new();
+            let mut probe_set = candidate.clone();
+            loop {
+                // Re-check the CURRENT probe_set before trying another
+                // removal — once it's already Sat/Skipped, stop; a
+                // single-candidate subset of an already-satisfiable set
+                // is not evidence that subset was the offender.
+                if !matches!(co_solve(probe_set.clone()).await, CoInstallVerdict::Unsat(_)) {
+                    break;
+                }
+                let mut healed_idx: Option<usize> = None;
+                for (i, pkg) in probe_set.iter().enumerate() {
+                    if opts.force_conda.contains(&pkg.pypi_name) {
+                        continue;
+                    }
+                    let mut trial = probe_set.clone();
+                    trial.remove(i);
+                    if !matches!(co_solve(trial).await, CoInstallVerdict::Unsat(_)) {
+                        healed_idx = Some(i);
+                        break;
+                    }
+                }
+                let Some(i) = healed_idx else { break };
+                let removed = probe_set.remove(i);
+                tracing::info!(
+                    bundle = %req.bundle,
+                    "auto-route: greedy retry-solve isolated {}=={} as the \
+                     transitive-conflict offender (unsat report named no \
+                     auto-routed package directly)",
+                    removed.pypi_name,
+                    removed.pypi_version,
+                );
+                greedy.push(removed);
+            }
+            if !greedy.is_empty() {
+                for pkg in &greedy {
+                    blocked.insert(pkg.pypi_name.clone());
+                }
+                let previously_routed = routed.len();
+                routed.retain(|r| !blocked.contains(&r.pypi_name));
+                if routed.len() != previously_routed {
+                    req = base_req.clone();
+                    apply_auto_route(&mut req, &routed);
+                    closure = solve(req.clone()).await?;
+                }
+                continue;
+            }
             tracing::warn!(
                 bundle = %req.bundle,
                 reasons = ?reasons,
                 "auto-route: conda co-install check is unsat but names no \
-                 auto-routed package; un-routing cannot heal this — \
+                 auto-routed package and greedy retry-solve found no \
+                 single-candidate fix; un-routing cannot heal this — \
                  applying the round unchanged",
             );
         } else if let CoInstallVerdict::Skipped(why) = &verdict {
@@ -1100,6 +1163,58 @@ pub fn build_constraints(
         );
     }
     set
+}
+
+/// PyPI families whose published release line tracks the CUDA toolkit
+/// MAJOR version 1:1, the same way conda-forge's `cuda-version`
+/// metapackage anchors the conda side (`cuda-bindings` releases 12.x
+/// against CUDA 12, 13.x against CUDA 13, with no narrower
+/// compatibility range published on either side). When a workspace's
+/// consuming env(s) pin `cuda-version` to some major X, uv must be
+/// capped to the same line up front — otherwise its resolver is free
+/// to pick e.g. `cuda-bindings==13.3.1` purely from PyPI metadata,
+/// which the auto-route co-install check then has to catch AFTER the
+/// fact and un-route (the incident this table exists to pre-empt:
+/// `cuda-bindings ==13.3.1`'s conda variant requires `cuda-version
+/// >=13,<14` against a workspace pinned to `cuda-version 12.9`).
+///
+/// Deliberately NOT included: `nvidia-*-cuXX` wheels (e.g.
+/// `nvidia-cublas-cu12`) and `cupy-cuda11x`/`cupy-cuda12x` — those
+/// already encode the CUDA major IN THE PACKAGE NAME, so "capping a
+/// version range" doesn't apply; picking the wrong one is a
+/// name-selection problem handled by the existing pypi<->conda name
+/// map, not a version constraint.
+pub const CUDA_MAJOR_TRACKED_PYPI_FAMILIES: &[&str] = &["cuda-bindings", "cuda-python"];
+
+/// Extract a CUDA major version (e.g. `12`) from the first parseable
+/// `cuda-version` conda spec string (`"==12.9"`, `">=12.8,<13"`,
+/// `"12"`, ...). Only the leading digit run is read — sufficient to
+/// recover the major line these specs always anchor on. `None` when no
+/// spec yields a leading integer.
+pub fn cuda_major_from_specs(specs: &[String]) -> Option<u32> {
+    specs.iter().find_map(|spec| {
+        let s = spec.trim();
+        let start = s.find(|c: char| c.is_ascii_digit())?;
+        s[start..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .parse()
+            .ok()
+    })
+}
+
+/// Constraint lines capping [`CUDA_MAJOR_TRACKED_PYPI_FAMILIES`] to the
+/// given CUDA major (`>=X,<X+1`). Harmless to add unconditionally: a
+/// uv constraints file entry for a package absent from the resolved
+/// graph is simply never applied (constraints never pull in a package
+/// on their own), so these are only load-bearing for bundles that
+/// actually depend on one of the tracked families.
+pub fn cuda_family_constraints(cuda_major: u32) -> Vec<(&'static str, String)> {
+    CUDA_MAJOR_TRACKED_PYPI_FAMILIES
+        .iter()
+        .map(|name| (*name, format!(">={cuda_major},<{}", cuda_major + 1)))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -2062,6 +2177,39 @@ isaaclab = { path = "wheels/isaaclab/isaaclab-2.0.0-py3-none-any.whl" }
         let json = provenance_json(&set).unwrap();
         assert!(json.contains("\"conda_name\": \"pytorch-gpu\""));
         assert!(json.contains("\"conda_version\": \"==2.10.0\""));
+    }
+
+    /// The cuda-bindings incident, at the unit level: a workspace whose
+    /// consuming env pins `cuda-version ==12.9` must synthesize a
+    /// `cuda-bindings>=12,<13` cap (and `cuda-python`, the other tracked
+    /// family) so uv never independently resolves a cuda-13-line release
+    /// whose conda variant the auto-route co-install check would later
+    /// have to un-route.
+    #[test]
+    fn cuda_family_constraints_caps_tracked_families_to_env_major() {
+        let major = cuda_major_from_specs(&["==12.9".to_string()]).expect("major parses");
+        assert_eq!(major, 12);
+        let caps = cuda_family_constraints(major);
+        assert!(
+            caps.contains(&("cuda-bindings", ">=12,<13".to_string())),
+            "caps: {caps:?}"
+        );
+        assert!(
+            caps.contains(&("cuda-python", ">=12,<13".to_string())),
+            "caps: {caps:?}"
+        );
+    }
+
+    #[test]
+    fn cuda_major_from_specs_handles_range_and_bare_forms() {
+        assert_eq!(
+            cuda_major_from_specs(&[">=12.8,<13".to_string()]),
+            Some(12)
+        );
+        assert_eq!(cuda_major_from_specs(&["12".to_string()]), Some(12));
+        assert_eq!(cuda_major_from_specs(&["13.0".to_string()]), Some(13));
+        assert_eq!(cuda_major_from_specs(&[]), None);
+        assert_eq!(cuda_major_from_specs(&["*".to_string()]), None);
     }
 
     /// v4.2.0 (post mirror-solver deletion): the "prefer conda deps"
@@ -3032,6 +3180,70 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
         );
     }
 
+    /// The cuda-bindings/cuda-version shape: the unsat report blames a
+    /// shared TRANSITIVE anchor package's name, not either routed
+    /// candidate's own name — `unsat_reason_names_package` finds
+    /// nothing to blame directly. The greedy retry-solve fallback must
+    /// still isolate and un-route the offender (removing just one of
+    /// the two candidates resolves the conflict) instead of giving up.
+    #[tokio::test]
+    async fn unroute_greedy_fallback_heals_unnamed_transitive_conflict() {
+        let mut hits = BTreeMap::new();
+        hits.insert(
+            "numpy".to_string(),
+            RouteProbeHit {
+                conda_version: "2.1.0".into(),
+                channel: "c/linux-64".into(),
+            },
+        );
+        hits.insert(
+            "typing-extensions".to_string(),
+            RouteProbeHit {
+                conda_version: "4.12.2".into(),
+                channel: "c/linux-64".into(),
+            },
+        );
+        // Custom co_solve (not `canned_co_solve`, which keys unsat off a
+        // conflict SET): Unsat only when BOTH are present, and the
+        // reason names neither routed package — only a transitive
+        // anchor ("cuda-version") that isn't itself a routed candidate.
+        let co_solve = |candidate: Vec<AutoRoutedPackage>| {
+            let names: BTreeSet<String> =
+                candidate.iter().map(|r| r.conda_name.clone()).collect();
+            let verdict = if names.contains("numpy") && names.contains("typing-extensions") {
+                CoInstallVerdict::Unsat(vec![
+                    "cuda-version >=13,<14.0a0, for which no candidates were found".to_string(),
+                ])
+            } else {
+                CoInstallVerdict::Sat
+            };
+            Box::pin(async move { verdict })
+                as futures::future::BoxFuture<'static, CoInstallVerdict>
+        };
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let closure = auto_route_fixpoint_checked(
+            &auto_route_req(),
+            &auto_route_opts(),
+            canned_solve(Arc::clone(&calls)),
+            canned_probe(hits),
+            co_solve,
+        )
+        .await
+        .unwrap();
+        let routed: Vec<String> = closure
+            .auto_routed
+            .iter()
+            .map(|r| r.pypi_name.clone())
+            .collect();
+        // Exactly one of the two got un-routed (whichever the greedy
+        // scan tried first) -- the conflict is healed, not left unsat
+        // nor over-pruned to both.
+        assert_eq!(routed.len(), 1, "routed: {routed:?}");
+        // mujoco (protected root) plus whichever of numpy/typing-extensions
+        // was NOT un-routed.
+        assert_eq!(closure.wheels.len() + routed.len(), 3, "wheels+routed: {:?} {:?}", closure.wheels.iter().map(|w| &w.name).collect::<Vec<_>>(), routed);
+    }
+
     /// A previously ACCEPTED route that a later round's cumulative check
     /// implicates gets reverted: request rebuilt without its pin, wheel
     /// regained.
@@ -3135,8 +3347,13 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
     }
 
     /// An unsat report that names NO routed package (channel-side
-    /// breakage) cannot be healed by un-routing: the round applies
-    /// unchanged with a warning.
+    /// breakage, independent of ANY routed candidate — e.g. python
+    /// itself has no viable build on this channel) cannot be healed by
+    /// un-routing: neither the name-match path nor the greedy
+    /// retry-solve fallback finds a single-candidate fix (the empty
+    /// conflict set below matches every candidate set, including the
+    /// empty one, modeling a conflict genuinely unrelated to what's
+    /// routed), so the round applies unchanged with a warning.
     #[tokio::test]
     async fn unsat_naming_no_routed_package_applies_round() {
         let mut hits = BTreeMap::new();
@@ -3148,7 +3365,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
             },
         );
         let co_solve = canned_co_solve(vec![(
-            BTreeSet::from(["numpy".to_string()]),
+            BTreeSet::new(),
             vec!["python 3.12.* cannot be installed: no candidates".to_string()],
         )]);
         let calls = Arc::new(Mutex::new(Vec::new()));
