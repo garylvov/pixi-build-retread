@@ -38,6 +38,27 @@ pub struct RegexConflictParser {
     ansi: Regex,
     no_candidates: Regex,
     help_conda: Regex,
+    // uv-closure JSON-RPC ErrorObject shape (pixi-build-retread wraps a uv
+    // resolver failure in a JSON-RPC error; pixi's miette renderer then
+    // word-wraps *that* debug-printed struct across physical lines with its
+    // own `│`/`├─▶`/`╰─▶` tree gutters, on top of uv's own embedded `\n`
+    // escapes). These three do the unwrap: pull the message field out,
+    // strip the per-line gutter noise, then flatten to one logical line.
+    uv_closure_message: Regex,
+    gutter_line_prefix: Regex,
+    whitespace: Regex,
+    // Backend's structured hint (src/handler or src/uv_closure.rs on the
+    // backend side) naming which conda package/table pinned the losing
+    // range -- lets us recover a widen floor from a two-range uv pubgrub
+    // disjunction without guessing which side is the conda-injected one.
+    conda_provenance: Regex,
+    no_conda_constraint_named: Regex,
+    no_version_of: Regex,
+    // Direct (non-JSON-RPC) conda-solver prose for a resolvo-style
+    // incompatible-range report (e.g. newer pixi's "cannot be installed
+    // because there are no viable options" / "would require" phrasing),
+    // distinct from the older "pinned by the conda solve" shape above.
+    conda_incompatible: Regex,
 }
 
 impl RegexConflictParser {
@@ -58,7 +79,115 @@ impl RegexConflictParser {
                 r"(?s)pinned by the conda solve.*?\n\s+([a-zA-Z0-9_-]+)==([0-9][0-9a-zA-Z._-]*)",
             )
             .expect("valid help-text regex"),
+            uv_closure_message: Regex::new(r#"(?s)message: "(.*?)",[\s│├╰▶─×]*data:"#)
+                .expect("valid uv-closure message regex"),
+            gutter_line_prefix: Regex::new(r"(?m)^[\s│├╰▶─×]+")
+                .expect("valid gutter-prefix regex"),
+            whitespace: Regex::new(r"\s+").expect("valid whitespace regex"),
+            conda_provenance: Regex::new(
+                r"package `([a-zA-Z0-9_.-]+)` is named in the conflict but conda pins `[a-zA-Z0-9_.-]+\s*(>=|>|==)\s*([0-9][0-9a-zA-Z.]*)",
+            )
+            .expect("valid conda-provenance regex"),
+            no_conda_constraint_named: Regex::new(
+                r"no generated conda constraint was named in uv's message",
+            )
+            .expect("valid no-constraint-named regex"),
+            no_version_of: Regex::new(
+                r"there is no version of ([a-zA-Z0-9_-]+)\s*==\s*([0-9][0-9a-zA-Z.]*(?:rc|a|b|dev)?[0-9a-zA-Z.]*)",
+            )
+            .expect("valid no-version-of regex"),
+            conda_incompatible: Regex::new(
+                r"(?s)([a-zA-Z0-9_-]+)\s*(<|<=)\s*([0-9][0-9a-zA-Z.]*)[\s│├╰└─▶]+cannot be installed[\s│├╰└─▶]+because there are no viable options",
+            )
+            .expect("valid conda-incompatible regex"),
         }
+    }
+
+    /// Pulls the uv resolver's message out of a pixi-build-retread
+    /// JSON-RPC `ErrorObject { .. }` and flattens miette's line-wrapped,
+    /// gutter-decorated rendering (plus uv's own embedded `\n` escapes)
+    /// back into a single logical line, so the regexes below can match
+    /// across what were originally several physical/escaped lines.
+    fn extract_uv_closure_message(&self, stderr: &str) -> Option<String> {
+        let caps = self.uv_closure_message.captures(stderr)?;
+        let raw = &caps[1];
+        let joined = raw
+            .lines()
+            .map(|line| self.gutter_line_prefix.replace(line, "").into_owned())
+            .collect::<Vec<String>>()
+            .join(" ");
+        let unescaped = joined.replace("\\n", " ");
+        let collapsed = self.whitespace.replace_all(&unescaped, " ");
+        Some(collapsed.trim().to_string())
+    }
+
+    /// Classifies an already-flattened uv-closure message into a
+    /// `Conflict`, or `None` if it doesn't match a known shape (e.g. the
+    /// backend's other JSON-RPC errors that aren't resolver conflicts at
+    /// all, like "package X has no wheels in the exported closure").
+    fn parse_uv_closure_message(&self, msg: &str) -> Option<Conflict> {
+        if let Some(caps) = self.conda_provenance.captures(msg) {
+            let package = caps[1].to_string();
+            let conda_op = caps[2].to_string();
+            let conda_floor = caps[3].to_string();
+            let escaped = regex::escape(&package);
+            let dual_range = Regex::new(&format!(
+                r"depends on {escaped}(?:\{{[^}}]*\}})?\s*(>=|>)\s*([0-9][0-9a-zA-Z.]*),<[0-9a-zA-Z.]+\s+and\s+{escaped}(?:\{{[^}}]*\}})?\s*(>=|>)\s*([0-9][0-9a-zA-Z.]*),<[0-9a-zA-Z.]+"
+            ))
+            .ok()?;
+            let dcaps = dual_range.captures(msg)?;
+            let (op1, floor1) = (dcaps[1].to_string(), dcaps[2].to_string());
+            let (op2, floor2) = (dcaps[3].to_string(), dcaps[4].to_string());
+            let (op, floor) = if op1 == conda_op && floor1 == conda_floor {
+                (op2, floor2)
+            } else {
+                (op1, floor1)
+            };
+            return Some(Conflict::CondaWidenNeeded {
+                package,
+                op,
+                floor,
+                conda_version: format!("{conda_op}{conda_floor}"),
+            });
+        }
+
+        if self.no_conda_constraint_named.is_match(msg)
+            && let Some(caps) = self.no_version_of.captures(msg)
+        {
+            return Some(Conflict::PypiInternal {
+                package: caps[1].to_string(),
+                version: caps[2].to_string(),
+            });
+        }
+
+        None
+    }
+
+    /// Direct (non-JSON-RPC) resolvo-style "cannot be installed because
+    /// there are no viable options" / "would require" prose -- a second
+    /// conflict shape distinct from the older `help_conda` "pinned by the
+    /// conda solve" text, seen on newer pixi versions.
+    fn parse_conda_incompatible(&self, stderr: &str) -> Option<Conflict> {
+        let caps = self.conda_incompatible.captures(stderr)?;
+        let package = caps[1].to_string();
+        let conda_op = caps[2].to_string();
+        let conda_version = caps[3].to_string();
+        let escaped = regex::escape(&package);
+        // Between "would require" and the package name, resolvo's tree
+        // rendering inserts its own `└─`-style gutter line (in addition to
+        // any outer miette gutter); tolerate box-drawing chars as well as
+        // whitespace in that gap.
+        let would_require = Regex::new(&format!(
+            r"(?s)would require[\s│├╰└─▶]*{escaped}\s*(>=|>)\s*([0-9][0-9a-zA-Z.]*)"
+        ))
+        .ok()?;
+        let rcaps = would_require.captures(stderr)?;
+        Some(Conflict::CondaWidenNeeded {
+            package,
+            op: rcaps[1].to_string(),
+            floor: rcaps[2].to_string(),
+            conda_version: format!("{conda_op}{conda_version}"),
+        })
     }
 
     pub fn strip_ansi<'a>(&self, stderr: &'a str) -> std::borrow::Cow<'a, str> {
@@ -79,6 +208,26 @@ impl Default for RegexConflictParser {
 
 impl ConflictParser for RegexConflictParser {
     fn parse(&self, stderr: &str) -> Option<Conflict> {
+        // Newest, most specific shapes first: a backend-wrapped uv-closure
+        // JSON-RPC ErrorObject, or (failing that) the plain resolvo-style
+        // incompatible-range prose. Both are distinct from the classic
+        // conda-solver shapes handled below and are checked first since
+        // they carry unambiguous signatures (`ErrorObject { .. }` /
+        // "cannot be installed because there are no viable options").
+        if let Some(msg) = self.extract_uv_closure_message(stderr) {
+            if let Some(conflict) = self.parse_uv_closure_message(&msg) {
+                return Some(conflict);
+            }
+            // It was a uv-closure ErrorObject, but not a resolver conflict
+            // shape we recognize (e.g. "has no wheels in the exported
+            // closure") -- unparseable, don't fall through to conda-prose
+            // regexes that can't match this text anyway.
+            return None;
+        }
+        if let Some(conflict) = self.parse_conda_incompatible(stderr) {
+            return Some(conflict);
+        }
+
         if let Some(caps) = self.no_candidates.captures(stderr) {
             return Some(Conflict::NoCandidates {
                 package: caps[1].to_string(),
@@ -182,6 +331,15 @@ mod tests {
         include_str!("../../tests/fixtures/solve_errors/unparseable_network_error.txt");
     const POST_WIDEN_UNSAT: &str =
         include_str!("../../tests/fixtures/solve_errors/conda_unsat_post_widen.txt");
+    const UV_CLOSURE_TINYOBJLOADER: &str = include_str!(
+        "../../tests/fixtures/solve_errors/uv_closure_tinyobjloader_prerelease.txt"
+    );
+    const UV_CLOSURE_CUDA_BINDINGS: &str =
+        include_str!("../../tests/fixtures/solve_errors/uv_closure_cuda_bindings_widen.txt");
+    const CONDA_INCOMPATIBLE_PYGLET: &str =
+        include_str!("../../tests/fixtures/solve_errors/conda_incompatible_pyglet.txt");
+    const UNPARSEABLE_UV_CLOSURE_NO_WHEELS: &str =
+        include_str!("../../tests/fixtures/solve_errors/unparseable_uv_closure_no_wheels.txt");
 
     #[test]
     fn parses_dumb_hack_shapes_and_range_amendment() {
@@ -237,6 +395,57 @@ mod tests {
                 op: ">".into(),
                 floor: "2.10.3".into(),
                 conda_version: "2.9.0".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_uv_closure_json_rpc_conflicts() {
+        let p = RegexConflictParser::new();
+        // Real log sample (lock-iter-2.log): uv-closure ErrorObject,
+        // tinyobjloader pre-release with no matching conda constraint ->
+        // treated as an intrinsic PyPI-side conflict.
+        assert_eq!(
+            p.parse(UV_CLOSURE_TINYOBJLOADER),
+            Some(Conflict::PypiInternal {
+                package: "tinyobjloader".into(),
+                version: "2.0.0rc13".into(),
+            })
+        );
+        // Real log sample (lock-succ-18.log): uv-closure ErrorObject,
+        // torch's cuda-bindings>=13.0.3,<14 requirement disjoint from the
+        // cuda-major-table-injected cuda-bindings>=12,<13 conda pin ->
+        // widen floor is the *other* (non-conda) range in the disjunction.
+        assert_eq!(
+            p.parse(UV_CLOSURE_CUDA_BINDINGS),
+            Some(Conflict::CondaWidenNeeded {
+                package: "cuda-bindings".into(),
+                op: ">=".into(),
+                floor: "13.0.3".into(),
+                conda_version: ">=12".into(),
+            })
+        );
+        // Real log sample (solve-hover-gpu.log distilled): a uv-closure
+        // ErrorObject that isn't a resolver conflict at all (no wheels in
+        // the exported closure) -- must fail gracefully, not crash or
+        // fall through to unrelated conda-prose regexes.
+        assert_eq!(p.parse(UNPARSEABLE_UV_CLOSURE_NO_WHEELS), None);
+    }
+
+    #[test]
+    fn parses_direct_conda_incompatible_prose() {
+        let p = RegexConflictParser::new();
+        // Real log sample (lock-succ-14.log): direct (non-JSON-RPC)
+        // resolvo-style "cannot be installed because there are no viable
+        // options" / "would require" conda-solver prose -- distinct from
+        // the older "pinned by the conda solve" help-text shape.
+        assert_eq!(
+            p.parse(CONDA_INCOMPATIBLE_PYGLET),
+            Some(Conflict::CondaWidenNeeded {
+                package: "pyglet".into(),
+                op: ">=".into(),
+                floor: "2".into(),
+                conda_version: "<2".into(),
             })
         );
     }

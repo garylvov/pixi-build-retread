@@ -1,0 +1,19 @@
+Error:   × failed to solve requirements of environment 'hover-gpu' for platform
+  │ 'linux-64'
+  ├─▶   × failed to solve the environment
+  │
+  ╰─▶ Cannot solve the request because of: pyglet <2 cannot be installed
+      because there are no viable options:
+      └─ pyglet 1.2.4 | 1.3.2 | 1.3.3 | 1.4.1 | 1.5.16 | 1.5.27 would require
+         └─ python 3.5.*, for which no candidates were found.
+      The following packages are incompatible
+      ├─ isaaclab-hover-pack * can be installed with any of the following
+      options:
+      │  └─ isaaclab-hover-pack 0.33.13 would require
+      │     └─ pyglet >=2,<3, which can be installed with any of the following
+      options:
+      │        └─ pyglet 2.0.20
+      └─ pyglet <2 cannot be installed because there are no viable options:
+         ├─ pyglet 1.5.16, which conflicts with the versions reported above.
+         ├─ pyglet 1.5.27, which conflicts with the versions reported above.
+         └─ pyglet 1.5.16, which conflicts with the versions reported above.

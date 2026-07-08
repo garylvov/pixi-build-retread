@@ -1,0 +1,28 @@
+Error:   × failed to solve requirements of environment 'isaaclab-gpu-latest' for
+  │ platform 'linux-64'
+  ├─▶   × failed to communicate with the build backend (/oscar/data/stellex/
+  │     │ glvov/imprint-env-test/_session_briefs/pixi-build-retread-bin)
+  │     help: Ensure that the build backend implements the JSON-RPC protocol
+  │           correctly.
+  │
+  ├─▶ ErrorObject { code: InvalidParams, message: "resolving wheels for
+  │   python 3.12: computing uv closure for bundle `isaac-pack-latest`: uv
+  │   lock failed for bundle `isaac-pack-latest` (python 3.12, linux-64):
+  │   \n\nUsing CPython 3.12.13\nDownloading isaacsim-extscache-physics
+  │   (246.4MiB)\nDownloading isaacsim-extscache-kit (5.5GiB)\nDownloading
+  │   isaacsim-extscache-kit-sdk (1.6GiB)\n Downloaded isaacsim-extscache-
+  │   physics\n Downloaded isaacsim-extscache-kit-sdk\n Downloaded isaacsim-
+  │   extscache-kit\n  × No solution found when resolving dependencies for
+  │   split (markers:\n  │ platform_machine == 'x86_64' and sys_platform ==
+  │   'linux'):\n  ╰─▶ Because there is no version of tinyobjloader==2.0.0rc13
+  │   and\n      isaacsim-core==6.0.0.1 depends on tinyobjloader==2.0.0rc13,
+  │   we can\n      conclude that isaacsim-core==6.0.0.1 cannot be used.\n
+  │   And because isaacsim[all]==6.0.0.1 depends on isaacsim-core==6.0.0.1\n
+  │   and your project depends on isaacsim[all]==6.0.0.1, we can conclude
+  │   that\n      your project's requirements are unsatisfiable.\n\nhint:
+  │   `tinyobjloader` was requested with a pre-release marker (e.g.,
+  │   tinyobjloader==2.0.0rc13), but pre-releases weren't enabled (try:
+  │   `--prerelease=allow`)\n\nno generated conda constraint was named in
+  │   uv's message; the conflict may be intrinsic to the PyPI requirements.
+  │   \n\nhint: run `retread solve` to widen the offending conda pin.\n",
+  │   data: None }

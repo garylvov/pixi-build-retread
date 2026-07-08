@@ -1,0 +1,12 @@
+Error:   × failed to solve requirements of environment 'unitree-rl-lab-gpu' for
+  │ platform 'linux-64'
+  ├─▶   × failed to communicate with the build backend (pixi-build-
+  │     │ retread)
+  │     help: Ensure that the build backend implements the JSON-RPC
+  │           protocol correctly.
+  │
+  ├─▶ ErrorObject { code: InvalidParams, message: "resolving wheels for python
+  │   3.11: computing uv closure for bundle `isaaclab-unitree-pack`: package
+  │   `isaacsim==5.1.0.0` has no wheels in the exported closure (sdist-only
+  │   under `no-build = true`?). Route it to conda via `retread-conda-deps`,
+  │   add a git/path source entry, or drop it.", data: None }
