@@ -15,6 +15,15 @@ pub enum Conflict {
         op: String,
         floor: String,
         conda_version: String,
+        /// Bounded "Because X==V depends on Y" walk up from `package`
+        /// (the conda-provenance footer's, i.e. the transitive SYMPTOM
+        /// package) toward the packages that actually require it,
+        /// nearest first (e.g. `["torch", "isaacsim-core", ...]` for a
+        /// `cuda-bindings` footer). Empty when the parse shape doesn't
+        /// carry a uv "Because" chain (older conda-solver prose shapes).
+        /// Lets repair re-attribute a conflict to a package with a real
+        /// user conda pin when the footer package has none of its own.
+        requiring_chain: Vec<String>,
     },
 }
 
@@ -54,6 +63,13 @@ pub struct RegexConflictParser {
     conda_provenance: Regex,
     no_conda_constraint_named: Regex,
     no_version_of: Regex,
+    // Bounded requiring-chain walk: uv's pubgrub explanation prose reads
+    // "Because torch==2.11.0 depends on cuda-bindings...", "And because
+    // isaacsim-core==6.0.0.1 depends on torch==2.11.0, ...". Each match is
+    // one (requirer, dependency) hop; `parse_uv_closure_message` walks
+    // these from the conda-provenance footer package outward to find the
+    // package that actually carries a user conda pin (attribution fix).
+    requiring_chain: Regex,
     // Direct (non-JSON-RPC) conda-solver prose for a resolvo-style
     // incompatible-range report (e.g. newer pixi's "cannot be installed
     // because there are no viable options" / "would require" phrasing),
@@ -96,6 +112,10 @@ impl RegexConflictParser {
                 r"there is no version of ([a-zA-Z0-9_-]+)\s*==\s*([0-9][0-9a-zA-Z.]*(?:rc|a|b|dev)?[0-9a-zA-Z.]*)",
             )
             .expect("valid no-version-of regex"),
+            requiring_chain: Regex::new(
+                r"(?i)because ([a-zA-Z0-9_.\[\]-]+)==[0-9a-zA-Z.]+ depends on ([a-zA-Z0-9_.\[\]-]+)",
+            )
+            .expect("valid requiring-chain regex"),
             conda_incompatible: Regex::new(
                 r"(?s)([a-zA-Z0-9_-]+)\s*(<|<=)\s*([0-9][0-9a-zA-Z.]*)[\s│├╰└─▶]+cannot be installed[\s│├╰└─▶]+because there are no viable options",
             )
@@ -143,11 +163,13 @@ impl RegexConflictParser {
             } else {
                 (op1, floor1)
             };
+            let requiring_chain = self.extract_requiring_chain(msg, &package);
             return Some(Conflict::CondaWidenNeeded {
                 package,
                 op,
                 floor,
                 conda_version: format!("{conda_op}{conda_floor}"),
+                requiring_chain,
             });
         }
 
@@ -161,6 +183,40 @@ impl RegexConflictParser {
         }
 
         None
+    }
+
+    /// Bounded walk of uv's "Because X==V depends on Y" pubgrub prose,
+    /// starting from the conda-provenance footer package and following
+    /// each hop to the package that named it as a dependency, nearest
+    /// first. Stops after `MAX_HOPS` or on a repeated name (cycle guard).
+    /// Used to re-attribute a `CondaWidenNeeded` conflict when the footer
+    /// package (the transitive symptom, e.g. `cuda-bindings`) has no user
+    /// conda pin of its own -- the real fix belongs on whichever ancestor
+    /// (e.g. `torch`) the user *does* pin (directly or via the conda name
+    /// map, e.g. `pytorch-gpu`).
+    fn extract_requiring_chain(&self, msg: &str, footer_package: &str) -> Vec<String> {
+        const MAX_HOPS: usize = 6;
+        let pairs: Vec<(String, String)> = self
+            .requiring_chain
+            .captures_iter(msg)
+            .map(|c| (c[1].to_string(), c[2].to_string()))
+            .collect();
+        let mut chain = Vec::new();
+        let mut current = footer_package.to_string();
+        for _ in 0..MAX_HOPS {
+            let Some((requirer, _dep)) = pairs
+                .iter()
+                .find(|(_, dep)| dep.eq_ignore_ascii_case(&current))
+            else {
+                break;
+            };
+            if chain.iter().any(|p: &String| p == requirer) || requirer == footer_package {
+                break;
+            }
+            chain.push(requirer.clone());
+            current = requirer.clone();
+        }
+        chain
     }
 
     /// Direct (non-JSON-RPC) resolvo-style "cannot be installed because
@@ -187,6 +243,7 @@ impl RegexConflictParser {
             op: rcaps[1].to_string(),
             floor: rcaps[2].to_string(),
             conda_version: format!("{conda_op}{conda_version}"),
+            requiring_chain: Vec::new(),
         })
     }
 
@@ -250,6 +307,7 @@ impl ConflictParser for RegexConflictParser {
                 op: caps[1].to_string(),
                 floor: caps[2].to_string(),
                 conda_version,
+                requiring_chain: Vec::new(),
             });
         }
 
@@ -263,6 +321,7 @@ impl ConflictParser for RegexConflictParser {
                 op: caps[1].to_string(),
                 floor: caps[2].to_string(),
                 conda_version,
+                requiring_chain: Vec::new(),
             });
         }
 
@@ -386,6 +445,7 @@ mod tests {
                 op: ">=".into(),
                 floor: "3.10.3".into(),
                 conda_version: "3.5.0".into(),
+                requiring_chain: Vec::new(),
             })
         );
         assert_eq!(
@@ -395,6 +455,7 @@ mod tests {
                 op: ">".into(),
                 floor: "2.10.3".into(),
                 conda_version: "2.9.0".into(),
+                requiring_chain: Vec::new(),
             })
         );
     }
@@ -423,6 +484,15 @@ mod tests {
                 op: ">=".into(),
                 floor: "13.0.3".into(),
                 conda_version: ">=12".into(),
+                // Attribution-fix chain: cuda-bindings has no user conda
+                // pin of its own; the requiring chain (torch ->
+                // isaacsim-core -> isaacsim[all]) is what repair walks to
+                // find `torch`'s `pytorch-gpu` conda pin instead.
+                requiring_chain: vec![
+                    "torch".into(),
+                    "isaacsim-core".into(),
+                    "isaacsim[all]".into(),
+                ],
             })
         );
         // Real log sample (solve-hover-gpu.log distilled): a uv-closure
@@ -446,6 +516,7 @@ mod tests {
                 op: ">=".into(),
                 floor: "2".into(),
                 conda_version: "<2".into(),
+                requiring_chain: Vec::new(),
             })
         );
     }

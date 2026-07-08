@@ -271,6 +271,21 @@ impl ManifestEditor {
         })
     }
 
+    /// Every feature name declared in the manifest, `"default"` (the
+    /// implicit top-level tables) first, then each `[feature.X]` table in
+    /// declaration order. Used by cross-feature conda-pin lookups (see
+    /// `RepairPlanner::resolve_conda_pin_owner`) so a repair can find --
+    /// and place its edit in -- the feature/pack that actually owns a
+    /// user conda pin, not just the feature the planner was constructed
+    /// for.
+    pub fn feature_names(&self) -> Vec<String> {
+        let mut out = vec!["default".to_string()];
+        if let Some(features) = self.doc.as_table().get("feature").and_then(Item::as_table) {
+            out.extend(features.iter().map(|(name, _)| name.to_string()));
+        }
+        out
+    }
+
     pub fn has_user_entry(&self, feature: &str, kind: TableKind, package: &str) -> bool {
         let snap = self.entry_snapshot(feature, kind, package);
         snap.value.is_some() && !snapshot_has_retread_sentinel(&snap)

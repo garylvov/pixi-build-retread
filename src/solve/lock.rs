@@ -241,6 +241,15 @@ async fn run_with_pixi_bin(args: LockArgs, pixi_bin: &str) -> Result<i32> {
                     continue;
                 }
                 Err(package) => {
+                    // Exhaustion never converges -- unlike the
+                    // `max_repairs` bound (which intentionally keeps
+                    // whatever progress was made so a human can pick up
+                    // where the ladder left off), a dead-end tier means
+                    // every repair applied *this run* is provably useless.
+                    // Roll the manifest back to the pre-run snapshot so no
+                    // orphaned `# retread:override`/`:pin`/`:widen` entry
+                    // survives a failed run.
+                    rollback_snapshot(&project_dir, &manifest_path)?;
                     ledger.finish_run(run_idx, "exhausted");
                     ledger.write_atomic(&ledger_path)?;
                     if is_abi_anchor(&package) {
@@ -603,6 +612,39 @@ exit 0
         // One repair was kept (bounded exhaustion keeps applied repairs).
         let manifest_text = std::fs::read_to_string(dir.join("pixi.toml")).unwrap();
         assert!(manifest_text.contains("numpy"));
+    }
+
+    #[tokio::test]
+    async fn exhaustion_rolls_back_to_pre_run_manifest_snapshot() {
+        // P0 regression (lock-succ-brief.md acceptance runs #1/#2): both
+        // real runs left a dead `# retread:override` entry in pixi.toml
+        // after the ladder exhausted -- repairs that never converged must
+        // not survive the run. numpy's ladder is conda -> pypi_dep ->
+        // pypi_override (3 successful repairs, each converging to the SAME
+        // unresolved conflict since the fake pixi always fails) then
+        // exhausts on the 4th attempt (override tier already tried).
+        let dir = temp_dir("exhaustrollback");
+        let original = "[dependencies]\n";
+        let manifest = write_manifest(&dir, original);
+        let pixi = write_fake_pixi(&dir, 50, CONDA_BOUNDARY_SINGLE_LINE);
+
+        let args = LockArgs {
+            manifest,
+            max_repairs: 10,
+            no_repair: false,
+        };
+        let code = run_with_pixi_bin(args, pixi.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(code, EXIT_EXHAUSTED);
+
+        // Manifest byte-identical to the pre-run snapshot -- every
+        // intermediate repair (conda pin, then pypi dep, then pypi
+        // override) was rolled back, not just the last one.
+        let manifest_text = std::fs::read_to_string(dir.join("pixi.toml")).unwrap();
+        assert_eq!(manifest_text, original);
+        assert!(!manifest_text.contains("numpy"));
+        assert!(!snapshot_path(&dir).exists());
     }
 
     #[tokio::test]

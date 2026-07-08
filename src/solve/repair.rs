@@ -353,15 +353,21 @@ impl RepairPlanner {
     }
 
     /// Resolves the conda-table name under which a `CondaWidenNeeded`
-    /// conflict's pypi `package` is actually pinned by the user, checking
-    /// the parselmouth-backed name family before falling back to an
-    /// exact-name match. Returns `None` if no candidate (including the
-    /// pypi name itself) is a user-owned conda entry.
-    fn resolve_conda_pin_name(&self, editor: &ManifestEditor, package: &str) -> Option<String> {
+    /// conflict's pypi `package` is actually pinned by the user in the
+    /// given `feature`, checking the parselmouth-backed name family before
+    /// falling back to an exact-name match. Returns `None` if no candidate
+    /// (including the pypi name itself) is a user-owned conda entry in
+    /// that feature.
+    fn resolve_conda_pin_name_in(
+        &self,
+        editor: &ManifestEditor,
+        feature: &str,
+        package: &str,
+    ) -> Option<String> {
         let canon = canonical_conda_name(package);
         if let Some(candidates) = self.conda_name_map.get(&canon) {
             for candidate in candidates {
-                if editor.has_user_entry(&self.feature, TableKind::Conda, candidate) {
+                if editor.has_user_entry(feature, TableKind::Conda, candidate) {
                     return Some(candidate.clone());
                 }
             }
@@ -369,10 +375,61 @@ impl RepairPlanner {
         // Exact-name fallback -- covers the identical-name case (conda
         // package name == pypi package name) and callers that didn't wire
         // in a name map at all.
-        if editor.has_user_entry(&self.feature, TableKind::Conda, package) {
+        if editor.has_user_entry(feature, TableKind::Conda, package) {
             return Some(package.to_string());
         }
         None
+    }
+
+    /// Cross-feature version of [`Self::resolve_conda_pin_name`]: scans
+    /// every feature table (own feature checked first, so existing
+    /// single-feature callers see no behavior change) for a user-owned
+    /// conda entry matching `package` (directly or via the name map),
+    /// returning `(owning_feature, conda_table_name)`. Backs both the
+    /// attribution-chain walk (bug: conflict misattributed to a leaf
+    /// package with no user pin) and feature-scoped repair placement
+    /// (bug: edits always landing in `default` instead of the consuming
+    /// feature/pack that actually declares the pin).
+    fn resolve_conda_pin_owner(
+        &self,
+        editor: &ManifestEditor,
+        package: &str,
+    ) -> Option<(String, String)> {
+        if let Some(name) = self.resolve_conda_pin_name_in(editor, &self.feature, package) {
+            return Some((self.feature.clone(), name));
+        }
+        for feature in editor.feature_names() {
+            if feature == self.feature {
+                continue;
+            }
+            if let Some(name) = self.resolve_conda_pin_name_in(editor, &feature, package) {
+                return Some((feature, name));
+            }
+        }
+        None
+    }
+
+    /// Runs [`Self::pypi_override_from_conda`] with `self.feature`
+    /// temporarily switched to `feature` (the feature that owns the conda
+    /// pin the override is derived from), so the emitted
+    /// `pypi-options.dependency-overrides` entry lands in the same
+    /// feature/pack table as the pin, not wherever the planner happened to
+    /// be constructed for (`default` for `retread lock`). Restores
+    /// `self.feature` before returning either way. `None` means the tier
+    /// was unavailable (ABI anchor / already tried / oscillation guard) --
+    /// caller falls through to the next tier.
+    fn try_pypi_override_in_feature(
+        &mut self,
+        editor: &mut ManifestEditor,
+        tried: &mut TriedState,
+        target: &PinTarget<'_>,
+        conda_version: &str,
+        feature: &str,
+    ) -> Option<RepairOutcome> {
+        let saved = std::mem::replace(&mut self.feature, feature.to_string());
+        let result = self.pypi_override_from_conda(editor, tried, target, conda_version);
+        self.feature = saved;
+        result.ok()
     }
 
     pub fn with_relax_preference(mut self, pref: RelaxPreference) -> Self {
@@ -420,6 +477,7 @@ impl RepairPlanner {
                 op,
                 floor,
                 conda_version,
+                requiring_chain,
             } => {
                 let target = PinTarget {
                     package,
@@ -427,7 +485,7 @@ impl RepairPlanner {
                     iter,
                     conflict,
                 };
-                self.conda_widen_needed(editor, tried, &target, op, conda_version)
+                self.conda_widen_needed(editor, tried, &target, op, conda_version, requiring_chain)
             }
         }
     }
@@ -445,29 +503,83 @@ impl RepairPlanner {
         target: &PinTarget<'_>,
         op: &str,
         conda_version: &str,
+        requiring_chain: &[String],
     ) -> std::result::Result<RepairOutcome, String> {
         let package = target.package;
-        // Resolve which conda-table name actually carries the user's pin --
-        // may differ from the pypi `package` name (e.g. pypi `torch` pinned
-        // via conda `pytorch-gpu`); see `resolve_conda_pin_name`.
-        let conda_pin_name = self.resolve_conda_pin_name(editor, package);
+        // Resolve which conda-table name (and feature) actually carries the
+        // user's pin -- may differ from the pypi `package` name (e.g. pypi
+        // `torch` pinned via conda `pytorch-gpu`) and from the feature the
+        // planner was constructed for (e.g. `retread lock`'s `default`);
+        // see `resolve_conda_pin_owner`.
+        let owner = self.resolve_conda_pin_owner(editor, package);
         if self.relax_preference == RelaxPreference::Conda {
-            let user_owned_conda_pin = conda_pin_name.is_some();
-            if user_owned_conda_pin && !tried.has(package, Strategy::PypiOverride) {
-                match self.pypi_override_from_conda(editor, tried, target, conda_version) {
-                    Ok(out) => return Ok(out),
-                    // Override tier unavailable (ABI anchor / oscillation
-                    // guard) -- fall through to widen/boundary below.
-                    Err(_) => {}
+            if let Some((feature, _name)) = owner.clone() {
+                if !tried.has(package, Strategy::PypiOverride)
+                    && let Some(out) = self.try_pypi_override_in_feature(
+                        editor,
+                        tried,
+                        target,
+                        conda_version,
+                        &feature,
+                    )
+                {
+                    return Ok(out);
+                }
+            } else {
+                // ATTRIBUTION FIX: the footer package (the transitive
+                // SYMPTOM the conda-provenance regex names, e.g.
+                // `cuda-bindings`) has no user conda pin of its own, so T1
+                // as written can never fire and every tier below would
+                // chase a spec that can never satisfy the real (anchor-
+                // derived) conda constraint. Walk the bounded "Because X
+                // depends on <footer>" requiring-chain outward (nearest
+                // requirer first, e.g. `torch`) until we find an ancestor
+                // that DOES carry a user conda pin (directly or via the
+                // name map, e.g. `torch` -> `pytorch-gpu`), and re-attribute
+                // the T1 override to THAT package/version instead.
+                for requirer in requiring_chain {
+                    if tried.has(requirer.as_str(), Strategy::PypiOverride) {
+                        continue;
+                    }
+                    let Some((requirer_feature, conda_name)) =
+                        self.resolve_conda_pin_owner(editor, requirer)
+                    else {
+                        continue;
+                    };
+                    let pin_value = editor
+                        .entry_snapshot(&requirer_feature, TableKind::Conda, &conda_name)
+                        .value;
+                    let Some(pin_value) = pin_value else {
+                        continue;
+                    };
+                    let reattributed = PinTarget {
+                        package: requirer.as_str(),
+                        version: target.version,
+                        iter: target.iter,
+                        conflict: target.conflict,
+                    };
+                    if let Some(out) = self.try_pypi_override_in_feature(
+                        editor,
+                        tried,
+                        &reattributed,
+                        &pin_value,
+                        &requirer_feature,
+                    ) {
+                        return Ok(out);
+                    }
                 }
             }
         }
-        let widen_target_name = conda_pin_name.as_deref().unwrap_or(package);
-        if !tried.has(package, Strategy::WidenConda) {
-            self.widen(editor, tried, target, op, widen_target_name)
+        let (widen_feature, widen_target_name) =
+            owner.unwrap_or_else(|| (self.feature.clone(), package.to_string()));
+        let saved = std::mem::replace(&mut self.feature, widen_feature);
+        let result = if !tried.has(package, Strategy::WidenConda) {
+            self.widen(editor, tried, target, op, &widen_target_name)
         } else {
             self.boundary(editor, tried, target, Reason::CondaBoundary)
-        }
+        };
+        self.feature = saved;
+        result
     }
 
     /// T1: relax the pypi requirement to accept the conda-provided version
@@ -907,6 +1019,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+    use super::super::parse::{ConflictParser, RegexConflictParser};
 
     fn temp_manifest(text: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -934,6 +1047,7 @@ mod tests {
             op: ">=".into(),
             floor: "3.10.3".into(),
             conda_version: "3.5.0".into(),
+            requiring_chain: Vec::new(),
         };
         let out = planner.repair(&mut editor, &mut tried, &widen, 1).unwrap();
         assert_eq!(out.attempt.strategy, "widen-conda");
@@ -1046,6 +1160,7 @@ mod tests {
             op: ">=".into(),
             floor: "2.11.0".into(),
             conda_version: "==2.10.0".into(),
+            requiring_chain: Vec::new(),
         };
         let out = planner
             .repair(&mut editor, &mut tried, &conflict, 1)
@@ -1094,6 +1209,7 @@ mod tests {
             op: ">=".into(),
             floor: "2.11.0".into(),
             conda_version: "==2.10.0".into(),
+            requiring_chain: Vec::new(),
         };
         let out = planner
             .repair(&mut editor, &mut tried, &conflict, 1)
@@ -1132,6 +1248,7 @@ mod tests {
             op: ">=".into(),
             floor: "3.10.3".into(),
             conda_version: "==3.5.0".into(),
+            requiring_chain: Vec::new(),
         };
         let out = planner
             .repair(&mut editor, &mut tried, &conflict, 1)
@@ -1152,6 +1269,7 @@ mod tests {
             op: ">=".into(),
             floor: "2.11.0".into(),
             conda_version: "==2.10.0".into(),
+            requiring_chain: Vec::new(),
         };
         let out = planner
             .repair(&mut editor, &mut tried, &conflict, 1)
@@ -1166,5 +1284,76 @@ mod tests {
         assert!(is_abi_anchor("cxx_compiler"));
         assert!(is_abi_anchor("sysroot_linux-64"));
         assert!(!is_abi_anchor("numpy"));
+    }
+
+    // ---- P0 acceptance fixture (lock-succ-brief.md acceptance run #1/#2):
+    // real uv-closure text, cuda-bindings footer (no user conda pin), torch
+    // named in the "Because torch==2.11.0 depends on cuda-bindings..."
+    // requiring clause, pytorch-gpu carrying the actual user conda pin in a
+    // NON-default feature (mirrors the root workspace's `feature.gpu`).
+
+    const UV_CLOSURE_CUDA_BINDINGS: &str =
+        include_str!("../../tests/fixtures/solve_errors/uv_closure_cuda_bindings_widen.txt");
+
+    #[test]
+    fn conda_widen_needed_reattributes_footer_to_requiring_package_with_conda_pin() {
+        // cuda-bindings (the footer/symptom package) has no conda pin
+        // anywhere; pytorch-gpu (torch's conda-side name) is pinned under
+        // `feature.gpu`, not `default`. Before the attribution fix, T1
+        // never fired (resolve_conda_pin_name("cuda-bindings") == None)
+        // and the ladder chased an unwidenable cuda-bindings spec against
+        // the ABI-anchored cuda-version pin. After the fix: repair walks
+        // the parsed requiring_chain (torch -> isaacsim-core ->
+        // isaacsim[all]), finds torch's pytorch-gpu pin under
+        // `feature.gpu`, and emits the pypi override THERE, for `torch`,
+        // pinned to the conda-provided version -- leaving pytorch-gpu and
+        // cuda-bindings untouched.
+        let path = temp_manifest(
+            "[dependencies]\n[feature.gpu.dependencies]\npytorch-gpu = \"==2.10.0\"\n",
+        );
+        let mut editor = ManifestEditor::open(path.clone()).unwrap();
+        let mut tried = TriedState::default();
+        let mut name_map = PypiToCondaMap::new();
+        name_map.insert(
+            "torch".to_string(),
+            vec![
+                "pytorch".to_string(),
+                "pytorch-cpu".to_string(),
+                "pytorch-gpu".to_string(),
+            ],
+        );
+        // Planner constructed for the `default` feature, exactly like
+        // `retread lock`'s LOCK_FEATURE -- the bug this closes is edits
+        // landing in `default` when the real owner is a named feature.
+        let mut planner = RepairPlanner::new("default".into()).with_conda_name_map(name_map);
+
+        let parser = RegexConflictParser::new();
+        let conflict = parser
+            .parse(UV_CLOSURE_CUDA_BINDINGS)
+            .expect("real acceptance fixture must parse");
+        assert_eq!(conflict.kind(), "CondaWidenNeeded");
+        if let Conflict::CondaWidenNeeded { package, .. } = &conflict {
+            assert_eq!(package, "cuda-bindings");
+        }
+
+        let out = planner
+            .repair(&mut editor, &mut tried, &conflict, 1)
+            .unwrap();
+        assert_eq!(out.attempt.strategy, "pypi_override");
+        assert_eq!(out.attempt.package, "torch");
+        assert_eq!(out.attempt.new_spec.as_deref(), Some("==2.10.0"));
+        // The planner's own feature is untouched -- the override was
+        // routed to `feature.gpu` for the duration of the one call only.
+        assert_eq!(planner.feature, "default");
+
+        editor.write_atomic().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("[feature.gpu.pypi-options.dependency-overrides]"));
+        assert!(text.contains("torch = \"==2.10.0\"  # retread:override"));
+        // pytorch-gpu and cuda-bindings are byte-for-byte untouched:
+        assert!(text.contains("pytorch-gpu = \"==2.10.0\"\n"));
+        assert!(!text.contains("cuda-bindings"));
+        // No bogus edit landed in the default feature's tables.
+        assert!(!text.contains("[pypi-options.dependency-overrides]"));
     }
 }
