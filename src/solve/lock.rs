@@ -1,0 +1,680 @@
+//! `retread lock`: `pixi lock` subprocess with bounded, ledgered auto-repair.
+//!
+//! Thin sibling of `retread solve` that reuses the same repair ladder
+//! (`RepairPlanner`), conflict parser (`RegexConflictParser`), manifest
+//! editor (`ManifestEditor`), and ledger (`SolveLedger`) but drives `pixi
+//! lock` instead of `pixi install` and bounds itself by a repair *count*
+//! (`--max-repairs`, default 10) rather than a raw iteration count.
+
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+
+use anyhow::Result;
+use tokio::io::AsyncReadExt;
+use tokio::process::Command;
+
+use super::error::{EXIT_EXHAUSTED, EXIT_INTERRUPTED, EXIT_MAX_ITERS, EXIT_OK, EXIT_UNPARSEABLE};
+use super::manifest::{AppliedEdit, ManifestEditor, copy_atomic};
+use super::parse::{ConflictParser, RegexConflictParser, tail};
+use super::repair::{
+    RepairPlanner, SolveLedger, Strategy, append_attempt, is_abi_anchor, ledger_path,
+    manifest_sha256, mark_last_widen_failed, retread_dir, snapshot_path,
+};
+
+const DEFAULT_MAX_REPAIRS: u32 = 10;
+const LOCK_FEATURE: &str = "default";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LockArgs {
+    pub manifest: PathBuf,
+    pub max_repairs: u32,
+    pub no_repair: bool,
+}
+
+impl Default for LockArgs {
+    fn default() -> Self {
+        Self {
+            manifest: PathBuf::from("pixi.toml"),
+            max_repairs: DEFAULT_MAX_REPAIRS,
+            no_repair: false,
+        }
+    }
+}
+
+pub mod args {
+    use super::*;
+
+    pub fn parse(argv: &[String]) -> anyhow::Result<LockArgs> {
+        let mut args = LockArgs::default();
+        let mut it = argv.iter();
+        while let Some(a) = it.next() {
+            match a.as_str() {
+                "--manifest" => {
+                    let p = it.next().ok_or_else(|| {
+                        anyhow::anyhow!("retread lock: --manifest <path> required")
+                    })?;
+                    args.manifest = PathBuf::from(p);
+                }
+                "--max-repairs" => {
+                    let raw = it.next().ok_or_else(|| {
+                        anyhow::anyhow!("retread lock: --max-repairs <N> required")
+                    })?;
+                    args.max_repairs = raw.parse().map_err(|_| {
+                        anyhow::anyhow!("retread lock: bad --max-repairs value {raw}")
+                    })?;
+                }
+                "--no-repair" => args.no_repair = true,
+                other => anyhow::bail!("retread lock: unknown arg {other}"),
+            }
+        }
+        Ok(args)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn argv(parts: &[&str]) -> Vec<String> {
+            parts.iter().map(|s| s.to_string()).collect()
+        }
+
+        #[test]
+        fn defaults_are_manifest_and_ten_repairs() {
+            let args = parse(&argv(&[])).unwrap();
+            assert_eq!(args.manifest, PathBuf::from("pixi.toml"));
+            assert_eq!(args.max_repairs, 10);
+            assert!(!args.no_repair);
+        }
+
+        #[test]
+        fn parses_all_flags() {
+            let args = parse(&argv(&["--manifest", "x.toml", "--max-repairs", "3"])).unwrap();
+            assert_eq!(args.manifest, PathBuf::from("x.toml"));
+            assert_eq!(args.max_repairs, 3);
+
+            let args = parse(&argv(&["--no-repair"])).unwrap();
+            assert!(args.no_repair);
+        }
+
+        #[test]
+        fn rejects_unknown_flag() {
+            assert!(parse(&argv(&["--bogus"])).is_err());
+        }
+    }
+}
+
+pub async fn run(args: LockArgs) -> Result<i32> {
+    run_with_pixi_bin(args, "pixi").await
+}
+
+/// One applied repair, kept around only to print the closing summary table.
+struct RepairRecord {
+    package: String,
+    strategy: Strategy,
+    old_spec: Option<String>,
+    new_spec: String,
+    feature: String,
+}
+
+struct PendingEdit {
+    package: String,
+    strategy: Strategy,
+    edits: Vec<AppliedEdit>,
+}
+
+impl PendingEdit {
+    fn from_edits(edits: Vec<AppliedEdit>) -> Option<Self> {
+        let last = edits.last()?;
+        Some(Self {
+            package: last.package.clone(),
+            strategy: last.strategy,
+            edits,
+        })
+    }
+
+    fn restore(&self, editor: &mut ManifestEditor, feature: &str) {
+        for edit in self.edits.iter().rev() {
+            editor.restore_entry(feature, edit.table, &edit.package, &edit.before);
+        }
+    }
+}
+
+async fn run_with_pixi_bin(args: LockArgs, pixi_bin: &str) -> Result<i32> {
+    let manifest_path = normalize_manifest(&args.manifest);
+    if !manifest_path.exists() {
+        eprintln!(
+            "retread lock: manifest {} not found",
+            manifest_path.display()
+        );
+        return Ok(super::error::EXIT_USAGE);
+    }
+
+    if args.no_repair {
+        return run_passthrough(pixi_bin, &manifest_path).await;
+    }
+
+    let mut editor = ManifestEditor::open(manifest_path.clone())?;
+    let project_dir = editor.project_dir().to_path_buf();
+    let ledger_path = ledger_path(&project_dir);
+    let manifest_display = manifest_path
+        .strip_prefix(&project_dir)
+        .unwrap_or(&manifest_path)
+        .to_string_lossy()
+        .to_string();
+
+    let parser = RegexConflictParser::new();
+    let mut ledger = SolveLedger::load(&ledger_path, manifest_display)?;
+    let manifest_hash = manifest_sha256(&manifest_path)?;
+    let mut tried = ledger.seed_tried_state(&manifest_path, &manifest_hash, &editor);
+    let mut planner = RepairPlanner::new(LOCK_FEATURE.to_string());
+
+    let run_idx = ledger.start_run(
+        "lock".to_string(),
+        manifest_sha256(&manifest_path)?,
+        pixi_version(&project_dir, pixi_bin).await,
+    );
+    ledger.write_atomic(&ledger_path)?;
+
+    let mut pending_edit: Option<PendingEdit> = None;
+    let mut records: Vec<RepairRecord> = Vec::new();
+    let mut repairs_applied: u32 = 0;
+    // Defensive hard cap on raw loop iterations (widen-revert retries don't
+    // consume a repair slot); bounded by the ladder depth per package so
+    // this should never bite in practice.
+    let hard_cap = args.max_repairs.saturating_mul(2) + 8;
+
+    for _ in 1..=hard_cap {
+        let lock = match run_pixi_lock(pixi_bin, &project_dir).await {
+            Ok(lock) => lock,
+            Err(err) => {
+                // Unexpected crash (spawn/IO failure), not a normal solver
+                // failure -- roll back any repairs applied so far.
+                rollback_snapshot(&project_dir, &manifest_path)?;
+                ledger.finish_run(run_idx, "crashed");
+                ledger.write_atomic(&ledger_path)?;
+                return Err(err);
+            }
+        };
+        if lock.interrupted {
+            rollback_snapshot(&project_dir, &manifest_path)?;
+            ledger.finish_run(run_idx, "interrupted");
+            ledger.write_atomic(&ledger_path)?;
+            return Ok(EXIT_INTERRUPTED);
+        }
+        if lock.success {
+            ledger.finish_run(run_idx, "converged");
+            ledger.write_atomic(&ledger_path)?;
+            cleanup_snapshot(&project_dir)?;
+            print_summary(&records);
+            return Ok(EXIT_OK);
+        }
+
+        let stripped = parser.strip_ansi(&lock.stderr);
+        let parsed = parser.parse(&stripped);
+
+        if let Some(conflict) = parsed {
+            if repairs_applied >= args.max_repairs {
+                ledger.finish_run(run_idx, "max_repairs");
+                ledger.write_atomic(&ledger_path)?;
+                eprintln!(
+                    "retread lock: max repairs ({}) reached; last conflict unresolved for manifest {}",
+                    args.max_repairs,
+                    manifest_path.display()
+                );
+                eprintln!("{}", tail(&lock.raw_stderr, 4000));
+                print_summary(&records);
+                return Ok(EXIT_MAX_ITERS);
+            }
+            ensure_snapshot(&project_dir, &manifest_path)?;
+            let iter = repairs_applied + 1;
+            let repair = planner.repair(&mut editor, &mut tried, &conflict, iter);
+            match repair {
+                Ok(out) => {
+                    editor.write_atomic()?;
+                    for attempt in out.extra_attempts {
+                        append_attempt(&mut ledger, &ledger_path, run_idx, attempt)?;
+                    }
+                    append_attempt(&mut ledger, &ledger_path, run_idx, out.attempt.clone())?;
+                    record_repair(&mut records, &out.attempt, &out.applied);
+                    pending_edit = PendingEdit::from_edits(out.applied);
+                    repairs_applied += 1;
+                    continue;
+                }
+                Err(package) => {
+                    ledger.finish_run(run_idx, "exhausted");
+                    ledger.write_atomic(&ledger_path)?;
+                    if is_abi_anchor(&package) {
+                        eprintln!(
+                            "retread lock: ABI-anchor package {package} cannot be auto-repaired; edit the manifest manually"
+                        );
+                    } else {
+                        eprintln!("retread lock: exhausted repair strategies for {package}");
+                    }
+                    print_summary(&records);
+                    return Ok(EXIT_EXHAUSTED);
+                }
+            }
+        }
+
+        // Unparseable this round. If the last applied edit was a conda
+        // widen and this failure looks like the generic post-widen unsat
+        // dump, revert just that widen and retry (same recovery `retread
+        // solve` performs) rather than giving up outright.
+        if let Some(pending) = pending_edit.take() {
+            if pending.strategy == Strategy::WidenConda
+                && RegexConflictParser::is_post_widen_conda_unsat(&stripped)
+            {
+                eprintln!(
+                    "retread lock: post-widen conda unsat for {}; reverting only that widen",
+                    pending.package
+                );
+                pending.restore(&mut editor, LOCK_FEATURE);
+                editor.write_atomic()?;
+                tried.mark(&pending.package, Strategy::WidenConda, true);
+                mark_last_widen_failed(&mut ledger, &ledger_path, run_idx, &pending.package)?;
+                records.retain(|r| {
+                    !(r.package == pending.package && r.strategy == Strategy::WidenConda)
+                });
+                continue;
+            }
+            pending.restore(&mut editor, LOCK_FEATURE);
+            editor.write_atomic()?;
+        }
+
+        ledger.finish_run(run_idx, "unparseable");
+        ledger.write_atomic(&ledger_path)?;
+        eprintln!("retread lock: could not parse solver error; manifest kept as-is");
+        eprintln!("{}", tail(&lock.raw_stderr, 4000));
+        print_summary(&records);
+        return Ok(EXIT_UNPARSEABLE);
+    }
+
+    ledger.finish_run(run_idx, "max_iters");
+    ledger.write_atomic(&ledger_path)?;
+    eprintln!("retread lock: internal loop bound reached without converging");
+    print_summary(&records);
+    Ok(EXIT_MAX_ITERS)
+}
+
+fn record_repair(
+    records: &mut Vec<RepairRecord>,
+    attempt: &super::repair::LedgerAttempt,
+    applied: &[AppliedEdit],
+) {
+    let old_spec = applied
+        .last()
+        .and_then(|e| e.before.value.clone())
+        .or_else(|| attempt.old_spec.clone());
+    let new_spec = attempt
+        .new_spec
+        .clone()
+        .or_else(|| attempt.version.as_ref().map(|v| format!("=={v}")))
+        .unwrap_or_default();
+    records.push(RepairRecord {
+        package: attempt.package.clone(),
+        strategy: parse_strategy(&attempt.strategy),
+        old_spec,
+        new_spec,
+        feature: LOCK_FEATURE.to_string(),
+    });
+}
+
+fn parse_strategy(raw: &str) -> Strategy {
+    match raw {
+        "widen-conda" => Strategy::WidenConda,
+        "pypi_dep" => Strategy::PypiDep,
+        "pypi_override" => Strategy::PypiOverride,
+        _ => Strategy::Conda,
+    }
+}
+
+async fn run_passthrough(pixi_bin: &str, manifest_path: &Path) -> Result<i32> {
+    let project_dir = manifest_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    let mut cmd = Command::new(pixi_bin);
+    cmd.arg("lock").current_dir(&project_dir);
+    passthrough_env(&mut cmd);
+    let status = cmd
+        .status()
+        .await
+        .map_err(|e| anyhow::anyhow!("retread lock: failed to spawn {pixi_bin} lock: {e}"))?;
+    Ok(status.code().unwrap_or(1))
+}
+
+struct LockResult {
+    success: bool,
+    interrupted: bool,
+    stderr: String,
+    raw_stderr: String,
+}
+
+fn passthrough_env(cmd: &mut Command) {
+    // `PIXI_BUILD_BACKEND_OVERRIDE` is already inherited by child processes
+    // (we never call env_clear); set it explicitly so the passthrough is
+    // not silently dependent on that default.
+    if let Ok(val) = std::env::var("PIXI_BUILD_BACKEND_OVERRIDE") {
+        cmd.env("PIXI_BUILD_BACKEND_OVERRIDE", val);
+    }
+}
+
+async fn run_pixi_lock(pixi_bin: &str, project_dir: &Path) -> Result<LockResult> {
+    let mut cmd = Command::new(pixi_bin);
+    cmd.arg("lock")
+        .arg("--color=never")
+        .current_dir(project_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("PIXI_COLOR", "never");
+    passthrough_env(&mut cmd);
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("retread lock: failed to spawn {pixi_bin} lock: {e}"))?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let stdout_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = stdout {
+            let _ = pipe.read_to_end(&mut buf).await;
+        }
+        buf
+    });
+    let stderr_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = stderr {
+            let _ = pipe.read_to_end(&mut buf).await;
+        }
+        buf
+    });
+
+    tokio::select! {
+        status = child.wait() => {
+            let status = status.map_err(|e| anyhow::anyhow!("retread lock: pixi lock failed: {e}"))?;
+            let _stdout = stdout_task.await.unwrap_or_default();
+            let stderr = stderr_task.await.unwrap_or_default();
+            let raw_stderr = String::from_utf8_lossy(&stderr).to_string();
+            Ok(LockResult {
+                success: status.success(),
+                interrupted: false,
+                stderr: raw_stderr.clone(),
+                raw_stderr,
+            })
+        }
+        _ = tokio::signal::ctrl_c() => {
+            let _ = child.kill().await;
+            let _ = stdout_task.await;
+            let _ = stderr_task.await;
+            Ok(LockResult {
+                success: false,
+                interrupted: true,
+                stderr: String::new(),
+                raw_stderr: String::new(),
+            })
+        }
+    }
+}
+
+async fn pixi_version(project_dir: &Path, pixi_bin: &str) -> Option<String> {
+    let out = Command::new(pixi_bin)
+        .arg("--version")
+        .current_dir(project_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .await
+        .ok()?;
+    if out.status.success() {
+        Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    } else {
+        None
+    }
+}
+
+fn normalize_manifest(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    }
+}
+
+fn ensure_snapshot(project_dir: &Path, manifest_path: &Path) -> Result<()> {
+    let retread = retread_dir(project_dir);
+    std::fs::create_dir_all(&retread)?;
+    let bak = snapshot_path(project_dir);
+    if !bak.exists() {
+        copy_atomic(manifest_path, &bak)?;
+    }
+    Ok(())
+}
+
+fn rollback_snapshot(project_dir: &Path, manifest_path: &Path) -> Result<()> {
+    let bak = snapshot_path(project_dir);
+    if bak.exists() {
+        copy_atomic(&bak, manifest_path)?;
+        let _ = std::fs::remove_file(&bak);
+    }
+    Ok(())
+}
+
+fn cleanup_snapshot(project_dir: &Path) -> Result<()> {
+    let bak = snapshot_path(project_dir);
+    if bak.exists() {
+        std::fs::remove_file(bak)?;
+    }
+    Ok(())
+}
+
+fn print_summary(records: &[RepairRecord]) {
+    if records.is_empty() {
+        println!("retread lock: no manifest repairs applied");
+        return;
+    }
+    println!("retread lock: repairs applied");
+    let header = format!(
+        "{:<24} {:<20} {:<24} {:<10} {}",
+        "package", "old_spec", "new_spec", "tier", "feature"
+    );
+    println!("{header}");
+    for r in records {
+        println!(
+            "{:<24} {:<20} {:<24} {:<10} {}",
+            r.package,
+            r.old_spec.as_deref().unwrap_or("(none)"),
+            r.new_spec,
+            r.strategy.as_str(),
+            r.feature
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "retread-lock-test-{tag}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Writes a fake `pixi` executable that fails (dumping `stderr_fixture`)
+    /// for the first `fail_count` invocations of `lock`, then succeeds.
+    /// `pixi --version` and any other subcommand always succeeds trivially.
+    /// State is a plain counter file scoped to this test's own temp dir, so
+    /// parallel tests never share process-wide env/PATH state.
+    fn write_fake_pixi(dir: &Path, fail_count: u32, stderr_fixture: &str) -> PathBuf {
+        let counter = dir.join("counter");
+        std::fs::write(&counter, b"0").unwrap();
+        let stderr_path = dir.join("stderr.txt");
+        std::fs::write(&stderr_path, stderr_fixture).unwrap();
+        let script_path = dir.join("pixi");
+        let script = format!(
+            r#"#!/bin/bash
+if [ "$1" != "lock" ]; then
+  exit 0
+fi
+n=$(cat "{counter}")
+n=$((n + 1))
+echo "$n" > "{counter}"
+if [ "$n" -le {fail_count} ]; then
+  cat "{stderr_path}" >&2
+  exit 1
+fi
+exit 0
+"#,
+            counter = counter.display(),
+            fail_count = fail_count,
+            stderr_path = stderr_path.display(),
+        );
+        let mut f = std::fs::File::create(&script_path).unwrap();
+        f.write_all(script.as_bytes()).unwrap();
+        let mut perm = f.metadata().unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perm).unwrap();
+        script_path
+    }
+
+    fn write_manifest(dir: &Path, text: &str) -> PathBuf {
+        let path = dir.join("pixi.toml");
+        std::fs::write(&path, text).unwrap();
+        path
+    }
+
+    const CONDA_BOUNDARY_SINGLE_LINE: &str =
+        include_str!("../../tests/fixtures/solve_errors/conda_boundary_single_line.txt");
+    const UNPARSEABLE: &str =
+        include_str!("../../tests/fixtures/solve_errors/unparseable_network_error.txt");
+
+    #[tokio::test]
+    async fn converges_after_one_repair() {
+        let dir = temp_dir("converge");
+        let manifest = write_manifest(&dir, "[dependencies]\n");
+        let pixi = write_fake_pixi(&dir, 1, CONDA_BOUNDARY_SINGLE_LINE);
+
+        let args = LockArgs {
+            manifest,
+            max_repairs: 10,
+            no_repair: false,
+        };
+        let code = run_with_pixi_bin(args, pixi.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(code, EXIT_OK);
+
+        let manifest_text = std::fs::read_to_string(dir.join("pixi.toml")).unwrap();
+        assert!(manifest_text.contains("numpy"));
+        // Snapshot must be cleaned up on convergence.
+        assert!(!snapshot_path(&dir).exists());
+    }
+
+    #[tokio::test]
+    async fn max_repairs_bound_stops_with_manifest_kept() {
+        let dir = temp_dir("maxrepairs");
+        let manifest = write_manifest(&dir, "[dependencies]\n");
+        // numpy's ladder is conda -> pypi_dep -> pypi_override (3 repairs)
+        // before exhausting; cap at 1 repair so we hit the bound first.
+        let pixi = write_fake_pixi(&dir, 50, CONDA_BOUNDARY_SINGLE_LINE);
+
+        let args = LockArgs {
+            manifest,
+            max_repairs: 1,
+            no_repair: false,
+        };
+        let code = run_with_pixi_bin(args, pixi.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(code, EXIT_MAX_ITERS);
+
+        // One repair was kept (bounded exhaustion keeps applied repairs).
+        let manifest_text = std::fs::read_to_string(dir.join("pixi.toml")).unwrap();
+        assert!(manifest_text.contains("numpy"));
+    }
+
+    #[tokio::test]
+    async fn abi_anchor_conflict_stops_without_repair() {
+        let dir = temp_dir("abianchor");
+        let manifest = write_manifest(&dir, "[dependencies]\n");
+        let fixture = CONDA_BOUNDARY_SINGLE_LINE.replace("numpy", "python");
+        let pixi = write_fake_pixi(&dir, 50, &fixture);
+
+        let args = LockArgs {
+            manifest,
+            max_repairs: 10,
+            no_repair: false,
+        };
+        let code = run_with_pixi_bin(args, pixi.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(code, EXIT_EXHAUSTED);
+
+        let manifest_text = std::fs::read_to_string(dir.join("pixi.toml")).unwrap();
+        assert!(!manifest_text.contains("python"));
+    }
+
+    #[tokio::test]
+    async fn unparseable_conflict_stops_and_keeps_manifest_untouched() {
+        let dir = temp_dir("unparseable");
+        let manifest = write_manifest(&dir, "[dependencies]\n");
+        let pixi = write_fake_pixi(&dir, 50, UNPARSEABLE);
+
+        let args = LockArgs {
+            manifest,
+            max_repairs: 10,
+            no_repair: false,
+        };
+        let code = run_with_pixi_bin(args, pixi.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(code, EXIT_UNPARSEABLE);
+
+        let manifest_text = std::fs::read_to_string(dir.join("pixi.toml")).unwrap();
+        assert_eq!(manifest_text, "[dependencies]\n");
+    }
+
+    #[tokio::test]
+    async fn no_repair_is_plain_passthrough() {
+        let dir = temp_dir("norepair");
+        let manifest = write_manifest(&dir, "[dependencies]\n");
+        // Fails once; --no-repair must not touch the manifest or retry.
+        let pixi = write_fake_pixi(&dir, 1, CONDA_BOUNDARY_SINGLE_LINE);
+
+        let args = LockArgs {
+            manifest,
+            max_repairs: 10,
+            no_repair: true,
+        };
+        let code = run_with_pixi_bin(args, pixi.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(code, 1);
+        let manifest_text = std::fs::read_to_string(dir.join("pixi.toml")).unwrap();
+        assert_eq!(manifest_text, "[dependencies]\n");
+
+        // Second run (fresh counter isn't reset, but the fake script's
+        // fail_count was already exhausted) succeeds -> passthrough exit 0.
+        let args2 = LockArgs {
+            manifest: dir.join("pixi.toml"),
+            max_repairs: 10,
+            no_repair: true,
+        };
+        let code2 = run_with_pixi_bin(args2, pixi.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(code2, 0);
+    }
+}

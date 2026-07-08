@@ -3,6 +3,7 @@
 pub mod args;
 mod driver;
 mod error;
+pub mod lock;
 mod manifest;
 mod parse;
 mod repair;

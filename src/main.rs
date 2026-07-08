@@ -26,12 +26,17 @@ async fn main() -> anyhow::Result<()> {
 
     if matches!(
         argv.get(1).map(String::as_str),
-        Some("install" | "verify" | "solve")
+        Some("install" | "verify" | "solve" | "lock")
     ) {
         let cmd = argv[1].as_str();
         if cmd == "solve" {
             let args = solve::args::parse(&argv[2..])?;
             let code = solve::run(args).await?;
+            std::process::exit(code);
+        }
+        if cmd == "lock" {
+            let args = solve::lock::args::parse(&argv[2..])?;
+            let code = solve::lock::run(args).await?;
             std::process::exit(code);
         }
         let mut lock: Option<String> = None;
