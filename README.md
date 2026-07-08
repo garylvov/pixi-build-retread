@@ -27,6 +27,24 @@ isaacsim = { version = "==5.1.0", index = "https://pypi.nvidia.com" }
 ```
 
 Run: `pixi install`
+
+## Pack Configuration Example
+A pack's `pixi.toml` (e.g., `examples/isaac6/isaac-pack/`) declares package metadata and wheels to bundle:
+```toml
+[package]
+name = "isaac-pack-6"
+version = "6.0.0.1"
+[package.build]
+backend = { name = "pixi-build-retread", version = "*" }
+[package.build.config]
+retread-python   = "3.12"
+retread-bundle   = "isaac-pack-6"
+retread-resolver = "uv"
+[package.build.config.retread-wheels]
+isaacsim = { version = "==6.0.0.1", index = "https://pypi.nvidia.com" }
+# ...
+```
+
 ## Commands
 
 | Command | Usage |
