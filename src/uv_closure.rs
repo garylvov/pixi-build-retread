@@ -491,22 +491,51 @@ pub fn build_constraints(
 // Ephemeral project synthesis
 // ---------------------------------------------------------------------------
 
-/// `tool.uv.environments` marker for a conda subdir. `None` for noarch /
-/// unknown subdirs (the `environments` key is then omitted; tag selection
-/// in [`parse_pylock_closure`] still enforces the platform).
-pub fn environment_marker(conda_subdir: &str) -> Option<String> {
-    let (platform, machine) = match conda_subdir {
-        "linux-64" => ("linux", "x86_64"),
-        "linux-aarch64" => ("linux", "aarch64"),
-        "linux-ppc64le" => ("linux", "ppc64le"),
-        "osx-64" => ("darwin", "x86_64"),
-        "osx-arm64" => ("darwin", "arm64"),
-        "win-64" => ("win32", "AMD64"),
-        _ => return None,
-    };
-    Some(format!(
-        "sys_platform == '{platform}' and platform_machine == '{machine}'"
-    ))
+/// `(lower, upper)` bounds spanning the target python minor: `"3.12"`
+/// (or `"3.12.4"`) -> `("3.12", "3.13")`. `None` when the string does
+/// not start with a parseable `major.minor`.
+pub fn python_minor_bounds(python_version: &str) -> Option<(String, String)> {
+    let mut parts = python_version.split('.');
+    let major: u64 = parts.next()?.trim().parse().ok()?;
+    let minor_digits: String = parts
+        .next()?
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    let minor: u64 = minor_digits.parse().ok()?;
+    Some((format!("{major}.{minor}"), format!("{major}.{}", minor + 1)))
+}
+
+/// `tool.uv.environments` marker restricting universal resolution to the
+/// single (python minor, platform) environment retread materializes for.
+///
+/// The python clause prunes marker-dead branches (e.g. aiohttp's
+/// `idna-ssl ; python_version < '3.7'`) from the resolve so they never
+/// need per-pack `retread-drop-deps`; the platform clause does the same
+/// for foreign platforms. `None` only when BOTH halves are unknown
+/// (unparseable python AND noarch/unknown subdir); tag selection in
+/// [`parse_pylock_closure`] still enforces the platform either way.
+pub fn environment_marker(python_version: &str, conda_subdir: &str) -> Option<String> {
+    let python_clause = python_minor_bounds(python_version)
+        .map(|(lo, hi)| format!("python_version >= '{lo}' and python_version < '{hi}'"));
+    let platform_clause = match conda_subdir {
+        "linux-64" => Some(("linux", "x86_64")),
+        "linux-aarch64" => Some(("linux", "aarch64")),
+        "linux-ppc64le" => Some(("linux", "ppc64le")),
+        "osx-64" => Some(("darwin", "x86_64")),
+        "osx-arm64" => Some(("darwin", "arm64")),
+        "win-64" => Some(("win32", "AMD64")),
+        _ => None,
+    }
+    .map(|(platform, machine)| {
+        format!("sys_platform == '{platform}' and platform_machine == '{machine}'")
+    });
+    match (python_clause, platform_clause) {
+        (Some(py), Some(plat)) => Some(format!("{py} and {plat}")),
+        (Some(py), None) => Some(py),
+        (None, Some(plat)) => Some(plat),
+        (None, None) => None,
+    }
 }
 
 /// Escape a string for a TOML basic (double-quoted) string.
@@ -561,9 +590,18 @@ pub fn synthesize_pyproject(req: &UvClosureRequest) -> String {
         toml_str(&project_name(&req.bundle))
     ));
     out.push_str("version = \"0\"\n");
+    // Bounded range (not `==X.Y.*`): the explicit upper AND lower bound
+    // restricts uv's universal resolution to the one python minor retread
+    // materializes for, so marker-dead branches on other pythons are never
+    // resolved. Falls back to the exact-match form when the version string
+    // has no parseable minor.
+    let requires_python = match python_minor_bounds(&req.python_version) {
+        Some((lo, hi)) => format!(">={lo},<{hi}"),
+        None => format!("=={}.*", req.python_version),
+    };
     out.push_str(&format!(
         "requires-python = {}\n",
-        toml_str(&format!("=={}.*", req.python_version))
+        toml_str(&requires_python)
     ));
     out.push_str(&format!(
         "dependencies = {}\n",
@@ -571,7 +609,7 @@ pub fn synthesize_pyproject(req: &UvClosureRequest) -> String {
     ));
 
     out.push_str("\n[tool.uv]\n");
-    if let Some(marker) = environment_marker(&req.conda_subdir) {
+    if let Some(marker) = environment_marker(&req.python_version, &req.conda_subdir) {
         out.push_str(&format!("environments = [{}]\n", toml_str(&marker)));
     }
     // sdists are never built by uv (spec §8.2): retread's source_build
@@ -579,6 +617,12 @@ pub fn synthesize_pyproject(req: &UvClosureRequest) -> String {
     out.push_str("no-build = true\n");
     // Matches the installer's index semantics (installer.rs build_uv_args).
     out.push_str("index-strategy = \"unsafe-best-match\"\n");
+    // Packages that publish ONLY pre-releases (e.g. tinyobjloader
+    // 2.0.0rc13) resolve without a per-pack override; stable releases
+    // still win everywhere else. Config-file-class key: also passed as
+    // a CLI flag on `uv lock` (see compute_closure) because UV_NO_CONFIG
+    // strips it from this table on uv 0.11.x.
+    out.push_str("prerelease = \"if-necessary-or-explicit\"\n");
     if !req.constraints.constraints.is_empty() {
         out.push_str(&format!(
             "constraint-dependencies = {}\n",
@@ -1033,20 +1077,23 @@ pub async fn compute_closure(
     // CRITICAL: we run uv with UV_NO_CONFIG=1 to isolate the resolve
     // from user-level uv.toml. As of uv 0.11.x that ALSO strips the
     // configuration-file-class keys from the synthesized pyproject's
-    // `[tool.uv]` table -- `[[tool.uv.index]]`, `no-build`, and
-    // `index-strategy` are silently ignored (project-only keys like
-    // `environments`, `override-dependencies`, `constraint-dependencies`
-    // and `[tool.uv.sources]` still apply). Without the index flags uv
-    // falls back to pypi.org alone, where e.g. `isaacsim` exists only as
-    // a stub sdist (the real manylinux_2_35 wheels live on
-    // pypi.nvidia.com) -- the closure then exports zero wheels and the
-    // whole workspace lock fails. Pass all three as CLI flags, which
-    // UV_NO_CONFIG never touches. The `[tool.uv]` copies stay in the
-    // synthesized pyproject for uv versions where --no-config leaves
-    // project tables alone (the flags and the table agree).
+    // `[tool.uv]` table -- `[[tool.uv.index]]`, `no-build`,
+    // `index-strategy`, and `prerelease` are silently ignored
+    // (project-only keys like `environments`, `override-dependencies`,
+    // `constraint-dependencies` and `[tool.uv.sources]` still apply).
+    // Without the index flags uv falls back to pypi.org alone, where
+    // e.g. `isaacsim` exists only as a stub sdist (the real
+    // manylinux_2_35 wheels live on pypi.nvidia.com) -- the closure then
+    // exports zero wheels and the whole workspace lock fails. Pass every
+    // config-file-class setting as a CLI flag, which UV_NO_CONFIG never
+    // touches. The `[tool.uv]` copies stay in the synthesized pyproject
+    // for uv versions where --no-config leaves project tables alone
+    // (the flags and the table agree).
     lock_args.push("--no-build".into());
     lock_args.push("--index-strategy".into());
     lock_args.push("unsafe-best-match".into());
+    lock_args.push("--prerelease".into());
+    lock_args.push("if-necessary-or-explicit".into());
     for url in &req.index_urls {
         lock_args.push("--index".into());
         lock_args.push(url.clone());
@@ -1219,16 +1266,17 @@ mod tests {
 [project]
 name = "retread-closure-isaac-pack-latest"
 version = "0"
-requires-python = "==3.12.*"
+requires-python = ">=3.12,<3.13"
 dependencies = [
     "isaacsim[all,extscache]==5.1.0",
     "mujoco==3.5.0",
 ]
 
 [tool.uv]
-environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
+environments = ["python_version >= '3.12' and python_version < '3.13' and sys_platform == 'linux' and platform_machine == 'x86_64'"]
 no-build = true
 index-strategy = "unsafe-best-match"
+prerelease = "if-necessary-or-explicit"
 constraint-dependencies = [
     "numpy>=1.26,<3",
     "torch==2.10.0",
@@ -1253,29 +1301,93 @@ isaaclab = { path = "wheels/isaaclab/isaaclab-2.0.0-py3-none-any.whl" }
     }
 
     #[test]
-    fn synthesize_pyproject_noarch_omits_environments() {
+    fn synthesize_pyproject_noarch_keeps_python_environments() {
+        // Unknown subdir: the platform clause is dropped but the python
+        // clause still restricts universal resolution.
         let mut req = sample_request();
         req.conda_subdir = "noarch".to_string();
         let got = synthesize_pyproject(&req);
-        assert!(!got.contains("environments ="));
+        assert!(
+            got.contains(
+                "environments = [\"python_version >= '3.12' and python_version < '3.13'\"]"
+            )
+        );
         assert!(got.contains("no-build = true"));
+    }
+
+    #[test]
+    fn synthesize_pyproject_unparseable_python_falls_back() {
+        let mut req = sample_request();
+        req.python_version = "weird".to_string();
+        let got = synthesize_pyproject(&req);
+        assert!(got.contains("requires-python = \"==weird.*\""));
+        // Platform-only marker; no python clause.
+        assert!(got.contains(
+            "environments = [\"sys_platform == 'linux' and platform_machine == 'x86_64'\"]"
+        ));
+    }
+
+    #[test]
+    fn synthesize_pyproject_sets_prerelease_policy() {
+        let got = synthesize_pyproject(&sample_request());
+        assert!(got.contains("prerelease = \"if-necessary-or-explicit\""));
+    }
+
+    #[test]
+    fn python_minor_bounds_matrix() {
+        assert_eq!(
+            python_minor_bounds("3.12"),
+            Some(("3.12".to_string(), "3.13".to_string()))
+        );
+        // Patch component is ignored; only the minor is bounded.
+        assert_eq!(
+            python_minor_bounds("3.10.14"),
+            Some(("3.10".to_string(), "3.11".to_string()))
+        );
+        assert_eq!(
+            python_minor_bounds("3.9"),
+            Some(("3.9".to_string(), "3.10".to_string()))
+        );
+        assert_eq!(python_minor_bounds("3"), None);
+        assert_eq!(python_minor_bounds("weird"), None);
+        assert_eq!(python_minor_bounds(""), None);
     }
 
     #[test]
     fn environment_marker_matrix() {
         assert_eq!(
-            environment_marker("linux-64").as_deref(),
+            environment_marker("3.12", "linux-64").as_deref(),
+            Some(
+                "python_version >= '3.12' and python_version < '3.13' \
+                 and sys_platform == 'linux' and platform_machine == 'x86_64'"
+            )
+        );
+        assert_eq!(
+            environment_marker("3.11", "osx-arm64").as_deref(),
+            Some(
+                "python_version >= '3.11' and python_version < '3.12' \
+                 and sys_platform == 'darwin' and platform_machine == 'arm64'"
+            )
+        );
+        assert_eq!(
+            environment_marker("3.12", "win-64").as_deref(),
+            Some(
+                "python_version >= '3.12' and python_version < '3.13' \
+                 and sys_platform == 'win32' and platform_machine == 'AMD64'"
+            )
+        );
+        // noarch keeps the python clause.
+        assert_eq!(
+            environment_marker("3.12", "noarch").as_deref(),
+            Some("python_version >= '3.12' and python_version < '3.13'")
+        );
+        // Unknown python keeps the platform clause.
+        assert_eq!(
+            environment_marker("weird", "linux-64").as_deref(),
             Some("sys_platform == 'linux' and platform_machine == 'x86_64'")
         );
-        assert_eq!(
-            environment_marker("osx-arm64").as_deref(),
-            Some("sys_platform == 'darwin' and platform_machine == 'arm64'")
-        );
-        assert_eq!(
-            environment_marker("win-64").as_deref(),
-            Some("sys_platform == 'win32' and platform_machine == 'AMD64'")
-        );
-        assert_eq!(environment_marker("noarch"), None);
+        // Neither half known: omitted.
+        assert_eq!(environment_marker("weird", "noarch"), None);
     }
 
     // ---- constraint generation + provenance ------------------------------
