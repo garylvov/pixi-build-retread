@@ -580,6 +580,242 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// Self-heal: sdist-only packages (no wheels at all under `no-build`)
+// ---------------------------------------------------------------------------
+//
+// A THIRD class of `uv lock` failure, alongside the ordinary conflict
+// (`format_lock_failure`) and the manylinux platform-tag ceiling
+// (`installer::is_platform_tag_conflict`, glibc relaxation): a package
+// that publishes NO wheels at all (pure sdist, e.g. pyperclip). Under
+// `no-build = true` (spec §8.2 — retread's source_build path owns
+// builds, uv never builds an sdist) this fails the WHOLE lock loudly,
+// even when the sdist-only package is a deep transitive nobody asked
+// for by name.
+//
+// uv phrases this "<pkg> has no wheels" (no tag qualifier) or "<pkg>
+// has no wheels with a matching <foo> tag" for some other unsatisfied
+// tag axis (python/abi). This is DISTINCT from the manylinux ceiling,
+// which uv always phrases as "...matching platform tag..." — that
+// case has its own recovery path (glibc relax) and must never be
+// mistaken for "no conda route exists at all".
+
+/// True when `text` (typically `uv lock` stderr) names a package with
+/// literally zero published wheels as the resolver failure — the
+/// sdist-only class this module self-heals. Returns `false` for the
+/// manylinux platform-tag ceiling (`installer::is_platform_tag_conflict`
+/// owns that recovery), even though both mention "no wheels": the tag
+/// case always says "platform tag" and is excluded here first.
+/// Whitespace-collapsed before matching (uv line-wraps its resolver
+/// prose across output lines).
+pub fn is_sdist_only_uv_error(text: &str) -> bool {
+    let t = text
+        .to_ascii_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if t.contains("platform tag") {
+        return false;
+    }
+    t.contains("has no wheels") || t.contains("no wheels with a matching")
+}
+
+/// Extract the PEP 503-canonical package name(s) uv's error names as
+/// sdist-only, e.g. from `"Because pyperclip has no wheels ... we can
+/// conclude..."` -> `["pyperclip"]`. Empty when [`is_sdist_only_uv_error`]
+/// is false (including the platform-tag class). Best-effort: an
+/// unparseable message that still matches the class returns an empty
+/// list rather than guessing, so the caller falls through to surfacing
+/// the original error (never silently drops a dependency it couldn't
+/// name).
+pub fn extract_sdist_only_packages(text: &str) -> Vec<String> {
+    if !is_sdist_only_uv_error(text) {
+        return Vec::new();
+    }
+    let t = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    // uv's resolver prose: "Because <name>[extra]==version has no wheels".
+    // `-`/`_`/`.` all appear in real PyPI names; extras and version
+    // pins are optional and dropped.
+    let re = regex::Regex::new(
+        r"(?i)because\s+([A-Za-z0-9][A-Za-z0-9._-]*)(?:\[[^\]]*\])?(?:[=><!~][=~<>0-9.a-zA-Z*, ]*)?\s+has no wheels",
+    )
+    .expect("static sdist-only extraction regex");
+    let mut names: BTreeSet<String> = BTreeSet::new();
+    for cap in re.captures_iter(&t) {
+        names.insert(canonical_conda_name(&cap[1]));
+    }
+    names.into_iter().collect()
+}
+
+/// Guidance appended to the ORIGINAL uv error (verbatim, never
+/// paraphrased — spec convention shared with [`format_lock_failure`])
+/// when one or more sdist-only packages have no conda candidate
+/// either. Never silently drops the dependency: the caller must choose.
+pub fn sdist_only_no_route_message(names: &[String]) -> String {
+    let list = names.join(", ");
+    format!(
+        "\npackage {list} has no wheels and no conda candidate; options: allow \
+         build (no-build = false), drop-dep, or vendor a wheel.\n"
+    )
+}
+
+/// Wrap a `solve` closure with the sdist-only self-heal: on a `uv lock`
+/// failure naming the sdist-only class ([`is_sdist_only_uv_error`]),
+/// each named package is probed against the workspace conda channels
+/// for ANY compatible version (`sdist_probe`; unlike the exact-version
+/// auto-route round, there is no resolved pypi version to probe AT —
+/// uv never produced a closure). A hit routes the package to conda via
+/// the same mechanism as an ordinary auto-route hit (exclude from the
+/// closure + pin/range on the conda-resolved version) and the request
+/// is re-solved. A miss on ANY named package aborts with the original
+/// uv error verbatim plus [`sdist_only_no_route_message`] — it never
+/// silently drops a dependency.
+///
+/// Bounded by [`AUTO_ROUTE_MAX_ROUNDS`] heal attempts, mirroring the
+/// auto-route round cap; every attempt that doesn't abort or succeed
+/// strictly grows the accumulated route set, which is bounded by the
+/// number of distinct sdist-only names uv can name.
+///
+/// The routes discovered here are appended to `routed` (shared with
+/// the caller via `Arc<Mutex<_>>`) so a wrapping [`auto_route_fixpoint`]
+/// caller can splice them into the final closure's `auto_routed` list
+/// and log them with the same "routed to conda" provenance.
+pub fn with_sdist_heal<S, SP>(
+    bundle: String,
+    solve: S,
+    sdist_probe: SP,
+    routed: std::sync::Arc<std::sync::Mutex<Vec<AutoRoutedPackage>>>,
+) -> impl FnMut(UvClosureRequest) -> futures::future::BoxFuture<'static, Result<UvClosure>>
+where
+    S: FnMut(UvClosureRequest) -> futures::future::BoxFuture<'static, Result<UvClosure>>
+        + Send
+        + 'static,
+    SP: Fn(String) -> futures::future::BoxFuture<'static, Option<RouteProbeHit>>
+        + Send
+        + Sync
+        + 'static,
+{
+    // `solve` is FnMut: shared across retries WITHIN one call and across
+    // the outer fixpoint's repeated calls to this wrapper via a mutex
+    // rather than by-value capture (moving it into the `async move` block
+    // below would strand the next outer invocation with nothing to call).
+    let solve = std::sync::Arc::new(std::sync::Mutex::new(solve));
+    let sdist_probe = std::sync::Arc::new(sdist_probe);
+    move |mut req: UvClosureRequest| {
+        let bundle = bundle.clone();
+        let solve = std::sync::Arc::clone(&solve);
+        let sdist_probe = std::sync::Arc::clone(&sdist_probe);
+        let routed = std::sync::Arc::clone(&routed);
+        // Already-healed exclusions/pins accumulated across earlier
+        // outer-loop rounds must apply to THIS round's request too —
+        // the outer fixpoint owns `req` and knows nothing about them.
+        {
+            let already = routed.lock().unwrap();
+            apply_auto_route(&mut req, &already);
+        }
+        let fut = (*solve.lock().unwrap())(req.clone());
+        Box::pin(async move {
+            let mut req = req;
+            let mut attempt = fut;
+            for _ in 0..AUTO_ROUTE_MAX_ROUNDS {
+                match attempt.await {
+                    Ok(closure) => return Ok(closure),
+                    Err(e) => {
+                        let msg = format!("{e:#}");
+                        let already: Vec<String> = {
+                            let g = routed.lock().unwrap();
+                            g.iter().map(|r| r.pypi_name.clone()).collect()
+                        };
+                        let names: Vec<String> = extract_sdist_only_packages(&msg)
+                            .into_iter()
+                            .filter(|n| !already.contains(n))
+                            .collect();
+                        if names.is_empty() {
+                            return Err(e);
+                        }
+                        let mut new_routes = Vec::new();
+                        let mut missing = Vec::new();
+                        for name in &names {
+                            match sdist_probe(name.clone()).await {
+                                Some(hit) => new_routes.push(AutoRoutedPackage {
+                                    pypi_name: name.clone(),
+                                    conda_name: name.clone(),
+                                    pypi_version: hit.conda_version.clone(),
+                                    conda_version: hit.conda_version.clone(),
+                                    channel: hit.channel.clone(),
+                                }),
+                                None => missing.push(name.clone()),
+                            }
+                        }
+                        if !missing.is_empty() {
+                            bail!("{msg}{}", sdist_only_no_route_message(&missing));
+                        }
+                        for h in &new_routes {
+                            tracing::info!(
+                                bundle = %bundle,
+                                "sdist-only {} routed to conda (channel {})",
+                                h.pypi_name,
+                                h.channel,
+                            );
+                        }
+                        apply_auto_route(&mut req, &new_routes);
+                        {
+                            let mut g = routed.lock().unwrap();
+                            g.extend(new_routes.clone());
+                        }
+                        attempt = (*solve.lock().unwrap())(req.clone());
+                    }
+                }
+            }
+            bail!(
+                "sdist-only self-heal exceeded {} rounds for bundle `{}`",
+                AUTO_ROUTE_MAX_ROUNDS,
+                bundle,
+            );
+        })
+    }
+}
+
+/// Compatibility entry point: [`auto_route_fixpoint`] with the
+/// sdist-only self-heal layered underneath (see [`with_sdist_heal`]).
+/// `sdist_probe` answers "does ANY workspace conda channel carry
+/// `conda_name` at any version?" — production wires
+/// [`crate::probe::find_route`] with spec `"*"`.
+///
+/// The routes the heal discovers are appended to the returned
+/// closure's `auto_routed` (same shape/logging convention as ordinary
+/// auto-route hits) even though the outer fixpoint never saw them
+/// directly.
+pub async fn auto_route_fixpoint_with_sdist_heal<S, P, SP>(
+    req: &UvClosureRequest,
+    opts: &AutoRouteOptions,
+    solve: S,
+    probe: P,
+    sdist_probe: SP,
+) -> Result<UvClosure>
+where
+    S: FnMut(UvClosureRequest) -> futures::future::BoxFuture<'static, Result<UvClosure>>
+        + Send
+        + 'static,
+    P: Fn(String, String) -> futures::future::BoxFuture<'static, Option<RouteProbeHit>>,
+    SP: Fn(String) -> futures::future::BoxFuture<'static, Option<RouteProbeHit>>
+        + Send
+        + Sync
+        + 'static,
+{
+    let sdist_routed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let healed_solve = with_sdist_heal(
+        req.bundle.clone(),
+        solve,
+        sdist_probe,
+        std::sync::Arc::clone(&sdist_routed),
+    );
+    let mut closure = auto_route_fixpoint(req, opts, healed_solve, probe).await?;
+    let extra = sdist_routed.lock().unwrap();
+    closure.auto_routed.extend(extra.iter().cloned());
+    Ok(closure)
+}
+
+// ---------------------------------------------------------------------------
 // Constraint generation (conda pins -> PEP 440), with provenance
 // ---------------------------------------------------------------------------
 
@@ -2759,5 +2995,188 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
         .unwrap();
         assert_eq!(closure.auto_routed.len(), 1);
         assert_eq!(closure.auto_routed[0].pypi_name, "numpy");
+    }
+
+    // ---- sdist-only self-heal --------------------------------------------
+
+    const SDIST_ONLY_UV_ERR: &str = "  x No solution found when resolving dependencies:\n  \
+         `-> Because pyperclip has no wheels and you require pyperclip,\n  \
+             we can conclude that your requirements are unsatisfiable.";
+
+    const PLATFORM_TAG_UV_ERR: &str = "× No solution found when resolving dependencies:\n  \
+        ╰─▶ Because isaacsim[all]==6.0.0.1 has no wheels with a matching platform \
+        tag (e.g., `manylinux_2_34_x86_64`) and you require isaacsim[all]==6.0.0.1, \
+        we can conclude that your requirements are unsatisfiable.";
+
+    #[test]
+    fn is_sdist_only_uv_error_matches_no_wheels_class() {
+        assert!(is_sdist_only_uv_error(SDIST_ONLY_UV_ERR));
+        // Platform-tag ceiling: distinct class, must NOT trigger this path
+        // (installer::is_platform_tag_conflict owns glibc relaxation there).
+        assert!(!is_sdist_only_uv_error(PLATFORM_TAG_UV_ERR));
+        assert!(!is_sdist_only_uv_error("unrelated network error"));
+    }
+
+    #[test]
+    fn extract_sdist_only_packages_names_the_package() {
+        assert_eq!(
+            extract_sdist_only_packages(SDIST_ONLY_UV_ERR),
+            vec!["pyperclip".to_string()]
+        );
+        // Platform-tag class extracts nothing -- it is not this class.
+        assert!(extract_sdist_only_packages(PLATFORM_TAG_UV_ERR).is_empty());
+        assert!(extract_sdist_only_packages("unrelated failure").is_empty());
+    }
+
+    #[test]
+    fn extract_sdist_only_packages_handles_extras_and_version() {
+        let text = "Because foo-bar[extra]==1.2.3 has no wheels and you require \
+                     foo-bar, we can conclude that your requirements are unsatisfiable.";
+        assert_eq!(
+            extract_sdist_only_packages(text),
+            vec!["foo-bar".to_string()]
+        );
+    }
+
+    /// Fixture-driven fixpoint: `uv lock` fails once with the sdist-only
+    /// class naming `pyperclip`; the mock repodata probe has a hit ->
+    /// the package is routed to conda (excluded + pinned) and the retry
+    /// succeeds. `auto_routed` records the sdist-heal route even though
+    /// the outer fixpoint never saw the failure directly.
+    #[tokio::test]
+    async fn sdist_heal_routes_on_repodata_hit() {
+        let attempts = Arc::new(Mutex::new(0usize));
+        let solve = {
+            let attempts = Arc::clone(&attempts);
+            move |r: UvClosureRequest| {
+                let attempts = Arc::clone(&attempts);
+                Box::pin(async move {
+                    let mut n = attempts.lock().unwrap();
+                    *n += 1;
+                    if !r.no_emit_packages.contains(&"pyperclip".to_string()) {
+                        bail!("{SDIST_ONLY_UV_ERR}");
+                    }
+                    parse_pylock_closure(
+                        PYLOCK_FIXTURE,
+                        &target("3.12", "linux-64"),
+                        &BTreeSet::new(),
+                        "0.11.15",
+                    )
+                }) as futures::future::BoxFuture<'static, Result<UvClosure>>
+            }
+        };
+        let probe = |_name: String, _spec: String| {
+            Box::pin(async { None }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
+        };
+        let sdist_probe = |name: String| {
+            Box::pin(async move {
+                if name == "pyperclip" {
+                    Some(RouteProbeHit {
+                        conda_version: "1.8.2".into(),
+                        channel: "https://conda.anaconda.org/conda-forge/linux-64".into(),
+                    })
+                } else {
+                    None
+                }
+            }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
+        };
+        let closure = auto_route_fixpoint_with_sdist_heal(
+            &auto_route_req(),
+            &auto_route_opts(),
+            solve,
+            probe,
+            sdist_probe,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            *attempts.lock().unwrap(),
+            2,
+            "one failure + one healed retry"
+        );
+        assert_eq!(closure.auto_routed.len(), 1);
+        let r = &closure.auto_routed[0];
+        assert_eq!(r.pypi_name, "pyperclip");
+        assert_eq!(r.conda_name, "pyperclip");
+        assert_eq!(r.conda_version, "1.8.2");
+        assert!(r.channel.contains("conda-forge"));
+    }
+
+    /// No conda candidate either: the original uv error surfaces
+    /// verbatim, with the guidance text appended, instead of silently
+    /// dropping `pyperclip` from the closure.
+    #[tokio::test]
+    async fn sdist_heal_surfaces_original_error_with_guidance_on_miss() {
+        let solve = |_r: UvClosureRequest| {
+            Box::pin(async { bail!("{SDIST_ONLY_UV_ERR}") })
+                as futures::future::BoxFuture<'static, Result<UvClosure>>
+        };
+        let probe = |_name: String, _spec: String| {
+            Box::pin(async { None }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
+        };
+        let sdist_probe = |_name: String| {
+            Box::pin(async { None }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
+        };
+        let err = auto_route_fixpoint_with_sdist_heal(
+            &auto_route_req(),
+            &auto_route_opts(),
+            solve,
+            probe,
+            sdist_probe,
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("pyperclip has no wheels"), "{msg}");
+        assert!(msg.contains("no conda candidate"), "{msg}");
+        assert!(msg.contains("no-build = false"), "{msg}");
+    }
+
+    /// A platform-tag conflict (the manylinux ceiling, already handled
+    /// by `installer::is_platform_tag_conflict` via glibc relaxation)
+    /// must pass straight through unchanged -- the sdist-only heal must
+    /// never misfire on it.
+    #[tokio::test]
+    async fn sdist_heal_ignores_platform_tag_class() {
+        let calls = Arc::new(Mutex::new(0usize));
+        let solve = {
+            let calls = Arc::clone(&calls);
+            move |_r: UvClosureRequest| {
+                let calls = Arc::clone(&calls);
+                Box::pin(async move {
+                    *calls.lock().unwrap() += 1;
+                    bail!("{PLATFORM_TAG_UV_ERR}")
+                }) as futures::future::BoxFuture<'static, Result<UvClosure>>
+            }
+        };
+        let probe = |_name: String, _spec: String| {
+            Box::pin(async { None }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
+        };
+        let sdist_probe_calls = Arc::new(Mutex::new(0usize));
+        let sdist_probe = {
+            let sdist_probe_calls = Arc::clone(&sdist_probe_calls);
+            move |_name: String| {
+                let sdist_probe_calls = Arc::clone(&sdist_probe_calls);
+                Box::pin(async move {
+                    *sdist_probe_calls.lock().unwrap() += 1;
+                    None
+                }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
+            }
+        };
+        let err = auto_route_fixpoint_with_sdist_heal(
+            &auto_route_req(),
+            &auto_route_opts(),
+            solve,
+            probe,
+            sdist_probe,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("platform"), "{err}");
+        // The original error propagated straight through: no retry, and
+        // the sdist-heal probe was never issued (wrong error class).
+        assert_eq!(*calls.lock().unwrap(), 1);
+        assert_eq!(*sdist_probe_calls.lock().unwrap(), 0);
     }
 }
