@@ -216,9 +216,8 @@ async fn run_env(
     } else {
         RelaxPreference::from_config_str(&editor.relax_preference())
     };
-    let mut planner = RepairPlanner::new(feature.clone())
-        .with_relax_preference(relax_preference)
-        .with_conda_name_map(conda_name_map.clone());
+    let mut planner =
+        RepairPlanner::configured(feature.clone(), conda_name_map.clone(), relax_preference);
     let mut pending_edit: Option<PendingEdit> = None;
     let smoke_modules = if args.smoke_modules.is_empty() {
         editor.smoke_modules()

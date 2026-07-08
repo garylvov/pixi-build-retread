@@ -352,6 +352,21 @@ impl RepairPlanner {
         self
     }
 
+    /// Single-sourced construction for both `retread solve` (driver.rs) and
+    /// `retread lock` (lock.rs): wires the conda-pypi name map (aaf58c6) and
+    /// relax-preference (59b5b40) identically so the two drivers can't drift
+    /// out of sync again (the `retread lock` path previously constructed a
+    /// bare planner and silently lost both fixes).
+    pub fn configured(
+        feature: String,
+        conda_name_map: PypiToCondaMap,
+        relax_preference: RelaxPreference,
+    ) -> Self {
+        Self::new(feature)
+            .with_relax_preference(relax_preference)
+            .with_conda_name_map(conda_name_map)
+    }
+
     /// Resolves the conda-table name under which a `CondaWidenNeeded`
     /// conflict's pypi `package` is actually pinned by the user in the
     /// given `feature`, checking the parselmouth-backed name family before

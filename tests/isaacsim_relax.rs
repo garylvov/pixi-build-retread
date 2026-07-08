@@ -74,6 +74,7 @@ fn baseline_config() -> RetreadConfig {
         git_sources: std::collections::BTreeMap::new(),
         python: None,
         pin_version: false,
+        sdist_build: Default::default(),
     }
 }
 

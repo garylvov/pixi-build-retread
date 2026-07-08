@@ -17,8 +17,8 @@ use super::error::{EXIT_EXHAUSTED, EXIT_INTERRUPTED, EXIT_MAX_ITERS, EXIT_OK, EX
 use super::manifest::{AppliedEdit, ManifestEditor, copy_atomic};
 use super::parse::{ConflictParser, RegexConflictParser, tail};
 use super::repair::{
-    RepairPlanner, SolveLedger, Strategy, append_attempt, is_abi_anchor, ledger_path,
-    manifest_sha256, mark_last_widen_failed, retread_dir, snapshot_path,
+    RelaxPreference, RepairPlanner, SolveLedger, Strategy, append_attempt, is_abi_anchor,
+    ledger_path, manifest_sha256, mark_last_widen_failed, retread_dir, snapshot_path,
 };
 
 const DEFAULT_MAX_REPAIRS: u32 = 10;
@@ -163,10 +163,17 @@ async fn run_with_pixi_bin(args: LockArgs, pixi_bin: &str) -> Result<i32> {
         .to_string();
 
     let parser = RegexConflictParser::new();
+    // Same parselmouth-backed pypi<->conda name family + relax-preference
+    // config that `retread solve` (driver.rs) wires into its planner --
+    // shared via `RepairPlanner::configured` so the two drivers can't drift
+    // (see aaf58c6 conda-pypi name map, 59b5b40 conda-as-truth preference).
+    let conda_name_map = crate::handler::load_pypi_to_conda_map().await;
+    let relax_preference = RelaxPreference::from_config_str(&editor.relax_preference());
     let mut ledger = SolveLedger::load(&ledger_path, manifest_display)?;
     let manifest_hash = manifest_sha256(&manifest_path)?;
     let mut tried = ledger.seed_tried_state(&manifest_path, &manifest_hash, &editor);
-    let mut planner = RepairPlanner::new(LOCK_FEATURE.to_string());
+    let mut planner =
+        RepairPlanner::configured(LOCK_FEATURE.to_string(), conda_name_map, relax_preference);
 
     let run_idx = ledger.start_run(
         "lock".to_string(),
@@ -562,6 +569,62 @@ exit 0
         let path = dir.join("pixi.toml");
         std::fs::write(&path, text).unwrap();
         path
+    }
+
+    /// The lock-path regression this module previously shipped: `retread
+    /// lock` constructed `RepairPlanner::new(LOCK_FEATURE)` bare, so the
+    /// parselmouth name map (aaf58c6) and relax-preference (59b5b40) were
+    /// silently inert in the lock path even though `retread solve` had
+    /// them. This exercises the exact planner construction
+    /// `run_with_pixi_bin` now performs (via `RepairPlanner::configured`
+    /// with `LOCK_FEATURE`) against the acceptance-conflict fixture: pypi
+    /// `torch>=2.11.0` vs a conda pin declared under the DIFFERENT name
+    /// `pytorch-gpu ==2.10.0`. With the name map wired, conda-as-truth T1
+    /// must fire -- pypi override for `torch`, `pytorch-gpu` untouched --
+    /// instead of falling through to widening a bogus `torch` conda entry.
+    #[test]
+    fn lock_planner_resolves_torch_to_pytorch_gpu_via_name_map() {
+        use super::super::parse::Conflict;
+        use super::super::repair::{RelaxPreference, TriedState};
+        use crate::handler::PypiToCondaMap;
+
+        let dir = temp_dir("namemap");
+        let path = write_manifest(&dir, "[dependencies]\npytorch-gpu = \"==2.10.0\"\n");
+        let mut editor = ManifestEditor::open(path.clone()).unwrap();
+        let mut tried = TriedState::default();
+        let mut name_map = PypiToCondaMap::new();
+        name_map.insert(
+            "torch".to_string(),
+            vec![
+                "pytorch".to_string(),
+                "pytorch-cpu".to_string(),
+                "pytorch-gpu".to_string(),
+            ],
+        );
+        // Same construction as run_with_pixi_bin.
+        let relax_preference = RelaxPreference::from_config_str(&editor.relax_preference());
+        let mut planner =
+            RepairPlanner::configured(LOCK_FEATURE.to_string(), name_map, relax_preference);
+
+        let conflict = Conflict::CondaWidenNeeded {
+            package: "torch".into(),
+            op: ">=".into(),
+            floor: "2.11.0".into(),
+            conda_version: "==2.10.0".into(),
+            requiring_chain: Vec::new(),
+        };
+        let out = planner
+            .repair(&mut editor, &mut tried, &conflict, 1)
+            .unwrap();
+        assert_eq!(out.attempt.strategy, "pypi_override");
+        assert_eq!(out.attempt.new_spec.as_deref(), Some("==2.10.0"));
+
+        editor.write_atomic().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("pytorch-gpu = \"==2.10.0\"\n")); // conda pin untouched
+        assert!(text.contains("[pypi-options.dependency-overrides]"));
+        assert!(text.contains("torch = \"==2.10.0\"  # retread:override"));
+        assert_eq!(text.matches("torch = ").count(), 1);
     }
 
     const CONDA_BOUNDARY_SINGLE_LINE: &str =
