@@ -660,6 +660,15 @@ struct Bundle {
     /// not a shipped wheel — provides it at install time. Empty on the
     /// legacy path and when `auto-route = false`.
     auto_routed: Vec<(String, String)>,
+    /// Canonical names of every package in the exported uv closure
+    /// (`UvClosure::pins`). These are provided by the wheel closure /
+    /// uv install set at install time, so `produce_output` must NEVER
+    /// translate a `Requires-Dist` line naming one of them into a conda
+    /// run-dep — conda channels may not even carry the package
+    /// (`isaacsim-kernel`) or may cap below the wheel's spec (`aiodns`).
+    /// Empty on the legacy (non-uv) path, where the BFS bundles the
+    /// full closure and the `vendored` set already covers members.
+    uv_closure_names: std::collections::HashSet<String>,
 }
 
 impl Bundle {
@@ -1960,6 +1969,15 @@ async fn resolve_all(
                 .iter()
                 .map(|r| (r.conda_name.clone(), r.conda_version.clone()))
                 .collect();
+            // Closure membership for the run-dep emission gate: any package
+            // uv exported into the wheel closure is uv-installed at install
+            // time and must never double as a conda run-dep (see
+            // Bundle::uv_closure_names).
+            bundle.uv_closure_names = closure
+                .pins
+                .keys()
+                .map(|k| canonical_conda_name(k))
+                .collect();
         }
         for sub in sub_bundles {
             bundle.extras.push(sub.primary);
@@ -2628,6 +2646,7 @@ async fn resolve_bundle(
             solve_diagnostics: BTreeMap::new(),
             conda_routed: vec![],
             auto_routed: vec![],
+            uv_closure_names: Default::default(),
         });
     }
 
@@ -3310,6 +3329,7 @@ async fn resolve_bundle(
         solve_diagnostics: BTreeMap::new(),
         conda_routed: conda_routed_acc,
         auto_routed: vec![],
+        uv_closure_names: Default::default(),
     };
 
     Ok(bfs_bundle)
@@ -4234,6 +4254,27 @@ fn produce_output(
                      non-Windows target. If you actually need this on this \
                      platform, set `retread-overrides.{dep_name} = \"*\"` to \
                      bypass the auto-drop.",
+                );
+                continue;
+            }
+            // uv-closure membership gate (v4.3.1): a dep that uv exported
+            // into the wheel closure is provided by the uv install set at
+            // install time — it must NOT also become a conda run-dep. Only
+            // packages actually ROUTED to conda may be emitted: auto-routed
+            // hits (exact-pinned above), explicit retread-conda-deps, and
+            // conda-routed deps outside the closure. Without this gate,
+            // closure members leaked as conda run-deps — pypi-only packages
+            // (`isaacsim-kernel`) or specs no channel satisfies
+            // (`aiodns >=3.1.1` vs conda-forge's 3.0.0) made the whole
+            // workspace solve unsatisfiable. Bundle base-deps (the
+            // `<entry>-*` prefix family) are closure members too, so this
+            // also stops their duplication as conda deps.
+            if in_set(&bundle.uv_closure_names) {
+                tracing::debug!(
+                    dep = %dep_name,
+                    bundle = %bundle.conda_name,
+                    "skipping run-dep emission: provided by the uv wheel \
+                     closure at install time (not conda-routed)",
                 );
                 continue;
             }
@@ -9115,6 +9156,7 @@ mod emit_wheel_upstream_url_tests {
             solve_diagnostics: BTreeMap::new(),
             conda_routed: vec![],
             auto_routed: vec![],
+            uv_closure_names: Default::default(),
         };
 
         // Reproduce the exact mapping from build_one that populates EmitWheel.
@@ -9229,6 +9271,7 @@ mod emit_wheel_upstream_url_tests {
             solve_diagnostics: BTreeMap::new(),
             conda_routed: vec![],
             auto_routed: vec![],
+            uv_closure_names: Default::default(),
         };
 
         let emit_wheels: Vec<crate::emit_pypi::EmitWheel> = bundle

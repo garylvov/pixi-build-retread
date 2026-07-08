@@ -420,6 +420,7 @@ fn courier_pure_python_bundle_is_platform_specific_not_noarch() {
         solve_diagnostics: BTreeMap::new(),
         conda_routed: vec![],
         auto_routed: vec![],
+        uv_closure_names: Default::default(),
     };
 
     let courier_cfg = RetreadConfig {
@@ -477,6 +478,7 @@ fn produce_output_emits_auto_routed_conda_run_deps() {
             ("numpy".to_string(), "2.1.0".to_string()),
             ("scipy".to_string(), "1.14.1".to_string()),
         ],
+        uv_closure_names: Default::default(),
     };
     let out = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
     let deps: Vec<(String, String)> = out
@@ -506,6 +508,7 @@ fn produce_output_emits_auto_routed_conda_run_deps() {
     // emitted and scipy is absent.
     let plain = Bundle {
         auto_routed: vec![],
+        uv_closure_names: Default::default(),
         ..bundle
     };
     let out = produce_output(&plain, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
@@ -521,6 +524,94 @@ fn produce_output_emits_auto_routed_conda_run_deps() {
         "{deps:?}"
     );
     assert!(!deps.iter().any(|(n, _)| n == "scipy"), "{deps:?}");
+}
+
+#[test]
+fn produce_output_never_emits_uv_closure_members_as_conda_run_deps() {
+    // Regression (isaaclab-viral-pack / isaac-pack-latest, 2026-07-08):
+    // a pypi-only external with NO conda candidate (`isaacsim-kernel`) and
+    // an external whose spec no channel satisfies (`aiodns >=3.1.1` vs
+    // conda-forge's 3.0.0 cap) are members of the exported uv closure —
+    // the uv install set provides them at install time. The run-dep
+    // translation loop leaked them as CONDA run-deps, making every isaac
+    // env's conda solve unsatisfiable. Only conda-routed packages may be
+    // emitted.
+    let mut bundle = solo_bundle(
+        "viral-pack",
+        vec![
+            "isaacsim-kernel==5.1.0.0", // pypi-only: no conda candidate anywhere
+            "aiodns==3.1.1",            // conda caps at 3.0.0: spec unsatisfiable
+            "requests>=2.31",           // control: NOT in the closure -> emitted
+        ],
+    );
+    bundle.uv_closure_names = ["isaacsim-kernel", "aiodns"]
+        .iter()
+        .map(|n| crate::relax::canonical_conda_name(n))
+        .collect();
+
+    let out = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
+    let deps: Vec<(String, String)> = out
+        .run_dependencies
+        .depends
+        .iter()
+        .map(|d| (d.name.clone(), format_packagespec(&d.spec)))
+        .collect();
+    assert!(
+        !deps.iter().any(|(n, _)| n == "isaacsim-kernel"),
+        "pypi-only closure member must never become a conda run-dep: {deps:?}"
+    );
+    assert!(
+        !deps.iter().any(|(n, _)| n == "aiodns"),
+        "closure member with conda-unsatisfiable spec must never become a \
+         conda run-dep: {deps:?}"
+    );
+    assert!(
+        deps.iter().any(|(n, _)| n == "requests"),
+        "non-closure dep must still be emitted (conda-routed path): {deps:?}"
+    );
+}
+
+#[test]
+fn produce_output_closure_gate_keeps_auto_routed_pins_and_base_deps_undoubled() {
+    // Companion to the closure gate: an auto-routed package (repodata
+    // hit) DOES appear, exact-pinned, even when a shipped wheel names it
+    // with a looser spec; and a bundle base-dep (`<entry>-*` family
+    // member living in the uv closure) is not duplicated as a conda dep.
+    let mut bundle = solo_bundle(
+        "isaacsim",
+        vec![
+            "numpy>=1.21",            // auto-routed below: pin must win
+            "isaacsim-kernel==6.0.0", // base-dep in the closure: no conda dep
+        ],
+    );
+    bundle.auto_routed = vec![("numpy".to_string(), "2.1.0".to_string())];
+    bundle.uv_closure_names = ["isaacsim-kernel", "numpy"]
+        .iter()
+        .map(|n| crate::relax::canonical_conda_name(n))
+        .collect();
+
+    let out = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
+    let deps: Vec<(String, String)> = out
+        .run_dependencies
+        .depends
+        .iter()
+        .map(|d| (d.name.clone(), format_packagespec(&d.spec)))
+        .collect();
+    assert!(
+        deps.contains(&("numpy".to_string(), "==2.1.0".to_string())),
+        "auto-routed package must appear exact-pinned even though it is \
+         also named by a wheel and present in uv pins pre-route: {deps:?}"
+    );
+    assert_eq!(
+        deps.iter().filter(|(n, _)| n == "numpy").count(),
+        1,
+        "auto-routed pin must not be duplicated by the wheel's spec: {deps:?}"
+    );
+    assert!(
+        !deps.iter().any(|(n, _)| n == "isaacsim-kernel"),
+        "bundle base-dep provided by the uv closure must not be duplicated \
+         as a conda run-dep: {deps:?}"
+    );
 }
 
 #[test]
@@ -695,6 +786,7 @@ fn solo_bundle(name: &str, requires: Vec<&str>) -> Bundle {
         solve_diagnostics: BTreeMap::new(),
         conda_routed: vec![],
         auto_routed: vec![],
+        uv_closure_names: Default::default(),
     }
 }
 
@@ -1140,6 +1232,7 @@ fn vendored_sub_packages_dropped_from_run_deps() {
         solve_diagnostics: BTreeMap::new(),
         conda_routed: vec![],
         auto_routed: vec![],
+        uv_closure_names: Default::default(),
     };
 
     let output =
@@ -1294,6 +1387,7 @@ fn bundle_field_groups_entries_into_one_output() {
         solve_diagnostics: BTreeMap::new(),
         conda_routed: vec![],
         auto_routed: vec![],
+        uv_closure_names: Default::default(),
     };
 
     let output =
@@ -1386,6 +1480,7 @@ fn relaxed_pure_python_primary_pins_python_to_workspace_variant() {
         solve_diagnostics: BTreeMap::new(),
         conda_routed: vec![],
         auto_routed: vec![],
+        uv_closure_names: Default::default(),
     };
 
     let output =
