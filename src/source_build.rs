@@ -262,10 +262,7 @@ pub fn git_wheel_cache_dir(
 /// into `out_dir` (hardlink, copy on EXDEV) so the downstream
 /// inject/autodata/relax pipeline finds it exactly where a fresh build
 /// would have put it. Returns the out_dir wheel path, or `None` on miss.
-async fn git_wheel_cache_lookup(
-    cache_wheel_dir: &Path,
-    out_dir: &Path,
-) -> Result<Option<PathBuf>> {
+async fn git_wheel_cache_lookup(cache_wheel_dir: &Path, out_dir: &Path) -> Result<Option<PathBuf>> {
     let Some(cached) = newest_wheel_in(cache_wheel_dir).await? else {
         return Ok(None);
     };
@@ -549,9 +546,7 @@ pub async fn build_wheel_from_git(
         clone_and_checkout(&clone_dir, url, rev)
             .await
             .with_context(|| {
-                format!(
-                    "re-clone after wiping corrupted dir still failed for {url}@{rev}"
-                )
+                format!("re-clone after wiping corrupted dir still failed for {url}@{rev}")
             })?;
     }
 
@@ -1275,9 +1270,10 @@ version = "0.1.0"
         std::fs::write(clone_dir.join(".git").join("index.lock"), "")
             .expect("write stale index.lock");
 
-        let (_, resolved_sha) = build_wheel_from_git(&repo_url, &rev, ".", &cache_dir, &out_dir, "3.11")
-            .await
-            .expect("must recover by wiping and re-cloning, not error out");
+        let (_, resolved_sha) =
+            build_wheel_from_git(&repo_url, &rev, ".", &cache_dir, &out_dir, "3.11")
+                .await
+                .expect("must recover by wiping and re-cloning, not error out");
         assert_eq!(resolved_sha, rev);
         assert!(
             !clone_dir.join(".git").join("index.lock").exists(),
@@ -1288,15 +1284,45 @@ version = "0.1.0"
     }
     #[test]
     fn git_wheel_cache_dir_is_keyed_by_all_inputs() {
-        let a = git_wheel_cache_dir("https://github.com/x/y.git", "a".repeat(40).as_str(), "sub", "3.11");
+        let a = git_wheel_cache_dir(
+            "https://github.com/x/y.git",
+            "a".repeat(40).as_str(),
+            "sub",
+            "3.11",
+        );
         // Same inputs => same dir (deterministic).
-        let a2 = git_wheel_cache_dir("https://github.com/x/y.git", "a".repeat(40).as_str(), "sub", "3.11");
+        let a2 = git_wheel_cache_dir(
+            "https://github.com/x/y.git",
+            "a".repeat(40).as_str(),
+            "sub",
+            "3.11",
+        );
         assert_eq!(a, a2);
         // Any input change => different dir.
-        let b = git_wheel_cache_dir("https://github.com/x/y.git", "b".repeat(40).as_str(), "sub", "3.11");
-        let c = git_wheel_cache_dir("https://github.com/x/y.git", "a".repeat(40).as_str(), "other", "3.11");
-        let d = git_wheel_cache_dir("https://github.com/x/y.git", "a".repeat(40).as_str(), "sub", "3.12");
-        let e = git_wheel_cache_dir("https://github.com/x/z.git", "a".repeat(40).as_str(), "sub", "3.11");
+        let b = git_wheel_cache_dir(
+            "https://github.com/x/y.git",
+            "b".repeat(40).as_str(),
+            "sub",
+            "3.11",
+        );
+        let c = git_wheel_cache_dir(
+            "https://github.com/x/y.git",
+            "a".repeat(40).as_str(),
+            "other",
+            "3.11",
+        );
+        let d = git_wheel_cache_dir(
+            "https://github.com/x/y.git",
+            "a".repeat(40).as_str(),
+            "sub",
+            "3.12",
+        );
+        let e = git_wheel_cache_dir(
+            "https://github.com/x/z.git",
+            "a".repeat(40).as_str(),
+            "sub",
+            "3.11",
+        );
         for other in [&b, &c, &d, &e] {
             assert_ne!(&a, other);
         }
@@ -1304,10 +1330,8 @@ version = "0.1.0"
 
     #[tokio::test]
     async fn git_wheel_cache_store_then_lookup_round_trips() {
-        let base = std::env::temp_dir().join(format!(
-            "retread-gitwheel-cache-{}",
-            std::process::id()
-        ));
+        let base =
+            std::env::temp_dir().join(format!("retread-gitwheel-cache-{}", std::process::id()));
         let cache_dir = base.join("shared");
         let out_dir = base.join("out");
         let built_dir = base.join("built");

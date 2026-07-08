@@ -16,10 +16,7 @@ fn unique_test_dir(label: &str) -> std::path::PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    std::env::temp_dir().join(format!(
-        "retread-{label}-{}-{nanos}",
-        std::process::id()
-    ))
+    std::env::temp_dir().join(format!("retread-{label}-{}-{nanos}", std::process::id()))
 }
 
 #[cfg(unix)]
@@ -33,10 +30,16 @@ fn initialize_preflight_repairs_dangling_pixi_bld_symlink_target() {
     std::fs::write(workspace.join("pixi.toml"), "[workspace]\nchannels = []\n").unwrap();
     std::os::unix::fs::symlink(&target, pixi.join("bld")).unwrap();
 
-    assert!(!target.exists(), "test setup must start with a dangling symlink");
+    assert!(
+        !target.exists(),
+        "test setup must start with a dangling symlink"
+    );
     ensure_pixi_bld_symlink_target(Some(&workspace)).unwrap();
 
-    assert!(target.is_dir(), "preflight should create only the symlink target");
+    assert!(
+        target.is_dir(),
+        "preflight should create only the symlink target"
+    );
     assert!(
         std::fs::symlink_metadata(pixi.join("bld"))
             .unwrap()

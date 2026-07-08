@@ -44,10 +44,6 @@ impl ManifestEditor {
         Ok(Self { path, doc })
     }
 
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
     pub fn project_dir(&self) -> &Path {
         self.path.parent().unwrap_or_else(|| Path::new("."))
     }
@@ -60,10 +56,6 @@ impl ManifestEditor {
 
     pub fn write_atomic(&self) -> Result<()> {
         write_atomic(&self.path, self.doc.to_string().as_bytes())
-    }
-
-    pub fn current_bytes(&self) -> Vec<u8> {
-        self.doc.to_string().into_bytes()
     }
 
     pub fn smoke_modules(&self) -> Vec<String> {
@@ -98,7 +90,10 @@ impl ManifestEditor {
             };
         };
         EntrySnapshot {
-            value: item.as_value().and_then(Value::as_str).map(ToString::to_string),
+            value: item
+                .as_value()
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
             suffix: item_suffix(item),
         }
     }
@@ -193,12 +188,7 @@ impl ManifestEditor {
         }
     }
 
-    pub fn set_conda_widen(
-        &mut self,
-        feature: &str,
-        package: &str,
-        spec: &str,
-    ) -> AppliedEdit {
+    pub fn set_conda_widen(&mut self, feature: &str, package: &str, spec: &str) -> AppliedEdit {
         let before = self.entry_snapshot(feature, TableKind::Conda, package);
         self.set_string(feature, TableKind::Conda, package, spec, &widen_suffix());
         AppliedEdit {
@@ -219,9 +209,7 @@ impl ManifestEditor {
         if snapshot.value.is_none() || !snapshot_has_retread_sentinel(&snapshot) {
             return None;
         }
-        let Some(table) = self.get_table_mut_existing(feature, kind) else {
-            return None;
-        };
+        let table = self.get_table_mut_existing(feature, kind)?;
         table.remove(package);
         self.drop_empty_path(feature, kind);
         Some(AppliedEdit {
@@ -264,10 +252,10 @@ impl ManifestEditor {
         let mut removed = 0;
         for (feature, kind, package, suffix) in entries {
             if suffix.contains(PIN_SENTINEL) || suffix.contains(WIDEN_SENTINEL) {
-                if let Some(table) = self.get_table_mut_existing(&feature, kind) {
-                    if table.remove(&package).is_some() {
-                        removed += 1;
-                    }
+                if let Some(table) = self.get_table_mut_existing(&feature, kind)
+                    && table.remove(&package).is_some()
+                {
+                    removed += 1;
                 }
                 self.drop_empty_path(&feature, kind);
             }

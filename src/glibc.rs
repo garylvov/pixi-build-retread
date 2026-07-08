@@ -295,15 +295,22 @@ fn parse_single_version_need(text: &str) -> Option<Option<(u32, u32)>> {
 pub(crate) fn extract_manylinux_floor(text: &str) -> Option<(u32, u32)> {
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     let re = RE.get_or_init(|| regex::Regex::new(r"manylinux_(\d+)_(\d+)").unwrap());
-    re.captures_iter(text).filter_map(|cap| {
-        let maj = cap.get(1)?.as_str().parse::<u32>().ok()?;
-        let min = cap.get(2)?.as_str().parse::<u32>().ok()?;
-        Some((maj, min))
-    }).max()
+    re.captures_iter(text)
+        .filter_map(|cap| {
+            let maj = cap.get(1)?.as_str().parse::<u32>().ok()?;
+            let min = cap.get(2)?.as_str().parse::<u32>().ok()?;
+            Some((maj, min))
+        })
+        .max()
 }
 
-pub(crate) fn undeclared_glibc_error(host: Option<(u32, u32)>, floor: Option<(u32, u32)>) -> String {
-    let host = host.map(format_glibc).unwrap_or_else(|| "unknown".to_string());
+pub(crate) fn undeclared_glibc_error(
+    host: Option<(u32, u32)>,
+    floor: Option<(u32, u32)>,
+) -> String {
+    let host = host
+        .map(format_glibc)
+        .unwrap_or_else(|| "unknown".to_string());
     let floor = floor.map(format_glibc).unwrap_or_else(|| "x.y".to_string());
     format!(
         "retread: uv rejected the only available wheels for their manylinux platform tag\n\
@@ -519,10 +526,7 @@ pub(crate) fn verify_audit_record(audit: &InstalledMarkerAudit, prefix: &Path) -
         }
     }
 
-    if let Some(recorded) = audit
-        .host_glibc
-        .as_deref()
-        .and_then(parse_glibc_version)
+    if let Some(recorded) = audit.host_glibc.as_deref().and_then(parse_glibc_version)
         && let Some(current) = host_glibc()
         && current < recorded
     {
@@ -548,8 +552,7 @@ pub(crate) fn verify_audit_record(audit: &InstalledMarkerAudit, prefix: &Path) -
 
 fn site_packages_from_fixup_path(prefix: &Path, rel: &str) -> Result<PathBuf> {
     let lib = prefix.join("lib");
-    let entries =
-        std::fs::read_dir(&lib).with_context(|| format!("reading {}", lib.display()))?;
+    let entries = std::fs::read_dir(&lib).with_context(|| format!("reading {}", lib.display()))?;
     for py in entries {
         let Ok(entry) = py else {
             continue;
@@ -621,7 +624,7 @@ pub(crate) fn full_verify_audit(
 }
 
 fn audit_payload(
-    lock: &RetreadLock,
+    _lock: &RetreadLock,
     prefix: &Path,
     payload_libs: &[PayloadLib],
     previous: Option<&InstalledMarkerAudit>,
@@ -829,14 +832,21 @@ fn audit_status_str(status: AuditStatus) -> &'static str {
     }
 }
 
-fn cache_map(audit: &InstalledMarkerAudit) -> BTreeMap<String, (u64, u128, Option<(u32, u32)>)> {
+/// Marker-audit file cache keyed by path: (size, mtime ns, parsed max `GLIBC_x.y` need).
+type ParsedFileCache = BTreeMap<String, (u64, u128, Option<(u32, u32)>)>;
+
+fn cache_map(audit: &InstalledMarkerAudit) -> ParsedFileCache {
     audit
         .file_cache
         .iter()
         .map(|(path, size, mtime_ns, need)| {
             (
                 path.clone(),
-                (*size, *mtime_ns, need.as_deref().and_then(parse_glibc_version)),
+                (
+                    *size,
+                    *mtime_ns,
+                    need.as_deref().and_then(parse_glibc_version),
+                ),
             )
         })
         .collect()
@@ -874,7 +884,7 @@ fn file_cache_key(path: &Path) -> Option<(u64, u128)> {
         let secs = meta.mtime() as i128;
         let nanos = meta.mtime_nsec() as i128;
         let mtime_ns = secs.saturating_mul(1_000_000_000).saturating_add(nanos);
-        return Some((meta.len(), mtime_ns.max(0) as u128));
+        Some((meta.len(), mtime_ns.max(0) as u128))
     }
     #[cfg(not(unix))]
     {
@@ -970,11 +980,12 @@ pub(crate) fn effective_shadow_libs(lock: &RetreadLock) -> BTreeMap<String, Stri
     if !lock.shadow_libs.is_empty() {
         return lock.shadow_libs.clone();
     }
-    if lock
-        .wheels
-        .iter()
-        .any(|w| matches!(normalize_dist_name(&w.name).as_str(), "isaacsim" | "isaacsim-kernel"))
-    {
+    if lock.wheels.iter().any(|w| {
+        matches!(
+            normalize_dist_name(&w.name).as_str(),
+            "isaacsim" | "isaacsim-kernel"
+        )
+    }) {
         DEFAULT_SHADOW_LIBS
             .iter()
             .map(|(path, policy)| ((*path).to_string(), (*policy).to_string()))
@@ -1012,8 +1023,7 @@ fn replace_with_provider_symlink(
     let parent = vendored
         .parent()
         .ok_or_else(|| anyhow::anyhow!("{} has no parent directory", vendored.display()))?;
-    std::fs::create_dir_all(parent)
-        .with_context(|| format!("creating {}", parent.display()))?;
+    std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     if let Ok(target) = std::fs::read_link(vendored) {
         let resolved = absolutize_link_target(vendored, &target);
         if path_resolves_same(&resolved, provider) {
@@ -1242,7 +1252,9 @@ fn match_segments(pattern: &[&str], path: &[&str]) -> bool {
         return match_segments(&pattern[1..], path)
             || (!path.is_empty() && match_segments(pattern, &path[1..]));
     }
-    !path.is_empty() && match_component(pattern[0], path[0]) && match_segments(&pattern[1..], &path[1..])
+    !path.is_empty()
+        && match_component(pattern[0], path[0])
+        && match_segments(&pattern[1..], &path[1..])
 }
 
 fn match_component(pattern: &str, text: &str) -> bool {
@@ -1300,7 +1312,10 @@ fn absolutize_link_target(link_path: &Path, target: &Path) -> PathBuf {
     if target.is_absolute() {
         target.to_path_buf()
     } else {
-        link_path.parent().unwrap_or_else(|| Path::new(".")).join(target)
+        link_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(target)
     }
 }
 
@@ -1368,7 +1383,10 @@ mod tests {
 
     #[test]
     fn relax_decision_matrix() {
-        assert_eq!(relax_decision(None, Some((2, 34))), RelaxDecision::Undeclared);
+        assert_eq!(
+            relax_decision(None, Some((2, 34))),
+            RelaxDecision::Undeclared
+        );
         assert_eq!(
             relax_decision(Some((2, 35)), Some((2, 34))),
             RelaxDecision::Relax { target: (2, 35) }
@@ -1389,7 +1407,10 @@ mod tests {
             relax_decision(Some((3, 1)), Some((2, 34))),
             RelaxDecision::Relax { target: (3, 1) }
         );
-        assert_eq!(relax_decision(Some((2, 35)), None), RelaxDecision::HostUnknown);
+        assert_eq!(
+            relax_decision(Some((2, 35)), None),
+            RelaxDecision::HostUnknown
+        );
         assert_eq!(relax_decision(None, None), RelaxDecision::HostUnknown);
     }
 
@@ -1399,7 +1420,9 @@ mod tests {
         let parsed = parse_readelf_dynamic(text);
         assert_eq!(
             parsed
-                .get(&PathBuf::from("/env/site/isaacsim/kit/kernel/plugins/libpython3.12.so.1.0"))
+                .get(&PathBuf::from(
+                    "/env/site/isaacsim/kit/kernel/plugins/libpython3.12.so.1.0"
+                ))
                 .cloned()
                 .flatten()
                 .as_deref(),
@@ -1513,7 +1536,10 @@ mod tests {
         };
         let body = marker_body("abc", &audit).unwrap();
         assert_eq!(body.lines().next(), Some("abc"));
-        assert_eq!(parse_marker_audit(&body).unwrap().host_glibc.as_deref(), Some("2.34"));
+        assert_eq!(
+            parse_marker_audit(&body).unwrap().host_glibc.as_deref(),
+            Some("2.34")
+        );
     }
 
     fn tempdir(label: &str) -> PathBuf {
@@ -1660,13 +1686,26 @@ platforms = [{ platform = "linux-64", glibc = "2.35" }, { platform = "linux-aarc
             abs_path: vendored.clone(),
         }];
         install_audit(&lock, &prefix, &site, &payload, None, None, None).unwrap();
-        assert!(std::fs::symlink_metadata(&vendored).unwrap().file_type().is_symlink());
-        assert_eq!(std::fs::read_to_string(backup_path(&vendored)).unwrap(), "v1");
+        assert!(
+            std::fs::symlink_metadata(&vendored)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read_to_string(backup_path(&vendored)).unwrap(),
+            "v1"
+        );
 
         std::fs::remove_file(&vendored).unwrap();
         std::fs::write(&vendored, "v2").unwrap();
         install_audit(&lock, &prefix, &site, &payload, None, None, None).unwrap();
-        assert!(std::fs::symlink_metadata(&vendored).unwrap().file_type().is_symlink());
+        assert!(
+            std::fs::symlink_metadata(&vendored)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         assert_eq!(
             std::fs::read_to_string(backup_path(&vendored)).unwrap(),
             "v2",

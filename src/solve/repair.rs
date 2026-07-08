@@ -270,6 +270,26 @@ pub struct RepairPlanner {
     current_run_attempts: HashSet<(String, String, Strategy)>,
 }
 
+/// One conflict target flowing through the repair tiers: which package and
+/// version the fix applies to, on which solve iteration, for which parsed
+/// conflict. Bundled so every tier helper shares one signature.
+struct PinTarget<'a> {
+    package: &'a str,
+    version: &'a str,
+    iter: u32,
+    conflict: &'a Conflict,
+}
+
+/// Optional ledger metadata for one attempt (only widens populate most of it).
+#[derive(Default)]
+struct AttemptDetails {
+    old_spec: Option<String>,
+    new_spec: Option<String>,
+    ceiling_policy: Option<String>,
+    before: Option<EntrySnapshot>,
+    failed: bool,
+}
+
 #[derive(Debug)]
 pub struct RepairOutcome {
     pub attempt: LedgerAttempt,
@@ -296,24 +316,45 @@ impl RepairPlanner {
     ) -> std::result::Result<RepairOutcome, String> {
         match conflict {
             Conflict::NoCandidates { package, version } => {
-                self.no_candidates(editor, tried, package, version, iter, conflict)
+                let target = PinTarget {
+                    package,
+                    version,
+                    iter,
+                    conflict,
+                };
+                self.no_candidates(editor, tried, &target)
             }
             Conflict::CondaBoundary { package, version } => {
-                self.boundary(editor, tried, package, version, iter, conflict, Reason::CondaBoundary)
+                let target = PinTarget {
+                    package,
+                    version,
+                    iter,
+                    conflict,
+                };
+                self.boundary(editor, tried, &target, Reason::CondaBoundary)
             }
             Conflict::PypiInternal { package, version } => {
-                self.override_pin(editor, tried, package, version, iter, conflict, Reason::PypiInternal)
+                let target = PinTarget {
+                    package,
+                    version,
+                    iter,
+                    conflict,
+                };
+                self.override_pin(editor, tried, &target, Reason::PypiInternal)
             }
             Conflict::CondaWidenNeeded {
-                package,
-                op,
-                floor,
-                ..
+                package, op, floor, ..
             } => {
+                let target = PinTarget {
+                    package,
+                    version: floor,
+                    iter,
+                    conflict,
+                };
                 if !tried.has(package, Strategy::WidenConda) {
-                    self.widen(editor, tried, package, op, floor, iter, conflict)
+                    self.widen(editor, tried, &target, op)
                 } else {
-                    self.boundary(editor, tried, package, floor, iter, conflict, Reason::CondaBoundary)
+                    self.boundary(editor, tried, &target, Reason::CondaBoundary)
                 }
             }
         }
@@ -323,33 +364,15 @@ impl RepairPlanner {
         &mut self,
         editor: &mut ManifestEditor,
         tried: &mut TriedState,
-        package: &str,
-        version: &str,
-        iter: u32,
-        conflict: &Conflict,
+        target: &PinTarget<'_>,
     ) -> std::result::Result<RepairOutcome, String> {
+        let package = target.package;
         if tried.has(package, Strategy::Conda) && !tried.has(package, Strategy::PypiDep) {
-            self.pypi_pin(
-                editor,
-                tried,
-                package,
-                version,
-                iter,
-                conflict,
-                Reason::NoCandidatesEscalation,
-            )
+            self.pypi_pin(editor, tried, target, Reason::NoCandidatesEscalation)
         } else if tried.has(package, Strategy::PypiDep)
             && !tried.has(package, Strategy::PypiOverride)
         {
-            self.override_pin(
-                editor,
-                tried,
-                package,
-                version,
-                iter,
-                conflict,
-                Reason::NoCandidatesEscalation,
-            )
+            self.override_pin(editor, tried, target, Reason::NoCandidatesEscalation)
         } else {
             Err(package.to_string())
         }
@@ -359,46 +382,32 @@ impl RepairPlanner {
         &mut self,
         editor: &mut ManifestEditor,
         tried: &mut TriedState,
-        package: &str,
-        version: &str,
-        iter: u32,
-        conflict: &Conflict,
+        target: &PinTarget<'_>,
         reason: Reason,
     ) -> std::result::Result<RepairOutcome, String> {
+        let package = target.package;
         if !tried.has(package, Strategy::Conda) {
             if editor.has_user_entry(&self.feature, TableKind::Conda, package) {
                 tried.mark(package, Strategy::Conda, false);
-                let attempt = self.ledger_attempt(
-                    iter,
-                    package,
-                    Some(version),
-                    Strategy::Conda,
-                    conflict,
-                    "user",
-                    None,
-                    None,
-                    None,
-                    None,
-                    false,
-                );
-                return self.pypi_pin(editor, tried, package, version, iter, conflict, reason)
-                    .map(|mut out| {
-                        out.summary_line = format!(
-                            "{}; skipped user-owned conda pin and {}",
-                            describe_attempt(&attempt),
-                            out.summary_line
-                        );
-                        out.extra_attempts.push(attempt);
-                        out
-                    });
+                let attempt =
+                    self.ledger_attempt(target, Strategy::Conda, "user", AttemptDetails::default());
+                return self.pypi_pin(editor, tried, target, reason).map(|mut out| {
+                    out.summary_line = format!(
+                        "{}; skipped user-owned conda pin and {}",
+                        describe_attempt(&attempt),
+                        out.summary_line
+                    );
+                    out.extra_attempts.push(attempt);
+                    out
+                });
             }
-            return self.conda_pin(editor, tried, package, version, iter, conflict, reason);
+            return self.conda_pin(editor, tried, target, reason);
         }
         if !tried.has(package, Strategy::PypiDep) {
-            return self.pypi_pin(editor, tried, package, version, iter, conflict, reason);
+            return self.pypi_pin(editor, tried, target, reason);
         }
         if !tried.has(package, Strategy::PypiOverride) {
-            return self.override_pin(editor, tried, package, version, iter, conflict, reason);
+            return self.override_pin(editor, tried, target, reason);
         }
         Err(package.to_string())
     }
@@ -407,29 +416,30 @@ impl RepairPlanner {
         &mut self,
         editor: &mut ManifestEditor,
         tried: &mut TriedState,
-        package: &str,
-        version: &str,
-        iter: u32,
-        conflict: &Conflict,
+        target: &PinTarget<'_>,
         reason: Reason,
     ) -> std::result::Result<RepairOutcome, String> {
+        let (package, version) = (target.package, target.version);
         self.guard_anchor(package)?;
         self.guard_oscillation(package, version, Strategy::Conda)?;
         let edit = editor.set_conda_pin(&self.feature, package, version, reason);
         tried.mark(package, Strategy::Conda, false);
-        Ok(self.outcome(iter, package, Some(version), Strategy::Conda, conflict, vec![edit], None, None, None, None, false))
+        Ok(self.outcome(
+            target,
+            Strategy::Conda,
+            vec![edit],
+            AttemptDetails::default(),
+        ))
     }
 
     fn pypi_pin(
         &mut self,
         editor: &mut ManifestEditor,
         tried: &mut TriedState,
-        package: &str,
-        version: &str,
-        iter: u32,
-        conflict: &Conflict,
+        target: &PinTarget<'_>,
         reason: Reason,
     ) -> std::result::Result<RepairOutcome, String> {
+        let (package, version) = (target.package, target.version);
         self.guard_anchor(package)?;
         self.guard_oscillation(package, version, Strategy::PypiDep)?;
         let mut edits = Vec::new();
@@ -438,19 +448,17 @@ impl RepairPlanner {
         }
         edits.push(editor.set_pypi_pin(&self.feature, package, version, reason));
         tried.mark(package, Strategy::PypiDep, false);
-        Ok(self.outcome(iter, package, Some(version), Strategy::PypiDep, conflict, edits, None, None, None, None, false))
+        Ok(self.outcome(target, Strategy::PypiDep, edits, AttemptDetails::default()))
     }
 
     fn override_pin(
         &mut self,
         editor: &mut ManifestEditor,
         tried: &mut TriedState,
-        package: &str,
-        version: &str,
-        iter: u32,
-        conflict: &Conflict,
+        target: &PinTarget<'_>,
         reason: Reason,
     ) -> std::result::Result<RepairOutcome, String> {
+        let (package, version) = (target.package, target.version);
         self.guard_anchor(package)?;
         if tried.has(package, Strategy::PypiOverride) {
             return Err(package.to_string());
@@ -462,19 +470,22 @@ impl RepairPlanner {
         }
         edits.push(editor.set_pypi_override(&self.feature, package, version, reason));
         tried.mark(package, Strategy::PypiOverride, false);
-        Ok(self.outcome(iter, package, Some(version), Strategy::PypiOverride, conflict, edits, None, None, None, None, false))
+        Ok(self.outcome(
+            target,
+            Strategy::PypiOverride,
+            edits,
+            AttemptDetails::default(),
+        ))
     }
 
     fn widen(
         &mut self,
         editor: &mut ManifestEditor,
         tried: &mut TriedState,
-        package: &str,
+        target: &PinTarget<'_>,
         op: &str,
-        floor: &str,
-        iter: u32,
-        conflict: &Conflict,
     ) -> std::result::Result<RepairOutcome, String> {
+        let (package, floor) = (target.package, target.version);
         self.guard_anchor(package)?;
         let spec = widen_spec(op, floor, self.ceiling_policy);
         self.guard_oscillation(package, &spec, Strategy::WidenConda)?;
@@ -482,74 +493,55 @@ impl RepairPlanner {
         let old_spec = edit.before.value.clone();
         tried.mark(package, Strategy::WidenConda, false);
         Ok(self.outcome(
-            iter,
-            package,
-            Some(floor),
+            target,
             Strategy::WidenConda,
-            conflict,
             vec![edit.clone()],
-            old_spec,
-            Some(spec),
-            Some(self.ceiling_policy.as_str().to_string()),
-            Some(edit.before),
-            false,
+            AttemptDetails {
+                old_spec,
+                new_spec: Some(spec),
+                ceiling_policy: Some(self.ceiling_policy.as_str().to_string()),
+                before: Some(edit.before),
+                failed: false,
+            },
         ))
     }
 
     fn outcome(
         &self,
-        iter: u32,
-        package: &str,
-        version: Option<&str>,
+        target: &PinTarget<'_>,
         strategy: Strategy,
-        conflict: &Conflict,
         applied: Vec<AppliedEdit>,
-        old_spec: Option<String>,
-        new_spec: Option<String>,
-        ceiling_policy: Option<String>,
-        before: Option<EntrySnapshot>,
-        failed: bool,
+        details: AttemptDetails,
     ) -> RepairOutcome {
+        let (package, version) = (target.package, target.version);
         let summary_line = match strategy {
             Strategy::WidenConda => format!(
                 "would add [{}] {} = \"{}\"  (tier: widen-conda)",
                 table_label(&self.feature, TableKind::Conda),
                 package,
-                new_spec.as_deref().unwrap_or("")
+                details.new_spec.as_deref().unwrap_or("")
             ),
             Strategy::Conda => format!(
                 "would add [{}] {} = \"=={}\"  (tier: conda)",
                 table_label(&self.feature, TableKind::Conda),
                 package,
-                version.unwrap_or("")
+                version
             ),
             Strategy::PypiDep => format!(
                 "would add [{}] {} = \"=={}\"  (tier: pypi_dep)",
                 table_label(&self.feature, TableKind::Pypi),
                 package,
-                version.unwrap_or("")
+                version
             ),
             Strategy::PypiOverride => format!(
                 "would add [{}] {} = \"=={}\"  (tier: pypi_override)",
                 table_label(&self.feature, TableKind::Override),
                 package,
-                version.unwrap_or("")
+                version
             ),
         };
         RepairOutcome {
-            attempt: self.ledger_attempt(
-                iter,
-                package,
-                version,
-                strategy,
-                conflict,
-                "retread",
-                old_spec,
-                new_spec.clone(),
-                ceiling_policy,
-                before,
-                failed,
-            ),
+            attempt: self.ledger_attempt(target, strategy, "retread", details),
             extra_attempts: Vec::new(),
             summary_line,
             applied,
@@ -558,32 +550,25 @@ impl RepairPlanner {
 
     fn ledger_attempt(
         &self,
-        iter: u32,
-        package: &str,
-        version: Option<&str>,
+        target: &PinTarget<'_>,
         strategy: Strategy,
-        conflict: &Conflict,
         source: &str,
-        old_spec: Option<String>,
-        new_spec: Option<String>,
-        ceiling_policy: Option<String>,
-        before: Option<EntrySnapshot>,
-        failed: bool,
+        details: AttemptDetails,
     ) -> LedgerAttempt {
         LedgerAttempt {
-            iter,
-            package: package.to_string(),
-            version: version.map(ToString::to_string),
+            iter: target.iter,
+            package: target.package.to_string(),
+            version: Some(target.version.to_string()),
             tier: strategy.as_str().to_string(),
             strategy: strategy.as_str().to_string(),
-            conflict: conflict.kind().to_string(),
+            conflict: target.conflict.kind().to_string(),
             source: source.to_string(),
             ts: timestamp(),
-            old_spec,
-            new_spec,
-            ceiling_policy,
-            before,
-            failed,
+            old_spec: details.old_spec,
+            new_spec: details.new_spec,
+            ceiling_policy: details.ceiling_policy,
+            before: details.before,
+            failed: details.failed,
         }
     }
 
@@ -838,19 +823,27 @@ mod tests {
             package: "numpy".into(),
             version: "2.3.1".into(),
         };
-        let out = planner.repair(&mut editor, &mut tried, &conflict, 1).unwrap();
+        let out = planner
+            .repair(&mut editor, &mut tried, &conflict, 1)
+            .unwrap();
         assert_eq!(out.attempt.strategy, "pypi_dep");
         assert!(tried.has("numpy", Strategy::Conda));
     }
 
     #[test]
     fn ledger_round_trips_and_seeds_from_hash_or_sentinels() {
-        let path = temp_manifest("[dependencies]\nnumpy = \"==2.3.1\"  # retread:pin 2026-07-07 conda-boundary\n");
+        let path = temp_manifest(
+            "[dependencies]\nnumpy = \"==2.3.1\"  # retread:pin 2026-07-07 conda-boundary\n",
+        );
         let editor = ManifestEditor::open(path.clone()).unwrap();
         let manifest_hash = manifest_sha256(&path).unwrap();
         let ledger_path = path.parent().unwrap().join(".retread/solve-ledger.json");
         let mut ledger = SolveLedger::load(&ledger_path, "pixi.toml".into()).unwrap();
-        let run = ledger.start_run("default".into(), manifest_hash.clone(), Some("pixi 0.70.0".into()));
+        let run = ledger.start_run(
+            "default".into(),
+            manifest_hash.clone(),
+            Some("pixi 0.70.0".into()),
+        );
         ledger.runs[run].attempts.push(LedgerAttempt {
             iter: 1,
             package: "torch".into(),

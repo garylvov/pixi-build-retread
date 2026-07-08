@@ -528,7 +528,9 @@ mod courier_tests {
             "must ship a matching deactivate.d hook"
         );
         assert!(
-            r.build.script.contains("LD_LIBRARY_PATH=\"$CONDA_PREFIX/lib"),
+            r.build
+                .script
+                .contains("LD_LIBRARY_PATH=\"$CONDA_PREFIX/lib"),
             "activate.d must prepend $CONDA_PREFIX/lib to LD_LIBRARY_PATH"
         );
         assert!(
@@ -676,7 +678,10 @@ mod courier_tests {
         let out = source_guard();
         assert!(payload.exists(), "self-heal must restore the payload");
         assert_eq!(
-            std::fs::read_to_string(&log).unwrap_or_default().lines().count(),
+            std::fs::read_to_string(&log)
+                .unwrap_or_default()
+                .lines()
+                .count(),
             1,
             "self-heal must invoke install exactly once"
         );
@@ -688,7 +693,10 @@ mod courier_tests {
         // Payload present -> guard is a no-op: verify passes, install NOT called.
         let out2 = source_guard();
         assert_eq!(
-            std::fs::read_to_string(&log).unwrap_or_default().lines().count(),
+            std::fs::read_to_string(&log)
+                .unwrap_or_default()
+                .lines()
+                .count(),
             1,
             "healthy env must not trigger another install (no wasted uv run)"
         );
@@ -804,7 +812,10 @@ mod courier_tests {
         };
 
         let first = source(false);
-        assert!(first.status.success(), "default guard must not fail activation");
+        assert!(
+            first.status.success(),
+            "default guard must not fail activation"
+        );
         assert!(
             String::from_utf8_lossy(&first.stdout).contains("status:0 broken:1"),
             "default failure should set broken env and return zero: {}",

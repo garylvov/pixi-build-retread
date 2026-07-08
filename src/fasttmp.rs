@@ -186,11 +186,7 @@ impl FastTmpConfig {
             .and_then(toml::Value::as_table)
             .and_then(|tool| tool.get("retread"))
             .and_then(toml::Value::as_table)
-            .and_then(|retread| {
-                retread
-                    .get("fast-tmp")
-                    .or_else(|| retread.get("fast_tmp"))
-            })
+            .and_then(|retread| retread.get("fast-tmp").or_else(|| retread.get("fast_tmp")))
             .and_then(toml::Value::as_table)
         else {
             return;
@@ -457,7 +453,8 @@ pub fn fs_check_path(path: &Path) -> PathBuf {
 }
 
 pub fn namespace(cfg: &FastTmpConfig, workspace_root: &Path) -> Namespace {
-    let canonical = fs::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf());
+    let canonical =
+        fs::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf());
     let hash = workspace_hash(&canonical);
     let job = current_job_component();
     Namespace {
@@ -479,13 +476,13 @@ pub fn engage(workspace_root: &Path, cfg: &FastTmpConfig) -> Result<Option<Engag
     engage_inner(workspace_root, cfg, true)
 }
 
-pub fn engage_backend(workspace_root: &Path, cfg: &FastTmpConfig) -> Result<Option<EngagedFastTmp>> {
+pub fn engage_backend(
+    workspace_root: &Path,
+    cfg: &FastTmpConfig,
+) -> Result<Option<EngagedFastTmp>> {
     let engaged = engage_inner(workspace_root, cfg, false)?;
     let backend = BackendEnv {
-        pairs: engaged
-            .as_ref()
-            .map(|e| e.env.clone())
-            .unwrap_or_default(),
+        pairs: engaged.as_ref().map(|e| e.env.clone()).unwrap_or_default(),
         remove_fast_vars: engaged.is_none() && inherited_fasttmp_stale(),
     };
     *BACKEND_ENV
@@ -591,7 +588,12 @@ fn desired_env_pairs(
     push_env_if_needed(&mut out, "PIXI_CACHE_DIR", &blob_cache, stale);
     push_env_if_needed(&mut out, "RATTLER_CACHE_DIR", &blob_cache, stale);
     push_env_if_needed(&mut out, "UV_CACHE_DIR", &ns.uv_cache_dir(), stale);
-    push_env_if_needed(&mut out, "RETREAD_CACHE_DIR", &ns.retread_cache_dir(), stale);
+    push_env_if_needed(
+        &mut out,
+        "RETREAD_CACHE_DIR",
+        &ns.retread_cache_dir(),
+        stale,
+    );
     push_env_str_if_needed(&mut out, "UV_LOCK_TIMEOUT", "1800", stale);
     push_env_if_needed(
         &mut out,
@@ -599,7 +601,12 @@ fn desired_env_pairs(
         &ns.envs_dir(),
         stale,
     );
-    push_env_str_if_needed(&mut out, "RETREAD_FAST_TMP_NS_JOB", &current_job_marker(), true);
+    push_env_str_if_needed(
+        &mut out,
+        "RETREAD_FAST_TMP_NS_JOB",
+        &current_job_marker(),
+        true,
+    );
     out
 }
 
@@ -616,16 +623,14 @@ fn push_env_str_if_needed(out: &mut Vec<(String, String)>, key: &str, value: &st
 }
 
 pub fn backend_env_value(key: &str) -> Option<String> {
-    BACKEND_ENV
-        .get()
-        .and_then(|env| {
-            env.lock()
-                .unwrap()
-                .pairs
-                .iter()
-                .find(|(k, _)| k == key)
-                .map(|(_, v)| v.clone())
-        })
+    BACKEND_ENV.get().and_then(|env| {
+        env.lock()
+            .unwrap()
+            .pairs
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.clone())
+    })
 }
 
 pub fn apply_backend_env(cmd: &mut tokio::process::Command) {
@@ -778,9 +783,7 @@ fn atomic_symlink_replace(target: &Path, link: &Path) -> Result<()> {
         .ok_or_else(|| anyhow!("symlink path {} has no parent", link.display()))?;
     let tmp = parent.join(format!(
         ".{}.retread-tmp.{}.{}",
-        link.file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("link"),
+        link.file_name().and_then(|s| s.to_str()).unwrap_or("link"),
         std::process::id(),
         unique_nonce()
     ));
@@ -922,12 +925,11 @@ pub fn effective_copy_workers(cfg: &FastTmpConfig) -> usize {
 /// CPUs actually allocated to this process, when a scheduler or cgroup
 /// says so. `None` = no allocation signal; caller falls back to ncpu.
 fn allocated_cpus() -> Option<usize> {
-    if let Ok(v) = std::env::var("SLURM_CPUS_ON_NODE") {
-        if let Ok(n) = v.trim().parse::<usize>() {
-            if n > 0 {
-                return Some(n);
-            }
-        }
+    if let Ok(v) = std::env::var("SLURM_CPUS_ON_NODE")
+        && let Ok(n) = v.trim().parse::<usize>()
+        && n > 0
+    {
+        return Some(n);
     }
     cgroup_v2_cpu_quota(Path::new("/sys/fs/cgroup/cpu.max"))
 }
@@ -1045,12 +1047,12 @@ pub fn parallel_copy_tree(src: &Path, dst: &Path, workers: usize) -> Result<Copy
         set_mode(&dst.join(rel), *mode);
     }
 
-    let (files, symlinks) = entries.iter().fold((0_u64, 0_u64), |(f, s), (_, k)| {
-        match k {
+    let (files, symlinks) = entries
+        .iter()
+        .fold((0_u64, 0_u64), |(f, s), (_, k)| match k {
             EntryKind::File => (f + 1, s),
             EntryKind::Symlink => (f, s + 1),
-        }
-    });
+        });
     Ok(CopyStats {
         files,
         bytes: bytes.into_inner(),
@@ -1094,8 +1096,7 @@ fn copy_entry(src: &Path, dst: &Path, rel: &Path, kind: EntryKind) -> Result<u64
             let target = fs::read_link(&from)
                 .with_context(|| format!("reading symlink {}", from.display()))?;
             if fs::symlink_metadata(&to).is_ok() {
-                fs::remove_file(&to)
-                    .with_context(|| format!("removing stale {}", to.display()))?;
+                fs::remove_file(&to).with_context(|| format!("removing stale {}", to.display()))?;
             }
             make_symlink(&target, &to)?;
             Ok(0)
@@ -1108,7 +1109,11 @@ fn copy_entry(src: &Path, dst: &Path, rel: &Path, kind: EntryKind) -> Result<u64
 #[cfg(unix)]
 fn make_symlink(target: &Path, link: &Path) -> Result<()> {
     std::os::unix::fs::symlink(target, link).with_context(|| {
-        format!("creating symlink {} -> {}", link.display(), target.display())
+        format!(
+            "creating symlink {} -> {}",
+            link.display(),
+            target.display()
+        )
     })
 }
 
@@ -1276,9 +1281,8 @@ pub fn persist_env(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
         Err(e) => {
             let _ = fs::remove_dir_all(&tmp);
-            return Err(e).with_context(|| {
-                format!("moving previous snapshot {} aside", dest.display())
-            });
+            return Err(e)
+                .with_context(|| format!("moving previous snapshot {} aside", dest.display()));
         }
     };
     if let Err(e) = fs::rename(&tmp, &dest) {
@@ -1287,13 +1291,8 @@ pub fn persist_env(
             let _ = fs::rename(&old, &dest);
         }
         let _ = fs::remove_dir_all(&tmp);
-        return Err(e).with_context(|| {
-            format!(
-                "swapping snapshot {} -> {}",
-                tmp.display(),
-                dest.display()
-            )
-        });
+        return Err(e)
+            .with_context(|| format!("swapping snapshot {} -> {}", tmp.display(), dest.display()));
     }
     if had_old {
         let _ = fs::remove_dir_all(&old);
@@ -1466,8 +1465,11 @@ pub fn preflight_lock_helper(lock_path: &Path) -> Result<()> {
 }
 
 pub fn stage_dir(ns: &Namespace, token: &str) -> PathBuf {
-    ns.bld_dir()
-        .join(format!("out-{token}-{}-{}", std::process::id(), unique_nonce()))
+    ns.bld_dir().join(format!(
+        "out-{token}-{}-{}",
+        std::process::id(),
+        unique_nonce()
+    ))
 }
 
 pub fn copy_back_artifacts(
@@ -1547,7 +1549,9 @@ fn copy_one_verified(src: &Path, dst: &Path) -> Result<()> {
         .with_context(|| format!("creating artifact output dir {}", parent.display()))?;
     let part = parent.join(format!(
         ".{}.part",
-        dst.file_name().and_then(|s| s.to_str()).unwrap_or("artifact")
+        dst.file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("artifact")
     ));
     let mut last_mismatch = None;
     for attempt in 0..2 {
@@ -1611,7 +1615,9 @@ fn maybe_corrupt_copyback_part(part: &Path) -> Result<()> {
             .write(true)
             .truncate(true)
             .open(part)
-            .with_context(|| format!("opening copy-back corruption test hook {}", part.display()))?;
+            .with_context(|| {
+                format!("opening copy-back corruption test hook {}", part.display())
+            })?;
     }
     Ok(())
 }
@@ -1690,10 +1696,16 @@ fn effective_budget(tmp_root: &Path, cfg: &FastTmpConfig) -> Result<(Option<u64>
     }
     if is_tmpfs(tmp_root) {
         if let Some(bytes) = cgroup_v2_available_memory()? {
-            return Ok((Some(bytes.saturating_mul(75) / 100), "cgroup v2 memory.max-current"));
+            return Ok((
+                Some(bytes.saturating_mul(75) / 100),
+                "cgroup v2 memory.max-current",
+            ));
         }
         if let Some(bytes) = slurm_memory_budget_bytes() {
-            return Ok((Some(bytes.saturating_mul(75) / 100), "SLURM memory environment"));
+            return Ok((
+                Some(bytes.saturating_mul(75) / 100),
+                "SLURM memory environment",
+            ));
         }
         return Ok((None, "unavailable tmpfs memory budget"));
     }
@@ -2119,7 +2131,10 @@ blob-caches = "tmp"
         let first = engage(&ws, &cfg).unwrap().unwrap();
         let second = engage(&ws, &cfg).unwrap().unwrap();
         assert_eq!(first.ns.root, second.ns.root);
-        assert_eq!(fs::read_link(ws.join(".pixi").join("bld")).unwrap(), first.ns.bld_dir());
+        assert_eq!(
+            fs::read_link(ws.join(".pixi").join("bld")).unwrap(),
+            first.ns.bld_dir()
+        );
         assert!(
             !first.env.iter().any(|(k, _)| k == "UV_CACHE_DIR"),
             "pre-set UV_CACHE_DIR must not be overridden"
@@ -2173,7 +2188,8 @@ blob-caches = "tmp"
         fs::create_dir_all(&stage).unwrap();
         let artifact = stage.join("pkg-1.0-0.conda");
         fs::write(&artifact, b"conda bytes").unwrap();
-        let final_path = copy_back_artifacts(root.join("stage").as_path(), &out, &artifact).unwrap();
+        let final_path =
+            copy_back_artifacts(root.join("stage").as_path(), &out, &artifact).unwrap();
         assert_eq!(fs::read(&final_path).unwrap(), b"conda bytes");
         assert_eq!(final_path, out.join("linux-64").join("pkg-1.0-0.conda"));
         fs::remove_dir_all(root).ok();
@@ -2192,12 +2208,20 @@ blob-caches = "tmp"
         )
         .unwrap();
         fs::write(
-            env_dir.join("lib").join("python3.11").join("pkg").join("mod.py"),
+            env_dir
+                .join("lib")
+                .join("python3.11")
+                .join("pkg")
+                .join("mod.py"),
             b"x = 1\n",
         )
         .unwrap();
         fs::set_permissions(
-            env_dir.join("lib").join("python3.11").join("pkg").join("mod.py"),
+            env_dir
+                .join("lib")
+                .join("python3.11")
+                .join("pkg")
+                .join("mod.py"),
             fs::Permissions::from_mode(0o644),
         )
         .unwrap();
@@ -2227,23 +2251,54 @@ blob-caches = "tmp"
         assert_eq!(stats.files, 2);
         assert_eq!(stats.symlinks, 2);
         assert_eq!(stats.dirs, 5);
-        assert_eq!(stats.bytes, fs::metadata(src.join("bin").join("tool")).unwrap().len()
-            + fs::metadata(src.join("lib").join("python3.11").join("pkg").join("mod.py")).unwrap().len());
-
-        assert_eq!(fs::read(dst.join("bin").join("tool")).unwrap(), b"#!/bin/sh\necho hi\n");
         assert_eq!(
-            fs::metadata(dst.join("bin").join("tool")).unwrap().permissions().mode() & 0o7777,
+            stats.bytes,
+            fs::metadata(src.join("bin").join("tool")).unwrap().len()
+                + fs::metadata(
+                    src.join("lib")
+                        .join("python3.11")
+                        .join("pkg")
+                        .join("mod.py")
+                )
+                .unwrap()
+                .len()
+        );
+
+        assert_eq!(
+            fs::read(dst.join("bin").join("tool")).unwrap(),
+            b"#!/bin/sh\necho hi\n"
+        );
+        assert_eq!(
+            fs::metadata(dst.join("bin").join("tool"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
             0o755
         );
         assert_eq!(
-            fs::metadata(dst.join("empty")).unwrap().permissions().mode() & 0o7777,
+            fs::metadata(dst.join("empty"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
             0o700
         );
         let alias = dst.join("bin").join("tool-alias");
-        assert!(fs::symlink_metadata(&alias).unwrap().file_type().is_symlink());
+        assert!(
+            fs::symlink_metadata(&alias)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         assert_eq!(fs::read_link(&alias).unwrap(), PathBuf::from("tool"));
         let dangling = dst.join("lib").join("dangling");
-        assert!(fs::symlink_metadata(&dangling).unwrap().file_type().is_symlink());
+        assert!(
+            fs::symlink_metadata(&dangling)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         assert_eq!(
             fs::read_link(&dangling).unwrap(),
             PathBuf::from("/definitely/not/a/real/target")
@@ -2300,7 +2355,10 @@ blob-caches = "tmp"
         fs::write(snap.join(ENV_HASH_FILE), format!("{hash}\n")).unwrap();
         assert!(materialize_persisted_envs(&fx.ws, &fx.cfg, &fx.ns));
         let dest = fx.ns.envs_dir().join("default");
-        assert_eq!(fs::read(dest.join("bin").join("tool")).unwrap(), b"#!/bin/sh\necho hi\n");
+        assert_eq!(
+            fs::read(dest.join("bin").join("tool")).unwrap(),
+            b"#!/bin/sh\necho hi\n"
+        );
         assert!(!dest.join(ENV_HASH_FILE).exists());
         assert!(dest.join("bin").join("tool-alias").is_symlink());
 
@@ -2349,7 +2407,10 @@ blob-caches = "tmp"
             fs::read_to_string(snap.join(ENV_HASH_FILE)).unwrap().trim(),
             hash
         );
-        assert_eq!(fs::read(snap.join("bin").join("tool")).unwrap(), b"#!/bin/sh\necho hi\n");
+        assert_eq!(
+            fs::read(snap.join("bin").join("tool")).unwrap(),
+            b"#!/bin/sh\necho hi\n"
+        );
         assert!(snap.join("bin").join("tool-alias").is_symlink());
 
         // Re-persist replaces the old snapshot and leaves no tmp/old debris.
@@ -2362,7 +2423,10 @@ blob-caches = "tmp"
             .map(|e| e.file_name().to_string_lossy().to_string())
             .filter(|n| n.starts_with(".tmp-") || n.starts_with(".old-"))
             .collect();
-        assert!(leftovers.is_empty(), "swap debris left behind: {leftovers:?}");
+        assert!(
+            leftovers.is_empty(),
+            "swap debris left behind: {leftovers:?}"
+        );
 
         // Failed persist removes the tmp dir and keeps the old snapshot.
         guard.set("RETREAD_FAST_TMP_COPY_FAIL_SUBSTR", "mod.py");
@@ -2409,7 +2473,7 @@ copy-workers = 12
 
         let default_cfg = FastTmpConfig::default();
         let n = effective_copy_workers(&default_cfg);
-        assert!(n >= 1 && n <= MAX_COPY_WORKERS);
+        assert!((1..=MAX_COPY_WORKERS).contains(&n));
         assert_eq!(
             persist_dir(&default_cfg, &ws),
             ws.join(".pixi/envs-persist")
@@ -2428,7 +2492,7 @@ copy-workers = 12
         assert_eq!(effective_copy_workers(&pinned), 2);
         guard.set("SLURM_CPUS_ON_NODE", "banana");
         let n = effective_copy_workers(&default_cfg);
-        assert!(n >= 1 && n <= MAX_COPY_WORKERS);
+        assert!((1..=MAX_COPY_WORKERS).contains(&n));
         guard.remove("SLURM_CPUS_ON_NODE");
         fs::remove_dir_all(ws).ok();
     }

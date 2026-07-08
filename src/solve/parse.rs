@@ -19,15 +19,6 @@ pub enum Conflict {
 }
 
 impl Conflict {
-    pub fn package(&self) -> &str {
-        match self {
-            Conflict::NoCandidates { package, .. }
-            | Conflict::CondaBoundary { package, .. }
-            | Conflict::PypiInternal { package, .. }
-            | Conflict::CondaWidenNeeded { package, .. } => package,
-        }
-    }
-
     pub fn kind(&self) -> &'static str {
         match self {
             Conflict::NoCandidates { .. } => "NoCandidates",
@@ -178,8 +169,7 @@ mod tests {
         include_str!("../../tests/fixtures/solve_errors/conda_boundary_single_line.txt");
     const CONDA_BOUNDARY_HELP_ONLY: &str =
         include_str!("../../tests/fixtures/solve_errors/conda_boundary_help_only.txt");
-    const PYPI_INTERNAL: &str =
-        include_str!("../../tests/fixtures/solve_errors/pypi_internal.txt");
+    const PYPI_INTERNAL: &str = include_str!("../../tests/fixtures/solve_errors/pypi_internal.txt");
     const NO_CANDIDATES: &str =
         include_str!("../../tests/fixtures/solve_errors/no_candidates_conda.txt");
     const NO_CANDIDATES_PYPI: &str =

@@ -16,10 +16,9 @@ pub async fn run_smoke(project_dir: &Path, env: Option<&str>, modules: &[String]
     let valid = Regex::new(r"^[A-Za-z_][A-Za-z0-9_.]*$").expect("valid smoke module regex");
     for module in modules {
         if !valid.is_match(module) {
-            return Err(SolveError::Usage(format!(
-                "retread solve: invalid smoke module {module}"
-            ))
-            .into());
+            return Err(
+                SolveError::Usage(format!("retread solve: invalid smoke module {module}")).into(),
+            );
         }
     }
     let code = modules

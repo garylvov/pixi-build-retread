@@ -11,7 +11,7 @@ use crate::workspace::WorkspaceManifest;
 use super::args::SolveArgs;
 use super::error::{EXIT_OK, EXIT_SMOKE_FAILED, SolveError};
 use super::manifest::{AppliedEdit, ManifestEditor, copy_atomic, restore_bytes_atomic};
-use super::parse::{Conflict, ConflictParser, RegexConflictParser, tail};
+use super::parse::{ConflictParser, RegexConflictParser, tail};
 use super::repair::{
     LedgerAttempt, RepairPlanner, SolveLedger, Strategy, TriedState, append_attempt, ledger_path,
     manifest_sha256, mark_last_widen_failed, retread_dir, snapshot_path, truncate_ledger_runs,
@@ -80,14 +80,16 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
             Some(idx)
         };
         let result = run_env(
-            &args,
-            &project_dir,
-            &manifest_path,
+            EnvRunCtx {
+                args: &args,
+                project_dir: &project_dir,
+                manifest_path: &manifest_path,
+                parser: &parser,
+                ledger_path: &ledger_path,
+                run_idx,
+            },
             &mut editor,
-            &parser,
             &mut ledger,
-            &ledger_path,
-            run_idx,
             &mut tried,
             feature,
             env.as_deref(),
@@ -169,19 +171,34 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
     Ok(any_failed_code)
 }
 
-async fn run_env(
-    args: &SolveArgs,
-    project_dir: &Path,
-    manifest_path: &Path,
-    editor: &mut ManifestEditor,
-    parser: &RegexConflictParser,
-    ledger: &mut SolveLedger,
-    ledger_path: &Path,
+/// Shared, read-only solve-session state threaded into each per-environment
+/// run; bundled into one parameter object to keep `run_env`'s arity sane.
+#[derive(Clone, Copy)]
+struct EnvRunCtx<'a> {
+    args: &'a SolveArgs,
+    project_dir: &'a Path,
+    manifest_path: &'a Path,
+    parser: &'a RegexConflictParser,
+    ledger_path: &'a Path,
     run_idx: Option<usize>,
+}
+
+async fn run_env(
+    ctx: EnvRunCtx<'_>,
+    editor: &mut ManifestEditor,
+    ledger: &mut SolveLedger,
     tried: &mut TriedState,
     feature: String,
     env: Option<&str>,
 ) -> std::result::Result<i32, SolveError> {
+    let EnvRunCtx {
+        args,
+        project_dir,
+        manifest_path,
+        parser,
+        ledger_path,
+        run_idx,
+    } = ctx;
     let mut planner = RepairPlanner::new(feature.clone());
     let mut pending_edit: Option<PendingEdit> = None;
     let smoke_modules = if args.smoke_modules.is_empty() {
@@ -204,20 +221,21 @@ async fn run_env(
                 println!("retread solve: pixi install already succeeds");
                 return Ok(EXIT_OK);
             }
-            if !args.no_smoke_test && !smoke_modules.is_empty() {
-                if let Err(err) = super::smoke::run_smoke(project_dir, env, &smoke_modules).await {
-                    if let Some(solve_err) = err.downcast_ref::<SolveError>() {
-                        match solve_err {
-                            SolveError::SmokeFailed { stderr_tail, .. } => {
-                                eprintln!("{stderr_tail}");
-                                return Ok(EXIT_SMOKE_FAILED);
-                            }
-                            SolveError::Usage(msg) => return Err(SolveError::Usage(msg.clone())),
-                            _ => return Err(SolveError::Usage(solve_err.to_string())),
+            if !args.no_smoke_test
+                && !smoke_modules.is_empty()
+                && let Err(err) = super::smoke::run_smoke(project_dir, env, &smoke_modules).await
+            {
+                if let Some(solve_err) = err.downcast_ref::<SolveError>() {
+                    match solve_err {
+                        SolveError::SmokeFailed { stderr_tail, .. } => {
+                            eprintln!("{stderr_tail}");
+                            return Ok(EXIT_SMOKE_FAILED);
                         }
+                        SolveError::Usage(msg) => return Err(SolveError::Usage(msg.clone())),
+                        _ => return Err(SolveError::Usage(solve_err.to_string())),
                     }
-                    return Err(SolveError::Usage(err.to_string()));
                 }
+                return Err(SolveError::Usage(err.to_string()));
             }
             print_success_summary(
                 run_idx
@@ -231,11 +249,6 @@ async fn run_env(
         let stripped = parser.strip_ansi(&install.stderr);
         let parsed = parser.parse(&stripped);
         if let Some(conflict) = parsed {
-            if let Some(pending) = &pending_edit
-                && pending.conflict_package != conflict.package()
-            {
-                pending_edit = None;
-            }
             if args.dry_run {
                 let mut dry_editor = ManifestEditor::open(manifest_path.to_path_buf())
                     .map_err(|e| SolveError::Usage(e.to_string()))?;
@@ -245,7 +258,8 @@ async fn run_env(
                 println!("{}", out.summary_line);
                 return Ok(EXIT_OK);
             }
-            ensure_snapshot(project_dir, manifest_path).map_err(|e| SolveError::Usage(e.to_string()))?;
+            ensure_snapshot(project_dir, manifest_path)
+                .map_err(|e| SolveError::Usage(e.to_string()))?;
             let out = planner
                 .repair(editor, tried, &conflict, iter)
                 .map_err(|package| SolveError::Exhausted { package })?;
@@ -260,7 +274,7 @@ async fn run_env(
                 append_attempt(ledger, ledger_path, run_idx, out.attempt.clone())
                     .map_err(|e| SolveError::Usage(e.to_string()))?;
             }
-            pending_edit = PendingEdit::from_edits(out.applied, conflict.package().to_string());
+            pending_edit = PendingEdit::from_edits(out.applied);
             continue;
         }
 
@@ -314,17 +328,15 @@ struct PendingEdit {
     package: String,
     strategy: Strategy,
     edits: Vec<AppliedEdit>,
-    conflict_package: String,
 }
 
 impl PendingEdit {
-    fn from_edits(edits: Vec<AppliedEdit>, conflict_package: String) -> Option<Self> {
+    fn from_edits(edits: Vec<AppliedEdit>) -> Option<Self> {
         let last = edits.last()?;
         Some(Self {
             package: last.package.clone(),
             strategy: last.strategy,
             edits,
-            conflict_package,
         })
     }
 
@@ -342,7 +354,10 @@ struct InstallResult {
     raw_stderr: String,
 }
 
-async fn run_pixi_install(project_dir: &Path, env: Option<&str>) -> std::result::Result<InstallResult, SolveError> {
+async fn run_pixi_install(
+    project_dir: &Path,
+    env: Option<&str>,
+) -> std::result::Result<InstallResult, SolveError> {
     let mut cmd = Command::new("pixi");
     cmd.arg("install");
     if let Some(env) = env {
@@ -358,8 +373,8 @@ async fn run_pixi_install(project_dir: &Path, env: Option<&str>) -> std::result:
     let mut child = cmd
         .spawn()
         .map_err(|e| SolveError::Usage(format!("retread solve: failed to spawn pixi: {e}")))?;
-    let mut stdout = child.stdout.take();
-    let mut stderr = child.stderr.take();
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
     let stdout_task = tokio::spawn(async move {
         let mut stdout = stdout;
         let mut buf = Vec::new();
@@ -443,9 +458,7 @@ fn resolve_feature(manifest_path: &Path, env: Option<&str>, explicit: Option<&st
         return feature.to_string();
     }
     if let Some(env) = env
-        && let Some(ws) = manifest_path
-            .parent()
-            .and_then(WorkspaceManifest::load)
+        && let Some(ws) = manifest_path.parent().and_then(WorkspaceManifest::load)
         && let Some(def) = ws.environments.get(env)
         && def.no_default_feature
         && def.features.len() == 1
@@ -512,8 +525,7 @@ fn outcome_for_code(code: i32) -> &'static str {
 fn print_error(err: &SolveError) {
     eprintln!("{err}");
     match err {
-        SolveError::Unparseable { stderr_tail }
-        | SolveError::SmokeFailed { stderr_tail, .. } => {
+        SolveError::Unparseable { stderr_tail } | SolveError::SmokeFailed { stderr_tail, .. } => {
             eprintln!("{stderr_tail}");
         }
         _ => {}
@@ -571,7 +583,10 @@ python = "3.11.*"
         )
         .unwrap();
         assert_eq!(resolve_feature(&manifest, Some("gpu"), None), "cuda");
-        assert_eq!(resolve_feature(&manifest, Some("gpu"), Some("manual")), "manual");
+        assert_eq!(
+            resolve_feature(&manifest, Some("gpu"), Some("manual")),
+            "manual"
+        );
     }
 
     #[test]

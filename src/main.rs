@@ -232,7 +232,10 @@ fn exec_fast_command(
         command.envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
     }
     let err = command.exec();
-    Err(anyhow::anyhow!("retread fast: exec {} failed: {err}", cmd[0]))
+    Err(anyhow::anyhow!(
+        "retread fast: exec {} failed: {err}",
+        cmd[0]
+    ))
 }
 
 #[cfg(not(unix))]

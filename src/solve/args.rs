@@ -76,9 +76,9 @@ pub fn parse(argv: &[String]) -> anyhow::Result<SolveArgs> {
             }
             "--smoke" => {
                 non_clean_flag_seen = true;
-                let raw = it
-                    .next()
-                    .ok_or_else(|| SolveError::Usage("--smoke <module>[,<module>...] required".into()))?;
+                let raw = it.next().ok_or_else(|| {
+                    SolveError::Usage("--smoke <module>[,<module>...] required".into())
+                })?;
                 for module in raw.split(',').map(str::trim).filter(|m| !m.is_empty()) {
                     if !args.smoke_modules.iter().any(|m| m == module) {
                         args.smoke_modules.push(module.to_string());
@@ -140,6 +140,9 @@ mod tests {
     #[test]
     fn clean_pins_rejects_other_flags() {
         let err = parse(&argv(&["--clean-pins", "--dry-run"])).unwrap_err();
-        assert!(err.to_string().contains("--clean-pins is mutually exclusive"));
+        assert!(
+            err.to_string()
+                .contains("--clean-pins is mutually exclusive")
+        );
     }
 }

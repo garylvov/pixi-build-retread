@@ -132,7 +132,10 @@ fn relax_platform_on_conflict(
         crate::glibc::RelaxDecision::Undeclared => {
             bail!(
                 "{}",
-                crate::glibc::undeclared_glibc_error(host, crate::glibc::extract_manylinux_floor(&text))
+                crate::glibc::undeclared_glibc_error(
+                    host,
+                    crate::glibc::extract_manylinux_floor(&text)
+                )
             );
         }
         crate::glibc::RelaxDecision::HostUnknown => {
@@ -667,13 +670,8 @@ pub fn verify(lock_path: &Path, prefix: &Path, full: bool) -> Result<()> {
     let audit = crate::glibc::verify_marker_state(&lock, prefix, &have)?;
     if full {
         let (site_packages, libs) = installed_payload_libraries(&lock, prefix)?;
-        let _ = crate::glibc::full_verify_audit(
-            &lock,
-            prefix,
-            &site_packages,
-            &libs,
-            Some(&audit),
-        )?;
+        let _ =
+            crate::glibc::full_verify_audit(&lock, prefix, &site_packages, &libs, Some(&audit))?;
     }
     Ok(())
 }
@@ -723,11 +721,9 @@ pub(crate) fn build_uv_replay_args(
 /// expose a torn marker to a concurrent reader; rename is atomic on POSIX.
 fn write_marker_atomic(marker: &Path, body: &str) -> Result<()> {
     let tmp = marker.with_extension(format!("tmp.{}", std::process::id()));
-    std::fs::write(&tmp, body)
-        .with_context(|| format!("writing marker temp {}", tmp.display()))?;
-    std::fs::rename(&tmp, marker).with_context(|| {
-        format!("renaming marker {} -> {}", tmp.display(), marker.display())
-    })
+    std::fs::write(&tmp, body).with_context(|| format!("writing marker temp {}", tmp.display()))?;
+    std::fs::rename(&tmp, marker)
+        .with_context(|| format!("renaming marker {} -> {}", tmp.display(), marker.display()))
 }
 
 /// Install (or no-op) the bundle described by `lock_path` into `prefix`.
@@ -790,7 +786,8 @@ pub async fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
                 let marker_text = std::fs::read_to_string(&marker).unwrap_or_default();
                 match crate::glibc::verify_marker_state(&lock, prefix, &marker_text) {
                     Ok(_) => {
-                        let msg = format!("retread install: {} already current; skipping", lock.bundle);
+                        let msg =
+                            format!("retread install: {} already current; skipping", lock.bundle);
                         eprintln!("{msg}");
                         crate::status::phase(
                             lock_path.parent().unwrap_or(std::path::Path::new(".")),
@@ -1038,10 +1035,8 @@ mod tests {
 
     #[test]
     fn write_marker_atomic_replaces_and_leaves_no_temp() {
-        let dir = std::env::temp_dir().join(format!(
-            "retread-marker-atomic-test-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("retread-marker-atomic-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let marker = dir.join("retread-test.installed");
         write_marker_atomic(&marker, "first\n").unwrap();
@@ -1095,7 +1090,8 @@ mod tests {
             name: name.into(),
             version: version.into(),
             origin: Origin::Index,
-            filename: crate::wheel::wheel_filename_from_url(&url::Url::parse(url).unwrap()).unwrap(),
+            filename: crate::wheel::wheel_filename_from_url(&url::Url::parse(url).unwrap())
+                .unwrap(),
             url: Some(url.into()),
             sha256: Some(sha256.into()),
             requires_dist: vec![],
@@ -1151,12 +1147,7 @@ mod tests {
     fn replay_args_preserve_python_platform_and_reinstall_only_when_requested() {
         let prefix = PathBuf::from("/fake/prefix");
         let wheels = vec![PathBuf::from("/cache/a-1.0-py3-none-any.whl")];
-        let args = build_uv_replay_args(
-            &prefix,
-            &wheels,
-            Some("x86_64-manylinux_2_35"),
-            true,
-        );
+        let args = build_uv_replay_args(&prefix, &wheels, Some("x86_64-manylinux_2_35"), true);
         let strs = argv_strings(&args);
 
         assert_eq!(
@@ -1173,12 +1164,20 @@ mod tests {
 
     #[test]
     fn validate_rejects_old_schema_and_index_without_hash() {
-        let mut lock = make_lock(vec![], vec!["https://pypi.org/simple/".into()], BTreeMap::new());
+        let mut lock = make_lock(
+            vec![],
+            vec!["https://pypi.org/simple/".into()],
+            BTreeMap::new(),
+        );
         lock.schema = crate::lock::SCHEMA - 1;
         let err = validate_install_lock(Path::new("/lock.json"), &lock).unwrap_err();
         assert!(format!("{err:#}").contains("requires schema"));
 
-        let mut lock = make_lock(vec![], vec!["https://pypi.org/simple/".into()], BTreeMap::new());
+        let mut lock = make_lock(
+            vec![],
+            vec!["https://pypi.org/simple/".into()],
+            BTreeMap::new(),
+        );
         lock.wheels = vec![LockWheel {
             name: "remote".into(),
             version: "1.0.0".into(),
@@ -1412,12 +1411,18 @@ mod tests {
     // (major, minor) pair; copyright noise on later lines is ignored.
     #[test]
     fn parses_glibc_version_banners() {
-        assert_eq!(crate::glibc::parse_glibc_version("glibc 2.34\n"), Some((2, 34)));
+        assert_eq!(
+            crate::glibc::parse_glibc_version("glibc 2.34\n"),
+            Some((2, 34))
+        );
         assert_eq!(
             crate::glibc::parse_glibc_version("ldd (GNU libc) 2.34\nCopyright (C) 2021 ...\n"),
             Some((2, 34))
         );
-        assert_eq!(crate::glibc::parse_glibc_version("glibc 2.34.9000"), Some((2, 34)));
+        assert_eq!(
+            crate::glibc::parse_glibc_version("glibc 2.34.9000"),
+            Some((2, 34))
+        );
         assert_eq!(crate::glibc::parse_glibc_version("no version here"), None);
     }
 
@@ -1463,11 +1468,19 @@ mod tests {
         let share = prefix.join("share").join("retread");
         std::fs::create_dir_all(&share).unwrap();
 
-        let lock = make_lock(vec![], vec!["https://pypi.org/simple/".into()], BTreeMap::new());
+        let lock = make_lock(
+            vec![],
+            vec!["https://pypi.org/simple/".into()],
+            BTreeMap::new(),
+        );
         let raw = serde_json::to_vec(&lock).unwrap();
         let lock_path = share.join(lock.marker_name().replace(".installed", ".lock.json"));
         std::fs::write(&lock_path, &raw).unwrap();
-        std::fs::write(share.join(lock.marker_name()), marker_with_audit(&lock_digest(&raw))).unwrap();
+        std::fs::write(
+            share.join(lock.marker_name()),
+            marker_with_audit(&lock_digest(&raw)),
+        )
+        .unwrap();
 
         let err = verify(&lock_path, &prefix, false).expect_err("marker alone must not verify");
         let msg = format!("{err:#}");
@@ -1485,7 +1498,8 @@ mod tests {
         )
         .unwrap();
 
-        let err = verify(&lock_path, &prefix, false).expect_err("metadata without RECORD must not verify");
+        let err = verify(&lock_path, &prefix, false)
+            .expect_err("metadata without RECORD must not verify");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("RECORD") && msg.contains("payload check failed"),
@@ -1515,12 +1529,20 @@ mod tests {
         let share = prefix.join("share").join("retread");
         std::fs::create_dir_all(&share).unwrap();
 
-        let mut lock = make_lock(vec![], vec!["https://pypi.org/simple/".into()], BTreeMap::new());
+        let mut lock = make_lock(
+            vec![],
+            vec!["https://pypi.org/simple/".into()],
+            BTreeMap::new(),
+        );
         lock.python = "3.12".into();
         let raw = serde_json::to_vec(&lock).unwrap();
         let lock_path = share.join(lock.marker_name().replace(".installed", ".lock.json"));
         std::fs::write(&lock_path, &raw).unwrap();
-        std::fs::write(share.join(lock.marker_name()), marker_with_audit(&lock_digest(&raw))).unwrap();
+        std::fs::write(
+            share.join(lock.marker_name()),
+            marker_with_audit(&lock_digest(&raw)),
+        )
+        .unwrap();
 
         let site_packages = site_packages_dir(&prefix, &lock.python);
         let dist_info = site_packages.join("mypackage-1.0.0.dist-info");
@@ -1572,7 +1594,11 @@ mod tests {
         let share = prefix.join("share").join("retread");
         std::fs::create_dir_all(&share).unwrap();
 
-        let lock = make_lock(vec![], vec!["https://pypi.org/simple/".into()], BTreeMap::new());
+        let lock = make_lock(
+            vec![],
+            vec!["https://pypi.org/simple/".into()],
+            BTreeMap::new(),
+        );
         let raw = serde_json::to_vec(&lock).unwrap();
         let lock_path = share.join("retread-test-bundle.lock.json");
         std::fs::write(&lock_path, &raw).unwrap();
@@ -1607,7 +1633,11 @@ mod tests {
         let share = prefix.join("share").join("retread");
         std::fs::create_dir_all(&share).unwrap();
 
-        let lock = make_lock(vec![], vec!["https://pypi.org/simple/".into()], BTreeMap::new());
+        let lock = make_lock(
+            vec![],
+            vec!["https://pypi.org/simple/".into()],
+            BTreeMap::new(),
+        );
         let raw = serde_json::to_vec(&lock).unwrap();
         let lock_path = share.join("retread-test-bundle.lock.json");
         std::fs::write(&lock_path, &raw).unwrap();
@@ -1632,7 +1662,10 @@ mod tests {
         let err = verify(&lock_path, &prefix, false)
             .expect_err("bare digest marker must trigger audit refresh");
         let msg = format!("{err:#}");
-        assert!(msg.contains("no glibc audit record"), "unexpected error: {msg}");
+        assert!(
+            msg.contains("no glibc audit record"),
+            "unexpected error: {msg}"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1643,11 +1676,19 @@ mod tests {
         let share = prefix.join("share").join("retread");
         std::fs::create_dir_all(&share).unwrap();
 
-        let lock = make_lock(vec![], vec!["https://pypi.org/simple/".into()], BTreeMap::new());
+        let lock = make_lock(
+            vec![],
+            vec!["https://pypi.org/simple/".into()],
+            BTreeMap::new(),
+        );
         let raw = serde_json::to_vec(&lock).unwrap();
         let lock_path = share.join("retread-test-bundle.lock.json");
         std::fs::write(&lock_path, &raw).unwrap();
-        std::fs::write(share.join(lock.marker_name()), marker_with_audit(&lock_digest(&raw))).unwrap();
+        std::fs::write(
+            share.join(lock.marker_name()),
+            marker_with_audit(&lock_digest(&raw)),
+        )
+        .unwrap();
 
         let site_packages = site_packages_dir(&prefix, &lock.python);
         let dist_info = site_packages.join("mypackage-1.0.0.dist-info");
@@ -1663,7 +1704,8 @@ mod tests {
         )
         .unwrap();
 
-        let err = verify(&lock_path, &prefix, false).expect_err("missing RECORD payload must not verify");
+        let err =
+            verify(&lock_path, &prefix, false).expect_err("missing RECORD payload must not verify");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("missing installed file") && msg.contains("mypackage/__init__.py"),

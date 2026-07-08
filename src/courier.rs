@@ -600,7 +600,8 @@ pub async fn stage(
                 })??;
             }
 
-            let stored_sha = ship_or_store(loose, &dst, &mut source_urls, &wheel_store_root).await?;
+            let stored_sha =
+                ship_or_store(loose, &dst, &mut source_urls, &wheel_store_root).await?;
             lock_wheels.push(LockWheel {
                 name: w.pypi_name.clone(),
                 version: w.version.clone(),
@@ -803,7 +804,8 @@ pub async fn stage(
                                     src.display()
                                 )
                             })?;
-                        let stored_sha = ship_or_store(loose, &dst, &mut source_urls, &wheel_store_root).await?;
+                        let stored_sha =
+                            ship_or_store(loose, &dst, &mut source_urls, &wheel_store_root).await?;
                         lock_wheels.push(LockWheel {
                             name: w.pypi_name.clone(),
                             version: w.version.clone(),
@@ -836,7 +838,8 @@ pub async fn stage(
                             dst.display()
                         )
                     })?;
-                    let stored_sha = ship_or_store(loose, &dst, &mut source_urls, &wheel_store_root).await?;
+                    let stored_sha =
+                        ship_or_store(loose, &dst, &mut source_urls, &wheel_store_root).await?;
                     // Prefer upstream_url (pristine pre-localization index URL,
                     // set for local-path shadows when EmitWheel was built from
                     // the cold produce path) over remote_url (set only for
@@ -885,7 +888,8 @@ pub async fn stage(
                     .with_context(|| {
                         format!("spawn_blocking shadow-rewrite of {}", w.pypi_name)
                     })??;
-                    let stored_sha = ship_or_store(loose, &dst, &mut source_urls, &wheel_store_root).await?;
+                    let stored_sha =
+                        ship_or_store(loose, &dst, &mut source_urls, &wheel_store_root).await?;
                     // Prefer upstream_url over remote_url (same rationale as
                     // the Rewritten arm above).
                     let upstream_url = w
@@ -1082,8 +1086,8 @@ pub async fn stage(
         .iter()
         .map(|(path, policy)| (path.clone(), policy.as_lock_value().to_string()))
         .collect();
-    let declared_glibc = crate::glibc::resolve_workspace_declared_glibc()
-        .map(crate::glibc::format_glibc);
+    let declared_glibc =
+        crate::glibc::resolve_workspace_declared_glibc().map(crate::glibc::format_glibc);
     let mut lock = RetreadLock {
         schema: SCHEMA,
         retread_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -2824,10 +2828,7 @@ version = "1.0.0"
         assert_eq!(sha, None, "fat mode must not record a store sha");
         assert_eq!(source_urls.len(), 1, "fat mode ships via source_urls");
         assert!(source_urls[0].ends_with("pkg-1.0.0-py3-none-any.whl"));
-        assert!(
-            !store.exists(),
-            "fat mode must not touch the wheel store"
-        );
+        assert!(!store.exists(), "fat mode must not touch the wheel store");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -2893,7 +2894,10 @@ version = "1.0.0"
         std::fs::write(&built_whl, &bytes).unwrap();
 
         let built = make_emit_wheel(bundle, "1.0.0", &[], Some(&built_whl), None);
-        assert!(built.must_ship(), "test setup: .injected infix => must_ship");
+        assert!(
+            built.must_ship(),
+            "test setup: .injected infix => must_ship"
+        );
 
         let emit_wheels = vec![built];
         let conda_capable: HashSet<String> = HashSet::new();
@@ -2933,10 +2937,7 @@ version = "1.0.0"
             stored.display()
         );
         assert!(
-            !result
-                .source_urls
-                .iter()
-                .any(|u| u.ends_with(&lw.filename)),
+            !result.source_urls.iter().any(|u| u.ends_with(&lw.filename)),
             "loose mode must not ship the built wheel in the .conda sources"
         );
         // Stub payload still ships: lock json, meta-wheel, installer.

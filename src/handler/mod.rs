@@ -220,9 +220,7 @@ fn workspace_manifest_mtime(
 /// ever sends `conda/outputs` to this backend. Repair only that invariant:
 /// the symlink stays unchanged, and only its missing target directory is
 /// created.
-fn ensure_pixi_bld_symlink_target(
-    workspace_dir: Option<&std::path::Path>,
-) -> Result<(), RpcError> {
+fn ensure_pixi_bld_symlink_target(workspace_dir: Option<&std::path::Path>) -> Result<(), RpcError> {
     if crate::fasttmp::in_slurm_job() {
         tracing::info!(
             "retread fast-tmp: SLURM job context; not repairing shared workspace .pixi/bld symlink"
@@ -1553,18 +1551,15 @@ impl Handler {
                                 .unwrap_or(4)
                                 / 2,
                         );
-                        let solve_sem = std::sync::Arc::new(
-                            tokio::sync::Semaphore::new(max_solve_concurrency),
-                        );
+                        let solve_sem =
+                            std::sync::Arc::new(tokio::sync::Semaphore::new(max_solve_concurrency));
                         let level_results: Vec<Result<EnvSolveResult, RpcError>> =
                             futures::future::join_all(env_names.iter().map(|e| {
                                 let sem = solve_sem.clone();
                                 let fut = solve_env(e, &level_seed);
                                 async move {
-                                    let _permit = sem
-                                        .acquire()
-                                        .await
-                                        .expect("solve semaphore never closed");
+                                    let _permit =
+                                        sem.acquire().await.expect("solve semaphore never closed");
                                     fut.await
                                 }
                             }))
@@ -2129,10 +2124,7 @@ impl Handler {
             let output_check = crate::fasttmp::fs_check_path(&output_dir);
             crate::fasttmp::is_slow(&output_check, &fast_cfg).then(|| {
                 let output_token = params.output.name.as_normalized().to_string();
-                crate::fasttmp::stage_dir(
-                    &fast.ns,
-                    &output_token,
-                )
+                crate::fasttmp::stage_dir(&fast.ns, &output_token)
             })
         });
         if let Some(stage) = &stage_output_dir {
@@ -2419,10 +2411,7 @@ impl Handler {
         finalize_fasttmp_build_output(result, stage_output_dir.as_deref(), &output_dir).await
     }
 
-    async fn snapshot(
-        &self,
-        work_dir: &Path,
-    ) -> Result<Snapshot, RpcError> {
+    async fn snapshot(&self, work_dir: &Path) -> Result<Snapshot, RpcError> {
         let (config, state_cache_dir, source_dir, workspace_dir) = {
             let state = self.state.read().await;
             let config = state
@@ -2792,11 +2781,11 @@ async fn resolve_all(
                         effective.relax,
                         &effective.git_sources,
                         auto_data,
-                        &pypi_to_conda,
+                        pypi_to_conda,
                         &effective.name_map,
                         conda_channels,
                         &effective.conda_deps,
-                        &workspace_pypi_indexes,
+                        workspace_pypi_indexes,
                         uv_pins, // uv resolver: pin to uv's closure; legacy: None (cold path)
                         Some(favored).filter(|m| !m.is_empty()), // favor-lock prefs (empty map → None)
                         &sibling_names,
@@ -7470,7 +7459,15 @@ mod replay_tests {
         let dir = unique_tmp_dir();
         let lock_path = dir.join("retread-missing.lock.json");
 
-        let result = replay_from_lock(&lock_path, "any-hash", true, Platform::Linux64, 0, false, &[]);
+        let result = replay_from_lock(
+            &lock_path,
+            "any-hash",
+            true,
+            Platform::Linux64,
+            0,
+            false,
+            &[],
+        );
         assert!(result.is_ok(), "missing file must not error: {result:?}");
         assert!(
             result.unwrap().is_none(),
@@ -7485,7 +7482,15 @@ mod replay_tests {
         let lock_path = dir.join(RetreadLock::file_name("badpack"));
         std::fs::write(&lock_path, b"not valid json{{{{").unwrap();
 
-        let result = replay_from_lock(&lock_path, "any-hash", true, Platform::Linux64, 0, false, &[]);
+        let result = replay_from_lock(
+            &lock_path,
+            "any-hash",
+            true,
+            Platform::Linux64,
+            0,
+            false,
+            &[],
+        );
         assert!(
             result.is_err(),
             "malformed JSON must return Err (caller falls through): {result:?}"
@@ -7527,7 +7532,15 @@ mod replay_tests {
             ("pack-a".to_string(), "2.0.0".to_string()),
             ("pack-b".to_string(), "2.0.0".to_string()),
         ];
-        let result = replay_from_lock(&lock_path, "hash42", true, Platform::Linux64, 0, false, &siblings);
+        let result = replay_from_lock(
+            &lock_path,
+            "hash42",
+            true,
+            Platform::Linux64,
+            0,
+            false,
+            &siblings,
+        );
         let out = result.unwrap().unwrap();
         let dep_names: Vec<&str> = out
             .run_dependencies
