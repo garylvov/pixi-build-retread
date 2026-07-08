@@ -271,8 +271,10 @@ pub struct RetreadConfig {
     ///   uv's picks. Requires `uv` on PATH (override with `$RETREAD_UV`).
     ///   Only closure computation changes; packaging/courier/lock-write
     ///   downstream are unchanged.
-    /// - `"legacy"`: the in-backend cascade/resolvo mirror-solver (fallback
-    ///   via `retread-resolver = "legacy"`).
+    /// - `"legacy"`: REMOVED in v4.2.0 (the in-backend cascade/resolvo
+    ///   mirror-solver was deleted). The variant is kept so the value
+    ///   still parses; `initialize` hard-errors on it with a pointer to
+    ///   `retread-resolver = "uv"` / pinning the backend `<4.2`.
     #[serde(default, rename = "retread-resolver", alias = "resolver")]
     pub resolver: ResolverKind,
 }
@@ -281,8 +283,8 @@ pub struct RetreadConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ResolverKind {
-    /// The historical cascade/resolvo mirror-solver
-    /// (opt-in fallback via `retread-resolver = "legacy"`).
+    /// The historical cascade/resolvo mirror-solver. Deleted in v4.2.0;
+    /// selecting it is a hard error at initialize time.
     Legacy,
     /// uv-subprocess closure computation (spec-uv-restructure.md; default).
     #[default]

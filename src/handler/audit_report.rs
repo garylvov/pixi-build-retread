@@ -70,7 +70,6 @@ pub(crate) fn build_bundle_audit(
     )
 }
 
-
 /// Render a PackageSpec to its conda match-spec string form (just the
 /// version-constraint half, name not included).
 #[cfg(test)]

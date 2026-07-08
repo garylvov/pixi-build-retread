@@ -660,7 +660,9 @@ mod tests {
         // ABI-compare class (invariant #8): anchor checks happen on
         // RAW conda-side names (depends arrays, emissions) that never
         // pass through the pypi-name normalizer -- pinned here first.
-        use crate::conflict_classifier::is_abi_anchor;
+        // (v4.2.0: the in-backend classifier is gone; `retread solve`
+        // owns the anchor list -- see src/solve/repair.rs.)
+        use crate::solve::is_abi_anchor;
         let anchors = [
             "python",
             "python_abi",

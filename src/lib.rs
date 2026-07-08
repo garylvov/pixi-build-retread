@@ -5,6 +5,7 @@
 
 pub mod audit;
 pub mod compat;
+pub mod conda_solve;
 pub mod config;
 pub mod courier;
 pub mod emit_pypi;
@@ -19,7 +20,6 @@ pub mod recipe;
 pub mod relax;
 pub mod repodata;
 pub mod rpc;
-pub mod conda_solve;
 pub mod solve;
 pub mod source_build;
 pub mod status;

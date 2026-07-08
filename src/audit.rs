@@ -217,8 +217,10 @@ pub struct BundleAudit {
 }
 
 /// One actionable suggestion attached to the user's terminal output
-/// + audit MD file. (Migrated from the deleted conflict_classifier.rs
-/// in v4.2.0 -- kept so historical audit JSON stays parseable/stable.)
+/// + audit MD file.
+///
+/// Migrated from the deleted conflict_classifier.rs in v4.2.0 -- kept
+/// so historical audit JSON stays parseable/stable.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct WorkspaceEditSuggestion {
     /// Pixi env this suggestion applies to.

@@ -364,15 +364,12 @@ mod tests {
         }
     }
 
-
-
     fn vp_lookup<'a>(
         vps: &'a [GenericVirtualPackage],
         name: &str,
     ) -> Option<&'a GenericVirtualPackage> {
         vps.iter().find(|vp| vp.name.as_normalized() == name)
     }
-
 
     #[test]
     fn build_virtual_packages_injects_cpython_from_target_python() {
@@ -460,7 +457,6 @@ mod tests {
             "unknown system-requirement keys must not add virtual packages"
         );
     }
-
 
     #[test]
     fn solve_selected_records_can_pick_lowest_direct_torch_line() {

@@ -12,7 +12,6 @@ use auto_bundle::{
 mod resolve_state;
 use resolve_state::{ObserveEdgeResult, ResolveState};
 
-
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -727,6 +726,17 @@ impl Handler {
                 .map_err(|e| RpcError::invalid_params(e.to_string()))?;
         }
 
+        // v4.2.0: the legacy cascade/resolvo mirror-solver was deleted.
+        // Fail loudly at initialize time -- silently running the uv
+        // resolver against a pack that explicitly pinned the legacy
+        // engine would change its outputs without warning.
+        if config.resolver == crate::config::ResolverKind::Legacy {
+            return Err(RpcError::invalid_params(
+                "legacy resolver removed in v4.2; use retread-resolver = \"uv\" \
+                 or pin backend <4.2",
+            ));
+        }
+
         // L2 (cleanup P4.6): conda-aware is not yet implemented -- warn
         // once at initialize time so the user knows what they're getting.
         // The variant is kept so existing manifests that set
@@ -1013,8 +1023,7 @@ impl Handler {
                     })
                     .collect();
                 for base_bundle in &materialized {
-                    let (bundle, effective) =
-                        apply_emission(base_bundle, &base_config, emission);
+                    let (bundle, effective) = apply_emission(base_bundle, &base_config, emission);
                     // WS-B: cold-solve replay. When courier mode is active and
                     // a committed lock exists whose inputs_hash matches the
                     // current resolution inputs (resolved wheel set + index

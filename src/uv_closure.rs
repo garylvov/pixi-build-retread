@@ -1006,6 +1006,64 @@ isaaclab = { path = "wheels/isaaclab/isaaclab-2.0.0-py3-none-any.whl" }
         assert!(json.contains("\"conda_version\": \"==2.10.0\""));
     }
 
+    /// v4.2.0 (post mirror-solver deletion): the "prefer conda deps"
+    /// guarantee, end to end at the unit level. A conda-pinned package
+    /// (torch, name-mapped to conda's pytorch-gpu) must (a) participate
+    /// in uv resolution as a constraint carrying conda provenance, and
+    /// (b) be EXCLUDED from the emitted wheel closure so the conda
+    /// package -- not a PyPI wheel -- provides it at install time.
+    #[test]
+    fn conda_pinned_torch_constrains_uv_and_is_excluded_from_closure() {
+        // (a) conda pin -> uv constraint with provenance.
+        let mut conda_deps = BTreeMap::new();
+        conda_deps.insert("pytorch-gpu".into(), "==2.10.0".into());
+        let mut name_map = BTreeMap::new();
+        name_map.insert("torch".into(), "pytorch-gpu".into());
+        let set = build_constraints(&conda_deps, &name_map, "manifest", "default");
+        assert_eq!(set.constraints, vec!["torch==2.10.0".to_string()]);
+        assert_eq!(set.provenance["torch"].conda_name, "pytorch-gpu");
+
+        // (b) conda-routed name -> post-parse filter drops it from the
+        // closure (wheels AND pins), the authoritative routing step.
+        let pylock = r#"
+lock-version = "1.0"
+created-by = "uv"
+
+[[packages]]
+name = "torch"
+version = "2.10.0"
+
+[[packages.wheels]]
+name = "torch-2.10.0-cp312-cp312-manylinux_2_28_x86_64.whl"
+url = "https://files.pythonhosted.org/torch-2.10.0-cp312-cp312-manylinux_2_28_x86_64.whl"
+
+[packages.wheels.hashes]
+sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
+
+[[packages]]
+name = "typing-extensions"
+version = "4.12.0"
+
+[[packages.wheels]]
+name = "typing_extensions-4.12.0-py3-none-any.whl"
+url = "https://files.pythonhosted.org/typing_extensions-4.12.0-py3-none-any.whl"
+
+[packages.wheels.hashes]
+sha256 = "3333333333333333333333333333333333333333333333333333333333333333"
+"#;
+        let mut exclude = BTreeSet::new();
+        exclude.insert(canonical_conda_name("torch"));
+        let closure =
+            parse_pylock_closure(pylock, &target("3.12", "linux-64"), &exclude, "0.11.15").unwrap();
+        let names: Vec<&str> = closure.wheels.iter().map(|w| w.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["typing-extensions"],
+            "conda-routed torch must not ship as a PyPI wheel"
+        );
+        assert!(!closure.pins.contains_key("torch"));
+    }
+
     // ---- pylock parsing ---------------------------------------------------
 
     const PYLOCK_FIXTURE: &str = r#"
