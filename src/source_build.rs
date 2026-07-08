@@ -221,6 +221,114 @@ pub async fn build_wheel_from_sdist_url(
     Ok(wheel_path)
 }
 
+/// Shared cross-pack cache directory for a built git wheel, keyed by
+/// (repo url, resolved commit sha, subdirectory, python version).
+///
+/// Layout: `<retread cache root>/built-wheels/git/<slug>/<key12>/<raw>.whl`
+/// (same slug/short-hash hierarchy rationale as [`git_checkout_root`]).
+/// Every pack that pins the same (url, rev, subdir) reuses ONE build --
+/// previously each pack rebuilt identical wheels into its own
+/// `pypi-packs/<pack>/wheels/<entry>/` dir (isaac-pack and
+/// isaac-pack-latest both building IsaacLab's 15-member group at the same
+/// rev was the motivating case; ~30-60 s of `uv build` per member).
+pub fn git_wheel_cache_dir(
+    url: &str,
+    sha: &str,
+    subdirectory: &str,
+    python_version: &str,
+) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"retread-git-wheel-v1\n");
+    hasher.update(url.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(sha.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(subdirectory.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(python_version.as_bytes());
+    let digest = hasher.finalize();
+    let key12: String = digest.iter().take(6).map(|b| format!("{b:02x}")).collect();
+    let mut slug = git_slug(url);
+    slug.truncate(24);
+    crate::courier::retread_cache_root()
+        .join("built-wheels")
+        .join("git")
+        .join(slug)
+        .join(key12)
+}
+
+/// Look up the shared git-wheel cache; on a hit, materialize the raw wheel
+/// into `out_dir` (hardlink, copy on EXDEV) so the downstream
+/// inject/autodata/relax pipeline finds it exactly where a fresh build
+/// would have put it. Returns the out_dir wheel path, or `None` on miss.
+async fn git_wheel_cache_lookup(
+    cache_wheel_dir: &Path,
+    out_dir: &Path,
+) -> Result<Option<PathBuf>> {
+    let Some(cached) = newest_wheel_in(cache_wheel_dir).await? else {
+        return Ok(None);
+    };
+    tokio::fs::create_dir_all(out_dir)
+        .await
+        .with_context(|| format!("creating wheel output dir {}", out_dir.display()))?;
+    let dst = out_dir.join(cached.file_name().expect("wheel path has a filename"));
+    if !dst.exists() {
+        crate::wheel::hardlink_or_copy_async(&cached, &dst)
+            .await
+            .with_context(|| {
+                format!(
+                    "materializing shared-cache git wheel {} -> {}",
+                    cached.display(),
+                    dst.display()
+                )
+            })?;
+    }
+    tracing::info!(
+        cache = %cached.display(),
+        wheel = %dst.display(),
+        "reusing shared-cache git wheel (cross-pack; delete the cache dir to force rebuild)",
+    );
+    Ok(Some(dst))
+}
+
+/// Best-effort population of the shared git-wheel cache after a successful
+/// build. Failure only warns: the pack-local out_dir copy is authoritative,
+/// the shared cache is purely a cross-pack build-speed optimization.
+async fn git_wheel_cache_store(wheel: &Path, cache_wheel_dir: &Path) {
+    let store = async {
+        tokio::fs::create_dir_all(cache_wheel_dir).await?;
+        let filename = wheel
+            .file_name()
+            .ok_or_else(|| anyhow!("wheel path has no filename: {}", wheel.display()))?;
+        let dst = cache_wheel_dir.join(filename);
+        if dst.exists() {
+            return Ok::<_, anyhow::Error>(());
+        }
+        let tmp = cache_wheel_dir.join(format!(
+            "{}.{}.tmp",
+            filename.to_string_lossy(),
+            std::process::id()
+        ));
+        crate::wheel::hardlink_or_copy_async(wheel, &tmp).await?;
+        if let Err(e) = tokio::fs::rename(&tmp, &dst).await {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            if !dst.exists() {
+                return Err(e.into());
+            }
+        }
+        Ok(())
+    };
+    if let Err(e) = store.await {
+        tracing::warn!(
+            wheel = %wheel.display(),
+            cache = %cache_wheel_dir.display(),
+            error = %format!("{e:#}"),
+            "could not populate shared git-wheel cache (non-fatal)",
+        );
+    }
+}
+
 /// Compute the on-disk source-tree directory that
 /// [`build_wheel_from_git`] will (or did) build from, without doing
 /// any clone work. Lets callers feed the same directory into
@@ -351,6 +459,13 @@ pub async fn build_wheel_from_git(
     out_dir: &Path,
     python_version: &str,
 ) -> Result<(PathBuf, String)> {
+    // NOTE on the shared cross-pack wheel cache: the lookup deliberately
+    // happens AFTER clone+checkout (below), not here. Callers derive
+    // `source_root` from the checkout for the auto-data inject phase, so the
+    // clone must exist even on a cache hit. The clone is machine-shared per
+    // (url, rev) and a no-op when warm; the cache only needs to skip the
+    // expensive per-pack `uv build`.
+
     // Delegate to git_checkout_root so the layout stays in sync. (Was
     // duplicated here before v0.13.3 -- update both or the resolver
     // half stops finding the cached clone the cloner half just made.)
@@ -471,6 +586,14 @@ pub async fn build_wheel_from_git(
     .await?;
     let resolved_sha = resolved_sha.trim().to_string();
 
+    // Cross-pack shared-cache lookup, now that a moving rev (branch/tag)
+    // has been resolved to an exact sha. A hit skips the `uv build` (the
+    // expensive part; the clone above was needed anyway to resolve the sha).
+    let shared = git_wheel_cache_dir(url, &resolved_sha, subdirectory, python_version);
+    if let Some(wheel) = git_wheel_cache_lookup(&shared, out_dir).await? {
+        return Ok((wheel, resolved_sha));
+    }
+
     // DETERMINISM GUARD: detect non-reproducible setuptools_scm versions.
     // A wheel whose version contains .devN, .dYYYYMMDD, or +g<sha> segments
     // was built without a reachable tag at the pinned SHA. Its filename (and
@@ -497,6 +620,9 @@ pub async fn build_wheel_from_git(
              SETUPTOOLS_SCM_PRETEND_VERSION=<version> in the build env.",
         );
     }
+
+    // Populate the shared cross-pack cache (best-effort).
+    git_wheel_cache_store(&wheel_path, &shared).await;
 
     Ok((wheel_path, resolved_sha))
 }
@@ -1156,6 +1282,72 @@ version = "0.1.0"
         assert!(
             !clone_dir.join(".git").join("index.lock").exists(),
             "the fresh clone must not carry over the stale lock file"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+    #[test]
+    fn git_wheel_cache_dir_is_keyed_by_all_inputs() {
+        let a = git_wheel_cache_dir("https://github.com/x/y.git", "a".repeat(40).as_str(), "sub", "3.11");
+        // Same inputs => same dir (deterministic).
+        let a2 = git_wheel_cache_dir("https://github.com/x/y.git", "a".repeat(40).as_str(), "sub", "3.11");
+        assert_eq!(a, a2);
+        // Any input change => different dir.
+        let b = git_wheel_cache_dir("https://github.com/x/y.git", "b".repeat(40).as_str(), "sub", "3.11");
+        let c = git_wheel_cache_dir("https://github.com/x/y.git", "a".repeat(40).as_str(), "other", "3.11");
+        let d = git_wheel_cache_dir("https://github.com/x/y.git", "a".repeat(40).as_str(), "sub", "3.12");
+        let e = git_wheel_cache_dir("https://github.com/x/z.git", "a".repeat(40).as_str(), "sub", "3.11");
+        for other in [&b, &c, &d, &e] {
+            assert_ne!(&a, other);
+        }
+    }
+
+    #[tokio::test]
+    async fn git_wheel_cache_store_then_lookup_round_trips() {
+        let base = std::env::temp_dir().join(format!(
+            "retread-gitwheel-cache-{}",
+            std::process::id()
+        ));
+        let cache_dir = base.join("shared");
+        let out_dir = base.join("out");
+        let built_dir = base.join("built");
+        std::fs::create_dir_all(&built_dir).unwrap();
+
+        // Empty cache: miss.
+        let miss = git_wheel_cache_lookup(&cache_dir, &out_dir).await.unwrap();
+        assert!(miss.is_none(), "empty cache must miss");
+
+        // Store a freshly-"built" wheel, then look it up into out_dir.
+        let wheel = built_dir.join("pkg-1.0.0-py3-none-any.whl");
+        std::fs::write(&wheel, b"wheel bytes").unwrap();
+        git_wheel_cache_store(&wheel, &cache_dir).await;
+        assert!(
+            cache_dir.join("pkg-1.0.0-py3-none-any.whl").is_file(),
+            "store must persist the raw wheel into the shared cache dir"
+        );
+
+        let hit = git_wheel_cache_lookup(&cache_dir, &out_dir)
+            .await
+            .unwrap()
+            .expect("populated cache must hit");
+        assert_eq!(hit, out_dir.join("pkg-1.0.0-py3-none-any.whl"));
+        assert_eq!(std::fs::read(&hit).unwrap(), b"wheel bytes");
+
+        // Post-processed variants must never be served from the cache
+        // (they are pack/config-specific and regenerate downstream).
+        std::fs::write(
+            cache_dir.join("pkg-1.0.0-py3-none-any.injected.whl"),
+            b"processed",
+        )
+        .unwrap();
+        let hit2 = git_wheel_cache_lookup(&cache_dir, &out_dir)
+            .await
+            .unwrap()
+            .expect("raw wheel still present");
+        assert!(
+            !hit2.to_string_lossy().contains(".injected."),
+            "cache lookup must skip retread-processed variants: {}",
+            hit2.display()
         );
 
         let _ = std::fs::remove_dir_all(&base);

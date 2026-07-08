@@ -199,6 +199,32 @@ pub struct RetreadConfig {
     )]
     pub courier: bool,
 
+    /// v3.2.0: where the courier bundle's shipped wheel BYTES live.
+    ///
+    /// - `"loose"` (the DEFAULT): the produced .conda is a KB-sized stub
+    ///   (lock + meta-wheel + installer binary + post-link script). The
+    ///   bundle's built/shadow wheels are persisted at build time to the
+    ///   shared content-addressed wheel store
+    ///   (`<retread cache root>/wheels/<sha256>/<filename>`, see
+    ///   [`crate::courier::retread_cache_root`]) and the lock records their
+    ///   sha256; `retread install` materializes them from the store
+    ///   (hash-verified) instead of from the package payload. Wheel bytes
+    ///   are never tarred into the conda artifact, dedupe across
+    ///   packs/rebuilds, and packaging drops from minutes to seconds.
+    ///   OFFLINE STORY: loose + warm store = fully offline install; loose +
+    ///   cold store needs network to the locked index URLs, and a
+    ///   store-evicted BUILT wheel requires a pack rebuild to re-populate.
+    /// - `"fat"`: legacy self-contained artifact -- built/shadow wheels ship
+    ///   inside the .conda. Use when publishing to a real channel whose
+    ///   consumers do not share a wheel store with the build machine.
+    ///
+    /// ```toml
+    /// [package.build.config]
+    /// retread-bundle-mode = "fat"   # opt out of the loose default
+    /// ```
+    #[serde(default, rename = "retread-bundle-mode", alias = "bundle-mode")]
+    pub bundle_mode: BundleMode,
+
     /// DEPRECATED (v2.0.0), parsed and ignored. Use `retread-courier`
     /// instead. This field is retained so `deny_unknown_fields` does not
     /// reject old manifests that still carry it -- it parses but has no
@@ -261,6 +287,20 @@ pub enum ResolverKind {
     /// uv-subprocess closure computation (spec-uv-restructure.md; default).
     #[default]
     Uv,
+}
+
+/// Where the courier bundle's shipped wheel bytes live
+/// (`retread-bundle-mode`): the shared content-addressed wheel store
+/// (`loose`, default) or inside the .conda artifact (`fat`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BundleMode {
+    /// Stub .conda; wheel bytes live in the shared wheel store (default).
+    #[default]
+    Loose,
+    /// Self-contained .conda carrying the wheel payload (legacy; for
+    /// channel publishing).
+    Fat,
 }
 
 /// `retread-blueprint` accepts `false` (off), `true` (blueprint +

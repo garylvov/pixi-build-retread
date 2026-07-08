@@ -323,6 +323,84 @@ pub async fn fetch_wheel_cached(
     Ok(downloaded)
 }
 
+/// Persist a finished wheel file into the shared content-addressed wheel
+/// store at `<cache_root>/wheels/<sha256>/<filename>` and return the hex
+/// sha256 of its bytes.
+///
+/// Loose bundle mode (`retread-bundle-mode = "loose"`) calls this at BUILD
+/// time for every wheel that fat mode would have shipped inside the .conda;
+/// `retread install` later materializes the wheel from this exact path
+/// (hash-verified). Unlike the best-effort store population in
+/// [`fetch_wheel_cached`], failure here is a HARD error: a loose lock
+/// records the sha and the install replay depends on the store holding the
+/// bytes.
+///
+/// Concurrency-safe: writes go to a process+sequence-unique `.tmp` and are
+/// promoted with an atomic rename, same protocol as `fetch_wheel_cached`.
+/// An existing store entry is trusted as-is (content-addressed: same sha =>
+/// same bytes) and the write is skipped.
+pub(crate) async fn store_wheel_in_cache(src: &Path, cache_root: &Path) -> Result<String> {
+    let filename = src
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| {
+            anyhow!(
+                "wheel store: source path has no utf-8 filename: {}",
+                src.display()
+            )
+        })?
+        .to_string();
+    let sha256 = sha256_file(src).await?;
+
+    let store_dir = cache_root.join("wheels").join(&sha256);
+    let store_final = store_dir.join(&filename);
+    if store_final.is_file() {
+        tracing::debug!(
+            wheel = %filename,
+            sha256 = %&sha256[..8],
+            "wheel store: already populated",
+        );
+        return Ok(sha256);
+    }
+    fs::create_dir_all(&store_dir)
+        .await
+        .with_context(|| format!("wheel store: creating {}", store_dir.display()))?;
+
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let store_tmp = store_dir.join(format!(
+        "{filename}.{}.{}.tmp",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    hardlink_or_copy_async(src, &store_tmp)
+        .await
+        .with_context(|| {
+            format!(
+                "wheel store: staging {} -> {}",
+                src.display(),
+                store_tmp.display()
+            )
+        })?;
+    if let Err(e) = fs::rename(&store_tmp, &store_final).await {
+        let _ = fs::remove_file(&store_tmp).await;
+        // A concurrent writer may have promoted the same content first;
+        // that is a success for our purposes (content-addressed store).
+        if !store_final.is_file() {
+            return Err(anyhow::Error::new(e).context(format!(
+                "wheel store: promoting {} -> {}",
+                store_tmp.display(),
+                store_final.display()
+            )));
+        }
+    }
+    tracing::info!(
+        wheel = %filename,
+        sha256 = %&sha256[..8],
+        "wheel store: persisted (loose bundle)",
+    );
+    Ok(sha256)
+}
+
 /// Returns `true` if the wheel filename's PEP 425 platform tag is `any`
 /// (i.e. the wheel is pure-Python and runs on every platform).
 ///

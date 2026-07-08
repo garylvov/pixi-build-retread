@@ -431,9 +431,23 @@ pub(crate) fn merge_index_chain(
 /// This function MUST be the single source of truth for courier build string
 /// format -- `produce_output` and `replay_from_lock` both call it so the
 /// strings are guaranteed byte-identical.
-fn courier_build_string(py_short: &str, inputs_hash: &str, build_number: u64) -> String {
+fn courier_build_string(
+    py_short: &str,
+    inputs_hash: &str,
+    build_number: u64,
+    loose: bool,
+) -> String {
     let prefix = &inputs_hash[..inputs_hash.len().min(10)];
-    format!("py{py_short}_h{prefix}_{build_number}")
+    // Loose bundle mode carries a `_loose` discriminant: the bundle mode
+    // never feeds inputs_hash (flipping fat<->loose must NOT force a cold
+    // re-solve), but the artifact CONTENT differs (stub vs full payload).
+    // Without the discriminant pixi would cache-hit the previously-built
+    // artifact of the other mode.
+    if loose {
+        format!("py{py_short}_h{prefix}_loose_{build_number}")
+    } else {
+        format!("py{py_short}_h{prefix}_{build_number}")
+    }
 }
 
 /// Compute the courier inputs hash that uniquely identifies a courier build's
@@ -1166,6 +1180,7 @@ impl Handler {
                             relax_is_default,
                             params.host_platform,
                             config.build_number,
+                            config.bundle_mode == crate::config::BundleMode::Loose,
                             &siblings,
                         ) {
                             Ok(Some(replayed)) => {
@@ -4872,6 +4887,7 @@ fn assemble_conda_output(
     host_platform: Platform,
     build_number: u64,
     build_hash: Option<&str>,
+    loose: bool,
     siblings: &[(String, String)],
 ) -> Result<CondaOutput> {
     // Always emit the glob form (`python {ver}.*`). Without the `.*`,
@@ -4934,7 +4950,7 @@ fn assemble_conda_output(
     // invalidated whenever the inputs change (wheel set, indexes, config...).
     // Non-courier: keep the legacy `py{XY}_{build_number}` string unchanged.
     let build = match build_hash {
-        Some(hash) => courier_build_string(&py_short, hash, build_number),
+        Some(hash) => courier_build_string(&py_short, hash, build_number, loose),
         None => format!("py{py_short}_{build_number}"),
     };
 
@@ -5159,6 +5175,7 @@ fn produce_output(
         host_platform,
         config.build_number,
         courier_build_hash,
+        config.bundle_mode == crate::config::BundleMode::Loose,
         siblings,
     )
 }
@@ -7242,6 +7259,7 @@ fn replay_from_lock(
     relax_is_default: bool,
     host_platform: Platform,
     build_number: u64,
+    loose: bool,
     siblings: &[(String, String)],
 ) -> anyhow::Result<Option<CondaOutput>> {
     let Some(lock) = load_replayable_lock(lock_path, current_inputs_hash, relax_is_default)? else {
@@ -7287,6 +7305,7 @@ fn replay_from_lock(
         host_platform,
         build_number,
         Some(current_inputs_hash),
+        loose,
         siblings,
     )?;
     Ok(Some(output))
@@ -7391,7 +7410,7 @@ mod replay_tests {
         let lock_path = dir.join(RetreadLock::file_name("mypack"));
         std::fs::write(&lock_path, &json).unwrap();
 
-        let result = replay_from_lock(&lock_path, "abc123", true, Platform::Linux64, 0, &[]);
+        let result = replay_from_lock(&lock_path, "abc123", true, Platform::Linux64, 0, false, &[]);
         assert!(result.is_ok(), "should not error: {result:?}");
         let output = result.unwrap();
         assert!(output.is_some(), "matching hash must return Some");
@@ -7435,6 +7454,7 @@ mod replay_tests {
             true,
             Platform::Linux64,
             0,
+            false,
             &[],
         );
         assert!(result.is_ok(), "mismatch must not error: {result:?}");
@@ -7450,7 +7470,7 @@ mod replay_tests {
         let dir = unique_tmp_dir();
         let lock_path = dir.join("retread-missing.lock.json");
 
-        let result = replay_from_lock(&lock_path, "any-hash", true, Platform::Linux64, 0, &[]);
+        let result = replay_from_lock(&lock_path, "any-hash", true, Platform::Linux64, 0, false, &[]);
         assert!(result.is_ok(), "missing file must not error: {result:?}");
         assert!(
             result.unwrap().is_none(),
@@ -7465,7 +7485,7 @@ mod replay_tests {
         let lock_path = dir.join(RetreadLock::file_name("badpack"));
         std::fs::write(&lock_path, b"not valid json{{{{").unwrap();
 
-        let result = replay_from_lock(&lock_path, "any-hash", true, Platform::Linux64, 0, &[]);
+        let result = replay_from_lock(&lock_path, "any-hash", true, Platform::Linux64, 0, false, &[]);
         assert!(
             result.is_err(),
             "malformed JSON must return Err (caller falls through): {result:?}"
@@ -7483,7 +7503,7 @@ mod replay_tests {
         let lock_path = dir.join(RetreadLock::file_name("mypack"));
         std::fs::write(&lock_path, &json).unwrap();
 
-        let result = replay_from_lock(&lock_path, "hash1", true, Platform::Linux64, 0, &[]);
+        let result = replay_from_lock(&lock_path, "hash1", true, Platform::Linux64, 0, false, &[]);
         let out = result.unwrap().unwrap();
         assert_eq!(
             out.metadata.subdir,
@@ -7507,7 +7527,7 @@ mod replay_tests {
             ("pack-a".to_string(), "2.0.0".to_string()),
             ("pack-b".to_string(), "2.0.0".to_string()),
         ];
-        let result = replay_from_lock(&lock_path, "hash42", true, Platform::Linux64, 0, &siblings);
+        let result = replay_from_lock(&lock_path, "hash42", true, Platform::Linux64, 0, false, &siblings);
         let out = result.unwrap().unwrap();
         let dep_names: Vec<&str> = out
             .run_dependencies
@@ -7543,7 +7563,7 @@ mod replay_tests {
         let lock_path = dir.join(RetreadLock::file_name("mypack"));
         std::fs::write(&lock_path, &json).unwrap();
 
-        let result = replay_from_lock(&lock_path, "hash9", true, Platform::Linux64, 0, &[]);
+        let result = replay_from_lock(&lock_path, "hash9", true, Platform::Linux64, 0, false, &[]);
         let out = result.unwrap().unwrap();
         let dep_names: Vec<&str> = out
             .run_dependencies
@@ -7583,7 +7603,7 @@ mod replay_tests {
         let lock_path = dir.join(RetreadLock::file_name("mypack"));
         std::fs::write(&lock_path, &json).unwrap();
 
-        let result = replay_from_lock(&lock_path, hash, true, Platform::Linux64, 0, &[]);
+        let result = replay_from_lock(&lock_path, hash, true, Platform::Linux64, 0, false, &[]);
         let out = result.unwrap().unwrap();
         // Build string must be content-addressed: py311_h<first10>_0
         assert_eq!(
@@ -9835,7 +9855,7 @@ mod courier_build_string_tests {
     #[test]
     fn build_string_includes_hash_prefix() {
         let hash = "abcdef0123456789";
-        let s = courier_build_string("311", hash, 0);
+        let s = courier_build_string("311", hash, 0, false);
         assert!(
             s.contains("habcdef0123"),
             "build string must contain h+first10 of hash: {s}"
@@ -9852,8 +9872,8 @@ mod courier_build_string_tests {
 
     #[test]
     fn different_hashes_give_different_build_strings() {
-        let s1 = courier_build_string("311", "aaaaaa0000111122", 0);
-        let s2 = courier_build_string("311", "bbbbbb9999888877", 0);
+        let s1 = courier_build_string("311", "aaaaaa0000111122", 0, false);
+        let s2 = courier_build_string("311", "bbbbbb9999888877", 0, false);
         assert_ne!(
             s1, s2,
             "different inputs hashes must yield different build strings"
@@ -9863,8 +9883,8 @@ mod courier_build_string_tests {
     #[test]
     fn same_hash_different_build_number_gives_different_string() {
         let hash = "abcdef0123456789";
-        let s0 = courier_build_string("311", hash, 0);
-        let s1 = courier_build_string("311", hash, 1);
+        let s0 = courier_build_string("311", hash, 0, false);
+        let s1 = courier_build_string("311", hash, 1, false);
         assert_ne!(
             s0, s1,
             "different build numbers must yield different strings"
@@ -9874,15 +9894,26 @@ mod courier_build_string_tests {
     #[test]
     fn hash_shorter_than_10_chars_does_not_panic() {
         // When the hash is shorter than 10 chars, min(len, 10) keeps all chars.
-        let s = courier_build_string("311", "abc", 0);
+        let s = courier_build_string("311", "abc", 0, false);
         assert_eq!(s, "py311_habc_0");
     }
 
     #[test]
     fn build_string_format_is_py_prefix_h_hash_number() {
         // Exact format spec: py{py_short}_h{hash[..10]}_{build_number}
-        let s = courier_build_string("312", "1234567890abcdef", 2);
+        let s = courier_build_string("312", "1234567890abcdef", 2, false);
         assert_eq!(s, "py312_h1234567890_2");
+    }
+
+    #[test]
+    fn loose_mode_gets_a_distinct_build_string() {
+        // Same inputs hash, different bundle mode => different artifact
+        // content => the build strings MUST differ or pixi cache-hits the
+        // other mode's artifact.
+        let fat = courier_build_string("312", "1234567890abcdef", 2, false);
+        let loose = courier_build_string("312", "1234567890abcdef", 2, true);
+        assert_ne!(fat, loose);
+        assert_eq!(loose, "py312_h1234567890_loose_2");
     }
 }
 

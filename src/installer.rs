@@ -314,8 +314,8 @@ async fn materialize_locked_wheels(
     lock: &RetreadLock,
     prefix: &Path,
     shipped_wheels_dir: &Path,
+    cache_root: &Path,
 ) -> Result<Vec<PathBuf>> {
-    let cache_root = crate::courier::retread_cache_root();
     let fetch_dir = prefix
         .join("share")
         .join("retread")
@@ -339,9 +339,47 @@ async fn materialize_locked_wheels(
 
         match wheel.origin {
             Origin::Index => {
-                files.push(materialize_index_wheel(lock, wheel, &fetch_dir, &cache_root).await?);
+                files.push(materialize_index_wheel(lock, wheel, &fetch_dir, cache_root).await?);
             }
             Origin::Built => {
+                // Loose bundle mode: Built wheels are not shipped inside
+                // the .conda -- their bytes were persisted to the shared
+                // content-addressed wheel store at build time and the lock
+                // records the sha256 lookup key. Verify before trusting.
+                if let Some(expected) = wheel.sha256.as_deref() {
+                    let store_path = cache_root
+                        .join("wheels")
+                        .join(expected)
+                        .join(&wheel.filename);
+                    if store_path.is_file() {
+                        match verify_sha256(&store_path, expected) {
+                            Ok(()) => {
+                                files.push(store_path);
+                                continue;
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    path = %store_path.display(),
+                                    error = %format!("{err:#}"),
+                                    "retread install: wheel-store hash mismatch for built \
+                                     wheel; removing corrupt entry"
+                                );
+                                let _ = std::fs::remove_file(&store_path);
+                            }
+                        }
+                    }
+                    bail!(
+                        "retread install: locked built wheel {}=={} is neither shipped at {} \
+                         nor present in the shared wheel store at {} (loose bundle mode). \
+                         The store entry was evicted or this machine does not share the \
+                         build machine's wheel store; rebuild/reinstall the pack to \
+                         re-populate it.",
+                        wheel.name,
+                        wheel.version,
+                        shipped.display(),
+                        store_path.display()
+                    );
+                }
                 bail!(
                     "retread install: locked wheel {}=={} is not present at {}. \
                      This wheel class is shipped inside the courier package (source-built, \
@@ -837,7 +875,13 @@ pub async fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
         }
     };
 
-    let wheel_files = materialize_locked_wheels(&lock, prefix, &wheels_dir).await?;
+    let wheel_files = materialize_locked_wheels(
+        &lock,
+        prefix,
+        &wheels_dir,
+        &crate::courier::retread_cache_root(),
+    )
+    .await?;
     let args = build_uv_replay_args(prefix, &wheel_files, None, force_reinstall);
 
     let install_msg = format!(
@@ -1216,7 +1260,7 @@ mod tests {
             &sha,
         )];
 
-        let files = materialize_locked_wheels(&lock, &prefix, &wheels_dir)
+        let files = materialize_locked_wheels(&lock, &prefix, &wheels_dir, &root.join("cache"))
             .await
             .unwrap();
         assert_eq!(files, vec![shipped]);
@@ -1228,6 +1272,78 @@ mod tests {
                 .join("fetched")
                 .exists(),
             "shipped offline replay must not create fetch dir"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Loose bundle mode: an Origin::Built wheel that is NOT shipped inside
+    /// the package must be materialized from the shared wheel store by its
+    /// lock sha256, hash-verified, without touching the network.
+    #[tokio::test]
+    async fn materialize_locked_wheels_serves_built_wheel_from_store() {
+        let root = tempdir("loose-built-store");
+        let prefix = root.join("prefix");
+        let wheels_dir = root.join("wheels"); // shipped dir: intentionally empty
+        let cache_root = root.join("cache");
+        let bytes = b"loose built wheel bytes";
+        let sha = hex_sha256(bytes);
+        let filename = "builtpkg-1.0.0-py3-none-any.whl";
+        let stored = cache_root.join("wheels").join(&sha).join(filename);
+        std::fs::create_dir_all(stored.parent().unwrap()).unwrap();
+        std::fs::write(&stored, bytes).unwrap();
+
+        let mut lock = make_lock(vec![], vec![], BTreeMap::new());
+        lock.wheels = vec![LockWheel {
+            name: "builtpkg".into(),
+            version: "1.0.0".into(),
+            origin: Origin::Built,
+            filename: filename.into(),
+            url: None,
+            sha256: Some(sha),
+            requires_dist: vec![],
+            must_ship: true,
+            upstream_url: None,
+            git_source: None,
+            sdist_source: None,
+        }];
+
+        let files = materialize_locked_wheels(&lock, &prefix, &wheels_dir, &cache_root)
+            .await
+            .unwrap();
+        assert_eq!(files, vec![stored]);
+    }
+
+    /// Loose mode failure story: a Built wheel with a sha but an EMPTY store
+    /// must fail loudly with the rebuild hint (no silent fallthrough).
+    #[tokio::test]
+    async fn materialize_locked_wheels_built_wheel_missing_from_store_errors() {
+        let root = tempdir("loose-built-miss");
+        let prefix = root.join("prefix");
+        let wheels_dir = root.join("wheels");
+        let cache_root = root.join("cache");
+
+        let mut lock = make_lock(vec![], vec![], BTreeMap::new());
+        lock.wheels = vec![LockWheel {
+            name: "builtpkg".into(),
+            version: "1.0.0".into(),
+            origin: Origin::Built,
+            filename: "builtpkg-1.0.0-py3-none-any.whl".into(),
+            url: None,
+            sha256: Some("0".repeat(64)),
+            requires_dist: vec![],
+            must_ship: true,
+            upstream_url: None,
+            git_source: None,
+            sdist_source: None,
+        }];
+
+        let err = materialize_locked_wheels(&lock, &prefix, &wheels_dir, &cache_root)
+            .await
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("shared wheel store") && msg.contains("rebuild"),
+            "error must explain the loose-mode store miss: {msg}"
         );
         let _ = std::fs::remove_dir_all(root);
     }

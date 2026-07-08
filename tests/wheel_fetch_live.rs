@@ -95,6 +95,7 @@ async fn fetch_isaacsim_kernel_end_to_end() {
         default_bundle: None,
         compression_level: None,
         emit_pypi: false,
+        bundle_mode: pixi_build_retread::config::BundleMode::Fat,
         courier: false,
         blueprint: Default::default(),
         blueprint_sync: Default::default(),

@@ -310,6 +310,31 @@ fn hardlink_or_copy(src: &Path, dst: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Route one staged (ship-class) wheel according to the bundle mode.
+///
+/// Fat mode (`loose == false`): push its `file://` URL into the recipe
+/// source list so rattler-build tars it into the .conda; returns `None`
+/// (the lock keeps whatever sha it already had).
+///
+/// Loose mode (`loose == true`): persist the staged bytes into the shared
+/// content-addressed wheel store instead and return `Some(sha256)` for the
+/// lock entry -- the .conda stays a stub and `retread install` materializes
+/// the wheel from `<store>/wheels/<sha256>/<filename>` (hash-verified).
+async fn ship_or_store(
+    loose: bool,
+    staged: &Path,
+    source_urls: &mut Vec<String>,
+    store_root: &Path,
+) -> anyhow::Result<Option<String>> {
+    if loose {
+        let sha = crate::wheel::store_wheel_in_cache(staged, store_root).await?;
+        Ok(Some(sha))
+    } else {
+        source_urls.push(file_url(staged)?);
+        Ok(None)
+    }
+}
+
 /// Look up or populate the shadow-rewrite cache, returning `(sha256, did_change)`.
 ///
 /// Cache dir: `<cache_dir>/<key>.changed` or `<cache_dir>/<key>.same`.
@@ -461,6 +486,11 @@ pub async fn stage(
     // (forces fresh rewrites, enabling byte-for-byte parity testing).
     let use_shadow_cache = std::env::var("RETREAD_NO_SHADOW_CACHE").is_err();
 
+    // Bundle mode: loose persists ship-class wheels to the shared wheel
+    // store (stub .conda); fat tars them into the artifact (legacy).
+    let loose = config.bundle_mode == crate::config::BundleMode::Loose;
+    let wheel_store_root = retread_cache_root();
+
     // Step 1: run plan() to get ship set + override table.
     let emit_plan = plan(emit_wheels, conda_capable);
 
@@ -570,14 +600,16 @@ pub async fn stage(
                 })??;
             }
 
-            source_urls.push(file_url(&dst)?);
+            let stored_sha = ship_or_store(loose, &dst, &mut source_urls, &wheel_store_root).await?;
             lock_wheels.push(LockWheel {
                 name: w.pypi_name.clone(),
                 version: w.version.clone(),
                 origin: Origin::Built,
                 filename: std_name,
                 url: None,
-                sha256: None,
+                // Loose mode: the store sha256 is the install-time lookup
+                // key. Fat mode: None (the wheel ships inside the .conda).
+                sha256: stored_sha,
                 requires_dist: w.requires_dist.clone(),
                 must_ship: w.must_ship(),
                 // Source-built (.injected) wheels exist on no index; there is
@@ -771,14 +803,17 @@ pub async fn stage(
                                     src.display()
                                 )
                             })?;
-                        source_urls.push(file_url(&dst)?);
+                        let stored_sha = ship_or_store(loose, &dst, &mut source_urls, &wheel_store_root).await?;
                         lock_wheels.push(LockWheel {
                             name: w.pypi_name.clone(),
                             version: w.version.clone(),
                             origin: Origin::Built,
                             filename: std_name,
                             url: None,
-                            sha256: w.sha256.clone(),
+                            // Loose mode: prefer the store sha (computed
+                            // from the exact staged bytes); fat keeps the
+                            // resolver-provided sha when present.
+                            sha256: stored_sha.or_else(|| w.sha256.clone()),
                             requires_dist: w.requires_dist.clone(),
                             must_ship: false,
                             upstream_url: None,
@@ -801,7 +836,7 @@ pub async fn stage(
                             dst.display()
                         )
                     })?;
-                    source_urls.push(file_url(&dst)?);
+                    let stored_sha = ship_or_store(loose, &dst, &mut source_urls, &wheel_store_root).await?;
                     // Prefer upstream_url (pristine pre-localization index URL,
                     // set for local-path shadows when EmitWheel was built from
                     // the cold produce path) over remote_url (set only for
@@ -819,7 +854,8 @@ pub async fn stage(
                         origin: Origin::Built,
                         filename: shadow_name,
                         url: None,
-                        sha256: None,
+                        // Loose mode: store sha256 = install-time lookup key.
+                        sha256: stored_sha,
                         requires_dist: w.requires_dist.clone(),
                         must_ship: w.must_ship(),
                         upstream_url,
@@ -849,7 +885,7 @@ pub async fn stage(
                     .with_context(|| {
                         format!("spawn_blocking shadow-rewrite of {}", w.pypi_name)
                     })??;
-                    source_urls.push(file_url(&dst)?);
+                    let stored_sha = ship_or_store(loose, &dst, &mut source_urls, &wheel_store_root).await?;
                     // Prefer upstream_url over remote_url (same rationale as
                     // the Rewritten arm above).
                     let upstream_url = w
@@ -863,7 +899,8 @@ pub async fn stage(
                         origin: Origin::Built,
                         filename: shadow_name,
                         url: None,
-                        sha256: None,
+                        // Loose mode: store sha256 = install-time lookup key.
+                        sha256: stored_sha,
                         requires_dist: w.requires_dist.clone(),
                         must_ship: w.must_ship(),
                         upstream_url,
@@ -1157,13 +1194,30 @@ mod tests {
         }
     }
 
+    // Fat mode: the historical stage() contract these tests were written
+    // against (wheels ship in source_urls). Loose-mode routing is covered
+    // by the dedicated `loose_mode_*` tests below.
     fn minimal_config(bundle_name: &str) -> RetreadConfig {
+        let json = serde_json::json!({
+            "retread-wheels": {
+                bundle_name: { "version": "==1.0.0" }
+            },
+            "retread-bundle-mode": "fat"
+        });
+        serde_json::from_value(json).unwrap()
+    }
+
+    fn minimal_loose_config(bundle_name: &str) -> RetreadConfig {
         let json = serde_json::json!({
             "retread-wheels": {
                 bundle_name: { "version": "==1.0.0" }
             }
         });
-        serde_json::from_value(json).unwrap()
+        let cfg: RetreadConfig = serde_json::from_value(json).unwrap();
+        // Loose must be the DEFAULT (owner decision: fat tarballs are
+        // opt-in for channel publishing only).
+        assert_eq!(cfg.bundle_mode, crate::config::BundleMode::Loose);
+        cfg
     }
 
     /// grizzly P1 regression: changing the conda channel list MUST change the
@@ -2752,5 +2806,161 @@ version = "1.0.0"
             stored_url.starts_with("https://"),
             "sdist_url must be portable https URL, got: {stored_url}"
         );
+    }
+
+    // ── Loose bundle mode ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn ship_or_store_fat_pushes_source_url_and_records_no_sha() {
+        let tmp = make_test_dir("loose-fat");
+        let store = tmp.join("store");
+        let wheel = tmp.join("pkg-1.0.0-py3-none-any.whl");
+        std::fs::write(&wheel, make_wheel_bytes("pkg", "1.0.0", &[])).unwrap();
+
+        let mut source_urls = Vec::new();
+        let sha = ship_or_store(false, &wheel, &mut source_urls, &store)
+            .await
+            .unwrap();
+        assert_eq!(sha, None, "fat mode must not record a store sha");
+        assert_eq!(source_urls.len(), 1, "fat mode ships via source_urls");
+        assert!(source_urls[0].ends_with("pkg-1.0.0-py3-none-any.whl"));
+        assert!(
+            !store.exists(),
+            "fat mode must not touch the wheel store"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn ship_or_store_loose_persists_to_store_and_skips_sources() {
+        let tmp = make_test_dir("loose-store");
+        let store = tmp.join("store");
+        let wheel = tmp.join("pkg-1.0.0-py3-none-any.whl");
+        let bytes = make_wheel_bytes("pkg", "1.0.0", &[]);
+        std::fs::write(&wheel, &bytes).unwrap();
+
+        let mut source_urls = Vec::new();
+        let sha = ship_or_store(true, &wheel, &mut source_urls, &store)
+            .await
+            .unwrap()
+            .expect("loose mode must record the store sha");
+        assert!(
+            source_urls.is_empty(),
+            "loose mode must not add the wheel to the recipe sources"
+        );
+        let stored = store
+            .join("wheels")
+            .join(&sha)
+            .join("pkg-1.0.0-py3-none-any.whl");
+        assert!(
+            stored.is_file(),
+            "wheel bytes must land in the content-addressed store: {}",
+            stored.display()
+        );
+        assert_eq!(
+            std::fs::read(&stored).unwrap(),
+            bytes,
+            "store entry must be byte-identical to the staged wheel"
+        );
+        // Idempotent re-store returns the same sha.
+        let mut again = Vec::new();
+        let sha2 = ship_or_store(true, &wheel, &mut again, &store)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sha, sha2);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// End-to-end loose stage(): a must_ship (.injected) built wheel must be
+    /// classified Origin::Built WITH a sha256, its bytes must land in the
+    /// wheel store, and it must NOT appear in source_urls -- while the lock
+    /// json + meta-wheel + installer binary still do (the stub payload).
+    #[tokio::test]
+    async fn loose_mode_stage_emits_stub_sources_and_store_shas() {
+        let tmp = make_test_dir("loose-e2e");
+        let staging = tmp.join("staging");
+        // NO env mutation here: overriding RETREAD_CACHE_DIR races parallel
+        // tests that read retread_cache_root() live (the shadow-cache suite).
+        // Assert against the real store root instead; the entry is
+        // content-addressed and tiny, so repeat runs are idempotent.
+        let cache = retread_cache_root();
+
+        let bundle = "loosepkg";
+        let built_whl_name = format!("{bundle}-1.0.0-py3-none-any.injected.whl");
+        let built_whl = tmp.join(&built_whl_name);
+        let bytes = make_wheel_bytes(bundle, "1.0.0", &[]);
+        std::fs::write(&built_whl, &bytes).unwrap();
+
+        let built = make_emit_wheel(bundle, "1.0.0", &[], Some(&built_whl), None);
+        assert!(built.must_ship(), "test setup: .injected infix => must_ship");
+
+        let emit_wheels = vec![built];
+        let conda_capable: HashSet<String> = HashSet::new();
+        let config = minimal_loose_config(bundle);
+
+        let result = stage(
+            &config,
+            bundle,
+            "1.0.0",
+            "3.11",
+            &emit_wheels,
+            &conda_capable,
+            &[],
+            &["https://pypi.org/simple/".to_string()],
+            "",
+            &tmp,
+            &staging,
+        )
+        .await
+        .unwrap();
+
+        let lw = result
+            .lock
+            .wheels
+            .iter()
+            .find(|w| w.name == bundle)
+            .expect("bundle wheel in lock");
+        assert_eq!(lw.origin, Origin::Built);
+        let sha = lw
+            .sha256
+            .as_deref()
+            .expect("loose lock must record the store sha for built wheels");
+        let stored = cache.join("wheels").join(sha).join(&lw.filename);
+        assert!(
+            stored.is_file(),
+            "built wheel bytes must be in the store: {}",
+            stored.display()
+        );
+        assert!(
+            !result
+                .source_urls
+                .iter()
+                .any(|u| u.ends_with(&lw.filename)),
+            "loose mode must not ship the built wheel in the .conda sources"
+        );
+        // Stub payload still ships: lock json, meta-wheel, installer.
+        assert!(
+            result
+                .source_urls
+                .iter()
+                .any(|u| u.ends_with(&RetreadLock::file_name(bundle))),
+            "lock json must remain a recipe source"
+        );
+        assert!(
+            result
+                .source_urls
+                .iter()
+                .any(|u| u.contains(&format!("{}_pypi-", bundle.replace('-', "_")))),
+            "meta-wheel must remain a recipe source"
+        );
+        assert!(
+            result
+                .source_urls
+                .iter()
+                .any(|u| u.ends_with("retread-installer")),
+            "installer binary must remain a recipe source"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

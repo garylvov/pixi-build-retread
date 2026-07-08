@@ -903,6 +903,7 @@ mod tests {
             default_bundle: None,
             compression_level: None,
             emit_pypi: false,
+            bundle_mode: crate::config::BundleMode::Fat,
             courier: false,
             blueprint: Default::default(),
             blueprint_sync: Default::default(),
