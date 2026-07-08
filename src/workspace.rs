@@ -775,7 +775,7 @@ pub async fn extract_transitive_constraints(
         })
         .collect();
 
-    let solved_records = match crate::solve_check::solve_selected_records(
+    let solved_records = match crate::conda_solve::solve_selected_records(
         conda_channels,
         &solve_specs,
         target_python,

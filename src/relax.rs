@@ -192,6 +192,7 @@ fn map_name(pypi: &str, overrides: &BTreeMap<String, String>) -> String {
 /// path); in test/dev builds a layer emitting a malformed pair fails
 /// fast at the boundary that produced it instead of at a misleading
 /// downstream leaf (the v0.37.1 build-string-leak class).
+#[cfg(test)]
 pub(crate) fn assert_spec_roundtrips(name: &str, spec: &str) {
     #[cfg(debug_assertions)]
     {

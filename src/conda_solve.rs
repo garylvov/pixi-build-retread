@@ -1,33 +1,13 @@
-//! v0.33.0+: pre-emission solve check.
+//! Conda solving helpers that survived the v4.2.0 removal of the
+//! legacy mirror-solver's pre-emission solve check.
 //!
-//! After retread builds a per-env CondaOutput, run a real conda solve
-//! over (workspace effective deps + retread's emitted run-deps) against
-//! the workspace's channels. If unsat, capture the explanation strings
-//! and persist them to the audit. This catches cross-package conflicts
-//! that the per-dep probe layer can't see:
-//!
-//!   - retread emits `cuda-bindings >=13.0.3,<14` (from a wheel's
-//!     Requires-Dist)
-//!   - workspace pins `cuda-toolkit 12.8.*`
-//!   - cuda-bindings 13.x's `depends` says it needs `cuda 13.x`
-//!   - cuda-toolkit 12.8.*'s `depends` says cuda 12.8.*
-//!   - same dep (`cuda`) with incompatible ranges across two
-//!     workspace-/retread-pinned packages -> solver explanation
-//!
-//! The per-dep probe never catches this because it only asks "does the
-//! spec I'd emit have ANY candidate on the channel" -- not "does that
-//! candidate compose with the rest of the workspace."
-//!
-//! Cost: the iterative refinement loop calls this ~8x per env across
-//! ~4 envs (~32 solves). v0.43.0: the ~1M repodata records are now
-//! parsed from the disk cache ONCE per (subdir, channel-set) and shared
-//! across every solve via `RECORDS_CACHE` (an `Arc<RecordSet>`). Before
-//! this, `run_solve_check` re-read + re-parsed + re-deduped ~1.08M
-//! RepoDataRecords on EVERY call -- ~32 redundant parses of hundreds of
-//! MB of JSON, which was the dominant CPU cost and the ~4 GB RSS thrash
-//! (NOT the resolvo solve itself). The older "repodata is cached by
-//! probe.rs" claim here was false: probe.rs caches a different parsed
-//! form (`RepodataIndex`) that the solver can't consume.
+//! `solve_selected_records` solves a spec set coherently against the
+//! workspace's channels (sparse, reachable-subset repodata) and returns
+//! the concrete records the solver selected. Its one production consumer
+//! is `workspace::extract_transitive_constraints`, which derives the
+//! constraints conda's actual picks impose on other packages -- part of
+//! the conda-first preference plumbing (conda pins flow into emissions
+//! and into the uv resolver's constraint set).
 
 use std::collections::{BTreeMap, HashSet};
 use std::str::FromStr;
@@ -37,62 +17,6 @@ use rattler_conda_types::{
     Version,
 };
 use rattler_solve::{ChannelPriority, SolveStrategy, SolverImpl, SolverTask, resolvo};
-use serde::Serialize;
-
-/// Result of running the solve check.
-#[derive(Debug, Clone, Serialize)]
-pub struct SolveOutcome {
-    /// True if the solver found a valid solution.
-    pub satisfiable: bool,
-    /// Per-leaf explanation strings from the rattler solver when
-    /// `satisfiable == false`. Each string names a constraint chain
-    /// the solver couldn't reconcile.
-    pub unsat_explanations: Vec<String>,
-    /// Channels actually consulted (after disk-cache reads).
-    pub channels_consulted: Vec<String>,
-    /// Total specs the solver was asked to satisfy.
-    pub specs_count: usize,
-    /// Total available records across all channels.
-    pub records_count: usize,
-    /// v0.34.0+: refinement passes the cascade made before reaching
-    /// this outcome (each pass widened one or more retread-emitted
-    /// deps to `*`). Empty when the first solve succeeded.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub refinement_steps: Vec<crate::audit::RefinementStep>,
-    /// v0.35.0+: workspace-edit suggestions from the classifier.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub workspace_edit_suggestions: Vec<crate::conflict_classifier::WorkspaceEditSuggestion>,
-    /// v0.35.0+: terminal classification name (A/AExhausted/B/C/None).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub terminal_classification: Option<String>,
-    /// v1.4.0: true when the check COULD NOT RUN (no channels given,
-    /// or no repodata loadable from any of them). A skipped check is
-    /// an abstention, not an unsat verdict: callers must not refine
-    /// against it, print failure banners for it, or fail conda/outputs
-    /// because of it. Before this flag, an empty/unreachable channel
-    /// set surfaced as `satisfiable: false`, the refinement loop
-    /// classified the "no repodata" text as cascade-exhausted, and
-    /// the fail gate hard-errored the build -- a diagnostic that
-    /// never ran was vetoing the output.
-    #[serde(default)]
-    pub skipped: bool,
-}
-
-impl SolveOutcome {
-    pub fn unreachable() -> Self {
-        Self {
-            satisfiable: false,
-            unsat_explanations: vec!["solve-check skipped: no repodata could be loaded".into()],
-            channels_consulted: Vec::new(),
-            specs_count: 0,
-            records_count: 0,
-            refinement_steps: Vec::new(),
-            workspace_edit_suggestions: Vec::new(),
-            terminal_classification: None,
-            skipped: true,
-        }
-    }
-}
 
 /// Solve a spec set against already-loaded records and return the
 /// concrete records the solver selected. Shared by the pre-emission
@@ -379,82 +303,6 @@ async fn load_selected_records_sparse(
     (records, consulted)
 }
 
-pub async fn run_solve_check(
-    channels: &[ChannelUrl],
-    specs: &[String],
-    target_python: &str,
-    target_subdir: &str,
-    channel_priority: ChannelPriority,
-    system_requirements: &std::collections::BTreeMap<String, String>,
-) -> SolveOutcome {
-    // Parse the specs first; bad input shouldn't be hidden behind
-    // network IO. Skip specs that don't parse (rare; logged at debug).
-    let parsed_specs = parse_match_specs(specs);
-
-    let (records, consulted) =
-        load_selected_records_sparse(channels, target_subdir, &parsed_specs).await;
-
-    if records.is_empty() {
-        return SolveOutcome {
-            satisfiable: false,
-            unsat_explanations: vec![
-                "solve-check skipped: no repodata available from disk cache".into(),
-            ],
-            channels_consulted: consulted,
-            specs_count: parsed_specs.len(),
-            records_count: 0,
-            refinement_steps: Vec::new(),
-            workspace_edit_suggestions: Vec::new(),
-            terminal_classification: None,
-            skipped: true,
-        };
-    }
-
-    let records_count = records.len();
-    let specs_count = parsed_specs.len();
-    // `preferred` is empty: the cascade call sites hold only spec
-    // strings, not resolved RepoDataRecords, so there is no clean
-    // externally-known set to seed from without re-deriving.  The
-    // infrastructure (locked_packages seeding in
-    // solve_selected_records_from_records) is in place for callers
-    // that DO carry a prior resolved set (e.g. solve_selected_records
-    // results surfaced back through the cascade in the future).
-    match solve_on_blocking_pool(
-        parsed_specs,
-        records,
-        target_python.to_string(),
-        channel_priority,
-        system_requirements.clone(),
-        SolveStrategy::Highest,
-        Vec::new(),
-    )
-    .await
-    {
-        Ok(_records) => SolveOutcome {
-            satisfiable: true,
-            unsat_explanations: Vec::new(),
-            channels_consulted: consulted,
-            specs_count,
-            records_count,
-            refinement_steps: Vec::new(),
-            workspace_edit_suggestions: Vec::new(),
-            terminal_classification: None,
-            skipped: false,
-        },
-        Err(reasons) => SolveOutcome {
-            satisfiable: false,
-            unsat_explanations: reasons,
-            channels_consulted: consulted,
-            specs_count,
-            records_count,
-            refinement_steps: Vec::new(),
-            workspace_edit_suggestions: Vec::new(),
-            terminal_classification: None,
-            skipped: false,
-        },
-    }
-}
-
 /// Solve a spec set against cached repodata and return the concrete
 /// records the solver selected. Callers that need to reason about
 /// transitives must use this instead of "latest matching build"
@@ -490,302 +338,6 @@ pub async fn solve_selected_records(
     .await
 }
 
-/// Compute the disk-cache path for repodata. Must match probe.rs's
-/// layout exactly -- we read what that module wrote.
-/// v0.34.0+: parse rattler_solve's tree-formatted unsat explanation
-/// strings to find the package names that are the ENTRY POINTS of the
-/// conflict graph. These are the deps the solver couldn't satisfy at
-/// the top level -- widening any of them in retread's emission gives
-/// the solver more freedom to backtrack.
-///
-/// Returns `["triton"]` for the typical triton-cuda chain. Multiple
-/// sibling top-level conflicts return multiple names.
-pub fn extract_blocking_dep_names(unsat_strs: &[String]) -> Vec<String> {
-    extract_blocking_chains(unsat_strs)
-        .into_iter()
-        .map(|c| c.name)
-        .collect()
-}
-
-/// v0.35.0+: richer version of `extract_blocking_dep_names`. Preserves
-/// the version data we used to throw away after extracting the name:
-/// the spec the blocked package was looking for, the versions the
-/// solver tried + rejected, and the transitive requirement that caused
-/// each rejection.
-///
-/// The classifier (`conflict_classifier::classify_unsat`) consumes
-/// these chains to produce a structured `ConflictClassification` --
-/// distinguishing "retread-side widenable" from "workspace-pin-
-/// dominated" failures.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct BlockingChain {
-    /// Top-level package name (e.g. `"torchvision"`).
-    pub name: String,
-    /// Spec that was looked up at the top level (e.g. `">=0.22.0"`).
-    /// Empty when the parser couldn't extract one.
-    pub current_spec: String,
-    /// Concrete versions the solver tried and rejected
-    /// (e.g. `["0.25.0", "0.26.0"]`). Deduped, sorted in encountered
-    /// order. May be empty when the rattler explanation didn't list
-    /// individual versions.
-    pub rejected_versions: Vec<String>,
-    /// Transitive requirement that caused the rejection
-    /// (e.g. `"pytorch >=2.10.0,<2.11.0a0"`). Empty when the chain
-    /// doesn't dive deeper or the parse missed it.
-    pub transitive_requirement: String,
-    /// v0.36.1+: true when rattler said "can be installed with any
-    /// of the following options" (the dep is satisfiable in
-    /// isolation but listed as part of a multi-dep incompatibility
-    /// group). false when "cannot be installed" (genuinely
-    /// blocking). The classifier uses this to skip suggestion
-    /// derivation for installable chains -- they're context, not
-    /// the root cause.
-    #[serde(default)]
-    pub installable: bool,
-}
-
-pub fn extract_blocking_chains(unsat_strs: &[String]) -> Vec<BlockingChain> {
-    let mut out: Vec<BlockingChain> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
-    for raw in unsat_strs {
-        // Walk lines; whenever a top-level marker is found, parse the
-        // chain rooted at that line + its descendants (denoted by
-        // deeper indentation).
-        let lines: Vec<&str> = raw.lines().collect();
-        for (idx, line) in lines.iter().enumerate() {
-            let trimmed_start = line
-                .strip_prefix("├─ ")
-                .or_else(|| line.strip_prefix("└─ "));
-            let Some(rest) = trimmed_start else { continue };
-            let token = rest.split_whitespace().next().unwrap_or("");
-            if token.is_empty() {
-                continue;
-            }
-            let name = token.split('[').next().unwrap_or(token);
-            if name
-                .chars()
-                .any(|c| matches!(c, '<' | '>' | '=' | ',' | '!' | '~' | '*'))
-            {
-                continue;
-            }
-            if !seen.insert(name.to_string()) {
-                continue;
-            }
-            // Extract the spec: everything after the name up to
-            // " cannot be installed" / " can be installed" / EOL.
-            // Also track whether this chain is genuinely blocking
-            // ("cannot be installed") or just listed as context
-            // ("can be installed with any of the following options").
-            let after_name = rest[token.len()..].trim_start();
-            let (current_spec, installable) =
-                if let Some(end) = after_name.find(" cannot be installed") {
-                    (after_name[..end].trim().to_string(), false)
-                } else if let Some(end) = after_name.find(" can be installed") {
-                    (after_name[..end].trim().to_string(), true)
-                } else {
-                    (String::new(), false)
-                };
-
-            // Walk descendant lines (deeper indentation than the
-            // current line) to find a `would require` block and the
-            // versions it enumerates.
-            let mut rejected_versions: Vec<String> = Vec::new();
-            let mut rejected_seen: HashSet<String> = HashSet::new();
-            let mut transitive_requirement: String = String::new();
-            for tail in lines.iter().skip(idx + 1) {
-                if !tail.starts_with('│')
-                    && !tail.starts_with(' ')
-                    && !tail.starts_with('├')
-                    && !tail.starts_with('└')
-                    && !tail.starts_with('\t')
-                {
-                    // Back to top-level, this chain is over.
-                    if !tail.is_empty() {
-                        break;
-                    }
-                }
-                // The "X 1.0 | 1.0 | 1.0 ... would require" line lists
-                // candidate versions. Extract the part after the name
-                // and before "would require".
-                if let Some(would_idx) = tail.find(" would require") {
-                    let before = &tail[..would_idx];
-                    // Strip leading tree decoration: any chars in
-                    // `│├└─ \t`.
-                    let payload = before.trim_start_matches(|c: char| {
-                        matches!(c, '│' | '├' | '└' | '─' | ' ' | '\t')
-                    });
-                    // payload looks like `<name> 0.25.0 | 0.25.0 | ...`
-                    // Drop the name (first whitespace-separated token).
-                    let mut it = payload.splitn(2, char::is_whitespace);
-                    let _ = it.next();
-                    if let Some(versions_part) = it.next() {
-                        for v in versions_part.split('|') {
-                            let v = v.trim();
-                            if v.is_empty() {
-                                continue;
-                            }
-                            if rejected_seen.insert(v.to_string()) {
-                                rejected_versions.push(v.to_string());
-                            }
-                        }
-                    }
-                    continue;
-                }
-                // Lines like `└─ pytorch >=2.10.0,<2.11.0a0, which
-                // cannot be installed` are the transitive requirement
-                // chain. Capture the FIRST such line per top-level
-                // chain (the closest cause).
-                if transitive_requirement.is_empty() {
-                    let strip = tail.trim_start_matches(|c: char| {
-                        matches!(c, '│' | '├' | '└' | '─' | ' ' | '\t')
-                    });
-                    // Strip trailing ", which cannot be installed..." /
-                    // ", for which no candidates...".
-                    let end = strip
-                        .find(", which")
-                        .or_else(|| strip.find(", for which"))
-                        .unwrap_or(strip.len());
-                    let candidate = strip[..end].trim().to_string();
-                    // Only keep if it looks like `<name> <spec>` not
-                    // a versions-list line. Version-enumeration
-                    // lines like `pytorch-gpu 2.7.1 | 2.7.1` contain
-                    // `|` (the rattler separator); those are
-                    // candidates, not transitive requirements.
-                    let looks_like_version_list = candidate.contains(" | ");
-                    if !candidate.contains(" would require")
-                        && !looks_like_version_list
-                        && !candidate.is_empty()
-                        && candidate
-                            .chars()
-                            .next()
-                            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-                    {
-                        transitive_requirement = candidate;
-                    }
-                }
-            }
-
-            out.push(BlockingChain {
-                name: name.to_string(),
-                current_spec,
-                rejected_versions,
-                transitive_requirement,
-                installable,
-            });
-        }
-    }
-    out
-}
-
-#[cfg(test)]
-mod parse_tests {
-    use super::*;
-
-    #[test]
-    fn extract_blocking_dep_names_pulls_top_level_only() {
-        let unsat = vec![
-            "The following packages are incompatible\n\
-             ├─ triton >=3.7.0,<3.8 cannot be installed because there are no viable options:\n\
-             │  ├─ triton 3.7.0 | 3.7.0 would require\n\
-             │  │  └─ cuda-version >=13.0,<14, which cannot be installed because there are no viable options:\n\
-             │  │     ├─ cuda-version 13.2, which conflicts with the versions reported above.\n\
-             └─ another-pkg >=1.0 cannot be installed because there are no viable options:\n\
-             │  └─ stuff"
-                .to_string(),
-        ];
-        let blocking = extract_blocking_dep_names(&unsat);
-        // Both `triton` and `another-pkg` are top-level conflict
-        // entry points. Nested deps (cuda-version) are NOT.
-        assert!(
-            blocking.contains(&"triton".to_string()),
-            "expected triton in {blocking:?}"
-        );
-        assert!(
-            blocking.contains(&"another-pkg".to_string()),
-            "expected another-pkg in {blocking:?}"
-        );
-        assert!(
-            !blocking.contains(&"cuda-version".to_string()),
-            "cuda-version is nested, not top-level: {blocking:?}"
-        );
-    }
-
-    #[test]
-    fn extract_blocking_dep_names_dedups() {
-        let unsat = vec!["├─ pkg cannot be installed\n├─ pkg also cannot be installed".to_string()];
-        let blocking = extract_blocking_dep_names(&unsat);
-        assert_eq!(blocking, vec!["pkg".to_string()]);
-    }
-
-    #[test]
-    fn extract_blocking_chains_captures_versions_and_transitive() {
-        let unsat = vec![
-            "The following packages are incompatible\n\
-             └─ torchvision >=0.22.0 cannot be installed because there are no viable options:\n   \
-                ├─ torchvision 0.25.0 | 0.25.0 | 0.26.0 would require\n   \
-                │  └─ pytorch >=2.10.0,<2.11.0a0, which cannot be installed because there are no viable options:\n   \
-                │     └─ pytorch 2.10.0 would require\n   \
-                │        └─ cuda-version >=12.9,<13, for which no candidates were found."
-                .to_string(),
-        ];
-        let chains = extract_blocking_chains(&unsat);
-        assert_eq!(chains.len(), 1);
-        let c = &chains[0];
-        assert_eq!(c.name, "torchvision");
-        assert_eq!(c.current_spec, ">=0.22.0");
-        // Versions deduped, in encountered order.
-        assert!(
-            c.rejected_versions.contains(&"0.25.0".to_string())
-                && c.rejected_versions.contains(&"0.26.0".to_string()),
-            "rejected_versions = {:?}",
-            c.rejected_versions,
-        );
-        // Transitive picks the closest cause (pytorch), not the
-        // deepest (cuda-version).
-        assert!(
-            c.transitive_requirement.starts_with("pytorch "),
-            "transitive_requirement = {:?}",
-            c.transitive_requirement,
-        );
-    }
-
-    #[test]
-    fn extract_blocking_chains_handles_multiple_top_levels() {
-        let unsat = vec![
-            "The following packages are incompatible\n\
-             ├─ pkga >=1 cannot be installed because there are no viable options:\n   \
-                └─ stuff\n\
-             └─ pkgb cannot be installed because there are no viable options:\n   \
-                └─ more stuff"
-                .to_string(),
-        ];
-        let chains = extract_blocking_chains(&unsat);
-        let names: Vec<&str> = chains.iter().map(|c| c.name.as_str()).collect();
-        assert!(names.contains(&"pkga"), "names = {names:?}");
-        assert!(names.contains(&"pkgb"), "names = {names:?}");
-    }
-
-    #[test]
-    fn extract_blocking_chains_empty_fields_when_unparseable() {
-        // No "would require" or transitive; chain still emits with
-        // empty rejected_versions / transitive_requirement.
-        let unsat = vec!["├─ foo cannot be installed because reasons".to_string()];
-        let chains = extract_blocking_chains(&unsat);
-        assert_eq!(chains.len(), 1);
-        assert_eq!(chains[0].name, "foo");
-        assert!(chains[0].rejected_versions.is_empty());
-        assert!(chains[0].transitive_requirement.is_empty());
-    }
-
-    #[test]
-    fn extract_blocking_dep_names_skips_specifier_tokens() {
-        // Lines whose first token after the marker is a version
-        // operator (rare; defensive) shouldn't accidentally count.
-        let unsat = vec!["├─ >=1.0 noisy".to_string()];
-        assert!(extract_blocking_dep_names(&unsat).is_empty());
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -812,23 +364,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn solve_outcome_unreachable_default() {
-        let o = SolveOutcome::unreachable();
-        assert!(!o.satisfiable);
-        assert_eq!(o.unsat_explanations.len(), 1);
-    }
 
-    // -------------------------------------------------------------
-    // v0.37.0 T1: build_virtual_packages exposes the workspace -> rattler
-    // virtual-package mapping for unit testing. The full end-to-end
-    // run_solve_check parity test against synthetic RepoData is left
-    // as future work (it would require committing repodata fixtures
-    // under tests/fixtures/); these unit tests pin the contract that
-    // the mapping is correct, which is the load-bearing piece. If
-    // these pass and the cascade is wired right, retread's solver
-    // sees the same virtual packages pixi's will.
-    // -------------------------------------------------------------
 
     fn vp_lookup<'a>(
         vps: &'a [GenericVirtualPackage],
@@ -837,31 +373,6 @@ mod tests {
         vps.iter().find(|vp| vp.name.as_normalized() == name)
     }
 
-    #[test]
-    fn run_solve_check_with_no_channels_abstains() {
-        // v1.4.0 regression (caught by tests/jsonrpc_protocol.rs):
-        // with no channels (or none loadable), the check must ABSTAIN
-        // (skipped=true, no terminal classification), not report a
-        // pseudo-unsat that the refinement loop classifies as
-        // cascade-exhausted and the fail gate turns into a hard
-        // conda/outputs error. A diagnostic that never ran must not
-        // veto the build.
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let outcome = rt.block_on(run_solve_check(
-            &[],
-            &["python ==3.11".to_string()],
-            "3.11",
-            "linux-64",
-            ChannelPriority::Strict,
-            &std::collections::BTreeMap::new(),
-        ));
-        assert!(outcome.skipped, "no channels -> the check must abstain");
-        assert!(!outcome.satisfiable, "skipped is not a sat verdict either");
-        assert!(outcome.terminal_classification.is_none());
-    }
 
     #[test]
     fn build_virtual_packages_injects_cpython_from_target_python() {
@@ -949,6 +460,7 @@ mod tests {
             "unknown system-requirement keys must not add virtual packages"
         );
     }
+
 
     #[test]
     fn solve_selected_records_can_pick_lowest_direct_torch_line() {

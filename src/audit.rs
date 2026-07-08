@@ -216,7 +216,56 @@ pub struct BundleAudit {
     pub envs_skipped: usize,
 }
 
-/// Persisted form of `solve_check::SolveOutcome`. Mirrors the in-memory
+/// One actionable suggestion attached to the user's terminal output
+/// + audit MD file. (Migrated from the deleted conflict_classifier.rs
+/// in v4.2.0 -- kept so historical audit JSON stays parseable/stable.)
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WorkspaceEditSuggestion {
+    /// Pixi env this suggestion applies to.
+    pub env: String,
+    /// Feature block the offending pin lives under, if locatable.
+    pub feature: Option<String>,
+    /// The pin retread thinks should be relaxed.
+    pub current_pin: String,
+    /// A spec the solver would accept (heuristic).
+    pub suggested_pin: String,
+    /// One-line human-readable reason.
+    pub reason: String,
+}
+
+/// One verdict per blocking chain from a rattler unsat explanation.
+/// (Migrated from the deleted conflict_classifier.rs in v4.2.0 --
+/// the in-backend refinement loop that produced these is gone, but the
+/// audit JSON schema keeps the type so old audits remain readable and
+/// the field can be re-populated by `retread solve` in the future.)
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub enum PerChainVerdict {
+    /// Retread emits this dep, workspace doesn't pin it, and it isn't
+    /// an ABI anchor. Safe to widen one level.
+    WidenRetread { dep: String, current_spec: String },
+    /// ABI anchor (python, libc, cuda-version, *_compiler, ...).
+    /// Never widen, regardless of whether retread emits it.
+    AbiAnchor { dep: String, reason: String },
+    /// Workspace pins this dep (possibly in addition to retread).
+    WorkspacePinDominates {
+        dep: String,
+        suggestion: Option<WorkspaceEditSuggestion>,
+        also_emitted_by_retread: bool,
+    },
+    /// Cascade already widened this to `*`; the binding constraint is
+    /// via the transitive requirement.
+    AlreadyExhausted {
+        dep: String,
+        current_spec: String,
+        transitive_requirement: String,
+    },
+    /// Surfaced as top-level but declared by neither side.
+    TransitiveOnly { dep: String },
+}
+
+/// Persisted form of the pre-emission solve check's outcome (the
+/// in-backend check itself was removed in v4.2.0). Mirrors the old
+/// in-memory
 /// type to keep the audit format stable even if rattler_solve's error
 /// API changes. Stored in `retread-audit-<name>.json` under
 /// `solve_diagnostics`.
@@ -238,7 +287,7 @@ pub struct SolveDiagnostics {
     /// (Class B/C). Empty for Class A (cascade resolved or in
     /// progress) and for sat outcomes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub workspace_edit_suggestions: Vec<crate::conflict_classifier::WorkspaceEditSuggestion>,
+    pub workspace_edit_suggestions: Vec<WorkspaceEditSuggestion>,
     /// v0.35.0+: terminal classification. Tells the user at a glance
     /// whether the failure is retread's responsibility ("A"/"A-exhausted")
     /// or the workspace's ("B"/"C"). Empty for sat outcomes.
@@ -280,7 +329,7 @@ pub struct RefinementStep {
     /// THAT chain (widened, refused-as-ABI-anchor, suggested
     /// workspace edit, ...).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub verdicts: Vec<crate::conflict_classifier::PerChainVerdict>,
+    pub verdicts: Vec<PerChainVerdict>,
     /// v0.36.0+: invariant-violation messages emitted by the
     /// post-condition assertion in `iterative_solve_refinement`.
     /// Non-empty means retread caught itself trying to corrupt the

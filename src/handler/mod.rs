@@ -1,10 +1,7 @@
 //! JSON-RPC method handlers. The four entry points pixi calls.
 
 mod audit_report;
-use audit_report::{
-    build_bundle_audit, format_packagespec, post_emit_widen_pass, write_probe_trace,
-    write_solve_failed_summary,
-};
+use audit_report::{build_bundle_audit, write_probe_trace};
 
 mod auto_bundle;
 use auto_bundle::{
@@ -12,18 +9,9 @@ use auto_bundle::{
     pick_conda_target, seed_worklist,
 };
 
-mod cascade;
-use cascade::{
-    bundle_group_for, iterative_solve_refinement, merge_looser_override, pre_emit_widen_pass,
-    pypi_fallback_indexes,
-};
-
 mod resolve_state;
 use resolve_state::{ObserveEdgeResult, ResolveState};
 
-mod resolvo_ab;
-mod resolvo_discovery;
-mod resolvo_provider;
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -293,77 +281,6 @@ fn pixi_workspace_dir(workspace_dir: Option<&std::path::Path>) -> Option<PathBuf
     std::env::current_dir()
         .ok()
         .filter(|dir| dir.join("pixi.toml").is_file())
-}
-
-/// Outcome classification after all environments have been solved.
-///
-/// Used to drive BOTH the stderr abstention banner AND the MD-deletion
-/// guard in `write_solve_failed_summary` -- a single pure helper so
-/// the two call sites cannot drift apart.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum RunTerminal {
-    /// Every attempted env produced a real solve (not abstained) and
-    /// none produced a workspace-block message.
-    VerifiedAllSat,
-    /// At least one env produced a real solve and at least one of those
-    /// produced a workspace-block message (unsat / B/C class).
-    VerifiedUnsat,
-    /// Every env that was attempted was skipped (no repodata reached).
-    /// The run is an abstention -- we can neither confirm nor deny.
-    AllAbstained,
-    /// No env was attempted at all (e.g. env list was empty after
-    /// filtering). Treated like abstention for the MD guard.
-    NothingAttempted,
-}
-
-/// Classify the terminal state of a conda/outputs run.
-///
-/// Arguments:
-/// - `envs_attempted`: total env iterations entered (including skipped).
-/// - `envs_skipped`: how many of those were abstentions (no repodata).
-/// - `has_block_messages`: true when `workspace_block_messages` is non-empty
-///   (i.e. at least one real unsat with a workspace-block class was found).
-///
-/// Returns `(RunTerminal, skipped_count)` where `skipped_count` mirrors
-/// `envs_skipped` (returned for convenience so callers don't need to
-/// re-compute it separately).
-/// P3 (grizzly #4): which envs in a completed level earn the single
-/// sibling-seeded re-run. Eligible only when the level has more than
-/// one env AND at least one sibling converged (otherwise there are no
-/// sibling widenings to seed with). Returns indices of capped envs.
-pub(crate) fn capped_envs_eligible_for_rerun<'a>(
-    classifications: impl Iterator<Item = Option<&'a str>>,
-) -> Vec<usize> {
-    let tags: Vec<Option<&str>> = classifications.collect();
-    let capped: Vec<usize> = tags
-        .iter()
-        .enumerate()
-        .filter(|(_, t)| **t == Some("A-iteration-cap"))
-        .map(|(i, _)| i)
-        .collect();
-    let any_converged = tags.iter().any(|t| *t != Some("A-iteration-cap"));
-    if tags.len() > 1 && any_converged {
-        capped
-    } else {
-        Vec::new()
-    }
-}
-
-pub(crate) fn classify_run_terminal(
-    envs_attempted: usize,
-    envs_skipped: usize,
-    has_block_messages: bool,
-) -> (RunTerminal, usize) {
-    let terminal = if envs_attempted == 0 {
-        RunTerminal::NothingAttempted
-    } else if envs_skipped == envs_attempted {
-        RunTerminal::AllAbstained
-    } else if has_block_messages {
-        RunTerminal::VerifiedUnsat
-    } else {
-        RunTerminal::VerifiedAllSat
-    };
-    (terminal, envs_skipped)
 }
 
 const NEGOTIATE: &str = "negotiateCapabilities";
@@ -958,35 +875,10 @@ impl Handler {
         // per-entry context from resolve_all is the only way the user
         // ever learns which [retread-wheels] entry actually broke.
         let mut outputs = Vec::new();
-        // v0.35.0+: track whether ANY (bundle, env) solve succeeded
-        // and accumulate workspace-block messages from envs that
-        // ended in Class B/C. If nothing solved AND retread has
-        // actionable workspace suggestions, fail conda/outputs with
-        // a clear error so pixi shows the diagnostic INSTEAD of its
-        // misleading leaf.
-        // v0.36.0: tracked but no longer used in the fail gate (see
-        // comments at the gate ~line 700). Kept for diagnostics
-        // (tracing emission after the per-env loop).
-        let mut any_solve_passed: bool = false;
-        let mut all_solve_attempted: bool = false;
-        let mut workspace_block_messages: Vec<String> = Vec::new();
-        // v0.36.1+: per-env solve-outcome counts so the failure
-        // message can name which envs failed instead of falsely
-        // claiming "every env failed" when in fact only some did.
-        let mut envs_attempted: usize = 0;
-        // P1: how many of those attempts were abstentions (outcome.skipped).
-        // Accumulates OUTSIDE the parallel solve tasks (invariant #9: per-env
-        // state isolates inside tasks; aggregate counters live in the
-        // coordinator scope). Mirrors how accumulated_diagnostics works.
-        let mut envs_skipped: usize = 0;
-        let mut envs_failed_with_block: std::collections::BTreeSet<String> =
-            std::collections::BTreeSet::new();
-        // v0.36.2+: track REAL suggestions separately from "see the
-        // trace" placeholders. The previous count conflated them,
-        // so the message claimed "4 workspace-edit suggestion(s)
-        // available" even when 0 actionable suggestions were
-        // generated (all chains filtered as installable).
-        let mut real_suggestion_count: usize = 0;
+        // v4.2.0: the per-env pre-emission solve check (and its
+        // bookkeeping / fail gate) was deleted with the legacy
+        // mirror-solver; outputs ship unvalidated and `retread solve`
+        // owns conflict handling.
         for python_version in &pythons {
             let target = wheel_target_for(params.host_platform, python_version);
             // Phase 1: materialize wheels + auto-bundle. Env-agnostic;
@@ -1041,18 +933,9 @@ impl Handler {
                 emissions = emissions.len(),
                 "bench: discover_emissions (workspace transitive extraction) finished",
             );
-            // PyPI index fallback chain for the cascade's bundling
-            // steps: entry indexes first (pypi.nvidia.com siblings),
-            // then workspace [pypi-options] indexes, then public PyPI.
-            // Extends the chain auto_bundle_transitives uses; without
-            // it the cascade could only bundle from pypi.org and
-            // private-index-only deps fell through to a doomed conda
-            // emission.
             let workspace_manifest = workspace_dir
                 .as_deref()
                 .and_then(crate::workspace::WorkspaceManifest::load);
-            let cascade_pypi_indexes =
-                pypi_fallback_indexes(&base_config, workspace_manifest.as_ref());
             // Cross-output siblings: per-emission so envs only link
             // to their own siblings (not other envs' renames).
             for emission in &emissions {
@@ -1130,7 +1013,7 @@ impl Handler {
                     })
                     .collect();
                 for base_bundle in &materialized {
-                    let (mut bundle, mut effective) =
+                    let (bundle, effective) =
                         apply_emission(base_bundle, &base_config, emission);
                     // WS-B: cold-solve replay. When courier mode is active and
                     // a committed lock exists whose inputs_hash matches the
@@ -1221,29 +1104,10 @@ impl Handler {
                             }
                         }
                     }
-                    // v0.30.0+ pre-emit widen pass: now scoped to this env's
-                    // channels + transitive overrides. Probes recorded
-                    // regardless of policy; mutation gated by
-                    // RelaxPolicy::allows_widening_mutation().
-                    pre_emit_widen_pass(
-                        &mut bundle,
-                        &mut effective,
-                        &emission.channels,
-                        &target,
-                        &download_dir,
-                        &cascade_pypi_indexes,
-                    )
-                    .await
-                    .map_err(|e| {
-                        RpcError::internal(format!(
-                            "pre-emit widen for {}: {e:#}",
-                            bundle.conda_name,
-                        ))
-                    })?;
                     let version_override_for_bundle = incr_version_overrides
                         .get(&bundle.conda_name)
                         .map(|s| s.as_str());
-                    let mut output = produce_output(
+                    let output = produce_output(
                         &bundle,
                         &effective,
                         params.host_platform,
@@ -1255,647 +1119,11 @@ impl Handler {
                     .map_err(|e| {
                         RpcError::internal(format!("output for {}: {e:#}", bundle.conda_name))
                     })?;
-                    post_emit_widen_pass(
-                        &mut output,
-                        &emission.channels,
-                        python_version,
-                        effective.relax,
-                        &mut bundle.probe_decisions,
-                    )
-                    .await
-                    .map_err(|e| {
-                        RpcError::internal(format!(
-                            "post-emit widen for {}: {e:#}",
-                            bundle.conda_name,
-                        ))
-                    })?;
-                    // v0.33.5+ per-env pre-emission solve check. For
-                    // each env that references this discovered
-                    // output, run a real conda solve scoped to THAT
-                    // env's channels + effective deps + retread's
-                    // emission. Each env gets its own diagnostic so
-                    // users see exactly which env conflicts on what.
-                    //
-                    // Why per-env (not union): cross-env union
-                    // over-constrains -- e.g. an env that doesn't use
-                    // feature.ros2 would still get ros-humble-*
-                    // transitive constraints folded in, producing
-                    // false-positive `ros2-distro-mutex` collisions
-                    // in the diagnostic that don't reflect what pixi
-                    // will actually fail on.
-                    let manifest_for_solve = workspace_dir
-                        .as_deref()
-                        .and_then(crate::workspace::WorkspaceManifest::load);
-                    // Honor the workspace's channel-priority setting
-                    // so retread's solve check matches what pixi will
-                    // actually do. Default to Strict (pixi's own
-                    // default) when the workspace doesn't specify.
-                    //
-                    // v0.36.3+: was Disabled in v0.34.5-0.36.2 as a
-                    // misread "fix" -- I thought strict was over-
-                    // rejecting conda-forge candidates, but actually
-                    // strict was doing exactly the right thing
-                    // (pytorch from pytorch channel; conda-forge's
-                    // pytorch would shadow it under disabled).
-                    // Disabled lets conda-forge's CPU torchaudio
-                    // compete with pytorch channel's GPU torchaudio
-                    // on raw version comparison and pick the wrong
-                    // one. Strict respects channel ORDER -- which is
-                    // why users list pytorch first in the first place.
-                    let workspace_channel_priority = manifest_for_solve
-                        .as_ref()
-                        .and_then(|m| m.channel_priority.as_deref())
-                        .map(|s| match s {
-                            "disabled" => rattler_solve::ChannelPriority::Disabled,
-                            _ => rattler_solve::ChannelPriority::Strict,
-                        })
-                        .unwrap_or(rattler_solve::ChannelPriority::Strict);
-                    let emitted_run_deps_strs: Vec<String> = output
-                        .run_dependencies
-                        .depends
-                        .iter()
-                        .map(|n| {
-                            let raw = format_packagespec(&n.spec);
-                            if raw.is_empty() {
-                                n.name.as_str().to_string()
-                            } else {
-                                format!("{} {raw}", n.name.as_str())
-                            }
-                        })
-                        .collect();
-                    let mut env_names: Vec<String> = if emission.envs.is_empty() {
-                        // Fallback default emission: no workspace
-                        // envs known -- do ONE solve check using the
-                        // emission's channels and just the
-                        // run-deps.
-                        vec!["__default__".to_string()]
-                    } else {
-                        emission.envs.clone()
-                    };
-                    // P1: filter out env names that are not declared in
-                    // the workspace manifest. A typo or a stale reference
-                    // after an env was removed would reach the solve with
-                    // zero effective_dependencies (empty env), which the
-                    // solver trivially satisfies -- hiding the misconfiguration
-                    // and inflating `all_solve_attempted`. The __default__
-                    // sentinel is always kept because it represents the
-                    // fallback-no-workspace path, not a manifest env.
-                    if let Some(m) = manifest_for_solve.as_ref() {
-                        env_names.retain(|n| {
-                            if n == "__default__" {
-                                return true;
-                            }
-                            let present = m.has_environment(n);
-                            if !present {
-                                tracing::warn!(
-                                    env = %n,
-                                    bundle = %bundle.conda_name,
-                                    "dropping env from solve: not declared in workspace manifest (typo or removed env?)",
-                                );
-                            }
-                            present
-                        });
-                    }
-                    // v0.44.0: solve the SMALLEST (most base) env first.
-                    // Workspace envs nest -- e.g. isaaclab-gpu ⊆ gsi ⊆
-                    // gsi-ros2 (each child adds features on top). Solving
-                    // the base env first lets its discovered widenings
-                    // SEED the children's refinement (see the
-                    // `accumulated_overrides` seed passed into
-                    // iterative_solve_refinement below), so a child env
-                    // doesn't re-discover the base's widening chain from
-                    // scratch. Ordering by ascending effective-dependency
-                    // count is a cheap proxy for the subset relation
-                    // (a superset env has at least as many deps). Pure
-                    // performance: seeding only cuts iteration count, the
-                    // final emission still unions every env's widenings
-                    // and every solve is re-verified.
-                    if let Some(m) = manifest_for_solve.as_ref() {
-                        env_names.sort_by_key(|n| {
-                            if n == "__default__" {
-                                0
-                            } else {
-                                m.effective_dependencies(n).len()
-                            }
-                        });
-                    }
-                    // v0.36.2+: snapshot the post-pre-emit-widen state
-                    // so each env's iterative refinement starts from
-                    // the SAME baseline. Without this, env A's
-                    // widenings leak into env B's solve via the shared
-                    // `&mut bundle` / `&mut effective` -- making
-                    // sibling envs appear "sat" because A already
-                    // widened pytorch/torchvision/etc. The user
-                    // caught this: gsi-ros2 ⊇ gsi (it includes every
-                    // gsi feature plus ros2); if gsi is unsat,
-                    // gsi-ros2 cannot truly be sat, but state leakage
-                    // was producing exactly that false positive.
-                    //
-                    // solve_diagnostics accumulates ACROSS envs
-                    // (each env contributes its own entry) -- only
-                    // the override + probe_decision state resets.
-                    let bundle_snapshot = bundle.clone();
-                    let effective_snapshot = effective.clone();
-                    let mut accumulated_diagnostics: BTreeMap<
-                        String,
-                        crate::audit::SolveDiagnostics,
-                    > = BTreeMap::new();
-                    // v0.36.4+: per-env refinement widens a LOCAL
-                    // copy of effective.overrides (via the
-                    // snapshot/restore pattern below). Union those
-                    // widenings here so we can rebuild `output` ONCE
-                    // after the env loop with the loosest spec per
-                    // dep — otherwise the iter widenings were inert
-                    // (the trace claimed they happened but the
-                    // CondaOutput pixi receives reflected only the
-                    // pre-refinement state). Starts from the
-                    // snapshot's overrides so non-widened entries
-                    // (transitive constraints injected by
-                    // discover_emissions, user overrides) carry
-                    // through unchanged.
-                    let mut accumulated_overrides: BTreeMap<String, String> =
-                        effective_snapshot.overrides.clone();
-                    // v1.4.3 solved envs in equal-dep-count LEVELS with a
-                    // barrier between levels; flattened here: solve ALL envs
-                    // concurrently in one bounded fan-out. The level barrier
-                    // only warm-started later (superset) envs with earlier
-                    // levels' widenings -- a convergence accelerator, not a
-                    // correctness dependency: every env still runs its own
-                    // full iterative refinement on its own clone of the
-                    // post-pre-emit snapshot (the v0.36.1/.2 isolation
-                    // contract), and the shipped CondaOutput is rebuilt from
-                    // the loosest-per-dep UNION of every env's widenings,
-                    // which is order-independent. Envs that hit
-                    // MAX_REFINEMENT without the warm seed are caught by the
-                    // P3 sibling-seeded re-run below, which now spans ALL
-                    // envs instead of one level. Concurrency is bounded by a
-                    // semaphore (max(2, ncpu/2)); the merge below still runs
-                    // serially in env order so accumulated_overrides stays a
-                    // deterministic monotonic union.
-                    {
-                        let level_seed = accumulated_overrides.clone();
-                        // One env's full seeded refinement, reusable by
-                        // both the parallel level fan-out and the P3
-                        // capped-env re-run. Inputs are cloned into the
-                        // future (snapshot isolation per invariant #9).
-                        let solve_env = |env_name: &String, seed: &BTreeMap<String, String>| {
-                            let mut bundle = bundle_snapshot.clone();
-                            let mut effective = effective_snapshot.clone();
-                            let env_name = env_name.clone();
-                            let seed = seed.clone();
-                            // Reference bindings so `async move` moves
-                            // only the &refs, not the outer values.
-                            let manifest_for_solve = &manifest_for_solve;
-                            let params = &params;
-                            let emitted_run_deps_strs = &emitted_run_deps_strs;
-                            let siblings = &siblings;
-                            async move {
-                                let env_name = &env_name;
-                                let level_seed = &seed;
-                                {
-                                    let (
-                                        env_channels,
-                                        env_workspace_specs,
-                                        env_system_requirements,
-                                    ) = match (manifest_for_solve, env_name.as_str()) {
-                                        (Some(m), n) if n != "__default__" => {
-                                            let chans: Vec<ChannelUrl> = m
-                                                .effective_channels(n)
-                                                .iter()
-                                                .filter_map(|s| {
-                                                    url::Url::parse(s).ok().map(ChannelUrl::from)
-                                                })
-                                                .collect();
-                                            let chans = if chans.is_empty() {
-                                                params.channels.clone()
-                                            } else {
-                                                chans
-                                            };
-                                            let mut specs: Vec<String> = Vec::new();
-                                            for (dep_name, spec) in m.effective_dependencies(n) {
-                                                if spec.is_empty() || spec == "*" {
-                                                    specs.push(dep_name);
-                                                } else {
-                                                    specs.push(format!("{dep_name} {spec}"));
-                                                }
-                                            }
-                                            // v0.37.0 D1b: pull per-env
-                                            // system-requirements so solve_check
-                                            // sees workspace-declared __cuda /
-                                            // __glibc / __osx instead of the
-                                            // build host's detected values.
-                                            let sysreqs = m.effective_system_requirements(n);
-                                            (chans, specs, sysreqs)
-                                        }
-                                        _ => (
-                                            params.channels.clone(),
-                                            Vec::new(),
-                                            std::collections::BTreeMap::new(),
-                                        ),
-                                    };
-                                    // v0.34.0+: iterative refinement. The solve
-                                    // check may say UNSAT because retread emitted
-                                    // a too-narrow spec (e.g. `triton >=3.7.0,<3.8`
-                                    // when conda's triton 3.7 needs cuda 13 but
-                                    // the workspace pins cuda 12.8). The cascade
-                                    // didn't widen because the per-dep probe saw
-                                    // triton 3.7.0 satisfying in isolation. Now
-                                    // we feed the solve-check failure BACK into
-                                    // the cascade: parse the blocking deps from
-                                    // the unsat explanation, widen any of them
-                                    // that are retread-emitted to `*`, re-run
-                                    // produce_output + solve check. Iterate up
-                                    // to MAX_REFINEMENT iterations (cap so we
-                                    // don't loop forever on external conflicts).
-                                    let t_env = std::time::Instant::now();
-                                    let outcome = iterative_solve_refinement(
-                                        emitted_run_deps_strs,
-                                        level_seed,
-                                        &env_workspace_specs,
-                                        &env_channels,
-                                        python_version,
-                                        &params.host_platform.to_string(),
-                                        &mut bundle,
-                                        &mut effective,
-                                        params.host_platform,
-                                        siblings,
-                                        env_name,
-                                        manifest_for_solve.as_ref(),
-                                        workspace_channel_priority,
-                                        &env_system_requirements,
-                                    )
-                                    .await
-                                    .map_err(|e| {
-                                        RpcError::internal(format!(
-                                            "solve refinement for {} env {}: {e:#}",
-                                            bundle.conda_name, env_name,
-                                        ))
-                                    })?;
-                                    tracing::info!(
-                                        env = %env_name,
-                                        elapsed_ms = t_env.elapsed().as_millis() as u64,
-                                        satisfiable = outcome.satisfiable,
-                                        refinement_rounds = outcome.refinement_steps.len(),
-                                        "bench: env refinement finished",
-                                    );
-                                    Ok((env_name.clone(), outcome, effective.overrides))
-                                }
-                            }
-                        };
-                        // Bounded fan-out over ALL envs. Note the clones
-                        // inside solve_env happen eagerly at closure-call
-                        // time (before the inner async block), so each env
-                        // still snapshots its inputs BEFORE any sibling
-                        // runs; the semaphore only gates the awaited solve
-                        // work. join_all preserves input order, so
-                        // level_results is in env_names order regardless of
-                        // completion order.
-                        let max_solve_concurrency = std::cmp::max(
-                            2,
-                            std::thread::available_parallelism()
-                                .map(|n| n.get())
-                                .unwrap_or(4)
-                                / 2,
-                        );
-                        let solve_sem =
-                            std::sync::Arc::new(tokio::sync::Semaphore::new(max_solve_concurrency));
-                        let level_results: Vec<Result<EnvSolveResult, RpcError>> =
-                            futures::future::join_all(env_names.iter().map(|e| {
-                                let sem = solve_sem.clone();
-                                let fut = solve_env(e, &level_seed);
-                                async move {
-                                    let _permit =
-                                        sem.acquire().await.expect("solve semaphore never closed");
-                                    fut.await
-                                }
-                            }))
-                            .await;
-
-                        // Unwrap all results first (fail fast on RPC errors).
-                        let mut level_outcomes: Vec<EnvSolveResult> = Vec::new();
-                        for result in level_results {
-                            level_outcomes.push(result?);
-                        }
-
-                        // P3 (grizzly #4): siblings can't cross-seed
-                        // during the parallel solve. When an env hit
-                        // MAX_REFINEMENT while any sibling converged,
-                        // give it exactly ONE re-run with a fresh full
-                        // budget, seeded with every sibling's widenings
-                        // (snapshot/restore + union accumulator). With
-                        // the flattened fan-out this spans ALL envs, so
-                        // it also replaces the old cross-level seeding.
-                        // A second cap is final: warn loudly and classify.
-                        let capped_idx = capped_envs_eligible_for_rerun(
-                            level_outcomes
-                                .iter()
-                                .map(|(_, o, _)| o.terminal_classification.as_deref()),
-                        );
-                        if !capped_idx.is_empty() {
-                            let mut rerun_seed = level_seed.clone();
-                            for (_, _, ovr) in &level_outcomes {
-                                for (dep, spec) in ovr {
-                                    merge_looser_override(&mut rerun_seed, dep, spec);
-                                }
-                            }
-                            for i in capped_idx {
-                                let env_name = level_outcomes[i].0.clone();
-                                tracing::info!(
-                                    env = %env_name,
-                                    "P3: re-running MAX_REFINEMENT-capped env once with sibling seeds",
-                                );
-                                let rerun = solve_env(&env_name, &rerun_seed).await?;
-                                if rerun.1.terminal_classification.as_deref()
-                                    == Some("A-iteration-cap")
-                                {
-                                    tracing::warn!(
-                                        env = %env_name,
-                                        "P3: env hit MAX_REFINEMENT again after the sibling-seeded re-run; classifying capped",
-                                    );
-                                }
-                                level_outcomes[i] = rerun;
-                            }
-                        }
-
-                        // Serial, in env order: union widenings +
-                        // bookkeeping. Identical to the old per-env
-                        // tail, just hoisted out of the parallel part.
-                        for result in level_outcomes {
-                            let (env_name, outcome, env_overrides) = result;
-                            let env_name = &env_name;
-                            // v0.36.4+: refinement may have widened
-                            // entries in `effective.overrides` for this
-                            // env. Union them into accumulated_overrides
-                            // (loosest spec per dep wins) so the
-                            // post-loop rebuild ships a CondaOutput
-                            // whose run-deps satisfy every env.
-                            for (dep, spec) in &env_overrides {
-                                merge_looser_override(&mut accumulated_overrides, dep, spec);
-                            }
-                            if !outcome.satisfiable
-                                && !outcome.skipped
-                                && !outcome.unsat_explanations.is_empty()
-                            {
-                                // Print the FULL diagnostic to stderr in
-                                // a banner so it survives pixi's log
-                                // filtering even at default verbosity.
-                                // pixi reports its own (often misleading)
-                                // leaf error -- this gives the user the
-                                // REAL upstream conflict chain alongside.
-                                let banner_lines: Vec<String> = outcome
-                                    .unsat_explanations
-                                    .iter()
-                                    .map(|r| format!("    {}", r.replace('\n', "\n    ")))
-                                    .collect();
-                                eprintln!(
-                                    "\n\
-                                 ┌──────────────────────────────────────────────────────────────────────\n\
-                                 │ RETREAD SOLVE FAILURE -- output `{}` env `{}`\n\
-                                 │ (pre-emission solve check; pixi's own error below may be misleading)\n\
-                                 ├──────────────────────────────────────────────────────────────────────\n\
-                                 {}\n\
-                                 │\n\
-                                 │ Full trace: retread-probe-trace-{}.json\n\
-                                 └──────────────────────────────────────────────────────────────────────\n",
-                                    bundle.conda_name,
-                                    env_name,
-                                    banner_lines.join("\n"),
-                                    bundle.conda_name,
-                                );
-                                tracing::error!(
-                                    bundle = %bundle.conda_name,
-                                    env = %env_name,
-                                    "pre-emission solve check UNSAT (see banner on stderr)",
-                                );
-                            }
-                            // v1.4.0: a SKIPPED check (no repodata) is an
-                            // abstention -- it must not arm the fail gate.
-                            if !outcome.skipped {
-                                all_solve_attempted = true;
-                            } else {
-                                // P1: count abstentions so classify_run_terminal
-                                // and the abstention banner both see the same
-                                // number. Accumulates outside the parallel tasks
-                                // (invariant #9: coordinator scope only).
-                                envs_skipped += 1;
-                            }
-                            envs_attempted += 1;
-                            if outcome.satisfiable {
-                                any_solve_passed = true;
-                            }
-                            // For workspace-blocked envs, accumulate a
-                            // one-liner suggestion for the consolidated
-                            // RPC failure message at the end.
-                            let class_tag =
-                                outcome.terminal_classification.clone().unwrap_or_default();
-                            if !outcome.satisfiable
-                                && (class_tag.starts_with("B-")
-                                    || class_tag.starts_with("C-")
-                                    || class_tag.starts_with("A-exhausted")
-                                    || class_tag.starts_with("A-no-widening")
-                                    || class_tag.starts_with("A-iteration-cap"))
-                            {
-                                envs_failed_with_block.insert(env_name.clone());
-                                for sug in &outcome.workspace_edit_suggestions {
-                                    real_suggestion_count += 1;
-                                    let feat = sug
-                                        .feature
-                                        .as_deref()
-                                        .map(|f| format!("[feature.{f}.dependencies]"))
-                                        .unwrap_or_else(|| "[dependencies]".to_string());
-                                    workspace_block_messages.push(format!(
-                                        "  env `{}` / {}: change `{}` -> `{}`  ({})",
-                                        sug.env,
-                                        feat,
-                                        sug.current_pin,
-                                        sug.suggested_pin,
-                                        sug.reason,
-                                    ));
-                                }
-                                // If no suggestions but workspace-blocked,
-                                // still include a generic line so the user
-                                // knows where to look.
-                                if outcome.workspace_edit_suggestions.is_empty() {
-                                    workspace_block_messages.push(format!(
-                                    "  env `{}` blocked ({}): see retread-probe-trace-{}.json.solve_diagnostics.{}",
-                                    env_name, class_tag, bundle.conda_name, env_name,
-                                ));
-                                }
-                            }
-                            accumulated_diagnostics.insert(
-                                env_name.clone(),
-                                crate::audit::SolveDiagnostics {
-                                    satisfiable: outcome.satisfiable,
-                                    unsat_explanations: outcome.unsat_explanations,
-                                    channels_consulted: outcome.channels_consulted,
-                                    specs_count: outcome.specs_count,
-                                    records_count: outcome.records_count,
-                                    refinement_steps: outcome.refinement_steps,
-                                    workspace_edit_suggestions: outcome.workspace_edit_suggestions,
-                                    terminal_classification: outcome.terminal_classification,
-                                    skipped: outcome.skipped,
-                                },
-                            );
-                        }
-                    }
-                    // Transfer accumulated per-env diagnostics back
-                    // onto the bundle so the probe trace + audit MD
-                    // files include all envs (the snapshot-restore
-                    // pattern above resets bundle.solve_diagnostics
-                    // every iteration).
-                    bundle.solve_diagnostics = accumulated_diagnostics.clone();
-                    // v0.36.4+: rebuild `output` to ship the
-                    // union'd refinement widenings. Snapshot-restore
-                    // semantics inside the env loop discarded each
-                    // env's mutations to bundle/effective, and the
-                    // original `output` (created pre-loop) reflected
-                    // only the pre-emit widen pass. Restore the
-                    // base bundle for emission, apply the
-                    // accumulated overrides, re-run produce_output +
-                    // post_emit_widen_pass, and replace `output`
-                    // with the result. Cheap: produce_output is
-                    // pure rendering and post_emit_widen_pass hits
-                    // the in-memory repodata cache.
-                    let widening_changed = accumulated_overrides != effective_snapshot.overrides;
-                    if widening_changed {
-                        let mut rebuild_effective = effective_snapshot.clone();
-                        rebuild_effective.overrides = accumulated_overrides.clone();
-                        let rebuilt = produce_output(
-                            &bundle_snapshot,
-                            &rebuild_effective,
-                            params.host_platform,
-                            python_version,
-                            &siblings,
-                            courier_build_hash.as_deref(),
-                            version_override_for_bundle,
-                        )
-                        .map_err(|e| {
-                            RpcError::internal(format!(
-                                "post-refinement output rebuild for {}: {e:#}",
-                                bundle_snapshot.conda_name,
-                            ))
-                        })?;
-                        output = rebuilt;
-                        // post_emit_widen_pass records its probes
-                        // against bundle.probe_decisions. After the
-                        // env loop's snapshot/restore + diagnostic
-                        // assignment above, `bundle` still holds the
-                        // last env's clone. That's fine for probe
-                        // recording -- the post-emit pass mutates
-                        // output's run-deps in place per the
-                        // ground-truth repodata, and any probe
-                        // decisions it adds become part of this
-                        // bundle's audit.
-                        post_emit_widen_pass(
-                            &mut output,
-                            &emission.channels,
-                            python_version,
-                            rebuild_effective.relax,
-                            &mut bundle.probe_decisions,
-                        )
-                        .await
-                        .map_err(|e| {
-                            RpcError::internal(format!(
-                                "post-refinement post-emit widen for {}: {e:#}",
-                                bundle.conda_name,
-                            ))
-                        })?;
-                        tracing::info!(
-                            bundle = %bundle.conda_name,
-                            widened_count = accumulated_overrides.len()
-                                - effective_snapshot.overrides.len(),
-                            "rebuilt output with refinement-widened overrides",
-                        );
-                        let rebuilt_run_deps_strs: Vec<String> = output
-                            .run_dependencies
-                            .depends
-                            .iter()
-                            .map(|n| {
-                                let raw = format_packagespec(&n.spec);
-                                if raw.is_empty() {
-                                    n.name.as_str().to_string()
-                                } else {
-                                    format!("{} {raw}", n.name.as_str())
-                                }
-                            })
-                            .collect();
-                        for env_name in &env_names {
-                            let should_reverify = accumulated_diagnostics
-                                .get(env_name)
-                                .map(|d| !d.satisfiable)
-                                .unwrap_or(true);
-                            if !should_reverify {
-                                continue;
-                            }
-                            let (env_channels, env_workspace_specs, env_system_requirements) =
-                                match (&manifest_for_solve, env_name.as_str()) {
-                                    (Some(m), n) if n != "__default__" => {
-                                        let chans: Vec<ChannelUrl> = m
-                                            .effective_channels(n)
-                                            .iter()
-                                            .filter_map(|s| {
-                                                url::Url::parse(s).ok().map(ChannelUrl::from)
-                                            })
-                                            .collect();
-                                        let chans = if chans.is_empty() {
-                                            params.channels.clone()
-                                        } else {
-                                            chans
-                                        };
-                                        let mut specs: Vec<String> = Vec::new();
-                                        for (dep_name, spec) in m.effective_dependencies(n) {
-                                            if spec.is_empty() || spec == "*" {
-                                                specs.push(dep_name);
-                                            } else {
-                                                specs.push(format!("{dep_name} {spec}"));
-                                            }
-                                        }
-                                        let sysreqs = m.effective_system_requirements(n);
-                                        (chans, specs, sysreqs)
-                                    }
-                                    _ => (
-                                        params.channels.clone(),
-                                        Vec::new(),
-                                        std::collections::BTreeMap::new(),
-                                    ),
-                                };
-                            let mut combined = rebuilt_run_deps_strs.clone();
-                            combined.extend(env_workspace_specs.iter().cloned());
-                            let outcome = crate::solve_check::run_solve_check(
-                                &env_channels,
-                                &combined,
-                                python_version,
-                                &params.host_platform.to_string(),
-                                workspace_channel_priority,
-                                &env_system_requirements,
-                            )
-                            .await;
-                            if outcome.satisfiable {
-                                any_solve_passed = true;
-                                envs_failed_with_block.remove(env_name);
-                                accumulated_diagnostics.insert(
-                                    env_name.clone(),
-                                    crate::audit::SolveDiagnostics {
-                                        satisfiable: true,
-                                        unsat_explanations: Vec::new(),
-                                        channels_consulted: outcome.channels_consulted,
-                                        specs_count: outcome.specs_count,
-                                        records_count: outcome.records_count,
-                                        refinement_steps: Vec::new(),
-                                        workspace_edit_suggestions: Vec::new(),
-                                        terminal_classification: None,
-                                        skipped: outcome.skipped,
-                                    },
-                                );
-                                tracing::info!(
-                                    bundle = %bundle.conda_name,
-                                    env = %env_name,
-                                    "rebuilt output re-verified SAT after sibling-env widenings",
-                                );
-                            }
-                        }
-                        bundle.solve_diagnostics = accumulated_diagnostics.clone();
-                    }
+                    // v4.2.0: the in-backend per-env solve check +
+                    // iterative widening cascade were removed with the
+                    // legacy mirror-solver. Emitted run-deps go to pixi
+                    // unvalidated; conflict attribution and conda-pin
+                    // widening are `retread solve`'s job (src/solve/).
                     if let Err(e) = write_probe_trace(&bundle, &source_dir).await {
                         tracing::warn!(
                             bundle = %bundle.conda_name,
@@ -1903,123 +1131,11 @@ impl Handler {
                             "probe trace write failed (non-fatal)",
                         );
                     }
-                    // v0.34.2+: write a sticky human-readable diagnostic
-                    // markdown file next to the source package's
-                    // pixi.toml whenever ANY env's solve is unsat.
-                    // pixi's progress spinner clears stderr lines, so
-                    // the banner doesn't survive. A file does. Path:
-                    // <source_dir>/RETREAD-SOLVE-FAILED-<bundle>.md
-                    if let Err(e) = write_solve_failed_summary(&bundle, &source_dir).await {
-                        tracing::debug!(
-                            bundle = %bundle.conda_name,
-                            error = %format!("{e:#}"),
-                            "solve-failed summary write failed (non-fatal)",
-                        );
-                    }
                     outputs.push(output);
                 }
             }
         }
-        tracing::debug!(
-            outputs = outputs.len(),
-            any_solve_passed,
-            all_solve_attempted,
-            envs_attempted,
-            envs_skipped,
-            workspace_block_messages = workspace_block_messages.len(),
-            "per-env emission loop complete",
-        );
-        // P1: classify the run terminal state and print a banner when any
-        // env abstained. Abstentions are NOT errors (offline-best-effort
-        // contract from invariant #9 / v1.4.0 skipped semantics), but they
-        // ARE visible -- silently shipping unverified outputs is worse than
-        // a loud notice. The banner goes to stderr AND the tty status line.
-        {
-            let (terminal, skipped_count) = classify_run_terminal(
-                envs_attempted,
-                envs_skipped,
-                !workspace_block_messages.is_empty(),
-            );
-            if skipped_count > 0 {
-                let banner = format!(
-                    "retread: solve check ABSTAINED for {skipped_count} of {envs_attempted} \
-                     env(s) (no repodata reachable); those envs ship UNVERIFIED",
-                );
-                eprintln!("\nretread WARNING: {banner}");
-                crate::status::tty(&format!("WARNING: {banner}"));
-                tracing::warn!(
-                    skipped = skipped_count,
-                    attempted = envs_attempted,
-                    terminal = ?terminal,
-                    "solve check abstained for some envs -- outputs ship unverified",
-                );
-            }
-        }
-        // v0.36.0+: fail conda/outputs if ANY env produced an
-        // actionable workspace conflict, even if other envs passed.
-        //
-        // Why this changed in v0.36.0: in v0.35.x the gate was
-        // `!any_solve_passed`. That hid a worst-case bug -- the
-        // ABI-anchor widening regression silently corrupted outputs
-        // (`python *`) so 3 of 4 envs "passed" against the
-        // pre-emission solve check; retread shipped those corrupt
-        // outputs to pixi; pixi's downstream solve then exploded on
-        // a misleading leaf (`gymnasium ... python_abi 3.11`). With
-        // v0.36.0's ABI-anchor invariant + per-chain verdicts, the
-        // cascade no longer corrupts outputs in this way -- so the
-        // gate can safely be tightened to "any env actionable" and
-        // the user gets the structured RPC error + the MD-file path
-        // even when sibling envs happen to be solvable.
-        if all_solve_attempted && !workspace_block_messages.is_empty() {
-            // Build the file-path hint pointing at the source dir.
-            // The MD file is named after the bundle's conda name.
-            let md_paths: Vec<String> =
-                bundle_md_paths(&source_dir, &outputs).into_iter().collect();
-            let md_hint = if md_paths.is_empty() {
-                format!("RETREAD-SOLVE-FAILED-*.md under {}", source_dir.display())
-            } else {
-                md_paths.join(" ")
-            };
-            // ONE short headline + accurate scope + path. Detail
-            // lives in the MD file. Pixi will display this verbatim.
-            //
-            // Scope text reflects whether the failure is total or
-            // partial -- "1 of 4 envs failed" reads very differently
-            // from "every env failed" and the user shouldn't have to
-            // open the MD file to know which.
-            let n_failed = envs_failed_with_block.len();
-            let failed_env_list: Vec<String> = envs_failed_with_block.iter().cloned().collect();
-            let scope = if envs_attempted > 0 && n_failed == envs_attempted {
-                format!("every env ({n_failed}/{envs_attempted})")
-            } else if envs_attempted > 0 {
-                format!(
-                    "{n_failed} of {envs_attempted} envs: [{}]",
-                    failed_env_list.join(", "),
-                )
-            } else {
-                format!("{n_failed} env(s)")
-            };
-            // v0.36.2+: distinguish real suggestions from
-            // "see-the-trace" fallback. Previous message
-            // conflated them ("4 workspace-edit suggestion(s)
-            // available" even when 0 actionable suggestions were
-            // generated) which was confusing when the MD's
-            // suggestions section was empty.
-            let action_line = if real_suggestion_count > 0 {
-                format!(
-                    "{real_suggestion_count} actionable workspace-edit suggestion(s) at the top of the MD",
-                )
-            } else {
-                "no auto-suggestion (cascade exhausted; conflict is upstream-wheel-vs-workspace-pin and \
-                 requires manual judgment -- see the per-env refinement steps in the MD for what was tried)"
-                    .to_string()
-            };
-            let msg = format!(
-                "retread: pre-emission solve check failed for {scope} against workspace pins. \
-                 {action_line}. Open: {md_hint}",
-            );
-            return Err(RpcError::invalid_params(msg));
-        }
+        tracing::debug!(outputs = outputs.len(), "per-env emission loop complete");
         let result = CondaOutputsResult {
             outputs,
             input_globs: Default::default(),
@@ -3018,10 +2134,14 @@ async fn uv_group_closure(
 #[derive(Debug, Clone)]
 struct DiscoveredEmission {
     output_name: String,
+    /// Channels + env names were consumed by the per-env pre-emission
+    /// solve check deleted in v4.2.0; kept because the channel union
+    /// still feeds `extract_transitive_constraints` at construction
+    /// time and the env list documents provenance in debug output.
+    #[allow(dead_code)]
     channels: Vec<ChannelUrl>,
     transitive_overrides: BTreeMap<String, String>,
-    /// v0.33.5+: env names this discovered output is referenced by.
-    /// Used to drive per-env solve checks downstream.
+    #[allow(dead_code)]
     envs: Vec<String>,
 }
 
@@ -3225,20 +2345,21 @@ fn join_transitive_to_overrides(
     out
 }
 
-/// Build the list of `RETREAD-SOLVE-FAILED-*.md` paths the user
-/// should open after a solve failure. One per emitted output that
-/// produced an MD file. Returned as absolute paths so the user can
-/// click them directly out of the terminal.
-fn bundle_md_paths(source_dir: &Path, outputs: &[CondaOutput]) -> Vec<String> {
-    let mut paths: HashSet<String> = HashSet::new();
-    for o in outputs {
-        let name = o.metadata.name.as_normalized();
-        let p = source_dir.join(format!("RETREAD-SOLVE-FAILED-{name}.md"));
-        paths.insert(p.display().to_string());
-    }
-    let mut v: Vec<String> = paths.into_iter().collect();
-    v.sort();
-    v
+/// Bundle group for a `[retread-wheels]` entry: the per-entry `bundle`
+/// field wins, then the pack-wide `retread-bundle` default (v1.4.0),
+/// then standalone (the entry's own name -- one conda output per
+/// entry, the historical behavior). (Migrated from the deleted
+/// cascade.rs in v4.2.0.)
+pub(crate) fn bundle_group_for(
+    entry_name: &str,
+    entry: &WheelEntry,
+    default_bundle: Option<&str>,
+) -> String {
+    entry
+        .bundle
+        .clone()
+        .or_else(|| default_bundle.map(String::from))
+        .unwrap_or_else(|| entry_name.to_string())
 }
 
 /// Apply a `DiscoveredEmission` to a materialized bundle + base
@@ -3304,9 +2425,10 @@ async fn resolve_bundle(
     // PR-2: retread-conda-deps names (force-list). Used only by the A/B
     // oracle to capture the auto_bundle skip-set route; never affects BFS logic.
     conda_deps_list: &[String],
-    // PR-2: workspace PyPI index chain for transitive resolvo discovery.
-    // Mirrors the chain auto_bundle_transitives uses. Build with merge_index_chain.
-    workspace_indexes: &[String],
+    // Workspace PyPI index chain (kept for call-site symmetry with
+    // auto_bundle_transitives; unused since the resolvo mirror-solver
+    // was deleted in v4.2.0).
+    _workspace_indexes: &[String],
     // incremental-add path: locked closure from the committed lock
     // (name → version_str for every wheel EXCEPT the new dep being added).
     // When Some, seeds ResolveState with ==V pinned constraints so ripples
@@ -3399,11 +2521,6 @@ async fn resolve_bundle(
     // metapackage's namespace convention.
     let is_source_form = entry.is_path() || entry.is_git() || entry.is_named_git();
     if is_source_form && entry.extras.is_empty() {
-        // PR-2: emit SKIPPED AbReport when the diff hook is active.
-        if let Ok(report_path) = std::env::var("RETREAD_RESOLVO_DIFF") {
-            resolvo_ab::ab_skip_hook(&report_path, entry_name, target, "source-form-no-extras")
-                .await;
-        }
         return Ok(Bundle {
             conda_name,
             primary,
@@ -3412,25 +2529,6 @@ async fn resolve_bundle(
             solve_diagnostics: BTreeMap::new(),
             conda_routed: vec![],
         });
-    }
-
-    // ── RETREAD_RESOLVO=1: resolvo path (default OFF) ─────────────────────
-    // When set, run the resolvo DependencyProvider + solve in place of the BFS.
-    // Both paths produce an identical `Bundle`.  The BFS remains the default.
-    if std::env::var("RETREAD_RESOLVO").is_ok() {
-        return resolve_bundle_resolvo(
-            conda_name,
-            primary,
-            entry,
-            target,
-            download_dir,
-            relax,
-            name_map,
-            conda_channels,
-            pypi_to_conda,
-            workspace_indexes,
-        )
-        .await;
     }
 
     // Seed BFS from the primary's deps. Two flavors:
@@ -4113,114 +3211,7 @@ async fn resolve_bundle(
         conda_routed: conda_routed_acc,
     };
 
-    // PR-2: A/B oracle hook (RETREAD_RESOLVO_DIFF=<path>).
-    if let Ok(report_path) = std::env::var("RETREAD_RESOLVO_DIFF") {
-        resolvo_ab::ab_diff_hook(
-            &report_path,
-            entry_name,
-            target,
-            &bfs_bundle,
-            entry,
-            download_dir,
-            relax,
-            name_map,
-            conda_channels,
-            pypi_to_conda,
-            conda_deps_list,
-            workspace_indexes,
-        )
-        .await;
-    }
-
     Ok(bfs_bundle)
-}
-
-/// resolvo path for `resolve_bundle` (gated on `RETREAD_RESOLVO=1`).
-///
-/// Runs the three-phase resolvo pipeline:
-///   1. PR-1b `run_discovery` — async, over-approximating fixpoint that
-///      fetches all reachable candidates + metadata + conda-route memo.
-///   2. PR-1c `PypiDependencyProvider` — build the resolvo Pool from the
-///      `DiscoveryPool`, then solve inside `spawn_blocking`.
-///   3. Map `Vec<SolvedWheel>` → `Bundle` using `pool_record_to_resolved_wheel`.
-///
-/// `primary` is already materialised by the caller (`resolve_bundle`);
-/// `extras` are the solved sub-wheels.
-#[allow(clippy::too_many_arguments)]
-async fn resolve_bundle_resolvo(
-    conda_name: String,
-    primary: ResolvedWheel,
-    entry: &crate::config::WheelEntry,
-    target: &pypi::WheelTarget,
-    download_dir: &Path,
-    relax: RelaxPolicy,
-    name_map: &std::collections::BTreeMap<String, String>,
-    conda_channels: &[ChannelUrl],
-    pypi_to_conda: &PypiToCondaMap,
-    workspace_indexes: &[String],
-) -> Result<Bundle> {
-    use crate::handler::resolvo_provider::{
-        SolveOutcome, pool_record_to_resolved_wheel, resolvo_solve_pool,
-    };
-
-    let primary_rd = primary.metadata.requires_dist.clone();
-
-    // ── Phases 1+2: discovery fixpoint + sync solve via shared harness ──────
-    // resolvo_solve_pool encapsulates discovery + spawn_blocking solve into one
-    // unit.  SolveOutcome::Unsolvable is mapped to Err here (the default path
-    // fails closed); the A/B oracle uses SolveOutcome directly via ab_diff_hook.
-    let (pool, outcome) = resolvo_solve_pool(
-        &primary_rd,
-        entry,
-        target,
-        download_dir,
-        relax,
-        name_map,
-        conda_channels,
-        pypi_to_conda,
-        &[], // force-list not relevant on the RETREAD_RESOLVO=1 path
-        workspace_indexes,
-    )
-    .await
-    .context("resolvo discovery pass failed")?;
-
-    let solved_wheels = match outcome {
-        SolveOutcome::Solved(wheels) => wheels,
-        SolveOutcome::Unsolvable(msg) => {
-            return Err(anyhow::anyhow!("resolvo: dependency conflict:\n{msg}"));
-        }
-    };
-
-    // ── Phase 3: map solution → Bundle extras ─────────────────────────────────
-    let mut extras: Vec<ResolvedWheel> = Vec::new();
-    for solved_wheel in &solved_wheels {
-        match pool_record_to_resolved_wheel(solved_wheel, &pool) {
-            Ok(rw) => extras.push(rw),
-            Err(e) => {
-                tracing::warn!(
-                    name = %solved_wheel.pypi_name,
-                    version = %solved_wheel.version_str,
-                    error = %format!("{e:#}"),
-                    "resolvo: failed to map solved wheel to ResolvedWheel; skipping"
-                );
-            }
-        }
-    }
-
-    tracing::debug!(
-        conda_name = %conda_name,
-        extras_count = extras.len(),
-        "resolvo: bundle assembled"
-    );
-
-    Ok(Bundle {
-        conda_name,
-        primary,
-        extras,
-        probe_decisions: vec![],
-        solve_diagnostics: BTreeMap::new(),
-        conda_routed: pool.conda_routed_names.iter().cloned().collect(),
-    })
 }
 
 /// One PyPI-form BFS item's materialization: wheel resolve -> fetch,
@@ -4851,13 +3842,6 @@ async fn materialize_and_rewrite(
 }
 
 /// (env name, refinement outcome, the env's final overrides) from one
-/// env's concurrent solve task in the per-level env loop.
-type EnvSolveResult = (
-    String,
-    crate::solve_check::SolveOutcome,
-    BTreeMap<String, String>,
-);
-
 /// Shared assembly helper: given the already-computed `run_dep_specs`
 /// (seeded with the python dep, siblings NOT yet added) and `seen_dep_names`
 /// (tracking which conda names were already added), assembles the final
