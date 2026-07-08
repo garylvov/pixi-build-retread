@@ -11,6 +11,8 @@ name: release
 on:
   push:
     tags: ['v*']
+  # Manual runs (builds whatever ref is selected, default branch by default).
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -22,10 +24,7 @@ jobs:
     env:
       # Consumed by `rattler-build upload prefix` ([env: PREFIX_API_KEY=]).
       PREFIX_API_KEY: ${{ secrets.PREFIX_API_KEY }}
-      # !!! PLACEHOLDER CHANNEL !!!
-      # No prefix.dev channel name is referenced anywhere in this repo yet;
-      # "garylvov" is a guess. EDIT THIS to the real prefix.dev channel
-      # before relying on the publish step.
+      # https://prefix.dev/channels/garylvov/packages/pixi-build-retread
       PREFIX_CHANNEL: garylvov
     steps:
       - uses: actions/checkout@v4
