@@ -2059,6 +2059,149 @@ async fn resolve_all(
     Ok((bundles, effective))
 }
 
+/// Production wiring for the sdist-only self-heal's THIRD rung (v4.4.0;
+/// spec ladder: wheel -> conda-route (existing) -> sdist auto-build (this
+/// fn) -> error). Resolves `name`'s sdist off the first index in
+/// `index_urls` that carries one (same PyPI-last chain priority as every
+/// other resolve in this module), builds it via the SAME machinery
+/// git-sourced `[retread-wheels]` entries use
+/// ([`crate::source_build::build_wheel_from_sdist_url`]), hash-verifies
+/// the downloaded sdist against the index's advertised sha256 (when the
+/// index published one), and persists the built wheel content-addressed
+/// in the shared wheel store ([`crate::wheel::store_wheel_in_cache`]) so
+/// `retread install` replay never re-resolves (no-resolve edict).
+///
+/// Build-output cache key: `sha256(sdist identity, python_version,
+/// conda_subdir)` — a toolchain change (different target python/subdir)
+/// or a changed sdist gets its own out-dir; an identical repeat request
+/// hits `source_build`'s own out-dir cache and skips the `uv build`
+/// subprocess entirely.
+async fn build_sdist_wheel(
+    name: String,
+    index_urls: Vec<String>,
+    python_version: String,
+    conda_subdir: String,
+    cache_dir: PathBuf,
+) -> Result<crate::uv_closure::BuiltSdistWheel> {
+    // Match-any version specifier (empty PEP 440 specifier set is
+    // vacuously satisfied by every version) -- the sdist-only self-heal
+    // has no resolved pypi version to target (uv never produced a
+    // closure for this name), mirroring the conda-route rung's ANY-
+    // version probe.
+    let specifiers = VersionSpecifiers::from_str("")
+        .expect("empty PEP 440 specifier string always parses (match-any)");
+    let mut last_err: Option<anyhow::Error> = None;
+    for index in &index_urls {
+        let (version, sdist) = match crate::pypi::resolve_sdist(index, &name, &specifiers).await {
+            Ok(hit) => hit,
+            Err(e) => {
+                last_err = Some(e);
+                continue;
+            }
+        };
+        tracing::info!(
+            pkg = %name,
+            version = %version,
+            "building sdist {name}=={version} (no wheel, no conda candidate)",
+        );
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(b"retread-sdist-autobuild-v1\n");
+        hasher.update(
+            sdist
+                .sha256
+                .as_deref()
+                .unwrap_or_else(|| sdist.url.as_str())
+                .as_bytes(),
+        );
+        hasher.update(b"\0");
+        hasher.update(python_version.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(conda_subdir.as_bytes());
+        let digest = hasher.finalize();
+        let key12: String = digest.iter().take(6).map(|b| format!("{b:02x}")).collect();
+        let out_dir = cache_dir
+            .join("sdist-auto-builds")
+            .join(canonical_conda_name(&name))
+            .join(key12);
+        let built =
+            crate::source_build::build_wheel_from_sdist_url(&sdist.url, &out_dir, &python_version)
+                .await
+                .with_context(|| {
+                    format!("sdist auto-build: building `{name}` from {}", sdist.url)
+                })?;
+
+        // Hash-verify the sdist tarball `build_wheel_from_sdist_url`
+        // downloaded against the index's advertised sha256, when it
+        // published one. Best-effort: an index that omits the fragment
+        // (rare) skips the check rather than failing a build it has no
+        // way to verify.
+        if let Some(expected) = &sdist.sha256 {
+            let sdist_filename = sdist
+                .url
+                .path_segments()
+                .and_then(|mut s| s.next_back())
+                .unwrap_or_default();
+            let sdist_path = out_dir.join(sdist_filename);
+            if sdist_path.is_file() {
+                let bytes = tokio::fs::read(&sdist_path).await.with_context(|| {
+                    format!(
+                        "sdist auto-build: reading {} for hash verify",
+                        sdist_path.display()
+                    )
+                })?;
+                let mut h = Sha256::new();
+                h.update(&bytes);
+                let actual = format!("{:x}", h.finalize());
+                if !actual.eq_ignore_ascii_case(expected) {
+                    bail!(
+                        "sdist auto-build: hash mismatch for `{name}` sdist \
+                         {sdist_filename} (index advertised {expected}, got {actual})"
+                    );
+                }
+            }
+        }
+
+        let store_root = crate::courier::retread_wheel_store_root();
+        let sha256 = crate::wheel::store_wheel_in_cache(&built, &store_root)
+            .await
+            .with_context(|| format!("sdist auto-build: storing built wheel for `{name}`"))?;
+        let filename = built
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| {
+                anyhow!(
+                    "sdist auto-build: built wheel path has no utf-8 filename: {}",
+                    built.display()
+                )
+            })?
+            .to_string();
+        let store_path = store_root.join(&sha256).join(&filename);
+        let sdist_url = match &sdist.sha256 {
+            Some(h) => format!("{}#sha256={h}", sdist.url),
+            None => sdist.url.to_string(),
+        };
+        return Ok(crate::uv_closure::BuiltSdistWheel {
+            pypi_name: name.clone(),
+            version: version.to_string(),
+            filename,
+            wheel_path: store_path,
+            sha256,
+            sdist_source: crate::lock::SdistWheelSource {
+                index: index.clone(),
+                name: name.clone(),
+                version: version.to_string(),
+                sdist_url,
+            },
+        });
+    }
+    Err(last_err
+        .unwrap_or_else(|| anyhow!("sdist auto-build: no index chain configured for `{name}`"))
+        .context(format!(
+            "sdist auto-build: no index in the chain has an sdist for `{name}`"
+        )))
+}
+
 /// spec-uv-restructure M1: build + solve one bundle group's closure via uv.
 ///
 /// Roots are the group's uv-resolvable entries (PyPI spec-form entries as
@@ -2205,7 +2348,7 @@ async fn uv_group_closure(
         constraints,
         overrides,
         no_emit_packages: no_emit,
-        index_urls,
+        index_urls: index_urls.clone(),
         built_wheel_sources: BTreeMap::new(), // M1: source-built entries stay legacy
         offline: false,
     };
@@ -2247,7 +2390,7 @@ async fn uv_group_closure(
 
     // `'static` closures for the fixpoint driver: clone the inputs each
     // solve/probe needs. Cheap relative to a uv subprocess / repodata hit.
-    let solve = {
+    let raw_solve = {
         let project_dir = project_dir.clone();
         let uv_cache_dir = uv_cache_dir.clone();
         move |r: crate::uv_closure::UvClosureRequest| {
@@ -2278,6 +2421,58 @@ async fn uv_group_closure(
                 as futures::future::BoxFuture<'static, Option<crate::uv_closure::RouteProbeHit>>
         }
     };
+    // Sdist-only self-heal (v4.4.0 third rung, spec-uv-restructure
+    // follow-up): rung 1 (conda-route) probes for ANY compatible version
+    // (spec "*") -- reuses the same `probe::find_route` the ordinary
+    // auto-route round uses, just without an exact-version pin. Rung 2
+    // (sdist auto-build) is gated by `sdist-build` (default "auto");
+    // `"never"` passes `None` so the wrapper reproduces the pre-v4.4.0
+    // conda-route-or-error behavior exactly.
+    let sdist_probe = {
+        let channels = conda_channels.to_vec();
+        let python = target.python_version.clone();
+        move |conda_name: String| {
+            let channels = channels.clone();
+            let python = python.clone();
+            let fut = async move {
+                crate::probe::find_route(&channels, &conda_name, "*", Some(&python))
+                    .await
+                    .map(|hit| crate::uv_closure::RouteProbeHit {
+                        conda_version: hit.version,
+                        channel: hit.channel,
+                    })
+            };
+            Box::pin(fut)
+                as futures::future::BoxFuture<'static, Option<crate::uv_closure::RouteProbeHit>>
+        }
+    };
+    let sdist_build = (effective.sdist_build == crate::config::SdistBuildPolicy::Auto).then(|| {
+        let index_urls = index_urls.clone();
+        let python_version = target.python_version.clone();
+        let conda_subdir = target.conda_subdir.clone();
+        let cache_dir = cache_dir.to_path_buf();
+        move |name: String| {
+            let fut = build_sdist_wheel(
+                name,
+                index_urls.clone(),
+                python_version.clone(),
+                conda_subdir.clone(),
+                cache_dir.clone(),
+            );
+            Box::pin(fut)
+                as futures::future::BoxFuture<'static, Result<crate::uv_closure::BuiltSdistWheel>>
+        }
+    });
+    let sdist_routed = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sdist_built = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let solve = crate::uv_closure::with_sdist_heal(
+        group_name.to_string(),
+        raw_solve,
+        sdist_probe,
+        sdist_build,
+        Arc::clone(&sdist_routed),
+        Arc::clone(&sdist_built),
+    );
     // Co-installability check for the self-healing un-route step: solve
     // the candidate auto-routed EXACT pins (plus the workspace default
     // env's own conda deps, mirroring the constraint source above, plus
@@ -2363,7 +2558,7 @@ async fn uv_group_closure(
                 as futures::future::BoxFuture<'static, crate::uv_closure::CoInstallVerdict>
         }
     };
-    let closure = crate::uv_closure::auto_route_fixpoint_checked(
+    let mut closure = crate::uv_closure::auto_route_fixpoint_checked(
         &req,
         &auto_route_opts,
         solve,
@@ -2371,6 +2566,37 @@ async fn uv_group_closure(
         co_solve,
     )
     .await?;
+    // Splice in the sdist-only self-heal's discoveries (mirrors
+    // `uv_closure::auto_route_fixpoint_with_sdist_heal`'s own splice,
+    // which this call site can't use directly -- production also needs
+    // the co-install-checked auto-route un-route step from
+    // `auto_route_fixpoint_checked`).
+    {
+        let routed = sdist_routed.lock().unwrap();
+        closure.auto_routed.extend(routed.iter().cloned());
+    }
+    {
+        let built = sdist_built.lock().unwrap();
+        for w in built.iter() {
+            closure
+                .pins
+                .entry(w.pypi_name.clone())
+                .or_insert_with(|| w.version.clone());
+            closure.wheels.push(crate::lock::LockWheel {
+                name: w.pypi_name.clone(),
+                version: w.version.clone(),
+                origin: crate::lock::Origin::Built,
+                filename: w.filename.clone(),
+                url: None,
+                sha256: Some(w.sha256.clone()),
+                requires_dist: Vec::new(),
+                must_ship: true,
+                upstream_url: None,
+                git_source: None,
+                sdist_source: Some(w.sdist_source.clone()),
+            });
+        }
+    }
     Ok(Some(closure))
 }
 

@@ -905,6 +905,7 @@ mod tests {
             auto_route: true,
             keep_pypi: vec![],
             force_conda: vec![],
+            sdist_build: Default::default(),
             retread_wheels: BTreeMap::new(),
             relax: RelaxPolicy::Minor,
             overrides: BTreeMap::new(),

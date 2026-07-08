@@ -649,7 +649,9 @@ pub fn extract_sdist_only_packages(text: &str) -> Vec<String> {
 /// Guidance appended to the ORIGINAL uv error (verbatim, never
 /// paraphrased — spec convention shared with [`format_lock_failure`])
 /// when one or more sdist-only packages have no conda candidate
-/// either. Never silently drops the dependency: the caller must choose.
+/// either AND the sdist auto-build rung is disabled (`sdist-build =
+/// "never"`) or was never reached. Never silently drops the
+/// dependency: the caller must choose.
 pub fn sdist_only_no_route_message(names: &[String]) -> String {
     let list = names.join(", ");
     format!(
@@ -658,38 +660,118 @@ pub fn sdist_only_no_route_message(names: &[String]) -> String {
     )
 }
 
-/// Wrap a `solve` closure with the sdist-only self-heal: on a `uv lock`
-/// failure naming the sdist-only class ([`is_sdist_only_uv_error`]),
-/// each named package is probed against the workspace conda channels
-/// for ANY compatible version (`sdist_probe`; unlike the exact-version
-/// auto-route round, there is no resolved pypi version to probe AT —
-/// uv never produced a closure). A hit routes the package to conda via
-/// the same mechanism as an ordinary auto-route hit (exclude from the
-/// closure + pin/range on the conda-resolved version) and the request
-/// is re-solved. A miss on ANY named package aborts with the original
-/// uv error verbatim plus [`sdist_only_no_route_message`] — it never
-/// silently drops a dependency.
+/// A wheel AUTO-BUILT from a PyPI sdist by the sdist-only self-heal's
+/// THIRD rung (ladder: wheel -> conda-route -> sdist auto-build ->
+/// error), reached when a package has no wheels at all AND no conda
+/// channel carries any version of it. Built through the SAME machinery
+/// git-sourced `[retread-wheels]` entries use
+/// ([`crate::source_build::build_wheel_from_sdist_url`]), stored
+/// content-addressed in the shared wheel store
+/// ([`crate::wheel::store_wheel_in_cache`]), and carrying the same
+/// provenance shape a legacy gym-class sdist-built wheel gets
+/// ([`crate::lock::SdistWheelSource`]) so replay never re-resolves
+/// (no-resolve edict).
+#[derive(Debug, Clone)]
+pub struct BuiltSdistWheel {
+    /// PEP 503-canonical PyPI name.
+    pub pypi_name: String,
+    /// Resolved version (from the built wheel's METADATA).
+    pub version: String,
+    /// Standardized wheel filename (basename of `wheel_path`).
+    pub filename: String,
+    /// On-disk path to the built wheel (already persisted into the
+    /// shared wheel store; this is the store-relative materialized
+    /// copy, hard-linked/copied wherever the caller needs it).
+    pub wheel_path: PathBuf,
+    /// sha256 of the built wheel's bytes (from
+    /// [`crate::wheel::store_wheel_in_cache`]).
+    pub sha256: String,
+    /// Sdist provenance: index, name, version, and the exact resolved
+    /// sdist URL (+ `#sha256` when the index advertised one).
+    pub sdist_source: crate::lock::SdistWheelSource,
+}
+
+/// Guidance appended to the ORIGINAL uv error when the sdist auto-build
+/// rung was attempted for one or more sdist-only names and FAILED for
+/// at least one of them. Surfaces the tail of each build failure
+/// (already includes the underlying `uv build --wheel` stderr snippet
+/// via [`crate::source_build::build_wheel_from_sdist_url`]'s error
+/// chain) so the user can act without re-running with more verbosity.
+pub fn sdist_build_failed_message(failures: &[(String, String)]) -> String {
+    let mut out = String::from("\nsdist auto-build failed for:\n");
+    for (name, err) in failures {
+        let lines: Vec<&str> = err.lines().collect();
+        let tail_start = lines.len().saturating_sub(20);
+        out.push_str(&format!("  {name}:\n"));
+        for line in &lines[tail_start..] {
+            out.push_str("    ");
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out.push_str(
+        "options: fix the sdist build (missing build backend / native \
+         toolchain), allow a manual build (no-build = false), drop-dep, \
+         or vendor a wheel.\n",
+    );
+    out
+}
+
+/// Wrap a `solve` closure with the sdist-only self-heal ladder: on a
+/// `uv lock` failure naming the sdist-only class
+/// ([`is_sdist_only_uv_error`]), each named package climbs a THREE-rung
+/// ladder before the caller ever sees an error:
+///
+/// 1. **conda-route** (pre-existing): probed against the workspace conda
+///    channels for ANY compatible version (`sdist_probe`; unlike the
+///    exact-version auto-route round, there is no resolved pypi version
+///    to probe AT — uv never produced a closure). A hit routes the
+///    package to conda via the same mechanism as an ordinary auto-route
+///    hit (exclude from the closure + pin/range on the conda-resolved
+///    version).
+/// 2. **sdist auto-build** (new): on a conda miss, when `sdist_build` is
+///    `Some` (config `sdist-build = "auto"`, the default), the package
+///    is built from its PyPI sdist via `sdist_build` — the SAME
+///    machinery git-sourced `[retread-wheels]` entries use
+///    (`crate::source_build::build_wheel_from_sdist_url`), cached/stored
+///    content-addressed. A success registers a `tool.uv.sources` path
+///    source (`req.built_wheel_sources`) so the re-solve is satisfied
+///    exactly like a real index wheel, and records a
+///    [`BuiltSdistWheel`] for the caller to splice into the final
+///    closure's `wheels` with full provenance.
+/// 3. **error**: only when conda-route misses AND (the build rung is
+///    disabled, i.e. `sdist_build` is `None` / `sdist-build = "never"`,
+///    OR the build itself fails) does the original uv error surface,
+///    verbatim, with guidance appended
+///    ([`sdist_only_no_route_message`] / [`sdist_build_failed_message`]).
+///    It never silently drops a dependency.
 ///
 /// Bounded by [`AUTO_ROUTE_MAX_ROUNDS`] heal attempts, mirroring the
 /// auto-route round cap; every attempt that doesn't abort or succeed
-/// strictly grows the accumulated route set, which is bounded by the
-/// number of distinct sdist-only names uv can name.
+/// strictly grows the accumulated routed+built set, which is bounded by
+/// the number of distinct sdist-only names uv can name.
 ///
-/// The routes discovered here are appended to `routed` (shared with
-/// the caller via `Arc<Mutex<_>>`) so a wrapping [`auto_route_fixpoint`]
-/// caller can splice them into the final closure's `auto_routed` list
-/// and log them with the same "routed to conda" provenance.
-pub fn with_sdist_heal<S, SP>(
+/// The routes/builds discovered here are appended to `routed` / `built`
+/// (shared with the caller via `Arc<Mutex<_>>`) so a wrapping
+/// [`auto_route_fixpoint`] caller can splice them into the final
+/// closure and log them with the same provenance conventions.
+pub fn with_sdist_heal<S, SP, SB>(
     bundle: String,
     solve: S,
     sdist_probe: SP,
+    sdist_build: Option<SB>,
     routed: std::sync::Arc<std::sync::Mutex<Vec<AutoRoutedPackage>>>,
+    built: std::sync::Arc<std::sync::Mutex<Vec<BuiltSdistWheel>>>,
 ) -> impl FnMut(UvClosureRequest) -> futures::future::BoxFuture<'static, Result<UvClosure>>
 where
     S: FnMut(UvClosureRequest) -> futures::future::BoxFuture<'static, Result<UvClosure>>
         + Send
         + 'static,
     SP: Fn(String) -> futures::future::BoxFuture<'static, Option<RouteProbeHit>>
+        + Send
+        + Sync
+        + 'static,
+    SB: Fn(String) -> futures::future::BoxFuture<'static, Result<BuiltSdistWheel>>
         + Send
         + Sync
         + 'static,
@@ -700,17 +782,28 @@ where
     // below would strand the next outer invocation with nothing to call).
     let solve = std::sync::Arc::new(std::sync::Mutex::new(solve));
     let sdist_probe = std::sync::Arc::new(sdist_probe);
+    let sdist_build = std::sync::Arc::new(sdist_build);
     move |mut req: UvClosureRequest| {
         let bundle = bundle.clone();
         let solve = std::sync::Arc::clone(&solve);
         let sdist_probe = std::sync::Arc::clone(&sdist_probe);
+        let sdist_build = std::sync::Arc::clone(&sdist_build);
         let routed = std::sync::Arc::clone(&routed);
-        // Already-healed exclusions/pins accumulated across earlier
-        // outer-loop rounds must apply to THIS round's request too —
-        // the outer fixpoint owns `req` and knows nothing about them.
+        let built = std::sync::Arc::clone(&built);
+        // Already-healed exclusions/pins/path-sources accumulated across
+        // earlier outer-loop rounds must apply to THIS round's request
+        // too — the outer fixpoint owns `req` and knows nothing about
+        // them.
         {
             let already = routed.lock().unwrap();
             apply_auto_route(&mut req, &already);
+        }
+        {
+            let already = built.lock().unwrap();
+            for w in already.iter() {
+                req.built_wheel_sources
+                    .insert(w.pypi_name.clone(), w.wheel_path.clone());
+            }
         }
         let fut = (*solve.lock().unwrap())(req.clone());
         Box::pin(async move {
@@ -721,9 +814,13 @@ where
                     Ok(closure) => return Ok(closure),
                     Err(e) => {
                         let msg = format!("{e:#}");
-                        let already: Vec<String> = {
-                            let g = routed.lock().unwrap();
-                            g.iter().map(|r| r.pypi_name.clone()).collect()
+                        let already: std::collections::BTreeSet<String> = {
+                            let r = routed.lock().unwrap();
+                            let b = built.lock().unwrap();
+                            r.iter()
+                                .map(|r| r.pypi_name.clone())
+                                .chain(b.iter().map(|w| w.pypi_name.clone()))
+                                .collect()
                         };
                         let names: Vec<String> = extract_sdist_only_packages(&msg)
                             .into_iter()
@@ -732,6 +829,7 @@ where
                         if names.is_empty() {
                             return Err(e);
                         }
+                        // Rung 1: conda-route.
                         let mut new_routes = Vec::new();
                         let mut missing = Vec::new();
                         for name in &names {
@@ -746,8 +844,39 @@ where
                                 None => missing.push(name.clone()),
                             }
                         }
+                        // Rung 2: sdist auto-build, for whatever rung 1
+                        // missed. Only attempted when the caller enabled
+                        // it (`sdist-build = "auto"`, the default); a
+                        // `None` builder means `"never"` and rung 3
+                        // fires immediately on any miss, matching the
+                        // pre-build-rung behavior exactly.
+                        let mut new_built = Vec::new();
+                        let mut build_failures: Vec<(String, String)> = Vec::new();
                         if !missing.is_empty() {
-                            bail!("{msg}{}", sdist_only_no_route_message(&missing));
+                            match sdist_build.as_ref() {
+                                Some(build) => {
+                                    for name in &missing {
+                                        match build(name.clone()).await {
+                                            Ok(w) => new_built.push(w),
+                                            Err(e) => {
+                                                build_failures
+                                                    .push((name.clone(), format!("{e:#}")));
+                                            }
+                                        }
+                                    }
+                                }
+                                None => {
+                                    bail!("{msg}{}", sdist_only_no_route_message(&missing));
+                                }
+                            }
+                        }
+                        // Rung 3: error. Only the names the build rung
+                        // actually failed for abort — a partial success
+                        // (some names built, one didn't) still fails
+                        // loudly rather than silently dropping the
+                        // failed name.
+                        if !build_failures.is_empty() {
+                            bail!("{msg}{}", sdist_build_failed_message(&build_failures));
                         }
                         for h in &new_routes {
                             tracing::info!(
@@ -761,6 +890,14 @@ where
                         {
                             let mut g = routed.lock().unwrap();
                             g.extend(new_routes.clone());
+                        }
+                        for w in &new_built {
+                            req.built_wheel_sources
+                                .insert(w.pypi_name.clone(), w.wheel_path.clone());
+                        }
+                        {
+                            let mut g = built.lock().unwrap();
+                            g.extend(new_built.clone());
                         }
                         attempt = (*solve.lock().unwrap())(req.clone());
                     }
@@ -776,21 +913,26 @@ where
 }
 
 /// Compatibility entry point: [`auto_route_fixpoint`] with the
-/// sdist-only self-heal layered underneath (see [`with_sdist_heal`]).
-/// `sdist_probe` answers "does ANY workspace conda channel carry
-/// `conda_name` at any version?" — production wires
-/// [`crate::probe::find_route`] with spec `"*"`.
+/// sdist-only self-heal ladder layered underneath (see
+/// [`with_sdist_heal`]). `sdist_probe` answers "does ANY workspace
+/// conda channel carry `conda_name` at any version?" — production wires
+/// [`crate::probe::find_route`] with spec `"*"`. `sdist_build` is `Some`
+/// when the pack's `sdist-build` config is `"auto"` (default); `None`
+/// disables the build rung (`"never"`), reproducing the original
+/// conda-route-or-error behavior exactly.
 ///
-/// The routes the heal discovers are appended to the returned
-/// closure's `auto_routed` (same shape/logging convention as ordinary
-/// auto-route hits) even though the outer fixpoint never saw them
-/// directly.
-pub async fn auto_route_fixpoint_with_sdist_heal<S, P, SP>(
+/// The routes/built wheels the heal discovers are appended to the
+/// returned closure's `auto_routed` list and `wheels` (as `Origin::Built`
+/// entries carrying `sdist_source` provenance) respectively — same
+/// shape/logging convention as ordinary auto-route hits — even though
+/// the outer fixpoint never saw them directly.
+pub async fn auto_route_fixpoint_with_sdist_heal<S, P, SP, SB>(
     req: &UvClosureRequest,
     opts: &AutoRouteOptions,
     solve: S,
     probe: P,
     sdist_probe: SP,
+    sdist_build: Option<SB>,
 ) -> Result<UvClosure>
 where
     S: FnMut(UvClosureRequest) -> futures::future::BoxFuture<'static, Result<UvClosure>>
@@ -801,17 +943,48 @@ where
         + Send
         + Sync
         + 'static,
+    SB: Fn(String) -> futures::future::BoxFuture<'static, Result<BuiltSdistWheel>>
+        + Send
+        + Sync
+        + 'static,
 {
     let sdist_routed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sdist_built = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let healed_solve = with_sdist_heal(
         req.bundle.clone(),
         solve,
         sdist_probe,
+        sdist_build,
         std::sync::Arc::clone(&sdist_routed),
+        std::sync::Arc::clone(&sdist_built),
     );
     let mut closure = auto_route_fixpoint(req, opts, healed_solve, probe).await?;
     let extra = sdist_routed.lock().unwrap();
     closure.auto_routed.extend(extra.iter().cloned());
+    drop(extra);
+    let built = sdist_built.lock().unwrap();
+    for w in built.iter() {
+        closure
+            .pins
+            .entry(w.pypi_name.clone())
+            .or_insert_with(|| w.version.clone());
+        closure.wheels.push(LockWheel {
+            name: w.pypi_name.clone(),
+            version: w.version.clone(),
+            origin: Origin::Built,
+            filename: w.filename.clone(),
+            url: None,
+            sha256: Some(w.sha256.clone()),
+            requires_dist: Vec::new(),
+            // No fetchable index URL: the wheel exists only in the
+            // shared wheel store, exactly like a git-source-built wheel
+            // (see `crate::lock::LockWheel::must_ship` docs).
+            must_ship: true,
+            upstream_url: None,
+            git_source: None,
+            sdist_source: Some(w.sdist_source.clone()),
+        });
+    }
     Ok(closure)
 }
 
@@ -2718,12 +2891,10 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
     /// conflict's Unsat reasons; everything else is Sat.
     fn canned_co_solve(
         conflicts: Vec<(BTreeSet<String>, Vec<String>)>,
-    ) -> impl Fn(
-        Vec<AutoRoutedPackage>,
-    ) -> futures::future::BoxFuture<'static, CoInstallVerdict> {
+    ) -> impl Fn(Vec<AutoRoutedPackage>) -> futures::future::BoxFuture<'static, CoInstallVerdict>
+    {
         move |candidate: Vec<AutoRoutedPackage>| {
-            let names: BTreeSet<String> =
-                candidate.iter().map(|r| r.conda_name.clone()).collect();
+            let names: BTreeSet<String> = candidate.iter().map(|r| r.conda_name.clone()).collect();
             let verdict = conflicts
                 .iter()
                 .find(|(set, _)| set.is_subset(&names))
@@ -2787,8 +2958,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
                 .map(|r| r.pypi_name.clone())
                 .collect();
             routed.sort();
-            let mut wheels: Vec<String> =
-                closure.wheels.iter().map(|w| w.name.clone()).collect();
+            let mut wheels: Vec<String> = closure.wheels.iter().map(|w| w.name.clone()).collect();
             wheels.sort();
             results.push((routed, wheels));
         }
@@ -2827,9 +2997,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
         // The report only names typing-extensions.
         let co_solve = canned_co_solve(vec![(
             BTreeSet::from(["typing-extensions".to_string()]),
-            vec![
-                "typing_extensions-4.12.2-pyhd8ed1ab_0 conflicts with __glibc".to_string(),
-            ],
+            vec!["typing_extensions-4.12.2-pyhd8ed1ab_0 conflicts with __glibc".to_string()],
         )]);
         let calls = Arc::new(Mutex::new(Vec::new()));
         let closure = auto_route_fixpoint_checked(
@@ -3038,11 +3206,29 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
         );
     }
 
+    /// Concrete "no builder" type for tests that disable the build rung
+    /// (`sdist-build = "never"`) — `None::<NoBuild>` is the terse
+    /// turbofish-free spelling.
+    type NoBuild = fn(String) -> futures::future::BoxFuture<'static, Result<BuiltSdistWheel>>;
+
+    fn sdist_source_fixture(name: &str, version: &str) -> crate::lock::SdistWheelSource {
+        crate::lock::SdistWheelSource {
+            index: "https://pypi.org/simple/".to_string(),
+            name: name.to_string(),
+            version: version.to_string(),
+            sdist_url: format!(
+                "https://files.pythonhosted.org/packages/{name}-{version}.tar.gz#sha256=deadbeef"
+            ),
+        }
+    }
+
     /// Fixture-driven fixpoint: `uv lock` fails once with the sdist-only
     /// class naming `pyperclip`; the mock repodata probe has a hit ->
     /// the package is routed to conda (excluded + pinned) and the retry
     /// succeeds. `auto_routed` records the sdist-heal route even though
-    /// the outer fixpoint never saw the failure directly.
+    /// the outer fixpoint never saw the failure directly. The build
+    /// rung must NEVER be invoked when the conda-route rung already won
+    /// (ladder ordering: conda hit wins over build).
     #[tokio::test]
     async fn sdist_heal_routes_on_repodata_hit() {
         let attempts = Arc::new(Mutex::new(0usize));
@@ -3080,12 +3266,24 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
                 }
             }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
         };
+        let build_calls = Arc::new(Mutex::new(0usize));
+        let sdist_build = {
+            let build_calls = Arc::clone(&build_calls);
+            move |name: String| {
+                let build_calls = Arc::clone(&build_calls);
+                Box::pin(async move {
+                    *build_calls.lock().unwrap() += 1;
+                    bail!("build rung should never run for {name}: conda hit wins")
+                }) as futures::future::BoxFuture<'static, Result<BuiltSdistWheel>>
+            }
+        };
         let closure = auto_route_fixpoint_with_sdist_heal(
             &auto_route_req(),
             &auto_route_opts(),
             solve,
             probe,
             sdist_probe,
+            Some(sdist_build),
         )
         .await
         .unwrap();
@@ -3101,13 +3299,150 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
         assert_eq!(r.conda_name, "pyperclip");
         assert_eq!(r.conda_version, "1.8.2");
         assert!(r.channel.contains("conda-forge"));
+        assert_eq!(
+            *build_calls.lock().unwrap(),
+            0,
+            "ladder ordering: conda-route hit must win over the build rung"
+        );
     }
 
-    /// No conda candidate either: the original uv error surfaces
-    /// verbatim, with the guidance text appended, instead of silently
-    /// dropping `pyperclip` from the closure.
+    /// Double-miss (no conda candidate) with the build rung ENABLED: the
+    /// sdist auto-build is invoked and, on success, the closure gains an
+    /// `Origin::Built` wheel carrying `sdist_source` provenance instead
+    /// of erroring.
     #[tokio::test]
-    async fn sdist_heal_surfaces_original_error_with_guidance_on_miss() {
+    async fn sdist_heal_builds_on_double_miss() {
+        let attempts = Arc::new(Mutex::new(0usize));
+        let solve = {
+            let attempts = Arc::clone(&attempts);
+            move |r: UvClosureRequest| {
+                let attempts = Arc::clone(&attempts);
+                Box::pin(async move {
+                    let mut n = attempts.lock().unwrap();
+                    *n += 1;
+                    if !r.built_wheel_sources.contains_key("pyperclip") {
+                        bail!("{SDIST_ONLY_UV_ERR}");
+                    }
+                    parse_pylock_closure(
+                        PYLOCK_FIXTURE,
+                        &target("3.12", "linux-64"),
+                        &BTreeSet::new(),
+                        "0.11.15",
+                    )
+                }) as futures::future::BoxFuture<'static, Result<UvClosure>>
+            }
+        };
+        let probe = |_name: String, _spec: String| {
+            Box::pin(async { None }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
+        };
+        let sdist_probe = |_name: String| {
+            Box::pin(async { None }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
+        };
+        let build_calls = Arc::new(Mutex::new(0usize));
+        let sdist_build = {
+            let build_calls = Arc::clone(&build_calls);
+            move |name: String| {
+                let build_calls = Arc::clone(&build_calls);
+                Box::pin(async move {
+                    *build_calls.lock().unwrap() += 1;
+                    assert_eq!(name, "pyperclip");
+                    Ok(BuiltSdistWheel {
+                        pypi_name: name.clone(),
+                        version: "1.8.2".to_string(),
+                        filename: "pyperclip-1.8.2-py3-none-any.whl".to_string(),
+                        wheel_path: PathBuf::from("/tmp/wheels/pyperclip-1.8.2-py3-none-any.whl"),
+                        sha256: "a".repeat(64),
+                        sdist_source: sdist_source_fixture("pyperclip", "1.8.2"),
+                    })
+                }) as futures::future::BoxFuture<'static, Result<BuiltSdistWheel>>
+            }
+        };
+        let closure = auto_route_fixpoint_with_sdist_heal(
+            &auto_route_req(),
+            &auto_route_opts(),
+            solve,
+            probe,
+            sdist_probe,
+            Some(sdist_build),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            *attempts.lock().unwrap(),
+            2,
+            "one failure + one healed retry"
+        );
+        assert_eq!(*build_calls.lock().unwrap(), 1);
+        assert!(closure.auto_routed.is_empty(), "no conda route this time");
+        let built = closure
+            .wheels
+            .iter()
+            .find(|w| w.name == "pyperclip")
+            .expect("built sdist wheel recorded in the closure");
+        assert_eq!(built.version, "1.8.2");
+        assert!(matches!(built.origin, Origin::Built));
+        assert!(built.must_ship);
+        assert_eq!(built.sha256.as_deref(), Some("a".repeat(64).as_str()));
+        let prov = built
+            .sdist_source
+            .as_ref()
+            .expect("built sdist wheel must carry sdist_source provenance");
+        assert_eq!(prov.name, "pyperclip");
+        assert_eq!(prov.version, "1.8.2");
+        assert_eq!(
+            closure.pins.get("pyperclip").map(String::as_str),
+            Some("1.8.2")
+        );
+    }
+
+    /// Build rung enabled but the build ITSELF fails: rung 3 (error)
+    /// fires, surfacing the original uv error plus the build failure's
+    /// log tail and guidance -- never silently drops the dependency.
+    #[tokio::test]
+    async fn sdist_heal_surfaces_build_failure_log_tail() {
+        let solve = |_r: UvClosureRequest| {
+            Box::pin(async { bail!("{SDIST_ONLY_UV_ERR}") })
+                as futures::future::BoxFuture<'static, Result<UvClosure>>
+        };
+        let probe = |_name: String, _spec: String| {
+            Box::pin(async { None }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
+        };
+        let sdist_probe = |_name: String| {
+            Box::pin(async { None }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
+        };
+        let sdist_build = |_name: String| {
+            Box::pin(async {
+                bail!(
+                    "uv [\"build\", \"--wheel\"] failed (status 1): error: \
+                     failed to build `pyperclip` (missing gcc)"
+                )
+            }) as futures::future::BoxFuture<'static, Result<BuiltSdistWheel>>
+        };
+        let err = auto_route_fixpoint_with_sdist_heal(
+            &auto_route_req(),
+            &auto_route_opts(),
+            solve,
+            probe,
+            sdist_probe,
+            Some(sdist_build),
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("pyperclip has no wheels"), "{msg}");
+        assert!(msg.contains("sdist auto-build failed"), "{msg}");
+        assert!(msg.contains("missing gcc"), "{msg}");
+    }
+
+    /// `sdist-build = "never"` (build rung disabled, `sdist_build: None`):
+    /// no conda candidate either -> the ORIGINAL uv error surfaces
+    /// verbatim, with the guidance text appended, exactly as before the
+    /// build rung existed. The build closure type itself is never
+    /// constructed (`None::<NoBuild>`), so there is no way for this path
+    /// to attempt a build.
+    #[tokio::test]
+    async fn sdist_heal_never_policy_surfaces_original_error_with_guidance_on_miss() {
         let solve = |_r: UvClosureRequest| {
             Box::pin(async { bail!("{SDIST_ONLY_UV_ERR}") })
                 as futures::future::BoxFuture<'static, Result<UvClosure>>
@@ -3124,6 +3459,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
             solve,
             probe,
             sdist_probe,
+            None::<NoBuild>,
         )
         .await
         .unwrap_err();
@@ -3136,7 +3472,8 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
     /// A platform-tag conflict (the manylinux ceiling, already handled
     /// by `installer::is_platform_tag_conflict` via glibc relaxation)
     /// must pass straight through unchanged -- the sdist-only heal must
-    /// never misfire on it.
+    /// never misfire on it, and neither the conda-route probe nor the
+    /// build rung is ever consulted.
     #[tokio::test]
     async fn sdist_heal_ignores_platform_tag_class() {
         let calls = Arc::new(Mutex::new(0usize));
@@ -3170,6 +3507,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
             solve,
             probe,
             sdist_probe,
+            None::<NoBuild>,
         )
         .await
         .unwrap_err();

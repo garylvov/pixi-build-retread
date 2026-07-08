@@ -315,6 +315,32 @@ pub struct RetreadConfig {
     /// `retread-conda-deps` to hard-force a conda dep).
     #[serde(default, rename = "retread-force-conda", alias = "force-conda")]
     pub force_conda: Vec<String>,
+
+    /// v4.4.0: third rung of the sdist-only self-heal ladder (wheel ->
+    /// conda-route -> sdist auto-build -> error). When a package has no
+    /// wheels at all AND no conda channel carries any version of it,
+    /// `"auto"` (default) builds it from its PyPI sdist through the
+    /// same machinery git-sourced `[retread-wheels]` entries use, caches
+    /// it content-addressed in the shared wheel store, and records it in
+    /// the bundle lock with the same provenance a git-built wheel gets.
+    /// `"never"` disables the build rung: a conda-route miss surfaces
+    /// the original uv error + guidance immediately, exactly as before
+    /// this rung existed.
+    #[serde(default, rename = "retread-sdist-build", alias = "sdist-build")]
+    pub sdist_build: SdistBuildPolicy,
+}
+
+/// Per-pack policy for the sdist-only self-heal's build rung
+/// (`sdist-build`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SdistBuildPolicy {
+    /// Auto-build sdist-only packages with no conda candidate (default).
+    #[default]
+    Auto,
+    /// Never build; a conda-route miss errors immediately (pre-v4.4.0
+    /// behavior).
+    Never,
 }
 
 /// Engine selection for closure computation (`retread-resolver`).
