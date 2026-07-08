@@ -1864,6 +1864,7 @@ async fn resolve_all(
                     &effective,
                     target,
                     cache_dir,
+                    source_dir,
                     workspace_dir,
                     &workspace_pypi_indexes,
                     conda_channels,
@@ -2235,6 +2236,7 @@ async fn uv_group_closure(
     effective: &RetreadConfig,
     target: &WheelTarget,
     cache_dir: &Path,
+    source_dir: &Path,
     workspace_dir: Option<&Path>,
     workspace_pypi_indexes: &[String],
     conda_channels: &[ChannelUrl],
@@ -2490,6 +2492,20 @@ async fn uv_group_closure(
         let python = target.python_version.clone();
         let subdir = target.conda_subdir.clone();
         let bundle = group_name.to_string();
+        // envoracle fix: the co-installability check must see the
+        // conda deps of the envs that actually CONSUME this bundle's
+        // pack, not just the workspace's `default` env. Using
+        // `default` unconditionally left an "env-scoped oracle blind
+        // spot" -- an exact auto-routed pin (e.g. `pillow ==12.3.0`)
+        // that satisfied `default` but violated another consuming
+        // env's declared range (`pillow >=11,<12`) sailed through
+        // this check and only surfaced as a hard unsat in the
+        // workspace lock. `consuming_env_dependencies` maps this
+        // pack's `source_dir` to its consuming envs (falling back to
+        // a conservative superset when the mapping is ambiguous) and
+        // returns every distinct spec per package name; feeding all
+        // of them into the same solve forces one version to satisfy
+        // every consuming env at once.
         let (channel_priority, system_requirements, workspace_deps) = match manifest_opt.as_ref() {
             Some(m) => (
                 match m.channel_priority.as_deref() {
@@ -2497,7 +2513,10 @@ async fn uv_group_closure(
                     _ => rattler_solve::ChannelPriority::Strict,
                 },
                 m.effective_system_requirements("default"),
-                m.effective_dependencies("default"),
+                match workspace_dir {
+                    Some(ws_dir) => m.consuming_env_dependencies(ws_dir, source_dir),
+                    None => Default::default(),
+                },
             ),
             None => (
                 rattler_solve::ChannelPriority::Strict,
@@ -2517,16 +2536,24 @@ async fn uv_group_closure(
                     .iter()
                     .map(|r| format!("{} =={}", r.conda_name, r.conda_version))
                     .collect();
-                for (name, spec) in &workspace_deps {
+                for (name, specs_for_name) in &workspace_deps {
                     let conda_name = canonical_conda_name(name);
                     // The bundle's own outputs aren't on any channel yet.
                     if conda_name == canonical_conda_name(&bundle) {
                         continue;
                     }
-                    if spec.trim().is_empty() || spec.trim() == "*" {
-                        specs.push(conda_name);
-                    } else {
-                        specs.push(format!("{conda_name} {spec}"));
+                    // Every distinct spec across the pack's consuming
+                    // envs is fed in; the solver must pick one version
+                    // satisfying all of them (a plain intersection, not
+                    // a special case) -- this is what actually catches
+                    // an exact pin that violates just ONE consuming
+                    // env's range.
+                    for spec in specs_for_name {
+                        if spec.trim().is_empty() || spec.trim() == "*" {
+                            specs.push(conda_name.clone());
+                        } else {
+                            specs.push(format!("{conda_name} {spec}"));
+                        }
                     }
                 }
                 specs.push(format!("python {python}.*"));

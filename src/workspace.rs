@@ -706,6 +706,94 @@ impl WorkspaceManifest {
         let env_vec: Vec<String> = all_envs.into_iter().collect();
         self.union_effective_channels(&env_vec)
     }
+
+    /// Env-aware conda dependency specs for the pack built from
+    /// `source_dir`, keyed by package name to every DISTINCT spec
+    /// declared for it across the envs that actually consume this
+    /// pack. Fix for the "env-scoped oracle blind spot": auto-route's
+    /// co-installability check used to validate exact conda pins only
+    /// against the `default` env's deps, so a pin that satisfied
+    /// `default` but violated another consuming env's range (e.g.
+    /// `pillow >=11,<12`) sailed through the check and only blew up
+    /// the workspace lock later. Feeding every distinct spec for a
+    /// name into the same solve (multiple matchspecs on one package
+    /// name) makes the solver require a single version satisfying
+    /// ALL of them -- exactly the co-install constraint pixi itself
+    /// will enforce.
+    ///
+    /// Mapping precedence (mirrors [`Self::courier_channel_set`]'s
+    /// pack -> envs discovery, with fallbacks for when it can't
+    /// resolve to a concrete env):
+    /// 1. `discover_outputs_for_source` finds the path-deps whose
+    ///    `path` resolves to `source_dir`; union the `envs` across
+    ///    every discovered output name (there's usually exactly one).
+    /// 2. If that yields at least one env, union `effective_dependencies`
+    ///    over those envs (via [`Self::union_effective_dependencies`]) --
+    ///    the precise, unambiguous case.
+    /// 3. If outputs were found but none map to an active env (a
+    ///    declaring feature exists but no `[environments]` entry
+    ///    activates it), fall back to the union of the declaring
+    ///    features' own `dependencies` tables -- still scoped to the
+    ///    pack, just not env-precise.
+    /// 4. If nothing at all references `source_dir` (workspace doesn't
+    ///    declare it, or path resolution failed), conservative
+    ///    superset: union across every feature's dependencies plus the
+    ///    top-level default -- "else all features" per the fix spec.
+    pub fn consuming_env_dependencies(
+        &self,
+        workspace_dir: &Path,
+        source_dir: &Path,
+    ) -> BTreeMap<String, Vec<String>> {
+        let outputs = self.discover_outputs_for_source(workspace_dir, source_dir);
+        if !outputs.is_empty() {
+            let mut envs: BTreeSet<String> = BTreeSet::new();
+            let mut features: BTreeSet<String> = BTreeSet::new();
+            for output in &outputs {
+                envs.extend(output.envs.iter().cloned());
+                features.extend(output.declaring_features.iter().cloned());
+            }
+            if !envs.is_empty() {
+                let env_vec: Vec<String> = envs.into_iter().collect();
+                return self.union_effective_dependencies(&env_vec);
+            }
+            // Tier 3: declaring features exist but no active env
+            // reaches them -- union their raw dependency tables.
+            let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+            for feat_name in &features {
+                let deps = if feat_name == DEFAULT_FEATURE {
+                    &self.dependencies
+                } else if let Some(f) = self.features.get(feat_name) {
+                    &f.dependencies
+                } else {
+                    continue;
+                };
+                for (k, v) in deps {
+                    let entry = out.entry(k.clone()).or_default();
+                    if !entry.contains(v) {
+                        entry.push(v.clone());
+                    }
+                }
+            }
+            if !out.is_empty() {
+                return out;
+            }
+        }
+        // Tier 4: nothing maps to this pack at all -- conservative
+        // superset over every feature (plus the top-level default).
+        let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (k, v) in &self.dependencies {
+            out.entry(k.clone()).or_default().push(v.clone());
+        }
+        for feat in self.features.values() {
+            for (k, v) in &feat.dependencies {
+                let entry = out.entry(k.clone()).or_default();
+                if !entry.contains(v) {
+                    entry.push(v.clone());
+                }
+            }
+        }
+        out
+    }
 }
 
 /// Sentinel name used to represent the implicit "default" feature
@@ -1670,6 +1758,110 @@ some-pkg = "==1.0"
         let outputs = ws.discover_outputs_for_source(&tmp, &tmp.join("isaac-pack"));
         assert!(outputs.is_empty());
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn consuming_env_dependencies_scopes_to_the_pack_env_range() {
+        // envoracle fix fixture: the workspace declares `pillow >=11,<12`
+        // for the env that consumes `hover-pack` (not the top-level
+        // `default`, which auto-route's old hardcoded lookup used).
+        // `consuming_env_dependencies` must surface THAT range so the
+        // co-installability check can catch an exact `pillow ==12.3.0`
+        // auto-route pin instead of missing it.
+        let tmp = std::env::temp_dir().join(format!(
+            "retread-ws-envdeps-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(tmp.join("hover-pack")).unwrap();
+        let ws = ws_toml(
+            r#"
+[dependencies]
+numpy = "*"
+
+[environments]
+hover = { features = ["hover"] }
+
+[feature.hover.dependencies]
+hover-pack = { path = "./hover-pack" }
+pillow = ">=11,<12"
+"#,
+        );
+        let deps = ws.consuming_env_dependencies(&tmp, &tmp.join("hover-pack"));
+        assert_eq!(deps.get("pillow"), Some(&vec![">=11,<12".to_string()]));
+        // The default env's `numpy` isn't pulled in unless `hover`
+        // actually inherits the default feature (it does here), but the
+        // key assertion is that the SCOPED env's own range is present
+        // and precise -- not silently dropped in favor of `default`.
+        assert!(deps.contains_key("numpy"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn consuming_env_dependencies_unions_multiple_consuming_envs() {
+        // Two envs both consume the pack with DIFFERENT pillow ranges;
+        // both distinct specs must appear so the solve is required to
+        // satisfy both simultaneously (a real conflict here is a
+        // pre-existing workspace misconfiguration, not something
+        // auto-route should paper over).
+        let tmp = std::env::temp_dir().join(format!(
+            "retread-ws-envdeps-union-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(tmp.join("hover-pack")).unwrap();
+        let ws = ws_toml(
+            r#"
+[environments]
+hover-a = { features = ["a"] }
+hover-b = { features = ["b"] }
+
+[feature.a.dependencies]
+hover-pack = { path = "./hover-pack" }
+pillow = ">=11,<12"
+
+[feature.b.dependencies]
+hover-pack = { path = "./hover-pack" }
+pillow = ">=10,<11"
+"#,
+        );
+        let deps = ws.consuming_env_dependencies(&tmp, &tmp.join("hover-pack"));
+        let mut specs = deps.get("pillow").cloned().unwrap_or_default();
+        specs.sort();
+        assert_eq!(specs, vec![">=10,<11".to_string(), ">=11,<12".to_string()]);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn consuming_env_dependencies_falls_back_to_all_features_when_pack_unreferenced() {
+        // Nothing in the workspace references this source_dir at all
+        // (e.g. discovery running before the workspace declares the
+        // path-dep, or a standalone build). Conservative superset:
+        // union across every feature rather than silently returning
+        // nothing (which would make the co-install check blind again).
+        let ws = ws_toml(
+            r#"
+[dependencies]
+numpy = "*"
+
+[feature.a.dependencies]
+pillow = ">=11,<12"
+
+[feature.b.dependencies]
+scipy = "*"
+"#,
+        );
+        let tmp = std::env::temp_dir().join("retread-ws-envdeps-unreferenced-nonexistent");
+        let deps = ws.consuming_env_dependencies(&tmp, &tmp.join("no-such-pack"));
+        assert_eq!(deps.get("pillow"), Some(&vec![">=11,<12".to_string()]));
+        assert_eq!(deps.get("scipy"), Some(&vec!["*".to_string()]));
+        assert_eq!(deps.get("numpy"), Some(&vec!["*".to_string()]));
     }
 
     #[test]
