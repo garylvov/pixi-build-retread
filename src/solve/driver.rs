@@ -13,8 +13,9 @@ use super::error::{EXIT_OK, EXIT_SMOKE_FAILED, SolveError};
 use super::manifest::{AppliedEdit, ManifestEditor, copy_atomic, restore_bytes_atomic};
 use super::parse::{ConflictParser, RegexConflictParser, tail};
 use super::repair::{
-    LedgerAttempt, RepairPlanner, SolveLedger, Strategy, TriedState, append_attempt, ledger_path,
-    manifest_sha256, mark_last_widen_failed, retread_dir, snapshot_path, truncate_ledger_runs,
+    LedgerAttempt, RelaxPreference, RepairPlanner, SolveLedger, Strategy, TriedState,
+    append_attempt, ledger_path, manifest_sha256, mark_last_widen_failed, retread_dir,
+    snapshot_path, truncate_ledger_runs,
 };
 
 pub async fn run(args: SolveArgs) -> Result<i32> {
@@ -199,7 +200,12 @@ async fn run_env(
         ledger_path,
         run_idx,
     } = ctx;
-    let mut planner = RepairPlanner::new(feature.clone());
+    let relax_preference = if args.prefer_pypi {
+        RelaxPreference::Pypi
+    } else {
+        RelaxPreference::from_config_str(&editor.relax_preference())
+    };
+    let mut planner = RepairPlanner::new(feature.clone()).with_relax_preference(relax_preference);
     let mut pending_edit: Option<PendingEdit> = None;
     let smoke_modules = if args.smoke_modules.is_empty() {
         editor.smoke_modules()

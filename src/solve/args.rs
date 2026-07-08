@@ -13,6 +13,10 @@ pub struct SolveArgs {
     pub smoke_modules: Vec<String>,
     pub dry_run: bool,
     pub clean_pins: bool,
+    /// Overrides `[tool.retread] relax-preference` to `"pypi"` for this
+    /// run: widen the conda pin before trying a pypi dependency-override
+    /// (the historical order, predating conda-as-truth).
+    pub prefer_pypi: bool,
 }
 
 impl Default for SolveArgs {
@@ -27,6 +31,7 @@ impl Default for SolveArgs {
             smoke_modules: Vec::new(),
             dry_run: false,
             clean_pins: false,
+            prefer_pypi: false,
         }
     }
 }
@@ -92,6 +97,10 @@ pub fn parse(argv: &[String]) -> anyhow::Result<SolveArgs> {
             "--clean-pins" => {
                 args.clean_pins = true;
             }
+            "--prefer-pypi" => {
+                non_clean_flag_seen = true;
+                args.prefer_pypi = true;
+            }
             other => anyhow::bail!("retread solve: unknown arg {other}"),
         }
     }
@@ -135,6 +144,14 @@ mod tests {
         assert_eq!(args.environments, vec!["gpu", "cpu"]);
         assert_eq!(args.feature.as_deref(), Some("isaac"));
         assert_eq!(args.smoke_modules, vec!["torch", "isaaclab"]);
+    }
+
+    #[test]
+    fn parses_prefer_pypi_flag() {
+        let args = parse(&argv(&["--prefer-pypi"])).unwrap();
+        assert!(args.prefer_pypi);
+        let default_args = parse(&argv(&[])).unwrap();
+        assert!(!default_args.prefer_pypi);
     }
 
     #[test]

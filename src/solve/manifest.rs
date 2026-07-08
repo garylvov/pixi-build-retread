@@ -7,6 +7,7 @@ use super::repair::{Reason, Strategy};
 
 pub const PIN_SENTINEL: &str = "# retread:pin";
 pub const WIDEN_SENTINEL: &str = "# retread:widen";
+pub const OVERRIDE_SENTINEL: &str = "# retread:override";
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EntrySnapshot {
@@ -80,6 +81,22 @@ impl ManifestEditor {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// `[tool.retread] relax-preference` -- `"conda"` (default, T1 pypi
+    /// override before T2 conda widen) or `"pypi"` (restores the historical
+    /// widen-first order). Read straight off the manifest doc, same
+    /// pattern as `smoke_modules`.
+    pub fn relax_preference(&self) -> String {
+        self.doc
+            .as_table()
+            .get("tool")
+            .and_then(|i| i.get("retread"))
+            .and_then(|i| i.get("relax-preference"))
+            .and_then(Item::as_value)
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "conda".to_string())
     }
 
     pub fn entry_snapshot(&self, feature: &str, kind: TableKind, package: &str) -> EntrySnapshot {
@@ -188,6 +205,36 @@ impl ManifestEditor {
         }
     }
 
+    /// Conda-as-truth (T1) repair: relax a pypi requirement to accept the
+    /// conda-provided version instead of widening the conda pin. Writes
+    /// into `pypi-options.dependency-overrides` (the same table the packs
+    /// already use for declarative overrides), tagged with a dedicated
+    /// `# retread:override <date>` sentinel so it's never confused with a
+    /// tool-owned conda pin/widen (those stay eligible for T2 escalation;
+    /// this one is a leaf -- the conda pin it derives from is left
+    /// untouched).
+    pub fn set_pypi_override_from_conda(
+        &mut self,
+        feature: &str,
+        package: &str,
+        version: &str,
+    ) -> AppliedEdit {
+        let before = self.entry_snapshot(feature, TableKind::Override, package);
+        self.set_string(
+            feature,
+            TableKind::Override,
+            package,
+            &format!("=={version}"),
+            &override_sentinel_suffix(),
+        );
+        AppliedEdit {
+            package: package.to_string(),
+            strategy: Strategy::PypiOverride,
+            table: TableKind::Override,
+            before,
+        }
+    }
+
     pub fn set_conda_widen(&mut self, feature: &str, package: &str, spec: &str) -> AppliedEdit {
         let before = self.entry_snapshot(feature, TableKind::Conda, package);
         self.set_string(feature, TableKind::Conda, package, spec, &widen_suffix());
@@ -251,7 +298,10 @@ impl ManifestEditor {
         let entries: Vec<(String, TableKind, String, String)> = self.sentinel_entries();
         let mut removed = 0;
         for (feature, kind, package, suffix) in entries {
-            if suffix.contains(PIN_SENTINEL) || suffix.contains(WIDEN_SENTINEL) {
+            if suffix.contains(PIN_SENTINEL)
+                || suffix.contains(WIDEN_SENTINEL)
+                || suffix.contains(OVERRIDE_SENTINEL)
+            {
                 if let Some(table) = self.get_table_mut_existing(&feature, kind)
                     && table.remove(&package).is_some()
                 {
@@ -480,7 +530,9 @@ fn snapshot_has_retread_sentinel(snapshot: &EntrySnapshot) -> bool {
     snapshot
         .suffix
         .as_deref()
-        .map(|s| s.contains(PIN_SENTINEL) || s.contains(WIDEN_SENTINEL))
+        .map(|s| {
+            s.contains(PIN_SENTINEL) || s.contains(WIDEN_SENTINEL) || s.contains(OVERRIDE_SENTINEL)
+        })
         .unwrap_or(false)
 }
 
@@ -492,7 +544,9 @@ fn collect_sentinel_entries(
 ) {
     for (package, item) in table.iter() {
         if let Some(suffix) = item_suffix(item)
-            && (suffix.contains(PIN_SENTINEL) || suffix.contains(WIDEN_SENTINEL))
+            && (suffix.contains(PIN_SENTINEL)
+                || suffix.contains(WIDEN_SENTINEL)
+                || suffix.contains(OVERRIDE_SENTINEL))
         {
             out.push((feature.to_string(), kind, package.to_string(), suffix));
         }
@@ -505,6 +559,10 @@ fn pin_suffix(reason: Reason) -> String {
 
 fn widen_suffix() -> String {
     format!("  # retread:widen {}", local_date())
+}
+
+fn override_sentinel_suffix() -> String {
+    format!("  # retread:override {}", local_date())
 }
 
 fn local_date() -> String {
@@ -583,6 +641,36 @@ torch = "==2.7.1"  # retread:pin 2026-07-07 conda-boundary
         assert!(out.contains("numpy = \"==1.26.4\""));
         assert!(!out.contains("mujoco"));
         assert!(!out.contains("torch"));
+    }
+
+    #[test]
+    fn relax_preference_defaults_to_conda_and_reads_tool_retread_table() {
+        let default_path = temp_manifest("[dependencies]\n");
+        let editor = ManifestEditor::open(default_path).unwrap();
+        assert_eq!(editor.relax_preference(), "conda");
+
+        let pypi_path = temp_manifest("[tool.retread]\nrelax-preference = \"pypi\"\n");
+        let editor = ManifestEditor::open(pypi_path).unwrap();
+        assert_eq!(editor.relax_preference(), "pypi");
+    }
+
+    #[test]
+    fn set_pypi_override_from_conda_writes_override_sentinel_and_removed_by_clean_pins() {
+        let path = temp_manifest("[dependencies]\ntorch = \"==2.10.0\"\n");
+        let mut editor = ManifestEditor::open(path.clone()).unwrap();
+        editor.set_pypi_override_from_conda("default", "torch", "2.10.0");
+        editor.write_atomic().unwrap();
+        let out = std::fs::read_to_string(&path).unwrap();
+        assert!(out.contains("[pypi-options.dependency-overrides]"));
+        assert!(out.contains("torch = \"==2.10.0\"  # retread:override"));
+        assert!(out.contains("torch = \"==2.10.0\"\n")); // conda pin untouched
+
+        let mut editor = ManifestEditor::open(path.clone()).unwrap();
+        assert_eq!(editor.clean_pins(), 1);
+        editor.write_atomic().unwrap();
+        let out = std::fs::read_to_string(&path).unwrap();
+        assert!(!out.contains("dependency-overrides"));
+        assert!(out.contains("torch = \"==2.10.0\"")); // conda pin still there
     }
 
     #[test]

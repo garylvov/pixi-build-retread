@@ -80,6 +80,28 @@ impl Reason {
     }
 }
 
+/// `[tool.retread] relax-preference` -- which side of a `CondaWidenNeeded`
+/// conflict retread relaxes first. Conda manifest = source of truth by
+/// default: a pypi requirement conflicting with a conda pin gets a pypi
+/// dependency-override (T1) rather than widening the conda pin (T2).
+/// `--prefer-pypi` / `relax-preference = "pypi"` restores the historical
+/// widen-first order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelaxPreference {
+    Conda,
+    Pypi,
+}
+
+impl RelaxPreference {
+    pub fn from_config_str(s: &str) -> Self {
+        if s.eq_ignore_ascii_case("pypi") {
+            RelaxPreference::Pypi
+        } else {
+            RelaxPreference::Conda
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum WidenCeilingPolicy {
@@ -267,6 +289,7 @@ impl TriedState {
 pub struct RepairPlanner {
     pub feature: String,
     pub ceiling_policy: WidenCeilingPolicy,
+    pub relax_preference: RelaxPreference,
     current_run_attempts: HashSet<(String, String, Strategy)>,
 }
 
@@ -303,8 +326,14 @@ impl RepairPlanner {
         Self {
             feature,
             ceiling_policy: WidenCeilingPolicy::NextMajor,
+            relax_preference: RelaxPreference::Conda,
             current_run_attempts: HashSet::new(),
         }
+    }
+
+    pub fn with_relax_preference(mut self, pref: RelaxPreference) -> Self {
+        self.relax_preference = pref;
+        self
     }
 
     pub fn repair(
@@ -343,7 +372,10 @@ impl RepairPlanner {
                 self.override_pin(editor, tried, &target, Reason::PypiInternal)
             }
             Conflict::CondaWidenNeeded {
-                package, op, floor, ..
+                package,
+                op,
+                floor,
+                conda_version,
             } => {
                 let target = PinTarget {
                     package,
@@ -351,13 +383,82 @@ impl RepairPlanner {
                     iter,
                     conflict,
                 };
-                if !tried.has(package, Strategy::WidenConda) {
-                    self.widen(editor, tried, &target, op)
-                } else {
-                    self.boundary(editor, tried, &target, Reason::CondaBoundary)
+                self.conda_widen_needed(editor, tried, &target, op, conda_version)
+            }
+        }
+    }
+
+    /// `CondaWidenNeeded` dispatch: conda-as-truth (T1, default) tries a
+    /// pypi dependency-override derived from the conda pin first, and only
+    /// falls back to widening the conda pin itself (T2) for tool-owned
+    /// (sentineled) pins, when `relax-preference = "pypi"` / `--prefer-pypi`
+    /// is set, or when the override tier is unavailable (ABI anchor,
+    /// already tried, oscillation guard).
+    fn conda_widen_needed(
+        &mut self,
+        editor: &mut ManifestEditor,
+        tried: &mut TriedState,
+        target: &PinTarget<'_>,
+        op: &str,
+        conda_version: &str,
+    ) -> std::result::Result<RepairOutcome, String> {
+        let package = target.package;
+        if self.relax_preference == RelaxPreference::Conda {
+            let user_owned_conda_pin =
+                editor.has_user_entry(&self.feature, TableKind::Conda, package);
+            if user_owned_conda_pin && !tried.has(package, Strategy::PypiOverride) {
+                match self.pypi_override_from_conda(editor, tried, target, conda_version) {
+                    Ok(out) => return Ok(out),
+                    // Override tier unavailable (ABI anchor / oscillation
+                    // guard) -- fall through to widen/boundary below.
+                    Err(_) => {}
                 }
             }
         }
+        if !tried.has(package, Strategy::WidenConda) {
+            self.widen(editor, tried, target, op)
+        } else {
+            self.boundary(editor, tried, target, Reason::CondaBoundary)
+        }
+    }
+
+    /// T1: relax the pypi requirement to accept the conda-provided version
+    /// instead of touching the (user-owned) conda pin. The conda pin is
+    /// left byte-for-byte untouched -- conda manifest is source of truth.
+    fn pypi_override_from_conda(
+        &mut self,
+        editor: &mut ManifestEditor,
+        tried: &mut TriedState,
+        target: &PinTarget<'_>,
+        conda_version: &str,
+    ) -> std::result::Result<RepairOutcome, String> {
+        let package = target.package;
+        self.guard_anchor(package)?;
+        let version = strip_version_op(conda_version);
+        self.guard_oscillation(package, version, Strategy::PypiOverride)?;
+        let edit = editor.set_pypi_override_from_conda(&self.feature, package, version);
+        let old_spec = edit.before.value.clone();
+        tried.mark(package, Strategy::PypiOverride, false);
+        Ok(RepairOutcome {
+            attempt: self.ledger_attempt(
+                target,
+                Strategy::PypiOverride,
+                "retread",
+                AttemptDetails {
+                    old_spec,
+                    new_spec: Some(format!("=={version}")),
+                    ..AttemptDetails::default()
+                },
+            ),
+            extra_attempts: Vec::new(),
+            summary_line: format!(
+                "would add [{}] {} = \"=={}\"  (tier: pypi_override; conda-as-truth)",
+                table_label(&self.feature, TableKind::Override),
+                package,
+                version
+            ),
+            applied: vec![edit],
+        })
     }
 
     fn no_candidates(
@@ -698,6 +799,13 @@ fn widen_spec(op: &str, floor: &str, policy: WidenCeilingPolicy) -> String {
     }
 }
 
+/// Strips a leading comparison operator (`==`, `>=`, `>`, ...) off a
+/// `Conflict::CondaWidenNeeded::conda_version` string (e.g. `"==2.10.0"` ->
+/// `"2.10.0"`), so it can be re-emitted verbatim as a pypi override pin.
+fn strip_version_op(spec: &str) -> &str {
+    spec.trim_start_matches(|c: char| !c.is_ascii_digit())
+}
+
 fn next_major(version: &str) -> Option<String> {
     let major = version.split('.').next()?.parse::<u64>().ok()?;
     Some((major + 1).to_string())
@@ -867,6 +975,84 @@ mod tests {
         let tried_from_sentinels = loaded.seed_tried_state(&path, "different", &editor);
         assert!(tried_from_sentinels.has("numpy", Strategy::Conda));
         assert!(!tried_from_sentinels.has("torch", Strategy::Conda));
+    }
+
+    #[test]
+    fn conda_widen_needed_user_pin_emits_override_and_leaves_conda_pin_untouched() {
+        // The live torch fixture: conda pin ==2.10.0 (user-owned, no
+        // sentinel), pypi side wants >=2.11.0. Conda-as-truth (T1, default
+        // relax-preference) must emit a pypi dependency-override pinned to
+        // the conda-provided version, and must NOT touch the conda pin.
+        let path = temp_manifest("[dependencies]\ntorch = \"==2.10.0\"\n");
+        let mut editor = ManifestEditor::open(path.clone()).unwrap();
+        let mut tried = TriedState::default();
+        let mut planner = RepairPlanner::new("default".into());
+        assert_eq!(planner.relax_preference, RelaxPreference::Conda);
+
+        let conflict = Conflict::CondaWidenNeeded {
+            package: "torch".into(),
+            op: ">=".into(),
+            floor: "2.11.0".into(),
+            conda_version: "==2.10.0".into(),
+        };
+        let out = planner
+            .repair(&mut editor, &mut tried, &conflict, 1)
+            .unwrap();
+        assert_eq!(out.attempt.strategy, "pypi_override");
+        assert_eq!(out.attempt.new_spec.as_deref(), Some("==2.10.0"));
+        assert!(!tried.has("torch", Strategy::Conda));
+        assert!(!tried.has("torch", Strategy::WidenConda));
+        assert!(tried.has("torch", Strategy::PypiOverride));
+
+        editor.write_atomic().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("torch = \"==2.10.0\"\n")); // conda pin untouched, no sentinel
+        assert!(text.contains("[pypi-options.dependency-overrides]"));
+        assert!(text.contains("torch = \"==2.10.0\"  # retread:override"));
+    }
+
+    #[test]
+    fn conda_widen_needed_sentineled_pin_takes_widen_tier() {
+        // A tool-written (sentineled) conda pin is eligible for T2 widen
+        // directly -- it isn't a user-owned pin conda-as-truth should
+        // protect.
+        let path = temp_manifest(
+            "[dependencies]\nmujoco = \"==3.5.0\"  # retread:pin 2026-07-07 conda-boundary\n",
+        );
+        let mut editor = ManifestEditor::open(path).unwrap();
+        let mut tried = TriedState::default();
+        let mut planner = RepairPlanner::new("default".into());
+
+        let conflict = Conflict::CondaWidenNeeded {
+            package: "mujoco".into(),
+            op: ">=".into(),
+            floor: "3.10.3".into(),
+            conda_version: "==3.5.0".into(),
+        };
+        let out = planner
+            .repair(&mut editor, &mut tried, &conflict, 1)
+            .unwrap();
+        assert_eq!(out.attempt.strategy, "widen-conda");
+    }
+
+    #[test]
+    fn relax_preference_pypi_restores_widen_first_even_for_user_pin() {
+        let path = temp_manifest("[dependencies]\ntorch = \"==2.10.0\"\n");
+        let mut editor = ManifestEditor::open(path).unwrap();
+        let mut tried = TriedState::default();
+        let mut planner =
+            RepairPlanner::new("default".into()).with_relax_preference(RelaxPreference::Pypi);
+
+        let conflict = Conflict::CondaWidenNeeded {
+            package: "torch".into(),
+            op: ">=".into(),
+            floor: "2.11.0".into(),
+            conda_version: "==2.10.0".into(),
+        };
+        let out = planner
+            .repair(&mut editor, &mut tried, &conflict, 1)
+            .unwrap();
+        assert_eq!(out.attempt.strategy, "widen-conda");
     }
 
     #[test]
