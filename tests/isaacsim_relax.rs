@@ -54,6 +54,7 @@ fn baseline_config() -> RetreadConfig {
         resolver: Default::default(),
         auto_route: true,
         keep_pypi: vec![],
+        force_conda: vec![],
         retread_wheels: BTreeMap::new(),
         relax: RelaxPolicy::Minor,
         overrides: BTreeMap::new(),

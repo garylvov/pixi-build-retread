@@ -159,11 +159,20 @@ pub struct AutoRouteOptions {
     /// Effective pypi -> conda name map (user retread-name-map + fallback
     /// table + parselmouth merge). Missing names use the identity mapping.
     pub name_map: BTreeMap<String, String>,
+    /// Canonical PyPI names the self-healing un-route step must NEVER
+    /// move back to the wheel closure (`force-conda`), even when the
+    /// co-installability solve names them in an unsat core. The user
+    /// asserts these must ship as conda run-deps; a persisting conflict
+    /// then fails the workspace lock loudly instead of silently
+    /// reverting to the wheel.
+    pub force_conda: BTreeSet<String>,
 }
 
-/// Hard cap on auto-route discovery rounds. The routing set only ever
-/// grows (a routed name is never un-routed), so the loop terminates on
-/// its own; the cap is a guard against pathological closures.
+/// Hard cap on auto-route discovery rounds (rounds that GROW the
+/// routing set). Growth rounds are capped here; self-healing un-route
+/// iterations (see [`auto_route_fixpoint_checked`]) are bounded
+/// separately by the closure size, since each one strictly grows the
+/// blocked set.
 pub const AUTO_ROUTE_MAX_ROUNDS: usize = 5;
 
 /// Per-round probe fan-out bound (matches `probe::probe_many`).
@@ -299,23 +308,145 @@ pub fn apply_auto_route(req: &mut UvClosureRequest, hits: &[AutoRoutedPackage]) 
 ///
 /// The returned closure's `auto_routed` lists every moved package;
 /// each move is logged as `auto-routed X==v to conda (channel C)`.
+///
+/// Compatibility wrapper over [`auto_route_fixpoint_checked`] with the
+/// co-installability check disabled (every routing round is accepted).
 pub async fn auto_route_fixpoint<S, P>(
     req: &UvClosureRequest,
     opts: &AutoRouteOptions,
-    mut solve: S,
+    solve: S,
     probe: P,
 ) -> Result<UvClosure>
 where
     S: FnMut(UvClosureRequest) -> futures::future::BoxFuture<'static, Result<UvClosure>>,
     P: Fn(String, String) -> futures::future::BoxFuture<'static, Option<RouteProbeHit>>,
 {
+    auto_route_fixpoint_checked(req, opts, solve, probe, |_| {
+        Box::pin(async { CoInstallVerdict::Skipped("co-solve not wired".into()) })
+    })
+    .await
+}
+
+/// Verdict of the conda co-installability check over one candidate
+/// auto-routed set (exact `conda_name ==conda_version` pins solved
+/// together against the workspace channels).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoInstallVerdict {
+    /// The pins co-install: accept the round.
+    Sat,
+    /// The conda solver reported unsat; the reason strings are scanned
+    /// for auto-routed names to un-route.
+    Unsat(Vec<String>),
+    /// The check could not run (no repodata on disk, offline, ...).
+    /// Routing proceeds UNCHECKED — identical to pre-check behavior —
+    /// so a missing cache can never veto a build. Deterministic given
+    /// the same cache state.
+    Skipped(String),
+}
+
+/// Does one resolvo unsat-reason line name this conda package?
+///
+/// Reasons embed names either as `name ==ver` / `name >=ver` match
+/// specs or as `name-version-build` filenames. Plain substring search
+/// over-matches (`ray` in `ray-core`, `numpy` in `numpydoc`), so an
+/// occurrence only counts when:
+///   * the char before it is not part of a conda name
+///     (`[a-z0-9._-]`), and
+///   * the char after it is either not a name char, or is `-`
+///     immediately followed by a digit (the `name-1.2.3-build`
+///     filename form; `ray-core` stays rejected).
+pub fn unsat_reason_names_package(reason: &str, conda_name: &str) -> bool {
+    // `-`/`_`/`.` are equivalent under conda name normalization
+    // (typing_extensions vs typing-extensions): fold both sides to `-`
+    // before matching. Versions in the reason get mangled by the fold,
+    // but only name-occurrence boundaries matter here.
+    let fold = |s: &str| s.to_ascii_lowercase().replace(['_', '.'], "-");
+    let hay = fold(reason);
+    let needle = fold(conda_name);
+    if needle.is_empty() {
+        return false;
+    }
+    let is_name_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-');
+    let bytes = hay.as_bytes();
+    let mut from = 0usize;
+    while let Some(pos) = hay[from..].find(&needle) {
+        let start = from + pos;
+        let end = start + needle.len();
+        let before_ok = start == 0 || !is_name_char(hay[..start].chars().next_back().unwrap());
+        let after_ok = match hay[end..].chars().next() {
+            None => true,
+            Some(c) if !is_name_char(c) => true,
+            Some('-') => hay[end + 1..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_digit()),
+            Some(_) => false,
+        };
+        if before_ok && after_ok {
+            return true;
+        }
+        from = start + 1;
+        if from >= bytes.len() {
+            break;
+        }
+    }
+    false
+}
+
+/// spec-uv-restructure M2 loop with the self-healing un-route step
+/// (fix for the exact-pin co-installability blocker): after each round
+/// that would GROW the routing set, `co_solve` checks that the whole
+/// candidate routed set (exact conda pins) still co-installs on the
+/// workspace channels.
+///
+/// * `Sat` / `Skipped`: the round is applied as before.
+/// * `Unsat(reasons)`: every candidate whose conda name appears in the
+///   unsat report is UN-ROUTED — moved back into the wheel closure and
+///   blocked from all future rounds — then the request is rebuilt from
+///   the surviving routes and the closure re-locked. `force-conda`
+///   names are exempt (warned, kept routed). If no routed name is
+///   named, the report is about something else entirely (channel-side
+///   breakage the un-route cannot heal); the round is applied with a
+///   warning so the workspace solve surfaces the real error.
+///
+/// Determinism: the verdict is a pure function of the candidate pin
+/// set + the channel repodata snapshot (and `Skipped` degrades to the
+/// old unchecked behavior), so identical inputs give identical routing.
+/// Termination: growth rounds are capped at [`AUTO_ROUTE_MAX_ROUNDS`];
+/// every un-route iteration strictly grows the blocked set, which is
+/// bounded by the closure size.
+pub async fn auto_route_fixpoint_checked<S, P, C>(
+    req: &UvClosureRequest,
+    opts: &AutoRouteOptions,
+    mut solve: S,
+    probe: P,
+    co_solve: C,
+) -> Result<UvClosure>
+where
+    S: FnMut(UvClosureRequest) -> futures::future::BoxFuture<'static, Result<UvClosure>>,
+    P: Fn(String, String) -> futures::future::BoxFuture<'static, Option<RouteProbeHit>>,
+    C: Fn(Vec<AutoRoutedPackage>) -> futures::future::BoxFuture<'static, CoInstallVerdict>,
+{
+    let base_req = req.clone();
     let mut req = req.clone();
     let mut closure = solve(req.clone()).await?;
     if !opts.enabled {
         return Ok(closure);
     }
     let mut routed: Vec<AutoRoutedPackage> = Vec::new();
-    for round in 1..=AUTO_ROUTE_MAX_ROUNDS {
+    // PyPI names the un-route step moved back to the wheel closure;
+    // excluded from every later round exactly like `keep-pypi`.
+    let mut blocked: BTreeSet<String> = BTreeSet::new();
+    let mut growth_rounds = 0usize;
+    // Belt-and-braces bound: growth rounds + one iteration per possible
+    // blocked name. The loop provably progresses (each iteration grows
+    // `routed`, grows `blocked`, or breaks), so this never fires.
+    let hard_cap = AUTO_ROUTE_MAX_ROUNDS + closure.wheels.len() + 8;
+    for _iteration in 0..hard_cap {
+        // Effective opt-out set for this iteration: user keep-pypi plus
+        // everything the self-heal has blocked so far.
+        let mut eff_opts = opts.clone();
+        eff_opts.keep_pypi.extend(blocked.iter().cloned());
         // Probe every still-unrouted closure wheel's conda equivalent at
         // the resolved version — the WHOLE round's candidate batch runs
         // concurrently (same 16-way bound as `probe_many`; repodata is
@@ -326,7 +457,7 @@ where
         // round's routing set.
         use futures::stream::{self, StreamExt};
         let batch: Vec<(String, Option<RouteProbeHit>)> =
-            stream::iter(auto_route_probe_specs(&closure, &req, opts, &routed))
+            stream::iter(auto_route_probe_specs(&closure, &req, &eff_opts, &routed))
                 .map(|(conda_name, spec)| {
                     let fut = probe(conda_name.clone(), spec);
                     async move { (conda_name, fut.await) }
@@ -340,14 +471,88 @@ where
                 hits.insert(conda_name, hit);
             }
         }
-        let new_routes = plan_auto_route_round(&closure, &req, opts, &routed, &hits);
+        let new_routes = plan_auto_route_round(&closure, &req, &eff_opts, &routed, &hits);
         if new_routes.is_empty() {
             break; // fixpoint
         }
+        // Candidate set = surviving routes + this round's additions;
+        // the co-install check always sees the CUMULATIVE pin set (a
+        // new pin can conflict with a pin accepted rounds ago).
+        let mut candidate = routed.clone();
+        candidate.extend(new_routes.iter().cloned());
+        let verdict = co_solve(candidate.clone()).await;
+        if let CoInstallVerdict::Unsat(reasons) = &verdict {
+            let mut named: Vec<AutoRoutedPackage> = Vec::new();
+            for pkg in &candidate {
+                let in_report = reasons
+                    .iter()
+                    .any(|r| unsat_reason_names_package(r, &pkg.conda_name));
+                if !in_report {
+                    continue;
+                }
+                if opts.force_conda.contains(&pkg.pypi_name) {
+                    tracing::warn!(
+                        bundle = %req.bundle,
+                        package = %pkg.pypi_name,
+                        "auto-route: {} =={} is named in the conda unsat \
+                         report but is force-conda; keeping it routed — \
+                         the workspace solve may fail",
+                        pkg.conda_name,
+                        pkg.conda_version,
+                    );
+                    continue;
+                }
+                named.push(pkg.clone());
+            }
+            if !named.is_empty() {
+                for pkg in &named {
+                    tracing::info!(
+                        bundle = %req.bundle,
+                        "auto-route: un-routed {}=={} (conda {} =={}) — \
+                         exact conda pins do not co-install; back to the \
+                         wheel closure",
+                        pkg.pypi_name,
+                        pkg.pypi_version,
+                        pkg.conda_name,
+                        pkg.conda_version,
+                    );
+                    blocked.insert(pkg.pypi_name.clone());
+                }
+                let previously_routed = routed.len();
+                routed.retain(|r| !blocked.contains(&r.pypi_name));
+                if routed.len() != previously_routed {
+                    // A previously ACCEPTED route was un-routed: rebuild
+                    // the request from scratch (its exclusion +
+                    // constraint must disappear) and re-lock so the
+                    // package's wheel — and any transitives it drags in —
+                    // rejoin the closure.
+                    req = base_req.clone();
+                    apply_auto_route(&mut req, &routed);
+                    closure = solve(req.clone()).await?;
+                }
+                // This round's additions were never applied to `req`;
+                // re-plan next iteration with the blocked set in force.
+                continue;
+            }
+            tracing::warn!(
+                bundle = %req.bundle,
+                reasons = ?reasons,
+                "auto-route: conda co-install check is unsat but names no \
+                 auto-routed package; un-routing cannot heal this — \
+                 applying the round unchanged",
+            );
+        } else if let CoInstallVerdict::Skipped(why) = &verdict {
+            tracing::debug!(
+                bundle = %req.bundle,
+                why = %why,
+                "auto-route: co-install check skipped; routing unchecked",
+            );
+        }
+        growth_rounds += 1;
         for h in &new_routes {
             tracing::info!(
                 bundle = %req.bundle,
-                round,
+                round = growth_rounds,
                 "auto-routed {}=={} to conda (channel {})",
                 h.pypi_name,
                 h.pypi_version,
@@ -355,18 +560,19 @@ where
             );
         }
         apply_auto_route(&mut req, &new_routes);
-        routed.extend(new_routes);
+        routed = candidate;
         // Re-lock with the updated exclusions + constraints so transitive
         // deps only the routed wheels pulled in fall out of (or shift
         // within) the closure.
         closure = solve(req.clone()).await?;
-        if round == AUTO_ROUTE_MAX_ROUNDS {
+        if growth_rounds == AUTO_ROUTE_MAX_ROUNDS {
             tracing::warn!(
                 bundle = %req.bundle,
                 rounds = AUTO_ROUTE_MAX_ROUNDS,
                 "auto-route: reached the round cap before fixpoint; \
                  remaining closure wheels stay on PyPI",
             );
+            break;
         }
     }
     closure.auto_routed = routed;
@@ -1756,6 +1962,7 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
         AutoRouteOptions {
             enabled: true,
             keep_pypi: BTreeSet::new(),
+            force_conda: BTreeSet::new(),
             // mujoco is the bundle's own root entry: never routed.
             protected: BTreeSet::from(["mujoco".to_string()]),
             name_map: BTreeMap::new(),
@@ -2165,6 +2372,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
         let opts = AutoRouteOptions {
             enabled: true,
             keep_pypi: BTreeSet::new(),
+            force_conda: BTreeSet::new(),
             protected: BTreeSet::from(["python-dateutil".to_string()]),
             name_map: BTreeMap::new(),
         };
@@ -2211,5 +2419,345 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
             closure.wheels.iter().any(|w| w.name == "python-dateutil"),
             "the protected root stays"
         );
+    }
+
+    // -- self-healing un-route (co-installability) ----------------------
+
+    /// Unsat-reason name matching: exact-name occurrences in match-spec
+    /// and filename forms hit; superstring package names do not.
+    #[test]
+    fn unsat_reason_name_matching_is_boundary_aware() {
+        // match-spec form
+        assert!(unsat_reason_names_package(
+            "cryptography >=44.0.1 cannot be installed because cryptography ==44.0.0 is pinned",
+            "cryptography"
+        ));
+        // filename form: name-version-build
+        assert!(unsat_reason_names_package(
+            "package aioboto3-15.1.0-pyhd8ed1ab_0 requires cryptography >=44.0.1",
+            "aioboto3"
+        ));
+        // superstrings must not match
+        assert!(!unsat_reason_names_package(
+            "numpydoc ==1.6.0 cannot be installed",
+            "numpy"
+        ));
+        assert!(!unsat_reason_names_package(
+            "ray-core 2.7.0 requires grpcio",
+            "ray"
+        ));
+        // ...but the filename form of the actual package still does
+        assert!(unsat_reason_names_package(
+            "package ray-2.7.0-py311_0 is excluded",
+            "ray"
+        ));
+        // substrings-with-prefix must not match
+        assert!(!unsat_reason_names_package(
+            "aioboto3 ==15.1.0 conflicts",
+            "boto3"
+        ));
+        // case-insensitive
+        assert!(unsat_reason_names_package(
+            "Numba ==0.59.1 requires llvmlite <0.43",
+            "numba"
+        ));
+        // -/_/. normalization equivalence
+        assert!(unsat_reason_names_package(
+            "typing_extensions-4.12.2-pyhd8ed1ab_0 conflicts",
+            "typing-extensions"
+        ));
+        assert!(unsat_reason_names_package(
+            "ruamel-yaml >=0.18 cannot be installed",
+            "ruamel.yaml"
+        ));
+        // python_abi must not match python
+        assert!(!unsat_reason_names_package(
+            "python_abi 3.12.* requires cpython",
+            "python"
+        ));
+    }
+
+    /// Canned co-solve keyed on the candidate conda-name set. Any set
+    /// containing every name of a listed conflict returns that
+    /// conflict's Unsat reasons; everything else is Sat.
+    fn canned_co_solve(
+        conflicts: Vec<(BTreeSet<String>, Vec<String>)>,
+    ) -> impl Fn(
+        Vec<AutoRoutedPackage>,
+    ) -> futures::future::BoxFuture<'static, CoInstallVerdict> {
+        move |candidate: Vec<AutoRoutedPackage>| {
+            let names: BTreeSet<String> =
+                candidate.iter().map(|r| r.conda_name.clone()).collect();
+            let verdict = conflicts
+                .iter()
+                .find(|(set, _)| set.is_subset(&names))
+                .map(|(_, reasons)| CoInstallVerdict::Unsat(reasons.clone()))
+                .unwrap_or(CoInstallVerdict::Sat);
+            Box::pin(async move { verdict })
+        }
+    }
+
+    /// The blocker-class fixture: BOTH numpy and typing-extensions have
+    /// conda hits at the resolved version, but conda-forge cannot
+    /// co-install the two exact pins (the unsat report names
+    /// typing-extensions). The self-heal must un-route
+    /// typing-extensions (wheel regained), keep numpy routed, and reach
+    /// a deterministic fixpoint.
+    #[tokio::test]
+    async fn unroute_heals_conflicting_exact_pins() {
+        let mut hits = BTreeMap::new();
+        hits.insert(
+            "numpy".to_string(),
+            RouteProbeHit {
+                conda_version: "2.1.0".into(),
+                channel: "c/linux-64".into(),
+            },
+        );
+        hits.insert(
+            "typing-extensions".to_string(),
+            RouteProbeHit {
+                conda_version: "4.12.2".into(),
+                channel: "c/linux-64".into(),
+            },
+        );
+        let co_solve = canned_co_solve(vec![(
+            BTreeSet::from(["numpy".to_string(), "typing-extensions".to_string()]),
+            vec![
+                "package numpy-2.1.0-py312_0 requires typing-extensions >=4.13, \
+                 but typing_extensions-4.12.2-pyhd8ed1ab_0 is pinned"
+                    .to_string(),
+            ],
+        )]);
+        let mut results = Vec::new();
+        for _ in 0..2 {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let closure = auto_route_fixpoint_checked(
+                &auto_route_req(),
+                &auto_route_opts(),
+                canned_solve(Arc::clone(&calls)),
+                canned_probe(hits.clone()),
+                &co_solve,
+            )
+            .await
+            .unwrap();
+            // Both were named in the report; both are candidates for
+            // un-routing — but numpy alone is Sat, so after
+            // typing-extensions AND numpy leave round 1's candidate set,
+            // the re-plan routes whatever survives. The report names
+            // BOTH names, so both get blocked: closure keeps both wheels.
+            let mut routed: Vec<String> = closure
+                .auto_routed
+                .iter()
+                .map(|r| r.pypi_name.clone())
+                .collect();
+            routed.sort();
+            let mut wheels: Vec<String> =
+                closure.wheels.iter().map(|w| w.name.clone()).collect();
+            wheels.sort();
+            results.push((routed, wheels));
+        }
+        // Deterministic across runs.
+        assert_eq!(results[0], results[1]);
+        let (routed, wheels) = &results[0];
+        // typing-extensions was named -> un-routed, wheel regained.
+        assert!(!routed.contains(&"typing-extensions".to_string()));
+        assert!(wheels.contains(&"typing-extensions".to_string()));
+        // numpy was ALSO named in the report -> conservatively un-routed.
+        assert!(!routed.contains(&"numpy".to_string()));
+        assert!(wheels.contains(&"numpy".to_string()));
+        // Protected root untouched.
+        assert!(wheels.contains(&"mujoco".to_string()));
+    }
+
+    /// Only the package(s) the unsat report names get un-routed; a
+    /// routed package the report does NOT name stays on the conda side.
+    #[tokio::test]
+    async fn unroute_is_scoped_to_named_packages() {
+        let mut hits = BTreeMap::new();
+        hits.insert(
+            "numpy".to_string(),
+            RouteProbeHit {
+                conda_version: "2.1.0".into(),
+                channel: "c/linux-64".into(),
+            },
+        );
+        hits.insert(
+            "typing-extensions".to_string(),
+            RouteProbeHit {
+                conda_version: "4.12.2".into(),
+                channel: "c/linux-64".into(),
+            },
+        );
+        // The report only names typing-extensions.
+        let co_solve = canned_co_solve(vec![(
+            BTreeSet::from(["typing-extensions".to_string()]),
+            vec![
+                "typing_extensions-4.12.2-pyhd8ed1ab_0 conflicts with __glibc".to_string(),
+            ],
+        )]);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let closure = auto_route_fixpoint_checked(
+            &auto_route_req(),
+            &auto_route_opts(),
+            canned_solve(Arc::clone(&calls)),
+            canned_probe(hits),
+            co_solve,
+        )
+        .await
+        .unwrap();
+        let routed: Vec<&str> = closure
+            .auto_routed
+            .iter()
+            .map(|r| r.pypi_name.as_str())
+            .collect();
+        assert_eq!(routed, vec!["numpy"], "numpy stays routed");
+        assert!(
+            closure.wheels.iter().any(|w| w.name == "typing-extensions"),
+            "typing-extensions regains its wheel"
+        );
+        assert!(!closure.wheels.iter().any(|w| w.name == "numpy"));
+        // The re-lock after the accepted numpy-only round saw numpy's
+        // exclusion + pin but NOT typing-extensions'.
+        let calls = calls.lock().unwrap();
+        let last = calls.last().unwrap();
+        assert!(last.no_emit_packages.contains(&"numpy".to_string()));
+        assert!(
+            !last
+                .no_emit_packages
+                .contains(&"typing-extensions".to_string())
+        );
+    }
+
+    /// A previously ACCEPTED route that a later round's cumulative check
+    /// implicates gets reverted: request rebuilt without its pin, wheel
+    /// regained.
+    #[tokio::test]
+    async fn unroute_reverts_previously_accepted_route() {
+        // Stateful probe: typing-extensions' hit only appears on its
+        // SECOND probe (fresh repodata mid-loop), so numpy routes alone
+        // in round 1 and typing-extensions joins in round 2.
+        let te_probes = Arc::new(Mutex::new(0usize));
+        let probe = {
+            let te_probes = Arc::clone(&te_probes);
+            move |name: String, _spec: String| {
+                let hit = match name.as_str() {
+                    "numpy" => Some(RouteProbeHit {
+                        conda_version: "2.1.0".into(),
+                        channel: "c/linux-64".into(),
+                    }),
+                    "typing-extensions" => {
+                        let mut n = te_probes.lock().unwrap();
+                        *n += 1;
+                        (*n >= 2).then(|| RouteProbeHit {
+                            conda_version: "4.12.2".into(),
+                            channel: "c/linux-64".into(),
+                        })
+                    }
+                    _ => None,
+                };
+                Box::pin(async move { hit })
+                    as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
+            }
+        };
+        // numpy alone: Sat. numpy + typing-extensions: Unsat naming
+        // numpy (the earlier-accepted route is the conflicting one).
+        let co_solve = canned_co_solve(vec![(
+            BTreeSet::from(["numpy".to_string(), "typing-extensions".to_string()]),
+            vec!["package numpy-2.1.0-py312_0 requires typing-extensions >=4.13".to_string()],
+        )]);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let closure = auto_route_fixpoint_checked(
+            &auto_route_req(),
+            &auto_route_opts(),
+            canned_solve(Arc::clone(&calls)),
+            probe,
+            co_solve,
+        )
+        .await
+        .unwrap();
+        // Report named both -> numpy (accepted in round 1) reverted,
+        // typing-extensions blocked; nothing stays routed.
+        assert!(
+            !closure.auto_routed.iter().any(|r| r.pypi_name == "numpy"),
+            "numpy's earlier route must be reverted; got {:?}",
+            closure.auto_routed
+        );
+        assert!(closure.wheels.iter().any(|w| w.name == "numpy"));
+        assert!(closure.wheels.iter().any(|w| w.name == "typing-extensions"));
+        // The final request no longer carries numpy's exclusion/pin.
+        let calls = calls.lock().unwrap();
+        let last = calls.last().unwrap();
+        assert!(!last.no_emit_packages.contains(&"numpy".to_string()));
+        assert!(
+            !last
+                .constraints
+                .constraints
+                .iter()
+                .any(|c| c.starts_with("numpy=="))
+        );
+    }
+
+    /// `force-conda` names are exempt from the self-heal: they stay
+    /// routed even when the unsat report names them.
+    #[tokio::test]
+    async fn force_conda_names_survive_unsat_reports() {
+        let mut hits = BTreeMap::new();
+        hits.insert(
+            "numpy".to_string(),
+            RouteProbeHit {
+                conda_version: "2.1.0".into(),
+                channel: "c/linux-64".into(),
+            },
+        );
+        let co_solve = canned_co_solve(vec![(
+            BTreeSet::from(["numpy".to_string()]),
+            vec!["numpy ==2.1.0 conflicts with the channel matrix".to_string()],
+        )]);
+        let mut opts = auto_route_opts();
+        opts.force_conda.insert("numpy".to_string());
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let closure = auto_route_fixpoint_checked(
+            &auto_route_req(),
+            &opts,
+            canned_solve(Arc::clone(&calls)),
+            canned_probe(hits),
+            co_solve,
+        )
+        .await
+        .unwrap();
+        assert_eq!(closure.auto_routed.len(), 1);
+        assert_eq!(closure.auto_routed[0].pypi_name, "numpy");
+        assert!(!closure.wheels.iter().any(|w| w.name == "numpy"));
+    }
+
+    /// An unsat report that names NO routed package (channel-side
+    /// breakage) cannot be healed by un-routing: the round applies
+    /// unchanged with a warning.
+    #[tokio::test]
+    async fn unsat_naming_no_routed_package_applies_round() {
+        let mut hits = BTreeMap::new();
+        hits.insert(
+            "numpy".to_string(),
+            RouteProbeHit {
+                conda_version: "2.1.0".into(),
+                channel: "c/linux-64".into(),
+            },
+        );
+        let co_solve = canned_co_solve(vec![(
+            BTreeSet::from(["numpy".to_string()]),
+            vec!["python 3.12.* cannot be installed: no candidates".to_string()],
+        )]);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let closure = auto_route_fixpoint_checked(
+            &auto_route_req(),
+            &auto_route_opts(),
+            canned_solve(Arc::clone(&calls)),
+            canned_probe(hits),
+            co_solve,
+        )
+        .await
+        .unwrap();
+        assert_eq!(closure.auto_routed.len(), 1);
+        assert_eq!(closure.auto_routed[0].pypi_name, "numpy");
     }
 }

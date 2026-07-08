@@ -2135,7 +2135,8 @@ async fn uv_group_closure(
 
     // Conda pins -> uv constraints, with provenance (spec §2.2 fallback
     // path: the manifest's effective deps; pixi.lock-gated read is M2+).
-    let constraints = match workspace_dir.and_then(crate::workspace::WorkspaceManifest::load) {
+    let manifest_opt = workspace_dir.and_then(crate::workspace::WorkspaceManifest::load);
+    let constraints = match manifest_opt.as_ref() {
         Some(manifest) => {
             let deps = manifest.effective_dependencies("default");
             crate::uv_closure::build_constraints(&deps, &effective.name_map, "manifest", "default")
@@ -2237,6 +2238,11 @@ async fn uv_group_closure(
             .collect(),
         protected,
         name_map: effective.name_map.clone(),
+        force_conda: effective
+            .force_conda
+            .iter()
+            .map(|n| canonical_conda_name(n))
+            .collect(),
     };
 
     // `'static` closures for the fixpoint driver: clone the inputs each
@@ -2272,8 +2278,99 @@ async fn uv_group_closure(
                 as futures::future::BoxFuture<'static, Option<crate::uv_closure::RouteProbeHit>>
         }
     };
-    let closure =
-        crate::uv_closure::auto_route_fixpoint(&req, &auto_route_opts, solve, probe).await?;
+    // Co-installability check for the self-healing un-route step: solve
+    // the candidate auto-routed EXACT pins (plus the workspace default
+    // env's own conda deps, mirroring the constraint source above, plus
+    // the target python) together against the workspace channels. This
+    // is the same rattler solve the workspace lock will run, restricted
+    // to the pins auto-route introduces, so a conda-forge build-matrix
+    // skew between two exact pins (aioboto3/cryptography-style) is
+    // caught HERE — where the conflicting package can still be un-routed
+    // back to its wheel — instead of failing `pixi lock`. Deterministic:
+    // the verdict depends only on the pin set + the cached repodata
+    // snapshot; when no repodata is on disk the check reports Skipped
+    // and routing proceeds unchecked (pre-check behavior).
+    let co_solve = {
+        let channels = conda_channels.to_vec();
+        let python = target.python_version.clone();
+        let subdir = target.conda_subdir.clone();
+        let bundle = group_name.to_string();
+        let (channel_priority, system_requirements, workspace_deps) = match manifest_opt.as_ref() {
+            Some(m) => (
+                match m.channel_priority.as_deref() {
+                    Some("disabled") => rattler_solve::ChannelPriority::Disabled,
+                    _ => rattler_solve::ChannelPriority::Strict,
+                },
+                m.effective_system_requirements("default"),
+                m.effective_dependencies("default"),
+            ),
+            None => (
+                rattler_solve::ChannelPriority::Strict,
+                Default::default(),
+                Default::default(),
+            ),
+        };
+        move |routed: Vec<crate::uv_closure::AutoRoutedPackage>| {
+            let channels = channels.clone();
+            let python = python.clone();
+            let subdir = subdir.clone();
+            let bundle = bundle.clone();
+            let system_requirements = system_requirements.clone();
+            let workspace_deps = workspace_deps.clone();
+            let fut = async move {
+                let mut specs: Vec<String> = routed
+                    .iter()
+                    .map(|r| format!("{} =={}", r.conda_name, r.conda_version))
+                    .collect();
+                for (name, spec) in &workspace_deps {
+                    let conda_name = canonical_conda_name(name);
+                    // The bundle's own outputs aren't on any channel yet.
+                    if conda_name == canonical_conda_name(&bundle) {
+                        continue;
+                    }
+                    if spec.trim().is_empty() || spec.trim() == "*" {
+                        specs.push(conda_name);
+                    } else {
+                        specs.push(format!("{conda_name} {spec}"));
+                    }
+                }
+                specs.push(format!("python {python}.*"));
+                match crate::conda_solve::solve_selected_records(
+                    &channels,
+                    &specs,
+                    &python,
+                    &subdir,
+                    channel_priority,
+                    &system_requirements,
+                    rattler_solve::SolveStrategy::Highest,
+                )
+                .await
+                {
+                    Ok(_) => crate::uv_closure::CoInstallVerdict::Sat,
+                    Err(reasons) => {
+                        if reasons
+                            .iter()
+                            .any(|r| r.contains("no repodata available from disk cache"))
+                        {
+                            crate::uv_closure::CoInstallVerdict::Skipped(reasons.join("; "))
+                        } else {
+                            crate::uv_closure::CoInstallVerdict::Unsat(reasons)
+                        }
+                    }
+                }
+            };
+            Box::pin(fut)
+                as futures::future::BoxFuture<'static, crate::uv_closure::CoInstallVerdict>
+        }
+    };
+    let closure = crate::uv_closure::auto_route_fixpoint_checked(
+        &req,
+        &auto_route_opts,
+        solve,
+        probe,
+        co_solve,
+    )
+    .await?;
     Ok(Some(closure))
 }
 

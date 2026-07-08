@@ -85,6 +85,7 @@ async fn fetch_isaacsim_kernel_end_to_end() {
         resolver: Default::default(),
         auto_route: true,
         keep_pypi: vec![],
+        force_conda: vec![],
         retread_wheels: BTreeMap::new(),
         relax: RelaxPolicy::Minor,
         overrides: BTreeMap::new(),

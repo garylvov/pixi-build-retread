@@ -304,6 +304,17 @@ pub struct RetreadConfig {
     /// there.
     #[serde(default, rename = "retread-keep-pypi", alias = "keep-pypi")]
     pub keep_pypi: Vec<String>,
+
+    /// Inverse of `retread-keep-pypi` for the self-healing un-route
+    /// step: PyPI names whose auto-route decision must stick even when
+    /// the co-installability solve names them in an unsat core. The
+    /// un-route step skips them (with a warning), so a persisting
+    /// conflict fails the workspace lock loudly instead of silently
+    /// reverting the package to its wheel. Does NOT force a route into
+    /// existence — the package still needs a repodata hit (use
+    /// `retread-conda-deps` to hard-force a conda dep).
+    #[serde(default, rename = "retread-force-conda", alias = "force-conda")]
+    pub force_conda: Vec<String>,
 }
 
 /// Engine selection for closure computation (`retread-resolver`).
