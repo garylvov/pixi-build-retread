@@ -117,6 +117,260 @@ pub struct UvClosure {
     pub pins: BTreeMap<String, String>,
     /// uv version that produced this closure.
     pub uv_version: String,
+    /// spec-uv-restructure M2: packages the auto-route loop moved out of
+    /// the wheel closure onto the conda side. Empty when auto-route is
+    /// off (or the plain [`compute_closure`] driver was used).
+    pub auto_routed: Vec<AutoRoutedPackage>,
+}
+
+// ---------------------------------------------------------------------------
+// Auto-route (spec-uv-restructure M2): probe-driven conda routing filter
+// ---------------------------------------------------------------------------
+
+/// One auto-routed package: excluded from the wheel closure, provided by
+/// a conda channel instead. Recorded so the backend emits it as a conda
+/// run-dependency of the stub package.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutoRoutedPackage {
+    /// PEP 503-canonical PyPI name (closure-side identity).
+    pub pypi_name: String,
+    /// Conda package name it routes to (name-mapped; identity fallback).
+    pub conda_name: String,
+    /// The closure's resolved PyPI version the conda side must satisfy.
+    pub pypi_version: String,
+    /// Conda version of the matching build on the channel.
+    pub conda_version: String,
+    /// `<channel_url>/<subdir>` the match was found on.
+    pub channel: String,
+}
+
+/// Configuration for the auto-route loop.
+#[derive(Debug, Clone, Default)]
+pub struct AutoRouteOptions {
+    /// Master switch (`auto-route` in `[package.build.config]`; default on).
+    pub enabled: bool,
+    /// Canonical PyPI names the user opted OUT of auto-routing
+    /// (`keep-pypi`). Never routed, no probe issued.
+    pub keep_pypi: BTreeSet<String>,
+    /// Canonical PyPI names that must stay in the closure regardless of
+    /// conda availability: the bundle's own root entries and retread-built
+    /// wheels. Routing a root to conda would hollow out the pack.
+    pub protected: BTreeSet<String>,
+    /// Effective pypi -> conda name map (user retread-name-map + fallback
+    /// table + parselmouth merge). Missing names use the identity mapping.
+    pub name_map: BTreeMap<String, String>,
+}
+
+/// Hard cap on auto-route discovery rounds. The routing set only ever
+/// grows (a routed name is never un-routed), so the loop terminates on
+/// its own; the cap is a guard against pathological closures.
+pub const AUTO_ROUTE_MAX_ROUNDS: usize = 5;
+
+/// Per-round probe fan-out bound (matches `probe::probe_many`).
+pub const AUTO_ROUTE_PROBE_CONCURRENCY: usize = 16;
+
+/// A successful conda-route probe for the loop: mirrors
+/// [`crate::probe::RouteHit`] (redeclared here so this module's loop is
+/// testable without touching repodata).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteProbeHit {
+    pub conda_version: String,
+    pub channel: String,
+}
+
+/// Pure routing sweep over one solved closure: which index wheels can
+/// move to the conda side this round?
+///
+/// A wheel is a CANDIDATE unless it is already excluded
+/// (`no_emit_packages`), user-kept (`keep-pypi`), protected (root /
+/// built wheel), or routed in a previous round. For each candidate the
+/// caller-supplied `probe_hits` map (conda name -> hit, from repodata)
+/// decides: present = route it.
+pub fn plan_auto_route_round(
+    closure: &UvClosure,
+    req: &UvClosureRequest,
+    opts: &AutoRouteOptions,
+    already_routed: &[AutoRoutedPackage],
+    probe_hits: &BTreeMap<String, RouteProbeHit>,
+) -> Vec<AutoRoutedPackage> {
+    let excluded: BTreeSet<String> = req
+        .no_emit_packages
+        .iter()
+        .map(|n| canonical_conda_name(n))
+        .collect();
+    let mut out = Vec::new();
+    for wheel in &closure.wheels {
+        let name = &wheel.name; // canonical (parse_pylock_closure output)
+        if excluded.contains(name)
+            || opts.keep_pypi.contains(name)
+            || opts.protected.contains(name)
+            || already_routed.iter().any(|r| &r.pypi_name == name)
+        {
+            continue;
+        }
+        let conda_name = opts
+            .name_map
+            .get(name)
+            .map(|c| canonical_conda_name(c))
+            .unwrap_or_else(|| name.clone());
+        if let Some(hit) = probe_hits.get(&conda_name) {
+            out.push(AutoRoutedPackage {
+                pypi_name: name.clone(),
+                conda_name,
+                pypi_version: wheel.version.clone(),
+                conda_version: hit.conda_version.clone(),
+                channel: hit.channel.clone(),
+            });
+        }
+    }
+    out
+}
+
+/// The conda names + `==version` specs to probe for one round's
+/// candidates (everything [`plan_auto_route_round`] would consider).
+/// Returned as (conda_name, spec) pairs, deduped.
+pub fn auto_route_probe_specs(
+    closure: &UvClosure,
+    req: &UvClosureRequest,
+    opts: &AutoRouteOptions,
+    already_routed: &[AutoRoutedPackage],
+) -> Vec<(String, String)> {
+    let excluded: BTreeSet<String> = req
+        .no_emit_packages
+        .iter()
+        .map(|n| canonical_conda_name(n))
+        .collect();
+    let mut out: Vec<(String, String)> = Vec::new();
+    for wheel in &closure.wheels {
+        let name = &wheel.name;
+        if excluded.contains(name)
+            || opts.keep_pypi.contains(name)
+            || opts.protected.contains(name)
+            || already_routed.iter().any(|r| &r.pypi_name == name)
+        {
+            continue;
+        }
+        let conda_name = opts
+            .name_map
+            .get(name)
+            .map(|c| canonical_conda_name(c))
+            .unwrap_or_else(|| name.clone());
+        let pair = (conda_name, format!("=={}", wheel.version));
+        if !out.contains(&pair) {
+            out.push(pair);
+        }
+    }
+    out
+}
+
+/// Apply one round's routing decisions to the request: each routed
+/// package is excluded from the exported closure (`--no-emit-package`)
+/// and its resolved version becomes a `constraint-dependencies` pin (so
+/// the re-lock cannot drift the rest of the graph away from what conda
+/// will provide). Provenance records `source = "auto-route"`.
+pub fn apply_auto_route(req: &mut UvClosureRequest, hits: &[AutoRoutedPackage]) {
+    for h in hits {
+        req.no_emit_packages.push(h.pypi_name.clone());
+        let line = format!("{}=={}", h.pypi_name, h.pypi_version);
+        req.constraints.constraints.push(line.clone());
+        req.constraints.provenance.insert(
+            h.pypi_name.clone(),
+            ConstraintProvenance {
+                constraint: line,
+                conda_name: h.conda_name.clone(),
+                conda_version: format!("=={}", h.conda_version),
+                source: "auto-route".to_string(),
+                env: "default".to_string(),
+            },
+        );
+    }
+}
+
+/// spec-uv-restructure M2 outer loop: solve, sweep the closure for
+/// wheels a workspace channel can provide at the resolved version, move
+/// them to the conda side, re-solve, repeat to fixpoint (max
+/// [`AUTO_ROUTE_MAX_ROUNDS`] discovery rounds — the routing set only
+/// grows, so this terminates).
+///
+/// * `solve`: computes a closure for the (progressively updated)
+///   request — production wires [`compute_closure`]; tests can can it.
+/// * `probe`: `(conda_name, "==version")` -> conda availability —
+///   production wires `crate::probe::find_route`; tests can can it.
+///
+/// The returned closure's `auto_routed` lists every moved package;
+/// each move is logged as `auto-routed X==v to conda (channel C)`.
+pub async fn auto_route_fixpoint<S, P>(
+    req: &UvClosureRequest,
+    opts: &AutoRouteOptions,
+    mut solve: S,
+    probe: P,
+) -> Result<UvClosure>
+where
+    S: FnMut(UvClosureRequest) -> futures::future::BoxFuture<'static, Result<UvClosure>>,
+    P: Fn(String, String) -> futures::future::BoxFuture<'static, Option<RouteProbeHit>>,
+{
+    let mut req = req.clone();
+    let mut closure = solve(req.clone()).await?;
+    if !opts.enabled {
+        return Ok(closure);
+    }
+    let mut routed: Vec<AutoRoutedPackage> = Vec::new();
+    for round in 1..=AUTO_ROUTE_MAX_ROUNDS {
+        // Probe every still-unrouted closure wheel's conda equivalent at
+        // the resolved version — the WHOLE round's candidate batch runs
+        // concurrently (same 16-way bound as `probe_many`; repodata is
+        // in-memory-cached after the first hit per (channel, subdir), so
+        // this collapses a cold 100-package sweep from serial fetch
+        // latency to a handful of parallel fetches). The round loop
+        // itself stays serial: each re-lock depends on the previous
+        // round's routing set.
+        use futures::stream::{self, StreamExt};
+        let batch: Vec<(String, Option<RouteProbeHit>)> =
+            stream::iter(auto_route_probe_specs(&closure, &req, opts, &routed))
+                .map(|(conda_name, spec)| {
+                    let fut = probe(conda_name.clone(), spec);
+                    async move { (conda_name, fut.await) }
+                })
+                .buffer_unordered(AUTO_ROUTE_PROBE_CONCURRENCY)
+                .collect()
+                .await;
+        let mut hits: BTreeMap<String, RouteProbeHit> = BTreeMap::new();
+        for (conda_name, hit) in batch {
+            if let Some(hit) = hit {
+                hits.insert(conda_name, hit);
+            }
+        }
+        let new_routes = plan_auto_route_round(&closure, &req, opts, &routed, &hits);
+        if new_routes.is_empty() {
+            break; // fixpoint
+        }
+        for h in &new_routes {
+            tracing::info!(
+                bundle = %req.bundle,
+                round,
+                "auto-routed {}=={} to conda (channel {})",
+                h.pypi_name,
+                h.pypi_version,
+                h.channel,
+            );
+        }
+        apply_auto_route(&mut req, &new_routes);
+        routed.extend(new_routes);
+        // Re-lock with the updated exclusions + constraints so transitive
+        // deps only the routed wheels pulled in fall out of (or shift
+        // within) the closure.
+        closure = solve(req.clone()).await?;
+        if round == AUTO_ROUTE_MAX_ROUNDS {
+            tracing::warn!(
+                bundle = %req.bundle,
+                rounds = AUTO_ROUTE_MAX_ROUNDS,
+                "auto-route: reached the round cap before fixpoint; \
+                 remaining closure wheels stay on PyPI",
+            );
+        }
+    }
+    closure.auto_routed = routed;
+    Ok(closure)
 }
 
 // ---------------------------------------------------------------------------
@@ -498,6 +752,7 @@ pub fn parse_pylock_closure(
         wheels,
         pins,
         uv_version: uv_version.to_string(),
+        auto_routed: Vec::new(),
     })
 }
 
@@ -1249,6 +1504,420 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
         assert!(none.is_empty());
     }
 
+    // ---- auto-route (spec-uv-restructure M2) -------------------------------
+
+    use std::sync::{Arc, Mutex};
+
+    /// Canned repodata: conda name -> hit. Mirrors how a real channel
+    /// would answer `find_route(name, ==version)`.
+    fn canned_probe(
+        hits: BTreeMap<String, RouteProbeHit>,
+    ) -> impl Fn(String, String) -> futures::future::BoxFuture<'static, Option<RouteProbeHit>> {
+        move |name: String, _spec: String| {
+            let hit = hits.get(&name).cloned();
+            Box::pin(async move { hit })
+        }
+    }
+
+    /// Canned solve: parse the shared pylock fixture with the request's
+    /// CURRENT `no_emit_packages` as the exclude set (exactly what the
+    /// real compute_closure does post-export), recording each request.
+    fn canned_solve(
+        calls: Arc<Mutex<Vec<UvClosureRequest>>>,
+    ) -> impl FnMut(UvClosureRequest) -> futures::future::BoxFuture<'static, Result<UvClosure>>
+    {
+        move |r: UvClosureRequest| {
+            let calls = Arc::clone(&calls);
+            Box::pin(async move {
+                calls.lock().unwrap().push(r.clone());
+                let exclude: BTreeSet<String> = r
+                    .no_emit_packages
+                    .iter()
+                    .map(|n| canonical_conda_name(n))
+                    .collect();
+                parse_pylock_closure(
+                    PYLOCK_FIXTURE,
+                    &WheelTarget {
+                        python_version: "3.12".into(),
+                        conda_subdir: "linux-64".into(),
+                    },
+                    &exclude,
+                    "0.11.15",
+                )
+            })
+        }
+    }
+
+    fn auto_route_req() -> UvClosureRequest {
+        UvClosureRequest {
+            bundle: "tiny-pack".into(),
+            python_version: "3.12".into(),
+            conda_subdir: "linux-64".into(),
+            dependencies: vec!["mujoco==3.5.0".into()],
+            constraints: ConstraintSet::default(),
+            overrides: vec![],
+            no_emit_packages: vec![],
+            index_urls: vec!["https://pypi.org/simple/".into()],
+            built_wheel_sources: BTreeMap::new(),
+            offline: false,
+        }
+    }
+
+    fn auto_route_opts() -> AutoRouteOptions {
+        AutoRouteOptions {
+            enabled: true,
+            keep_pypi: BTreeSet::new(),
+            // mujoco is the bundle's own root entry: never routed.
+            protected: BTreeSet::from(["mujoco".to_string()]),
+            name_map: BTreeMap::new(),
+        }
+    }
+
+    /// The core loop: numpy exists on a channel at the resolved version
+    /// -> excluded from the closure, pinned as a constraint, recorded as
+    /// auto-routed; the loop re-locks once and reaches fixpoint.
+    #[tokio::test]
+    async fn auto_route_routes_hit_and_reaches_fixpoint() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut hits = BTreeMap::new();
+        hits.insert(
+            "numpy".to_string(),
+            RouteProbeHit {
+                conda_version: "2.1.0".into(),
+                channel: "https://conda.anaconda.org/conda-forge/linux-64".into(),
+            },
+        );
+        let closure = auto_route_fixpoint(
+            &auto_route_req(),
+            &auto_route_opts(),
+            canned_solve(Arc::clone(&calls)),
+            canned_probe(hits),
+        )
+        .await
+        .unwrap();
+
+        // numpy moved to conda; typing-extensions (no conda hit) and the
+        // protected root (mujoco) stay.
+        let names: Vec<&str> = closure.wheels.iter().map(|w| w.name.as_str()).collect();
+        assert_eq!(names, vec!["typing-extensions", "mujoco"]);
+        assert_eq!(closure.auto_routed.len(), 1);
+        let r = &closure.auto_routed[0];
+        assert_eq!(r.pypi_name, "numpy");
+        assert_eq!(r.conda_name, "numpy");
+        assert_eq!(r.pypi_version, "2.1.0");
+        assert_eq!(r.conda_version, "2.1.0");
+        assert!(r.channel.contains("conda-forge"));
+
+        // Initial lock + one re-lock after routing; round 2 found
+        // nothing new (no third solve).
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        // The re-lock saw the exclusion AND the exact-version constraint
+        // with auto-route provenance.
+        let relock = &calls[1];
+        assert!(relock.no_emit_packages.contains(&"numpy".to_string()));
+        assert!(
+            relock
+                .constraints
+                .constraints
+                .contains(&"numpy==2.1.0".to_string())
+        );
+        let prov = &relock.constraints.provenance["numpy"];
+        assert_eq!(prov.source, "auto-route");
+        assert_eq!(prov.conda_name, "numpy");
+        assert_eq!(prov.conda_version, "==2.1.0");
+    }
+
+    /// `keep-pypi` names are never routed (and never probed).
+    #[tokio::test]
+    async fn auto_route_respects_keep_pypi() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut hits = BTreeMap::new();
+        hits.insert(
+            "numpy".to_string(),
+            RouteProbeHit {
+                conda_version: "2.1.0".into(),
+                channel: "c/linux-64".into(),
+            },
+        );
+        let mut opts = auto_route_opts();
+        opts.keep_pypi.insert("numpy".to_string());
+        let closure = auto_route_fixpoint(
+            &auto_route_req(),
+            &opts,
+            canned_solve(Arc::clone(&calls)),
+            canned_probe(hits),
+        )
+        .await
+        .unwrap();
+        assert!(closure.auto_routed.is_empty());
+        assert!(closure.wheels.iter().any(|w| w.name == "numpy"));
+        // Fixpoint on round 1 with zero routes: no re-lock.
+        assert_eq!(calls.lock().unwrap().len(), 1);
+    }
+
+    /// Root entries (protected) are never routed even on a conda hit.
+    #[tokio::test]
+    async fn auto_route_never_routes_protected_roots() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut hits = BTreeMap::new();
+        hits.insert(
+            "mujoco".to_string(),
+            RouteProbeHit {
+                conda_version: "3.5.0".into(),
+                channel: "c/linux-64".into(),
+            },
+        );
+        let closure = auto_route_fixpoint(
+            &auto_route_req(),
+            &auto_route_opts(),
+            canned_solve(Arc::clone(&calls)),
+            canned_probe(hits),
+        )
+        .await
+        .unwrap();
+        assert!(closure.auto_routed.is_empty());
+        assert!(closure.wheels.iter().any(|w| w.name == "mujoco"));
+        assert_eq!(calls.lock().unwrap().len(), 1);
+    }
+
+    /// `auto-route = false`: one solve, no probing effects, empty record.
+    #[tokio::test]
+    async fn auto_route_disabled_is_single_solve() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut hits = BTreeMap::new();
+        hits.insert(
+            "numpy".to_string(),
+            RouteProbeHit {
+                conda_version: "2.1.0".into(),
+                channel: "c/linux-64".into(),
+            },
+        );
+        let mut opts = auto_route_opts();
+        opts.enabled = false;
+        let closure = auto_route_fixpoint(
+            &auto_route_req(),
+            &opts,
+            canned_solve(Arc::clone(&calls)),
+            canned_probe(hits),
+        )
+        .await
+        .unwrap();
+        assert!(closure.auto_routed.is_empty());
+        assert!(closure.wheels.iter().any(|w| w.name == "numpy"));
+        assert_eq!(calls.lock().unwrap().len(), 1);
+    }
+
+    /// The name-map is honored: `torch` routes via conda's `pytorch`.
+    #[tokio::test]
+    async fn auto_route_maps_pypi_to_conda_names() {
+        let pylock = r#"
+[[packages]]
+name = "torch"
+version = "2.10.0"
+[[packages.wheels]]
+name = "torch-2.10.0-cp312-cp312-manylinux_2_28_x86_64.whl"
+url = "https://files.pythonhosted.org/torch-2.10.0-cp312-cp312-manylinux_2_28_x86_64.whl"
+[packages.wheels.hashes]
+sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
+"#;
+        let calls = Arc::new(Mutex::new(Vec::<UvClosureRequest>::new()));
+        let solve = {
+            let calls = Arc::clone(&calls);
+            move |r: UvClosureRequest| {
+                let calls = Arc::clone(&calls);
+                Box::pin(async move {
+                    calls.lock().unwrap().push(r.clone());
+                    let exclude: BTreeSet<String> = r
+                        .no_emit_packages
+                        .iter()
+                        .map(|n| canonical_conda_name(n))
+                        .collect();
+                    parse_pylock_closure(pylock, &target("3.12", "linux-64"), &exclude, "0.11.15")
+                }) as futures::future::BoxFuture<'static, Result<UvClosure>>
+            }
+        };
+        let mut hits = BTreeMap::new();
+        hits.insert(
+            "pytorch".to_string(),
+            RouteProbeHit {
+                conda_version: "2.10.0".into(),
+                channel: "c/linux-64".into(),
+            },
+        );
+        let mut opts = auto_route_opts();
+        opts.name_map
+            .insert("torch".to_string(), "pytorch".to_string());
+        let closure = auto_route_fixpoint(&auto_route_req(), &opts, solve, canned_probe(hits))
+            .await
+            .unwrap();
+        assert_eq!(closure.auto_routed.len(), 1);
+        assert_eq!(closure.auto_routed[0].pypi_name, "torch");
+        assert_eq!(closure.auto_routed[0].conda_name, "pytorch");
+        assert!(closure.wheels.is_empty(), "torch left the closure");
+        // Constraint pins the PYPI name (uv-side), not the conda name.
+        assert!(
+            calls.lock().unwrap()[1]
+                .constraints
+                .constraints
+                .contains(&"torch==2.10.0".to_string())
+        );
+    }
+
+    /// Termination guard: a pathological solve that grows a NEW routable
+    /// wheel every round must stop at AUTO_ROUTE_MAX_ROUNDS re-locks.
+    #[tokio::test]
+    async fn auto_route_terminates_at_round_cap() {
+        let n_solves = Arc::new(Mutex::new(0usize));
+        let solve = {
+            let n_solves = Arc::clone(&n_solves);
+            move |_r: UvClosureRequest| {
+                let n_solves = Arc::clone(&n_solves);
+                Box::pin(async move {
+                    let mut n = n_solves.lock().unwrap();
+                    *n += 1;
+                    let round_id = *n;
+                    // Every solve invents a fresh package, so every sweep
+                    // finds something new to route.
+                    Ok(UvClosure {
+                        wheels: vec![LockWheel {
+                            name: format!("gen{round_id}"),
+                            version: "1.0".into(),
+                            origin: Origin::Index,
+                            filename: format!("gen{round_id}-1.0-py3-none-any.whl"),
+                            url: Some("https://example.com/x.whl".into()),
+                            sha256: Some("00".repeat(32)),
+                            requires_dist: vec![],
+                            must_ship: false,
+                            upstream_url: None,
+                            git_source: None,
+                            sdist_source: None,
+                        }],
+                        pins: BTreeMap::new(),
+                        uv_version: "0.11.15".into(),
+                        auto_routed: vec![],
+                    })
+                }) as futures::future::BoxFuture<'static, Result<UvClosure>>
+            }
+        };
+        // Probe hits EVERYTHING.
+        let probe = |name: String, _spec: String| {
+            Box::pin(async move {
+                Some(RouteProbeHit {
+                    conda_version: "1.0".into(),
+                    channel: format!("c/{name}"),
+                })
+            }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
+        };
+        let closure = auto_route_fixpoint(&auto_route_req(), &auto_route_opts(), solve, probe)
+            .await
+            .unwrap();
+        // Initial solve + exactly AUTO_ROUTE_MAX_ROUNDS re-locks.
+        assert_eq!(*n_solves.lock().unwrap(), 1 + AUTO_ROUTE_MAX_ROUNDS);
+        assert_eq!(closure.auto_routed.len(), AUTO_ROUTE_MAX_ROUNDS);
+    }
+
+    /// Within one round, every candidate's repodata lookup is issued
+    /// CONCURRENTLY (16-way `buffer_unordered`), and the whole batch is
+    /// collected before any re-lock. Six candidates whose probes each
+    /// park on a timer must overlap; a serial sweep would show
+    /// max-in-flight == 1.
+    #[tokio::test]
+    async fn auto_route_probes_run_concurrently_within_a_round() {
+        let n_solves = Arc::new(Mutex::new(0usize));
+        let solve = {
+            let n_solves = Arc::clone(&n_solves);
+            move |_r: UvClosureRequest| {
+                let n_solves = Arc::clone(&n_solves);
+                Box::pin(async move {
+                    *n_solves.lock().unwrap() += 1;
+                    let wheels = (0..6)
+                        .map(|i| LockWheel {
+                            name: format!("p{i}"),
+                            version: "1.0".into(),
+                            origin: Origin::Index,
+                            filename: format!("p{i}-1.0-py3-none-any.whl"),
+                            url: Some("https://example.com/x.whl".into()),
+                            sha256: Some("00".repeat(32)),
+                            requires_dist: vec![],
+                            must_ship: false,
+                            upstream_url: None,
+                            git_source: None,
+                            sdist_source: None,
+                        })
+                        .collect();
+                    Ok(UvClosure {
+                        wheels,
+                        pins: BTreeMap::new(),
+                        uv_version: "0.11.15".into(),
+                        auto_routed: vec![],
+                    })
+                }) as futures::future::BoxFuture<'static, Result<UvClosure>>
+            }
+        };
+        // (in_flight, max_in_flight, total_calls)
+        let gauge = Arc::new(Mutex::new((0usize, 0usize, 0usize)));
+        let probe = {
+            let gauge = Arc::clone(&gauge);
+            move |_name: String, _spec: String| {
+                let gauge = Arc::clone(&gauge);
+                Box::pin(async move {
+                    {
+                        let mut g = gauge.lock().unwrap();
+                        g.0 += 1;
+                        g.1 = g.1.max(g.0);
+                        g.2 += 1;
+                    }
+                    // Park so overlapping probes are observable.
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                    gauge.lock().unwrap().0 -= 1;
+                    None // no hits -> single round, no re-lock
+                }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
+            }
+        };
+        let closure = auto_route_fixpoint(&auto_route_req(), &auto_route_opts(), solve, probe)
+            .await
+            .unwrap();
+        assert!(closure.auto_routed.is_empty());
+        let (_, max_in_flight, total) = *gauge.lock().unwrap();
+        assert_eq!(total, 6, "every candidate probed exactly once");
+        assert!(
+            max_in_flight >= 2,
+            "probes must overlap within a round (max in-flight {max_in_flight})"
+        );
+        // The whole batch completed with NO intervening re-lock.
+        assert_eq!(*n_solves.lock().unwrap(), 1);
+    }
+
+    /// The pure planner: an already-excluded (`retread-conda-deps`) name
+    /// is not re-routed, and identity fallback applies without a map.
+    #[test]
+    fn plan_auto_route_round_skips_already_excluded() {
+        let mut req = auto_route_req();
+        req.no_emit_packages.push("numpy".into());
+        let exclude: BTreeSet<String> = req
+            .no_emit_packages
+            .iter()
+            .map(|n| canonical_conda_name(n))
+            .collect();
+        let closure =
+            parse_pylock_closure(PYLOCK_FIXTURE, &target("3.12", "linux-64"), &exclude, "x")
+                .unwrap();
+        let mut hits = BTreeMap::new();
+        for n in ["numpy", "typing-extensions"] {
+            hits.insert(
+                n.to_string(),
+                RouteProbeHit {
+                    conda_version: "1".into(),
+                    channel: "c/linux-64".into(),
+                },
+            );
+        }
+        let routes = plan_auto_route_round(&closure, &req, &auto_route_opts(), &[], &hits);
+        let names: Vec<&str> = routes.iter().map(|r| r.pypi_name.as_str()).collect();
+        assert_eq!(names, vec!["typing-extensions"]);
+    }
+
     // ---- live subprocess (network) ---------------------------------------
 
     /// Live-network smoke: requires uv on PATH + PyPI reachability.
@@ -1280,5 +1949,78 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
         );
         assert_eq!(closure.wheels.len(), 1);
         assert!(closure.wheels[0].sha256.is_some());
+    }
+
+    /// Live-network auto-route smoke: uv on PATH + PyPI + conda-forge
+    /// repodata. python-dateutil's closure pulls `six`, which conda-forge
+    /// carries at the same version — the loop must route it.
+    /// Run manually: `cargo test uv_closure -- --ignored`.
+    #[tokio::test]
+    #[ignore = "requires network + uv on PATH + conda-forge repodata"]
+    async fn live_auto_route_six_via_conda_forge() {
+        use rattler_conda_types::ChannelUrl;
+        let tmp =
+            std::env::temp_dir().join(format!("retread-auto-route-smoke-{}", std::process::id()));
+        let req = UvClosureRequest {
+            bundle: "smoke-autoroute".into(),
+            python_version: "3.12".into(),
+            conda_subdir: "linux-64".into(),
+            dependencies: vec!["python-dateutil==2.9.0.post0".into()],
+            constraints: ConstraintSet::default(),
+            overrides: vec![],
+            no_emit_packages: vec![],
+            index_urls: vec!["https://pypi.org/simple/".into()],
+            built_wheel_sources: BTreeMap::new(),
+            offline: false,
+        };
+        let opts = AutoRouteOptions {
+            enabled: true,
+            keep_pypi: BTreeSet::new(),
+            protected: BTreeSet::from(["python-dateutil".to_string()]),
+            name_map: BTreeMap::new(),
+        };
+        let channels: Vec<ChannelUrl> = vec![ChannelUrl::from(
+            url::Url::parse("https://conda.anaconda.org/conda-forge/").unwrap(),
+        )];
+        let project = tmp.join("project");
+        let cache = tmp.join("uv-cache");
+        let solve = {
+            let project = project.clone();
+            let cache = cache.clone();
+            move |r: UvClosureRequest| {
+                let project = project.clone();
+                let cache = cache.clone();
+                Box::pin(async move { compute_closure(&r, &project, &cache, None).await })
+                    as futures::future::BoxFuture<'static, Result<UvClosure>>
+            }
+        };
+        let probe = move |name: String, spec: String| {
+            let channels = channels.clone();
+            Box::pin(async move {
+                crate::probe::find_route(&channels, &name, &spec, Some("3.12"))
+                    .await
+                    .map(|h| RouteProbeHit {
+                        conda_version: h.version,
+                        channel: h.channel,
+                    })
+            }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
+        };
+        let closure = auto_route_fixpoint(&req, &opts, solve, probe)
+            .await
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(
+            closure.auto_routed.iter().any(|r| r.pypi_name == "six"),
+            "six should auto-route to conda-forge; got {:?}",
+            closure.auto_routed,
+        );
+        assert!(
+            !closure.wheels.iter().any(|w| w.name == "six"),
+            "six must leave the wheel closure"
+        );
+        assert!(
+            closure.wheels.iter().any(|w| w.name == "python-dateutil"),
+            "the protected root stays"
+        );
     }
 }

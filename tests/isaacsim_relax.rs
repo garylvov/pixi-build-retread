@@ -52,6 +52,8 @@ fn baseline_config() -> RetreadConfig {
     // should NOT be needed once retread is in the loop.
     RetreadConfig {
         resolver: Default::default(),
+        auto_route: true,
+        keep_pypi: vec![],
         retread_wheels: BTreeMap::new(),
         relax: RelaxPolicy::Minor,
         overrides: BTreeMap::new(),

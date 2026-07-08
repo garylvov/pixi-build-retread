@@ -653,6 +653,13 @@ struct Bundle {
     /// (RETREAD_RESOLVO_DIFF) and never serialized to a lock.
     #[allow(dead_code)]
     conda_routed: Vec<String>,
+    /// v4.3.0 (spec-uv-restructure M2): packages the uv auto-route loop
+    /// moved from the wheel closure to the conda side, as
+    /// (conda_name, conda_version) pairs. Each becomes an exact-pinned
+    /// conda run-dep of the stub output (`produce_output`) so conda —
+    /// not a shipped wheel — provides it at install time. Empty on the
+    /// legacy path and when `auto-route = false`.
+    auto_routed: Vec<(String, String)>,
 }
 
 impl Bundle {
@@ -1853,6 +1860,7 @@ async fn resolve_all(
                     cache_dir,
                     workspace_dir,
                     &workspace_pypi_indexes,
+                    conda_channels,
                 )
                 .await
                 .with_context(|| format!("computing uv closure for bundle `{group_name}`"))?
@@ -1946,6 +1954,16 @@ async fn resolve_all(
         };
         let mut bundle = sub_bundles.remove(0);
         bundle.conda_name = canonical_conda_name(&group_name);
+        // M2: carry the uv auto-route decisions onto the bundle so
+        // produce_output can emit each routed package as a conda run-dep
+        // of the stub output.
+        if let Some(closure) = &uv_closure {
+            bundle.auto_routed = closure
+                .auto_routed
+                .iter()
+                .map(|r| (r.conda_name.clone(), r.conda_version.clone()))
+                .collect();
+        }
         for sub in sub_bundles {
             bundle.extras.push(sub.primary);
             bundle.extras.extend(sub.extras);
@@ -2012,8 +2030,15 @@ async fn resolve_all(
 ///   `pixi.lock`-gated read, no per-env constraint sets yet);
 /// - source-built (path/git/from) entries are not fed to uv as
 ///   `tool.uv.sources` — they resolve via the legacy path;
-/// - routing is force-list only (`retread-conda-deps`); the probe-driven
-///   post-resolution filter is M2.
+/// - source-built (path/git/from) entries are not fed to uv as
+///   `tool.uv.sources` — they resolve via the legacy path.
+///
+/// M2 (v4.3.0): probe-driven conda-route auto-discovery. After the lock,
+/// closure wheels whose conda equivalent exists on the workspace channels
+/// at the resolved version are moved to the conda side and the lock is
+/// re-run to fixpoint (see `uv_closure::auto_route_fixpoint`). Off via
+/// `auto-route = false`; per-name opt-out via `keep-pypi`.
+#[allow(clippy::too_many_arguments)]
 async fn uv_group_closure(
     group_name: &str,
     group_entries: &[(String, WheelEntry)],
@@ -2022,6 +2047,7 @@ async fn uv_group_closure(
     cache_dir: &Path,
     workspace_dir: Option<&Path>,
     workspace_pypi_indexes: &[String],
+    conda_channels: &[ChannelUrl],
 ) -> Result<Option<crate::uv_closure::UvClosure>> {
     let mut roots: Vec<String> = Vec::new();
     for (name, entry) in group_entries {
@@ -2132,8 +2158,65 @@ async fn uv_group_closure(
         target.conda_subdir,
     ));
     let uv_cache_dir = cache_dir.join("uv-cache");
+
+    // M2: auto-route options. Roots (this bundle's own entries) and
+    // retread-built wheel sources must never leave the closure; keep-pypi
+    // is the user's opt-out list.
+    let mut protected: std::collections::BTreeSet<String> = group_entries
+        .iter()
+        .map(|(n, _)| canonical_conda_name(n))
+        .collect();
+    protected.extend(
+        req.built_wheel_sources
+            .keys()
+            .map(|n| canonical_conda_name(n)),
+    );
+    let auto_route_opts = crate::uv_closure::AutoRouteOptions {
+        enabled: effective.auto_route,
+        keep_pypi: effective
+            .keep_pypi
+            .iter()
+            .map(|n| canonical_conda_name(n))
+            .collect(),
+        protected,
+        name_map: effective.name_map.clone(),
+    };
+
+    // `'static` closures for the fixpoint driver: clone the inputs each
+    // solve/probe needs. Cheap relative to a uv subprocess / repodata hit.
+    let solve = {
+        let project_dir = project_dir.clone();
+        let uv_cache_dir = uv_cache_dir.clone();
+        move |r: crate::uv_closure::UvClosureRequest| {
+            let project_dir = project_dir.clone();
+            let uv_cache_dir = uv_cache_dir.clone();
+            let fut = async move {
+                crate::uv_closure::compute_closure(&r, &project_dir, &uv_cache_dir, None).await
+            };
+            Box::pin(fut)
+                as futures::future::BoxFuture<'static, Result<crate::uv_closure::UvClosure>>
+        }
+    };
+    let probe = {
+        let channels = conda_channels.to_vec();
+        let python = target.python_version.clone();
+        move |conda_name: String, spec: String| {
+            let channels = channels.clone();
+            let python = python.clone();
+            let fut = async move {
+                crate::probe::find_route(&channels, &conda_name, &spec, Some(&python))
+                    .await
+                    .map(|hit| crate::uv_closure::RouteProbeHit {
+                        conda_version: hit.version,
+                        channel: hit.channel,
+                    })
+            };
+            Box::pin(fut)
+                as futures::future::BoxFuture<'static, Option<crate::uv_closure::RouteProbeHit>>
+        }
+    };
     let closure =
-        crate::uv_closure::compute_closure(&req, &project_dir, &uv_cache_dir, None).await?;
+        crate::uv_closure::auto_route_fixpoint(&req, &auto_route_opts, solve, probe).await?;
     Ok(Some(closure))
 }
 
@@ -2537,6 +2620,7 @@ async fn resolve_bundle(
             probe_decisions: vec![],
             solve_diagnostics: BTreeMap::new(),
             conda_routed: vec![],
+            auto_routed: vec![],
         });
     }
 
@@ -3218,6 +3302,7 @@ async fn resolve_bundle(
         probe_decisions,
         solve_diagnostics: BTreeMap::new(),
         conda_routed: conda_routed_acc,
+        auto_routed: vec![],
     };
 
     Ok(bfs_bundle)
@@ -4079,6 +4164,19 @@ fn produce_output(
     let env = marker_env_for(&host_platform.to_string(), &python_version)?;
     let mut run_dep_specs: Vec<NamedSpec<PackageSpec>> = vec![spec_from_str(&python_dep)?];
     let mut seen_dep_names: HashSet<String> = HashSet::from(["python".to_string()]);
+
+    // M2 (v4.3.0): auto-routed packages FIRST, exact-pinned. The uv
+    // closure was resolved against exactly these versions, and the probe
+    // already confirmed the (channel, python) build exists — the exact
+    // pin must win over any looser Requires-Dist spec a shipped wheel
+    // would emit for the same name below (seen_dep_names dedup).
+    for (conda_name, conda_version) in &bundle.auto_routed {
+        let canon = canonical_conda_name(conda_name);
+        if seen_dep_names.insert(canon.clone()) {
+            run_dep_specs.push(spec_from_str(&format!("{canon} =={conda_version}"))?);
+        }
+    }
+
     let mut sorted_wheels: Vec<&ResolvedWheel> = bundle.all_wheels().collect();
     sorted_wheels.sort_by_key(|w| canonical_conda_name(&w.pypi_name));
     for wheel in sorted_wheels {
@@ -9001,6 +9099,7 @@ mod emit_wheel_upstream_url_tests {
             probe_decisions: vec![],
             solve_diagnostics: BTreeMap::new(),
             conda_routed: vec![],
+            auto_routed: vec![],
         };
 
         // Reproduce the exact mapping from build_one that populates EmitWheel.
@@ -9114,6 +9213,7 @@ mod emit_wheel_upstream_url_tests {
             probe_decisions: vec![],
             solve_diagnostics: BTreeMap::new(),
             conda_routed: vec![],
+            auto_routed: vec![],
         };
 
         let emit_wheels: Vec<crate::emit_pypi::EmitWheel> = bundle

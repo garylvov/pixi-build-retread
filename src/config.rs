@@ -277,6 +277,32 @@ pub struct RetreadConfig {
     ///   `retread-resolver = "uv"` / pinning the backend `<4.2`.
     #[serde(default, rename = "retread-resolver", alias = "resolver")]
     pub resolver: ResolverKind,
+
+    /// v4.3.0 (spec-uv-restructure M2): conda-route auto-discovery.
+    /// After `uv lock` yields the wheel closure, every closure wheel
+    /// whose conda equivalent (name-mapped; identity fallback) exists on
+    /// the workspace's channels AT THE RESOLVED VERSION is moved to the
+    /// conda side: excluded from the shipped closure, pinned as a uv
+    /// constraint, and emitted as a conda run-dep of the stub package.
+    /// The lock is then re-run and the sweep repeats to fixpoint (max 5
+    /// rounds). Roots and retread-built wheels are never routed.
+    /// Default `true`; set `auto-route = false` to ship everything uv
+    /// resolves as PyPI wheels (minus force-listed `retread-conda-deps`).
+    #[serde(
+        default = "default_true",
+        rename = "retread-auto-route",
+        alias = "auto-route"
+    )]
+    pub auto_route: bool,
+
+    /// v4.3.0: PyPI names auto-route must NEVER move to conda, even when
+    /// a channel has a matching version. Use for packages whose conda
+    /// build differs materially from the wheel (patched builds, split
+    /// outputs, optional native features). Only affects auto-route;
+    /// `retread-conda-deps` (force TO conda) still wins for names listed
+    /// there.
+    #[serde(default, rename = "retread-keep-pypi", alias = "keep-pypi")]
+    pub keep_pypi: Vec<String>,
 }
 
 /// Engine selection for closure computation (`retread-resolver`).

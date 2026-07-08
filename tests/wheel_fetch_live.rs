@@ -83,6 +83,8 @@ async fn fetch_isaacsim_kernel_end_to_end() {
 
     let config = RetreadConfig {
         resolver: Default::default(),
+        auto_route: true,
+        keep_pypi: vec![],
         retread_wheels: BTreeMap::new(),
         relax: RelaxPolicy::Minor,
         overrides: BTreeMap::new(),

@@ -293,6 +293,8 @@ fn pythons_for_rejects_bare_major_variant() {
     );
     let cfg = RetreadConfig {
         resolver: Default::default(),
+        auto_route: true,
+        keep_pypi: vec![],
         retread_wheels: BTreeMap::new(),
         relax: RelaxPolicy::Minor,
         overrides: BTreeMap::new(),
@@ -332,6 +334,8 @@ fn pythons_for_accepts_dotted_variant() {
     );
     let cfg = RetreadConfig {
         resolver: Default::default(),
+        auto_route: true,
+        keep_pypi: vec![],
         retread_wheels: BTreeMap::new(),
         relax: RelaxPolicy::Minor,
         overrides: BTreeMap::new(),
@@ -371,6 +375,8 @@ fn pythons_for_filters_bare_major_keeps_dotted() {
     );
     let cfg = RetreadConfig {
         resolver: Default::default(),
+        auto_route: true,
+        keep_pypi: vec![],
         retread_wheels: BTreeMap::new(),
         relax: RelaxPolicy::Minor,
         overrides: BTreeMap::new(),
@@ -413,10 +419,13 @@ fn courier_pure_python_bundle_is_platform_specific_not_noarch() {
         probe_decisions: vec![],
         solve_diagnostics: BTreeMap::new(),
         conda_routed: vec![],
+        auto_routed: vec![],
     };
 
     let courier_cfg = RetreadConfig {
         resolver: Default::default(),
+        auto_route: true,
+        keep_pypi: vec![],
         courier: true,
         ..cfg()
     };
@@ -445,6 +454,73 @@ fn courier_pure_python_bundle_is_platform_specific_not_noarch() {
     let legacy =
         produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
     assert_eq!(legacy.metadata.subdir, Platform::NoArch);
+}
+
+#[test]
+fn produce_output_emits_auto_routed_conda_run_deps() {
+    // M2 (v4.3.0): packages the uv auto-route loop moved to conda must
+    // land as exact-pinned conda run-deps of the stub output — including
+    // deep transitives no shipped wheel's Requires-Dist names (scipy
+    // below). For a name a wheel DOES declare (numpy), the auto-route
+    // exact pin wins over the wheel's looser spec (first-insert dedup).
+    let bundle = Bundle {
+        conda_name: "auto-pack".into(),
+        primary: rw(
+            "auto-pack",
+            meta("auto-pack", "1.0.0", vec!["numpy>=1.21"], false),
+        ),
+        extras: vec![],
+        probe_decisions: vec![],
+        solve_diagnostics: BTreeMap::new(),
+        conda_routed: vec![],
+        auto_routed: vec![
+            ("numpy".to_string(), "2.1.0".to_string()),
+            ("scipy".to_string(), "1.14.1".to_string()),
+        ],
+    };
+    let out = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
+    let deps: Vec<(String, String)> = out
+        .run_dependencies
+        .depends
+        .iter()
+        .map(|d| (d.name.clone(), format_packagespec(&d.spec)))
+        .collect();
+    assert!(
+        deps.contains(&("numpy".to_string(), "==2.1.0".to_string())),
+        "auto-routed numpy must be an exact-pinned run-dep (won over the \
+         wheel's numpy>=1.21): {deps:?}"
+    );
+    assert!(
+        deps.contains(&("scipy".to_string(), "==1.14.1".to_string())),
+        "auto-routed transitive scipy must be a run-dep even though no \
+         shipped wheel names it: {deps:?}"
+    );
+    // No duplicate numpy from the wheel's Requires-Dist.
+    assert_eq!(
+        deps.iter().filter(|(n, _)| n == "numpy").count(),
+        1,
+        "{deps:?}"
+    );
+
+    // Control: without auto_routed the wheel's own (relaxed) spec is
+    // emitted and scipy is absent.
+    let plain = Bundle {
+        auto_routed: vec![],
+        ..bundle
+    };
+    let out = produce_output(&plain, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
+    let deps: Vec<(String, String)> = out
+        .run_dependencies
+        .depends
+        .iter()
+        .map(|d| (d.name.clone(), format_packagespec(&d.spec)))
+        .collect();
+    assert!(
+        deps.iter()
+            .any(|(n, s)| n == "numpy" && s != "==2.1.0" && !s.trim().is_empty()),
+        "{deps:?}"
+    );
+    assert!(!deps.iter().any(|(n, _)| n == "scipy"), "{deps:?}");
 }
 
 #[test]
@@ -553,6 +629,8 @@ fn produce_output_reflects_overrides_for_refinement_widening() {
 fn cfg() -> RetreadConfig {
     RetreadConfig {
         resolver: Default::default(),
+        auto_route: true,
+        keep_pypi: vec![],
         retread_wheels: BTreeMap::new(),
         relax: RelaxPolicy::Minor,
         overrides: BTreeMap::new(),
@@ -616,6 +694,7 @@ fn solo_bundle(name: &str, requires: Vec<&str>) -> Bundle {
         probe_decisions: vec![],
         solve_diagnostics: BTreeMap::new(),
         conda_routed: vec![],
+        auto_routed: vec![],
     }
 }
 
@@ -1060,6 +1139,7 @@ fn vendored_sub_packages_dropped_from_run_deps() {
         probe_decisions: vec![],
         solve_diagnostics: BTreeMap::new(),
         conda_routed: vec![],
+        auto_routed: vec![],
     };
 
     let output =
@@ -1212,6 +1292,7 @@ fn bundle_field_groups_entries_into_one_output() {
         probe_decisions: vec![],
         solve_diagnostics: BTreeMap::new(),
         conda_routed: vec![],
+        auto_routed: vec![],
     };
 
     let output =
@@ -1303,6 +1384,7 @@ fn relaxed_pure_python_primary_pins_python_to_workspace_variant() {
         probe_decisions: vec![],
         solve_diagnostics: BTreeMap::new(),
         conda_routed: vec![],
+        auto_routed: vec![],
     };
 
     let output =

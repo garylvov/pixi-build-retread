@@ -334,6 +334,79 @@ pub async fn fetch_latest_build_depends(
     best.map(|(_, deps)| deps).unwrap_or_default()
 }
 
+/// A successful conda-route lookup: the best (highest) conda version
+/// satisfying the queried spec, plus the `<channel>/<subdir>` label it
+/// was found on. Consumed by the uv-closure auto-route loop
+/// (spec-uv-restructure M2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteHit {
+    /// Conda version string of the best matching build.
+    pub version: String,
+    /// `<channel_url>/<subdir>` the match came from (channel-priority
+    /// order breaks version ties toward the earlier channel).
+    pub channel: String,
+}
+
+/// spec-uv-restructure M2: query the workspace channels' repodata for a
+/// build of `package` satisfying `spec` (+ `target_python` compat) and
+/// report WHICH channel had it at WHICH version. Same repodata source /
+/// caches as [`probe`]; unlike `probe` this keeps per-channel
+/// attribution so the auto-route log line can name the channel.
+///
+/// Returns `None` when no consulted channel has a satisfying build
+/// (including the nothing-reachable case: auto-routing must never
+/// trigger off a network outage).
+pub async fn find_route(
+    channels: &[ChannelUrl],
+    package: &str,
+    spec: &str,
+    target_python: Option<&str>,
+) -> Option<RouteHit> {
+    let parsed_spec = VersionSpec::from_str(spec, ParseStrictness::Lenient).ok()?;
+    let target_py_version: Option<Version> =
+        target_python.and_then(|tp| Version::from_str(tp).ok());
+
+    let target_subdir = "linux-64";
+    let work = crate::repodata::channel_subdir_pairs(channels, target_subdir);
+
+    // Sequential in channel-priority order is fine here: repodata is
+    // in-memory-cached after the first probe of a build, so these are
+    // hashmap lookups in the steady state.
+    let mut best: Option<(Version, RouteHit)> = None;
+    for (channel_url, subdir) in work {
+        let Some(candidates) = candidates_for(&channel_url, &subdir, package).await else {
+            continue;
+        };
+        for v in &candidates {
+            if !parsed_spec.matches(&v.version) {
+                continue;
+            }
+            let py_ok = match (&target_py_version, &v.python_constraint) {
+                (None, _) => true,
+                (Some(_), PythonConstraint::Any) => true,
+                (Some(tp), PythonConstraint::Spec(s)) => s.matches(tp),
+            };
+            if !py_ok {
+                continue;
+            }
+            let better = match &best {
+                Some((best_v, _)) => &v.version > best_v,
+                None => true,
+            };
+            if better {
+                best = Some((
+                    v.version.clone(),
+                    RouteHit {
+                        version: v.version.to_string(),
+                        channel: format!("{channel_url}/{subdir}"),
+                    },
+                ));
+            }
+        }
+    }
+    best.map(|(_, hit)| hit)
+}
+
 /// Convenience wrapper used by the auto-bundle path: probe many
 /// (name, spec) pairs against the same channel set. Each probe call
 /// already parallelizes per-channel fetches; this layer adds

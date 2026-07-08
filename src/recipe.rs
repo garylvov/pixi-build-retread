@@ -902,6 +902,8 @@ mod tests {
     fn cfg() -> RetreadConfig {
         RetreadConfig {
             resolver: Default::default(),
+            auto_route: true,
+            keep_pypi: vec![],
             retread_wheels: BTreeMap::new(),
             relax: RelaxPolicy::Minor,
             overrides: BTreeMap::new(),

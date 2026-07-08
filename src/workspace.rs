@@ -1022,6 +1022,65 @@ mod tests {
         WorkspaceManifest::from_toml(&parsed)
     }
 
+    /// pixi 0.71 introduced a STRUCTURED `[workspace.conda-pypi-map]`
+    /// form: per-channel OBJECTS carrying a mapping location plus a
+    /// `mapping-mode`, replacing the old flat `channel = "url-or-path"`
+    /// strings. retread does not consume the map, but its manifest walk
+    /// must TOLERATE the new shape: parsing must succeed and every field
+    /// retread does read must be unaffected. (Previously zero coverage.)
+    #[test]
+    fn tolerates_pixi071_structured_conda_pypi_map() {
+        let ws = ws_toml(
+            r#"
+[workspace]
+channels = ["conda-forge", "https://prefix.dev/garylvov"]
+platforms = ["linux-64"]
+
+[workspace.conda-pypi-map]
+conda-forge = { location = "https://example.com/conda-forge-map.json", mapping-mode = "canonical" }
+"https://prefix.dev/garylvov" = { location = "./local-map.json", mapping-mode = "manual" }
+
+[dependencies]
+python = "==3.12"
+numpy = ">=1.26,<3"
+"#,
+        );
+        // The structured map neither aborts the parse nor bleeds into
+        // the fields retread reads.
+        assert_eq!(
+            ws.channels,
+            vec![
+                "conda-forge".to_string(),
+                "https://prefix.dev/garylvov".to_string()
+            ]
+        );
+        assert_eq!(
+            ws.dependencies.get("numpy").map(String::as_str),
+            Some(">=1.26,<3")
+        );
+        assert_eq!(
+            ws.dependencies.get("python").map(String::as_str),
+            Some("==3.12")
+        );
+
+        // Legacy flat-string form (pixi <=0.70) must keep parsing too.
+        let legacy = ws_toml(
+            r#"
+[workspace]
+channels = ["conda-forge"]
+conda-pypi-map = { conda-forge = "https://example.com/map.json" }
+
+[dependencies]
+python = "==3.12"
+"#,
+        );
+        assert_eq!(legacy.channels, vec!["conda-forge".to_string()]);
+        assert_eq!(
+            legacy.dependencies.get("python").map(String::as_str),
+            Some("==3.12")
+        );
+    }
+
     #[test]
     fn parses_top_level_dependencies_and_channels() {
         let ws = ws_toml(
