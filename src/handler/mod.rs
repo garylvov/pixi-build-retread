@@ -1874,6 +1874,21 @@ async fn resolve_all(
                 None
             };
         let uv_pins: Option<&BTreeMap<String, String>> = uv_closure.as_ref().map(|c| &c.pins);
+        // M1 seam FIX (cold-path bundling): uv's closure pins guide the BFS
+        // as fetch-time version PREFERENCES (the favor-lock seam), NEVER via
+        // the locked-closure seam. `seed_locked` marks every pinned name as
+        // already handled (ResolveState.constraints + chosen), which
+        // suppressed BFS seeding (`seen_set`) and observe_edge enqueueing for
+        // the ENTIRE closure — the bundle shipped only the primary wheel and
+        // every transitive (isaacsim-app, isaacsim-kernel, ...) leaked into
+        // the conda run-deps as a relaxed spec no conda channel can satisfy
+        // ("no candidates" for wheels that exist only on pypi.nvidia.com).
+        // `resolve_preferring` picks uv's version whenever it satisfies the
+        // accumulated constraints, so the BFS reproduces uv's closure while
+        // still fetching + bundling it. The locked-closure seam stays
+        // reserved for the incremental-add path (which re-materializes the
+        // rest of the bundle from the committed lock, not from the BFS).
+        let favored = merge_uv_pins_into_prefs(favored, uv_pins);
 
         // v2.10.0: build the full sibling name set for this group once.
         // For each entry in the group we compute a sibling set = all OTHER
@@ -1931,8 +1946,8 @@ async fn resolve_all(
                         conda_channels,
                         &effective.conda_deps,
                         workspace_pypi_indexes,
-                        uv_pins, // uv resolver: pin to uv's closure; legacy: None (cold path)
-                        Some(favored).filter(|m| !m.is_empty()), // favor-lock prefs (empty map → None)
+                        None, // locked-closure seam: incremental-add ONLY (uv pins flow via prefs below)
+                        Some(favored).filter(|m| !m.is_empty()), // favor-lock + uv-closure prefs (empty map → None)
                         &sibling_names,
                     )
                     .await
@@ -1999,7 +2014,23 @@ async fn resolve_all(
                 None
             }
         });
-        if effective.auto_bundle
+        // uv resolver: the closure is AUTHORITATIVE — every member the
+        // auto-route did not move to the conda side must ship in the
+        // bundle. The BFS above only walks extras-gated + prefix-family
+        // deps (isaacsim -> isaacsim-*); non-family transitives (aiodns,
+        // nvidia-*, ...) used to be rescued by the pre-emission solve
+        // cascade, which v4.2.0 deleted. auto-bundle is the remaining seam
+        // that probes conda per dep and bundles what conda lacks, so it
+        // must run whenever a uv closure exists — not only when the pack
+        // opts in — or those transitives leak into the conda run-deps as
+        // relaxed specs no channel can satisfy ("no candidates").
+        // uv resolver: closure membership (canonical names) — auto-routed
+        // members were already excluded from the exported pylock, so this
+        // is exactly "everything that must ship in the bundle".
+        let uv_closure_members: Option<std::collections::BTreeSet<String>> = uv_closure
+            .as_ref()
+            .map(|c| c.wheels.iter().map(|w| w.name.clone()).collect());
+        if (effective.auto_bundle || uv_closure.is_some())
             && let Some(idx) = auto_index
         {
             auto_bundle_transitives(
@@ -2010,8 +2041,9 @@ async fn resolve_all(
                 download_dir,
                 &effective,
                 conda_channels,
-                uv_pins, // uv resolver: pin to uv's closure; legacy: None (cold path)
-                Some(&favored).filter(|m| !m.is_empty()), // favor-lock prefs
+                None, // locked-closure seam: incremental-add ONLY (uv pins flow via prefs below)
+                Some(&favored).filter(|m| !m.is_empty()), // favor-lock + uv-closure prefs
+                uv_closure_members.as_ref(),
             )
             .await?;
         }
@@ -6305,6 +6337,35 @@ fn load_favored_versions(lock_path: &Path) -> std::collections::BTreeMap<String,
     m
 }
 
+/// Fold the uv closure's `name -> version` pins into the favor-lock
+/// preference map, uv winning on collision (the closure was resolved THIS
+/// run against the current conda pins/overrides; a committed lock's favored
+/// version is at best last run's answer).
+///
+/// This is the ONLY seam through which uv pins reach the BFS
+/// (spec-uv-restructure M1, fixed): fetch-time version preferences via
+/// `resolve_preferring`, which pick uv's version whenever it satisfies the
+/// accumulated constraints while still FETCHING and BUNDLING the wheel.
+/// Feeding pins through `resolve_bundle`'s `locked_closure` parameter
+/// instead is a regression: `seed_locked` marks every pinned name as
+/// already handled, the BFS never walks the closure, the bundle ships only
+/// the primary wheel, and every transitive leaks into the conda run-deps
+/// as a relaxed spec (NVIDIA-only families like isaacsim-app then fail the
+/// consumer's conda solve with "no candidates"). Guarded by
+/// `uv_pins_merge_semantics` + `resolve_bundle_uv_pins_as_prefs_bundles_transitive`.
+fn merge_uv_pins_into_prefs(
+    favored: std::collections::BTreeMap<String, String>,
+    uv_pins: Option<&BTreeMap<String, String>>,
+) -> std::collections::BTreeMap<String, String> {
+    let mut merged = favored;
+    if let Some(pins) = uv_pins {
+        for (name, version) in pins {
+            merged.insert(canonical_conda_name(name), version.clone());
+        }
+    }
+    merged
+}
+
 /// Authority gate for the courier replay path.
 ///
 /// Returns `Some(lock)` iff ALL of the following hold:
@@ -9540,7 +9601,7 @@ mod resolve_bundle_bfs_tests {
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    use super::{PypiToCondaMap, WheelTarget, resolve_bundle};
+    use super::{PypiToCondaMap, WheelTarget, merge_uv_pins_into_prefs, resolve_bundle};
     use crate::config::{RelaxPolicy, WheelEntry};
 
     fn unique_tmp_dir() -> std::path::PathBuf {
@@ -9964,6 +10025,202 @@ mod resolve_bundle_bfs_tests {
              and the unconstrained >=1.0 resolved to 2.0 instead)",
             sub_wheel.metadata.version,
         );
+    }
+
+    /// M1 seam regression guard (NVIDIA-only wheel leak): uv closure pins
+    /// must flow into `resolve_bundle` as favor-lock PREFERENCES, never as
+    /// `locked_closure`.
+    ///
+    /// Scenario (same fixture shape as the BFS tests above):
+    ///   - Primary `rtest-pkg==1.0` requires `rtest-pkg-sub>=1.0` (prefix
+    ///     base dep, exactly like isaacsim -> isaacsim-app).
+    ///   - Index serves rtest-pkg-sub at 1.0 and 2.0.
+    ///   - The uv closure pinned rtest-pkg-sub to 1.0.
+    ///
+    /// Part 1 (the FIX): pins passed as prefs -> the transitive is fetched,
+    /// bundled, and resolved at uv's pinned 1.0 (not the latest 2.0).
+    ///
+    /// Part 2 (the BUG shape, pinned as documentation of WHY the seam
+    /// matters): the same pins passed as `locked_closure` suppress BFS
+    /// seeding entirely -- `seed_locked` marks the name as already handled,
+    /// `seen_set` skips it, and bundle.extras comes back EMPTY. On a real
+    /// pack that empty bundle leaks every closure member into the conda
+    /// run-deps as a relaxed spec (`isaacsim-app >=4.2,<4.3`), which no
+    /// conda channel can satisfy for families that exist only on
+    /// pypi.nvidia.com -> the consumer's solve fails with "no candidates".
+    /// The locked-closure seam is for the incremental-add path only.
+    #[tokio::test]
+    async fn resolve_bundle_uv_pins_as_prefs_bundles_transitive() {
+        let dir = unique_tmp_dir();
+        let download_dir = dir.join("download");
+        let source_dir = dir.join("source");
+        let cache_dir = dir.join("cache");
+        std::fs::create_dir_all(&download_dir).unwrap();
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        let primary_name = "rtest-pkg";
+        let primary_version = "1.0";
+        let sub_name = "rtest-pkg-sub";
+
+        let primary_bytes = make_wheel_bytes(
+            primary_name,
+            primary_version,
+            &[&format!("{sub_name}>=1.0")],
+        );
+        let sub_10_bytes = make_wheel_bytes(sub_name, "1.0", &[]);
+        let sub_20_bytes = make_wheel_bytes(sub_name, "2.0", &[]);
+
+        let port = spawn_index_server(
+            vec![
+                (
+                    primary_name.to_string(),
+                    primary_version.to_string(),
+                    primary_bytes,
+                ),
+                (sub_name.to_string(), "1.0".to_string(), sub_10_bytes),
+                (sub_name.to_string(), "2.0".to_string(), sub_20_bytes),
+            ],
+            64, // two resolve_bundle passes share one server
+        )
+        .await;
+
+        let index_url = format!("http://127.0.0.1:{port}/simple/");
+
+        let entry = WheelEntry {
+            version: Some(primary_version.to_string()),
+            index: Some(index_url),
+            ..Default::default()
+        };
+        let target = WheelTarget {
+            python_version: "3.11".to_string(),
+            conda_subdir: "linux-64".to_string(),
+            max_glibc: None,
+        };
+        let pypi_to_conda: PypiToCondaMap = HashMap::new();
+        let name_map: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        let git_sources: std::collections::BTreeMap<String, crate::config::NamedGitSource> =
+            std::collections::BTreeMap::new();
+        let conda_channels: Vec<rattler_conda_types::ChannelUrl> = vec![];
+
+        // The uv closure's pins for this bundle: the primary AND the
+        // transitive, exactly as parse_pylock_closure produces them.
+        let mut uv_pins: BTreeMap<String, String> = BTreeMap::new();
+        uv_pins.insert(primary_name.to_string(), primary_version.to_string());
+        uv_pins.insert(sub_name.to_string(), "1.0".to_string());
+
+        // Part 1: pins as PREFERENCES (the fixed resolve_all seam:
+        // merge_uv_pins_into_prefs + locked_closure=None).
+        let prefs = merge_uv_pins_into_prefs(std::collections::BTreeMap::new(), Some(&uv_pins));
+        let bundle = resolve_bundle(
+            primary_name,
+            &entry,
+            &target,
+            &download_dir,
+            &source_dir,
+            &cache_dir,
+            RelaxPolicy::default(),
+            &git_sources,
+            None, // auto_data
+            &pypi_to_conda,
+            &name_map,
+            &conda_channels,
+            &[],          // conda_deps_list
+            &[],          // workspace_indexes
+            None,         // FIXED seam: uv pins must NOT ride locked_closure
+            Some(&prefs), // uv pins ride the favor-lock preference seam
+            &std::collections::HashSet::new(),
+        )
+        .await
+        .expect("resolve_bundle (uv pins as prefs) must succeed");
+
+        let extras_names: Vec<&str> = bundle.extras.iter().map(|w| w.pypi_name.as_str()).collect();
+        assert!(
+            extras_names.contains(&sub_name),
+            "uv-pinned transitive '{sub_name}' must be fetched into bundle.extras when the \
+             pins flow through the preference seam; got: {extras_names:?}. If this fails, \
+             uv pins are suppressing BFS seeding again (the NVIDIA-only \"no candidates\" \
+             run-dep leak).",
+        );
+        let sub_wheel = bundle
+            .extras
+            .iter()
+            .find(|w| w.pypi_name == sub_name)
+            .unwrap();
+        assert_eq!(
+            sub_wheel.metadata.version, "1.0",
+            "the bundled transitive must resolve at uv's pinned version 1.0, not the \
+             index-latest 2.0",
+        );
+
+        // Part 2: the same pins through the locked-closure seam suppress
+        // bundling (this is the incremental-add semantic, and the exact bug
+        // shape resolve_all used to trigger on every cold uv-resolver pack).
+        let bundle_locked = resolve_bundle(
+            primary_name,
+            &entry,
+            &target,
+            &download_dir,
+            &source_dir,
+            &cache_dir,
+            RelaxPolicy::default(),
+            &git_sources,
+            None,
+            &pypi_to_conda,
+            &name_map,
+            &conda_channels,
+            &[],
+            &[],
+            Some(&uv_pins), // locked-closure seam: suppresses the walk
+            None,
+            &std::collections::HashSet::new(),
+        )
+        .await
+        .expect("resolve_bundle (pins as locked_closure) must succeed");
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(
+            bundle_locked.extras.is_empty(),
+            "locked_closure must suppress BFS seeding (incremental-add semantic); if this \
+             starts bundling, re-audit BOTH seams: got {:?}",
+            bundle_locked
+                .extras
+                .iter()
+                .map(|w| w.pypi_name.as_str())
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    /// Pure-merge semantics for the uv-pin preference seam.
+    #[test]
+    fn uv_pins_merge_semantics() {
+        use std::collections::BTreeMap;
+        let mut favored = BTreeMap::new();
+        favored.insert("alpha".to_string(), "1.0".to_string());
+        favored.insert("beta".to_string(), "2.0".to_string());
+
+        let mut pins = BTreeMap::new();
+        pins.insert("beta".to_string(), "2.5".to_string()); // uv wins on collision
+        pins.insert("Gamma_X".to_string(), "3.0".to_string()); // canonicalized
+
+        let merged = merge_uv_pins_into_prefs(favored.clone(), Some(&pins));
+        assert_eq!(merged.get("alpha").map(String::as_str), Some("1.0"));
+        assert_eq!(
+            merged.get("beta").map(String::as_str),
+            Some("2.5"),
+            "uv's closure pin must override the committed-lock favored version"
+        );
+        assert_eq!(
+            merged.get("gamma-x").map(String::as_str),
+            Some("3.0"),
+            "pin names must be canonicalized to match the BFS lookup key"
+        );
+
+        // No pins: favored passes through untouched.
+        let merged_none = merge_uv_pins_into_prefs(favored.clone(), None);
+        assert_eq!(merged_none, favored);
     }
 
     /// favor-lock: when favor_lock_prefs contains a version for a transitive

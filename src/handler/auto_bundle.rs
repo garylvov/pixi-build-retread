@@ -128,6 +128,18 @@ pub(crate) async fn auto_bundle_transitives(
     // use resolve_preferring so the re-resolve prefers that version.
     // Cold path (RETREAD_FAVOR_LOCK unset or first build): None.
     favor_lock_prefs: Option<&std::collections::BTreeMap<String, String>>,
+    // uv resolver: canonical names of the uv closure's exported wheels
+    // (auto-routed members already excluded via --no-emit-package). The
+    // closure is AUTHORITATIVE: uv resolved these from PyPI under
+    // no-build, the auto-route probe already declined to move them to
+    // conda at the resolved version, so they MUST ship in the bundle.
+    // Candidates in this set bypass the prefer-conda probes below —
+    // the name-level "conda has it at SOME version, keep it conda-side"
+    // arm otherwise emits a relaxed run-dep spec that no channel can
+    // satisfy (aiodns==3.1.1 -> `>=3.1.1,<3.2` -> "no candidates"),
+    // and the pre-emission solve cascade that used to rescue that died
+    // in v4.2.0. Legacy resolver path: None (probes decide, unchanged).
+    uv_closure_members: Option<&std::collections::BTreeSet<String>>,
 ) -> Result<()> {
     // Build the skip set: anything already in the bundle, plus the user's
     // `retread-conda-deps` allowlist (deps that should stay as conda
@@ -238,8 +250,12 @@ pub(crate) async fn auto_bundle_transitives(
         // name-level + PyPI fallback steps below stay serial -- they
         // only run for the few definitively-unsat candidates, against
         // the already-warm in-memory repodata cache.
+        let is_closure_member = |name: &str| {
+            uv_closure_members.is_some_and(|s| s.contains(&canonical_conda_name(name)))
+        };
         let prefer_pairs: Vec<(String, String)> = candidates
             .iter()
+            .filter(|(name, _)| !is_closure_member(name))
             .filter(|(name, _)| prefer_conda_match(&canonical_conda_name(name), &config.name_map))
             .map(|(name, version)| {
                 let conda_name = canonical_conda_name(name);
@@ -264,7 +280,27 @@ pub(crate) async fn auto_bundle_transitives(
             Vec::new();
         for (name, version) in candidates {
             let conda_name = canonical_conda_name(&name);
-            if prefer_conda_match(&conda_name, &config.name_map) {
+            if is_closure_member(&name) {
+                // uv closure member not auto-routed: ships in the bundle,
+                // no conda probes (see uv_closure_members doc above).
+                bundle.probe_decisions.push(crate::audit::ProbeDecision {
+                    stage: "auto_bundle".into(),
+                    pypi_name: name.clone(),
+                    conda_name: conda_name.clone(),
+                    spec: format!("=={version}"),
+                    target_python: target.python_version.clone(),
+                    channels_consulted: vec![],
+                    satisfiable: None,
+                    matching_candidates: 0,
+                    routing_decision: "uv-closure-authoritative-bundle".into(),
+                });
+                tracing::info!(
+                    dep = %name,
+                    version = %version,
+                    "auto-bundle: uv closure member not moved to conda by the \
+                     auto-route; bundling from PyPI (closure is authoritative)",
+                );
+            } else if prefer_conda_match(&conda_name, &config.name_map) {
                 // Probe the workspace's conda channels for whether the
                 // spec retread would emit is actually satisfiable. If
                 // ANY channel has a matching candidate, keep on conda.
@@ -406,6 +442,7 @@ pub(crate) async fn auto_bundle_transitives(
         // stays conda-side (the cascade translates the line).
         let loose_pairs: Vec<(String, String)> = loose_candidates
             .iter()
+            .filter(|(name, _)| !is_closure_member(name))
             .map(|(name, _)| {
                 let conda_name = canonical_conda_name(name);
                 let target_name = config
@@ -424,6 +461,29 @@ pub(crate) async fn auto_bundle_transitives(
                 .collect();
         for (name, specs) in loose_candidates {
             let conda_name = canonical_conda_name(&name);
+            if is_closure_member(&name) {
+                // Same authoritative-closure rule as the exact arm above.
+                bundle.probe_decisions.push(crate::audit::ProbeDecision {
+                    stage: "auto_bundle_loose".into(),
+                    pypi_name: name.clone(),
+                    conda_name: conda_name.clone(),
+                    spec: specs.to_string(),
+                    target_python: target.python_version.clone(),
+                    channels_consulted: vec![],
+                    satisfiable: None,
+                    matching_candidates: 0,
+                    routing_decision: "uv-closure-authoritative-bundle".into(),
+                });
+                tracing::info!(
+                    dep = %name,
+                    specs = %specs,
+                    "auto-bundle: uv closure member (loose spec) not moved to conda \
+                     by the auto-route; bundling from PyPI (closure is authoritative)",
+                );
+                let preferred_ver = favor_lock_prefs.and_then(|m| m.get(&conda_name)).cloned();
+                to_fetch.push((name, specs.to_string(), conda_name, specs, preferred_ver));
+                continue;
+            }
             let target_name = config
                 .name_map
                 .get(&conda_name)
