@@ -382,16 +382,44 @@ impl RepairPlanner {
         let canon = canonical_conda_name(package);
         if let Some(candidates) = self.conda_name_map.get(&canon) {
             for candidate in candidates {
-                if editor.has_user_entry(feature, TableKind::Conda, candidate) {
-                    return Some(candidate.clone());
+                if let Some(found) = self.resolve_conda_pin_name_or_variant(editor, feature, candidate) {
+                    return Some(found);
                 }
             }
         }
         // Exact-name fallback -- covers the identical-name case (conda
         // package name == pypi package name) and callers that didn't wire
         // in a name map at all.
-        if editor.has_user_entry(feature, TableKind::Conda, package) {
-            return Some(package.to_string());
+        self.resolve_conda_pin_name_or_variant(editor, feature, package)
+    }
+
+    /// Checks `name` itself, then its `-gpu`/`-cpu` meta-package variants,
+    /// for a user-owned conda entry. Covers the class of split accelerator
+    /// meta-packages (`pytorch` / `pytorch-gpu` / `pytorch-cpu`,
+    /// `tensorflow` / `tensorflow-gpu` / `tensorflow-cpu`, etc.) whose
+    /// variant names aren't all individually listed as name-map candidates
+    /// -- so a pin on ANY variant of a mapped conda name family is
+    /// discoverable from the pypi name, not just the exact candidates the
+    /// name map happens to enumerate.
+    fn resolve_conda_pin_name_or_variant(
+        &self,
+        editor: &ManifestEditor,
+        feature: &str,
+        name: &str,
+    ) -> Option<String> {
+        if editor.has_user_entry(feature, TableKind::Conda, name) {
+            return Some(name.to_string());
+        }
+        for suffix in ["-gpu", "-cpu"] {
+            // Don't double-suffix a candidate that's already variant-named
+            // (e.g. the name map may already list "pytorch-gpu" directly).
+            if name.ends_with(suffix) {
+                continue;
+            }
+            let variant = format!("{name}{suffix}");
+            if editor.has_user_entry(feature, TableKind::Conda, &variant) {
+                return Some(variant);
+            }
         }
         None
     }
@@ -1193,8 +1221,8 @@ mod tests {
         assert!(text.contains("torch = \"==2.10.0\"  # retread:override"));
     }
 
-    #[test]
-    fn conda_widen_needed_matches_conda_pin_via_name_map_pytorch_gpu() {
+    #[tokio::test]
+    async fn conda_widen_needed_matches_conda_pin_via_name_map_pytorch_gpu() {
         // Live gap this closes: pypi requirement `torch==2.11.0` conflicts
         // with a conda pin declared as `pytorch-gpu ==2.10.0` -- a
         // DIFFERENT name than the pypi package. Without the parselmouth-
@@ -1204,17 +1232,28 @@ mod tests {
         // entry. With the name map wired in, T1 must fire: emit a pypi
         // override for `torch`, and leave `pytorch-gpu` byte-for-byte
         // untouched.
+        //
+        // Uses the PRODUCTION map-loading path (`load_pypi_to_conda_map`),
+        // not a hand-inserted map -- a prior version of this test built its
+        // own `torch -> [pytorch, pytorch-cpu, pytorch-gpu]` map by hand,
+        // which masked the real data gap: FALLBACK_PYPI_TO_CONDA didn't
+        // actually carry the `torch -> pytorch-gpu` entry (parselmouth's
+        // `pytorch-gpu` is a meta-package with no pypi names of its own),
+        // so production code returned None here even though this test
+        // passed (see lock-succ-brief.md ACCEPTANCE RUN #4). The parselmouth
+        // network fetch inside `load_pypi_to_conda_map` may fail in this
+        // sandbox (no network) -- that's fine, the FALLBACK_PYPI_TO_CONDA
+        // merge runs unconditionally regardless of fetch outcome.
         let path = temp_manifest("[dependencies]\npytorch-gpu = \"==2.10.0\"\n");
         let mut editor = ManifestEditor::open(path.clone()).unwrap();
         let mut tried = TriedState::default();
-        let mut name_map = PypiToCondaMap::new();
-        name_map.insert(
-            "torch".to_string(),
-            vec![
-                "pytorch".to_string(),
-                "pytorch-cpu".to_string(),
-                "pytorch-gpu".to_string(),
-            ],
+        let name_map = crate::handler::load_pypi_to_conda_map().await;
+        assert!(
+            name_map
+                .get("torch")
+                .is_some_and(|c| c.iter().any(|n| n == "pytorch-gpu")),
+            "production pypi->conda map must carry torch -> pytorch-gpu \
+             (FALLBACK_PYPI_TO_CONDA entry) or this test is vacuous"
         );
         let mut planner = RepairPlanner::new("default".into()).with_conda_name_map(name_map);
         assert_eq!(planner.relax_preference, RelaxPreference::Conda);
@@ -1310,8 +1349,8 @@ mod tests {
     const UV_CLOSURE_CUDA_BINDINGS: &str =
         include_str!("../../tests/fixtures/solve_errors/uv_closure_cuda_bindings_widen.txt");
 
-    #[test]
-    fn conda_widen_needed_reattributes_footer_to_requiring_package_with_conda_pin() {
+    #[tokio::test]
+    async fn conda_widen_needed_reattributes_footer_to_requiring_package_with_conda_pin() {
         // cuda-bindings (the footer/symptom package) has no conda pin
         // anywhere; pytorch-gpu (torch's conda-side name) is pinned under
         // `feature.gpu`, not `default`. Before the attribution fix, T1
@@ -1323,19 +1362,22 @@ mod tests {
         // `feature.gpu`, and emits the pypi override THERE, for `torch`,
         // pinned to the conda-provided version -- leaving pytorch-gpu and
         // cuda-bindings untouched.
+        //
+        // Uses the PRODUCTION map-loading path (see sibling test above for
+        // why a hand-inserted map masks real data gaps -- this is the exact
+        // scenario ACCEPTANCE RUN #4 hit against the live backend).
         let path = temp_manifest(
             "[dependencies]\n[feature.gpu.dependencies]\npytorch-gpu = \"==2.10.0\"\n",
         );
         let mut editor = ManifestEditor::open(path.clone()).unwrap();
         let mut tried = TriedState::default();
-        let mut name_map = PypiToCondaMap::new();
-        name_map.insert(
-            "torch".to_string(),
-            vec![
-                "pytorch".to_string(),
-                "pytorch-cpu".to_string(),
-                "pytorch-gpu".to_string(),
-            ],
+        let name_map = crate::handler::load_pypi_to_conda_map().await;
+        assert!(
+            name_map
+                .get("torch")
+                .is_some_and(|c| c.iter().any(|n| n == "pytorch-gpu")),
+            "production pypi->conda map must carry torch -> pytorch-gpu \
+             (FALLBACK_PYPI_TO_CONDA entry) or this test is vacuous"
         );
         // Planner constructed for the `default` feature, exactly like
         // `retread lock`'s LOCK_FEATURE -- the bug this closes is edits

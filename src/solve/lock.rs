@@ -582,24 +582,32 @@ exit 0
     /// `pytorch-gpu ==2.10.0`. With the name map wired, conda-as-truth T1
     /// must fire -- pypi override for `torch`, `pytorch-gpu` untouched --
     /// instead of falling through to widening a bogus `torch` conda entry.
-    #[test]
-    fn lock_planner_resolves_torch_to_pytorch_gpu_via_name_map() {
+    #[tokio::test]
+    async fn lock_planner_resolves_torch_to_pytorch_gpu_via_name_map() {
         use super::super::parse::Conflict;
         use super::super::repair::{RelaxPreference, TriedState};
-        use crate::handler::PypiToCondaMap;
 
+        // Uses the PRODUCTION map-loading path (`crate::handler::
+        // load_pypi_to_conda_map`, the exact call `run_with_pixi_bin` makes
+        // above), not a hand-inserted map -- a prior version of this test
+        // built its own `torch -> [pytorch, pytorch-cpu, pytorch-gpu]` map,
+        // which masked a real data gap: FALLBACK_PYPI_TO_CONDA didn't carry
+        // `torch -> pytorch-gpu` (parselmouth's `pytorch-gpu` entry is a
+        // meta-package with no pypi names), so this test passed while the
+        // live tool failed identically 4 times (lock-succ-brief.md
+        // ACCEPTANCE RUNs #1-#4). The parselmouth network fetch may fail in
+        // this sandbox -- fine, the FALLBACK merge runs unconditionally.
         let dir = temp_dir("namemap");
         let path = write_manifest(&dir, "[dependencies]\npytorch-gpu = \"==2.10.0\"\n");
         let mut editor = ManifestEditor::open(path.clone()).unwrap();
         let mut tried = TriedState::default();
-        let mut name_map = PypiToCondaMap::new();
-        name_map.insert(
-            "torch".to_string(),
-            vec![
-                "pytorch".to_string(),
-                "pytorch-cpu".to_string(),
-                "pytorch-gpu".to_string(),
-            ],
+        let name_map = crate::handler::load_pypi_to_conda_map().await;
+        assert!(
+            name_map
+                .get("torch")
+                .is_some_and(|c| c.iter().any(|n| n == "pytorch-gpu")),
+            "production pypi->conda map must carry torch -> pytorch-gpu \
+             (FALLBACK_PYPI_TO_CONDA entry) or this test is vacuous"
         );
         // Same construction as run_with_pixi_bin.
         let relax_preference = RelaxPreference::from_config_str(&editor.relax_preference());

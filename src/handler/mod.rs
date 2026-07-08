@@ -458,6 +458,15 @@ const FALLBACK_PYPI_TO_CONDA: &[(&str, &str)] = &[
     // Already covered by parselmouth (`pytorch: [torch]`) but here as a
     // safety net in case the fetch fails entirely.
     ("torch", "pytorch"),
+    // `pytorch-gpu` is a meta-package on conda-forge (no Requires-Dist /
+    // pypi names of its own -- parselmouth's compressed_mapping.json ships
+    // `"pytorch-gpu": null`), so the inverse map never gets a `torch ->
+    // pytorch-gpu` edge from parselmouth alone. Workspaces commonly pin the
+    // GPU variant directly (`pytorch-gpu = "==X"`), so without this entry
+    // `resolve_conda_pin_owner("torch")` returns None and the CondaWidenNeeded
+    // conda-as-truth ladder (repair.rs) can never find the user's pin.
+    // (lock-succ-brief.md ACCEPTANCE RUN #4.)
+    ("torch", "pytorch-gpu"),
     // isaacsim's `Requires-Dist` lists `pywin32` (it's Windows-only on
     // PyPI, but Isaac Sim declares it unconditionally). conda-forge ships a
     // `pywin32` stub on Linux that satisfies the import, so route the PyPI
