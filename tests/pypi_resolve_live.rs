@@ -16,6 +16,9 @@ fn linux64(py: &str) -> WheelTarget {
     WheelTarget {
         python_version: py.to_string(),
         conda_subdir: "linux-64".to_string(),
+        // No ceiling: these live-index assertions must not depend on the
+        // CI host's glibc.
+        max_glibc: None,
     }
 }
 

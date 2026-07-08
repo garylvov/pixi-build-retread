@@ -1697,10 +1697,7 @@ fn wheel_target_for(subdir: Platform, python_version: &str) -> WheelTarget {
     // The python_version comes from variant configuration (or the chosen
     // output's variant in conda/build_v1). It drives wheel selection on
     // the PyPI index (cp tag matching) and the marker env in relax.rs.
-    WheelTarget {
-        python_version: python_version.to_string(),
-        conda_subdir: subdir.to_string(),
-    }
+    WheelTarget::for_subdir(python_version, &subdir.to_string())
 }
 
 /// Resolve every user-supplied entry into a list of bundles. Each bundle
@@ -2120,13 +2117,23 @@ async fn uv_group_closure(
         overrides.push(format!("{name} ; {}", crate::uv_closure::DROP_MARKER));
     }
 
-    // Index chain: entry indexes in group order, then workspace
+    // Index chain: EXPLICIT entry indexes in group order, then workspace
     // [pypi-options] indexes, then public PyPI. Deduped, order-preserving.
+    //
+    // Only explicitly-declared entry indexes join the priority chain --
+    // entries without an `index =` fall through to the PUBLIC_PYPI tail.
+    // Including their implicit pypi.org here put pypi.org FIRST whenever
+    // an index-less entry preceded an explicit-index one in group order,
+    // and uv breaks equal-version ties by index order: NVIDIA publishes
+    // stub sdists of `isaacsim` (and its isaacsim-* constellation) on
+    // pypi.org while the real manylinux wheels live only on
+    // pypi.nvidia.com, so pypi.org-first made uv lock the useless stub
+    // (-> "has no usable wheels" under no-build).
     let mut index_urls: Vec<String> = Vec::new();
     for url in group_entries
         .iter()
         .filter(|(_, e)| e.url.is_none())
-        .map(|(_, e)| e.index_url())
+        .filter_map(|(_, e)| e.index.clone())
         .chain(workspace_pypi_indexes.iter().cloned())
         .chain(std::iter::once(PUBLIC_PYPI.to_string()))
     {
@@ -9682,6 +9689,7 @@ mod resolve_bundle_bfs_tests {
         let target = WheelTarget {
             python_version: "3.11".to_string(),
             conda_subdir: "linux-64".to_string(),
+            max_glibc: None,
         };
         let pypi_to_conda: PypiToCondaMap = HashMap::new();
         let name_map: BTreeMap<String, String> = BTreeMap::new();
@@ -9837,6 +9845,7 @@ mod resolve_bundle_bfs_tests {
         let target = WheelTarget {
             python_version: "3.11".to_string(),
             conda_subdir: "linux-64".to_string(),
+            max_glibc: None,
         };
         let pypi_to_conda: PypiToCondaMap = HashMap::new();
         let name_map: std::collections::BTreeMap<String, String> =
@@ -9972,6 +9981,7 @@ mod resolve_bundle_bfs_tests {
         let target = WheelTarget {
             python_version: "3.11".to_string(),
             conda_subdir: "linux-64".to_string(),
+            max_glibc: None,
         };
         let pypi_to_conda: PypiToCondaMap = HashMap::new();
         let name_map: BTreeMap<String, String> = BTreeMap::new();
@@ -10085,6 +10095,7 @@ mod resolve_bundle_bfs_tests {
         let target = WheelTarget {
             python_version: "3.11".to_string(),
             conda_subdir: "linux-64".to_string(),
+            max_glibc: None,
         };
         let pypi_to_conda: PypiToCondaMap = HashMap::new();
         let name_map: BTreeMap<String, String> = BTreeMap::new();

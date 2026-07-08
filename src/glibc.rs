@@ -153,6 +153,50 @@ pub(crate) fn host_glibc() -> Option<(u32, u32)> {
     *HOST_GLIBC.get_or_init(detect_host_glibc)
 }
 
+/// Declared glibc floor without a lock in hand: `$RETREAD_DECLARED_GLIBC`
+/// first, then the workspace manifest walk (both the pre-0.71
+/// `[system-requirements] libc = "X.Y"` form and the 0.71+ rich
+/// `platforms = [{ platform = ..., glibc = "X.Y" }]` form, via
+/// `WorkspaceManifest::declared_glibc`).
+pub(crate) fn declared_glibc_no_lock() -> Option<(u32, u32)> {
+    if let Ok(value) = std::env::var("RETREAD_DECLARED_GLIBC")
+        && let Some(version) = parse_glibc_version(&value)
+    {
+        return Some(version);
+    }
+    resolve_workspace_declared_glibc()
+}
+
+/// The manylinux ceiling for wheel-tag selection on a linux target:
+/// `manylinux_X_Y` wheels are acceptable when `(X, Y)` is at or below
+/// this. The ceiling is the MAX of the workspace-declared glibc (the
+/// user promised the runtime env provides it; retread's install-time
+/// GLIBC symbol audit enforces the promise) and the detected host glibc
+/// (the pre-declaration behavior). `None` = no ceiling information at
+/// all (non-linux subdir, or neither declaration nor host detection
+/// available) -- callers then accept every manylinux tag, preserving
+/// the historical behavior on exotic hosts.
+pub(crate) fn manylinux_ceiling(conda_subdir: &str) -> Option<(u32, u32)> {
+    if !conda_subdir.starts_with("linux") {
+        return None;
+    }
+    combine_glibc_ceiling(declared_glibc_no_lock(), host_glibc())
+}
+
+/// Pure combiner for [`manylinux_ceiling`]: max of declared and host,
+/// `None` only when both are unknown (undeclared -> host floor).
+pub(crate) fn combine_glibc_ceiling(
+    declared: Option<(u32, u32)>,
+    host: Option<(u32, u32)>,
+) -> Option<(u32, u32)> {
+    match (declared, host) {
+        (Some(d), Some(h)) => Some(d.max(h)),
+        (Some(d), None) => Some(d),
+        (None, Some(h)) => Some(h),
+        (None, None) => None,
+    }
+}
+
 fn detect_host_glibc() -> Option<(u32, u32)> {
     if let Ok(override_value) = std::env::var("RETREAD_HOST_GLIBC") {
         return parse_glibc_version(&override_value);

@@ -1199,6 +1199,7 @@ async fn d_rewrites_metadata_on_the_wheel_the_recipe_will_source() {
     let target = WheelTarget {
         python_version: "3.11".into(),
         conda_subdir: "linux-64".into(),
+        max_glibc: None,
     };
 
     let (resolved, original_rd) = materialize_and_rewrite(

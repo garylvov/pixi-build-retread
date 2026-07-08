@@ -41,6 +41,28 @@ pub struct WheelTarget {
     /// e.g. "linux-64", "osx-arm64", or "noarch" if the workspace is
     /// targeting a noarch package and we should prefer a `none-any` wheel.
     pub conda_subdir: String,
+    /// Manylinux / glibc ceiling for linux targets: a `manylinux_X_Y`
+    /// wheel is compatible only when `(X, Y) <= max_glibc`. Resolved
+    /// from the workspace-declared glibc (`[system-requirements]
+    /// libc = "X.Y"` pre-0.71, or the 0.71+ rich `platforms` form) OR
+    /// the detected host glibc, whichever is higher -- so a pack whose
+    /// consuming workspace declares `libc = "2.35"` accepts
+    /// `manylinux_2_35` wheels (e.g. isaacsim) even on a glibc-2.34
+    /// build host. `None` = no ceiling (non-linux target, or nothing
+    /// known): every manylinux tag is accepted.
+    pub max_glibc: Option<(u32, u32)>,
+}
+
+impl WheelTarget {
+    /// Standard constructor: fills [`Self::max_glibc`] from the
+    /// declared-glibc plumbing in `crate::glibc` for linux subdirs.
+    pub fn for_subdir(python_version: &str, conda_subdir: &str) -> Self {
+        WheelTarget {
+            python_version: python_version.to_string(),
+            conda_subdir: conda_subdir.to_string(),
+            max_glibc: crate::glibc::manylinux_ceiling(conda_subdir),
+        }
+    }
 }
 
 /// Fetch the simple index for `name` and pick the best wheel for the
@@ -602,10 +624,11 @@ pub(crate) fn score_wheel(filename: &str, target: &WheelTarget) -> i64 {
         Some(s) => s,
         None => return -1,
     };
-    let plat_score = match score_platform_tag(parts.platform, &target.conda_subdir) {
-        Some(s) => s,
-        None => return -1,
-    };
+    let plat_score =
+        match score_platform_tag(parts.platform, &target.conda_subdir, target.max_glibc) {
+            Some(s) => s,
+            None => return -1,
+        };
 
     // Multiply python by a smaller factor so platform specificity dominates.
     py_score as i64 + plat_score
@@ -723,15 +746,25 @@ fn parse_python_version(s: &str) -> Option<(u32, u32)> {
     Some((major, minor))
 }
 
-fn score_platform_tag(tag: &str, conda_subdir: &str) -> Option<i64> {
+fn score_platform_tag(tag: &str, conda_subdir: &str, max_glibc: Option<(u32, u32)>) -> Option<i64> {
     // PEP 425 compressed tag sets: a single wheel can list multiple platform
     // tags joined by `.`. Score each and return the best match.
     tag.split('.')
-        .filter_map(|t| score_one_platform_tag(t, conda_subdir))
+        .filter_map(|t| score_one_platform_tag(t, conda_subdir, max_glibc))
         .max()
 }
 
-fn score_one_platform_tag(tag: &str, conda_subdir: &str) -> Option<i64> {
+/// `true` when a manylinux glibc requirement `need` fits under the
+/// target's ceiling (`None` ceiling = accept everything).
+fn glibc_fits(need: (u32, u32), max_glibc: Option<(u32, u32)>) -> bool {
+    max_glibc.is_none_or(|ceiling| need <= ceiling)
+}
+
+fn score_one_platform_tag(
+    tag: &str,
+    conda_subdir: &str,
+    max_glibc: Option<(u32, u32)>,
+) -> Option<i64> {
     if tag == "any" {
         // Universal wheel. Match `noarch` strongly; for native subdirs it's
         // still usable (we'll just emit a noarch conda package).
@@ -753,20 +786,26 @@ fn score_one_platform_tag(tag: &str, conda_subdir: &str) -> Option<i64> {
             // Format: X_Y_<arch>
             let suffix = format!("_{arch}");
             let ver = rest.strip_suffix(&suffix)?;
-            // Score: prefer higher glibc (more specific).
             let mut parts = ver.split('_');
-            let major: i64 = parts.next()?.parse().ok()?;
-            let minor: i64 = parts.next()?.parse().ok()?;
-            return Some(200 + major * 100 + minor);
+            let major: u32 = parts.next()?.parse().ok()?;
+            let minor: u32 = parts.next()?.parse().ok()?;
+            // Reject tags above the declared/host glibc ceiling.
+            if !glibc_fits((major, minor), max_glibc) {
+                return None;
+            }
+            // Score: prefer higher glibc (more specific).
+            return Some(200 + major as i64 * 100 + minor as i64);
         }
+        // Legacy aliases (PEP 600 equivalences): manylinux1 == 2.5,
+        // manylinux2010 == 2.12, manylinux2014 == 2.17.
         if tag.starts_with("manylinux1_") && tag.ends_with(arch) {
-            return Some(150);
+            return glibc_fits((2, 5), max_glibc).then_some(150);
         }
         if tag.starts_with("manylinux2010_") && tag.ends_with(arch) {
-            return Some(160);
+            return glibc_fits((2, 12), max_glibc).then_some(160);
         }
         if tag.starts_with("manylinux2014_") && tag.ends_with(arch) {
-            return Some(170);
+            return glibc_fits((2, 17), max_glibc).then_some(170);
         }
         if tag == format!("linux_{arch}") {
             return Some(100);
@@ -785,6 +824,7 @@ mod tests {
         WheelTarget {
             python_version: "3.11".into(),
             conda_subdir: "linux-64".into(),
+            max_glibc: None,
         }
     }
 
@@ -816,6 +856,84 @@ mod tests {
             links[0].sha256.is_some(),
             "wheel hash still parsed from fragment"
         );
+    }
+
+    /// Target with an explicit manylinux ceiling.
+    fn t_glibc(max_glibc: Option<(u32, u32)>) -> WheelTarget {
+        WheelTarget {
+            python_version: "3.12".into(),
+            conda_subdir: "linux-64".into(),
+            max_glibc,
+        }
+    }
+
+    #[test]
+    fn manylinux_2_35_accepted_when_declared_glibc_covers_it() {
+        // isaacsim's only linux wheel. Host glibc 2.34, workspace declares
+        // libc = "2.35" -> ceiling max(2.34, 2.35) = 2.35 -> accepted.
+        let wheel = "isaacsim-6.0.0.0-cp312-none-manylinux_2_35_x86_64.whl";
+        let ceiling = crate::glibc::combine_glibc_ceiling(Some((2, 35)), Some((2, 34)));
+        assert_eq!(ceiling, Some((2, 35)));
+        assert!(score_wheel(wheel, &t_glibc(ceiling)) >= 0);
+    }
+
+    #[test]
+    fn manylinux_2_35_rejected_without_declaration_on_2_34_host() {
+        // Undeclared -> host floor: ceiling is the detected host glibc
+        // alone, and a manylinux_2_35 wheel must be rejected on 2.34.
+        let wheel = "isaacsim-6.0.0.0-cp312-none-manylinux_2_35_x86_64.whl";
+        let ceiling = crate::glibc::combine_glibc_ceiling(None, Some((2, 34)));
+        assert_eq!(ceiling, Some((2, 34)));
+        assert_eq!(score_wheel(wheel, &t_glibc(ceiling)), -1);
+    }
+
+    #[test]
+    fn manylinux_ceiling_none_accepts_everything() {
+        // No declaration and no detectable host glibc -> historical
+        // behavior: accept every manylinux tag.
+        assert_eq!(crate::glibc::combine_glibc_ceiling(None, None), None);
+        let wheel = "isaacsim-6.0.0.0-cp312-none-manylinux_2_35_x86_64.whl";
+        assert!(score_wheel(wheel, &t_glibc(None)) >= 0);
+    }
+
+    #[test]
+    fn legacy_manylinux_aliases_respect_ceiling() {
+        // manylinux2014 == glibc 2.17 (PEP 600): fits a 2.17+ ceiling,
+        // not a 2.12 one.
+        let wheel = "numpy-2.1.0-cp312-cp312-manylinux2014_x86_64.whl";
+        assert!(score_wheel(wheel, &t_glibc(Some((2, 17)))) >= 0);
+        assert_eq!(score_wheel(wheel, &t_glibc(Some((2, 12)))), -1);
+    }
+
+    #[test]
+    fn compressed_tag_set_picks_tag_under_ceiling() {
+        // A wheel advertising both manylinux_2_17 and manylinux_2_28:
+        // under a 2.17 ceiling the 2_17 tag still matches.
+        let wheel = "mujoco-3.5.1-cp312-cp312-manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl";
+        assert!(score_wheel(wheel, &t_glibc(Some((2, 17)))) >= 0);
+        assert_eq!(score_wheel(wheel, &t_glibc(Some((2, 5)))), -1);
+    }
+
+    #[test]
+    fn rich_platform_declaration_raises_ceiling_for_manylinux_2_35() {
+        // 0.71+ rich platforms form parses into a declared glibc that,
+        // combined with a lower host glibc, admits the isaacsim wheel.
+        let toml: toml::Value = toml::from_str(
+            r#"
+[workspace]
+platforms = [{ platform = "linux-64", glibc = "2.35" }]
+"#,
+        )
+        .unwrap();
+        let ws = crate::workspace::WorkspaceManifest::from_toml(&toml);
+        let declared = ws
+            .platform_glibc
+            .get("linux-64")
+            .and_then(|s| crate::glibc::parse_glibc_version(s));
+        assert_eq!(declared, Some((2, 35)));
+        let ceiling = crate::glibc::combine_glibc_ceiling(declared, Some((2, 34)));
+        let wheel = "isaacsim-6.0.0.0-cp312-none-manylinux_2_35_x86_64.whl";
+        assert!(score_wheel(wheel, &t_glibc(ceiling)) >= 0);
     }
 
     #[test]
@@ -1161,6 +1279,7 @@ mod tests {
         let target = WheelTarget {
             python_version: "3.11".into(),
             conda_subdir: "linux-64".into(),
+            max_glibc: None,
         };
 
         let candidates = list_all_versions(&index, "mylib", &target)
@@ -1234,6 +1353,7 @@ mod tests {
         let target = WheelTarget {
             python_version: "3.11".into(),
             conda_subdir: "linux-64".into(),
+            max_glibc: None,
         };
 
         let candidates = list_all_versions(&index, "mylib", &target)
@@ -1285,6 +1405,7 @@ mod tests {
         let target = WheelTarget {
             python_version: "3.11".into(),
             conda_subdir: "linux-64".into(),
+            max_glibc: None,
         };
 
         let candidates = list_all_versions(&index, "mylib", &target)
@@ -1317,6 +1438,7 @@ mod tests {
         let target = WheelTarget {
             python_version: "3.11".into(),
             conda_subdir: "linux-64".into(),
+            max_glibc: None,
         };
         let specs: VersionSpecifiers = ">=1.0".parse().unwrap();
 
@@ -1343,6 +1465,7 @@ mod tests {
         let target = WheelTarget {
             python_version: "3.11".into(),
             conda_subdir: "linux-64".into(),
+            max_glibc: None,
         };
         let specs: VersionSpecifiers = ">=1.0".parse().unwrap();
 
@@ -1370,6 +1493,7 @@ mod tests {
         let target = WheelTarget {
             python_version: "3.11".into(),
             conda_subdir: "linux-64".into(),
+            max_glibc: None,
         };
         // Specifiers only allow >=2.0, but we prefer 1.0 (outside the range).
         let specs: VersionSpecifiers = ">=2.0".parse().unwrap();
@@ -1399,6 +1523,7 @@ mod tests {
         let target = WheelTarget {
             python_version: "3.11".into(),
             conda_subdir: "linux-64".into(),
+            max_glibc: None,
         };
         let specs: VersionSpecifiers = ">=1.0".parse().unwrap();
 
@@ -1426,6 +1551,7 @@ mod tests {
         let target = WheelTarget {
             python_version: "3.11".into(),
             conda_subdir: "linux-64".into(),
+            max_glibc: None,
         };
 
         let candidates = list_all_versions(&index, "mylib", &target)

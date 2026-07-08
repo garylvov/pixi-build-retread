@@ -708,10 +708,21 @@ pub fn parse_pylock_closure(
             }
         }
         let Some((_, wheel, filename)) = best else {
+            let glibc_hint = match target.max_glibc {
+                Some((maj, min)) => format!(
+                    " manylinux ceiling in effect: glibc {maj}.{min} (max of \
+                     declared system-requirements libc and host glibc). If the \
+                     runtime env provides a newer glibc, declare it: \
+                     `[system-requirements] libc = \"X.Y\"` (pixi < 0.71) or the \
+                     rich `platforms = [{{ platform = ..., glibc = \"X.Y\" }}]` \
+                     form (pixi >= 0.71)."
+                ),
+                None => String::new(),
+            };
             bail!(
                 "package `{name}=={version}`: none of its {} wheel(s) is compatible \
                  with python {} on {} (tag selection). If only an sdist fits, route \
-                 it via `retread-conda-deps` or a source entry.",
+                 it via `retread-conda-deps` or a source entry.{glibc_hint}",
                 wheel_entries.len(),
                 target.python_version,
                 target.conda_subdir,
@@ -913,6 +924,31 @@ pub fn warn_on_uv_version_skew(current: &str, recorded: Option<&str>) {
 #[derive(Debug, Serialize, Deserialize)]
 struct ClosureMeta {
     uv_version: String,
+    /// Fingerprint of every resolution input uv itself cannot see in the
+    /// project files: the CLI flag vector (indexes, --no-build,
+    /// index-strategy) plus the synthesized pyproject and the uv version.
+    /// A pre-existing `uv.lock` is only reused when this matches -- uv's
+    /// own lock-freshness check validates against the pyproject TEXT, so
+    /// a lock produced by an older backend (different flags, or a run
+    /// where `[tool.uv]` was ignored under UV_NO_CONFIG) passes uv's
+    /// check while pinning packages to the wrong index (e.g. isaacsim to
+    /// pypi.org's stub sdist instead of pypi.nvidia.com's wheels).
+    #[serde(default)]
+    inputs_fingerprint: String,
+}
+
+/// Hex sha256 over the resolution inputs recorded in [`ClosureMeta`].
+fn closure_inputs_fingerprint(pyproject: &str, lock_args: &[String], uv_version: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(pyproject.as_bytes());
+    for arg in lock_args {
+        h.update([0u8]);
+        h.update(arg.as_bytes());
+    }
+    h.update([0u8]);
+    h.update(uv_version.as_bytes());
+    format!("{:x}", h.finalize())
 }
 
 const META_FILE: &str = "retread-closure.meta.json";
@@ -956,12 +992,10 @@ pub async fn compute_closure(
     tokio::fs::create_dir_all(uv_cache_dir)
         .await
         .with_context(|| format!("creating uv cache dir {}", uv_cache_dir.display()))?;
-    tokio::fs::write(
-        project_dir.join("pyproject.toml"),
-        synthesize_pyproject(req),
-    )
-    .await
-    .context("writing synthesized pyproject.toml")?;
+    let pyproject_text = synthesize_pyproject(req);
+    tokio::fs::write(project_dir.join("pyproject.toml"), &pyproject_text)
+        .await
+        .context("writing synthesized pyproject.toml")?;
     tokio::fs::write(
         project_dir.join(PROVENANCE_FILE),
         provenance_json(&req.constraints)?,
@@ -996,9 +1030,52 @@ pub async fn compute_closure(
         "--color".into(),
         "never".into(),
     ];
+    // CRITICAL: we run uv with UV_NO_CONFIG=1 to isolate the resolve
+    // from user-level uv.toml. As of uv 0.11.x that ALSO strips the
+    // configuration-file-class keys from the synthesized pyproject's
+    // `[tool.uv]` table -- `[[tool.uv.index]]`, `no-build`, and
+    // `index-strategy` are silently ignored (project-only keys like
+    // `environments`, `override-dependencies`, `constraint-dependencies`
+    // and `[tool.uv.sources]` still apply). Without the index flags uv
+    // falls back to pypi.org alone, where e.g. `isaacsim` exists only as
+    // a stub sdist (the real manylinux_2_35 wheels live on
+    // pypi.nvidia.com) -- the closure then exports zero wheels and the
+    // whole workspace lock fails. Pass all three as CLI flags, which
+    // UV_NO_CONFIG never touches. The `[tool.uv]` copies stay in the
+    // synthesized pyproject for uv versions where --no-config leaves
+    // project tables alone (the flags and the table agree).
+    lock_args.push("--no-build".into());
+    lock_args.push("--index-strategy".into());
+    lock_args.push("unsafe-best-match".into());
+    for url in &req.index_urls {
+        lock_args.push("--index".into());
+        lock_args.push(url.clone());
+    }
     if req.offline {
         lock_args.push("--offline".into());
     }
+
+    // Stale-lock guard: `uv lock` reuses a pre-existing uv.lock whenever
+    // it still satisfies the pyproject TEXT -- it cannot see the CLI
+    // flags above, so a lock written by a different backend version /
+    // flag set survives validation while pinning packages to the wrong
+    // index. Drop the lock (forcing a fresh resolve) whenever the
+    // recorded input fingerprint is absent or different.
+    let fingerprint = closure_inputs_fingerprint(&pyproject_text, &lock_args, &uv_version);
+    let lock_file = project_dir.join("uv.lock");
+    let recorded_fingerprint = std::fs::read_to_string(&meta_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<ClosureMeta>(&s).ok())
+        .map(|m| m.inputs_fingerprint);
+    if lock_file.exists() && recorded_fingerprint.as_deref() != Some(fingerprint.as_str()) {
+        tracing::info!(
+            bundle = %req.bundle,
+            "uv closure: resolution inputs changed since the cached uv.lock \
+             was written; discarding it for a fresh resolve",
+        );
+        let _ = std::fs::remove_file(&lock_file);
+    }
+
     let lock_out = run(lock_args).await?;
     if !lock_out.status.success() {
         let stderr = String::from_utf8_lossy(&lock_out.stderr).into_owned();
@@ -1059,16 +1136,14 @@ pub async fn compute_closure(
         .iter()
         .map(|n| canonical_conda_name(n))
         .collect();
-    let target = WheelTarget {
-        python_version: req.python_version.clone(),
-        conda_subdir: req.conda_subdir.clone(),
-    };
+    let target = WheelTarget::for_subdir(&req.python_version, &req.conda_subdir);
     let closure = parse_pylock_closure(&pylock, &target, &exclude, &uv_version)?;
 
     let _ = std::fs::write(
         &meta_path,
         serde_json::to_string_pretty(&ClosureMeta {
             uv_version: uv_version.clone(),
+            inputs_fingerprint: fingerprint,
         })
         .unwrap_or_default(),
     );
@@ -1094,6 +1169,7 @@ mod tests {
         WheelTarget {
             python_version: py.to_string(),
             conda_subdir: subdir.to_string(),
+            max_glibc: None,
         }
     }
 
@@ -1540,6 +1616,7 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
                     &WheelTarget {
                         python_version: "3.12".into(),
                         conda_subdir: "linux-64".into(),
+                        max_glibc: None,
                     },
                     &exclude,
                     "0.11.15",

@@ -589,6 +589,7 @@ mod tests {
             let target = crate::pypi::WheelTarget {
                 python_version: "3.11".into(),
                 conda_subdir: "linux-64".into(),
+                max_glibc: None,
             };
             let specs = "==2.0.1".parse().unwrap();
             let resolved =
