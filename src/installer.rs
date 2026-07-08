@@ -239,11 +239,52 @@ fn read_validated_lock(lock_path: &Path) -> Result<(Vec<u8>, RetreadLock)> {
     Ok((raw, lock))
 }
 
+/// Resolve the wheel-store root this install reads from (and populates).
+/// Order: `RETREAD_WHEEL_STORE` env override > store recorded in the lock at
+/// build time (`~` expands against THIS machine's home) > shared default.
+fn resolve_wheel_store_root(lock: &RetreadLock) -> PathBuf {
+    resolve_wheel_store_root_with(&|key| std::env::var(key).ok(), lock)
+}
+
+/// Testable core of [`resolve_wheel_store_root`]; `env` is the variable
+/// lookup. With no override and no lock-recorded store this is EXACTLY the
+/// build-side default (`courier::wheel_store_root_with`), so producer and
+/// consumer agree even when fast-tmp has redirected `RETREAD_CACHE_DIR`.
+fn resolve_wheel_store_root_with(
+    env: &dyn Fn(&str) -> Option<String>,
+    lock: &RetreadLock,
+) -> PathBuf {
+    if let Some(dir) = env("RETREAD_WHEEL_STORE").filter(|s| !s.trim().is_empty()) {
+        return PathBuf::from(dir);
+    }
+    if let Some(recorded) = lock.wheel_store.as_deref() {
+        return crate::courier::expand_wheel_store_path(recorded);
+    }
+    crate::courier::wheel_store_root_with(env)
+}
+
+/// Store roots to probe for a locked Built wheel, in precedence order:
+/// the resolved primary store, the lock-recorded store, the shared default,
+/// and the legacy `<retread cache root>/wheels` location (stores written by
+/// older binaries under `RETREAD_CACHE_DIR`, including fast-tmp-redirected
+/// ones still alive on this node). Deduplicated, order-preserving.
+fn built_wheel_store_candidates(lock: &RetreadLock, primary: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = vec![primary.to_path_buf()];
+    if let Some(recorded) = lock.wheel_store.as_deref() {
+        out.push(crate::courier::expand_wheel_store_path(recorded));
+    }
+    out.push(crate::courier::retread_wheel_store_root());
+    out.push(crate::courier::retread_cache_root().join("wheels"));
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|p| seen.insert(p.clone()));
+    out
+}
+
 async fn materialize_index_wheel(
     lock: &RetreadLock,
     wheel: &crate::lock::LockWheel,
     fetch_dir: &Path,
-    cache_root: &Path,
+    store_root: &Path,
 ) -> Result<PathBuf> {
     let url_text = wheel.url.as_deref().expect("validated index url");
     let expected_sha = wheel.sha256.as_deref().expect("validated index sha256");
@@ -278,10 +319,7 @@ async fn materialize_index_wheel(
         return Ok(path);
     }
 
-    let store_path = cache_root
-        .join("wheels")
-        .join(expected_sha)
-        .join(&wheel.filename);
+    let store_path = store_root.join(expected_sha).join(&wheel.filename);
     if store_path.is_file() {
         match verify_sha256(&store_path, expected_sha) {
             Ok(()) => return Ok(store_path),
@@ -296,7 +334,7 @@ async fn materialize_index_wheel(
         }
     }
 
-    let fetched = crate::wheel::fetch_wheel_cached(&url, Some(expected_sha), fetch_dir, cache_root)
+    let fetched = crate::wheel::fetch_wheel_cached(&url, Some(expected_sha), fetch_dir, store_root)
         .await
         .with_context(|| {
             format!(
@@ -317,13 +355,14 @@ async fn materialize_locked_wheels(
     lock: &RetreadLock,
     prefix: &Path,
     shipped_wheels_dir: &Path,
-    cache_root: &Path,
+    store_root: &Path,
 ) -> Result<Vec<PathBuf>> {
     let fetch_dir = prefix
         .join("share")
         .join("retread")
         .join(&lock.bundle)
         .join("fetched");
+    let store_candidates = built_wheel_store_candidates(lock, store_root);
     let mut files = Vec::with_capacity(lock.wheels.len());
     for wheel in &lock.wheels {
         let shipped = shipped_wheels_dir.join(&wheel.filename);
@@ -342,23 +381,50 @@ async fn materialize_locked_wheels(
 
         match wheel.origin {
             Origin::Index => {
-                files.push(materialize_index_wheel(lock, wheel, &fetch_dir, cache_root).await?);
+                files.push(materialize_index_wheel(lock, wheel, &fetch_dir, store_root).await?);
             }
             Origin::Built => {
                 // Loose bundle mode: Built wheels are not shipped inside
                 // the .conda -- their bytes were persisted to the shared
                 // content-addressed wheel store at build time and the lock
                 // records the sha256 lookup key. Verify before trusting.
+                // Probe the primary store first, then self-heal from the
+                // lock-recorded / default / legacy store locations (a hit
+                // there means the paths diverged, not that bytes are lost).
                 if let Some(expected) = wheel.sha256.as_deref() {
-                    let store_path = cache_root
-                        .join("wheels")
-                        .join(expected)
-                        .join(&wheel.filename);
-                    if store_path.is_file() {
+                    let mut found: Option<PathBuf> = None;
+                    for (i, root) in store_candidates.iter().enumerate() {
+                        let store_path = root.join(expected).join(&wheel.filename);
+                        if !store_path.is_file() {
+                            continue;
+                        }
                         match verify_sha256(&store_path, expected) {
                             Ok(()) => {
-                                files.push(store_path);
-                                continue;
+                                if i > 0 {
+                                    tracing::warn!(
+                                        wheel = %wheel.filename,
+                                        primary = %store_root.display(),
+                                        fallback = %root.display(),
+                                        "retread install: built wheel missing from the \
+                                         primary wheel store; self-healed from a fallback \
+                                         store location (copying into the primary store)"
+                                    );
+                                    // Best-effort forward-heal so the next
+                                    // install on this machine hits directly.
+                                    if let Err(err) =
+                                        crate::wheel::store_wheel_in_cache(&store_path, store_root)
+                                            .await
+                                    {
+                                        tracing::warn!(
+                                            error = %format!("{err:#}"),
+                                            "retread install: could not copy built wheel \
+                                             into the primary store; continuing from the \
+                                             fallback location"
+                                        );
+                                    }
+                                }
+                                found = Some(store_path);
+                                break;
                             }
                             Err(err) => {
                                 tracing::warn!(
@@ -371,16 +437,28 @@ async fn materialize_locked_wheels(
                             }
                         }
                     }
+                    if let Some(store_path) = found {
+                        files.push(store_path);
+                        continue;
+                    }
                     bail!(
                         "retread install: locked built wheel {}=={} is neither shipped at {} \
-                         nor present in the shared wheel store at {} (loose bundle mode). \
-                         The store entry was evicted or this machine does not share the \
-                         build machine's wheel store; rebuild/reinstall the pack to \
+                         nor present in the shared wheel store at {} (loose bundle mode; also \
+                         probed: {}). The store entry was evicted or this machine does not \
+                         share the build machine's wheel store; rebuild/reinstall the pack to \
                          re-populate it.",
                         wheel.name,
                         wheel.version,
                         shipped.display(),
-                        store_path.display()
+                        store_candidates[0]
+                            .join(expected)
+                            .join(&wheel.filename)
+                            .display(),
+                        store_candidates[1..]
+                            .iter()
+                            .map(|p| p.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     );
                 }
                 bail!(
@@ -872,13 +950,9 @@ pub async fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
         }
     };
 
-    let wheel_files = materialize_locked_wheels(
-        &lock,
-        prefix,
-        &wheels_dir,
-        &crate::courier::retread_cache_root(),
-    )
-    .await?;
+    let wheel_files =
+        materialize_locked_wheels(&lock, prefix, &wheels_dir, &resolve_wheel_store_root(&lock))
+            .await?;
     let args = build_uv_replay_args(prefix, &wheel_files, None, force_reinstall);
 
     let install_msg = format!(
@@ -1030,6 +1104,7 @@ mod tests {
             declared_glibc: None,
             conda_capable: vec![],
             entry_specs: vec![],
+            wheel_store: None,
         }
     }
 
@@ -1212,12 +1287,12 @@ mod tests {
     #[tokio::test]
     async fn materialize_index_wheel_uses_sha_cache_without_network() {
         let root = tempdir("index-cache");
-        let cache_root = root.join("cache");
+        let store_root = root.join("store");
         let fetch_dir = root.join("fetch");
         let bytes = b"cached wheel bytes";
         let sha = hex_sha256(bytes);
         let filename = "remote-1.0.0-py3-none-any.whl";
-        let cached = cache_root.join("wheels").join(&sha).join(filename);
+        let cached = store_root.join(&sha).join(filename);
         std::fs::create_dir_all(cached.parent().unwrap()).unwrap();
         std::fs::write(&cached, bytes).unwrap();
 
@@ -1228,7 +1303,7 @@ mod tests {
             &format!("http://127.0.0.1:9/{filename}"),
             &sha,
         );
-        let path = materialize_index_wheel(&lock, &wheel, &fetch_dir, &cache_root)
+        let path = materialize_index_wheel(&lock, &wheel, &fetch_dir, &store_root)
             .await
             .unwrap();
         assert_eq!(path, cached);
@@ -1283,11 +1358,11 @@ mod tests {
         let root = tempdir("loose-built-store");
         let prefix = root.join("prefix");
         let wheels_dir = root.join("wheels"); // shipped dir: intentionally empty
-        let cache_root = root.join("cache");
+        let store_root = root.join("store");
         let bytes = b"loose built wheel bytes";
         let sha = hex_sha256(bytes);
         let filename = "builtpkg-1.0.0-py3-none-any.whl";
-        let stored = cache_root.join("wheels").join(&sha).join(filename);
+        let stored = store_root.join(&sha).join(filename);
         std::fs::create_dir_all(stored.parent().unwrap()).unwrap();
         std::fs::write(&stored, bytes).unwrap();
 
@@ -1306,7 +1381,7 @@ mod tests {
             sdist_source: None,
         }];
 
-        let files = materialize_locked_wheels(&lock, &prefix, &wheels_dir, &cache_root)
+        let files = materialize_locked_wheels(&lock, &prefix, &wheels_dir, &store_root)
             .await
             .unwrap();
         assert_eq!(files, vec![stored]);
@@ -1319,7 +1394,7 @@ mod tests {
         let root = tempdir("loose-built-miss");
         let prefix = root.join("prefix");
         let wheels_dir = root.join("wheels");
-        let cache_root = root.join("cache");
+        let store_root = root.join("store");
 
         let mut lock = make_lock(vec![], vec![], BTreeMap::new());
         lock.wheels = vec![LockWheel {
@@ -1336,7 +1411,7 @@ mod tests {
             sdist_source: None,
         }];
 
-        let err = materialize_locked_wheels(&lock, &prefix, &wheels_dir, &cache_root)
+        let err = materialize_locked_wheels(&lock, &prefix, &wheels_dir, &store_root)
             .await
             .unwrap_err();
         let msg = format!("{err:#}");
@@ -1347,12 +1422,137 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// THE fast-tmp divergence regression: the build side resolves the wheel
+    /// store via `courier::wheel_store_root_with` and the install side via
+    /// `resolve_wheel_store_root_with`. Under fast-tmp env (RETREAD_CACHE_DIR
+    /// redirected into a job-local tmp namespace) both must still resolve to
+    /// the SAME shared store — the redirect must not move the store.
+    #[test]
+    fn build_and_install_store_resolution_identical_under_fast_tmp_env() {
+        let fasttmp_env = |key: &str| -> Option<String> {
+            match key {
+                // What fasttmp::desired_env_pairs exports in a SLURM job.
+                "RETREAD_CACHE_DIR" => {
+                    Some("/tmp/retread-user/abc123/job-99/caches/retread".into())
+                }
+                "PIXI_CACHE_DIR" | "RATTLER_CACHE_DIR" | "UV_CACHE_DIR" => {
+                    Some("/tmp/retread-user/abc123/job-99/caches/x".into())
+                }
+                "HOME" => Some("/users/tester".into()),
+                _ => None,
+            }
+        };
+        let build_side = crate::courier::wheel_store_root_with(&fasttmp_env);
+        let lock = make_lock(vec![], vec![], BTreeMap::new());
+        let install_side = resolve_wheel_store_root_with(&fasttmp_env, &lock);
+        assert_eq!(
+            build_side, install_side,
+            "build-store and courier-store must resolve identically under fast-tmp env"
+        );
+        assert_eq!(
+            build_side,
+            PathBuf::from("/users/tester/.cache/retread/wheels"),
+            "the store must stay in the shared per-user cache, not job-local tmp"
+        );
+        assert!(
+            !build_side.starts_with("/tmp"),
+            "fast-tmp RETREAD_CACHE_DIR redirect must never relocate the wheel store"
+        );
+    }
+
+    /// Install-side precedence: RETREAD_WHEEL_STORE env > lock-recorded
+    /// store (with `~` expanded against the local HOME) > shared default.
+    #[test]
+    fn install_store_resolution_precedence_env_lock_default() {
+        let env_with_override = |key: &str| -> Option<String> {
+            match key {
+                "RETREAD_WHEEL_STORE" => Some("/shared/project/wheel-store".into()),
+                "HOME" => Some("/users/tester".into()),
+                _ => None,
+            }
+        };
+        let env_plain = |key: &str| -> Option<String> {
+            match key {
+                "HOME" => Some("/users/tester".into()),
+                _ => None,
+            }
+        };
+
+        let mut lock = make_lock(vec![], vec![], BTreeMap::new());
+        lock.wheel_store = Some("/nfs/build-host/wheel-store".into());
+
+        assert_eq!(
+            resolve_wheel_store_root_with(&env_with_override, &lock),
+            PathBuf::from("/shared/project/wheel-store"),
+            "env override must win over the lock-recorded store"
+        );
+        assert_eq!(
+            resolve_wheel_store_root_with(&env_plain, &lock),
+            PathBuf::from("/nfs/build-host/wheel-store"),
+            "lock-recorded store must win over the default"
+        );
+        lock.wheel_store = None;
+        assert_eq!(
+            resolve_wheel_store_root_with(&env_plain, &lock),
+            PathBuf::from("/users/tester/.cache/retread/wheels"),
+            "no override + no lock record must fall back to the shared default"
+        );
+    }
+
+    /// Store-path mismatch self-heal: a Built wheel absent from the primary
+    /// store but present in the LOCK-RECORDED store must install (with the
+    /// bytes forward-copied into the primary store), not hard-fail.
+    #[tokio::test]
+    async fn materialize_locked_wheels_built_wheel_heals_from_lock_recorded_store() {
+        let root = tempdir("loose-built-heal");
+        let prefix = root.join("prefix");
+        let wheels_dir = root.join("wheels"); // shipped dir: intentionally empty
+        let primary_store = root.join("primary-store"); // intentionally empty
+        let recorded_store = root.join("recorded-store");
+        let bytes = b"loose built wheel bytes (recorded store)";
+        let sha = hex_sha256(bytes);
+        let filename = "builtpkg-1.0.0-py3-none-any.whl";
+        let recorded_path = recorded_store.join(&sha).join(filename);
+        std::fs::create_dir_all(recorded_path.parent().unwrap()).unwrap();
+        std::fs::write(&recorded_path, bytes).unwrap();
+
+        let mut lock = make_lock(vec![], vec![], BTreeMap::new());
+        lock.wheel_store = Some(recorded_store.display().to_string());
+        lock.wheels = vec![LockWheel {
+            name: "builtpkg".into(),
+            version: "1.0.0".into(),
+            origin: Origin::Built,
+            filename: filename.into(),
+            url: None,
+            sha256: Some(sha.clone()),
+            requires_dist: vec![],
+            must_ship: true,
+            upstream_url: None,
+            git_source: None,
+            sdist_source: None,
+        }];
+
+        let files = materialize_locked_wheels(&lock, &prefix, &wheels_dir, &primary_store)
+            .await
+            .unwrap();
+        assert_eq!(
+            files,
+            vec![recorded_path],
+            "self-heal must serve the wheel from the lock-recorded store"
+        );
+        assert!(
+            primary_store.join(&sha).join(filename).is_file(),
+            "self-heal must forward-copy the wheel into the primary store"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[tokio::test]
     async fn materialize_index_wheel_fetches_locked_url_and_verifies_hash() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let root = tempdir("index-fetch");
-        let cache_root = root.join("cache");
+        let store_root = root.join("store");
         let fetch_dir = root.join("fetch");
         let filename = "remote-1.0.0-py3-none-any.whl";
         let bytes = b"downloaded locked wheel bytes".to_vec();
@@ -1382,15 +1582,15 @@ mod tests {
             &format!("http://127.0.0.1:{port}/{filename}"),
             &sha,
         );
-        let path = materialize_index_wheel(&lock, &wheel, &fetch_dir, &cache_root)
+        let path = materialize_index_wheel(&lock, &wheel, &fetch_dir, &store_root)
             .await
             .unwrap();
         serve.await.unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
         assert_eq!(sha256_file(&path).unwrap(), sha);
         assert!(
-            cache_root.join("wheels").join(&sha).join(filename).exists(),
-            "fetch must populate sha-addressed cache"
+            store_root.join(&sha).join(filename).exists(),
+            "fetch must populate the sha-addressed wheel store"
         );
         let _ = std::fs::remove_dir_all(root);
     }

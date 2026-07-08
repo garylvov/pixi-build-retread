@@ -246,6 +246,21 @@ pub struct RetreadLock {
     /// compute delta → fall back to full cold resolve" (safe).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub entry_specs: Vec<String>,
+    /// Shared content-addressed wheel-store root recorded at BUILD time for
+    /// loose bundles (the directory holding `<sha256>/<filename>`). A leading
+    /// `~/` means the producer's `$HOME`; the installer expands it against its
+    /// OWN `$HOME` (the store default is per-user, and the store is
+    /// content-addressed, so a same-path-different-user read either hits the
+    /// right bytes or misses safely). Install-side resolution order:
+    /// `RETREAD_WHEEL_STORE` env > this field > the shared default
+    /// (`courier::retread_wheel_store_root`). `None` for fat bundles and
+    /// pre-4.x locks (serde default; the installer falls back to the default
+    /// store + legacy candidates).
+    ///
+    /// NOT part of `inputs_hash` and NOT schema-bumping: this is a byte
+    /// LOCATION, never byte content (emit-neutral, like the cache root).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wheel_store: Option<String>,
 }
 
 /// Schema 12: install-time pure replay metadata.
@@ -564,6 +579,7 @@ mod tests {
             declared_glibc: None,
             conda_capable: vec!["numpy".into(), "torch".into()],
             entry_specs: vec!["isaaclab==0.51.1".into()],
+            wheel_store: None,
         };
         let json = lock.to_pretty_json().unwrap();
         let back: RetreadLock = serde_json::from_str(&json).unwrap();
@@ -1046,6 +1062,7 @@ mod tests {
             declared_glibc: None,
             conda_capable: vec!["zlib".into(), "blas".into()],
             entry_specs: vec!["torch==2.0.0".into(), "numpy==1.26.0".into()],
+            wheel_store: None,
         }
     }
 

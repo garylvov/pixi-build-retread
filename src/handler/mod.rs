@@ -3651,7 +3651,7 @@ async fn materialize_and_rewrite(
             url,
             entry.sha256.as_deref(),
             download_dir,
-            &crate::courier::retread_cache_root(),
+            &crate::courier::retread_wheel_store_root(),
         )
         .await
         .with_context(|| format!("phase 1 URL fetch for entry `{entry_name}` (url=`{url}`)"))?
@@ -3737,7 +3737,7 @@ async fn materialize_and_rewrite(
             &resolved.url,
             resolved.sha256.as_deref(),
             download_dir,
-            &crate::courier::retread_cache_root(),
+            &crate::courier::retread_wheel_store_root(),
         )
         .await
         .with_context(|| {
@@ -6490,6 +6490,7 @@ mod replay_tests {
             declared_glibc: None,
             conda_capable: vec![],
             entry_specs: vec![],
+            wheel_store: None,
         }
     }
 
@@ -6780,6 +6781,7 @@ mod replay_tests {
             declared_glibc: None,
             conda_capable: vec![],
             entry_specs: vec![],
+            wheel_store: None,
         };
         // Config has no retread_wheels entries — wheel is a class-3 orphan.
         // Use serde_json to construct a minimal config (RetreadConfig has no
@@ -6849,6 +6851,7 @@ mod replay_tests {
             declared_glibc: None,
             conda_capable: vec![],
             entry_specs: vec![],
+            wheel_store: None,
         };
         let config: RetreadConfig =
             serde_json::from_value(serde_json::json!({"retread-wheels": {}})).unwrap();
@@ -6954,6 +6957,7 @@ mod replay_tests {
             declared_glibc: None,
             conda_capable: vec![],
             entry_specs: vec![],
+            wheel_store: None,
         };
         let config: RetreadConfig =
             serde_json::from_value(serde_json::json!({"retread-wheels": {}})).unwrap();
@@ -7152,6 +7156,7 @@ mod replay_tests {
             declared_glibc: None,
             conda_capable: vec![],
             entry_specs: vec![],
+            wheel_store: None,
         };
         let config: RetreadConfig = serde_json::from_value(serde_json::json!({"retread-wheels": {
             "gympack": { "version": "==1.0.0" }
@@ -7510,6 +7515,7 @@ mod replay_tests {
             declared_glibc: None,
             conda_capable: vec![wheel_name.to_string()],
             entry_specs: vec![],
+            wheel_store: None,
         };
 
         // Build the replay EmitWheel exactly as the new Class-2 arm would:
@@ -7674,6 +7680,7 @@ mod replay_tests {
             declared_glibc: None,
             conda_capable: vec!["requests".into()],
             entry_specs: vec![],
+            wheel_store: None,
         };
         let config: RetreadConfig = serde_json::from_value(serde_json::json!({"retread-wheels": {
             "reqpack": { "version": "==1.0.0" }
@@ -8479,6 +8486,7 @@ version = "1.0.0"
             prerelease: std::collections::BTreeMap::new(),
             conda_capable: vec![],
             entry_specs: vec![],
+            wheel_store: None,
         };
 
         // Config has no retread_wheels entries.
@@ -9312,6 +9320,7 @@ mod load_favored_versions_tests {
             declared_glibc: None,
             conda_capable: vec![],
             entry_specs: vec![],
+            wheel_store: None,
         };
         let json = lock.to_pretty_json().unwrap();
         let path = dir.join(RetreadLock::file_name(bundle));
@@ -10173,6 +10182,7 @@ mod incremental_add_tests {
             declared_glibc: None,
             conda_capable: vec![],
             entry_specs,
+            wheel_store: None,
         };
         let json = lock.to_pretty_json().unwrap();
         std::fs::write(path, json).unwrap();
@@ -10266,6 +10276,7 @@ mod incremental_add_tests {
             declared_glibc: None,
             conda_capable: vec![],
             entry_specs: vec!["test-bundle==1.0".into()],
+            wheel_store: None,
         };
         let mut json: serde_json::Value =
             serde_json::from_str(&lock.to_pretty_json().unwrap()).unwrap();
@@ -10345,6 +10356,7 @@ mod incremental_add_tests {
             declared_glibc: None,
             conda_capable: vec![],
             entry_specs,
+            wheel_store: None,
         };
         let json = lock.to_pretty_json().unwrap();
         std::fs::write(path, json).unwrap();
@@ -10890,6 +10902,7 @@ mod incremental_add_tests {
             declared_glibc: None,
             conda_capable: vec![],
             entry_specs: vec!["test-bundle==1.0".into()],
+            wheel_store: None,
         };
         let json = lock.to_pretty_json().unwrap();
         std::fs::write(path, json).unwrap();

@@ -205,7 +205,8 @@ pub(crate) async fn hardlink_or_copy_async(src: &Path, dst: &Path) -> Result<()>
 
 /// Download a wheel with a machine-global persistent content-addressed cache.
 ///
-/// Store layout: `<cache_root>/wheels/<sha256>/<filename>.whl`.
+/// Store layout: `<store_root>/<sha256>/<filename>.whl` (the shared
+/// content-addressed wheel store; see `courier::retread_wheel_store_root`).
 ///
 /// On cache HIT (sha256 known and file present): hard-links the cached file
 /// into `dest_dir/<filename>`, no network.
@@ -219,7 +220,7 @@ pub async fn fetch_wheel_cached(
     url: &url::Url,
     expected_sha256: Option<&str>,
     dest_dir: &Path,
-    cache_root: &Path,
+    store_root: &Path,
 ) -> Result<PathBuf> {
     // Bypass when disabled or when we have no sha256 to address by.
     let bypass = std::env::var("RETREAD_NO_SHADOW_CACHE").is_ok();
@@ -248,7 +249,7 @@ pub async fn fetch_wheel_cached(
     }
 
     // Check the persistent store.
-    let store_path = cache_root.join("wheels").join(sha256).join(&filename);
+    let store_path = store_root.join(sha256).join(&filename);
     if store_path.exists() {
         // Cache hit: hard-link (copy on EXDEV) into dest_dir.
         if let Err(e) = hardlink_or_copy_async(&store_path, &dest).await {
@@ -277,7 +278,7 @@ pub async fn fetch_wheel_cached(
     let downloaded = fetch_wheel(url, Some(sha256), dest_dir).await?;
 
     // Populate the persistent store (atomic temp+rename).
-    let store_dir = cache_root.join("wheels").join(sha256);
+    let store_dir = store_root.join(sha256);
     if let Err(e) = fs::create_dir_all(&store_dir).await {
         tracing::warn!(
             wheel = %filename,
@@ -324,8 +325,8 @@ pub async fn fetch_wheel_cached(
 }
 
 /// Persist a finished wheel file into the shared content-addressed wheel
-/// store at `<cache_root>/wheels/<sha256>/<filename>` and return the hex
-/// sha256 of its bytes.
+/// store at `<store_root>/<sha256>/<filename>` and return the hex sha256 of
+/// its bytes.
 ///
 /// Loose bundle mode (`retread-bundle-mode = "loose"`) calls this at BUILD
 /// time for every wheel that fat mode would have shipped inside the .conda;
@@ -339,7 +340,7 @@ pub async fn fetch_wheel_cached(
 /// promoted with an atomic rename, same protocol as `fetch_wheel_cached`.
 /// An existing store entry is trusted as-is (content-addressed: same sha =>
 /// same bytes) and the write is skipped.
-pub(crate) async fn store_wheel_in_cache(src: &Path, cache_root: &Path) -> Result<String> {
+pub(crate) async fn store_wheel_in_cache(src: &Path, store_root: &Path) -> Result<String> {
     let filename = src
         .file_name()
         .and_then(|s| s.to_str())
@@ -352,7 +353,7 @@ pub(crate) async fn store_wheel_in_cache(src: &Path, cache_root: &Path) -> Resul
         .to_string();
     let sha256 = sha256_file(src).await?;
 
-    let store_dir = cache_root.join("wheels").join(&sha256);
+    let store_dir = store_root.join(&sha256);
     let store_final = store_dir.join(&filename);
     if store_final.is_file() {
         tracing::debug!(
@@ -792,7 +793,7 @@ mod tests {
     async fn wheel_cache_persistent_store_hit() {
         let tmp =
             std::env::temp_dir().join(format!("retread-wheel-test-store-{}", std::process::id()));
-        let cache_root = tmp.join("cache");
+        let store_root = tmp.join("store");
         let dest_dir = tmp.join("dest");
         std::fs::create_dir_all(&dest_dir).unwrap();
 
@@ -813,7 +814,7 @@ mod tests {
         let filename = "mypkg-1.0.0-py3-none-any.whl";
 
         // Simulate: populate the persistent store (as fetch_wheel_cached does after a download).
-        let store_dir = cache_root.join("wheels").join(&sha256);
+        let store_dir = store_root.join(&sha256);
         std::fs::create_dir_all(&store_dir).unwrap();
         let store_path = store_dir.join(filename);
         std::fs::write(&store_path, wheel_bytes).unwrap();

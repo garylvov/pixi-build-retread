@@ -1626,6 +1626,7 @@ mod tests {
             declared_glibc: None,
             conda_capable: Vec::new(),
             entry_specs: Vec::new(),
+            wheel_store: None,
         }
     }
 

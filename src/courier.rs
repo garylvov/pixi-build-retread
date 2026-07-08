@@ -227,6 +227,71 @@ pub fn retread_cache_root() -> std::path::PathBuf {
     base.join("retread")
 }
 
+// ── Shared loose-bundle wheel store ─────────────────────────────────────────
+
+/// Shared content-addressed wheel store root: the directory holding
+/// `<sha256>/<filename>` entries (loose-bundle built wheels + the download
+/// cache of `fetch_wheel_cached`).
+///
+/// Priority (first wins):
+///   1. `RETREAD_WHEEL_STORE` env var (absolute path to the store dir).
+///   2. `XDG_CACHE_HOME/retread/wheels`.
+///   3. `$HOME/.cache/retread/wheels` (POSIX fallback).
+///
+/// DELIBERATELY independent of `RETREAD_CACHE_DIR` / [`retread_cache_root`]:
+/// fast-tmp redirects `RETREAD_CACHE_DIR` into a JOB-LOCAL tmp namespace, but
+/// the wheel store is a PERSISTENCE CONTRACT, not a scratch cache — a loose
+/// bundle's lock records store shas at build time and `retread install` must
+/// find those bytes later, on other nodes, after the build job's tmp is gone.
+/// Blob stores stay SHARED; only envs/scratch are job-local. The store is
+/// content-addressed with atomic tmp+rename writes, so concurrent writers on
+/// NFS are safe.
+pub fn retread_wheel_store_root() -> std::path::PathBuf {
+    wheel_store_root_with(&|key| std::env::var(key).ok())
+}
+
+/// Testable core of [`retread_wheel_store_root`]; `env` is the variable
+/// lookup. Note the intentional ABSENCE of a `RETREAD_CACHE_DIR` branch.
+pub(crate) fn wheel_store_root_with(env: &dyn Fn(&str) -> Option<String>) -> std::path::PathBuf {
+    if let Some(dir) = env("RETREAD_WHEEL_STORE").filter(|s| !s.trim().is_empty()) {
+        return std::path::PathBuf::from(dir);
+    }
+    let base = env("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            env("HOME")
+                .map(|h| std::path::PathBuf::from(h).join(".cache"))
+                .unwrap_or_else(|| std::env::temp_dir().join(".retread-cache-fallback"))
+        });
+    base.join("retread").join("wheels")
+}
+
+/// Portable form of a wheel-store path for the committed lock: a store under
+/// the producer's `$HOME` is recorded as `~/...` so the lock stays
+/// byte-identical across users/machines (the store default is per-user; the
+/// consumer expands `~` against its OWN home). Non-home paths (e.g. a shared
+/// project dir via `RETREAD_WHEEL_STORE`) are recorded verbatim.
+pub(crate) fn portable_wheel_store_path(store: &Path) -> String {
+    if let Ok(home) = std::env::var("HOME")
+        && !home.trim().is_empty()
+        && let Ok(rel) = store.strip_prefix(&home)
+    {
+        return format!("~/{}", rel.display());
+    }
+    store.display().to_string()
+}
+
+/// Inverse of [`portable_wheel_store_path`] on the consumer side.
+pub fn expand_wheel_store_path(recorded: &str) -> std::path::PathBuf {
+    if let Some(rest) = recorded.strip_prefix("~/")
+        && let Ok(home) = std::env::var("HOME")
+        && !home.trim().is_empty()
+    {
+        return std::path::PathBuf::from(home).join(rest);
+    }
+    std::path::PathBuf::from(recorded)
+}
+
 // ── Shadow-rewrite cache helpers ────────────────────────────────────────────
 
 /// Compute the shadow-rewrite cache key for one wheel.
@@ -319,7 +384,7 @@ fn hardlink_or_copy(src: &Path, dst: &Path) -> anyhow::Result<()> {
 /// Loose mode (`loose == true`): persist the staged bytes into the shared
 /// content-addressed wheel store instead and return `Some(sha256)` for the
 /// lock entry -- the .conda stays a stub and `retread install` materializes
-/// the wheel from `<store>/wheels/<sha256>/<filename>` (hash-verified).
+/// the wheel from `<store>/<sha256>/<filename>` (hash-verified).
 async fn ship_or_store(
     loose: bool,
     staged: &Path,
@@ -488,8 +553,10 @@ pub async fn stage(
 
     // Bundle mode: loose persists ship-class wheels to the shared wheel
     // store (stub .conda); fat tars them into the artifact (legacy).
+    // The store root is fast-tmp-EXEMPT (see retread_wheel_store_root):
+    // installs on other nodes must find these bytes after this job dies.
     let loose = config.bundle_mode == crate::config::BundleMode::Loose;
-    let wheel_store_root = retread_cache_root();
+    let wheel_store_root = retread_wheel_store_root();
 
     // Step 1: run plan() to get ship set + override table.
     let emit_plan = plan(emit_wheels, conda_capable);
@@ -1104,6 +1171,11 @@ pub async fn stage(
         declared_glibc,
         conda_capable: conda_capable.iter().cloned().collect(),
         entry_specs,
+        // Loose bundles: record WHERE the built-wheel bytes were persisted so
+        // the installer can find them even when its default store resolution
+        // differs from the build machine's (home-relative "~" form; see
+        // portable_wheel_store_path). Fat bundles carry their bytes.
+        wheel_store: loose.then(|| portable_wheel_store_path(&wheel_store_root)),
     };
     lock.canonicalize();
 
@@ -2832,6 +2904,70 @@ version = "1.0.0"
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    /// The wheel store root must IGNORE RETREAD_CACHE_DIR entirely: fast-tmp
+    /// redirects that variable into a job-local tmp namespace, and following
+    /// it was the loose-bundle store-divergence bug (build wrote job-local,
+    /// courier post-link read ~/.cache/retread/wheels).
+    #[test]
+    fn wheel_store_root_ignores_retread_cache_dir() {
+        let env = |key: &str| -> Option<String> {
+            match key {
+                "RETREAD_CACHE_DIR" => Some("/tmp/retread-user/ns/job-7/caches/retread".into()),
+                "HOME" => Some("/users/tester".into()),
+                _ => None,
+            }
+        };
+        assert_eq!(
+            wheel_store_root_with(&env),
+            std::path::PathBuf::from("/users/tester/.cache/retread/wheels")
+        );
+
+        // RETREAD_WHEEL_STORE is the only env override, and it wins.
+        let env_override = |key: &str| -> Option<String> {
+            match key {
+                "RETREAD_WHEEL_STORE" => Some("/shared/store".into()),
+                "RETREAD_CACHE_DIR" => Some("/tmp/job-local".into()),
+                "HOME" => Some("/users/tester".into()),
+                _ => None,
+            }
+        };
+        assert_eq!(
+            wheel_store_root_with(&env_override),
+            std::path::PathBuf::from("/shared/store")
+        );
+
+        // XDG_CACHE_HOME beats HOME, matching retread_cache_root's default.
+        let env_xdg = |key: &str| -> Option<String> {
+            match key {
+                "XDG_CACHE_HOME" => Some("/users/tester/.xdg-cache".into()),
+                "HOME" => Some("/users/tester".into()),
+                _ => None,
+            }
+        };
+        assert_eq!(
+            wheel_store_root_with(&env_xdg),
+            std::path::PathBuf::from("/users/tester/.xdg-cache/retread/wheels")
+        );
+    }
+
+    /// Home-relative portable form round-trips through expand on the same
+    /// machine; non-home paths are recorded and expanded verbatim.
+    #[test]
+    fn portable_wheel_store_path_roundtrips() {
+        if let Ok(home) = std::env::var("HOME")
+            && !home.trim().is_empty()
+        {
+            let store = std::path::Path::new(&home).join(".cache/retread/wheels");
+            let portable = portable_wheel_store_path(&store);
+            assert_eq!(portable, "~/.cache/retread/wheels");
+            assert_eq!(expand_wheel_store_path(&portable), store);
+        }
+        let shared = std::path::Path::new("/oscar/data/proj/wheel-store");
+        let portable = portable_wheel_store_path(shared);
+        assert_eq!(portable, "/oscar/data/proj/wheel-store");
+        assert_eq!(expand_wheel_store_path(&portable), shared);
+    }
+
     #[tokio::test]
     async fn ship_or_store_loose_persists_to_store_and_skips_sources() {
         let tmp = make_test_dir("loose-store");
@@ -2849,10 +2985,7 @@ version = "1.0.0"
             source_urls.is_empty(),
             "loose mode must not add the wheel to the recipe sources"
         );
-        let stored = store
-            .join("wheels")
-            .join(&sha)
-            .join("pkg-1.0.0-py3-none-any.whl");
+        let stored = store.join(&sha).join("pkg-1.0.0-py3-none-any.whl");
         assert!(
             stored.is_file(),
             "wheel bytes must land in the content-addressed store: {}",
@@ -2881,11 +3014,11 @@ version = "1.0.0"
     async fn loose_mode_stage_emits_stub_sources_and_store_shas() {
         let tmp = make_test_dir("loose-e2e");
         let staging = tmp.join("staging");
-        // NO env mutation here: overriding RETREAD_CACHE_DIR races parallel
-        // tests that read retread_cache_root() live (the shadow-cache suite).
-        // Assert against the real store root instead; the entry is
-        // content-addressed and tiny, so repeat runs are idempotent.
-        let cache = retread_cache_root();
+        // NO env mutation here: overriding store env vars races parallel
+        // tests that read the live env. Assert against the real store root
+        // instead; the entry is content-addressed and tiny, so repeat runs
+        // are idempotent.
+        let store = retread_wheel_store_root();
 
         let bundle = "loosepkg";
         let built_whl_name = format!("{bundle}-1.0.0-py3-none-any.injected.whl");
@@ -2930,11 +3063,21 @@ version = "1.0.0"
             .sha256
             .as_deref()
             .expect("loose lock must record the store sha for built wheels");
-        let stored = cache.join("wheels").join(sha).join(&lw.filename);
+        let stored = store.join(sha).join(&lw.filename);
         assert!(
             stored.is_file(),
             "built wheel bytes must be in the store: {}",
             stored.display()
+        );
+        let recorded = result
+            .lock
+            .wheel_store
+            .as_deref()
+            .expect("loose lock must record the wheel-store root");
+        assert_eq!(
+            expand_wheel_store_path(recorded),
+            store,
+            "lock-recorded store must expand back to the build-time store root"
         );
         assert!(
             !result.source_urls.iter().any(|u| u.ends_with(&lw.filename)),

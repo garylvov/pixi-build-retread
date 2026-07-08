@@ -205,9 +205,10 @@ pub struct RetreadConfig {
     ///   (lock + meta-wheel + installer binary + post-link script). The
     ///   bundle's built/shadow wheels are persisted at build time to the
     ///   shared content-addressed wheel store
-    ///   (`<retread cache root>/wheels/<sha256>/<filename>`, see
-    ///   [`crate::courier::retread_cache_root`]) and the lock records their
-    ///   sha256; `retread install` materializes them from the store
+    ///   (`<wheel store root>/<sha256>/<filename>`, see
+    ///   [`crate::courier::retread_wheel_store_root`]; fast-tmp-exempt, and
+    ///   the lock records the store root used) plus their sha256;
+    ///   `retread install` materializes them from the store
     ///   (hash-verified) instead of from the package payload. Wheel bytes
     ///   are never tarred into the conda artifact, dedupe across
     ///   packs/rebuilds, and packaging drops from minutes to seconds.

@@ -588,6 +588,11 @@ fn desired_env_pairs(
     push_env_if_needed(&mut out, "PIXI_CACHE_DIR", &blob_cache, stale);
     push_env_if_needed(&mut out, "RATTLER_CACHE_DIR", &blob_cache, stale);
     push_env_if_needed(&mut out, "UV_CACHE_DIR", &ns.uv_cache_dir(), stale);
+    // NOTE: this redirect deliberately does NOT move the loose-bundle wheel
+    // store. The store is resolved by courier::retread_wheel_store_root(),
+    // which ignores RETREAD_CACHE_DIR precisely so blob stores stay SHARED
+    // while scratch caches go job-local (a job-local store dies with the
+    // job, breaking `retread install` on other nodes / later jobs).
     push_env_if_needed(
         &mut out,
         "RETREAD_CACHE_DIR",
