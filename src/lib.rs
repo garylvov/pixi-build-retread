@@ -4,6 +4,7 @@
 //! through the crate.
 
 pub mod audit;
+pub mod compat;
 pub mod config;
 pub mod conflict_classifier;
 pub mod courier;

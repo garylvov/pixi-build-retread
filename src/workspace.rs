@@ -53,6 +53,11 @@ pub struct WorkspaceManifest {
     /// pixi 0.71+ rich platform declarations from `[workspace].platforms`,
     /// keyed by pixi platform string (`linux-64`, `linux-aarch64`, ...).
     pub platform_glibc: BTreeMap<String, String>,
+    /// pixi 0.71+ rich platform `cuda = "..."` declarations, keyed the same
+    /// way as [`Self::platform_glibc`]. Folded into
+    /// `effective_system_requirements` (rich wins over the deprecated
+    /// `[system-requirements]` table, mirroring `declared_glibc`).
+    pub platform_cuda: BTreeMap<String, String>,
     /// v1.3.0: top-level `[pypi-options]` index URLs -- `index-url`
     /// first, then `extra-index-urls` in declaration order. Feeds the
     /// cascade's PyPI fallback chain so workspace-declared private
@@ -145,8 +150,14 @@ impl WorkspaceManifest {
                 .map(String::from);
             if let Some(platforms) = workspace.get("platforms").and_then(|v| v.as_array()) {
                 for platform in platforms {
-                    if let Some((name, glibc)) = parse_rich_platform_glibc(platform) {
-                        out.platform_glibc.insert(name, glibc);
+                    let Some((name, glibc, cuda)) = parse_rich_platform(platform) else {
+                        continue;
+                    };
+                    if let Some(glibc) = glibc {
+                        out.platform_glibc.insert(name.clone(), glibc);
+                    }
+                    if let Some(cuda) = cuda {
+                        out.platform_cuda.insert(name, cuda);
                     }
                 }
             }
@@ -362,6 +373,17 @@ impl WorkspaceManifest {
             for (k, v) in &feat.system_requirements {
                 out.insert(k.clone(), v.clone());
             }
+        }
+        // pixi 0.71+ rich `[workspace].platforms` declarations replace the
+        // deprecated `[system-requirements]` table. They are workspace-wide
+        // (per platform, not per env/feature) and, matching
+        // `declared_glibc`'s precedence, win over any legacy declaration.
+        let platform = crate::glibc::current_pixi_platform();
+        if let Some(glibc) = self.platform_glibc.get(platform) {
+            out.insert("libc".to_string(), glibc.clone());
+        }
+        if let Some(cuda) = self.platform_cuda.get(platform) {
+            out.insert("cuda".to_string(), cuda.clone());
         }
         out
     }
@@ -885,11 +907,32 @@ fn parse_system_requirement_value(key: &str, v: &toml::Value) -> Option<String> 
     None
 }
 
-fn parse_rich_platform_glibc(v: &toml::Value) -> Option<(String, String)> {
+/// Parse one pixi 0.71+ rich `[workspace].platforms` entry
+/// (`{ platform = "linux-64", glibc = "2.28", cuda = "12.0" }`) into
+/// `(platform, glibc, cuda)`. Bare-string entries (`"linux-64"`) and
+/// entries without a `platform` key return `None`.
+fn parse_rich_platform(v: &toml::Value) -> Option<(String, Option<String>, Option<String>)> {
     let t = v.as_table()?;
     let platform = t.get("platform")?.as_str()?.to_string();
-    let glibc = parse_glibc_value(t.get("glibc")?)?;
-    Some((platform, glibc))
+    let glibc = t.get("glibc").and_then(parse_glibc_value);
+    let cuda = t.get("cuda").and_then(parse_scalarish_value);
+    Some((platform, glibc, cuda))
+}
+
+/// Render a scalar-ish TOML value (string, float, integer) as the string
+/// form pixi's own schema accepts for rich-platform virtual-package
+/// versions (`cuda = "12"` / `cuda = 12`).
+fn parse_scalarish_value(v: &toml::Value) -> Option<String> {
+    if let Some(s) = v.as_str() {
+        return Some(s.to_string());
+    }
+    if let Some(f) = v.as_float() {
+        return Some(f.to_string());
+    }
+    if let Some(i) = v.as_integer() {
+        return Some(i.to_string());
+    }
+    None
 }
 
 fn parse_glibc_value(v: &toml::Value) -> Option<String> {
@@ -939,6 +982,18 @@ fn split_conda_dep_line(raw: &str) -> Option<(String, String)> {
 }
 
 fn parse_env_def(value: &toml::Value) -> Option<EnvironmentDef> {
+    // Bare array form: `env = ["feat1", "feat2"]` (pixi shorthand for
+    // `{ features = [...] }`). `default = []` is the common spelling for
+    // "just the default feature".
+    if let Some(arr) = value.as_array() {
+        return Some(EnvironmentDef {
+            features: arr
+                .iter()
+                .filter_map(|f| f.as_str().map(String::from))
+                .collect(),
+            no_default_feature: false,
+        });
+    }
     let table = value.as_table()?;
     let mut features = Vec::new();
     if let Some(arr) = table.get("features").and_then(|v| v.as_array()) {
@@ -1131,6 +1186,68 @@ libc = "2.39"
         let sr = ws.effective_system_requirements("standalone");
         assert_eq!(sr.get("libc").map(String::as_str), Some("2.39"));
         assert!(!sr.contains_key("cuda")); // top-level skipped
+    }
+
+    #[test]
+    fn effective_system_requirements_rich_platforms_win_over_legacy() {
+        let ws = ws_toml(&format!(
+            r#"
+[workspace]
+platforms = [{{ platform = "{plat}", glibc = "2.35", cuda = "12.0" }}]
+
+[system-requirements]
+libc = "2.50"
+cuda = "11"
+
+[environments]
+default = []
+"#,
+            plat = crate::glibc::current_pixi_platform()
+        ));
+        let sr = ws.effective_system_requirements("default");
+        // Rich platform declarations replace the deprecated table.
+        assert_eq!(sr.get("libc").map(String::as_str), Some("2.35"));
+        assert_eq!(sr.get("cuda").map(String::as_str), Some("12.0"));
+    }
+
+    #[test]
+    fn effective_system_requirements_rich_platform_other_platform_ignored() {
+        let other = if crate::glibc::current_pixi_platform() == "linux-64" {
+            "linux-aarch64"
+        } else {
+            "linux-64"
+        };
+        let ws = ws_toml(&format!(
+            r#"
+[workspace]
+platforms = [{{ platform = "{other}", glibc = "2.39", cuda = "13" }}]
+
+[system-requirements]
+libc = "2.34"
+
+[environments]
+default = []
+"#,
+        ));
+        let sr = ws.effective_system_requirements("default");
+        // Legacy declaration stands; the rich entry targets another platform.
+        assert_eq!(sr.get("libc").map(String::as_str), Some("2.34"));
+        assert!(!sr.contains_key("cuda"));
+    }
+
+    #[test]
+    fn rich_platform_cuda_only_entry_is_parsed() {
+        let ws = ws_toml(
+            r#"
+[workspace]
+platforms = ["linux-aarch64", { platform = "linux-64", cuda = "12" }]
+"#,
+        );
+        assert_eq!(
+            ws.platform_cuda.get("linux-64").map(String::as_str),
+            Some("12")
+        );
+        assert!(ws.platform_glibc.is_empty());
     }
 
     #[test]

@@ -755,8 +755,14 @@ impl Handler {
             NEGOTIATE => self.negotiate(parse_params(params)?).await.and_then(ok),
             INITIALIZE => self.initialize(parse_params(params)?).await.and_then(ok),
             CONDA_OUTPUTS => self.conda_outputs(parse_params(params)?).await.and_then(ok),
+            // Pixi Build API 5 (pixi 0.72+) serializes dependency match
+            // specs in conda/build_v1 as structured objects; normalize
+            // them back to the API-4 string form our pinned wire types
+            // deserialize, so one binary speaks both protocol revisions.
             CONDA_BUILD_V1 => self
-                .conda_build_v1(parse_params(params)?)
+                .conda_build_v1(parse_params(
+                    crate::compat::normalize_conda_build_v1_params(params),
+                )?)
                 .await
                 .and_then(ok),
             other => Err(RpcError {

@@ -2,7 +2,7 @@ schema_version: 1
 
 context:
   name: pixi-build-retread
-  version: "4.0.0"
+  version: "4.1.0"
 
 package:
   name: ${{ name }}
@@ -67,9 +67,11 @@ requirements:
   run:
     # The backend shells out to `rattler-build` for the actual conda build.
     - rattler-build >=0.27
-    # pixi-build-api-version pins the protocol version. Bump alongside any
-    # change to the pixi_build_types git rev in our Cargo.toml.
-    - pixi-build-api-version >=4,<5
+    # pixi-build-api-version pins the protocol revision range this binary
+    # speaks. API 4 natively (pinned pixi_build_types rev); API 5 (pixi
+    # 0.72+) via the src/compat.rs normalization shim that converts the
+    # structured conda/build_v1 match specs back to the API-4 string form.
+    - pixi-build-api-version >=4,<6
     # uv replaces pip + setuptools + a baked-in python for source builds.
     # `uv pip wheel --python <ver>` downloads python-build-standalone on
     # demand and uses it for the build, so retread itself is
