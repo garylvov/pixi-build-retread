@@ -239,13 +239,14 @@ pub struct RetreadConfig {
     /// v4.0.0-pre (spec-uv-restructure M1): which engine computes the
     /// bundle's wheel closure.
     ///
-    /// - `"legacy"` (default): the in-backend cascade/resolvo mirror-solver.
-    /// - `"uv"`: synthesize an ephemeral uv project (conda pins become
-    ///   `constraint-dependencies` with provenance), `uv lock` + `uv export
-    ///   --format pylock.toml`, and pin the legacy materialization to uv's
-    ///   picks. Requires `uv` on PATH (override with `$RETREAD_UV`).
+    /// - `"uv"` (default): synthesize an ephemeral uv project (conda pins
+    ///   become `constraint-dependencies` with provenance), `uv lock` + `uv
+    ///   export --format pylock.toml`, and pin the legacy materialization to
+    ///   uv's picks. Requires `uv` on PATH (override with `$RETREAD_UV`).
     ///   Only closure computation changes; packaging/courier/lock-write
     ///   downstream are unchanged.
+    /// - `"legacy"`: the in-backend cascade/resolvo mirror-solver (fallback
+    ///   via `retread-resolver = "legacy"`).
     #[serde(default, rename = "retread-resolver", alias = "resolver")]
     pub resolver: ResolverKind,
 }
@@ -254,10 +255,11 @@ pub struct RetreadConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ResolverKind {
-    /// The historical cascade/resolvo mirror-solver (default).
-    #[default]
+    /// The historical cascade/resolvo mirror-solver
+    /// (opt-in fallback via `retread-resolver = "legacy"`).
     Legacy,
-    /// uv-subprocess closure computation (spec-uv-restructure.md).
+    /// uv-subprocess closure computation (spec-uv-restructure.md; default).
+    #[default]
     Uv,
 }
 

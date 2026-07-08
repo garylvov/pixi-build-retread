@@ -23,6 +23,8 @@ retread-python       = "3.12"
 # the shape identical to gigastrap's multi-entry pack).
 retread-bundle       = "isaac-pack-6"
 retread-courier      = true
+# uv is the default closure engine (v4.0.0); spelled out here for clarity.
+retread-resolver     = "uv"
 
 # Same-repo siblings built from one git source (v2.10.0+): isaaclab_visualizers'
 # upstream setup.py declares `install_requires = ["isaaclab", ...]`. Since

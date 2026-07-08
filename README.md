@@ -37,11 +37,21 @@ Run: `pixi install`
 | fast (env) | `eval "$(pixi-build-retread fast --print-env)"` |
 | fast (persist) | `pixi-build-retread fast --persist <env>` |
 
+## Fast path
+
+`eval "$(pixi-build-retread fast --print-env)"` puts caches and envs on job-local tmp
+(auto-detects slow FS / SLURM). `pixi install` then materializes the env by parallel
+copy from the `envs-persist` snapshot when the lock hash matches, else does a frozen
+rebuild (~3 min warm). `fast --persist <env>` writes/updates that snapshot (~1.5 min);
+run it after the env changes.
+
 ## Config
+
+Default solver is uv; set `retread-resolver = "legacy"` to fall back.
 
 ```toml
 [package.build.config]
-retread-resolver = "legacy"    # or "uv" (experimental)
+retread-resolver = "uv"        # default; or "legacy" fallback
 
 [tool.retread.fast-tmp]
 mode = "auto"                  # auto | on | off
