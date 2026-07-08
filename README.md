@@ -27,6 +27,24 @@ isaacsim = { version = "==5.1.0", index = "https://pypi.nvidia.com" }
 ```
 
 Run: `pixi install`
+
+## Pack Configuration Example
+A pack's `pixi.toml` (e.g., `examples/isaac6/isaac-pack/`) declares package metadata and wheels to bundle:
+```toml
+[package]
+name = "isaac-pack-6"
+version = "6.0.0.1"
+[package.build]
+backend = { name = "pixi-build-retread", version = "*" }
+[package.build.config]
+retread-python   = "3.12"
+retread-bundle   = "isaac-pack-6"
+retread-resolver = "uv"
+[package.build.config.retread-wheels]
+isaacsim = { version = "==6.0.0.1", index = "https://pypi.nvidia.com" }
+# ...
+```
+
 ## Commands
 
 | Command | Usage |
@@ -39,11 +57,12 @@ Run: `pixi install`
 
 ## Fast path
 
-`eval "$(pixi-build-retread fast --print-env)"` puts caches and envs on job-local tmp
-(auto-detects slow FS / SLURM). `pixi install` then materializes the env by parallel
-copy from the `envs-persist` snapshot when the lock hash matches, else does a frozen
-rebuild (~3 min warm). `fast --persist <env>` writes/updates that snapshot (~1.5 min);
-run it after the env changes.
+For shared-filesystem machines (SLURM clusters, EC2+EFS) where the project and caches
+sit on slow shared storage: `eval "$(pixi-build-retread fast --print-env)"` reroutes
+caches and env storage to fast machine-local disk. `pixi install` then materializes the
+env by parallel copy from the `envs-persist` snapshot (~1.5 min for 40 GB, lock hash
+match) or a no-resolve frozen rebuild (~3 min); `fast --persist <env>` writes/updates
+the snapshot after env changes. On a local machine with fast disk it auto-disengages.
 
 ## Config
 
