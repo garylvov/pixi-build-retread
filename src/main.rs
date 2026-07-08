@@ -132,6 +132,9 @@ fn run_fast(args: &[String]) -> anyhow::Result<()> {
                 workspace.display()
             );
         };
+        if env_name == "all" {
+            return fasttmp::persist_all_envs(&workspace, &cfg, &engaged.ns);
+        }
         return fasttmp::persist_env(&workspace, &cfg, &engaged.ns, env_name);
     }
     if parsed.cmd.is_empty() {
@@ -182,11 +185,15 @@ fn parse_fast_args(args: &[String]) -> anyhow::Result<FastCli> {
             }
             "--print-env" => out.print_env = true,
             "--persist" => {
-                i += 1;
-                let Some(value) = args.get(i) else {
-                    anyhow::bail!("retread fast: --persist requires an env name");
-                };
-                out.persist = Some(value.clone());
+                // Env name is optional: `--persist` with no env (or the
+                // literal `all`) persists every job-local env.
+                match args.get(i + 1) {
+                    Some(value) if !value.starts_with('-') => {
+                        i += 1;
+                        out.persist = Some(value.clone());
+                    }
+                    _ => out.persist = Some("all".to_string()),
+                }
             }
             "--preflight-locks" => {
                 i += 1;

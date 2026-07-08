@@ -1301,6 +1301,41 @@ pub fn persist_env(
     Ok(())
 }
 
+/// `retread fast --persist` with the env omitted (or the literal `all`):
+/// persist every env directory present under the job-local envs root.
+/// Non-directories and dotted entries are skipped; each env goes through
+/// `persist_env`, so every snapshot keeps its own per-env hash stamp.
+pub fn persist_all_envs(workspace_root: &Path, cfg: &FastTmpConfig, ns: &Namespace) -> Result<()> {
+    let envs_dir = ns.envs_dir();
+    let entries = fs::read_dir(&envs_dir)
+        .with_context(|| format!("reading job-local envs dir {}", envs_dir.display()))?;
+    let mut names: Vec<String> = Vec::new();
+    for entry in entries {
+        let entry = entry.with_context(|| format!("reading entry in {}", envs_dir.display()))?;
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if name.starts_with('.') {
+            continue;
+        }
+        names.push(name);
+    }
+    if names.is_empty() {
+        bail!(
+            "retread fast --persist: no job-local envs found under {}",
+            envs_dir.display()
+        );
+    }
+    names.sort();
+    for name in &names {
+        persist_env(workspace_root, cfg, ns, name)?;
+    }
+    Ok(())
+}
+
 fn log_copy_timing(verb: &str, env_name: &str, stats: &CopyStats, elapsed: Duration) {
     let secs = elapsed.as_secs_f64();
     let total = stats.files + stats.symlinks;
@@ -2439,6 +2474,43 @@ blob-caches = "tmp"
         assert!(!tmp_left, "failed persist must remove its tmp dir");
 
         assert!(persist_env(&fx.ws, &fx.cfg, &fx.ns, "../evil").is_err());
+        fs::remove_dir_all(fx.root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persist_all_envs_persists_every_env_dir() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _guard = EnvGuard::new(&fasttmp_env_keys());
+        let fx = persist_fixture("persistall");
+
+        // Nothing job-local yet -> error, not a silent no-op.
+        assert!(persist_all_envs(&fx.ws, &fx.cfg, &fx.ns).is_err());
+
+        write_fixture_env(&fx.ns.envs_dir().join("default"));
+        write_fixture_env(&fx.ns.envs_dir().join("gpu"));
+        // Skipped: non-directory and dotted entries in the envs root.
+        fs::write(fx.ns.envs_dir().join("stray-file"), b"not an env").unwrap();
+        fs::create_dir_all(fx.ns.envs_dir().join(".hidden")).unwrap();
+
+        persist_all_envs(&fx.ws, &fx.cfg, &fx.ns).unwrap();
+
+        let pdir = persist_dir(&fx.cfg, &fx.ws);
+        let hash = current_lock_hash(&fx.ws).unwrap();
+        for env in ["default", "gpu"] {
+            let snap = pdir.join(env);
+            assert_eq!(
+                fs::read_to_string(snap.join(ENV_HASH_FILE)).unwrap().trim(),
+                hash,
+                "per-env hash stamp missing for {env}"
+            );
+            assert_eq!(
+                fs::read(snap.join("bin").join("tool")).unwrap(),
+                b"#!/bin/sh\necho hi\n"
+            );
+        }
+        assert!(!pdir.join("stray-file").exists());
+        assert!(!pdir.join(".hidden").exists());
         fs::remove_dir_all(fx.root).ok();
     }
 
