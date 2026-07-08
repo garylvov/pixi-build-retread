@@ -39,11 +39,12 @@ Run: `pixi install`
 
 ## Fast path
 
-`eval "$(pixi-build-retread fast --print-env)"` puts caches and envs on job-local tmp
-(auto-detects slow FS / SLURM). `pixi install` then materializes the env by parallel
-copy from the `envs-persist` snapshot when the lock hash matches, else does a frozen
-rebuild (~3 min warm). `fast --persist <env>` writes/updates that snapshot (~1.5 min);
-run it after the env changes.
+For shared-filesystem machines (SLURM clusters, EC2+EFS) where the project and caches
+sit on slow shared storage: `eval "$(pixi-build-retread fast --print-env)"` reroutes
+caches and env storage to fast machine-local disk. `pixi install` then materializes the
+env by parallel copy from the `envs-persist` snapshot (~1.5 min for 40 GB, lock hash
+match) or a no-resolve frozen rebuild (~3 min); `fast --persist <env>` writes/updates
+the snapshot after env changes. On a local machine with fast disk it auto-disengages.
 
 ## Config
 

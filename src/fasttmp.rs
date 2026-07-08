@@ -68,7 +68,8 @@ pub struct FastTmpConfig {
     /// Where env snapshots persist on the shared/NFS side. Relative paths are
     /// resolved against the workspace root. Default: `.pixi/envs-persist`.
     pub persist_dir: Option<PathBuf>,
-    /// Worker count for parallel env copies. Default: min(60, 4*ncpu).
+    /// Worker count for parallel env copies. Default: min(60, 4*allocated
+    /// cpus) — SLURM/cgroup-aware, ncpu fallback; see effective_copy_workers.
     pub copy_workers: Option<usize>,
 }
 
@@ -898,15 +899,54 @@ pub fn persist_dir(cfg: &FastTmpConfig, workspace_root: &Path) -> PathBuf {
     }
 }
 
-/// Worker count: config wins, else min(60, 4*ncpu).
+/// Worker count: config wins, else min(60, 4*allocated_cpus).
+///
+/// "Allocated" is allocation-aware: on shared nodes the process is often
+/// confined to a slice of the machine, and sizing off the full core count
+/// oversubscribes the copy pool. Precedence:
+/// 1. `$SLURM_CPUS_ON_NODE` (cpus SLURM granted on this node)
+/// 2. cgroup v2 cpu quota (`/sys/fs/cgroup/cpu.max`, quota/period rounded up)
+/// 3. `available_parallelism()` (the historical formula)
 pub fn effective_copy_workers(cfg: &FastTmpConfig) -> usize {
     if let Some(n) = cfg.copy_workers {
         return n.max(1);
     }
-    let ncpu = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
+    let ncpu = allocated_cpus().unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+    });
     MAX_COPY_WORKERS.min(4 * ncpu).max(1)
+}
+
+/// CPUs actually allocated to this process, when a scheduler or cgroup
+/// says so. `None` = no allocation signal; caller falls back to ncpu.
+fn allocated_cpus() -> Option<usize> {
+    if let Ok(v) = std::env::var("SLURM_CPUS_ON_NODE") {
+        if let Ok(n) = v.trim().parse::<usize>() {
+            if n > 0 {
+                return Some(n);
+            }
+        }
+    }
+    cgroup_v2_cpu_quota(Path::new("/sys/fs/cgroup/cpu.max"))
+}
+
+/// Parse a cgroup v2 `cpu.max` file ("<quota> <period>" or "max <period>")
+/// into a whole-cpu count (quota/period, rounded up). "max" = unconstrained.
+fn cgroup_v2_cpu_quota(path: &Path) -> Option<usize> {
+    let raw = fs::read_to_string(path).ok()?;
+    let mut it = raw.split_whitespace();
+    let quota = it.next()?;
+    if quota == "max" {
+        return None;
+    }
+    let quota: u64 = quota.parse().ok()?;
+    let period: u64 = it.next()?.parse().ok()?;
+    if quota == 0 || period == 0 {
+        return None;
+    }
+    Some(quota.div_ceil(period).max(1) as usize)
 }
 
 /// sha256 hex over the workspace lock(s) a snapshot is keyed by. Currently
@@ -2374,6 +2414,40 @@ copy-workers = 12
             persist_dir(&default_cfg, &ws),
             ws.join(".pixi/envs-persist")
         );
+
+        // Allocation-aware default: SLURM_CPUS_ON_NODE beats ncpu...
+        guard.remove("RETREAD_FAST_TMP_COPY_WORKERS");
+        guard.set("SLURM_CPUS_ON_NODE", "3");
+        assert_eq!(effective_copy_workers(&default_cfg), 12);
+        // ...but never beats an explicit copy-workers override, and junk
+        // values fall back to the ncpu formula.
+        let pinned = FastTmpConfig {
+            copy_workers: Some(2),
+            ..FastTmpConfig::default()
+        };
+        assert_eq!(effective_copy_workers(&pinned), 2);
+        guard.set("SLURM_CPUS_ON_NODE", "banana");
+        let n = effective_copy_workers(&default_cfg);
+        assert!(n >= 1 && n <= MAX_COPY_WORKERS);
+        guard.remove("SLURM_CPUS_ON_NODE");
         fs::remove_dir_all(ws).ok();
+    }
+
+    #[test]
+    fn cgroup_v2_cpu_quota_parses_quota_and_max() {
+        let dir = tmp_dir("cgroup");
+        let f = dir.join("cpu.max");
+        // 2.5 cpus rounds up to 3.
+        fs::write(&f, "250000 100000\n").unwrap();
+        assert_eq!(cgroup_v2_cpu_quota(&f), Some(3));
+        fs::write(&f, "100000 100000\n").unwrap();
+        assert_eq!(cgroup_v2_cpu_quota(&f), Some(1));
+        // Unconstrained and malformed both mean "no signal".
+        fs::write(&f, "max 100000\n").unwrap();
+        assert_eq!(cgroup_v2_cpu_quota(&f), None);
+        fs::write(&f, "garbage\n").unwrap();
+        assert_eq!(cgroup_v2_cpu_quota(&f), None);
+        assert_eq!(cgroup_v2_cpu_quota(&dir.join("absent")), None);
+        fs::remove_dir_all(dir).ok();
     }
 }
