@@ -7,6 +7,8 @@ use sha2::{Digest, Sha256};
 
 use super::manifest::{AppliedEdit, EntrySnapshot, ManifestEditor, TableKind, write_atomic};
 use super::parse::Conflict;
+use crate::handler::PypiToCondaMap;
+use crate::relax::canonical_conda_name;
 
 // Copied from src/conflict_classifier.rs:52 so solve has no dependency on cascade-era modules.
 pub(crate) const ABI_ANCHOR_NAMES: &[&str] = &[
@@ -291,6 +293,15 @@ pub struct RepairPlanner {
     pub ceiling_policy: WidenCeilingPolicy,
     pub relax_preference: RelaxPreference,
     current_run_attempts: HashSet<(String, String, Strategy)>,
+    /// PyPI name -> conda-forge candidate names, from the same
+    /// parselmouth-backed dataset (`crate::handler::load_pypi_to_conda_map`,
+    /// FALLBACK_PYPI_TO_CONDA merged in) the courier/auto-route path uses to
+    /// build its `name_map`. Lets `CondaWidenNeeded` conflicts (which name
+    /// the *pypi* package, e.g. `torch`) find a conda pin declared under a
+    /// differently-named variant package (e.g. `pytorch-gpu`). Empty by
+    /// default -- callers that don't wire it in (tests, `--offline`-style
+    /// use) fall back to exact-name matching only.
+    conda_name_map: PypiToCondaMap,
 }
 
 /// One conflict target flowing through the repair tiers: which package and
@@ -328,7 +339,40 @@ impl RepairPlanner {
             ceiling_policy: WidenCeilingPolicy::NextMajor,
             relax_preference: RelaxPreference::Conda,
             current_run_attempts: HashSet::new(),
+            conda_name_map: PypiToCondaMap::new(),
         }
+    }
+
+    /// Wires in the parselmouth-backed pypi<->conda name family (see
+    /// `conda_name_map` doc comment). `driver::run` loads this once per
+    /// invocation via `crate::handler::load_pypi_to_conda_map` and passes it
+    /// down so conflict matching agrees with the courier/auto-route path.
+    pub fn with_conda_name_map(mut self, map: PypiToCondaMap) -> Self {
+        self.conda_name_map = map;
+        self
+    }
+
+    /// Resolves the conda-table name under which a `CondaWidenNeeded`
+    /// conflict's pypi `package` is actually pinned by the user, checking
+    /// the parselmouth-backed name family before falling back to an
+    /// exact-name match. Returns `None` if no candidate (including the
+    /// pypi name itself) is a user-owned conda entry.
+    fn resolve_conda_pin_name(&self, editor: &ManifestEditor, package: &str) -> Option<String> {
+        let canon = canonical_conda_name(package);
+        if let Some(candidates) = self.conda_name_map.get(&canon) {
+            for candidate in candidates {
+                if editor.has_user_entry(&self.feature, TableKind::Conda, candidate) {
+                    return Some(candidate.clone());
+                }
+            }
+        }
+        // Exact-name fallback -- covers the identical-name case (conda
+        // package name == pypi package name) and callers that didn't wire
+        // in a name map at all.
+        if editor.has_user_entry(&self.feature, TableKind::Conda, package) {
+            return Some(package.to_string());
+        }
+        None
     }
 
     pub fn with_relax_preference(mut self, pref: RelaxPreference) -> Self {
@@ -403,9 +447,12 @@ impl RepairPlanner {
         conda_version: &str,
     ) -> std::result::Result<RepairOutcome, String> {
         let package = target.package;
+        // Resolve which conda-table name actually carries the user's pin --
+        // may differ from the pypi `package` name (e.g. pypi `torch` pinned
+        // via conda `pytorch-gpu`); see `resolve_conda_pin_name`.
+        let conda_pin_name = self.resolve_conda_pin_name(editor, package);
         if self.relax_preference == RelaxPreference::Conda {
-            let user_owned_conda_pin =
-                editor.has_user_entry(&self.feature, TableKind::Conda, package);
+            let user_owned_conda_pin = conda_pin_name.is_some();
             if user_owned_conda_pin && !tried.has(package, Strategy::PypiOverride) {
                 match self.pypi_override_from_conda(editor, tried, target, conda_version) {
                     Ok(out) => return Ok(out),
@@ -415,8 +462,9 @@ impl RepairPlanner {
                 }
             }
         }
+        let widen_target_name = conda_pin_name.as_deref().unwrap_or(package);
         if !tried.has(package, Strategy::WidenConda) {
-            self.widen(editor, tried, target, op)
+            self.widen(editor, tried, target, op, widen_target_name)
         } else {
             self.boundary(editor, tried, target, Reason::CondaBoundary)
         }
@@ -585,12 +633,16 @@ impl RepairPlanner {
         tried: &mut TriedState,
         target: &PinTarget<'_>,
         op: &str,
+        conda_name: &str,
     ) -> std::result::Result<RepairOutcome, String> {
         let (package, floor) = (target.package, target.version);
-        self.guard_anchor(package)?;
+        // Guard on the actual conda-table name being widened (may differ
+        // from the pypi `package` name via the name-family match), so ABI
+        // anchors are protected regardless of which side named the conflict.
+        self.guard_anchor(conda_name)?;
         let spec = widen_spec(op, floor, self.ceiling_policy);
         self.guard_oscillation(package, &spec, Strategy::WidenConda)?;
-        let edit = editor.set_conda_widen(&self.feature, package, &spec);
+        let edit = editor.set_conda_widen(&self.feature, conda_name, &spec);
         let old_spec = edit.before.value.clone();
         tried.mark(package, Strategy::WidenConda, false);
         Ok(self.outcome(
@@ -1009,6 +1061,58 @@ mod tests {
         assert!(text.contains("torch = \"==2.10.0\"\n")); // conda pin untouched, no sentinel
         assert!(text.contains("[pypi-options.dependency-overrides]"));
         assert!(text.contains("torch = \"==2.10.0\"  # retread:override"));
+    }
+
+    #[test]
+    fn conda_widen_needed_matches_conda_pin_via_name_map_pytorch_gpu() {
+        // Live gap this closes: pypi requirement `torch==2.11.0` conflicts
+        // with a conda pin declared as `pytorch-gpu ==2.10.0` -- a
+        // DIFFERENT name than the pypi package. Without the parselmouth-
+        // backed name family, `has_user_entry(.., "torch")` never finds the
+        // `pytorch-gpu` pin, so T1 is skipped entirely and the ladder falls
+        // through to (wrongly) widening/creating a bogus `torch` conda
+        // entry. With the name map wired in, T1 must fire: emit a pypi
+        // override for `torch`, and leave `pytorch-gpu` byte-for-byte
+        // untouched.
+        let path = temp_manifest("[dependencies]\npytorch-gpu = \"==2.10.0\"\n");
+        let mut editor = ManifestEditor::open(path.clone()).unwrap();
+        let mut tried = TriedState::default();
+        let mut name_map = PypiToCondaMap::new();
+        name_map.insert(
+            "torch".to_string(),
+            vec![
+                "pytorch".to_string(),
+                "pytorch-cpu".to_string(),
+                "pytorch-gpu".to_string(),
+            ],
+        );
+        let mut planner = RepairPlanner::new("default".into()).with_conda_name_map(name_map);
+        assert_eq!(planner.relax_preference, RelaxPreference::Conda);
+
+        let conflict = Conflict::CondaWidenNeeded {
+            package: "torch".into(),
+            op: ">=".into(),
+            floor: "2.11.0".into(),
+            conda_version: "==2.10.0".into(),
+        };
+        let out = planner
+            .repair(&mut editor, &mut tried, &conflict, 1)
+            .unwrap();
+        assert_eq!(out.attempt.strategy, "pypi_override");
+        assert_eq!(out.attempt.new_spec.as_deref(), Some("==2.10.0"));
+        assert!(!tried.has("torch", Strategy::Conda));
+        assert!(!tried.has("torch", Strategy::WidenConda));
+        assert!(tried.has("torch", Strategy::PypiOverride));
+
+        editor.write_atomic().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        // conda pin untouched, no sentinel:
+        assert!(text.contains("pytorch-gpu = \"==2.10.0\"\n"));
+        assert!(text.contains("[pypi-options.dependency-overrides]"));
+        assert!(text.contains("torch = \"==2.10.0\"  # retread:override"));
+        // No bogus `torch` conda entry was created alongside `pytorch-gpu`:
+        // the only `torch = ` line in the whole manifest is the override.
+        assert_eq!(text.matches("torch = ").count(), 1);
     }
 
     #[test]

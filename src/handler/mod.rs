@@ -471,12 +471,17 @@ const FALLBACK_PYPI_TO_CONDA: &[(&str, &str)] = &[
 /// Inverted parselmouth mapping: PyPI name -> conda-forge candidates.
 /// One PyPI name can have multiple conda names (e.g., split packages
 /// like `airflow` -> `apache-airflow`).
-type PypiToCondaMap = std::collections::HashMap<String, Vec<String>>;
+pub(crate) type PypiToCondaMap = std::collections::HashMap<String, Vec<String>>;
 
 /// Best-effort fetch of the parselmouth mapping. Returns a fallback map
 /// if the network call fails -- never errors. Async because it makes an
 /// HTTP request.
-async fn load_pypi_to_conda_map() -> PypiToCondaMap {
+///
+/// `pub(crate)` so `src/solve/` (the offline lock-repair ladder) can reuse
+/// the SAME parselmouth-backed name family (torch -> [pytorch, pytorch-cpu,
+/// pytorch-gpu], etc.) that the courier/auto-route path uses to build its
+/// `name_map`, instead of hand-rolling a second conda<->pypi name table.
+pub(crate) async fn load_pypi_to_conda_map() -> PypiToCondaMap {
     let mut inverse: PypiToCondaMap = std::collections::HashMap::new();
 
     match reqwest::get(PARSELMOUTH_MAPPING_URL).await {

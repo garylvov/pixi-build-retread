@@ -52,6 +52,14 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
     let pixi_version = pixi_version(&project_dir).await;
     warn_if_uncalibrated(pixi_version.as_deref());
     let parser = RegexConflictParser::new();
+    // Same parselmouth-backed pypi<->conda name family the courier/auto-
+    // route path builds its `name_map` from (FALLBACK_PYPI_TO_CONDA merged
+    // over the fetched parselmouth data) -- loaded once per `retread solve`
+    // invocation and threaded into every env's RepairPlanner so
+    // CondaWidenNeeded matching agrees with emission (e.g. pypi `torch`
+    // resolves to a user's `pytorch-gpu` conda pin). Best-effort: falls back
+    // to an empty map (exact-name matching only) if the fetch fails.
+    let conda_name_map = crate::handler::load_pypi_to_conda_map().await;
     let mut ledger = SolveLedger::load(&ledger_path, manifest_display)?;
     let manifest_hash = manifest_sha256(&manifest_path)?;
     let mut tried = ledger.seed_tried_state(&manifest_path, &manifest_hash, &editor);
@@ -88,6 +96,7 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
                 parser: &parser,
                 ledger_path: &ledger_path,
                 run_idx,
+                conda_name_map: &conda_name_map,
             },
             &mut editor,
             &mut ledger,
@@ -182,6 +191,7 @@ struct EnvRunCtx<'a> {
     parser: &'a RegexConflictParser,
     ledger_path: &'a Path,
     run_idx: Option<usize>,
+    conda_name_map: &'a crate::handler::PypiToCondaMap,
 }
 
 async fn run_env(
@@ -199,13 +209,16 @@ async fn run_env(
         parser,
         ledger_path,
         run_idx,
+        conda_name_map,
     } = ctx;
     let relax_preference = if args.prefer_pypi {
         RelaxPreference::Pypi
     } else {
         RelaxPreference::from_config_str(&editor.relax_preference())
     };
-    let mut planner = RepairPlanner::new(feature.clone()).with_relax_preference(relax_preference);
+    let mut planner = RepairPlanner::new(feature.clone())
+        .with_relax_preference(relax_preference)
+        .with_conda_name_map(conda_name_map.clone());
     let mut pending_edit: Option<PendingEdit> = None;
     let smoke_modules = if args.smoke_modules.is_empty() {
         editor.smoke_modules()
