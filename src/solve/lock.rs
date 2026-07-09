@@ -17,9 +17,9 @@ use super::error::{EXIT_EXHAUSTED, EXIT_INTERRUPTED, EXIT_MAX_ITERS, EXIT_OK, EX
 use super::manifest::{AppliedEdit, ManifestEditor, copy_atomic};
 use super::parse::{ConflictParser, RegexConflictParser, tail};
 use super::repair::{
-    RelaxPreference, RepairPlanner, SolveLedger, Strategy, append_attempt, is_abi_anchor,
-    ledger_path, manifest_sha256, mark_last_widen_failed, persist_conflict_trace, retread_dir,
-    snapshot_path,
+    PackOverrideWrite, RelaxPreference, RepairPlanner, SolveLedger, Strategy, append_attempt,
+    is_abi_anchor, ledger_path, manifest_sha256, mark_last_widen_failed, persist_conflict_trace,
+    retread_dir, snapshot_path,
 };
 
 const DEFAULT_MAX_REPAIRS: u32 = 10;
@@ -198,6 +198,7 @@ async fn run_with_pixi_bin(args: LockArgs, pixi_bin: &str) -> Result<i32> {
                 // Unexpected crash (spawn/IO failure), not a normal solver
                 // failure -- roll back any repairs applied so far.
                 rollback_snapshot(&project_dir, &manifest_path)?;
+                crate::pack_overrides::rollback_all(&project_dir)?;
                 ledger.finish_run(run_idx, "crashed");
                 ledger.write_atomic(&ledger_path)?;
                 return Err(err);
@@ -205,6 +206,7 @@ async fn run_with_pixi_bin(args: LockArgs, pixi_bin: &str) -> Result<i32> {
         };
         if lock.interrupted {
             rollback_snapshot(&project_dir, &manifest_path)?;
+            crate::pack_overrides::rollback_all(&project_dir)?;
             ledger.finish_run(run_idx, "interrupted");
             ledger.write_atomic(&ledger_path)?;
             return Ok(EXIT_INTERRUPTED);
@@ -213,6 +215,7 @@ async fn run_with_pixi_bin(args: LockArgs, pixi_bin: &str) -> Result<i32> {
             ledger.finish_run(run_idx, "converged");
             ledger.write_atomic(&ledger_path)?;
             cleanup_snapshot(&project_dir)?;
+            crate::pack_overrides::cleanup_all(&project_dir)?;
             print_summary(&records);
             return Ok(EXIT_OK);
         }
@@ -240,11 +243,27 @@ async fn run_with_pixi_bin(args: LockArgs, pixi_bin: &str) -> Result<i32> {
             match repair {
                 Ok(out) => {
                     editor.write_atomic()?;
+                    if let Some(po) = &out.pack_override {
+                        // Snapshot the pack file before its first write so an
+                        // exhausted run rolls it back, then write the override
+                        // into the pack's own retread-overrides table.
+                        crate::pack_overrides::ensure_snapshot(&project_dir, &po.pack_pixi)?;
+                        crate::pack_overrides::write_override(
+                            &po.pack_pixi,
+                            &po.package,
+                            &po.spec,
+                        )?;
+                    }
                     for attempt in out.extra_attempts {
                         append_attempt(&mut ledger, &ledger_path, run_idx, attempt)?;
                     }
                     append_attempt(&mut ledger, &ledger_path, run_idx, out.attempt.clone())?;
-                    record_repair(&mut records, &out.attempt, &out.applied);
+                    record_repair(
+                        &mut records,
+                        &out.attempt,
+                        &out.applied,
+                        out.pack_override.as_ref(),
+                    );
                     pending_edit = PendingEdit::from_edits(out.applied);
                     repairs_applied += 1;
                     continue;
@@ -257,8 +276,10 @@ async fn run_with_pixi_bin(args: LockArgs, pixi_bin: &str) -> Result<i32> {
                     // every repair applied *this run* is provably useless.
                     // Roll the manifest back to the pre-run snapshot so no
                     // orphaned `# retread:override`/`:pin`/`:widen` entry
-                    // survives a failed run.
+                    // survives a failed run (and any `.retread/
+                    // overrides.json` entry recorded this run too).
                     rollback_snapshot(&project_dir, &manifest_path)?;
+                    crate::pack_overrides::rollback_all(&project_dir)?;
                     ledger.finish_run(run_idx, "exhausted");
                     ledger.write_atomic(&ledger_path)?;
                     if is_abi_anchor(&package) {
@@ -318,6 +339,7 @@ fn record_repair(
     records: &mut Vec<RepairRecord>,
     attempt: &super::repair::LedgerAttempt,
     applied: &[AppliedEdit],
+    pack_override: Option<&PackOverrideWrite>,
 ) {
     let old_spec = applied
         .last()
@@ -333,9 +355,13 @@ fn record_repair(
     // to a pin owner in another feature/pack table -- see fix #16/#19),
     // not a hardcoded constant (fix #19: the repair table previously
     // always printed `default` here even when the edit landed elsewhere).
+    // Fix #20: a `pack_override` repair never touches the workspace
+    // manifest (`applied` is empty), so label it with the bundle's
+    // pack-manifest scope instead of falling back to `LOCK_FEATURE`.
     let feature = applied
         .last()
         .map(|e| e.feature.clone())
+        .or_else(|| pack_override.map(|po| format!("{} (pack)", po.bundle)))
         .unwrap_or_else(|| LOCK_FEATURE.to_string());
     records.push(RepairRecord {
         package: attempt.package.clone(),
@@ -631,6 +657,7 @@ exit 0
             floor: "2.11.0".into(),
             conda_version: "==2.10.0".into(),
             requiring_chain: Vec::new(),
+            pack_name: None,
         };
         let out = planner
             .repair(&mut editor, &mut tried, &conflict, 1)
@@ -841,7 +868,7 @@ exit 0
             failed: false,
         };
         let mut records = Vec::new();
-        record_repair(&mut records, &attempt, &applied);
+        record_repair(&mut records, &attempt, &applied, None);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].feature, "feature.gpu");
         assert_ne!(records[0].feature, LOCK_FEATURE);

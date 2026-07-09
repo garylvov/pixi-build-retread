@@ -121,6 +121,7 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
                     ledger.write_atomic(&ledger_path)?;
                 }
                 cleanup_snapshot(&project_dir)?;
+                crate::pack_overrides::cleanup_all(&project_dir)?;
                 return Ok(code);
             }
             Ok(code) => {
@@ -133,6 +134,11 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
                         restore_bytes_atomic(&manifest_path, &bytes)?;
                         editor.reload()?;
                     }
+                    // Fix #20: pack-manifest overrides written for THIS env
+                    // are workspace-scoped side effects -- roll them back so
+                    // a failed env's override doesn't survive into the next
+                    // env's attempt.
+                    crate::pack_overrides::rollback_all(&project_dir)?;
                     if let Some(run_idx) = run_idx {
                         ledger.finish_run(run_idx, outcome_for_code(code));
                         ledger.write_atomic(&ledger_path)?;
@@ -149,6 +155,7 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
                     }
                     3 => {
                         rollback_snapshot(&project_dir, &manifest_path)?;
+                        crate::pack_overrides::rollback_all(&project_dir)?;
                         if let Some(run_idx) = run_idx {
                             ledger.finish_run(run_idx, "exhausted");
                             ledger.write_atomic(&ledger_path)?;
@@ -156,6 +163,7 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
                     }
                     4 => {
                         rollback_snapshot(&project_dir, &manifest_path)?;
+                        crate::pack_overrides::rollback_all(&project_dir)?;
                         if let Some(run_idx) = run_idx {
                             ledger.finish_run(run_idx, "max_iters");
                             ledger.write_atomic(&ledger_path)?;
@@ -163,6 +171,7 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
                     }
                     130 => {
                         rollback_snapshot(&project_dir, &manifest_path)?;
+                        crate::pack_overrides::rollback_all(&project_dir)?;
                         if let Some(run_idx) = run_idx {
                             ledger.finish_run(run_idx, "interrupted");
                             ledger.write_atomic(&ledger_path)?;
@@ -170,6 +179,7 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
                     }
                     _ => {
                         rollback_snapshot(&project_dir, &manifest_path)?;
+                        crate::pack_overrides::rollback_all(&project_dir)?;
                     }
                 }
                 print_error(&err);
@@ -178,6 +188,7 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
         }
     }
     cleanup_snapshot(&project_dir)?;
+    crate::pack_overrides::cleanup_all(&project_dir)?;
     Ok(any_failed_code)
 }
 
@@ -286,6 +297,15 @@ async fn run_env(
             editor
                 .write_atomic()
                 .map_err(|e| SolveError::Usage(e.to_string()))?;
+            if let Some(po) = &out.pack_override {
+                // Snapshot the pack file before its first write so an
+                // exhausted/interrupted run rolls it back, then write the
+                // override into the pack's own retread-overrides table.
+                crate::pack_overrides::ensure_snapshot(project_dir, &po.pack_pixi)
+                    .map_err(|e| SolveError::Usage(e.to_string()))?;
+                crate::pack_overrides::write_override(&po.pack_pixi, &po.package, &po.spec)
+                    .map_err(|e| SolveError::Usage(e.to_string()))?;
+            }
             if let Some(run_idx) = run_idx {
                 for attempt in out.extra_attempts {
                     append_attempt(ledger, ledger_path, run_idx, attempt)

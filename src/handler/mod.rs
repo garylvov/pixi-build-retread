@@ -2340,6 +2340,14 @@ async fn uv_group_closure(
     }
 
     // retread-overrides -> override-dependencies where PEP 440-representable.
+    // Fix #20: `retread solve`/`retread lock` now WRITE auto-repaired T1
+    // conda-as-truth overrides for a backend-closure conflict directly
+    // into THIS pack's `[package.build.config.retread-overrides]` table
+    // (the same table the manual trio lives in) -- so they arrive here in
+    // `effective.overrides` with no special handling, exactly like a
+    // user-declared override. A workspace `pypi-options.dependency-
+    // overrides` write was inert (the pack's uv closure never reads it);
+    // the pack table is what the closure actually consumes.
     let mut overrides: Vec<String> = Vec::new();
     for (name, spec) in &effective.overrides {
         let spec = spec.trim();

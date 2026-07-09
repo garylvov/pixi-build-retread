@@ -330,6 +330,31 @@ pub struct RepairOutcome {
     pub extra_attempts: Vec<LedgerAttempt>,
     pub applied: Vec<AppliedEdit>,
     pub summary_line: String,
+    /// Fix #20: set instead of (never alongside) `applied` when this
+    /// repair's target came from a backend uv-closure conflict
+    /// (`Conflict::CondaWidenNeeded::pack_name` is `Some`). The WORKSPACE
+    /// manifest is left untouched; the caller (`retread solve`'s
+    /// `driver.rs` / `retread lock`'s `lock.rs`) is responsible for
+    /// actually writing this into the PACK manifest's
+    /// `[package.build.config.retread-overrides]` table (via
+    /// `crate::pack_overrides::write_override`) -- kept out of `repair()`
+    /// itself so a `--dry-run` repair (which only ever mutates a throwaway
+    /// `ManifestEditor`) never side-effects a real pack file.
+    pub pack_override: Option<PackOverrideWrite>,
+}
+
+/// One pending pack-manifest `retread-overrides` write a repair wants
+/// persisted. See [`RepairOutcome::pack_override`].
+#[derive(Debug, Clone)]
+pub struct PackOverrideWrite {
+    /// The bundle/pack name (as the uv-closure conflict reported it).
+    pub bundle: String,
+    /// Absolute path to the pack's `pixi.toml` the override is written to.
+    pub pack_pixi: PathBuf,
+    /// PyPI package name the override applies to (e.g. `"torch"`).
+    pub package: String,
+    /// Conda-style spec written verbatim (e.g. `"==2.10.0"`).
+    pub spec: String,
 }
 
 impl RepairPlanner {
@@ -432,7 +457,9 @@ impl RepairPlanner {
     /// attribution-chain walk (bug: conflict misattributed to a leaf
     /// package with no user pin) and feature-scoped repair placement
     /// (bug: edits always landing in `default` instead of the consuming
-    /// feature/pack that actually declares the pin).
+    /// feature/pack that actually declares the pin). Used only on the
+    /// WORKSPACE (non-pack) path; backend-closure conflicts resolve their
+    /// override version via [`Self::resolve_pack_override`] instead.
     fn resolve_conda_pin_owner(
         &self,
         editor: &ManifestEditor,
@@ -447,6 +474,54 @@ impl RepairPlanner {
             }
             if let Some(name) = self.resolve_conda_pin_name_in(editor, &feature, package) {
                 return Some((feature, name));
+            }
+        }
+        None
+    }
+
+    /// Fix #20: resolve the exact override version for a BACKEND-closure
+    /// conflict from the CONSUMING env's conda deps, scoped to the failing
+    /// `pack_name`. Walks candidate packages (the conflict's own package
+    /// first, then its `requiring_chain` outward -- e.g. cuda-bindings
+    /// footer -> torch -> ...), mapping each pypi name to its conda name
+    /// family (name map + `-gpu`/`-cpu` variants) and looking it up in
+    /// `WorkspaceManifest::consuming_env_dependencies(pack)` -- the exact
+    /// env-scoped, sentinel-AGNOSTIC dep map fix 6f9524a already exposes.
+    ///
+    /// Two things this gets right that the old workspace `resolve_conda_
+    /// pin_owner` scan got wrong (override20 brief ACCEPTANCE RUN #6b):
+    /// (defect 2) it is scoped to the consuming env, so an unrelated
+    /// feature's pin (e.g. `feature.holosoma`, not in `isaaclab-gpu-latest`)
+    /// is never matched; and it reads the RAW dep spec, so the consuming
+    /// env's own `# retread:pin`-sentineled torch-family pins (in
+    /// `feature.gpu`) ARE the source of truth -- exactly the conda pins the
+    /// owner policy says to relax the pypi side onto. Returns
+    /// `(pypi_package, exact_version)` for the first untried candidate with
+    /// an exact `==X` consuming-env pin, or `None`.
+    fn resolve_pack_override(
+        &self,
+        editor: &ManifestEditor,
+        tried: &TriedState,
+        conflict_package: &str,
+        requiring_chain: &[String],
+        pack_name: &str,
+    ) -> Option<(String, String)> {
+        let ws = crate::workspace::WorkspaceManifest::load(editor.project_dir())?;
+        let pack_dir = resolve_pack_dir(&ws, editor.project_dir(), pack_name)?;
+        let deps = ws.consuming_env_dependencies(editor.project_dir(), &pack_dir);
+
+        let mut candidates: Vec<&str> = vec![conflict_package];
+        candidates.extend(requiring_chain.iter().map(String::as_str));
+        for pkg in candidates {
+            if tried.has(pkg, Strategy::PypiOverride) || is_abi_anchor(pkg) {
+                continue;
+            }
+            for conda_name in conda_name_family(pkg, &self.conda_name_map) {
+                if let Some(specs) = deps.get(&conda_name)
+                    && let Some(version) = exact_pin_version(specs)
+                {
+                    return Some((pkg.to_string(), version));
+                }
             }
         }
         None
@@ -521,6 +596,7 @@ impl RepairPlanner {
                 floor,
                 conda_version,
                 requiring_chain,
+                ..
             } => {
                 let target = PinTarget {
                     package,
@@ -549,13 +625,35 @@ impl RepairPlanner {
         requiring_chain: &[String],
     ) -> std::result::Result<RepairOutcome, String> {
         let package = target.package;
+        let pack_name = match target.conflict {
+            Conflict::CondaWidenNeeded { pack_name, .. } => pack_name.clone(),
+            _ => None,
+        };
+
+        // Fix #20: a BACKEND uv-closure conflict (`pack_name: Some`) is
+        // resolved on its own path -- the override version is derived from
+        // the CONSUMING env's conda deps (env-scoped + sentinel-agnostic;
+        // defect 2) and WRITTEN to the pack's own retread-overrides table
+        // (the only table the pack's closure reads; defect 1). The
+        // workspace `resolve_conda_pin_owner` scan below is NOT used for
+        // this class -- it matched an unrelated feature's pin and wrote a
+        // table the closure never reads (ACCEPTANCE RUN #6b).
+        if self.relax_preference == RelaxPreference::Conda
+            && let Some(bundle) = &pack_name
+            && let Some((pkg, version)) =
+                self.resolve_pack_override(editor, tried, package, requiring_chain, bundle)
+            && let Some(out) = self.try_pack_override(tried, target, &pkg, &version, bundle, editor)
+        {
+            return Ok(out);
+        }
+
         // Resolve which conda-table name (and feature) actually carries the
         // user's pin -- may differ from the pypi `package` name (e.g. pypi
         // `torch` pinned via conda `pytorch-gpu`) and from the feature the
         // planner was constructed for (e.g. `retread lock`'s `default`);
         // see `resolve_conda_pin_owner`.
         let owner = self.resolve_conda_pin_owner(editor, package);
-        if self.relax_preference == RelaxPreference::Conda {
+        if self.relax_preference == RelaxPreference::Conda && pack_name.is_none() {
             if let Some((feature, _name)) = owner.clone() {
                 if !tried.has(package, Strategy::PypiOverride)
                     && let Some(out) = self.try_pypi_override_in_feature(
@@ -625,9 +723,77 @@ impl RepairPlanner {
         result
     }
 
+    /// Fix #20 (defect 1): emit a [`PackOverrideWrite`] for a
+    /// backend-closure conflict -- the override is written to the failing
+    /// PACK's own `[package.build.config.retread-overrides]` table (the
+    /// only override table the pack's uv closure consumes; a workspace
+    /// `pypi-options.dependency-overrides` write is inert here, see
+    /// override20 brief ACCEPTANCE RUN #6b). No manifest is touched by
+    /// `repair()` itself; the caller performs the pack write, so
+    /// `--dry-run` stays side-effect-free. `pkg`/`version` come from
+    /// [`Self::resolve_pack_override`] (consuming-env, sentinel-agnostic).
+    fn try_pack_override(
+        &mut self,
+        tried: &mut TriedState,
+        target: &PinTarget<'_>,
+        pkg: &str,
+        version: &str,
+        bundle: &str,
+        editor: &ManifestEditor,
+    ) -> Option<RepairOutcome> {
+        if is_abi_anchor(pkg) {
+            return None;
+        }
+        // Oscillation guard shares the planner-run set with the other tiers.
+        if self
+            .guard_oscillation(pkg, version, Strategy::PypiOverride)
+            .is_err()
+        {
+            return None;
+        }
+        let pack_pixi = crate::workspace::WorkspaceManifest::load(editor.project_dir())
+            .and_then(|ws| resolve_pack_dir(&ws, editor.project_dir(), bundle))
+            .map(|dir| dir.join("pixi.toml"))?;
+        tried.mark(pkg, Strategy::PypiOverride, false);
+        let new_spec = format!("=={version}");
+        // The ledger attempt is attributed to the re-attributed package
+        // (e.g. `torch`), not the footer symptom (`cuda-bindings`).
+        let attempt_target = PinTarget {
+            package: pkg,
+            version,
+            iter: target.iter,
+            conflict: target.conflict,
+        };
+        Some(RepairOutcome {
+            attempt: self.ledger_attempt(
+                &attempt_target,
+                Strategy::PypiOverride,
+                "retread",
+                AttemptDetails {
+                    old_spec: None,
+                    new_spec: Some(new_spec.clone()),
+                    ..AttemptDetails::default()
+                },
+            ),
+            extra_attempts: Vec::new(),
+            summary_line: format!(
+                "would add [{bundle} :: retread-overrides] {pkg} = \"{new_spec}\"  (tier: pypi_override; conda-as-truth; pack manifest)",
+            ),
+            applied: Vec::new(),
+            pack_override: Some(PackOverrideWrite {
+                bundle: bundle.to_string(),
+                pack_pixi,
+                package: pkg.to_string(),
+                spec: new_spec,
+            }),
+        })
+    }
+
     /// T1: relax the pypi requirement to accept the conda-provided version
     /// instead of touching the (user-owned) conda pin. The conda pin is
     /// left byte-for-byte untouched -- conda manifest is source of truth.
+    /// This is the WORKSPACE path (`pack_name: None`); backend-closure
+    /// conflicts use [`Self::try_pack_override`] instead.
     fn pypi_override_from_conda(
         &mut self,
         editor: &mut ManifestEditor,
@@ -639,6 +805,7 @@ impl RepairPlanner {
         self.guard_anchor(package)?;
         let version = strip_version_op(conda_version);
         self.guard_oscillation(package, version, Strategy::PypiOverride)?;
+
         let edit = editor.set_pypi_override_from_conda(&self.feature, package, version);
         let old_spec = edit.before.value.clone();
         tried.mark(package, Strategy::PypiOverride, false);
@@ -661,6 +828,7 @@ impl RepairPlanner {
                 version
             ),
             applied: vec![edit],
+            pack_override: None,
         })
     }
 
@@ -853,6 +1021,7 @@ impl RepairPlanner {
             extra_attempts: Vec::new(),
             summary_line,
             applied,
+            pack_override: None,
         }
     }
 
@@ -1008,6 +1177,82 @@ pub fn timestamp() -> String {
     format!("{secs}")
 }
 
+/// Resolves `pack_name` (a bundle name, e.g. `"isaac-pack-latest"`, as
+/// named by a uv-closure conflict's `computing uv closure for bundle`
+/// line -- which always matches the workspace's own path-dep name for
+/// that pack) to its source directory, by scanning the workspace
+/// manifest's path-dependency declarations (default feature first, then
+/// every named feature). `None` if nothing declares it.
+pub fn resolve_pack_dir(
+    ws: &crate::workspace::WorkspaceManifest,
+    workspace_dir: &Path,
+    pack_name: &str,
+) -> Option<PathBuf> {
+    let raw = ws
+        .path_dependencies
+        .get(pack_name)
+        .or_else(|| ws.features.values().find_map(|f| f.path_dependencies.get(pack_name)))?;
+    let candidate = PathBuf::from(raw);
+    Some(if candidate.is_absolute() {
+        candidate
+    } else {
+        workspace_dir.join(candidate)
+    })
+}
+
+/// Conda-name candidates for a pypi `pkg`, in match order: the name-map
+/// family (parselmouth-backed, e.g. `torch` -> `pytorch`/`pytorch-cpu`)
+/// plus each candidate's `-gpu`/`-cpu` meta-package variants, then the
+/// canonical name itself with the same variants. Mirrors
+/// `RepairPlanner::resolve_conda_pin_name_in`'s lookup order but yields
+/// plain names for a MAP lookup rather than checking a manifest table.
+fn conda_name_family(pkg: &str, name_map: &PypiToCondaMap) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push_with_variants = |name: &str| {
+        for candidate in variants_of(name) {
+            if !out.contains(&candidate) {
+                out.push(candidate);
+            }
+        }
+    };
+    let canon = canonical_conda_name(pkg);
+    if let Some(candidates) = name_map.get(&canon) {
+        for c in candidates {
+            push_with_variants(c);
+        }
+    }
+    push_with_variants(pkg);
+    out
+}
+
+/// A conda name plus its `-gpu`/`-cpu` accelerator meta-package variants
+/// (the name itself first). Skips double-suffixing an already-variant name.
+fn variants_of(name: &str) -> Vec<String> {
+    let mut out = vec![name.to_string()];
+    for suffix in ["-gpu", "-cpu"] {
+        if !name.ends_with(suffix) {
+            out.push(format!("{name}{suffix}"));
+        }
+    }
+    out
+}
+
+/// The exact `X` from a single `==X` spec in `specs`, or `None` if there
+/// isn't exactly one exact-equality pin (a range like `>=1,<2`, or two
+/// conflicting specs, can't be relaxed onto a single override version).
+fn exact_pin_version(specs: &[String]) -> Option<String> {
+    let exacts: Vec<&str> = specs
+        .iter()
+        .filter_map(|s| s.trim().strip_prefix("=="))
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    match exacts.as_slice() {
+        [only] => Some((*only).to_string()),
+        _ => None,
+    }
+}
+
 pub fn is_abi_anchor(name: &str) -> bool {
     ABI_ANCHOR_NAMES.contains(&name)
         || name.starts_with("__")
@@ -1127,6 +1372,7 @@ mod tests {
             floor: "3.10.3".into(),
             conda_version: "3.5.0".into(),
             requiring_chain: Vec::new(),
+            pack_name: None,
         };
         let out = planner.repair(&mut editor, &mut tried, &widen, 1).unwrap();
         assert_eq!(out.attempt.strategy, "widen-conda");
@@ -1240,6 +1486,7 @@ mod tests {
             floor: "2.11.0".into(),
             conda_version: "==2.10.0".into(),
             requiring_chain: Vec::new(),
+            pack_name: None,
         };
         let out = planner
             .repair(&mut editor, &mut tried, &conflict, 1)
@@ -1300,6 +1547,7 @@ mod tests {
             floor: "2.11.0".into(),
             conda_version: "==2.10.0".into(),
             requiring_chain: Vec::new(),
+            pack_name: None,
         };
         let out = planner
             .repair(&mut editor, &mut tried, &conflict, 1)
@@ -1339,11 +1587,149 @@ mod tests {
             floor: "3.10.3".into(),
             conda_version: "==3.5.0".into(),
             requiring_chain: Vec::new(),
+            pack_name: None,
         };
         let out = planner
             .repair(&mut editor, &mut tried, &conflict, 1)
             .unwrap();
         assert_eq!(out.attempt.strategy, "widen-conda");
+    }
+
+    #[test]
+    fn backend_closure_conflict_writes_pack_table_not_workspace() {
+        // Fix #20 (defect 1, override20 brief ACCEPTANCE RUN #6b): a
+        // `CondaWidenNeeded` conflict carrying `pack_name` came from the
+        // PACK's own uv closure inside the build backend -- a workspace
+        // `pypi-options.dependency-overrides` write is provably inert for
+        // that class (the closure never reads it). The T1 override must
+        // target the PACK's `[package.build.config.retread-overrides]`
+        // table, and the workspace manifest must stay untouched.
+        let manifest_text = "[dependencies]\ntorch = \"==2.10.0\"\n\n\
+             [feature.gpu.dependencies]\n\
+             isaac-pack-latest = { path = \"./pypi-packs/isaac-pack-latest\" }\n";
+        let path = temp_manifest(manifest_text);
+        let project_dir = path.parent().unwrap().to_path_buf();
+        let pack_dir = project_dir.join("pypi-packs/isaac-pack-latest");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        let pack_pixi = pack_dir.join("pixi.toml");
+        std::fs::write(&pack_pixi, "[package]\nname = \"isaac-pack-latest\"\nversion = \"6.0.0\"\n")
+            .unwrap();
+
+        let mut editor = ManifestEditor::open(path.clone()).unwrap();
+        let mut tried = TriedState::default();
+        let mut planner = RepairPlanner::new("default".into());
+
+        let conflict = Conflict::CondaWidenNeeded {
+            package: "torch".into(),
+            op: ">=".into(),
+            floor: "2.11.0".into(),
+            conda_version: "==2.10.0".into(),
+            requiring_chain: Vec::new(),
+            pack_name: Some("isaac-pack-latest".into()),
+        };
+        let out = planner
+            .repair(&mut editor, &mut tried, &conflict, 1)
+            .unwrap();
+        assert_eq!(out.attempt.strategy, "pypi_override");
+        assert!(
+            out.applied.is_empty(),
+            "a backend-closure override must not touch any workspace table"
+        );
+        let po = out.pack_override.expect("expected a pack-override write");
+        assert_eq!(po.bundle, "isaac-pack-latest");
+        assert_eq!(po.package, "torch");
+        assert_eq!(po.spec, "==2.10.0");
+        assert_eq!(po.pack_pixi, pack_pixi);
+
+        // Workspace manifest untouched.
+        editor.write_atomic().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), manifest_text);
+
+        // Caller (lock.rs / driver.rs) performs the write -- simulate it
+        // and confirm the override lands in the PACK's retread-overrides
+        // table, the exact table the build backend consumes.
+        crate::pack_overrides::write_override(&po.pack_pixi, &po.package, &po.spec).unwrap();
+        let pack_text = std::fs::read_to_string(&pack_pixi).unwrap();
+        assert!(pack_text.contains("torch = \"==2.10.0\"  # retread:override"));
+        let doc = pack_text.parse::<toml_edit::DocumentMut>().unwrap();
+        assert_eq!(
+            doc["package"]["build"]["config"]["retread-overrides"]["torch"]
+                .as_str()
+                .unwrap(),
+            "==2.10.0"
+        );
+    }
+
+    #[tokio::test]
+    async fn pack_override_scoped_to_consuming_env_uses_gpu_pin_not_holosoma() {
+        // Fix #20 (defect 2, override20 brief ACCEPTANCE RUN #6b): the old
+        // workspace pin-owner scan matched `feature.holosoma`'s unsentineled
+        // `pytorch-gpu ==2.10.0` -- even though `holosoma` is NOT a feature
+        // of the failing env (`isaaclab-gpu-latest`). The pack-override path
+        // resolves the version from the CONSUMING env's conda deps
+        // (`consuming_env_dependencies`), which (a) excludes holosoma
+        // entirely and (b) reads the RAW spec, so `feature.gpu`'s
+        // `# retread:pin`-sentineled `pytorch-gpu ==2.10.0` IS the source of
+        // truth (conda = truth per owner policy).
+        //
+        // To make the point unmistakable, holosoma pins a DIFFERENT version
+        // (==9.9.9): if scope leaked, the override would be 9.9.9; scoped
+        // correctly it must be gpu's 2.10.0.
+        let manifest_text = r#"[dependencies]
+
+[feature.gpu.dependencies]
+pytorch-gpu = "==2.10.0"  # retread:pin 2026-07-08 conda-boundary
+
+[feature.holosoma.dependencies]
+pytorch-gpu = "==9.9.9"
+
+[feature.isaaclab-latest.dependencies]
+isaac-pack-latest = { path = "./pypi-packs/isaac-pack-latest" }
+
+[environments]
+isaaclab-gpu-latest = { features = ["gpu", "isaaclab-latest"] }
+holosoma-gpu = { features = ["holosoma"] }
+"#;
+        let path = temp_manifest(manifest_text);
+        let project_dir = path.parent().unwrap().to_path_buf();
+        let pack_dir = project_dir.join("pypi-packs/isaac-pack-latest");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        std::fs::write(
+            pack_dir.join("pixi.toml"),
+            "[package]\nname = \"isaac-pack-latest\"\nversion = \"6.0.0\"\n",
+        )
+        .unwrap();
+        let mut editor = ManifestEditor::open(path.clone()).unwrap();
+        let mut tried = TriedState::default();
+        // Production name map so torch -> pytorch-gpu resolves (the
+        // FALLBACK_PYPI_TO_CONDA merge runs even without network).
+        let name_map = crate::handler::load_pypi_to_conda_map().await;
+        let mut planner = RepairPlanner::new("default".into()).with_conda_name_map(name_map);
+
+        // The conflict names the cuda-bindings footer; the requiring chain
+        // reaches torch (which maps to the consuming env's pytorch-gpu pin).
+        let conflict = Conflict::CondaWidenNeeded {
+            package: "cuda-bindings".into(),
+            op: ">=".into(),
+            floor: "13.0.3".into(),
+            conda_version: ">=12".into(),
+            requiring_chain: vec!["torch".into(), "isaacsim-core".into()],
+            pack_name: Some("isaac-pack-latest".into()),
+        };
+        let out = planner
+            .repair(&mut editor, &mut tried, &conflict, 1)
+            .unwrap();
+        assert_eq!(out.attempt.strategy, "pypi_override");
+        let po = out.pack_override.expect("expected a pack-override write");
+        assert_eq!(po.package, "torch");
+        assert_eq!(
+            po.spec, "==2.10.0",
+            "must use feature.gpu's consuming-env pin, NOT holosoma's ==9.9.9"
+        );
+        // Workspace manifest untouched (no edit in any feature).
+        assert!(out.applied.is_empty());
+        editor.write_atomic().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), manifest_text);
     }
 
     #[test]
@@ -1360,6 +1746,7 @@ mod tests {
             floor: "2.11.0".into(),
             conda_version: "==2.10.0".into(),
             requiring_chain: Vec::new(),
+            pack_name: None,
         };
         let out = planner
             .repair(&mut editor, &mut tried, &conflict, 1)
@@ -1402,9 +1789,21 @@ mod tests {
         // Uses the PRODUCTION map-loading path (see sibling test above for
         // why a hand-inserted map masks real data gaps -- this is the exact
         // scenario ACCEPTANCE RUN #4 hit against the live backend).
-        let path = temp_manifest(
-            "[dependencies]\n[feature.gpu.dependencies]\npytorch-gpu = \"==2.10.0\"\n",
+        let manifest_text = concat!(
+            "[dependencies]\n\n",
+            "[feature.gpu.dependencies]\n",
+            "pytorch-gpu = \"==2.10.0\"  # retread:pin\n\n",
+            "[feature.isaaclab-latest.dependencies]\n",
+            "isaac-pack-latest = { path = \"./pypi-packs/isaac-pack-latest\" }\n\n",
+            "[environments]\n",
+            "isaaclab-gpu-latest = { features = [\"gpu\", \"isaaclab-latest\"] }\n",
         );
+        let path = temp_manifest(manifest_text);
+        let project_dir = path.parent().unwrap().to_path_buf();
+        let pack_dir = project_dir.join("pypi-packs/isaac-pack-latest");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        std::fs::write(pack_dir.join("pixi.toml"), "[package]\nname = \"p\"\nversion = \"6.0\"\n")
+            .unwrap();
         let mut editor = ManifestEditor::open(path.clone()).unwrap();
         let mut tried = TriedState::default();
         let name_map = crate::handler::load_pypi_to_conda_map().await;
@@ -1416,8 +1815,7 @@ mod tests {
              (FALLBACK_PYPI_TO_CONDA entry) or this test is vacuous"
         );
         // Planner constructed for the `default` feature, exactly like
-        // `retread lock`'s LOCK_FEATURE -- the bug this closes is edits
-        // landing in `default` when the real owner is a named feature.
+        // `retread lock`'s LOCK_FEATURE.
         let mut planner = RepairPlanner::new("default".into()).with_conda_name_map(name_map);
 
         let parser = RegexConflictParser::new();
@@ -1435,19 +1833,23 @@ mod tests {
         assert_eq!(out.attempt.strategy, "pypi_override");
         assert_eq!(out.attempt.package, "torch");
         assert_eq!(out.attempt.new_spec.as_deref(), Some("==2.10.0"));
-        // The planner's own feature is untouched -- the override was
-        // routed to `feature.gpu` for the duration of the one call only.
-        assert_eq!(planner.feature, "default");
+
+        // Fix #20: this fixture is a BACKEND uv-closure conflict
+        // (`pack_name: Some("isaac-pack-latest")`), so the T1 override
+        // targets the PACK's retread-overrides table (defect 1), and the
+        // version is resolved from the CONSUMING env's `feature.gpu` pin --
+        // sentinel-agnostic, env-scoped (defect 2). Attribution (fix
+        // #16/#18: footer cuda-bindings -> requiring torch -> pytorch-gpu)
+        // is unchanged; only the write TARGET/scoping moved.
+        let po = out.pack_override.expect("expected a pack-override write");
+        assert_eq!(po.bundle, "isaac-pack-latest");
+        assert_eq!(po.package, "torch");
+        assert_eq!(po.spec, "==2.10.0");
+        assert!(out.applied.is_empty());
 
         editor.write_atomic().unwrap();
-        let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("[feature.gpu.pypi-options.dependency-overrides]"));
-        assert!(text.contains("torch = \"==2.10.0\"  # retread:override"));
-        // pytorch-gpu and cuda-bindings are byte-for-byte untouched:
-        assert!(text.contains("pytorch-gpu = \"==2.10.0\"\n"));
-        assert!(!text.contains("cuda-bindings"));
-        // No bogus edit landed in the default feature's tables.
-        assert!(!text.contains("[pypi-options.dependency-overrides]"));
+        // The workspace manifest is byte-for-byte untouched.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), manifest_text);
     }
 
     // ---- Fix #19 acceptance fixture (lock-succ-brief.md ACCEPTANCE RUN
@@ -1466,9 +1868,22 @@ mod tests {
 
     #[tokio::test]
     async fn conda_widen_needed_continues_chain_walk_past_tried_package_to_sibling_pin_owner() {
-        let path = temp_manifest(
-            "[dependencies]\n[feature.gpu.dependencies]\npytorch-gpu = \"==2.10.0\"\ntorchvision = \"==0.25.0\"\n",
+        let manifest_text = concat!(
+            "[dependencies]\n\n",
+            "[feature.gpu.dependencies]\n",
+            "pytorch-gpu = \"==2.10.0\"  # retread:pin\n",
+            "torchvision = \"==0.25.0\"  # retread:pin\n\n",
+            "[feature.isaaclab-latest.dependencies]\n",
+            "isaac-pack-latest = { path = \"./pypi-packs/isaac-pack-latest\" }\n\n",
+            "[environments]\n",
+            "isaaclab-gpu-latest = { features = [\"gpu\", \"isaaclab-latest\"] }\n",
         );
+        let path = temp_manifest(manifest_text);
+        let project_dir = path.parent().unwrap().to_path_buf();
+        let pack_dir = project_dir.join("pypi-packs/isaac-pack-latest");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        std::fs::write(pack_dir.join("pixi.toml"), "[package]\nname = \"p\"\nversion = \"6.0\"\n")
+            .unwrap();
         let mut editor = ManifestEditor::open(path.clone()).unwrap();
         let mut tried = TriedState::default();
         // Iter 1 already tried (and applied) a `torch` pypi_override --
@@ -1506,10 +1921,21 @@ mod tests {
         assert_eq!(out.attempt.package, "torchvision");
         assert_eq!(out.attempt.new_spec.as_deref(), Some("==0.25.0"));
 
+        // Fix #20: backend-closure conflict -> the chain-walked torchvision
+        // override targets the PACK's retread-overrides table (defect 1),
+        // versioned from the consuming env's `feature.gpu` torchvision pin
+        // (defect 2). The fix #19 chain walk (skip already-tried torch,
+        // continue to the sibling torchvision) is what's under test and is
+        // unchanged: resolve_pack_override's candidate loop skips torch
+        // (tried) and stops at torchvision.
+        let po = out.pack_override.expect("expected a pack-override write");
+        assert_eq!(po.bundle, "isaac-pack-latest");
+        assert_eq!(po.package, "torchvision");
+        assert_eq!(po.spec, "==0.25.0");
+        assert!(out.applied.is_empty());
+
         editor.write_atomic().unwrap();
-        let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("[feature.gpu.pypi-options.dependency-overrides]"));
-        assert!(text.contains("torchvision = \"==0.25.0\"  # retread:override"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), manifest_text);
         // torch's tried-state stayed marked -- no second torch attempt.
         assert!(tried.has("torch", Strategy::PypiOverride));
     }

@@ -14,6 +14,7 @@ pub mod glibc;
 pub mod handler;
 pub mod installer;
 pub mod lock;
+pub mod pack_overrides;
 pub mod probe;
 pub mod pypi;
 pub mod recipe;

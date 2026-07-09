@@ -24,6 +24,16 @@ pub enum Conflict {
         /// Lets repair re-attribute a conflict to a package with a real
         /// user conda pin when the footer package has none of its own.
         requiring_chain: Vec<String>,
+        /// Fix #20: the pack/bundle name this conflict was raised inside
+        /// (`computing uv closure for bundle `<name>`:`), when the
+        /// conflict came from a backend uv-closure JSON-RPC error --
+        /// `None` for the older direct conda-solver prose shapes (which
+        /// aren't scoped to any one pack's closure). Doubles as the
+        /// provenance signal: `Some` means "this is a backend-closure
+        /// conflict", so repair must write any auto-override into the
+        /// `.retread/overrides.json` ledger keyed by this bundle instead
+        /// of a workspace manifest table the closure never reads.
+        pack_name: Option<String>,
     },
 }
 
@@ -70,6 +80,12 @@ pub struct RegexConflictParser {
     // these from the conda-provenance footer package outward to find the
     // package that actually carries a user conda pin (attribution fix).
     requiring_chain: Regex,
+    // Fix #20: the pack/bundle name a uv-closure conflict was raised
+    // inside ("computing uv closure for bundle `X`:"), always present in
+    // the backend's ErrorObject message ahead of the resolver prose.
+    // Lets repair find (and write auto-overrides into) THIS pack's own
+    // `.retread/overrides.json` ledger entry instead of guessing.
+    uv_closure_bundle: Regex,
     // Direct (non-JSON-RPC) conda-solver prose for a resolvo-style
     // incompatible-range report (e.g. newer pixi's "cannot be installed
     // because there are no viable options" / "would require" phrasing),
@@ -116,6 +132,8 @@ impl RegexConflictParser {
                 r"(?i)because ([a-zA-Z0-9_.\[\]-]+)==[0-9a-zA-Z.]+ depends on ([a-zA-Z0-9_.\[\]-]+)",
             )
             .expect("valid requiring-chain regex"),
+            uv_closure_bundle: Regex::new(r"computing uv closure for bundle `([^`]+)`")
+                .expect("valid uv-closure-bundle regex"),
             conda_incompatible: Regex::new(
                 r"(?s)([a-zA-Z0-9_-]+)\s*(<|<=)\s*([0-9][0-9a-zA-Z.]*)[\s│├╰└─▶]+cannot be installed[\s│├╰└─▶]+because there are no viable options",
             )
@@ -146,6 +164,10 @@ impl RegexConflictParser {
     /// backend's other JSON-RPC errors that aren't resolver conflicts at
     /// all, like "package X has no wheels in the exported closure").
     fn parse_uv_closure_message(&self, msg: &str) -> Option<Conflict> {
+        let pack_name = self
+            .uv_closure_bundle
+            .captures(msg)
+            .map(|c| c[1].to_string());
         if let Some(caps) = self.conda_provenance.captures(msg) {
             let package = caps[1].to_string();
             let conda_op = caps[2].to_string();
@@ -170,6 +192,7 @@ impl RegexConflictParser {
                 floor,
                 conda_version: format!("{conda_op}{conda_floor}"),
                 requiring_chain,
+                pack_name,
             });
         }
 
@@ -262,6 +285,7 @@ impl RegexConflictParser {
             floor: rcaps[2].to_string(),
             conda_version: format!("{conda_op}{conda_version}"),
             requiring_chain: Vec::new(),
+            pack_name: None,
         })
     }
 
@@ -326,6 +350,7 @@ impl ConflictParser for RegexConflictParser {
                 floor: caps[2].to_string(),
                 conda_version,
                 requiring_chain: Vec::new(),
+            pack_name: None,
             });
         }
 
@@ -340,6 +365,7 @@ impl ConflictParser for RegexConflictParser {
                 floor: caps[2].to_string(),
                 conda_version,
                 requiring_chain: Vec::new(),
+            pack_name: None,
             });
         }
 
@@ -473,6 +499,7 @@ mod tests {
                 floor: "3.10.3".into(),
                 conda_version: "3.5.0".into(),
                 requiring_chain: Vec::new(),
+            pack_name: None,
             })
         );
         assert_eq!(
@@ -483,6 +510,7 @@ mod tests {
                 floor: "2.10.3".into(),
                 conda_version: "2.9.0".into(),
                 requiring_chain: Vec::new(),
+            pack_name: None,
             })
         );
     }
@@ -520,6 +548,7 @@ mod tests {
                     "isaacsim-core".into(),
                     "isaacsim[all]".into(),
                 ],
+                pack_name: Some("isaac-pack-latest".into()),
             })
         );
         // Real log sample (solve-hover-gpu.log distilled): a uv-closure
@@ -551,6 +580,7 @@ mod tests {
                     "isaacsim-core".into(),
                     "isaacsim[all]".into(),
                 ],
+                pack_name: Some("isaac-pack-latest".into()),
             })
         );
     }
@@ -570,6 +600,7 @@ mod tests {
                 floor: "2".into(),
                 conda_version: "<2".into(),
                 requiring_chain: Vec::new(),
+            pack_name: None,
             })
         );
     }
