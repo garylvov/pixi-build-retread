@@ -448,21 +448,16 @@ async fn clone_and_checkout(clone_dir: &Path, url: &str, rev: &str) -> Result<()
 /// `lock drift` (the filename/version in the lock changes every day
 /// even though the inputs have not changed). To fix this the upstream
 /// project must tag a release or set `SETUPTOOLS_SCM_PRETEND_VERSION`.
-pub async fn build_wheel_from_git(
-    url: &str,
-    rev: &str,
-    subdirectory: &str,
-    cache_dir: &Path,
-    out_dir: &Path,
-    python_version: &str,
-) -> Result<(PathBuf, String)> {
-    // NOTE on the shared cross-pack wheel cache: the lookup deliberately
-    // happens AFTER clone+checkout (below), not here. Callers derive
-    // `source_root` from the checkout for the auto-data inject phase, so the
-    // clone must exist even on a cache hit. The clone is machine-shared per
-    // (url, rev) and a no-op when warm; the cache only needs to skip the
-    // expensive per-pack `uv build`.
-
+/// Ensure a git clone of `url` at `rev` exists (and is checked out) under
+/// `cache_dir`, guarded by a per-(url, rev) exclusive file lock so
+/// concurrent resolvers don't race on the same working tree. Returns the
+/// clone directory (the repo root, not a subdirectory).
+///
+/// Extracted out of `build_wheel_from_git` (which used to inline this)
+/// so callers that just need file contents out of a pinned git rev --
+/// not a built wheel, e.g. `deps_from::fetch_dep_source` -- can reuse the
+/// exact same clone + locking dance instead of re-implementing it.
+pub(crate) async fn ensure_git_checkout(url: &str, rev: &str, cache_dir: &Path) -> Result<PathBuf> {
     // Delegate to git_checkout_root so the layout stays in sync. (Was
     // duplicated here before v0.13.3 -- update both or the resolver
     // half stops finding the cached clone the cloner half just made.)
@@ -551,13 +546,31 @@ pub async fn build_wheel_from_git(
     }
 
     // Release the lock now that the clone_dir holds a complete checkout;
-    // the remaining work (reading subdirectory, `git rev-parse`, building
-    // the wheel) only reads the tree and is safe to run concurrently with
-    // other entries once the checkout itself is settled.
+    // remaining reads of the tree are safe to run concurrently with other
+    // entries once the checkout itself is settled.
     tokio::task::spawn_blocking(move || fs4::fs_std::FileExt::unlock(&lock_file))
         .await
         .context("git-clone unlock task panicked")?
         .with_context(|| format!("unlocking git-clone lock file {}", lock_path.display()))?;
+
+    Ok(clone_dir)
+}
+
+pub async fn build_wheel_from_git(
+    url: &str,
+    rev: &str,
+    subdirectory: &str,
+    cache_dir: &Path,
+    out_dir: &Path,
+    python_version: &str,
+) -> Result<(PathBuf, String)> {
+    // NOTE on the shared cross-pack wheel cache: the lookup deliberately
+    // happens AFTER clone+checkout (below), not here. Callers derive
+    // `source_root` from the checkout for the auto-data inject phase, so the
+    // clone must exist even on a cache hit. The clone is machine-shared per
+    // (url, rev) and a no-op when warm; the cache only needs to skip the
+    // expensive per-pack `uv build`.
+    let clone_dir = ensure_git_checkout(url, rev, cache_dir).await?;
 
     let source_dir = clone_dir.join(subdirectory);
     if !source_dir.exists() {

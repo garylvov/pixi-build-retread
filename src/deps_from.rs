@@ -1,11 +1,19 @@
 //! Dependency-file parser: turns a requirements.txt or PEP 621 pyproject.toml
 //! into a flat list of PEP 508 requirement strings.
 //!
-//! This module is intentionally standalone: it does no relaxation, no
-//! resolution, no filesystem I/O beyond what the caller hands it as a
-//! string. It just parses.
+//! The parser (`parse_dep_source`) is intentionally standalone: it does no
+//! relaxation, no resolution, no filesystem I/O beyond what the caller hands
+//! it as a string. It just parses.
+//!
+//! The fetcher (`fetch_dep_source`) below is the layer that gets a
+//! `deps_from`-style source spec (local path / raw URL / git@rev) down to
+//! file text, so a caller can pipe the result straight into
+//! `parse_dep_source`. It does no wiring into config/handler/uv_closure --
+//! that's a separate piece.
 
-use anyhow::{bail, Result};
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result, bail};
 
 /// Parse a dependency source file's content into a Vec of PEP 508
 /// requirement strings.
@@ -126,6 +134,140 @@ fn parse_pyproject(content: &str) -> Result<Vec<String>> {
     Ok(Vec::new())
 }
 
+/// A resolved dependency-source spec, i.e. "where does the requirements.txt
+/// / pyproject.toml text come from."
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DepSource {
+    /// A file living inside the workspace, given as a path relative to
+    /// `workspace_root` (or absolute).
+    Local(PathBuf),
+    /// A raw HTTP(S) URL serving the file directly (e.g. a
+    /// raw.githubusercontent.com blob link).
+    Url(String),
+    /// A path inside a git repo, pinned to a specific rev (commit SHA, tag,
+    /// or branch name -- see the "Determinism" note below for why a
+    /// resolved SHA is preferred).
+    Git {
+        git: String,
+        rev: String,
+        path: String,
+    },
+}
+
+/// Resolve a `DepSource` to file text, ready to hand to `parse_dep_source`.
+///
+/// Returns `(file_content, filename_hint)`: `filename_hint` is the file's
+/// base name (e.g. `"requirements_isaaclab.txt"`), which is exactly what
+/// `parse_dep_source`'s `filename_hint` parameter wants for format sniffing.
+///
+/// - `DepSource::Local(path)`: `path` is resolved relative to
+///   `workspace_root` (an absolute `path` is used as-is), then read.
+/// - `DepSource::Git { git, rev, path }`: reuses
+///   `source_build::ensure_git_checkout`, the same clone + per-(url, rev)
+///   flock dance `build_wheel_from_git` uses, so concurrent resolvers don't
+///   race on the same on-disk clone and repeated calls for the same (git,
+///   rev) are a cheap no-op. `rev` should be a pinned commit SHA for
+///   reproducibility (a moving branch/tag ref means the fetched content can
+///   change between calls); this function does not itself resolve a moving
+///   ref to a SHA.
+/// - `DepSource::Url(u)`: plain HTTP GET via `reqwest` (same client
+///   `wheel::fetch_wheel` / `pypi` use), cached under `cache_dir` keyed by a
+///   hash of the URL so repeated calls don't re-fetch.
+pub async fn fetch_dep_source(
+    src: &DepSource,
+    workspace_root: &Path,
+    cache_dir: &Path,
+) -> Result<(String, String)> {
+    match src {
+        DepSource::Local(path) => {
+            let resolved = if path.is_absolute() {
+                path.clone()
+            } else {
+                workspace_root.join(path)
+            };
+            let content = tokio::fs::read_to_string(&resolved)
+                .await
+                .with_context(|| format!("reading local dep source {}", resolved.display()))?;
+            let hint = filename_of(&resolved)?;
+            Ok((content, hint))
+        }
+        DepSource::Git { git, rev, path } => {
+            let clone_dir = crate::source_build::ensure_git_checkout(git, rev, cache_dir)
+                .await
+                .with_context(|| format!("cloning {git}@{rev} for dep source {path}"))?;
+            let file_path = clone_dir.join(path);
+            let content = tokio::fs::read_to_string(&file_path)
+                .await
+                .with_context(|| {
+                    format!(
+                        "reading {path} from git clone of {git}@{rev} (at {})",
+                        file_path.display()
+                    )
+                })?;
+            let hint = filename_of(Path::new(path))?;
+            Ok((content, hint))
+        }
+        DepSource::Url(u) => {
+            let content = fetch_url_cached(u, cache_dir).await?;
+            let parsed =
+                url::Url::parse(u).with_context(|| format!("parsing dep source URL {u}"))?;
+            let hint = parsed
+                .path_segments()
+                .and_then(|mut s| s.next_back())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .ok_or_else(|| anyhow::anyhow!("URL has no filename component: {u}"))?;
+            Ok((content, hint))
+        }
+    }
+}
+
+/// GET `url`, caching the response body under `cache_dir` keyed by a
+/// sha256 hash of the URL string (the same style of cache key
+/// `source_build::git_checkout_root` uses for git clones). Cache hits skip
+/// the network entirely.
+async fn fetch_url_cached(url: &str, cache_dir: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(url.as_bytes());
+    let digest = hasher.finalize();
+    let hash: String = digest.iter().take(12).map(|b| format!("{b:02x}")).collect();
+
+    let dir = cache_dir.join("retread-dep-source-urls");
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .with_context(|| format!("creating dep-source URL cache dir {}", dir.display()))?;
+    let cached_path = dir.join(&hash);
+
+    if let Ok(cached) = tokio::fs::read_to_string(&cached_path).await {
+        return Ok(cached);
+    }
+
+    let body = reqwest::get(url)
+        .await
+        .with_context(|| format!("GET {url}"))?
+        .error_for_status()
+        .with_context(|| format!("HTTP error for {url}"))?
+        .text()
+        .await
+        .with_context(|| format!("reading body of {url}"))?;
+
+    tokio::fs::write(&cached_path, &body)
+        .await
+        .with_context(|| format!("caching dep source URL body at {}", cached_path.display()))?;
+
+    Ok(body)
+}
+
+/// Extract a file's base name as a `String` for use as `parse_dep_source`'s
+/// `filename_hint`.
+fn filename_of(path: &Path) -> Result<String> {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("path has no valid filename component: {}", path.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,8 +354,14 @@ dev = ["pytest>=7.0"]
 
     #[test]
     fn empty_content_yields_empty_vec() {
-        assert_eq!(parse_dep_source("", "requirements.txt").unwrap(), Vec::<String>::new());
-        assert_eq!(parse_dep_source("", "pyproject.toml").unwrap(), Vec::<String>::new());
+        assert_eq!(
+            parse_dep_source("", "requirements.txt").unwrap(),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            parse_dep_source("", "pyproject.toml").unwrap(),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
@@ -228,5 +376,148 @@ requests = "^2.28"
 "#;
         let err = parse_dep_source(content, "pyproject.toml").unwrap_err();
         assert!(err.to_string().contains("poetry format not supported"));
+    }
+
+    // --- fetch_dep_source ---------------------------------------------
+
+    /// Uses only std (no tempfile crate dependency), matching the
+    /// convention in `handler::replay_tests` -- a unique subdir of
+    /// `std::env::temp_dir()` per test call.
+    fn unique_tmp_dir(tag: &str) -> PathBuf {
+        let base = std::env::temp_dir();
+        let unique = format!(
+            "retread-deps-from-test-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let dir = base.join(unique);
+        std::fs::create_dir_all(&dir).expect("tmp dir creation should not fail");
+        dir
+    }
+
+    /// Local path + parse pipeline end-to-end: no network needed.
+    #[tokio::test]
+    async fn fetch_local_round_trips_through_parse() {
+        let workspace = unique_tmp_dir("local-roundtrip");
+        std::fs::write(
+            workspace.join("requirements_isaaclab.txt"),
+            PROTOMOTIONS_REQUIREMENTS,
+        )
+        .expect("write temp requirements.txt");
+
+        let src = DepSource::Local(PathBuf::from("requirements_isaaclab.txt"));
+        let cache_dir = workspace.join("cache"); // unused by Local, but must be a valid Path
+        let (content, hint) = fetch_dep_source(&src, &workspace, &cache_dir)
+            .await
+            .expect("fetch_dep_source(Local) should succeed");
+
+        assert_eq!(hint, "requirements_isaaclab.txt");
+        assert_eq!(content, PROTOMOTIONS_REQUIREMENTS);
+
+        let parsed = parse_dep_source(&content, &hint).expect("parse should succeed");
+        assert_eq!(
+            parsed,
+            vec![
+                "tensordict==0.9.0".to_string(),
+                "lightning".to_string(),
+                "rtree==1.2.0".to_string(),
+                "typer>=0.6.1".to_string(),
+                "pkg[cli]>=1.9.4".to_string(),
+            ]
+        );
+
+        std::fs::remove_dir_all(workspace).ok();
+    }
+
+    /// Local path given as absolute is used as-is (not joined onto
+    /// workspace_root).
+    #[tokio::test]
+    async fn fetch_local_absolute_path_ignores_workspace_root() {
+        let dir = unique_tmp_dir("local-absolute-file");
+        let file = dir.join("pyproject.toml");
+        std::fs::write(&file, SAGE_PYPROJECT).expect("write temp pyproject.toml");
+
+        let other_workspace = unique_tmp_dir("local-absolute-workspace");
+        let src = DepSource::Local(file.clone());
+        let (content, hint) = fetch_dep_source(&src, &other_workspace, &other_workspace)
+            .await
+            .expect("fetch_dep_source(Local, absolute) should succeed");
+
+        assert_eq!(hint, "pyproject.toml");
+        assert_eq!(content, SAGE_PYPROJECT);
+
+        std::fs::remove_dir_all(dir).ok();
+        std::fs::remove_dir_all(other_workspace).ok();
+    }
+
+    /// Missing local file surfaces a readable error rather than panicking.
+    #[tokio::test]
+    async fn fetch_local_missing_file_errors() {
+        let workspace = unique_tmp_dir("local-missing");
+        let src = DepSource::Local(PathBuf::from("does_not_exist.txt"));
+        let err = fetch_dep_source(&src, &workspace, &workspace)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("does_not_exist.txt"));
+
+        std::fs::remove_dir_all(workspace).ok();
+    }
+
+    /// Live network: fetch ProtoMotions' requirements_isaaclab.txt straight
+    /// off raw.githubusercontent.com at a pinned commit. Ignored by default
+    /// (`cargo test deps_from` does not need network); run explicitly with
+    /// `cargo test deps_from -- --ignored`.
+    #[tokio::test]
+    #[ignore = "hits raw.githubusercontent.com; run with --ignored"]
+    async fn fetch_url_live_protomotions_requirements() {
+        let cache_dir = unique_tmp_dir("url-live-cache");
+        let workspace = unique_tmp_dir("url-live-workspace");
+        let src = DepSource::Url(
+            "https://raw.githubusercontent.com/NVlabs/ProtoMotions/main/requirements_isaaclab.txt"
+                .to_string(),
+        );
+        let (content, hint) = fetch_dep_source(&src, &workspace, &cache_dir)
+            .await
+            .expect("fetch_dep_source(Url) should succeed");
+        assert_eq!(hint, "requirements_isaaclab.txt");
+        assert!(!content.is_empty());
+        parse_dep_source(&content, &hint).expect("parse should succeed");
+
+        // Second call should hit the on-disk cache (same URL hash), not
+        // the network -- exercised implicitly by not erroring/timing out.
+        let (content2, _) = fetch_dep_source(&src, &workspace, &cache_dir)
+            .await
+            .expect("cached fetch_dep_source(Url) should succeed");
+        assert_eq!(content, content2);
+
+        std::fs::remove_dir_all(cache_dir).ok();
+        std::fs::remove_dir_all(workspace).ok();
+    }
+
+    /// Live network: clone ProtoMotions at a pinned rev and read
+    /// requirements_isaaclab.txt out of the checkout via the reused
+    /// `source_build::ensure_git_checkout` helper.
+    #[tokio::test]
+    #[ignore = "clones github.com/NVlabs/ProtoMotions; run with --ignored"]
+    async fn fetch_git_live_protomotions_requirements() {
+        let cache_dir = unique_tmp_dir("git-live-cache");
+        let workspace = unique_tmp_dir("git-live-workspace");
+        let src = DepSource::Git {
+            git: "https://github.com/NVlabs/ProtoMotions".to_string(),
+            rev: "main".to_string(),
+            path: "requirements_isaaclab.txt".to_string(),
+        };
+        let (content, hint) = fetch_dep_source(&src, &workspace, &cache_dir)
+            .await
+            .expect("fetch_dep_source(Git) should succeed");
+        assert_eq!(hint, "requirements_isaaclab.txt");
+        assert!(!content.is_empty());
+        parse_dep_source(&content, &hint).expect("parse should succeed");
+
+        std::fs::remove_dir_all(cache_dir).ok();
+        std::fs::remove_dir_all(workspace).ok();
     }
 }
