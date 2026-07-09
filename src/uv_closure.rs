@@ -891,24 +891,45 @@ pub fn sdist_build_failed_message(failures: &[(String, String)]) -> String {
 ///    exact-version auto-route round, there is no resolved pypi version
 ///    to probe AT — uv never produced a closure). A hit routes the
 ///    package to conda via the same mechanism as an ordinary auto-route
-///    hit (exclude from the closure + pin/range on the conda-resolved
-///    version).
-/// 2. **sdist auto-build** (new): on a conda miss, when `sdist_build` is
-///    `Some` (config `sdist-build = "auto"`, the default), the package
-///    is built from its PyPI sdist via `sdist_build` — the SAME
-///    machinery git-sourced `[retread-wheels]` entries use
+///    hit (exclude from the closure at `uv export` time + pin/range on
+///    the conda-resolved version). **This alone can never satisfy `uv
+///    lock`**: `--no-emit-package` is an `export`-only flag
+///    (`compute_closure` never passes `req.no_emit_packages` to the
+///    `lock` subcommand), so a package with zero usable PyPI wheels in
+///    its required range fails `uv lock` identically whether or not it
+///    is conda-routed. Rung 1 exists purely to keep the routed package
+///    out of the final exported closure (conda already provides it) —
+///    it is NOT an alternative to rung 2, it runs alongside it.
+/// 2. **sdist auto-build**: attempted for EVERY named package this
+///    round — including ones rung 1 just routed or routed in an earlier
+///    round — when `sdist_build` is `Some` (config `sdist-build =
+///    "auto"`, the default). The package is built from its PyPI sdist
+///    via `sdist_build` — the SAME machinery git-sourced
+///    `[retread-wheels]` entries use
 ///    (`crate::source_build::build_wheel_from_sdist_url`), cached/stored
 ///    content-addressed. A success registers a `tool.uv.sources` path
 ///    source (`req.built_wheel_sources`) so the re-solve is satisfied
-///    exactly like a real index wheel, and records a
-///    [`BuiltSdistWheel`] for the caller to splice into the final
-///    closure's `wheels` with full provenance.
-/// 3. **error**: only when conda-route misses AND (the build rung is
-///    disabled, i.e. `sdist_build` is `None` / `sdist-build = "never"`,
-///    OR the build itself fails) does the original uv error surface,
-///    verbatim, with guidance appended
-///    ([`sdist_only_no_route_message`] / [`sdist_build_failed_message`]).
-///    It never silently drops a dependency.
+///    exactly like a real index wheel — this is what actually clears
+///    `uv lock`, whether or not the package was also conda-routed — and
+///    records a [`BuiltSdistWheel`] for the caller to splice into the
+///    final closure's `wheels` with full provenance (harmless if the
+///    package is ALSO conda-routed: `no_emit_packages` still drops it
+///    from the exported closure, so conda's copy is what ships).
+/// 3. **error**: when the build rung is disabled (`sdist_build` is
+///    `None` / `sdist-build = "never"`) or the build itself fails, the
+///    original uv error surfaces verbatim, with guidance appended
+///    ([`sdist_only_no_route_message`] for names with no conda route /
+///    a routed-but-build-disabled note for names that do /
+///    [`sdist_build_failed_message`] on a build failure). It never
+///    silently drops a dependency.
+///
+/// A name is considered fully "healed" (dropped from later rounds'
+/// `names`) only once rung 2 has actually BUILT a wheel for it — a
+/// rung-1-only route is never sufficient (see point 1 above), so a name
+/// that keeps recurring in uv's error after being routed keeps climbing
+/// to rung 2 rather than being treated as already handled (deps-from
+/// proof run 6: an earlier revision filtered on "routed OR built" and
+/// let a rung-1 hit permanently mask the still-failing `uv lock`).
 ///
 /// Bounded by [`AUTO_ROUTE_MAX_ROUNDS`] heal attempts, mirroring the
 /// auto-route round cap; every attempt that doesn't abort or succeed
@@ -978,25 +999,45 @@ where
                     Ok(closure) => return Ok(closure),
                     Err(e) => {
                         let msg = format!("{e:#}");
-                        let already: std::collections::BTreeSet<String> = {
-                            let r = routed.lock().unwrap();
+                        // A name is fully exhausted only once a wheel has
+                        // actually been BUILT for it (rung 2 success).
+                        // Conda-routing (rung 1) alone can NEVER satisfy
+                        // `uv lock` for this error class: `--no-emit-
+                        // package` only reaches the later `uv export`
+                        // step (see the module doc + `compute_closure`),
+                        // so a package pinned to a conda-resolved version
+                        // that itself has zero usable PyPI wheels fails
+                        // `uv lock` identically, whether or not it is
+                        // routed. Filtering `names` on `routed` too (as
+                        // an earlier revision did) let a rung-1 hit mask
+                        // the fact that rung 2 was never reached, then
+                        // treated the IDENTICAL failure recurring next
+                        // round as "already handled" and surfaced it
+                        // verbatim (deps-from proof run 6: antlr4-python3-
+                        // runtime==4.9.3, conda-routed, `uv lock` still
+                        // failed on it every round after).
+                        let already_built: std::collections::BTreeSet<String> = {
                             let b = built.lock().unwrap();
-                            r.iter()
-                                .map(|r| r.pypi_name.clone())
-                                .chain(b.iter().map(|w| w.pypi_name.clone()))
-                                .collect()
+                            b.iter().map(|w| w.pypi_name.clone()).collect()
+                        };
+                        let already_routed: std::collections::BTreeSet<String> = {
+                            let r = routed.lock().unwrap();
+                            r.iter().map(|r| r.pypi_name.clone()).collect()
                         };
                         let names: Vec<String> = extract_sdist_only_packages(&msg)
                             .into_iter()
-                            .filter(|n| !already.contains(n))
+                            .filter(|n| !already_built.contains(n))
                             .collect();
                         if names.is_empty() {
                             return Err(e);
                         }
-                        // Rung 1: conda-route.
+                        // Rung 1: conda-route. Skip names already routed
+                        // in an earlier round (no need to re-probe or
+                        // re-log an already-known route) -- but note a
+                        // route, new or old, does NOT exempt the name
+                        // from rung 2 below.
                         let mut new_routes = Vec::new();
-                        let mut missing = Vec::new();
-                        for name in &names {
+                        for name in names.iter().filter(|n| !already_routed.contains(*n)) {
                             // Carry the ORIGINATING pypi requirement's
                             // version range into the conda probe -- a
                             // bare `"*"` (any version) let a wheel-less
@@ -1006,41 +1047,72 @@ where
                             // requirement's own metadata (`==4.9.*`).
                             let raw_requirement = extract_sdist_only_requirement(&msg, name);
                             let spec = conda_spec_from_pypi_specifier(raw_requirement.as_deref());
-                            match sdist_probe(name.clone(), spec).await {
-                                Some(hit) => new_routes.push(AutoRoutedPackage {
+                            if let Some(hit) = sdist_probe(name.clone(), spec).await {
+                                new_routes.push(AutoRoutedPackage {
                                     pypi_name: name.clone(),
                                     conda_name: name.clone(),
                                     pypi_version: hit.conda_version.clone(),
                                     conda_version: hit.conda_version.clone(),
                                     channel: hit.channel.clone(),
-                                }),
-                                None => missing.push(name.clone()),
+                                });
                             }
                         }
-                        // Rung 2: sdist auto-build, for whatever rung 1
-                        // missed. Only attempted when the caller enabled
-                        // it (`sdist-build = "auto"`, the default); a
-                        // `None` builder means `"never"` and rung 3
-                        // fires immediately on any miss, matching the
-                        // pre-build-rung behavior exactly.
+                        let routed_now: std::collections::BTreeSet<&str> =
+                            new_routes.iter().map(|r| r.pypi_name.as_str()).collect();
+                        // Rung 2: sdist auto-build. Attempted for EVERY
+                        // name still unresolved this round -- not only
+                        // rung-1 misses -- since rung 1 can never satisfy
+                        // `uv lock` by itself for this error class (see
+                        // comment above `names`). Only attempted when the
+                        // caller enabled it (`sdist-build = "auto"`, the
+                        // default); a `None` builder means `"never"` and
+                        // rung 3 fires immediately, matching the pre-
+                        // build-rung behavior for names with no route,
+                        // plus a distinct message for names that DID
+                        // route but still can't clear `uv lock` without a
+                        // build.
                         let mut new_built = Vec::new();
                         let mut build_failures: Vec<(String, String)> = Vec::new();
-                        if !missing.is_empty() {
-                            match sdist_build.as_ref() {
-                                Some(build) => {
-                                    for name in &missing {
-                                        match build(name.clone()).await {
-                                            Ok(w) => new_built.push(w),
-                                            Err(e) => {
-                                                build_failures
-                                                    .push((name.clone(), format!("{e:#}")));
-                                            }
+                        match sdist_build.as_ref() {
+                            Some(build) => {
+                                for name in &names {
+                                    match build(name.clone()).await {
+                                        Ok(w) => new_built.push(w),
+                                        Err(e) => {
+                                            build_failures.push((name.clone(), format!("{e:#}")));
                                         }
                                     }
                                 }
-                                None => {
-                                    bail!("{msg}{}", sdist_only_no_route_message(&missing));
+                            }
+                            None => {
+                                let unrouted: Vec<String> = names
+                                    .iter()
+                                    .filter(|n| {
+                                        !routed_now.contains(n.as_str())
+                                            && !already_routed.contains(*n)
+                                    })
+                                    .cloned()
+                                    .collect();
+                                let mut guidance = String::new();
+                                if !unrouted.is_empty() {
+                                    guidance.push_str(&sdist_only_no_route_message(&unrouted));
                                 }
+                                let routed_unbuildable: Vec<String> = names
+                                    .iter()
+                                    .filter(|n| !unrouted.contains(n))
+                                    .cloned()
+                                    .collect();
+                                if !routed_unbuildable.is_empty() {
+                                    guidance.push_str(&format!(
+                                        "\npackage {} has a conda candidate but `sdist-build = \
+                                         \"never\"` -- `uv lock` still requires a real PyPI \
+                                         wheel for it (conda-routing only exempts a package at \
+                                         the later `uv export` step); set `sdist-build = \
+                                         \"auto\"` or vendor a wheel.\n",
+                                        routed_unbuildable.join(", "),
+                                    ));
+                                }
+                                bail!("{msg}{guidance}");
                             }
                         }
                         // Rung 3: error. Only the names the build rung
@@ -3634,7 +3706,11 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
     /// (translated to conda's `4.9.*`) rather than an unconstrained
     /// `"*"`, so a conda-forge channel carrying BOTH a 4.9.x build and a
     /// newer 4.13.x build routes to the 4.9.x version instead of
-    /// clashing with hydra-core's own pypi metadata.
+    /// clashing with hydra-core's own pypi metadata. Run 6 additionally
+    /// proved routing alone can never satisfy `uv lock` for this error
+    /// class, so this fixture's mock `solve` (like real
+    /// `compute_closure`) also requires the rung-2 built wheel source
+    /// before it succeeds.
     #[tokio::test]
     async fn sdist_heal_probe_carries_pypi_requirement_range() {
         let attempts = Arc::new(Mutex::new(0usize));
@@ -3648,6 +3724,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
                     if !r
                         .no_emit_packages
                         .contains(&"antlr4-python3-runtime".to_string())
+                        || !r.built_wheel_sources.contains_key("antlr4-python3-runtime")
                     {
                         bail!("{NO_USABLE_WHEELS_RANGE_UV_ERR}");
                     }
@@ -3681,13 +3758,25 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
                 }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
             }
         };
+        let sdist_build = |name: String| {
+            Box::pin(async move {
+                Ok(BuiltSdistWheel {
+                    pypi_name: name.clone(),
+                    version: "4.9.3".to_string(),
+                    filename: format!("{name}-4.9.3-py3-none-any.whl"),
+                    wheel_path: PathBuf::from(format!("/tmp/wheels/{name}-4.9.3.whl")),
+                    sha256: "d".repeat(64),
+                    sdist_source: sdist_source_fixture(&name, "4.9.3"),
+                })
+            }) as futures::future::BoxFuture<'static, Result<BuiltSdistWheel>>
+        };
         let closure = auto_route_fixpoint_with_sdist_heal(
             &auto_route_req(),
             &auto_route_opts(),
             solve,
             probe,
             sdist_probe,
-            None::<NoBuild>,
+            Some(sdist_build),
         )
         .await
         .unwrap();
@@ -3719,14 +3808,17 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
     }
 
     /// Fixture-driven fixpoint: `uv lock` fails once with the sdist-only
-    /// class naming `pyperclip`; the mock repodata probe has a hit ->
-    /// the package is routed to conda (excluded + pinned) and the retry
-    /// succeeds. `auto_routed` records the sdist-heal route even though
-    /// the outer fixpoint never saw the failure directly. The build
-    /// rung must NEVER be invoked when the conda-route rung already won
-    /// (ladder ordering: conda hit wins over build).
+    /// class naming `pyperclip`; the mock repodata probe has a hit -> the
+    /// package is ALSO routed to conda (excluded from export + pinned).
+    /// Routing alone can never satisfy `uv lock` (`--no-emit-package` is
+    /// an `export`-only flag), so the mock `solve` requires BOTH the
+    /// route AND a built wheel before it succeeds — modeling real
+    /// `compute_closure` behavior — and the build rung MUST still run
+    /// even though rung 1 hit (deps-from proof run 6 regression test:
+    /// an earlier revision skipped rung 2 whenever rung 1 hit and got
+    /// stuck re-surfacing the identical `uv lock` failure every round).
     #[tokio::test]
-    async fn sdist_heal_routes_on_repodata_hit() {
+    async fn sdist_heal_builds_even_after_conda_route_hit() {
         let attempts = Arc::new(Mutex::new(0usize));
         let solve = {
             let attempts = Arc::clone(&attempts);
@@ -3735,7 +3827,9 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
                 Box::pin(async move {
                     let mut n = attempts.lock().unwrap();
                     *n += 1;
-                    if !r.no_emit_packages.contains(&"pyperclip".to_string()) {
+                    if !r.no_emit_packages.contains(&"pyperclip".to_string())
+                        || !r.built_wheel_sources.contains_key("pyperclip")
+                    {
                         bail!("{SDIST_ONLY_UV_ERR}");
                     }
                     parse_pylock_closure(
@@ -3769,7 +3863,15 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
                 let build_calls = Arc::clone(&build_calls);
                 Box::pin(async move {
                     *build_calls.lock().unwrap() += 1;
-                    bail!("build rung should never run for {name}: conda hit wins")
+                    assert_eq!(name, "pyperclip");
+                    Ok(BuiltSdistWheel {
+                        pypi_name: name.clone(),
+                        version: "1.8.2".to_string(),
+                        filename: "pyperclip-1.8.2-py3-none-any.whl".to_string(),
+                        wheel_path: PathBuf::from("/tmp/wheels/pyperclip-1.8.2-py3-none-any.whl"),
+                        sha256: "b".repeat(64),
+                        sdist_source: sdist_source_fixture("pyperclip", "1.8.2"),
+                    })
                 }) as futures::future::BoxFuture<'static, Result<BuiltSdistWheel>>
             }
         };
@@ -3797,9 +3899,104 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
         assert!(r.channel.contains("conda-forge"));
         assert_eq!(
             *build_calls.lock().unwrap(),
-            0,
-            "ladder ordering: conda-route hit must win over the build rung"
+            1,
+            "rung 2 (build) must run in the SAME round as a rung-1 conda-route hit -- \
+             routing alone can never satisfy `uv lock`",
         );
+    }
+
+    /// Regression test for deps-from proof run 6: the SAME package name
+    /// recurs in uv's error across TWO rounds even after being
+    /// conda-routed in round 1 (mirroring a real `uv lock` that still
+    /// needs a wheel despite the conda pin). The old ladder treated
+    /// "routed" as fully healed and, on round 2's identical failure,
+    /// filtered the name out of `names` and returned the original error
+    /// verbatim instead of climbing to rung 2. The fixed ladder must
+    /// still reach the build rung and succeed.
+    #[tokio::test]
+    async fn sdist_heal_recurring_failure_after_route_still_reaches_build_rung() {
+        let attempts = Arc::new(Mutex::new(0usize));
+        let solve = {
+            let attempts = Arc::clone(&attempts);
+            move |r: UvClosureRequest| {
+                let attempts = Arc::clone(&attempts);
+                Box::pin(async move {
+                    let mut n = attempts.lock().unwrap();
+                    *n += 1;
+                    if !r.built_wheel_sources.contains_key("antlr4-python3-runtime") {
+                        bail!("{NO_USABLE_WHEELS_RANGE_UV_ERR}");
+                    }
+                    parse_pylock_closure(
+                        PYLOCK_FIXTURE,
+                        &target("3.12", "linux-64"),
+                        &BTreeSet::new(),
+                        "0.11.15",
+                    )
+                }) as futures::future::BoxFuture<'static, Result<UvClosure>>
+            }
+        };
+        let probe = |_name: String, _spec: String| {
+            Box::pin(async { None }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
+        };
+        let route_calls = Arc::new(Mutex::new(0usize));
+        let sdist_probe = {
+            let route_calls = Arc::clone(&route_calls);
+            move |name: String, _spec: String| {
+                let route_calls = Arc::clone(&route_calls);
+                Box::pin(async move {
+                    *route_calls.lock().unwrap() += 1;
+                    if name == "antlr4-python3-runtime" {
+                        Some(RouteProbeHit {
+                            conda_version: "4.9.3".into(),
+                            channel: "https://conda.anaconda.org/conda-forge/linux-64".into(),
+                        })
+                    } else {
+                        None
+                    }
+                }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
+            }
+        };
+        let build_calls = Arc::new(Mutex::new(0usize));
+        let sdist_build = {
+            let build_calls = Arc::clone(&build_calls);
+            move |name: String| {
+                let build_calls = Arc::clone(&build_calls);
+                Box::pin(async move {
+                    *build_calls.lock().unwrap() += 1;
+                    Ok(BuiltSdistWheel {
+                        pypi_name: name.clone(),
+                        version: "4.9.3".to_string(),
+                        filename: format!("{name}-4.9.3-py3-none-any.whl"),
+                        wheel_path: PathBuf::from(format!("/tmp/wheels/{name}-4.9.3.whl")),
+                        sha256: "c".repeat(64),
+                        sdist_source: sdist_source_fixture(&name, "4.9.3"),
+                    })
+                }) as futures::future::BoxFuture<'static, Result<BuiltSdistWheel>>
+            }
+        };
+        let closure = auto_route_fixpoint_with_sdist_heal(
+            &auto_route_req(),
+            &auto_route_opts(),
+            solve,
+            probe,
+            sdist_probe,
+            Some(sdist_build),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            *attempts.lock().unwrap() >= 2,
+            "must retry at least once after the conda-route-only round still fails"
+        );
+        assert_eq!(
+            *build_calls.lock().unwrap(),
+            1,
+            "the recurring failure must still climb to rung 2 (build) instead of being \
+             surfaced verbatim as already-handled",
+        );
+        assert_eq!(closure.auto_routed.len(), 1);
+        assert_eq!(closure.auto_routed[0].pypi_name, "antlr4-python3-runtime");
     }
 
     /// Double-miss (no conda candidate) with the build rung ENABLED: the
