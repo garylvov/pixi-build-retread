@@ -1179,5 +1179,4 @@ platforms = [{ platform = "linux-64", glibc = "2.35" }]
             "plain resolve must pick the highest version (3.0)"
         );
     }
-
 }

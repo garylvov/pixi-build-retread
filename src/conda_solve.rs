@@ -539,7 +539,8 @@ mod tests {
             SolveStrategy::Highest,
             Vec::new(),
         );
-        let reasons = result.expect_err("cuda-bindings 13.3.1 must conflict with cuda-version ==12.9");
+        let reasons =
+            result.expect_err("cuda-bindings 13.3.1 must conflict with cuda-version ==12.9");
         assert!(
             reasons.iter().any(|r| unsat_mentions(r, "cuda-bindings")),
             "unsat reasons should name cuda-bindings: {reasons:?}"

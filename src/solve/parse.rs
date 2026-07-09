@@ -408,7 +408,7 @@ impl ConflictParser for RegexConflictParser {
                 floor: caps[2].to_string(),
                 conda_version,
                 requiring_chain: Vec::new(),
-            pack_name: None,
+                pack_name: None,
             });
         }
 
@@ -423,7 +423,7 @@ impl ConflictParser for RegexConflictParser {
                 floor: caps[2].to_string(),
                 conda_version,
                 requiring_chain: Vec::new(),
-            pack_name: None,
+                pack_name: None,
             });
         }
 
@@ -492,9 +492,8 @@ mod tests {
         include_str!("../../tests/fixtures/solve_errors/unparseable_network_error.txt");
     const POST_WIDEN_UNSAT: &str =
         include_str!("../../tests/fixtures/solve_errors/conda_unsat_post_widen.txt");
-    const UV_CLOSURE_TINYOBJLOADER: &str = include_str!(
-        "../../tests/fixtures/solve_errors/uv_closure_tinyobjloader_prerelease.txt"
-    );
+    const UV_CLOSURE_TINYOBJLOADER: &str =
+        include_str!("../../tests/fixtures/solve_errors/uv_closure_tinyobjloader_prerelease.txt");
     const UV_CLOSURE_CUDA_BINDINGS: &str =
         include_str!("../../tests/fixtures/solve_errors/uv_closure_cuda_bindings_widen.txt");
     // Fix #19 fixture (lock-succ-brief.md ACCEPTANCE RUN #5): a second
@@ -514,9 +513,8 @@ mod tests {
     // override reached the closure -- direct rattler conda-solver prose,
     // pinned operator `==` (not `<`/`<=`), requiring clause `==` (not a
     // `>=`/`>` floor).
-    const CONDA_INCOMPATIBLE_TORCHVISION_EXACT: &str = include_str!(
-        "../../tests/fixtures/solve_errors/conda_incompatible_torchvision_exact.txt"
-    );
+    const CONDA_INCOMPATIBLE_TORCHVISION_EXACT: &str =
+        include_str!("../../tests/fixtures/solve_errors/conda_incompatible_torchvision_exact.txt");
     const UNPARSEABLE_UV_CLOSURE_NO_WHEELS: &str =
         include_str!("../../tests/fixtures/solve_errors/unparseable_uv_closure_no_wheels.txt");
 
@@ -566,7 +564,7 @@ mod tests {
                 floor: "3.10.3".into(),
                 conda_version: "3.5.0".into(),
                 requiring_chain: Vec::new(),
-            pack_name: None,
+                pack_name: None,
             })
         );
         assert_eq!(
@@ -577,7 +575,7 @@ mod tests {
                 floor: "2.10.3".into(),
                 conda_version: "2.9.0".into(),
                 requiring_chain: Vec::new(),
-            pack_name: None,
+                pack_name: None,
             })
         );
     }
@@ -667,7 +665,7 @@ mod tests {
                 floor: "2".into(),
                 conda_version: "<2".into(),
                 requiring_chain: Vec::new(),
-            pack_name: None,
+                pack_name: None,
             })
         );
     }

@@ -156,7 +156,7 @@ pub async fn build_wheel_from_sdist_url(
     let filename = sdist_url
         .path_segments()
         .and_then(|mut s| s.next_back())
-        .and_then(|f| if f.is_empty() { None } else { Some(f) })
+        .filter(|f| !f.is_empty())
         .ok_or_else(|| anyhow!("sdist URL {sdist_url} has no filename component"))?
         .to_string();
     let sdist_path = out_dir.join(&filename);

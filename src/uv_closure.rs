@@ -557,7 +557,10 @@ where
                 // removal — once it's already Sat/Skipped, stop; a
                 // single-candidate subset of an already-satisfiable set
                 // is not evidence that subset was the offender.
-                if !matches!(co_solve(probe_set.clone()).await, CoInstallVerdict::Unsat(_)) {
+                if !matches!(
+                    co_solve(probe_set.clone()).await,
+                    CoInstallVerdict::Unsat(_)
+                ) {
                     break;
                 }
                 let mut healed_idx: Option<usize> = None;
@@ -2203,10 +2206,7 @@ isaaclab = { path = "wheels/isaaclab/isaaclab-2.0.0-py3-none-any.whl" }
 
     #[test]
     fn cuda_major_from_specs_handles_range_and_bare_forms() {
-        assert_eq!(
-            cuda_major_from_specs(&[">=12.8,<13".to_string()]),
-            Some(12)
-        );
+        assert_eq!(cuda_major_from_specs(&[">=12.8,<13".to_string()]), Some(12));
         assert_eq!(cuda_major_from_specs(&["12".to_string()]), Some(12));
         assert_eq!(cuda_major_from_specs(&["13.0".to_string()]), Some(13));
         assert_eq!(cuda_major_from_specs(&[]), None);
@@ -3209,8 +3209,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
         // reason names neither routed package — only a transitive
         // anchor ("cuda-version") that isn't itself a routed candidate.
         let co_solve = |candidate: Vec<AutoRoutedPackage>| {
-            let names: BTreeSet<String> =
-                candidate.iter().map(|r| r.conda_name.clone()).collect();
+            let names: BTreeSet<String> = candidate.iter().map(|r| r.conda_name.clone()).collect();
             let verdict = if names.contains("numpy") && names.contains("typing-extensions") {
                 CoInstallVerdict::Unsat(vec![
                     "cuda-version >=13,<14.0a0, for which no candidates were found".to_string(),
@@ -3242,7 +3241,13 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
         assert_eq!(routed.len(), 1, "routed: {routed:?}");
         // mujoco (protected root) plus whichever of numpy/typing-extensions
         // was NOT un-routed.
-        assert_eq!(closure.wheels.len() + routed.len(), 3, "wheels+routed: {:?} {:?}", closure.wheels.iter().map(|w| &w.name).collect::<Vec<_>>(), routed);
+        assert_eq!(
+            closure.wheels.len() + routed.len(),
+            3,
+            "wheels+routed: {:?} {:?}",
+            closure.wheels.iter().map(|w| &w.name).collect::<Vec<_>>(),
+            routed
+        );
     }
 
     /// A previously ACCEPTED route that a later round's cumulative check
