@@ -683,7 +683,17 @@ pub fn is_sdist_only_uv_error(text: &str) -> bool {
     if t.contains("platform tag") {
         return false;
     }
-    t.contains("has no wheels") || t.contains("no wheels with a matching")
+    // "has no usable wheels" is uv's phrasing when a NAMED VERSION RANGE
+    // (not the bare package) is the subject -- e.g. a transitive exact
+    // pin with a `.*` wildcard range collapses to "pkg>=X,<=Y has no
+    // usable wheels" rather than the bare-package "pkg has no wheels"
+    // shape below (deps-from proof run 3: `hydra-core==1.3.2` pins
+    // `antlr4-python3-runtime==4.9.*`, which resolves to a range with
+    // zero wheel-bearing builds under `--no-build`). Same sdist-only
+    // class, different uv prose shape -- must self-heal identically.
+    t.contains("has no wheels")
+        || t.contains("no wheels with a matching")
+        || t.contains("has no usable wheels")
 }
 
 /// Extract the PEP 503-canonical package name(s) uv's error names as
@@ -708,6 +718,19 @@ pub fn extract_sdist_only_packages(text: &str) -> Vec<String> {
     .expect("static sdist-only extraction regex");
     let mut names: BTreeSet<String> = BTreeSet::new();
     for cap in re.captures_iter(&t) {
+        names.insert(canonical_conda_name(&cap[1]));
+    }
+    // "has no usable wheels" shape: the subject is a RANGE, not the bare
+    // "Because <name>" clause above (e.g. "...and antlr4-python3-
+    // runtime>=4.9,<=4.9.3 has no usable wheels, we can conclude..." --
+    // the package name sits directly before the version range, not right
+    // after "Because"). Anchor on the range/operator immediately
+    // preceding the phrase instead.
+    let re_ranged = regex::Regex::new(
+        r"(?i)([A-Za-z0-9][A-Za-z0-9._-]*)(?:>=|<=|==|>|<)\S*\s+has no usable wheels",
+    )
+    .expect("static ranged sdist-only extraction regex");
+    for cap in re_ranged.captures_iter(&t) {
         names.insert(canonical_conda_name(&cap[1]));
     }
     names.into_iter().collect()
@@ -3426,6 +3449,39 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
         assert_eq!(
             extract_sdist_only_packages(text),
             vec!["foo-bar".to_string()]
+        );
+    }
+
+    // deps-from proof run 3 (step4-lock-run3.log): a wildcard-pinned
+    // transitive dep (`hydra-core==1.3.2` depends on
+    // `antlr4-python3-runtime==4.9.*`) collapses to a RANGE subject in
+    // uv's prose ("...antlr4-python3-runtime>=4.9,<=4.9.3 has no usable
+    // wheels...") rather than the bare "Because <name> has no wheels"
+    // shape -- distinct phrasing ("usable"), distinct clause shape (the
+    // package sits right before the range/operator, not right after
+    // "Because"). Must still be recognized as the same sdist-only class
+    // so the pre-existing conda-route/auto-build ladder self-heals it.
+    const NO_USABLE_WHEELS_RANGE_UV_ERR: &str = "× No solution found when resolving dependencies for split: \
+         Because only the following versions of antlr4-python3-runtime are \
+         available: antlr4-python3-runtime<4.9.dev0, antlr4-python3-runtime==4.9, \
+         antlr4-python3-runtime==4.9.1, antlr4-python3-runtime==4.9.2, \
+         antlr4-python3-runtime==4.9.3, antlr4-python3-runtime>4.10.dev0 and \
+         antlr4-python3-runtime>=4.9,<=4.9.3 has no usable wheels, we can \
+         conclude that antlr4-python3-runtime>=4.9,<=4.9.3 cannot be used. \
+         And because hydra-core==1.3.2 depends on antlr4-python3-runtime==4.9.* \
+         and your project depends on hydra-core==1.3.2, we can conclude that \
+         your project's requirements are unsatisfiable.";
+
+    #[test]
+    fn is_sdist_only_uv_error_matches_has_no_usable_wheels_range_class() {
+        assert!(is_sdist_only_uv_error(NO_USABLE_WHEELS_RANGE_UV_ERR));
+    }
+
+    #[test]
+    fn extract_sdist_only_packages_names_wildcard_pinned_transitive_dep() {
+        assert_eq!(
+            extract_sdist_only_packages(NO_USABLE_WHEELS_RANGE_UV_ERR),
+            vec!["antlr4-python3-runtime".to_string()]
         );
     }
 

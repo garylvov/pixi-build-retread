@@ -66,6 +66,41 @@ pub enum Conflict {
         /// always `Some` in practice; `None` is treated as unrepairable.
         pack_name: Option<String>,
     },
+    /// A `retread-deps-from` root's own EXACT pin (e.g. `hydra-core==1.3.2`)
+    /// hard-depends on another package via a wildcard/exact range (e.g.
+    /// `antlr4-python3-runtime==4.9.*`) for which NO version in that range
+    /// has a usable wheel under `--no-build` (source-dist only) -- distinct
+    /// from `DepsFromPin`: there is no COMPETING requirement from a sibling
+    /// package, the pinned transitive dependency is simply unbuildable from
+    /// a wheel. This shape only reaches `retread solve`'s parser at all
+    /// when the backend's sdist-only self-heal ladder
+    /// (`uv_closure::with_sdist_heal`: conda-route -> sdist auto-build)
+    /// already tried and exhausted BOTH rungs for `package` -- i.e. the
+    /// original uv prose survives verbatim with the ladder's own
+    /// exhaustion guidance appended. Doctrine (matching `DepsFromPin`):
+    /// `retread-deps-from` pins are upstream advisories, so `repair` may
+    /// relax the REQUIRER's (`hydra-core`) own exact pin to a `>=` floor,
+    /// letting uv pick a newer requirer release whose own metadata may no
+    /// longer wildcard-pin the wheel-less package -- but ONLY after
+    /// confirming (at repair time, see `deps_from_owns_exact_pin` in
+    /// repair.rs) that the requirer's pin actually originates from
+    /// `pack_name`'s own deps-from source(s).
+    NoWheelTransitive {
+        /// The wheel-less transitive package (e.g.
+        /// `antlr4-python3-runtime`), informational.
+        package: String,
+        /// The unsatisfiable version range uv named for `package` (e.g.
+        /// `>=4.9,<=4.9.3`), informational.
+        range: String,
+        /// The package whose exact pin wildcard-pins `package` (e.g.
+        /// `hydra-core`) -- this is what repair relaxes.
+        requirer: String,
+        /// `requirer`'s own exact pinned version (e.g. `1.3.2`).
+        requirer_pin: String,
+        /// Bundle the uv closure was computed for; `None` is treated as
+        /// unrepairable (mirrors `DepsFromPin`).
+        pack_name: Option<String>,
+    },
 }
 
 impl Conflict {
@@ -76,6 +111,7 @@ impl Conflict {
             Conflict::PypiInternal { .. } => "PypiInternal",
             Conflict::CondaWidenNeeded { .. } => "CondaWidenNeeded",
             Conflict::DepsFromPin { .. } => "DepsFromPin",
+            Conflict::NoWheelTransitive { .. } => "NoWheelTransitive",
         }
     }
 }
@@ -138,6 +174,16 @@ pub struct RegexConflictParser {
     // dynamically-escaped "your project depends on B==W" regex (the
     // `regex` crate has no backreferences, so this can't be one pattern).
     deps_from_because: Regex,
+    // `NoWheelTransitive` generic (name-agnostic) half: uv's "<pkg><range>
+    // has no usable wheels" clause (a wildcard/range-pinned transitive dep
+    // with zero wheel-bearing builds under `--no-build`), distinct from
+    // the bare "Because <pkg> has no wheels" shape `uv_closure.rs`'s
+    // sdist-only self-heal already recognizes (that ladder tries this
+    // package FIRST; this parser branch only ever sees the message when
+    // both of that ladder's rungs -- conda-route, sdist auto-build --
+    // already failed for it). Package name is captured but not yet
+    // anchored, same two-pass reasoning as `deps_from_because`.
+    no_usable_wheels_range: Regex,
 }
 
 impl RegexConflictParser {
@@ -199,6 +245,10 @@ impl RegexConflictParser {
                 r"(?i)because\s+([a-zA-Z0-9_.\[\]-]+)==[0-9a-zA-Z.]+\s+depends\s+on\s+([a-zA-Z0-9_.\[\]-]+)(?:\[[^\]]*\])?\s*(>=|>)\s*([0-9][0-9a-zA-Z.]*)",
             )
             .expect("valid deps-from-because regex"),
+            no_usable_wheels_range: Regex::new(
+                r"(?i)([a-zA-Z0-9][a-zA-Z0-9._-]*)((?:>=|<=|==|>|<)\S*)\s+has no usable wheels",
+            )
+            .expect("valid no-usable-wheels-range regex"),
         }
     }
 
@@ -210,11 +260,23 @@ impl RegexConflictParser {
     fn extract_uv_closure_message(&self, stderr: &str) -> Option<String> {
         let caps = self.uv_closure_message.captures(stderr)?;
         let raw = &caps[1];
-        let joined = raw
-            .lines()
-            .map(|line| self.gutter_line_prefix.replace(line, "").into_owned())
-            .collect::<Vec<String>>()
-            .join(" ");
+        // Rejoin gutter-stripped physical lines with a space -- UNLESS the
+        // previous line ends in a hyphen, in which case miette's own
+        // textwrap broke a hyphenated identifier mid-word (real observed
+        // shape: a long name like `antlr4-python3-runtime` line-wraps as
+        // `antlr4-python3-` / `runtime...` with no whitespace at the
+        // break) and the fragments must rejoin with NO space so a whole-
+        // name regex still sees one contiguous token. Every other wrap is
+        // a genuine word boundary and keeps its separating space, exactly
+        // as before.
+        let mut joined = String::new();
+        for line in raw.lines() {
+            let stripped = self.gutter_line_prefix.replace(line, "");
+            if !joined.is_empty() && !joined.ends_with('-') {
+                joined.push(' ');
+            }
+            joined.push_str(&stripped);
+        }
         let unescaped = joined.replace("\\n", " ");
         let collapsed = self.whitespace.replace_all(&unescaped, " ");
         Some(collapsed.trim().to_string())
@@ -292,6 +354,35 @@ impl RegexConflictParser {
                     op,
                     floor,
                     requirer,
+                    pack_name,
+                });
+            }
+        }
+
+        // `NoWheelTransitive`: same `no_conda_constraint_named` footer, a
+        // THIRD pubgrub prose shape -- "<pkg><range> has no usable
+        // wheels ... And because <requirer>==<requirer_pin> depends on
+        // <pkg>==<wildcard>". Only reached when the backend's sdist-only
+        // self-heal ladder already exhausted the conda-route and
+        // sdist-auto-build rungs for `pkg` (see `uv_closure.rs`); by the
+        // time it surfaces here there is no route left except relaxing
+        // the requirer's own exact pin. Two-pass match, same reasoning as
+        // `deps_from_because` above.
+        if self.no_conda_constraint_named.is_match(msg)
+            && let Some(caps) = self.no_usable_wheels_range.captures(msg)
+        {
+            let package = caps[1].to_string();
+            let range = caps[2].to_string();
+            let escaped = regex::escape(&package);
+            if let Ok(requirer_re) = Regex::new(&format!(
+                r"(?i)because\s+([a-zA-Z0-9_.\[\]-]+)==([0-9][0-9a-zA-Z.]*)\s+depends\s+on\s+{escaped}(?:\[[^\]]*\])?\s*(==|===)\s*[0-9a-zA-Z.*]+"
+            )) && let Some(rcaps) = requirer_re.captures(msg)
+            {
+                return Some(Conflict::NoWheelTransitive {
+                    package,
+                    range,
+                    requirer: rcaps[1].to_string(),
+                    requirer_pin: rcaps[2].to_string(),
                     pack_name,
                 });
             }
@@ -597,6 +688,16 @@ mod tests {
         include_str!("../../tests/fixtures/solve_errors/conda_incompatible_torchvision_exact.txt");
     const UNPARSEABLE_UV_CLOSURE_NO_WHEELS: &str =
         include_str!("../../tests/fixtures/solve_errors/unparseable_uv_closure_no_wheels.txt");
+    // Real failure (step4-lock-run3.log, `pm-isaaclab` proof run 3), as it
+    // would surface to `retread solve`'s parser AFTER the backend's
+    // sdist-only self-heal ladder (uv_closure.rs) already exhausted both
+    // the conda-route and sdist-auto-build rungs for
+    // `antlr4-python3-runtime` (its own exhaustion guidance appended,
+    // `sdist_only_no_route_message`): `hydra-core==1.3.2`'s own wildcard
+    // pin (`antlr4-python3-runtime==4.9.*`) names a range with zero
+    // wheel-bearing builds under `--no-build`.
+    const UV_CLOSURE_NO_WHEEL_TRANSITIVE: &str =
+        include_str!("../../tests/fixtures/solve_errors/uv_closure_no_wheel_transitive.txt");
 
     #[test]
     fn parses_dumb_hack_shapes_and_range_amendment() {
@@ -783,6 +884,21 @@ mod tests {
                 op: ">=".into(),
                 floor: "2.0.0".into(),
                 requirer: "wandb".into(),
+                pack_name: Some("protomotions-deps-pack".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_no_wheel_transitive_conflict_after_sdist_heal_exhausted() {
+        let p = RegexConflictParser::new();
+        assert_eq!(
+            p.parse(UV_CLOSURE_NO_WHEEL_TRANSITIVE),
+            Some(Conflict::NoWheelTransitive {
+                package: "antlr4-python3-runtime".into(),
+                range: ">=4.9,<=4.9.3".into(),
+                requirer: "hydra-core".into(),
+                requirer_pin: "1.3.2".into(),
                 pack_name: Some("protomotions-deps-pack".into()),
             })
         );

@@ -631,6 +631,20 @@ impl RepairPlanner {
                     pack_name.as_deref(),
                 )
             }
+            Conflict::NoWheelTransitive {
+                requirer,
+                requirer_pin,
+                pack_name,
+                ..
+            } => {
+                let target = PinTarget {
+                    package: requirer,
+                    version: requirer_pin,
+                    iter,
+                    conflict,
+                };
+                self.no_wheel_transitive_conflict(editor, tried, &target, pack_name.as_deref())
+            }
         }
     }
 
@@ -882,6 +896,78 @@ impl RepairPlanner {
                 bundle: bundle.to_string(),
                 pack_pixi,
                 package: package.to_string(),
+                spec: new_spec,
+            }),
+        })
+    }
+
+    /// `NoWheelTransitive` dispatch: `package` (e.g.
+    /// `antlr4-python3-runtime`) is wheel-less across the whole range
+    /// `requirer`'s own exact pin wildcards it into, and the backend's
+    /// sdist-only self-heal ladder (conda-route, then sdist auto-build --
+    /// see `uv_closure.rs`) already exhausted both rungs before this
+    /// conflict ever reached the parser. The only route left is relaxing
+    /// `requirer`'s (e.g. `hydra-core`) own exact pin to a `>=` floor, so
+    /// uv is free to pick a newer `requirer` release whose metadata may no
+    /// longer wildcard-pin the wheel-less package -- same
+    /// `deps_from_owns_exact_pin` ownership doctrine as `DepsFromPin`
+    /// (never guess at a non-deps-from-owned pin), just checked against
+    /// `requirer` (`target.package`, already renamed by the `repair()`
+    /// dispatch above) instead of the wheel-less package itself.
+    fn no_wheel_transitive_conflict(
+        &mut self,
+        editor: &mut ManifestEditor,
+        tried: &mut TriedState,
+        target: &PinTarget<'_>,
+        pack_name: Option<&str>,
+    ) -> std::result::Result<RepairOutcome, String> {
+        let requirer = target.package;
+        let requirer_pin = target.version;
+        self.guard_anchor(requirer)?;
+        let Some(bundle) = pack_name else {
+            return Err(requirer.to_string());
+        };
+        let new_spec = format!(">={requirer_pin}");
+        self.guard_oscillation(requirer, &new_spec, Strategy::PypiOverride)?;
+        if tried.has(requirer, Strategy::PypiOverride) {
+            return Err(requirer.to_string());
+        }
+        if !deps_from_owns_exact_pin(editor.project_dir(), bundle, requirer) {
+            eprintln!(
+                "retread: {requirer}=={requirer_pin} conflict is not attributable to a \
+                 retread-deps-from root of bundle `{bundle}`; refusing to auto-relax"
+            );
+            return Err(requirer.to_string());
+        }
+        let pack_pixi = crate::workspace::WorkspaceManifest::load(editor.project_dir())
+            .and_then(|ws| resolve_pack_dir(&ws, editor.project_dir(), bundle))
+            .map(|dir| dir.join("pixi.toml"))
+            .ok_or_else(|| requirer.to_string())?;
+        tried.mark(requirer, Strategy::PypiOverride, false);
+        eprintln!(
+            "retread: deps-from pin relaxed {requirer} =={requirer_pin} -> {new_spec} \
+             (no-wheel-transitive; upstream-advisory)"
+        );
+        Ok(RepairOutcome {
+            attempt: self.ledger_attempt(
+                target,
+                Strategy::PypiOverride,
+                "retread",
+                AttemptDetails {
+                    old_spec: Some(format!("=={requirer_pin}")),
+                    new_spec: Some(new_spec.clone()),
+                    ..AttemptDetails::default()
+                },
+            ),
+            extra_attempts: Vec::new(),
+            summary_line: format!(
+                "would add [{bundle} :: retread-overrides] {requirer} = \"{new_spec}\"  (tier: pypi_override; deps-from-advisory; no-wheel-transitive; .retread/auto-overrides.json ledger)",
+            ),
+            applied: Vec::new(),
+            pack_override: Some(PackOverrideWrite {
+                bundle: bundle.to_string(),
+                pack_pixi,
+                package: requirer.to_string(),
                 spec: new_spec,
             }),
         })
@@ -2405,6 +2491,101 @@ holosoma-gpu = { features = ["holosoma"] }
             op: ">=".into(),
             floor: "3.12".into(),
             requirer: "some-pkg".into(),
+            pack_name: Some("no-such-pack".into()),
+        };
+        let err = planner
+            .repair(&mut editor, &mut tried, &conflict, 1)
+            .expect_err("ABI anchor must never be relaxed");
+        assert_eq!(err, "python");
+    }
+
+    // ---- no-wheel-transitive repair (hydra-core/antlr4-python3-runtime
+    // proof, step4-lock-run3.log): a `retread-deps-from` root's own exact
+    // pin wildcard-pins a transitive dependency into a version range with
+    // NO usable wheel under `--no-build` at all -- reached only after the
+    // backend's sdist-only self-heal ladder (conda-route, sdist
+    // auto-build) already exhausted both rungs for the wheel-less
+    // package. Repair must relax the REQUIRER's (`hydra-core`) own exact
+    // pin, not the wheel-less package (there is nothing to relax on a
+    // package retread doesn't pin at all).
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_wheel_transitive_relaxes_owned_requirer_pin_to_floor() {
+        let manifest_text = deps_from_manifest("./pypi-packs/deps-from-pack");
+        let path = temp_manifest(&manifest_text);
+        let project_dir = path.parent().unwrap().to_path_buf();
+        deps_from_pack(&project_dir, "hydra-core==1.3.2\n");
+
+        let mut editor = ManifestEditor::open(path.clone()).unwrap();
+        let mut tried = TriedState::default();
+        let mut planner = RepairPlanner::new("default".into());
+
+        let conflict = Conflict::NoWheelTransitive {
+            package: "antlr4-python3-runtime".into(),
+            range: ">=4.9,<=4.9.3".into(),
+            requirer: "hydra-core".into(),
+            requirer_pin: "1.3.2".into(),
+            pack_name: Some("deps-from-pack".into()),
+        };
+        let out = planner
+            .repair(&mut editor, &mut tried, &conflict, 1)
+            .expect("deps-from-owned requirer pin must relax, not exhaust");
+        assert_eq!(out.attempt.strategy, "pypi_override");
+        assert_eq!(out.attempt.package, "hydra-core");
+        assert_eq!(out.attempt.new_spec.as_deref(), Some(">=1.3.2"));
+        assert!(
+            out.applied.is_empty(),
+            "workspace manifest must stay untouched"
+        );
+
+        let po = out.pack_override.expect("expected a pack-override write");
+        assert_eq!(po.bundle, "deps-from-pack");
+        assert_eq!(po.package, "hydra-core");
+        assert_eq!(po.spec, ">=1.3.2");
+
+        editor.write_atomic().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), manifest_text);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_wheel_transitive_refuses_non_deps_from_requirer() {
+        // The bundle's deps-from root doesn't mention `hydra-core` at
+        // all -- ownership can't be confirmed, so repair must report
+        // exhausted rather than guess at relaxing an arbitrary pin.
+        let manifest_text = deps_from_manifest("./pypi-packs/deps-from-pack");
+        let path = temp_manifest(&manifest_text);
+        let project_dir = path.parent().unwrap().to_path_buf();
+        deps_from_pack(&project_dir, "numpy==1.26.0\n");
+
+        let mut editor = ManifestEditor::open(path).unwrap();
+        let mut tried = TriedState::default();
+        let mut planner = RepairPlanner::new("default".into());
+
+        let conflict = Conflict::NoWheelTransitive {
+            package: "antlr4-python3-runtime".into(),
+            range: ">=4.9,<=4.9.3".into(),
+            requirer: "hydra-core".into(),
+            requirer_pin: "1.3.2".into(),
+            pack_name: Some("deps-from-pack".into()),
+        };
+        let err = planner
+            .repair(&mut editor, &mut tried, &conflict, 1)
+            .expect_err("non-deps-from-owned requirer pin must not be auto-relaxed");
+        assert_eq!(err, "hydra-core");
+    }
+
+    #[test]
+    fn no_wheel_transitive_exempts_abi_anchor_before_any_disk_io() {
+        let path = temp_manifest("[dependencies]\n");
+        let mut editor = ManifestEditor::open(path).unwrap();
+        let mut tried = TriedState::default();
+        let mut planner = RepairPlanner::new("default".into());
+
+        let conflict = Conflict::NoWheelTransitive {
+            package: "antlr4-python3-runtime".into(),
+            range: ">=4.9,<=4.9.3".into(),
+            requirer: "python".into(),
+            requirer_pin: "3.11.15".into(),
             pack_name: Some("no-such-pack".into()),
         };
         let err = planner
