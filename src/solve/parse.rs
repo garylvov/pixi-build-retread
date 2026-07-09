@@ -168,6 +168,16 @@ pub struct RegexConflictParser {
     // operator class in place) so the widen path's behavior/tests are
     // untouched.
     conda_incompatible_exact: Regex,
+    // Run 8 (setuptools/isaaclab-2.3x-pack): same "cannot be installed ...
+    // no viable options" header, but the workspace's OWN pin is a
+    // two-sided RANGE (`>=68,<81`), not the bare `<`/`<=` upper bound
+    // `conda_incompatible` expects -- so that regex never matches (its
+    // single-operator group can't see past the leading `>=68,` prefix)
+    // and the whole tree fell through to "could not parse solver error".
+    // Distinct regex (rather than making the op-group of `conda_incompatible`
+    // optional-prefix) so the simpler, already-covered bare shape's
+    // behavior/tests stay untouched.
+    conda_incompatible_range: Regex,
     // Generic (name-agnostic) half of the `DepsFromPin` shape:
     // uv's "Because P==V depends on B>=F" clause. Package `B`'s name is
     // captured but not yet anchored -- the caller re-checks it against a
@@ -241,6 +251,10 @@ impl RegexConflictParser {
                 r"(?s)([a-zA-Z0-9_-]+)\s*(==|=)\s*([0-9][0-9a-zA-Z.]*)[\s│├╰└─▶]+cannot\s+be\s+installed[\s│├╰└─▶]+because\s+there\s+are\s+no\s+viable\s+options",
             )
             .expect("valid conda-incompatible-exact regex"),
+            conda_incompatible_range: Regex::new(
+                r"(?s)([a-zA-Z0-9_-]+)\s*(?:>=|>)\s*[0-9][0-9a-zA-Z.]*\s*,\s*(<|<=)\s*([0-9][0-9a-zA-Z.]*)[\s│├╰└─▶]+cannot\s+be\s+installed[\s│├╰└─▶]+because\s+there\s+are\s+no\s+viable\s+options",
+            )
+            .expect("valid conda-incompatible-range regex"),
             deps_from_because: Regex::new(
                 r"(?i)because\s+([a-zA-Z0-9_.\[\]-]+)==[0-9a-zA-Z.]+\s+depends\s+on\s+([a-zA-Z0-9_.\[\]-]+)(?:\[[^\]]*\])?\s*(>=|>)\s*([0-9][0-9a-zA-Z.]*)",
             )
@@ -508,6 +522,43 @@ impl RegexConflictParser {
             }
         }
 
+        // Run 8: the workspace's own conda pin is a `>=X,<Y` RANGE and a
+        // sibling pack's stub demands an exact version above the range's
+        // ceiling (e.g. workspace `setuptools >=68,<81` vs
+        // `isaaclab-2.3x-pack 0.54.2 would require setuptools ==83.0.0`).
+        // Doctrine mirrors the plain (bare `<`/`<=`) widen shape above, NOT
+        // the exact-companion shape: the workspace range is a manual cap
+        // the user chose for an unrelated reason (e.g. a different pack's
+        // `--editable` requirement), not a hard anchor, so conda-as-truth
+        // says WIDEN the workspace's own pin rather than override the
+        // pack (no `pack_name` -- routes through the workspace
+        // conda-pin-owner scan in `conda_widen_needed`, same as
+        // `conda_incompatible`). The pack's `==`/`=` demand is normalized
+        // to a `>=` floor (not re-emitted as an exact pin): conda-as-truth
+        // only asserts a MINIMUM version is required, matching the
+        // `deps-from` exact-pin-softening precedent elsewhere in this
+        // ladder.
+        if let Some(caps) = self.conda_incompatible_range.captures(stderr) {
+            let package = caps[1].to_string();
+            let conda_op = caps[2].to_string();
+            let conda_version = caps[3].to_string();
+            let escaped = regex::escape(&package);
+            let would_require = Regex::new(&format!(
+                r"(?s)would require[\s│├╰└─▶]*{escaped}\s*(==|=|>=|>)\s*([0-9][0-9a-zA-Z.]*)"
+            ))
+            .ok()?;
+            if let Some(rcaps) = would_require.captures(stderr) {
+                return Some(Conflict::CondaWidenNeeded {
+                    package,
+                    op: ">=".to_string(),
+                    floor: rcaps[2].to_string(),
+                    conda_version: format!("{conda_op}{conda_version}"),
+                    requiring_chain: Vec::new(),
+                    pack_name: None,
+                });
+            }
+        }
+
         None
     }
 
@@ -686,6 +737,18 @@ mod tests {
     // `>=`/`>` floor).
     const CONDA_INCOMPATIBLE_TORCHVISION_EXACT: &str =
         include_str!("../../tests/fixtures/solve_errors/conda_incompatible_torchvision_exact.txt");
+    // Run 8 fixture (depsfrom-proof-brief.md, verbatim
+    // `.retread/solve-conflicts/lock-2.txt`): the workspace's own
+    // `setuptools >=68,<81` conda pin (declared directly in several
+    // `feature.*.dependencies` tables wherever `isaaclab-2.3x-pack` is
+    // composed) vs the pack's own exact companion demand
+    // (`isaaclab-2.3x-pack 0.54.2 would require setuptools ==83.0.0`) --
+    // a RANGE-pinned (not bare `<`/`<=`) workspace side, which the
+    // existing `conda_incompatible`/`conda_incompatible_exact` regexes
+    // both miss (this previously fell all the way through to "could not
+    // parse solver error").
+    const CONDA_INCOMPATIBLE_SETUPTOOLS_RANGE: &str =
+        include_str!("../../tests/fixtures/solve_errors/conda_incompatible_setuptools_range.txt");
     const UNPARSEABLE_UV_CLOSURE_NO_WHEELS: &str =
         include_str!("../../tests/fixtures/solve_errors/unparseable_uv_closure_no_wheels.txt");
     // Real failure (step4-lock-run3.log, `pm-isaaclab` proof run 3), as it
@@ -869,6 +932,30 @@ mod tests {
                 conda_version: "==0.25.0".into(),
                 requiring_chain: Vec::new(),
                 pack_name: Some("isaac-pack-latest".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_range_pinned_conda_conflict_to_workspace_widen() {
+        // Run 8: unlike fix #21's exact-vs-exact companion shape (which
+        // routes to a PACK override because the workspace's own pin is
+        // exact and therefore authoritative), here the workspace pin is a
+        // `>=`/`<` RANGE -- a manual cap chosen for an unrelated reason,
+        // not a hard anchor -- so conda-as-truth widens the WORKSPACE's
+        // own pin instead (`pack_name: None`, same routing as the plain
+        // `conda_incompatible` shape). The pack's exact `==83.0.0` demand
+        // is normalized to a `>=` floor, not re-emitted as a new exact pin.
+        let p = RegexConflictParser::new();
+        assert_eq!(
+            p.parse(CONDA_INCOMPATIBLE_SETUPTOOLS_RANGE),
+            Some(Conflict::CondaWidenNeeded {
+                package: "setuptools".into(),
+                op: ">=".into(),
+                floor: "83.0.0".into(),
+                conda_version: "<81".into(),
+                requiring_chain: Vec::new(),
+                pack_name: None,
             })
         );
     }
