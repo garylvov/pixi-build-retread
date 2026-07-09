@@ -664,11 +664,19 @@ struct Bundle {
     solve_diagnostics: BTreeMap<String, crate::audit::SolveDiagnostics>,
     /// v4.3.0 (spec-uv-restructure M2): packages the uv auto-route loop
     /// moved from the wheel closure to the conda side, as
-    /// (conda_name, conda_version) pairs. Each becomes an exact-pinned
-    /// conda run-dep of the stub output (`produce_output`) so conda —
-    /// not a shipped wheel — provides it at install time. Empty on the
-    /// legacy path and when `auto-route = false`.
-    auto_routed: Vec<(String, String)>,
+    /// (conda_name, conda_version, deps_from_floor) triples. Each
+    /// becomes a conda run-dep of the stub output (`produce_output`) so
+    /// conda — not a shipped wheel — provides it at install time. Empty
+    /// on the legacy path and when `auto-route = false`.
+    ///
+    /// `deps_from_floor`: true when this root ORIGINATED from a
+    /// `retread-deps-from` source file as an exact `==`/`===` pin
+    /// (conda-as-truth doctrine, see `deps_from_exact_pinned_names`):
+    /// upstream requirement-file pins are pip-world advisories, so the
+    /// emitted conda run-dep is softened to a `>=` floor instead of the
+    /// usual exact pin, letting a sibling pack's own conda pin for the
+    /// same name win the conda solve instead of hard-conflicting.
+    auto_routed: Vec<(String, String, bool)>,
     /// Canonical names of every package in the exported uv closure
     /// (`UvClosure::pins`). These are provided by the wheel closure /
     /// uv install set at install time, so `produce_output` must NEVER
@@ -1878,7 +1886,10 @@ async fn resolve_all(
         // Packaging / courier / lock-write downstream are unchanged.
         // `Ok(None)` = no uv-resolvable roots (all source-built entries);
         // the materialization path then runs unpinned.
-        let uv_closure: Option<crate::uv_closure::UvClosure> = uv_group_closure(
+        let (uv_closure, deps_from_floor_names): (
+            Option<crate::uv_closure::UvClosure>,
+            std::collections::BTreeSet<String>,
+        ) = uv_group_closure(
             &group_name,
             &group_entries,
             &effective,
@@ -1999,7 +2010,10 @@ async fn resolve_all(
             bundle.auto_routed = closure
                 .auto_routed
                 .iter()
-                .map(|r| (r.conda_name.clone(), r.conda_version.clone()))
+                .map(|r| {
+                    let floor = deps_from_floor_names.contains(&r.pypi_name);
+                    (r.conda_name.clone(), r.conda_version.clone(), floor)
+                })
                 .collect();
             // Closure membership for the run-dep emission gate: any package
             // uv exported into the wheel closure is uv-installed at install
@@ -2288,7 +2302,10 @@ async fn uv_group_closure(
     workspace_dir: Option<&Path>,
     workspace_pypi_indexes: &[String],
     conda_channels: &[ChannelUrl],
-) -> Result<Option<crate::uv_closure::UvClosure>> {
+) -> Result<(
+    Option<crate::uv_closure::UvClosure>,
+    std::collections::BTreeSet<String>,
+)> {
     let mut roots: Vec<String> = Vec::new();
     for (name, entry) in group_entries {
         if entry.is_spec() {
@@ -2322,6 +2339,14 @@ async fn uv_group_closure(
     // uv-resolvable `[retread-wheels]` entries at all) is exactly why this
     // runs BEFORE the `roots.is_empty()` bail-out below -- deps-from alone
     // can supply every root this bundle needs.
+    // conda-as-truth (deps-from soften-pins fix): canonical PyPI names
+    // whose deps-from-sourced root carries an exact `==`/`===` pin.
+    // deps-from roots are appended strictly AFTER `[retread-wheels]`
+    // roots and `dedupe_roots_last_wins` keeps the last occurrence per
+    // name, so any name present here is guaranteed to be the winning
+    // root below -- these pins are safe to soften at conda run-dep
+    // emission time (see `Bundle::auto_routed`'s `deps_from_floor`).
+    let mut deps_from_floor_names: std::collections::BTreeSet<String> = Default::default();
     if !effective.deps_from.is_empty() {
         let deps_from_roots = crate::deps_from::resolve_deps_from_roots(
             effective.deps_from.as_slice(),
@@ -2330,6 +2355,7 @@ async fn uv_group_closure(
         )
         .await
         .with_context(|| format!("retread-deps-from: bundle `{group_name}`"))?;
+        deps_from_floor_names = deps_from_exact_pinned_names(&deps_from_roots);
         roots.extend(deps_from_roots);
         // Dedupe by PEP 503-normalized package name, LAST occurrence wins.
         // deps-from entries are appended after `[retread-wheels]` roots
@@ -2347,7 +2373,7 @@ async fn uv_group_closure(
             "uv closure: no uv-resolvable roots in this bundle; \
              running the legacy closure path unpinned",
         );
-        return Ok(None);
+        return Ok((None, std::collections::BTreeSet::new()));
     }
 
     // Conda pins -> uv constraints, with provenance (spec §2.2 fallback
@@ -2740,7 +2766,34 @@ async fn uv_group_closure(
             });
         }
     }
-    Ok(Some(closure))
+    Ok((Some(closure), deps_from_floor_names))
+}
+
+/// retread-deps-from conda-as-truth: canonical PyPI names among `roots`
+/// (PEP 508 requirement strings straight from a deps-from source file)
+/// whose version specifier is a single exact `==`/`===` pin. Non-exact
+/// specs (`>=`, ranges, bare) and unparseable lines are ignored.
+fn deps_from_exact_pinned_names(roots: &[String]) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    for root in roots {
+        let Ok(req): Result<uv_pep508::Requirement, _> = uv_pep508::Requirement::from_str(root)
+        else {
+            continue;
+        };
+        let Some(uv_pep508::VersionOrUrl::VersionSpecifier(specs)) = &req.version_or_url else {
+            continue;
+        };
+        let specs: Vec<_> = specs.iter().collect();
+        if specs.len() == 1
+            && matches!(
+                specs[0].operator(),
+                uv_pep508::uv_pep440::Operator::Equal | uv_pep508::uv_pep440::Operator::ExactEqual
+            )
+        {
+            out.insert(canonical_conda_name(req.name.as_ref()));
+        }
+    }
+    out
 }
 
 /// One emission targeting a specific discovered output name. The
@@ -4658,10 +4711,31 @@ fn produce_output(
     // already confirmed the (channel, python) build exists — the exact
     // pin must win over any looser Requires-Dist spec a shipped wheel
     // would emit for the same name below (seen_dep_names dedup).
-    for (conda_name, conda_version) in &bundle.auto_routed {
+    //
+    // conda-as-truth exception: a root whose ONLY reason for an exact
+    // pin is a `retread-deps-from` requirement-file line (`floor` ==
+    // true, see `deps_from_exact_pinned_names`) is softened to a `>=`
+    // floor instead. Upstream requirement-file pins are pip-world
+    // advisories; the composed workspace's conda solve is the source of
+    // truth, so this pack must not hard-conflict with a sibling pack's
+    // own conda pin for the same name (e.g. `setuptools ==83.0.0`).
+    for (conda_name, conda_version, floor) in &bundle.auto_routed {
         let canon = canonical_conda_name(conda_name);
         if seen_dep_names.insert(canon.clone()) {
-            run_dep_specs.push(spec_from_str(&format!("{canon} =={conda_version}"))?);
+            let spec = if *floor {
+                format!("{canon} >={conda_version}")
+            } else {
+                format!("{canon} =={conda_version}")
+            };
+            if *floor {
+                tracing::info!(
+                    bundle = %bundle.conda_name,
+                    package = %canon,
+                    version = %conda_version,
+                    "retread: deps-from pin softened {canon} =={conda_version} -> >={conda_version} (conda-as-truth)",
+                );
+            }
+            run_dep_specs.push(spec_from_str(&spec)?);
         }
     }
 

@@ -487,8 +487,8 @@ fn produce_output_emits_auto_routed_conda_run_deps() {
         probe_decisions: vec![],
         solve_diagnostics: BTreeMap::new(),
         auto_routed: vec![
-            ("numpy".to_string(), "2.1.0".to_string()),
-            ("scipy".to_string(), "1.14.1".to_string()),
+            ("numpy".to_string(), "2.1.0".to_string(), false),
+            ("scipy".to_string(), "1.14.1".to_string(), false),
         ],
         uv_closure_names: Default::default(),
     };
@@ -536,6 +536,46 @@ fn produce_output_emits_auto_routed_conda_run_deps() {
         "{deps:?}"
     );
     assert!(!deps.iter().any(|(n, _)| n == "scipy"), "{deps:?}");
+}
+
+#[test]
+fn produce_output_softens_deps_from_floor_pin_to_floor_spec() {
+    // conda-as-truth fix: an auto-routed package whose root ORIGINATED
+    // from a `retread-deps-from` exact pin (the third tuple element)
+    // must be emitted as a `>=` floor, not the usual exact `==` pin --
+    // otherwise a sibling pack's own exact conda pin for the same name
+    // (e.g. `setuptools ==83.0.0`) hard-conflicts with this pack's
+    // `setuptools ==69.5.1` at workspace conda-solve time.
+    let bundle = Bundle {
+        conda_name: "protomotions-pack".into(),
+        primary: rw(
+            "protomotions-pack",
+            meta("protomotions-pack", "1.0.0", vec![], false),
+        ),
+        extras: vec![],
+        probe_decisions: vec![],
+        solve_diagnostics: BTreeMap::new(),
+        auto_routed: vec![
+            ("setuptools".to_string(), "69.5.1".to_string(), true),
+            ("numpy".to_string(), "2.1.0".to_string(), false),
+        ],
+        uv_closure_names: Default::default(),
+    };
+    let out = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
+    let deps: Vec<(String, String)> = out
+        .run_dependencies
+        .depends
+        .iter()
+        .map(|d| (d.name.clone(), format_packagespec(&d.spec)))
+        .collect();
+    assert!(
+        deps.contains(&("setuptools".to_string(), ">=69.5.1".to_string())),
+        "deps-from-originated exact pin must be softened to a floor: {deps:?}"
+    );
+    assert!(
+        deps.contains(&("numpy".to_string(), "==2.1.0".to_string())),
+        "non-deps-from auto-routed pins stay exact: {deps:?}"
+    );
 }
 
 #[test]
@@ -596,7 +636,7 @@ fn produce_output_closure_gate_keeps_auto_routed_pins_and_base_deps_undoubled() 
             "isaacsim-kernel==6.0.0", // base-dep in the closure: no conda dep
         ],
     );
-    bundle.auto_routed = vec![("numpy".to_string(), "2.1.0".to_string())];
+    bundle.auto_routed = vec![("numpy".to_string(), "2.1.0".to_string(), false)];
     bundle.uv_closure_names = ["isaacsim-kernel", "numpy"]
         .iter()
         .map(|n| crate::relax::canonical_conda_name(n))
@@ -2207,4 +2247,49 @@ async fn deps_from_roots_reach_closure_input_root_set() {
     );
 
     std::fs::remove_dir_all(&workspace).ok();
+}
+
+// --- deps_from_exact_pinned_names (conda-as-truth pin-softening) ----------
+
+#[test]
+fn deps_from_exact_pinned_names_flags_exact_and_triple_equal() {
+    let roots = vec![
+        "setuptools==69.5.1".to_string(),
+        "tensordict===0.9.0".to_string(),
+    ];
+    let names = deps_from_exact_pinned_names(&roots);
+    assert!(names.contains("setuptools"));
+    assert!(names.contains("tensordict"));
+    assert_eq!(names.len(), 2);
+}
+
+#[test]
+fn deps_from_exact_pinned_names_ignores_non_exact_specs() {
+    let roots = vec![
+        "typer>=0.6.1".to_string(),
+        "lightning".to_string(),
+        "pkg[cli]>=1.9.4,<2".to_string(),
+        "rtree!=1.2.0".to_string(),
+    ];
+    let names = deps_from_exact_pinned_names(&roots);
+    assert!(
+        names.is_empty(),
+        "non-exact specs must not be flagged: {names:?}"
+    );
+}
+
+#[test]
+fn deps_from_exact_pinned_names_ignores_unparseable_lines() {
+    let roots = vec!["!!! not a requirement !!!".to_string()];
+    assert!(deps_from_exact_pinned_names(&roots).is_empty());
+}
+
+#[test]
+fn deps_from_exact_pinned_names_canonicalizes_conda_name() {
+    // Underscore/dot/dash normalization must match `canonical_conda_name`
+    // so lookups against `AutoRoutedPackage::pypi_name` (PEP 503-canonical)
+    // succeed regardless of the deps-from file's original spelling.
+    let roots = vec!["My_Package.Name==1.0.0".to_string()];
+    let names = deps_from_exact_pinned_names(&roots);
+    assert!(names.contains("my-package-name"));
 }
