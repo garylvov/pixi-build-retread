@@ -356,6 +356,79 @@ pub struct RetreadConfig {
     /// this rung existed.
     #[serde(default, rename = "retread-sdist-build", alias = "sdist-build")]
     pub sdist_build: SdistBuildPolicy,
+
+    /// Extra root PyPI dependencies pulled from an externally-maintained
+    /// requirements/pyproject file, layered on top of (or instead of)
+    /// `[retread-wheels]` entries. Each source is fetched
+    /// (`deps_from::fetch_dep_source`) and parsed
+    /// (`deps_from::parse_dep_source`) into PEP 508 requirement strings,
+    /// which are added as roots to the bundle's uv closure alongside the
+    /// `[retread-wheels]` roots (see `handler::uv_group_closure`). A
+    /// bundle's `[retread-wheels]` table may be empty when
+    /// `retread-deps-from` alone supplies its roots.
+    ///
+    /// Accepts three TOML shapes (a bare string, a git table, or a list
+    /// mixing both -- union of all sources):
+    ///
+    /// ```toml
+    /// [package.build.config]
+    /// retread-deps-from = "requirements_isaaclab.txt"   # local path (relative to this pixi.toml)
+    /// # or:
+    /// retread-deps-from = "https://raw.githubusercontent.com/org/repo/main/requirements.txt"
+    /// # or:
+    /// retread-deps-from = { git = "https://github.com/org/repo", rev = "deadbeef", path = "requirements.txt" }
+    /// # or a list mixing forms:
+    /// retread-deps-from = [
+    ///     "requirements_base.txt",
+    ///     { git = "https://github.com/org/repo", rev = "deadbeef", path = "pyproject.toml" },
+    /// ]
+    /// ```
+    ///
+    /// Default: empty (feature off).
+    #[serde(default, rename = "retread-deps-from", alias = "deps-from")]
+    pub deps_from: DepsFromSpec,
+}
+
+/// `retread-deps-from`'s value: a bare source or a list of sources (union).
+/// See [`RetreadConfig::deps_from`] for the accepted TOML shapes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DepsFromSpec(pub Vec<crate::deps_from::DepSource>);
+
+impl DepsFromSpec {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn as_slice(&self) -> &[crate::deps_from::DepSource] {
+        &self.0
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for DepsFromSpec {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            One(crate::deps_from::DepSource),
+            Many(Vec<crate::deps_from::DepSource>),
+        }
+        Ok(match Repr::deserialize(deserializer)? {
+            Repr::One(d) => DepsFromSpec(vec![d]),
+            Repr::Many(d) => DepsFromSpec(d),
+        })
+    }
+}
+
+impl Serialize for DepsFromSpec {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.0.serialize(serializer)
+    }
 }
 
 /// Per-pack policy for the sdist-only self-heal's build rung
@@ -813,6 +886,100 @@ mod tests {
         });
         let cfg: RetreadConfig = serde_json::from_value(json).unwrap();
         assert_eq!(cfg.compression_level, None);
+    }
+
+    #[test]
+    fn parses_retread_deps_from_default_empty() {
+        let json = serde_json::json!({
+            "retread-wheels": { "foo": { "version": "==1.0" } },
+        });
+        let cfg: RetreadConfig = serde_json::from_value(json).unwrap();
+        assert!(cfg.deps_from.is_empty());
+    }
+
+    #[test]
+    fn parses_retread_deps_from_bare_string_local() {
+        // Invariant #6: every new config field needs a serde test.
+        let json = serde_json::json!({
+            "retread-wheels": {},
+            "retread-deps-from": "requirements_isaaclab.txt",
+        });
+        let cfg: RetreadConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            cfg.deps_from.as_slice(),
+            &[crate::deps_from::DepSource::Local(
+                std::path::PathBuf::from("requirements_isaaclab.txt")
+            )]
+        );
+    }
+
+    #[test]
+    fn parses_retread_deps_from_bare_string_url() {
+        let json = serde_json::json!({
+            "retread-wheels": {},
+            "retread-deps-from": "https://raw.githubusercontent.com/org/repo/main/requirements.txt",
+        });
+        let cfg: RetreadConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            cfg.deps_from.as_slice(),
+            &[crate::deps_from::DepSource::Url(
+                "https://raw.githubusercontent.com/org/repo/main/requirements.txt".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn parses_retread_deps_from_git_table() {
+        let json = serde_json::json!({
+            "retread-wheels": {},
+            "retread-deps-from": {
+                "git": "https://github.com/org/repo",
+                "rev": "deadbeef",
+                "path": "requirements.txt",
+            },
+        });
+        let cfg: RetreadConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            cfg.deps_from.as_slice(),
+            &[crate::deps_from::DepSource::Git {
+                git: "https://github.com/org/repo".to_string(),
+                rev: "deadbeef".to_string(),
+                path: "requirements.txt".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn parses_retread_deps_from_list_mixing_forms() {
+        let json = serde_json::json!({
+            "retread-wheels": {},
+            "retread-deps-from": [
+                "requirements_base.txt",
+                "https://raw.githubusercontent.com/org/repo/main/requirements.txt",
+                {
+                    "git": "https://github.com/org/repo",
+                    "rev": "deadbeef",
+                    "path": "pyproject.toml",
+                },
+            ],
+        });
+        let cfg: RetreadConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            cfg.deps_from.as_slice(),
+            &[
+                crate::deps_from::DepSource::Local(std::path::PathBuf::from(
+                    "requirements_base.txt"
+                )),
+                crate::deps_from::DepSource::Url(
+                    "https://raw.githubusercontent.com/org/repo/main/requirements.txt".to_string()
+                ),
+                crate::deps_from::DepSource::Git {
+                    git: "https://github.com/org/repo".to_string(),
+                    rev: "deadbeef".to_string(),
+                    path: "pyproject.toml".to_string(),
+                },
+            ]
+        );
     }
 
     #[test]

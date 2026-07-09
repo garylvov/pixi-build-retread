@@ -14,6 +14,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Parse a dependency source file's content into a Vec of PEP 508
 /// requirement strings.
@@ -154,6 +155,59 @@ pub enum DepSource {
     },
 }
 
+/// Deserialize form for one `retread-deps-from` list element / the bare
+/// (non-list) value. A bare string is scheme-sniffed: `http://` / `https://`
+/// -> [`DepSource::Url`], anything else -> [`DepSource::Local`]. A table
+/// with `git`/`rev`/`path` keys -> [`DepSource::Git`].
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum DepSourceRepr {
+    Str(String),
+    Git {
+        git: String,
+        rev: String,
+        path: String,
+    },
+}
+
+impl<'de> Deserialize<'de> for DepSource {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(match DepSourceRepr::deserialize(deserializer)? {
+            DepSourceRepr::Str(s) => {
+                if s.starts_with("http://") || s.starts_with("https://") {
+                    DepSource::Url(s)
+                } else {
+                    DepSource::Local(PathBuf::from(s))
+                }
+            }
+            DepSourceRepr::Git { git, rev, path } => DepSource::Git { git, rev, path },
+        })
+    }
+}
+
+impl Serialize for DepSource {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            DepSource::Local(path) => serializer.serialize_str(&path.to_string_lossy()),
+            DepSource::Url(u) => serializer.serialize_str(u),
+            DepSource::Git { git, rev, path } => {
+                use serde::ser::SerializeStruct;
+                let mut s = serializer.serialize_struct("DepSource", 3)?;
+                s.serialize_field("git", git)?;
+                s.serialize_field("rev", rev)?;
+                s.serialize_field("path", path)?;
+                s.end()
+            }
+        }
+    }
+}
+
 /// Resolve a `DepSource` to file text, ready to hand to `parse_dep_source`.
 ///
 /// Returns `(file_content, filename_hint)`: `filename_hint` is the file's
@@ -220,6 +274,32 @@ pub async fn fetch_dep_source(
             Ok((content, hint))
         }
     }
+}
+
+/// Wiring layer: fetch + parse every `DepSource` in `sources` (in order)
+/// and flatten the results into one PEP 508 root-requirement list, ready
+/// to extend a `uv_closure::UvClosureRequest::dependencies` (or any other
+/// uv-resolvable root set) with. Each source is fetched via
+/// [`fetch_dep_source`] then parsed via [`parse_dep_source`]; a source's
+/// requirements are appended in the source's list order, so later sources
+/// appear later in the returned Vec (relevant for the caller's
+/// last-wins-by-name dedupe against other root sources, e.g.
+/// `[retread-wheels]` entries).
+pub async fn resolve_deps_from_roots(
+    sources: &[DepSource],
+    workspace_root: &Path,
+    cache_dir: &Path,
+) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for src in sources {
+        let (content, hint) = fetch_dep_source(src, workspace_root, cache_dir)
+            .await
+            .with_context(|| format!("retread-deps-from: fetching {src:?}"))?;
+        let deps = parse_dep_source(&content, &hint)
+            .with_context(|| format!("retread-deps-from: parsing {hint} ({src:?})"))?;
+        out.extend(deps);
+    }
+    Ok(out)
 }
 
 /// GET `url`, caching the response body under `cache_dir` keyed by a
@@ -464,6 +544,97 @@ requests = "^2.28"
         assert!(err.to_string().contains("does_not_exist.txt"));
 
         std::fs::remove_dir_all(workspace).ok();
+    }
+
+    /// Root-assembly test: `resolve_deps_from_roots` over a single Local
+    /// source produces exactly the PEP 508 strings a caller (e.g.
+    /// `uv_group_closure`) would extend its root requirement set with.
+    #[tokio::test]
+    async fn resolve_deps_from_roots_local_source_yields_requirements() {
+        let workspace = unique_tmp_dir("resolve-roots-local");
+        std::fs::write(
+            workspace.join("requirements_isaaclab.txt"),
+            PROTOMOTIONS_REQUIREMENTS,
+        )
+        .expect("write temp requirements.txt");
+
+        let sources = vec![DepSource::Local(PathBuf::from("requirements_isaaclab.txt"))];
+        let cache_dir = workspace.join("cache");
+        let roots = resolve_deps_from_roots(&sources, &workspace, &cache_dir)
+            .await
+            .expect("resolve_deps_from_roots should succeed");
+
+        assert_eq!(
+            roots,
+            vec![
+                "tensordict==0.9.0".to_string(),
+                "lightning".to_string(),
+                "rtree==1.2.0".to_string(),
+                "typer>=0.6.1".to_string(),
+                "pkg[cli]>=1.9.4".to_string(),
+            ]
+        );
+
+        std::fs::remove_dir_all(workspace).ok();
+    }
+
+    /// Multiple sources flatten in list order.
+    #[tokio::test]
+    async fn resolve_deps_from_roots_multiple_sources_flatten_in_order() {
+        let workspace = unique_tmp_dir("resolve-roots-multi");
+        std::fs::write(workspace.join("a.txt"), "foo==1.0\n").expect("write a.txt");
+        std::fs::write(workspace.join("b.txt"), "bar==2.0\n").expect("write b.txt");
+
+        let sources = vec![
+            DepSource::Local(PathBuf::from("a.txt")),
+            DepSource::Local(PathBuf::from("b.txt")),
+        ];
+        let cache_dir = workspace.join("cache");
+        let roots = resolve_deps_from_roots(&sources, &workspace, &cache_dir)
+            .await
+            .expect("resolve_deps_from_roots should succeed");
+
+        assert_eq!(roots, vec!["foo==1.0".to_string(), "bar==2.0".to_string()]);
+
+        std::fs::remove_dir_all(workspace).ok();
+    }
+
+    // --- DepSource (de)serialization -----------------------------------
+
+    #[test]
+    fn depsource_bare_string_local_vs_url_sniff() {
+        let local: DepSource = toml::from_str("v = \"requirements.txt\"")
+            .map(|t: toml::Value| DepSource::deserialize(t.get("v").unwrap().clone()).unwrap())
+            .unwrap();
+        assert_eq!(local, DepSource::Local(PathBuf::from("requirements.txt")));
+
+        let url: DepSource = toml::from_str("v = \"https://example.com/requirements.txt\"")
+            .map(|t: toml::Value| DepSource::deserialize(t.get("v").unwrap().clone()).unwrap())
+            .unwrap();
+        assert_eq!(
+            url,
+            DepSource::Url("https://example.com/requirements.txt".to_string())
+        );
+    }
+
+    #[test]
+    fn depsource_table_form_is_git() {
+        let toml_val: toml::Value = toml::from_str(
+            r#"git = "https://github.com/foo/bar"
+rev = "deadbeef"
+path = "requirements.txt"
+"#,
+        )
+        .unwrap();
+        let src = DepSource::deserialize(toml_val).unwrap();
+        assert_eq!(
+            src,
+            DepSource::Git {
+                git: "https://github.com/foo/bar".to_string(),
+                rev: "deadbeef".to_string(),
+                path: "requirements.txt".to_string(),
+            }
+        );
     }
 
     /// Live network: fetch ProtoMotions' requirements_isaaclab.txt straight

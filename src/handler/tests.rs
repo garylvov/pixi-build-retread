@@ -317,6 +317,7 @@ fn pythons_for_rejects_bare_major_variant() {
         git_sources: std::collections::BTreeMap::new(),
         python: None,
         pin_version: false,
+        deps_from: Default::default(),
     };
     let result = pythons_for(&cfg, Some(&variants));
     assert_eq!(
@@ -361,6 +362,7 @@ fn pythons_for_accepts_dotted_variant() {
         git_sources: std::collections::BTreeMap::new(),
         python: None,
         pin_version: false,
+        deps_from: Default::default(),
     };
     let result = pythons_for(&cfg, Some(&variants));
     assert_eq!(result, vec!["3.11".to_string()]);
@@ -405,6 +407,7 @@ fn pythons_for_filters_bare_major_keeps_dotted() {
         git_sources: std::collections::BTreeMap::new(),
         python: None,
         pin_version: false,
+        deps_from: Default::default(),
     };
     let result = pythons_for(&cfg, Some(&variants));
     assert_eq!(result, vec!["3.11".to_string(), "3.12".to_string()]);
@@ -753,6 +756,7 @@ fn cfg() -> RetreadConfig {
         git_sources: std::collections::BTreeMap::new(),
         python: None,
         pin_version: false,
+        deps_from: Default::default(),
     }
 }
 
@@ -2116,4 +2120,91 @@ fn siblings_with_override_use_lock_version() {
         "6.0.0.1",
         "version_override must be reflected in the emitted metadata version"
     );
+}
+
+// --- retread-deps-from root assembly --------------------------------------
+
+#[test]
+fn root_req_name_normalizes_pep508_names() {
+    assert_eq!(
+        root_req_name("Foo_Bar[extra]==1.0"),
+        Some("foo-bar".to_string())
+    );
+    assert_eq!(
+        root_req_name("tensordict==0.9.0"),
+        Some("tensordict".to_string())
+    );
+    // Unparsable garbage doesn't panic; caller falls back to the raw string.
+    assert_eq!(root_req_name("!!! not a requirement !!!"), None);
+}
+
+#[test]
+fn dedupe_roots_last_wins_keeps_last_occurrence_by_name() {
+    let roots = vec![
+        "isaacsim==5.1.0".to_string(),
+        "tensordict==0.9.0".to_string(),
+        // deps-from re-states isaacsim with a different pin: this must win.
+        "isaacsim==5.2.0".to_string(),
+    ];
+    let deduped = dedupe_roots_last_wins(roots);
+    assert_eq!(
+        deduped,
+        vec![
+            "isaacsim==5.2.0".to_string(),
+            "tensordict==0.9.0".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn dedupe_roots_last_wins_preserves_order_when_no_collisions() {
+    let roots = vec!["a==1".to_string(), "b==2".to_string(), "c==3".to_string()];
+    assert_eq!(dedupe_roots_last_wins(roots.clone()), roots);
+}
+
+/// End-to-end root-assembly test: a `retread-deps-from` local source's
+/// PEP 508 lines make it into the root set `uv_group_closure` extends,
+/// combined + deduped against a `[retread-wheels]` root — without driving
+/// an actual uv solve (which `uv_group_closure` would need network /
+/// the `uv` binary for). Exercises the exact two calls `uv_group_closure`
+/// makes: `deps_from::resolve_deps_from_roots` then
+/// `dedupe_roots_last_wins`.
+#[tokio::test]
+async fn deps_from_roots_reach_closure_input_root_set() {
+    let workspace = unique_test_dir("deps-from-roots");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::write(
+        workspace.join("requirements_isaaclab.txt"),
+        "tensordict==0.9.0\nlightning\nrtree==1.2.0\n",
+    )
+    .unwrap();
+
+    let deps_from = vec![crate::deps_from::DepSource::Local(
+        std::path::PathBuf::from("requirements_isaaclab.txt"),
+    )];
+    let cache_dir = workspace.join("cache");
+
+    // Mirrors uv_group_closure: `[retread-wheels]` roots built first...
+    let mut roots: Vec<String> = vec!["isaacsim==5.1.0".to_string()];
+    // ...then retread-deps-from roots fetched + parsed + appended...
+    let deps_from_roots =
+        crate::deps_from::resolve_deps_from_roots(&deps_from, &workspace, &cache_dir)
+            .await
+            .expect("resolve_deps_from_roots should succeed");
+    roots.extend(deps_from_roots);
+    // ...then deduped by name (last wins).
+    let roots = dedupe_roots_last_wins(roots);
+
+    assert_eq!(
+        roots,
+        vec![
+            "isaacsim==5.1.0".to_string(),
+            "tensordict==0.9.0".to_string(),
+            "lightning".to_string(),
+            "rtree==1.2.0".to_string(),
+        ],
+        "deps-from's parsed requirements must reach the root set fed to the uv closure"
+    );
+
+    std::fs::remove_dir_all(&workspace).ok();
 }

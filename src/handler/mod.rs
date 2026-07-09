@@ -2219,6 +2219,38 @@ async fn build_sdist_wheel(
         )))
 }
 
+/// Dedupe root requirement strings by PEP 503-normalized package name,
+/// keeping the LAST occurrence of each name (order-preserving on first
+/// sight, so unrelated roots keep their original relative order). Used by
+/// `uv_group_closure` to reconcile `[retread-wheels]` roots against
+/// `retread-deps-from` roots: whichever list contributes a name LAST wins
+/// -- see the call site for why that's deps-from by construction. A root
+/// string that doesn't parse as PEP 508 (unexpected, but don't panic) is
+/// treated as its own unique key, i.e. never deduped away.
+fn dedupe_roots_last_wins(roots: Vec<String>) -> Vec<String> {
+    let mut order: Vec<String> = Vec::new();
+    let mut by_key: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for req in roots {
+        let key = root_req_name(&req).unwrap_or_else(|| req.clone());
+        if !by_key.contains_key(&key) {
+            order.push(key.clone());
+        }
+        by_key.insert(key, req);
+    }
+    order
+        .into_iter()
+        .map(|k| by_key.remove(&k).expect("key was just inserted"))
+        .collect()
+}
+
+/// Extract a PEP 508 requirement string's PEP 503-normalized package name,
+/// e.g. `"Foo_Bar[extra]==1.0"` -> `Some("foo-bar")`. `None` if the string
+/// doesn't parse as a PEP 508 requirement.
+fn root_req_name(req: &str) -> Option<String> {
+    let parsed: uv_pep508::Requirement = uv_pep508::Requirement::from_str(req).ok()?;
+    Some(canonical_conda_name(parsed.name.as_ref()))
+}
+
 /// spec-uv-restructure M1: build + solve one bundle group's closure via uv.
 ///
 /// Roots are the group's uv-resolvable entries (PyPI spec-form entries as
@@ -2285,6 +2317,30 @@ async fn uv_group_closure(
             );
         }
     }
+    // retread-deps-from: fetch + parse each configured source and append
+    // its PEP 508 lines as additional roots. A pure deps-from bundle (no
+    // uv-resolvable `[retread-wheels]` entries at all) is exactly why this
+    // runs BEFORE the `roots.is_empty()` bail-out below -- deps-from alone
+    // can supply every root this bundle needs.
+    if !effective.deps_from.is_empty() {
+        let deps_from_roots = crate::deps_from::resolve_deps_from_roots(
+            effective.deps_from.as_slice(),
+            source_dir,
+            cache_dir,
+        )
+        .await
+        .with_context(|| format!("retread-deps-from: bundle `{group_name}`"))?;
+        roots.extend(deps_from_roots);
+        // Dedupe by PEP 503-normalized package name, LAST occurrence wins.
+        // deps-from entries are appended after `[retread-wheels]` roots
+        // above, so on a same-name collision the deps-from requirement
+        // string wins -- lets a deps-from file's own pin override a
+        // `[retread-wheels]` spec-form entry's implicit root without an
+        // error (or vice versa if a later deps-from source repeats a
+        // name an earlier one set).
+        roots = dedupe_roots_last_wins(roots);
+    }
+
     if roots.is_empty() {
         tracing::info!(
             bundle = %group_name,

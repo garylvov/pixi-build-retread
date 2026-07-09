@@ -1135,6 +1135,7 @@ mod tests {
             git_sources: std::collections::BTreeMap::new(),
             python: None,
             pin_version: false,
+            deps_from: Default::default(),
         }
     }
 
