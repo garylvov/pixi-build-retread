@@ -8,6 +8,7 @@ pub mod compat;
 pub mod conda_solve;
 pub mod config;
 pub mod courier;
+pub mod deps_from;
 pub mod emit_pypi;
 pub mod fasttmp;
 pub mod glibc;
