@@ -245,9 +245,26 @@ impl SolveLedger {
             .unwrap_or(false);
         let mut state = TriedState::default();
         if same_hash {
+            // Only seed strategies that actually FAILED. A ledger entry with
+            // `failed: false` means the repair worked in-memory when it was
+            // applied; if the run later died on an unrelated conflict, that
+            // fix was never persisted to `.retread/auto-overrides.json`, so
+            // there is nothing to oscillate against -- the correct behavior
+            // on the next invocation is to retry it, not to treat it as
+            // already-exhausted. Seeding successes here (regardless of
+            // whether they ended up persisted) previously caused
+            // `deps_from_pin_conflict` et al. to refuse a retry with
+            // "exhausted repair strategies" even though the repair had
+            // never actually failed. `TriedState::has` doesn't distinguish
+            // tried-and-failed from tried-and-succeeded, so the only way to
+            // preserve oscillation protection for genuine failures while
+            // unblocking good-but-unpersisted repairs is to never mark the
+            // latter into `tried` at all.
             for run in &self.runs {
                 for a in &run.attempts {
-                    state.mark(&a.package, parse_strategy(&a.strategy), a.failed);
+                    if a.failed {
+                        state.mark(&a.package, parse_strategy(&a.strategy), true);
+                    }
                 }
             }
         } else {
@@ -1703,6 +1720,8 @@ mod tests {
             manifest_hash.clone(),
             Some("pixi 0.70.0".into()),
         );
+        // Genuinely FAILED attempt -- must still be seeded (oscillation
+        // protection across runs must survive the fix).
         ledger.runs[run].attempts.push(LedgerAttempt {
             iter: 1,
             package: "torch".into(),
@@ -1716,7 +1735,7 @@ mod tests {
             new_spec: None,
             ceiling_policy: None,
             before: None,
-            failed: false,
+            failed: true,
         });
         ledger.write_atomic(&ledger_path).unwrap();
         let loaded = SolveLedger::load(&ledger_path, "pixi.toml".into()).unwrap();
@@ -1726,6 +1745,60 @@ mod tests {
         let tried_from_sentinels = loaded.seed_tried_state(&path, "different", &editor);
         assert!(tried_from_sentinels.has("numpy", Strategy::Conda));
         assert!(!tried_from_sentinels.has("torch", Strategy::Conda));
+    }
+
+    #[test]
+    fn seed_tried_state_only_seeds_failed_ledger_entries() {
+        // Regression test for the sentry-sdk desync (proof run 4 of
+        // pm-isaaclab): a repair that RESOLVED its conflict in-memory
+        // (`failed: false`) but was never persisted to
+        // `.retread/auto-overrides.json` because the overall lock later
+        // died on an unrelated conflict must NOT block a retry on the next
+        // invocation. A genuinely failed attempt must still block retry
+        // (oscillation protection across runs).
+        let path = temp_manifest("[dependencies]\n");
+        let editor = ManifestEditor::open(path.clone()).unwrap();
+        let manifest_hash = manifest_sha256(&path).unwrap();
+        let ledger_path = path.parent().unwrap().join(".retread/solve-ledger.json");
+        let mut ledger = SolveLedger::load(&ledger_path, "pixi.toml".into()).unwrap();
+        let run = ledger.start_run(
+            "default".into(),
+            manifest_hash.clone(),
+            Some("pixi 0.70.0".into()),
+        );
+        fn attempt(package: &str, failed: bool) -> LedgerAttempt {
+            LedgerAttempt {
+                iter: 1,
+                package: package.into(),
+                version: Some("1.0.0".into()),
+                tier: "pypi".into(),
+                strategy: "pypi_override".into(),
+                conflict: "DepsFromPin".into(),
+                source: "retread".into(),
+                ts: timestamp(),
+                old_spec: None,
+                new_spec: None,
+                ceiling_policy: None,
+                before: None,
+                failed,
+            }
+        }
+        // succeeded in-memory but never persisted (the sentry-sdk case).
+        ledger.runs[run].attempts.push(attempt("sentry-sdk", false));
+        // genuinely failed and must remain blocked.
+        ledger.runs[run].attempts.push(attempt("antlr4", true));
+        ledger.write_atomic(&ledger_path).unwrap();
+
+        let loaded = SolveLedger::load(&ledger_path, "pixi.toml".into()).unwrap();
+        let tried = loaded.seed_tried_state(&path, &manifest_hash, &editor);
+        assert!(
+            !tried.has("sentry-sdk", Strategy::PypiOverride),
+            "successful-but-unpersisted repair must be retried, not treated as exhausted"
+        );
+        assert!(
+            tried.has("antlr4", Strategy::PypiOverride),
+            "genuinely failed repair must still block retry (oscillation protection)"
+        );
     }
 
     #[test]
