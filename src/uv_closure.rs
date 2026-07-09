@@ -691,9 +691,31 @@ pub fn is_sdist_only_uv_error(text: &str) -> bool {
     // `antlr4-python3-runtime==4.9.*`, which resolves to a range with
     // zero wheel-bearing builds under `--no-build`). Same sdist-only
     // class, different uv prose shape -- must self-heal identically.
-    t.contains("has no wheels")
+    if t.contains("has no wheels")
         || t.contains("no wheels with a matching")
         || t.contains("has no usable wheels")
+    {
+        return true;
+    }
+    // "only the following versions ... are available" band-complement
+    // shape (deps-from proof run 7, step4-lock-run7.log): once a
+    // wheel-less version band is filtered OUT of uv's candidate set
+    // entirely (e.g. `--no-build` hides every 4.9.x sdist-only release
+    // while a conda pin still demands one), uv stops saying "has no
+    // (usable) wheels" at all and instead lists the AVAILABLE set as
+    // the band's complement -- "only the following versions of
+    // antlr4-python3-runtime are available: antlr4-python3-
+    // runtime<4.9.dev0, antlr4-python3-runtime>=4.10.dev0". The
+    // `.dev0` range boundaries are the tell that an interior band of
+    // versions EXISTS upstream but was filtered (a genuinely-missing
+    // version is listed as plain released versions/ranges, never as a
+    // dev-bounded complement), so this is the same sdist-only class in
+    // a third prose shape. A rare misfire is benign: rung 2's sdist
+    // resolve fails for a version that truly doesn't exist and rung 3
+    // surfaces the ORIGINAL error verbatim (plus guidance).
+    t.contains("only the following versions of")
+        && t.contains("are available")
+        && t.contains(".dev0")
 }
 
 /// Extract the PEP 503-canonical package name(s) uv's error names as
@@ -733,6 +755,17 @@ pub fn extract_sdist_only_packages(text: &str) -> Vec<String> {
     for cap in re_ranged.captures_iter(&t) {
         names.insert(canonical_conda_name(&cap[1]));
     }
+    // Band-complement shape (run 7): the failing package is the subject
+    // of "only the following versions of <name> are available" -- no
+    // "has no (usable) wheels" clause exists anywhere in the message,
+    // so neither regex above can name it.
+    let re_avail = regex::Regex::new(
+        r"(?i)only the following versions of\s+([A-Za-z0-9][A-Za-z0-9._-]*)\s+are\s+available",
+    )
+    .expect("static available-band sdist-only extraction regex");
+    for cap in re_avail.captures_iter(&t) {
+        names.insert(canonical_conda_name(&cap[1]));
+    }
     names.into_iter().collect()
 }
 
@@ -766,7 +799,14 @@ pub fn extract_sdist_only_requirement(text: &str, name: &str) -> Option<String> 
     .ok()?;
     re.captures(&t)
         .and_then(|c| c.get(1))
-        .map(|m| m.as_str().to_string())
+        // uv's prose may run the specifier straight into sentence
+        // punctuation ("...depends on antlr4-python3-runtime==4.9.*, we
+        // can conclude..." -- run 7's band-complement shape), which the
+        // greedy `\S*` capture swallows. A PEP 440 specifier never ENDS
+        // with `,` (comma is the AND separator between clauses) or `.`
+        // (a version segment always follows a dot), so trailing sentence
+        // punctuation is safe to strip.
+        .map(|m| m.as_str().trim_end_matches([',', '.', ';']).to_string())
 }
 
 /// Translate a raw PyPI/PEP 440 version specifier (as captured by
@@ -904,7 +944,12 @@ pub fn sdist_build_failed_message(failures: &[(String, String)]) -> String {
 ///    round — including ones rung 1 just routed or routed in an earlier
 ///    round — when `sdist_build` is `Some` (config `sdist-build =
 ///    "auto"`, the default). The package is built from its PyPI sdist
-///    via `sdist_build` — the SAME machinery git-sourced
+///    via `sdist_build`, which receives the ORIGINATING pypi
+///    requirement's raw version specifier (the same one rung 1's conda
+///    probe uses, e.g. `==4.9.*`; `None` = unpinned = newest) so the
+///    built wheel actually SATISFIES the requirer's metadata — building
+///    the newest sdist (4.13.x) for a `==4.9.*` requirement just re-fails
+///    the re-solve (deps-from proof run 7). Same machinery git-sourced
 ///    `[retread-wheels]` entries use
 ///    (`crate::source_build::build_wheel_from_sdist_url`), cached/stored
 ///    content-addressed. A success registers a `tool.uv.sources` path
@@ -956,7 +1001,7 @@ where
         + Send
         + Sync
         + 'static,
-    SB: Fn(String) -> futures::future::BoxFuture<'static, Result<BuiltSdistWheel>>
+    SB: Fn(String, Option<String>) -> futures::future::BoxFuture<'static, Result<BuiltSdistWheel>>
         + Send
         + Sync
         + 'static,
@@ -1036,16 +1081,23 @@ where
                         // re-log an already-known route) -- but note a
                         // route, new or old, does NOT exempt the name
                         // from rung 2 below.
+                        // Carry the ORIGINATING pypi requirement's
+                        // version range into BOTH rungs -- a bare
+                        // "any version" let a wheel-less transitive dep
+                        // like `antlr4-python3-runtime` route to conda's
+                        // unconstrained latest (`==4.13.2`) and, run 7,
+                        // let the build rung download/build the newest
+                        // sdist (4.13.x) instead of one satisfying the
+                        // requirer's own metadata (`==4.9.*`), so the
+                        // re-solve failed identically.
+                        let requirements: std::collections::BTreeMap<&str, Option<String>> = names
+                            .iter()
+                            .map(|n| (n.as_str(), extract_sdist_only_requirement(&msg, n)))
+                            .collect();
                         let mut new_routes = Vec::new();
                         for name in names.iter().filter(|n| !already_routed.contains(*n)) {
-                            // Carry the ORIGINATING pypi requirement's
-                            // version range into the conda probe -- a
-                            // bare `"*"` (any version) let a wheel-less
-                            // transitive dep like `antlr4-python3-runtime`
-                            // route to conda's unconstrained latest
-                            // (`==4.13.2`), clashing with the pypi
-                            // requirement's own metadata (`==4.9.*`).
-                            let raw_requirement = extract_sdist_only_requirement(&msg, name);
+                            let raw_requirement =
+                                requirements.get(name.as_str()).cloned().unwrap_or_default();
                             let spec = conda_spec_from_pypi_specifier(raw_requirement.as_deref());
                             if let Some(hit) = sdist_probe(name.clone(), spec).await {
                                 new_routes.push(AutoRoutedPackage {
@@ -1076,7 +1128,11 @@ where
                         match sdist_build.as_ref() {
                             Some(build) => {
                                 for name in &names {
-                                    match build(name.clone()).await {
+                                    let raw_requirement = requirements
+                                        .get(name.as_str())
+                                        .cloned()
+                                        .unwrap_or_default();
+                                    match build(name.clone(), raw_requirement).await {
                                         Ok(w) => new_built.push(w),
                                         Err(e) => {
                                             build_failures.push((name.clone(), format!("{e:#}")));
@@ -1191,7 +1247,7 @@ where
         + Send
         + Sync
         + 'static,
-    SB: Fn(String) -> futures::future::BoxFuture<'static, Result<BuiltSdistWheel>>
+    SB: Fn(String, Option<String>) -> futures::future::BoxFuture<'static, Result<BuiltSdistWheel>>
         + Send
         + Sync
         + 'static,
@@ -3678,6 +3734,44 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
         );
     }
 
+    // deps-from proof run 7 (step4-lock-run7.log, ErrorObject message
+    // decoded: pixi display-wrapping undone, `\n` escapes restored to
+    // real newlines -- the shape the backend-side error chain actually
+    // carries): once the wheel-less 4.9.x band is filtered out of uv's
+    // candidate set entirely, uv stops saying "has no (usable) wheels"
+    // and lists the AVAILABLE set as the band's dev-bounded complement
+    // ("antlr4-python3-runtime<4.9.dev0", ">=4.10.dev0"). Third prose
+    // shape of the same sdist-only class.
+    const ONLY_VERSIONS_AVAILABLE_BAND_UV_ERR: &str =
+        include_str!("../tests/fixtures/solve_errors/uv_closure_only_versions_available_band.txt");
+
+    #[test]
+    fn is_sdist_only_uv_error_matches_available_band_class() {
+        assert!(is_sdist_only_uv_error(ONLY_VERSIONS_AVAILABLE_BAND_UV_ERR));
+    }
+
+    #[test]
+    fn extract_sdist_only_packages_names_available_band_subject() {
+        assert_eq!(
+            extract_sdist_only_packages(ONLY_VERSIONS_AVAILABLE_BAND_UV_ERR),
+            vec!["antlr4-python3-runtime".to_string()]
+        );
+    }
+
+    #[test]
+    fn extract_sdist_only_requirement_trims_trailing_sentence_punctuation() {
+        // Run 7's prose runs the specifier straight into a comma
+        // ("...depends on antlr4-python3-runtime==4.9.*, we can...") --
+        // the greedy capture must not keep it.
+        assert_eq!(
+            extract_sdist_only_requirement(
+                ONLY_VERSIONS_AVAILABLE_BAND_UV_ERR,
+                "antlr4-python3-runtime"
+            ),
+            Some("==4.9.*".to_string())
+        );
+    }
+
     #[test]
     fn conda_spec_from_pypi_specifier_translates_wildcard() {
         assert_eq!(conda_spec_from_pypi_specifier(Some("==4.9.*")), "4.9.*");
@@ -3758,17 +3852,23 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
                 }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
             }
         };
-        let sdist_build = |name: String| {
-            Box::pin(async move {
-                Ok(BuiltSdistWheel {
-                    pypi_name: name.clone(),
-                    version: "4.9.3".to_string(),
-                    filename: format!("{name}-4.9.3-py3-none-any.whl"),
-                    wheel_path: PathBuf::from(format!("/tmp/wheels/{name}-4.9.3.whl")),
-                    sha256: "d".repeat(64),
-                    sdist_source: sdist_source_fixture(&name, "4.9.3"),
-                })
-            }) as futures::future::BoxFuture<'static, Result<BuiltSdistWheel>>
+        let seen_build_reqs = Arc::new(Mutex::new(Vec::new()));
+        let sdist_build = {
+            let seen_build_reqs = Arc::clone(&seen_build_reqs);
+            move |name: String, req: Option<String>| {
+                let seen_build_reqs = Arc::clone(&seen_build_reqs);
+                Box::pin(async move {
+                    seen_build_reqs.lock().unwrap().push(req);
+                    Ok(BuiltSdistWheel {
+                        pypi_name: name.clone(),
+                        version: "4.9.3".to_string(),
+                        filename: format!("{name}-4.9.3-py3-none-any.whl"),
+                        wheel_path: PathBuf::from(format!("/tmp/wheels/{name}-4.9.3.whl")),
+                        sha256: "d".repeat(64),
+                        sdist_source: sdist_source_fixture(&name, "4.9.3"),
+                    })
+                }) as futures::future::BoxFuture<'static, Result<BuiltSdistWheel>>
+            }
         };
         let closure = auto_route_fixpoint_with_sdist_heal(
             &auto_route_req(),
@@ -3785,16 +3885,95 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
             &["4.9.*".to_string()],
             "probe must be queried with the translated pypi requirement range, not a bare wildcard"
         );
+        assert_eq!(
+            seen_build_reqs.lock().unwrap().as_slice(),
+            &[Some("==4.9.*".to_string())],
+            "the build rung must receive the RAW pypi requirement range (run-7 fix: a \
+             match-any selection built the newest sdist instead of one satisfying the requirer)"
+        );
         assert_eq!(closure.auto_routed.len(), 1);
         let r = &closure.auto_routed[0];
         assert_eq!(r.pypi_name, "antlr4-python3-runtime");
         assert_eq!(r.conda_version, "4.9.3");
     }
 
+    /// Run-7 end-to-end: the band-complement template (which contains NO
+    /// "has no (usable) wheels" prose at all) must drive the full heal
+    /// ladder, and the build rung must receive the extracted requirement
+    /// range (`==4.9.*`) so the sdist selection builds 4.9.3 rather than
+    /// the newest release.
+    #[tokio::test]
+    async fn sdist_heal_available_band_template_builds_at_required_range() {
+        let solve = move |r: UvClosureRequest| {
+            Box::pin(async move {
+                if !r.built_wheel_sources.contains_key("antlr4-python3-runtime") {
+                    bail!("{ONLY_VERSIONS_AVAILABLE_BAND_UV_ERR}");
+                }
+                parse_pylock_closure(
+                    PYLOCK_FIXTURE,
+                    &target("3.12", "linux-64"),
+                    &BTreeSet::new(),
+                    "0.11.15",
+                )
+            }) as futures::future::BoxFuture<'static, Result<UvClosure>>
+        };
+        let probe = |_name: String, _spec: String| {
+            Box::pin(async { None }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
+        };
+        let sdist_probe = |_name: String, _spec: String| {
+            Box::pin(async { None }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
+        };
+        let seen_build_reqs = Arc::new(Mutex::new(Vec::new()));
+        let sdist_build = {
+            let seen_build_reqs = Arc::clone(&seen_build_reqs);
+            move |name: String, req: Option<String>| {
+                let seen_build_reqs = Arc::clone(&seen_build_reqs);
+                Box::pin(async move {
+                    seen_build_reqs.lock().unwrap().push((name.clone(), req));
+                    Ok(BuiltSdistWheel {
+                        pypi_name: name.clone(),
+                        version: "4.9.3".to_string(),
+                        filename: format!("{name}-4.9.3-py3-none-any.whl"),
+                        wheel_path: PathBuf::from(format!("/tmp/wheels/{name}-4.9.3.whl")),
+                        sha256: "e".repeat(64),
+                        sdist_source: sdist_source_fixture(&name, "4.9.3"),
+                    })
+                }) as futures::future::BoxFuture<'static, Result<BuiltSdistWheel>>
+            }
+        };
+        let closure = auto_route_fixpoint_with_sdist_heal(
+            &auto_route_req(),
+            &auto_route_opts(),
+            solve,
+            probe,
+            sdist_probe,
+            Some(sdist_build),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            seen_build_reqs.lock().unwrap().as_slice(),
+            &[(
+                "antlr4-python3-runtime".to_string(),
+                Some("==4.9.*".to_string())
+            )],
+            "build rung must be reached from the band-complement template and receive \
+             the requirer's raw range"
+        );
+        let built = closure
+            .wheels
+            .iter()
+            .find(|w| w.name == "antlr4-python3-runtime")
+            .expect("built sdist wheel recorded in the closure");
+        assert_eq!(built.version, "4.9.3");
+        assert!(matches!(built.origin, Origin::Built));
+    }
+
     /// Concrete "no builder" type for tests that disable the build rung
     /// (`sdist-build = "never"`) — `None::<NoBuild>` is the terse
     /// turbofish-free spelling.
-    type NoBuild = fn(String) -> futures::future::BoxFuture<'static, Result<BuiltSdistWheel>>;
+    type NoBuild =
+        fn(String, Option<String>) -> futures::future::BoxFuture<'static, Result<BuiltSdistWheel>>;
 
     fn sdist_source_fixture(name: &str, version: &str) -> crate::lock::SdistWheelSource {
         crate::lock::SdistWheelSource {
@@ -3859,7 +4038,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
         let build_calls = Arc::new(Mutex::new(0usize));
         let sdist_build = {
             let build_calls = Arc::clone(&build_calls);
-            move |name: String| {
+            move |name: String, _req: Option<String>| {
                 let build_calls = Arc::clone(&build_calls);
                 Box::pin(async move {
                     *build_calls.lock().unwrap() += 1;
@@ -3959,7 +4138,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
         let build_calls = Arc::new(Mutex::new(0usize));
         let sdist_build = {
             let build_calls = Arc::clone(&build_calls);
-            move |name: String| {
+            move |name: String, _req: Option<String>| {
                 let build_calls = Arc::clone(&build_calls);
                 Box::pin(async move {
                     *build_calls.lock().unwrap() += 1;
@@ -4034,7 +4213,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
         let build_calls = Arc::new(Mutex::new(0usize));
         let sdist_build = {
             let build_calls = Arc::clone(&build_calls);
-            move |name: String| {
+            move |name: String, _req: Option<String>| {
                 let build_calls = Arc::clone(&build_calls);
                 Box::pin(async move {
                     *build_calls.lock().unwrap() += 1;
@@ -4104,7 +4283,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
         let sdist_probe = |_name: String, _spec: String| {
             Box::pin(async { None }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
         };
-        let sdist_build = |_name: String| {
+        let sdist_build = |_name: String, _req: Option<String>| {
             Box::pin(async {
                 bail!(
                     "uv [\"build\", \"--wheel\"] failed (status 1): error: \

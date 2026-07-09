@@ -2109,18 +2109,40 @@ async fn resolve_all(
 /// subprocess entirely.
 async fn build_sdist_wheel(
     name: String,
+    requirement: Option<String>,
     index_urls: Vec<String>,
     python_version: String,
     conda_subdir: String,
     cache_dir: PathBuf,
 ) -> Result<crate::uv_closure::BuiltSdistWheel> {
-    // Match-any version specifier (empty PEP 440 specifier set is
-    // vacuously satisfied by every version) -- the sdist-only self-heal
-    // has no resolved pypi version to target (uv never produced a
-    // closure for this name), mirroring the conda-route rung's ANY-
-    // version probe.
-    let specifiers = VersionSpecifiers::from_str("")
-        .expect("empty PEP 440 specifier string always parses (match-any)");
+    // Constrain sdist selection to the ORIGINATING pypi requirement's
+    // version range when the heal ladder extracted one from uv's error
+    // (`extract_sdist_only_requirement`, e.g. `==4.9.*` -- the same
+    // range rung 1's conda probe uses). uv never produced a closure for
+    // this name, so there is no RESOLVED version to target, but there
+    // IS a required range: a match-any pick here downloaded/built the
+    // newest sdist (antlr4-python3-runtime 4.13.x) for a `==4.9.*`
+    // requirement, and the re-solve failed identically (deps-from proof
+    // run 7). `None` (unpinned dependency) or an unparseable captured
+    // specifier falls back to match-any (empty PEP 440 specifier set is
+    // vacuously satisfied by every version) -- the pre-range behavior,
+    // best-effort rather than refusing to heal at all.
+    let match_any = || {
+        VersionSpecifiers::from_str("")
+            .expect("empty PEP 440 specifier string always parses (match-any)")
+    };
+    let specifiers = match requirement.as_deref() {
+        Some(raw) => VersionSpecifiers::from_str(raw).unwrap_or_else(|e| {
+            tracing::warn!(
+                pkg = %name,
+                spec = %raw,
+                "sdist auto-build: extracted requirement is not valid PEP 440 \
+                 ({e}); falling back to match-any",
+            );
+            match_any()
+        }),
+        None => match_any(),
+    };
     let mut last_err: Option<anyhow::Error> = None;
     for index in &index_urls {
         let (version, sdist) = match crate::pypi::resolve_sdist(index, &name, &specifiers).await {
@@ -2600,9 +2622,10 @@ async fn uv_group_closure(
         let python_version = target.python_version.clone();
         let conda_subdir = target.conda_subdir.clone();
         let cache_dir = cache_dir.to_path_buf();
-        move |name: String| {
+        move |name: String, requirement: Option<String>| {
             let fut = build_sdist_wheel(
                 name,
+                requirement,
                 index_urls.clone(),
                 python_version.clone(),
                 conda_subdir.clone(),
