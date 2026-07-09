@@ -19,12 +19,16 @@ isaac-pack = { path = "./isaac-pack" }
 # isaac-pack/pixi.toml
 [package]
 name = "isaac-pack"
-backend = { name = "pixi-build-retread", version = ">=4.0.0" }
+backend = { name = "pixi-build-retread", version = ">=4.4.0", channels = ["https://prefix.dev/garylvov", "https://prefix.dev/pixi-build-backends", "https://prefix.dev/conda-forge"] }
 [package.build.config]
 retread-bundle = "isaac-pack"
 [package.build.config.retread-wheels]
 isaacsim = { version = "==5.1.0", index = "https://pypi.nvidia.com" }
 ```
+
+The backend itself is published on `prefix.dev/garylvov`, not conda-forge, so
+`channels` in the backend spec (separate from the workspace `channels` above)
+must list it -- omitting it leaves the backend unresolvable.
 
 Run: `pixi install`
 
@@ -41,7 +45,7 @@ A pack's `pixi.toml` (e.g., `examples/isaac6/isaac-pack/`) declares package meta
 name = "isaac-pack-6"
 version = "6.0.0.1"
 [package.build]
-backend = { name = "pixi-build-retread", version = "*" }
+backend = { name = "pixi-build-retread", version = "*", channels = ["https://prefix.dev/garylvov", "https://prefix.dev/pixi-build-backends", "https://prefix.dev/conda-forge"] }
 [package.build.config]
 retread-python   = "3.12"
 retread-bundle   = "isaac-pack-6"
