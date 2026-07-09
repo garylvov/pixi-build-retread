@@ -1975,9 +1975,9 @@ fn cache_key_changes_when_manifest_mtime_changes() {
     let t0 = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
     let t1 = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_001);
 
-    let key0 = conda_outputs_cache_key(&make_params(), Some(t0));
-    let key1 = conda_outputs_cache_key(&make_params(), Some(t1));
-    let key_none = conda_outputs_cache_key(&make_params(), None);
+    let key0 = conda_outputs_cache_key(&make_params(), Some(t0), "none");
+    let key1 = conda_outputs_cache_key(&make_params(), Some(t1), "none");
+    let key_none = conda_outputs_cache_key(&make_params(), None, "none");
 
     // Different mtimes -> different keys.
     assert_ne!(key0, key1, "distinct mtimes must produce distinct keys");
@@ -1987,11 +1987,60 @@ fn cache_key_changes_when_manifest_mtime_changes() {
         "None mtime must not collide with a real mtime"
     );
     // Identical params + identical mtime -> same key (deterministic).
-    let key0_dup = conda_outputs_cache_key(&make_params(), Some(t0));
+    let key0_dup = conda_outputs_cache_key(&make_params(), Some(t0), "none");
     assert_eq!(
         key0, key0_dup,
         "same params+mtime must produce identical key"
     );
+
+    // Run-12 regression: an auto-overrides ledger change (fix #22 pack
+    // repairs write ONLY the ledger, never a manifest, so the mtime
+    // component never moves) must bust the key too -- otherwise a repair
+    // iteration's fresh backend cache-hits the STALE pack render.
+    let key_ledger = conda_outputs_cache_key(&make_params(), Some(t0), "abcdef0123456789");
+    assert_ne!(
+        key0, key_ledger,
+        "distinct auto-overrides ledger fingerprints must produce distinct keys"
+    );
+}
+
+#[test]
+fn auto_overrides_fingerprint_tracks_ledger_content_not_mtime() {
+    let dir = std::env::temp_dir().join(format!(
+        "retread-auto-fp-test-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(dir.join(".retread")).unwrap();
+
+    // No workspace dir / no ledger -> "none" sentinel.
+    assert_eq!(auto_overrides_fingerprint(None), "none");
+    assert_eq!(auto_overrides_fingerprint(Some(&dir)), "none");
+
+    let ledger = dir.join(".retread").join("auto-overrides.json");
+    std::fs::write(&ledger, br#"{"packs":{}}"#).unwrap();
+    let fp_empty = auto_overrides_fingerprint(Some(&dir));
+    assert_ne!(fp_empty, "none");
+
+    std::fs::write(
+        &ledger,
+        br#"{"packs":{"pypi-packs/isaaclab-2.3x-pack":{"setuptools":{"spec":">=68,<81"}}}}"#,
+    )
+    .unwrap();
+    let fp_with_override = auto_overrides_fingerprint(Some(&dir));
+    assert_ne!(
+        fp_empty, fp_with_override,
+        "a ledger write must change the fingerprint"
+    );
+
+    // Rollback (restoring the previous BYTES) must restore the previous
+    // fingerprint -- this is why the fingerprint hashes content, not mtime.
+    std::fs::write(&ledger, br#"{"packs":{}}"#).unwrap();
+    assert_eq!(auto_overrides_fingerprint(Some(&dir)), fp_empty);
+
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 // -----------------------------------------------------------------

@@ -79,6 +79,7 @@ static CONDA_OUTPUTS_CACHE: std::sync::OnceLock<
 fn conda_outputs_cache_key(
     params: &CondaOutputsParams,
     workspace_mtime: Option<std::time::SystemTime>,
+    auto_overrides_fp: &str,
 ) -> String {
     let mut chans: Vec<String> = params
         .channels
@@ -96,13 +97,39 @@ fn conda_outputs_cache_key(
         })
         .unwrap_or_else(|| "0".to_string());
     format!(
-        "{}|{}|{}|{:?}|{}",
+        "{}|{}|{}|{:?}|{}|{}",
         params.host_platform,
         params.build_platform,
         chans.join(","),
         params.variant_configuration,
         mtime_str,
+        auto_overrides_fp,
     )
+}
+
+/// Content fingerprint of the workspace's `.retread/auto-overrides.json`
+/// ledger, folded into [`conda_outputs_cache_key`]. Run-12 of the
+/// retread-deps-from proof exposed the gap this closes: fix #22's pack
+/// repairs write ONLY the ledger (never any pixi.toml, by design), so the
+/// workspace-manifest mtime in the cache key never moves between repair
+/// iterations -- the next `pixi lock`'s fresh backend hit the v2.11.0
+/// cross-process disk memo and returned the STALE pack render (still
+/// carrying the pre-repair auto-routed pin, e.g. `setuptools ==83.0.0`)
+/// even though `merge_ledger_overrides` had correctly merged the new
+/// override into config. Hashing the ledger's bytes (not its mtime --
+/// rollback restores the old bytes and must restore the old key too)
+/// makes any ledger write bust both the in-memory and disk memos.
+/// `"none"` when there's no workspace dir or no ledger yet.
+fn auto_overrides_fingerprint(workspace_dir: Option<&std::path::Path>) -> String {
+    use sha2::{Digest, Sha256};
+    let Some(dir) = workspace_dir else {
+        return "none".to_string();
+    };
+    let Ok(bytes) = std::fs::read(crate::pack_overrides::ledger_path(dir)) else {
+        return "none".to_string();
+    };
+    let digest = Sha256::digest(&bytes);
+    digest.iter().take(8).map(|b| format!("{b:02x}")).collect()
 }
 
 /// On-disk path for the cross-process `conda/outputs` memo (see the
@@ -835,7 +862,8 @@ impl Handler {
             state.workspace_dir.clone()
         };
         let mtime = workspace_manifest_mtime(pre_key_workspace_dir.as_deref());
-        let cache_key = conda_outputs_cache_key(&params, mtime);
+        let auto_overrides_fp = auto_overrides_fingerprint(pre_key_workspace_dir.as_deref());
+        let cache_key = conda_outputs_cache_key(&params, mtime, &auto_overrides_fp);
         if let Some(cached) = CONDA_OUTPUTS_CACHE
             .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
             .lock()
