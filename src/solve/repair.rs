@@ -1939,4 +1939,119 @@ holosoma-gpu = { features = ["holosoma"] }
         // torch's tried-state stayed marked -- no second torch attempt.
         assert!(tried.has("torch", Strategy::PypiOverride));
     }
+
+    // ---- Fix #21 (exactpin-fix-brief.md): the full "companion chaining"
+    // scenario acceptance-final.md observed live but couldn't complete --
+    // a fix-#20 torch pypi_override reaches the pack's uv closure, which
+    // re-emits its torchvision companion as an exact `==` conda run-dep,
+    // clashing with the workspace's own exact torchvision pin; repairing
+    // THAT surfaces the same shape one layer deeper for torchaudio. Each
+    // hop is the direct (non-JSON-RPC) rattler conda-solver prose fix #21
+    // teaches `parse_conda_incompatible` to read (`conda_incompatible_
+    // exact` + `would_require_exact`), carrying `pack_name` so every hop
+    // resolves via `resolve_pack_override`/`try_pack_override` -- never
+    // the workspace conda-pin-owner path. Three sequential `repair()`
+    // calls (mocking the driver's iter loop) must converge to exactly the
+    // manual trio the acceptance brief pinned by hand: torch==2.10.0,
+    // torchvision==0.25.0, torchaudio==2.10.0.
+    const CONDA_INCOMPATIBLE_TORCHVISION_EXACT: &str = include_str!(
+        "../../tests/fixtures/solve_errors/conda_incompatible_torchvision_exact.txt"
+    );
+    const CONDA_INCOMPATIBLE_TORCHAUDIO_EXACT: &str = concat!(
+        "Cannot solve the request because of: torchaudio ==2.10.0 cannot be\n",
+        "installed because there are no viable options:\n",
+        "  torchaudio 2.10.0 would require\n",
+        "     python_abi 3.13.*, for which no candidates were found.\n",
+        "The following packages are incompatible\n",
+        "isaac-pack-latest * can be installed with any of the following options:\n",
+        "   isaac-pack-latest 6.1.11 would require\n",
+        "      torchaudio ==2.11.0, which can be installed with any of the following options:\n",
+        "         torchaudio 2.11.0\n",
+    );
+
+    #[tokio::test]
+    async fn pack_override_chain_converges_torch_torchvision_torchaudio_exact_pin() {
+        let manifest_text = concat!(
+            "[dependencies]\n\n",
+            "[feature.gpu.dependencies]\n",
+            "torch = \"==2.10.0\"  # retread:pin\n",
+            "torchvision = \"==0.25.0\"  # retread:pin\n",
+            "torchaudio = \"==2.10.0\"  # retread:pin\n\n",
+            "[feature.isaaclab-latest.dependencies]\n",
+            "isaac-pack-latest = { path = \"./pypi-packs/isaac-pack-latest\" }\n\n",
+            "[environments]\n",
+            "isaaclab-gpu-latest = { features = [\"gpu\", \"isaaclab-latest\"] }\n",
+        );
+        let path = temp_manifest(manifest_text);
+        let project_dir = path.parent().unwrap().to_path_buf();
+        let pack_dir = project_dir.join("pypi-packs/isaac-pack-latest");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        let pack_pixi = pack_dir.join("pixi.toml");
+        std::fs::write(
+            &pack_pixi,
+            "[package]\nname = \"isaac-pack-latest\"\nversion = \"6.1.11\"\n",
+        )
+        .unwrap();
+
+        let mut editor = ManifestEditor::open(path.clone()).unwrap();
+        let mut tried = TriedState::default();
+        let mut planner = RepairPlanner::new("default".into());
+        let parser = RegexConflictParser::new();
+
+        // iter 1: torch, backend-closure-style conflict (as fix #20 shipped
+        // it), pack_name already Some -- resolves straight to
+        // resolve_pack_override without needing the parser fixture.
+        let torch_conflict = Conflict::CondaWidenNeeded {
+            package: "torch".into(),
+            op: ">=".into(),
+            floor: "2.11.0".into(),
+            conda_version: "==2.10.0".into(),
+            requiring_chain: Vec::new(),
+            pack_name: Some("isaac-pack-latest".into()),
+        };
+        let out1 = planner
+            .repair(&mut editor, &mut tried, &torch_conflict, 1)
+            .unwrap();
+        let po1 = out1.pack_override.expect("iter 1 expected a pack override");
+        assert_eq!(po1.package, "torch");
+        assert_eq!(po1.spec, "==2.10.0");
+        assert!(out1.applied.is_empty());
+        crate::pack_overrides::write_override(&po1.pack_pixi, &po1.package, &po1.spec).unwrap();
+
+        // iter 2: torchvision, the fix #21 exact-pin companion shape
+        // (verbatim acceptance-final.md fixture).
+        let torchvision_conflict = parser
+            .parse(CONDA_INCOMPATIBLE_TORCHVISION_EXACT)
+            .expect("torchvision exact-pin fixture must parse (fix #21)");
+        let out2 = planner
+            .repair(&mut editor, &mut tried, &torchvision_conflict, 2)
+            .unwrap();
+        let po2 = out2.pack_override.expect("iter 2 expected a pack override");
+        assert_eq!(po2.package, "torchvision");
+        assert_eq!(po2.spec, "==0.25.0");
+        assert!(out2.applied.is_empty());
+        crate::pack_overrides::write_override(&po2.pack_pixi, &po2.package, &po2.spec).unwrap();
+
+        // iter 3: torchaudio, same shape one layer deeper.
+        let torchaudio_conflict = parser
+            .parse(CONDA_INCOMPATIBLE_TORCHAUDIO_EXACT)
+            .expect("torchaudio exact-pin fixture must parse (fix #21)");
+        let out3 = planner
+            .repair(&mut editor, &mut tried, &torchaudio_conflict, 3)
+            .unwrap();
+        let po3 = out3.pack_override.expect("iter 3 expected a pack override");
+        assert_eq!(po3.package, "torchaudio");
+        assert_eq!(po3.spec, "==2.10.0");
+        assert!(out3.applied.is_empty());
+        crate::pack_overrides::write_override(&po3.pack_pixi, &po3.package, &po3.spec).unwrap();
+
+        // Converged to exactly the manual trio; workspace manifest was
+        // never touched by any of the three hops.
+        editor.write_atomic().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), manifest_text);
+        let pack_text = std::fs::read_to_string(&pack_pixi).unwrap();
+        assert!(pack_text.contains("torch = \"==2.10.0\"  # retread:override"));
+        assert!(pack_text.contains("torchvision = \"==0.25.0\"  # retread:override"));
+        assert!(pack_text.contains("torchaudio = \"==2.10.0\"  # retread:override"));
+    }
 }

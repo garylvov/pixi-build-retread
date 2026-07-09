@@ -1,0 +1,22 @@
+Error:   × failed to solve requirements of environment 'isaaclab-gpu-latest' for
+  │ platform 'linux-64'
+  ├─▶   × failed to solve the environment
+  │
+  ╰─▶ Cannot solve the request because of: torchvision ==0.25.0 cannot be
+      installed because there are no viable options:
+      └─ torchvision 0.25.0 | 0.25.0 | 0.25.0 | 0.25.0 | 0.25.0 | 0.25.0 |
+      0.25.0 | 0.25.0 | 0.25.0 | 0.25.0 would require
+         └─ python_abi 3.13.* *_cp313, for which no candidates were found.
+      The following packages are incompatible
+      ├─ isaac-pack-latest * can be installed with any of the following
+      options:
+      │  └─ isaac-pack-latest 6.1.11 would require
+      │     └─ torchvision ==0.26.0, which can be installed with any of the
+      following options:
+      │        └─ torchvision 0.26.0
+      └─ torchvision ==0.25.0 cannot be installed because there are no viable
+      options:
+         ├─ torchvision 0.25.0, which conflicts with the versions reported
+      above.
+         └─ torchvision 0.25.0, which conflicts with the versions reported
+      above.

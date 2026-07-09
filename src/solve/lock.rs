@@ -320,6 +320,16 @@ async fn run_with_pixi_bin(args: LockArgs, pixi_bin: &str) -> Result<i32> {
             editor.write_atomic()?;
         }
 
+        // An unparseable conflict never converges either -- like
+        // exhaustion, every repair applied *this run* (workspace edits AND
+        // any pack-table `retread-overrides` writes) is provably useless,
+        // since there's no way to plan a next repair off an error we
+        // can't read. Roll everything back to the pre-run snapshot rather
+        // than leaving an orphaned pack override behind (see fix #21:
+        // iter-1's `torch = "==2.10.0"  # retread:override` survived a
+        // later unparseable iter-2 until this was added).
+        rollback_snapshot(&project_dir, &manifest_path)?;
+        crate::pack_overrides::rollback_all(&project_dir)?;
         ledger.finish_run(run_idx, "unparseable");
         ledger.write_atomic(&ledger_path)?;
         eprintln!("retread lock: could not parse solver error; manifest kept as-is");
@@ -593,6 +603,48 @@ exit 0
             counter = counter.display(),
             fail_count = fail_count,
             stderr_path = stderr_path.display(),
+        );
+        let mut f = std::fs::File::create(&script_path).unwrap();
+        f.write_all(script.as_bytes()).unwrap();
+        let mut perm = f.metadata().unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perm).unwrap();
+        script_path
+    }
+
+    /// Like `write_fake_pixi`, but plays a DIFFERENT stderr fixture on each
+    /// successive `lock` invocation (clamped to the last entry once the
+    /// list is exhausted) and always fails. Lets a test drive a specific
+    /// multi-iteration sequence -- e.g. iter-1 a parseable pack-override
+    /// conflict, iter-2 unparseable garbage -- deterministically.
+    fn write_fake_pixi_sequence(dir: &Path, fixtures: &[&str]) -> PathBuf {
+        let counter = dir.join("counter");
+        std::fs::write(&counter, b"0").unwrap();
+        let fixtures_dir = dir.join("seq-fixtures");
+        std::fs::create_dir_all(&fixtures_dir).unwrap();
+        for (i, fx) in fixtures.iter().enumerate() {
+            std::fs::write(fixtures_dir.join(format!("{i}.txt")), fx).unwrap();
+        }
+        let last = fixtures.len().saturating_sub(1);
+        let script_path = dir.join("pixi");
+        let script = format!(
+            r#"#!/bin/bash
+if [ "$1" != "lock" ]; then
+  exit 0
+fi
+n=$(cat "{counter}")
+n=$((n + 1))
+echo "$n" > "{counter}"
+idx=$((n - 1))
+if [ "$idx" -gt {last} ]; then
+  idx={last}
+fi
+cat "{fixtures_dir}/$idx.txt" >&2
+exit 1
+"#,
+            counter = counter.display(),
+            last = last,
+            fixtures_dir = fixtures_dir.display(),
         );
         let mut f = std::fs::File::create(&script_path).unwrap();
         f.write_all(script.as_bytes()).unwrap();
@@ -900,5 +952,74 @@ exit 0
         assert!(trace.exists(), "expected conflict trace at {}", trace.display());
         let text = std::fs::read_to_string(&trace).unwrap();
         assert!(text.contains("numpy"));
+    }
+
+    // ---- Fix #21 (exactpin-fix-brief.md / acceptance-final.md secondary
+    // defect): iter-1 wrote a PACK override (`torch = "==2.10.0"
+    // # retread:override`) into the pack's own manifest; iter-2 then hits a
+    // conflict the parser can't read (unparseable). Before this fix,
+    // `run_with_pixi_bin`'s `unparseable` exit only restored the (empty, in
+    // this case) `pending_edit` -- it never called `pack_overrides::
+    // rollback_all`, so the pack's manifest kept the iter-1 override even
+    // though the run never converged. Live capture: acceptance-final.md's
+    // "Secondary defect (minor)" note.
+    const PACK_EXACT_PIN_TORCH_CONFLICT: &str = concat!(
+        "Error: failed to solve requirements of environment 'isaaclab-gpu-latest'\n",
+        "Cannot solve the request because of: torch ==2.10.0 cannot be\n",
+        "installed because there are no viable options:\n",
+        "  torch 2.10.0 would require\n",
+        "     python_abi 3.13.*, for which no candidates were found.\n",
+        "The following packages are incompatible\n",
+        "isaac-pack-latest * can be installed with any of the following options:\n",
+        "   isaac-pack-latest 6.1.11 would require\n",
+        "      torch ==2.11.0, which can be installed with any of the following options:\n",
+        "         torch 2.11.0\n",
+    );
+    const GARBAGE_UNPARSEABLE: &str = "some totally unrecognized solver failure text\n";
+
+    #[tokio::test]
+    async fn unparseable_after_pack_override_rolls_back_pack_manifest_too() {
+        let dir = temp_dir("unparseable-pack-rollback");
+        let manifest_text = concat!(
+            "[dependencies]\n\n",
+            "[feature.gpu.dependencies]\n",
+            "torch = \"==2.10.0\"  # retread:pin\n\n",
+            "[feature.isaaclab-latest.dependencies]\n",
+            "isaac-pack-latest = { path = \"./pypi-packs/isaac-pack-latest\" }\n\n",
+            "[environments]\n",
+            "isaaclab-gpu-latest = { features = [\"gpu\", \"isaaclab-latest\"] }\n",
+        );
+        let manifest = write_manifest(&dir, manifest_text);
+        let pack_dir = dir.join("pypi-packs/isaac-pack-latest");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        let pack_pixi = pack_dir.join("pixi.toml");
+        let pack_text = "[package]\nname = \"isaac-pack-latest\"\nversion = \"6.1.11\"\n";
+        std::fs::write(&pack_pixi, pack_text).unwrap();
+
+        let pixi = write_fake_pixi_sequence(
+            &dir,
+            &[PACK_EXACT_PIN_TORCH_CONFLICT, GARBAGE_UNPARSEABLE],
+        );
+
+        let args = LockArgs {
+            manifest,
+            max_repairs: 10,
+            no_repair: false,
+        };
+        let code = run_with_pixi_bin(args, pixi.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(code, EXIT_UNPARSEABLE);
+
+        // Both the workspace manifest AND the pack's own manifest (where
+        // iter-1's pack-override write landed) must be byte-identical to
+        // their pre-run state -- no orphaned override survives a run that
+        // never converged.
+        assert_eq!(
+            std::fs::read_to_string(dir.join("pixi.toml")).unwrap(),
+            manifest_text
+        );
+        assert_eq!(std::fs::read_to_string(&pack_pixi).unwrap(), pack_text);
+        assert!(!snapshot_path(&dir).exists());
     }
 }

@@ -91,6 +91,15 @@ pub struct RegexConflictParser {
     // because there are no viable options" / "would require" phrasing),
     // distinct from the older "pinned by the conda solve" shape above.
     conda_incompatible: Regex,
+    // Fix #21: same "cannot be installed ... no viable options" shape, but
+    // for an EXACT (`==`/`=`) conda pin rather than a `<`/`<=` upper bound
+    // -- the "companion" case where a fix-#20 pack override (e.g. torch)
+    // makes the pack re-emit an exact `==` companion pin (torchvision,
+    // torchaudio) that clashes with the workspace's own exact conda pin.
+    // Kept distinct from `conda_incompatible` (rather than widening its
+    // operator class in place) so the widen path's behavior/tests are
+    // untouched.
+    conda_incompatible_exact: Regex,
 }
 
 impl RegexConflictParser {
@@ -138,6 +147,16 @@ impl RegexConflictParser {
                 r"(?s)([a-zA-Z0-9_-]+)\s*(<|<=)\s*([0-9][0-9a-zA-Z.]*)[\s│├╰└─▶]+cannot be installed[\s│├╰└─▶]+because there are no viable options",
             )
             .expect("valid conda-incompatible regex"),
+            // Real rattler output can word-wrap the "cannot be installed"/
+            // "because there are no viable options" phrases themselves
+            // mid-sentence at arbitrary terminal widths (e.g. "cannot be\n
+            // installed because..."), unlike the widen-shape fixtures seen
+            // so far -- tolerate whitespace/newlines between every word,
+            // not just around the gutter-decorated boundary.
+            conda_incompatible_exact: Regex::new(
+                r"(?s)([a-zA-Z0-9_-]+)\s*(==|=)\s*([0-9][0-9a-zA-Z.]*)[\s│├╰└─▶]+cannot\s+be\s+installed[\s│├╰└─▶]+because\s+there\s+are\s+no\s+viable\s+options",
+            )
+            .expect("valid conda-incompatible-exact regex"),
         }
     }
 
@@ -265,28 +284,67 @@ impl RegexConflictParser {
     /// conflict shape distinct from the older `help_conda` "pinned by the
     /// conda solve" text, seen on newer pixi versions.
     fn parse_conda_incompatible(&self, stderr: &str) -> Option<Conflict> {
-        let caps = self.conda_incompatible.captures(stderr)?;
-        let package = caps[1].to_string();
-        let conda_op = caps[2].to_string();
-        let conda_version = caps[3].to_string();
-        let escaped = regex::escape(&package);
-        // Between "would require" and the package name, resolvo's tree
-        // rendering inserts its own `└─`-style gutter line (in addition to
-        // any outer miette gutter); tolerate box-drawing chars as well as
-        // whitespace in that gap.
-        let would_require = Regex::new(&format!(
-            r"(?s)would require[\s│├╰└─▶]*{escaped}\s*(>=|>)\s*([0-9][0-9a-zA-Z.]*)"
-        ))
-        .ok()?;
-        let rcaps = would_require.captures(stderr)?;
-        Some(Conflict::CondaWidenNeeded {
-            package,
-            op: rcaps[1].to_string(),
-            floor: rcaps[2].to_string(),
-            conda_version: format!("{conda_op}{conda_version}"),
-            requiring_chain: Vec::new(),
-            pack_name: None,
-        })
+        // Widen shape first (pinned `<`/`<=`, pypi side wants a `>=`/`>`
+        // floor) -- unchanged from before fix #21, no pack-name attribution
+        // (this class resolves via the workspace conda-pin-owner path, not
+        // the pack-override path; see `conda_widen_needed`).
+        if let Some(caps) = self.conda_incompatible.captures(stderr) {
+            let package = caps[1].to_string();
+            let conda_op = caps[2].to_string();
+            let conda_version = caps[3].to_string();
+            let escaped = regex::escape(&package);
+            // Between "would require" and the package name, resolvo's tree
+            // rendering inserts its own `└─`-style gutter line (in addition
+            // to any outer miette gutter); tolerate box-drawing chars as
+            // well as whitespace in that gap.
+            let would_require = Regex::new(&format!(
+                r"(?s)would require[\s│├╰└─▶]*{escaped}\s*(>=|>)\s*([0-9][0-9a-zA-Z.]*)"
+            ))
+            .ok()?;
+            if let Some(rcaps) = would_require.captures(stderr) {
+                return Some(Conflict::CondaWidenNeeded {
+                    package,
+                    op: rcaps[1].to_string(),
+                    floor: rcaps[2].to_string(),
+                    conda_version: format!("{conda_op}{conda_version}"),
+                    requiring_chain: Vec::new(),
+                    pack_name: None,
+                });
+            }
+        }
+
+        // Fix #21: exact-pin companion shape (pinned `==`/`=`, the pack's
+        // own re-emitted companion also demands an exact `==`/`=`). The
+        // workspace pin is authoritative here (conda-as-truth), so the
+        // fix belongs on the PACK's side -- carry `pack_name` (parsed from
+        // the "<pack> X.Y.Z would require" clause immediately preceding
+        // the package's requiring clause; the pack-version prefix is what
+        // distinguishes this from the OTHER "<ver> would require" clauses
+        // in the same prose, e.g. the unrelated `python_abi` requirement)
+        // so the existing fix-#20 `resolve_pack_override` path fires
+        // instead of the workspace conda-pin-owner scan.
+        if let Some(caps) = self.conda_incompatible_exact.captures(stderr) {
+            let package = caps[1].to_string();
+            let conda_op = caps[2].to_string();
+            let conda_version = caps[3].to_string();
+            let escaped = regex::escape(&package);
+            let would_require_exact = Regex::new(&format!(
+                r"(?s)([a-zA-Z][a-zA-Z0-9_.-]*)\s+[0-9][0-9a-zA-Z.]*\s+would require[\s│├╰└─▶]*{escaped}\s*(==|=)\s*([0-9][0-9a-zA-Z.]*)"
+            ))
+            .ok()?;
+            if let Some(rcaps) = would_require_exact.captures(stderr) {
+                return Some(Conflict::CondaWidenNeeded {
+                    package,
+                    op: rcaps[2].to_string(),
+                    floor: rcaps[3].to_string(),
+                    conda_version: format!("{conda_op}{conda_version}"),
+                    requiring_chain: Vec::new(),
+                    pack_name: Some(rcaps[1].to_string()),
+                });
+            }
+        }
+
+        None
     }
 
     pub fn strip_ansi<'a>(&self, stderr: &'a str) -> std::borrow::Cow<'a, str> {
@@ -450,6 +508,15 @@ mod tests {
     );
     const CONDA_INCOMPATIBLE_PYGLET: &str =
         include_str!("../../tests/fixtures/solve_errors/conda_incompatible_pyglet.txt");
+    // Fix #21 fixture (acceptance-final.md, verbatim
+    // solve-conflicts.acceptance-final.lock-2.txt): the torchvision
+    // exact-pin companion conflict that surfaced after fix #20's torch
+    // override reached the closure -- direct rattler conda-solver prose,
+    // pinned operator `==` (not `<`/`<=`), requiring clause `==` (not a
+    // `>=`/`>` floor).
+    const CONDA_INCOMPATIBLE_TORCHVISION_EXACT: &str = include_str!(
+        "../../tests/fixtures/solve_errors/conda_incompatible_torchvision_exact.txt"
+    );
     const UNPARSEABLE_UV_CLOSURE_NO_WHEELS: &str =
         include_str!("../../tests/fixtures/solve_errors/unparseable_uv_closure_no_wheels.txt");
 
@@ -601,6 +668,28 @@ mod tests {
                 conda_version: "<2".into(),
                 requiring_chain: Vec::new(),
             pack_name: None,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_exact_pin_companion_conda_conflict_to_pack_scoped_override() {
+        // Fix #21: an exact `==` conda pin (torchvision==0.25.0) clashing
+        // with a pack's own exact `==` companion demand
+        // (isaac-pack-latest would require torchvision==0.26.0) must parse
+        // to a `CondaWidenNeeded` carrying `pack_name: Some(..)` so the
+        // fix-#20 pack-override path fires (workspace pin wins, pack gets
+        // the override) -- NOT fall through to `unparseable`.
+        let p = RegexConflictParser::new();
+        assert_eq!(
+            p.parse(CONDA_INCOMPATIBLE_TORCHVISION_EXACT),
+            Some(Conflict::CondaWidenNeeded {
+                package: "torchvision".into(),
+                op: "==".into(),
+                floor: "0.26.0".into(),
+                conda_version: "==0.25.0".into(),
+                requiring_chain: Vec::new(),
+                pack_name: Some("isaac-pack-latest".into()),
             })
         );
     }
