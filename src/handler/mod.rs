@@ -732,7 +732,7 @@ impl Handler {
     }
 
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult, RpcError> {
-        let config: RetreadConfig = match params.configuration {
+        let mut config: RetreadConfig = match params.configuration {
             Some(v) => serde_json::from_value(v)
                 .map_err(|e| RpcError::invalid_params(format!("[build.config]: {e}")))?,
             None => {
@@ -786,6 +786,20 @@ impl Handler {
 
         let workspace_dir = params.workspace_directory;
         ensure_pixi_bld_symlink_target(workspace_dir.as_deref())?;
+
+        // Fix #22: merge this pack's auto-repaired overrides from the
+        // workspace's `.retread/auto-overrides.json` ledger into
+        // `config.overrides`, IN MEMORY only -- the pack's pixi.toml is
+        // never touched. Every downstream consumer (resolve_all,
+        // apply_emission's `effective.overrides`, and
+        // `courier::config_fingerprint`'s `declared_config`) reads this
+        // same `config`, so they see auto overrides exactly like a manual
+        // `retread-overrides` entry, and a ledger change busts the
+        // fingerprint like a manifest edit would. No-op (and no error)
+        // when there's no workspace directory or no ledger yet.
+        if let Some(ws) = workspace_dir.as_deref() {
+            crate::pack_overrides::merge_ledger_overrides(&mut config, ws, &params.manifest_path);
+        }
 
         let mut state = self.state.write().await;
         state.config = Some(config);

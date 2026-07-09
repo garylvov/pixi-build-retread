@@ -24,6 +24,10 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    if matches!(argv.get(1).map(String::as_str), Some("migrate-overrides")) {
+        return run_migrate_overrides(&argv[2..]);
+    }
+
     if matches!(
         argv.get(1).map(String::as_str),
         Some("install" | "verify" | "solve" | "lock")
@@ -92,6 +96,63 @@ async fn main() -> anyhow::Result<()> {
         async move { handler.dispatch(method, params).await }
     })
     .await
+}
+
+/// `retread migrate-overrides --workspace <dir> --pack <pack pixi.toml>`:
+/// fix #22 one-shot. Moves fix #20-era auto-written `# retread:override`
+/// entries out of a pack's pixi.toml and into the workspace's
+/// `.retread/auto-overrides.json` ledger, leaving any genuinely manual
+/// (un-sentineled) `retread-overrides` entries untouched. Safe to re-run
+/// (no-op once migrated).
+fn run_migrate_overrides(args: &[String]) -> anyhow::Result<()> {
+    let mut workspace: Option<PathBuf> = None;
+    let mut pack: Option<PathBuf> = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--workspace" => {
+                workspace = Some(PathBuf::from(it.next().ok_or_else(|| {
+                    anyhow::anyhow!("retread migrate-overrides: --workspace <dir> requires a value")
+                })?));
+            }
+            "--pack" => {
+                pack = Some(PathBuf::from(it.next().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "retread migrate-overrides: --pack <pixi.toml> requires a value"
+                    )
+                })?));
+            }
+            other => anyhow::bail!("retread migrate-overrides: unknown arg {other}"),
+        }
+    }
+    let workspace = workspace
+        .ok_or_else(|| anyhow::anyhow!("retread migrate-overrides: --workspace <dir> required"))?;
+    let pack = pack.ok_or_else(|| {
+        anyhow::anyhow!("retread migrate-overrides: --pack <pack pixi.toml> required")
+    })?;
+    if !pack.is_file() {
+        anyhow::bail!(
+            "retread migrate-overrides: pack manifest {} not found",
+            pack.display()
+        );
+    }
+    let migrated =
+        pixi_build_retread::pack_overrides::migrate_pack_toml_entries(&workspace, &pack)?;
+    if migrated.is_empty() {
+        println!(
+            "retread migrate-overrides: no sentineled auto overrides found in {} (already migrated, or none ever written)",
+            pack.display()
+        );
+    } else {
+        println!(
+            "retread migrate-overrides: moved {} override(s) from {} into {}: {}",
+            migrated.len(),
+            pack.display(),
+            pixi_build_retread::pack_overrides::ledger_path(&workspace).display(),
+            migrated.join(", "),
+        );
+    }
+    Ok(())
 }
 
 struct FastCli {

@@ -1,151 +1,349 @@
-//! Fix #20: auto-repaired T1 (conda-as-truth) overrides whose conflict
-//! originated in a **backend uv-closure** (a pack's
-//! `[package.build.config.retread-wheels]` resolution, computed deep inside
-//! the JSON-RPC build backend) are written into that failing PACK's own
-//! `[package.build.config.retread-overrides]` table -- the exact table the
-//! manual torch trio already lives in, and the ONLY override table the
-//! pack's uv closure actually consumes.
+//! Fix #22: the auto-repaired T1 (conda-as-truth) overrides that fix #20
+//! discovered (a conflict originating in a **backend uv-closure** -- a
+//! pack's `[package.build.config.retread-wheels]` resolution, computed deep
+//! inside the JSON-RPC build backend) are recorded in a workspace-level
+//! **ledger** (`.retread/auto-overrides.json`), NOT written into the
+//! failing pack's own `pixi.toml`.
 //!
-//! Why not the workspace manifest: `retread solve`/`retread lock`'s
-//! original T1 path wrote `pypi-options.dependency-overrides` in the
-//! WORKSPACE pixi.toml, which is provably inert for this class -- the
-//! pack's closure never reads it (no `dependency-overrides` handling
-//! anywhere in `uv_closure.rs`/`handler`/`config.rs`), so the override was
-//! applied and silently ignored (override20 brief ACCEPTANCE RUN #6b:
-//! iter-2 conflict byte-identical to iter-1). The pack table arrives in
-//! `handler`'s `effective.overrides` with no special casing and is folded
-//! into the uv `override-dependencies`, so it actually takes effect; it
-//! also participates in `courier::config_fingerprint`, so writing one
-//! busts cold-solve replay automatically.
+//! Why not the pack manifest (fix #20's original sink, superseded here):
+//! retread's core "clean minimal manifest" design goal requires that
+//! AUTO-generated repairs never mutate a pixi.toml -- only a human editing
+//! `[package.build.config.retread-overrides]` themselves should change that
+//! file. Fix #20 proved the *closure* needs the override (the pack's uv
+//! closure has no other override-consuming table), but writing it into the
+//! pack's `pixi.toml` violated the pristine-manifest goal. This module
+//! keeps the closure behavior identical while relocating the SINK: the
+//! ledger is read back and merged into the pack's `RetreadConfig.overrides`
+//! **in memory**, at `Handler::initialize` time (see
+//! `merge_ledger_overrides` and its call site in `handler/mod.rs`), so the
+//! closure sees the exact same effective overrides it always did -- it just
+//! never touches disk to get there.
+//!
+//! Keying: a pack is identified by its `pixi.toml`'s workspace-relative
+//! *directory* (e.g. `pypi-packs/isaac-pack-latest`), which is both stable
+//! across a run (unlike an in-process bundle/pack "name" that isn't always
+//! available at `initialize` time) and readable in a `git diff` -- the
+//! ledger is meant to be committed alongside the workspace, exactly like
+//! `.retread/solve-ledger.json`.
 //!
 //! Run-scoped rollback: a repair run that later EXHAUSTS must not leave a
-//! half-written pack override behind (defect #3 parity for the workspace
-//! manifest). Each touched pack pixi.toml is snapshotted once per run under
-//! the workspace's `.retread/pack-overrides-bak/`, restored on
+//! half-written auto override behind (defect #3 parity, carried over from
+//! fix #20/#21's pack-manifest snapshot). The single ledger file is
+//! snapshotted once per run under `.retread/auto-overrides.json.bak`
+//! (plus an `.absent` marker if the ledger didn't exist yet), restored on
 //! exhaustion/interrupt/crash, and dropped on convergence.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use sha2::{Digest, Sha256};
-use toml_edit::{DocumentMut, Item, Table, Value};
+use serde::{Deserialize, Serialize};
 
-/// Sentinel appended to every auto-written pack override so it is
-/// distinguishable from a user's manual entry (and could later be swept).
-pub const OVERRIDE_SENTINEL: &str = "# retread:override";
+use crate::config::RetreadConfig;
 
-/// Write (or replace) `package = "spec"  # retread:override <date>` into
-/// `pack_pixi`'s `[package.build.config.retread-overrides]` table,
-/// creating the nested tables if absent. `spec` is the full conda-style
-/// spec (e.g. `"==2.10.0"`); the value is written verbatim so it matches
-/// the manual-trio format the pack already uses.
-pub fn write_override(pack_pixi: &Path, package: &str, spec: &str) -> Result<()> {
+/// One auto-repaired override recorded in the ledger.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutoOverrideEntry {
+    /// Conda-style spec written verbatim (e.g. `"==2.10.0"`), same format
+    /// the manual `retread-overrides` table uses.
+    pub spec: String,
+    /// The bundle/pack name as the triggering conflict reported it (e.g.
+    /// `"isaac-pack-latest"`); informational, not used as a lookup key.
+    #[serde(default)]
+    pub bundle: String,
+    /// Human-readable description of the conflict that caused this
+    /// override (the parsed `Conflict`'s ledger `conflict` text) -- the
+    /// auditable "why" a `git diff` on the ledger alone can't show.
+    #[serde(default)]
+    pub provenance: String,
+    /// `YYYY-MM-DD` the override was recorded.
+    #[serde(default)]
+    pub date: String,
+}
+
+/// `.retread/auto-overrides.json`: every pack's auto-repaired overrides,
+/// keyed by the pack's workspace-relative directory, then by PyPI package
+/// name. Deliberately mirrors the shape of a pack's manual
+/// `[package.build.config.retread-overrides]` table (map of name -> spec)
+/// with provenance metadata alongside.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutoOverrideLedger {
+    #[serde(default)]
+    pub packs: BTreeMap<String, BTreeMap<String, AutoOverrideEntry>>,
+}
+
+impl AutoOverrideLedger {
+    pub fn load(workspace_dir: &Path) -> Result<Self> {
+        let path = ledger_path(workspace_dir);
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        serde_json::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))
+    }
+
+    pub fn write_atomic(&self, workspace_dir: &Path) -> Result<()> {
+        let path = ledger_path(workspace_dir);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        let bytes = serde_json::to_vec_pretty(self)?;
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, bytes)
+            .with_context(|| format!("failed to write {}", tmp.display()))?;
+        std::fs::rename(&tmp, &path)
+            .with_context(|| format!("failed to rename into {}", path.display()))?;
+        Ok(())
+    }
+}
+
+pub fn ledger_path(workspace_dir: &Path) -> PathBuf {
+    workspace_dir.join(".retread").join("auto-overrides.json")
+}
+
+fn snapshot_path(workspace_dir: &Path) -> PathBuf {
+    workspace_dir
+        .join(".retread")
+        .join("auto-overrides.json.bak")
+}
+
+fn snapshot_absent_marker(workspace_dir: &Path) -> PathBuf {
+    workspace_dir
+        .join(".retread")
+        .join("auto-overrides.json.bak.absent")
+}
+
+/// Workspace-relative, forward-slash-normalized key for a pack: the
+/// directory containing its `pixi.toml`. Best-effort canonicalization on
+/// both sides so callers can pass either absolute or relative paths as
+/// long as they agree on the same workspace root; falls back to the raw
+/// path if canonicalization fails (e.g. in tests against paths that don't
+/// exist yet).
+fn pack_key(workspace_dir: &Path, pack_pixi: &Path) -> String {
+    let ws = workspace_dir
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_dir.to_path_buf());
+    let pack_abs = pack_pixi
+        .canonicalize()
+        .unwrap_or_else(|_| pack_pixi.to_path_buf());
+    let pack_dir = pack_abs.parent().unwrap_or(&pack_abs);
+    let rel = pack_dir.strip_prefix(&ws).unwrap_or(pack_dir);
+    rel.to_string_lossy().replace('\\', "/")
+}
+
+/// Append (or replace) an auto-repaired override for `pack_pixi`/`package`
+/// into the workspace's ledger. This is the fix #22 replacement for fix
+/// #20's `write_override`, which wrote directly into the pack's pixi.toml.
+pub fn write_override(
+    workspace_dir: &Path,
+    pack_pixi: &Path,
+    bundle: &str,
+    package: &str,
+    spec: &str,
+    provenance: &str,
+) -> Result<()> {
+    let mut ledger = AutoOverrideLedger::load(workspace_dir)?;
+    let key = pack_key(workspace_dir, pack_pixi);
+    ledger.packs.entry(key).or_default().insert(
+        package.to_string(),
+        AutoOverrideEntry {
+            spec: spec.to_string(),
+            bundle: bundle.to_string(),
+            provenance: provenance.to_string(),
+            date: local_date(),
+        },
+    );
+    ledger.write_atomic(workspace_dir)
+}
+
+/// Read-only: every auto-repaired override recorded for `pack_pixi`, as a
+/// plain `package -> spec` map ready to merge into a `RetreadConfig`.
+/// Never fails the caller -- a missing/corrupt ledger degrades to "no auto
+/// overrides" rather than aborting the build (the ledger is a cache-like
+/// durable record, not a required input).
+pub fn overrides_for_pack(workspace_dir: &Path, pack_pixi: &Path) -> BTreeMap<String, String> {
+    let ledger = match AutoOverrideLedger::load(workspace_dir) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "retread: failed to read .retread/auto-overrides.json; \
+                 proceeding with no auto overrides for this pack"
+            );
+            return BTreeMap::new();
+        }
+    };
+    let key = pack_key(workspace_dir, pack_pixi);
+    ledger
+        .packs
+        .get(&key)
+        .map(|entries| {
+            entries
+                .iter()
+                .map(|(name, entry)| (name.clone(), entry.spec.clone()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Merge this pack's ledger entries into `config.overrides`, in memory
+/// only. Ledger entries take the same "last write wins" precedence a
+/// repeated fix #20 pack-manifest write used to have: if a ledger entry
+/// and a user's manual `retread-overrides` entry share a key, the ledger
+/// (the more recently auto-repaired value) wins, matching the byte-for-
+/// byte overwrite `write_override`'s old `pixi.toml` sink used to perform.
+///
+/// Called once per pack, from `Handler::initialize`, before the config is
+/// stored in `state.config` -- every downstream consumer (`resolve_all`,
+/// `apply_emission`'s `effective.overrides`, and `courier::
+/// config_fingerprint`'s `declared_config`) sees the merged result with no
+/// further special-casing, and a ledger change busts the fingerprint
+/// exactly like a manifest edit would.
+pub fn merge_ledger_overrides(config: &mut RetreadConfig, workspace_dir: &Path, pack_pixi: &Path) {
+    for (package, spec) in overrides_for_pack(workspace_dir, pack_pixi) {
+        config.overrides.insert(package, spec);
+    }
+}
+
+/// Snapshot the ledger file before this run's first write to it. No-op if
+/// a snapshot already exists (first snapshot of the run wins). Records
+/// whether the ledger existed at all so rollback can tell "restore old
+/// content" from "delete -- there was no ledger before this run" apart.
+pub fn ensure_snapshot(workspace_dir: &Path) -> Result<()> {
+    let dir = workspace_dir.join(".retread");
+    std::fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    let bak = snapshot_path(workspace_dir);
+    let marker = snapshot_absent_marker(workspace_dir);
+    if bak.exists() || marker.exists() {
+        return Ok(());
+    }
+    let path = ledger_path(workspace_dir);
+    if path.exists() {
+        std::fs::copy(&path, &bak)
+            .with_context(|| format!("failed to snapshot {}", path.display()))?;
+    } else {
+        std::fs::write(&marker, b"")
+            .with_context(|| "failed to write ledger-absent marker".to_string())?;
+    }
+    Ok(())
+}
+
+/// Restore the ledger to its pre-run state (or delete it, if it didn't
+/// exist before this run), then drop the snapshot. Used on any
+/// non-converged exit (exhaustion / interrupt / crash / per-env
+/// `--keep-going` restore) -- same call sites that used to call fix #20's
+/// per-pack-file `rollback_all`.
+pub fn rollback_all(workspace_dir: &Path) -> Result<()> {
+    let bak = snapshot_path(workspace_dir);
+    let marker = snapshot_absent_marker(workspace_dir);
+    let path = ledger_path(workspace_dir);
+    if marker.exists() {
+        if path.exists() {
+            std::fs::remove_file(&path)
+                .with_context(|| format!("failed to remove {}", path.display()))?;
+        }
+    } else if bak.exists() {
+        std::fs::copy(&bak, &path)
+            .with_context(|| format!("failed to restore {}", path.display()))?;
+    }
+    let _ = std::fs::remove_file(&bak);
+    let _ = std::fs::remove_file(&marker);
+    Ok(())
+}
+
+/// Drop the run's ledger snapshot without restoring -- called once the run
+/// converges (the ledger entries are now part of the green lock and stay).
+pub fn cleanup_all(workspace_dir: &Path) -> Result<()> {
+    let _ = std::fs::remove_file(snapshot_path(workspace_dir));
+    let _ = std::fs::remove_file(snapshot_absent_marker(workspace_dir));
+    Ok(())
+}
+
+/// The exact trailing-comment sentinel fix #20's (now-removed) pixi.toml
+/// sink used to tag an auto-written entry, e.g. `torch = "==2.10.0"  #
+/// retread:override 2026-07-09`. Only used by [`migrate_pack_toml_entries`]
+/// to identify pre-fix-#22 auto entries already committed to a pack's
+/// pixi.toml; the current write path never emits this into any manifest.
+const LEGACY_OVERRIDE_SENTINEL: &str = "retread:override";
+
+/// One-shot migration for packs that already have fix #20-era auto
+/// overrides committed in their `[package.build.config.retread-overrides]`
+/// table (tagged with the `# retread:override <date>` sentinel comment).
+/// Moves each sentineled entry into the workspace's
+/// `.retread/auto-overrides.json` ledger and removes it from `pack_pixi`,
+/// leaving any un-sentineled (genuinely manual) entries untouched. Returns
+/// the migrated package names.
+///
+/// Run via `retread migrate-overrides --workspace <dir> --pack <pack
+/// pixi.toml>`. Idempotent: running it again on an already-migrated pack
+/// finds no sentineled entries and is a no-op.
+pub fn migrate_pack_toml_entries(workspace_dir: &Path, pack_pixi: &Path) -> Result<Vec<String>> {
     let text = std::fs::read_to_string(pack_pixi)
         .with_context(|| format!("failed to read pack manifest {}", pack_pixi.display()))?;
     let mut doc = text
-        .parse::<DocumentMut>()
+        .parse::<toml_edit::DocumentMut>()
         .with_context(|| format!("failed to parse pack manifest {}", pack_pixi.display()))?;
 
-    let package_tbl = ensure_table(doc.as_table_mut(), "package");
-    let build_tbl = ensure_table(package_tbl, "build");
-    let config_tbl = ensure_table(build_tbl, "config");
-    let overrides_tbl = ensure_table(config_tbl, "retread-overrides");
+    let bundle = doc
+        .get("package")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())
+        .unwrap_or("unknown-pack")
+        .to_string();
 
-    let mut value = Value::from(spec.to_string());
-    value
-        .decor_mut()
-        .set_suffix(format!("  {OVERRIDE_SENTINEL} {}", local_date()));
-    overrides_tbl[package] = Item::Value(value);
+    let Some(overrides_tbl) = doc
+        .get_mut("package")
+        .and_then(|p| p.get_mut("build"))
+        .and_then(|b| b.get_mut("config"))
+        .and_then(|c| c.get_mut("retread-overrides"))
+        .and_then(toml_edit::Item::as_table_like_mut)
+    else {
+        return Ok(Vec::new());
+    };
 
-    write_atomic(pack_pixi, doc.to_string().as_bytes())
-}
+    let mut migrated = Vec::new();
+    let sentineled: Vec<String> = overrides_tbl
+        .iter()
+        .filter(|(_, item)| {
+            item.as_value()
+                .map(|v| {
+                    v.decor().suffix().is_some_and(|s| {
+                        s.as_str()
+                            .is_some_and(|s| s.contains(LEGACY_OVERRIDE_SENTINEL))
+                    })
+                })
+                .unwrap_or(false)
+        })
+        .map(|(k, _)| k.to_string())
+        .collect();
 
-/// Navigate to (creating if needed) a child table, marking any created
-/// table implicit so a fresh `[package.build.config.retread-overrides]`
-/// serializes as a single dotted header rather than a chain of empty
-/// `[package]` / `[package.build]` stanzas.
-fn ensure_table<'a>(parent: &'a mut Table, key: &str) -> &'a mut Table {
-    if !parent.contains_key(key) {
-        let mut t = Table::new();
-        t.set_implicit(true);
-        parent.insert(key, Item::Table(t));
+    for package in &sentineled {
+        let spec = overrides_tbl
+            .get(package)
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .unwrap_or_default();
+        write_override(
+            workspace_dir,
+            pack_pixi,
+            &bundle,
+            package,
+            &spec,
+            "migrated from a pre-fix-#22 pixi.toml `# retread:override` sentinel entry",
+        )?;
+        overrides_tbl.remove(package);
+        migrated.push(package.clone());
     }
-    parent
-        .get_mut(key)
-        .and_then(Item::as_table_mut)
-        .expect("ensured table exists")
-}
 
-fn snapshot_dir(workspace_dir: &Path) -> PathBuf {
-    workspace_dir.join(".retread").join("pack-overrides-bak")
-}
-
-/// Stable per-path basename for a pack pixi.toml's snapshot.
-fn snapshot_stem(pack_pixi: &Path) -> String {
-    format!("{:x}", Sha256::digest(pack_pixi.to_string_lossy().as_bytes()))
-}
-
-/// Snapshot `pack_pixi` under the workspace's `.retread/` before the run's
-/// first write to it. No-op if a snapshot already exists (first snapshot
-/// of the run wins). Records the origin path alongside so rollback needs
-/// no external index.
-pub fn ensure_snapshot(workspace_dir: &Path, pack_pixi: &Path) -> Result<()> {
-    let dir = snapshot_dir(workspace_dir);
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("failed to create {}", dir.display()))?;
-    let stem = snapshot_stem(pack_pixi);
-    let bak = dir.join(format!("{stem}.toml"));
-    if bak.exists() {
-        return Ok(());
+    if !migrated.is_empty() {
+        write_atomic_toml(pack_pixi, doc.to_string().as_bytes())?;
     }
-    std::fs::copy(pack_pixi, &bak)
-        .with_context(|| format!("failed to snapshot {}", pack_pixi.display()))?;
-    std::fs::write(
-        dir.join(format!("{stem}.path")),
-        pack_pixi.to_string_lossy().as_bytes(),
-    )
-    .with_context(|| "failed to write pack snapshot path record".to_string())?;
-    Ok(())
+    Ok(migrated)
 }
 
-/// Restore every pack pixi.toml snapshotted this run, then drop the whole
-/// snapshot dir. Used on any non-converged exit (exhaustion / interrupt /
-/// crash / per-env `--keep-going` restore).
-pub fn rollback_all(workspace_dir: &Path) -> Result<()> {
-    let dir = snapshot_dir(workspace_dir);
-    if !dir.is_dir() {
-        return Ok(());
-    }
-    for entry in std::fs::read_dir(&dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("path") {
-            continue;
-        }
-        let origin = std::fs::read_to_string(&path)?;
-        let origin = Path::new(origin.trim());
-        let bak = path.with_extension("toml");
-        if bak.exists() {
-            std::fs::copy(&bak, origin)
-                .with_context(|| format!("failed to restore {}", origin.display()))?;
-        }
-    }
-    let _ = std::fs::remove_dir_all(&dir);
-    Ok(())
-}
-
-/// Drop the run's pack snapshots without restoring -- called once the run
-/// converges (the overrides are now part of the green lock and stay).
-pub fn cleanup_all(workspace_dir: &Path) -> Result<()> {
-    let dir = snapshot_dir(workspace_dir);
-    if dir.is_dir() {
-        std::fs::remove_dir_all(&dir)
-            .with_context(|| format!("failed to remove {}", dir.display()))?;
-    }
-    Ok(())
-}
-
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+fn write_atomic_toml(path: &Path, bytes: &[u8]) -> Result<()> {
     let tmp = path.with_extension("toml.retread-tmp");
     std::fs::write(&tmp, bytes).with_context(|| format!("failed to write {}", tmp.display()))?;
     std::fs::rename(&tmp, path)
@@ -177,7 +375,7 @@ mod tests {
     impl TempDir {
         fn new(tag: &str) -> Self {
             let dir = std::env::temp_dir().join(format!(
-                "retread-pack-overrides-test-{tag}-{}",
+                "retread-auto-overrides-test-{tag}-{}",
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
@@ -196,74 +394,260 @@ mod tests {
         }
     }
 
-    #[test]
-    fn writes_override_into_pack_table_with_sentinel() {
-        let tmp = TempDir::new("write");
-        let pack = tmp.path().join("pixi.toml");
+    fn make_pack(ws: &Path, rel: &str) -> PathBuf {
+        let pack_dir = ws.join(rel);
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        let pack_pixi = pack_dir.join("pixi.toml");
         std::fs::write(
-            &pack,
-            "[package]\nname = \"isaac-pack-latest\"\nversion = \"6.0.0\"\n\n\
-             [package.build.config.retread-overrides]\ntinyobjloader = \"==2.0.0rc13\"\n",
+            &pack_pixi,
+            "[package]\nname = \"isaac-pack-latest\"\nversion = \"6.0.0\"\n",
         )
         .unwrap();
-        write_override(&pack, "torch", "==2.10.0").unwrap();
-        let text = std::fs::read_to_string(&pack).unwrap();
-        assert!(text.contains("torch = \"==2.10.0\"  # retread:override"));
-        // Existing manual entry preserved.
-        assert!(text.contains("tinyobjloader = \"==2.0.0rc13\""));
-        // Reparses as valid TOML with the override in the right table.
-        let doc = text.parse::<DocumentMut>().unwrap();
-        let spec = doc["package"]["build"]["config"]["retread-overrides"]["torch"]
-            .as_str()
-            .unwrap();
-        assert_eq!(spec, "==2.10.0");
+        pack_pixi
     }
 
     #[test]
-    fn creates_overrides_table_when_absent() {
-        let tmp = TempDir::new("create");
-        let pack = tmp.path().join("pixi.toml");
-        std::fs::write(&pack, "[package]\nname = \"p\"\nversion = \"1.0\"\n").unwrap();
-        write_override(&pack, "torch", "==2.10.0").unwrap();
-        let text = std::fs::read_to_string(&pack).unwrap();
-        let doc = text.parse::<DocumentMut>().unwrap();
+    fn write_override_lands_in_ledger_not_pack_manifest() {
+        let tmp = TempDir::new("write");
+        let ws = tmp.path();
+        let pack_pixi = make_pack(ws, "pypi-packs/isaac-pack-latest");
+        let original = std::fs::read_to_string(&pack_pixi).unwrap();
+
+        write_override(
+            ws,
+            &pack_pixi,
+            "isaac-pack-latest",
+            "torch",
+            "==2.10.0",
+            "conflict: torch >=2.11.0 vs conda ==2.10.0",
+        )
+        .unwrap();
+
+        // Pack manifest is byte-identical -- the auto override never
+        // touched it.
+        assert_eq!(std::fs::read_to_string(&pack_pixi).unwrap(), original);
+
+        // The ledger recorded it instead.
+        let ledger = AutoOverrideLedger::load(ws).unwrap();
+        let entry = ledger
+            .packs
+            .get("pypi-packs/isaac-pack-latest")
+            .and_then(|p| p.get("torch"))
+            .expect("expected a ledger entry for torch");
+        assert_eq!(entry.spec, "==2.10.0");
+        assert_eq!(entry.bundle, "isaac-pack-latest");
+        assert!(entry.provenance.contains("2.11.0"));
+    }
+
+    #[test]
+    fn closure_read_merges_ledger_over_manual_overrides() {
+        let tmp = TempDir::new("merge");
+        let ws = tmp.path();
+        let pack_pixi = make_pack(ws, "pypi-packs/isaac-pack-latest");
+
+        write_override(
+            ws,
+            &pack_pixi,
+            "isaac-pack-latest",
+            "torch",
+            "==2.10.0",
+            "c",
+        )
+        .unwrap();
+
+        let mut config: RetreadConfig = serde_json::from_value(serde_json::json!({
+            "retread-wheels": { "mypkg": { "version": "==1.0.0" } },
+            "retread-overrides": { "tinyobjloader": "==2.0.0rc13" }
+        }))
+        .unwrap();
+
+        merge_ledger_overrides(&mut config, ws, &pack_pixi);
+
+        // Manual entry preserved.
         assert_eq!(
-            doc["package"]["build"]["config"]["retread-overrides"]["torch"]
-                .as_str()
-                .unwrap(),
-            "==2.10.0"
+            config.overrides.get("tinyobjloader").map(String::as_str),
+            Some("==2.0.0rc13")
+        );
+        // Ledger entry merged in.
+        assert_eq!(
+            config.overrides.get("torch").map(String::as_str),
+            Some("==2.10.0")
         );
     }
 
     #[test]
-    fn snapshot_rollback_restores_pack_manifest() {
-        let tmp = TempDir::new("rollback");
+    fn ledger_entry_wins_on_key_conflict_with_manual_entry() {
+        // Matches the old write_override's unconditional-overwrite
+        // semantics: a later auto-repair for a key the user also declared
+        // manually replaces the manual value (same as when both lived in
+        // the same pixi.toml table).
+        let tmp = TempDir::new("conflict");
         let ws = tmp.path();
-        let pack_dir = ws.join("pypi-packs/p");
-        std::fs::create_dir_all(&pack_dir).unwrap();
-        let pack = pack_dir.join("pixi.toml");
-        let original = "[package]\nname = \"p\"\nversion = \"1.0\"\n";
-        std::fs::write(&pack, original).unwrap();
+        let pack_pixi = make_pack(ws, "pypi-packs/isaac-pack-latest");
+        write_override(
+            ws,
+            &pack_pixi,
+            "isaac-pack-latest",
+            "torch",
+            "==2.10.0",
+            "c",
+        )
+        .unwrap();
 
-        ensure_snapshot(ws, &pack).unwrap();
-        write_override(&pack, "torch", "==2.10.0").unwrap();
-        assert!(std::fs::read_to_string(&pack).unwrap().contains("torch"));
-
-        rollback_all(ws).unwrap();
-        assert_eq!(std::fs::read_to_string(&pack).unwrap(), original);
-        assert!(!snapshot_dir(ws).exists());
+        let mut config: RetreadConfig = serde_json::from_value(serde_json::json!({
+            "retread-wheels": { "mypkg": { "version": "==1.0.0" } },
+            "retread-overrides": { "torch": "==2.9.0" }
+        }))
+        .unwrap();
+        merge_ledger_overrides(&mut config, ws, &pack_pixi);
+        assert_eq!(
+            config.overrides.get("torch").map(String::as_str),
+            Some("==2.10.0")
+        );
     }
 
     #[test]
-    fn cleanup_keeps_the_written_override() {
+    fn fingerprint_changes_when_ledger_changes() {
+        let tmp = TempDir::new("fingerprint");
+        let ws = tmp.path();
+        let pack_pixi = make_pack(ws, "pypi-packs/isaac-pack-latest");
+        let base: RetreadConfig = serde_json::from_value(serde_json::json!({
+            "retread-wheels": { "mypkg": { "version": "==1.0.0" } }
+        }))
+        .unwrap();
+        let chans = ["conda-forge".to_string()];
+
+        let mut before = base.clone();
+        merge_ledger_overrides(&mut before, ws, &pack_pixi);
+        let fp_before = crate::courier::config_fingerprint(&before, &chans, "");
+
+        write_override(
+            ws,
+            &pack_pixi,
+            "isaac-pack-latest",
+            "torch",
+            "==2.10.0",
+            "c",
+        )
+        .unwrap();
+        let mut after = base.clone();
+        merge_ledger_overrides(&mut after, ws, &pack_pixi);
+        let fp_after = crate::courier::config_fingerprint(&after, &chans, "");
+
+        assert_ne!(
+            fp_before, fp_after,
+            "a ledger change must bust the config fingerprint (cache must not replay stale)"
+        );
+    }
+
+    #[test]
+    fn snapshot_rollback_restores_ledger_absence() {
+        let tmp = TempDir::new("rollback-absent");
+        let ws = tmp.path();
+        let pack_pixi = make_pack(ws, "pypi-packs/p");
+
+        // No ledger exists yet this run.
+        ensure_snapshot(ws).unwrap();
+        write_override(ws, &pack_pixi, "p", "torch", "==2.10.0", "c").unwrap();
+        assert!(ledger_path(ws).exists());
+
+        rollback_all(ws).unwrap();
+        assert!(
+            !ledger_path(ws).exists(),
+            "ledger must be deleted on rollback when it was absent pre-run"
+        );
+        assert!(!snapshot_path(ws).exists());
+        assert!(!snapshot_absent_marker(ws).exists());
+    }
+
+    #[test]
+    fn snapshot_rollback_restores_prior_ledger_content() {
+        let tmp = TempDir::new("rollback-prior");
+        let ws = tmp.path();
+        let pack_pixi = make_pack(ws, "pypi-packs/p");
+
+        // A prior (converged) run already recorded an entry.
+        write_override(ws, &pack_pixi, "p", "numpy", ">=1.24", "prior run").unwrap();
+        let prior = AutoOverrideLedger::load(ws).unwrap();
+
+        // This run adds another entry, then exhausts.
+        ensure_snapshot(ws).unwrap();
+        write_override(ws, &pack_pixi, "p", "torch", "==2.10.0", "this run").unwrap();
+        rollback_all(ws).unwrap();
+
+        let after = AutoOverrideLedger::load(ws).unwrap();
+        assert_eq!(
+            after, prior,
+            "rollback must drop only this run's ledger appends"
+        );
+        assert!(!after.packs["pypi-packs/p"].contains_key("torch"));
+        assert!(after.packs["pypi-packs/p"].contains_key("numpy"));
+    }
+
+    #[test]
+    fn cleanup_keeps_the_written_ledger_entry() {
         let tmp = TempDir::new("cleanup");
         let ws = tmp.path();
-        let pack = ws.join("pixi.toml");
-        std::fs::write(&pack, "[package]\nname = \"p\"\nversion = \"1.0\"\n").unwrap();
-        ensure_snapshot(ws, &pack).unwrap();
-        write_override(&pack, "torch", "==2.10.0").unwrap();
+        let pack_pixi = make_pack(ws, "pypi-packs/p");
+        ensure_snapshot(ws).unwrap();
+        write_override(ws, &pack_pixi, "p", "torch", "==2.10.0", "c").unwrap();
         cleanup_all(ws).unwrap();
-        assert!(!snapshot_dir(ws).exists());
-        assert!(std::fs::read_to_string(&pack).unwrap().contains("torch"));
+        assert!(!snapshot_path(ws).exists());
+        assert!(!snapshot_absent_marker(ws).exists());
+        let ledger = AutoOverrideLedger::load(ws).unwrap();
+        assert!(ledger.packs["pypi-packs/p"].contains_key("torch"));
+    }
+
+    #[test]
+    fn migrate_moves_sentineled_entries_to_ledger_and_leaves_manual_ones() {
+        let tmp = TempDir::new("migrate");
+        let ws = tmp.path();
+        let pack_dir = ws.join("pypi-packs/isaac-pack-latest");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        let pack_pixi = pack_dir.join("pixi.toml");
+        std::fs::write(
+            &pack_pixi,
+            "[package]\nname = \"isaac-pack-latest\"\nversion = \"6.0.0\"\n\n\
+             [package.build.config.retread-overrides]\n\
+             tinyobjloader = \"==2.0.0rc13\"\n\
+             torch = \"==2.10.0\"  # retread:override 2026-07-09\n\
+             torchvision = \"==0.25.0\"  # retread:override 2026-07-09\n\
+             torchaudio = \"==2.10.0\"  # retread:override 2026-07-09\n",
+        )
+        .unwrap();
+
+        let migrated = migrate_pack_toml_entries(ws, &pack_pixi).unwrap();
+        let migrated_set: std::collections::BTreeSet<String> = migrated.into_iter().collect();
+        let expected_set: std::collections::BTreeSet<String> =
+            ["torch", "torchvision", "torchaudio"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        assert_eq!(migrated_set, expected_set);
+
+        // Manual entry (no sentinel) stays in the pack manifest.
+        let pack_text = std::fs::read_to_string(&pack_pixi).unwrap();
+        assert!(pack_text.contains("tinyobjloader = \"==2.0.0rc13\""));
+        assert!(!pack_text.contains("torch"));
+        assert!(!pack_text.contains(LEGACY_OVERRIDE_SENTINEL));
+
+        // Ledger has all three, with correct specs and bundle attribution.
+        let overrides = overrides_for_pack(ws, &pack_pixi);
+        assert_eq!(overrides.get("torch").map(String::as_str), Some("==2.10.0"));
+        assert_eq!(
+            overrides.get("torchvision").map(String::as_str),
+            Some("==0.25.0")
+        );
+        assert_eq!(
+            overrides.get("torchaudio").map(String::as_str),
+            Some("==2.10.0")
+        );
+        let ledger = AutoOverrideLedger::load(ws).unwrap();
+        let entry = &ledger.packs["pypi-packs/isaac-pack-latest"]["torch"];
+        assert_eq!(entry.bundle, "isaac-pack-latest");
+
+        // Re-running is a no-op (idempotent).
+        let migrated_again = migrate_pack_toml_entries(ws, &pack_pixi).unwrap();
+        assert!(migrated_again.is_empty());
     }
 }

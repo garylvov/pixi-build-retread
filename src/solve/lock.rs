@@ -244,14 +244,18 @@ async fn run_with_pixi_bin(args: LockArgs, pixi_bin: &str) -> Result<i32> {
                 Ok(out) => {
                     editor.write_atomic()?;
                     if let Some(po) = &out.pack_override {
-                        // Snapshot the pack file before its first write so an
-                        // exhausted run rolls it back, then write the override
-                        // into the pack's own retread-overrides table.
-                        crate::pack_overrides::ensure_snapshot(&project_dir, &po.pack_pixi)?;
+                        // Fix #22: snapshot the ledger before this run's
+                        // first write to it so an exhausted run rolls it
+                        // back, then append the override into `.retread/
+                        // auto-overrides.json` -- NOT the pack's pixi.toml.
+                        crate::pack_overrides::ensure_snapshot(&project_dir)?;
                         crate::pack_overrides::write_override(
+                            &project_dir,
                             &po.pack_pixi,
+                            &po.bundle,
                             &po.package,
                             &po.spec,
+                            &out.attempt.conflict,
                         )?;
                     }
                     for attempt in out.extra_attempts {
@@ -948,8 +952,15 @@ exit 1
             .unwrap();
         assert_eq!(code, EXIT_MAX_ITERS);
 
-        let trace = dir.join(".retread").join("solve-conflicts").join("lock-1.txt");
-        assert!(trace.exists(), "expected conflict trace at {}", trace.display());
+        let trace = dir
+            .join(".retread")
+            .join("solve-conflicts")
+            .join("lock-1.txt");
+        assert!(
+            trace.exists(),
+            "expected conflict trace at {}",
+            trace.display()
+        );
         let text = std::fs::read_to_string(&trace).unwrap();
         assert!(text.contains("numpy"));
     }
@@ -996,10 +1007,8 @@ exit 1
         let pack_text = "[package]\nname = \"isaac-pack-latest\"\nversion = \"6.1.11\"\n";
         std::fs::write(&pack_pixi, pack_text).unwrap();
 
-        let pixi = write_fake_pixi_sequence(
-            &dir,
-            &[PACK_EXACT_PIN_TORCH_CONFLICT, GARBAGE_UNPARSEABLE],
-        );
+        let pixi =
+            write_fake_pixi_sequence(&dir, &[PACK_EXACT_PIN_TORCH_CONFLICT, GARBAGE_UNPARSEABLE]);
 
         let args = LockArgs {
             manifest,
@@ -1021,5 +1030,12 @@ exit 1
         );
         assert_eq!(std::fs::read_to_string(&pack_pixi).unwrap(), pack_text);
         assert!(!snapshot_path(&dir).exists());
+        // Fix #22: iter-1's pack override landed in the ledger, not the
+        // pack manifest -- confirm the ledger itself was also rolled back
+        // (it didn't exist before this run, so it must not exist after).
+        assert!(
+            !crate::pack_overrides::ledger_path(&dir).exists(),
+            "the auto-overrides ledger must be rolled back on an unparseable run too"
+        );
     }
 }

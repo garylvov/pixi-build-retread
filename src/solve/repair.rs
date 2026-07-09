@@ -330,16 +330,16 @@ pub struct RepairOutcome {
     pub extra_attempts: Vec<LedgerAttempt>,
     pub applied: Vec<AppliedEdit>,
     pub summary_line: String,
-    /// Fix #20: set instead of (never alongside) `applied` when this
-    /// repair's target came from a backend uv-closure conflict
-    /// (`Conflict::CondaWidenNeeded::pack_name` is `Some`). The WORKSPACE
-    /// manifest is left untouched; the caller (`retread solve`'s
-    /// `driver.rs` / `retread lock`'s `lock.rs`) is responsible for
-    /// actually writing this into the PACK manifest's
-    /// `[package.build.config.retread-overrides]` table (via
+    /// Fix #20 (relocated to the ledger by fix #22): set instead of (never
+    /// alongside) `applied` when this repair's target came from a backend
+    /// uv-closure conflict (`Conflict::CondaWidenNeeded::pack_name` is
+    /// `Some`). The WORKSPACE manifest is left untouched; the caller
+    /// (`retread solve`'s `driver.rs` / `retread lock`'s `lock.rs`) is
+    /// responsible for actually recording this in the workspace's
+    /// `.retread/auto-overrides.json` ledger (via
     /// `crate::pack_overrides::write_override`) -- kept out of `repair()`
     /// itself so a `--dry-run` repair (which only ever mutates a throwaway
-    /// `ManifestEditor`) never side-effects a real pack file.
+    /// `ManifestEditor`) never side-effects the ledger.
     pub pack_override: Option<PackOverrideWrite>,
 }
 
@@ -407,7 +407,9 @@ impl RepairPlanner {
         let canon = canonical_conda_name(package);
         if let Some(candidates) = self.conda_name_map.get(&canon) {
             for candidate in candidates {
-                if let Some(found) = self.resolve_conda_pin_name_or_variant(editor, feature, candidate) {
+                if let Some(found) =
+                    self.resolve_conda_pin_name_or_variant(editor, feature, candidate)
+                {
                     return Some(found);
                 }
             }
@@ -723,15 +725,18 @@ impl RepairPlanner {
         result
     }
 
-    /// Fix #20 (defect 1): emit a [`PackOverrideWrite`] for a
-    /// backend-closure conflict -- the override is written to the failing
-    /// PACK's own `[package.build.config.retread-overrides]` table (the
-    /// only override table the pack's uv closure consumes; a workspace
+    /// Fix #20 (defect 1; sink relocated to the ledger by fix #22): emit a
+    /// [`PackOverrideWrite`] for a backend-closure conflict -- the override
+    /// is recorded in the workspace's `.retread/auto-overrides.json`
+    /// ledger and merged in-memory into the failing PACK's effective
+    /// `retread-overrides` at `Handler::initialize` time (the only
+    /// override table the pack's uv closure consumes; a workspace
     /// `pypi-options.dependency-overrides` write is inert here, see
-    /// override20 brief ACCEPTANCE RUN #6b). No manifest is touched by
-    /// `repair()` itself; the caller performs the pack write, so
-    /// `--dry-run` stays side-effect-free. `pkg`/`version` come from
-    /// [`Self::resolve_pack_override`] (consuming-env, sentinel-agnostic).
+    /// override20 brief ACCEPTANCE RUN #6b). No manifest, and no pack
+    /// pixi.toml, is touched by `repair()` itself; the caller performs the
+    /// ledger write, so `--dry-run` stays side-effect-free. `pkg`/`version`
+    /// come from [`Self::resolve_pack_override`] (consuming-env,
+    /// sentinel-agnostic).
     fn try_pack_override(
         &mut self,
         tried: &mut TriedState,
@@ -777,7 +782,7 @@ impl RepairPlanner {
             ),
             extra_attempts: Vec::new(),
             summary_line: format!(
-                "would add [{bundle} :: retread-overrides] {pkg} = \"{new_spec}\"  (tier: pypi_override; conda-as-truth; pack manifest)",
+                "would add [{bundle} :: retread-overrides] {pkg} = \"{new_spec}\"  (tier: pypi_override; conda-as-truth; .retread/auto-overrides.json ledger)",
             ),
             applied: Vec::new(),
             pack_override: Some(PackOverrideWrite {
@@ -1135,7 +1140,13 @@ pub fn conflict_trace_dir(project_dir: &Path) -> PathBuf {
 pub fn conflict_trace_path(project_dir: &Path, run: &str, iter: u32) -> PathBuf {
     let safe_run: String = run
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     conflict_trace_dir(project_dir).join(format!("{safe_run}-{iter}.txt"))
 }
@@ -1152,7 +1163,10 @@ pub fn persist_conflict_trace(project_dir: &Path, run: &str, iter: u32, text: &s
         return;
     }
     if let Err(err) = std::fs::write(&path, text) {
-        eprintln!("retread: could not write conflict trace {}: {err}", path.display());
+        eprintln!(
+            "retread: could not write conflict trace {}: {err}",
+            path.display()
+        );
     }
 }
 
@@ -1188,10 +1202,11 @@ pub fn resolve_pack_dir(
     workspace_dir: &Path,
     pack_name: &str,
 ) -> Option<PathBuf> {
-    let raw = ws
-        .path_dependencies
-        .get(pack_name)
-        .or_else(|| ws.features.values().find_map(|f| f.path_dependencies.get(pack_name)))?;
+    let raw = ws.path_dependencies.get(pack_name).or_else(|| {
+        ws.features
+            .values()
+            .find_map(|f| f.path_dependencies.get(pack_name))
+    })?;
     let candidate = PathBuf::from(raw);
     Some(if candidate.is_absolute() {
         candidate
@@ -1342,8 +1357,8 @@ fn table_label(feature: &str, kind: TableKind) -> String {
 mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::*;
     use super::super::parse::{ConflictParser, RegexConflictParser};
+    use super::*;
 
     fn temp_manifest(text: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -1601,9 +1616,10 @@ mod tests {
         // `CondaWidenNeeded` conflict carrying `pack_name` came from the
         // PACK's own uv closure inside the build backend -- a workspace
         // `pypi-options.dependency-overrides` write is provably inert for
-        // that class (the closure never reads it). The T1 override must
-        // target the PACK's `[package.build.config.retread-overrides]`
-        // table, and the workspace manifest must stay untouched.
+        // that class (the closure never reads it). Fix #22: the T1
+        // override is recorded in the workspace's `.retread/
+        // auto-overrides.json` ledger (not the pack's pixi.toml, and
+        // still not the workspace manifest).
         let manifest_text = "[dependencies]\ntorch = \"==2.10.0\"\n\n\
              [feature.gpu.dependencies]\n\
              isaac-pack-latest = { path = \"./pypi-packs/isaac-pack-latest\" }\n";
@@ -1612,8 +1628,11 @@ mod tests {
         let pack_dir = project_dir.join("pypi-packs/isaac-pack-latest");
         std::fs::create_dir_all(&pack_dir).unwrap();
         let pack_pixi = pack_dir.join("pixi.toml");
-        std::fs::write(&pack_pixi, "[package]\nname = \"isaac-pack-latest\"\nversion = \"6.0.0\"\n")
-            .unwrap();
+        std::fs::write(
+            &pack_pixi,
+            "[package]\nname = \"isaac-pack-latest\"\nversion = \"6.0.0\"\n",
+        )
+        .unwrap();
 
         let mut editor = ManifestEditor::open(path.clone()).unwrap();
         let mut tried = TriedState::default();
@@ -1646,18 +1665,24 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), manifest_text);
 
         // Caller (lock.rs / driver.rs) performs the write -- simulate it
-        // and confirm the override lands in the PACK's retread-overrides
-        // table, the exact table the build backend consumes.
-        crate::pack_overrides::write_override(&po.pack_pixi, &po.package, &po.spec).unwrap();
-        let pack_text = std::fs::read_to_string(&pack_pixi).unwrap();
-        assert!(pack_text.contains("torch = \"==2.10.0\"  # retread:override"));
-        let doc = pack_text.parse::<toml_edit::DocumentMut>().unwrap();
+        // and confirm the override lands in the workspace ledger, and the
+        // pack manifest stays byte-identical.
+        crate::pack_overrides::write_override(
+            &project_dir,
+            &po.pack_pixi,
+            &po.bundle,
+            &po.package,
+            &po.spec,
+            &out.attempt.conflict,
+        )
+        .unwrap();
         assert_eq!(
-            doc["package"]["build"]["config"]["retread-overrides"]["torch"]
-                .as_str()
-                .unwrap(),
-            "==2.10.0"
+            std::fs::read_to_string(&pack_pixi).unwrap(),
+            "[package]\nname = \"isaac-pack-latest\"\nversion = \"6.0.0\"\n",
+            "the pack manifest must stay byte-identical after an auto repair"
         );
+        let overrides = crate::pack_overrides::overrides_for_pack(&project_dir, &pack_pixi);
+        assert_eq!(overrides.get("torch").map(String::as_str), Some("==2.10.0"));
     }
 
     #[tokio::test]
@@ -1802,8 +1827,11 @@ holosoma-gpu = { features = ["holosoma"] }
         let project_dir = path.parent().unwrap().to_path_buf();
         let pack_dir = project_dir.join("pypi-packs/isaac-pack-latest");
         std::fs::create_dir_all(&pack_dir).unwrap();
-        std::fs::write(pack_dir.join("pixi.toml"), "[package]\nname = \"p\"\nversion = \"6.0\"\n")
-            .unwrap();
+        std::fs::write(
+            pack_dir.join("pixi.toml"),
+            "[package]\nname = \"p\"\nversion = \"6.0\"\n",
+        )
+        .unwrap();
         let mut editor = ManifestEditor::open(path.clone()).unwrap();
         let mut tried = TriedState::default();
         let name_map = crate::handler::load_pypi_to_conda_map().await;
@@ -1882,8 +1910,11 @@ holosoma-gpu = { features = ["holosoma"] }
         let project_dir = path.parent().unwrap().to_path_buf();
         let pack_dir = project_dir.join("pypi-packs/isaac-pack-latest");
         std::fs::create_dir_all(&pack_dir).unwrap();
-        std::fs::write(pack_dir.join("pixi.toml"), "[package]\nname = \"p\"\nversion = \"6.0\"\n")
-            .unwrap();
+        std::fs::write(
+            pack_dir.join("pixi.toml"),
+            "[package]\nname = \"p\"\nversion = \"6.0\"\n",
+        )
+        .unwrap();
         let mut editor = ManifestEditor::open(path.clone()).unwrap();
         let mut tried = TriedState::default();
         // Iter 1 already tried (and applied) a `torch` pypi_override --
@@ -1954,9 +1985,8 @@ holosoma-gpu = { features = ["holosoma"] }
     // calls (mocking the driver's iter loop) must converge to exactly the
     // manual trio the acceptance brief pinned by hand: torch==2.10.0,
     // torchvision==0.25.0, torchaudio==2.10.0.
-    const CONDA_INCOMPATIBLE_TORCHVISION_EXACT: &str = include_str!(
-        "../../tests/fixtures/solve_errors/conda_incompatible_torchvision_exact.txt"
-    );
+    const CONDA_INCOMPATIBLE_TORCHVISION_EXACT: &str =
+        include_str!("../../tests/fixtures/solve_errors/conda_incompatible_torchvision_exact.txt");
     const CONDA_INCOMPATIBLE_TORCHAUDIO_EXACT: &str = concat!(
         "Cannot solve the request because of: torchaudio ==2.10.0 cannot be\n",
         "installed because there are no viable options:\n",
@@ -2016,7 +2046,15 @@ holosoma-gpu = { features = ["holosoma"] }
         assert_eq!(po1.package, "torch");
         assert_eq!(po1.spec, "==2.10.0");
         assert!(out1.applied.is_empty());
-        crate::pack_overrides::write_override(&po1.pack_pixi, &po1.package, &po1.spec).unwrap();
+        crate::pack_overrides::write_override(
+            &project_dir,
+            &po1.pack_pixi,
+            &po1.bundle,
+            &po1.package,
+            &po1.spec,
+            &out1.attempt.conflict,
+        )
+        .unwrap();
 
         // iter 2: torchvision, the fix #21 exact-pin companion shape
         // (verbatim acceptance-final.md fixture).
@@ -2030,7 +2068,15 @@ holosoma-gpu = { features = ["holosoma"] }
         assert_eq!(po2.package, "torchvision");
         assert_eq!(po2.spec, "==0.25.0");
         assert!(out2.applied.is_empty());
-        crate::pack_overrides::write_override(&po2.pack_pixi, &po2.package, &po2.spec).unwrap();
+        crate::pack_overrides::write_override(
+            &project_dir,
+            &po2.pack_pixi,
+            &po2.bundle,
+            &po2.package,
+            &po2.spec,
+            &out2.attempt.conflict,
+        )
+        .unwrap();
 
         // iter 3: torchaudio, same shape one layer deeper.
         let torchaudio_conflict = parser
@@ -2043,15 +2089,34 @@ holosoma-gpu = { features = ["holosoma"] }
         assert_eq!(po3.package, "torchaudio");
         assert_eq!(po3.spec, "==2.10.0");
         assert!(out3.applied.is_empty());
-        crate::pack_overrides::write_override(&po3.pack_pixi, &po3.package, &po3.spec).unwrap();
+        crate::pack_overrides::write_override(
+            &project_dir,
+            &po3.pack_pixi,
+            &po3.bundle,
+            &po3.package,
+            &po3.spec,
+            &out3.attempt.conflict,
+        )
+        .unwrap();
 
-        // Converged to exactly the manual trio; workspace manifest was
-        // never touched by any of the three hops.
+        // Converged to exactly the manual trio; workspace manifest AND the
+        // pack manifest were never touched by any of the three hops -- all
+        // three overrides landed in the ledger.
         editor.write_atomic().unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), manifest_text);
-        let pack_text = std::fs::read_to_string(&pack_pixi).unwrap();
-        assert!(pack_text.contains("torch = \"==2.10.0\"  # retread:override"));
-        assert!(pack_text.contains("torchvision = \"==0.25.0\"  # retread:override"));
-        assert!(pack_text.contains("torchaudio = \"==2.10.0\"  # retread:override"));
+        assert_eq!(
+            std::fs::read_to_string(&pack_pixi).unwrap(),
+            "[package]\nname = \"isaac-pack-latest\"\nversion = \"6.1.11\"\n"
+        );
+        let overrides = crate::pack_overrides::overrides_for_pack(&project_dir, &pack_pixi);
+        assert_eq!(overrides.get("torch").map(String::as_str), Some("==2.10.0"));
+        assert_eq!(
+            overrides.get("torchvision").map(String::as_str),
+            Some("==0.25.0")
+        );
+        assert_eq!(
+            overrides.get("torchaudio").map(String::as_str),
+            Some("==2.10.0")
+        );
     }
 }

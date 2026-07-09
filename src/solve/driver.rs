@@ -298,13 +298,21 @@ async fn run_env(
                 .write_atomic()
                 .map_err(|e| SolveError::Usage(e.to_string()))?;
             if let Some(po) = &out.pack_override {
-                // Snapshot the pack file before its first write so an
-                // exhausted/interrupted run rolls it back, then write the
-                // override into the pack's own retread-overrides table.
-                crate::pack_overrides::ensure_snapshot(project_dir, &po.pack_pixi)
+                // Fix #22: snapshot the ledger before this run's first
+                // write to it so an exhausted/interrupted run rolls it
+                // back, then append the override into `.retread/
+                // auto-overrides.json` -- NOT the pack's pixi.toml.
+                crate::pack_overrides::ensure_snapshot(project_dir)
                     .map_err(|e| SolveError::Usage(e.to_string()))?;
-                crate::pack_overrides::write_override(&po.pack_pixi, &po.package, &po.spec)
-                    .map_err(|e| SolveError::Usage(e.to_string()))?;
+                crate::pack_overrides::write_override(
+                    project_dir,
+                    &po.pack_pixi,
+                    &po.bundle,
+                    &po.package,
+                    &po.spec,
+                    &out.attempt.conflict,
+                )
+                .map_err(|e| SolveError::Usage(e.to_string()))?;
             }
             if let Some(run_idx) = run_idx {
                 for attempt in out.extra_attempts {
