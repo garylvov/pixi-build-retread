@@ -161,8 +161,13 @@ pub fn inject_source_extras(src: &Path, dst: &Path, source_root: &Path) -> Resul
 
     if extras.is_empty() {
         // Nothing to add. Copy through so the caller can treat the
-        // output path uniformly.
-        fs::copy(src, dst)?;
+        // output path uniformly. Atomic: copy to a same-directory temp
+        // file then rename, so a process/node death mid-copy never
+        // leaves a truncated file at `dst` for a later run's mtime-only
+        // `is_fresh()` check to mistake for a valid cache hit.
+        let (tmp, _) = crate::wheel::create_atomic_tmp(dst)?;
+        fs::copy(src, &tmp)?;
+        crate::wheel::commit_atomic_write(&tmp, dst)?;
         return Ok(());
     }
 
@@ -182,7 +187,13 @@ pub fn inject_source_extras(src: &Path, dst: &Path, source_root: &Path) -> Resul
 
     // Rewrite the wheel: copy every original entry through, swap
     // RECORD for the new one, then append the extras at the end.
-    let dst_file = fs::File::create(dst).with_context(|| format!("creating {}", dst.display()))?;
+    //
+    // Atomic write: build the zip in a same-directory temp file, then
+    // rename over `dst` only once every byte is flushed, so a process/
+    // node death mid-write can never leave a truncated wheel at `dst`
+    // for a later run's mtime-only `is_fresh()` check to mistake for a
+    // valid cache hit (the exact failure mode proven in run 9).
+    let (tmp, dst_file) = crate::wheel::create_atomic_tmp(dst)?;
     let mut writer = ZipWriter::new(dst_file);
 
     for i in 0..archive.len() {
@@ -205,7 +216,10 @@ pub fn inject_source_extras(src: &Path, dst: &Path, source_root: &Path) -> Resul
         writer.start_file(&extra.zip_path, options)?;
         writer.write_all(&extra.bytes)?;
     }
-    writer.finish()?.flush()?;
+    let mut finished = writer.finish()?;
+    finished.flush()?;
+    drop(finished);
+    crate::wheel::commit_atomic_write(&tmp, dst)?;
     Ok(())
 }
 

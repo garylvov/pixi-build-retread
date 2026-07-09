@@ -2293,3 +2293,76 @@ fn deps_from_exact_pinned_names_canonicalizes_conda_name() {
     let names = deps_from_exact_pinned_names(&roots);
     assert!(names.contains("my-package-name"));
 }
+
+// ── Run 9: is_fresh() self-heals a corrupted cached wheel ───────────────────
+
+#[cfg(unix)]
+fn write_zip(path: &std::path::Path) {
+    let file = std::fs::File::create(path).unwrap();
+    let mut writer = zip::ZipWriter::new(file);
+    writer
+        .start_file("a.txt", zip::write::SimpleFileOptions::default())
+        .unwrap();
+    use std::io::Write as _;
+    writer.write_all(b"hello").unwrap();
+    writer.finish().unwrap();
+}
+
+/// A cached `.whl` newer than its input, but not a real zip (a node died
+/// mid-write before the atomic rename landed -- or, pre-fix, before an
+/// in-place write finished): `is_fresh` must reject it as NOT fresh AND
+/// delete it, instead of trusting the mtime and handing a corrupt file to
+/// the next pipeline phase (the run-9 "Could not find EOCD" failure).
+#[cfg(unix)]
+#[test]
+fn is_fresh_self_heals_corrupted_cached_wheel() {
+    let dir = unique_test_dir("is-fresh-selfheal");
+    std::fs::create_dir_all(&dir).unwrap();
+    let input = dir.join("raw-1.0-py3-none-any.whl");
+    let output = dir.join("raw-1.0-py3-none-any.injected.whl");
+
+    std::fs::write(&input, b"raw wheel bytes").unwrap();
+    // Truncated/garbage output, deliberately made newer than the input so
+    // the plain mtime check alone would call it "fresh".
+    std::fs::write(&output, b"not a valid zip, truncated mid-write").unwrap();
+    let future = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+    let out_file = std::fs::File::options().write(true).open(&output).unwrap();
+    out_file.set_modified(future).unwrap();
+
+    assert!(
+        !is_fresh(&output, &input).unwrap(),
+        "a corrupted cached wheel must never be reported fresh, even if newer than its input"
+    );
+    assert!(
+        !output.exists(),
+        "is_fresh must remove the corrupted cache file so the caller rebuilds it"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A genuinely valid, up-to-date cached wheel is still reported fresh and
+/// left untouched -- the self-heal check must not false-positive on good
+/// cache hits.
+#[cfg(unix)]
+#[test]
+fn is_fresh_accepts_valid_cached_wheel() {
+    let dir = unique_test_dir("is-fresh-valid");
+    std::fs::create_dir_all(&dir).unwrap();
+    let input = dir.join("raw-1.0-py3-none-any.whl");
+    let output = dir.join("raw-1.0-py3-none-any.injected.whl");
+
+    std::fs::write(&input, b"raw wheel bytes").unwrap();
+    write_zip(&output);
+    let future = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+    let out_file = std::fs::File::options().write(true).open(&output).unwrap();
+    out_file.set_modified(future).unwrap();
+
+    assert!(
+        is_fresh(&output, &input).unwrap(),
+        "a valid, newer-than-input cached wheel must be reported fresh"
+    );
+    assert!(output.exists(), "a valid cache hit must not be deleted");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

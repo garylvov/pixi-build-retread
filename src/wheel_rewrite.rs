@@ -109,13 +109,18 @@ pub(crate) fn rewrite_wheel_with(
     let new_metadata = rewrite_metadata_text_with(&metadata_str, map)?;
     if new_metadata == metadata_str {
         // Nothing changed; hard-link when possible (free for
-        // multi-GB wheels on the same filesystem), else copy.
-        if dst.exists() {
-            std::fs::remove_file(dst)?;
+        // multi-GB wheels on the same filesystem), else copy. Atomic:
+        // land the hard-link/copy at a same-directory temp path first,
+        // then rename over `dst` -- never remove `dst` before its
+        // replacement is fully in place, so a process/node death
+        // mid-operation leaves either the old `dst` or the new one,
+        // never neither/a truncated stub.
+        let tmp = crate::wheel::atomic_tmp_path(dst);
+        if std::fs::hard_link(src, &tmp).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            std::fs::copy(src, &tmp)?;
         }
-        if std::fs::hard_link(src, dst).is_err() {
-            std::fs::copy(src, dst)?;
-        }
+        crate::wheel::commit_atomic_write(&tmp, dst)?;
         let h = sha256_hex(&bytes);
         return Ok((h, false));
     }
@@ -135,8 +140,14 @@ pub(crate) fn rewrite_wheel_with(
     // Write new wheel zip. Iterate every entry; substitute METADATA/RECORD,
     // pass everything else through. Preserve compression and timestamps so
     // tools that inspect the wheel see a minimally-different file.
-    let dst_file =
-        std::fs::File::create(dst).with_context(|| format!("creating {}", dst.display()))?;
+    //
+    // Atomic write: build in a same-directory temp file, then rename
+    // over `dst` only once every byte is flushed -- a process/node
+    // death mid-write can never leave a truncated wheel at `dst` for a
+    // later run's mtime-only `is_fresh()` check to mistake for a valid
+    // cache hit (the exact failure mode proven in run 9: a corrupted
+    // `*.autodata.whl` fed straight into this function as `src`).
+    let (tmp, dst_file) = crate::wheel::create_atomic_tmp(dst)?;
     let mut writer = ZipWriter::new(dst_file);
 
     for i in 0..archive.len() {
@@ -164,7 +175,10 @@ pub(crate) fn rewrite_wheel_with(
             std::io::copy(&mut entry, &mut writer)?;
         }
     }
-    writer.finish()?.flush()?;
+    let mut finished = writer.finish()?;
+    finished.flush()?;
+    drop(finished);
+    crate::wheel::commit_atomic_write(&tmp, dst)?;
 
     // sha256 of the rewritten wheel file (for recipe.yaml's source: sha256).
     let dst_bytes = std::fs::read(dst)?;

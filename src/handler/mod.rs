@@ -4059,7 +4059,27 @@ fn is_fresh(output: &Path, input: &Path) -> Result<bool> {
     let (Ok(out_t), Ok(in_t)) = (out_meta.modified(), in_meta.modified()) else {
         return Ok(false);
     };
-    Ok(out_t >= in_t)
+    if out_t < in_t {
+        return Ok(false);
+    }
+    // Self-heal (run 9 fix): mtime alone can't tell a fully-written cache
+    // wheel from a truncated one left behind by a process/node that died
+    // mid-write. wheel_inject.rs / wheel_inject_data.rs / wheel_rewrite.rs
+    // now write atomically (temp + same-dir rename) going forward, but old
+    // corrupted cache entries -- and any future write path that forgets the
+    // pattern -- must never be silently trusted just because they're
+    // "newer". Validate zip integrity before calling a `.whl` cache hit
+    // fresh; on failure, remove the corrupt file and fall through to the
+    // caller's normal rebuild path.
+    if output.extension().is_some_and(|e| e == "whl") && !crate::wheel::is_valid_zip(output) {
+        tracing::warn!(
+            wheel = %output.display(),
+            "retread: corrupted cached wheel, removing and rebuilding",
+        );
+        let _ = std::fs::remove_file(output);
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 /// After the user-driven (extras + prefix) BFS, optionally bundle any

@@ -29,6 +29,65 @@ pub struct WheelMetadata {
     pub filename: String,
 }
 
+/// Create a same-directory temp file for an atomic wheel-cache write.
+///
+/// `ZipWriter` (used by the inject/autodata/relax pipeline in
+/// `wheel_inject.rs`, `wheel_inject_data.rs`, and `wheel_rewrite.rs`) needs
+/// a concrete `std::fs::File` to write into, so those call sites can't
+/// reuse the async tokio-fs temp+rename dance above. This is the sync
+/// equivalent of the same protocol: write into `<dst>.<pid>.tmp` (same
+/// directory as `dst`, so the final rename is atomic even on NFS) and
+/// promote it with [`commit_atomic_write`] only after every byte is
+/// flushed. Without this, a process/node death mid-write leaves a
+/// truncated file sitting at `dst` -- and because `is_fresh()` only
+/// checks mtime, that truncated file gets treated as a valid cache hit
+/// forever afterward (see the self-heal check in `is_fresh`).
+pub(crate) fn create_atomic_tmp(dst: &Path) -> Result<(PathBuf, std::fs::File)> {
+    let tmp = atomic_tmp_path(dst);
+    let file =
+        std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+    Ok((tmp, file))
+}
+
+/// Same-directory temp path for an atomic write, without creating the
+/// file. Used by callers (e.g. the hard-link fast path in
+/// `wheel_rewrite.rs`) whose write step needs the path to NOT already
+/// exist (`std::fs::hard_link` errors if the destination is present).
+pub(crate) fn atomic_tmp_path(dst: &Path) -> PathBuf {
+    let parent = dst.parent().unwrap_or_else(|| Path::new("."));
+    parent.join(format!(
+        "{}.{}.tmp",
+        dst.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("wheel.whl"),
+        std::process::id()
+    ))
+}
+
+/// Promote a temp file created by [`create_atomic_tmp`] to its final
+/// destination with an atomic same-directory rename. Callers must fully
+/// flush (and drop, if holding a wrapping writer) the file before calling
+/// this. On any failure the temp file is removed so it never lingers as
+/// cache-poisoning debris that a later run could mistake for real output.
+pub(crate) fn commit_atomic_write(tmp: &Path, dst: &Path) -> Result<()> {
+    std::fs::rename(tmp, dst).map_err(|e| {
+        let _ = std::fs::remove_file(tmp);
+        anyhow::Error::from(e).context(format!("renaming {} -> {}", tmp.display(), dst.display()))
+    })
+}
+
+/// Check whether `path` is a well-formed zip archive (just the central
+/// directory / EOCD, not full CRC validation of every entry -- callers
+/// only need to know "is this readable at all", the corruption pattern
+/// seen in practice is a truncated file from an interrupted write, which
+/// this catches). Used by the self-heal cache-freshness check.
+pub(crate) fn is_valid_zip(path: &Path) -> bool {
+    match std::fs::File::open(path) {
+        Ok(f) => zip::ZipArchive::new(f).is_ok(),
+        Err(_) => false,
+    }
+}
+
 /// Derive the on-disk filename for a wheel URL. Percent-decodes the last
 /// path segment so URLs that encode the `+` of a PEP 440 local-version
 /// identifier (e.g. miropsota's
@@ -832,5 +891,125 @@ mod tests {
             result_bytes, wheel_bytes,
             "persistent store hit must produce byte-identical output"
         );
+    }
+
+    // ── Run 9: atomic cache-write + corrupted-zip self-heal ──────────────────
+
+    /// `create_atomic_tmp` + `commit_atomic_write` round-trips real bytes to
+    /// the final destination and leaves no temp file behind.
+    #[test]
+    fn atomic_write_round_trips_and_cleans_up_tmp() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "retread-wheel-test-atomic-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let dst = tmp_dir.join("pkg-1.0-py3-none-any.whl");
+
+        let (tmp, mut file) = create_atomic_tmp(&dst).unwrap();
+        assert_ne!(tmp, dst, "temp path must differ from the final destination");
+        assert_eq!(
+            tmp.parent(),
+            dst.parent(),
+            "temp file must live in the same directory as dst so the rename is atomic"
+        );
+        use std::io::Write as _;
+        file.write_all(b"PK\x03\x04pretend wheel bytes").unwrap();
+        file.flush().unwrap();
+        drop(file);
+
+        assert!(!dst.exists(), "dst must not exist before the commit");
+        commit_atomic_write(&tmp, &dst).unwrap();
+
+        assert!(dst.exists(), "dst must exist after commit");
+        assert!(
+            !tmp.exists(),
+            "temp file must be gone after a successful commit"
+        );
+        assert_eq!(
+            std::fs::read(&dst).unwrap(),
+            b"PK\x03\x04pretend wheel bytes"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    /// A reader that dies between `create_atomic_tmp` and `commit_atomic_write`
+    /// (the run-9 failure: a compute node dying mid wheel-write) leaves ONLY
+    /// the `.tmp` file on disk -- `dst` never appears in a truncated state.
+    #[test]
+    fn atomic_write_never_leaves_truncated_dst_on_interruption() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "retread-wheel-test-atomic-interrupt-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let dst = tmp_dir.join("pkg-1.0-py3-none-any.whl");
+
+        let (tmp, mut file) = create_atomic_tmp(&dst).unwrap();
+        use std::io::Write as _;
+        file.write_all(b"only half the wheel").unwrap();
+        // Simulate the process dying here: never call commit_atomic_write.
+        drop(file);
+
+        assert!(
+            !dst.exists(),
+            "dst must never appear until the atomic rename commits"
+        );
+        assert!(
+            tmp.exists(),
+            "the half-written temp file is the only artifact left behind"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    /// `is_valid_zip` accepts a well-formed zip and rejects a truncated one
+    /// (the "Could not find EOCD" corruption pattern proven in run 9).
+    #[test]
+    fn is_valid_zip_detects_corrupted_archive() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "retread-wheel-test-validzip-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        // A real, complete zip archive.
+        let good = tmp_dir.join("good.whl");
+        {
+            let file = std::fs::File::create(&good).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            writer
+                .start_file("a.txt", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            use std::io::Write as _;
+            writer.write_all(b"hello").unwrap();
+            writer.finish().unwrap();
+        }
+        assert!(is_valid_zip(&good), "a complete zip archive must validate");
+
+        // Garbage bytes masquerading as a wheel: not a zip at all.
+        let garbage = tmp_dir.join("garbage.whl");
+        std::fs::write(&garbage, b"not a zip file, just garbage bytes").unwrap();
+        assert!(
+            !is_valid_zip(&garbage),
+            "non-zip garbage bytes must be rejected"
+        );
+
+        // Truncated zip: valid header, but the EOCD record got cut off --
+        // the exact "invalid Zip archive: Could not find EOCD" failure mode
+        // from a node dying mid-write.
+        let good_bytes = std::fs::read(&good).unwrap();
+        let truncated = tmp_dir.join("truncated.whl");
+        std::fs::write(&truncated, &good_bytes[..good_bytes.len() / 2]).unwrap();
+        assert!(
+            !is_valid_zip(&truncated),
+            "a truncated (EOCD-missing) zip must be rejected, not treated as valid"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

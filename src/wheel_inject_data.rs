@@ -242,8 +242,14 @@ pub fn inject_checkout_root_data(
 
     if data_entries.is_empty() {
         // Nothing to add. Copy through so the caller can uniformly
-        // chain on the next pipeline phase.
-        fs::copy(src_wheel, dst_wheel)?;
+        // chain on the next pipeline phase. Atomic: copy to a
+        // same-directory temp file then rename, so a process/node
+        // death mid-copy never leaves a truncated file sitting at
+        // `dst_wheel` (which `is_fresh()` would otherwise mistake for
+        // a valid cache hit on the next run).
+        let (tmp, _) = crate::wheel::create_atomic_tmp(dst_wheel)?;
+        fs::copy(src_wheel, &tmp)?;
+        crate::wheel::commit_atomic_write(&tmp, dst_wheel)?;
         return Ok(0);
     }
 
@@ -266,8 +272,16 @@ pub fn inject_checkout_root_data(
     // Two-pass writeback identical in shape to wheel_inject: copy
     // every original entry through (substituting RECORD for the
     // rebuilt one), then append new data entries.
-    let dst_file =
-        fs::File::create(dst_wheel).with_context(|| format!("creating {}", dst_wheel.display()))?;
+    //
+    // Atomic write: build the zip in a same-directory temp file, then
+    // rename over `dst_wheel` only once every byte is flushed. A node
+    // dying mid-write (the failure this guards against -- proven in
+    // run 9, a corrupted `*.autodata.whl` from a node that died
+    // mid-write) previously left a truncated file at `dst_wheel`
+    // itself, which `is_fresh()` would then treat as a valid cache hit
+    // forever after (mtime-only freshness check, no content
+    // validation).
+    let (tmp, dst_file) = crate::wheel::create_atomic_tmp(dst_wheel)?;
     let mut writer = ZipWriter::new(dst_file);
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i)?;
@@ -289,7 +303,10 @@ pub fn inject_checkout_root_data(
         writer.start_file(&data.zip_path, options)?;
         writer.write_all(&data.bytes)?;
     }
-    writer.finish()?.flush()?;
+    let mut finished = writer.finish()?;
+    finished.flush()?;
+    drop(finished);
+    crate::wheel::commit_atomic_write(&tmp, dst_wheel)?;
     Ok(data_entries.len())
 }
 
