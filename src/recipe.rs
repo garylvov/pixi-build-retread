@@ -280,6 +280,37 @@ pub fn build_courier_recipe(
     // without a pixi context), rattler-build synthesizes the string itself.
     expected_build: Option<&str>,
 ) -> Recipe {
+    build_courier_recipe_with_mode(
+        conda_name,
+        version,
+        python_version,
+        run_deps,
+        source_urls,
+        expected_build,
+        crate::config::CourierMode::PostLink,
+    )
+}
+
+/// Same as [`build_courier_recipe`], but lets the caller pick the
+/// [`crate::config::CourierMode`] (`retread-courier-mode`): the default
+/// `post-link` mode ships an eager conda post-link script (wants
+/// `run-post-link-scripts = "insecure"` for `pixi install`-time install);
+/// `activation` mode skips the post-link entirely and relies solely on the
+/// activate.d self-heal guard below to install lazily on first activation,
+/// so no `insecure` config is ever needed. The guard's `retread install`
+/// call is unconditional and idempotent (same command either mode would
+/// run), so it already handles the cold "never installed" case identically
+/// to a repair -- `activation` mode is not a separate code path, just the
+/// absence of the post-link's eager trigger.
+pub fn build_courier_recipe_with_mode(
+    conda_name: &str,
+    version: &str,
+    python_version: &str,
+    run_deps: &[String],
+    source_urls: &[String],
+    expected_build: Option<&str>,
+    courier_mode: crate::config::CourierMode,
+) -> Recipe {
     let python_pin = format!("python {python_version}.*");
     let lock_filename = crate::lock::RetreadLock::file_name(conda_name);
 
@@ -308,6 +339,23 @@ pub fn build_courier_recipe(
     // and must fail the conda link if the PyPI payload cannot be installed;
     // otherwise pixi can report success for an incomplete environment.
     let post_link = format!("$PREFIX/bin/.{conda_name}-post-link.sh");
+    // `activation` mode (`retread-courier-mode = "activation"`) never emits
+    // this block at all -- no post-link file is created, so conda/pixi never
+    // gates on `run-post-link-scripts`. The activate.d guard below is the
+    // SAME code either way and already performs a full idempotent install
+    // (not merely a "repair"), so it alone is sufficient to bring up a
+    // freshly-linked, never-installed env on first activation.
+    let post_link_section = match courier_mode {
+        crate::config::CourierMode::PostLink => format!(
+            "cat > \"{post_link}\" <<'POSTLINK'\n\
+             #!/bin/bash\n\
+             set -euo pipefail\n\
+             \"$PREFIX/bin/retread\" install --lock \"$PREFIX/share/retread/{lock_filename}\" --prefix \"$PREFIX\"\n\
+             POSTLINK\n\
+             chmod +x \"{post_link}\"\n"
+        ),
+        crate::config::CourierMode::Activation => String::new(),
+    };
     // Loud-failure guard: an activate.d script runs on every activation
     // (regardless of the post-link toggle) and warns when the marker is absent
     // or no longer matches the actual installed wheel state.
@@ -323,12 +371,7 @@ pub fn build_courier_recipe(
          cp \"$SRC_DIR\"/{lock_filename} \"$SHARE\"/\n\
          cp \"$SRC_DIR\"/retread-installer \"$PREFIX/bin/retread\"\n\
          chmod +x \"$PREFIX/bin/retread\"\n\
-         cat > \"{post_link}\" <<'POSTLINK'\n\
-         #!/bin/bash\n\
-         set -euo pipefail\n\
-         \"$PREFIX/bin/retread\" install --lock \"$PREFIX/share/retread/{lock_filename}\" --prefix \"$PREFIX\"\n\
-         POSTLINK\n\
-         chmod +x \"{post_link}\"\n\
+         {post_link_section}\
          cat > \"{activate_guard}\" <<'ACTIVATE'\n\
          #!/bin/bash\n\
          # SELF-HEAL guard, sourced on every activation. The bundle's PyPI wheels\n\
@@ -891,6 +934,172 @@ mod courier_tests {
             "None expected_build must leave build.string absent"
         );
     }
+
+    /// `courier-mode = "activation"`: no post-link script is emitted at all
+    /// (so conda/pixi never gates on `run-post-link-scripts = "insecure"`),
+    /// but the activate.d/deactivate.d self-heal guard is still shipped
+    /// unchanged -- it is the SAME script as `post-link` mode.
+    #[test]
+    fn courier_recipe_activation_mode_omits_post_link_but_keeps_guard() {
+        let r = build_courier_recipe_with_mode(
+            "isaac-pack",
+            "5.1.0",
+            "3.11",
+            &[],
+            &[],
+            None,
+            crate::config::CourierMode::Activation,
+        );
+        assert!(
+            !r.build.script.contains(".isaac-pack-post-link.sh"),
+            "activation mode must not emit a post-link script"
+        );
+        assert!(
+            !r.build.script.contains("POSTLINK"),
+            "activation mode must not emit the post-link heredoc at all"
+        );
+        assert!(
+            r.build
+                .script
+                .contains("etc/conda/activate.d/zzz-retread-isaac-pack.sh"),
+            "activation mode must still ship the activate.d self-heal guard"
+        );
+        assert!(
+            r.build
+                .script
+                .contains("etc/conda/deactivate.d/zzz-retread-isaac-pack.sh"),
+            "activation mode must still ship the deactivate.d hook"
+        );
+        // Wheels/lock/binary are still staged as data; only the eager
+        // post-link trigger is dropped.
+        assert!(r.build.script.contains("share/retread"));
+        assert!(
+            r.build.script.contains("cp \"$SRC_DIR\"/retread-installer"),
+            "activation mode must still stage the shipped installer binary"
+        );
+    }
+
+    #[test]
+    fn courier_recipe_post_link_mode_is_default() {
+        let with_default = build_courier_recipe("isaac-pack", "5.1.0", "3.11", &[], &[], None);
+        let with_explicit = build_courier_recipe_with_mode(
+            "isaac-pack",
+            "5.1.0",
+            "3.11",
+            &[],
+            &[],
+            None,
+            crate::config::CourierMode::PostLink,
+        );
+        assert_eq!(with_default.build.script, with_explicit.build.script);
+    }
+
+    /// End-to-end: in `activation` mode there is no post-link at all, so the
+    /// activate.d guard sourced on the FIRST activation of a freshly-linked
+    /// (never-installed) prefix must perform a full cold install, not merely
+    /// a "repair" -- `retread verify`/`install` are the same idempotent
+    /// calls either way, so the cold case is not a separate code path.
+    #[test]
+    fn courier_activation_mode_guard_performs_cold_install_with_no_post_link() {
+        use std::process::Command;
+
+        let bash = match which("bash") {
+            Some(b) => b,
+            None => {
+                eprintln!("skipping: bash not on PATH");
+                return;
+            }
+        };
+
+        let root = std::env::temp_dir().join(format!(
+            "retread-activation-cold-e2e-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let src = root.join("src");
+        let prefix = root.join("prefix");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&prefix).unwrap();
+        std::fs::write(src.join("retread-isaac-pack.lock.json"), "{}").unwrap();
+        std::fs::write(src.join("retread-installer"), "#!/bin/sh\n").unwrap();
+
+        let recipe = build_courier_recipe_with_mode(
+            "isaac-pack",
+            "5.1.0",
+            "3.11",
+            &[],
+            &[],
+            None,
+            crate::config::CourierMode::Activation,
+        );
+        let build = Command::new(&bash)
+            .arg("-c")
+            .arg(&recipe.build.script)
+            .env("SRC_DIR", &src)
+            .env("PREFIX", &prefix)
+            .output()
+            .expect("run build script");
+        assert!(
+            build.status.success(),
+            "build script failed: {}",
+            String::from_utf8_lossy(&build.stderr)
+        );
+        assert!(
+            !prefix.join("bin/.isaac-pack-post-link.sh").exists(),
+            "activation mode must never materialize a post-link file"
+        );
+
+        // Stub installer: `verify` fails until the payload sentinel exists
+        // (mirrors a freshly-linked env: marker/payload absent, never
+        // installed -- NOT a repair of a previously-healthy env).
+        let stub = "#!/bin/bash\n\
+             log=\"$CONDA_PREFIX/retread-stub.log\"\n\
+             payload=\"$CONDA_PREFIX/lib/python3.11/site-packages/isaaclab/__init__.py\"\n\
+             case \"$1\" in\n\
+             verify) [ -f \"$payload\" ] ;;\n\
+             install) echo \"install $(date +%s.%N)\" >> \"$log\"; mkdir -p \"$(dirname \"$payload\")\"; echo x > \"$payload\" ;;\n\
+             *) exit 0 ;;\n\
+             esac\n";
+        std::fs::write(prefix.join("bin/retread"), stub).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                prefix.join("bin/retread"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+
+        let guard = prefix.join("etc/conda/activate.d/zzz-retread-isaac-pack.sh");
+        let payload = prefix.join("lib/python3.11/site-packages/isaaclab/__init__.py");
+        assert!(
+            !payload.exists(),
+            "payload must start absent -- never-linked cold env, no prior install"
+        );
+
+        let out = Command::new(&bash)
+            .arg("-c")
+            .arg(format!(". \"{}\"", guard.display()))
+            .env("CONDA_PREFIX", &prefix)
+            .output()
+            .expect("source guard");
+        assert!(
+            payload.exists(),
+            "first activation of a never-installed env must cold-install the payload \
+             via the activate.d guard alone (no post-link ever ran)"
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("repairing"),
+            "guard's install path is the same message for cold-install and repair \
+             (verify/install do not distinguish the two)"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
 }
 
 #[cfg(test)]
@@ -919,6 +1128,7 @@ mod tests {
             compression_level: None,
             emit_pypi: false,
             bundle_mode: crate::config::BundleMode::Fat,
+            courier_mode: Default::default(),
             courier: false,
             blueprint: Default::default(),
             blueprint_sync: Default::default(),

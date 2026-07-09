@@ -68,6 +68,7 @@ fn baseline_config() -> RetreadConfig {
         compression_level: None,
         emit_pypi: false,
         bundle_mode: pixi_build_retread::config::BundleMode::Fat,
+        courier_mode: Default::default(),
         courier: false,
         blueprint: Default::default(),
         blueprint_sync: Default::default(),

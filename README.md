@@ -28,6 +28,12 @@ isaacsim = { version = "==5.1.0", index = "https://pypi.nvidia.com" }
 
 Run: `pixi install`
 
+Courier installs via a conda post-link script (retread's own, not
+third-party), so the workspace `.pixi/config.toml` needs
+`run-post-link-scripts = "insecure"`. Set `retread-courier-mode =
+"activation"` to skip the post-link and install lazily on first `pixi
+run`/`shell` instead -- no insecure config, slower first activation.
+
 ## Pack Configuration Example
 A pack's `pixi.toml` (e.g., `examples/isaac6/isaac-pack/`) declares package metadata and wheels to bundle:
 ```toml

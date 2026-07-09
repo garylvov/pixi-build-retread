@@ -182,11 +182,19 @@ pub struct RetreadConfig {
     ///
     /// Defaults to `true`. Set `retread-courier = false` to opt OUT to the
     /// legacy conda-artifact path (a full conda package carrying the wheels
-    /// as a payload). Courier REQUIRES the consumer workspace to enable
-    /// post-link scripts (`<workspace>/.pixi/config.toml` with
-    /// `run-post-link-scripts = "insecure"`); without it the wheels are
-    /// never installed -- the shipped conda `activate.d` guard prints a loud
-    /// banner on every activation so this failure is never silent.
+    /// as a payload). In the default `courier-mode = "post-link"`, courier
+    /// wants the consumer workspace to enable post-link scripts
+    /// (`<workspace>/.pixi/config.toml` with
+    /// `run-post-link-scripts = "insecure"`) so the wheels are installed
+    /// eagerly at `pixi install` time; without it, `pixi install` SKIPS the
+    /// post-link (pixi refuses to run it) but the env is not left broken --
+    /// the shipped conda `activate.d` guard runs `retread verify`/`install`
+    /// on every activation regardless of the post-link toggle, and installs
+    /// the wheels lazily on first `pixi run`/`pixi shell` instead. Set
+    /// `courier-mode = "activation"` to skip emitting the post-link script
+    /// entirely and rely solely on that lazy activate.d install -- this
+    /// drops the `run-post-link-scripts = "insecure"` requirement at the
+    /// cost of a slower first activation (see [`CourierMode`]).
     ///
     /// ```toml
     /// [package.build.config]
@@ -198,6 +206,30 @@ pub struct RetreadConfig {
         alias = "courier"
     )]
     pub courier: bool,
+
+    /// v4.3.0: how the courier bundle installs its PyPI wheel payload into
+    /// the consumer env (`retread-courier-mode`).
+    ///
+    /// - `"post-link"` (the DEFAULT): install eagerly at env link time via a
+    ///   conda post-link script (`retread install` runs during `pixi
+    ///   install`). Requires the consumer's `<workspace>/.pixi/config.toml`
+    ///   to set `run-post-link-scripts = "insecure"` for the install to run
+    ///   at link time (see [`RetreadConfig::courier`] doc); without it, the
+    ///   activate.d guard still installs lazily on first activation.
+    /// - `"activation"`: never emit a post-link script at all. The wheels
+    ///   are installed lazily by the same `retread install` call, but only
+    ///   the first time the env is activated (`pixi run` / `pixi shell`).
+    ///   No `run-post-link-scripts = "insecure"` config is needed anywhere.
+    ///   Trade-off: `pixi install` finishes faster (no wheel install), but
+    ///   the first `pixi run`/`pixi shell` after install pays that cost
+    ///   instead, blocking on the install synchronously.
+    ///
+    /// ```toml
+    /// [package.build.config]
+    /// retread-courier-mode = "activation"  # no insecure config needed
+    /// ```
+    #[serde(default, rename = "retread-courier-mode", alias = "courier-mode")]
+    pub courier_mode: CourierMode,
 
     /// v3.2.0: where the courier bundle's shipped wheel BYTES live.
     ///
@@ -263,21 +295,17 @@ pub struct RetreadConfig {
     #[serde(default, rename = "retread-python", alias = "python")]
     pub python: Option<PythonSpec>,
 
-    /// v4.0.0-pre (spec-uv-restructure M1): which engine computes the
-    /// bundle's wheel closure.
-    ///
-    /// - `"uv"` (default): synthesize an ephemeral uv project (conda pins
-    ///   become `constraint-dependencies` with provenance), `uv lock` + `uv
-    ///   export --format pylock.toml`, and pin the legacy materialization to
-    ///   uv's picks. Requires `uv` on PATH (override with `$RETREAD_UV`).
-    ///   Only closure computation changes; packaging/courier/lock-write
-    ///   downstream are unchanged.
-    /// - `"legacy"`: REMOVED in v4.2.0 (the in-backend cascade/resolvo
-    ///   mirror-solver was deleted). The variant is kept so the value
-    ///   still parses; `initialize` hard-errors on it with a pointer to
-    ///   `retread-resolver = "uv"` / pinning the backend `<4.2`.
+    /// DEPRECATED (v4.4.0), parsed and ignored. uv is the ONLY resolver:
+    /// the bundle's wheel closure is always computed by a uv subprocess
+    /// (ephemeral project + `uv lock` + `uv export --format pylock.toml`).
+    /// The old `retread-resolver = "legacy"` cascade/resolvo mirror-solver
+    /// was deleted in v4.2.0 and the knob itself removed in v4.4.0. This
+    /// field is retained so `deny_unknown_fields` does not reject old
+    /// manifests that still carry `retread-resolver`; `initialize` emits a
+    /// deprecation warning when it is set. Remove it from your
+    /// `[package.build.config]`.
     #[serde(default, rename = "retread-resolver", alias = "resolver")]
-    pub resolver: ResolverKind,
+    pub resolver: Option<String>,
 
     /// v4.3.0 (spec-uv-restructure M2): conda-route auto-discovery.
     /// After `uv lock` yields the wheel closure, every closure wheel
@@ -343,18 +371,6 @@ pub enum SdistBuildPolicy {
     Never,
 }
 
-/// Engine selection for closure computation (`retread-resolver`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ResolverKind {
-    /// The historical cascade/resolvo mirror-solver. Deleted in v4.2.0;
-    /// selecting it is a hard error at initialize time.
-    Legacy,
-    /// uv-subprocess closure computation (spec-uv-restructure.md; default).
-    #[default]
-    Uv,
-}
-
 /// Where the courier bundle's shipped wheel bytes live
 /// (`retread-bundle-mode`): the shared content-addressed wheel store
 /// (`loose`, default) or inside the .conda artifact (`fat`).
@@ -367,6 +383,24 @@ pub enum BundleMode {
     /// Self-contained .conda carrying the wheel payload (legacy; for
     /// channel publishing).
     Fat,
+}
+
+/// How the courier bundle installs its wheel payload (`retread-courier-mode`):
+/// eagerly via a conda post-link script at env link time (`post-link`,
+/// default), or lazily via the activate.d self-heal guard only, on first
+/// activation (`activation` -- no post-link, no `insecure` config needed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CourierMode {
+    /// Install eagerly at env link time via a conda post-link script.
+    /// Wants `run-post-link-scripts = "insecure"` in the consumer's
+    /// `.pixi/config.toml` for the install to happen at `pixi install` time.
+    #[default]
+    PostLink,
+    /// Skip the post-link script entirely; the activate.d guard installs
+    /// the wheels lazily on first `pixi run` / `pixi shell`. No `insecure`
+    /// post-link config required.
+    Activation,
 }
 
 /// `retread-blueprint` accepts `false` (off), `true` (blueprint +
