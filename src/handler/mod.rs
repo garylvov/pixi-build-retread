@@ -2566,20 +2566,25 @@ async fn uv_group_closure(
         }
     };
     // Sdist-only self-heal (v4.4.0 third rung, spec-uv-restructure
-    // follow-up): rung 1 (conda-route) probes for ANY compatible version
-    // (spec "*") -- reuses the same `probe::find_route` the ordinary
-    // auto-route round uses, just without an exact-version pin. Rung 2
-    // (sdist auto-build) is gated by `sdist-build` (default "auto");
-    // `"never"` passes `None` so the wrapper reproduces the pre-v4.4.0
-    // conda-route-or-error behavior exactly.
+    // follow-up): rung 1 (conda-route) probes for a compatible version
+    // -- `with_sdist_heal` derives the spec from the ORIGINATING pypi
+    // requirement's version range (e.g. `==4.9.*`) when it can extract
+    // one from the uv error, falling back to `"*"` (any version) for an
+    // unpinned dependency. This reuses the same `probe::find_route` the
+    // ordinary auto-route round uses; unlike that round there is no
+    // resolved pypi version to probe AT (uv never produced a closure),
+    // only the requirement range. Rung 2 (sdist auto-build) is gated by
+    // `sdist-build` (default "auto"); `"never"` passes `None` so the
+    // wrapper reproduces the pre-v4.4.0 conda-route-or-error behavior
+    // exactly.
     let sdist_probe = {
         let channels = conda_channels.to_vec();
         let python = target.python_version.clone();
-        move |conda_name: String| {
+        move |conda_name: String, spec: String| {
             let channels = channels.clone();
             let python = python.clone();
             let fut = async move {
-                crate::probe::find_route(&channels, &conda_name, "*", Some(&python))
+                crate::probe::find_route(&channels, &conda_name, &spec, Some(&python))
                     .await
                     .map(|hit| crate::uv_closure::RouteProbeHit {
                         conda_version: hit.version,

@@ -736,6 +736,80 @@ pub fn extract_sdist_only_packages(text: &str) -> Vec<String> {
     names.into_iter().collect()
 }
 
+/// Find the ORIGINATING pypi requirement's raw version specifier for
+/// `name` in a sdist-only `uv lock` error, e.g. from `"...hydra-core==1.3.2
+/// depends on antlr4-python3-runtime==4.9.* and your project depends on
+/// hydra-core==1.3.2..."` with `name = "antlr4-python3-runtime"` ->
+/// `Some("==4.9.*")`. `name` is matched separator-insensitively (`-`/`_`
+/// both fold to a shared class) since uv's prose preserves the
+/// requirer's original spelling, which may differ from the
+/// PEP 503-canonical form [`extract_sdist_only_packages`] returns.
+/// `None` when no "depends on <name><specifier>" clause is found (either
+/// no specifier at all -- an unpinned dependency -- or the shape isn't
+/// present), which callers treat as "unpinned" (probe any version).
+pub fn extract_sdist_only_requirement(text: &str, name: &str) -> Option<String> {
+    let t = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Escape each separator-delimited segment BEFORE inserting the
+    // `[-_]` character class -- escaping the whole name first (e.g.
+    // `regex::escape("antlr4-python3-runtime")` -> `antlr4\-python3\-
+    // runtime`) and then substituting `-` would land the class right
+    // after a stray backslash (`\[-_]`), which the regex engine reads
+    // as an escaped literal `[`, not a character class.
+    let name_pat = name
+        .split(['-', '_'])
+        .map(regex::escape)
+        .collect::<Vec<_>>()
+        .join("[-_]");
+    let re = regex::Regex::new(&format!(
+        r"(?i)depends on\s+{name_pat}((?:[=><!~]=?|==)\S*)"
+    ))
+    .ok()?;
+    re.captures(&t)
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str().to_string())
+}
+
+/// Translate a raw PyPI/PEP 440 version specifier (as captured by
+/// [`extract_sdist_only_requirement`]) into the equivalent conda
+/// match-spec version fragment, so a conda-route probe for a
+/// wheel-less transitive dependency is constrained to the SAME range
+/// the originating pypi requirement demanded (rather than resolving to
+/// conda's unconstrained latest, which can clash with the pypi
+/// requirement's own metadata -- deps-from proof run 5:
+/// `antlr4-python3-runtime` routed to conda `==4.13.2` while
+/// hydra-core's metadata still required `==4.9.*`).
+///
+/// Translation rules (conda match-spec version syntax is a near-superset
+/// of PEP 440 for the forms uv's error prose actually emits):
+/// * `None` (no specifier captured -- unpinned dependency) -> `"*"`
+///   (any version, the pre-existing probe behavior).
+/// * `==X.Y.*` (wildcard/prefix match) -> `X.Y.*` (conda's own prefix
+///   wildcard syntax; the `==` prefix is conda-invalid and dropped).
+/// * `==X.Y.Z` (exact pin, no wildcard) -> `==X.Y.Z` (conda accepts `==`
+///   for an exact match; passed through unchanged).
+/// * Comma-joined range clauses (`>=A,<B`, `>=A,<=B`, etc.) -> passed
+///   through unchanged; conda match-spec ANDs comma-separated clauses
+///   exactly like PEP 440 does.
+/// * Anything else unrecognized -> passed through unchanged (best
+///   effort: an over-constrained but syntactically-invalid spec fails
+///   the probe closed, i.e. routes nothing, rather than silently
+///   widening to conda's latest).
+pub fn conda_spec_from_pypi_specifier(spec: Option<&str>) -> String {
+    let Some(spec) = spec else {
+        return "*".to_string();
+    };
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return "*".to_string();
+    }
+    if let Some(rest) = spec.strip_prefix("==")
+        && rest.ends_with(".*")
+    {
+        return rest.to_string();
+    }
+    spec.to_string()
+}
+
 /// Guidance appended to the ORIGINAL uv error (verbatim, never
 /// paraphrased — spec convention shared with [`format_lock_failure`])
 /// when one or more sdist-only packages have no conda candidate
@@ -857,7 +931,7 @@ where
     S: FnMut(UvClosureRequest) -> futures::future::BoxFuture<'static, Result<UvClosure>>
         + Send
         + 'static,
-    SP: Fn(String) -> futures::future::BoxFuture<'static, Option<RouteProbeHit>>
+    SP: Fn(String, String) -> futures::future::BoxFuture<'static, Option<RouteProbeHit>>
         + Send
         + Sync
         + 'static,
@@ -923,7 +997,16 @@ where
                         let mut new_routes = Vec::new();
                         let mut missing = Vec::new();
                         for name in &names {
-                            match sdist_probe(name.clone()).await {
+                            // Carry the ORIGINATING pypi requirement's
+                            // version range into the conda probe -- a
+                            // bare `"*"` (any version) let a wheel-less
+                            // transitive dep like `antlr4-python3-runtime`
+                            // route to conda's unconstrained latest
+                            // (`==4.13.2`), clashing with the pypi
+                            // requirement's own metadata (`==4.9.*`).
+                            let raw_requirement = extract_sdist_only_requirement(&msg, name);
+                            let spec = conda_spec_from_pypi_specifier(raw_requirement.as_deref());
+                            match sdist_probe(name.clone(), spec).await {
                                 Some(hit) => new_routes.push(AutoRoutedPackage {
                                     pypi_name: name.clone(),
                                     conda_name: name.clone(),
@@ -1005,8 +1088,11 @@ where
 /// Compatibility entry point: [`auto_route_fixpoint`] with the
 /// sdist-only self-heal ladder layered underneath (see
 /// [`with_sdist_heal`]). `sdist_probe` answers "does ANY workspace
-/// conda channel carry `conda_name` at any version?" — production wires
-/// [`crate::probe::find_route`] with spec `"*"`. `sdist_build` is `Some`
+/// conda channel carry `conda_name` at a version matching the given
+/// spec?" — production wires [`crate::probe::find_route`] with the
+/// spec [`with_sdist_heal`] derives from the originating pypi
+/// requirement (falling back to `"*"`, any version, when none can be
+/// extracted). `sdist_build` is `Some`
 /// when the pack's `sdist-build` config is `"auto"` (default); `None`
 /// disables the build rung (`"never"`), reproducing the original
 /// conda-route-or-error behavior exactly.
@@ -1029,7 +1115,7 @@ where
         + Send
         + 'static,
     P: Fn(String, String) -> futures::future::BoxFuture<'static, Option<RouteProbeHit>>,
-    SP: Fn(String) -> futures::future::BoxFuture<'static, Option<RouteProbeHit>>
+    SP: Fn(String, String) -> futures::future::BoxFuture<'static, Option<RouteProbeHit>>
         + Send
         + Sync
         + 'static,
@@ -3485,6 +3571,137 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
         );
     }
 
+    // ---- run-5 fix: carry the pypi requirement's range into the conda
+    // probe (rather than routing to conda's unconstrained latest) -----
+
+    #[test]
+    fn extract_sdist_only_requirement_finds_wildcard_pin() {
+        assert_eq!(
+            extract_sdist_only_requirement(NO_USABLE_WHEELS_RANGE_UV_ERR, "antlr4-python3-runtime"),
+            Some("==4.9.*".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_sdist_only_requirement_none_when_unpinned() {
+        // The bare "has no wheels" class never names a requirer's own
+        // specifier -- no "depends on <name><spec>" clause exists.
+        assert_eq!(
+            extract_sdist_only_requirement(SDIST_ONLY_UV_ERR, "pyperclip"),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_sdist_only_requirement_is_separator_insensitive() {
+        // uv may spell the requirer's dependency with underscores where
+        // the canonical (PEP 503) name uses hyphens, or vice versa.
+        let text = "Because foo_bar has no wheels, we can conclude that \
+                     foo_bar cannot be used. And because baz depends on \
+                     foo-bar==1.2.* and your project depends on baz, we \
+                     can conclude your requirements are unsatisfiable.";
+        assert_eq!(
+            extract_sdist_only_requirement(text, "foo_bar"),
+            Some("==1.2.*".to_string())
+        );
+    }
+
+    #[test]
+    fn conda_spec_from_pypi_specifier_translates_wildcard() {
+        assert_eq!(conda_spec_from_pypi_specifier(Some("==4.9.*")), "4.9.*");
+    }
+
+    #[test]
+    fn conda_spec_from_pypi_specifier_passes_through_exact_pin() {
+        assert_eq!(conda_spec_from_pypi_specifier(Some("==4.9.3")), "==4.9.3");
+    }
+
+    #[test]
+    fn conda_spec_from_pypi_specifier_passes_through_range() {
+        assert_eq!(
+            conda_spec_from_pypi_specifier(Some(">=4.9,<=4.9.3")),
+            ">=4.9,<=4.9.3"
+        );
+    }
+
+    #[test]
+    fn conda_spec_from_pypi_specifier_none_is_unpinned_wildcard() {
+        assert_eq!(conda_spec_from_pypi_specifier(None), "*");
+    }
+
+    /// Fixture-driven fixpoint reproducing deps-from proof run 5: the
+    /// sdist-route probe must receive the requirement's `==4.9.*` range
+    /// (translated to conda's `4.9.*`) rather than an unconstrained
+    /// `"*"`, so a conda-forge channel carrying BOTH a 4.9.x build and a
+    /// newer 4.13.x build routes to the 4.9.x version instead of
+    /// clashing with hydra-core's own pypi metadata.
+    #[tokio::test]
+    async fn sdist_heal_probe_carries_pypi_requirement_range() {
+        let attempts = Arc::new(Mutex::new(0usize));
+        let solve = {
+            let attempts = Arc::clone(&attempts);
+            move |r: UvClosureRequest| {
+                let attempts = Arc::clone(&attempts);
+                Box::pin(async move {
+                    let mut n = attempts.lock().unwrap();
+                    *n += 1;
+                    if !r
+                        .no_emit_packages
+                        .contains(&"antlr4-python3-runtime".to_string())
+                    {
+                        bail!("{NO_USABLE_WHEELS_RANGE_UV_ERR}");
+                    }
+                    parse_pylock_closure(
+                        PYLOCK_FIXTURE,
+                        &target("3.12", "linux-64"),
+                        &BTreeSet::new(),
+                        "0.11.15",
+                    )
+                }) as futures::future::BoxFuture<'static, Result<UvClosure>>
+            }
+        };
+        let probe = |_name: String, _spec: String| {
+            Box::pin(async { None }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
+        };
+        let seen_specs = Arc::new(Mutex::new(Vec::new()));
+        let sdist_probe = {
+            let seen_specs = Arc::clone(&seen_specs);
+            move |name: String, spec: String| {
+                let seen_specs = Arc::clone(&seen_specs);
+                Box::pin(async move {
+                    seen_specs.lock().unwrap().push(spec.clone());
+                    if name == "antlr4-python3-runtime" && spec == "4.9.*" {
+                        Some(RouteProbeHit {
+                            conda_version: "4.9.3".into(),
+                            channel: "https://conda.anaconda.org/conda-forge/linux-64".into(),
+                        })
+                    } else {
+                        None
+                    }
+                }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
+            }
+        };
+        let closure = auto_route_fixpoint_with_sdist_heal(
+            &auto_route_req(),
+            &auto_route_opts(),
+            solve,
+            probe,
+            sdist_probe,
+            None::<NoBuild>,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            seen_specs.lock().unwrap().as_slice(),
+            &["4.9.*".to_string()],
+            "probe must be queried with the translated pypi requirement range, not a bare wildcard"
+        );
+        assert_eq!(closure.auto_routed.len(), 1);
+        let r = &closure.auto_routed[0];
+        assert_eq!(r.pypi_name, "antlr4-python3-runtime");
+        assert_eq!(r.conda_version, "4.9.3");
+    }
+
     /// Concrete "no builder" type for tests that disable the build rung
     /// (`sdist-build = "never"`) — `None::<NoBuild>` is the terse
     /// turbofish-free spelling.
@@ -3533,7 +3750,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
         let probe = |_name: String, _spec: String| {
             Box::pin(async { None }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
         };
-        let sdist_probe = |name: String| {
+        let sdist_probe = |name: String, _spec: String| {
             Box::pin(async move {
                 if name == "pyperclip" {
                     Some(RouteProbeHit {
@@ -3614,7 +3831,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
         let probe = |_name: String, _spec: String| {
             Box::pin(async { None }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
         };
-        let sdist_probe = |_name: String| {
+        let sdist_probe = |_name: String, _spec: String| {
             Box::pin(async { None }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
         };
         let build_calls = Arc::new(Mutex::new(0usize));
@@ -3687,7 +3904,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
         let probe = |_name: String, _spec: String| {
             Box::pin(async { None }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
         };
-        let sdist_probe = |_name: String| {
+        let sdist_probe = |_name: String, _spec: String| {
             Box::pin(async { None }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
         };
         let sdist_build = |_name: String| {
@@ -3729,7 +3946,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
         let probe = |_name: String, _spec: String| {
             Box::pin(async { None }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
         };
-        let sdist_probe = |_name: String| {
+        let sdist_probe = |_name: String, _spec: String| {
             Box::pin(async { None }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
         };
         let err = auto_route_fixpoint_with_sdist_heal(
@@ -3772,7 +3989,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
         let sdist_probe_calls = Arc::new(Mutex::new(0usize));
         let sdist_probe = {
             let sdist_probe_calls = Arc::clone(&sdist_probe_calls);
-            move |_name: String| {
+            move |_name: String, _spec: String| {
                 let sdist_probe_calls = Arc::clone(&sdist_probe_calls);
                 Box::pin(async move {
                     *sdist_probe_calls.lock().unwrap() += 1;
