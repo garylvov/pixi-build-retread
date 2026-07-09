@@ -1,0 +1,36 @@
+Error:   × failed to solve requirements of environment 'isaaclab-gpu-latest' for
+  │ platform 'linux-64'
+  ├─▶   × failed to communicate with the build backend (/oscar/data/
+  │     │ stellex/glvov/imprint-env-test/_session_briefs/pixi-build-
+  │     │ retread-bin)
+  │     help: Ensure that the build backend implements the JSON-RPC
+  │           protocol correctly.
+  │
+  ├─▶ ErrorObject { code: InvalidParams, message: "resolving wheels for
+  │   python 3.12: computing uv closure for bundle `isaac-pack-latest`:
+  │   uv lock failed for bundle `isaac-pack-latest` (python 3.12, linux-
+  │   64):\n\nUsing CPython 3.12.13\nDownloading isaacsim-extscache-kit
+  │   (5.5GiB)\nDownloading isaacsim-extscache-kit-sdk (1.6GiB)\nDownloading
+  │   isaacsim-extscache-physics (246.4MiB)\n Downloaded isaacsim-extscache-
+  │   physics\n Downloaded isaacsim-extscache-kit-sdk\n Downloaded isaacsim-
+  │   extscache-kit\n  × No solution found when resolving dependencies
+  │   for split (markers:\n  │ python_full_version == '3.12.*' and
+  │   platform_machine == 'x86_64' and\n  │ sys_platform == 'linux'):\n
+  │   ╰─▶ Because torch==2.10.0 depends on cuda-bindings{sys_platform ==\n
+  │   'linux'}>=13.0.3,<14 and cuda-bindings{sys_platform == 'linux'}>=12,<13,
+  │   \n      we can conclude that torch==2.10.0 cannot be used.\n      And
+  │   because torchvision==0.26.0 depends on cuda-bindings{sys_platform ==\n
+  │   'linux'}>=13.0.3,<14, we can conclude that torchvision==0.26.0\n
+  │   cannot be used.\n      And because isaacsim-core==6.0.0.1 depends on\n
+  │   torch==2.10.0, we can conclude that isaacsim-core==6.0.0.1 cannot\n
+  │   be used.\n      And because isaacsim-core==6.0.0.1 depends on\n
+  │   torchvision==0.26.0, we can conclude that isaacsim-core==6.0.0.1\n
+  │   cannot be used.\n      And because isaacsim[all]==6.0.0.1 depends on
+  │   isaacsim-core==6.0.0.1\n      and your project depends on
+  │   isaacsim[all]==6.0.0.1, we can conclude that\n      your project's
+  │   requirements are unsatisfiable.\n\nconflict attribution (conda
+  │   constraint provenance):\n  - package `cuda-bindings` is named in the
+  │   conflict but conda pins `cuda-bindings>=12,<13` (conda package
+  │   `cuda-version` 12.*, from cuda-major-table, env `consuming-
+  │   envs`)\n\nhint: run `retread solve` to widen the offending conda pin.
+  │   \n", data: None }

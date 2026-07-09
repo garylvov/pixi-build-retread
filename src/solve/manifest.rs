@@ -21,6 +21,14 @@ pub struct AppliedEdit {
     pub strategy: Strategy,
     pub table: TableKind,
     pub before: EntrySnapshot,
+    /// The feature/pack table the edit actually landed in -- may differ
+    /// from the planner's ambient `self.feature` (e.g. `retread lock`'s
+    /// `default`) when the repair re-attributed to a pin owner in another
+    /// feature (see `RepairPlanner::try_pypi_override_in_feature`). Used
+    /// both to label repair-summary output correctly and so a revert
+    /// restores the SAME table the edit was written to, not whatever
+    /// feature happened to be ambient when the revert runs.
+    pub feature: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -156,6 +164,7 @@ impl ManifestEditor {
             strategy: Strategy::Conda,
             table: TableKind::Conda,
             before,
+            feature: feature.to_string(),
         }
     }
 
@@ -179,6 +188,7 @@ impl ManifestEditor {
             strategy: Strategy::PypiDep,
             table: TableKind::Pypi,
             before,
+            feature: feature.to_string(),
         }
     }
 
@@ -202,6 +212,7 @@ impl ManifestEditor {
             strategy: Strategy::PypiOverride,
             table: TableKind::Override,
             before,
+            feature: feature.to_string(),
         }
     }
 
@@ -232,6 +243,7 @@ impl ManifestEditor {
             strategy: Strategy::PypiOverride,
             table: TableKind::Override,
             before,
+            feature: feature.to_string(),
         }
     }
 
@@ -243,6 +255,7 @@ impl ManifestEditor {
             strategy: Strategy::WidenConda,
             table: TableKind::Conda,
             before,
+            feature: feature.to_string(),
         }
     }
 
@@ -268,6 +281,7 @@ impl ManifestEditor {
             },
             table: kind,
             before: snapshot,
+            feature: feature.to_string(),
         })
     }
 

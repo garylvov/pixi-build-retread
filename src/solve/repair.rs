@@ -951,6 +951,42 @@ pub fn snapshot_path(project_dir: &Path) -> PathBuf {
     retread_dir(project_dir).join("pixi.toml.bak")
 }
 
+/// Directory each iteration's raw (pre-parse, ANSI-stripped) solver error
+/// text is persisted under -- so a triage session after an exhausted run
+/// isn't limited to the terse repair-table summary (which survived the
+/// 2026-07-08 acceptance-#5 run but wasn't enough to see what the *next*
+/// iteration's conflict text actually named).
+pub fn conflict_trace_dir(project_dir: &Path) -> PathBuf {
+    retread_dir(project_dir).join("solve-conflicts")
+}
+
+/// Path for one iteration's captured conflict text: `<run>-<iter>.txt`
+/// under [`conflict_trace_dir`]. `run` is the ledger run name (e.g. "lock"
+/// or an environment name); `iter` is the 1-based repair iteration.
+pub fn conflict_trace_path(project_dir: &Path, run: &str, iter: u32) -> PathBuf {
+    let safe_run: String = run
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    conflict_trace_dir(project_dir).join(format!("{safe_run}-{iter}.txt"))
+}
+
+/// Writes the flattened solver stderr for one iteration to
+/// [`conflict_trace_path`]; best-effort (a write failure here must never
+/// abort a solve run, so errors are swallowed after an eprintln).
+pub fn persist_conflict_trace(project_dir: &Path, run: &str, iter: u32, text: &str) {
+    let path = conflict_trace_path(project_dir, run, iter);
+    if let Some(parent) = path.parent()
+        && let Err(err) = std::fs::create_dir_all(parent)
+    {
+        eprintln!("retread: could not create {}: {err}", parent.display());
+        return;
+    }
+    if let Err(err) = std::fs::write(&path, text) {
+        eprintln!("retread: could not write conflict trace {}: {err}", path.display());
+    }
+}
+
 pub fn truncate_ledger_runs(ledger_path: &Path, manifest_display: String) -> Result<()> {
     let ledger = SolveLedger {
         version: 1,
@@ -1412,5 +1448,69 @@ mod tests {
         assert!(!text.contains("cuda-bindings"));
         // No bogus edit landed in the default feature's tables.
         assert!(!text.contains("[pypi-options.dependency-overrides]"));
+    }
+
+    // ---- Fix #19 acceptance fixture (lock-succ-brief.md ACCEPTANCE RUN
+    // #5): iter 2 of the same run. Iter 1 already emitted a `torch`
+    // pypi_override (tried-state carries it); the iter-2 uv-closure report
+    // re-conflicts on cuda-bindings, and the requiring chain now names
+    // BOTH torch (already tried -- must be skipped, not fallen back from)
+    // and torchvision (untried, with its own exact-name conda pin). Before
+    // the chain-walk fix, the single-path walk only ever surfaced torch,
+    // so with torch tried the walk found nothing and fell through to the
+    // unwidenable cuda-bindings ladder (EXIT=3, exhausted). After the fix,
+    // the walk continues past torch to torchvision and fires T1 there.
+    const UV_CLOSURE_CUDA_BINDINGS_ITER2_TORCHVISION: &str = include_str!(
+        "../../tests/fixtures/solve_errors/uv_closure_cuda_bindings_widen_iter2_torchvision.txt"
+    );
+
+    #[tokio::test]
+    async fn conda_widen_needed_continues_chain_walk_past_tried_package_to_sibling_pin_owner() {
+        let path = temp_manifest(
+            "[dependencies]\n[feature.gpu.dependencies]\npytorch-gpu = \"==2.10.0\"\ntorchvision = \"==0.25.0\"\n",
+        );
+        let mut editor = ManifestEditor::open(path.clone()).unwrap();
+        let mut tried = TriedState::default();
+        // Iter 1 already tried (and applied) a `torch` pypi_override --
+        // seed the exact tried-state the second repair() call would see.
+        tried.mark("torch", Strategy::PypiOverride, false);
+
+        let name_map = crate::handler::load_pypi_to_conda_map().await;
+        let mut planner = RepairPlanner::new("default".into()).with_conda_name_map(name_map);
+
+        let parser = RegexConflictParser::new();
+        let conflict = parser
+            .parse(UV_CLOSURE_CUDA_BINDINGS_ITER2_TORCHVISION)
+            .expect("iter-2 acceptance fixture must parse");
+        if let Conflict::CondaWidenNeeded {
+            requiring_chain, ..
+        } = &conflict
+        {
+            assert_eq!(
+                requiring_chain,
+                &vec![
+                    "torch".to_string(),
+                    "torchvision".to_string(),
+                    "isaacsim-core".to_string(),
+                    "isaacsim[all]".to_string(),
+                ]
+            );
+        } else {
+            panic!("expected CondaWidenNeeded, got {conflict:?}");
+        }
+
+        let out = planner
+            .repair(&mut editor, &mut tried, &conflict, 2)
+            .unwrap();
+        assert_eq!(out.attempt.strategy, "pypi_override");
+        assert_eq!(out.attempt.package, "torchvision");
+        assert_eq!(out.attempt.new_spec.as_deref(), Some("==0.25.0"));
+
+        editor.write_atomic().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("[feature.gpu.pypi-options.dependency-overrides]"));
+        assert!(text.contains("torchvision = \"==0.25.0\"  # retread:override"));
+        // torch's tried-state stayed marked -- no second torch attempt.
+        assert!(tried.has("torch", Strategy::PypiOverride));
     }
 }

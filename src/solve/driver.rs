@@ -14,8 +14,8 @@ use super::manifest::{AppliedEdit, ManifestEditor, copy_atomic, restore_bytes_at
 use super::parse::{ConflictParser, RegexConflictParser, tail};
 use super::repair::{
     LedgerAttempt, RelaxPreference, RepairPlanner, SolveLedger, Strategy, TriedState,
-    append_attempt, ledger_path, manifest_sha256, mark_last_widen_failed, retread_dir,
-    snapshot_path, truncate_ledger_runs,
+    append_attempt, ledger_path, manifest_sha256, mark_last_widen_failed, persist_conflict_trace,
+    retread_dir, snapshot_path, truncate_ledger_runs,
 };
 
 pub async fn run(args: SolveArgs) -> Result<i32> {
@@ -266,6 +266,8 @@ async fn run_env(
 
         let stripped = parser.strip_ansi(&install.stderr);
         let parsed = parser.parse(&stripped);
+        let trace_run = env.unwrap_or("default");
+        persist_conflict_trace(project_dir, trace_run, iter, &stripped);
         if let Some(conflict) = parsed {
             if args.dry_run {
                 let mut dry_editor = ManifestEditor::open(manifest_path.to_path_buf())
@@ -304,7 +306,7 @@ async fn run_env(
                         pending.package
                     );
                 }
-                pending.restore(editor, &feature);
+                pending.restore(editor);
                 editor
                     .write_atomic()
                     .map_err(|e| SolveError::Usage(e.to_string()))?;
@@ -315,7 +317,7 @@ async fn run_env(
                 }
                 continue;
             }
-            pending.restore(editor, &feature);
+            pending.restore(editor);
             editor
                 .write_atomic()
                 .map_err(|e| SolveError::Usage(e.to_string()))?;
@@ -358,9 +360,9 @@ impl PendingEdit {
         })
     }
 
-    fn restore(&self, editor: &mut ManifestEditor, feature: &str) {
+    fn restore(&self, editor: &mut ManifestEditor) {
         for edit in self.edits.iter().rev() {
-            editor.restore_entry(feature, edit.table, &edit.package, &edit.before);
+            editor.restore_entry(&edit.feature, edit.table, &edit.package, &edit.before);
         }
     }
 }

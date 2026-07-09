@@ -185,15 +185,27 @@ impl RegexConflictParser {
         None
     }
 
-    /// Bounded walk of uv's "Because X==V depends on Y" pubgrub prose,
-    /// starting from the conda-provenance footer package and following
-    /// each hop to the package that named it as a dependency, nearest
-    /// first. Stops after `MAX_HOPS` or on a repeated name (cycle guard).
-    /// Used to re-attribute a `CondaWidenNeeded` conflict when the footer
-    /// package (the transitive symptom, e.g. `cuda-bindings`) has no user
-    /// conda pin of its own -- the real fix belongs on whichever ancestor
-    /// (e.g. `torch`) the user *does* pin (directly or via the conda name
-    /// map, e.g. `pytorch-gpu`).
+    /// Bounded breadth-first walk of uv's "Because X==V depends on Y"
+    /// pubgrub prose, starting from the conda-provenance footer package and
+    /// following every hop to *each* package that named it as a
+    /// dependency (not just the first match), nearest first, then their
+    /// requirers in turn. Stops after `MAX_HOPS` layers or on a repeated
+    /// name (cycle guard). Used to re-attribute a `CondaWidenNeeded`
+    /// conflict when the footer package (the transitive symptom, e.g.
+    /// `cuda-bindings`) has no user conda pin of its own -- the real fix
+    /// belongs on whichever ancestor (e.g. `torch`) the user *does* pin
+    /// (directly or via the conda name map, e.g. `pytorch-gpu`).
+    ///
+    /// A single-path walk (stop at the first requirer found) misses
+    /// SIBLING requirers of the same footer/hop -- e.g. when both `torch`
+    /// and `torchvision` independently depend on `cuda-bindings`, a
+    /// strict walk finds only `torch` and, once that's already in
+    /// tried-state (fix #19: torch overridden in a prior iteration), the
+    /// caller has nowhere else to look even though `torchvision` (right
+    /// there in the same report, with its own user conda pin) would work.
+    /// Collecting every requirer at each layer, in report order, and
+    /// letting the caller skip already-tried entries fixes that: "first
+    /// untried wins" over ALL pin-owning candidates, not just the nearest.
     fn extract_requiring_chain(&self, msg: &str, footer_package: &str) -> Vec<String> {
         const MAX_HOPS: usize = 6;
         let pairs: Vec<(String, String)> = self
@@ -202,19 +214,25 @@ impl RegexConflictParser {
             .map(|c| (c[1].to_string(), c[2].to_string()))
             .collect();
         let mut chain = Vec::new();
-        let mut current = footer_package.to_string();
+        let mut frontier = vec![footer_package.to_string()];
         for _ in 0..MAX_HOPS {
-            let Some((requirer, _dep)) = pairs
-                .iter()
-                .find(|(_, dep)| dep.eq_ignore_ascii_case(&current))
-            else {
-                break;
-            };
-            if chain.iter().any(|p: &String| p == requirer) || requirer == footer_package {
+            let mut next_frontier = Vec::new();
+            for current in &frontier {
+                for (requirer, dep) in &pairs {
+                    if !dep.eq_ignore_ascii_case(current) {
+                        continue;
+                    }
+                    if requirer == footer_package || chain.iter().any(|p: &String| p == requirer) {
+                        continue;
+                    }
+                    chain.push(requirer.clone());
+                    next_frontier.push(requirer.clone());
+                }
+            }
+            if next_frontier.is_empty() {
                 break;
             }
-            chain.push(requirer.clone());
-            current = requirer.clone();
+            frontier = next_frontier;
         }
         chain
     }
@@ -395,6 +413,15 @@ mod tests {
     );
     const UV_CLOSURE_CUDA_BINDINGS: &str =
         include_str!("../../tests/fixtures/solve_errors/uv_closure_cuda_bindings_widen.txt");
+    // Fix #19 fixture (lock-succ-brief.md ACCEPTANCE RUN #5): a second
+    // uv-closure report for the SAME cuda-bindings footer, but with a
+    // sibling requirer (torchvision) alongside torch in the "Because"
+    // prose -- reproduces iter-2 of the acceptance run, where torch is
+    // already tried (its pypi_override was applied in iter 1) and the old
+    // single-path chain walk had nowhere else to look.
+    const UV_CLOSURE_CUDA_BINDINGS_ITER2_TORCHVISION: &str = include_str!(
+        "../../tests/fixtures/solve_errors/uv_closure_cuda_bindings_widen_iter2_torchvision.txt"
+    );
     const CONDA_INCOMPATIBLE_PYGLET: &str =
         include_str!("../../tests/fixtures/solve_errors/conda_incompatible_pyglet.txt");
     const UNPARSEABLE_UV_CLOSURE_NO_WHEELS: &str =
@@ -500,6 +527,32 @@ mod tests {
         // the exported closure) -- must fail gracefully, not crash or
         // fall through to unrelated conda-prose regexes.
         assert_eq!(p.parse(UNPARSEABLE_UV_CLOSURE_NO_WHEELS), None);
+    }
+
+    #[test]
+    fn requiring_chain_collects_sibling_requirers_not_just_first_match() {
+        // Fix #19: torchvision is a SIBLING requirer of the same
+        // cuda-bindings footer, not on torch's single path -- a strict
+        // "first match wins" walk would stop at torch and never surface
+        // torchvision at all. The chain must include both, in report
+        // order, so repair.rs's "skip already-tried" loop can fall
+        // through to torchvision once torch is exhausted.
+        let p = RegexConflictParser::new();
+        assert_eq!(
+            p.parse(UV_CLOSURE_CUDA_BINDINGS_ITER2_TORCHVISION),
+            Some(Conflict::CondaWidenNeeded {
+                package: "cuda-bindings".into(),
+                op: ">=".into(),
+                floor: "13.0.3".into(),
+                conda_version: ">=12".into(),
+                requiring_chain: vec![
+                    "torch".into(),
+                    "torchvision".into(),
+                    "isaacsim-core".into(),
+                    "isaacsim[all]".into(),
+                ],
+            })
+        );
     }
 
     #[test]

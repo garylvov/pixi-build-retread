@@ -18,7 +18,8 @@ use super::manifest::{AppliedEdit, ManifestEditor, copy_atomic};
 use super::parse::{ConflictParser, RegexConflictParser, tail};
 use super::repair::{
     RelaxPreference, RepairPlanner, SolveLedger, Strategy, append_attempt, is_abi_anchor,
-    ledger_path, manifest_sha256, mark_last_widen_failed, retread_dir, snapshot_path,
+    ledger_path, manifest_sha256, mark_last_widen_failed, persist_conflict_trace, retread_dir,
+    snapshot_path,
 };
 
 const DEFAULT_MAX_REPAIRS: u32 = 10;
@@ -132,9 +133,9 @@ impl PendingEdit {
         })
     }
 
-    fn restore(&self, editor: &mut ManifestEditor, feature: &str) {
+    fn restore(&self, editor: &mut ManifestEditor) {
         for edit in self.edits.iter().rev() {
-            editor.restore_entry(feature, edit.table, &edit.package, &edit.before);
+            editor.restore_entry(&edit.feature, edit.table, &edit.package, &edit.before);
         }
     }
 }
@@ -218,6 +219,7 @@ async fn run_with_pixi_bin(args: LockArgs, pixi_bin: &str) -> Result<i32> {
 
         let stripped = parser.strip_ansi(&lock.stderr);
         let parsed = parser.parse(&stripped);
+        persist_conflict_trace(&project_dir, "lock", repairs_applied + 1, &stripped);
 
         if let Some(conflict) = parsed {
             if repairs_applied >= args.max_repairs {
@@ -284,7 +286,7 @@ async fn run_with_pixi_bin(args: LockArgs, pixi_bin: &str) -> Result<i32> {
                     "retread lock: post-widen conda unsat for {}; reverting only that widen",
                     pending.package
                 );
-                pending.restore(&mut editor, LOCK_FEATURE);
+                pending.restore(&mut editor);
                 editor.write_atomic()?;
                 tried.mark(&pending.package, Strategy::WidenConda, true);
                 mark_last_widen_failed(&mut ledger, &ledger_path, run_idx, &pending.package)?;
@@ -293,7 +295,7 @@ async fn run_with_pixi_bin(args: LockArgs, pixi_bin: &str) -> Result<i32> {
                 });
                 continue;
             }
-            pending.restore(&mut editor, LOCK_FEATURE);
+            pending.restore(&mut editor);
             editor.write_atomic()?;
         }
 
@@ -326,12 +328,21 @@ fn record_repair(
         .clone()
         .or_else(|| attempt.version.as_ref().map(|v| format!("=={v}")))
         .unwrap_or_default();
+    // Label with the feature the edit actually landed in (may differ from
+    // the planner's ambient `LOCK_FEATURE` when the repair re-attributed
+    // to a pin owner in another feature/pack table -- see fix #16/#19),
+    // not a hardcoded constant (fix #19: the repair table previously
+    // always printed `default` here even when the edit landed elsewhere).
+    let feature = applied
+        .last()
+        .map(|e| e.feature.clone())
+        .unwrap_or_else(|| LOCK_FEATURE.to_string());
     records.push(RepairRecord {
         package: attempt.package.clone(),
         strategy: parse_strategy(&attempt.strategy),
         old_spec,
         new_spec,
-        feature: LOCK_FEATURE.to_string(),
+        feature,
     });
 }
 
@@ -789,5 +800,78 @@ exit 0
             .await
             .unwrap();
         assert_eq!(code2, 0);
+    }
+
+    // ---- Fix #19 (lock-succ-brief.md ACCEPTANCE RUN #5, feature-column
+    // finding): `record_repair` previously hardcoded every repair-table row
+    // to `LOCK_FEATURE` ("default"), even when the edit landed in a named
+    // feature (e.g. `feature.gpu`) via the conda-pin-owner re-attribution
+    // in `conda_widen_needed`. Placement was already correct (fix #16);
+    // only the printed LABEL lied. This exercises `record_repair` directly
+    // against an `AppliedEdit` carrying a non-default feature and checks
+    // the resulting `RepairRecord.feature` reflects it, not `LOCK_FEATURE`.
+    #[test]
+    fn record_repair_labels_feature_the_edit_actually_landed_in() {
+        use super::super::manifest::{EntrySnapshot, TableKind};
+        use super::super::repair::{LedgerAttempt, Strategy};
+
+        let applied = vec![AppliedEdit {
+            package: "torchvision".to_string(),
+            strategy: Strategy::PypiOverride,
+            table: TableKind::Override,
+            before: EntrySnapshot {
+                value: None,
+                suffix: None,
+            },
+            feature: "feature.gpu".to_string(),
+        }];
+        let attempt = LedgerAttempt {
+            iter: 2,
+            package: "torchvision".to_string(),
+            version: Some("0.25.0".to_string()),
+            tier: "pypi_override".to_string(),
+            strategy: "pypi_override".to_string(),
+            conflict: "CondaWidenNeeded".to_string(),
+            source: "retread".to_string(),
+            ts: "2026-07-08T00:00:00Z".to_string(),
+            old_spec: None,
+            new_spec: Some("==0.25.0".to_string()),
+            ceiling_policy: None,
+            before: None,
+            failed: false,
+        };
+        let mut records = Vec::new();
+        record_repair(&mut records, &attempt, &applied);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].feature, "feature.gpu");
+        assert_ne!(records[0].feature, LOCK_FEATURE);
+    }
+
+    // ---- Fix #19 (lock-succ-brief.md item 2, conflict-text capture):
+    // acceptance run #5 left triage blind after exhaustion -- only the
+    // terse repair table survived, no raw per-iteration solver text. Each
+    // iteration's flattened conflict text must now be persisted under
+    // `.retread/solve-conflicts/<run>-<iter>.txt` so a future session can
+    // see exactly what the NEXT iteration's uv report named.
+    #[tokio::test]
+    async fn persists_raw_conflict_text_per_iteration() {
+        let dir = temp_dir("conflicttrace");
+        let manifest = write_manifest(&dir, "[dependencies]\n");
+        let pixi = write_fake_pixi(&dir, 50, CONDA_BOUNDARY_SINGLE_LINE);
+
+        let args = LockArgs {
+            manifest,
+            max_repairs: 1,
+            no_repair: false,
+        };
+        let code = run_with_pixi_bin(args, pixi.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(code, EXIT_MAX_ITERS);
+
+        let trace = dir.join(".retread").join("solve-conflicts").join("lock-1.txt");
+        assert!(trace.exists(), "expected conflict trace at {}", trace.display());
+        let text = std::fs::read_to_string(&trace).unwrap();
+        assert!(text.contains("numpy"));
     }
 }
