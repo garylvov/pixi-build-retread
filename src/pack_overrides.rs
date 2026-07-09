@@ -155,7 +155,47 @@ pub fn write_override(
             date: local_date(),
         },
     );
-    ledger.write_atomic(workspace_dir)
+    ledger.write_atomic(workspace_dir)?;
+    // Run-12 (deps-from proof): pixi's own per-workspace source-metadata
+    // cache (`.pixi/meta-v0/<output>-<hash>/<platform>-<hash>.json`)
+    // memoizes each source pack's conda/outputs result keyed on the
+    // pack's project model / configuration / backend fingerprints -- the
+    // auto-overrides ledger is invisible to ALL of those (that's the
+    // point of the ledger sink: the pack's pixi.toml is never touched),
+    // so the next `pixi lock` replays the STALE pack render without ever
+    // invoking the backend, and the repair is a silent no-op (iteration 3
+    // of run 12 hit the byte-identical conflict 6 seconds later). Evict
+    // this pack's metadata entries so pixi re-requests conda/outputs; the
+    // backend then recomputes with the merged ledger override (and its
+    // own conda-outputs memo is correctly keyed on a ledger fingerprint).
+    invalidate_pixi_source_metadata(workspace_dir, bundle);
+    Ok(())
+}
+
+/// Removes pixi's cached source-metadata entries for `bundle` from the
+/// workspace's `.pixi/meta-v0/` cache (directories named
+/// `<output-name>-<hash>`). Prefix-matched on `<bundle>-`; a false
+/// positive (a sibling output whose name extends `bundle`'s) only costs a
+/// recompute, never correctness. Best-effort: cache eviction must never
+/// fail the caller (a vanished/absent dir is fine).
+pub fn invalidate_pixi_source_metadata(workspace_dir: &Path, bundle: &str) {
+    let meta_dir = workspace_dir.join(".pixi").join("meta-v0");
+    let Ok(entries) = std::fs::read_dir(&meta_dir) else {
+        return;
+    };
+    let prefix = format!("{bundle}-");
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.starts_with(&prefix)
+            && let Err(err) = std::fs::remove_dir_all(entry.path())
+        {
+            eprintln!(
+                "retread: could not evict pixi source-metadata cache {}: {err}",
+                entry.path().display()
+            );
+        }
+    }
 }
 
 /// Read-only: every auto-repaired override recorded for `pack_pixi`, as a
@@ -236,6 +276,23 @@ pub fn ensure_snapshot(workspace_dir: &Path) -> Result<()> {
 /// `--keep-going` restore) -- same call sites that used to call fix #20's
 /// per-pack-file `rollback_all`.
 pub fn rollback_all(workspace_dir: &Path) -> Result<()> {
+    // Evict pixi's source-metadata cache for every pack named in the
+    // CURRENT (about-to-be-reverted) ledger: any metadata pixi recomputed
+    // during this run reflects overrides that are about to disappear, and
+    // pixi's cache key can't see the ledger (see `write_override`), so a
+    // stale post-override render would otherwise replay after rollback.
+    // Collected before the revert so the run's own additions are included.
+    let touched_bundles: std::collections::BTreeSet<String> =
+        AutoOverrideLedger::load(workspace_dir)
+            .map(|ledger| {
+                ledger
+                    .packs
+                    .values()
+                    .flat_map(|entries| entries.values().map(|e| e.bundle.clone()))
+                    .filter(|b| !b.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
     let bak = snapshot_path(workspace_dir);
     let marker = snapshot_absent_marker(workspace_dir);
     let path = ledger_path(workspace_dir);
@@ -250,6 +307,9 @@ pub fn rollback_all(workspace_dir: &Path) -> Result<()> {
     }
     let _ = std::fs::remove_file(&bak);
     let _ = std::fs::remove_file(&marker);
+    for bundle in &touched_bundles {
+        invalidate_pixi_source_metadata(workspace_dir, bundle);
+    }
     Ok(())
 }
 
@@ -404,6 +464,76 @@ mod tests {
         )
         .unwrap();
         pack_pixi
+    }
+
+    #[test]
+    fn write_override_evicts_pixi_source_metadata_for_the_pack() {
+        // Run-12 regression: pixi's `.pixi/meta-v0/<output>-<hash>/` cache
+        // can't see the ledger, so a ledger write MUST evict the pack's
+        // cached metadata or the next `pixi lock` replays the stale render
+        // and the repair is a silent no-op. Sibling packs' entries stay.
+        let tmp = TempDir::new("evict");
+        let ws = tmp.path();
+        let pack_pixi = make_pack(ws, "pypi-packs/isaac-pack-latest");
+        let stale = ws.join(".pixi/meta-v0/isaac-pack-latest-ClbwcsBUfqs");
+        let sibling = ws.join(".pixi/meta-v0/other-pack-AbCdEfGhIjK");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        std::fs::write(stale.join("linux_64-x.json"), b"{}").unwrap();
+        std::fs::write(sibling.join("linux_64-y.json"), b"{}").unwrap();
+
+        write_override(
+            ws,
+            &pack_pixi,
+            "isaac-pack-latest",
+            "setuptools",
+            ">=68,<81",
+            "conflict: workspace range vs auto-routed pin",
+        )
+        .unwrap();
+
+        assert!(
+            !stale.exists(),
+            "the repaired pack's stale pixi metadata cache entry must be evicted"
+        );
+        assert!(
+            sibling.exists(),
+            "an unrelated pack's metadata cache entry must survive"
+        );
+    }
+
+    #[test]
+    fn rollback_all_evicts_pixi_source_metadata_for_touched_packs() {
+        // Metadata pixi recomputed DURING the run reflects overrides that
+        // rollback removes; those entries must be evicted too or the
+        // post-rollback state replays a render of overrides that no
+        // longer exist.
+        let tmp = TempDir::new("rollback-evict");
+        let ws = tmp.path();
+        let pack_pixi = make_pack(ws, "pypi-packs/isaac-pack-latest");
+        ensure_snapshot(ws).unwrap();
+        write_override(
+            ws,
+            &pack_pixi,
+            "isaac-pack-latest",
+            "setuptools",
+            ">=68,<81",
+            "conflict",
+        )
+        .unwrap();
+        // Simulate pixi re-rendering the pack mid-run (a fresh cache
+        // entry that bakes in the just-written override).
+        let recomputed = ws.join(".pixi/meta-v0/isaac-pack-latest-XyZ123");
+        std::fs::create_dir_all(&recomputed).unwrap();
+
+        rollback_all(ws).unwrap();
+
+        assert!(
+            !recomputed.exists(),
+            "rollback must evict metadata rendered with the reverted overrides"
+        );
+        // Ledger restored to pre-run (absent) state.
+        assert!(!ledger_path(ws).exists());
     }
 
     #[test]

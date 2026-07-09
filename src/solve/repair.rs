@@ -1045,11 +1045,21 @@ impl RepairPlanner {
             .map(|dir| dir.join("pixi.toml"))
             .ok_or_else(|| package.to_string())?;
         let new_spec = translate_conda_range_to_pep440(conda_range);
-        self.guard_oscillation(package, &new_spec, Strategy::PypiOverride)?;
-        if tried.has(package, Strategy::PypiOverride) {
+        // Tried/oscillation state is keyed by (package, PACK) -- run 11
+        // showed the same package (`setuptools`) auto-routed at an exact
+        // pin by SEVERAL sibling packs (isaaclab-2.3x-pack,
+        // unitree-rl-gym/robogen owners); a package-only key would let the
+        // first pack's repair permanently block the identical (and equally
+        // legitimate) repair for the next pack the follow-up conflict
+        // names. One shot per distinct (package, pack) pair; a REPEAT of
+        // an already-repaired pair still exhausts (the repair provably
+        // didn't stick).
+        let tried_key = format!("{package}@{pack_name}");
+        self.guard_oscillation(&tried_key, &new_spec, Strategy::PypiOverride)?;
+        if tried.has(&tried_key, Strategy::PypiOverride) {
             return Err(package.to_string());
         }
-        tried.mark(package, Strategy::PypiOverride, false);
+        tried.mark(&tried_key, Strategy::PypiOverride, false);
         eprintln!(
             "retread: workspace conda range {conda_range} for {package} injected into pack \
              `{pack_name}` as pypi override {new_spec} (conda-as-truth; auto-routed pack pin not \
@@ -2191,6 +2201,72 @@ mod tests {
         // widened.
         editor.write_atomic().unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), manifest_text);
+    }
+
+    #[test]
+    fn conda_range_vs_pack_pin_fires_once_per_distinct_pack_owner() {
+        // Run 11 named several sibling packs auto-routing the SAME package
+        // (setuptools) at exact pins. The tried-state is keyed by
+        // (package, pack): each distinct pack owner gets one repair shot;
+        // a REPEAT of an already-repaired pair exhausts.
+        let manifest_text = "[dependencies]\nsetuptools = \">=68,<81\"\n\n\
+             [feature.gpu.dependencies]\n\
+             \"isaaclab-2.3x-pack\" = { path = \"./pypi-packs/isaaclab-2.3x-pack\" }\n\
+             \"unitree-rl-gym\" = { path = \"./pypi-packs/unitree-rl-gym\" }\n";
+        let path = temp_manifest(manifest_text);
+        let project_dir = path.parent().unwrap().to_path_buf();
+        for pack in ["isaaclab-2.3x-pack", "unitree-rl-gym"] {
+            let pack_dir = project_dir.join("pypi-packs").join(pack);
+            std::fs::create_dir_all(&pack_dir).unwrap();
+            std::fs::write(
+                pack_dir.join("pixi.toml"),
+                format!("[package]\nname = \"{pack}\"\nversion = \"1.0.0\"\n"),
+            )
+            .unwrap();
+        }
+
+        let mut editor = ManifestEditor::open(path).unwrap();
+        let mut tried = TriedState::default();
+        let mut planner = RepairPlanner::new("default".into());
+
+        let conflict_for = |pack: &str| Conflict::CondaRangeVsPackPin {
+            package: "setuptools".into(),
+            conda_range: ">=68,<81".into(),
+            pack_demand: "83.0.0".into(),
+            pack_name: pack.into(),
+        };
+
+        let out1 = planner
+            .repair(
+                &mut editor,
+                &mut tried,
+                &conflict_for("isaaclab-2.3x-pack"),
+                1,
+            )
+            .expect("first pack owner must repair");
+        assert_eq!(
+            out1.pack_override.as_ref().unwrap().bundle,
+            "isaaclab-2.3x-pack"
+        );
+        let out2 = planner
+            .repair(&mut editor, &mut tried, &conflict_for("unitree-rl-gym"), 2)
+            .expect("a DIFFERENT pack owner of the same package must also repair");
+        assert_eq!(
+            out2.pack_override.as_ref().unwrap().bundle,
+            "unitree-rl-gym"
+        );
+        // Repeat of an already-repaired (package, pack) pair exhausts.
+        assert!(
+            planner
+                .repair(
+                    &mut editor,
+                    &mut tried,
+                    &conflict_for("isaaclab-2.3x-pack"),
+                    3
+                )
+                .is_err(),
+            "a repeat of an already-repaired pair must exhaust (repair didn't stick)"
+        );
     }
 
     #[test]
