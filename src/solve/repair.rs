@@ -662,6 +662,20 @@ impl RepairPlanner {
                 };
                 self.no_wheel_transitive_conflict(editor, tried, &target, pack_name.as_deref())
             }
+            Conflict::CondaRangeVsPackPin {
+                package,
+                conda_range,
+                pack_demand,
+                pack_name,
+            } => {
+                let target = PinTarget {
+                    package,
+                    version: pack_demand,
+                    iter,
+                    conflict,
+                };
+                self.conda_range_vs_pack_pin(editor, tried, &target, conda_range, pack_name)
+            }
         }
     }
 
@@ -985,6 +999,82 @@ impl RepairPlanner {
                 bundle: bundle.to_string(),
                 pack_pixi,
                 package: requirer.to_string(),
+                spec: new_spec,
+            }),
+        })
+    }
+
+    /// `CondaRangeVsPackPin` dispatch (tenth fix, deps-from hardening
+    /// series): the workspace's own two-sided conda RANGE pin for
+    /// `package` is real owner intent (conda-as-truth) and must never be
+    /// widened; `pack_name`'s own exact companion demand is AUTO-ROUTED
+    /// (derived from whatever uv's own closure happened to lock inside
+    /// the pack -- `handler/mod.rs`'s `bundle.auto_routed` emission is the
+    /// only mechanism that produces an exact companion conda run-dep for a
+    /// pack this backend composed, so it is never a hand-authored
+    /// constraint) and is not a real constraint at all. Repair injects the
+    /// workspace's own range, translated to PEP440, as a
+    /// `retread-overrides` entry in the PACK's own ledger
+    /// (`.retread/auto-overrides.json`, merged into its uv closure at
+    /// `Handler::initialize` time -- same sink as `try_pack_override` /
+    /// `deps_from_pin_conflict`) so uv re-locks `package` inside the
+    /// workspace's range; the pack's auto-routed companion pin then
+    /// follows to a version inside that range on its next render.
+    ///
+    /// Guardrail: only fires when `pack_name` resolves to one of THIS
+    /// workspace's own composed packs (`resolve_pack_dir` succeeds) --
+    /// the only packs whose exact companion conda pins are provably
+    /// auto-routed by this backend's own render pipeline; an unresolvable
+    /// `pack_name` (a foreign/third-party conda package) is refused rather
+    /// than guessed at. ABI anchors are exempt (never touched, matching
+    /// every other override tier). This tier never widens any conda pin,
+    /// so it runs unconditionally ahead of `conda_widen_needed`'s
+    /// widen-conda rung for the (disjoint) conflict shape it handles.
+    fn conda_range_vs_pack_pin(
+        &mut self,
+        editor: &ManifestEditor,
+        tried: &mut TriedState,
+        target: &PinTarget<'_>,
+        conda_range: &str,
+        pack_name: &str,
+    ) -> std::result::Result<RepairOutcome, String> {
+        let package = target.package;
+        self.guard_anchor(package)?;
+        let pack_pixi = crate::workspace::WorkspaceManifest::load(editor.project_dir())
+            .and_then(|ws| resolve_pack_dir(&ws, editor.project_dir(), pack_name))
+            .map(|dir| dir.join("pixi.toml"))
+            .ok_or_else(|| package.to_string())?;
+        let new_spec = translate_conda_range_to_pep440(conda_range);
+        self.guard_oscillation(package, &new_spec, Strategy::PypiOverride)?;
+        if tried.has(package, Strategy::PypiOverride) {
+            return Err(package.to_string());
+        }
+        tried.mark(package, Strategy::PypiOverride, false);
+        eprintln!(
+            "retread: workspace conda range {conda_range} for {package} injected into pack \
+             `{pack_name}` as pypi override {new_spec} (conda-as-truth; auto-routed pack pin not \
+             widened)"
+        );
+        Ok(RepairOutcome {
+            attempt: self.ledger_attempt(
+                target,
+                Strategy::PypiOverride,
+                "retread",
+                AttemptDetails {
+                    old_spec: Some(format!("=={}", target.version)),
+                    new_spec: Some(new_spec.clone()),
+                    ..AttemptDetails::default()
+                },
+            ),
+            extra_attempts: Vec::new(),
+            summary_line: format!(
+                "would add [{pack_name} :: retread-overrides] {package} = \"{new_spec}\"  (tier: pypi_override; workspace-range-vs-auto-routed-pin; .retread/auto-overrides.json ledger)",
+            ),
+            applied: Vec::new(),
+            pack_override: Some(PackOverrideWrite {
+                bundle: pack_name.to_string(),
+                pack_pixi,
+                package: package.to_string(),
                 spec: new_spec,
             }),
         })
@@ -1530,6 +1620,40 @@ fn exact_pin_version(specs: &[String]) -> Option<String> {
     }
 }
 
+/// Translates a conda-solver two-sided range string (e.g. `">=68,<81"`, as
+/// captured from `<pkg> >=X,<Y cannot be installed...` prose) into a
+/// PEP440-valid `retread-overrides`/`pypi-options.dependency-overrides`
+/// spec. Conda and PEP440 share the same relational operators
+/// (`>=`/`>`/`<=`/`<`/`==`), so this is close to a pass-through -- the two
+/// normalizations actually needed are conda's bare `=` (never valid in
+/// PEP440, which requires `==`) and preserving a trailing conda glob
+/// build (e.g. `83.0.0.*`) verbatim, since PEP440 already accepts that
+/// unchanged under `==` (arbitrary equality, PEP 440 §Version matching).
+/// A clause with no recognized leading operator is passed through
+/// unchanged rather than dropped, so a translation gap surfaces as an
+/// obviously-wrong override version instead of silently vanishing.
+pub(crate) fn translate_conda_range_to_pep440(range: &str) -> String {
+    range
+        .split(',')
+        .map(|clause| translate_conda_clause_to_pep440(clause.trim()))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn translate_conda_clause_to_pep440(clause: &str) -> String {
+    // Longest-prefix-first so `==`/`<=`/`>=` are matched before the bare
+    // `=`/`<`/`>` fallbacks (an `=` check first would also match `==`'s
+    // leading char and truncate the operator).
+    const OPS: &[&str] = &[">=", "<=", "==", ">", "<", "="];
+    for op in OPS {
+        if let Some(rest) = clause.strip_prefix(op) {
+            let normalized_op = if *op == "=" { "==" } else { *op };
+            return format!("{normalized_op}{}", rest.trim());
+        }
+    }
+    clause.to_string()
+}
+
 pub fn is_abi_anchor(name: &str) -> bool {
     ABI_ANCHOR_NAMES.contains(&name)
         || name.starts_with("__")
@@ -2001,6 +2125,159 @@ mod tests {
         );
         let overrides = crate::pack_overrides::overrides_for_pack(&project_dir, &pack_pixi);
         assert_eq!(overrides.get("torch").map(String::as_str), Some("==2.10.0"));
+    }
+
+    #[test]
+    fn translate_conda_range_to_pep440_basic_and_glob() {
+        assert_eq!(translate_conda_range_to_pep440(">=68,<81"), ">=68,<81");
+        // conda's bare `=` normalizes to PEP440's `==`.
+        assert_eq!(translate_conda_range_to_pep440("=68"), "==68");
+        // conda glob build passes through verbatim under `==` (already
+        // PEP440-valid arbitrary equality).
+        assert_eq!(translate_conda_range_to_pep440("==83.0.0.*"), "==83.0.0.*");
+        assert_eq!(translate_conda_range_to_pep440(">=1,<=2"), ">=1,<=2");
+        // Malformed clause (no recognized operator) passes through
+        // unchanged rather than being silently dropped.
+        assert_eq!(translate_conda_range_to_pep440("garbage"), "garbage");
+    }
+
+    #[test]
+    fn conda_range_vs_pack_pin_injects_workspace_range_into_pack_not_workspace() {
+        // Tenth fix (deps-from hardening): a `CondaRangeVsPackPin`
+        // conflict must inject the WORKSPACE'S OWN range into the named
+        // pack's own ledger/closure as a pypi override -- never widen the
+        // workspace's conda pin, and never touch the workspace manifest.
+        let manifest_text = "[dependencies]\nsetuptools = \">=68,<81\"\n\n\
+             [feature.gpu.dependencies]\n\
+             \"isaaclab-2.3x-pack\" = { path = \"./pypi-packs/isaaclab-2.3x-pack\" }\n";
+        let path = temp_manifest(manifest_text);
+        let project_dir = path.parent().unwrap().to_path_buf();
+        let pack_dir = project_dir.join("pypi-packs/isaaclab-2.3x-pack");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        let pack_pixi = pack_dir.join("pixi.toml");
+        std::fs::write(
+            &pack_pixi,
+            "[package]\nname = \"isaaclab-2.3x-pack\"\nversion = \"0.54.2\"\n",
+        )
+        .unwrap();
+
+        let mut editor = ManifestEditor::open(path.clone()).unwrap();
+        let mut tried = TriedState::default();
+        let mut planner = RepairPlanner::new("default".into());
+
+        let conflict = Conflict::CondaRangeVsPackPin {
+            package: "setuptools".into(),
+            conda_range: ">=68,<81".into(),
+            pack_demand: "83.0.0".into(),
+            pack_name: "isaaclab-2.3x-pack".into(),
+        };
+        let out = planner
+            .repair(&mut editor, &mut tried, &conflict, 1)
+            .unwrap();
+        assert_eq!(out.attempt.strategy, "pypi_override");
+        assert_eq!(out.attempt.old_spec.as_deref(), Some("==83.0.0"));
+        assert_eq!(out.attempt.new_spec.as_deref(), Some(">=68,<81"));
+        assert!(
+            out.applied.is_empty(),
+            "must not touch the workspace manifest"
+        );
+        let po = out.pack_override.expect("expected a pack-override write");
+        assert_eq!(po.bundle, "isaaclab-2.3x-pack");
+        assert_eq!(po.package, "setuptools");
+        assert_eq!(po.spec, ">=68,<81");
+        assert_eq!(po.pack_pixi, pack_pixi);
+
+        // Workspace manifest's own conda range is byte-identical -- never
+        // widened.
+        editor.write_atomic().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), manifest_text);
+    }
+
+    #[test]
+    fn conda_range_vs_pack_pin_refuses_when_pack_is_not_ours() {
+        // Guardrail: a `pack_name` that doesn't resolve to one of this
+        // workspace's own composed packs (no `path = ...` dependency
+        // entry found) must be refused rather than guessed at -- there is
+        // no way to confirm its conda companion pin is auto-routed.
+        let path = temp_manifest("[dependencies]\nsetuptools = \">=68,<81\"\n");
+        let mut editor = ManifestEditor::open(path).unwrap();
+        let mut tried = TriedState::default();
+        let mut planner = RepairPlanner::new("default".into());
+
+        let conflict = Conflict::CondaRangeVsPackPin {
+            package: "setuptools".into(),
+            conda_range: ">=68,<81".into(),
+            pack_demand: "83.0.0".into(),
+            pack_name: "not-a-real-pack".into(),
+        };
+        let result = planner.repair(&mut editor, &mut tried, &conflict, 1);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn conda_range_vs_pack_pin_exempts_abi_anchors() {
+        let path = temp_manifest("[dependencies]\npython = \">=3.10,<3.12\"\n");
+        let mut editor = ManifestEditor::open(path).unwrap();
+        let mut tried = TriedState::default();
+        let mut planner = RepairPlanner::new("default".into());
+
+        let conflict = Conflict::CondaRangeVsPackPin {
+            package: "python".into(),
+            conda_range: ">=3.10,<3.12".into(),
+            pack_demand: "3.13.0".into(),
+            pack_name: "isaaclab-2.3x-pack".into(),
+        };
+        let result = planner.repair(&mut editor, &mut tried, &conflict, 1);
+        assert!(result.is_err(), "ABI anchors must never be auto-repaired");
+    }
+
+    #[test]
+    fn end_to_end_setuptools_range_fixture_repairs_via_pack_not_widen() {
+        // Regression test for run 11's exhaustion (depsfrom-proof-brief.md):
+        // the real captured `.retread/solve-conflicts` trace, parsed and
+        // repaired end-to-end, must land a pack override -- not a
+        // widen-conda repair on the workspace's own `setuptools` pin.
+        const CONDA_INCOMPATIBLE_SETUPTOOLS_RANGE: &str = include_str!(
+            "../../tests/fixtures/solve_errors/conda_incompatible_setuptools_range.txt"
+        );
+        let manifest_text = "[dependencies]\nsetuptools = \">=68,<81\"\n\n\
+             [feature.gpu.dependencies]\n\
+             \"isaaclab-2.3x-pack\" = { path = \"./pypi-packs/isaaclab-2.3x-pack\" }\n";
+        let path = temp_manifest(manifest_text);
+        let project_dir = path.parent().unwrap().to_path_buf();
+        let pack_dir = project_dir.join("pypi-packs/isaaclab-2.3x-pack");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        std::fs::write(
+            pack_dir.join("pixi.toml"),
+            "[package]\nname = \"isaaclab-2.3x-pack\"\nversion = \"0.54.2\"\n",
+        )
+        .unwrap();
+
+        let parser = RegexConflictParser::new();
+        let conflict = parser
+            .parse(CONDA_INCOMPATIBLE_SETUPTOOLS_RANGE)
+            .expect("fixture must parse");
+
+        let mut editor = ManifestEditor::open(path.clone()).unwrap();
+        let mut tried = TriedState::default();
+        let mut planner = RepairPlanner::new("default".into());
+        let out = planner
+            .repair(&mut editor, &mut tried, &conflict, 1)
+            .expect("repair must succeed on the first rung, no ladder exhaustion");
+        assert_eq!(out.attempt.strategy, "pypi_override");
+        let po = out
+            .pack_override
+            .expect("must be a pack override, not a workspace widen");
+        assert_eq!(po.bundle, "isaaclab-2.3x-pack");
+        assert_eq!(po.package, "setuptools");
+        assert_eq!(po.spec, ">=68,<81");
+
+        editor.write_atomic().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            manifest_text,
+            "the workspace's own setuptools range must never be widened"
+        );
     }
 
     #[tokio::test]

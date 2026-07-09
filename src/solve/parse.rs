@@ -101,6 +101,35 @@ pub enum Conflict {
         /// unrepairable (mirrors `DepsFromPin`).
         pack_name: Option<String>,
     },
+    /// Tenth fix (deps-from hardening series): the workspace's own
+    /// two-sided conda RANGE pin (`>=X,<Y`) for `package` conflicts with a
+    /// NAMED pack's own exact companion demand (`==Z`, `Z` outside the
+    /// range) -- e.g. workspace `setuptools >=68,<81` vs
+    /// `isaaclab-2.3x-pack 0.54.2 would require setuptools ==83.0.0`.
+    /// Distinct from the plain `CondaWidenNeeded` range fallback (no named
+    /// pack): doctrine says the workspace's hand-written range is real
+    /// owner intent and must NOT be widened, while a NAMED pack's exact
+    /// companion pin is auto-routed (derived from whatever uv's own
+    /// closure happened to lock inside that pack, see `handler/mod.rs`'s
+    /// `bundle.auto_routed` emission -- the only mechanism that produces
+    /// an exact companion conda run-dep for a pack this backend composed)
+    /// and is not a real constraint at all. Repair injects the workspace's
+    /// range into the PACK's own uv closure as a pypi override instead of
+    /// widening anything.
+    CondaRangeVsPackPin {
+        /// The conda package name both sides pin (e.g. `setuptools`).
+        package: String,
+        /// The workspace's own range, in conda syntax (e.g. `">=68,<81"`).
+        conda_range: String,
+        /// The pack's exact demanded version (e.g. `"83.0.0"`),
+        /// informational (ledger old_spec).
+        pack_demand: String,
+        /// The pack/bundle name whose closure the override is written
+        /// into (always present -- this variant only exists when a named
+        /// pack was captured; see [`Conflict::DepsFromPin::pack_name`] for
+        /// the `None` convention used elsewhere).
+        pack_name: String,
+    },
 }
 
 impl Conflict {
@@ -112,6 +141,7 @@ impl Conflict {
             Conflict::CondaWidenNeeded { .. } => "CondaWidenNeeded",
             Conflict::DepsFromPin { .. } => "DepsFromPin",
             Conflict::NoWheelTransitive { .. } => "NoWheelTransitive",
+            Conflict::CondaRangeVsPackPin { .. } => "CondaRangeVsPackPin",
         }
     }
 }
@@ -251,8 +281,14 @@ impl RegexConflictParser {
                 r"(?s)([a-zA-Z0-9_-]+)\s*(==|=)\s*([0-9][0-9a-zA-Z.]*)[\s│├╰└─▶]+cannot\s+be\s+installed[\s│├╰└─▶]+because\s+there\s+are\s+no\s+viable\s+options",
             )
             .expect("valid conda-incompatible-exact regex"),
+            // Tenth fix (deps-from hardening): now captures the RANGE's
+            // floor op/value too (groups 2-3), not just the ceiling
+            // (groups 4-5) -- needed to reconstruct the full workspace
+            // range (`>=68,<81`) for `CondaRangeVsPackPin`'s repair
+            // instead of just the ceiling half the old widen-only path
+            // used.
             conda_incompatible_range: Regex::new(
-                r"(?s)([a-zA-Z0-9_-]+)\s*(?:>=|>)\s*[0-9][0-9a-zA-Z.]*\s*,\s*(<|<=)\s*([0-9][0-9a-zA-Z.]*)[\s│├╰└─▶]+cannot\s+be\s+installed[\s│├╰└─▶]+because\s+there\s+are\s+no\s+viable\s+options",
+                r"(?s)([a-zA-Z0-9_-]+)\s*(>=|>)\s*([0-9][0-9a-zA-Z.]*)\s*,\s*(<|<=)\s*([0-9][0-9a-zA-Z.]*)[\s│├╰└─▶]+cannot\s+be\s+installed[\s│├╰└─▶]+because\s+there\s+are\s+no\s+viable\s+options",
             )
             .expect("valid conda-incompatible-range regex"),
             deps_from_because: Regex::new(
@@ -540,9 +576,38 @@ impl RegexConflictParser {
         // ladder.
         if let Some(caps) = self.conda_incompatible_range.captures(stderr) {
             let package = caps[1].to_string();
-            let conda_op = caps[2].to_string();
-            let conda_version = caps[3].to_string();
+            let floor_op = caps[2].to_string();
+            let floor = caps[3].to_string();
+            let ceil_op = caps[4].to_string();
+            let ceil = caps[5].to_string();
             let escaped = regex::escape(&package);
+
+            // Tenth fix (deps-from hardening): if a NAMED pack's own
+            // render demands an EXACT companion version (the auto-routed
+            // shape `handler/mod.rs`'s `bundle.auto_routed` emits), route
+            // to `CondaRangeVsPackPin` -- the workspace range wins, the
+            // pack's exact pin is what gets relaxed, via a pypi override
+            // written into THAT pack's own closure. Checked before the
+            // name-agnostic fallback below so a named pack + exact demand
+            // always takes the conda-as-truth direction (never widens the
+            // workspace's own hand-written range).
+            let would_require_pack_exact = Regex::new(&format!(
+                r"(?s)([a-zA-Z][a-zA-Z0-9_.-]*)\s+[0-9][0-9a-zA-Z.]*\s+would require[\s│├╰└─▶]*{escaped}\s*(==|=)\s*([0-9][0-9a-zA-Z.]*)"
+            ))
+            .ok()?;
+            if let Some(rcaps) = would_require_pack_exact.captures(stderr) {
+                return Some(Conflict::CondaRangeVsPackPin {
+                    package,
+                    conda_range: format!("{floor_op}{floor},{ceil_op}{ceil}"),
+                    pack_demand: rcaps[3].to_string(),
+                    pack_name: rcaps[1].to_string(),
+                });
+            }
+
+            // Fallback (no named pack captured, or the demand wasn't a
+            // bare exact version): unchanged from before this fix --
+            // widen the workspace's own pin, since there is no pack to
+            // attribute an override to.
             let would_require = Regex::new(&format!(
                 r"(?s)would require[\s│├╰└─▶]*{escaped}\s*(==|=|>=|>)\s*([0-9][0-9a-zA-Z.]*)"
             ))
@@ -552,7 +617,7 @@ impl RegexConflictParser {
                     package,
                     op: ">=".to_string(),
                     floor: rcaps[2].to_string(),
-                    conda_version: format!("{conda_op}{conda_version}"),
+                    conda_version: format!("{ceil_op}{ceil}"),
                     requiring_chain: Vec::new(),
                     pack_name: None,
                 });
@@ -937,18 +1002,37 @@ mod tests {
     }
 
     #[test]
-    fn parses_range_pinned_conda_conflict_to_workspace_widen() {
-        // Run 8: unlike fix #21's exact-vs-exact companion shape (which
-        // routes to a PACK override because the workspace's own pin is
-        // exact and therefore authoritative), here the workspace pin is a
-        // `>=`/`<` RANGE -- a manual cap chosen for an unrelated reason,
-        // not a hard anchor -- so conda-as-truth widens the WORKSPACE's
-        // own pin instead (`pack_name: None`, same routing as the plain
-        // `conda_incompatible` shape). The pack's exact `==83.0.0` demand
-        // is normalized to a `>=` floor, not re-emitted as a new exact pin.
+    fn parses_range_pinned_conda_conflict_to_pack_override() {
+        // Run 8 / tenth fix: unlike fix #21's exact-vs-exact companion
+        // shape, here the workspace pin is a `>=`/`<` RANGE -- but this
+        // fixture's conflict tree NAMES the pack (`isaaclab-2.3x-pack
+        // 0.54.2 would require setuptools ==83.0.0`), so doctrine now says
+        // the workspace's hand-written range is real owner intent (must
+        // NOT be widened) and the pack's exact `==83.0.0` demand is the
+        // auto-routed side that gets relaxed via a pypi override written
+        // into the PACK's own closure, not the workspace manifest.
         let p = RegexConflictParser::new();
         assert_eq!(
             p.parse(CONDA_INCOMPATIBLE_SETUPTOOLS_RANGE),
+            Some(Conflict::CondaRangeVsPackPin {
+                package: "setuptools".into(),
+                conda_range: ">=68,<81".into(),
+                pack_demand: "83.0.0".into(),
+                pack_name: "isaaclab-2.3x-pack".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_range_pinned_conda_conflict_with_no_named_pack_to_workspace_widen() {
+        // Fallback shape (no named pack in the conflict tree, e.g. a
+        // direct conda-conda clash with no pack rendering step involved):
+        // still widens the workspace's own pin, same as before this fix,
+        // since there is no pack to attribute an override to.
+        const NO_PACK_NAME: &str = "setuptools >=68,<81 cannot be installed because there are no viable options:\n  would require setuptools ==83.0.0, which cannot be installed";
+        let p = RegexConflictParser::new();
+        assert_eq!(
+            p.parse(NO_PACK_NAME),
             Some(Conflict::CondaWidenNeeded {
                 package: "setuptools".into(),
                 op: ">=".into(),
