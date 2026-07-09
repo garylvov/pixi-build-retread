@@ -51,6 +51,15 @@ isaacsim = { version = "==6.0.0.1", index = "https://pypi.nvidia.com" }
 # ...
 ```
 
+## Rust toolchain
+
+The exact Rust version is pinned in `rust-toolchain.toml` (kept in sync with
+CI's `dtolnay/rust-toolchain` pin) so `fmt`/`clippy` never drift between local
+and CI. Install it with [rustup](https://rustup.rs) (which reads
+`rust-toolchain.toml` automatically) -- `pixi exec --spec rust` pulls from
+conda-forge, which lags the pinned version and will disagree on `fmt`/
+`clippy` output.
+
 ## Commands
 
 | Command | Usage |

@@ -20,8 +20,12 @@ repos:
         args: [--fix=lf]
 
   # Cargo hooks run inside the local repo (system: local), not pulled from a
-  # remote pre-commit repo, because we want to use whatever rust toolchain the
-  # contributor already has rather than version-pinning one here.
+  # remote pre-commit repo, so `cargo` resolves via the toolchain the
+  # contributor already has on PATH. That toolchain is pinned by
+  # rust-toolchain.toml (rustup reads it automatically) so fmt/clippy match
+  # CI -- `pixi exec --spec rust` is conda-forge and typically lags the exact
+  # pinned version by one release; use `rustup` + rust-toolchain.toml
+  # instead for fmt/clippy, see README.md.
   - repo: local
     hooks:
       - id: cargo-fmt
