@@ -1,0 +1,36 @@
+Error:   × failed to solve requirements of environment 'pm-isaaclab' for platform
+  │ 'linux-64'
+  ├─▶   × failed to communicate with the build backend (/oscar/data/
+  │     │ stellex/glvov/imprint-env-test/_session_briefs/pixi-build-
+  │     │ retread-bin)
+  │     help: Ensure that the build backend implements the JSON-RPC
+  │           protocol correctly.
+  │
+  ├─▶ ErrorObject { code: InvalidParams, message: "resolving wheels for python
+  │   3.11: computing uv closure for bundle `protomotions-deps-pack`: uv
+  │   lock failed for bundle `protomotions-deps-pack` (python 3.11, linux-
+  │   64):\n\nUsing CPython 3.11.15\n  × No solution found when resolving
+  │   dependencies for split (markers:\n  │ python_full_version == '3.11.*'
+  │   and platform_machine == 'x86_64' and\n  │ sys_platform == 'linux'):
+  │   \n  ╰─▶ Because wandb==0.23.0 depends on sentry-sdk>=2.0.0 and your
+  │   project\n      depends on sentry-sdk==1.38.0, we can conclude that your
+  │   project and\n      wandb==0.23.0 are incompatible.\n      And because
+  │   your project depends on wandb==0.23.0, we can conclude that\n      your
+  │   project's requirements are unsatisfiable.\n\nno generated conda
+  │   constraint was named in uv's message; the conflict may be intrinsic
+  │   to the PyPI requirements.\n\nhint: run `retread solve` to widen the
+  │   offending conda pin.\n", data: None }
+  ╰─▶ ErrorObject { code: InvalidParams, message: "resolving wheels for python
+      3.11: computing uv closure for bundle `protomotions-deps-pack`: uv
+      lock failed for bundle `protomotions-deps-pack` (python 3.11, linux-
+      64):\n\nUsing CPython 3.11.15\n  × No solution found when resolving
+      dependencies for split (markers:\n  │ python_full_version == '3.11.*'
+      and platform_machine == 'x86_64' and\n  │ sys_platform == 'linux'):
+      \n  ╰─▶ Because wandb==0.23.0 depends on sentry-sdk>=2.0.0 and your
+      project\n      depends on sentry-sdk==1.38.0, we can conclude that your
+      project and\n      wandb==0.23.0 are incompatible.\n      And because
+      your project depends on wandb==0.23.0, we can conclude that\n      your
+      project's requirements are unsatisfiable.\n\nno generated conda
+      constraint was named in uv's message; the conflict may be intrinsic
+      to the PyPI requirements.\n\nhint: run `retread solve` to widen the
+      offending conda pin.\n", data: None }

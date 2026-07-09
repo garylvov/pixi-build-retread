@@ -35,6 +35,37 @@ pub enum Conflict {
         /// of a workspace manifest table the closure never reads.
         pack_name: Option<String>,
     },
+    /// A uv conflict entirely inside the pypi subgraph where the losing
+    /// side is an EXACT pin, with NO conda constraint attributable at all
+    /// (the `no_conda_constraint_named` footer fired, unlike
+    /// `CondaWidenNeeded`'s `conda_provenance` shape) -- e.g. a `deps-from`
+    /// requirements file pins both `wandb==0.23.0` (whose metadata
+    /// requires `sentry-sdk>=2.0.0`) and `sentry-sdk==1.38.0` directly.
+    /// Doctrine: `retread-deps-from` pins are upstream advisories, not
+    /// user intent, so `repair` may relax `package`'s exact pin to a
+    /// `floor` -- but ONLY after confirming (at repair time, see
+    /// `deps_from_owns_exact_pin` in repair.rs) that the pin actually
+    /// originates from `pack_name`'s own deps-from source(s); this variant
+    /// alone never implies that.
+    DepsFromPin {
+        /// The exact-pinned package blocking the other requirement (e.g.
+        /// `sentry-sdk`).
+        package: String,
+        /// The pin's own exact version (e.g. `1.38.0`), informational
+        /// (ledger old_spec / ownership double-check).
+        pinned_version: String,
+        /// Comparison operator of the unmet requirement (`>=`/`>`).
+        op: String,
+        /// Floor version demanded by the other package (e.g. `2.0.0`).
+        floor: String,
+        /// The package whose requirement collided with the pin (e.g.
+        /// `wandb`); informational only.
+        requirer: String,
+        /// Bundle the uv closure was computed for. This shape only
+        /// appears inside a backend uv-closure JSON-RPC error, so this is
+        /// always `Some` in practice; `None` is treated as unrepairable.
+        pack_name: Option<String>,
+    },
 }
 
 impl Conflict {
@@ -44,6 +75,7 @@ impl Conflict {
             Conflict::CondaBoundary { .. } => "CondaBoundary",
             Conflict::PypiInternal { .. } => "PypiInternal",
             Conflict::CondaWidenNeeded { .. } => "CondaWidenNeeded",
+            Conflict::DepsFromPin { .. } => "DepsFromPin",
         }
     }
 }
@@ -100,6 +132,12 @@ pub struct RegexConflictParser {
     // operator class in place) so the widen path's behavior/tests are
     // untouched.
     conda_incompatible_exact: Regex,
+    // Generic (name-agnostic) half of the `DepsFromPin` shape:
+    // uv's "Because P==V depends on B>=F" clause. Package `B`'s name is
+    // captured but not yet anchored -- the caller re-checks it against a
+    // dynamically-escaped "your project depends on B==W" regex (the
+    // `regex` crate has no backreferences, so this can't be one pattern).
+    deps_from_because: Regex,
 }
 
 impl RegexConflictParser {
@@ -157,6 +195,10 @@ impl RegexConflictParser {
                 r"(?s)([a-zA-Z0-9_-]+)\s*(==|=)\s*([0-9][0-9a-zA-Z.]*)[\s│├╰└─▶]+cannot\s+be\s+installed[\s│├╰└─▶]+because\s+there\s+are\s+no\s+viable\s+options",
             )
             .expect("valid conda-incompatible-exact regex"),
+            deps_from_because: Regex::new(
+                r"(?i)because\s+([a-zA-Z0-9_.\[\]-]+)==[0-9a-zA-Z.]+\s+depends\s+on\s+([a-zA-Z0-9_.\[\]-]+)(?:\[[^\]]*\])?\s*(>=|>)\s*([0-9][0-9a-zA-Z.]*)",
+            )
+            .expect("valid deps-from-because regex"),
         }
     }
 
@@ -222,6 +264,37 @@ impl RegexConflictParser {
                 package: caps[1].to_string(),
                 version: caps[2].to_string(),
             });
+        }
+
+        // Intrinsic pypi-vs-pypi conflict (no conda pin named at all --
+        // same `no_conda_constraint_named` footer as the `PypiInternal`
+        // shape above, but a different pubgrub prose shape: uv's own
+        // "Because P==V depends on B>=F and your project depends on
+        // B==W" two-clause explanation, where B's `==W` pin is a
+        // `retread-deps-from` root, not a hand-authored one). Two-pass
+        // match (generic "because" capture, then a name-anchored second
+        // regex) since the `regex` crate has no backreferences.
+        if self.no_conda_constraint_named.is_match(msg)
+            && let Some(caps) = self.deps_from_because.captures(msg)
+        {
+            let requirer = caps[1].to_string();
+            let package = caps[2].to_string();
+            let op = caps[3].to_string();
+            let floor = caps[4].to_string();
+            let escaped = regex::escape(&package);
+            if let Ok(pin_re) = Regex::new(&format!(
+                r"(?i)your project depends on {escaped}(?:\[[^\]]*\])?\s*(==|===)\s*([0-9][0-9a-zA-Z.]*)"
+            )) && let Some(pcaps) = pin_re.captures(msg)
+            {
+                return Some(Conflict::DepsFromPin {
+                    package,
+                    pinned_version: pcaps[2].to_string(),
+                    op,
+                    floor,
+                    requirer,
+                    pack_name,
+                });
+            }
         }
 
         None
@@ -507,6 +580,13 @@ mod tests {
     );
     const CONDA_INCOMPATIBLE_PYGLET: &str =
         include_str!("../../tests/fixtures/solve_errors/conda_incompatible_pyglet.txt");
+    // Real failure (step4-lock-run2.log, `pm-isaaclab` proof run 2):
+    // ProtoMotions' `requirements_isaaclab.txt` (a `retread-deps-from`
+    // root) pins both `wandb==0.23.0` (whose metadata requires
+    // `sentry-sdk>=2.0.0`) and `sentry-sdk==1.38.0` directly -- an
+    // intrinsic pypi-vs-pypi conflict with no conda pin involved at all.
+    const UV_CLOSURE_DEPS_FROM_INTRINSIC_PIN: &str =
+        include_str!("../../tests/fixtures/solve_errors/uv_closure_deps_from_intrinsic_pin.txt");
     // Fix #21 fixture (acceptance-final.md, verbatim
     // solve-conflicts.acceptance-final.lock-2.txt): the torchvision
     // exact-pin companion conflict that surfaced after fix #20's torch
@@ -688,6 +768,22 @@ mod tests {
                 conda_version: "==0.25.0".into(),
                 requiring_chain: Vec::new(),
                 pack_name: Some("isaac-pack-latest".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_deps_from_intrinsic_pypi_conflict() {
+        let p = RegexConflictParser::new();
+        assert_eq!(
+            p.parse(UV_CLOSURE_DEPS_FROM_INTRINSIC_PIN),
+            Some(Conflict::DepsFromPin {
+                package: "sentry-sdk".into(),
+                pinned_version: "1.38.0".into(),
+                op: ">=".into(),
+                floor: "2.0.0".into(),
+                requirer: "wandb".into(),
+                pack_name: Some("protomotions-deps-pack".into()),
             })
         );
     }

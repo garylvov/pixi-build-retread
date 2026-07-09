@@ -608,6 +608,29 @@ impl RepairPlanner {
                 };
                 self.conda_widen_needed(editor, tried, &target, op, conda_version, requiring_chain)
             }
+            Conflict::DepsFromPin {
+                package,
+                pinned_version,
+                op,
+                floor,
+                pack_name,
+                ..
+            } => {
+                let target = PinTarget {
+                    package,
+                    version: floor,
+                    iter,
+                    conflict,
+                };
+                self.deps_from_pin_conflict(
+                    editor,
+                    tried,
+                    &target,
+                    pinned_version,
+                    op,
+                    pack_name.as_deref(),
+                )
+            }
         }
     }
 
@@ -789,6 +812,76 @@ impl RepairPlanner {
                 bundle: bundle.to_string(),
                 pack_pixi,
                 package: pkg.to_string(),
+                spec: new_spec,
+            }),
+        })
+    }
+
+    /// `DepsFromPin` dispatch: relax `package`'s exact pin to a
+    /// `{op}{floor}` floor, but ONLY when `deps_from_owns_exact_pin`
+    /// confirms the pin actually originates from `bundle`'s own
+    /// `retread-deps-from` root(s) -- doctrine limits auto-relaxing exact
+    /// pins with no conda involvement at all to that one provenance;
+    /// anything else (a hand-authored `[retread-wheels]` exact pin, for
+    /// instance) is left alone and this tier reports exhausted instead of
+    /// guessing. Mirrors `try_pack_override`'s ledger sink
+    /// (`.retread/auto-overrides.json`, never the pack's own `pixi.toml`)
+    /// but writes a `>=`/`>` floor spec instead of a conda-derived `==`.
+    fn deps_from_pin_conflict(
+        &mut self,
+        editor: &mut ManifestEditor,
+        tried: &mut TriedState,
+        target: &PinTarget<'_>,
+        pinned_version: &str,
+        op: &str,
+        pack_name: Option<&str>,
+    ) -> std::result::Result<RepairOutcome, String> {
+        let package = target.package;
+        let floor = target.version;
+        self.guard_anchor(package)?;
+        let Some(bundle) = pack_name else {
+            return Err(package.to_string());
+        };
+        let new_spec = format!("{op}{floor}");
+        self.guard_oscillation(package, &new_spec, Strategy::PypiOverride)?;
+        if tried.has(package, Strategy::PypiOverride) {
+            return Err(package.to_string());
+        }
+        if !deps_from_owns_exact_pin(editor.project_dir(), bundle, package) {
+            eprintln!(
+                "retread: {package}=={pinned_version} conflict is not attributable to a \
+                 retread-deps-from root of bundle `{bundle}`; refusing to auto-relax"
+            );
+            return Err(package.to_string());
+        }
+        let pack_pixi = crate::workspace::WorkspaceManifest::load(editor.project_dir())
+            .and_then(|ws| resolve_pack_dir(&ws, editor.project_dir(), bundle))
+            .map(|dir| dir.join("pixi.toml"))
+            .ok_or_else(|| package.to_string())?;
+        tried.mark(package, Strategy::PypiOverride, false);
+        eprintln!(
+            "retread: deps-from pin relaxed {package} =={pinned_version} -> {new_spec} (upstream-advisory)"
+        );
+        Ok(RepairOutcome {
+            attempt: self.ledger_attempt(
+                target,
+                Strategy::PypiOverride,
+                "retread",
+                AttemptDetails {
+                    old_spec: Some(format!("=={pinned_version}")),
+                    new_spec: Some(new_spec.clone()),
+                    ..AttemptDetails::default()
+                },
+            ),
+            extra_attempts: Vec::new(),
+            summary_line: format!(
+                "would add [{bundle} :: retread-overrides] {package} = \"{new_spec}\"  (tier: pypi_override; deps-from-advisory; .retread/auto-overrides.json ledger)",
+            ),
+            applied: Vec::new(),
+            pack_override: Some(PackOverrideWrite {
+                bundle: bundle.to_string(),
+                pack_pixi,
+                package: package.to_string(),
                 spec: new_spec,
             }),
         })
@@ -1213,6 +1306,72 @@ pub fn resolve_pack_dir(
     } else {
         workspace_dir.join(candidate)
     })
+}
+
+/// Re-verifies that `package`'s exact pin actually originates from
+/// `bundle`'s own `retread-deps-from` root(s) -- the ONLY provenance
+/// doctrine allows auto-relaxing an exact pypi pin with no conda
+/// involvement at all. The CLI ladder runs outside the JSON-RPC build
+/// backend process (where `deps_from_exact_pinned_names` normally runs,
+/// see `handler/mod.rs`), so this reads the bundle's `pixi.toml` straight
+/// off disk (same file the backend would parse into `RetreadConfig`) and
+/// re-fetches its deps-from source(s) via the same
+/// `deps_from::resolve_deps_from_roots` fetcher the backend closure uses
+/// -- cached under `.retread/deps-from-verify-cache` so a second repair
+/// attempt for the same bundle doesn't re-clone/re-fetch. `repair()` is
+/// synchronous (many call sites, including plain `#[test]`s, call it
+/// directly), so the async fetch is bridged in with
+/// `block_in_place`+`block_on` rather than threading `async` through the
+/// whole repair ladder -- safe here because `main.rs` runs
+/// `#[tokio::main]`'s default multi-thread scheduler.
+fn deps_from_owns_exact_pin(project_dir: &Path, bundle: &str, package: &str) -> bool {
+    let Some(ws) = crate::workspace::WorkspaceManifest::load(project_dir) else {
+        return false;
+    };
+    let Some(pack_dir) = resolve_pack_dir(&ws, project_dir, bundle) else {
+        return false;
+    };
+    let Ok(text) = std::fs::read_to_string(pack_dir.join("pixi.toml")) else {
+        return false;
+    };
+    let Ok(value) = text.parse::<toml::Value>() else {
+        return false;
+    };
+    let Some(config_value) = value
+        .get("package")
+        .and_then(|p| p.get("build"))
+        .and_then(|b| b.get("config"))
+        .cloned()
+    else {
+        return false;
+    };
+    // Only `deps_from` is needed here, so deserialize a minimal partial
+    // view rather than the full `RetreadConfig` (which requires fields
+    // like `retread-wheels` that a deps-from-only re-parse has no reason
+    // to demand -- this check must not spuriously fail just because some
+    // OTHER config field's shape changed or is absent).
+    #[derive(serde::Deserialize)]
+    struct DepsFromOnlyConfig {
+        #[serde(default, rename = "retread-deps-from", alias = "deps-from")]
+        deps_from: crate::config::DepsFromSpec,
+    }
+    let Ok(cfg) = config_value.try_into::<DepsFromOnlyConfig>() else {
+        return false;
+    };
+    if cfg.deps_from.is_empty() {
+        return false;
+    }
+    let cache_dir = retread_dir(project_dir).join("deps-from-verify-cache");
+    let sources = cfg.deps_from.as_slice().to_vec();
+    let roots = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(crate::deps_from::resolve_deps_from_roots(
+            &sources, &pack_dir, &cache_dir,
+        ))
+    });
+    let Ok(roots) = roots else {
+        return false;
+    };
+    crate::handler::deps_from_exact_pinned_names(&roots).contains(&canonical_conda_name(package))
 }
 
 /// Conda-name candidates for a pypi `pkg`, in match order: the name-map
@@ -2118,5 +2277,139 @@ holosoma-gpu = { features = ["holosoma"] }
             overrides.get("torchaudio").map(String::as_str),
             Some("==2.10.0")
         );
+    }
+
+    // ---- deps-from intrinsic-pypi-conflict repair (wandb/sentry-sdk
+    // proof, step4-lock-run2.log): a `retread-deps-from` root pins two
+    // packages whose PyPI metadata mutually conflicts, with NO conda pin
+    // involved at all. `deps_from_pin_conflict` must confirm ownership
+    // (re-fetching the bundle's deps-from source(s) off disk) before
+    // relaxing the exact pin to a floor -- these tests use `#[tokio::test
+    // (flavor = "multi_thread")]` because `deps_from_owns_exact_pin`
+    // bridges its async fetch via `block_in_place`, which panics on the
+    // (default) current-thread test runtime.
+
+    fn deps_from_pack(project_dir: &std::path::Path, requirements_txt: &str) -> PathBuf {
+        let pack_dir = project_dir.join("pypi-packs/deps-from-pack");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        std::fs::write(
+            pack_dir.join("pixi.toml"),
+            concat!(
+                "[package]\nname = \"deps-from-pack\"\nversion = \"0.1.0\"\n\n",
+                "[package.build.config]\n",
+                "retread-deps-from = \"requirements.txt\"\n",
+            ),
+        )
+        .unwrap();
+        std::fs::write(pack_dir.join("requirements.txt"), requirements_txt).unwrap();
+        pack_dir
+    }
+
+    fn deps_from_manifest(pack_rel: &str) -> String {
+        format!(
+            concat!(
+                "[dependencies]\n\n",
+                "[feature.pm.dependencies]\n",
+                "deps-from-pack = {{ path = \"{}\" }}\n\n",
+                "[environments]\n",
+                "pm = {{ features = [\"pm\"] }}\n",
+            ),
+            pack_rel
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deps_from_pin_conflict_relaxes_owned_exact_pin_to_floor() {
+        let manifest_text = deps_from_manifest("./pypi-packs/deps-from-pack");
+        let path = temp_manifest(&manifest_text);
+        let project_dir = path.parent().unwrap().to_path_buf();
+        deps_from_pack(&project_dir, "sentry-sdk==1.38.0\nwandb==0.23.0\n");
+
+        let mut editor = ManifestEditor::open(path.clone()).unwrap();
+        let mut tried = TriedState::default();
+        let mut planner = RepairPlanner::new("default".into());
+
+        let conflict = Conflict::DepsFromPin {
+            package: "sentry-sdk".into(),
+            pinned_version: "1.38.0".into(),
+            op: ">=".into(),
+            floor: "2.0.0".into(),
+            requirer: "wandb".into(),
+            pack_name: Some("deps-from-pack".into()),
+        };
+        let out = planner
+            .repair(&mut editor, &mut tried, &conflict, 1)
+            .expect("deps-from-owned exact pin must relax, not exhaust");
+        assert_eq!(out.attempt.strategy, "pypi_override");
+        assert_eq!(out.attempt.package, "sentry-sdk");
+        assert_eq!(out.attempt.new_spec.as_deref(), Some(">=2.0.0"));
+        assert!(
+            out.applied.is_empty(),
+            "workspace manifest must stay untouched"
+        );
+
+        let po = out.pack_override.expect("expected a pack-override write");
+        assert_eq!(po.bundle, "deps-from-pack");
+        assert_eq!(po.package, "sentry-sdk");
+        assert_eq!(po.spec, ">=2.0.0");
+
+        editor.write_atomic().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), manifest_text);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deps_from_pin_conflict_refuses_non_deps_from_participant() {
+        // The bundle's deps-from root doesn't mention `sentry-sdk` at all
+        // (e.g. the requirements file changed, or the conflict was
+        // misattributed) -- ownership can't be confirmed, so repair must
+        // report exhausted rather than guess at relaxing an arbitrary
+        // pypi pin with no provenance.
+        let manifest_text = deps_from_manifest("./pypi-packs/deps-from-pack");
+        let path = temp_manifest(&manifest_text);
+        let project_dir = path.parent().unwrap().to_path_buf();
+        deps_from_pack(&project_dir, "numpy==1.26.0\n");
+
+        let mut editor = ManifestEditor::open(path).unwrap();
+        let mut tried = TriedState::default();
+        let mut planner = RepairPlanner::new("default".into());
+
+        let conflict = Conflict::DepsFromPin {
+            package: "sentry-sdk".into(),
+            pinned_version: "1.38.0".into(),
+            op: ">=".into(),
+            floor: "2.0.0".into(),
+            requirer: "wandb".into(),
+            pack_name: Some("deps-from-pack".into()),
+        };
+        let err = planner
+            .repair(&mut editor, &mut tried, &conflict, 1)
+            .expect_err("non-deps-from-owned pin must not be auto-relaxed");
+        assert_eq!(err, "sentry-sdk");
+    }
+
+    #[test]
+    fn deps_from_pin_conflict_exempts_abi_anchor_before_any_disk_io() {
+        // `python`/`python_abi`/etc. are never relaxable regardless of
+        // deps-from provenance (same guardrail every other repair tier
+        // reuses) -- and the anchor guard must fire BEFORE any pack
+        // lookup, so this needs no pack on disk at all (pack_name points
+        // at a bundle that doesn't exist in the manifest).
+        let path = temp_manifest("[dependencies]\n");
+        let mut editor = ManifestEditor::open(path).unwrap();
+        let mut tried = TriedState::default();
+        let mut planner = RepairPlanner::new("default".into());
+
+        let conflict = Conflict::DepsFromPin {
+            package: "python".into(),
+            pinned_version: "3.11.15".into(),
+            op: ">=".into(),
+            floor: "3.12".into(),
+            requirer: "some-pkg".into(),
+            pack_name: Some("no-such-pack".into()),
+        };
+        let err = planner
+            .repair(&mut editor, &mut tried, &conflict, 1)
+            .expect_err("ABI anchor must never be relaxed");
+        assert_eq!(err, "python");
     }
 }

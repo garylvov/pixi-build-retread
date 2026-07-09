@@ -2773,7 +2773,7 @@ async fn uv_group_closure(
 /// (PEP 508 requirement strings straight from a deps-from source file)
 /// whose version specifier is a single exact `==`/`===` pin. Non-exact
 /// specs (`>=`, ranges, bare) and unparseable lines are ignored.
-fn deps_from_exact_pinned_names(roots: &[String]) -> std::collections::BTreeSet<String> {
+pub(crate) fn deps_from_exact_pinned_names(roots: &[String]) -> std::collections::BTreeSet<String> {
     let mut out = std::collections::BTreeSet::new();
     for root in roots {
         let Ok(req): Result<uv_pep508::Requirement, _> = uv_pep508::Requirement::from_str(root)
