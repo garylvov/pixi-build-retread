@@ -39,7 +39,7 @@ use uv_pep508::uv_pep440::VersionSpecifiers;
 
 use crate::config::{RelaxPolicy, RetreadConfig, WheelEntry};
 use crate::pypi::{self, WheelTarget};
-use crate::recipe::{BundleSource, build_bundle_recipe, build_courier_recipe, to_yaml};
+use crate::recipe::{BundleSource, build_bundle_recipe, build_courier_recipe_with_mode, to_yaml};
 use crate::relax::{canonical_conda_name, emit_python_version, marker_env_for};
 use crate::rpc::{RpcError, ok, parse_params};
 use crate::wheel::WheelMetadata;
@@ -662,11 +662,6 @@ struct Bundle {
     /// don't actually pull in all features still inherit those
     /// features' transitives in the union).
     solve_diagnostics: BTreeMap<String, crate::audit::SolveDiagnostics>,
-    /// PR-2: canonical conda names that the BFS (or resolvo) routed to
-    /// conda rather than bundling. Used exclusively by the A/B oracle
-    /// (RETREAD_RESOLVO_DIFF) and never serialized to a lock.
-    #[allow(dead_code)]
-    conda_routed: Vec<String>,
     /// v4.3.0 (spec-uv-restructure M2): packages the uv auto-route loop
     /// moved from the wheel closure to the conda side, as
     /// (conda_name, conda_version) pairs. Each becomes an exact-pinned
@@ -756,15 +751,15 @@ impl Handler {
                 .map_err(|e| RpcError::invalid_params(e.to_string()))?;
         }
 
-        // v4.2.0: the legacy cascade/resolvo mirror-solver was deleted.
-        // Fail loudly at initialize time -- silently running the uv
-        // resolver against a pack that explicitly pinned the legacy
-        // engine would change its outputs without warning.
-        if config.resolver == crate::config::ResolverKind::Legacy {
-            return Err(RpcError::invalid_params(
-                "legacy resolver removed in v4.2; use retread-resolver = \"uv\" \
-                 or pin backend <4.2",
-            ));
+        // v4.4.0: the `retread-resolver` knob was removed -- uv is the only
+        // resolver. The legacy cascade/resolvo mirror-solver was deleted in
+        // v4.2.0. The field is still parsed (so old manifests load under
+        // deny_unknown_fields) but ignored; warn once so the user removes it.
+        if let Some(kind) = config.resolver.as_deref() {
+            tracing::warn!(
+                "retread-resolver = \"{kind}\" is ignored (removed in v4.4; uv is the \
+                 only resolver). Remove it from your [package.build.config].",
+            );
         }
 
         // L2 (cleanup P4.6): conda-aware is not yet implemented -- warn
@@ -1876,32 +1871,26 @@ async fn resolve_all(
         let lock_path = source_dir.join(crate::lock::RetreadLock::file_name(&bundle_conda_name));
         let favored = load_favored_versions(&lock_path);
 
-        // spec-uv-restructure M1: uv-backed closure computation. When the
-        // pack selects `retread-resolver = "uv"`, this group's closure is
-        // computed by a uv subprocess (ephemeral project + `uv lock` +
-        // `uv export --format pylock.toml`) and the legacy materialization
+        // uv-backed closure computation (the only resolver). This group's
+        // closure is computed by a uv subprocess (ephemeral project + `uv
+        // lock` + `uv export --format pylock.toml`) and the materialization
         // below is PINNED to uv's picks via the locked-closure seam.
         // Packaging / courier / lock-write downstream are unchanged.
         // `Ok(None)` = no uv-resolvable roots (all source-built entries);
-        // the legacy path then runs unpinned exactly as before.
-        let uv_closure: Option<crate::uv_closure::UvClosure> =
-            if effective.resolver == crate::config::ResolverKind::Uv {
-                uv_group_closure(
-                    &group_name,
-                    &group_entries,
-                    &effective,
-                    target,
-                    cache_dir,
-                    source_dir,
-                    workspace_dir,
-                    &workspace_pypi_indexes,
-                    conda_channels,
-                )
-                .await
-                .with_context(|| format!("computing uv closure for bundle `{group_name}`"))?
-            } else {
-                None
-            };
+        // the materialization path then runs unpinned.
+        let uv_closure: Option<crate::uv_closure::UvClosure> = uv_group_closure(
+            &group_name,
+            &group_entries,
+            &effective,
+            target,
+            cache_dir,
+            source_dir,
+            workspace_dir,
+            &workspace_pypi_indexes,
+            conda_channels,
+        )
+        .await
+        .with_context(|| format!("computing uv closure for bundle `{group_name}`"))?;
         let uv_pins: Option<&BTreeMap<String, String>> = uv_closure.as_ref().map(|c| &c.pins);
         // M1 seam FIX (cold-path bundling): uv's closure pins guide the BFS
         // as fetch-time version PREFERENCES (the favor-lock seam), NEVER via
@@ -1973,7 +1962,6 @@ async fn resolve_all(
                         pypi_to_conda,
                         &effective.name_map,
                         conda_channels,
-                        &effective.conda_deps,
                         workspace_pypi_indexes,
                         None, // locked-closure seam: incremental-add ONLY (uv pins flow via prefs below)
                         Some(favored).filter(|m| !m.is_empty()), // favor-lock + uv-closure prefs (empty map → None)
@@ -2993,12 +2981,8 @@ async fn resolve_bundle(
     // this map; the BFS now matches it.
     name_map: &std::collections::BTreeMap<String, String>,
     conda_channels: &[ChannelUrl],
-    // PR-2: retread-conda-deps names (force-list). Used only by the A/B
-    // oracle to capture the auto_bundle skip-set route; never affects BFS logic.
-    conda_deps_list: &[String],
     // Workspace PyPI index chain (kept for call-site symmetry with
-    // auto_bundle_transitives; unused since the resolvo mirror-solver
-    // was deleted in v4.2.0).
+    // auto_bundle_transitives; unused by this BFS).
     _workspace_indexes: &[String],
     // incremental-add path: locked closure from the committed lock
     // (name → version_str for every wheel EXCEPT the new dep being added).
@@ -3098,7 +3082,6 @@ async fn resolve_bundle(
             extras: vec![],
             probe_decisions: vec![],
             solve_diagnostics: BTreeMap::new(),
-            conda_routed: vec![],
             auto_routed: vec![],
             uv_closure_names: Default::default(),
         });
@@ -3174,9 +3157,6 @@ async fn resolve_bundle(
     // sub-wheels propagate their own extras but NOT prefix-base-dep
     // matching (they're project code, same rule as primary).
     let mut extras = Vec::new();
-    // PR-2: canonical conda names routed to conda (not bundled) during BFS.
-    // Used only by the A/B oracle; never serialized.
-    let mut conda_routed_acc: Vec<String> = Vec::new();
     // v1.4.3: process the BFS level by level. A child's existence is
     // only known after its parent's METADATA is parsed, but items at
     // the SAME depth never read each other's results -- so each
@@ -3449,8 +3429,6 @@ async fn resolve_bundle(
                 }
             }
             if routed_to_conda {
-                // PR-2: record the routed conda name for the A/B oracle.
-                conda_routed_acc.push(dep_conda_name.clone());
                 continue;
             }
             // v2.10.0 defense-in-depth: a sibling dep that reached the BFS
@@ -3749,39 +3727,12 @@ async fn resolve_bundle(
         }
     }
 
-    // PR-2: union in force-list names (retread-conda-deps) that appear as
-    // transitive requires_dist entries in the bundled wheels. auto_bundle_transitives
-    // skips these silently (no ProbeDecision pushed); we mirror that here so the
-    // A/B oracle sees the same effective conda-routed set.
-    {
-        let force_conda: std::collections::HashSet<String> = conda_deps_list
-            .iter()
-            .map(|n| canonical_conda_name(n))
-            .collect();
-        // Collect all transitive Requires-Dist names from bundled wheels.
-        let bundled_rd_names: std::collections::HashSet<String> = std::iter::once(&primary)
-            .chain(extras.iter())
-            .flat_map(|w| w.metadata.requires_dist.iter())
-            .filter_map(|raw| {
-                uv_pep508::Requirement::from_str(raw.as_str())
-                    .ok()
-                    .map(|r: uv_pep508::Requirement| canonical_conda_name(r.name.as_ref()))
-            })
-            .collect();
-        for name in force_conda.intersection(&bundled_rd_names) {
-            if !conda_routed_acc.contains(name) {
-                conda_routed_acc.push(name.clone());
-            }
-        }
-    }
-
     let bfs_bundle = Bundle {
         conda_name,
         primary,
         extras,
         probe_decisions,
         solve_diagnostics: BTreeMap::new(),
-        conda_routed: conda_routed_acc,
         auto_routed: vec![],
         uv_closure_names: Default::default(),
     };
@@ -5613,7 +5564,7 @@ async fn materialize_and_pack(
     let lock_path = source_dir.join(crate::lock::RetreadLock::file_name(bundle_name));
     let courier_lock_to_commit = (lock_path, staged.lock.to_pretty_json()?);
 
-    let recipe = build_courier_recipe(
+    let recipe = build_courier_recipe_with_mode(
         bundle_name,
         version,
         python_version,
@@ -5622,6 +5573,7 @@ async fn materialize_and_pack(
         // Thread the content-addressed build string into the recipe so
         // the on-disk artifact name matches what conda/outputs advertised.
         expected_build,
+        config.courier_mode,
     );
     let yaml = to_yaml(&recipe)?;
 
@@ -5860,7 +5812,6 @@ async fn resolve_incremental_add(
             &pypi_to_conda,
             &effective.name_map,
             conda_channels,
-            &effective.conda_deps,
             &workspace_pypi_indexes,
             Some(&locked_closure),
             None, // favor-lock prefs: not used on the incremental-add path (locked closure handles version pinning)
@@ -9637,7 +9588,6 @@ mod emit_wheel_upstream_url_tests {
             extras: vec![],
             probe_decisions: vec![],
             solve_diagnostics: BTreeMap::new(),
-            conda_routed: vec![],
             auto_routed: vec![],
             uv_closure_names: Default::default(),
         };
@@ -9752,7 +9702,6 @@ mod emit_wheel_upstream_url_tests {
             extras: vec![sub],
             probe_decisions: vec![],
             solve_diagnostics: BTreeMap::new(),
-            conda_routed: vec![],
             auto_routed: vec![],
             uv_closure_names: Default::default(),
         };
@@ -10244,7 +10193,6 @@ mod resolve_bundle_bfs_tests {
             &pypi_to_conda,
             &name_map,
             &conda_channels,
-            &[],                               // conda_deps_list
             &[],                               // workspace_indexes
             None,                              // cold path: no locked closure
             None,                              // cold path: no favor-lock prefs
@@ -10402,7 +10350,6 @@ mod resolve_bundle_bfs_tests {
             &pypi_to_conda,
             &name_map,
             &conda_channels,
-            &[],                               // conda_deps_list
             &[],                               // workspace_indexes
             None,                              // cold path: no locked closure
             None,                              // cold path: no favor-lock prefs
@@ -10548,7 +10495,6 @@ mod resolve_bundle_bfs_tests {
             &pypi_to_conda,
             &name_map,
             &conda_channels,
-            &[],          // conda_deps_list
             &[],          // workspace_indexes
             None,         // FIXED seam: uv pins must NOT ride locked_closure
             Some(&prefs), // uv pins ride the favor-lock preference seam
@@ -10592,7 +10538,6 @@ mod resolve_bundle_bfs_tests {
             &pypi_to_conda,
             &name_map,
             &conda_channels,
-            &[],
             &[],
             Some(&uv_pins), // locked-closure seam: suppresses the walk
             None,
@@ -10740,7 +10685,6 @@ mod resolve_bundle_bfs_tests {
             &pypi_to_conda,
             &name_map,
             &conda_channels,
-            &[],                               // conda_deps_list
             &[],                               // workspace_indexes
             None, // no incremental-add locked closure (deps must go through BFS)
             Some(&favor_lock_prefs), // favor-lock prefs: hint BFS to prefer flpkg-sub @ 1.0
@@ -10848,7 +10792,6 @@ mod resolve_bundle_bfs_tests {
             &pypi_to_conda,
             &name_map,
             &conda_channels,
-            &[],                               // conda_deps_list
             &[],                               // workspace_indexes
             None,                              // no incremental-add locked closure
             None,                              // no favor-lock prefs → cold path, picks latest

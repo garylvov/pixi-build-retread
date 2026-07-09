@@ -10,8 +10,8 @@
 //! by fixed precedence iff its version satisfies the pypi constraint, else
 //! conflict error.
 //!
-//! SEAM: `ResolveState` is the future drop-in point for a resolvo-based
-//! `DependencyProvider` (B-β). All version-selection logic lives here.
+//! All version-selection logic for the auto-bundle transitive BFS lives here
+//! (the single seam a future solver-backed provider would replace).
 
 use std::collections::HashMap;
 use std::str::FromStr;

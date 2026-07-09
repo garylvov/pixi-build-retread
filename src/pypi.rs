@@ -1,10 +1,6 @@
 //! PEP 503 simple-index resolver. Turns `(name, version, index)` into a
 //! concrete `(url, sha256)` for the wheel matching our target platform +
 //! python tag.
-//!
-//! PR-1a (resolvo foundation): adds `list_all_versions` / `PyPiCandidate`
-//! for whole-index discovery -- the resolvo `DependencyProvider`'s
-//! `get_candidates` needs every compatible version, not just the highest one.
 
 use anyhow::{Result, bail};
 use regex::Regex;
@@ -138,8 +134,8 @@ async fn resolve_inner(
     // PEP 440 normalization makes `5.1.0` and `5.1.0.0` compare equal, so
     // a user pin of `==5.1.0` still matches a four-component publisher tag.
     //
-    // Uses the shared `extract_version_from_wheel_filename` helper (also used
-    // by `list_all_versions`) so both functions stay in sync on parsing logic.
+    // Uses the shared `extract_version_from_wheel_filename` helper so the
+    // name-prefix + version extraction logic stays single-sourced.
     let mut versioned: Vec<(uv_pep440::Version, ResolvedWheel)> = candidates
         .into_iter()
         .filter_map(|c| {
@@ -274,192 +270,6 @@ pub async fn resolve_sdist(
     versioned.sort_by(|a, b| b.0.cmp(&a.0));
     let (version, wheel) = versioned.into_iter().next().unwrap();
     Ok((version, wheel))
-}
-
-// ── PR-1a: all-versions discovery for the resolvo DependencyProvider ─────────
-
-/// A single version on a PyPI simple index, as seen from the target platform's
-/// perspective.
-///
-/// Used by the resolvo `DependencyProvider`'s `get_candidates` callback, which
-/// needs the FULL candidate set (not just the highest matching version).  Each
-/// `PyPiCandidate` represents one PEP 440 version that is reachable on the index
-/// and is not excluded by platform incompatibility.
-///
-/// A candidate is either:
-/// - **wheel** (`wheel` is `Some`): a platform-compatible wheel was found.
-///   The `wheel` field holds the best wheel for this version (same pick as
-///   `pypi::resolve` would use).  `sdist_url` MAY also be `Some` if a source
-///   distribution exists alongside the wheel.
-/// - **sdist-only** (`wheel` is `None`, `sdist_url` is `Some`): no compatible
-///   wheel exists for this version, but an sdist does.  The resolvo provider
-///   may later build the sdist via `source_build::build_wheel_from_sdist_url`.
-///   `is_sdist_only()` is a convenience test for this case.
-///
-/// Versions with neither a compatible wheel NOR an sdist are silently omitted
-/// by `list_all_versions` (they are unreachable from this target).
-#[derive(Debug, Clone)]
-pub struct PyPiCandidate {
-    /// Parsed PEP 440 version.
-    pub version: Version,
-    /// Best target-compatible wheel for this version, if any.
-    /// `None` when the version is sdist-only.
-    pub wheel: Option<ResolvedWheel>,
-    /// Source-distribution URL for this version, if one was advertised on the
-    /// index.  Present for both wheel+sdist and sdist-only candidates.
-    pub sdist_url: Option<url::Url>,
-}
-
-impl PyPiCandidate {
-    /// True when no compatible wheel is available and only an sdist exists.
-    /// The caller is responsible for building the sdist when this is true.
-    pub fn is_sdist_only(&self) -> bool {
-        self.wheel.is_none() && self.sdist_url.is_some()
-    }
-}
-
-/// Fetch the simple index for `name` and return **all** version candidates that
-/// are reachable from `target` (i.e. have a compatible wheel or at least an
-/// sdist), sorted highest-version first.
-///
-/// This is the all-versions counterpart to [`resolve`], which returns only the
-/// single highest matching version.  The resolvo `DependencyProvider` needs the
-/// full list so the solver can backtrack to a lower version when the highest one
-/// conflicts.
-///
-/// # Reuse
-///
-/// Internally reuses the same helpers as [`resolve`] and [`resolve_sdist`]:
-/// - `build_index_url` -- PEP 503 normalized URL construction.
-/// - `parse_index_links_any` -- parse ALL `<a href=...>` links on the page.
-/// - `extract_version_from_wheel_filename` -- name-prefix + version segment
-///   extraction, shared with `resolve` to avoid drift.
-/// - `pick_best` / `score_wheel` -- identical platform compat filter; if
-///   `pick_best` returns `None` for a version, that version has no compatible
-///   wheel for this target.
-///
-/// # Sdist-only versions
-///
-/// If a version has no compatible wheel but the index lists a source
-/// distribution (`.tar.gz`, `.zip`, `.tar.bz2`), the version is included as
-/// a `PyPiCandidate` with `wheel = None` and `sdist_url = Some(...)`.  The
-/// caller decides whether to build the sdist (resolvo PR-1b/discovery pass).
-/// Building is NOT done here.
-///
-/// # Errors
-///
-/// Returns an error only on HTTP failure or a completely empty/unparseable
-/// index.  An index that lists files but none for `name` is OK -- returns an
-/// empty `Vec`.
-pub async fn list_all_versions(
-    index: &str,
-    name: &str,
-    target: &WheelTarget,
-) -> Result<Vec<PyPiCandidate>> {
-    let index_url = build_index_url(index, name)?;
-    tracing::info!(url = %index_url, "list_all_versions: fetching simple index");
-    let html = reqwest::get(index_url.clone())
-        .await?
-        .error_for_status()?
-        .text()
-        .await?;
-
-    // Parse all links on the page (wheels + sdists).
-    let all_links = match parse_index_links_any(&html, &index_url) {
-        Ok(links) => links,
-        // Empty index: return no candidates rather than propagating the error.
-        Err(_) => return Ok(vec![]),
-    };
-
-    // Shared name prefix for wheel filename matching (same as resolve()).
-    // PEP 503: case-insensitive, `-` / `_` are equivalent in names.
-    let name_prefix_lower = format!("{}-", name.replace('-', "_").to_ascii_lowercase());
-
-    // ── Separate wheels from sdists ──────────────────────────────────────────
-
-    // Wheel candidates: (parsed_version, ResolvedWheel).  We need the
-    // compat-tagged ResolvedWheel to pass to pick_best, but parse_index_links_any
-    // returns plain ResolvedWheel structs without the compat info.  Re-parse
-    // the compat attributes via score_wheel later.
-    //
-    // We rebuild proper ResolvedWheel structs from parse_index_links_any output;
-    // they already carry url, sha256, filename, has_metadata_sidecar.
-    let mut wheels_by_version: std::collections::BTreeMap<Version, Vec<ResolvedWheel>> =
-        std::collections::BTreeMap::new();
-
-    // Sdist candidates: (parsed_version, url).
-    let mut sdists_by_version: std::collections::BTreeMap<Version, url::Url> =
-        std::collections::BTreeMap::new();
-
-    let name_norm_dash = name.replace('_', "-").to_ascii_lowercase();
-    let name_norm_underscore = name.replace('-', "_").to_ascii_lowercase();
-
-    for link in all_links {
-        let fname_lower = link.filename.to_ascii_lowercase();
-
-        if fname_lower.ends_with(".whl") {
-            // Wheel: extract version via the name-prefix strip.
-            if let Some(version) =
-                extract_version_from_wheel_filename(&fname_lower, &name_prefix_lower)
-            {
-                wheels_by_version.entry(version).or_default().push(link);
-            }
-        } else if fname_lower.ends_with(".tar.gz")
-            || fname_lower.ends_with(".zip")
-            || fname_lower.ends_with(".tar.bz2")
-        {
-            // Sdist: name-<version>.tar.gz (same logic as resolve_sdist).
-            let stem = fname_lower
-                .strip_suffix(".tar.gz")
-                .or_else(|| fname_lower.strip_suffix(".zip"))
-                .or_else(|| fname_lower.strip_suffix(".tar.bz2"));
-            if let Some(stem) = stem {
-                let rest = stem
-                    .strip_prefix(&format!("{name_norm_dash}-"))
-                    .or_else(|| stem.strip_prefix(&format!("{name_norm_underscore}-")));
-                if let Some(ver_str) = rest
-                    && let Ok(version) = Version::from_str(ver_str)
-                {
-                    // First sdist for this version wins (same as resolve_sdist).
-                    sdists_by_version.entry(version).or_insert(link.url);
-                }
-            }
-        }
-    }
-
-    // ── Assemble candidates per version ─────────────────────────────────────
-
-    // Collect all versions mentioned by either wheels or sdists.
-    let mut all_versions: std::collections::BTreeSet<Version> = std::collections::BTreeSet::new();
-    all_versions.extend(wheels_by_version.keys().cloned());
-    all_versions.extend(sdists_by_version.keys().cloned());
-
-    let mut candidates: Vec<PyPiCandidate> = Vec::new();
-
-    for version in all_versions {
-        let sdist_url = sdists_by_version.get(&version).cloned();
-
-        let best_wheel = wheels_by_version
-            .remove(&version)
-            .and_then(|group| pick_best(group, target));
-
-        // Include this version only if it has a compatible wheel OR an sdist.
-        // Versions whose wheels are all platform-incompatible AND have no sdist
-        // are silently dropped (unreachable from this target).
-        if best_wheel.is_some() || sdist_url.is_some() {
-            candidates.push(PyPiCandidate {
-                version,
-                wheel: best_wheel,
-                sdist_url,
-            });
-        }
-    }
-
-    // Sort highest version first (matches pypi::resolve sort order and the
-    // resolvo provider's preferred-highest-first strategy).
-    candidates.sort_by(|a, b| b.version.cmp(&a.version));
-
-    Ok(candidates)
 }
 
 /// Extract the PEP 440 version from a wheel filename given the pre-computed
@@ -1132,7 +942,7 @@ platforms = [{ platform = "linux-64", glibc = "2.35" }]
         }
     }
 
-    // ── PR-1a: list_all_versions tests (localhost PEP 503 fixture server) ────
+    // ── localhost PEP 503 fixture-server tests ──────────────────────────────
     //
     // These tests mirror the fixture-server pattern from
     // `handler::resolve_bundle_bfs_tests` (mod.rs).  A minimal TCP listener
@@ -1217,8 +1027,8 @@ platforms = [{ platform = "linux-64", glibc = "2.35" }]
                                 fname_norm.starts_with(&prefix)
                             })
                             .map(|fname| {
-                                // Include a fake sha256 for wheel files so
-                                // the sha256-parsing test can verify it.
+                                // Include a fake sha256 fragment on wheel links
+                                // so link-hash parsing is exercised.
                                 let hash_frag = if fname.ends_with(".whl") {
                                     format!("#sha256={}", "a".repeat(64))
                                 } else {
@@ -1253,173 +1063,6 @@ platforms = [{ platform = "linux-64", glibc = "2.35" }]
         });
 
         port
-    }
-
-    /// Three wheel versions (1.0, 2.0, 3.0), all compatible with linux-64 /
-    /// py3.11.  `list_all_versions` must return all three, sorted 3.0 > 2.0 >
-    /// 1.0.  Each candidate must carry the correct version and wheel URL.
-    #[tokio::test]
-    async fn list_all_versions_returns_all_three_wheel_versions() {
-        let entries = vec![
-            (
-                "mylib-1.0-py3-none-any.whl".to_string(),
-                b"wheel10".to_vec(),
-            ),
-            (
-                "mylib-2.0-py3-none-any.whl".to_string(),
-                b"wheel20".to_vec(),
-            ),
-            (
-                "mylib-3.0-py3-none-any.whl".to_string(),
-                b"wheel30".to_vec(),
-            ),
-        ];
-        let port = spawn_fixture_server(entries, 8).await;
-        let index = format!("http://127.0.0.1:{port}/simple/");
-        let target = WheelTarget {
-            python_version: "3.11".into(),
-            conda_subdir: "linux-64".into(),
-            max_glibc: None,
-        };
-
-        let candidates = list_all_versions(&index, "mylib", &target)
-            .await
-            .expect("list_all_versions must succeed");
-
-        assert_eq!(
-            candidates.len(),
-            3,
-            "must return all 3 versions; got {candidates:?}"
-        );
-
-        // Verify descending sort.
-        let versions: Vec<String> = candidates.iter().map(|c| c.version.to_string()).collect();
-        assert_eq!(
-            versions,
-            vec!["3.0", "2.0", "1.0"],
-            "must be sorted highest first"
-        );
-
-        // All three must be wheel candidates (not sdist-only).
-        for c in &candidates {
-            assert!(
-                c.wheel.is_some(),
-                "version {} must have a compatible wheel",
-                c.version
-            );
-            assert!(
-                !c.is_sdist_only(),
-                "version {} must not be sdist-only",
-                c.version
-            );
-        }
-
-        // Wheel URLs must reference the correct filenames.
-        let filenames: Vec<String> = candidates
-            .iter()
-            .map(|c| c.wheel.as_ref().unwrap().filename.clone())
-            .collect();
-        assert_eq!(
-            filenames,
-            vec![
-                "mylib-3.0-py3-none-any.whl",
-                "mylib-2.0-py3-none-any.whl",
-                "mylib-1.0-py3-none-any.whl",
-            ]
-        );
-    }
-
-    /// A version that has NO compatible wheel (wrong python tag: cp310 when
-    /// target is 3.11) but an sdist.  That version must be included as
-    /// sdist-only.  The compatible wheel version (2.0, py3-none-any) must be
-    /// included as a wheel candidate.
-    #[tokio::test]
-    async fn list_all_versions_sdist_only_when_no_compatible_wheel() {
-        let entries = vec![
-            // Version 1.0: only a cp310 wheel (incompatible with py3.11) + sdist.
-            (
-                "mylib-1.0-cp310-cp310-manylinux_2_17_x86_64.whl".to_string(),
-                b"incompatible_wheel".to_vec(),
-            ),
-            ("mylib-1.0.tar.gz".to_string(), b"sdist_bytes".to_vec()),
-            // Version 2.0: compatible wheel.
-            (
-                "mylib-2.0-py3-none-any.whl".to_string(),
-                b"wheel20".to_vec(),
-            ),
-        ];
-        let port = spawn_fixture_server(entries, 12).await;
-        let index = format!("http://127.0.0.1:{port}/simple/");
-        let target = WheelTarget {
-            python_version: "3.11".into(),
-            conda_subdir: "linux-64".into(),
-            max_glibc: None,
-        };
-
-        let candidates = list_all_versions(&index, "mylib", &target)
-            .await
-            .expect("list_all_versions must succeed");
-
-        assert_eq!(
-            candidates.len(),
-            2,
-            "must have 2 candidates; got {candidates:?}"
-        );
-
-        // 2.0 first (highest).
-        let v2 = &candidates[0];
-        assert_eq!(v2.version.to_string(), "2.0");
-        assert!(v2.wheel.is_some(), "2.0 must have a compatible wheel");
-        assert!(!v2.is_sdist_only());
-
-        // 1.0 second: no compatible wheel, sdist-only.
-        let v1 = &candidates[1];
-        assert_eq!(v1.version.to_string(), "1.0");
-        assert!(
-            v1.wheel.is_none(),
-            "1.0 must have no compatible wheel (cp310 != target 3.11)"
-        );
-        assert!(v1.sdist_url.is_some(), "1.0 must have an sdist url");
-        assert!(v1.is_sdist_only(), "1.0 must be sdist-only");
-    }
-
-    /// A version whose wheel has an incompatible platform tag (arm64 when
-    /// target is linux-64/x86_64) and no sdist must be EXCLUDED entirely.
-    /// A compatible version (py3-none-any) must still be returned.
-    #[tokio::test]
-    async fn list_all_versions_excludes_incompatible_wheel_version_without_sdist() {
-        let entries = vec![
-            // Version 1.0: wrong arch wheel only, no sdist.
-            (
-                "mylib-1.0-cp311-cp311-manylinux_2_17_aarch64.whl".to_string(),
-                b"arm_wheel".to_vec(),
-            ),
-            // Version 2.0: universally compatible.
-            (
-                "mylib-2.0-py3-none-any.whl".to_string(),
-                b"wheel20".to_vec(),
-            ),
-        ];
-        let port = spawn_fixture_server(entries, 8).await;
-        let index = format!("http://127.0.0.1:{port}/simple/");
-        let target = WheelTarget {
-            python_version: "3.11".into(),
-            conda_subdir: "linux-64".into(),
-            max_glibc: None,
-        };
-
-        let candidates = list_all_versions(&index, "mylib", &target)
-            .await
-            .expect("list_all_versions must succeed");
-
-        // Only version 2.0 must be returned; 1.0 is unreachable (wrong arch,
-        // no sdist fallback).
-        assert_eq!(
-            candidates.len(),
-            1,
-            "only 1.0 with wrong arch + no sdist must be excluded; got {candidates:?}"
-        );
-        assert_eq!(candidates[0].version.to_string(), "2.0");
     }
 
     // ── favor-lock: resolve_preferring tests ─────────────────────────────────
@@ -1537,34 +1180,4 @@ platforms = [{ platform = "linux-64", glibc = "2.35" }]
         );
     }
 
-    /// The #sha256=<hex> fragment on wheel index links must be parsed into
-    /// `wheel.sha256`.  The fixture server appends a fake 64-hex-char sha256
-    /// to each wheel's link; verify it round-trips into the candidate.
-    #[tokio::test]
-    async fn list_all_versions_parses_sha256_fragment() {
-        let entries = vec![(
-            "mylib-1.0-py3-none-any.whl".to_string(),
-            b"wheel_bytes".to_vec(),
-        )];
-        let port = spawn_fixture_server(entries, 4).await;
-        let index = format!("http://127.0.0.1:{port}/simple/");
-        let target = WheelTarget {
-            python_version: "3.11".into(),
-            conda_subdir: "linux-64".into(),
-            max_glibc: None,
-        };
-
-        let candidates = list_all_versions(&index, "mylib", &target)
-            .await
-            .expect("list_all_versions must succeed");
-
-        assert_eq!(candidates.len(), 1);
-        let wheel = candidates[0].wheel.as_ref().expect("must have a wheel");
-        assert_eq!(
-            wheel.sha256.as_deref(),
-            // The fixture server appends `#sha256=aaa...aaa` (64 'a' chars).
-            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-            "sha256 from URL fragment must be parsed into the candidate"
-        );
-    }
 }

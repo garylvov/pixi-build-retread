@@ -10,9 +10,9 @@
 //!    with conda — exactly pixi's conda-first handoff.
 //! 2. `uv lock` the project, then `uv export --format pylock.toml` with
 //!    `--no-emit-package <name>` per conda-routed package.
-//! 3. Parse the PEP 751 pylock into the SAME closure/lock shapes the legacy
-//!    cascade produces (`crate::lock::LockWheel`), selecting ONE wheel per
-//!    package by tag priority (`crate::pypi::score_wheel`).
+//! 3. Parse the PEP 751 pylock into the closure/lock shapes the
+//!    materialization path consumes (`crate::lock::LockWheel`), selecting ONE
+//!    wheel per package by tag priority (`crate::pypi::score_wheel`).
 //!
 //! Constraint *provenance* is load-bearing: every generated constraint line
 //! carries a record of the conda source package it came from
@@ -22,8 +22,9 @@
 //! with altered inputs (spec §4c) — on conflict it reports and points at
 //! `retread solve`.
 //!
-//! Selected behind `[package.build.config] retread-resolver = "uv"`
-//! (default: `"legacy"`, the cascade/resolvo path — untouched).
+//! uv is the only resolver: this closure computation runs unconditionally
+//! for every bundle with uv-resolvable roots (v4.4.0; the `retread-resolver`
+//! knob and the historical cascade/resolvo mirror-solver are both gone).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};

@@ -311,6 +311,7 @@ fn pythons_for_rejects_bare_major_variant() {
         emit_pypi: false,
         bundle_mode: crate::config::BundleMode::Fat,
         courier: false,
+        courier_mode: Default::default(),
         blueprint: Default::default(),
         blueprint_sync: Default::default(),
         git_sources: std::collections::BTreeMap::new(),
@@ -354,6 +355,7 @@ fn pythons_for_accepts_dotted_variant() {
         emit_pypi: false,
         bundle_mode: crate::config::BundleMode::Fat,
         courier: false,
+        courier_mode: Default::default(),
         blueprint: Default::default(),
         blueprint_sync: Default::default(),
         git_sources: std::collections::BTreeMap::new(),
@@ -397,6 +399,7 @@ fn pythons_for_filters_bare_major_keeps_dotted() {
         emit_pypi: false,
         bundle_mode: crate::config::BundleMode::Fat,
         courier: false,
+        courier_mode: Default::default(),
         blueprint: Default::default(),
         blueprint_sync: Default::default(),
         git_sources: std::collections::BTreeMap::new(),
@@ -424,7 +427,6 @@ fn courier_pure_python_bundle_is_platform_specific_not_noarch() {
         extras: vec![],
         probe_decisions: vec![],
         solve_diagnostics: BTreeMap::new(),
-        conda_routed: vec![],
         auto_routed: vec![],
         uv_closure_names: Default::default(),
     };
@@ -481,7 +483,6 @@ fn produce_output_emits_auto_routed_conda_run_deps() {
         extras: vec![],
         probe_decisions: vec![],
         solve_diagnostics: BTreeMap::new(),
-        conda_routed: vec![],
         auto_routed: vec![
             ("numpy".to_string(), "2.1.0".to_string()),
             ("scipy".to_string(), "1.14.1".to_string()),
@@ -746,6 +747,7 @@ fn cfg() -> RetreadConfig {
         emit_pypi: false,
         bundle_mode: crate::config::BundleMode::Fat,
         courier: false,
+        courier_mode: Default::default(),
         blueprint: Default::default(),
         blueprint_sync: Default::default(),
         git_sources: std::collections::BTreeMap::new(),
@@ -794,7 +796,6 @@ fn solo_bundle(name: &str, requires: Vec<&str>) -> Bundle {
         extras: vec![],
         probe_decisions: vec![],
         solve_diagnostics: BTreeMap::new(),
-        conda_routed: vec![],
         auto_routed: vec![],
         uv_closure_names: Default::default(),
     }
@@ -1240,7 +1241,6 @@ fn vendored_sub_packages_dropped_from_run_deps() {
         ],
         probe_decisions: vec![],
         solve_diagnostics: BTreeMap::new(),
-        conda_routed: vec![],
         auto_routed: vec![],
         uv_closure_names: Default::default(),
     };
@@ -1395,7 +1395,6 @@ fn bundle_field_groups_entries_into_one_output() {
         ],
         probe_decisions: vec![],
         solve_diagnostics: BTreeMap::new(),
-        conda_routed: vec![],
         auto_routed: vec![],
         uv_closure_names: Default::default(),
     };
@@ -1488,7 +1487,6 @@ fn relaxed_pure_python_primary_pins_python_to_workspace_variant() {
         extras: vec![],
         probe_decisions: vec![],
         solve_diagnostics: BTreeMap::new(),
-        conda_routed: vec![],
         auto_routed: vec![],
         uv_closure_names: Default::default(),
     };
