@@ -1,0 +1,19 @@
+Error:   × failed to solve requirements of environment 'pm-isaaclab' for platform
+  │ 'linux-64'
+  ├─▶   × failed to solve the environment
+  │
+  ╰─▶ Cannot solve the request because of: The following packages are
+      incompatible
+      ├─ protomotions-deps-pack * can be installed with any of the following
+      options:
+      │  └─ protomotions-deps-pack 3.1 would require
+      │     └─ sentry-sdk >=2.64.0, which can be installed with any of the
+      following options:
+      │        └─ sentry-sdk 2.64.0
+      └─ isaaclab-2.3x-pack * cannot be installed because there are no viable
+      options:
+         └─ isaaclab-2.3x-pack 0.54.2 would require
+            └─ sentry-sdk ==2.29.1, which cannot be installed because there
+      are no viable options:
+               └─ sentry-sdk 2.29.1, which conflicts with the versions
+      reported above.

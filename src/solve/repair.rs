@@ -2168,6 +2168,19 @@ impl RepairPlanner {
         })
     }
 
+    /// Whether `name` resolves as one of THIS workspace's own composed
+    /// packs (`resolve_pack_dir`). Guardrail for tier 7 (two-pack
+    /// same-package clash, run-18 `sentry-sdk` fixture): a sibling
+    /// requirer that doesn't resolve to a pack this workspace itself
+    /// composed is a foreign/unresolvable name, and the clash is refused
+    /// rather than guessed at -- same doctrine `CondaRangeVsPackPin` and
+    /// the deps-from tiers already apply via `resolve_pack_dir`.
+    fn is_owned_pack(&self, editor: &ManifestEditor, name: &str) -> bool {
+        crate::workspace::WorkspaceManifest::load(editor.project_dir())
+            .and_then(|ws| resolve_pack_dir(&ws, editor.project_dir(), name))
+            .is_some()
+    }
+
     /// Doctrine-ordered candidate generation over every mention the
     /// generic extractor found. Only mentions inside a NAMED pack's
     /// conflict (`pack_name: Some`) can be attributed a resolvable owner
@@ -2370,6 +2383,80 @@ impl RepairPlanner {
                 reason: format!(
                     "generic fallback: auto-routed pin {} {} requires ABI anchor {} {} the env can't satisfy -- un-routing {} to PyPI",
                     req_mention.package, req_mention.spec, m.package, m.spec, req_mention.package
+                ),
+            });
+        }
+
+        // Tier 7: two-pack same-package clash (run-18 `sentry-sdk`
+        // fixture). The SAME package is pinned incompatibly by TWO of
+        // this workspace's own composed packs within one conflict -- an
+        // exact companion pin owned by the dead-end pack (`bundle`,
+        // e.g. `isaaclab-2.3x-pack 0.54.2 would require sentry-sdk
+        // ==2.29.1`) collides with a satisfiable floor/range owned by a
+        // SIBLING pack named elsewhere in the SAME error (e.g.
+        // `protomotions-deps-pack 3.1 would require sentry-sdk
+        // >=2.64.0`). Tiers 1-6 all classify every mention under the
+        // single `bundle` `extract_bundle_name` picked (the dead-end
+        // branch), so a sibling's own auto-routed pin is invisible to
+        // them and this shape falls through unrepaired (the generic
+        // engine never even engages: `candidates` stays empty).
+        //
+        // Repair: float the dead-end pack's own exact pin to a `>=`
+        // floor at its OWN pinned version (`==2.29.1` -> `>=2.29.1`).
+        // The sibling's floor is, by construction of this conflict shape,
+        // already proven satisfiable by resolvo ("can be installed with
+        // any of the following options") and is necessarily the higher
+        // of the two -- the dead-end branch says so explicitly
+        // ("conflicts with the versions reported above") -- so `>=` the
+        // dead-end pin's own version is sufficient to let conda pick
+        // whichever release clears both; no need to parse or compare the
+        // sibling's exact floor value (over-engineering the brief
+        // explicitly warns against).
+        //
+        // Guardrail: the sibling's requirer must itself resolve as one
+        // of this workspace's own composed packs (`is_owned_pack`) -- a
+        // same-package clash against an unresolvable/foreign requirer
+        // name is refused rather than guessed at, same doctrine every
+        // other pack-scoped tier already applies via `resolve_pack_dir`.
+        for m in mentions {
+            let Some(requirer) = &m.requirer else {
+                continue;
+            };
+            // Only the dead-end pack's OWN exact companion pin is a
+            // candidate for this tier's "victim" side.
+            if !requirer.eq_ignore_ascii_case(bundle) {
+                continue;
+            }
+            if is_abi_anchor(&m.package) || self.has_workspace_pin(editor, &m.package) {
+                continue;
+            }
+            let Some((op, version)) = leading_clause(&m.spec) else {
+                continue;
+            };
+            if op != "==" {
+                continue;
+            }
+            let sibling_owned = mentions.iter().any(|sm| {
+                sm.package.eq_ignore_ascii_case(&m.package)
+                    && sm.requirer.as_deref().is_some_and(|r| {
+                        !r.eq_ignore_ascii_case(bundle) && self.is_owned_pack(editor, r)
+                    })
+            });
+            if !sibling_owned {
+                continue;
+            }
+            out.push(FallbackCandidate {
+                tier: 7,
+                package: m.package.clone(),
+                pack_name: bundle.to_string(),
+                kind: PackOverrideKind::Override,
+                old_spec: Some(m.spec.clone()),
+                new_spec: format!(">={version}"),
+                ownership: Ownership::AutoRoutedPackPin,
+                tried_key: format!("{}@{bundle}#fallback-twopack", m.package),
+                reason: format!(
+                    "generic fallback: two-pack same-package clash -- `{bundle}`'s own exact pin {} floored to satisfy a sibling pack's own (already-satisfiable) higher floor",
+                    m.spec
                 ),
             });
         }
@@ -4065,6 +4152,8 @@ holosoma-gpu = { features = ["holosoma"] }
     );
     const TRITON_CUDA_VERSION_FALLBACK_FIXTURE: &str =
         include_str!("../../tests/fixtures/solve_errors/uv_closure_triton_cuda_version_abi.txt");
+    const SENTRY_SDK_TWO_PACK_FALLBACK_FIXTURE: &str =
+        include_str!("../../tests/fixtures/solve_errors/conda_two_pack_sentry_sdk.txt");
 
     #[test]
     fn classify_mention_ownership_abi_anchor_wins_regardless_of_pack() {
@@ -4418,6 +4507,96 @@ holosoma-gpu = { features = ["holosoma"] }
         .unwrap();
         let unrouted = crate::pack_overrides::unrouted_for_pack(&project_dir, &po.pack_pixi);
         assert!(unrouted.contains("triton"));
+    }
+
+    #[test]
+    fn end_to_end_run18_two_pack_sentry_sdk_floors_the_dead_end_exact_pin() {
+        // Run 18 shape (step4-lock-run18.log): NO specific rung recognizes
+        // this ("could not parse solver error" in the actual run) --
+        // `protomotions-deps-pack` would require `sentry-sdk >=2.64.0`
+        // (satisfiable: `sentry-sdk 2.64.0` exists) while the DEAD-END
+        // branch, `isaaclab-2.3x-pack`, would require `sentry-sdk
+        // ==2.29.1` ("conflicts with the versions reported above"). Both
+        // `protomotions-deps-pack` and `isaaclab-2.3x-pack` are this
+        // workspace's own composed packs, so tier 7 must float the
+        // dead-end pack's own exact pin to `>=2.29.1`.
+        let manifest_text = "[dependencies]\n\n\
+             [feature.pm-isaaclab.dependencies]\n\
+             \"protomotions-deps-pack\" = { path = \"./pypi-packs/protomotions-deps-pack\" }\n\
+             \"isaaclab-2.3x-pack\" = { path = \"./pypi-packs/isaaclab-2.3x-pack\" }\n\n\
+             [environments]\npm-isaaclab = { features = [\"pm-isaaclab\"] }\n";
+        let path = temp_manifest(manifest_text);
+        let project_dir = path.parent().unwrap().to_path_buf();
+        for (name, version) in [
+            ("protomotions-deps-pack", "3.1"),
+            ("isaaclab-2.3x-pack", "0.54.2"),
+        ] {
+            let pack_dir = project_dir.join(format!("pypi-packs/{name}"));
+            std::fs::create_dir_all(&pack_dir).unwrap();
+            std::fs::write(
+                pack_dir.join("pixi.toml"),
+                format!("[package]\nname = \"{name}\"\nversion = \"{version}\"\n"),
+            )
+            .unwrap();
+        }
+
+        let editor = ManifestEditor::open(path).unwrap();
+        let mut tried = TriedState::default();
+        let mut planner = RepairPlanner::new("default".into());
+
+        let (result, po) = planner
+            .generic_fallback_repair(&editor, &mut tried, SENTRY_SDK_TWO_PACK_FALLBACK_FIXTURE, 1)
+            .expect("generic fallback engine must find an actionable mention");
+        let outcome = result.expect("must floor the dead-end pack's exact pin, not exhaust");
+        assert_eq!(outcome.attempt.strategy, "pypi_override");
+        assert_eq!(outcome.attempt.old_spec.as_deref(), Some("==2.29.1"));
+        assert_eq!(outcome.attempt.new_spec.as_deref(), Some(">=2.29.1"));
+        let po = po.expect("expected a pack-override write");
+        assert_eq!(po.bundle, "isaaclab-2.3x-pack");
+        assert_eq!(po.package, "sentry-sdk");
+        assert_eq!(po.spec, ">=2.29.1");
+        assert_eq!(po.kind, PackOverrideKind::Override);
+    }
+
+    #[test]
+    fn run18_two_pack_sentry_sdk_refused_when_sibling_pack_is_foreign() {
+        // Same fixture as
+        // `end_to_end_run18_two_pack_sentry_sdk_floors_the_dead_end_exact_pin`,
+        // but `protomotions-deps-pack` (the sibling naming the
+        // satisfiable `>=2.64.0` floor) is NOT one of this workspace's
+        // own composed packs (no `path-dependencies` entry at all) --
+        // tier 7's guardrail must refuse rather than guess, so the
+        // dead-end pin is left untouched and the engine reports nothing
+        // actionable.
+        let manifest_text = "[dependencies]\n\n\
+             [feature.pm-isaaclab.dependencies]\n\
+             \"isaaclab-2.3x-pack\" = { path = \"./pypi-packs/isaaclab-2.3x-pack\" }\n\n\
+             [environments]\npm-isaaclab = { features = [\"pm-isaaclab\"] }\n";
+        let path = temp_manifest(manifest_text);
+        let project_dir = path.parent().unwrap().to_path_buf();
+        let pack_dir = project_dir.join("pypi-packs/isaaclab-2.3x-pack");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        std::fs::write(
+            pack_dir.join("pixi.toml"),
+            "[package]\nname = \"isaaclab-2.3x-pack\"\nversion = \"0.54.2\"\n",
+        )
+        .unwrap();
+
+        let editor = ManifestEditor::open(path).unwrap();
+        let mut tried = TriedState::default();
+        let mut planner = RepairPlanner::new("default".into());
+
+        assert!(
+            planner
+                .generic_fallback_repair(
+                    &editor,
+                    &mut tried,
+                    SENTRY_SDK_TWO_PACK_FALLBACK_FIXTURE,
+                    1
+                )
+                .is_none(),
+            "must refuse a same-package clash against a foreign/unresolvable sibling pack"
+        );
     }
 
     #[test]
