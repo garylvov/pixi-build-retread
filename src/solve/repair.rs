@@ -2648,13 +2648,54 @@ impl RepairPlanner {
             let Some(version) = pack_emitted_pin_floor(&m.spec) else {
                 continue;
             };
-            let sibling_owned = mentions.iter().any(|sm| {
+            let Some(sibling) = mentions.iter().find(|sm| {
                 sm.package.eq_ignore_ascii_case(&m.package)
                     && sm.requirer.as_deref().is_some_and(|r| {
                         !r.eq_ignore_ascii_case(bundle) && self.is_owned_pack(editor, r)
                     })
-            });
-            if !sibling_owned {
+            }) else {
+                continue;
+            };
+            // Tier 8 (run-33): PROVABLY DISJOINT two-pack ranges. Run
+            // 33's ladder proved the float cannot converge here: the
+            // dead-end pack's own PyPI metadata re-imposes its cap on
+            // the very next iteration (tier-2 narrowed the floated
+            // `wrapt >=1.16.0` right back to `<2` -- isaaclab's closure
+            // genuinely requires wrapt<2 while protomotions locked
+            // 2.2.2), and an unbounded float would anyway make conda
+            // pick a 2.x while the pack's own wheels were locked against
+            // 1.x. When the two intervals have an EMPTY intersection,
+            // conda must simply stop arbitrating this package: un-route
+            // it from BOTH packs so each env installs its own locked
+            // wheel via the courier, and no conda run-dep exists to
+            // clash. Overlapping (or unprovable -- missing/unparseable
+            // interval) pairs keep the tier-7 float, which can converge
+            // by letting uv re-pick inside the overlap.
+            let disjoint = match (pack_pin_interval(&m.spec), pack_pin_interval(&sibling.spec)) {
+                (Some(a), Some(b)) => pack_pin_intervals_disjoint(&a, &b),
+                _ => false,
+            };
+            if disjoint {
+                let sibling_pack = sibling
+                    .requirer
+                    .as_deref()
+                    .expect("sibling matched via requirer");
+                for (pack, spec) in [(bundle, &m.spec), (sibling_pack, &sibling.spec)] {
+                    out.push(FallbackCandidate {
+                        tier: 8,
+                        package: m.package.clone(),
+                        pack_name: pack.to_string(),
+                        kind: PackOverrideKind::Unroute,
+                        old_spec: Some(spec.clone()),
+                        new_spec: String::new(),
+                        ownership: Ownership::AutoRoutedPackPin,
+                        tried_key: format!("{}@{pack}#fallback-disjoint-unroute", m.package),
+                        reason: format!(
+                            "generic fallback: two-pack DISJOINT ranges for {} ({} vs {}) -- no version satisfies both; un-routing from `{pack}` so each pack ships its own locked wheel",
+                            m.package, m.spec, sibling.spec
+                        ),
+                    });
+                }
                 continue;
             }
             out.push(FallbackCandidate {
@@ -2927,6 +2968,70 @@ fn pack_emitted_pin_floor(spec: &str) -> Option<String> {
         return Some(v.trim().to_string());
     }
     None
+}
+
+/// The version interval `[floor, cap)` (or `[floor, cap]` for an exact
+/// pin) of a pack-emission-shaped spec, for the tier-7/8 disjointness
+/// test: `==X` -> `(X, X, inclusive)`; `>=X,<Y` -> `(X, Y, exclusive)`.
+/// `None` for anything that isn't a pack emission shape (bare floors,
+/// lone caps, unparseable versions) -- no interval means no disjointness
+/// PROOF, and the caller falls back to the float repair.
+fn pack_pin_interval(
+    spec: &str,
+) -> Option<(
+    rattler_conda_types::Version,
+    rattler_conda_types::Version,
+    bool,
+)> {
+    use rattler_conda_types::Version;
+    use std::str::FromStr as _;
+    let mut clauses = spec.split(',');
+    let first = clauses.next()?.trim();
+    let second = clauses.next().map(str::trim);
+    if clauses.next().is_some() {
+        return None;
+    }
+    if let Some(v) = first.strip_prefix("==")
+        && second.is_none()
+    {
+        let v = Version::from_str(v.trim()).ok()?;
+        return Some((v.clone(), v, true));
+    }
+    if let Some(f) = first.strip_prefix(">=")
+        && let Some(s) = second
+        && let Some(c) = s.strip_prefix('<')
+        && !c.starts_with('=')
+    {
+        let floor = Version::from_str(f.trim()).ok()?;
+        let cap = Version::from_str(c.trim()).ok()?;
+        return Some((floor, cap, false));
+    }
+    None
+}
+
+/// Whether two pack-pin intervals (from [`pack_pin_interval`]) have an
+/// EMPTY intersection -- the proof tier 8 requires before un-routing
+/// both sides of a two-pack clash (an overlapping pair stays on tier
+/// 7's float, which can converge by letting uv re-pick inside the
+/// overlap).
+fn pack_pin_intervals_disjoint(
+    a: &(
+        rattler_conda_types::Version,
+        rattler_conda_types::Version,
+        bool,
+    ),
+    b: &(
+        rattler_conda_types::Version,
+        rattler_conda_types::Version,
+        bool,
+    ),
+) -> bool {
+    let (a_floor, a_cap, a_incl) = a;
+    let (b_floor, b_cap, b_incl) = b;
+    // a entirely below b: a.cap < b.floor, or touching at an exclusive cap.
+    let a_below = a_cap < b_floor || (a_cap == b_floor && !a_incl);
+    let b_below = b_cap < a_floor || (b_cap == a_floor && !b_incl);
+    a_below || b_below
 }
 
 /// The first upper-bound (`<`/`<=`) clause in a possibly-multi-clause
@@ -4470,6 +4575,8 @@ holosoma-gpu = { features = ["holosoma"] }
         include_str!("../../tests/fixtures/solve_errors/nested_conda_cap_reversed_run31.txt");
     const CONDA_TWO_PACK_WRAPT_RANGE_RUN32_FIXTURE: &str =
         include_str!("../../tests/fixtures/solve_errors/conda_two_pack_wrapt_range_run32.txt");
+    const CONDA_TWO_PACK_WRAPT_DISJOINT_RUN33_FIXTURE: &str =
+        include_str!("../../tests/fixtures/solve_errors/conda_two_pack_wrapt_disjoint_run33.txt");
     const PILLOW_MOVIEPY_FALLBACK_FIXTURE: &str = include_str!(
         "../../tests/fixtures/solve_errors/pypi_conda_metadata_skew_pillow_moviepy.txt"
     );
@@ -4916,47 +5023,144 @@ holosoma-gpu = { features = ["holosoma"] }
     }
 
     #[test]
-    fn end_to_end_run32_two_pack_range_clash_floats_dead_end_range() {
-        // Run 32 shape (verbatim trace): TWO packs' bounded-range
-        // emissions for the SAME package are disjoint --
+    fn end_to_end_run32_run33_disjoint_two_pack_ranges_unroute_both_sides() {
+        // Runs 32+33 shape (verbatim traces): TWO packs' bounded-range
+        // emissions for the SAME package are PROVABLY DISJOINT --
         // protomotions-deps-pack locked wrapt 2.2.2 (`>=2.2.2,<3`,
-        // satisfiable branch) while isaaclab-2.3x-pack locked 1.16.0
-        // (`>=1.16.0,<2`, dead-end branch). Tier 7 handled exactly this
-        // clash in its exact-pin form (run 18's sentry-sdk) but skipped
-        // range-form pins (`op != "=="`), so run 32 died "unparseable".
-        // The dead-end pack's range must float to `>=floor` (dropping
-        // the `<2` cap that excludes the sibling's proven-satisfiable
-        // 2.2.2); uv then re-picks inside the widened range and the next
-        // render's emission follows.
+        // satisfiable branch) while isaaclab-2.3x-pack locked 1.x
+        // (`>=1.16.0,<2` in run 32, `>=1.17.3,<2` in run 33; dead-end
+        // branch). Run 33 PROVED the tier-7 float cannot converge here:
+        // the dead-end pack's own PyPI metadata re-imposed the `<2` cap
+        // one iteration later (tier-2 narrow), then exhausted. The
+        // terminal repair is tier 8: un-route the package from BOTH
+        // packs so each env installs its own locked wheel and conda
+        // stops arbitrating.
+        for (label, fixture, dead_end_spec) in [
+            (
+                "run 32",
+                CONDA_TWO_PACK_WRAPT_RANGE_RUN32_FIXTURE,
+                ">=1.16.0,<2",
+            ),
+            (
+                "run 33",
+                CONDA_TWO_PACK_WRAPT_DISJOINT_RUN33_FIXTURE,
+                ">=1.17.3,<2",
+            ),
+        ] {
+            let (path, _project_dir) = run20_two_pack_workspace(false);
+            let editor = ManifestEditor::open(path).unwrap();
+            let mut tried = TriedState::default();
+            let mut planner = RepairPlanner::new("default".into());
+
+            let applied = planner
+                .generic_fallback_repair_batch(&editor, &mut tried, fixture, 1)
+                .unwrap_or_else(|| panic!("[{label}] engine must find the clash actionable"))
+                .unwrap_or_else(|_| panic!("[{label}] must apply, not exhaust"));
+            let wrapt: Vec<_> = applied
+                .iter()
+                .filter(|(o, _)| o.attempt.package == "wrapt")
+                .collect();
+            assert_eq!(
+                wrapt.len(),
+                2,
+                "[{label}] BOTH packs must get an un-route in one batch: {:?}",
+                applied
+                    .iter()
+                    .map(|(o, _)| (&o.attempt.package, &o.attempt.new_spec))
+                    .collect::<Vec<_>>()
+            );
+            let mut by_pack: Vec<(&str, &PackOverrideWrite)> = wrapt
+                .iter()
+                .map(|(_, po)| {
+                    let po = po.as_ref().expect("pack-override write");
+                    (po.bundle.as_str(), po)
+                })
+                .collect();
+            by_pack.sort_by_key(|(b, _)| *b);
+            assert_eq!(
+                by_pack.iter().map(|(b, _)| *b).collect::<Vec<_>>(),
+                vec!["isaaclab-2.3x-pack", "protomotions-deps-pack"],
+                "[{label}]"
+            );
+            for (_, po) in &by_pack {
+                assert_eq!(po.kind, PackOverrideKind::Unroute, "[{label}]");
+                assert_eq!(po.package, "wrapt", "[{label}]");
+            }
+            let dead_end = wrapt
+                .iter()
+                .find(|(_, po)| po.as_ref().unwrap().bundle == "isaaclab-2.3x-pack")
+                .unwrap();
+            assert_eq!(
+                dead_end.0.attempt.old_spec.as_deref(),
+                Some(dead_end_spec),
+                "[{label}]"
+            );
+        }
+    }
+
+    #[test]
+    fn end_to_end_overlapping_two_pack_ranges_still_float_not_unroute() {
+        // Control for tier 8: when the two packs' ranges OVERLAP (here
+        // the dead-end cap is raised `<2` -> `<3`, so 2.2.2 satisfies
+        // both), the float remains the preferred repair -- uv can
+        // re-pick inside the overlap; un-routing would needlessly fork
+        // the package out of conda.
+        let overlapping = CONDA_TWO_PACK_WRAPT_RANGE_RUN32_FIXTURE
+            .replace("wrapt >=1.16.0,<2", "wrapt >=1.16.0,<3");
         let (path, _project_dir) = run20_two_pack_workspace(false);
         let editor = ManifestEditor::open(path).unwrap();
         let mut tried = TriedState::default();
         let mut planner = RepairPlanner::new("default".into());
 
         let applied = planner
-            .generic_fallback_repair_batch(
-                &editor,
-                &mut tried,
-                CONDA_TWO_PACK_WRAPT_RANGE_RUN32_FIXTURE,
-                1,
-            )
+            .generic_fallback_repair_batch(&editor, &mut tried, &overlapping, 1)
             .expect("engine must find the two-pack range clash actionable")
             .expect("must apply, not exhaust");
         let (outcome, po) = applied
             .iter()
             .find(|(o, _)| o.attempt.package == "wrapt")
             .expect("wrapt candidate expected");
-        assert_eq!(outcome.attempt.strategy, "pypi_override");
-        assert_eq!(outcome.attempt.old_spec.as_deref(), Some(">=1.16.0,<2"));
-        assert_eq!(outcome.attempt.new_spec.as_deref(), Some(">=1.16.0"));
-        let po = po.as_ref().expect("expected a pack-override write");
+        assert_eq!(outcome.attempt.old_spec.as_deref(), Some(">=1.16.0,<3"));
         assert_eq!(
-            po.bundle, "isaaclab-2.3x-pack",
-            "the DEAD-END pack's range floats, not the satisfiable sibling's"
+            outcome.attempt.new_spec.as_deref(),
+            Some(">=1.16.0"),
+            "overlapping ranges must float, not un-route"
         );
-        assert_eq!(po.package, "wrapt");
-        assert_eq!(po.spec, ">=1.16.0");
+        let po = po.as_ref().expect("expected a pack-override write");
+        assert_eq!(po.bundle, "isaaclab-2.3x-pack");
         assert_eq!(po.kind, PackOverrideKind::Override);
+        assert_eq!(
+            applied
+                .iter()
+                .filter(|(o, _)| o.attempt.package == "wrapt")
+                .count(),
+            1,
+            "no dual un-route for overlapping ranges"
+        );
+    }
+
+    #[test]
+    fn pack_pin_interval_disjointness_table() {
+        let iv = |s: &str| pack_pin_interval(s);
+        let dj = |a: &str, b: &str| pack_pin_intervals_disjoint(&iv(a).unwrap(), &iv(b).unwrap());
+        // Genuinely disjoint (run 32/33 wrapt).
+        assert!(dj(">=1.16.0,<2", ">=2.2.2,<3"));
+        assert!(dj(">=2.2.2,<3", ">=1.16.0,<2"), "symmetric");
+        // Touching at an exclusive cap: <2 excludes 2.0.0 -> disjoint.
+        assert!(dj(">=1.0,<2", ">=2.0,<3"));
+        // Overlapping.
+        assert!(!dj(">=1.16.0,<3", ">=2.2.2,<3"));
+        assert!(!dj(">=1.0,<2", ">=1.5,<3"));
+        // Exact pin inside / outside a range.
+        assert!(!dj("==2.2.2", ">=2.0,<3"));
+        assert!(dj("==1.5.0", ">=2.0,<3"));
+        // Exact == exact.
+        assert!(dj("==1.0", "==2.0"));
+        assert!(!dj("==2.0", "==2.0"));
+        // Unprovable shapes yield no interval (caller falls back to float).
+        assert!(iv(">=2.64.0").is_none(), "bare floor: no proof");
+        assert!(iv("<2").is_none());
+        assert!(iv("*").is_none());
     }
 
     #[test]
