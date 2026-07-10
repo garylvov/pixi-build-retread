@@ -871,17 +871,61 @@ impl RegexConflictParser {
         }
         // Fallback for direct (non-JSON-RPC) resolvo/conda-solver prose,
         // which never carries a "computing uv closure for bundle `X`:"
-        // label at all: the OUTERMOST "<name> <ver> would require" clause's
-        // subject is, in every rung this hardening series has seen, the
+        // label at all: a "<name> <ver> would require" clause's subject
+        // is, in every rung this hardening series has seen, the
         // pack/bundle this workspace composed (the same capture
         // `conda_incompatible_exact`/`conda_range_vs_pack_pin`'s regexes
         // already rely on) -- best-effort, only actually load-bearing
         // downstream once `resolve_pack_dir` confirms it names one of
         // this workspace's own composed packs.
+        //
+        // When resolvo names MULTIPLE packs (run-17's pandas fixture:
+        // both `isaaclab-2.3x-pack` and `protomotions-deps-pack` appear,
+        // each with their own single-version "would require" clause),
+        // the textually-FIRST match is not necessarily the actual
+        // failing pack -- resolvo prints a pack's SATISFIABLE branch
+        // ("* can be installed with any of the following options") for
+        // context before the branch that actually dead-ends ("* cannot
+        // be installed because there are no viable options"). Prefer a
+        // "would require" match whose nearest preceding branch marker is
+        // "cannot be installed" (a real dead end) over one under "can be
+        // installed" (a satisfiable alternative merely shown for
+        // context); among equally-qualified matches, keep the first
+        // (outermost), preserving prior behavior for single-pack
+        // fixtures and fixtures with no branch markers at all.
+        //
+        // Terminal-wrapped source text (every fixture decoded verbatim
+        // from a captured log) routinely breaks "cannot be installed"
+        // across a line boundary mid-phrase ("cannot be\n    installed
+        // because..."); scanning raw `stderr` for that substring misses
+        // it. Flatten first (same ANSI-strip + gutter-strip +
+        // whitespace-collapse `extract_generic_mentions` already relies
+        // on) so both the "would require" regex and the marker substring
+        // search operate on the same rewrapped text.
+        let text = self.flatten_for_generic_scan(stderr);
         let would_require =
             Regex::new(r"(?s)([a-zA-Z][a-zA-Z0-9_.-]*)\s+[0-9][0-9a-zA-Z.]*\s+would\s+require")
                 .ok()?;
-        would_require.captures(stderr).map(|c| c[1].to_string())
+        let mut first: Option<String> = None;
+        for caps in would_require.captures_iter(&text) {
+            let start = caps.get(0).expect("group 0 always matches").start();
+            let name = caps[1].to_string();
+            if first.is_none() {
+                first = Some(name.clone());
+            }
+            let preceding = &text[..start];
+            let cannot_pos = preceding.rfind("cannot be installed");
+            let can_pos = preceding.rfind("can be installed");
+            let is_dead_end_branch = match (cannot_pos, can_pos) {
+                (Some(c), Some(k)) => c > k,
+                (Some(_), None) => true,
+                _ => false,
+            };
+            if is_dead_end_branch {
+                return Some(name);
+            }
+        }
+        first
     }
 
     pub fn is_post_widen_conda_unsat(stderr: &str) -> bool {
@@ -1055,6 +1099,16 @@ mod tests {
     // `>=`/`>` floor).
     const CONDA_INCOMPATIBLE_TORCHVISION_EXACT: &str =
         include_str!("../../tests/fixtures/solve_errors/conda_incompatible_torchvision_exact.txt");
+    // Run 17 fixture (depsfrom-proof-brief.md, verbatim
+    // `.retread/solve-conflicts/`): TWO packs named in the same
+    // resolvo tree, each with a single-version "would require" clause --
+    // `isaaclab-2.3x-pack` under a "can be installed" (satisfiable,
+    // shown for context) branch, `protomotions-deps-pack` under the
+    // actual "cannot be installed" dead end that owns `pandas==3.0.3`.
+    // The textually-first "would require" belongs to isaaclab-2.3x-pack;
+    // the correct owner is protomotions-deps-pack.
+    const CONDA_TWO_PACK_PANDAS_PYTZ: &str =
+        include_str!("../../tests/fixtures/solve_errors/conda_two_pack_pandas_pytz.txt");
     // Run 8 fixture (depsfrom-proof-brief.md, verbatim
     // `.retread/solve-conflicts/lock-2.txt`): the workspace's own
     // `setuptools >=68,<81` conda pin (declared directly in several
@@ -1459,6 +1513,20 @@ mod tests {
         assert_eq!(
             p.extract_bundle_name(NESTED_CONDA_CAP_PYTORCH_SETUPTOOLS),
             Some("isaaclab-2.3x-pack".to_string())
+        );
+    }
+
+    /// Run-17 wrong-owner bug: when two packs are each named with their
+    /// own "would require" clause, the actual dead-end pack (marked
+    /// "cannot be installed") must win over a merely-satisfiable pack
+    /// shown for context (marked "can be installed"), even though the
+    /// satisfiable pack's clause appears FIRST in the text.
+    #[test]
+    fn extract_bundle_name_prefers_the_dead_end_pack_over_a_satisfiable_one_shown_first() {
+        let p = RegexConflictParser::new();
+        assert_eq!(
+            p.extract_bundle_name(CONDA_TWO_PACK_PANDAS_PYTZ),
+            Some("protomotions-deps-pack".to_string())
         );
     }
 

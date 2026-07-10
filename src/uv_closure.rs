@@ -314,7 +314,16 @@ pub fn route_metadata_consistent(
 
     for dep in depends {
         let trimmed = dep.trim();
-        let mut parts = trimmed.splitn(2, char::is_whitespace);
+        // Conda dep lines are `name version build` (3 whitespace-separated
+        // fields, build optional) -- e.g. `python_abi 3.13.* *_cp313`. A
+        // 2-way split leaves the build string glued onto the version
+        // (`"3.13.* *_cp313"`), which `VersionSpec::from_str` cannot parse,
+        // silently falling through the `let Ok(spec) = ... else { continue }`
+        // guard below and disarming this entire check for every anchor that
+        // carries a build tag (python_abi always does). Match
+        // `split_conda_dep_line`'s (`workspace.rs`) 3-way split so the build
+        // field is discarded here too.
+        let mut parts = trimmed.splitn(3, char::is_whitespace);
         let Some(raw_name) = parts.next() else {
             continue;
         };
@@ -355,8 +364,18 @@ pub fn route_metadata_consistent(
         // build's requirement against the workspace's concretely pinned
         // anchor instead. Only an EXACT workspace pin arms the check, so it
         // never over-refuses a range the build might legally fall inside.
-        if crate::solve::is_abi_anchor(&dep_name)
-            && let Some(anchor_spec) = abi_anchor_pins.get(&dep_name)
+        //
+        // Deliberately keyed by `raw_name`, NOT the PEP503-canonicalized
+        // `dep_name`: `ABI_ANCHOR_NAMES` and `abi_anchor_pins` are both
+        // populated from raw conda dependency identifiers, which use
+        // underscores conda-side names never do (`python_abi`, the
+        // `gcc_`/`sysroot_`-prefixed compiler families) -- canonicalizing
+        // to `dep_name` turns `python_abi` into `python-abi`, which
+        // matches neither `ABI_ANCHOR_NAMES`'s literal entry nor the
+        // anchor map's key, silently disarming the check for every
+        // underscore-named anchor (run 17's root cause for `python_abi`).
+        if crate::solve::is_abi_anchor(raw_name)
+            && let Some(anchor_spec) = abi_anchor_pins.get(raw_name)
             && let Some(pinned) = exact_anchor_version(anchor_spec)
             && !spec.matches(&pinned)
         {
@@ -3387,6 +3406,51 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
                 "triton",
                 "3.6.0",
                 &["cuda-version >=12.9,<13".to_string()],
+                &BTreeMap::new(),
+                &anchors,
+            ),
+            Ok(())
+        );
+    }
+
+    /// Run-17 gap: the routed build's depend line carries a conda BUILD
+    /// string after the version (`python_abi 3.13.* *_cp313`), the real
+    /// shape every python_abi depend takes. A 2-way split left
+    /// `"3.13.* *_cp313"` as the spec, which `VersionSpec::from_str`
+    /// cannot parse, so the check silently skipped and let
+    /// `pandas==3.0.3` (needing `python_abi 3.13.*`) route into a
+    /// python-3.11 env. The 3-way split (matching `split_conda_dep_line`)
+    /// must strip the build field and let the anchor contradiction fire.
+    #[test]
+    fn route_metadata_consistent_rejects_abi_anchor_with_build_string() {
+        let mut anchors = BTreeMap::new();
+        anchors.insert("python_abi".to_string(), "==3.11".to_string());
+        let err = route_metadata_consistent(
+            "pandas",
+            "3.0.3",
+            &["python_abi 3.13.* *_cp313".to_string()],
+            &BTreeMap::new(),
+            &anchors,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("python-abi") || err.contains("python_abi"),
+            "reason should name the python_abi anchor: {err}"
+        );
+    }
+
+    /// Same build-string shape, but the requirement DOES admit the
+    /// workspace's exact anchor pin -- route proceeds (build string is
+    /// discarded, not treated as part of the version spec).
+    #[test]
+    fn route_metadata_consistent_accepts_abi_anchor_with_build_string() {
+        let mut anchors = BTreeMap::new();
+        anchors.insert("python_abi".to_string(), "==3.11".to_string());
+        assert_eq!(
+            route_metadata_consistent(
+                "pandas",
+                "2.2.0",
+                &["python_abi 3.11.* *_cp311".to_string()],
                 &BTreeMap::new(),
                 &anchors,
             ),

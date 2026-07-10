@@ -2572,7 +2572,7 @@ async fn uv_group_closure(
     // build requiring a conda-only anchor version the env can't provide
     // is refused up front (run 16c: `triton ==3.6.0` -> `cuda-version
     // >=12.9,<13` against a cuda-12.8 workspace).
-    let abi_anchor_pins: std::collections::BTreeMap<String, String> =
+    let mut abi_anchor_pins: std::collections::BTreeMap<String, String> =
         if let (Some(manifest), Some(ws_dir)) = (manifest_opt.as_ref(), workspace_dir) {
             manifest
                 .consuming_env_dependencies(ws_dir, source_dir)
@@ -2583,6 +2583,22 @@ async fn uv_group_closure(
         } else {
             Default::default()
         };
+    // `python_abi` is never written directly in a manifest (users pin
+    // `python`; conda derives the cp-tag ABI constraint from it), so the
+    // scan above can never populate it from `consuming_env_dependencies`
+    // -- the workspace's exact `python` pin never gets a chance to arm
+    // the anchor check for it (run 17: `pandas==3.0.3` needing
+    // `python_abi 3.13.*` routed clean against a python-3.11 workspace
+    // because the anchor map had no `python_abi` entry at all). Synthesize
+    // one from the exact `python` pin, the same numeric major.minor a
+    // routed build's `python_abi X.Y.*` depend is checked against
+    // (`route_metadata_consistent` only reads the numeric version, the
+    // build/cp-tag suffix is discarded).
+    if !abi_anchor_pins.contains_key("python_abi")
+        && let Some(python_pin) = abi_anchor_pins.get("python").cloned()
+    {
+        abi_anchor_pins.insert("python_abi".to_string(), python_pin);
+    }
     let auto_route_opts = crate::uv_closure::AutoRouteOptions {
         enabled: effective.auto_route,
         keep_pypi: effective

@@ -1,0 +1,23 @@
+Error:   × failed to solve requirements of environment 'pm-isaaclab' for platform
+  │ 'linux-64'
+  ├─▶   × failed to solve the environment
+  │
+  ╰─▶ Cannot solve the request because of: The following packages are
+      incompatible
+      ├─ isaaclab-2.3x-pack * can be installed with any of the following
+      options:
+      │  └─ isaaclab-2.3x-pack 0.54.2 would require
+      │     └─ pytz ==2024.1, which can be installed with any of the following
+      options:
+      │        └─ pytz 2024.1
+      └─ protomotions-deps-pack * cannot be installed because there are no
+      viable options:
+         └─ protomotions-deps-pack 3.1 would require
+            └─ pandas ==3.0.3, which cannot be installed because there are no
+      viable options:
+               ├─ pandas 3.0.3 would constrain
+               │  └─ pytz >=2024.2, which conflicts with any installable
+      versions previously reported
+               └─ pandas 3.0.3 | 3.0.3 | 3.0.3 | 3.0.3 would require
+                  └─ python_abi 3.13.* *_cp313, for which no candidates were
+      found.
