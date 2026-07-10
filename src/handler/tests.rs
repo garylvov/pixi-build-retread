@@ -473,10 +473,12 @@ fn courier_pure_python_bundle_is_platform_specific_not_noarch() {
 #[test]
 fn produce_output_emits_auto_routed_conda_run_deps() {
     // M2 (v4.3.0): packages the uv auto-route loop moved to conda must
-    // land as exact-pinned conda run-deps of the stub output — including
-    // deep transitives no shipped wheel's Requires-Dist names (scipy
-    // below). For a name a wheel DOES declare (numpy), the auto-route
-    // exact pin wins over the wheel's looser spec (first-insert dedup).
+    // land as conda run-deps of the stub output — including deep
+    // transitives no shipped wheel's Requires-Dist names (scipy below).
+    // For a name a wheel DOES declare (numpy), the auto-route pin wins
+    // over the wheel's looser spec (first-insert dedup). Since the
+    // bounded-range fix, non-deps-from, non-anchor, non-overridden pins
+    // are emitted as `>=locked,<next-major` rather than an exact `==`.
     let bundle = Bundle {
         conda_name: "auto-pack".into(),
         primary: rw(
@@ -500,12 +502,12 @@ fn produce_output_emits_auto_routed_conda_run_deps() {
         .map(|d| (d.name.clone(), format_packagespec(&d.spec)))
         .collect();
     assert!(
-        deps.contains(&("numpy".to_string(), "==2.1.0".to_string())),
-        "auto-routed numpy must be an exact-pinned run-dep (won over the \
-         wheel's numpy>=1.21): {deps:?}"
+        deps.contains(&("numpy".to_string(), ">=2.1.0,<3".to_string())),
+        "auto-routed numpy must be a bounded-range run-dep floored at the \
+         locked version (won over the wheel's numpy>=1.21): {deps:?}"
     );
     assert!(
-        deps.contains(&("scipy".to_string(), "==1.14.1".to_string())),
+        deps.contains(&("scipy".to_string(), ">=1.14.1,<2".to_string())),
         "auto-routed transitive scipy must be a run-dep even though no \
          shipped wheel names it: {deps:?}"
     );
@@ -532,7 +534,7 @@ fn produce_output_emits_auto_routed_conda_run_deps() {
         .collect();
     assert!(
         deps.iter()
-            .any(|(n, s)| n == "numpy" && s != "==2.1.0" && !s.trim().is_empty()),
+            .any(|(n, s)| n == "numpy" && s != ">=2.1.0,<3" && !s.trim().is_empty()),
         "{deps:?}"
     );
     assert!(!deps.iter().any(|(n, _)| n == "scipy"), "{deps:?}");
@@ -570,11 +572,129 @@ fn produce_output_softens_deps_from_floor_pin_to_floor_spec() {
         .collect();
     assert!(
         deps.contains(&("setuptools".to_string(), ">=69.5.1".to_string())),
-        "deps-from-originated exact pin must be softened to a floor: {deps:?}"
+        "deps-from-originated exact pin must be softened to an unbounded \
+         floor (not a bounded range -- the deps-from softening path takes \
+         priority over the bounded-range path): {deps:?}"
     );
     assert!(
-        deps.contains(&("numpy".to_string(), "==2.1.0".to_string())),
-        "non-deps-from auto-routed pins stay exact: {deps:?}"
+        deps.contains(&("numpy".to_string(), ">=2.1.0,<3".to_string())),
+        "non-deps-from auto-routed pins get a bounded range, not an exact \
+         pin: {deps:?}"
+    );
+}
+
+// --- bounded_range_ceiling / auto-routed pin emission ----------------------
+
+#[test]
+fn bounded_range_ceiling_caps_at_next_major() {
+    assert_eq!(bounded_range_ceiling("1.26.4").as_deref(), Some("2"));
+    assert_eq!(bounded_range_ceiling("12.8").as_deref(), Some("13"));
+    assert_eq!(bounded_range_ceiling("2.0.0").as_deref(), Some("3"));
+}
+
+#[test]
+fn bounded_range_ceiling_zero_x_caps_at_next_minor() {
+    // semver: pre-1.0 releases treat the minor component as the
+    // breaking axis, so 0.x auto-routed pins cap at the next MINOR
+    // instead of jumping straight to `<1`.
+    assert_eq!(bounded_range_ceiling("0.20.1").as_deref(), Some("0.21"));
+    assert_eq!(bounded_range_ceiling("0.9.0").as_deref(), Some("0.10"));
+    assert_eq!(bounded_range_ceiling("0").as_deref(), Some("0.1"));
+}
+
+#[test]
+fn bounded_range_ceiling_unparseable_returns_none() {
+    assert!(bounded_range_ceiling("not-a-version").is_none());
+    assert!(bounded_range_ceiling("").is_none());
+}
+
+#[test]
+fn produce_output_auto_routed_pin_widens_to_bounded_range() {
+    // The core fix under test: a plain (non-floor) auto-routed pin
+    // widens from the exact `==X.Y.Z` uv resolved to `>=X.Y.Z,<next-major`
+    // -- floored at the locked version so the uv-solved closure it was
+    // resolved against still installs, capped so the conda solver can't
+    // pick something wildly newer than what the pack was ever tested with.
+    let bundle = Bundle {
+        auto_routed: vec![("pandas".to_string(), "2.2.3".to_string(), false)],
+        ..solo_bundle("range-pack", vec![])
+    };
+    let out = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
+    let deps: Vec<(String, String)> = out
+        .run_dependencies
+        .depends
+        .iter()
+        .map(|d| (d.name.clone(), format_packagespec(&d.spec)))
+        .collect();
+    assert!(
+        deps.contains(&("pandas".to_string(), ">=2.2.3,<3".to_string())),
+        "{deps:?}"
+    );
+}
+
+#[test]
+fn produce_output_auto_routed_pin_zero_x_widens_to_next_minor() {
+    let bundle = Bundle {
+        auto_routed: vec![("etgen".to_string(), "0.20.1".to_string(), false)],
+        ..solo_bundle("range-pack-zero-x", vec![])
+    };
+    let out = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
+    let deps: Vec<(String, String)> = out
+        .run_dependencies
+        .depends
+        .iter()
+        .map(|d| (d.name.clone(), format_packagespec(&d.spec)))
+        .collect();
+    assert!(
+        deps.contains(&("etgen".to_string(), ">=0.20.1,<0.21".to_string())),
+        "0.x auto-routed pin must cap at the next MINOR: {deps:?}"
+    );
+}
+
+#[test]
+fn produce_output_auto_routed_abi_anchor_stays_exact() {
+    // ABI anchors (python/python_abi/libc/cuda family) must never widen:
+    // "any newer build" is a lie about what this pack's wheels actually
+    // run on.
+    let bundle = Bundle {
+        auto_routed: vec![("cuda-version".to_string(), "12.8".to_string(), false)],
+        ..solo_bundle("anchor-pack", vec![])
+    };
+    let out = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
+    let deps: Vec<(String, String)> = out
+        .run_dependencies
+        .depends
+        .iter()
+        .map(|d| (d.name.clone(), format_packagespec(&d.spec)))
+        .collect();
+    assert!(
+        deps.contains(&("cuda-version".to_string(), "==12.8".to_string())),
+        "ABI anchor auto-routed pin must stay exact, not widen: {deps:?}"
+    );
+}
+
+#[test]
+fn produce_output_auto_routed_manual_override_stays_exact() {
+    // Hand-written intent (a `retread-overrides` entry for this exact
+    // name) wins over the auto-derived bounded range.
+    let mut config = cfg();
+    config
+        .overrides
+        .insert("sentry-sdk".to_string(), "==1.2.3".to_string());
+    let bundle = Bundle {
+        auto_routed: vec![("sentry-sdk".to_string(), "1.2.3".to_string(), false)],
+        ..solo_bundle("override-pack", vec![])
+    };
+    let out = produce_output(&bundle, &config, Platform::Linux64, "3.11", &[], None, None).unwrap();
+    let deps: Vec<(String, String)> = out
+        .run_dependencies
+        .depends
+        .iter()
+        .map(|d| (d.name.clone(), format_packagespec(&d.spec)))
+        .collect();
+    assert!(
+        deps.contains(&("sentry-sdk".to_string(), "==1.2.3".to_string())),
+        "manually-overridden name must stay exact, not widen: {deps:?}"
     );
 }
 
@@ -650,9 +770,10 @@ fn produce_output_closure_gate_keeps_auto_routed_pins_and_base_deps_undoubled() 
         .map(|d| (d.name.clone(), format_packagespec(&d.spec)))
         .collect();
     assert!(
-        deps.contains(&("numpy".to_string(), "==2.1.0".to_string())),
-        "auto-routed package must appear exact-pinned even though it is \
-         also named by a wheel and present in uv pins pre-route: {deps:?}"
+        deps.contains(&("numpy".to_string(), ">=2.1.0,<3".to_string())),
+        "auto-routed package must appear (as a bounded range) even though \
+         it is also named by a wheel and present in uv pins pre-route: \
+         {deps:?}"
     );
     assert_eq!(
         deps.iter().filter(|(n, _)| n == "numpy").count(),

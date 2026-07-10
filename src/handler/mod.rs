@@ -4831,13 +4831,38 @@ fn produce_output(
     // advisories; the composed workspace's conda solve is the source of
     // truth, so this pack must not hard-conflict with a sibling pack's
     // own conda pin for the same name (e.g. `setuptools ==83.0.0`).
+    //
+    // Bounded-range emission (root-cause fix for the serial repair grind):
+    // every OTHER auto-routed pin -- one this pack picked itself off the
+    // uv resolver, not inherited from a deps-from file -- used to be
+    // emitted as an exact `==X.Y.Z`. That exact snapshot of uv's pick is
+    // what clashed with siblings/workspace/conda-metadata run after run,
+    // forcing the repair engine to loosen ONE conflict at a time
+    // (~5min/render). Emitting a bounded range up front (floored at the
+    // locked version -- the uv closure was solved against exactly this
+    // version, so the floor must not move -- capped at the next MAJOR,
+    // semver's `0.x` convention capping at the next MINOR instead) lets
+    // most of these clashes solve clean on the first render. Two cases
+    // still keep the exact pin, because widening them is wrong, not just
+    // unnecessary: ABI anchors (`is_abi_anchor` -- python/libc/cuda
+    // family, where "any newer build" is a lie about what this pack's
+    // wheels actually run on) and names the user gave an explicit
+    // `retread-overrides` entry for (hand-written intent always wins over
+    // an auto-derived range).
     for (conda_name, conda_version, floor) in &bundle.auto_routed {
         let canon = canonical_conda_name(conda_name);
         if seen_dep_names.insert(canon.clone()) {
             let spec = if *floor {
                 format!("{canon} >={conda_version}")
-            } else {
+            } else if crate::solve::is_abi_anchor(&canon) || config.overrides.contains_key(&canon) {
                 format!("{canon} =={conda_version}")
+            } else {
+                match bounded_range_ceiling(conda_version) {
+                    Some(ceiling) => format!("{canon} >={conda_version},<{ceiling}"),
+                    // Unparseable version (no leading numeric component) --
+                    // fall back to the exact pin rather than emit garbage.
+                    None => format!("{canon} =={conda_version}"),
+                }
             };
             if *floor {
                 tracing::info!(
@@ -6674,6 +6699,26 @@ async fn build_one(
         build,
         subdir: target_subdir,
     })
+}
+
+/// Computes the exclusive upper bound for a bounded-range auto-routed conda
+/// pin: `floor` at `version` (unchanged), capped at the next MAJOR --
+/// e.g. `1.26.4` -> `2` (so the emitted range is `>=1.26.4,<2`). Follows
+/// semver convention for pre-1.0 releases (major component `0`): the cap
+/// is the next MINOR instead, since `0.x` is the "breaking axis" for those
+/// packages -- e.g. `0.20.1` -> `0.21` (`>=0.20.1,<0.21`).
+///
+/// Returns `None` when `version` has no parseable leading numeric
+/// component (the caller falls back to an exact pin in that case).
+fn bounded_range_ceiling(version: &str) -> Option<String> {
+    let mut parts = version.split('.');
+    let major: u64 = parts.next()?.parse().ok()?;
+    if major == 0 {
+        let minor: u64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        Some(format!("0.{}", minor + 1))
+    } else {
+        Some((major + 1).to_string())
+    }
 }
 
 fn spec_from_str(s: &str) -> Result<NamedSpec<PackageSpec>> {
