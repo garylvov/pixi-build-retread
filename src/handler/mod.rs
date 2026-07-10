@@ -2627,6 +2627,9 @@ async fn uv_group_closure(
             .map(|n| canonical_conda_name(n))
             .collect(),
         abi_anchor_pins,
+        // Populated below (workspace-deps solve) just before the
+        // fixpoint call; empty = un-route fallback only.
+        workspace_conda_versions: Default::default(),
     };
 
     // `'static` closures for the fixpoint driver: clone the inputs each
@@ -2759,7 +2762,17 @@ async fn uv_group_closure(
                     Some("disabled") => rattler_solve::ChannelPriority::Disabled,
                     _ => rattler_solve::ChannelPriority::Strict,
                 },
-                m.effective_system_requirements("default"),
+                // Run-34: system requirements must come from the pack's
+                // CONSUMING envs, not `default` -- a no-default-feature
+                // env's feature-scoped `cuda = "12"` was invisible here,
+                // so the trial set containing that env's cuda-only pins
+                // (pytorch-gpu ==2.7.0) was unsat regardless of the
+                // routed candidates and the whole co-install check
+                // degraded to "cannot heal, applying unchanged".
+                match workspace_dir {
+                    Some(ws_dir) => m.consuming_env_system_requirements(ws_dir, source_dir),
+                    None => m.effective_system_requirements("default"),
+                },
                 match workspace_dir {
                     Some(ws_dir) => m.consuming_env_dependencies(ws_dir, source_dir),
                     None => Default::default(),
@@ -2832,6 +2845,73 @@ async fn uv_group_closure(
                 as futures::future::BoxFuture<'static, crate::uv_closure::CoInstallVerdict>
         }
     };
+    // Run-34: solve the consuming envs' workspace deps ALONE (no routed
+    // pins) once per bundle, so the fixpoint's unsat path can HARMONIZE a
+    // routed package toward the version the workspace actually provides
+    // (`pytorch` 2.7.0 via the hand-written `pytorch-gpu ==2.7.0`)
+    // instead of un-routing it into a wrong-version wheel. Best-effort:
+    // any failure (no manifest, no repodata, workspace deps themselves
+    // unsat) degrades to an empty map = the pre-harmonization un-route
+    // behavior.
+    let mut auto_route_opts = auto_route_opts;
+    if let Some(m) = manifest_opt.as_ref()
+        && let Some(ws_dir) = workspace_dir
+    {
+        let channel_priority = match m.channel_priority.as_deref() {
+            Some("disabled") => rattler_solve::ChannelPriority::Disabled,
+            _ => rattler_solve::ChannelPriority::Strict,
+        };
+        let system_requirements = m.consuming_env_system_requirements(ws_dir, source_dir);
+        let workspace_deps = m.consuming_env_dependencies(ws_dir, source_dir);
+        let mut specs: Vec<String> = Vec::new();
+        for (name, specs_for_name) in &workspace_deps {
+            let conda_name = canonical_conda_name(name);
+            if conda_name == canonical_conda_name(group_name) {
+                continue;
+            }
+            for spec in specs_for_name {
+                if spec.trim().is_empty() || spec.trim() == "*" {
+                    specs.push(conda_name.clone());
+                } else {
+                    specs.push(format!("{conda_name} {spec}"));
+                }
+            }
+        }
+        if !specs.is_empty() {
+            specs.push(format!("python {}.*", target.python_version));
+            match crate::conda_solve::solve_selected_records(
+                conda_channels,
+                &specs,
+                &target.python_version,
+                &target.conda_subdir,
+                channel_priority,
+                &system_requirements,
+                rattler_solve::SolveStrategy::Highest,
+            )
+            .await
+            {
+                Ok(records) => {
+                    auto_route_opts.workspace_conda_versions = records
+                        .iter()
+                        .map(|r| {
+                            (
+                                r.package_record.name.as_normalized().to_string(),
+                                r.package_record.version.version().to_string(),
+                            )
+                        })
+                        .collect();
+                }
+                Err(reasons) => {
+                    tracing::debug!(
+                        bundle = %group_name,
+                        reasons = ?reasons,
+                        "auto-route: workspace-deps solve for harmonization \
+                         unavailable; un-route fallback only",
+                    );
+                }
+            }
+        }
+    }
     let mut closure = crate::uv_closure::auto_route_fixpoint_checked(
         &req,
         &auto_route_opts,

@@ -794,6 +794,75 @@ impl WorkspaceManifest {
         }
         out
     }
+
+    /// System requirements (cuda, libc, ...) unioned over the envs that
+    /// actually CONSUME the pack at `source_dir` -- the system-requirement
+    /// counterpart of [`Self::consuming_env_dependencies`], and the run-34
+    /// fix for the co-install oracle's `__cuda` blind spot: the check fed
+    /// `effective_system_requirements("default")`, but a
+    /// `no-default-feature` env like pm-isaaclab declares `cuda = "12"`
+    /// under ITS OWN feature -- with no `__cuda` virtual package, the
+    /// trial set containing the env's `pytorch-gpu ==2.7.0` (cuda-only
+    /// builds) was unsat REGARDLESS of the routed pins, the greedy
+    /// retry-solve could never heal it, and every route (`pytorch
+    /// ==2.10.0` included) sailed through "unchecked, applying the round
+    /// unchanged".
+    ///
+    /// Same env-discovery tiers as `consuming_env_dependencies`; the
+    /// fallback (nothing maps) unions the default env with every
+    /// feature's declaration (conservative superset). Workspace-wide
+    /// `[workspace].platforms` glibc/cuda declarations win last, exactly
+    /// like `effective_system_requirements`.
+    pub fn consuming_env_system_requirements(
+        &self,
+        workspace_dir: &Path,
+        source_dir: &Path,
+    ) -> BTreeMap<String, String> {
+        let mut out: BTreeMap<String, String> = BTreeMap::new();
+        let outputs = self.discover_outputs_for_source(workspace_dir, source_dir);
+        let mut envs: BTreeSet<String> = BTreeSet::new();
+        let mut features: BTreeSet<String> = BTreeSet::new();
+        for output in &outputs {
+            envs.extend(output.envs.iter().cloned());
+            features.extend(output.declaring_features.iter().cloned());
+        }
+        if !envs.is_empty() {
+            for env in &envs {
+                for (k, v) in self.effective_system_requirements(env) {
+                    out.insert(k, v);
+                }
+            }
+            return out;
+        }
+        if !features.is_empty() {
+            for feat_name in &features {
+                if let Some(f) = self.features.get(feat_name) {
+                    for (k, v) in &f.system_requirements {
+                        out.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+        }
+        if out.is_empty() {
+            // Conservative superset: default env + every feature.
+            out = self.effective_system_requirements("default");
+            for feat in self.features.values() {
+                for (k, v) in &feat.system_requirements {
+                    out.entry(k.clone()).or_insert_with(|| v.clone());
+                }
+            }
+        }
+        // Workspace-wide platform declarations win (parity with
+        // effective_system_requirements).
+        let platform = crate::glibc::current_pixi_platform();
+        if let Some(glibc) = self.platform_glibc.get(platform) {
+            out.insert("libc".to_string(), glibc.clone());
+        }
+        if let Some(cuda) = self.platform_cuda.get(platform) {
+            out.insert("cuda".to_string(), cuda.clone());
+        }
+        out
+    }
 }
 
 /// Sentinel name used to represent the implicit "default" feature
@@ -1797,6 +1866,49 @@ pillow = ">=11,<12"
         // key assertion is that the SCOPED env's own range is present
         // and precise -- not silently dropped in favor of `default`.
         assert!(deps.contains_key("numpy"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn consuming_env_system_requirements_surfaces_feature_scoped_cuda() {
+        // Run-34 fixture: a `no-default-feature` env (pm-isaaclab shape)
+        // declares `cuda = "12"` under ITS OWN feature. The co-install
+        // oracle fed `effective_system_requirements("default")` -- no
+        // `__cuda` virtual -- so the trial set containing the env's
+        // cuda-only pins was unsat regardless of the routed candidates
+        // and every route sailed through unchecked. The consuming-env
+        // lookup must surface the feature-scoped cuda.
+        let tmp = std::env::temp_dir().join(format!(
+            "retread-ws-envsysreq-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(tmp.join("pm-pack")).unwrap();
+        let ws = ws_toml(
+            r#"
+[dependencies]
+numpy = "*"
+
+[environments]
+pm = { features = ["pm"], no-default-feature = true }
+
+[feature.pm.dependencies]
+pm-pack = { path = "./pm-pack" }
+pytorch-gpu = "==2.7.0"
+
+[feature.pm.system-requirements]
+cuda = "12"
+"#,
+        );
+        let sysreqs = ws.consuming_env_system_requirements(&tmp, &tmp.join("pm-pack"));
+        assert_eq!(
+            sysreqs.get("cuda").map(String::as_str),
+            Some("12"),
+            "feature-scoped cuda must reach the co-install oracle: {sysreqs:?}"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

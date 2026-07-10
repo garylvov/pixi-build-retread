@@ -179,6 +179,19 @@ pub struct AutoRouteOptions {
     /// conflict one iteration later. Empty in tests/probes that don't
     /// supply it -- the check then simply has no anchor to contradict.
     pub abi_anchor_pins: BTreeMap<String, String>,
+    /// Conda name -> version the pack's CONSUMING envs' workspace solve
+    /// picks (hand-written pins + their full transitive closure, solved
+    /// against the workspace channels by the handler before the fixpoint
+    /// runs). Run-34 doctrine source: when the co-install check is unsat
+    /// and names a routed package present in this map at a DIFFERENT
+    /// version, the workspace's pick is truth -- the routed package is
+    /// HARMONIZED (pypi side re-pinned to the workspace version and the
+    /// closure re-locked) instead of un-routed, because un-routing would
+    /// ship a wheel at the wrong version that clobbers the conda package
+    /// the workspace installs (torch 2.10.0 wheel over conda pytorch
+    /// 2.7.0). Empty (tests / no workspace / workspace solve failed) --
+    /// the un-route fallback then behaves exactly as before.
+    pub workspace_conda_versions: BTreeMap<String, String>,
 }
 
 /// Hard cap on auto-route discovery rounds (rounds that GROW the
@@ -591,6 +604,35 @@ pub fn unsat_reason_names_package(reason: &str, conda_name: &str) -> bool {
 /// Termination: growth rounds are capped at [`AUTO_ROUTE_MAX_ROUNDS`];
 /// every un-route iteration strictly grows the blocked set, which is
 /// bounded by the closure size.
+/// Rebuild the closure request from scratch: base request + surviving
+/// routes + workspace-harmonized pypi pins (run-34; see
+/// [`AutoRouteOptions::workspace_conda_versions`]). Every rebuild site
+/// in the fixpoint goes through this so a harmonized pin survives
+/// un-route rebuilds and vice versa.
+fn rebuild_routed_request(
+    base: &UvClosureRequest,
+    routed: &[AutoRoutedPackage],
+    harmonize_pins: &BTreeMap<String, (String, String)>,
+) -> UvClosureRequest {
+    let mut req = base.clone();
+    apply_auto_route(&mut req, routed);
+    for (pypi_name, (version, conda_name)) in harmonize_pins {
+        let line = format!("{pypi_name}=={version}");
+        req.constraints.constraints.push(line.clone());
+        req.constraints.provenance.insert(
+            pypi_name.clone(),
+            ConstraintProvenance {
+                constraint: line,
+                conda_name: conda_name.clone(),
+                conda_version: format!("=={version}"),
+                source: "workspace-harmonize".to_string(),
+                env: "default".to_string(),
+            },
+        );
+    }
+    req
+}
+
 pub async fn auto_route_fixpoint_checked<S, P, C>(
     req: &UvClosureRequest,
     opts: &AutoRouteOptions,
@@ -613,6 +655,14 @@ where
     // PyPI names the un-route step moved back to the wheel closure;
     // excluded from every later round exactly like `keep-pypi`.
     let mut blocked: BTreeSet<String> = BTreeSet::new();
+    // Workspace-harmonized pins (run-34): pypi_name -> (version, conda
+    // name). Applied as uv `constraint-dependencies` on every rebuild so
+    // the closure re-locks the package at the version the consuming
+    // envs' workspace solve provides (hand-written pins win). Each name
+    // is harmonized at most once (`harmonize_tried`); if it is named in
+    // an unsat core AGAIN afterwards, the un-route fallback takes over.
+    let mut harmonize_pins: BTreeMap<String, (String, String)> = BTreeMap::new();
+    let mut harmonize_tried: BTreeSet<String> = BTreeSet::new();
     let mut growth_rounds = 0usize;
     // Belt-and-braces bound: growth rounds + one iteration per possible
     // blocked name. The loop provably progresses (each iteration grows
@@ -681,7 +731,43 @@ where
                 named.push(pkg.clone());
             }
             if !named.is_empty() {
+                // Run-34 doctrine split: a named candidate whose conda
+                // name the WORKSPACE solve pins at a different version
+                // is HARMONIZED (pypi side re-pinned to the workspace
+                // version, closure re-locked, route re-planned at the
+                // right version next round) rather than un-routed --
+                // un-routing would ship a wheel at the conflicting
+                // version that clobbers the conda package the workspace
+                // installs (torch 2.10.0 wheel over conda pytorch
+                // 2.7.0, pulled by the hand-written pytorch-gpu
+                // ==2.7.0). Each name gets ONE harmonization attempt;
+                // named again afterwards -> un-route fallback.
+                let mut round_harmonized: Vec<String> = Vec::new();
                 for pkg in &named {
+                    let ws_version = opts.workspace_conda_versions.get(&pkg.conda_name);
+                    if let Some(ws_version) = ws_version
+                        && ws_version != &pkg.conda_version
+                        && !harmonize_tried.contains(&pkg.pypi_name)
+                    {
+                        harmonize_tried.insert(pkg.pypi_name.clone());
+                        harmonize_pins.insert(
+                            pkg.pypi_name.clone(),
+                            (ws_version.clone(), pkg.conda_name.clone()),
+                        );
+                        round_harmonized.push(pkg.pypi_name.clone());
+                        tracing::info!(
+                            bundle = %req.bundle,
+                            "auto-route: workspace-harmonized {} {} -> {} \
+                             (consuming envs' workspace solve provides conda \
+                             {} =={}; hand-written pins win over the uv pick)",
+                            pkg.pypi_name,
+                            pkg.pypi_version,
+                            ws_version,
+                            pkg.conda_name,
+                            ws_version,
+                        );
+                        continue;
+                    }
                     tracing::info!(
                         bundle = %req.bundle,
                         "auto-route: un-routed {}=={} (conda {} =={}) — \
@@ -696,15 +782,38 @@ where
                 }
                 let previously_routed = routed.len();
                 routed.retain(|r| !blocked.contains(&r.pypi_name));
-                if routed.len() != previously_routed {
-                    // A previously ACCEPTED route was un-routed: rebuild
-                    // the request from scratch (its exclusion +
-                    // constraint must disappear) and re-lock so the
-                    // package's wheel — and any transitives it drags in —
-                    // rejoin the closure.
-                    req = base_req.clone();
-                    apply_auto_route(&mut req, &routed);
-                    closure = solve(req.clone()).await?;
+                if routed.len() != previously_routed || !round_harmonized.is_empty() {
+                    // A previously ACCEPTED route was un-routed and/or a
+                    // harmonized pin was added: rebuild the request from
+                    // scratch (an un-routed exclusion + constraint must
+                    // disappear; a harmonized constraint must appear)
+                    // and re-lock so wheels rejoin/re-pick accordingly.
+                    req = rebuild_routed_request(&base_req, &routed, &harmonize_pins);
+                    match solve(req.clone()).await {
+                        Ok(c) => closure = c,
+                        Err(e) if !round_harmonized.is_empty() => {
+                            // The harmonized version has no satisfiable
+                            // pypi-side pick (no wheel / metadata refuses
+                            // it). Drop THIS round's harmonized pins and
+                            // un-route those packages instead -- the
+                            // pre-harmonization fallback behavior.
+                            tracing::warn!(
+                                bundle = %req.bundle,
+                                error = %e,
+                                "auto-route: workspace-harmonized re-lock \
+                                 failed; falling back to un-route for {:?}",
+                                round_harmonized,
+                            );
+                            for name in &round_harmonized {
+                                harmonize_pins.remove(name);
+                                blocked.insert(name.clone());
+                            }
+                            routed.retain(|r| !blocked.contains(&r.pypi_name));
+                            req = rebuild_routed_request(&base_req, &routed, &harmonize_pins);
+                            closure = solve(req.clone()).await?;
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
                 // This round's additions were never applied to `req`;
                 // re-plan next iteration with the blocked set in force.
@@ -769,8 +878,7 @@ where
                 let previously_routed = routed.len();
                 routed.retain(|r| !blocked.contains(&r.pypi_name));
                 if routed.len() != previously_routed {
-                    req = base_req.clone();
-                    apply_auto_route(&mut req, &routed);
+                    req = rebuild_routed_request(&base_req, &routed, &harmonize_pins);
                     closure = solve(req.clone()).await?;
                 }
                 continue;
@@ -2937,6 +3045,7 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
             protected: BTreeSet::from(["mujoco".to_string()]),
             name_map: BTreeMap::new(),
             abi_anchor_pins: BTreeMap::new(),
+            workspace_conda_versions: BTreeMap::new(),
         }
     }
 
@@ -3561,6 +3670,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
             protected: BTreeSet::from(["python-dateutil".to_string()]),
             name_map: BTreeMap::new(),
             abi_anchor_pins: BTreeMap::new(),
+            workspace_conda_versions: BTreeMap::new(),
         };
         let channels: Vec<ChannelUrl> = vec![ChannelUrl::from(
             url::Url::parse("https://conda.anaconda.org/conda-forge/").unwrap(),
@@ -3811,6 +3921,198 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
             !last
                 .no_emit_packages
                 .contains(&"typing-extensions".to_string())
+        );
+    }
+
+    /// Mock solve for the workspace-harmonization tests: a closure with a
+    /// protected root (mujoco) plus torch, whose version follows a
+    /// `torch==X` constraint when present (mirrors a real uv re-lock
+    /// honoring `constraint-dependencies`) and floats to 2.10.0
+    /// otherwise. `fail_on` simulates "no wheel at the harmonized
+    /// version" (uv lock failure) for that constraint line.
+    fn harmonize_mock_solve(
+        calls: Arc<Mutex<Vec<UvClosureRequest>>>,
+        fail_on: Option<String>,
+    ) -> impl FnMut(UvClosureRequest) -> futures::future::BoxFuture<'static, Result<UvClosure>>
+    {
+        move |r: UvClosureRequest| {
+            let calls = Arc::clone(&calls);
+            let fail_on = fail_on.clone();
+            Box::pin(async move {
+                calls.lock().unwrap().push(r.clone());
+                if let Some(bad) = &fail_on
+                    && r.constraints.constraints.iter().any(|c| c == bad)
+                {
+                    anyhow::bail!("uv lock: no wheels satisfy {bad}");
+                }
+                let torch_version = r
+                    .constraints
+                    .constraints
+                    .iter()
+                    .find_map(|c| c.strip_prefix("torch==").map(str::to_string))
+                    .unwrap_or_else(|| "2.10.0".to_string());
+                let excluded: BTreeSet<String> = r
+                    .no_emit_packages
+                    .iter()
+                    .map(|n| canonical_conda_name(n))
+                    .collect();
+                let mk = |name: &str, version: &str| LockWheel {
+                    name: name.to_string(),
+                    version: version.to_string(),
+                    origin: Origin::Index,
+                    filename: format!("{name}-{version}-py3-none-any.whl"),
+                    url: Some("https://example.com/x.whl".into()),
+                    sha256: Some("00".repeat(32)),
+                    requires_dist: vec![],
+                    must_ship: false,
+                    upstream_url: None,
+                    git_source: None,
+                    sdist_source: None,
+                };
+                let mut wheels = vec![mk("mujoco", "3.5.0")];
+                if !excluded.contains("torch") {
+                    wheels.push(mk("torch", &torch_version));
+                }
+                let pins = wheels
+                    .iter()
+                    .map(|w| (w.name.clone(), w.version.clone()))
+                    .collect();
+                Ok(UvClosure {
+                    wheels,
+                    pins,
+                    uv_version: "0.11.15".into(),
+                    auto_routed: vec![],
+                })
+            })
+        }
+    }
+
+    /// Echo probe: a hit for conda `pytorch` at exactly the requested
+    /// spec version (`==X` -> X), mirroring a channel that has every
+    /// version. Other names miss.
+    fn harmonize_mock_probe()
+    -> impl Fn(String, String) -> futures::future::BoxFuture<'static, Option<RouteProbeHit>> {
+        |conda_name: String, spec: String| {
+            Box::pin(async move {
+                if conda_name != "pytorch" {
+                    return None;
+                }
+                let version = spec.trim_start_matches('=').to_string();
+                Some(RouteProbeHit {
+                    conda_version: version,
+                    channel: "c/linux-64".into(),
+                    depends: Vec::new(),
+                })
+            })
+        }
+    }
+
+    fn harmonize_opts() -> AutoRouteOptions {
+        AutoRouteOptions {
+            enabled: true,
+            keep_pypi: BTreeSet::new(),
+            force_conda: BTreeSet::new(),
+            protected: BTreeSet::from(["mujoco".to_string()]),
+            name_map: BTreeMap::from([("torch".to_string(), "pytorch".to_string())]),
+            abi_anchor_pins: BTreeMap::new(),
+            workspace_conda_versions: BTreeMap::from([(
+                "pytorch".to_string(),
+                "2.7.0".to_string(),
+            )]),
+        }
+    }
+
+    /// Version-aware co-solve: unsat naming pytorch while the candidate
+    /// set carries pytorch at 2.10.0 (the run-34 clash against the
+    /// hand-written pytorch-gpu ==2.7.0); Sat at 2.7.0.
+    fn harmonize_mock_co_solve()
+    -> impl Fn(Vec<AutoRoutedPackage>) -> futures::future::BoxFuture<'static, CoInstallVerdict>
+    {
+        |candidate: Vec<AutoRoutedPackage>| {
+            let bad = candidate
+                .iter()
+                .any(|r| r.conda_name == "pytorch" && r.conda_version == "2.10.0");
+            Box::pin(async move {
+                if bad {
+                    CoInstallVerdict::Unsat(vec![
+                        "nothing provides pytorch 2.7.0 cuda* needed by                          pytorch-gpu-2.7.0, but pytorch ==2.10.0 is pinned"
+                            .to_string(),
+                    ])
+                } else {
+                    CoInstallVerdict::Sat
+                }
+            })
+        }
+    }
+
+    /// Run-34 doctrine: a routed package the co-install unsat names,
+    /// whose conda name the WORKSPACE solve pins at a different version
+    /// (torch 2.10.0 uv pick vs conda pytorch 2.7.0 via the hand-written
+    /// pytorch-gpu ==2.7.0), is HARMONIZED -- pypi side re-pinned to the
+    /// workspace version and re-routed at that version -- NOT un-routed
+    /// (an un-routed torch wheel at 2.10.0 would clobber the conda
+    /// pytorch 2.7.0 the workspace installs).
+    #[tokio::test]
+    async fn workspace_harmonize_repins_named_route_instead_of_unroute() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let closure = auto_route_fixpoint_checked(
+            &auto_route_req(),
+            &harmonize_opts(),
+            harmonize_mock_solve(Arc::clone(&calls), None),
+            harmonize_mock_probe(),
+            harmonize_mock_co_solve(),
+        )
+        .await
+        .unwrap();
+        let torch = closure
+            .auto_routed
+            .iter()
+            .find(|r| r.pypi_name == "torch")
+            .expect("torch must stay ROUTED (harmonized), not un-routed");
+        assert_eq!(torch.conda_name, "pytorch");
+        assert_eq!(
+            torch.conda_version, "2.7.0",
+            "routed at the workspace's version, not uv's 2.10.0 pick"
+        );
+        assert!(
+            !closure.wheels.iter().any(|w| w.name == "torch"),
+            "no torch wheel may ship (it would clobber conda pytorch)"
+        );
+        // The harmonized constraint reached the re-lock.
+        let calls = calls.lock().unwrap();
+        assert!(
+            calls.iter().any(|r| r
+                .constraints
+                .constraints
+                .iter()
+                .any(|c| c == "torch==2.7.0")),
+            "harmonized uv constraint must be applied on the re-lock"
+        );
+    }
+
+    /// Fallback: the harmonized version has no satisfiable pypi-side
+    /// pick (uv lock fails under the `torch==2.7.0` constraint) -- the
+    /// pin is dropped and torch is UN-ROUTED (pre-harmonization
+    /// behavior), keeping the fixpoint alive instead of erroring out.
+    #[tokio::test]
+    async fn workspace_harmonize_falls_back_to_unroute_when_pypi_refuses() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let closure = auto_route_fixpoint_checked(
+            &auto_route_req(),
+            &harmonize_opts(),
+            harmonize_mock_solve(Arc::clone(&calls), Some("torch==2.7.0".to_string())),
+            harmonize_mock_probe(),
+            harmonize_mock_co_solve(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !closure.auto_routed.iter().any(|r| r.pypi_name == "torch"),
+            "torch must be un-routed when harmonization cannot lock"
+        );
+        assert!(
+            closure.wheels.iter().any(|w| w.name == "torch"),
+            "torch ships as a wheel again (un-route fallback)"
         );
     }
 
