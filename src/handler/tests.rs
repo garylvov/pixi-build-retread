@@ -2123,6 +2123,24 @@ fn cache_key_changes_when_manifest_mtime_changes() {
         key0, key_ledger,
         "distinct auto-overrides ledger fingerprints must produce distinct keys"
     );
+
+    // Run-31 regression: the backend build identity (crate version + git
+    // hash from build.rs) must be IN the key, so a binary built from a
+    // different commit can never reuse this build's cached pack renders
+    // (run 30 served the bounded-range binary pre-fix exact-pin renders).
+    let ident = backend_build_identity();
+    assert!(
+        !ident.is_empty() && ident.contains('+'),
+        "build identity must be `version+githash`, got `{ident}`"
+    );
+    assert!(
+        ident.starts_with(env!("CARGO_PKG_VERSION")),
+        "build identity must start with the crate version, got `{ident}`"
+    );
+    assert!(
+        key0.ends_with(ident),
+        "cache key must fold in the backend build identity: key=`{key0}` ident=`{ident}`"
+    );
 }
 
 #[test]

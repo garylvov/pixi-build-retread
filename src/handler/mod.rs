@@ -97,14 +97,27 @@ fn conda_outputs_cache_key(
         })
         .unwrap_or_else(|| "0".to_string());
     format!(
-        "{}|{}|{}|{:?}|{}|{}",
+        "{}|{}|{}|{:?}|{}|{}|{}",
         params.host_platform,
         params.build_platform,
         chans.join(","),
         params.variant_configuration,
         mtime_str,
         auto_overrides_fp,
+        backend_build_identity(),
     )
+}
+
+/// Backend build identity folded into [`conda_outputs_cache_key`]: crate
+/// version + git commit hash (embedded by `build.rs`, `-dirty` suffixed
+/// for uncommitted worktrees, `unknown` when built without git). Run-31
+/// of the retread-deps-from proof exposed the gap this closes: the
+/// bounded-range emission binary (16f20ec) reused the previous binary's
+/// cached pack renders -- still carrying the old exact `==` auto-routed
+/// pins -- because nothing about the BINARY was in the key. Any backend
+/// upgrade must bust both the in-memory and disk memos.
+fn backend_build_identity() -> &'static str {
+    concat!(env!("CARGO_PKG_VERSION"), "+", env!("RETREAD_GIT_HASH"))
 }
 
 /// Content fingerprint of the workspace's `.retread/auto-overrides.json`
