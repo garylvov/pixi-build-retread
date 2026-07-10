@@ -2100,6 +2100,30 @@ struct FallbackCandidate {
     reason: String,
 }
 
+/// Bound on tier 9's requirer-chain walk ([`RepairPlanner::
+/// walk_chain_anchor`]) -- resolvo trees in this campaign never nest
+/// deeper than 4-5 requirer levels; 8 leaves headroom without letting a
+/// pathological mention graph loop.
+const MAX_CHAIN_HOPS: usize = 8;
+
+/// Where a tier-9 requirer-chain walk terminated. See
+/// [`RepairPlanner::walk_chain_anchor`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ChainAnchor {
+    /// The chain roots at one of this workspace's own composed packs;
+    /// `emitted_mention` indexes the mention the pack DIRECTLY requires
+    /// (its own emitted pin -- the un-route target).
+    Pack {
+        pack: String,
+        emitted_mention: usize,
+    },
+    /// The chain is anchored by a hand-written workspace pin (directly
+    /// or via the conda name family) -- untouchable owner intent.
+    WorkspacePin,
+    /// The chain ran out of mentions/hops or cycled -- no anchor proof.
+    Unknown,
+}
+
 impl RepairPlanner {
     /// Classifies a single mentioned package's ownership within a
     /// `pack_name`-scoped conflict (or the workspace, when `pack_name` is
@@ -2192,20 +2216,34 @@ impl RepairPlanner {
         bundle: &str,
         package: &str,
     ) -> Option<String> {
+        // Name-mapping fix (run-34 torchaudio wall / run-37 hardening):
+        // the workspace pin is routinely declared under a conda name that
+        // differs from the mention's pypi name (`torch`/`pytorch` pinned
+        // via the accelerator meta-package `pytorch-gpu ==2.7.0`). Look
+        // up the whole conda name family (parselmouth map +
+        // `-gpu`/`-cpu` variants), exact name first, at BOTH lookup
+        // tiers -- otherwise tier 1 never sees the hand-written pin and
+        // the conflict falls through to "unparseable".
+        let candidates = conda_name_family(package, &self.conda_name_map);
         if let Some(ws) = crate::workspace::WorkspaceManifest::load(editor.project_dir())
             && let Some(owning_feature) = resolve_pack_feature(&ws, bundle)
-            && editor.has_user_entry(&owning_feature, TableKind::Conda, package)
         {
-            let snap = editor.entry_snapshot(&owning_feature, TableKind::Conda, package);
-            if let Some(value) = snap.value {
-                return Some(value);
+            for name in &candidates {
+                if editor.has_user_entry(&owning_feature, TableKind::Conda, name) {
+                    let snap = editor.entry_snapshot(&owning_feature, TableKind::Conda, name);
+                    if let Some(value) = snap.value {
+                        return Some(value);
+                    }
+                }
             }
         }
         for feature in editor.feature_names() {
-            if editor.has_user_entry(&feature, TableKind::Conda, package) {
-                let snap = editor.entry_snapshot(&feature, TableKind::Conda, package);
-                if let Some(value) = snap.value {
-                    return Some(value);
+            for name in &candidates {
+                if editor.has_user_entry(&feature, TableKind::Conda, name) {
+                    let snap = editor.entry_snapshot(&feature, TableKind::Conda, name);
+                    if let Some(value) = snap.value {
+                        return Some(value);
+                    }
                 }
             }
         }
@@ -2290,6 +2328,77 @@ impl RepairPlanner {
             editor.has_user_entry(feature, TableKind::Conda, package)
                 || editor.has_user_entry(feature, TableKind::Pypi, package)
         })
+    }
+
+    /// Family-aware [`Self::workspace_pin_governs_pack`]: also true when
+    /// a `-gpu`/`-cpu` variant or name-map sibling of `package` carries
+    /// the governing pin (workspace `pytorch-gpu ==2.7.0` governs a
+    /// mention of `pytorch`). Used by tier 9's chain walk, where the
+    /// resolvo tree names the REAL conda package while the hand-written
+    /// pin lives on the accelerator meta-package.
+    fn workspace_pin_governs_pack_family(
+        &self,
+        editor: &ManifestEditor,
+        bundle: &str,
+        package: &str,
+    ) -> bool {
+        conda_name_family(package, &self.conda_name_map)
+            .iter()
+            .any(|name| self.workspace_pin_governs_pack(editor, bundle, name))
+    }
+
+    /// Whether ANY feature declares a hand-written conda/pypi entry for
+    /// `package` or any of its conda name-family variants -- the
+    /// family-aware [`Self::has_workspace_pin`], for chain anchoring
+    /// where no pack scope is known yet.
+    fn has_workspace_pin_family(&self, editor: &ManifestEditor, package: &str) -> bool {
+        conda_name_family(package, &self.conda_name_map)
+            .iter()
+            .any(|name| self.has_workspace_pin(editor, name))
+    }
+
+    /// Tier-9 chain walk: follow a mention's `requirer` links upward
+    /// (each requirer's own mention, nearest textual attribution) until
+    /// the chain terminates at either one of this workspace's own
+    /// composed PACKS (returning the pack name plus the index of the
+    /// mention the pack directly requires -- the pack's own emitted pin,
+    /// tier 9's un-route target) or a package carrying a hand-written
+    /// workspace pin, directly or via its conda name family (`pytorch`
+    /// anchored by `pytorch-gpu ==2.7.0`). Bounded and cycle-safe;
+    /// `ChainAnchor::Unknown` for chains that run out of mentions.
+    fn walk_chain_anchor(
+        &self,
+        editor: &ManifestEditor,
+        mentions: &[super::parse::Mention],
+        start: usize,
+    ) -> ChainAnchor {
+        let mut idx = start;
+        let mut visited: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for _ in 0..MAX_CHAIN_HOPS {
+            let Some(requirer) = mentions[idx].requirer.as_deref() else {
+                return ChainAnchor::Unknown;
+            };
+            if self.is_owned_pack(editor, requirer) {
+                return ChainAnchor::Pack {
+                    pack: requirer.to_string(),
+                    emitted_mention: idx,
+                };
+            }
+            if self.has_workspace_pin_family(editor, requirer) {
+                return ChainAnchor::WorkspacePin;
+            }
+            if !visited.insert(requirer.to_ascii_lowercase()) {
+                return ChainAnchor::Unknown;
+            }
+            let Some(next) = mentions
+                .iter()
+                .position(|m| m.package.eq_ignore_ascii_case(requirer))
+            else {
+                return ChainAnchor::Unknown;
+            };
+            idx = next;
+        }
+        ChainAnchor::Unknown
     }
 
     /// Whether `name` resolves as one of THIS workspace's own composed
@@ -2712,6 +2821,98 @@ impl RepairPlanner {
                     m.spec
                 ),
             });
+        }
+
+        // Tier 9: pack-emission vs workspace-pin TRANSITIVE disjoint
+        // clash (run 37, grpcio/libabseil). A pack's own emitted pin
+        // (`isaaclab-2.3x-pack would require grpcio >=1.74.0,<2.0`) is
+        // satisfiable IN ISOLATION -- every conda build of it, however,
+        // chains to a shared low-level library (`libgrpc -> libabseil
+        // >=20250512.1,<20250513.0a0`) that is provably disjoint from
+        // what a HAND-WRITTEN workspace pin's own chain demands
+        // (`pytorch-gpu ==2.7.0 -> pytorch -> libabseil
+        // >=20250127.1,<20250128.0a0`). No tier above can see this:
+        // the dead-end branch's subject is the workspace pin (not a
+        // pack, so `extract_bundle_name`'s pick doesn't resolve and
+        // every ownership classification degrades to Unowned), the
+        // pack's own mention is on the SATISFIABLE branch, and the
+        // clash surfaces two requirer hops below it. Detection walks
+        // the requirer chains of a provably-disjoint same-package
+        // mention pair: one side must root at an owned pack (via that
+        // pack's own emitted-pin mention), the other at a hand-written
+        // workspace pin (family-aware: `pytorch` is anchored by
+        // `pytorch-gpu`). The workspace pin is untouchable doctrine and
+        // the shared library is not ours to pin, so the only knob is
+        // the pack's own emitted package: UN-ROUTE it (ship the locked
+        // PyPI wheel; conda stops arbitrating its version and the
+        // library chain it drags in).
+        for (i, a) in mentions.iter().enumerate() {
+            let Some(a_iv) = pack_pin_interval(&a.spec) else {
+                continue;
+            };
+            for (j, b) in mentions.iter().enumerate().skip(i + 1) {
+                if !b.package.eq_ignore_ascii_case(&a.package) || b.spec == a.spec {
+                    continue;
+                }
+                let Some(b_iv) = pack_pin_interval(&b.spec) else {
+                    continue;
+                };
+                if !pack_pin_intervals_disjoint(&a_iv, &b_iv) {
+                    continue;
+                }
+                let anchors = (
+                    self.walk_chain_anchor(editor, mentions, i),
+                    self.walk_chain_anchor(editor, mentions, j),
+                );
+                let (pack, emitted_mention) = match anchors {
+                    (
+                        ChainAnchor::Pack {
+                            pack,
+                            emitted_mention,
+                        },
+                        ChainAnchor::WorkspacePin,
+                    )
+                    | (
+                        ChainAnchor::WorkspacePin,
+                        ChainAnchor::Pack {
+                            pack,
+                            emitted_mention,
+                        },
+                    ) => (pack, emitted_mention),
+                    _ => continue,
+                };
+                let target = &mentions[emitted_mention];
+                if is_abi_anchor(&target.package)
+                    || pack_emitted_pin_floor(&target.spec).is_none()
+                    || self.workspace_pin_governs_pack_family(editor, &pack, &target.package)
+                    || self.classify_mention_ownership(editor, Some(&pack), &target.package)
+                        != Ownership::AutoRoutedPackPin
+                {
+                    continue;
+                }
+                out.push(FallbackCandidate {
+                    tier: 9,
+                    package: target.package.clone(),
+                    pack_name: pack.clone(),
+                    kind: PackOverrideKind::Unroute,
+                    old_spec: Some(target.spec.clone()),
+                    new_spec: String::new(),
+                    ownership: Ownership::AutoRoutedPackPin,
+                    tried_key: format!("{}@{pack}#fallback-transitive-unroute", target.package),
+                    reason: format!(
+                        "generic fallback: pack `{pack}`'s emitted pin {} {} transitively \
+                         requires {} {} while a hand-written workspace pin's chain requires \
+                         the disjoint {} {} -- un-routing {} to PyPI",
+                        target.package,
+                        target.spec,
+                        a.package,
+                        a.spec,
+                        b.package,
+                        b.spec,
+                        target.package
+                    ),
+                });
+            }
         }
 
         out.sort_by_key(|c| c.tier);
@@ -4577,6 +4778,9 @@ holosoma-gpu = { features = ["holosoma"] }
         include_str!("../../tests/fixtures/solve_errors/conda_two_pack_wrapt_range_run32.txt");
     const CONDA_TWO_PACK_WRAPT_DISJOINT_RUN33_FIXTURE: &str =
         include_str!("../../tests/fixtures/solve_errors/conda_two_pack_wrapt_disjoint_run33.txt");
+    const CONDA_PACK_VS_WORKSPACE_TRANSITIVE_DISJOINT_RUN37: &str = include_str!(
+        "../../tests/fixtures/solve_errors/conda_pack_vs_workspace_transitive_disjoint_run37.txt"
+    );
     const PILLOW_MOVIEPY_FALLBACK_FIXTURE: &str = include_str!(
         "../../tests/fixtures/solve_errors/pypi_conda_metadata_skew_pillow_moviepy.txt"
     );
@@ -5096,6 +5300,149 @@ holosoma-gpu = { features = ["holosoma"] }
                 "[{label}]"
             );
         }
+    }
+
+    /// Run-37 workspace shape: a feature pins the accelerator
+    /// meta-package (`pytorch-gpu ==2.7.0`) and composes
+    /// `isaaclab-2.3x-pack` as a path dependency.
+    fn run37_workspace() -> (PathBuf, PathBuf) {
+        let manifest_text = "[feature.isaaclab-unitree.dependencies]\n\
+             pytorch-gpu = \"==2.7.0\"\n\
+             \"isaaclab-2.3x-pack\" = { path = \"./pypi-packs/isaaclab-2.3x-pack\" }\n";
+        let path = temp_manifest(manifest_text);
+        let project_dir = path.parent().unwrap().to_path_buf();
+        let pack_dir = project_dir.join("pypi-packs").join("isaaclab-2.3x-pack");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        std::fs::write(
+            pack_dir.join("pixi.toml"),
+            "[package]\nname = \"isaaclab-2.3x-pack\"\nversion = \"1.0\"\n",
+        )
+        .unwrap();
+        (path, project_dir)
+    }
+
+    #[test]
+    fn end_to_end_run37_pack_vs_workspace_transitive_disjoint_unroutes_grpcio() {
+        // Run-37 fixture verbatim: isaaclab-2.3x-pack's own emitted
+        // `grpcio >=1.74.0,<2.0` is satisfiable in isolation, but every
+        // conda grpcio 1.74.x chains to `libgrpc -> libabseil
+        // >=20250512.1,<20250513.0a0`, provably disjoint from the
+        // hand-written `pytorch-gpu ==2.7.0` chain's `libabseil
+        // >=20250127.1,<20250128.0a0`. The dead-end branch subject is
+        // `pytorch-gpu` (a workspace pin, not a pack), so tiers 1-8 see
+        // nothing ownable; tier 9's chain walk must root the grpcio side
+        // at the pack, anchor the pytorch side at the workspace pin (via
+        // the -gpu family), and un-route grpcio from the pack.
+        let (path, _project_dir) = run37_workspace();
+        let editor = ManifestEditor::open(path).unwrap();
+        let parser = super::super::parse::RegexConflictParser::new();
+        let bundle = parser.extract_bundle_name(CONDA_PACK_VS_WORKSPACE_TRANSITIVE_DISJOINT_RUN37);
+        assert_eq!(
+            bundle.as_deref(),
+            Some("pytorch-gpu"),
+            "the dead-end pick is the WORKSPACE pin, not a pack -- the very \
+             reason tiers 1-8 cannot own this shape"
+        );
+        let mut tried = TriedState::default();
+        let mut planner = RepairPlanner::new("default".into());
+        let applied = planner
+            .generic_fallback_repair_batch(
+                &editor,
+                &mut tried,
+                CONDA_PACK_VS_WORKSPACE_TRANSITIVE_DISJOINT_RUN37,
+                1,
+            )
+            .expect("tier 9 must find the transitive disjoint clash actionable")
+            .expect("must apply, not exhaust");
+        let (outcome, po) = applied
+            .iter()
+            .find(|(o, _)| o.attempt.package == "grpcio")
+            .expect("grpcio un-route expected");
+        assert_eq!(outcome.attempt.old_spec.as_deref(), Some(">=1.74.0,<2.0"));
+        let po = po.as_ref().expect("expected a pack-override write");
+        assert_eq!(po.bundle, "isaaclab-2.3x-pack");
+        assert_eq!(po.kind, PackOverrideKind::Unroute);
+        assert_eq!(po.package, "grpcio");
+        // The workspace pin's own side must never be touched.
+        assert!(
+            applied.iter().all(|(o, _)| {
+                o.attempt.package != "pytorch-gpu"
+                    && o.attempt.package != "pytorch"
+                    && o.attempt.package != "libabseil"
+            }),
+            "only the pack-rooted side is a knob: {:?}",
+            applied
+                .iter()
+                .map(|(o, _)| &o.attempt.package)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn tier1_workspace_pin_matches_via_name_family_pytorch_gpu() {
+        // Name-mapping half of the run-34/37 fix: a pack-scoped conflict
+        // mention names the REAL conda/pypi package (`pytorch`, or pypi
+        // `torch` via the parselmouth map) while the hand-written
+        // workspace pin lives on the accelerator meta-package
+        // (`pytorch-gpu ==2.7.0`). Tier 1 must find the pin through the
+        // conda name family and override the pack's pin toward it.
+        let manifest_text = "[feature.pm-isaaclab.dependencies]\n\
+             pytorch-gpu = \"==2.7.0\"\n\
+             \"protomotions-deps-pack\" = { path = \"./pypi-packs/protomotions-deps-pack\" }\n";
+        let path = temp_manifest(manifest_text);
+        let project_dir = path.parent().unwrap().to_path_buf();
+        let pack_dir = project_dir
+            .join("pypi-packs")
+            .join("protomotions-deps-pack");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        std::fs::write(
+            pack_dir.join("pixi.toml"),
+            "[package]\nname = \"protomotions-deps-pack\"\nversion = \"1.0\"\n",
+        )
+        .unwrap();
+        let editor = ManifestEditor::open(path).unwrap();
+        let parser = super::super::parse::RegexConflictParser::new();
+
+        // Conda-name mention (`pytorch`): reachable via the -gpu variant
+        // walk alone, no name map needed.
+        let text = "protomotions-deps-pack 0.1.0 would require\n\
+             pytorch ==2.10.0, which cannot be installed because there are no viable options\n";
+        let mentions = parser.extract_generic_mentions(text);
+        let planner = RepairPlanner::new("default".into());
+        let candidates = planner.generate_fallback_candidates(
+            &editor,
+            Some("protomotions-deps-pack"),
+            &mentions,
+        );
+        let cand = candidates
+            .iter()
+            .find(|c| c.package == "pytorch" && c.tier == 1)
+            .expect("tier 1 must see the pytorch-gpu pin for a pytorch mention");
+        assert_eq!(cand.new_spec, "==2.7.0");
+        assert_eq!(cand.pack_name, "protomotions-deps-pack");
+
+        // PyPI-name mention (`torch`): needs the parselmouth-style map
+        // (torch -> pytorch), then the -gpu variant walk on the mapped
+        // candidate.
+        let text_torch = "protomotions-deps-pack 0.1.0 would require\n\
+             torch ==2.10.0, which cannot be installed because there are no viable options\n";
+        let mentions_torch = parser.extract_generic_mentions(text_torch);
+        let mut map = PypiToCondaMap::new();
+        map.insert("torch".to_string(), vec!["pytorch".to_string()]);
+        let planner_mapped = RepairPlanner::new("default".into()).with_conda_name_map(map);
+        let candidates_torch = planner_mapped.generate_fallback_candidates(
+            &editor,
+            Some("protomotions-deps-pack"),
+            &mentions_torch,
+        );
+        let cand_torch = candidates_torch
+            .iter()
+            .find(|c| c.package == "torch" && c.tier == 1)
+            .expect("tier 1 must map pypi `torch` to the pytorch-gpu workspace pin");
+        assert_eq!(
+            cand_torch.new_spec, "==2.7.0",
+            "the injected override must target the workspace's 2.7.0 line"
+        );
     }
 
     #[test]

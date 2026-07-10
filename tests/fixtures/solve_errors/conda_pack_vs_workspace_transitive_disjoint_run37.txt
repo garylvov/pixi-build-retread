@@ -1,0 +1,57 @@
+Error:   × failed to solve requirements of environment 'unitree-rl-lab-gpu' for
+  │ platform 'linux-64'
+  ├─▶   × failed to solve the environment
+  │   
+  ╰─▶ Cannot solve the request because of: The following packages are
+      incompatible
+      ├─ isaaclab-2.3x-pack * can be installed with any of the following
+      options:
+      │  └─ isaaclab-2.3x-pack 0.54.2 would require
+      │     └─ grpcio >=1.74.0,<2.0, which can be installed with any of the
+      following options:
+      │        ├─ grpcio 1.74.1 would require
+      │        │  └─ libgrpc ==1.74.1 h3288cfb_1, which can be installed with
+      any of the following options:
+      │        │     └─ libgrpc 1.74.1 would require
+      │        │        └─ libabseil >=20250512.1,<20250513.0a0, which can be
+      installed with any of the following options:
+      │        │           └─ libabseil 20250512.1
+      │        ├─ grpcio 1.74.1 would require
+      │        │  └─ libgrpc ==1.74.1 hebd82d6_0, which can be installed with
+      any of the following options:
+      │        │     └─ libgrpc 1.74.1 would require
+      │        │        └─ libabseil >=20250512.1,<20250513.0a0, which can be
+      installed with any of the following options:
+      │        │           └─ libabseil 20250512.1
+      │        └─ grpcio 1.74.0 would require
+      │           └─ libgrpc ==1.74.0 hebd82d6_0, which can be installed with
+      any of the following options:
+      │              └─ libgrpc 1.74.0 would require
+      │                 └─ libabseil >=20250512.1,<20250513.0a0, which can be
+      installed with any of the following options:
+      │                    └─ libabseil 20250512.1
+      └─ pytorch-gpu ==2.7.0 cannot be installed because there are no viable
+      options:
+         ├─ pytorch-gpu 2.7.0 would require
+         │  └─ pytorch ==2.7.0 cuda*_mkl*300, which cannot be installed
+      because there are no viable options:
+         │     ├─ pytorch 2.7.0 would require
+         │     │  └─ libabseil >=20250127.1,<20250128.0a0, which cannot be
+      installed because there are no viable options:
+         │     │     └─ libabseil 20250127.1, which conflicts with the
+      versions reported above.
+         │     └─ pytorch 2.7.0 | 2.7.0 | 2.7.0 | 2.7.0 would require
+         │        └─ python >=3.12,<3.13.0a0, for which no candidates were
+      found.
+         └─ pytorch-gpu 2.7.0 would require
+            └─ pytorch ==2.7.0 cuda*_generic*200, which cannot be installed
+      because there are no viable options:
+               ├─ pytorch 2.7.0 would require
+               │  └─ libabseil >=20250127.1,<20250128.0a0, which cannot be
+      installed because there are no viable options:
+               │     └─ libabseil 20250127.1, which conflicts with the
+      versions reported above.
+               └─ pytorch 2.7.0 | 2.7.0 | 2.7.0 | 2.7.0 would require
+                  └─ python >=3.13,<3.14.0a0, for which no candidates were
+      found.
+      
