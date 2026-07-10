@@ -375,6 +375,13 @@ pub enum PackOverrideKind {
     Unroute,
 }
 
+/// Result of one [`RepairPlanner::generic_fallback_repair_batch`] call:
+/// `Ok` carries every (outcome, pack-override write) pair applied from a
+/// single failed solve; `Err` names the package whose candidates were all
+/// already tried/refused (exhaustion).
+pub type FallbackBatchResult =
+    std::result::Result<Vec<(RepairOutcome, Option<PackOverrideWrite>)>, String>;
+
 /// One pending pack-manifest `retread-overrides` write a repair wants
 /// persisted. See [`RepairOutcome::pack_override`].
 #[derive(Debug, Clone)]
@@ -2695,6 +2702,8 @@ impl RepairPlanner {
     /// comment); `Some(Err(package))` when candidates exist but every one
     /// is already tried/oscillation-guarded (exhausted, not
     /// unparseable).
+    #[cfg(test)] // production drives the batched variant below; retained for
+    // single-step iteration-order tests (e.g. run20_both_owner_iteration_converges)
     pub fn generic_fallback_repair(
         &mut self,
         editor: &ManifestEditor,
@@ -2736,6 +2745,79 @@ impl RepairPlanner {
             return Some((Ok(outcome), Some(po)));
         }
         Some((Err(candidates[0].package.clone()), None))
+    }
+
+    /// Batched variant of [`Self::generic_fallback_repair`]: apply EVERY
+    /// applicable candidate for a DISTINCT (package, pack) pair from ONE
+    /// failed solve, instead of one candidate per full lock re-render.
+    ///
+    /// Run-27 motivation: each lock iteration costs a full multi-env
+    /// re-render (~6 min on the imprint workspace), and a single resolvo
+    /// error routinely names several independently-owned pins (run 27
+    /// applied `trimesh ==4.12.2` for `protomotions-deps-pack` and
+    /// `trimesh ==4.5.1` for `isaaclab-2.3x-pack` in two SEPARATE
+    /// hour-fraction iterations). Every fallback candidate is an
+    /// independent, ledgered, conservative pack-override -- there is no
+    /// cross-candidate ordering dependency the way workspace manifest
+    /// edits can have -- so distinct (package, pack) repairs from the
+    /// same error can land together before the next render. At most one
+    /// candidate per (package, pack) applies per batch (candidates are
+    /// tier-sorted, so the lowest applicable tier wins), preserving the
+    /// ladder's tier discipline for any SINGLE knob.
+    ///
+    /// Returns `None` when the engine finds nothing actionable (same as
+    /// the single-shot variant), `Some(Err(package))` when candidates
+    /// exist but every one is already tried/refused (exhaustion), and
+    /// `Some(Ok(applied))` with one entry per repair actually applied.
+    pub fn generic_fallback_repair_batch(
+        &mut self,
+        editor: &ManifestEditor,
+        tried: &mut TriedState,
+        stderr: &str,
+        iter: u32,
+    ) -> Option<FallbackBatchResult> {
+        let parser = super::parse::RegexConflictParser::new();
+        let mentions = parser.extract_generic_mentions(stderr);
+        if mentions.is_empty() {
+            return None;
+        }
+        let pack_name = parser.extract_bundle_name(stderr);
+        let candidates = self.generate_fallback_candidates(editor, pack_name.as_deref(), &mentions);
+        if candidates.is_empty() {
+            return None;
+        }
+        let project_dir = editor.project_dir();
+        let mut applied: Vec<(RepairOutcome, Option<PackOverrideWrite>)> = Vec::new();
+        let mut touched: std::collections::BTreeSet<(String, String)> =
+            std::collections::BTreeSet::new();
+        for cand in &candidates {
+            let key = (cand.package.to_ascii_lowercase(), cand.pack_name.clone());
+            if touched.contains(&key) {
+                continue;
+            }
+            let Some(outcome) = self.apply_fallback_candidate(tried, cand, iter) else {
+                continue;
+            };
+            let Some(pack_pixi) = crate::workspace::WorkspaceManifest::load(project_dir)
+                .and_then(|ws| resolve_pack_dir(&ws, project_dir, &cand.pack_name))
+                .map(|d| d.join("pixi.toml"))
+            else {
+                continue;
+            };
+            touched.insert(key);
+            let po = PackOverrideWrite {
+                bundle: cand.pack_name.clone(),
+                pack_pixi,
+                package: cand.package.clone(),
+                spec: cand.new_spec.clone(),
+                kind: cand.kind,
+            };
+            applied.push((outcome, Some(po)));
+        }
+        if applied.is_empty() {
+            return Some(Err(candidates[0].package.clone()));
+        }
+        Some(Ok(applied))
     }
 }
 
@@ -4607,6 +4689,49 @@ holosoma-gpu = { features = ["holosoma"] }
             vec!["isaaclab-2.3x-pack", "protomotions-deps-pack"],
             "both owners must get a repair shot"
         );
+    }
+
+    /// Run-27 batching: the SAME two-owner conflict must land BOTH packs'
+    /// repairs in ONE `generic_fallback_repair_batch` call (one full lock
+    /// re-render) instead of one per iteration, and a follow-up call on
+    /// the same error must report exhaustion (everything already tried),
+    /// not loop.
+    #[test]
+    fn run27_batch_applies_both_owners_repairs_in_one_call() {
+        let (path, _project_dir) = run20_two_pack_workspace(true);
+        let editor = ManifestEditor::open(path).unwrap();
+        let mut tried = TriedState::default();
+        let mut planner = RepairPlanner::new("default".into());
+
+        let applied = planner
+            .generic_fallback_repair_batch(&editor, &mut tried, CONDA_TWO_PACK_NUMPY_PINT, 1)
+            .expect("must find actionable mentions")
+            .expect("must apply, not exhaust");
+        assert_eq!(
+            applied.len(),
+            2,
+            "both owners' distinct (package, pack) repairs must land in one batch: {:?}",
+            applied
+                .iter()
+                .map(|(o, _)| (&o.attempt.package, &o.attempt.new_spec))
+                .collect::<Vec<_>>()
+        );
+        let mut bundles: Vec<&str> = applied
+            .iter()
+            .map(|(_, po)| po.as_ref().expect("pack-override write").bundle.as_str())
+            .collect();
+        bundles.sort_unstable();
+        assert_eq!(
+            bundles,
+            vec!["isaaclab-2.3x-pack", "protomotions-deps-pack"]
+        );
+
+        // Same error again: every candidate is now tried -- exhaustion,
+        // not an infinite batch loop.
+        let second = planner
+            .generic_fallback_repair_batch(&editor, &mut tried, CONDA_TWO_PACK_NUMPY_PINT, 2)
+            .expect("mentions are still extractable");
+        assert!(second.is_err(), "repeat must exhaust: {second:?}");
     }
 
     #[test]

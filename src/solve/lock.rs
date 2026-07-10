@@ -22,7 +22,14 @@ use super::repair::{
     persist_conflict_trace, retread_dir, snapshot_path,
 };
 
-const DEFAULT_MAX_REPAIRS: u32 = 10;
+// Run-27 (imprint deps-from proof): a two-pack workspace with dozens of
+// auto-routed exact pins legitimately needs a repair tail far deeper than
+// 10 -- run 27 burned its whole budget on 10 correct repairs and exited
+// EXIT_MAX_ITERS one repair short of the next layer. Repairs are cheap,
+// ledgered, conservative relaxations; the budget exists to stop runaway
+// loops (which the oscillation guard + TriedState already prevent
+// per-package), not to be the binding constraint on a healthy ladder.
+const DEFAULT_MAX_REPAIRS: u32 = 50;
 const LOCK_FEATURE: &str = "default";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,10 +87,11 @@ pub mod args {
         }
 
         #[test]
-        fn defaults_are_manifest_and_ten_repairs() {
+        fn defaults_are_manifest_and_fifty_repairs() {
             let args = parse(&argv(&[])).unwrap();
             assert_eq!(args.manifest, PathBuf::from("pixi.toml"));
-            assert_eq!(args.max_repairs, 10);
+            assert_eq!(args.max_repairs, DEFAULT_MAX_REPAIRS);
+            assert_eq!(args.max_repairs, 50);
             assert!(!args.no_repair);
         }
 
@@ -182,6 +190,18 @@ async fn run_with_pixi_bin(args: LockArgs, pixi_bin: &str) -> Result<i32> {
         pixi_version(&project_dir, pixi_bin).await,
     );
     ledger.write_atomic(&ledger_path)?;
+
+    // Run-26 stale-snapshot bug: a run that dies without reaching any
+    // finish path (signal kill, run 25) or exits keeping its progress
+    // (max_repairs, run 27) leaves its pre-run `.bak` snapshots behind.
+    // `ensure_snapshot`'s first-write-wins no-op then makes the NEXT
+    // run's rollback restore to the PREVIOUS run's start state, wiping
+    // repairs that run legitimately persisted (run 26 rolled the ledger
+    // back to run-25-START, erasing run 25's tier-7 overrides). The
+    // current on-disk state at run start IS this run's baseline -- drop
+    // any stale snapshot so this run's own `ensure_snapshot` captures it.
+    cleanup_snapshot(&project_dir)?;
+    crate::pack_overrides::cleanup_all(&project_dir)?;
 
     let mut pending_edit: Option<PendingEdit> = None;
     let mut records: Vec<RepairRecord> = Vec::new();
@@ -316,9 +336,12 @@ async fn run_with_pixi_bin(args: LockArgs, pixi_bin: &str) -> Result<i32> {
         // honestly as `max_repairs` instead, exactly like the
         // specific-conflict path above, which keeps whatever progress
         // this run made rather than wiping it.
-        if let Some((result, po)) =
-            planner.generic_fallback_repair(&editor, &mut tried, &stripped, repairs_applied + 1)
-        {
+        if let Some(result) = planner.generic_fallback_repair_batch(
+            &editor,
+            &mut tried,
+            &stripped,
+            repairs_applied + 1,
+        ) {
             if repairs_applied >= args.max_repairs {
                 ledger.finish_run(run_idx, "max_repairs");
                 ledger.write_atomic(&ledger_path)?;
@@ -332,39 +355,45 @@ async fn run_with_pixi_bin(args: LockArgs, pixi_bin: &str) -> Result<i32> {
                 return Ok(EXIT_MAX_ITERS);
             }
             match result {
-                Ok(out) => {
-                    if let Some(po) = &po {
-                        crate::pack_overrides::ensure_snapshot(&project_dir)?;
-                        match po.kind {
-                            PackOverrideKind::Override => {
-                                crate::pack_overrides::write_override(
-                                    &project_dir,
-                                    &po.pack_pixi,
-                                    &po.bundle,
-                                    &po.package,
-                                    &po.spec,
-                                    &out.attempt.conflict,
-                                )?;
-                            }
-                            PackOverrideKind::Unroute => {
-                                crate::pack_overrides::write_unroute(
-                                    &project_dir,
-                                    &po.pack_pixi,
-                                    &po.bundle,
-                                    &po.package,
-                                    &out.attempt.conflict,
-                                )?;
+                Ok(applied) => {
+                    // Batched: every entry is an independent, distinct-
+                    // (package, pack) ledger override derived from this
+                    // SAME error -- land them all before the next (multi-
+                    // minute) full re-render instead of one per iteration.
+                    for (out, po) in &applied {
+                        if let Some(po) = po {
+                            crate::pack_overrides::ensure_snapshot(&project_dir)?;
+                            match po.kind {
+                                PackOverrideKind::Override => {
+                                    crate::pack_overrides::write_override(
+                                        &project_dir,
+                                        &po.pack_pixi,
+                                        &po.bundle,
+                                        &po.package,
+                                        &po.spec,
+                                        &out.attempt.conflict,
+                                    )?;
+                                }
+                                PackOverrideKind::Unroute => {
+                                    crate::pack_overrides::write_unroute(
+                                        &project_dir,
+                                        &po.pack_pixi,
+                                        &po.bundle,
+                                        &po.package,
+                                        &out.attempt.conflict,
+                                    )?;
+                                }
                             }
                         }
+                        append_attempt(&mut ledger, &ledger_path, run_idx, out.attempt.clone())?;
+                        record_repair(&mut records, &out.attempt, &out.applied, po.as_ref());
                     }
-                    append_attempt(&mut ledger, &ledger_path, run_idx, out.attempt.clone())?;
-                    record_repair(&mut records, &out.attempt, &out.applied, po.as_ref());
                     // The fallback engine never edits the workspace
                     // manifest directly (every candidate is a pack-ledger
                     // write) -- nothing for `pending_edit`'s post-widen
                     // revert-on-unsat recovery to track.
                     pending_edit = None;
-                    repairs_applied += 1;
+                    repairs_applied += applied.len() as u32;
                     continue;
                 }
                 Err(package) => {
@@ -1052,6 +1081,46 @@ exit 1
         assert!(
             manifest_after.contains("numpy"),
             "iter 1's repair must be kept, not rolled back: {manifest_after}"
+        );
+    }
+
+    /// Run-26 stale-snapshot regression: a `.bak` snapshot left behind by
+    /// a PREVIOUS run (signal kill / max_repairs exit never cleaned it)
+    /// must not become a later run's rollback baseline -- pre-fix,
+    /// `rollback_snapshot` on an unparseable failure would restore the
+    /// STALE bak over the manifest, silently reverting state a previous
+    /// run legitimately persisted (run 26 wiped run 25's tier-7 ledger
+    /// overrides this way). Run-start hygiene must drop stale snapshots
+    /// so the current on-disk state is this run's baseline.
+    #[tokio::test]
+    async fn stale_snapshot_from_a_previous_run_is_not_this_runs_rollback_baseline() {
+        let dir = temp_dir("stalesnap");
+        let current = "[dependencies]\n# current, post-previous-run state\n";
+        let manifest = write_manifest(&dir, current);
+        // Simulate the leftover: a stale pre-run snapshot from an older run
+        // whose content differs from the current manifest.
+        std::fs::create_dir_all(dir.join(".retread")).unwrap();
+        std::fs::write(
+            snapshot_path(&dir),
+            "[dependencies]\n# STALE state from a killed previous run\n",
+        )
+        .unwrap();
+        let pixi = write_fake_pixi(&dir, 50, UNPARSEABLE);
+
+        let args = LockArgs {
+            manifest,
+            max_repairs: 10,
+            no_repair: false,
+        };
+        let code = run_with_pixi_bin(args, pixi.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(code, EXIT_UNPARSEABLE);
+
+        let manifest_text = std::fs::read_to_string(dir.join("pixi.toml")).unwrap();
+        assert_eq!(
+            manifest_text, current,
+            "the stale snapshot must not clobber the current manifest on rollback"
         );
     }
 
