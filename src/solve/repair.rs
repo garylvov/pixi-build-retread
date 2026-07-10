@@ -360,6 +360,21 @@ pub struct RepairOutcome {
     pub pack_override: Option<PackOverrideWrite>,
 }
 
+/// Which ledger sink a [`PackOverrideWrite`] targets. Generic fallback
+/// engine addition: doctrine-(v) UN-ROUTE writes to
+/// `AutoOverrideLedger::unrouted` (`pack_overrides::write_unroute`)
+/// instead of the ordinary spec-override sink (`pack_overrides::
+/// write_override`) every other tier uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackOverrideKind {
+    /// Ordinary `retread-overrides`-shaped spec write (existing behavior,
+    /// every tier before the generic fallback engine).
+    Override,
+    /// Force this package to stay a PyPI wheel (`retread-keep-pypi`),
+    /// abandoning its conda auto-route -- `spec` is unused for this kind.
+    Unroute,
+}
+
 /// One pending pack-manifest `retread-overrides` write a repair wants
 /// persisted. See [`RepairOutcome::pack_override`].
 #[derive(Debug, Clone)]
@@ -370,8 +385,13 @@ pub struct PackOverrideWrite {
     pub pack_pixi: PathBuf,
     /// PyPI package name the override applies to (e.g. `"torch"`).
     pub package: String,
-    /// Conda-style spec written verbatim (e.g. `"==2.10.0"`).
+    /// Conda-style spec written verbatim (e.g. `"==2.10.0"`). Unused when
+    /// `kind` is [`PackOverrideKind::Unroute`].
     pub spec: String,
+    /// Which ledger sink this write targets. Defaults to `Override` at
+    /// every pre-existing call site (added by the generic fallback
+    /// engine; see [`PackOverrideKind`]).
+    pub kind: PackOverrideKind,
 }
 
 impl RepairPlanner {
@@ -874,6 +894,7 @@ impl RepairPlanner {
                 pack_pixi,
                 package: pkg.to_string(),
                 spec: new_spec,
+                kind: PackOverrideKind::Override,
             }),
         })
     }
@@ -944,6 +965,7 @@ impl RepairPlanner {
                 pack_pixi,
                 package: package.to_string(),
                 spec: new_spec,
+                kind: PackOverrideKind::Override,
             }),
         })
     }
@@ -1016,6 +1038,7 @@ impl RepairPlanner {
                 pack_pixi,
                 package: requirer.to_string(),
                 spec: new_spec,
+                kind: PackOverrideKind::Override,
             }),
         })
     }
@@ -1102,6 +1125,7 @@ impl RepairPlanner {
                 pack_pixi,
                 package: package.to_string(),
                 spec: new_spec,
+                kind: PackOverrideKind::Override,
             }),
         })
     }
@@ -1203,6 +1227,7 @@ impl RepairPlanner {
                 pack_pixi,
                 package: package.to_string(),
                 spec: narrowed,
+                kind: PackOverrideKind::Override,
             }),
         })
     }
@@ -1940,6 +1965,516 @@ fn table_label(feature: &str, kind: TableKind) -> String {
             TableKind::Override => format!("feature.{feature}.pypi-options.dependency-overrides"),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Generic ownership-driven fallback repair engine
+// ---------------------------------------------------------------------------
+//
+// Twelve rungs, each a hand-written parser + repair tier for ONE prose
+// shape a solver failure can take, is a treadmill: every new shape (run
+// 15's PyPI-vs-conda-forge metadata skew was the 13th) demanded another
+// bespoke `Conflict` variant, another regex, another tier. This engine
+// ends the treadmill: it fires ONLY when none of the specific parsers
+// above matched (`RegexConflictParser::parse` returned `None`), scans the
+// ENTIRE error text for every `<package> <spec>` mention regardless of
+// surrounding prose (`extract_generic_mentions`), classifies each
+// mentioned package by WHO owns the knob that could fix it (this
+// workspace's own hand-written pin? a `retread-deps-from` root? an
+// already-ledgered override? an auto-routed pack pin? an ABI anchor? or
+// someone else's untouchable transitive?), and generates a repair
+// candidate for each OWNED mention, tried in a fixed doctrine order, one
+// per ladder iteration -- reusing every existing tier's mechanics
+// (`intersect_range_with_cap`, `deps_from_owns_exact_pin`,
+// `translate_conda_range_to_pep440`, the ledger, tried-state,
+// oscillation guard) rather than re-implementing them.
+
+/// Who -- if anyone -- owns the knob that could relax a mentioned
+/// package's conflicting spec. Doctrine priority mirrors the specific
+/// tiers this engine generalizes: a hand-written workspace pin is real
+/// owner intent (never touched by relaxing IT; the auto-routed side
+/// yields instead); a `deps-from` exact pin is an upstream advisory
+/// (safe to relax); an already-ledgered override is a PRIOR repair this
+/// engine can narrow further; an auto-routed pack pin is provably not
+/// hand-authored (see `CondaRangeVsPackPin`'s doc comment) so it's safe
+/// to override OR un-route; an ABI anchor is immutable; anything else is
+/// someone else's transitive and untouchable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ownership {
+    /// A `retread-deps-from` root's own exact pin (see
+    /// `deps_from_owns_exact_pin`) -- upstream advisory, safe to relax.
+    DepsFromExactPin,
+    /// A pack's own auto-routed exact companion pin (a NAMED pack's
+    /// `<pack> <ver> would require <package> ==<v>` clause) -- provably
+    /// not hand-authored (`handler/mod.rs`'s `bundle.auto_routed`
+    /// emission is the only mechanism that produces one).
+    AutoRoutedPackPin,
+    /// A PRIOR repair (this engine's or a specific tier's) already wrote
+    /// a `.retread/auto-overrides.json` entry for this (package, pack).
+    LedgeredOverride,
+    /// A hand-written entry in the WORKSPACE's own `pixi.toml` (any
+    /// feature, conda or pypi table) -- real owner intent, never
+    /// widened; the auto-routed side yields toward it instead (doctrine
+    /// (i), mirroring `CondaRangeVsPackPin`).
+    WorkspacePin,
+    /// One of `ABI_ANCHOR_NAMES` / the `is_abi_anchor` predicate --
+    /// immutable guardrail, never touched.
+    AbiAnchor,
+    /// None of the above: someone else's transitive dependency this
+    /// workspace has no ownership stake in. Untouchable.
+    Unowned,
+}
+
+impl Ownership {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Ownership::DepsFromExactPin => "deps-from-exact-pin",
+            Ownership::AutoRoutedPackPin => "auto-routed-pack-pin",
+            Ownership::LedgeredOverride => "ledgered-override",
+            Ownership::WorkspacePin => "workspace-pin",
+            Ownership::AbiAnchor => "abi-anchor",
+            Ownership::Unowned => "unowned",
+        }
+    }
+}
+
+/// One candidate repair the fallback engine could apply, in doctrine
+/// priority order (`tier`, ascending): (1) an owned auto-routed pin has a
+/// visible workspace range for the SAME package -- override the pack's
+/// pin toward that range; (2) a package already has a ledgered override
+/// for this pack, and the mentions include a tighter cap -- intersect;
+/// (3) a `deps-from`-owned exact pin -- relax to a `>=` floor; (5) two of
+/// a pack's OWN emitted pins contradict each other (no workspace pin, no
+/// external constrainer -- conda-forge repackage metadata skew) --
+/// UN-ROUTE the requirer so it ships as a PyPI wheel instead. (Tier 4,
+/// "override the mentioned package toward whatever the conda closure
+/// provides", is the specific tiers' T1 pypi-override and is already
+/// covered by tiers 1/3 for every mention this generic scan can attribute
+/// an owner to; kept out of the numbering gap intentionally rather than
+/// force a redundant candidate.)
+#[derive(Debug, Clone)]
+struct FallbackCandidate {
+    tier: u8,
+    package: String,
+    pack_name: String,
+    kind: PackOverrideKind,
+    old_spec: Option<String>,
+    new_spec: String,
+    ownership: Ownership,
+    tried_key: String,
+    reason: String,
+}
+
+impl RepairPlanner {
+    /// Classifies a single mentioned package's ownership within a
+    /// `pack_name`-scoped conflict (or the workspace, when `pack_name` is
+    /// `None`). See [`Ownership`]'s doc comment for the priority
+    /// reasoning; this only ever returns ONE ownership per package (the
+    /// highest-priority provenance that actually applies), since a
+    /// package can be relaxed via only one real knob at a time.
+    fn classify_mention_ownership(
+        &self,
+        editor: &ManifestEditor,
+        pack_name: Option<&str>,
+        package: &str,
+    ) -> Ownership {
+        if is_abi_anchor(package) {
+            return Ownership::AbiAnchor;
+        }
+        let Some(bundle) = pack_name else {
+            // No pack context at all: the workspace-manifest-widen path
+            // (a hand-written pin colliding with an unscoped pypi
+            // requirement) is already covered by the specific
+            // `CondaWidenNeeded`/`CondaBoundary` tiers, so the only
+            // ownership this generic engine recognizes here is that same
+            // hand-written pin (informational -- callers skip it);
+            // anything else is someone else's untouchable transitive.
+            if self.has_workspace_pin(editor, package) {
+                return Ownership::WorkspacePin;
+            }
+            return Ownership::Unowned;
+        };
+        // NOTE: deliberately does NOT check for a hand-written workspace
+        // pin on `package` here, even though one may ALSO exist -- inside
+        // a NAMED pack's conflict, the pack's own auto-routed pin and the
+        // workspace's hand-written pin for the SAME name are two
+        // different knobs (doctrine (i), `CondaRangeVsPackPin`'s own
+        // precedent: the workspace range is real intent and is never
+        // touched, but the PACK's companion pin still gets overridden
+        // toward it). `generate_fallback_candidates`' tier-1 branch looks
+        // up the workspace pin itself via `workspace_conda_pin` when it
+        // needs the value; `has_workspace_pin` gates the UN-ROUTE tier
+        // separately, for the same reason.
+        let Some(pack_pixi) = crate::workspace::WorkspaceManifest::load(editor.project_dir())
+            .and_then(|ws| resolve_pack_dir(&ws, editor.project_dir(), bundle))
+            .map(|d| d.join("pixi.toml"))
+        else {
+            return Ownership::Unowned;
+        };
+        // (c) a prior repair already ledgered an override for this
+        // (package, pack) -- checked before deps-from/auto-routed so a
+        // SECOND fallback pass narrows the existing entry instead of
+        // reclassifying it from scratch.
+        if crate::pack_overrides::overrides_for_pack(editor.project_dir(), &pack_pixi)
+            .contains_key(package)
+        {
+            return Ownership::LedgeredOverride;
+        }
+        // (a) a `retread-deps-from` root's own exact pin.
+        if deps_from_owns_exact_pin(editor.project_dir(), bundle, package) {
+            return Ownership::DepsFromExactPin;
+        }
+        // (b) everything else mentioned inside a NAMED pack's own
+        // uv-closure conflict is, by the same doctrine `CondaRangeVsPackPin`
+        // / `NestedCondaCap` already rely on, part of that pack's own
+        // auto-routed/rendered closure (no OTHER mechanism produces a
+        // pack-scoped exact companion conda run-dep) -- treat it as an
+        // owned, relaxable/un-routable knob rather than an untouchable
+        // transitive.
+        Ownership::AutoRoutedPackPin
+    }
+
+    /// The workspace's own conda-range pin for `package`, if any feature
+    /// declares one directly -- used by doctrine tier (i) to translate
+    /// toward the SAME spec `CondaRangeVsPackPin` would inject.
+    fn workspace_conda_pin(&self, editor: &ManifestEditor, package: &str) -> Option<String> {
+        for feature in editor.feature_names() {
+            if editor.has_user_entry(&feature, TableKind::Conda, package) {
+                let snap = editor.entry_snapshot(&feature, TableKind::Conda, package);
+                if let Some(value) = snap.value {
+                    return Some(value);
+                }
+            }
+        }
+        None
+    }
+
+    /// Whether ANY feature declares a hand-written conda or pypi entry
+    /// for `package` -- real owner intent per doctrine (d), regardless of
+    /// whether it's also mentioned inside a pack-scoped conflict. Used to
+    /// gate the UN-ROUTE tier (5): a metadata-skew un-route only makes
+    /// sense between two of a PACK's own emitted pins with no external
+    /// constrainer, so a package the workspace itself pins is excluded.
+    fn has_workspace_pin(&self, editor: &ManifestEditor, package: &str) -> bool {
+        editor.feature_names().iter().any(|feature| {
+            editor.has_user_entry(feature, TableKind::Conda, package)
+                || editor.has_user_entry(feature, TableKind::Pypi, package)
+        })
+    }
+
+    /// Doctrine-ordered candidate generation over every mention the
+    /// generic extractor found. Only mentions inside a NAMED pack's
+    /// conflict (`pack_name: Some`) can be attributed a resolvable owner
+    /// today -- the workspace-manifest-widen path (`pack_name: None`) is
+    /// already covered by the specific `CondaWidenNeeded`/`CondaBoundary`
+    /// tiers, so the fallback engine's UNIQUE value-add is entirely on
+    /// the pack-scoped side.
+    fn generate_fallback_candidates(
+        &self,
+        editor: &ManifestEditor,
+        pack_name: Option<&str>,
+        mentions: &[super::parse::Mention],
+    ) -> Vec<FallbackCandidate> {
+        let mut out = Vec::new();
+        let Some(bundle) = pack_name else {
+            return out;
+        };
+        let project_dir = editor.project_dir();
+        let Some(pack_pixi) = crate::workspace::WorkspaceManifest::load(project_dir)
+            .and_then(|ws| resolve_pack_dir(&ws, project_dir, bundle))
+            .map(|d| d.join("pixi.toml"))
+        else {
+            return out;
+        };
+        let existing_overrides = crate::pack_overrides::overrides_for_pack(project_dir, &pack_pixi);
+
+        for m in mentions {
+            let ownership = self.classify_mention_ownership(editor, pack_name, &m.package);
+            match ownership {
+                Ownership::AbiAnchor | Ownership::Unowned | Ownership::WorkspacePin => continue,
+                Ownership::AutoRoutedPackPin => {
+                    // Tier 1: a workspace range for the SAME package is
+                    // visible -- override the pack's auto-routed pin
+                    // toward it (same mechanics as `conda_range_vs_pack_pin`).
+                    if let Some(range) = self.workspace_conda_pin(editor, &m.package) {
+                        let new_spec = translate_conda_range_to_pep440(&range);
+                        out.push(FallbackCandidate {
+                            tier: 1,
+                            package: m.package.clone(),
+                            pack_name: bundle.to_string(),
+                            kind: PackOverrideKind::Override,
+                            old_spec: Some(m.spec.clone()),
+                            new_spec,
+                            ownership,
+                            tried_key: format!("{}@{bundle}#fallback-range", m.package),
+                            reason: format!(
+                                "generic fallback: workspace range {range} for {} overridden into pack `{bundle}`",
+                                m.package
+                            ),
+                        });
+                    }
+                }
+                Ownership::LedgeredOverride => {
+                    // Tier 2: a prior repair already narrowed/overrode
+                    // this package for this pack; if this mention carries
+                    // a tighter upper-bound cap, intersect (same
+                    // mechanics as `nested_conda_cap`).
+                    if let Some(existing) = existing_overrides.get(&m.package)
+                        && let Some((cap_op, cap_version)) = extract_cap_clause(&m.spec)
+                        && let Ok(narrowed) =
+                            intersect_range_with_cap(existing, &cap_op, &cap_version)
+                        && &narrowed != existing
+                    {
+                        out.push(FallbackCandidate {
+                            tier: 2,
+                            package: m.package.clone(),
+                            pack_name: bundle.to_string(),
+                            kind: PackOverrideKind::Override,
+                            old_spec: Some(existing.clone()),
+                            new_spec: narrowed,
+                            ownership,
+                            tried_key: format!("{}@{bundle}#fallback-narrow", m.package),
+                            reason: format!(
+                                "generic fallback: nested cap {cap_op}{cap_version} narrows existing pack override for {}",
+                                m.package
+                            ),
+                        });
+                    }
+                }
+                Ownership::DepsFromExactPin => {
+                    // Tier 3: relax the deps-from-owned exact pin to a
+                    // `>=` floor (same doctrine as `deps_from_pin_conflict`
+                    // / `no_wheel_transitive_conflict`).
+                    if let Some((op, version)) = leading_clause(&m.spec) {
+                        let new_spec = format!(">={version}");
+                        let _ = op;
+                        out.push(FallbackCandidate {
+                            tier: 3,
+                            package: m.package.clone(),
+                            pack_name: bundle.to_string(),
+                            kind: PackOverrideKind::Override,
+                            old_spec: Some(m.spec.clone()),
+                            new_spec,
+                            ownership,
+                            tried_key: format!("{}@{bundle}#fallback-relax", m.package),
+                            reason: format!(
+                                "generic fallback: deps-from exact pin {} relaxed",
+                                m.package
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+
+        // Tier 5: metadata-skew UN-ROUTE. A mention `m` (e.g. `pillow
+        // <11.0,>=9.2.0`) names a `requirer` (e.g. `moviepy`); if that
+        // requirer is ITSELF mentioned with an exact pin owned by this
+        // same pack (an `AutoRoutedPackPin`, i.e. the pack's own
+        // top-level emission -- not a workspace pin, not someone else's
+        // transitive), the conflict is between two of the pack's OWN
+        // emitted pins: no relax candidate makes sense (neither side is
+        // externally constrained), so un-route the requirer instead of
+        // guessing a version.
+        for m in mentions {
+            let Some(requirer) = &m.requirer else {
+                continue;
+            };
+            if is_abi_anchor(&m.package) || self.has_workspace_pin(editor, &m.package) {
+                continue;
+            }
+            let Some(req_mention) = mentions
+                .iter()
+                .find(|mm| mm.package.eq_ignore_ascii_case(requirer) && mm.spec.starts_with("=="))
+            else {
+                continue;
+            };
+            if self.has_workspace_pin(editor, &req_mention.package) {
+                continue;
+            }
+            let req_ownership =
+                self.classify_mention_ownership(editor, pack_name, &req_mention.package);
+            if req_ownership != Ownership::AutoRoutedPackPin {
+                continue;
+            }
+            out.push(FallbackCandidate {
+                tier: 5,
+                package: req_mention.package.clone(),
+                pack_name: bundle.to_string(),
+                kind: PackOverrideKind::Unroute,
+                old_spec: Some(req_mention.spec.clone()),
+                new_spec: String::new(),
+                ownership: req_ownership,
+                tried_key: format!("{}@{bundle}#fallback-unroute", req_mention.package),
+                reason: format!(
+                    "generic fallback: metadata skew ({} {} contradicts {}'s own emitted pin) -- un-routing {}",
+                    m.package, m.spec, req_mention.package, req_mention.package
+                ),
+            });
+        }
+
+        out.sort_by_key(|c| c.tier);
+        out.dedup_by(|a, b| {
+            a.tier == b.tier && a.package == b.package && a.pack_name == b.pack_name
+        });
+        out
+    }
+
+    fn apply_fallback_candidate(
+        &mut self,
+        tried: &mut TriedState,
+        cand: &FallbackCandidate,
+        iter: u32,
+    ) -> Option<RepairOutcome> {
+        if tried.has(&cand.tried_key, Strategy::PypiOverride) {
+            return None;
+        }
+        let strategy_spec = match cand.kind {
+            PackOverrideKind::Override => cand.new_spec.clone(),
+            PackOverrideKind::Unroute => format!("unroute:{}", cand.package),
+        };
+        if self
+            .guard_oscillation(&cand.tried_key, &strategy_spec, Strategy::PypiOverride)
+            .is_err()
+        {
+            return None;
+        }
+        tried.mark(&cand.tried_key, Strategy::PypiOverride, false);
+        eprintln!(
+            "retread: generic repair [{}] {} {} -> {} ({}, fallback engine)",
+            cand.tier,
+            cand.package,
+            cand.old_spec.as_deref().unwrap_or("(none)"),
+            match cand.kind {
+                PackOverrideKind::Override => cand.new_spec.as_str(),
+                PackOverrideKind::Unroute => "pypi (un-routed)",
+            },
+            cand.ownership.as_str(),
+        );
+        let summary_line = match cand.kind {
+            PackOverrideKind::Override => format!(
+                "would add [{} :: retread-overrides] {} = \"{}\"  (tier: pypi_override; {}; fallback engine)",
+                cand.pack_name, cand.package, cand.new_spec, cand.reason
+            ),
+            PackOverrideKind::Unroute => format!(
+                "would add [{} :: retread-keep-pypi] {}  (tier: pypi_override; un-route; {}; fallback engine)",
+                cand.pack_name, cand.package, cand.reason
+            ),
+        };
+        let new_spec_ledgered = match cand.kind {
+            PackOverrideKind::Override => cand.new_spec.clone(),
+            PackOverrideKind::Unroute => "keep-pypi".to_string(),
+        };
+        Some(RepairOutcome {
+            attempt: LedgerAttempt {
+                iter,
+                package: cand.package.clone(),
+                version: cand.old_spec.clone(),
+                tier: Strategy::PypiOverride.as_str().to_string(),
+                strategy: Strategy::PypiOverride.as_str().to_string(),
+                // Distinct from every specific `Conflict::kind()` tag
+                // (`NoCandidates`, `CondaWidenNeeded`, ...) -- honestly
+                // marks this attempt as the generic engine's own, not a
+                // specific rung's, in the ledger/audit trail.
+                conflict: "GenericFallback".to_string(),
+                source: "retread-fallback".to_string(),
+                ts: timestamp(),
+                old_spec: cand.old_spec.clone(),
+                new_spec: Some(new_spec_ledgered),
+                ceiling_policy: None,
+                before: None,
+                failed: false,
+            },
+            extra_attempts: Vec::new(),
+            summary_line,
+            applied: Vec::new(),
+            pack_override: None, // caller resolves pack_pixi + writes; see generic_fallback_repair
+        })
+    }
+
+    /// Generic ownership-driven fallback repair engine entry point.
+    /// Called by `retread lock` / `retread solve` ONLY when
+    /// `RegexConflictParser::parse` returned `None` for this iteration's
+    /// solver error (every specific rung already declined it). Returns
+    /// `None` when there is truly nothing actionable (no mentions found,
+    /// or no mention could be attributed an owner) -- the caller then
+    /// falls through to its existing "unparseable" dead end unchanged.
+    /// Returns `Some(Ok(outcome))` when a candidate was applied (caller
+    /// must still perform the pack-ledger write itself, same as every
+    /// other pack-scoped tier -- see `RepairOutcome::pack_override`'s doc
+    /// comment); `Some(Err(package))` when candidates exist but every one
+    /// is already tried/oscillation-guarded (exhausted, not
+    /// unparseable).
+    pub fn generic_fallback_repair(
+        &mut self,
+        editor: &ManifestEditor,
+        tried: &mut TriedState,
+        stderr: &str,
+        iter: u32,
+    ) -> Option<(
+        std::result::Result<RepairOutcome, String>,
+        Option<PackOverrideWrite>,
+    )> {
+        let parser = super::parse::RegexConflictParser::new();
+        let mentions = parser.extract_generic_mentions(stderr);
+        if mentions.is_empty() {
+            return None;
+        }
+        let pack_name = parser.extract_bundle_name(stderr);
+        let candidates = self.generate_fallback_candidates(editor, pack_name.as_deref(), &mentions);
+        if candidates.is_empty() {
+            return None;
+        }
+        let project_dir = editor.project_dir();
+        for cand in &candidates {
+            let Some(outcome) = self.apply_fallback_candidate(tried, cand, iter) else {
+                continue;
+            };
+            let Some(pack_pixi) = crate::workspace::WorkspaceManifest::load(project_dir)
+                .and_then(|ws| resolve_pack_dir(&ws, project_dir, &cand.pack_name))
+                .map(|d| d.join("pixi.toml"))
+            else {
+                continue;
+            };
+            let po = PackOverrideWrite {
+                bundle: cand.pack_name.clone(),
+                pack_pixi,
+                package: cand.package.clone(),
+                spec: cand.new_spec.clone(),
+                kind: cand.kind,
+            };
+            return Some((Ok(outcome), Some(po)));
+        }
+        Some((Err(candidates[0].package.clone()), None))
+    }
+}
+
+/// The first clause of a possibly-two-sided spec string (e.g. `"==2.2.1"`
+/// -> `("==", "2.2.1")`, `">=68,<81"` -> `(">=", "68")`).
+fn leading_clause(spec: &str) -> Option<(String, String)> {
+    let clause = spec.split(',').next()?.trim();
+    const OPS: &[&str] = &[">=", "<=", "==", ">", "<"];
+    for op in OPS {
+        if let Some(rest) = clause.strip_prefix(op) {
+            return Some((op.to_string(), rest.trim().to_string()));
+        }
+    }
+    None
+}
+
+/// The first upper-bound (`<`/`<=`) clause in a possibly-multi-clause
+/// spec string (e.g. `"<11.0,>=9.2.0"` -> `("<", "11.0")`), for tier 2's
+/// intersect candidate.
+fn extract_cap_clause(spec: &str) -> Option<(String, String)> {
+    for clause in spec.split(',') {
+        let clause = clause.trim();
+        for op in ["<=", "<"] {
+            if let Some(rest) = clause.strip_prefix(op) {
+                return Some((op.to_string(), rest.trim().to_string()));
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -3458,5 +3993,370 @@ holosoma-gpu = { features = ["holosoma"] }
             .repair(&mut editor, &mut tried, &conflict, 1)
             .expect_err("ABI anchor must never be relaxed");
         assert_eq!(err, "python");
+    }
+
+    // ---- generic ownership-driven fallback repair engine ------------------
+
+    const NESTED_CONDA_CAP_FALLBACK_FIXTURE: &str =
+        include_str!("../../tests/fixtures/solve_errors/nested_conda_cap_pytorch_setuptools.txt");
+    const PILLOW_MOVIEPY_FALLBACK_FIXTURE: &str = include_str!(
+        "../../tests/fixtures/solve_errors/pypi_conda_metadata_skew_pillow_moviepy.txt"
+    );
+
+    #[test]
+    fn classify_mention_ownership_abi_anchor_wins_regardless_of_pack() {
+        let path = temp_manifest("[dependencies]\n");
+        let editor = ManifestEditor::open(path).unwrap();
+        let planner = RepairPlanner::new("default".into());
+        assert_eq!(
+            planner.classify_mention_ownership(&editor, Some("some-pack"), "python"),
+            Ownership::AbiAnchor
+        );
+        assert_eq!(
+            planner.classify_mention_ownership(&editor, None, "python"),
+            Ownership::AbiAnchor
+        );
+    }
+
+    #[test]
+    fn classify_mention_ownership_workspace_pin_when_no_pack_context() {
+        let path = temp_manifest("[dependencies]\nnumpy = \">=1.26,<2\"\n");
+        let editor = ManifestEditor::open(path).unwrap();
+        let planner = RepairPlanner::new("default".into());
+        assert_eq!(
+            planner.classify_mention_ownership(&editor, None, "numpy"),
+            Ownership::WorkspacePin
+        );
+        assert_eq!(
+            planner.classify_mention_ownership(&editor, None, "some-other-package"),
+            Ownership::Unowned
+        );
+    }
+
+    #[test]
+    fn classify_mention_ownership_unowned_when_pack_unresolvable() {
+        let path = temp_manifest("[dependencies]\n");
+        let editor = ManifestEditor::open(path).unwrap();
+        let planner = RepairPlanner::new("default".into());
+        assert_eq!(
+            planner.classify_mention_ownership(&editor, Some("no-such-pack"), "setuptools"),
+            Ownership::Unowned
+        );
+    }
+
+    #[test]
+    fn classify_mention_ownership_auto_routed_pack_pin_when_named_pack_resolves() {
+        let manifest_text = "[dependencies]\n\n\
+             [feature.gpu.dependencies]\n\
+             \"isaaclab-2.3x-pack\" = { path = \"./pypi-packs/isaaclab-2.3x-pack\" }\n";
+        let path = temp_manifest(manifest_text);
+        let project_dir = path.parent().unwrap().to_path_buf();
+        let pack_dir = project_dir.join("pypi-packs/isaaclab-2.3x-pack");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        std::fs::write(
+            pack_dir.join("pixi.toml"),
+            "[package]\nname = \"isaaclab-2.3x-pack\"\nversion = \"0.54.2\"\n",
+        )
+        .unwrap();
+        let editor = ManifestEditor::open(path).unwrap();
+        let planner = RepairPlanner::new("default".into());
+        assert_eq!(
+            planner.classify_mention_ownership(&editor, Some("isaaclab-2.3x-pack"), "setuptools"),
+            Ownership::AutoRoutedPackPin
+        );
+    }
+
+    #[test]
+    fn classify_mention_ownership_ledgered_override_when_a_prior_repair_already_wrote_one() {
+        let manifest_text = "[dependencies]\n\n\
+             [feature.gpu.dependencies]\n\
+             \"isaaclab-2.3x-pack\" = { path = \"./pypi-packs/isaaclab-2.3x-pack\" }\n";
+        let path = temp_manifest(manifest_text);
+        let project_dir = path.parent().unwrap().to_path_buf();
+        let pack_dir = project_dir.join("pypi-packs/isaaclab-2.3x-pack");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        let pack_pixi = pack_dir.join("pixi.toml");
+        std::fs::write(
+            &pack_pixi,
+            "[package]\nname = \"isaaclab-2.3x-pack\"\nversion = \"0.54.2\"\n",
+        )
+        .unwrap();
+        crate::pack_overrides::write_override(
+            &project_dir,
+            &pack_pixi,
+            "isaaclab-2.3x-pack",
+            "setuptools",
+            ">=68,<81",
+            "prior repair",
+        )
+        .unwrap();
+        let editor = ManifestEditor::open(path).unwrap();
+        let planner = RepairPlanner::new("default".into());
+        assert_eq!(
+            planner.classify_mention_ownership(&editor, Some("isaaclab-2.3x-pack"), "setuptools"),
+            Ownership::LedgeredOverride
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn classify_mention_ownership_deps_from_exact_pin_when_bundle_owns_it() {
+        let manifest_text = deps_from_manifest("./pypi-packs/deps-from-pack");
+        let path = temp_manifest(&manifest_text);
+        let project_dir = path.parent().unwrap().to_path_buf();
+        deps_from_pack(&project_dir, "sentry-sdk==1.38.0\n");
+        let editor = ManifestEditor::open(path).unwrap();
+        let planner = RepairPlanner::new("default".into());
+        assert_eq!(
+            planner.classify_mention_ownership(&editor, Some("deps-from-pack"), "sentry-sdk"),
+            Ownership::DepsFromExactPin
+        );
+    }
+
+    #[test]
+    fn generate_fallback_candidates_orders_by_doctrine_tier() {
+        // Synthetic mentions spanning tiers 1 (workspace-range-vs-owned-pin),
+        // 2 (ledgered-override intersect), and 5 (metadata-skew un-route),
+        // deliberately listed out of order -- the generator must sort by
+        // doctrine tier regardless of extraction order.
+        let manifest_text = "[dependencies]\nsetuptools = \">=68,<81\"\n\n\
+             [feature.gpu.dependencies]\n\
+             \"isaaclab-2.3x-pack\" = { path = \"./pypi-packs/isaaclab-2.3x-pack\" }\n";
+        let path = temp_manifest(manifest_text);
+        let project_dir = path.parent().unwrap().to_path_buf();
+        let pack_dir = project_dir.join("pypi-packs/isaaclab-2.3x-pack");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        let pack_pixi = pack_dir.join("pixi.toml");
+        std::fs::write(
+            &pack_pixi,
+            "[package]\nname = \"isaaclab-2.3x-pack\"\nversion = \"0.54.2\"\n",
+        )
+        .unwrap();
+        crate::pack_overrides::write_override(
+            &project_dir,
+            &pack_pixi,
+            "isaaclab-2.3x-pack",
+            "pillow",
+            ">=9.2.0,<11.3.0",
+            "prior repair",
+        )
+        .unwrap();
+        let editor = ManifestEditor::open(path).unwrap();
+        let planner = RepairPlanner::new("default".into());
+        let mentions = vec![
+            // Tier 5 candidate material (listed first, out of order).
+            super::super::parse::Mention {
+                package: "pillow".into(),
+                spec: "<11.0,>=9.2.0".into(),
+                requirer: Some("moviepy".into()),
+            },
+            super::super::parse::Mention {
+                package: "moviepy".into(),
+                spec: "==2.2.1".into(),
+                requirer: None,
+            },
+            // Tier 2 candidate material: a tighter cap than the ledgered
+            // pillow override above.
+            super::super::parse::Mention {
+                package: "pillow".into(),
+                spec: "<10.0".into(),
+                requirer: Some("some-other-dep".into()),
+            },
+            // Tier 1 candidate material: setuptools has a visible
+            // workspace range AND an auto-routed exact companion demand.
+            super::super::parse::Mention {
+                package: "setuptools".into(),
+                spec: "==83.0.0".into(),
+                requirer: Some("isaaclab-2.3x-pack".into()),
+            },
+        ];
+        let candidates =
+            planner.generate_fallback_candidates(&editor, Some("isaaclab-2.3x-pack"), &mentions);
+        let tiers: Vec<u8> = candidates.iter().map(|c| c.tier).collect();
+        let mut sorted = tiers.clone();
+        sorted.sort();
+        assert_eq!(tiers, sorted, "candidates must already be in tier order");
+        assert!(
+            tiers.contains(&1),
+            "expected a tier-1 (workspace-range) candidate: {candidates:?}"
+        );
+        assert!(
+            tiers.contains(&2),
+            "expected a tier-2 (ledgered-override intersect) candidate: {candidates:?}"
+        );
+        assert!(
+            tiers.contains(&5),
+            "expected a tier-5 (un-route) candidate: {candidates:?}"
+        );
+    }
+
+    #[test]
+    fn end_to_end_run13_nested_cap_via_generic_fallback_without_specific_rung() {
+        // Run 13 shape, fed through the GENERIC fallback engine directly
+        // (never `parser.parse()`, never the specific `NestedCondaCap`
+        // rung) -- proves the fallback engine alone can narrow an existing
+        // pack override via the generic extractor + ownership
+        // classification + tier-2 intersect candidate.
+        let manifest_text = "[dependencies]\nsetuptools = \">=68,<81\"\n\n\
+             [feature.gpu.dependencies]\n\
+             \"isaaclab-2.3x-pack\" = { path = \"./pypi-packs/isaaclab-2.3x-pack\" }\n";
+        let path = temp_manifest(manifest_text);
+        let project_dir = path.parent().unwrap().to_path_buf();
+        let pack_dir = project_dir.join("pypi-packs/isaaclab-2.3x-pack");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        let pack_pixi = pack_dir.join("pixi.toml");
+        std::fs::write(
+            &pack_pixi,
+            "[package]\nname = \"isaaclab-2.3x-pack\"\nversion = \"0.54.2\"\n",
+        )
+        .unwrap();
+        // Simulate the PRIOR `CondaRangeVsPackPin` repair having already
+        // been persisted to the ledger (same setup as
+        // `nested_conda_cap_narrows_an_existing_pack_override`, but here
+        // the generic engine -- not the specific `NestedCondaCap` tier --
+        // must find and narrow it).
+        crate::pack_overrides::write_override(
+            &project_dir,
+            &pack_pixi,
+            "isaaclab-2.3x-pack",
+            "setuptools",
+            ">=68,<81",
+            "prior CondaRangeVsPackPin repair",
+        )
+        .unwrap();
+
+        let editor = ManifestEditor::open(path).unwrap();
+        let mut tried = TriedState::default();
+        let mut planner = RepairPlanner::new("default".into());
+
+        let (result, po) = planner
+            .generic_fallback_repair(&editor, &mut tried, NESTED_CONDA_CAP_FALLBACK_FIXTURE, 1)
+            .expect("generic fallback engine must find an actionable mention");
+        let outcome = result.expect("must narrow the existing override, not exhaust");
+        assert_eq!(outcome.attempt.strategy, "pypi_override");
+        assert_eq!(outcome.attempt.old_spec.as_deref(), Some(">=68,<81"));
+        assert_eq!(outcome.attempt.new_spec.as_deref(), Some(">=68,<76"));
+        let po = po.expect("expected a pack-override write");
+        assert_eq!(po.bundle, "isaaclab-2.3x-pack");
+        assert_eq!(po.package, "setuptools");
+        assert_eq!(po.spec, ">=68,<76");
+        assert_eq!(po.kind, PackOverrideKind::Override);
+    }
+
+    #[test]
+    fn end_to_end_run15_pypi_conda_metadata_skew_unroutes_moviepy() {
+        // Run 15 shape: NO specific rung recognizes this at all (asserted
+        // separately in `parse.rs`'s
+        // `pypi_conda_metadata_skew_stays_unparseable_to_every_specific_rung`)
+        // -- the generic fallback engine must classify `moviepy` as an
+        // auto-routed pack pin implicated in a metadata-skew conflict with
+        // `pillow` (also the pack's own emission, no workspace pin
+        // touching either) and generate an UN-ROUTE candidate for
+        // `moviepy`, writing to the ledger's `unrouted` sink rather than
+        // an override spec.
+        let manifest_text = "[dependencies]\n\n\
+             [feature.pm.dependencies]\n\
+             \"protomotions-deps-pack\" = { path = \"./pypi-packs/protomotions-deps-pack\" }\n\n\
+             [environments]\npm = { features = [\"pm\"] }\n";
+        let path = temp_manifest(manifest_text);
+        let project_dir = path.parent().unwrap().to_path_buf();
+        let pack_dir = project_dir.join("pypi-packs/protomotions-deps-pack");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        std::fs::write(
+            pack_dir.join("pixi.toml"),
+            "[package]\nname = \"protomotions-deps-pack\"\nversion = \"3.1\"\n",
+        )
+        .unwrap();
+
+        let editor = ManifestEditor::open(path).unwrap();
+        let mut tried = TriedState::default();
+        let mut planner = RepairPlanner::new("default".into());
+
+        let (result, po) = planner
+            .generic_fallback_repair(&editor, &mut tried, PILLOW_MOVIEPY_FALLBACK_FIXTURE, 1)
+            .expect("generic fallback engine must find an actionable mention");
+        let outcome = result.expect("must un-route moviepy, not exhaust");
+        assert_eq!(outcome.attempt.strategy, "pypi_override");
+        let po = po.expect("expected a pack-override write");
+        assert_eq!(po.bundle, "protomotions-deps-pack");
+        assert_eq!(po.package, "moviepy");
+        assert_eq!(po.kind, PackOverrideKind::Unroute);
+
+        // And the ledger sink is actually the un-route table, not the
+        // ordinary overrides table.
+        crate::pack_overrides::write_unroute(
+            &project_dir,
+            &po.pack_pixi,
+            &po.bundle,
+            &po.package,
+            &outcome.attempt.conflict,
+        )
+        .unwrap();
+        let unrouted = crate::pack_overrides::unrouted_for_pack(&project_dir, &po.pack_pixi);
+        assert!(unrouted.contains("moviepy"));
+
+        // And `merge_ledger_overrides` actually feeds it into
+        // `RetreadConfig.keep_pypi`, the knob the real auto-route sweep
+        // reads (`plan_auto_route_round` / `AutoRouteOptions.keep_pypi`).
+        let mut config: crate::config::RetreadConfig =
+            serde_json::from_value(serde_json::json!({"retread-wheels": {}})).unwrap();
+        crate::pack_overrides::merge_ledger_overrides(&mut config, &project_dir, &po.pack_pixi);
+        assert!(config.keep_pypi.contains(&"moviepy".to_string()));
+    }
+
+    #[test]
+    fn generic_fallback_repair_returns_none_when_no_mentions_found() {
+        let path = temp_manifest("[dependencies]\n");
+        let editor = ManifestEditor::open(path).unwrap();
+        let mut tried = TriedState::default();
+        let mut planner = RepairPlanner::new("default".into());
+        assert!(
+            planner
+                .generic_fallback_repair(&editor, &mut tried, "totally unrelated text", 1)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn generic_fallback_repair_exhausts_on_repeat_rather_than_looping() {
+        let manifest_text = "[dependencies]\nsetuptools = \">=68,<81\"\n\n\
+             [feature.gpu.dependencies]\n\
+             \"isaaclab-2.3x-pack\" = { path = \"./pypi-packs/isaaclab-2.3x-pack\" }\n";
+        let path = temp_manifest(manifest_text);
+        let project_dir = path.parent().unwrap().to_path_buf();
+        let pack_dir = project_dir.join("pypi-packs/isaaclab-2.3x-pack");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        let pack_pixi = pack_dir.join("pixi.toml");
+        std::fs::write(
+            &pack_pixi,
+            "[package]\nname = \"isaaclab-2.3x-pack\"\nversion = \"0.54.2\"\n",
+        )
+        .unwrap();
+        crate::pack_overrides::write_override(
+            &project_dir,
+            &pack_pixi,
+            "isaaclab-2.3x-pack",
+            "setuptools",
+            ">=68,<76",
+            "already narrowed to the fixture's own cap",
+        )
+        .unwrap();
+
+        let editor = ManifestEditor::open(path).unwrap();
+        let mut tried = TriedState::default();
+        let mut planner = RepairPlanner::new("default".into());
+        // The existing override already matches what the nested cap would
+        // narrow it to -- intersecting is a no-op, so tier 2 offers no
+        // candidate at all for this mention (and none of the other
+        // mentions in this fixture attribute an owner either: `setuptools`
+        // itself is workspace-pinned, which gates tier 5's un-route). The
+        // engine must recognize there is nothing actionable and return
+        // `None` (falls through to the caller's normal "unparseable" path)
+        // rather than manufacture a no-op repair or loop.
+        assert!(
+            planner
+                .generic_fallback_repair(&editor, &mut tried, NESTED_CONDA_CAP_FALLBACK_FIXTURE, 1)
+                .is_none(),
+            "a no-op intersection must not be offered as a candidate"
+        );
     }
 }

@@ -186,6 +186,14 @@ pub const AUTO_ROUTE_PROBE_CONCURRENCY: usize = 16;
 pub struct RouteProbeHit {
     pub conda_version: String,
     pub channel: String,
+    /// Route-time metadata-consistency check (prevention for the
+    /// PyPI-vs-conda-forge metadata-skew class, see
+    /// `route_metadata_consistent`): the raw conda `depends` array of
+    /// the routed build, when the caller has it available. Empty when
+    /// unavailable (older probes, most tests) -- the check then simply
+    /// has nothing to contradict and the route proceeds unchecked,
+    /// identical to pre-this-fix behavior.
+    pub depends: Vec<String>,
 }
 
 /// Pure routing sweep over one solved closure: which index wheels can
@@ -224,6 +232,24 @@ pub fn plan_auto_route_round(
             .map(|c| canonical_conda_name(c))
             .unwrap_or_else(|| name.clone());
         if let Some(hit) = probe_hits.get(&conda_name) {
+            // Route-time metadata-consistency check (prevention for the
+            // PyPI-vs-conda-forge metadata-skew class -- run-15's
+            // moviepy==2.2.1/pillow==11.3.0 shape): the routed build's
+            // OWN conda `depends` might name a version of something the
+            // closure ALREADY locked that its own recipe can't actually
+            // accept (conda-forge's repackage metadata lagging the
+            // upstream PyPI release). Refuse the route rather than ship
+            // a conda run-dep the workspace solve is guaranteed to choke
+            // on one iteration later; the package stays on PyPI instead.
+            if let Err(reason) =
+                route_metadata_consistent(name, &wheel.version, &hit.depends, &closure.pins)
+            {
+                eprintln!(
+                    "retread: route refused for {name}=={} — {reason}",
+                    wheel.version
+                );
+                continue;
+            }
             out.push(AutoRoutedPackage {
                 pypi_name: name.clone(),
                 conda_name,
@@ -234,6 +260,74 @@ pub fn plan_auto_route_round(
         }
     }
     out
+}
+
+/// One-level-deep route-time metadata-consistency check (prevention
+/// counterpart to the CLI fallback engine's UN-ROUTE cure): before
+/// routing `candidate`==`candidate_version` to conda, walk the conda
+/// build's own `depends` array and check each entry naming a package the
+/// uv closure ALREADY locked (`locked_versions`, PEP 503-normalized name
+/// -> resolved version -- `UvClosure::pins`) against that dep's version
+/// spec. A mismatch means the routed build's own recipe metadata
+/// contradicts the closure the rest of the workspace already committed
+/// to -- almost always a conda-forge repackage whose pinned dependency
+/// range lags the upstream PyPI release the wheel closure resolved
+/// against (the run-15 shape: conda `moviepy-2.2.1`'s own recipe still
+/// says `pillow <11.0`, but PyPI's `moviepy 2.2.1` legally allows
+/// `pillow <12`, and the closure already locked `pillow==11.3.0`).
+///
+/// Deliberately shallow (one level): only `depends`'s own entries are
+/// checked, never their OWN transitive dependencies -- a contradiction
+/// found only several levels down still reaches the ordinary solve
+/// attempt as a ladder conflict, for the CLI's generic-repair UN-ROUTE
+/// candidate to cure after the fact (`retread lock`'s fallback engine).
+/// Unrecognized dep entries (bad name, unparseable spec, `*`/empty
+/// range, or a name the closure never locked at all) are silently
+/// skipped rather than treated as a contradiction -- this check only
+/// ever REFUSES on a provable mismatch, never on missing information.
+pub fn route_metadata_consistent(
+    candidate: &str,
+    candidate_version: &str,
+    depends: &[String],
+    locked_versions: &BTreeMap<String, String>,
+) -> std::result::Result<(), String> {
+    use rattler_conda_types::{ParseStrictness, Version, VersionSpec};
+    use std::str::FromStr;
+    let _ = candidate_version;
+
+    for dep in depends {
+        let trimmed = dep.trim();
+        let mut parts = trimmed.splitn(2, char::is_whitespace);
+        let Some(raw_name) = parts.next() else {
+            continue;
+        };
+        if raw_name.is_empty() {
+            continue;
+        }
+        let dep_name = canonical_conda_name(raw_name);
+        if dep_name == canonical_conda_name(candidate) {
+            continue;
+        }
+        let spec_str = parts.next().unwrap_or("").trim();
+        if spec_str.is_empty() || spec_str == "*" {
+            continue;
+        }
+        let Some(locked_version) = locked_versions.get(&dep_name) else {
+            continue;
+        };
+        let Ok(spec) = VersionSpec::from_str(spec_str, ParseStrictness::Lenient) else {
+            continue;
+        };
+        let Ok(locked) = Version::from_str(locked_version) else {
+            continue;
+        };
+        if !spec.matches(&locked) {
+            return Err(format!(
+                "conda repackage metadata ({dep_name} {spec_str}) contradicts locked closure ({dep_name} {locked_version})"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The conda names + `==version` specs to probe for one round's
@@ -2776,6 +2870,7 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
             RouteProbeHit {
                 conda_version: "2.1.0".into(),
                 channel: "https://conda.anaconda.org/conda-forge/linux-64".into(),
+                depends: Vec::new(),
             },
         );
         let closure = auto_route_fixpoint(
@@ -2829,6 +2924,7 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
             RouteProbeHit {
                 conda_version: "2.1.0".into(),
                 channel: "c/linux-64".into(),
+                depends: Vec::new(),
             },
         );
         let mut opts = auto_route_opts();
@@ -2857,6 +2953,7 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
             RouteProbeHit {
                 conda_version: "3.5.0".into(),
                 channel: "c/linux-64".into(),
+                depends: Vec::new(),
             },
         );
         let closure = auto_route_fixpoint(
@@ -2882,6 +2979,7 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
             RouteProbeHit {
                 conda_version: "2.1.0".into(),
                 channel: "c/linux-64".into(),
+                depends: Vec::new(),
             },
         );
         let mut opts = auto_route_opts();
@@ -2934,6 +3032,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
             RouteProbeHit {
                 conda_version: "2.10.0".into(),
                 channel: "c/linux-64".into(),
+                depends: Vec::new(),
             },
         );
         let mut opts = auto_route_opts();
@@ -2997,6 +3096,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
                 Some(RouteProbeHit {
                     conda_version: "1.0".into(),
                     channel: format!("c/{name}"),
+                    depends: Vec::new(),
                 })
             }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
         };
@@ -3101,12 +3201,112 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
                 RouteProbeHit {
                     conda_version: "1".into(),
                     channel: "c/linux-64".into(),
+                    depends: Vec::new(),
                 },
             );
         }
         let routes = plan_auto_route_round(&closure, &req, &auto_route_opts(), &[], &hits);
         let names: Vec<&str> = routes.iter().map(|r| r.pypi_name.as_str()).collect();
         assert_eq!(names, vec!["typing-extensions"]);
+    }
+
+    /// Run-15 shape, mocked at the repodata layer: conda `moviepy`'s own
+    /// recipe still says `pillow <11.0,>=9.2.0`, but the uv closure
+    /// already locked `pillow==11.3.0` (uv's legal PyPI-truth pick,
+    /// `moviepy 2.2.1`'s PyPI metadata allows `pillow<12`). The
+    /// contradiction must refuse the route.
+    #[test]
+    fn route_metadata_consistent_rejects_conda_forge_metadata_skew() {
+        let mut locked = BTreeMap::new();
+        locked.insert("pillow".to_string(), "11.3.0".to_string());
+        let err = route_metadata_consistent(
+            "moviepy",
+            "2.2.1",
+            &["pillow <11.0,>=9.2.0".to_string()],
+            &locked,
+        )
+        .unwrap_err();
+        assert!(err.contains("pillow"), "reason should name pillow: {err}");
+        assert!(
+            err.contains("11.3.0"),
+            "reason should cite the locked version: {err}"
+        );
+    }
+
+    /// Same shape, but the closure's locked pillow version DOES satisfy
+    /// the conda recipe's range -- no contradiction, route proceeds.
+    #[test]
+    fn route_metadata_consistent_accepts_matching_metadata() {
+        let mut locked = BTreeMap::new();
+        locked.insert("pillow".to_string(), "10.4.0".to_string());
+        assert_eq!(
+            route_metadata_consistent(
+                "moviepy",
+                "2.2.1",
+                &["pillow <11.0,>=9.2.0".to_string()],
+                &locked,
+            ),
+            Ok(())
+        );
+    }
+
+    /// A depends entry naming something the closure never locked at all
+    /// (or an unparseable/`*` spec) is skipped, not treated as a
+    /// contradiction -- this check only ever refuses on a PROVABLE
+    /// mismatch.
+    #[test]
+    fn route_metadata_consistent_skips_unknown_and_wildcard_deps() {
+        let locked = BTreeMap::new();
+        assert_eq!(
+            route_metadata_consistent(
+                "moviepy",
+                "2.2.1",
+                &["pillow <11.0,>=9.2.0".to_string(), "numpy *".to_string()],
+                &locked,
+            ),
+            Ok(())
+        );
+    }
+
+    /// End-to-end through the real planner: a probe hit whose `depends`
+    /// contradicts the closure's own locked pillow version is refused --
+    /// the candidate is never routed, even though the probe found it on
+    /// a channel.
+    #[test]
+    fn plan_auto_route_round_refuses_metadata_skewed_route() {
+        let mut req = auto_route_req();
+        let exclude: BTreeSet<String> = BTreeSet::new();
+        let mut closure =
+            parse_pylock_closure(PYLOCK_FIXTURE, &target("3.12", "linux-64"), &exclude, "x")
+                .unwrap();
+        closure
+            .pins
+            .insert("pillow".to_string(), "11.3.0".to_string());
+        req.no_emit_packages.clear();
+        let mut hits = BTreeMap::new();
+        hits.insert(
+            "numpy".to_string(),
+            RouteProbeHit {
+                conda_version: "2.1.0".into(),
+                channel: "c/linux-64".into(),
+                depends: vec!["pillow <11.0,>=9.2.0".to_string()],
+            },
+        );
+        hits.insert(
+            "typing-extensions".to_string(),
+            RouteProbeHit {
+                conda_version: "4.12.2".into(),
+                channel: "c/linux-64".into(),
+                depends: Vec::new(),
+            },
+        );
+        let routes = plan_auto_route_round(&closure, &req, &auto_route_opts(), &[], &hits);
+        let names: Vec<&str> = routes.iter().map(|r| r.pypi_name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["typing-extensions"],
+            "numpy's route must be refused (metadata skew); typing-extensions unaffected"
+        );
     }
 
     // ---- live subprocess (network) ---------------------------------------
@@ -3194,6 +3394,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
                     .map(|h| RouteProbeHit {
                         conda_version: h.version,
                         channel: h.channel,
+                        depends: Vec::new(),
                     })
             }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
         };
@@ -3304,6 +3505,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
             RouteProbeHit {
                 conda_version: "2.1.0".into(),
                 channel: "c/linux-64".into(),
+                depends: Vec::new(),
             },
         );
         hits.insert(
@@ -3311,6 +3513,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
             RouteProbeHit {
                 conda_version: "4.12.2".into(),
                 channel: "c/linux-64".into(),
+                depends: Vec::new(),
             },
         );
         let co_solve = canned_co_solve(vec![(
@@ -3371,6 +3574,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
             RouteProbeHit {
                 conda_version: "2.1.0".into(),
                 channel: "c/linux-64".into(),
+                depends: Vec::new(),
             },
         );
         hits.insert(
@@ -3378,6 +3582,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
             RouteProbeHit {
                 conda_version: "4.12.2".into(),
                 channel: "c/linux-64".into(),
+                depends: Vec::new(),
             },
         );
         // The report only names typing-extensions.
@@ -3432,6 +3637,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
             RouteProbeHit {
                 conda_version: "2.1.0".into(),
                 channel: "c/linux-64".into(),
+                depends: Vec::new(),
             },
         );
         hits.insert(
@@ -3439,6 +3645,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
             RouteProbeHit {
                 conda_version: "4.12.2".into(),
                 channel: "c/linux-64".into(),
+                depends: Vec::new(),
             },
         );
         // Custom co_solve (not `canned_co_solve`, which keys unsat off a
@@ -3503,6 +3710,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
                     "numpy" => Some(RouteProbeHit {
                         conda_version: "2.1.0".into(),
                         channel: "c/linux-64".into(),
+                        depends: Vec::new(),
                     }),
                     "typing-extensions" => {
                         let mut n = te_probes.lock().unwrap();
@@ -3510,6 +3718,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
                         (*n >= 2).then(|| RouteProbeHit {
                             conda_version: "4.12.2".into(),
                             channel: "c/linux-64".into(),
+                            depends: Vec::new(),
                         })
                     }
                     _ => None,
@@ -3566,6 +3775,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
             RouteProbeHit {
                 conda_version: "2.1.0".into(),
                 channel: "c/linux-64".into(),
+                depends: Vec::new(),
             },
         );
         let co_solve = canned_co_solve(vec![(
@@ -3605,6 +3815,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
             RouteProbeHit {
                 conda_version: "2.1.0".into(),
                 channel: "c/linux-64".into(),
+                depends: Vec::new(),
             },
         );
         let co_solve = canned_co_solve(vec![(
@@ -3845,6 +4056,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
                         Some(RouteProbeHit {
                             conda_version: "4.9.3".into(),
                             channel: "https://conda.anaconda.org/conda-forge/linux-64".into(),
+                            depends: Vec::new(),
                         })
                     } else {
                         None
@@ -4029,6 +4241,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
                     Some(RouteProbeHit {
                         conda_version: "1.8.2".into(),
                         channel: "https://conda.anaconda.org/conda-forge/linux-64".into(),
+                        depends: Vec::new(),
                     })
                 } else {
                     None
@@ -4128,6 +4341,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
                         Some(RouteProbeHit {
                             conda_version: "4.9.3".into(),
                             channel: "https://conda.anaconda.org/conda-forge/linux-64".into(),
+                            depends: Vec::new(),
                         })
                     } else {
                         None

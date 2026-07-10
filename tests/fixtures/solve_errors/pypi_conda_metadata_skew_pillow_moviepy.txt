@@ -1,0 +1,13 @@
+Error:   × failed to solve requirements of environment 'pm-isaaclab' for platform
+  │ 'linux-64'
+  ├─▶   × failed to solve the environment
+  │
+  ╰─▶ Cannot solve the request because of: protomotions-deps-pack * cannot be
+      installed because there are no viable options:
+      └─ protomotions-deps-pack 3.1 would require
+         └─ moviepy ==2.2.1, which cannot be installed because there are no
+      viable options:
+            └─ moviepy 2.2.1 would require
+               └─ pillow <11.0,>=9.2.0, for which no candidates were found.
+
+

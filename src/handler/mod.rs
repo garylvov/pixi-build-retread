@@ -2609,6 +2609,7 @@ async fn uv_group_closure(
                     .map(|hit| crate::uv_closure::RouteProbeHit {
                         conda_version: hit.version,
                         channel: hit.channel,
+                        depends: hit.depends,
                     })
             };
             Box::pin(fut)
@@ -2639,6 +2640,7 @@ async fn uv_group_closure(
                     .map(|hit| crate::uv_closure::RouteProbeHit {
                         conda_version: hit.version,
                         channel: hit.channel,
+                        depends: hit.depends,
                     })
             };
             Box::pin(fut)

@@ -70,6 +70,34 @@ pub struct AutoOverrideEntry {
 pub struct AutoOverrideLedger {
     #[serde(default)]
     pub packs: BTreeMap<String, BTreeMap<String, AutoOverrideEntry>>,
+    /// Generic fallback engine (ownership-driven repair, un-route
+    /// candidate): PyPI names, per pack, that a repair decided must ship
+    /// as a PyPI wheel rather than be conda-routed (the doctrine-(v)
+    /// cure for a PyPI-vs-conda-forge metadata skew, e.g. run-15's
+    /// `moviepy==2.2.1` vs conda-forge's stale `pillow <11.0` cap).
+    /// Merged into the pack's `RetreadConfig.keep_pypi` at
+    /// `Handler::initialize` time (see [`merge_ledger_overrides`]),
+    /// exactly like [`Self::packs`] merges into `config.overrides` -- the
+    /// pack's own `pixi.toml` is never touched.
+    #[serde(default)]
+    pub unrouted: BTreeMap<String, BTreeMap<String, UnrouteEntry>>,
+}
+
+/// One auto-repaired un-route decision recorded in the ledger. Mirrors
+/// [`AutoOverrideEntry`]'s provenance fields; carries no `spec` (un-route
+/// is a boolean "keep as pypi" decision, not a version).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnrouteEntry {
+    /// The bundle/pack name as the triggering conflict reported it.
+    #[serde(default)]
+    pub bundle: String,
+    /// Human-readable description of the conflict that caused this
+    /// un-route (the parsed fallback candidate's "why").
+    #[serde(default)]
+    pub provenance: String,
+    /// `YYYY-MM-DD` the un-route was recorded.
+    #[serde(default)]
+    pub date: String,
 }
 
 impl AutoOverrideLedger {
@@ -198,6 +226,58 @@ pub fn invalidate_pixi_source_metadata(workspace_dir: &Path, bundle: &str) {
     }
 }
 
+/// Append (or replace) an auto-repaired un-route decision for
+/// `pack_pixi`/`package` into the workspace's ledger -- the un-route
+/// counterpart of [`write_override`]. Same ledger, same cache-eviction
+/// follow-up (a pack's `keep-pypi` set changing invalidates its cached
+/// conda/outputs render exactly like an overrides change does).
+pub fn write_unroute(
+    workspace_dir: &Path,
+    pack_pixi: &Path,
+    bundle: &str,
+    package: &str,
+    provenance: &str,
+) -> Result<()> {
+    let mut ledger = AutoOverrideLedger::load(workspace_dir)?;
+    let key = pack_key(workspace_dir, pack_pixi);
+    ledger.unrouted.entry(key).or_default().insert(
+        package.to_string(),
+        UnrouteEntry {
+            bundle: bundle.to_string(),
+            provenance: provenance.to_string(),
+            date: local_date(),
+        },
+    );
+    ledger.write_atomic(workspace_dir)?;
+    invalidate_pixi_source_metadata(workspace_dir, bundle);
+    Ok(())
+}
+
+/// Read-only: every PyPI name auto-repaired to un-route for `pack_pixi`.
+/// Never fails the caller -- see [`overrides_for_pack`]'s doc comment.
+pub fn unrouted_for_pack(
+    workspace_dir: &Path,
+    pack_pixi: &Path,
+) -> std::collections::BTreeSet<String> {
+    let ledger = match AutoOverrideLedger::load(workspace_dir) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "retread: failed to read .retread/auto-overrides.json; \
+                 proceeding with no auto un-routes for this pack"
+            );
+            return std::collections::BTreeSet::new();
+        }
+    };
+    let key = pack_key(workspace_dir, pack_pixi);
+    ledger
+        .unrouted
+        .get(&key)
+        .map(|entries| entries.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
 /// Read-only: every auto-repaired override recorded for `pack_pixi`, as a
 /// plain `package -> spec` map ready to merge into a `RetreadConfig`.
 /// Never fails the caller -- a missing/corrupt ledger degrades to "no auto
@@ -245,6 +325,16 @@ pub fn merge_ledger_overrides(config: &mut RetreadConfig, workspace_dir: &Path, 
     for (package, spec) in overrides_for_pack(workspace_dir, pack_pixi) {
         config.overrides.insert(package, spec);
     }
+    // Generic fallback engine's un-route candidate (doctrine (v)): merge
+    // ledgered un-routes into `keep_pypi` the same way, so the pack's
+    // auto-route sweep (`plan_auto_route_round`) skips these names on its
+    // very next render -- see `AutoRouteOptions.keep_pypi` in
+    // `uv_closure.rs`, sourced from `config.keep_pypi` in `handler/mod.rs`.
+    for package in unrouted_for_pack(workspace_dir, pack_pixi) {
+        if !config.keep_pypi.contains(&package) {
+            config.keep_pypi.push(package);
+        }
+    }
 }
 
 /// Snapshot the ledger file before this run's first write to it. No-op if
@@ -289,6 +379,12 @@ pub fn rollback_all(workspace_dir: &Path) -> Result<()> {
                     .packs
                     .values()
                     .flat_map(|entries| entries.values().map(|e| e.bundle.clone()))
+                    .chain(
+                        ledger
+                            .unrouted
+                            .values()
+                            .flat_map(|entries| entries.values().map(|e| e.bundle.clone())),
+                    )
                     .filter(|b| !b.is_empty())
                     .collect()
             })

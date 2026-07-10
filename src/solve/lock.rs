@@ -17,9 +17,9 @@ use super::error::{EXIT_EXHAUSTED, EXIT_INTERRUPTED, EXIT_MAX_ITERS, EXIT_OK, EX
 use super::manifest::{AppliedEdit, ManifestEditor, copy_atomic};
 use super::parse::{ConflictParser, RegexConflictParser, tail};
 use super::repair::{
-    PackOverrideWrite, RelaxPreference, RepairPlanner, SolveLedger, Strategy, append_attempt,
-    is_abi_anchor, ledger_path, manifest_sha256, mark_last_widen_failed, persist_conflict_trace,
-    retread_dir, snapshot_path,
+    PackOverrideKind, PackOverrideWrite, RelaxPreference, RepairPlanner, SolveLedger, Strategy,
+    append_attempt, is_abi_anchor, ledger_path, manifest_sha256, mark_last_widen_failed,
+    persist_conflict_trace, retread_dir, snapshot_path,
 };
 
 const DEFAULT_MAX_REPAIRS: u32 = 10;
@@ -293,6 +293,66 @@ async fn run_with_pixi_bin(args: LockArgs, pixi_bin: &str) -> Result<i32> {
                     } else {
                         eprintln!("retread lock: exhausted repair strategies for {package}");
                     }
+                    print_summary(&records);
+                    return Ok(EXIT_EXHAUSTED);
+                }
+            }
+        }
+
+        // Fallback: no specific parser matched this iteration's error --
+        // try the generic ownership-driven engine (ends the
+        // rung-per-error-shape treadmill; see `RepairPlanner::
+        // generic_fallback_repair`) before declaring the conflict
+        // unparseable. Bounded by the same `--max-repairs` budget as the
+        // specific-conflict path.
+        if repairs_applied < args.max_repairs
+            && let Some((result, po)) =
+                planner.generic_fallback_repair(&editor, &mut tried, &stripped, repairs_applied + 1)
+        {
+            match result {
+                Ok(out) => {
+                    if let Some(po) = &po {
+                        crate::pack_overrides::ensure_snapshot(&project_dir)?;
+                        match po.kind {
+                            PackOverrideKind::Override => {
+                                crate::pack_overrides::write_override(
+                                    &project_dir,
+                                    &po.pack_pixi,
+                                    &po.bundle,
+                                    &po.package,
+                                    &po.spec,
+                                    &out.attempt.conflict,
+                                )?;
+                            }
+                            PackOverrideKind::Unroute => {
+                                crate::pack_overrides::write_unroute(
+                                    &project_dir,
+                                    &po.pack_pixi,
+                                    &po.bundle,
+                                    &po.package,
+                                    &out.attempt.conflict,
+                                )?;
+                            }
+                        }
+                    }
+                    append_attempt(&mut ledger, &ledger_path, run_idx, out.attempt.clone())?;
+                    record_repair(&mut records, &out.attempt, &out.applied, po.as_ref());
+                    // The fallback engine never edits the workspace
+                    // manifest directly (every candidate is a pack-ledger
+                    // write) -- nothing for `pending_edit`'s post-widen
+                    // revert-on-unsat recovery to track.
+                    pending_edit = None;
+                    repairs_applied += 1;
+                    continue;
+                }
+                Err(package) => {
+                    rollback_snapshot(&project_dir, &manifest_path)?;
+                    crate::pack_overrides::rollback_all(&project_dir)?;
+                    ledger.finish_run(run_idx, "exhausted");
+                    ledger.write_atomic(&ledger_path)?;
+                    eprintln!(
+                        "retread lock: exhausted generic fallback repair strategies for {package}"
+                    );
                     print_summary(&records);
                     return Ok(EXIT_EXHAUSTED);
                 }

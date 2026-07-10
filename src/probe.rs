@@ -345,6 +345,13 @@ pub struct RouteHit {
     /// `<channel_url>/<subdir>` the match came from (channel-priority
     /// order breaks version ties toward the earlier channel).
     pub channel: String,
+    /// Route-time metadata-consistency check: the raw `depends` array
+    /// of the matched build (same strings `VariantInfo::depends`
+    /// carries, e.g. `"pillow <11.0,>=9.2.0"`). Lets the auto-route
+    /// planner reject a route whose conda-forge repackage metadata
+    /// contradicts the locked uv closure one level deep, without a
+    /// second repodata fetch.
+    pub depends: Vec<String>,
 }
 
 /// spec-uv-restructure M2: query the workspace channels' repodata for a
@@ -399,6 +406,7 @@ pub async fn find_route(
                     RouteHit {
                         version: v.version.to_string(),
                         channel: format!("{channel_url}/{subdir}"),
+                        depends: v.depends.clone(),
                     },
                 ));
             }

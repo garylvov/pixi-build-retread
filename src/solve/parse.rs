@@ -1,5 +1,28 @@
 use regex::Regex;
 
+/// One `<package> <version-specifier>` clause found anywhere in a failed
+/// solve's error text by the generic fallback extractor
+/// ([`RegexConflictParser::extract_generic_mentions`]) -- the raw
+/// material the ownership-driven fallback repair engine classifies and
+/// generates candidates from, when none of the specific per-shape
+/// `Conflict` parsers above matched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Mention {
+    /// The mentioned package's name, as it appeared in the prose
+    /// (case as-written; callers should canonicalize before comparing).
+    pub package: String,
+    /// The version specifier exactly as found, normalized to a
+    /// conda/PEP440-compatible operator (`==`/`>=`/`<=`/`>`/`<`, `=`
+    /// normalized to `==`), e.g. `"==1.38.0"`, `">=68,<81"`,
+    /// `"==4.9.*"`.
+    pub spec: String,
+    /// The nearest preceding "<requirer> [==ver] would require" /
+    /// "because <requirer>==ver depends on" clause's subject, when one
+    /// was found before this mention in the text. Best-effort and
+    /// informational only -- `None` when no such clause precedes it.
+    pub requirer: Option<String>,
+}
+
 /// One actionable fact extracted from a failed solve.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum Conflict {
@@ -731,6 +754,136 @@ impl RegexConflictParser {
         self.ansi.replace_all(stderr, "")
     }
 
+    /// Generic ownership-driven fallback engine (ends the
+    /// rung-per-error-shape treadmill): flattens `stderr` the same way
+    /// [`Self::extract_uv_closure_message`] does for a backend uv-closure
+    /// JSON-RPC error, falling back to a plain ANSI-strip + gutter-strip +
+    /// whitespace-collapse for direct (non-JSON-RPC) resolvo/conda-solver
+    /// prose -- either way producing one logical line the mention regex
+    /// can scan without per-shape special-casing.
+    fn flatten_for_generic_scan(&self, stderr: &str) -> String {
+        if let Some(msg) = self.extract_uv_closure_message(stderr) {
+            return msg;
+        }
+        let stripped = self.ansi.replace_all(stderr, "");
+        let mut joined = String::new();
+        for line in stripped.lines() {
+            let cleaned = self.gutter_line_prefix.replace(line, "");
+            if !joined.is_empty() && !joined.ends_with('-') {
+                joined.push(' ');
+            }
+            joined.push_str(&cleaned);
+        }
+        self.whitespace.replace_all(&joined, " ").trim().to_string()
+    }
+
+    /// Generic (shape-agnostic) extraction of every
+    /// `<package-name> <version-specifier>` clause anywhere in a failed
+    /// solve's error text -- the corpus in `tests/fixtures/solve_errors/`
+    /// covers uv-closure JSON-RPC errors, direct rattler/resolvo prose,
+    /// and the older "pinned by the conda solve" shape alike, and this one
+    /// permissive regex family finds the relevant package(s) in all of
+    /// them, whatever the surrounding prose ("no candidates were found
+    /// for", "would require", "depends on", "is needed", ...). Handles
+    /// `==X`, `>=X`, `<X`, `<=X`, `>X`, a single trailing `,<Y`/`,<=Y`
+    /// second clause (the common two-sided range shape), and a trailing
+    /// glob (`X.Y.*`) verbatim. This is the FALLBACK extractor -- existing
+    /// per-shape parsers in [`RegexConflictParser::parse`] still run
+    /// first; this only ever needs to fire when none of them matched.
+    pub fn extract_generic_mentions(&self, stderr: &str) -> Vec<Mention> {
+        let text = self.flatten_for_generic_scan(stderr);
+        // A package/spec mention: a name, an operator, a version (with an
+        // optional trailing `.*` glob), and an optional second
+        // `,<op><version>` clause completing a two-sided range.
+        let mention_re = Regex::new(
+            r"(?i)\b([A-Za-z][A-Za-z0-9._-]{1,60}?)\s*(>=|<=|==|=|>|<)\s*([0-9][0-9A-Za-z.]*\*?)(?:\s*,\s*(>=|<=|==|=|>|<)\s*([0-9][0-9A-Za-z.]*\*?))?",
+        )
+        .expect("valid generic mention regex");
+        // Best-effort requirer attribution: the nearest PRECEDING "<name>
+        // [==<ver>] would require" / "because <name>==<ver> depends on"
+        // clause, whichever package it actually turns out to name --
+        // informational only (`Mention::requirer` is `Option`), never
+        // load-bearing for the extraction itself.
+        let requirer_re = Regex::new(
+            r"(?i)\b([A-Za-z][A-Za-z0-9._-]*)\s*(?:==|=)?\s*[0-9][0-9A-Za-z.]*(?:\s*\|\s*[0-9A-Za-z.]+)*\s+(?:would\s+require|depends\s+on)",
+        )
+        .expect("valid generic requirer regex");
+        let requirer_positions: Vec<(usize, String)> = requirer_re
+            .captures_iter(&text)
+            .map(|c| {
+                (
+                    c.get(0).expect("group 0 always matches").start(),
+                    c[1].to_string(),
+                )
+            })
+            .collect();
+
+        let mut mentions = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for caps in mention_re.captures_iter(&text) {
+            let package = caps[1].to_string();
+            if package.len() < 2 {
+                continue;
+            }
+            fn norm_op(op: &str) -> &str {
+                if op == "=" { "==" } else { op }
+            }
+            let op1 = norm_op(&caps[2]);
+            let v1 = &caps[3];
+            let spec = match (caps.get(4), caps.get(5)) {
+                (Some(op2), Some(v2)) => {
+                    format!("{op1}{v1},{}{}", norm_op(op2.as_str()), v2.as_str())
+                }
+                _ => format!("{op1}{v1}"),
+            };
+            let start = caps.get(0).expect("group 0 always matches").start();
+            let requirer = requirer_positions
+                .iter()
+                .filter(|(pos, name)| *pos < start && !name.eq_ignore_ascii_case(&package))
+                .max_by_key(|(pos, _)| *pos)
+                .map(|(_, name)| name.clone());
+            let key = (package.clone(), spec.clone());
+            if seen.insert(key) {
+                mentions.push(Mention {
+                    package,
+                    spec,
+                    requirer,
+                });
+            }
+        }
+        mentions
+    }
+
+    /// The pack/bundle name a conflict was raised inside (`computing uv
+    /// closure for bundle `<name>`:`), when present -- same signature
+    /// [`Self::parse_uv_closure_message`] already reads via
+    /// `uv_closure_bundle`, exposed standalone so the generic fallback
+    /// engine can scope its ownership classification the same way the
+    /// specific parsers do, even though it never calls
+    /// `parse_uv_closure_message` itself.
+    pub fn extract_bundle_name(&self, stderr: &str) -> Option<String> {
+        if let Some(name) = self
+            .uv_closure_bundle
+            .captures(stderr)
+            .map(|c| c[1].to_string())
+        {
+            return Some(name);
+        }
+        // Fallback for direct (non-JSON-RPC) resolvo/conda-solver prose,
+        // which never carries a "computing uv closure for bundle `X`:"
+        // label at all: the OUTERMOST "<name> <ver> would require" clause's
+        // subject is, in every rung this hardening series has seen, the
+        // pack/bundle this workspace composed (the same capture
+        // `conda_incompatible_exact`/`conda_range_vs_pack_pin`'s regexes
+        // already rely on) -- best-effort, only actually load-bearing
+        // downstream once `resolve_pack_dir` confirms it names one of
+        // this workspace's own composed packs.
+        let would_require =
+            Regex::new(r"(?s)([a-zA-Z][a-zA-Z0-9_.-]*)\s+[0-9][0-9a-zA-Z.]*\s+would\s+require")
+                .ok()?;
+        would_require.captures(stderr).map(|c| c[1].to_string())
+    }
+
     pub fn is_post_widen_conda_unsat(stderr: &str) -> bool {
         stderr.contains("Cannot solve the request because of")
             || stderr.contains("The following packages are incompatible")
@@ -940,6 +1093,25 @@ mod tests {
     // aside in the way), hence EXIT=2 (unparseable) before this fix.
     const NESTED_CONDA_CAP_PYTORCH_SETUPTOOLS: &str =
         include_str!("../../tests/fixtures/solve_errors/nested_conda_cap_pytorch_setuptools.txt");
+    // Run 15 fixture (depsfrom-proof-brief.md, verbatim
+    // `.retread/solve-conflicts/lock-1.txt` from the imprint workspace): a
+    // NEW conflict class none of the 12 hardening fixes' specific rungs
+    // recognize -- a PyPI-vs-conda-forge metadata skew. The pack's own
+    // auto-routed exact pins (`moviepy ==2.2.1`, `pillow ==11.3.0`
+    // elsewhere in its render, not visible in this trace) are BOTH the
+    // pack's own emissions; conda-forge's `moviepy-2.2.1` recipe still
+    // caps `pillow <11.0`, contradicting the pillow version the pack's
+    // own uv closure (PyPI truth) already locked. No relax tier fixes
+    // this -- it's what the generic fallback engine's UN-ROUTE candidate
+    // exists for. `Some(Conflict::...)` is intentionally never asserted
+    // for this fixture in `RegexConflictParser::parse` tests: it stays
+    // unparseable to every SPECIFIC rung by design (that's the whole
+    // point of the fallback engine), and is exercised end-to-end via
+    // `repair::tests::end_to_end_run15_pypi_conda_metadata_skew_unroutes_moviepy`
+    // instead.
+    const PYPI_CONDA_METADATA_SKEW_PILLOW_MOVIEPY: &str = include_str!(
+        "../../tests/fixtures/solve_errors/pypi_conda_metadata_skew_pillow_moviepy.txt"
+    );
 
     #[test]
     fn parses_dumb_hack_shapes_and_range_amendment() {
@@ -1202,6 +1374,91 @@ mod tests {
                 requirer_pin: "1.3.2".into(),
                 pack_name: Some("protomotions-deps-pack".into()),
             })
+        );
+    }
+
+    /// Generic fallback extractor: must find the package(s) that matter
+    /// in EVERY specific-shape fixture the 12-rung hardening series
+    /// produced -- the whole point is that this one permissive scan
+    /// covers every prose shape a new rung would otherwise be needed for.
+    #[test]
+    fn extract_generic_mentions_finds_relevant_packages_in_every_fixture() {
+        let p = RegexConflictParser::new();
+        let cases: &[(&str, &[&str])] = &[
+            (CONDA_BOUNDARY_SINGLE_LINE, &["numpy"]),
+            (CONDA_BOUNDARY_HELP_ONLY, &["numpy"]),
+            (PYPI_INTERNAL, &["torch"]),
+            (NO_CANDIDATES, &["mujoco"]),
+            (NO_CANDIDATES_PYPI, &["torch"]),
+            (CONDA_BOUNDARY_RANGE, &["mujoco"]),
+            (CONDA_BOUNDARY_RANGE_ALT, &["foo"]),
+            (UV_CLOSURE_TINYOBJLOADER, &["tinyobjloader"]),
+            (UV_CLOSURE_CUDA_BINDINGS, &["cuda-bindings", "torch"]),
+            (CONDA_INCOMPATIBLE_PYGLET, &["pyglet"]),
+            (CONDA_INCOMPATIBLE_TORCHVISION_EXACT, &["torchvision"]),
+            (CONDA_INCOMPATIBLE_SETUPTOOLS_RANGE, &["setuptools"]),
+            (UV_CLOSURE_DEPS_FROM_INTRINSIC_PIN, &["sentry-sdk", "wandb"]),
+            (
+                UV_CLOSURE_NO_WHEEL_TRANSITIVE,
+                &["antlr4-python3-runtime", "hydra-core"],
+            ),
+            // Note: `pytorch` itself is never given a `<name> <op><ver>`
+            // clause in this fixture (it only ever appears as a bare
+            // "pytorch 2.7.0 | 2.7.0 | ... would require" subject, or
+            // wildcard "pytorch *" -- neither carries an operator), so
+            // it isn't expected as a mention here; `setuptools` (the
+            // package actually in conflict) is.
+            (
+                NESTED_CONDA_CAP_PYTORCH_SETUPTOOLS,
+                &["setuptools", "dex-retargeting"],
+            ),
+            (
+                PYPI_CONDA_METADATA_SKEW_PILLOW_MOVIEPY,
+                &["moviepy", "pillow"],
+            ),
+        ];
+        for (fixture, expected) in cases {
+            let mentions = p.extract_generic_mentions(fixture);
+            let found: Vec<String> = mentions
+                .iter()
+                .map(|m| m.package.to_ascii_lowercase())
+                .collect();
+            for want in *expected {
+                assert!(
+                    found.iter().any(|f| f == &want.to_ascii_lowercase()),
+                    "expected to find {want} in {found:?} (fixture head: {:?})",
+                    tail(fixture, 200)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pypi_conda_metadata_skew_stays_unparseable_to_every_specific_rung() {
+        // The whole point of the generic fallback engine: this shape must
+        // NOT gain a 13th specific rung. `repair.rs`'s end-to-end test
+        // exercises the fallback engine directly against this fixture.
+        let p = RegexConflictParser::new();
+        assert_eq!(p.parse(PYPI_CONDA_METADATA_SKEW_PILLOW_MOVIEPY), None);
+    }
+
+    #[test]
+    fn extract_bundle_name_reads_the_uv_closure_bundle_label() {
+        let p = RegexConflictParser::new();
+        assert_eq!(
+            p.extract_bundle_name(UV_CLOSURE_DEPS_FROM_INTRINSIC_PIN),
+            Some("protomotions-deps-pack".to_string())
+        );
+        // No JSON-RPC bundle label at all in this fixture, but the
+        // outermost "<name> <ver> would require" clause names a real
+        // pack (`isaaclab-hover-pack`) -- the fallback finds it too.
+        assert_eq!(
+            p.extract_bundle_name(CONDA_INCOMPATIBLE_PYGLET),
+            Some("isaaclab-hover-pack".to_string())
+        );
+        assert_eq!(
+            p.extract_bundle_name(NESTED_CONDA_CAP_PYTORCH_SETUPTOOLS),
+            Some("isaaclab-2.3x-pack".to_string())
         );
     }
 
