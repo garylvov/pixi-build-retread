@@ -1,0 +1,20 @@
+Error:   × failed to solve requirements of environment 'pm-isaaclab' for platform
+  │ 'linux-64'
+  ├─▶   × failed to solve the environment
+  │
+  ╰─▶ Cannot solve the request because of: The following packages are
+      incompatible
+      ├─ protomotions-deps-pack * can be installed with any of the following
+      options:
+      │  └─ protomotions-deps-pack 3.1 would require
+      │     └─ numpy ==2.4.6, which can be installed with any of the following
+      options:
+      │        └─ numpy 2.4.6
+      └─ isaaclab-2.3x-pack * cannot be installed because there are no viable
+      options:
+         └─ isaaclab-2.3x-pack 0.54.2 would require
+            └─ pint ==0.20.1, which cannot be installed because there are no
+      viable options:
+               └─ pint 0.20.1 would constrain
+                  └─ numpy <2.0.0a0, which conflicts with any installable
+      versions previously reported

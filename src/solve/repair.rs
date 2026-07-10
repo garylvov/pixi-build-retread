@@ -1653,6 +1653,28 @@ pub fn resolve_pack_dir(
     })
 }
 
+/// The feature name that declares `pack_name` as a path dependency --
+/// `"default"` for a top-level `[dependencies]` entry, the `[feature.X]`
+/// name otherwise, or `None` if `pack_name` isn't composed anywhere.
+/// Lets a per-pack lookup (`RepairPlanner::workspace_conda_pin`) scope to
+/// the SAME feature the pack actually lives in, instead of scanning every
+/// feature in declaration order and returning whichever happens to
+/// declare the queried package first (`resolve_pack_dir`'s own
+/// `find_map` deliberately discards the feature name since it never
+/// needed it before).
+fn resolve_pack_feature(
+    ws: &crate::workspace::WorkspaceManifest,
+    pack_name: &str,
+) -> Option<String> {
+    if ws.path_dependencies.contains_key(pack_name) {
+        return Some("default".to_string());
+    }
+    ws.features
+        .iter()
+        .find(|(_, f)| f.path_dependencies.contains_key(pack_name))
+        .map(|(name, _)| name.clone())
+}
+
 /// Re-verifies that `package`'s exact pin actually originates from
 /// `bundle`'s own `retread-deps-from` root(s) -- the ONLY provenance
 /// doctrine allows auto-relaxing an exact pypi pin with no conda
@@ -2143,7 +2165,35 @@ impl RepairPlanner {
     /// The workspace's own conda-range pin for `package`, if any feature
     /// declares one directly -- used by doctrine tier (i) to translate
     /// toward the SAME spec `CondaRangeVsPackPin` would inject.
-    fn workspace_conda_pin(&self, editor: &ManifestEditor, package: &str) -> Option<String> {
+    ///
+    /// `bundle` scopes the lookup: `feature_names()` returns `"default"`
+    /// (the top-level tables) first, then every `[feature.X]` in
+    /// declaration order, and a bare first-match scan picks up whichever
+    /// feature happens to declare the package first -- which is routinely
+    /// the WRONG pin when several features pin the same package
+    /// differently (e.g. a top-level `numpy = ">=1.26.4,<3"` shadowing
+    /// the `[feature.pm-isaaclab]`-scoped `numpy = ">=1.26,<1.27"` that
+    /// actually governs the pack this repair targets). Prefer the
+    /// feature that actually declares `bundle` as a path dependency (the
+    /// SAME feature composing the pack this pin would be injected into);
+    /// fall back to the old first-match scan across all features only
+    /// when that feature has no entry for `package` at all, preserving
+    /// prior behavior for packages the owning feature doesn't itself pin.
+    fn workspace_conda_pin(
+        &self,
+        editor: &ManifestEditor,
+        bundle: &str,
+        package: &str,
+    ) -> Option<String> {
+        if let Some(ws) = crate::workspace::WorkspaceManifest::load(editor.project_dir())
+            && let Some(owning_feature) = resolve_pack_feature(&ws, bundle)
+            && editor.has_user_entry(&owning_feature, TableKind::Conda, package)
+        {
+            let snap = editor.entry_snapshot(&owning_feature, TableKind::Conda, package);
+            if let Some(value) = snap.value {
+                return Some(value);
+            }
+        }
         for feature in editor.feature_names() {
             if editor.has_user_entry(&feature, TableKind::Conda, package) {
                 let snap = editor.entry_snapshot(&feature, TableKind::Conda, package);
@@ -2199,35 +2249,53 @@ impl RepairPlanner {
             return out;
         };
         let project_dir = editor.project_dir();
-        let Some(pack_pixi) = crate::workspace::WorkspaceManifest::load(project_dir)
-            .and_then(|ws| resolve_pack_dir(&ws, project_dir, bundle))
-            .map(|d| d.join("pixi.toml"))
-        else {
-            return out;
-        };
-        let existing_overrides = crate::pack_overrides::overrides_for_pack(project_dir, &pack_pixi);
 
+        // Tiers 1-3: unlike tiers 5-7 below (which are genuinely scoped
+        // to the single dead-end `bundle` extract_bundle_name picked),
+        // an owned pin can belong to ANY pack mentioned anywhere in the
+        // conflict tree -- resolvo prints a pack's SATISFIABLE branch
+        // ("* can be installed with any of the following options") right
+        // alongside the dead-end one, and a mention's own `requirer`
+        // (e.g. `protomotions-deps-pack` for a `numpy ==2.4.6` mention
+        // nested under ITS branch) is the real owner of that pin, not
+        // whichever pack the dead-end branch happens to name. Prefer the
+        // mention's own requirer when it resolves to one of this
+        // workspace's own composed packs; fall back to the dead-end
+        // `bundle` for mentions with no attributable (or unowned)
+        // requirer, preserving prior single-bundle behavior for those.
         for m in mentions {
-            let ownership = self.classify_mention_ownership(editor, pack_name, &m.package);
+            let owner_bundle = m
+                .requirer
+                .as_deref()
+                .filter(|r| self.is_owned_pack(editor, r))
+                .unwrap_or(bundle);
+            let Some(pack_pixi) = crate::workspace::WorkspaceManifest::load(project_dir)
+                .and_then(|ws| resolve_pack_dir(&ws, project_dir, owner_bundle))
+                .map(|d| d.join("pixi.toml"))
+            else {
+                continue;
+            };
+            let ownership = self.classify_mention_ownership(editor, Some(owner_bundle), &m.package);
             match ownership {
                 Ownership::AbiAnchor | Ownership::Unowned | Ownership::WorkspacePin => continue,
                 Ownership::AutoRoutedPackPin => {
                     // Tier 1: a workspace range for the SAME package is
                     // visible -- override the pack's auto-routed pin
                     // toward it (same mechanics as `conda_range_vs_pack_pin`).
-                    if let Some(range) = self.workspace_conda_pin(editor, &m.package) {
+                    if let Some(range) = self.workspace_conda_pin(editor, owner_bundle, &m.package)
+                    {
                         let new_spec = translate_conda_range_to_pep440(&range);
                         out.push(FallbackCandidate {
                             tier: 1,
                             package: m.package.clone(),
-                            pack_name: bundle.to_string(),
+                            pack_name: owner_bundle.to_string(),
                             kind: PackOverrideKind::Override,
                             old_spec: Some(m.spec.clone()),
                             new_spec,
                             ownership,
-                            tried_key: format!("{}@{bundle}#fallback-range", m.package),
+                            tried_key: format!("{}@{owner_bundle}#fallback-range", m.package),
                             reason: format!(
-                                "generic fallback: workspace range {range} for {} overridden into pack `{bundle}`",
+                                "generic fallback: workspace range {range} for {} overridden into pack `{owner_bundle}`",
                                 m.package
                             ),
                         });
@@ -2238,6 +2306,8 @@ impl RepairPlanner {
                     // this package for this pack; if this mention carries
                     // a tighter upper-bound cap, intersect (same
                     // mechanics as `nested_conda_cap`).
+                    let existing_overrides =
+                        crate::pack_overrides::overrides_for_pack(project_dir, &pack_pixi);
                     if let Some(existing) = existing_overrides.get(&m.package)
                         && let Some((cap_op, cap_version)) = extract_cap_clause(&m.spec)
                         && let Ok(narrowed) =
@@ -2247,12 +2317,12 @@ impl RepairPlanner {
                         out.push(FallbackCandidate {
                             tier: 2,
                             package: m.package.clone(),
-                            pack_name: bundle.to_string(),
+                            pack_name: owner_bundle.to_string(),
                             kind: PackOverrideKind::Override,
                             old_spec: Some(existing.clone()),
                             new_spec: narrowed,
                             ownership,
-                            tried_key: format!("{}@{bundle}#fallback-narrow", m.package),
+                            tried_key: format!("{}@{owner_bundle}#fallback-narrow", m.package),
                             reason: format!(
                                 "generic fallback: nested cap {cap_op}{cap_version} narrows existing pack override for {}",
                                 m.package
@@ -2270,12 +2340,12 @@ impl RepairPlanner {
                         out.push(FallbackCandidate {
                             tier: 3,
                             package: m.package.clone(),
-                            pack_name: bundle.to_string(),
+                            pack_name: owner_bundle.to_string(),
                             kind: PackOverrideKind::Override,
                             old_spec: Some(m.spec.clone()),
                             new_spec,
                             ownership,
-                            tried_key: format!("{}@{bundle}#fallback-relax", m.package),
+                            tried_key: format!("{}@{owner_bundle}#fallback-relax", m.package),
                             reason: format!(
                                 "generic fallback: deps-from exact pin {} relaxed",
                                 m.package
@@ -4338,6 +4408,132 @@ holosoma-gpu = { features = ["holosoma"] }
         assert!(
             tiers.contains(&5),
             "expected a tier-5 (un-route) candidate: {candidates:?}"
+        );
+    }
+
+    const CONDA_TWO_PACK_NUMPY_PINT: &str =
+        include_str!("../../tests/fixtures/solve_errors/conda_two_pack_numpy_pint.txt");
+
+    /// Run-20 workspace shape shared by the two-branch numpy tests: two
+    /// composed packs, a numpy pin in the pack-owning feature
+    /// (`pm-isaaclab`, mirroring imprint pixi.toml:955) AND a different
+    /// top-level numpy pin (mirroring imprint pixi.toml:35) so the
+    /// feature-scoping assertion has something to get wrong.
+    fn run20_two_pack_workspace(top_level_numpy: bool) -> (PathBuf, PathBuf) {
+        let manifest_text = format!(
+            "[dependencies]\n{}\n\
+             [feature.pm-isaaclab.dependencies]\n\
+             numpy = \">=1.26,<1.27\"\n\
+             \"protomotions-deps-pack\" = {{ path = \"./pypi-packs/protomotions-deps-pack\" }}\n\
+             \"isaaclab-2.3x-pack\" = {{ path = \"./pypi-packs/isaaclab-2.3x-pack\" }}\n",
+            if top_level_numpy {
+                "numpy = \">=1.26.4,<3\"\n"
+            } else {
+                ""
+            }
+        );
+        let path = temp_manifest(&manifest_text);
+        let project_dir = path.parent().unwrap().to_path_buf();
+        for pack in ["protomotions-deps-pack", "isaaclab-2.3x-pack"] {
+            let pack_dir = project_dir.join("pypi-packs").join(pack);
+            std::fs::create_dir_all(&pack_dir).unwrap();
+            std::fs::write(
+                pack_dir.join("pixi.toml"),
+                format!("[package]\nname = \"{pack}\"\nversion = \"1.0\"\n"),
+            )
+            .unwrap();
+        }
+        (path, project_dir)
+    }
+
+    #[test]
+    fn run20_satisfiable_branch_owned_pin_generates_candidate() {
+        // Run-20 fixture: `extract_bundle_name` picks the dead-end pack
+        // (`isaaclab-2.3x-pack`), but the actually-relaxable owned pin
+        // (`numpy ==2.4.6`) lives in the SATISFIABLE branch, owned by
+        // `protomotions-deps-pack`. Candidate generation must attribute
+        // that mention to its own requirer pack and produce a tier-1
+        // workspace-range candidate for it -- not only for the dead-end
+        // pack's mentions.
+        let (path, _project_dir) = run20_two_pack_workspace(true);
+        let editor = ManifestEditor::open(path).unwrap();
+        let planner = RepairPlanner::new("default".into());
+        let parser = super::super::parse::RegexConflictParser::new();
+        let mentions = parser.extract_generic_mentions(CONDA_TWO_PACK_NUMPY_PINT);
+        let bundle = parser.extract_bundle_name(CONDA_TWO_PACK_NUMPY_PINT);
+        assert_eq!(
+            bundle.as_deref(),
+            Some("isaaclab-2.3x-pack"),
+            "dead-end pick unchanged -- the satisfiable owner must come from the mention's requirer"
+        );
+        let candidates =
+            planner.generate_fallback_candidates(&editor, bundle.as_deref(), &mentions);
+        let numpy_pm = candidates
+            .iter()
+            .find(|c| c.package == "numpy" && c.pack_name == "protomotions-deps-pack")
+            .expect("satisfiable-branch owned numpy pin must generate a candidate");
+        assert_eq!(numpy_pm.tier, 1, "workspace range exists -- tier 1 first");
+        assert_eq!(numpy_pm.old_spec.as_deref(), Some("==2.4.6"));
+        assert_eq!(
+            numpy_pm.new_spec, ">=1.26,<1.27",
+            "must use the pack-owning feature's pin (pm-isaaclab), not the top-level one"
+        );
+    }
+
+    #[test]
+    fn run20_workspace_range_tier_fires_for_feature_scoped_pin() {
+        // The numpy workspace pin lives ONLY under
+        // `[feature.pm-isaaclab.dependencies]` (no top-level entry) --
+        // tier 1's lookup must see feature-scoped conda deps.
+        let (path, _project_dir) = run20_two_pack_workspace(false);
+        let editor = ManifestEditor::open(path).unwrap();
+        let planner = RepairPlanner::new("default".into());
+        let parser = super::super::parse::RegexConflictParser::new();
+        let mentions = parser.extract_generic_mentions(CONDA_TWO_PACK_NUMPY_PINT);
+        let candidates =
+            planner.generate_fallback_candidates(&editor, Some("isaaclab-2.3x-pack"), &mentions);
+        assert!(
+            candidates
+                .iter()
+                .any(|c| c.package == "numpy" && c.tier == 1 && c.new_spec == ">=1.26,<1.27"),
+            "feature-scoped workspace pin must be visible to tier 1: {candidates:?}"
+        );
+    }
+
+    #[test]
+    fn run20_both_owner_iteration_converges() {
+        // Two packs each own a numpy knob in the same conflict
+        // (protomotions-deps-pack's `==2.4.6` and isaaclab-2.3x-pack's
+        // auto-routed side). (package, pack, tier) tried-keying must give
+        // each owner its own repair iteration instead of exhausting after
+        // the first.
+        let (path, _project_dir) = run20_two_pack_workspace(true);
+        let editor = ManifestEditor::open(path).unwrap();
+        let mut tried = TriedState::default();
+        let mut planner = RepairPlanner::new("default".into());
+
+        let (r1, po1) = planner
+            .generic_fallback_repair(&editor, &mut tried, CONDA_TWO_PACK_NUMPY_PINT, 1)
+            .expect("iteration 1 must find an actionable mention");
+        let _ = r1.expect("iteration 1 must apply, not exhaust");
+        let po1 = po1.expect("iteration 1 must carry a pack-override write");
+
+        let (r2, po2) = planner
+            .generic_fallback_repair(&editor, &mut tried, CONDA_TWO_PACK_NUMPY_PINT, 2)
+            .expect("iteration 2 must still find an actionable mention");
+        let _ = r2.expect("iteration 2 must apply the OTHER owner's candidate, not exhaust");
+        let po2 = po2.expect("iteration 2 must carry a pack-override write");
+
+        assert_ne!(
+            po1.bundle, po2.bundle,
+            "successive iterations must target distinct owner packs"
+        );
+        let mut bundles = vec![po1.bundle.as_str(), po2.bundle.as_str()];
+        bundles.sort_unstable();
+        assert_eq!(
+            bundles,
+            vec!["isaaclab-2.3x-pack", "protomotions-deps-pack"],
+            "both owners must get a repair shot"
         );
     }
 
