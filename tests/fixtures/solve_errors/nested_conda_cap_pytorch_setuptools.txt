@@ -1,0 +1,84 @@
+Error:   × failed to solve requirements of environment 'viral-gpu' for platform
+  │ 'linux-64'
+  ├─▶   × failed to solve the environment
+  │
+  ╰─▶ Cannot solve the request because of: The following packages are
+      incompatible
+      └─ isaaclab-2.3x-pack * cannot be installed because there are no viable
+      options:
+         └─ isaaclab-2.3x-pack 0.54.2 would require
+            ├─ setuptools ==80.10.2, which cannot be installed because there
+      are no viable options:
+            │  └─ setuptools 80.10.2, which conflicts with the versions
+      reported above.
+            └─ dex-retargeting >=0.4.6,<0.5, which cannot be installed because
+      there are no viable options:
+               └─ dex-retargeting 0.4.6 would require
+                  └─ pytorch *, which cannot be installed because there are no
+      viable options:
+                     ├─ pytorch 2.7.0 | 2.7.0 | 2.7.0 | 2.7.0 would require
+                     │  └─ setuptools <76, which cannot be installed because
+      there are no viable options:
+                     │     ├─ setuptools 75.8.2, which conflicts with the
+      versions reported above.
+                     │     ├─ setuptools 75.8.0, which conflicts with the
+      versions reported above.
+                     │     ├─ setuptools 75.7.0, which conflicts with the
+      versions reported above.
+                     │     ├─ setuptools 75.6.0, which conflicts with the
+      versions reported above.
+                     │     ├─ setuptools 75.6.0, which conflicts with the
+      versions reported above.
+                     │     ├─ setuptools 75.5.0, which conflicts with the
+      versions reported above.
+                     │     ├─ setuptools 75.3.0, which conflicts with the
+      versions reported above.
+                     │     ├─ setuptools 75.1.0, which conflicts with the
+      versions reported above.
+                     │     ├─ setuptools 74.1.2, which conflicts with the
+      versions reported above.
+                     │     ├─ setuptools 73.0.1, which conflicts with the
+      versions reported above.
+                     │     ├─ setuptools 72.2.0, which conflicts with the
+      versions reported above.
+                     │     ├─ setuptools 72.1.0, which conflicts with the
+      versions reported above.
+                     │     ├─ setuptools 71.0.4, which conflicts with the
+      versions reported above.
+                     │     ├─ setuptools 71.0.3, which conflicts with the
+      versions reported above.
+                     │     ├─ setuptools 71.0.1, which conflicts with the
+      versions reported above.
+                     │     ├─ setuptools 70.3.0, which conflicts with the
+      versions reported above.
+                     │     ├─ setuptools 70.2.0, which conflicts with the
+      versions reported above.
+                     │     ├─ setuptools 70.1.1, which conflicts with the
+      versions reported above.
+                     │     ├─ setuptools 70.1.0, which conflicts with the
+      versions reported above.
+                     │     ├─ setuptools 70.0.0, which conflicts with the
+      versions reported above.
+                     │     ├─ setuptools 69.5.1, which conflicts with the
+      versions reported above.
+                     │     ├─ setuptools 69.2.0, which conflicts with the
+      versions reported above.
+                     │     ├─ setuptools 69.1.1, which conflicts with the
+      versions reported above.
+                     │     ├─ setuptools 69.1.0, which conflicts with the
+      versions reported above.
+                     │     ├─ setuptools 69.1.0, which conflicts with the
+      versions reported above.
+                     │     ├─ setuptools 69.0.3, which conflicts with the
+      versions reported above.
+                     │     ├─ setuptools 68.2.2, which conflicts with the
+      versions reported above.
+                     │     ├─ setuptools 68.1.2, which conflicts with the
+      versions reported above.
+                     │     └─ setuptools 68.0.0, which conflicts with the
+      versions reported above.
+                     └─ pytorch 2.7.0 | 2.7.0 | 2.7.0 | 2.7.0 | 2.7.0 | 2.7.0
+      | 2.7.0 | 2.7.0 | 2.7.0 | 2.7.0 | 2.7.0 | 2.7.0 | 2.7.0 | 2.7.0 | 2.7.0
+      | 2.7.0 would require
+                        └─ python >=3.12,<3.13.0a0, for which no candidates
+      were found.

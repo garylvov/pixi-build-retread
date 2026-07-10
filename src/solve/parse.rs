@@ -130,6 +130,41 @@ pub enum Conflict {
         /// the `None` convention used elsewhere).
         pack_name: String,
     },
+    /// Eleventh fix (deps-from hardening series, run 13): a package
+    /// already repaired by `CondaRangeVsPackPin` (the pack's own
+    /// auto-routed exact demand for `package` re-rendered to
+    /// `pack_demand`, uv's max-in-range pick inside the injected
+    /// workspace range) still fails because a DEEPER conda run-dependency
+    /// of the same pack (reached transitively, e.g.
+    /// `dex-retargeting -> pytorch`) imposes an additional upper-bound cap
+    /// on the same `package` that the injected range doesn't respect
+    /// (e.g. `pytorch` requires `setuptools <76`, nested several levels
+    /// below the pack's own top-level "would require" clause). Distinct
+    /// from `CondaRangeVsPackPin`: there is no NEW workspace range to
+    /// derive here, only a narrower cap to intersect into the range that
+    /// repair already injected -- see `conda_range_vs_pack_pin`'s
+    /// ledgered override, read back via
+    /// `pack_overrides::overrides_for_pack`, then intersected with this
+    /// conflict's `cap_op`/`cap_version`.
+    NestedCondaCap {
+        /// The conda package name whose existing pack override needs
+        /// narrowing (e.g. `setuptools`).
+        package: String,
+        /// The pack/bundle name whose ledgered override should be
+        /// narrowed (e.g. `isaaclab-2.3x-pack`).
+        pack_name: String,
+        /// The pack's own current (auto-routed) exact demand for
+        /// `package` (e.g. `"80.10.2"`), informational only.
+        pack_demand: String,
+        /// Comparison operator of the newly discovered nested cap
+        /// (`<`/`<=`).
+        cap_op: String,
+        /// The nested cap's version ceiling (e.g. `"76"`).
+        cap_version: String,
+        /// The package whose own conda run-dependency imposed the cap
+        /// (e.g. `pytorch`), informational only.
+        via: String,
+    },
 }
 
 impl Conflict {
@@ -142,6 +177,7 @@ impl Conflict {
             Conflict::DepsFromPin { .. } => "DepsFromPin",
             Conflict::NoWheelTransitive { .. } => "NoWheelTransitive",
             Conflict::CondaRangeVsPackPin { .. } => "CondaRangeVsPackPin",
+            Conflict::NestedCondaCap { .. } => "NestedCondaCap",
         }
     }
 }
@@ -624,7 +660,71 @@ impl RegexConflictParser {
             }
         }
 
-        None
+        self.parse_nested_conda_cap(stderr)
+    }
+
+    /// Run-13 shape (eleventh fix): a NESTED resolvo tree where a named
+    /// pack's own top-level "would require {package} =={V}" clause (the
+    /// auto-routed pin a prior `CondaRangeVsPackPin` repair produced) is
+    /// followed, several tree levels further down the SAME error, by an
+    /// unrelated conda run-dep's own "would require {package} (<|<=){V2}"
+    /// clause -- e.g.:
+    ///
+    /// ```text
+    /// isaaclab-2.3x-pack 0.54.2 would require
+    ///   setuptools ==80.10.2, which cannot be installed ...
+    ///   dex-retargeting >=0.4.6,<0.5, which cannot be installed ...
+    ///     dex-retargeting 0.4.6 would require
+    ///       pytorch *, which cannot be installed ...
+    ///         pytorch 2.7.0 | ... would require
+    ///           setuptools <76, which cannot be installed ...
+    /// ```
+    ///
+    /// Neither `conda_incompatible_exact` nor `conda_incompatible` match
+    /// this text: both require "cannot be installed" to follow the
+    /// package/version with only gutter/whitespace in between, but this
+    /// shape always has a ", which" aside in the way -- hence run 13's
+    /// EXIT=2 (unparseable). This is a distinct, narrower parse pass (not
+    /// a fix to those regexes' char classes) since widening them to
+    /// tolerate ", which ..." would also change behavior for every
+    /// already-covered shape.
+    fn parse_nested_conda_cap(&self, stderr: &str) -> Option<Conflict> {
+        // Outer clause: "<pack> <ver> would require <package> ==<val>",
+        // same shape `conda_incompatible_exact`'s pack-exact branch looks
+        // for, but WITHOUT requiring "cannot be installed" to immediately
+        // follow (this shape's own "cannot be installed" is separated by
+        // the ", which" aside those other regexes don't tolerate).
+        let outer = Regex::new(
+            r"(?s)([a-zA-Z][a-zA-Z0-9_.-]*)\s+[0-9][0-9a-zA-Z.]*\s+would\s+require[\s│├╰└─▶]*([a-zA-Z0-9_-]+)\s*(?:==|=)\s*([0-9][0-9a-zA-Z.]*)",
+        )
+        .ok()?;
+        let outer_caps = outer.captures(stderr)?;
+        let pack_name = outer_caps[1].to_string();
+        let package = outer_caps[2].to_string();
+        let pack_demand = outer_caps[3].to_string();
+        let outer_end = outer_caps.get(0)?.end();
+
+        // Nested clause, searched only in the text AFTER the outer match:
+        // "<via> <ver>[ | <ver> ...] would require <package> (<|<=)<val>".
+        // The version-list char class deliberately excludes letters other
+        // than the digits/dots/pipes a resolvo version disjunction uses,
+        // so it can't accidentally swallow the "would require" keywords
+        // themselves and match some unrelated, much later clause.
+        let escaped = regex::escape(&package);
+        let nested = Regex::new(&format!(
+            r"(?s)([a-zA-Z][a-zA-Z0-9_.-]*)\s+[0-9.]+(?:\s*\|\s*[0-9.]+)*\s+would\s+require[\s│├╰└─▶]*{escaped}\s*(<=|<)\s*([0-9][0-9a-zA-Z.]*)"
+        ))
+        .ok()?;
+        let nested_caps = nested.captures(&stderr[outer_end..])?;
+
+        Some(Conflict::NestedCondaCap {
+            package,
+            pack_name,
+            pack_demand,
+            cap_op: nested_caps[2].to_string(),
+            cap_version: nested_caps[3].to_string(),
+            via: nested_caps[1].to_string(),
+        })
     }
 
     pub fn strip_ansi<'a>(&self, stderr: &'a str) -> std::borrow::Cow<'a, str> {
@@ -826,6 +926,20 @@ mod tests {
     // wheel-bearing builds under `--no-build`.
     const UV_CLOSURE_NO_WHEEL_TRANSITIVE: &str =
         include_str!("../../tests/fixtures/solve_errors/uv_closure_no_wheel_transitive.txt");
+    // Run 13 fixture (depsfrom-proof-brief.md, verbatim
+    // `.retread/solve-conflicts/lock-3.txt`): the setuptools
+    // `CondaRangeVsPackPin` repair stuck (the pack's auto-routed pin
+    // FOLLOWED the injected workspace range to `==80.10.2`, uv's
+    // max-in-range pick), but a DEEPER conda run-dep of the same pack
+    // (`dex-retargeting -> pytorch`) imposes an additional
+    // `setuptools <76` cap several tree levels below the pack's own
+    // top-level "would require" clause -- neither `conda_incompatible`
+    // nor `conda_incompatible_exact` match (both require "cannot be
+    // installed" to immediately follow the package/version with only
+    // gutter/whitespace in between; this shape always has a ", which"
+    // aside in the way), hence EXIT=2 (unparseable) before this fix.
+    const NESTED_CONDA_CAP_PYTORCH_SETUPTOOLS: &str =
+        include_str!("../../tests/fixtures/solve_errors/nested_conda_cap_pytorch_setuptools.txt");
 
     #[test]
     fn parses_dumb_hack_shapes_and_range_amendment() {
@@ -1056,6 +1170,22 @@ mod tests {
                 floor: "2.0.0".into(),
                 requirer: "wandb".into(),
                 pack_name: Some("protomotions-deps-pack".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_nested_conda_cap_beneath_pack_auto_routed_exact_pin() {
+        let p = RegexConflictParser::new();
+        assert_eq!(
+            p.parse(NESTED_CONDA_CAP_PYTORCH_SETUPTOOLS),
+            Some(Conflict::NestedCondaCap {
+                package: "setuptools".into(),
+                pack_name: "isaaclab-2.3x-pack".into(),
+                pack_demand: "80.10.2".into(),
+                cap_op: "<".into(),
+                cap_version: "76".into(),
+                via: "pytorch".into(),
             })
         );
     }

@@ -676,6 +676,22 @@ impl RepairPlanner {
                 };
                 self.conda_range_vs_pack_pin(editor, tried, &target, conda_range, pack_name)
             }
+            Conflict::NestedCondaCap {
+                package,
+                pack_name,
+                pack_demand,
+                cap_op,
+                cap_version,
+                ..
+            } => {
+                let target = PinTarget {
+                    package,
+                    version: pack_demand,
+                    iter,
+                    conflict,
+                };
+                self.nested_conda_cap(editor, tried, &target, pack_name, cap_op, cap_version)
+            }
         }
     }
 
@@ -1086,6 +1102,107 @@ impl RepairPlanner {
                 pack_pixi,
                 package: package.to_string(),
                 spec: new_spec,
+            }),
+        })
+    }
+
+    /// `NestedCondaCap` dispatch (eleventh fix, deps-from hardening
+    /// series, run 13): a package a prior `CondaRangeVsPackPin` repair
+    /// already narrowed for this pack fails again because a DEEPER conda
+    /// run-dependency of the same pack (reached transitively, e.g.
+    /// `dex-retargeting -> pytorch`) imposes an additional cap this
+    /// conflict names. Reads the ledgered override
+    /// (`.retread/auto-overrides.json`, via `pack_overrides::
+    /// overrides_for_pack`) that the earlier `CondaRangeVsPackPin` repair
+    /// wrote for `(package, pack_name)`, intersects it with the newly
+    /// discovered cap (`cap_op`/`cap_version`), and re-writes the
+    /// narrowed range into the SAME ledger sink -- the pack's own render
+    /// then follows the narrower range on its next re-lock, exactly like
+    /// the original override did.
+    ///
+    /// Termination: each successful narrowing strictly shrinks the range
+    /// (a repeated intersection can only tighten or leave it unchanged),
+    /// so `guard_oscillation` refusing an EXACT repeat of a
+    /// previously-attempted (key, spec) pair is sufficient to bound the
+    /// loop -- a narrowing that stops making progress surfaces as a
+    /// normal repair exhaustion instead of looping forever. An
+    /// intersection with no viable version at all (the cap's ceiling at
+    /// or below the range's own floor) is refused up front with a clear
+    /// message rather than emitted as a nonsensical override.
+    ///
+    /// Guardrail: refuses (rather than guesses a range from scratch) when
+    /// no `CondaRangeVsPackPin` override already exists for this exact
+    /// `(package, pack_name)` pair -- this tier only ever narrows an
+    /// existing injected range, it never originates one.
+    fn nested_conda_cap(
+        &mut self,
+        editor: &ManifestEditor,
+        tried: &mut TriedState,
+        target: &PinTarget<'_>,
+        pack_name: &str,
+        cap_op: &str,
+        cap_version: &str,
+    ) -> std::result::Result<RepairOutcome, String> {
+        let package = target.package;
+        self.guard_anchor(package)?;
+        let workspace_dir = editor.project_dir();
+        let pack_pixi = crate::workspace::WorkspaceManifest::load(workspace_dir)
+            .and_then(|ws| resolve_pack_dir(&ws, workspace_dir, pack_name))
+            .map(|dir| dir.join("pixi.toml"))
+            .ok_or_else(|| package.to_string())?;
+        let existing = crate::pack_overrides::overrides_for_pack(workspace_dir, &pack_pixi)
+            .get(package)
+            .cloned()
+            .ok_or_else(|| {
+                eprintln!(
+                    "retread: NestedCondaCap fired for {package} in pack `{pack_name}` but no \
+                     prior CondaRangeVsPackPin override exists to narrow; refusing to originate \
+                     a range from scratch"
+                );
+                package.to_string()
+            })?;
+        let narrowed = intersect_range_with_cap(&existing, cap_op, cap_version).map_err(|reason| {
+            eprintln!(
+                "retread: exhausted -- narrowing {package} in pack `{pack_name}` from {existing} \
+                 with nested cap {cap_op}{cap_version} produced an empty range ({reason}); no \
+                 version can satisfy both the workspace range and the nested conda cap"
+            );
+            package.to_string()
+        })?;
+        // Keyed distinctly from `conda_range_vs_pack_pin`'s own
+        // `{package}@{pack_name}` tried-key (that key is marked
+        // exhausted after ONE shot, see the comment there) -- each
+        // narrowing here produces a strictly different spec, so
+        // `guard_oscillation` (keyed on the resulting spec, not just the
+        // package/pack pair) is what actually bounds this loop.
+        let tried_key = format!("{package}@{pack_name}#narrow");
+        self.guard_oscillation(&tried_key, &narrowed, Strategy::PypiOverride)?;
+        tried.mark(&tried_key, Strategy::PypiOverride, false);
+        eprintln!(
+            "retread: narrowed {package} override in pack `{pack_name}`: {existing} -> {narrowed} \
+             (nested conda cap {cap_op}{cap_version} via a transitive conda run-dep intersected)"
+        );
+        Ok(RepairOutcome {
+            attempt: self.ledger_attempt(
+                target,
+                Strategy::PypiOverride,
+                "retread",
+                AttemptDetails {
+                    old_spec: Some(existing),
+                    new_spec: Some(narrowed.clone()),
+                    ..AttemptDetails::default()
+                },
+            ),
+            extra_attempts: Vec::new(),
+            summary_line: format!(
+                "would add [{pack_name} :: retread-overrides] {package} = \"{narrowed}\"  (tier: pypi_override; nested-cap-intersection; .retread/auto-overrides.json ledger)",
+            ),
+            applied: Vec::new(),
+            pack_override: Some(PackOverrideWrite {
+                bundle: pack_name.to_string(),
+                pack_pixi,
+                package: package.to_string(),
+                spec: narrowed,
             }),
         })
     }
@@ -1662,6 +1779,82 @@ fn translate_conda_clause_to_pep440(clause: &str) -> String {
         }
     }
     clause.to_string()
+}
+
+/// Eleventh fix: intersects an existing PEP440 range override (e.g.
+/// `">=68,<81"`, as written by a prior `CondaRangeVsPackPin` repair) with
+/// a newly discovered upper-bound cap (`cap_op`/`cap_version`, e.g.
+/// `"<"`/`"76"`, parsed from a `NestedCondaCap` conflict). Keeps the
+/// existing floor (if any) untouched -- only the ceiling half narrows --
+/// and keeps whichever ceiling (existing vs. cap) is tighter, so a
+/// SECOND `NestedCondaCap` naming a looser cap than one already applied
+/// is a no-op rather than an accidental widen. Returns `Err` describing
+/// the empty-intersection case when the cap's ceiling is at or below the
+/// range's own floor: no version can satisfy both.
+fn intersect_range_with_cap(
+    existing: &str,
+    cap_op: &str,
+    cap_version: &str,
+) -> std::result::Result<String, String> {
+    use rattler_conda_types::Version;
+    use std::str::FromStr;
+
+    let cap_v = Version::from_str(cap_version)
+        .map_err(|e| format!("unparseable cap version {cap_version}: {e}"))?;
+
+    let mut floor: Option<(String, String)> = None;
+    let mut ceil: Option<(String, String)> = None;
+    for clause in existing.split(',') {
+        let clause = clause.trim();
+        for op in ["==", ">=", "<=", ">", "<"] {
+            if let Some(rest) = clause.strip_prefix(op) {
+                let rest = rest.trim().to_string();
+                match op {
+                    ">=" | ">" => floor = Some((op.to_string(), rest)),
+                    "<=" | "<" => ceil = Some((op.to_string(), rest)),
+                    _ => {}
+                }
+                break;
+            }
+        }
+    }
+
+    let narrower_ceil = match &ceil {
+        Some((_, existing_ceil_str)) => match Version::from_str(existing_ceil_str) {
+            Ok(existing_ceil_v) if existing_ceil_v <= cap_v => ceil.clone().unwrap(),
+            _ => (cap_op.to_string(), cap_version.to_string()),
+        },
+        None => (cap_op.to_string(), cap_version.to_string()),
+    };
+
+    if let Some((floor_op, floor_str)) = &floor {
+        let floor_v = Version::from_str(floor_str)
+            .map_err(|e| format!("unparseable floor version {floor_str}: {e}"))?;
+        let ceil_v = Version::from_str(&narrower_ceil.1)
+            .map_err(|e| format!("unparseable ceiling version {}: {e}", narrower_ceil.1))?;
+        let empty = match narrower_ceil.0.as_str() {
+            "<" => floor_v >= ceil_v,
+            "<=" => floor_v > ceil_v,
+            _ => false,
+        };
+        if empty {
+            return Err(format!(
+                "floor {floor_op}{floor_str} vs narrowed ceiling {}{}",
+                narrower_ceil.0, narrower_ceil.1
+            ));
+        }
+    }
+    let mut out = String::new();
+    if let Some((op, v)) = &floor {
+        out.push_str(op);
+        out.push_str(v);
+    }
+    if !out.is_empty() {
+        out.push(',');
+    }
+    out.push_str(&narrower_ceil.0);
+    out.push_str(&narrower_ceil.1);
+    Ok(out)
 }
 
 pub fn is_abi_anchor(name: &str) -> bool {
@@ -2353,6 +2546,253 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             manifest_text,
             "the workspace's own setuptools range must never be widened"
+        );
+    }
+
+    #[test]
+    fn end_to_end_run13_nested_cap_fixture_narrows_pack_override() {
+        // Regression test for run 13's EXIT=2 (depsfrom-proof-brief.md): the
+        // real captured `.retread/solve-conflicts/lock-3.txt` trace, parsed
+        // and repaired end-to-end against a ledger already carrying the
+        // prior `CondaRangeVsPackPin` repair, must narrow that override --
+        // not fail to parse, and not touch the workspace manifest.
+        const NESTED_CONDA_CAP_PYTORCH_SETUPTOOLS: &str = include_str!(
+            "../../tests/fixtures/solve_errors/nested_conda_cap_pytorch_setuptools.txt"
+        );
+        let manifest_text = "[dependencies]\nsetuptools = \">=68,<81\"\n\n\
+             [feature.gpu.dependencies]\n\
+             \"isaaclab-2.3x-pack\" = { path = \"./pypi-packs/isaaclab-2.3x-pack\" }\n";
+        let path = temp_manifest(manifest_text);
+        let project_dir = path.parent().unwrap().to_path_buf();
+        let pack_dir = project_dir.join("pypi-packs/isaaclab-2.3x-pack");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        let pack_pixi = pack_dir.join("pixi.toml");
+        std::fs::write(
+            &pack_pixi,
+            "[package]\nname = \"isaaclab-2.3x-pack\"\nversion = \"0.54.2\"\n",
+        )
+        .unwrap();
+        // Iteration 2's `CondaRangeVsPackPin` repair (already proven in run
+        // 13) already landed this override before iteration 3's nested-cap
+        // conflict fired.
+        crate::pack_overrides::write_override(
+            &project_dir,
+            &pack_pixi,
+            "isaaclab-2.3x-pack",
+            "setuptools",
+            ">=68,<81",
+            "run-13 iter-2 CondaRangeVsPackPin repair",
+        )
+        .unwrap();
+
+        let parser = RegexConflictParser::new();
+        let conflict = parser
+            .parse(NESTED_CONDA_CAP_PYTORCH_SETUPTOOLS)
+            .expect("run-13 fixture must parse (was EXIT=2/unparseable before this fix)");
+
+        let mut editor = ManifestEditor::open(path.clone()).unwrap();
+        let mut tried = TriedState::default();
+        let mut planner = RepairPlanner::new("default".into());
+        let out = planner
+            .repair(&mut editor, &mut tried, &conflict, 3)
+            .expect("repair must narrow the existing override, not exhaust");
+        assert_eq!(out.attempt.strategy, "pypi_override");
+        assert_eq!(out.attempt.old_spec.as_deref(), Some(">=68,<81"));
+        assert_eq!(out.attempt.new_spec.as_deref(), Some(">=68,<76"));
+        let po = out
+            .pack_override
+            .expect("must be a pack override, not a workspace widen");
+        assert_eq!(po.bundle, "isaaclab-2.3x-pack");
+        assert_eq!(po.package, "setuptools");
+        assert_eq!(po.spec, ">=68,<76");
+
+        editor.write_atomic().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            manifest_text,
+            "the workspace's own setuptools range must never be widened"
+        );
+    }
+
+    #[test]
+    fn intersect_range_with_cap_narrows_ceiling_only() {
+        assert_eq!(
+            intersect_range_with_cap(">=68,<81", "<", "76").unwrap(),
+            ">=68,<76"
+        );
+    }
+
+    #[test]
+    fn intersect_range_with_cap_is_noop_when_cap_looser_than_existing_ceiling() {
+        // A second, LOOSER cap than one already applied must not widen the
+        // range back out.
+        assert_eq!(
+            intersect_range_with_cap(">=68,<76", "<", "81").unwrap(),
+            ">=68,<76"
+        );
+    }
+
+    #[test]
+    fn intersect_range_with_cap_handles_bare_floor_with_no_existing_ceiling() {
+        assert_eq!(
+            intersect_range_with_cap(">=68", "<", "76").unwrap(),
+            ">=68,<76"
+        );
+    }
+
+    #[test]
+    fn intersect_range_with_cap_reports_empty_intersection() {
+        // Floor at or above the cap's ceiling: no version satisfies both.
+        let err = intersect_range_with_cap(">=76,<81", "<", "76").unwrap_err();
+        assert!(
+            err.contains("floor"),
+            "error should explain the clash: {err}"
+        );
+    }
+
+    #[test]
+    fn nested_conda_cap_narrows_an_existing_pack_override() {
+        // Run 13 (eleventh fix): a package a prior `CondaRangeVsPackPin`
+        // repair already injected into a pack's ledger fails again because
+        // a deeper conda run-dep of the SAME pack imposes an additional
+        // cap. `NestedCondaCap` must read the ledgered override back and
+        // intersect it, not originate a fresh range.
+        let manifest_text = "[dependencies]\nsetuptools = \">=68,<81\"\n\n\
+             [feature.gpu.dependencies]\n\
+             \"isaaclab-2.3x-pack\" = { path = \"./pypi-packs/isaaclab-2.3x-pack\" }\n";
+        let path = temp_manifest(manifest_text);
+        let project_dir = path.parent().unwrap().to_path_buf();
+        let pack_dir = project_dir.join("pypi-packs/isaaclab-2.3x-pack");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        let pack_pixi = pack_dir.join("pixi.toml");
+        std::fs::write(
+            &pack_pixi,
+            "[package]\nname = \"isaaclab-2.3x-pack\"\nversion = \"0.54.2\"\n",
+        )
+        .unwrap();
+        // Simulate the PRIOR `CondaRangeVsPackPin` repair having already
+        // been persisted to the ledger (this is a caller-side write in
+        // production, not something `repair()` itself does).
+        crate::pack_overrides::write_override(
+            &project_dir,
+            &pack_pixi,
+            "isaaclab-2.3x-pack",
+            "setuptools",
+            ">=68,<81",
+            "prior CondaRangeVsPackPin repair",
+        )
+        .unwrap();
+
+        let mut editor = ManifestEditor::open(path).unwrap();
+        let mut tried = TriedState::default();
+        let mut planner = RepairPlanner::new("default".into());
+
+        let conflict = Conflict::NestedCondaCap {
+            package: "setuptools".into(),
+            pack_name: "isaaclab-2.3x-pack".into(),
+            pack_demand: "80.10.2".into(),
+            cap_op: "<".into(),
+            cap_version: "76".into(),
+            via: "pytorch".into(),
+        };
+        let out = planner
+            .repair(&mut editor, &mut tried, &conflict, 1)
+            .expect("must narrow the existing override, not exhaust");
+        assert_eq!(out.attempt.strategy, "pypi_override");
+        assert_eq!(out.attempt.old_spec.as_deref(), Some(">=68,<81"));
+        assert_eq!(out.attempt.new_spec.as_deref(), Some(">=68,<76"));
+        let po = out.pack_override.expect("expected a pack-override write");
+        assert_eq!(po.bundle, "isaaclab-2.3x-pack");
+        assert_eq!(po.package, "setuptools");
+        assert_eq!(po.spec, ">=68,<76");
+    }
+
+    #[test]
+    fn nested_conda_cap_refuses_to_originate_a_range_from_scratch() {
+        // Guardrail: this tier only ever NARROWS an existing
+        // `CondaRangeVsPackPin` override -- if none was ever recorded for
+        // this (package, pack) pair, refuse rather than guess a range.
+        let manifest_text = "[dependencies]\nsetuptools = \">=68,<81\"\n\n\
+             [feature.gpu.dependencies]\n\
+             \"isaaclab-2.3x-pack\" = { path = \"./pypi-packs/isaaclab-2.3x-pack\" }\n";
+        let path = temp_manifest(manifest_text);
+        let project_dir = path.parent().unwrap().to_path_buf();
+        let pack_dir = project_dir.join("pypi-packs/isaaclab-2.3x-pack");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        std::fs::write(
+            pack_dir.join("pixi.toml"),
+            "[package]\nname = \"isaaclab-2.3x-pack\"\nversion = \"0.54.2\"\n",
+        )
+        .unwrap();
+
+        let mut editor = ManifestEditor::open(path).unwrap();
+        let mut tried = TriedState::default();
+        let mut planner = RepairPlanner::new("default".into());
+        let conflict = Conflict::NestedCondaCap {
+            package: "setuptools".into(),
+            pack_name: "isaaclab-2.3x-pack".into(),
+            pack_demand: "80.10.2".into(),
+            cap_op: "<".into(),
+            cap_version: "76".into(),
+            via: "pytorch".into(),
+        };
+        let result = planner.repair(&mut editor, &mut tried, &conflict, 1);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn nested_conda_cap_convergence_loop_is_bounded_by_oscillation_guard() {
+        // Each narrowing must strictly shrink (or the repair is refused as
+        // empty), so a REPEAT of the identical resulting spec -- the same
+        // conflict reported again with no progress made -- must be refused
+        // by the existing oscillation guard rather than looping forever.
+        let manifest_text = "[dependencies]\nsetuptools = \">=68,<81\"\n\n\
+             [feature.gpu.dependencies]\n\
+             \"isaaclab-2.3x-pack\" = { path = \"./pypi-packs/isaaclab-2.3x-pack\" }\n";
+        let path = temp_manifest(manifest_text);
+        let project_dir = path.parent().unwrap().to_path_buf();
+        let pack_dir = project_dir.join("pypi-packs/isaaclab-2.3x-pack");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        let pack_pixi = pack_dir.join("pixi.toml");
+        std::fs::write(
+            &pack_pixi,
+            "[package]\nname = \"isaaclab-2.3x-pack\"\nversion = \"0.54.2\"\n",
+        )
+        .unwrap();
+        crate::pack_overrides::write_override(
+            &project_dir,
+            &pack_pixi,
+            "isaaclab-2.3x-pack",
+            "setuptools",
+            ">=68,<76",
+            "prior narrowing",
+        )
+        .unwrap();
+
+        let mut editor = ManifestEditor::open(path).unwrap();
+        let mut tried = TriedState::default();
+        let mut planner = RepairPlanner::new("default".into());
+        // Cap identical to the ceiling the ledger already carries -- the
+        // intersection is a no-op, producing the SAME spec as last time.
+        let conflict = Conflict::NestedCondaCap {
+            package: "setuptools".into(),
+            pack_name: "isaaclab-2.3x-pack".into(),
+            pack_demand: "75.9.0".into(),
+            cap_op: "<".into(),
+            cap_version: "76".into(),
+            via: "pytorch".into(),
+        };
+        // First attempt succeeds (marks the resulting spec as tried this run).
+        planner
+            .repair(&mut editor, &mut tried, &conflict, 1)
+            .expect("first narrowing attempt succeeds even though it's a no-op change");
+        // A second, identical attempt (e.g. the same conflict resurfacing
+        // unchanged) must be refused -- no progress, bounded loop.
+        assert!(
+            planner
+                .repair(&mut editor, &mut tried, &conflict, 2)
+                .is_err(),
+            "repeating the identical narrowed spec must be refused, not loop forever"
         );
     }
 
