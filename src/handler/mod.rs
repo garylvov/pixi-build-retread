@@ -2891,15 +2891,8 @@ async fn uv_group_closure(
             .await
             {
                 Ok(records) => {
-                    auto_route_opts.workspace_conda_versions = records
-                        .iter()
-                        .map(|r| {
-                            (
-                                r.package_record.name.as_normalized().to_string(),
-                                r.package_record.version.version().to_string(),
-                            )
-                        })
-                        .collect();
+                    auto_route_opts.workspace_conda_versions =
+                        restrict_workspace_conda_versions(&workspace_deps, &records);
                 }
                 Err(reasons) => {
                     tracing::debug!(
@@ -2952,6 +2945,180 @@ async fn uv_group_closure(
         }
     }
     Ok((Some(closure), deps_from_floor_names))
+}
+
+/// Run-35 fix (design flaw 1 + 2, from the holosoma regression): narrows
+/// the full transitive workspace-deps solve (`records`, hundreds of
+/// packages) down to what hand-written intent actually FORCES, for
+/// [`crate::uv_closure::AutoRouteOptions::workspace_conda_versions`].
+///
+/// The prior implementation took every solved record verbatim as
+/// "workspace truth", so harmonization treated every free-floating
+/// uv/conda pick (e.g. `grpcio`) as a hand-written pin and re-locked
+/// packs' uv closures under many spurious `==` constraints, shifting
+/// Requires-Dist dedup winners and breaking previously-green packs
+/// (holosoma, run 35).
+///
+/// Restricted set = records whose name is a directly-pinned workspace
+/// dependency (a real, non-wildcard spec in `workspace_deps` -- i.e. a
+/// hand-written `[feature.*.dependencies]` entry, not `"*"`), PLUS the
+/// DIRECT `depends` of those pinned records in this solution. The
+/// second half is what makes conda accelerator meta-packages resolve
+/// correctly without a separate name-translation table: the workspace
+/// pin is often on a selector meta-package (e.g. `pytorch-gpu
+/// ==2.7.0`), while auto-route's routed conda name is the underlying
+/// real package (`pytorch`) that the meta-package's own `depends`
+/// names -- so walking one hop of `depends` surfaces `pytorch ==2.7.0`
+/// under the key harmonization actually looks up by
+/// (`pkg.conda_name`), without pulling in the meta-package's other,
+/// un-pinned transitives.
+fn restrict_workspace_conda_versions(
+    workspace_deps: &BTreeMap<String, Vec<String>>,
+    records: &[rattler_conda_types::RepoDataRecord],
+) -> BTreeMap<String, String> {
+    let pinned_names: HashSet<String> = workspace_deps
+        .iter()
+        .filter(|(_, specs_for_name)| {
+            specs_for_name
+                .iter()
+                .any(|s| !(s.trim().is_empty() || s.trim() == "*"))
+        })
+        .map(|(name, _)| canonical_conda_name(name))
+        .collect();
+    let all: std::collections::HashMap<String, String> = records
+        .iter()
+        .map(|r| {
+            (
+                r.package_record.name.as_normalized().to_string(),
+                r.package_record.version.version().to_string(),
+            )
+        })
+        .collect();
+    let mut restricted: BTreeMap<String, String> = BTreeMap::new();
+    for record in records {
+        let name = record.package_record.name.as_normalized();
+        if !pinned_names.contains(name) {
+            continue;
+        }
+        if let Some(v) = all.get(name) {
+            restricted.insert(name.to_string(), v.clone());
+        }
+        for dep in &record.package_record.depends {
+            let Ok(spec) = rattler_conda_types::MatchSpec::from_str(
+                dep,
+                rattler_conda_types::ParseStrictness::Lenient,
+            ) else {
+                continue;
+            };
+            let dep_name = match spec.name.as_ref() {
+                Some(rattler_conda_types::PackageNameMatcher::Exact(n)) => n.as_normalized(),
+                _ => continue,
+            };
+            if let Some(v) = all.get(dep_name) {
+                restricted
+                    .entry(dep_name.to_string())
+                    .or_insert_with(|| v.clone());
+            }
+        }
+    }
+    restricted
+}
+
+#[cfg(test)]
+mod restrict_workspace_conda_versions_tests {
+    use super::restrict_workspace_conda_versions;
+    use rattler_conda_types::{PackageRecord, RepoDataRecord, VersionWithSource};
+    use std::collections::BTreeMap;
+    use std::str::FromStr;
+    use url::Url;
+
+    fn repo_record(name: &str, version: &str, depends: &[&str]) -> RepoDataRecord {
+        let mut package_record = PackageRecord::new(
+            name.parse().unwrap(),
+            VersionWithSource::from_str(version).unwrap(),
+            "h123456_0".to_string(),
+        );
+        package_record.subdir = "linux-64".to_string();
+        package_record.depends = depends.iter().map(|s| (*s).to_string()).collect();
+        RepoDataRecord {
+            package_record,
+            file_name: format!("{name}-{version}-h123456_0.conda"),
+            url: Url::parse(&format!(
+                "https://example.invalid/linux-64/{name}-{version}-h123456_0.conda"
+            ))
+            .unwrap(),
+            channel: Some("https://example.invalid".into()),
+        }
+    }
+
+    /// Run-35 regression guard (design flaw 1): a workspace pin on a
+    /// hand-written package (`pytorch-gpu`) must survive into the
+    /// restricted map, but a free-floating transitive the solve merely
+    /// happened to pick (`grpcio`, unpinned/no workspace entry at all)
+    /// must NOT -- that's exactly the over-broad map that shifted
+    /// holosoma-pack's uv closure and broke a previously-green pack.
+    #[test]
+    fn excludes_unpinned_transitives_like_grpcio() {
+        let workspace_deps =
+            BTreeMap::from([("pytorch-gpu".to_string(), vec!["==2.7.0".to_string()])]);
+        let records = vec![
+            repo_record("pytorch-gpu", "2.7.0", &["pytorch ==2.7.0"]),
+            repo_record("pytorch", "2.7.0", &[]),
+            repo_record("grpcio", "1.71.0", &[]),
+        ];
+        let restricted = restrict_workspace_conda_versions(&workspace_deps, &records);
+        assert!(
+            !restricted.contains_key("grpcio"),
+            "unpinned transitive must not enter the harmonization map: {restricted:?}"
+        );
+    }
+
+    /// Run-35 design flaw 2 (name mapping): the workspace pin lives on
+    /// the accelerator meta-package name (`pytorch-gpu`), but auto-route
+    /// looks up harmonization by the REAL routed conda name (`pytorch`,
+    /// what `pytorch-gpu` itself `depends` on). One hop of `depends`
+    /// must surface `pytorch` at the pinned version without requiring a
+    /// separate pypi<->conda translation table.
+    #[test]
+    fn surfaces_meta_package_direct_dependency_by_real_name() {
+        let workspace_deps =
+            BTreeMap::from([("pytorch-gpu".to_string(), vec!["==2.7.0".to_string()])]);
+        let records = vec![
+            repo_record(
+                "pytorch-gpu",
+                "2.7.0",
+                &["pytorch ==2.7.0", "cuda-version >=12"],
+            ),
+            repo_record("pytorch", "2.7.0", &[]),
+            repo_record("cuda-version", "12.4", &[]),
+        ];
+        let restricted = restrict_workspace_conda_versions(&workspace_deps, &records);
+        assert_eq!(
+            restricted.get("pytorch").map(String::as_str),
+            Some("2.7.0"),
+            "harmonization lookup keys by the real conda name (pytorch), \
+             not the meta-package (pytorch-gpu) it was pinned under: {restricted:?}"
+        );
+        assert!(
+            restricted.contains_key("cuda-version"),
+            "every direct dep of a pinned record is a hand-written-forced \
+             version, not just the first one: {restricted:?}"
+        );
+    }
+
+    /// A workspace entry with a wildcard spec ("*") is NOT hand-written
+    /// intent -- it must not be treated as pinned even if the solve
+    /// happens to pick some version for it.
+    #[test]
+    fn wildcard_workspace_entry_is_not_pinned() {
+        let workspace_deps = BTreeMap::from([("numpy".to_string(), vec!["*".to_string()])]);
+        let records = vec![repo_record("numpy", "2.1.0", &[])];
+        let restricted = restrict_workspace_conda_versions(&workspace_deps, &records);
+        assert!(
+            !restricted.contains_key("numpy"),
+            "a wildcard workspace spec is not hand-written intent: {restricted:?}"
+        );
+    }
 }
 
 /// retread-deps-from conda-as-truth: canonical PyPI names among `roots`
