@@ -2218,6 +2218,73 @@ impl RepairPlanner {
         })
     }
 
+    /// Whether a hand-written workspace pin for `package` GOVERNS
+    /// `bundle`'s composition -- i.e. lives in a feature that
+    /// participates in at least one environment that composes `bundle`
+    /// (or in the top-level default tables when such an env inherits
+    /// them).
+    ///
+    /// Run-24 convergence bug: tiers 5-7 guarded with the ANY-feature
+    /// `has_workspace_pin` scan above, so a `sentry-sdk = "==2.0.0"`
+    /// entry under `[feature.pm-newton.pypi-dependencies]` /
+    /// `[feature.pm-mujoco.pypi-dependencies]` -- features belonging to
+    /// entirely different environments that never compose
+    /// `isaaclab-2.3x-pack` at all -- was treated as "real owner intent"
+    /// for the pm-isaaclab conflict and silently vetoed tier 7's floor
+    /// repair on every run (the repair itself was proven correct in
+    /// isolation; only this guard blocked it live). A pin only expresses
+    /// intent for the solves it participates in: scope the veto to the
+    /// features reachable from environments that actually compose the
+    /// pack being repaired.
+    ///
+    /// Conservative fallbacks: if the workspace manifest can't be
+    /// loaded, or `bundle` isn't declared as a path dependency anywhere
+    /// (unknown composition), fall back to the old any-feature scan. A
+    /// pack declared only by features no environment references scopes
+    /// to those declaring features (plus default when top-level).
+    fn workspace_pin_governs_pack(
+        &self,
+        editor: &ManifestEditor,
+        bundle: &str,
+        package: &str,
+    ) -> bool {
+        let Some(ws) = crate::workspace::WorkspaceManifest::load(editor.project_dir()) else {
+            return self.has_workspace_pin(editor, package);
+        };
+        let owning: Vec<&String> = ws
+            .features
+            .iter()
+            .filter(|(_, f)| f.path_dependencies.contains_key(bundle))
+            .map(|(name, _)| name)
+            .collect();
+        let default_owns = ws.path_dependencies.contains_key(bundle);
+        if owning.is_empty() && !default_owns {
+            return self.has_workspace_pin(editor, package);
+        }
+        let mut governing: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for def in ws.environments.values() {
+            let composes_pack = def.features.iter().any(|f| owning.contains(&f))
+                || (default_owns && !def.no_default_feature);
+            if !composes_pack {
+                continue;
+            }
+            governing.extend(def.features.iter().cloned());
+            if !def.no_default_feature {
+                governing.insert("default".to_string());
+            }
+        }
+        if governing.is_empty() {
+            governing.extend(owning.into_iter().cloned());
+            if default_owns {
+                governing.insert("default".to_string());
+            }
+        }
+        governing.iter().any(|feature| {
+            editor.has_user_entry(feature, TableKind::Conda, package)
+                || editor.has_user_entry(feature, TableKind::Pypi, package)
+        })
+    }
+
     /// Whether `name` resolves as one of THIS workspace's own composed
     /// packs (`resolve_pack_dir`). Guardrail for tier 7 (two-pack
     /// same-package clash, run-18 `sentry-sdk` fixture): a sibling
@@ -2369,7 +2436,9 @@ impl RepairPlanner {
             let Some(requirer) = &m.requirer else {
                 continue;
             };
-            if is_abi_anchor(&m.package) || self.has_workspace_pin(editor, &m.package) {
+            if is_abi_anchor(&m.package)
+                || self.workspace_pin_governs_pack(editor, bundle, &m.package)
+            {
                 continue;
             }
             let Some(req_mention) = mentions
@@ -2378,7 +2447,7 @@ impl RepairPlanner {
             else {
                 continue;
             };
-            if self.has_workspace_pin(editor, &req_mention.package) {
+            if self.workspace_pin_governs_pack(editor, bundle, &req_mention.package) {
                 continue;
             }
             let req_ownership =
@@ -2426,8 +2495,9 @@ impl RepairPlanner {
                 continue;
             };
             // Respect real owner intent: a hand-written workspace pin on
-            // the requirer is never un-routed out from under the user.
-            if self.has_workspace_pin(editor, requirer) {
+            // the requirer (in a feature governing THIS pack's
+            // composition) is never un-routed out from under the user.
+            if self.workspace_pin_governs_pack(editor, bundle, requirer) {
                 continue;
             }
             let Some(req_mention) = mentions
@@ -2497,7 +2567,9 @@ impl RepairPlanner {
             if !requirer.eq_ignore_ascii_case(bundle) {
                 continue;
             }
-            if is_abi_anchor(&m.package) || self.has_workspace_pin(editor, &m.package) {
+            if is_abi_anchor(&m.package)
+                || self.workspace_pin_governs_pack(editor, bundle, &m.package)
+            {
                 continue;
             }
             let Some((op, version)) = leading_clause(&m.spec) else {
@@ -4719,11 +4791,24 @@ holosoma-gpu = { features = ["holosoma"] }
         // the 10-repair budget was already spent (see the `solve::lock`
         // regression tests `generic_only_conflict_at_budget_reports_max_repairs_not_unparseable`
         // / `generic_only_conflict_after_budget_spent_keeps_prior_repair`).
+        // Run-24 addendum: the REAL workspace also carries
+        // `sentry-sdk = "==2.0.0"` pins under [feature.pm-newton.pypi-
+        // dependencies] / [feature.pm-mujoco.pypi-dependencies] --
+        // features whose environments never compose either pack in this
+        // conflict. The old ANY-feature `has_workspace_pin` guard treated
+        // those as owner intent and vetoed tier 7 on every live run
+        // (run-24 non-convergence); `workspace_pin_governs_pack` must
+        // scope the veto to features reachable from environments that
+        // compose the dead-end pack.
         let manifest_text = "[dependencies]\n\n\
              [feature.pm-isaaclab.dependencies]\n\
              \"protomotions-deps-pack\" = { path = \"./pypi-packs/protomotions-deps-pack\" }\n\
              \"isaaclab-2.3x-pack\" = { path = \"./pypi-packs/isaaclab-2.3x-pack\" }\n\n\
-             [environments]\npm-isaaclab = { features = [\"pm-isaaclab\"] }\n";
+             [feature.pm-newton.pypi-dependencies]\n\
+             sentry-sdk = \"==2.0.0\"\n\n\
+             [environments]\n\
+             pm-isaaclab = { features = [\"pm-isaaclab\"], no-default-feature = true }\n\
+             pm-newton-gpu = { features = [\"pm-newton\"], no-default-feature = true }\n";
         let path = temp_manifest(manifest_text);
         let project_dir = path.parent().unwrap().to_path_buf();
         let mut pack_pixis = std::collections::HashMap::new();
@@ -4799,6 +4884,89 @@ holosoma-gpu = { features = ["holosoma"] }
         assert_eq!(
             po.expect("expected a pack-override write").package,
             "sentry-sdk"
+        );
+    }
+
+    const SENTRY_SDK_TWO_PACK_RUN24_FIXTURE: &str =
+        include_str!("../../tests/fixtures/solve_errors/conda_two_pack_sentry_sdk_run24.txt");
+
+    /// Converse of the run-24 guard-scoping fix: a hand-written pin in a
+    /// feature that DOES govern the dead-end pack's composition (the
+    /// same feature composing it, or any feature co-activated by an
+    /// environment that composes it) is still real owner intent -- tier
+    /// 7 must keep refusing to floor over it.
+    #[test]
+    fn run24_tier7_still_vetoed_by_pin_in_a_governing_feature() {
+        let manifest_text = "[dependencies]\n\n\
+             [feature.pm-isaaclab.dependencies]\n\
+             \"protomotions-deps-pack\" = { path = \"./pypi-packs/protomotions-deps-pack\" }\n\
+             \"isaaclab-2.3x-pack\" = { path = \"./pypi-packs/isaaclab-2.3x-pack\" }\n\n\
+             [feature.pm-isaaclab.pypi-dependencies]\n\
+             sentry-sdk = \"==2.0.0\"\n\n\
+             [environments]\n\
+             pm-isaaclab = { features = [\"pm-isaaclab\"], no-default-feature = true }\n";
+        let path = temp_manifest(manifest_text);
+        let project_dir = path.parent().unwrap().to_path_buf();
+        for (name, version) in [
+            ("protomotions-deps-pack", "3.1"),
+            ("isaaclab-2.3x-pack", "0.54.2"),
+        ] {
+            let pack_dir = project_dir.join(format!("pypi-packs/{name}"));
+            std::fs::create_dir_all(&pack_dir).unwrap();
+            std::fs::write(
+                pack_dir.join("pixi.toml"),
+                format!("[package]\nname = \"{name}\"\nversion = \"{version}\"\n"),
+            )
+            .unwrap();
+        }
+        let editor = ManifestEditor::open(path).unwrap();
+        let mut tried = TriedState::default();
+        let mut planner = RepairPlanner::new("default".into());
+        assert!(
+            planner
+                .generic_fallback_repair(&editor, &mut tried, SENTRY_SDK_TWO_PACK_RUN24_FIXTURE, 1)
+                .is_none(),
+            "a workspace pin in the pack's OWN governing feature must still veto tier 7"
+        );
+    }
+
+    /// Sibling-feature scoping: the veto also applies when the pin lives
+    /// in a DIFFERENT feature that an environment co-activates alongside
+    /// the pack's owning feature (e.g. a `doit-task-runner`-style shared
+    /// feature in the same env) -- governance is env-reachability, not
+    /// just the owning feature itself.
+    #[test]
+    fn run24_tier7_vetoed_by_pin_in_a_co_activated_sibling_feature() {
+        let manifest_text = "[dependencies]\n\n\
+             [feature.pm-isaaclab.dependencies]\n\
+             \"protomotions-deps-pack\" = { path = \"./pypi-packs/protomotions-deps-pack\" }\n\
+             \"isaaclab-2.3x-pack\" = { path = \"./pypi-packs/isaaclab-2.3x-pack\" }\n\n\
+             [feature.shared-tools.pypi-dependencies]\n\
+             sentry-sdk = \"==2.0.0\"\n\n\
+             [environments]\n\
+             pm-isaaclab = { features = [\"shared-tools\", \"pm-isaaclab\"], no-default-feature = true }\n";
+        let path = temp_manifest(manifest_text);
+        let project_dir = path.parent().unwrap().to_path_buf();
+        for (name, version) in [
+            ("protomotions-deps-pack", "3.1"),
+            ("isaaclab-2.3x-pack", "0.54.2"),
+        ] {
+            let pack_dir = project_dir.join(format!("pypi-packs/{name}"));
+            std::fs::create_dir_all(&pack_dir).unwrap();
+            std::fs::write(
+                pack_dir.join("pixi.toml"),
+                format!("[package]\nname = \"{name}\"\nversion = \"{version}\"\n"),
+            )
+            .unwrap();
+        }
+        let editor = ManifestEditor::open(path).unwrap();
+        let mut tried = TriedState::default();
+        let mut planner = RepairPlanner::new("default".into());
+        assert!(
+            planner
+                .generic_fallback_repair(&editor, &mut tried, SENTRY_SDK_TWO_PACK_RUN24_FIXTURE, 1)
+                .is_none(),
+            "a pin in a co-activated sibling feature governs the pack and must veto tier 7"
         );
     }
 

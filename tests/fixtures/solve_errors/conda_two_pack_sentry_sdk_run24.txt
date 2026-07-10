@@ -1,0 +1,203 @@
+ WARN Encountered 15 warnings while parsing the manifest:
+  ⚠ The feature 'test' is defined but not used in any environment.
+  │ Dependencies of unused features are not resolved or checked, and use
+  │ wildcard (*) version specifiers by default, disregarding any set `pinning-
+  │ strategy`
+     ╭─[/oscar/data/stellex/glvov/imprint-env-test/pixi.toml:133:10]
+ 132 │ # This environment is relied upon by default by the CI in .github/workflows/pre-commit.yml
+ 133 │ [feature.test.dependencies]
+     ·          ────
+ 134 │ pytest = ">=7.0.0"
+     ╰────
+  help: Remove the feature from the manifest or add it to an environment
+
+  ⚠ The feature 'unitree-rl-gym' is defined but not used in any environment.
+  │ Dependencies of unused features are not resolved or checked, and use
+  │ wildcard (*) version specifiers by default, disregarding any set `pinning-
+  │ strategy`
+     ╭─[/oscar/data/stellex/glvov/imprint-env-test/pixi.toml:180:10]
+ 179 │ # default project environments target Python 3.12.
+ 180 │ [feature.unitree-rl-gym]
+     ·          ──────────────
+ 181 │ channels = [
+     ╰────
+  help: Remove the feature from the manifest or add it to an environment
+
+  ⚠ The feature 'robogen' is defined but not used in any environment.
+  │ Dependencies of unused features are not resolved or checked, and use
+  │ wildcard (*) version specifiers by default, disregarding any set `pinning-
+  │ strategy`
+     ╭─[/oscar/data/stellex/glvov/imprint-env-test/pixi.toml:247:10]
+ 246 │ # project environments.
+ 247 │ [feature.robogen]
+     ·          ───────
+ 248 │ [feature.robogen.system-requirements]
+     ╰────
+  help: Remove the feature from the manifest or add it to an environment
+
+  ⚠ The feature 'flashsac' is defined but not used in any environment.
+  │ Dependencies of unused features are not resolved or checked, and use
+  │ wildcard (*) version specifiers by default, disregarding any set `pinning-
+  │ strategy`
+     ╭─[/oscar/data/stellex/glvov/imprint-env-test/pixi.toml:562:10]
+ 561 │ # names only FlashRL as the root; retread resolves the wheel closure.
+ 562 │ [feature.flashsac]
+     ·          ────────
+ 563 │ [feature.flashsac.dependencies]
+     ╰────
+  help: Remove the feature from the manifest or add it to an environment
+
+  ⚠ The feature 'isaaclab-hover' is defined but not used in any environment.
+  │ Dependencies of unused features are not resolved or checked, and use
+  │ wildcard (*) version specifiers by default, disregarding any set `pinning-
+  │ strategy`
+     ╭─[/oscar/data/stellex/glvov/imprint-env-test/pixi.toml:589:10]
+ 588 │ # dedicated no-default environment and retread pack.
+ 589 │ [feature.isaaclab-hover]
+     ·          ──────────────
+ 590 │ channels = ["https://prefix.dev/conda-forge", "https://conda.anaconda.org/pytorch", "https://prefix.dev/pytorch", "https://prefix.dev/nvidia"]
+     ╰────
+  help: Remove the feature from the manifest or add it to an environment
+
+  ⚠ The feature 'hover' is defined but not used in any environment.
+  │ Dependencies of unused features are not resolved or checked, and use
+  │ wildcard (*) version specifiers by default, disregarding any set `pinning-
+  │ strategy`
+     ╭─[/oscar/data/stellex/glvov/imprint-env-test/pixi.toml:664:10]
+ 663 │ 
+ 664 │ [feature.hover.dependencies]
+     ·          ─────
+ 665 │ psutil = ">=5.9,<8"
+     ╰────
+  help: Remove the feature from the manifest or add it to an environment
+
+  ⚠ The feature 'sage' is defined but not used in any environment.
+  │ Dependencies of unused features are not resolved or checked, and use
+  │ wildcard (*) version specifiers by default, disregarding any set `pinning-
+  │ strategy`
+     ╭─[/oscar/data/stellex/glvov/imprint-env-test/pixi.toml:679:10]
+ 678 │ # Keep it separate from the root Isaac Sim 6 and Isaac Sim 5.1 packs.
+ 679 │ [feature.sage]
+     ·          ────
+ 680 │ channels = ["https://prefix.dev/conda-forge", "https://conda.anaconda.org/pytorch", "https://prefix.dev/pytorch", "https://prefix.dev/nvidia"]
+     ╰────
+  help: Remove the feature from the manifest or add it to an environment
+
+  ⚠ The feature 'ros2-humble' is defined but not used in any environment.
+  │ Dependencies of unused features are not resolved or checked, and use
+  │ wildcard (*) version specifiers by default, disregarding any set `pinning-
+  │ strategy`
+     ╭─[/oscar/data/stellex/glvov/imprint-env-test/pixi.toml:791:10]
+ 790 │ #### ROS 2 Environment---------------------------------------------------------------------------
+ 791 │ [feature.ros2-humble]
+     ·          ───────────
+ 792 │ # "https://prefix.dev/robostack-[humble|jazzy|kilted]"
+     ╰────
+  help: Remove the feature from the manifest or add it to an environment
+
+  ⚠ The feature 'ros2-jazzy' is defined but not used in any environment.
+  │ Dependencies of unused features are not resolved or checked, and use
+  │ wildcard (*) version specifiers by default, disregarding any set `pinning-
+  │ strategy`
+     ╭─[/oscar/data/stellex/glvov/imprint-env-test/pixi.toml:829:10]
+ 828 │ # overlay + points COLCON_DEFAULTS_FILE at jazzy_ws/colcon-defaults.yaml.
+ 829 │ [feature.ros2-jazzy]
+     ·          ──────────
+ 830 │ # "https://prefix.dev/robostack-[humble|jazzy|kilted]"
+     ╰────
+  help: Remove the feature from the manifest or add it to an environment
+
+  ⚠ The feature 'isaaclab' is defined but not used in any environment.
+  │ Dependencies of unused features are not resolved or checked, and use
+  │ wildcard (*) version specifiers by default, disregarding any set `pinning-
+  │ strategy`
+     ╭─[/oscar/data/stellex/glvov/imprint-env-test/pixi.toml:879:10]
+ 878 │ # The active retread config expands the compatible sibling IsaacLab packages from the same Git revision instead.
+ 879 │ [feature.isaaclab]
+     ·          ────────
+ 880 │ [feature.isaaclab.dependencies]
+     ╰────
+  help: Remove the feature from the manifest or add it to an environment
+
+  ⚠ The feature 'newton' is defined but not used in any environment.
+  │ Dependencies of unused features are not resolved or checked, and use
+  │ wildcard (*) version specifiers by default, disregarding any set `pinning-
+  │ strategy`
+     ╭─[/oscar/data/stellex/glvov/imprint-env-test/pixi.toml:921:10]
+ 920 │ # Newton is pinned from source in pypi-packs/newton-pack-latest/.
+ 921 │ [feature.newton.dependencies]
+     ·          ──────
+ 922 │ newton-pack-latest = { path = "./pypi-packs/newton-pack-latest" }
+     ╰────
+  help: Remove the feature from the manifest or add it to an environment
+
+  ⚠ The feature 'pm-mujoco' is defined but not used in any environment.
+  │ Dependencies of unused features are not resolved or checked, and use
+  │ wildcard (*) version specifiers by default, disregarding any set `pinning-
+  │ strategy`
+      ╭─[/oscar/data/stellex/glvov/imprint-env-test/pixi.toml:1045:10]
+ 1044 │ # debugging without a GPU. No retread pack needed: mujoco is a plain PyPI/conda dependency here.
+ 1045 │ [feature.pm-mujoco.dependencies]
+      ·          ─────────
+ 1046 │ python = ">=3.10,<3.11"
+      ╰────
+  help: Remove the feature from the manifest or add it to an environment
+
+  ⚠ The feature 'teleop-pico' is defined but not used in any environment.
+  │ Dependencies of unused features are not resolved or checked, and use
+  │ wildcard (*) version specifiers by default, disregarding any set `pinning-
+  │ strategy`
+      ╭─[/oscar/data/stellex/glvov/imprint-env-test/pixi.toml:1170:10]
+ 1169 │ # (pyzmq above).
+ 1170 │ [feature.teleop-pico.pypi-dependencies]
+      ·          ───────────
+ 1171 │ # SCAFFOLD: uncomment + pin to enable (needs --extra-index-url https://pypi.nvidia.com for
+      ╰────
+  help: Remove the feature from the manifest or add it to an environment
+
+  ⚠ The feature 'figaroh' is defined but not used in any environment.
+  │ Dependencies of unused features are not resolved or checked, and use
+  │ wildcard (*) version specifiers by default, disregarding any set `pinning-
+  │ strategy`
+      ╭─[/oscar/data/stellex/glvov/imprint-env-test/pixi.toml:1187:10]
+ 1186 │ # (third_party/unitree_rl_gym/resources/robots/h1_2/h1_2.urdf).
+ 1187 │ [feature.figaroh]
+      ·          ───────
+ 1188 │ channels = ["https://prefix.dev/conda-forge"]
+      ╰────
+  help: Remove the feature from the manifest or add it to an environment
+
+  ⚠ The feature 'pace' is defined but not used in any environment.
+  │ Dependencies of unused features are not resolved or checked, and use
+  │ wildcard (*) version specifiers by default, disregarding any set `pinning-
+  │ strategy`
+      ╭─[/oscar/data/stellex/glvov/imprint-env-test/pixi.toml:1220:10]
+ 1219 │ # adapter itself is CPU/torch-only; only the fit needs Isaac.
+ 1220 │ [feature.pace]
+      ·          ────
+ 1221 │ [feature.pace.system-requirements]
+      ╰────
+  help: Remove the feature from the manifest or add it to an environment
+
+ WARN overriding build backend with: pixi-build-retread=/oscar/data/stellex/glvov/imprint-env-test/_session_briefs/pixi-build-retread-bin
+Error:   × failed to solve requirements of environment 'pm-isaaclab' for platform
+  │ 'linux-64'
+  ├─▶   × failed to solve the environment
+  │   
+  ╰─▶ Cannot solve the request because of: The following packages are
+      incompatible
+      ├─ protomotions-deps-pack * can be installed with any of the following
+      options:
+      │  └─ protomotions-deps-pack 3.1 would require
+      │     └─ sentry-sdk >=2.64.0, which can be installed with any of the
+      following options:
+      │        └─ sentry-sdk 2.64.0
+      └─ isaaclab-2.3x-pack * cannot be installed because there are no viable
+      options:
+         └─ isaaclab-2.3x-pack 0.54.2 would require
+            └─ sentry-sdk ==2.29.1, which cannot be installed because there
+      are no viable options:
+               └─ sentry-sdk 2.29.1, which conflicts with the versions
+      reported above.
+      
+
