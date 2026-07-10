@@ -304,11 +304,33 @@ async fn run_with_pixi_bin(args: LockArgs, pixi_bin: &str) -> Result<i32> {
         // rung-per-error-shape treadmill; see `RepairPlanner::
         // generic_fallback_repair`) before declaring the conflict
         // unparseable. Bounded by the same `--max-repairs` budget as the
-        // specific-conflict path.
-        if repairs_applied < args.max_repairs
-            && let Some((result, po)) =
-                planner.generic_fallback_repair(&editor, &mut tried, &stripped, repairs_applied + 1)
+        // specific-conflict path -- but, unlike the old `repairs_applied <
+        // args.max_repairs` short-circuit on the CALL itself, the budget
+        // check happens AFTER confirming the engine actually recognizes
+        // this shape as actionable (run-21 bug: a real, repairable
+        // tier-7 two-pack clash landed as the 11th needed repair against
+        // a 10-repair budget; short-circuiting the call entirely skipped
+        // straight to "unparseable" below, which rolls EVERY prior
+        // in-run repair back -- silently discarding 10 good repairs and
+        // misreporting a budget problem as a parse failure). Report this
+        // honestly as `max_repairs` instead, exactly like the
+        // specific-conflict path above, which keeps whatever progress
+        // this run made rather than wiping it.
+        if let Some((result, po)) =
+            planner.generic_fallback_repair(&editor, &mut tried, &stripped, repairs_applied + 1)
         {
+            if repairs_applied >= args.max_repairs {
+                ledger.finish_run(run_idx, "max_repairs");
+                ledger.write_atomic(&ledger_path)?;
+                eprintln!(
+                    "retread lock: max repairs ({}) reached; last conflict unresolved (generic fallback) for manifest {}",
+                    args.max_repairs,
+                    manifest_path.display()
+                );
+                eprintln!("{}", tail(&lock.raw_stderr, 4000));
+                print_summary(&records);
+                return Ok(EXIT_MAX_ITERS);
+            }
             match result {
                 Ok(out) => {
                     if let Some(po) = &po {
@@ -911,6 +933,126 @@ exit 1
 
         let manifest_text = std::fs::read_to_string(dir.join("pixi.toml")).unwrap();
         assert_eq!(manifest_text, "[dependencies]\n");
+    }
+
+    const SENTRY_SDK_TWO_PACK: &str =
+        include_str!("../../tests/fixtures/solve_errors/conda_two_pack_sentry_sdk.txt");
+
+    /// Run-21 regression: a conflict shape ONLY the generic fallback
+    /// engine recognizes (no specific `Conflict` parser matches tier-7's
+    /// two-pack same-package clash) that surfaces exactly when the
+    /// `--max-repairs` budget is already spent must be reported as
+    /// `max_repairs` (budget exhausted, progress kept) -- not silently
+    /// short-circuited into the "unparseable" catch-all, which rolls
+    /// EVERY repair this run made back to the pre-run snapshot and prints
+    /// a misleading "could not parse solver error" even though the
+    /// engine, given one more repair slot, would have floored the
+    /// dead-end pin and converged (verified directly against this same
+    /// fixture in `solve::repair::tests::
+    /// end_to_end_run18_two_pack_sentry_sdk_floors_the_dead_end_exact_pin`).
+    #[tokio::test]
+    async fn generic_only_conflict_at_budget_reports_max_repairs_not_unparseable() {
+        let dir = temp_dir("genericbudget");
+        let manifest_text = "[dependencies]\n\n\
+             [feature.pm-isaaclab.dependencies]\n\
+             \"protomotions-deps-pack\" = { path = \"./pypi-packs/protomotions-deps-pack\" }\n\
+             \"isaaclab-2.3x-pack\" = { path = \"./pypi-packs/isaaclab-2.3x-pack\" }\n\n\
+             [environments]\npm-isaaclab = { features = [\"pm-isaaclab\"] }\n";
+        let manifest = write_manifest(&dir, manifest_text);
+        for (name, version) in [
+            ("protomotions-deps-pack", "3.1"),
+            ("isaaclab-2.3x-pack", "0.54.2"),
+        ] {
+            let pack_dir = dir.join(format!("pypi-packs/{name}"));
+            std::fs::create_dir_all(&pack_dir).unwrap();
+            std::fs::write(
+                pack_dir.join("pixi.toml"),
+                format!("[package]\nname = \"{name}\"\nversion = \"{version}\"\n"),
+            )
+            .unwrap();
+        }
+        let pixi = write_fake_pixi(&dir, 50, SENTRY_SDK_TWO_PACK);
+
+        // Budget already exhausted (0) before this conflict is even seen
+        // -- mirrors run 21, where 10 unrelated repairs had already
+        // consumed the whole budget before the sentry-sdk clash was the
+        // sole remaining error.
+        let args = LockArgs {
+            manifest,
+            max_repairs: 0,
+            no_repair: false,
+        };
+        let code = run_with_pixi_bin(args, pixi.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            code, EXIT_MAX_ITERS,
+            "an actionable-but-budget-starved generic-fallback conflict must report \
+             max_repairs, not unparseable"
+        );
+
+        // Unlike "unparseable" (blanket rollback), "max_repairs" keeps
+        // whatever the run accomplished -- here, nothing was applied (the
+        // budget was 0 from the start), so the manifest is simply
+        // untouched, but critically via the KEEP path, not the ROLLBACK
+        // path (snapshot must be gone either way once the run finishes,
+        // but the outcome/exit code is the load-bearing assertion above).
+        let manifest_after = std::fs::read_to_string(dir.join("pixi.toml")).unwrap();
+        assert_eq!(manifest_after, manifest_text);
+    }
+
+    /// Same shape, but ONE specific-conflict repair already consumed the
+    /// only budget slot before the generic-only sentry-sdk conflict shows
+    /// up on the next iteration -- the prior repair must survive (kept,
+    /// not rolled back) exactly like the existing specific-conflict
+    /// `max_repairs_bound_stops_with_manifest_kept` case.
+    #[tokio::test]
+    async fn generic_only_conflict_after_budget_spent_keeps_prior_repair() {
+        let dir = temp_dir("genericbudgetprior");
+        let manifest_text = "[dependencies]\n\n\
+             [feature.pm-isaaclab.dependencies]\n\
+             \"protomotions-deps-pack\" = { path = \"./pypi-packs/protomotions-deps-pack\" }\n\
+             \"isaaclab-2.3x-pack\" = { path = \"./pypi-packs/isaaclab-2.3x-pack\" }\n\n\
+             [environments]\npm-isaaclab = { features = [\"pm-isaaclab\"] }\n";
+        let manifest = write_manifest(&dir, manifest_text);
+        for (name, version) in [
+            ("protomotions-deps-pack", "3.1"),
+            ("isaaclab-2.3x-pack", "0.54.2"),
+        ] {
+            let pack_dir = dir.join(format!("pypi-packs/{name}"));
+            std::fs::create_dir_all(&pack_dir).unwrap();
+            std::fs::write(
+                pack_dir.join("pixi.toml"),
+                format!("[package]\nname = \"{name}\"\nversion = \"{version}\"\n"),
+            )
+            .unwrap();
+        }
+        // iter 1: a plain specific-conflict repair (numpy conda boundary)
+        // that consumes the single repair slot; iter 2+: the generic-only
+        // sentry-sdk two-pack clash, clamped for every call after.
+        let pixi =
+            write_fake_pixi_sequence(&dir, &[CONDA_BOUNDARY_SINGLE_LINE, SENTRY_SDK_TWO_PACK]);
+
+        let args = LockArgs {
+            manifest,
+            max_repairs: 1,
+            no_repair: false,
+        };
+        let code = run_with_pixi_bin(args, pixi.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(code, EXIT_MAX_ITERS);
+
+        // iter 1's numpy repair must have survived -- the generic-only
+        // conflict on iter 2 hitting the exhausted budget must NOT roll
+        // it back (the run-21 bug: it used to fall through to the
+        // "unparseable" path, which rolls back every repair the run
+        // made).
+        let manifest_after = std::fs::read_to_string(dir.join("pixi.toml")).unwrap();
+        assert!(
+            manifest_after.contains("numpy"),
+            "iter 1's repair must be kept, not rolled back: {manifest_after}"
+        );
     }
 
     #[tokio::test]

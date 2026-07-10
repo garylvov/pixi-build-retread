@@ -1,0 +1,60 @@
+227;161m">=3.10,<3.11"
+      ╰────
+  help: Remove the feature from the manifest or add it to an environment
+
+  ⚠ The feature 'teleop-pico' is defined but not used in any environment.
+  │ Dependencies of unused features are not resolved or checked, and use
+  │ wildcard (*) version specifiers by default, disregarding any set `pinning-
+  │ strategy`
+      ╭─[/oscar/data/stellex/glvov/imprint-env-test/pixi.toml:1170:10]
+ 1169 │ # (pyzmq above).
+ 1170 │ [feature.teleop-pico.pypi-dependencies]
+      ·          ───────────
+ 1171 │ # SCAFFOLD: uncomment + pin to enable (needs --extra-index-url https://pypi.nvidia.com for
+      ╰────
+  help: Remove the feature from the manifest or add it to an environment
+
+  ⚠ The feature 'figaroh' is defined but not used in any environment.
+  │ Dependencies of unused features are not resolved or checked, and use
+  │ wildcard (*) version specifiers by default, disregarding any set `pinning-
+  │ strategy`
+      ╭─[/oscar/data/stellex/glvov/imprint-env-test/pixi.toml:1187:10]
+ 1186 │ # (third_party/unitree_rl_gym/resources/robots/h1_2/h1_2.urdf).
+ 1187 │ [feature.figaroh]
+      ·          ───────
+ 1188 │ channels = ["https://prefix.dev/conda-forge"]
+      ╰────
+  help: Remove the feature from the manifest or add it to an environment
+
+  ⚠ The feature 'pace' is defined but not used in any environment.
+  │ Dependencies of unused features are not resolved or checked, and use
+  │ wildcard (*) version specifiers by default, disregarding any set `pinning-
+  │ strategy`
+      ╭─[/oscar/data/stellex/glvov/imprint-env-test/pixi.toml:1220:10]
+ 1219 │ # adapter itself is CPU/torch-only; only the fit needs Isaac.
+ 1220 │ [feature.pace]
+      ·          ────
+ 1221 │ [feature.pace.system-requirements]
+      ╰────
+  help: Remove the feature from the manifest or add it to an environment
+
+ WARN overriding build backend with: pixi-build-retread=/oscar/data/stellex/glvov/imprint-env-test/_session_briefs/pixi-build-retread-bin
+Error:   × failed to solve requirements of environment 'pm-isaaclab' for platform
+  │ 'linux-64'
+  ├─▶   × failed to solve the environment
+  │   
+  ╰─▶ Cannot solve the request because of: The following packages are
+      incompatible
+      ├─ protomotions-deps-pack * can be installed with any of the following
+      options:
+      │  └─ protomotions-deps-pack 3.1 would require
+      │     └─ sentry-sdk >=2.64.0, which can be installed with any of the
+      following options:
+      │        └─ sentry-sdk 2.64.0
+      └─ isaaclab-2.3x-pack * cannot be installed because there are no viable
+      options:
+         └─ isaaclab-2.3x-pack 0.54.2 would require
+            └─ sentry-sdk ==2.29.1, which cannot be installed because there
+      are no viable options:
+               └─ sentry-sdk 2.29.1, which conflicts with the versions
+      reported above.

@@ -4706,6 +4706,103 @@ holosoma-gpu = { features = ["holosoma"] }
     }
 
     #[test]
+    fn run21_tier7_still_fires_with_full_accumulated_override_state_and_real_stderr() {
+        // Run-21 root-cause verification: reproduce run 21's exact
+        // accumulated .retread/auto-overrides.json state (the 9 prior
+        // in-run repairs already applied to both packs by the time the
+        // sentry-sdk conflict was the sole remaining error) plus the REAL
+        // captured stderr (leading pixi build-backend/unused-feature
+        // warnings included, not just the bare Cannot-solve block) to
+        // confirm tier 7 fires correctly against the exact live shape --
+        // it does (this was NOT the bug). The actual run-21 bug was
+        // `lock.rs` never even calling `generic_fallback_repair` because
+        // the 10-repair budget was already spent (see the `solve::lock`
+        // regression tests `generic_only_conflict_at_budget_reports_max_repairs_not_unparseable`
+        // / `generic_only_conflict_after_budget_spent_keeps_prior_repair`).
+        let manifest_text = "[dependencies]\n\n\
+             [feature.pm-isaaclab.dependencies]\n\
+             \"protomotions-deps-pack\" = { path = \"./pypi-packs/protomotions-deps-pack\" }\n\
+             \"isaaclab-2.3x-pack\" = { path = \"./pypi-packs/isaaclab-2.3x-pack\" }\n\n\
+             [environments]\npm-isaaclab = { features = [\"pm-isaaclab\"] }\n";
+        let path = temp_manifest(manifest_text);
+        let project_dir = path.parent().unwrap().to_path_buf();
+        let mut pack_pixis = std::collections::HashMap::new();
+        for (name, version) in [
+            ("protomotions-deps-pack", "3.1"),
+            ("isaaclab-2.3x-pack", "0.54.2"),
+        ] {
+            let pack_dir = project_dir.join(format!("pypi-packs/{name}"));
+            std::fs::create_dir_all(&pack_dir).unwrap();
+            let pack_pixi = pack_dir.join("pixi.toml");
+            std::fs::write(
+                &pack_pixi,
+                format!("[package]\nname = \"{name}\"\nversion = \"{version}\"\n"),
+            )
+            .unwrap();
+            pack_pixis.insert(name.to_string(), pack_pixi);
+        }
+        // Replay run 21's exact repair table (10 rows) into the ledger.
+        let overrides = [
+            ("protomotions-deps-pack", "sentry-sdk", ">=2.0.0"),
+            ("protomotions-deps-pack", "hydra-core", ">=1.3.2"),
+            ("isaaclab-2.3x-pack", "setuptools", ">=68,<76"),
+            ("protomotions-deps-pack", "fsspec", ">=2023.1.0,<=2026.4.0"),
+            ("protomotions-deps-pack", "pandas", ">=1.5,<1.6"),
+            ("isaaclab-2.3x-pack", "fsspec", ">=2023.1.0,<=2026.4.0"),
+            ("protomotions-deps-pack", "numpy", ">=1.26,<1.27"),
+            ("protomotions-deps-pack", "trimesh", ">=4.5,<5"),
+            ("isaaclab-2.3x-pack", "trimesh", ">=4.5,<5"),
+        ];
+        for (pack, package, spec) in overrides {
+            crate::pack_overrides::write_override(
+                &project_dir,
+                &pack_pixis[pack],
+                pack,
+                package,
+                spec,
+                "pypi_override",
+            )
+            .unwrap();
+        }
+
+        let real_stderr = include_str!(
+            "../../tests/fixtures/solve_errors/conda_two_pack_sentry_sdk_run21_full.txt"
+        );
+        let editor = ManifestEditor::open(path).unwrap();
+        let mut tried = TriedState::default();
+        let mut planner = RepairPlanner::new("default".into());
+        let parser = super::super::parse::RegexConflictParser::new();
+        let stripped = parser.strip_ansi(real_stderr);
+        let mentions = parser.extract_generic_mentions(&stripped);
+        assert_eq!(
+            mentions.len(),
+            2,
+            "must extract both sentry-sdk mentions: {mentions:?}"
+        );
+        let bundle = parser.extract_bundle_name(&stripped);
+        assert_eq!(bundle.as_deref(), Some("isaaclab-2.3x-pack"));
+        let candidates =
+            planner.generate_fallback_candidates(&editor, bundle.as_deref(), &mentions);
+        assert_eq!(
+            candidates.len(),
+            1,
+            "tier 7 must still fire: {candidates:?}"
+        );
+        assert_eq!(candidates[0].tier, 7);
+        assert_eq!(candidates[0].new_spec, ">=2.29.1");
+
+        let (result, po) = planner
+            .generic_fallback_repair(&editor, &mut tried, &stripped, 11)
+            .expect("must recognize the conflict as actionable");
+        let outcome = result.expect("must floor the dead-end pin, not exhaust");
+        assert_eq!(outcome.attempt.new_spec.as_deref(), Some(">=2.29.1"));
+        assert_eq!(
+            po.expect("expected a pack-override write").package,
+            "sentry-sdk"
+        );
+    }
+
+    #[test]
     fn end_to_end_run18_two_pack_sentry_sdk_floors_the_dead_end_exact_pin() {
         // Run 18 shape (step4-lock-run18.log): NO specific rung recognizes
         // this ("could not parse solver error" in the actual run) --
