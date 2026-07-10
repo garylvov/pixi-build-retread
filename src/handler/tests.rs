@@ -318,6 +318,7 @@ fn pythons_for_rejects_bare_major_variant() {
         python: None,
         pin_version: false,
         deps_from: Default::default(),
+        ledger_overrides: Default::default(),
     };
     let result = pythons_for(&cfg, Some(&variants));
     assert_eq!(
@@ -363,6 +364,7 @@ fn pythons_for_accepts_dotted_variant() {
         python: None,
         pin_version: false,
         deps_from: Default::default(),
+        ledger_overrides: Default::default(),
     };
     let result = pythons_for(&cfg, Some(&variants));
     assert_eq!(result, vec!["3.11".to_string()]);
@@ -408,6 +410,7 @@ fn pythons_for_filters_bare_major_keeps_dotted() {
         python: None,
         pin_version: false,
         deps_from: Default::default(),
+        ledger_overrides: Default::default(),
     };
     let result = pythons_for(&cfg, Some(&variants));
     assert_eq!(result, vec!["3.11".to_string(), "3.12".to_string()]);
@@ -674,6 +677,40 @@ fn produce_output_auto_routed_abi_anchor_stays_exact() {
 }
 
 #[test]
+fn produce_output_auto_routed_ledger_override_still_widens() {
+    // Run-31 regression: an override merged from the
+    // .retread/auto-overrides.json ledger (repair-engine-derived pypi
+    // steering knob) lands in config.overrides exactly like a
+    // hand-written [retread-overrides] entry -- but it must NOT trigger
+    // the manual-override exemption, or every package ANY repair touched
+    // re-emits an exact ==locked conda pin and the exact-pin conflict
+    // class the bounded ranges eliminate comes straight back
+    // (isaaclab-2.3x-pack re-emitted `setuptools ==80.10.2` right after
+    // tier-1 ledgered `setuptools >=68,<81`).
+    let mut config = cfg();
+    config
+        .overrides
+        .insert("setuptools".to_string(), ">=68,<81".to_string());
+    config.ledger_overrides.insert("setuptools".to_string());
+    let bundle = Bundle {
+        auto_routed: vec![("setuptools".to_string(), "80.10.2".to_string(), false)],
+        ..solo_bundle("ledger-pack", vec![])
+    };
+    let out = produce_output(&bundle, &config, Platform::Linux64, "3.11", &[], None, None).unwrap();
+    let deps: Vec<(String, String)> = out
+        .run_dependencies
+        .depends
+        .iter()
+        .map(|d| (d.name.clone(), format_packagespec(&d.spec)))
+        .collect();
+    assert!(
+        deps.contains(&("setuptools".to_string(), ">=80.10.2,<81".to_string())),
+        "ledger-derived override must NOT freeze the conda pin to exact; \
+         bounded range expected: {deps:?}"
+    );
+}
+
+#[test]
 fn produce_output_auto_routed_manual_override_stays_exact() {
     // Hand-written intent (a `retread-overrides` entry for this exact
     // name) wins over the auto-derived bounded range.
@@ -918,6 +955,7 @@ fn cfg() -> RetreadConfig {
         python: None,
         pin_version: false,
         deps_from: Default::default(),
+        ledger_overrides: Default::default(),
     }
 }
 

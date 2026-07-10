@@ -323,6 +323,12 @@ pub fn overrides_for_pack(workspace_dir: &Path, pack_pixi: &Path) -> BTreeMap<St
 /// exactly like a manifest edit would.
 pub fn merge_ledger_overrides(config: &mut RetreadConfig, workspace_dir: &Path, pack_pixi: &Path) {
     for (package, spec) in overrides_for_pack(workspace_dir, pack_pixi) {
+        // Record ledger provenance so the conda run-dep emission's
+        // manual-override exemption doesn't mistake this repair-derived
+        // pypi override for hand-written intent (run-31 regression: the
+        // pack re-emitted an exact `==` conda pin for every ledgered
+        // package, undoing the bounded-range emission).
+        config.ledger_overrides.insert(package.clone());
         config.overrides.insert(package, spec);
     }
     // Generic fallback engine's un-route candidate (doctrine (v)): merge

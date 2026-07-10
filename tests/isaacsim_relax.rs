@@ -76,6 +76,7 @@ fn baseline_config() -> RetreadConfig {
         python: None,
         pin_version: false,
         deps_from: Default::default(),
+        ledger_overrides: Default::default(),
         sdist_build: Default::default(),
     }
 }

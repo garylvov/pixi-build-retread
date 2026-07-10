@@ -4865,9 +4865,18 @@ fn produce_output(
     for (conda_name, conda_version, floor) in &bundle.auto_routed {
         let canon = canonical_conda_name(conda_name);
         if seen_dep_names.insert(canon.clone()) {
+            // Manual-override exemption: only a HAND-WRITTEN
+            // `[retread-overrides]` entry counts as intent -- a ledgered
+            // override merged from `.retread/auto-overrides.json` is a
+            // repair-derived pypi steering knob and must NOT freeze the
+            // conda pin back to exact (run-31 regression: every package
+            // ANY repair touched re-emitted `==locked`, resurrecting the
+            // exact-pin conflict class the ranges exist to prevent).
+            let manual_override =
+                config.overrides.contains_key(&canon) && !config.ledger_overrides.contains(&canon);
             let spec = if *floor {
                 format!("{canon} >={conda_version}")
-            } else if crate::solve::is_abi_anchor(&canon) || config.overrides.contains_key(&canon) {
+            } else if crate::solve::is_abi_anchor(&canon) || manual_override {
                 format!("{canon} =={conda_version}")
             } else {
                 match bounded_range_ceiling(conda_version) {

@@ -387,6 +387,21 @@ pub struct RetreadConfig {
     /// Default: empty (feature off).
     #[serde(default, rename = "retread-deps-from", alias = "deps-from")]
     pub deps_from: DepsFromSpec,
+
+    /// Names of `overrides` entries that were merged from the
+    /// `.retread/auto-overrides.json` ledger (repair-engine-derived pypi
+    /// overrides, see `pack_overrides::merge_ledger_overrides`) rather
+    /// than hand-written in a `[retread-overrides]` table. Never part of
+    /// the TOML surface (`serde(skip)`). Run-31 regression this guards:
+    /// the conda run-dep emission exempts manually-overridden names from
+    /// bounded-range widening ("hand-written intent wins"), but a
+    /// ledgered override is a pypi-side steering knob the repair engine
+    /// derived -- treating it as manual intent froze the conda pin back
+    /// to an exact `==` the moment ANY repair landed for that package,
+    /// resurrecting the exact-pin conflict class the ranges exist to
+    /// prevent.
+    #[serde(skip)]
+    pub ledger_overrides: std::collections::BTreeSet<String>,
 }
 
 /// `retread-deps-from`'s value: a bare source or a list of sources (union).

@@ -2377,31 +2377,64 @@ impl RepairPlanner {
                 }
                 Ownership::LedgeredOverride => {
                     // Tier 2: a prior repair already narrowed/overrode
-                    // this package for this pack; if this mention carries
-                    // a tighter upper-bound cap, intersect (same
+                    // this package for this pack; if a tighter
+                    // upper-bound cap is visible, intersect (same
                     // mechanics as `nested_conda_cap`).
+                    //
+                    // Run-31 gap: the cap need not live in THIS mention's
+                    // own spec. resolvo printed the pack's demand
+                    // (`setuptools ==80.10.2`, requirer
+                    // isaaclab-2.3x-pack) and the transitive cap
+                    // (`setuptools <76`, requirer pytorch -- unowned, so
+                    // no candidate of its own) as SEPARATE mentions, with
+                    // the cap subtree BEFORE the pack clause; the
+                    // same-mention-only lookup found no cap and the whole
+                    // error fell through to "unparseable". Scan ALL caps
+                    // visible for this package -- this mention's own spec
+                    // first, then every OTHER mention of the same package
+                    // (case-insensitive) -- and take the first one that
+                    // ACTUALLY narrows the existing override. "First that
+                    // narrows", not "first found": under bounded-range
+                    // emission the pack's own mention is range-form
+                    // (`>=80.10.2,<81`) whose own `<81` cap intersects to
+                    // no change; the real cap (`<76`) is on the other
+                    // mention and must still be reached.
                     let existing_overrides =
                         crate::pack_overrides::overrides_for_pack(project_dir, &pack_pixi);
-                    if let Some(existing) = existing_overrides.get(&m.package)
-                        && let Some((cap_op, cap_version)) = extract_cap_clause(&m.spec)
-                        && let Ok(narrowed) =
-                            intersect_range_with_cap(existing, &cap_op, &cap_version)
-                        && &narrowed != existing
-                    {
-                        out.push(FallbackCandidate {
-                            tier: 2,
-                            package: m.package.clone(),
-                            pack_name: owner_bundle.to_string(),
-                            kind: PackOverrideKind::Override,
-                            old_spec: Some(existing.clone()),
-                            new_spec: narrowed,
-                            ownership,
-                            tried_key: format!("{}@{owner_bundle}#fallback-narrow", m.package),
-                            reason: format!(
-                                "generic fallback: nested cap {cap_op}{cap_version} narrows existing pack override for {}",
-                                m.package
-                            ),
-                        });
+                    if let Some(existing) = existing_overrides.get(&m.package) {
+                        let caps = extract_cap_clause(&m.spec).into_iter().chain(
+                            mentions
+                                .iter()
+                                .filter(|o| {
+                                    o.package.eq_ignore_ascii_case(&m.package) && o.spec != m.spec
+                                })
+                                .filter_map(|o| extract_cap_clause(&o.spec)),
+                        );
+                        for (cap_op, cap_version) in caps {
+                            let Ok(narrowed) =
+                                intersect_range_with_cap(existing, &cap_op, &cap_version)
+                            else {
+                                continue;
+                            };
+                            if &narrowed == existing {
+                                continue;
+                            }
+                            out.push(FallbackCandidate {
+                                tier: 2,
+                                package: m.package.clone(),
+                                pack_name: owner_bundle.to_string(),
+                                kind: PackOverrideKind::Override,
+                                old_spec: Some(existing.clone()),
+                                new_spec: narrowed,
+                                ownership,
+                                tried_key: format!("{}@{owner_bundle}#fallback-narrow", m.package),
+                                reason: format!(
+                                    "generic fallback: nested cap {cap_op}{cap_version} narrows existing pack override for {}",
+                                    m.package
+                                ),
+                            });
+                            break;
+                        }
                     }
                 }
                 Ownership::DepsFromExactPin => {
@@ -4371,6 +4404,8 @@ holosoma-gpu = { features = ["holosoma"] }
 
     const NESTED_CONDA_CAP_FALLBACK_FIXTURE: &str =
         include_str!("../../tests/fixtures/solve_errors/nested_conda_cap_pytorch_setuptools.txt");
+    const NESTED_CONDA_CAP_REVERSED_RUN31_FIXTURE: &str =
+        include_str!("../../tests/fixtures/solve_errors/nested_conda_cap_reversed_run31.txt");
     const PILLOW_MOVIEPY_FALLBACK_FIXTURE: &str = include_str!(
         "../../tests/fixtures/solve_errors/pypi_conda_metadata_skew_pillow_moviepy.txt"
     );
@@ -4785,6 +4820,86 @@ holosoma-gpu = { features = ["holosoma"] }
         assert_eq!(po.package, "setuptools");
         assert_eq!(po.spec, ">=68,<76");
         assert_eq!(po.kind, PackOverrideKind::Override);
+    }
+
+    #[test]
+    fn end_to_end_run31_reversed_nested_cap_via_generic_fallback() {
+        // Run 31 shape (verbatim trace): the tree ORDER is REVERSED
+        // relative to run 13 -- the workspace dep's subtree carrying the
+        // cap (`pytorch 2.7.0 would require setuptools <76`) prints
+        // BEFORE the pack's own clause (`isaaclab-2.3x-pack 0.54.2 would
+        // require setuptools ==80.10.2`), so the specific
+        // `NestedCondaCap` rung (outer-then-nested ordering) misses it,
+        // and the cap lives on a DIFFERENT mention than the pack's own
+        // (whose spec carries no `<` clause), so tier 2's
+        // same-mention-only cap lookup missed it too: run 31 died
+        // "unparseable". The cross-mention cap scan must narrow the
+        // ledgered override exactly like run 13's ordering.
+        let manifest_text = "[dependencies]\nsetuptools = \">=68,<81\"\n\n\
+             [feature.gpu.dependencies]\n\
+             \"isaaclab-2.3x-pack\" = { path = \"./pypi-packs/isaaclab-2.3x-pack\" }\n";
+        for (label, stderr) in [
+            (
+                "exact pack clause (run-31 verbatim)",
+                NESTED_CONDA_CAP_REVERSED_RUN31_FIXTURE.to_string(),
+            ),
+            (
+                // Bounded-range emission: the pack clause is range-form.
+                // Its own `<81` cap intersects the ledgered `>=68,<81` to
+                // NO change; the scan must keep going to the real `<76`.
+                "range-form pack clause (bounded-range emission)",
+                NESTED_CONDA_CAP_REVERSED_RUN31_FIXTURE
+                    .replace("setuptools ==80.10.2", "setuptools >=80.10.2,<81"),
+            ),
+        ] {
+            let path = temp_manifest(manifest_text);
+            let project_dir = path.parent().unwrap().to_path_buf();
+            let pack_dir = project_dir.join("pypi-packs/isaaclab-2.3x-pack");
+            std::fs::create_dir_all(&pack_dir).unwrap();
+            let pack_pixi = pack_dir.join("pixi.toml");
+            std::fs::write(
+                &pack_pixi,
+                "[package]\nname = \"isaaclab-2.3x-pack\"\nversion = \"0.54.2\"\n",
+            )
+            .unwrap();
+            // The prior tier-1 repair's ledgered override (run 31's
+            // iteration 1 wrote exactly this before the unparseable
+            // iteration rolled everything back).
+            crate::pack_overrides::write_override(
+                &project_dir,
+                &pack_pixi,
+                "isaaclab-2.3x-pack",
+                "setuptools",
+                ">=68,<81",
+                "prior CondaRangeVsPackPin repair",
+            )
+            .unwrap();
+
+            let editor = ManifestEditor::open(path).unwrap();
+            let mut tried = TriedState::default();
+            let mut planner = RepairPlanner::new("default".into());
+
+            let (result, po) = planner
+                .generic_fallback_repair(&editor, &mut tried, &stderr, 1)
+                .unwrap_or_else(|| panic!("[{label}] engine must find an actionable mention"));
+            let outcome = result.unwrap_or_else(|_| panic!("[{label}] must narrow, not exhaust"));
+            assert_eq!(outcome.attempt.strategy, "pypi_override", "[{label}]");
+            assert_eq!(
+                outcome.attempt.old_spec.as_deref(),
+                Some(">=68,<81"),
+                "[{label}]"
+            );
+            assert_eq!(
+                outcome.attempt.new_spec.as_deref(),
+                Some(">=68,<76"),
+                "[{label}]"
+            );
+            let po = po.unwrap_or_else(|| panic!("[{label}] expected a pack-override write"));
+            assert_eq!(po.bundle, "isaaclab-2.3x-pack", "[{label}]");
+            assert_eq!(po.package, "setuptools", "[{label}]");
+            assert_eq!(po.spec, ">=68,<76", "[{label}]");
+            assert_eq!(po.kind, PackOverrideKind::Override, "[{label}]");
+        }
     }
 
     #[test]

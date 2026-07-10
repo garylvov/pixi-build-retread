@@ -1136,6 +1136,7 @@ mod tests {
             python: None,
             pin_version: false,
             deps_from: Default::default(),
+            ledger_overrides: Default::default(),
         }
     }
 
