@@ -167,6 +167,18 @@ pub struct AutoRouteOptions {
     /// then fails the workspace lock loudly instead of silently
     /// reverting to the wheel.
     pub force_conda: BTreeSet<String>,
+    /// Workspace/system ABI-anchor conda pins (`cuda-version`,
+    /// `python_abi`, ...), keyed by canonical conda name -> the raw
+    /// consuming-env spec (`"==12.8"`), surfaced from
+    /// `WorkspaceManifest::consuming_env_dependencies` -- the same source
+    /// the proactive cuda-major capping already reads. Checked at route
+    /// time by [`route_metadata_consistent`] against a candidate build's
+    /// own conda `depends`, so a routed build requiring an anchor version
+    /// the env can't provide (conda-only, hence invisible to the pypi
+    /// closure) is refused up front instead of surfacing as a ladder
+    /// conflict one iteration later. Empty in tests/probes that don't
+    /// supply it -- the check then simply has no anchor to contradict.
+    pub abi_anchor_pins: BTreeMap<String, String>,
 }
 
 /// Hard cap on auto-route discovery rounds (rounds that GROW the
@@ -241,9 +253,13 @@ pub fn plan_auto_route_round(
             // upstream PyPI release). Refuse the route rather than ship
             // a conda run-dep the workspace solve is guaranteed to choke
             // on one iteration later; the package stays on PyPI instead.
-            if let Err(reason) =
-                route_metadata_consistent(name, &wheel.version, &hit.depends, &closure.pins)
-            {
+            if let Err(reason) = route_metadata_consistent(
+                name,
+                &wheel.version,
+                &hit.depends,
+                &closure.pins,
+                &opts.abi_anchor_pins,
+            ) {
                 eprintln!(
                     "retread: route refused for {name}=={} — {reason}",
                     wheel.version
@@ -290,6 +306,7 @@ pub fn route_metadata_consistent(
     candidate_version: &str,
     depends: &[String],
     locked_versions: &BTreeMap<String, String>,
+    abi_anchor_pins: &BTreeMap<String, String>,
 ) -> std::result::Result<(), String> {
     use rattler_conda_types::{ParseStrictness, Version, VersionSpec};
     use std::str::FromStr;
@@ -312,22 +329,67 @@ pub fn route_metadata_consistent(
         if spec_str.is_empty() || spec_str == "*" {
             continue;
         }
-        let Some(locked_version) = locked_versions.get(&dep_name) else {
-            continue;
-        };
         let Ok(spec) = VersionSpec::from_str(spec_str, ParseStrictness::Lenient) else {
             continue;
         };
-        let Ok(locked) = Version::from_str(locked_version) else {
+        if let Some(locked_version) = locked_versions.get(&dep_name) {
+            // The pypi-closure path: the routed build's own recipe range
+            // vs. the version the rest of the workspace already locked
+            // (the run-15 conda-forge repackage metadata skew).
+            let Ok(locked) = Version::from_str(locked_version) else {
+                continue;
+            };
+            if !spec.matches(&locked) {
+                return Err(format!(
+                    "conda repackage metadata ({dep_name} {spec_str}) contradicts locked closure ({dep_name} {locked_version})"
+                ));
+            }
             continue;
-        };
-        if !spec.matches(&locked) {
+        }
+        // Conda-only ABI anchor (`cuda-version`, `python_abi`, ...) the
+        // pypi closure never locks -- previously invisible to this check,
+        // so a routed build requiring an anchor version the env can't
+        // provide (run 16c: `triton ==3.6.0` needs `cuda-version
+        // >=12.9,<13`, workspace pins 12.8) sailed through route-time and
+        // only surfaced as an unparseable ladder conflict later. Check the
+        // build's requirement against the workspace's concretely pinned
+        // anchor instead. Only an EXACT workspace pin arms the check, so it
+        // never over-refuses a range the build might legally fall inside.
+        if crate::solve::is_abi_anchor(&dep_name)
+            && let Some(anchor_spec) = abi_anchor_pins.get(&dep_name)
+            && let Some(pinned) = exact_anchor_version(anchor_spec)
+            && !spec.matches(&pinned)
+        {
             return Err(format!(
-                "conda repackage metadata ({dep_name} {spec_str}) contradicts locked closure ({dep_name} {locked_version})"
+                "routed build's conda depend ({dep_name} {spec_str}) contradicts the workspace ABI anchor ({dep_name} {anchor_spec})"
             ));
         }
     }
     Ok(())
+}
+
+/// The single exact version an ABI-anchor workspace pin names, if it is
+/// an exact pin (`==X`, `=X`, or a bare `X`) -- `None` for ranges,
+/// globs, or any inequality operator. Keeps [`route_metadata_consistent`]'s
+/// ABI-anchor branch to a PROVABLE contradiction: an exact env pin the
+/// routed build's requirement demonstrably excludes, never a range the
+/// build might still satisfy.
+fn exact_anchor_version(spec: &str) -> Option<rattler_conda_types::Version> {
+    use rattler_conda_types::Version;
+    use std::str::FromStr;
+    let s = spec.trim();
+    if s.is_empty() || s == "*" || s.contains(',') {
+        return None;
+    }
+    let v = s
+        .strip_prefix("==")
+        .or_else(|| s.strip_prefix('='))
+        .unwrap_or(s)
+        .trim();
+    if v.is_empty() || v.contains('*') || v.starts_with(['>', '<', '!', '~', '=']) {
+        return None;
+    }
+    Version::from_str(v).ok()
 }
 
 /// The conda names + `==version` specs to probe for one round's
@@ -2855,6 +2917,7 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
             // mujoco is the bundle's own root entry: never routed.
             protected: BTreeSet::from(["mujoco".to_string()]),
             name_map: BTreeMap::new(),
+            abi_anchor_pins: BTreeMap::new(),
         }
     }
 
@@ -3224,6 +3287,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
             "2.2.1",
             &["pillow <11.0,>=9.2.0".to_string()],
             &locked,
+            &BTreeMap::new(),
         )
         .unwrap_err();
         assert!(err.contains("pillow"), "reason should name pillow: {err}");
@@ -3245,6 +3309,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
                 "2.2.1",
                 &["pillow <11.0,>=9.2.0".to_string()],
                 &locked,
+                &BTreeMap::new(),
             ),
             Ok(())
         );
@@ -3263,6 +3328,67 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
                 "2.2.1",
                 &["pillow <11.0,>=9.2.0".to_string(), "numpy *".to_string()],
                 &locked,
+                &BTreeMap::new(),
+            ),
+            Ok(())
+        );
+    }
+
+    /// Run 16c gap: a routed build's conda depend names a conda-ONLY ABI
+    /// anchor (`cuda-version`) the pypi closure never locks. The workspace
+    /// pins that anchor to an incompatible exact version -- the route must
+    /// be refused, closing the hole that let `triton ==3.6.0` (needing
+    /// `cuda-version >=12.9,<13`) route against a cuda-12.8 env.
+    #[test]
+    fn route_metadata_consistent_rejects_conda_only_abi_anchor_violation() {
+        let mut anchors = BTreeMap::new();
+        anchors.insert("cuda-version".to_string(), "==12.8".to_string());
+        let err = route_metadata_consistent(
+            "triton",
+            "3.6.0",
+            &["cuda-version >=12.9,<13".to_string()],
+            &BTreeMap::new(), // cuda-version is never in the pypi closure
+            &anchors,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("cuda-version"),
+            "reason should name the anchor: {err}"
+        );
+    }
+
+    /// Same anchor, but the routed build's requirement DOES admit the
+    /// exact workspace pin -- no contradiction, route proceeds.
+    #[test]
+    fn route_metadata_consistent_accepts_satisfiable_abi_anchor() {
+        let mut anchors = BTreeMap::new();
+        anchors.insert("cuda-version".to_string(), "==12.8".to_string());
+        assert_eq!(
+            route_metadata_consistent(
+                "triton",
+                "3.4.0",
+                &["cuda-version >=12.8,<13".to_string()],
+                &BTreeMap::new(),
+                &anchors,
+            ),
+            Ok(())
+        );
+    }
+
+    /// A RANGE workspace anchor pin never arms the ABI-anchor check (the
+    /// env might still pick a version inside both ranges) -- only an exact
+    /// pin yields a provable contradiction.
+    #[test]
+    fn route_metadata_consistent_range_anchor_pin_is_not_armed() {
+        let mut anchors = BTreeMap::new();
+        anchors.insert("cuda-version".to_string(), ">=12.8,<13".to_string());
+        assert_eq!(
+            route_metadata_consistent(
+                "triton",
+                "3.6.0",
+                &["cuda-version >=12.9,<13".to_string()],
+                &BTreeMap::new(),
+                &anchors,
             ),
             Ok(())
         );
@@ -3370,6 +3496,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
             force_conda: BTreeSet::new(),
             protected: BTreeSet::from(["python-dateutil".to_string()]),
             name_map: BTreeMap::new(),
+            abi_anchor_pins: BTreeMap::new(),
         };
         let channels: Vec<ChannelUrl> = vec![ChannelUrl::from(
             url::Url::parse("https://conda.anaconda.org/conda-forge/").unwrap(),

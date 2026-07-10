@@ -1,0 +1,14 @@
+Error:   × failed to solve requirements of environment 'pm-isaaclab' for platform
+  │ 'linux-64'
+  ├─▶   × failed to solve the environment
+  │
+  ╰─▶ Cannot solve the request because of: protomotions-deps-pack * cannot be
+      installed because there are no viable options:
+      └─ protomotions-deps-pack 3.1 would require
+         └─ triton ==3.6.0, which cannot be installed because there are no
+      viable options:
+            └─ triton 3.6.0 | 3.6.0 | 3.6.0 | 3.6.0 | 3.6.0 | 3.6.0 | 3.6.0 |
+      3.6.0 | 3.6.0 | 3.6.0 | 3.6.0 | 3.6.0 | 3.6.0 | 3.6.0 | 3.6.0 | 3.6.0 |
+      3.6.0 | 3.6.0 | 3.6.0 | 3.6.0 | 3.6.0 | 3.6.0 | 3.6.0 | 3.6.0 | 3.6.0 |
+      3.6.0 | 3.6.0 | 3.6.0 | 3.6.0 | 3.6.0 would require
+               └─ cuda-version >=12.9,<13, for which no candidates were found.

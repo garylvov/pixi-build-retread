@@ -2046,7 +2046,13 @@ impl Ownership {
 /// (3) a `deps-from`-owned exact pin -- relax to a `>=` floor; (5) two of
 /// a pack's OWN emitted pins contradict each other (no workspace pin, no
 /// external constrainer -- conda-forge repackage metadata skew) --
-/// UN-ROUTE the requirer so it ships as a PyPI wheel instead. (Tier 4,
+/// UN-ROUTE the requirer so it ships as a PyPI wheel instead; (6) an
+/// auto-routed pin whose routed conda build requires an ABI anchor
+/// version the env can't provide (a `triton ==3.6.0` needing
+/// `cuda-version 12.9`+ against a cuda-12.8 env) and has no workspace
+/// range to override toward -- UN-ROUTE the pin so its self-contained
+/// PyPI wheel (no conda anchor run-dep) ships at the exact resolved
+/// version instead. (Tier 4,
 /// "override the mentioned package toward whatever the conda closure
 /// provides", is the specific tiers' T1 pypi-override and is already
 /// covered by tiers 1/3 for every mention this generic scan can attribute
@@ -2309,6 +2315,61 @@ impl RepairPlanner {
                 reason: format!(
                     "generic fallback: metadata skew ({} {} contradicts {}'s own emitted pin) -- un-routing {}",
                     m.package, m.spec, req_mention.package, req_mention.package
+                ),
+            });
+        }
+
+        // Tier 6: ABI-anchor un-route. An auto-routed pack pin (e.g.
+        // `triton ==3.6.0`) whose OWN routed conda build requires an ABI
+        // anchor version the workspace/env can't provide (`cuda-version
+        // >=12.9,<13` against a cuda-12.8 env -> "for which no candidates
+        // were found") has NO relaxable knob: the anchor itself is
+        // immutable (tier-loop `continue`s on `AbiAnchor`) and the pin has
+        // no visible workspace range for tier 1 to override toward. The
+        // cure mirrors tier 5 -- un-route the pin so it ships as its
+        // self-contained PyPI wheel (whose manylinux build carries no
+        // conda `cuda-version` run-dep) instead of forcing conda to find a
+        // build of the EXACT pinned version against an incompatible anchor.
+        // The exact version is preserved (the wheel closure already
+        // resolved it), so a consumer like torch that pins `triton==X`
+        // stays satisfied -- which is why un-route, not relax-to-range, is
+        // correct here: relaxing the conda pin would let conda install a
+        // triton whose version contradicts torch's own PyPI metadata.
+        for m in mentions {
+            if !is_abi_anchor(&m.package) {
+                continue;
+            }
+            let Some(requirer) = &m.requirer else {
+                continue;
+            };
+            // Respect real owner intent: a hand-written workspace pin on
+            // the requirer is never un-routed out from under the user.
+            if self.has_workspace_pin(editor, requirer) {
+                continue;
+            }
+            let Some(req_mention) = mentions
+                .iter()
+                .find(|mm| mm.package.eq_ignore_ascii_case(requirer) && mm.spec.starts_with("=="))
+            else {
+                continue;
+            };
+            if self.classify_mention_ownership(editor, pack_name, &req_mention.package)
+                != Ownership::AutoRoutedPackPin
+            {
+                continue;
+            }
+            out.push(FallbackCandidate {
+                tier: 6,
+                package: req_mention.package.clone(),
+                pack_name: bundle.to_string(),
+                kind: PackOverrideKind::Unroute,
+                old_spec: Some(req_mention.spec.clone()),
+                new_spec: String::new(),
+                ownership: Ownership::AutoRoutedPackPin,
+                tried_key: format!("{}@{bundle}#fallback-abi-unroute", req_mention.package),
+                reason: format!(
+                    "generic fallback: auto-routed pin {} {} requires ABI anchor {} {} the env can't satisfy -- un-routing {} to PyPI",
+                    req_mention.package, req_mention.spec, m.package, m.spec, req_mention.package
                 ),
             });
         }
@@ -4002,6 +4063,8 @@ holosoma-gpu = { features = ["holosoma"] }
     const PILLOW_MOVIEPY_FALLBACK_FIXTURE: &str = include_str!(
         "../../tests/fixtures/solve_errors/pypi_conda_metadata_skew_pillow_moviepy.txt"
     );
+    const TRITON_CUDA_VERSION_FALLBACK_FIXTURE: &str =
+        include_str!("../../tests/fixtures/solve_errors/uv_closure_triton_cuda_version_abi.txt");
 
     #[test]
     fn classify_mention_ownership_abi_anchor_wins_regardless_of_pack() {
@@ -4301,6 +4364,60 @@ holosoma-gpu = { features = ["holosoma"] }
             serde_json::from_value(serde_json::json!({"retread-wheels": {}})).unwrap();
         crate::pack_overrides::merge_ledger_overrides(&mut config, &project_dir, &po.pack_pixi);
         assert!(config.keep_pypi.contains(&"moviepy".to_string()));
+    }
+
+    #[test]
+    fn end_to_end_run16c_triton_cuda_version_abi_unroutes_triton() {
+        // Run 16c shape (lock-7.txt): an auto-routed pack pin
+        // `triton ==3.6.0` whose routed conda build requires the ABI
+        // anchor `cuda-version >=12.9,<13`, against a workspace pinned to
+        // cuda 12.8 -> "for which no candidates were found". NO specific
+        // rung recognizes it (the previous run died with "could not parse
+        // solver error"), and tier 1 declines (no workspace conda range on
+        // triton). The generic engine's tier-6 ABI-anchor un-route must
+        // fire: un-route triton so its self-contained PyPI wheel ships at
+        // the exact resolved version instead of forcing conda to find a
+        // 3.6.0 build against an incompatible cuda anchor.
+        let manifest_text = "[dependencies]\n\n\
+             [feature.pm.dependencies]\n\
+             \"protomotions-deps-pack\" = { path = \"./pypi-packs/protomotions-deps-pack\" }\n\n\
+             [environments]\npm = { features = [\"pm\"] }\n";
+        let path = temp_manifest(manifest_text);
+        let project_dir = path.parent().unwrap().to_path_buf();
+        let pack_dir = project_dir.join("pypi-packs/protomotions-deps-pack");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        std::fs::write(
+            pack_dir.join("pixi.toml"),
+            "[package]\nname = \"protomotions-deps-pack\"\nversion = \"3.1\"\n",
+        )
+        .unwrap();
+
+        let editor = ManifestEditor::open(path).unwrap();
+        let mut tried = TriedState::default();
+        let mut planner = RepairPlanner::new("default".into());
+
+        let (result, po) = planner
+            .generic_fallback_repair(&editor, &mut tried, TRITON_CUDA_VERSION_FALLBACK_FIXTURE, 1)
+            .expect("generic fallback engine must find an actionable mention");
+        let outcome = result.expect("must un-route triton, not exhaust");
+        assert_eq!(outcome.attempt.strategy, "pypi_override");
+        let po = po.expect("expected a pack-override write");
+        assert_eq!(po.bundle, "protomotions-deps-pack");
+        assert_eq!(po.package, "triton");
+        assert_eq!(po.kind, PackOverrideKind::Unroute);
+
+        // The ledger sink is the un-route table, and it feeds
+        // `RetreadConfig.keep_pypi` -- the knob the auto-route sweep reads.
+        crate::pack_overrides::write_unroute(
+            &project_dir,
+            &po.pack_pixi,
+            &po.bundle,
+            &po.package,
+            &outcome.attempt.conflict,
+        )
+        .unwrap();
+        let unrouted = crate::pack_overrides::unrouted_for_pack(&project_dir, &po.pack_pixi);
+        assert!(unrouted.contains("triton"));
     }
 
     #[test]

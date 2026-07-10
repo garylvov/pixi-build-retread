@@ -2566,6 +2566,23 @@ async fn uv_group_closure(
             .keys()
             .map(|n| canonical_conda_name(n)),
     );
+    // ABI-anchor pins (`cuda-version`, `python_abi`, ...) from the
+    // consuming env(s) -- same source the proactive cuda-major capping
+    // above reads. Passed to the route-time metadata check so a routed
+    // build requiring a conda-only anchor version the env can't provide
+    // is refused up front (run 16c: `triton ==3.6.0` -> `cuda-version
+    // >=12.9,<13` against a cuda-12.8 workspace).
+    let abi_anchor_pins: std::collections::BTreeMap<String, String> =
+        if let (Some(manifest), Some(ws_dir)) = (manifest_opt.as_ref(), workspace_dir) {
+            manifest
+                .consuming_env_dependencies(ws_dir, source_dir)
+                .into_iter()
+                .filter(|(name, _)| crate::solve::is_abi_anchor(name))
+                .filter_map(|(name, specs)| specs.into_iter().next().map(|spec| (name, spec)))
+                .collect()
+        } else {
+            Default::default()
+        };
     let auto_route_opts = crate::uv_closure::AutoRouteOptions {
         enabled: effective.auto_route,
         keep_pypi: effective
@@ -2580,6 +2597,7 @@ async fn uv_group_closure(
             .iter()
             .map(|n| canonical_conda_name(n))
             .collect(),
+        abi_anchor_pins,
     };
 
     // `'static` closures for the fixpoint driver: clone the inputs each
