@@ -1,0 +1,38 @@
+Error:   × failed to solve requirements of environment 'pm-isaaclab' for platform
+  │ 'linux-64'
+  ├─▶   × failed to solve the environment
+  │   
+  ╰─▶ Cannot solve the request because of: The following packages are
+      incompatible
+      ├─ protomotions-deps-pack * can be installed with any of the following
+      options:
+      │  └─ protomotions-deps-pack 3.1 would require
+      │     └─ wrapt >=2.2.2,<3, which can be installed with any of the
+      following options:
+      │        └─ wrapt 2.2.2
+      └─ isaaclab-2.3x-pack * cannot be installed because there are no viable
+      options:
+         └─ isaaclab-2.3x-pack 0.54.2 would require
+            └─ wrapt >=1.16.0,<2, which cannot be installed because there are
+      no viable options:
+               ├─ wrapt 1.17.3, which conflicts with the versions reported
+      above.
+               ├─ wrapt 1.17.3, which conflicts with the versions reported
+      above.
+               ├─ wrapt 1.17.2, which conflicts with the versions reported
+      above.
+               ├─ wrapt 1.17.1, which conflicts with the versions reported
+      above.
+               ├─ wrapt 1.17.0, which conflicts with the versions reported
+      above.
+               ├─ wrapt 1.16.0, which conflicts with the versions reported
+      above.
+               ├─ wrapt 1.16.0, which conflicts with the versions reported
+      above.
+               └─ wrapt 1.16.0 | 1.16.0 | 1.16.0 | 1.16.0 | 1.16.0 | 1.16.0
+      | 1.16.0 | 1.16.0 | 1.16.0 | 1.17.0 | 1.17.0 | 1.17.0 | 1.17.0 | 1.17.1
+      | 1.17.1 | 1.17.1 | 1.17.1 | 1.17.2 | 1.17.2 | 1.17.2 | 1.17.2 | 1.17.3
+      | 1.17.3 | 1.17.3 | 1.17.3 | 1.17.3 | 1.17.3 | 1.17.3 | 1.17.3 would
+      require
+                  └─ python >=3.9,<3.10.0a0, for which no candidates were
+      found.

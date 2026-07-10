@@ -2481,10 +2481,10 @@ impl RepairPlanner {
             {
                 continue;
             }
-            let Some(req_mention) = mentions
-                .iter()
-                .find(|mm| mm.package.eq_ignore_ascii_case(requirer) && mm.spec.starts_with("=="))
-            else {
+            let Some(req_mention) = mentions.iter().find(|mm| {
+                mm.package.eq_ignore_ascii_case(requirer)
+                    && pack_emitted_pin_floor(&mm.spec).is_some()
+            }) else {
                 continue;
             };
             if self.workspace_pin_governs_pack(editor, bundle, &req_mention.package) {
@@ -2540,12 +2540,37 @@ impl RepairPlanner {
             if self.workspace_pin_governs_pack(editor, bundle, requirer) {
                 continue;
             }
-            let Some(req_mention) = mentions
-                .iter()
-                .find(|mm| mm.package.eq_ignore_ascii_case(requirer) && mm.spec.starts_with("=="))
-            else {
+            // The requirer's own pin mention must be the DEAD-END pack's
+            // (attribution == `bundle` or unattributed) -- run-32: the
+            // first wrapt mention in the text was the SIBLING pack's
+            // (`>=2.2.2,<3`, requirer protomotions-deps-pack), and
+            // matching it produced an un-route candidate for `bundle`
+            // carrying the sibling's spec.
+            let Some(req_mention) = mentions.iter().find(|mm| {
+                mm.package.eq_ignore_ascii_case(requirer)
+                    && pack_emitted_pin_floor(&mm.spec).is_some()
+                    && mm
+                        .requirer
+                        .as_deref()
+                        .is_none_or(|r| r.eq_ignore_ascii_case(bundle))
+            }) else {
                 continue;
             };
+            // Two-pack clash signature: a SIBLING pack also pins this
+            // package (its branch proves a version conda CAN provide).
+            // That's tier 7's domain -- floating the dead-end range is
+            // surgical; un-routing would fork the wheel out of conda for
+            // no reason (the anchor mention here is just the leftover
+            // old-build tail of the version enumeration, not the cause).
+            let sibling_owned = mentions.iter().any(|sm| {
+                sm.package.eq_ignore_ascii_case(&req_mention.package)
+                    && sm.requirer.as_deref().is_some_and(|r| {
+                        !r.eq_ignore_ascii_case(bundle) && self.is_owned_pack(editor, r)
+                    })
+            });
+            if sibling_owned {
+                continue;
+            }
             if self.classify_mention_ownership(editor, pack_name, &req_mention.package)
                 != Ownership::AutoRoutedPackPin
             {
@@ -2612,12 +2637,17 @@ impl RepairPlanner {
             {
                 continue;
             }
-            let Some((op, version)) = leading_clause(&m.spec) else {
+            // Run-32: the dead-end pack's own companion pin arrives in
+            // bounded-range form (`wrapt >=1.16.0,<2`) under range
+            // emission, exact form (`==2.29.1`) on pre-range renders --
+            // both are pack emissions and both float to `>=floor` (the
+            // range's own `<next-major` cap is exactly what excludes the
+            // sibling's already-satisfiable higher floor, so dropping it
+            // is the repair; uv then re-picks inside the widened range
+            // and the next render's emitted range follows the new pick).
+            let Some(version) = pack_emitted_pin_floor(&m.spec) else {
                 continue;
             };
-            if op != "==" {
-                continue;
-            }
             let sibling_owned = mentions.iter().any(|sm| {
                 sm.package.eq_ignore_ascii_case(&m.package)
                     && sm.requirer.as_deref().is_some_and(|r| {
@@ -2863,6 +2893,38 @@ fn leading_clause(spec: &str) -> Option<(String, String)> {
         if let Some(rest) = clause.strip_prefix(op) {
             return Some((op.to_string(), rest.trim().to_string()));
         }
+    }
+    None
+}
+
+/// The floor version of a spec shaped like a pack's own emitted
+/// companion pin: exact form (`==X` -> `X`, the pre-bounded-range
+/// emission and the un-widened direct pins) or bounded-range form
+/// (`>=X,<Y` -> `X`, what the v4.4.0 bounded-range emission produces
+/// for auto-routed pins). Anything else (a bare `>=X` floor, a lone
+/// `<Y` cap, `*`, three-clause specs) is NOT a shape the pack emission
+/// produces and returns `None` -- run-32 gap: tiers 5/6/7 recognized a
+/// pack's own pin ONLY in the exact `==` form, so the moment bounded
+/// ranges shipped, every pack-pin-shaped mention (`wrapt >=1.16.0,<2`)
+/// fell through them to "unparseable".
+fn pack_emitted_pin_floor(spec: &str) -> Option<String> {
+    let mut clauses = spec.split(',');
+    let first = clauses.next()?.trim();
+    let second = clauses.next().map(str::trim);
+    if clauses.next().is_some() {
+        return None;
+    }
+    if let Some(v) = first.strip_prefix("==") {
+        return match second {
+            None => Some(v.trim().to_string()),
+            Some(_) => None,
+        };
+    }
+    if let Some(v) = first.strip_prefix(">=")
+        && let Some(s) = second
+        && s.starts_with('<')
+    {
+        return Some(v.trim().to_string());
     }
     None
 }
@@ -4406,6 +4468,8 @@ holosoma-gpu = { features = ["holosoma"] }
         include_str!("../../tests/fixtures/solve_errors/nested_conda_cap_pytorch_setuptools.txt");
     const NESTED_CONDA_CAP_REVERSED_RUN31_FIXTURE: &str =
         include_str!("../../tests/fixtures/solve_errors/nested_conda_cap_reversed_run31.txt");
+    const CONDA_TWO_PACK_WRAPT_RANGE_RUN32_FIXTURE: &str =
+        include_str!("../../tests/fixtures/solve_errors/conda_two_pack_wrapt_range_run32.txt");
     const PILLOW_MOVIEPY_FALLBACK_FIXTURE: &str = include_str!(
         "../../tests/fixtures/solve_errors/pypi_conda_metadata_skew_pillow_moviepy.txt"
     );
@@ -4819,6 +4883,79 @@ holosoma-gpu = { features = ["holosoma"] }
         assert_eq!(po.bundle, "isaaclab-2.3x-pack");
         assert_eq!(po.package, "setuptools");
         assert_eq!(po.spec, ">=68,<76");
+        assert_eq!(po.kind, PackOverrideKind::Override);
+    }
+
+    #[test]
+    fn pack_emitted_pin_floor_accepts_exact_and_bounded_range_only() {
+        assert_eq!(
+            pack_emitted_pin_floor("==2.29.1").as_deref(),
+            Some("2.29.1")
+        );
+        assert_eq!(
+            pack_emitted_pin_floor(">=1.16.0,<2").as_deref(),
+            Some("1.16.0"),
+            "bounded-range emission form must be recognized as a pack pin"
+        );
+        assert_eq!(
+            pack_emitted_pin_floor(">=0.20.1,<0.21").as_deref(),
+            Some("0.20.1")
+        );
+        // NOT pack emission shapes:
+        assert!(pack_emitted_pin_floor(">=2.0.0").is_none(), "bare floor");
+        assert!(pack_emitted_pin_floor("<76").is_none(), "lone cap");
+        assert!(pack_emitted_pin_floor("*").is_none());
+        assert!(
+            pack_emitted_pin_floor(">=1,<2,<3").is_none(),
+            "three clauses"
+        );
+        assert!(
+            pack_emitted_pin_floor("==1.0,<2").is_none(),
+            "exact+cap mix"
+        );
+    }
+
+    #[test]
+    fn end_to_end_run32_two_pack_range_clash_floats_dead_end_range() {
+        // Run 32 shape (verbatim trace): TWO packs' bounded-range
+        // emissions for the SAME package are disjoint --
+        // protomotions-deps-pack locked wrapt 2.2.2 (`>=2.2.2,<3`,
+        // satisfiable branch) while isaaclab-2.3x-pack locked 1.16.0
+        // (`>=1.16.0,<2`, dead-end branch). Tier 7 handled exactly this
+        // clash in its exact-pin form (run 18's sentry-sdk) but skipped
+        // range-form pins (`op != "=="`), so run 32 died "unparseable".
+        // The dead-end pack's range must float to `>=floor` (dropping
+        // the `<2` cap that excludes the sibling's proven-satisfiable
+        // 2.2.2); uv then re-picks inside the widened range and the next
+        // render's emission follows.
+        let (path, _project_dir) = run20_two_pack_workspace(false);
+        let editor = ManifestEditor::open(path).unwrap();
+        let mut tried = TriedState::default();
+        let mut planner = RepairPlanner::new("default".into());
+
+        let applied = planner
+            .generic_fallback_repair_batch(
+                &editor,
+                &mut tried,
+                CONDA_TWO_PACK_WRAPT_RANGE_RUN32_FIXTURE,
+                1,
+            )
+            .expect("engine must find the two-pack range clash actionable")
+            .expect("must apply, not exhaust");
+        let (outcome, po) = applied
+            .iter()
+            .find(|(o, _)| o.attempt.package == "wrapt")
+            .expect("wrapt candidate expected");
+        assert_eq!(outcome.attempt.strategy, "pypi_override");
+        assert_eq!(outcome.attempt.old_spec.as_deref(), Some(">=1.16.0,<2"));
+        assert_eq!(outcome.attempt.new_spec.as_deref(), Some(">=1.16.0"));
+        let po = po.as_ref().expect("expected a pack-override write");
+        assert_eq!(
+            po.bundle, "isaaclab-2.3x-pack",
+            "the DEAD-END pack's range floats, not the satisfiable sibling's"
+        );
+        assert_eq!(po.package, "wrapt");
+        assert_eq!(po.spec, ">=1.16.0");
         assert_eq!(po.kind, PackOverrideKind::Override);
     }
 
