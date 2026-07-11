@@ -3039,7 +3039,26 @@ async fn uv_group_closure(
     crate::uv_closure::save_heal_facts(
         &heal_facts_path,
         &crate::uv_closure::HealFacts {
-            routed: sdist_routed.lock().unwrap().clone(),
+            // The FULL routing set, not just the sdist-heal ledger:
+            // `closure.auto_routed` (post-splice) also carries the M2
+            // auto-route fixpoint's discoveries (torch/cuda-* style
+            // harmonization routes). Persisting those is what lets the next
+            // run's ROUND 0 request already include the routing constraints
+            // -- so its synthesized pyproject matches the recorded
+            // fingerprint, the healed uv.lock is kept, and the fixpoint
+            // converges without a second discovery re-lock (run7 measured
+            // the miss at 2x ~9 min: round 0 pinless-routeless, round 1
+            // re-resolving from scratch after apply_auto_route changed the
+            // constraint set). Deduped by pypi_name (splice can repeat).
+            routed: {
+                let mut seen = std::collections::BTreeSet::new();
+                closure
+                    .auto_routed
+                    .iter()
+                    .filter(|r| seen.insert(r.pypi_name.clone()))
+                    .cloned()
+                    .collect()
+            },
             built: sdist_built.lock().unwrap().clone(),
             prereleased: sdist_prereleased.lock().unwrap().clone(),
         },
