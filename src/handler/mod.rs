@@ -2590,7 +2590,7 @@ async fn uv_group_closure(
         no_emit_packages: no_emit,
         index_urls: index_urls.clone(),
         built_wheel_sources: BTreeMap::new(), // M1: source-built entries stay legacy
-        prerelease_pins: BTreeMap::new(),      // populated by the self-heal
+        explicit_pins: BTreeMap::new(),      // populated by the self-heal
         offline: false,
     };
     let project_dir = cache_dir.join("uv-projects").join(format!(

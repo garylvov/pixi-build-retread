@@ -102,15 +102,22 @@ pub struct UvClosureRequest {
     /// entry name -> path (relative to the project dir or absolute),
     /// emitted as `[tool.uv.sources]` path sources.
     pub built_wheel_sources: BTreeMap<String, PathBuf>,
-    /// Transitive PRERELEASE repairs the self-heal injected: canonical
-    /// pypi name -> exact resolved pre-release version. Rendered as
-    /// EXPLICIT first-party `name==version` entries in the synthesized
-    /// project's `dependencies` (spec §two-pass; see [`with_sdist_heal`])
-    /// so uv's `if-necessary-or-explicit` prerelease policy honors a
-    /// pre-release a transitive dependency pinned. Empty on the green
-    /// path; kept out of the user's manifest (the synthesized project is
-    /// ephemeral).
-    pub prerelease_pins: BTreeMap<String, String>,
+    /// Self-heal repairs injected as EXPLICIT first-party `name==version`
+    /// entries in the synthesized project's `dependencies` (see
+    /// [`with_sdist_heal`]): canonical pypi name -> exact resolved
+    /// version. Two heal classes need first-party status:
+    /// * transitive PRERELEASE pins -- uv's `if-necessary-or-explicit`
+    ///   policy only honors a pre-release specifier declared first-party;
+    /// * heal-BUILT sdist wheels -- a `[tool.uv.sources]` path entry only
+    ///   applies to the project's OWN requirements, so a wheel built for
+    ///   a TRANSITIVE dependency is invisible to the resolver ("not found
+    ///   in the package registry") unless the name is also a direct
+    ///   dependency (isaac-pack repro: `idna-ssl==1.1.0`, required only
+    ///   by isaacsim-kernel, re-failed the healed relock identically).
+    ///
+    /// Empty on the green path; kept out of the user's manifest (the
+    /// synthesized project is ephemeral).
+    pub explicit_pins: BTreeMap<String, String>,
     /// Append `--offline` to uv invocations (replay mode).
     pub offline: bool,
 }
@@ -1195,7 +1202,7 @@ pub struct BuiltSdistWheel {
 /// A transitive PRERELEASE pin the heal injected: the offending package
 /// resolved to a pre-release version only once uv's prerelease policy was
 /// relaxed (Pass B), so the heal re-pins it as an EXPLICIT first-party
-/// `name==version` requirement (`req.prerelease_pins`) to make uv's
+/// `name==version` requirement (`req.explicit_pins`) to make uv's
 /// `explicit` policy honor it on the next Pass A. Unlike a sdist build,
 /// the package keeps its own index wheel; this record exists so the caller
 /// can log/audit the repair with the same provenance conventions the
@@ -1261,7 +1268,7 @@ pub fn sdist_build_failed_message(failures: &[(String, String)]) -> String {
 ///    place -- this branch is defensive.)
 ///
 /// PRERELEASE offenders `(name, resolved_version)` are re-pinned as an
-/// EXPLICIT first-party `name==version` requirement (`req.prerelease_pins`
+/// EXPLICIT first-party `name==version` requirement (`req.explicit_pins`
 /// -> the synthesized project's `dependencies`), so uv's
 /// `if-necessary-or-explicit` policy honors the transitive pre-release on
 /// the next Pass A. This is orthogonal to the build policy and works even
@@ -1323,12 +1330,18 @@ where
             for w in already.iter() {
                 req.built_wheel_sources
                     .insert(w.pypi_name.clone(), w.wheel_path.clone());
+                // A path source only applies to FIRST-PARTY requirements
+                // (see `UvClosureRequest::explicit_pins`): without this
+                // pin a wheel built for a transitive dep is invisible to
+                // the resolver and the relock re-fails identically.
+                req.explicit_pins
+                    .insert(w.pypi_name.clone(), w.version.clone());
             }
         }
         {
             let already = prereleased.lock().unwrap();
             for p in already.iter() {
-                req.prerelease_pins
+                req.explicit_pins
                     .insert(p.pypi_name.clone(), p.version.clone());
             }
         }
@@ -1448,6 +1461,11 @@ where
                         for w in &new_built {
                             req.built_wheel_sources
                                 .insert(w.pypi_name.clone(), w.wheel_path.clone());
+                            // First-party pin so the path source applies to
+                            // a TRANSITIVE dependency (see the reapply
+                            // block above / `explicit_pins` docs).
+                            req.explicit_pins
+                                .insert(w.pypi_name.clone(), w.version.clone());
                         }
                         built.lock().unwrap().extend(new_built.clone());
                         for p in &new_pre {
@@ -1458,7 +1476,7 @@ where
                                 p.pypi_name,
                                 p.version,
                             );
-                            req.prerelease_pins
+                            req.explicit_pins
                                 .insert(p.pypi_name.clone(), p.version.clone());
                         }
                         prereleased.lock().unwrap().extend(new_pre.clone());
@@ -1860,14 +1878,14 @@ pub fn synthesize_pyproject(req: &UvClosureRequest) -> String {
         "requires-python = {}\n",
         toml_str(&requires_python)
     ));
-    // Transitive-prerelease repairs are appended to the project's DIRECT
-    // dependencies as explicit `name==version` pins: uv's `explicit`
-    // prerelease policy only honors a pre-release specifier declared
-    // first-party, so this is the least-invasive carrier that makes uv
-    // select the pre-release a transitive dep pinned (see
-    // `with_sdist_heal`). Ephemeral -- never touches the user's manifest.
+    // Self-heal repairs are appended to the project's DIRECT dependencies
+    // as explicit `name==version` pins -- transitive prerelease pins (uv's
+    // `explicit` prerelease policy is first-party-only) AND heal-built
+    // sdist wheels (a `[tool.uv.sources]` path entry only applies to
+    // first-party requirements; see `UvClosureRequest::explicit_pins`).
+    // Ephemeral -- never touches the user's manifest.
     let mut deps = req.dependencies.clone();
-    for (name, version) in &req.prerelease_pins {
+    for (name, version) in &req.explicit_pins {
         deps.push(format!("{}=={}", canonical_conda_name(name), version));
     }
     out.push_str(&format!(
@@ -2666,7 +2684,7 @@ mod tests {
                 "https://pypi.org/simple/".to_string(),
             ],
             built_wheel_sources: built,
-            prerelease_pins: BTreeMap::new(),
+            explicit_pins: BTreeMap::new(),
             offline: false,
         }
     }
@@ -3256,7 +3274,7 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
             no_emit_packages: vec![],
             index_urls: vec!["https://pypi.org/simple/".into()],
             built_wheel_sources: BTreeMap::new(),
-            prerelease_pins: BTreeMap::new(),
+            explicit_pins: BTreeMap::new(),
             offline: false,
         }
     }
@@ -3962,7 +3980,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
             no_emit_packages: vec![],
             index_urls: vec!["https://pypi.org/simple/".into()],
             built_wheel_sources: BTreeMap::new(),
-            prerelease_pins: BTreeMap::new(),
+            explicit_pins: BTreeMap::new(),
             offline: false,
         };
         let closure = compute_closure(
@@ -4003,7 +4021,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
             no_emit_packages: vec![],
             index_urls: vec!["https://pypi.org/simple/".into()],
             built_wheel_sources: BTreeMap::new(),
-            prerelease_pins: BTreeMap::new(),
+            explicit_pins: BTreeMap::new(),
             offline: false,
         };
         let opts = AutoRouteOptions {
@@ -4931,7 +4949,12 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
                 let attempts = Arc::clone(&attempts);
                 Box::pin(async move {
                     *attempts.lock().unwrap() += 1;
-                    if !r.built_wheel_sources.contains_key("pyperclip") {
+                    // Model the real resolver: a path source alone is NOT
+                    // enough for a transitive dep -- the name must ALSO be
+                    // pinned first-party (isaac-pack idna-ssl regression).
+                    if !r.built_wheel_sources.contains_key("pyperclip")
+                        || r.explicit_pins.get("pyperclip").map(String::as_str) != Some("1.8.2")
+                    {
                         return Err(heal_needed(
                             &[("pyperclip", "1.8.2")],
                             &[],
@@ -5080,8 +5103,8 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
             move |r: UvClosureRequest| {
                 let seen_pins = Arc::clone(&seen_pins);
                 Box::pin(async move {
-                    seen_pins.lock().unwrap().push(r.prerelease_pins.clone());
-                    if r.prerelease_pins.get("tinyobjloader").map(String::as_str) == Some("2.0.0rc13") {
+                    seen_pins.lock().unwrap().push(r.explicit_pins.clone());
+                    if r.explicit_pins.get("tinyobjloader").map(String::as_str) == Some("2.0.0rc13") {
                         parse_pylock_closure(PYLOCK_FIXTURE, &target("3.12", "linux-64"), &BTreeSet::new(), "0.11.15")
                     } else {
                         Err(heal_needed(
@@ -5122,7 +5145,7 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
     #[test]
     fn synthesize_pyproject_renders_prerelease_pin_as_first_party_dep() {
         let mut req = sample_request();
-        req.prerelease_pins.insert("tinyobjloader".to_string(), "2.0.0rc13".to_string());
+        req.explicit_pins.insert("tinyobjloader".to_string(), "2.0.0rc13".to_string());
         let got = synthesize_pyproject(&req);
         assert!(
             got.contains("\"tinyobjloader==2.0.0rc13\""),
@@ -5215,7 +5238,7 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
             no_emit_packages: vec![],
             index_urls: vec![index_url.clone()],
             built_wheel_sources: BTreeMap::new(),
-            prerelease_pins: BTreeMap::new(),
+            explicit_pins: BTreeMap::new(),
             offline: false,
         };
 
@@ -5298,4 +5321,168 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    /// Write a minimal legacy zip sdist (`<name>-<version>.zip`) carrying
+    /// STATIC PEP 643 metadata (`PKG-INFO`, Metadata-Version 2.2) so uv's
+    /// Pass B can resolve it WITHOUT invoking a build backend
+    /// (offline-safe; zip rather than tar.gz to reuse the existing `zip`
+    /// dependency). Returns the PEP 503 index href
+    /// (`<filename>#sha256=<hash>`).
+    fn write_test_sdist(dir: &Path, name: &str, version: &str) -> String {
+        use sha2::{Digest, Sha256};
+        use std::io::Write as _;
+        std::fs::create_dir_all(dir).unwrap();
+        let filename = format!("{name}-{version}.zip");
+        let path = dir.join(&filename);
+        {
+            let f = std::fs::File::create(&path).unwrap();
+            let mut zip = zip::ZipWriter::new(f);
+            zip.start_file(
+                format!("{name}-{version}/PKG-INFO"),
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+            zip.write_all(
+                format!("Metadata-Version: 2.2\nName: {name}\nVersion: {version}\n").as_bytes(),
+            )
+            .unwrap();
+            zip.finish().unwrap();
+        }
+        let hash = format!("{:x}", Sha256::digest(std::fs::read(&path).unwrap()));
+        format!("{filename}#sha256={hash}")
+    }
+
+    /// End-to-end reproduction of issue #10's sdist-only half AND the
+    /// isaac-pack return-path regression, fully offline, at the REAL
+    /// `compute_closure` seam (the layer that answered the failing RPC).
+    /// `astub==1.0` (wheel) depends on `tstub==1.0`, which the index
+    /// carries ONLY as an sdist -- Pass A fails with uv's "building from
+    /// source is disabled" hint (the exact issue-#10 phrasing the old
+    /// regexes missed), Pass B resolves via the sdist's static metadata
+    /// and names `tstub` structurally, rung 2 "builds" a wheel (mock
+    /// builder writing a REAL wheel file), and the healed relock must
+    /// succeed -- proving the FUNCTION RETURN is the healed closure, not
+    /// just on-disk artifacts. Regression guard for the isaac-pack repro
+    /// where the built wheel's `[tool.uv.sources]` entry alone was
+    /// invisible to the resolver for a TRANSITIVE dependency (no
+    /// first-party pin), the healed relock re-failed identically, and the
+    /// heal surfaced Pass A's error to the RPC despite healed artifacts
+    /// sitting on disk.
+    #[tokio::test]
+    async fn sdist_only_transitive_two_pass_heal_returns_healed_closure_offline() {
+        if detect_uv().await.is_err() {
+            eprintln!("skipping: uv not found on PATH");
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("retread-sdist-heal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let idx = tmp.join("index");
+        let astub_dir = idx.join("astub");
+        let tstub_dir = idx.join("tstub");
+        let a = write_test_wheel(&astub_dir, "astub", "1.0", &["tstub==1.0"]);
+        let t = write_test_sdist(&tstub_dir, "tstub", "1.0");
+        std::fs::write(astub_dir.join("index.html"), format!("<a href=\"{a}\">a</a>")).unwrap();
+        std::fs::write(tstub_dir.join("index.html"), format!("<a href=\"{t}\">t</a>")).unwrap();
+        let index_url = format!("file://{}/", idx.display());
+
+        let req = UvClosureRequest {
+            bundle: "sdist-smoke".into(),
+            python_version: "3.12".into(),
+            conda_subdir: "linux-64".into(),
+            dependencies: vec!["astub".into()],
+            constraints: ConstraintSet::default(),
+            overrides: vec![],
+            no_emit_packages: vec![],
+            index_urls: vec![index_url],
+            built_wheel_sources: BTreeMap::new(),
+            explicit_pins: BTreeMap::new(),
+            offline: false,
+        };
+        let project = tmp.join("proj");
+        let cache = tmp.join("cache");
+        let solve = {
+            let project = project.clone();
+            let cache = cache.clone();
+            move |r: UvClosureRequest| {
+                let project = project.clone();
+                let cache = cache.clone();
+                Box::pin(async move {
+                    compute_closure(
+                        &r,
+                        &project,
+                        &cache,
+                        None,
+                        crate::config::SdistBuildPolicy::Auto,
+                    )
+                    .await
+                }) as futures::future::BoxFuture<'static, Result<UvClosure>>
+            }
+        };
+        let probe = |_n: String, _s: String| {
+            Box::pin(async { None }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
+        };
+        let sdist_probe = |_n: String, _s: String| {
+            Box::pin(async { None }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
+        };
+        // Rung-2 builder: writes a REAL wheel file (what
+        // `handler::build_sdist_wheel` would produce from the sdist), so
+        // the relock's `[tool.uv.sources]` path + first-party pin resolve
+        // against an actual artifact.
+        let wheels_dir = tmp.join("built-wheels");
+        let sdist_build = {
+            let wheels_dir = wheels_dir.clone();
+            move |name: String, req: Option<String>| {
+                let wheels_dir = wheels_dir.clone();
+                Box::pin(async move {
+                    assert_eq!(name, "tstub");
+                    assert_eq!(
+                        req.as_deref(),
+                        Some("==1.0"),
+                        "build rung must receive the exact Pass-B-resolved version"
+                    );
+                    let href = write_test_wheel(&wheels_dir, "tstub", "1.0", &[]);
+                    let filename = href.split('#').next().unwrap().to_string();
+                    Ok(BuiltSdistWheel {
+                        pypi_name: "tstub".to_string(),
+                        version: "1.0".to_string(),
+                        wheel_path: wheels_dir.join(&filename),
+                        sha256: href.split("sha256=").nth(1).unwrap().to_string(),
+                        filename,
+                        sdist_source: sdist_source_fixture("tstub", "1.0"),
+                    })
+                }) as futures::future::BoxFuture<'static, Result<BuiltSdistWheel>>
+            }
+        };
+        let opts = AutoRouteOptions {
+            enabled: true,
+            protected: BTreeSet::from(["astub".to_string()]),
+            ..Default::default()
+        };
+        let closure = auto_route_fixpoint_with_sdist_heal(
+            &req,
+            &opts,
+            solve,
+            probe,
+            sdist_probe,
+            Some(sdist_build),
+        )
+        .await
+        .expect("the RETURNED result must be the healed closure, not Pass A's error");
+        assert_eq!(
+            closure.pins.get("tstub").map(String::as_str),
+            Some("1.0"),
+            "healed closure must pin the sdist-only transitive dep"
+        );
+        let built = closure
+            .wheels
+            .iter()
+            .find(|w| w.name == "tstub")
+            .expect("built wheel spliced into the returned closure");
+        assert!(matches!(built.origin, Origin::Built));
+        assert!(built.must_ship);
+        assert!(
+            closure.wheels.iter().any(|w| w.name == "astub"),
+            "the requirer's own index wheel stays in the closure"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }
