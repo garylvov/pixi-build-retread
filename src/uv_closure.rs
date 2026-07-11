@@ -2281,10 +2281,6 @@ fn closure_inputs_fingerprint(pyproject: &str, lock_args: &[String], uv_version:
 }
 
 const META_FILE: &str = "retread-closure.meta.json";
-/// Persisted self-heal ledger. Written next to the uv project after a
-/// successful heal, re-seeded into the ledgers on the next run so the
-/// FIRST Pass A already carries the learned pins / built-wheel sources.
-const HEAL_FACTS_FILE: &str = "retread-heal-facts.json";
 // uv requires the export filename to match `pylock.*.toml`.
 const PYLOCK_FILE: &str = "pylock.retread.toml";
 const PROVENANCE_FILE: &str = "constraints.provenance.json";
@@ -2318,14 +2314,31 @@ impl HealFacts {
     }
 }
 
-/// Load persisted heal facts for a uv project, dropping any built-wheel
-/// entry whose store path no longer exists (the content-addressed wheel
-/// store is durable, but a pruned cache must fall back to a rebuild rather
-/// than feed uv a `[tool.uv.sources]` path that 404s). Missing/corrupt
-/// file -> empty facts (cold start).
-pub fn load_heal_facts(project_dir: &Path) -> HealFacts {
-    let path = project_dir.join(HEAL_FACTS_FILE);
-    let Ok(text) = std::fs::read_to_string(&path) else {
+/// Absolute path of the persisted heal-facts file for a target.
+///
+/// Stored under `<cache_dir>/retread-heal-facts/`, a SIBLING of
+/// `<cache_dir>/uv-projects/` -- deliberately OUTSIDE the uv project so it
+/// survives "delete the uv-projects state" (the operation that forces a
+/// cold re-resolve). That survival is the whole point: after wiping the
+/// uv.lock, the persisted facts still seed the first Pass A so it converges
+/// in a single lock (issue #10 perf, item 3b). Keyed identically to the uv
+/// project dir (bundle + python minor + subdir) so each target has its own.
+pub fn heal_facts_path(cache_dir: &Path, bundle: &str, python_version: &str, subdir: &str) -> PathBuf {
+    cache_dir.join("retread-heal-facts").join(format!(
+        "{}-py{}-{}.json",
+        canonical_conda_name(bundle),
+        python_version,
+        subdir,
+    ))
+}
+
+/// Load persisted heal facts from `path`, dropping any built-wheel entry
+/// whose store path no longer exists (the content-addressed wheel store is
+/// durable, but a pruned cache must fall back to a rebuild rather than feed
+/// uv a `[tool.uv.sources]` path that 404s). Missing/corrupt file -> empty
+/// facts (cold start).
+pub fn load_heal_facts(path: &Path) -> HealFacts {
+    let Ok(text) = std::fs::read_to_string(path) else {
         return HealFacts::default();
     };
     let mut facts: HealFacts = match serde_json::from_str(&text) {
@@ -2349,21 +2362,24 @@ pub fn load_heal_facts(project_dir: &Path) -> HealFacts {
     facts
 }
 
-/// Persist heal facts atomically (temp + rename) next to the uv project.
-/// Best-effort: a write failure only costs the reuse optimization on the
-/// next run, never correctness. Writing empty facts removes any stale file
-/// so a pack that stopped needing a heal doesn't keep injecting dead pins.
-pub fn save_heal_facts(project_dir: &Path, facts: &HealFacts) {
-    let path = project_dir.join(HEAL_FACTS_FILE);
+/// Persist heal facts atomically (temp + rename) to `path` (see
+/// [`heal_facts_path`]). Best-effort: a write failure only costs the reuse
+/// optimization on the next run, never correctness. Writing empty facts
+/// removes any stale file so a pack that stopped needing a heal doesn't keep
+/// injecting dead pins.
+pub fn save_heal_facts(path: &Path, facts: &HealFacts) {
     if facts.is_empty() {
-        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path);
         return;
     }
     let Ok(json) = serde_json::to_string_pretty(facts) else {
         return;
     };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
     let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
-    if std::fs::write(&tmp, json.as_bytes()).is_ok() && std::fs::rename(&tmp, &path).is_err() {
+    if std::fs::write(&tmp, json.as_bytes()).is_ok() && std::fs::rename(&tmp, path).is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
 }
@@ -5623,6 +5639,11 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
         let tmp = std::env::temp_dir().join(format!("retread-healfacts-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
+        // Facts path is a SIBLING of uv-projects under the cache dir; keyed
+        // per (bundle, python, subdir). Verify the layout survives being
+        // outside any uv project dir.
+        let facts_file = heal_facts_path(&tmp, "isaac-pack", "3.12", "linux-64");
+        assert!(facts_file.starts_with(tmp.join("retread-heal-facts")));
 
         // A real wheel on disk (kept) and a phantom path (dropped on load).
         let live_wheel = tmp.join("live-1.0-py3-none-any.whl");
@@ -5659,8 +5680,8 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
             }],
         };
 
-        save_heal_facts(&tmp, &facts);
-        let loaded = load_heal_facts(&tmp);
+        save_heal_facts(&facts_file, &facts);
+        let loaded = load_heal_facts(&facts_file);
         assert_eq!(loaded.routed.len(), 1);
         assert_eq!(loaded.prereleased.len(), 1);
         // Stale built-wheel (missing from store) is dropped; live one kept.
@@ -5669,9 +5690,9 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
 
         // Saving empty facts removes the file (a pack that stopped needing
         // a heal must not keep injecting dead pins).
-        save_heal_facts(&tmp, &HealFacts::default());
-        assert!(load_heal_facts(&tmp).is_empty());
-        assert!(!tmp.join(HEAL_FACTS_FILE).exists());
+        save_heal_facts(&facts_file, &HealFacts::default());
+        assert!(load_heal_facts(&facts_file).is_empty());
+        assert!(!facts_file.exists());
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

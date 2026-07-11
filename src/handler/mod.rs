@@ -2606,6 +2606,15 @@ async fn uv_group_closure(
         target.conda_subdir,
     ));
     let uv_cache_dir = cache_dir.join("uv-cache");
+    // Persisted heal facts live OUTSIDE uv-projects so they survive a
+    // "delete uv-projects state" cold reset -- that survival is what lets
+    // the post-reset Pass A converge in one lock (issue #10 perf, item 3b).
+    let heal_facts_path = crate::uv_closure::heal_facts_path(
+        cache_dir,
+        group_name,
+        &target.python_version,
+        &target.conda_subdir,
+    );
 
     // M2: auto-route options. Roots (this bundle's own entries) and
     // retread-built wheel sources must never leave the closure; keep-pypi
@@ -2777,7 +2786,7 @@ async fn uv_group_closure(
     // a single lock (and the pyproject fingerprint matches the recorded
     // meta, letting uv reuse the healed uv.lock instead of re-resolving).
     // Stale built-wheel entries (store pruned) are dropped on load.
-    let persisted_facts = crate::uv_closure::load_heal_facts(&project_dir);
+    let persisted_facts = crate::uv_closure::load_heal_facts(&heal_facts_path);
     if !persisted_facts.is_empty() {
         tracing::info!(
             bundle = %group_name,
@@ -3028,7 +3037,7 @@ async fn uv_group_closure(
     // The ledgers now hold the union of persisted + newly-discovered facts
     // (with_sdist_heal re-injects the seed ledgers each round).
     crate::uv_closure::save_heal_facts(
-        &project_dir,
+        &heal_facts_path,
         &crate::uv_closure::HealFacts {
             routed: sdist_routed.lock().unwrap().clone(),
             built: sdist_built.lock().unwrap().clone(),
