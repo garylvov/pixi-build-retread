@@ -2771,12 +2771,28 @@ async fn uv_group_closure(
                 as futures::future::BoxFuture<'static, Result<crate::uv_closure::BuiltSdistWheel>>
         }
     });
-    let sdist_routed = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let sdist_built = Arc::new(std::sync::Mutex::new(Vec::new()));
+    // Seed the heal ledgers from facts persisted by a previous run (issue
+    // #10 perf): with these present, the FIRST Pass A already carries the
+    // learned pins / built-wheel path-sources, so a warm rerun resolves in
+    // a single lock (and the pyproject fingerprint matches the recorded
+    // meta, letting uv reuse the healed uv.lock instead of re-resolving).
+    // Stale built-wheel entries (store pruned) are dropped on load.
+    let persisted_facts = crate::uv_closure::load_heal_facts(&project_dir);
+    if !persisted_facts.is_empty() {
+        tracing::info!(
+            bundle = %group_name,
+            routed = persisted_facts.routed.len(),
+            built = persisted_facts.built.len(),
+            prereleased = persisted_facts.prereleased.len(),
+            "uv closure: seeding heal ledgers from persisted facts (warm reuse path)",
+        );
+    }
+    let sdist_routed = Arc::new(std::sync::Mutex::new(persisted_facts.routed));
+    let sdist_built = Arc::new(std::sync::Mutex::new(persisted_facts.built));
     // Transitive-prerelease repairs surface naturally in the closure's
     // pins/wheels (the offender keeps its own index wheel); collected here
     // only for logging/audit parity with the route/build ledgers.
-    let sdist_prereleased = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sdist_prereleased = Arc::new(std::sync::Mutex::new(persisted_facts.prereleased));
     let solve = crate::uv_closure::with_sdist_heal(
         group_name.to_string(),
         raw_solve,
@@ -3005,6 +3021,20 @@ async fn uv_group_closure(
             });
         }
     }
+    // Persist the heal facts that produced this successful closure so the
+    // next run's FIRST Pass A carries them (issue #10 perf: warm single-lock
+    // convergence + healed-uv.lock reuse). Only reached on success -- a
+    // failed solve returned via `?` above and never overwrites good facts.
+    // The ledgers now hold the union of persisted + newly-discovered facts
+    // (with_sdist_heal re-injects the seed ledgers each round).
+    crate::uv_closure::save_heal_facts(
+        &project_dir,
+        &crate::uv_closure::HealFacts {
+            routed: sdist_routed.lock().unwrap().clone(),
+            built: sdist_built.lock().unwrap().clone(),
+            prereleased: sdist_prereleased.lock().unwrap().clone(),
+        },
+    );
     Ok((Some(closure), deps_from_floor_names))
 }
 

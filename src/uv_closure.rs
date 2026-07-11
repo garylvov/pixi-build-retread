@@ -1179,7 +1179,7 @@ pub fn classify_pylock_offenders(pylock_text: &str) -> Result<ClosureOffenders> 
 /// provenance shape a legacy gym-class sdist-built wheel gets
 /// ([`crate::lock::SdistWheelSource`]) so replay never re-resolves
 /// (no-resolve edict).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuiltSdistWheel {
     /// PEP 503-canonical PyPI name.
     pub pypi_name: String,
@@ -1208,7 +1208,7 @@ pub struct BuiltSdistWheel {
 /// can log/audit the repair with the same provenance conventions the
 /// route/build rungs use (the resolved version also lands in the closure's
 /// `pins` naturally, keeping the repair out of the user's manifest).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrereleasePin {
     /// PEP 503-canonical PyPI name.
     pub pypi_name: String,
@@ -2281,10 +2281,94 @@ fn closure_inputs_fingerprint(pyproject: &str, lock_args: &[String], uv_version:
 }
 
 const META_FILE: &str = "retread-closure.meta.json";
+/// Persisted self-heal ledger. Written next to the uv project after a
+/// successful heal, re-seeded into the ledgers on the next run so the
+/// FIRST Pass A already carries the learned pins / built-wheel sources.
+const HEAL_FACTS_FILE: &str = "retread-heal-facts.json";
 // uv requires the export filename to match `pylock.*.toml`.
 const PYLOCK_FILE: &str = "pylock.retread.toml";
 const PROVENANCE_FILE: &str = "constraints.provenance.json";
 const CONFLICT_FILE: &str = "retread-conflict.json";
+
+/// The self-heal facts learned during a heal cycle -- routed sdist-only
+/// packages, sdist-built wheels, and transitive prerelease pins. Persisting
+/// these next to the uv project and re-injecting them on the next run's
+/// FIRST Pass A is what makes a cold rerun converge in a single lock: the
+/// synthesized pyproject already carries the pins/path-sources that made
+/// the previous run's heal succeed, so Pass A resolves immediately AND the
+/// resulting pyproject text matches the fingerprint recorded in
+/// [`ClosureMeta`] -- so uv's own lock-freshness check reuses the healed
+/// `uv.lock` instead of re-resolving the whole closure from scratch (issue
+/// #10 perf: the fingerprint could never match before, because the meta was
+/// written for the pinned pyproject while the next run's Pass A started
+/// pinless).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HealFacts {
+    #[serde(default)]
+    pub routed: Vec<AutoRoutedPackage>,
+    #[serde(default)]
+    pub built: Vec<BuiltSdistWheel>,
+    #[serde(default)]
+    pub prereleased: Vec<PrereleasePin>,
+}
+
+impl HealFacts {
+    pub fn is_empty(&self) -> bool {
+        self.routed.is_empty() && self.built.is_empty() && self.prereleased.is_empty()
+    }
+}
+
+/// Load persisted heal facts for a uv project, dropping any built-wheel
+/// entry whose store path no longer exists (the content-addressed wheel
+/// store is durable, but a pruned cache must fall back to a rebuild rather
+/// than feed uv a `[tool.uv.sources]` path that 404s). Missing/corrupt
+/// file -> empty facts (cold start).
+pub fn load_heal_facts(project_dir: &Path) -> HealFacts {
+    let path = project_dir.join(HEAL_FACTS_FILE);
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return HealFacts::default();
+    };
+    let mut facts: HealFacts = match serde_json::from_str(&text) {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::debug!(path = %path.display(), error = %e, "heal facts: unreadable, ignoring");
+            return HealFacts::default();
+        }
+    };
+    facts.built.retain(|w| {
+        let present = w.wheel_path.exists();
+        if !present {
+            tracing::info!(
+                pkg = %w.pypi_name,
+                path = %w.wheel_path.display(),
+                "heal facts: built wheel missing from store; dropping (will rebuild if needed)",
+            );
+        }
+        present
+    });
+    facts
+}
+
+/// Persist heal facts atomically (temp + rename) next to the uv project.
+/// Best-effort: a write failure only costs the reuse optimization on the
+/// next run, never correctness. Writing empty facts removes any stale file
+/// so a pack that stopped needing a heal doesn't keep injecting dead pins.
+pub fn save_heal_facts(project_dir: &Path, facts: &HealFacts) {
+    let path = project_dir.join(HEAL_FACTS_FILE);
+    if facts.is_empty() {
+        let _ = std::fs::remove_file(&path);
+        return;
+    }
+    let Ok(json) = serde_json::to_string_pretty(facts) else {
+        return;
+    };
+    let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    if std::fs::write(&tmp, json.as_bytes()).is_ok() {
+        if std::fs::rename(&tmp, &path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+}
 
 /// The relaxations Pass B may apply over Pass A when `uv lock` fails.
 /// SINGLE-SOURCED so the Pass A and Pass B argument vectors can only
@@ -2491,6 +2575,18 @@ pub async fn compute_closure(
     // flag set survives validation while pinning packages to the wrong
     // index. Drop the lock (forcing a fresh resolve) whenever the
     // recorded input fingerprint is absent or different.
+    //
+    // ISSUE #10 PERF ROOT CAUSE (why cross-run reuse used to always miss):
+    // the fingerprint is over the SYNTHESIZED pyproject. A HEALED run writes
+    // the meta for the pinned pyproject (explicit_pins + built-wheel
+    // path-sources appended). The next run's FIRST Pass A started PINLESS,
+    // so its pyproject -- and therefore its fingerprint -- never matched the
+    // recorded one; the healed uv.lock was discarded and the whole 9-min
+    // closure re-resolved from scratch every time. The persisted heal facts
+    // (see `HealFacts` / `load_heal_facts`, re-seeded into the ledgers before
+    // the first solve) make Pass A carry the same pins the meta was written
+    // for, so the fingerprint matches and this guard KEEPS the lock -> uv
+    // fast-relocks instead of re-resolving.
     let fingerprint = closure_inputs_fingerprint(&pyproject_text, &lock_args, &uv_version);
     let lock_file = project_dir.join("uv.lock");
     let recorded_fingerprint = std::fs::read_to_string(&meta_path)
@@ -5483,6 +5579,102 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
             closure.wheels.iter().any(|w| w.name == "astub"),
             "the requirer's own index wheel stays in the closure"
         );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // -- issue #10 perf: closure-reuse fingerprint stability -------------
+
+    #[test]
+    fn fingerprint_is_stable_for_identical_inputs() {
+        // The whole cross-run reuse guard hinges on this: identical
+        // resolution inputs must hash to the same fingerprint, or the
+        // healed uv.lock is discarded and re-resolved every run.
+        let args = vec!["lock".to_string(), "--no-build".to_string()];
+        let a = closure_inputs_fingerprint("[project]\nname='x'\n", &args, "0.11.0");
+        let b = closure_inputs_fingerprint("[project]\nname='x'\n", &args, "0.11.0");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn fingerprint_changes_when_manifest_changes() {
+        let args = vec!["lock".to_string()];
+        let base = closure_inputs_fingerprint("deps=['a==1']", &args, "0.11.0");
+        // A changed synthesized pyproject (e.g. a new explicit pin) must
+        // invalidate: otherwise a pinned lock would be reused for a
+        // different (pinless) request.
+        assert_ne!(
+            base,
+            closure_inputs_fingerprint("deps=['a==2']", &args, "0.11.0")
+        );
+        // A changed flag vector (index set, prerelease policy) invalidates.
+        assert_ne!(
+            base,
+            closure_inputs_fingerprint("deps=['a==1']", &["lock".into(), "--x".into()], "0.11.0")
+        );
+        // A uv upgrade invalidates.
+        assert_ne!(
+            base,
+            closure_inputs_fingerprint("deps=['a==1']", &args, "0.12.0")
+        );
+    }
+
+    // -- issue #10 perf: persisted heal-facts round-trip -----------------
+
+    #[test]
+    fn heal_facts_round_trip_and_stale_wheel_dropped() {
+        let tmp = std::env::temp_dir().join(format!("retread-healfacts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // A real wheel on disk (kept) and a phantom path (dropped on load).
+        let live_wheel = tmp.join("live-1.0-py3-none-any.whl");
+        std::fs::write(&live_wheel, b"pk").unwrap();
+        let facts = HealFacts {
+            routed: vec![AutoRoutedPackage {
+                pypi_name: "routed-pkg".into(),
+                conda_name: "routed-pkg".into(),
+                pypi_version: "1.0".into(),
+                conda_version: "1.0".into(),
+                channel: "conda-forge".into(),
+            }],
+            built: vec![
+                BuiltSdistWheel {
+                    pypi_name: "live".into(),
+                    version: "1.0".into(),
+                    filename: "live-1.0-py3-none-any.whl".into(),
+                    wheel_path: live_wheel.clone(),
+                    sha256: "a".repeat(64),
+                    sdist_source: sdist_source_fixture("live", "1.0"),
+                },
+                BuiltSdistWheel {
+                    pypi_name: "gone".into(),
+                    version: "2.0".into(),
+                    filename: "gone-2.0-py3-none-any.whl".into(),
+                    wheel_path: tmp.join("does-not-exist.whl"),
+                    sha256: "b".repeat(64),
+                    sdist_source: sdist_source_fixture("gone", "2.0"),
+                },
+            ],
+            prereleased: vec![PrereleasePin {
+                pypi_name: "pre".into(),
+                version: "3.0rc1".into(),
+            }],
+        };
+
+        save_heal_facts(&tmp, &facts);
+        let loaded = load_heal_facts(&tmp);
+        assert_eq!(loaded.routed.len(), 1);
+        assert_eq!(loaded.prereleased.len(), 1);
+        // Stale built-wheel (missing from store) is dropped; live one kept.
+        assert_eq!(loaded.built.len(), 1);
+        assert_eq!(loaded.built[0].pypi_name, "live");
+
+        // Saving empty facts removes the file (a pack that stopped needing
+        // a heal must not keep injecting dead pins).
+        save_heal_facts(&tmp, &HealFacts::default());
+        assert!(load_heal_facts(&tmp).is_empty());
+        assert!(!tmp.join(HEAL_FACTS_FILE).exists());
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
