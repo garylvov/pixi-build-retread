@@ -293,6 +293,26 @@ async fn run_with_pixi_bin(args: LockArgs, pixi_bin: &str) -> Result<i32> {
                     continue;
                 }
                 Err(package) => {
+                    // Run-39 terminal fallback: before declaring
+                    // exhaustion, try un-routing the package from the
+                    // failing env's packs (once per package per run).
+                    if apply_terminal_unroute(
+                        &planner,
+                        &mut tried,
+                        &editor,
+                        &project_dir,
+                        &mut ledger,
+                        &ledger_path,
+                        run_idx,
+                        &mut records,
+                        &stripped,
+                        &package,
+                        repairs_applied + 1,
+                    )? {
+                        pending_edit = None;
+                        repairs_applied += 1;
+                        continue;
+                    }
                     // Exhaustion never converges -- unlike the
                     // `max_repairs` bound (which intentionally keeps
                     // whatever progress was made so a human can pick up
@@ -397,6 +417,25 @@ async fn run_with_pixi_bin(args: LockArgs, pixi_bin: &str) -> Result<i32> {
                     continue;
                 }
                 Err(package) => {
+                    // Run-39 terminal fallback (same as the specific-
+                    // conflict exhaustion branch above).
+                    if apply_terminal_unroute(
+                        &planner,
+                        &mut tried,
+                        &editor,
+                        &project_dir,
+                        &mut ledger,
+                        &ledger_path,
+                        run_idx,
+                        &mut records,
+                        &stripped,
+                        &package,
+                        repairs_applied + 1,
+                    )? {
+                        pending_edit = None;
+                        repairs_applied += 1;
+                        continue;
+                    }
                     rollback_snapshot(&project_dir, &manifest_path)?;
                     crate::pack_overrides::rollback_all(&project_dir)?;
                     ledger.finish_run(run_idx, "exhausted");
@@ -467,6 +506,58 @@ async fn run_with_pixi_bin(args: LockArgs, pixi_bin: &str) -> Result<i32> {
     eprintln!("retread lock: internal loop bound reached without converging");
     print_summary(&records);
     Ok(EXIT_MAX_ITERS)
+}
+
+/// Run-39 terminal un-route (see `RepairPlanner::terminal_unroute_writes`):
+/// invoked from BOTH exhaustion branches (specific-conflict ladder and
+/// generic fallback engine) right before declaring EXIT_EXHAUSTED. Returns
+/// `Ok(true)` when un-route writes were applied (caller `continue`s the
+/// lock loop for a re-solve), `Ok(false)` when the fallback doesn't apply
+/// (already tried for this package, no packs resolvable, workspace-pinned
+/// or ABI-anchor package) and real exhaustion should proceed. One attempt
+/// per package per run (tried-guarded) -- a second exhaustion of the same
+/// package after its un-route is a genuine dead end.
+#[allow(clippy::too_many_arguments)]
+fn apply_terminal_unroute(
+    planner: &RepairPlanner,
+    tried: &mut super::repair::TriedState,
+    editor: &ManifestEditor,
+    project_dir: &Path,
+    ledger: &mut SolveLedger,
+    ledger_path: &Path,
+    run_idx: usize,
+    records: &mut Vec<RepairRecord>,
+    stripped: &str,
+    package: &str,
+    iter: u32,
+) -> Result<bool> {
+    let key = format!("{package}#terminal-unroute");
+    if tried.has(&key, Strategy::PypiOverride) {
+        return Ok(false);
+    }
+    let writes = planner.terminal_unroute_writes(editor, stripped, package);
+    if writes.is_empty() {
+        return Ok(false);
+    }
+    tried.mark(&key, Strategy::PypiOverride, false);
+    crate::pack_overrides::ensure_snapshot(project_dir)?;
+    for w in &writes {
+        crate::pack_overrides::write_unroute(
+            project_dir,
+            &w.pack_pixi,
+            &w.bundle,
+            &w.package,
+            "TerminalUnroute",
+        )?;
+        let attempt = RepairPlanner::terminal_unroute_attempt(iter, package, &w.bundle);
+        append_attempt(ledger, ledger_path, run_idx, attempt.clone())?;
+        record_repair(records, &attempt, &[], Some(w));
+        eprintln!(
+            "retread: terminal un-route {package} -> pypi (ladder exhausted; pack `{}`)",
+            w.bundle
+        );
+    }
+    Ok(true)
 }
 
 fn record_repair(
@@ -874,6 +965,95 @@ exit 1
         assert!(manifest_text.contains("numpy"));
         // Snapshot must be cleaned up on convergence.
         assert!(!snapshot_path(&dir).exists());
+    }
+
+    const PYPI_CONDA_PINNED_HF_HUB_RUN39: &str =
+        include_str!("../../tests/fixtures/solve_errors/pypi_conda_pinned_hf_hub_run39.txt");
+
+    /// Writes a fake `pixi` that fails with `stderr_fixture` UNTIL the
+    /// workspace's `.retread/auto-overrides.json` un-routes `package`,
+    /// then succeeds -- models a conflict that only the terminal
+    /// un-route can clear, independent of how many ladder iterations
+    /// precede exhaustion.
+    fn write_fake_pixi_until_unrouted(dir: &Path, package: &str, stderr_fixture: &str) -> PathBuf {
+        let stderr_path = dir.join("stderr.txt");
+        std::fs::write(&stderr_path, stderr_fixture).unwrap();
+        let ledger = dir.join(".retread").join("auto-overrides.json");
+        let script_path = dir.join("pixi");
+        let script = format!(
+            r#"#!/bin/bash
+if [ "$1" != "lock" ]; then
+  exit 0
+fi
+if grep -q '"{package}"' "{ledger}" 2>/dev/null; then
+  exit 0
+fi
+cat "{stderr_path}" >&2
+exit 1
+"#,
+            package = package,
+            ledger = ledger.display(),
+            stderr_path = stderr_path.display(),
+        );
+        let mut f = std::fs::File::create(&script_path).unwrap();
+        f.write_all(script.as_bytes()).unwrap();
+        let mut perm = f.metadata().unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perm).unwrap();
+        script_path
+    }
+
+    /// Run-39 end-to-end: `viral-gpu`'s pypi solve dead-ends on the
+    /// conda-pinned pack emission `huggingface-hub==1.23.0` (transformers
+    /// needs `<1.0`); no workspace conda pin exists to widen, so the
+    /// specific ladder exhausts -- the terminal un-route must then land a
+    /// `keep-pypi` for huggingface-hub in the failing env's pack and the
+    /// lock must converge instead of exiting EXIT_EXHAUSTED.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn terminal_unroute_converges_run39_hf_hub_exhaustion() {
+        let dir = temp_dir("terminal-unroute");
+        let manifest = write_manifest(
+            &dir,
+            "[environments]\n\
+             viral-gpu = { features = [\"isaaclab-viral\"], no-default-feature = true }\n\
+             \n\
+             [feature.isaaclab-viral.dependencies]\n\
+             pytorch-gpu = \"==2.7.0\"\n\
+             \"isaaclab-2.3x-pack\" = { path = \"./pypi-packs/isaaclab-2.3x-pack\" }\n",
+        );
+        let pack_dir = dir.join("pypi-packs").join("isaaclab-2.3x-pack");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        std::fs::write(
+            pack_dir.join("pixi.toml"),
+            "[package]\nname = \"isaaclab-2.3x-pack\"\nversion = \"1.0\"\n",
+        )
+        .unwrap();
+        let pixi =
+            write_fake_pixi_until_unrouted(&dir, "huggingface-hub", PYPI_CONDA_PINNED_HF_HUB_RUN39);
+
+        let args = LockArgs {
+            manifest,
+            max_repairs: 20,
+            no_repair: false,
+        };
+        let code = run_with_pixi_bin(args, pixi.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            code, EXIT_OK,
+            "terminal un-route must let the lock converge"
+        );
+
+        let ledger_text =
+            std::fs::read_to_string(dir.join(".retread").join("auto-overrides.json")).unwrap();
+        assert!(
+            ledger_text.contains("huggingface-hub"),
+            "un-route must persist in the pack-overrides ledger: {ledger_text}"
+        );
+        assert!(
+            ledger_text.contains("TerminalUnroute"),
+            "provenance must name the terminal rule: {ledger_text}"
+        );
     }
 
     #[tokio::test]

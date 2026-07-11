@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -3124,6 +3125,97 @@ impl RepairPlanner {
         }
         Some(Ok(applied))
     }
+
+    /// Run-39 TERMINAL fallback: when the ladder EXHAUSTS for `package`
+    /// (every tier tried or refused -- run 39's `huggingface-hub`: the
+    /// conda solve pinned a pack-emitted 1.23.0 while the env's own pypi
+    /// requirement `transformers >=4.46,<5` needs `<1.0`; T1's
+    /// conda-as-truth override just re-asserts the conda pin and no widen
+    /// tier has a workspace conda-pin owner to act on), the last sound
+    /// knob before giving up is to stop letting conda arbitrate the
+    /// package at all: un-route it from every pack the FAILING env
+    /// composes. The failing env is parsed from the solver error's
+    /// `environment '<name>'` clause; when no env can be resolved, the
+    /// conservative fallback is every pack any feature declares. An
+    /// un-route (`retread-keep-pypi`) is inert for a pack that never
+    /// routed the package, so over-approximating the pack set is safe.
+    ///
+    /// Guards: never un-route an ABI anchor, and never un-route a package
+    /// the workspace pins by hand (family-aware -- `pytorch` is anchored
+    /// by a `pytorch-gpu` pin); hand-written intent exhausting the ladder
+    /// is a real stop, not a routing knob. Returns the pending writes;
+    /// the CALLER owns tried-guarding (one attempt per package), ledger
+    /// recording, and the actual writes (mirrors
+    /// [`RepairOutcome::pack_override`]'s split of planning vs writing).
+    pub fn terminal_unroute_writes(
+        &self,
+        editor: &ManifestEditor,
+        stderr: &str,
+        package: &str,
+    ) -> Vec<PackOverrideWrite> {
+        if is_abi_anchor(package) || self.has_workspace_pin_family(editor, package) {
+            return Vec::new();
+        }
+        let Some(ws) = crate::workspace::WorkspaceManifest::load(editor.project_dir()) else {
+            return Vec::new();
+        };
+        let env_name = Regex::new(r"environment '([^']+)'")
+            .ok()
+            .and_then(|re| re.captures(stderr).map(|c| c[1].to_string()));
+        let mut pack_names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        match env_name.as_deref().and_then(|e| ws.environments.get(e)) {
+            Some(def) => {
+                for feat in &def.features {
+                    if let Some(f) = ws.features.get(feat) {
+                        pack_names.extend(f.path_dependencies.keys().cloned());
+                    }
+                }
+                if !def.no_default_feature {
+                    pack_names.extend(ws.path_dependencies.keys().cloned());
+                }
+            }
+            None => {
+                for f in ws.features.values() {
+                    pack_names.extend(f.path_dependencies.keys().cloned());
+                }
+                pack_names.extend(ws.path_dependencies.keys().cloned());
+            }
+        }
+        pack_names
+            .into_iter()
+            .filter_map(|bundle| {
+                let pack_pixi = resolve_pack_dir(&ws, editor.project_dir(), &bundle)
+                    .map(|d| d.join("pixi.toml"))?;
+                Some(PackOverrideWrite {
+                    bundle,
+                    pack_pixi,
+                    package: package.to_string(),
+                    spec: String::new(),
+                    kind: PackOverrideKind::Unroute,
+                })
+            })
+            .collect()
+    }
+
+    /// Ledger attempt row for one terminal un-route write (see
+    /// [`Self::terminal_unroute_writes`]).
+    pub fn terminal_unroute_attempt(iter: u32, package: &str, bundle: &str) -> LedgerAttempt {
+        LedgerAttempt {
+            iter,
+            package: package.to_string(),
+            version: None,
+            tier: "terminal_unroute".to_string(),
+            strategy: Strategy::PypiOverride.as_str().to_string(),
+            conflict: "Exhausted".to_string(),
+            source: format!("retread lock terminal un-route (pack `{bundle}`)"),
+            ts: timestamp(),
+            old_spec: None,
+            new_spec: Some("keep-pypi".to_string()),
+            ceiling_policy: None,
+            before: None,
+            failed: false,
+        }
+    }
 }
 
 /// The first clause of a possibly-two-sided spec string (e.g. `"==2.2.1"`
@@ -5376,6 +5468,66 @@ holosoma-gpu = { features = ["holosoma"] }
                 .map(|(o, _)| &o.attempt.package)
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn terminal_unroute_writes_scope_to_failing_env_and_respect_workspace_pins() {
+        // Run-39 shape: env `viral-gpu`'s pypi solve dead-ends on a
+        // conda-pinned pack emission (`huggingface-hub==1.23.0`) with no
+        // workspace pin to widen -- the terminal fallback must un-route
+        // the package from the FAILING env's packs only, and must refuse
+        // for hand-written workspace intent (family-aware).
+        let manifest_text = "[environments]\n\
+             viral-gpu = { features = [\"isaaclab-viral\"], no-default-feature = true }\n\
+             other-env = { features = [\"other\"], no-default-feature = true }\n\
+             \n\
+             [feature.isaaclab-viral.dependencies]\n\
+             pytorch-gpu = \"==2.7.0\"\n\
+             \"isaaclab-2.3x-pack\" = { path = \"./pypi-packs/isaaclab-2.3x-pack\" }\n\
+             \n\
+             [feature.other.dependencies]\n\
+             \"other-pack\" = { path = \"./pypi-packs/other-pack\" }\n";
+        let path = temp_manifest(manifest_text);
+        let project_dir = path.parent().unwrap().to_path_buf();
+        for pack in ["isaaclab-2.3x-pack", "other-pack"] {
+            let pack_dir = project_dir.join("pypi-packs").join(pack);
+            std::fs::create_dir_all(&pack_dir).unwrap();
+            std::fs::write(
+                pack_dir.join("pixi.toml"),
+                format!("[package]\nname = \"{pack}\"\nversion = \"1.0\"\n"),
+            )
+            .unwrap();
+        }
+        let editor = ManifestEditor::open(path).unwrap();
+        let planner = RepairPlanner::new("default".into());
+        let stderr = "Error:   × failed to solve the pypi requirements of \
+                      environment 'viral-gpu' for platform 'linux-64'";
+
+        let writes = planner.terminal_unroute_writes(&editor, stderr, "huggingface-hub");
+        assert_eq!(
+            writes.iter().map(|w| w.bundle.as_str()).collect::<Vec<_>>(),
+            vec!["isaaclab-2.3x-pack"],
+            "only the failing env's pack, not other-env's"
+        );
+        assert!(writes.iter().all(|w| w.kind == PackOverrideKind::Unroute));
+
+        // Family-aware workspace-pin guard: `pytorch` is anchored by the
+        // hand-written `pytorch-gpu ==2.7.0` -- never un-routed.
+        assert!(
+            planner
+                .terminal_unroute_writes(&editor, stderr, "pytorch")
+                .is_empty()
+        );
+        // ABI anchors are never un-routed.
+        assert!(
+            planner
+                .terminal_unroute_writes(&editor, stderr, "python")
+                .is_empty()
+        );
+        // Unresolvable env name -> conservative superset (both packs).
+        let writes_all =
+            planner.terminal_unroute_writes(&editor, "some unrelated error", "huggingface-hub");
+        assert_eq!(writes_all.len(), 2, "{writes_all:?}");
     }
 
     #[test]
