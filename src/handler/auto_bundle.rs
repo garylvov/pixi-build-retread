@@ -128,18 +128,30 @@ pub(crate) async fn auto_bundle_transitives(
     // use resolve_preferring so the re-resolve prefers that version.
     // Cold path (RETREAD_FAVOR_LOCK unset or first build): None.
     favor_lock_prefs: Option<&std::collections::BTreeMap<String, String>>,
-    // uv resolver: canonical names of the uv closure's exported wheels
-    // (auto-routed members already excluded via --no-emit-package). The
-    // closure is AUTHORITATIVE: uv resolved these from PyPI under
-    // no-build, the auto-route probe already declined to move them to
-    // conda at the resolved version, so they MUST ship in the bundle.
-    // Candidates in this set bypass the prefer-conda probes below —
-    // the name-level "conda has it at SOME version, keep it conda-side"
-    // arm otherwise emits a relaxed run-dep spec that no channel can
-    // satisfy (aiodns==3.1.1 -> `>=3.1.1,<3.2` -> "no candidates"),
-    // and the pre-emission solve cascade that used to rescue that died
-    // in v4.2.0. Legacy resolver path: None (probes decide, unchanged).
-    uv_closure_members: Option<&std::collections::BTreeSet<String>>,
+    // uv resolver: canonical name -> resolved version of the uv
+    // closure's exported wheels (auto-routed members already excluded
+    // via --no-emit-package). The closure is AUTHORITATIVE: uv resolved
+    // these from PyPI under no-build, the auto-route probe already
+    // declined to move them to conda at the resolved version, so they
+    // MUST ship in the bundle. Candidates in this set bypass the
+    // prefer-conda probes below — the name-level "conda has it at SOME
+    // version, keep it conda-side" arm otherwise emits a relaxed
+    // run-dep spec that no channel can satisfy (aiodns==3.1.1 ->
+    // `>=3.1.1,<3.2` -> "no candidates"), and the pre-emission solve
+    // cascade that used to rescue that died in v4.2.0.
+    //
+    // v4.6 Part A follow-up (run-44 smoke failure): the map's entries
+    // are ALSO seeded as first-round candidates. Requires-Dist scans
+    // alone cannot discover closure members no bundled wheel's metadata
+    // names — retread-deps-from roots (tensordict, lightning, ...) ride
+    // only the uv closure, and under the minimal routing policy they are
+    // refused conda routes AND blocked from conda run-dep emission
+    // (Bundle::uv_closure_names), so without this seed they silently
+    // vanished from the pack (shipped wheels == [protomotions], smoke
+    // ModuleNotFoundError). Under aggressive routing the gap was
+    // invisible: the sweep moved them all to conda.
+    // Legacy resolver path: None (probes decide, unchanged).
+    uv_closure_wheels: Option<&std::collections::BTreeMap<String, String>>,
 ) -> Result<()> {
     // Build the skip set: anything already in the bundle, plus the user's
     // `retread-conda-deps` allowlist (deps that should stay as conda
@@ -182,6 +194,19 @@ pub(crate) async fn auto_bundle_transitives(
     if let Some(closure) = locked_closure {
         seen_candidate.extend(closure.keys().map(|n| canonical_conda_name(n)));
     }
+    // v4.6: seed the first round with every exported closure wheel not
+    // already in the bundle/skip set (see the `uv_closure_wheels` doc
+    // above — deps-from roots are reachable ONLY through the closure).
+    // Each seed hits the `is_closure_member` authoritative-bundle arm
+    // below and is fetched at uv's exact resolved version.
+    let mut closure_seed: Vec<(String, String)> = Vec::new();
+    if let Some(pins) = uv_closure_wheels {
+        for (name, version) in pins {
+            if seen_candidate.insert(canonical_conda_name(name)) {
+                closure_seed.push((name.clone(), version.clone()));
+            }
+        }
+    }
     let mut processed_wheel_count = 0;
     loop {
         // Collect new candidates from wheels we haven't scanned yet.
@@ -209,6 +234,9 @@ pub(crate) async fn auto_bundle_transitives(
             }
         }
         processed_wheel_count = bundle.all_wheels().count();
+        // v4.6: drain the one-time closure seed into this round's exact
+        // candidates (first iteration; empty afterwards).
+        candidates.append(&mut closure_seed);
         if candidates.is_empty() && loose_candidates.is_empty() {
             break;
         }
@@ -251,7 +279,7 @@ pub(crate) async fn auto_bundle_transitives(
         // only run for the few definitively-unsat candidates, against
         // the already-warm in-memory repodata cache.
         let is_closure_member = |name: &str| {
-            uv_closure_members.is_some_and(|s| s.contains(&canonical_conda_name(name)))
+            uv_closure_wheels.is_some_and(|s| s.contains_key(&canonical_conda_name(name)))
         };
         let prefer_pairs: Vec<(String, String)> = candidates
             .iter()
@@ -282,7 +310,7 @@ pub(crate) async fn auto_bundle_transitives(
             let conda_name = canonical_conda_name(&name);
             if is_closure_member(&name) {
                 // uv closure member not auto-routed: ships in the bundle,
-                // no conda probes (see uv_closure_members doc above).
+                // no conda probes (see uv_closure_wheels doc above).
                 bundle.probe_decisions.push(crate::audit::ProbeDecision {
                     stage: "auto_bundle".into(),
                     pypi_name: name.clone(),

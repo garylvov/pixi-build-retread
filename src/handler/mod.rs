@@ -2099,9 +2099,13 @@ async fn resolve_all(
         // uv resolver: closure membership (canonical names) — auto-routed
         // members were already excluded from the exported pylock, so this
         // is exactly "everything that must ship in the bundle".
-        let uv_closure_members: Option<std::collections::BTreeSet<String>> = uv_closure
-            .as_ref()
-            .map(|c| c.wheels.iter().map(|w| w.name.clone()).collect());
+        let uv_closure_members: Option<std::collections::BTreeMap<String, String>> =
+            uv_closure.as_ref().map(|c| {
+                c.wheels
+                    .iter()
+                    .map(|w| (w.name.clone(), w.version.clone()))
+                    .collect()
+            });
         if (effective.auto_bundle || uv_closure.is_some())
             && let Some(idx) = auto_index
         {
