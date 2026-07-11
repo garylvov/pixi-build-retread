@@ -2372,6 +2372,30 @@ impl RepairPlanner {
             .any(|name| self.workspace_pin_governs_pack(editor, bundle, name))
     }
 
+    /// Whether a hand-written EXACT (`==X`) workspace pin governs
+    /// `bundle`'s composition for `package` or any conda name-family
+    /// variant. Exact pins are point-truth -- derived repairs must never
+    /// narrow/relax them (run 41: `pytorch-gpu ==2.7.0`). RANGE pins
+    /// (e.g. `matplotlib >=3.10.3,<4`) deliberately do NOT count: a pack
+    /// override may legitimately narrow within a workspace range (run-43
+    /// regression -- the blanket family guard vetoed the proven run-40
+    /// matplotlib ceiling-step).
+    fn workspace_exact_pin_governs_pack_family(
+        &self,
+        editor: &ManifestEditor,
+        bundle: &str,
+        package: &str,
+    ) -> bool {
+        conda_name_family(package, &self.conda_name_map)
+            .iter()
+            .any(|name| {
+                self.workspace_pin_governs_pack(editor, bundle, name)
+                    && self
+                        .workspace_conda_pin(editor, bundle, name)
+                        .is_some_and(|spec| spec.trim_start().starts_with("=="))
+            })
+    }
+
     /// Whether ANY feature declares a hand-written conda/pypi entry for
     /// `package` or any of its conda name-family variants -- the
     /// family-aware [`Self::has_workspace_pin`], for chain anchoring
@@ -2510,20 +2534,27 @@ impl RepairPlanner {
                     }
                 }
                 Ownership::LedgeredOverride => {
-                    // Run-41 guardrail: a name governed by a hand-written
-                    // workspace pin (family-aware: `pytorch-gpu ==2.7.0`
-                    // anchors `pytorch`/`torch`/... via the conda name
-                    // family) is TRUTH and exempt from every derived
-                    // narrow. The only ledgered entry such a name can
-                    // carry is tier 1's own confirmation of that pin --
+                    // Run-41 guardrail, refined by run 43: a name governed
+                    // by a hand-written EXACT workspace pin (family-aware:
+                    // `pytorch-gpu ==2.7.0` anchors `pytorch`/`torch`/...)
+                    // is point-truth and exempt from every derived narrow
+                    // -- the only ledgered entry such a name carries is
+                    // tier 1's own confirmation of that pin, and
                     // "narrowing" it means moving off the workspace's
                     // intent (run 41 scraped resolvo's `would constrain
                     // pytorch-gpu <0.0a0` exclusion sentinel as a cap and
-                    // wrote an impossible override for the workspace
-                    // pin). The movable knob in such a conflict is always
-                    // some OTHER mention (the pack emission whose chain
-                    // excludes the pin), never the pin itself.
-                    if self.workspace_pin_governs_pack_family(editor, owner_bundle, &m.package) {
+                    // wrote an impossible override for the pin). A RANGE
+                    // workspace pin is different: it admits narrowing the
+                    // PACK's override WITHIN it (run 43 regression: the
+                    // blanket guard vetoed the proven run-40 matplotlib
+                    // ceiling-step because the workspace ranges
+                    // `matplotlib >=3.10.3,<4` govern the pack -- the
+                    // step to `<3.11.0` stays inside that intent).
+                    if self.workspace_exact_pin_governs_pack_family(
+                        editor,
+                        owner_bundle,
+                        &m.package,
+                    ) {
                         continue;
                     }
                     // Tier 2: a prior repair already narrowed/overrode
@@ -2668,12 +2699,16 @@ impl RepairPlanner {
                     }
                 }
                 Ownership::DepsFromExactPin => {
-                    // Run-41 guardrail (same as the LedgeredOverride arm):
-                    // hand-written workspace intent is exempt from derived
-                    // relaxes -- a deps-from root that the workspace ALSO
-                    // pins is governed by the workspace pin, not by the
-                    // upstream requirements file.
-                    if self.workspace_pin_governs_pack_family(editor, owner_bundle, &m.package) {
+                    // Run-41 guardrail (same as the LedgeredOverride arm,
+                    // exact-form only per the run-43 refinement): a
+                    // deps-from root the workspace ALSO pins exactly is
+                    // governed by the workspace pin, not by the upstream
+                    // requirements file.
+                    if self.workspace_exact_pin_governs_pack_family(
+                        editor,
+                        owner_bundle,
+                        &m.package,
+                    ) {
                         continue;
                     }
                     // Tier 3: relax the deps-from-owned exact pin to a
@@ -5696,6 +5731,60 @@ holosoma-gpu = { features = ["holosoma"] }
             "ceiling must step below the failing emitted floor"
         );
         assert_eq!(cand.pack_name, "isaaclab-2.3x-pack");
+    }
+
+    #[test]
+    fn tier2_ceiling_step_survives_governing_workspace_range_pin_run43() {
+        // Run-43 regression: the run-41 blanket workspace-pin guard
+        // vetoed the proven run-40 matplotlib ceiling-step because the
+        // live workspace RANGE-pins matplotlib (`>=3.10.3,<4` in
+        // [dependencies], `>=3.10,<4` in [feature.viral]) in features
+        // governing isaaclab-2.3x-pack. A range pin admits narrowing the
+        // PACK's override within it -- only EXACT workspace pins are
+        // point-truth. Same fixture and ledger state as the run-40 test,
+        // plus a governing workspace range pin that must NOT veto.
+        let manifest_text = "[environments]\n\
+             viral-gpu = { features = [\"isaaclab-viral\"], no-default-feature = true }\n\
+             \n\
+             [feature.isaaclab-viral.dependencies]\n\
+             matplotlib = \">=3.10.3,<4\"\n\
+             \"isaaclab-2.3x-pack\" = { path = \"./pypi-packs/isaaclab-2.3x-pack\" }\n";
+        let path = temp_manifest(manifest_text);
+        let project_dir = path.parent().unwrap().to_path_buf();
+        let pack_dir = project_dir.join("pypi-packs").join("isaaclab-2.3x-pack");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        std::fs::write(
+            pack_dir.join("pixi.toml"),
+            "[package]\nname = \"isaaclab-2.3x-pack\"\nversion = \"1.0\"\n",
+        )
+        .unwrap();
+        let pack_pixi = pack_dir.join("pixi.toml");
+        crate::pack_overrides::write_override(
+            &project_dir,
+            &pack_pixi,
+            "isaaclab-2.3x-pack",
+            "matplotlib",
+            ">=3.10.3,<4",
+            "GenericFallback",
+        )
+        .unwrap();
+        let editor = ManifestEditor::open(path).unwrap();
+        let planner = RepairPlanner::new("default".into());
+        let parser = super::super::parse::RegexConflictParser::new();
+        let mentions =
+            parser.extract_generic_mentions(CONDA_LEDGERED_RANGE_TOP_PICK_DEAD_END_RUN40);
+        let bundle = parser.extract_bundle_name(CONDA_LEDGERED_RANGE_TOP_PICK_DEAD_END_RUN40);
+        let candidates =
+            planner.generate_fallback_candidates(&editor, bundle.as_deref(), &mentions);
+        let cand = candidates
+            .iter()
+            .find(|c| c.package == "matplotlib" && c.tier == 2)
+            .unwrap_or_else(|| {
+                panic!(
+                    "governing workspace RANGE pin must not veto the ceiling-step: {candidates:?}"
+                )
+            });
+        assert_eq!(cand.new_spec, ">=3.10.3,<3.11.0");
     }
 
     const CONDA_WORKSPACE_PIN_POISON_TENSORDICT_RUN41: &str = include_str!(
