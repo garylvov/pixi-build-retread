@@ -933,6 +933,33 @@ platforms = [{ platform = "linux-64", glibc = "2.35" }]
         );
     }
 
+    #[test]
+    fn exact_prerelease_pin_matches_prerelease_version() {
+        // The BFS wheel-resolve path (`resolve_inner`/`resolve_sdist`)
+        // filters candidates via `VersionSpecifiers::contains`. An exact
+        // pre-release pin (e.g. a transitive `tinyobjloader==2.0.0rc13`
+        // the self-heal re-pins first-party) must match the pre-release
+        // version by PEP 440 semantics -- otherwise the healed pin would
+        // resolve to nothing.
+        let spec = VersionSpecifiers::from_str("==2.0.0rc13").unwrap();
+        let version = uv_pep440::Version::from_str("2.0.0rc13").unwrap();
+        assert!(
+            version.any_prerelease(),
+            "2.0.0rc13 must be recognized as a PEP 440 pre-release"
+        );
+        assert!(
+            spec.contains(&version),
+            "`==2.0.0rc13` must match version 2.0.0rc13 (PEP 440 exact prerelease pin)"
+        );
+        // Sanity: the exact pin must not match the stable release of the
+        // same X.Y.Z (rc13 precedes the final 2.0.0).
+        let stable = uv_pep440::Version::from_str("2.0.0").unwrap();
+        assert!(
+            !spec.contains(&stable),
+            "`==2.0.0rc13` must not match the stable 2.0.0 release"
+        );
+    }
+
     fn mk(name: &str) -> ResolvedWheel {
         ResolvedWheel {
             url: format!("https://example.com/{name}").parse().unwrap(),

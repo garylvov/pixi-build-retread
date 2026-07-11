@@ -1242,9 +1242,9 @@ mod tests {
     // would surface to `retread solve`'s parser AFTER the backend's
     // sdist-only self-heal ladder (uv_closure.rs) already exhausted both
     // the conda-route and sdist-auto-build rungs for
-    // `antlr4-python3-runtime` (its own exhaustion guidance appended,
-    // `sdist_only_no_route_message`): `hydra-core==1.3.2`'s own wildcard
-    // pin (`antlr4-python3-runtime==4.9.*`) names a range with zero
+    // `antlr4-python3-runtime` (its own exhaustion guidance appended):
+    // `hydra-core==1.3.2`'s own wildcard pin
+    // (`antlr4-python3-runtime==4.9.*`) names a range with zero
     // wheel-bearing builds under `--no-build`.
     const UV_CLOSURE_NO_WHEEL_TRANSITIVE: &str =
         include_str!("../../tests/fixtures/solve_errors/uv_closure_no_wheel_transitive.txt");

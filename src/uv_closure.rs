@@ -28,6 +28,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
@@ -101,6 +102,15 @@ pub struct UvClosureRequest {
     /// entry name -> path (relative to the project dir or absolute),
     /// emitted as `[tool.uv.sources]` path sources.
     pub built_wheel_sources: BTreeMap<String, PathBuf>,
+    /// Transitive PRERELEASE repairs the self-heal injected: canonical
+    /// pypi name -> exact resolved pre-release version. Rendered as
+    /// EXPLICIT first-party `name==version` entries in the synthesized
+    /// project's `dependencies` (spec §two-pass; see [`with_sdist_heal`])
+    /// so uv's `if-necessary-or-explicit` prerelease policy honors a
+    /// pre-release a transitive dependency pinned. Empty on the green
+    /// path; kept out of the user's manifest (the synthesized project is
+    /// ephemeral).
+    pub prerelease_pins: BTreeMap<String, String>,
     /// Append `--offline` to uv invocations (replay mode).
     pub offline: bool,
 }
@@ -1017,221 +1027,138 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// Self-heal: sdist-only packages (no wheels at all under `no-build`)
+// Self-heal detection: sdist-only + transitive-prerelease closure failures
 // ---------------------------------------------------------------------------
 //
-// A THIRD class of `uv lock` failure, alongside the ordinary conflict
-// (`format_lock_failure`) and the manylinux platform-tag ceiling
-// (`installer::is_platform_tag_conflict`, glibc relaxation): a package
-// that publishes NO wheels at all (pure sdist, e.g. pyperclip). Under
-// `no-build = true` (spec §8.2 — retread's source_build path owns
-// builds, uv never builds an sdist) this fails the WHOLE lock loudly,
-// even when the sdist-only package is a deep transitive nobody asked
-// for by name.
+// Two classes of `uv lock` failure are self-healed by re-solving with a
+// pin/route/build rung (see `with_sdist_heal`) instead of surfacing to the
+// user:
 //
-// uv phrases this "<pkg> has no wheels" (no tag qualifier) or "<pkg>
-// has no wheels with a matching <foo> tag" for some other unsatisfied
-// tag axis (python/abi). This is DISTINCT from the manylinux ceiling,
-// which uv always phrases as "...matching platform tag..." — that
-// case has its own recovery path (glibc relax) and must never be
-// mistaken for "no conda route exists at all".
+//   * SDIST-ONLY: a transitive dependency publishes NO usable wheel (pure
+//     sdist, e.g. `pyperclip`, or a wheel-less version band pinned by a
+//     requirer's metadata). Under `--no-build` (spec §8.2 -- retread's
+//     source_build path owns builds) uv fails the WHOLE lock loudly, even
+//     when the sdist-only package is a deep transitive nobody asked for.
+//   * TRANSITIVE PRERELEASE: an exact pre-release pin declared by a
+//     TRANSITIVE dependency (e.g. isaacsim-core pinning
+//     `tinyobjloader==2.0.0rc13`). uv's `--prerelease
+//     if-necessary-or-explicit` only honors a pre-release specifier in a
+//     FIRST-PARTY (project) requirement, and "if-necessary" only fires
+//     when a package has zero stable releases -- so a transitive exact-rc
+//     pin still fails even with the flag set (issue #10, second half).
+//
+// DETECTION IS STRUCTURED, NOT PROSE-PARSED (issue #10 root cause). The
+// old approach regex-matched uv's human-readable stderr for a handful of
+// phrasings; any message uv worded differently fell through and failed the
+// whole lock. Instead, `compute_closure` runs a SECOND `uv lock` (Pass B)
+// with the offending restrictions relaxed (drop `--no-build`, set
+// `--prerelease allow`); if Pass B succeeds it EXPORTS the resolved lock
+// and reads, from the pylock document itself, exactly which packages
+// resolved sdist-only and which resolved to a pre-release version. That
+// structured offender set is carried to `with_sdist_heal` as a
+// [`HealNeeded`] error, replacing all stderr regex parsing. The manylinux
+// platform-tag ceiling stays a DIFFERENT recovery layer's job (glibc
+// relaxation, `installer::is_platform_tag_conflict`) and never enters the
+// two-pass at all.
 
-/// True when `text` (typically `uv lock` stderr) names a package with
-/// literally zero published wheels as the resolver failure — the
-/// sdist-only class this module self-heals. Returns `false` for the
-/// manylinux platform-tag ceiling (`installer::is_platform_tag_conflict`
-/// owns that recovery), even though both mention "no wheels": the tag
-/// case always says "platform tag" and is excluded here first.
-/// Whitespace-collapsed before matching (uv line-wraps its resolver
-/// prose across output lines).
-pub fn is_sdist_only_uv_error(text: &str) -> bool {
-    let t = text
-        .to_ascii_lowercase()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    if t.contains("platform tag") {
-        return false;
-    }
-    // "has no usable wheels" is uv's phrasing when a NAMED VERSION RANGE
-    // (not the bare package) is the subject -- e.g. a transitive exact
-    // pin with a `.*` wildcard range collapses to "pkg>=X,<=Y has no
-    // usable wheels" rather than the bare-package "pkg has no wheels"
-    // shape below (deps-from proof run 3: `hydra-core==1.3.2` pins
-    // `antlr4-python3-runtime==4.9.*`, which resolves to a range with
-    // zero wheel-bearing builds under `--no-build`). Same sdist-only
-    // class, different uv prose shape -- must self-heal identically.
-    if t.contains("has no wheels")
-        || t.contains("no wheels with a matching")
-        || t.contains("has no usable wheels")
-    {
-        return true;
-    }
-    // "only the following versions ... are available" band-complement
-    // shape (deps-from proof run 7, step4-lock-run7.log): once a
-    // wheel-less version band is filtered OUT of uv's candidate set
-    // entirely (e.g. `--no-build` hides every 4.9.x sdist-only release
-    // while a conda pin still demands one), uv stops saying "has no
-    // (usable) wheels" at all and instead lists the AVAILABLE set as
-    // the band's complement -- "only the following versions of
-    // antlr4-python3-runtime are available: antlr4-python3-
-    // runtime<4.9.dev0, antlr4-python3-runtime>=4.10.dev0". The
-    // `.dev0` range boundaries are the tell that an interior band of
-    // versions EXISTS upstream but was filtered (a genuinely-missing
-    // version is listed as plain released versions/ranges, never as a
-    // dev-bounded complement), so this is the same sdist-only class in
-    // a third prose shape. A rare misfire is benign: rung 2's sdist
-    // resolve fails for a version that truly doesn't exist and rung 3
-    // surfaces the ORIGINAL error verbatim (plus guidance).
-    t.contains("only the following versions of")
-        && t.contains("are available")
-        && t.contains(".dev0")
+/// The two offender classes [`classify_pylock_offenders`] extracts from a
+/// Pass-B export.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClosureOffenders {
+    /// Packages that resolved WITHOUT a usable wheel (sdist-only):
+    /// `(canonical pypi name, resolved version)`.
+    pub sdist_only: Vec<(String, String)>,
+    /// Packages that resolved to a PEP 440 pre-release version:
+    /// `(canonical pypi name, resolved version)`.
+    pub prerelease: Vec<(String, String)>,
 }
 
-/// Extract the PEP 503-canonical package name(s) uv's error names as
-/// sdist-only, e.g. from `"Because pyperclip has no wheels ... we can
-/// conclude..."` -> `["pyperclip"]`. Empty when [`is_sdist_only_uv_error`]
-/// is false (including the platform-tag class). Best-effort: an
-/// unparseable message that still matches the class returns an empty
-/// list rather than guessing, so the caller falls through to surfacing
-/// the original error (never silently drops a dependency it couldn't
-/// name).
-pub fn extract_sdist_only_packages(text: &str) -> Vec<String> {
-    if !is_sdist_only_uv_error(text) {
-        return Vec::new();
-    }
-    let t = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    // uv's resolver prose: "Because <name>[extra]==version has no wheels".
-    // `-`/`_`/`.` all appear in real PyPI names; extras and version
-    // pins are optional and dropped.
-    let re = regex::Regex::new(
-        r"(?i)because\s+([A-Za-z0-9][A-Za-z0-9._-]*)(?:\[[^\]]*\])?(?:[=><!~][=~<>0-9.a-zA-Z*, ]*)?\s+has no wheels",
-    )
-    .expect("static sdist-only extraction regex");
-    let mut names: BTreeSet<String> = BTreeSet::new();
-    for cap in re.captures_iter(&t) {
-        names.insert(canonical_conda_name(&cap[1]));
-    }
-    // "has no usable wheels" shape: the subject is a RANGE, not the bare
-    // "Because <name>" clause above (e.g. "...and antlr4-python3-
-    // runtime>=4.9,<=4.9.3 has no usable wheels, we can conclude..." --
-    // the package name sits directly before the version range, not right
-    // after "Because"). Anchor on the range/operator immediately
-    // preceding the phrase instead.
-    let re_ranged = regex::Regex::new(
-        r"(?i)([A-Za-z0-9][A-Za-z0-9._-]*)(?:>=|<=|==|>|<)\S*\s+has no usable wheels",
-    )
-    .expect("static ranged sdist-only extraction regex");
-    for cap in re_ranged.captures_iter(&t) {
-        names.insert(canonical_conda_name(&cap[1]));
-    }
-    // Band-complement shape (run 7): the failing package is the subject
-    // of "only the following versions of <name> are available" -- no
-    // "has no (usable) wheels" clause exists anywhere in the message,
-    // so neither regex above can name it.
-    let re_avail = regex::Regex::new(
-        r"(?i)only the following versions of\s+([A-Za-z0-9][A-Za-z0-9._-]*)\s+are\s+available",
-    )
-    .expect("static available-band sdist-only extraction regex");
-    for cap in re_avail.captures_iter(&t) {
-        names.insert(canonical_conda_name(&cap[1]));
-    }
-    names.into_iter().collect()
+/// Structured outcome of the two-pass detection in [`compute_closure`]:
+/// Pass A (`uv lock` with retread's normal restrictions) FAILED, but Pass
+/// B (the same lock with the offending restrictions relaxed) SUCCEEDED,
+/// and its exported lock was inspected to name the offenders exactly.
+/// Carried as an `anyhow` error so [`with_sdist_heal`] can `downcast` it
+/// and drive the heal rungs; any OTHER error class (a genuine resolution
+/// conflict, a platform-tag ceiling, Pass B also failing) surfaces as an
+/// ordinary error and passes straight through the heal wrapper unchanged.
+#[derive(Debug, Clone)]
+pub struct HealNeeded {
+    /// sdist-only offenders. Empty under `sdist-build = "never"` (Pass B
+    /// keeps `--no-build`, so sdist-only packages never resolve there --
+    /// only the prerelease relaxation applies).
+    pub sdist_only: Vec<(String, String)>,
+    /// Prerelease offenders. Healed by injecting an explicit first-party
+    /// `name==version` pin so uv's `explicit` prerelease policy honors it
+    /// on the next Pass A.
+    pub prerelease: Vec<(String, String)>,
+    /// Pass A's formatted failure, surfaced verbatim if the heal cannot
+    /// make progress (never silently drops a dependency).
+    pub original_error: String,
 }
 
-/// Find the ORIGINATING pypi requirement's raw version specifier for
-/// `name` in a sdist-only `uv lock` error, e.g. from `"...hydra-core==1.3.2
-/// depends on antlr4-python3-runtime==4.9.* and your project depends on
-/// hydra-core==1.3.2..."` with `name = "antlr4-python3-runtime"` ->
-/// `Some("==4.9.*")`. `name` is matched separator-insensitively (`-`/`_`
-/// both fold to a shared class) since uv's prose preserves the
-/// requirer's original spelling, which may differ from the
-/// PEP 503-canonical form [`extract_sdist_only_packages`] returns.
-/// `None` when no "depends on <name><specifier>" clause is found (either
-/// no specifier at all -- an unpinned dependency -- or the shape isn't
-/// present), which callers treat as "unpinned" (probe any version).
-pub fn extract_sdist_only_requirement(text: &str, name: &str) -> Option<String> {
-    let t = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    // Escape each separator-delimited segment BEFORE inserting the
-    // `[-_]` character class -- escaping the whole name first (e.g.
-    // `regex::escape("antlr4-python3-runtime")` -> `antlr4\-python3\-
-    // runtime`) and then substituting `-` would land the class right
-    // after a stray backslash (`\[-_]`), which the regex engine reads
-    // as an escaped literal `[`, not a character class.
-    let name_pat = name
-        .split(['-', '_'])
-        .map(regex::escape)
-        .collect::<Vec<_>>()
-        .join("[-_]");
-    let re = regex::Regex::new(&format!(
-        r"(?i)depends on\s+{name_pat}((?:[=><!~]=?|==)\S*)"
-    ))
-    .ok()?;
-    re.captures(&t)
-        .and_then(|c| c.get(1))
-        // uv's prose may run the specifier straight into sentence
-        // punctuation ("...depends on antlr4-python3-runtime==4.9.*, we
-        // can conclude..." -- run 7's band-complement shape), which the
-        // greedy `\S*` capture swallows. A PEP 440 specifier never ENDS
-        // with `,` (comma is the AND separator between clauses) or `.`
-        // (a version segment always follows a dot), so trailing sentence
-        // punctuation is safe to strip.
-        .map(|m| m.as_str().trim_end_matches([',', '.', ';']).to_string())
+impl std::fmt::Display for HealNeeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.original_error)
+    }
 }
 
-/// Translate a raw PyPI/PEP 440 version specifier (as captured by
-/// [`extract_sdist_only_requirement`]) into the equivalent conda
-/// match-spec version fragment, so a conda-route probe for a
-/// wheel-less transitive dependency is constrained to the SAME range
-/// the originating pypi requirement demanded (rather than resolving to
-/// conda's unconstrained latest, which can clash with the pypi
-/// requirement's own metadata -- deps-from proof run 5:
-/// `antlr4-python3-runtime` routed to conda `==4.13.2` while
-/// hydra-core's metadata still required `==4.9.*`).
-///
-/// Translation rules (conda match-spec version syntax is a near-superset
-/// of PEP 440 for the forms uv's error prose actually emits):
-/// * `None` (no specifier captured -- unpinned dependency) -> `"*"`
-///   (any version, the pre-existing probe behavior).
-/// * `==X.Y.*` (wildcard/prefix match) -> `X.Y.*` (conda's own prefix
-///   wildcard syntax; the `==` prefix is conda-invalid and dropped).
-/// * `==X.Y.Z` (exact pin, no wildcard) -> `==X.Y.Z` (conda accepts `==`
-///   for an exact match; passed through unchanged).
-/// * Comma-joined range clauses (`>=A,<B`, `>=A,<=B`, etc.) -> passed
-///   through unchanged; conda match-spec ANDs comma-separated clauses
-///   exactly like PEP 440 does.
-/// * Anything else unrecognized -> passed through unchanged (best
-///   effort: an over-constrained but syntactically-invalid spec fails
-///   the probe closed, i.e. routes nothing, rather than silently
-///   widening to conda's latest).
-pub fn conda_spec_from_pypi_specifier(spec: Option<&str>) -> String {
-    let Some(spec) = spec else {
-        return "*".to_string();
-    };
-    let spec = spec.trim();
-    if spec.is_empty() {
-        return "*".to_string();
-    }
-    if let Some(rest) = spec.strip_prefix("==")
-        && rest.ends_with(".*")
-    {
-        return rest.to_string();
-    }
-    spec.to_string()
-}
+impl std::error::Error for HealNeeded {}
 
-/// Guidance appended to the ORIGINAL uv error (verbatim, never
-/// paraphrased — spec convention shared with [`format_lock_failure`])
-/// when one or more sdist-only packages have no conda candidate
-/// either AND the sdist auto-build rung is disabled (`sdist-build =
-/// "never"`) or was never reached. Never silently drops the
-/// dependency: the caller must choose.
-pub fn sdist_only_no_route_message(names: &[String]) -> String {
-    let list = names.join(", ");
-    format!(
-        "\npackage {list} has no wheels and no conda candidate; options: allow \
-         build (no-build = false), drop-dep, or vendor a wheel.\n"
-    )
+/// Classify the offenders in a Pass-B pylock export (structured, no prose
+/// parsing). A package is SDIST-ONLY when it carries a source
+/// distribution but no wheels in the resolved lock (uv had to build it
+/// from source because it publishes no usable wheel); and PRERELEASE when
+/// its resolved version parses as a PEP 440 pre-release
+/// ([`uv_pep440::Version::any_prerelease`]). Local sources
+/// (path/vcs/archive -- retread's own built wheels / editable checkouts)
+/// are skipped: they are never index offenders. A package may fall in
+/// BOTH lists (a wheel-less pre-release); each list is then handled by its
+/// own rung.
+pub fn classify_pylock_offenders(pylock_text: &str) -> Result<ClosureOffenders> {
+    let doc: toml::Value = toml::from_str(pylock_text)
+        .context("parsing Pass-B pylock.toml for offender detection")?;
+    let packages = doc
+        .get("packages")
+        .and_then(|p| p.as_array())
+        .ok_or_else(|| anyhow!("Pass-B pylock.toml: missing [[packages]] array"))?;
+    let mut sdist_only = Vec::new();
+    let mut prerelease = Vec::new();
+    for pkg in packages {
+        let Some(name) = pkg.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        // Local sources are never index offenders.
+        if pkg.get("directory").is_some()
+            || pkg.get("vcs").is_some()
+            || pkg.get("archive").is_some()
+        {
+            continue;
+        }
+        let Some(version) = pkg.get("version").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let canon = canonical_conda_name(name);
+        // sdist-only: has a source distribution but no wheels resolved.
+        let has_sdist = pkg.get("sdist").is_some();
+        let has_wheel = pkg
+            .get("wheels")
+            .and_then(|w| w.as_array())
+            .is_some_and(|a| !a.is_empty());
+        if has_sdist && !has_wheel {
+            sdist_only.push((canon.clone(), version.to_string()));
+        }
+        // prerelease: resolved version is a PEP 440 pre-release.
+        if uv_pep508::uv_pep440::Version::from_str(version)
+            .map(|v| v.any_prerelease())
+            .unwrap_or(false)
+        {
+            prerelease.push((canon, version.to_string()));
+        }
+    }
+    Ok(ClosureOffenders {
+        sdist_only,
+        prerelease,
+    })
 }
 
 /// A wheel AUTO-BUILT from a PyPI sdist by the sdist-only self-heal's
@@ -1265,6 +1192,23 @@ pub struct BuiltSdistWheel {
     pub sdist_source: crate::lock::SdistWheelSource,
 }
 
+/// A transitive PRERELEASE pin the heal injected: the offending package
+/// resolved to a pre-release version only once uv's prerelease policy was
+/// relaxed (Pass B), so the heal re-pins it as an EXPLICIT first-party
+/// `name==version` requirement (`req.prerelease_pins`) to make uv's
+/// `explicit` policy honor it on the next Pass A. Unlike a sdist build,
+/// the package keeps its own index wheel; this record exists so the caller
+/// can log/audit the repair with the same provenance conventions the
+/// route/build rungs use (the resolved version also lands in the closure's
+/// `pins` naturally, keeping the repair out of the user's manifest).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrereleasePin {
+    /// PEP 503-canonical PyPI name.
+    pub pypi_name: String,
+    /// Resolved pre-release version pinned explicitly.
+    pub version: String,
+}
+
 /// Guidance appended to the ORIGINAL uv error when the sdist auto-build
 /// rung was attempted for one or more sdist-only names and FAILED for
 /// at least one of them. Surfaces the tail of each build failure
@@ -1291,70 +1235,44 @@ pub fn sdist_build_failed_message(failures: &[(String, String)]) -> String {
     out
 }
 
-/// Wrap a `solve` closure with the sdist-only self-heal ladder: on a
-/// `uv lock` failure naming the sdist-only class
-/// ([`is_sdist_only_uv_error`]), each named package climbs a THREE-rung
-/// ladder before the caller ever sees an error:
+/// Wrap a `solve` closure with the self-heal ladder. On a
+/// [`HealNeeded`] error (Pass A failed, Pass B succeeded, offenders named
+/// structurally by [`classify_pylock_offenders`]), each offender is
+/// repaired before the caller ever sees an error:
 ///
-/// 1. **conda-route** (pre-existing): probed against the workspace conda
-///    channels for ANY compatible version (`sdist_probe`; unlike the
-///    exact-version auto-route round, there is no resolved pypi version
-///    to probe AT — uv never produced a closure). A hit routes the
-///    package to conda via the same mechanism as an ordinary auto-route
-///    hit (exclude from the closure at `uv export` time + pin/range on
-///    the conda-resolved version). **This alone can never satisfy `uv
-///    lock`**: `--no-emit-package` is an `export`-only flag
-///    (`compute_closure` never passes `req.no_emit_packages` to the
-///    `lock` subcommand), so a package with zero usable PyPI wheels in
-///    its required range fails `uv lock` identically whether or not it
-///    is conda-routed. Rung 1 exists purely to keep the routed package
-///    out of the final exported closure (conda already provides it) —
-///    it is NOT an alternative to rung 2, it runs alongside it.
-/// 2. **sdist auto-build**: attempted for EVERY named package this
-///    round — including ones rung 1 just routed or routed in an earlier
-///    round — when `sdist_build` is `Some` (config `sdist-build =
-///    "auto"`, the default). The package is built from its PyPI sdist
-///    via `sdist_build`, which receives the ORIGINATING pypi
-///    requirement's raw version specifier (the same one rung 1's conda
-///    probe uses, e.g. `==4.9.*`; `None` = unpinned = newest) so the
-///    built wheel actually SATISFIES the requirer's metadata — building
-///    the newest sdist (4.13.x) for a `==4.9.*` requirement just re-fails
-///    the re-solve (deps-from proof run 7). Same machinery git-sourced
-///    `[retread-wheels]` entries use
-///    (`crate::source_build::build_wheel_from_sdist_url`), cached/stored
-///    content-addressed. A success registers a `tool.uv.sources` path
-///    source (`req.built_wheel_sources`) so the re-solve is satisfied
-///    exactly like a real index wheel — this is what actually clears
-///    `uv lock`, whether or not the package was also conda-routed — and
-///    records a [`BuiltSdistWheel`] for the caller to splice into the
-///    final closure's `wheels` with full provenance (harmless if the
-///    package is ALSO conda-routed: `no_emit_packages` still drops it
-///    from the exported closure, so conda's copy is what ships).
-/// 3. **error**: when the build rung is disabled (`sdist_build` is
-///    `None` / `sdist-build = "never"`) or the build itself fails, the
-///    original uv error surfaces verbatim, with guidance appended
-///    ([`sdist_only_no_route_message`] for names with no conda route /
-///    a routed-but-build-disabled note for names that do /
-///    [`sdist_build_failed_message`] on a build failure). It never
-///    silently drops a dependency.
+/// SDIST-ONLY offenders `(name, resolved_version)` climb the pre-existing
+/// rungs, now keyed on the EXACT version Pass B resolved (`==version`)
+/// rather than a regex-guessed range:
+/// 1. **conda-route**: probed against the workspace conda channels at the
+///    resolved version (`sdist_probe`). A hit routes the package to conda
+///    (exclude from the closure at export + pin). This alone can never
+///    satisfy `uv lock` (`--no-emit-package` is export-only), so it runs
+///    ALONGSIDE rung 2, never instead of it.
+/// 2. **sdist auto-build**: builds the package from its PyPI sdist at the
+///    resolved version via `sdist_build` (config `sdist-build = "auto"`,
+///    the default). Registers a `tool.uv.sources` path source so the
+///    re-solve is satisfied like a real index wheel, and records a
+///    [`BuiltSdistWheel`] for the caller to splice into the closure.
+/// 3. **error**: build rung disabled (`sdist_build` is `None`) or the
+///    build itself fails -> Pass A's original error surfaces (with the
+///    build failure's log tail on a build failure). Never silently drops a
+///    dependency. (Under `sdist-build = "never"`, Pass B keeps
+///    `--no-build` so sdist-only offenders never appear here in the first
+///    place -- this branch is defensive.)
 ///
-/// A name is considered fully "healed" (dropped from later rounds'
-/// `names`) only once rung 2 has actually BUILT a wheel for it — a
-/// rung-1-only route is never sufficient (see point 1 above), so a name
-/// that keeps recurring in uv's error after being routed keeps climbing
-/// to rung 2 rather than being treated as already handled (deps-from
-/// proof run 6: an earlier revision filtered on "routed OR built" and
-/// let a rung-1 hit permanently mask the still-failing `uv lock`).
+/// PRERELEASE offenders `(name, resolved_version)` are re-pinned as an
+/// EXPLICIT first-party `name==version` requirement (`req.prerelease_pins`
+/// -> the synthesized project's `dependencies`), so uv's
+/// `if-necessary-or-explicit` policy honors the transitive pre-release on
+/// the next Pass A. This is orthogonal to the build policy and works even
+/// under `sdist-build = "never"`.
 ///
-/// Bounded by [`AUTO_ROUTE_MAX_ROUNDS`] heal attempts, mirroring the
-/// auto-route round cap; every attempt that doesn't abort or succeed
-/// strictly grows the accumulated routed+built set, which is bounded by
-/// the number of distinct sdist-only names uv can name.
-///
-/// The routes/builds discovered here are appended to `routed` / `built`
-/// (shared with the caller via `Arc<Mutex<_>>`) so a wrapping
-/// [`auto_route_fixpoint`] caller can splice them into the final
-/// closure and log them with the same provenance conventions.
+/// Bounded by [`AUTO_ROUTE_MAX_ROUNDS`] heal attempts; every attempt that
+/// doesn't abort or succeed strictly grows the accumulated
+/// routed+built+prereleased set. The routes/builds/prerelease pins
+/// discovered are appended to `routed` / `built` / `prereleased` (shared
+/// with the caller via `Arc<Mutex<_>>`) so a wrapping caller can splice
+/// them into the final closure and log them.
 pub fn with_sdist_heal<S, SP, SB>(
     bundle: String,
     solve: S,
@@ -1362,6 +1280,7 @@ pub fn with_sdist_heal<S, SP, SB>(
     sdist_build: Option<SB>,
     routed: std::sync::Arc<std::sync::Mutex<Vec<AutoRoutedPackage>>>,
     built: std::sync::Arc<std::sync::Mutex<Vec<BuiltSdistWheel>>>,
+    prereleased: std::sync::Arc<std::sync::Mutex<Vec<PrereleasePin>>>,
 ) -> impl FnMut(UvClosureRequest) -> futures::future::BoxFuture<'static, Result<UvClosure>>
 where
     S: FnMut(UvClosureRequest) -> futures::future::BoxFuture<'static, Result<UvClosure>>
@@ -1390,10 +1309,11 @@ where
         let sdist_build = std::sync::Arc::clone(&sdist_build);
         let routed = std::sync::Arc::clone(&routed);
         let built = std::sync::Arc::clone(&built);
-        // Already-healed exclusions/pins/path-sources accumulated across
-        // earlier outer-loop rounds must apply to THIS round's request
-        // too — the outer fixpoint owns `req` and knows nothing about
-        // them.
+        let prereleased = std::sync::Arc::clone(&prereleased);
+        // Already-healed exclusions/pins/path-sources/prerelease-pins
+        // accumulated across earlier outer-loop rounds must apply to THIS
+        // round's request too — the outer fixpoint owns `req` and knows
+        // nothing about them.
         {
             let already = routed.lock().unwrap();
             apply_auto_route(&mut req, &already);
@@ -1405,6 +1325,13 @@ where
                     .insert(w.pypi_name.clone(), w.wheel_path.clone());
             }
         }
+        {
+            let already = prereleased.lock().unwrap();
+            for p in already.iter() {
+                req.prerelease_pins
+                    .insert(p.pypi_name.clone(), p.version.clone());
+            }
+        }
         let fut = (*solve.lock().unwrap())(req.clone());
         Box::pin(async move {
             let mut req = req;
@@ -1413,24 +1340,14 @@ where
                 match attempt.await {
                     Ok(closure) => return Ok(closure),
                     Err(e) => {
-                        let msg = format!("{e:#}");
-                        // A name is fully exhausted only once a wheel has
-                        // actually been BUILT for it (rung 2 success).
-                        // Conda-routing (rung 1) alone can NEVER satisfy
-                        // `uv lock` for this error class: `--no-emit-
-                        // package` only reaches the later `uv export`
-                        // step (see the module doc + `compute_closure`),
-                        // so a package pinned to a conda-resolved version
-                        // that itself has zero usable PyPI wheels fails
-                        // `uv lock` identically, whether or not it is
-                        // routed. Filtering `names` on `routed` too (as
-                        // an earlier revision did) let a rung-1 hit mask
-                        // the fact that rung 2 was never reached, then
-                        // treated the IDENTICAL failure recurring next
-                        // round as "already handled" and surfaced it
-                        // verbatim (deps-from proof run 6: antlr4-python3-
-                        // runtime==4.9.3, conda-routed, `uv lock` still
-                        // failed on it every round after).
+                        // ONLY the structured two-pass verdict drives the
+                        // heal; every other error class (genuine conflict,
+                        // platform-tag ceiling, Pass B also failing) passes
+                        // straight through unchanged.
+                        let heal = match e.downcast::<HealNeeded>() {
+                            Ok(h) => h,
+                            Err(other) => return Err(other),
+                        };
                         let already_built: std::collections::BTreeSet<String> = {
                             let b = built.lock().unwrap();
                             b.iter().map(|w| w.pypi_name.clone()).collect()
@@ -1439,116 +1356,85 @@ where
                             let r = routed.lock().unwrap();
                             r.iter().map(|r| r.pypi_name.clone()).collect()
                         };
-                        let names: Vec<String> = extract_sdist_only_packages(&msg)
-                            .into_iter()
-                            .filter(|n| !already_built.contains(n))
-                            .collect();
-                        if names.is_empty() {
-                            return Err(e);
-                        }
-                        // Rung 1: conda-route. Skip names already routed
-                        // in an earlier round (no need to re-probe or
-                        // re-log an already-known route) -- but note a
-                        // route, new or old, does NOT exempt the name
-                        // from rung 2 below.
-                        // Carry the ORIGINATING pypi requirement's
-                        // version range into BOTH rungs -- a bare
-                        // "any version" let a wheel-less transitive dep
-                        // like `antlr4-python3-runtime` route to conda's
-                        // unconstrained latest (`==4.13.2`) and, run 7,
-                        // let the build rung download/build the newest
-                        // sdist (4.13.x) instead of one satisfying the
-                        // requirer's own metadata (`==4.9.*`), so the
-                        // re-solve failed identically.
-                        let requirements: std::collections::BTreeMap<&str, Option<String>> = names
+                        let already_pre: std::collections::BTreeSet<String> = {
+                            let p = prereleased.lock().unwrap();
+                            p.iter().map(|p| p.pypi_name.clone()).collect()
+                        };
+                        // Prerelease offenders not yet pinned this run.
+                        let new_pre: Vec<PrereleasePin> = heal
+                            .prerelease
                             .iter()
-                            .map(|n| (n.as_str(), extract_sdist_only_requirement(&msg, n)))
+                            .filter(|(n, _)| !already_pre.contains(n))
+                            .map(|(n, v)| PrereleasePin {
+                                pypi_name: n.clone(),
+                                version: v.clone(),
+                            })
                             .collect();
-                        let mut new_routes = Vec::new();
-                        for name in names.iter().filter(|n| !already_routed.contains(*n)) {
-                            let raw_requirement =
-                                requirements.get(name.as_str()).cloned().unwrap_or_default();
-                            let spec = conda_spec_from_pypi_specifier(raw_requirement.as_deref());
-                            if let Some(hit) = sdist_probe(name.clone(), spec).await {
-                                new_routes.push(AutoRoutedPackage {
-                                    pypi_name: name.clone(),
-                                    conda_name: name.clone(),
-                                    pypi_version: hit.conda_version.clone(),
-                                    conda_version: hit.conda_version.clone(),
-                                    channel: hit.channel.clone(),
-                                });
-                            }
+                        // Sdist-only offenders that still need a wheel. A
+                        // name is fully exhausted only once rung 2 has
+                        // actually BUILT a wheel for it (a rung-1 route
+                        // alone can never satisfy `uv lock` -- deps-from
+                        // proof run 6).
+                        let sdist_names: Vec<(String, String)> = heal
+                            .sdist_only
+                            .iter()
+                            .filter(|(n, _)| !already_built.contains(n))
+                            .cloned()
+                            .collect();
+                        if new_pre.is_empty() && sdist_names.is_empty() {
+                            // Nothing new to try -> surface Pass A's error.
+                            return Err(anyhow!("{}", heal.original_error));
                         }
-                        let routed_now: std::collections::BTreeSet<&str> =
-                            new_routes.iter().map(|r| r.pypi_name.as_str()).collect();
-                        // Rung 2: sdist auto-build. Attempted for EVERY
-                        // name still unresolved this round -- not only
-                        // rung-1 misses -- since rung 1 can never satisfy
-                        // `uv lock` by itself for this error class (see
-                        // comment above `names`). Only attempted when the
-                        // caller enabled it (`sdist-build = "auto"`, the
-                        // default); a `None` builder means `"never"` and
-                        // rung 3 fires immediately, matching the pre-
-                        // build-rung behavior for names with no route,
-                        // plus a distinct message for names that DID
-                        // route but still can't clear `uv lock` without a
-                        // build.
+
+                        // -- sdist rungs (only when a wheel is needed) --
+                        let mut new_routes = Vec::new();
                         let mut new_built = Vec::new();
-                        let mut build_failures: Vec<(String, String)> = Vec::new();
-                        match sdist_build.as_ref() {
-                            Some(build) => {
-                                for name in &names {
-                                    let raw_requirement = requirements
-                                        .get(name.as_str())
-                                        .cloned()
-                                        .unwrap_or_default();
-                                    match build(name.clone(), raw_requirement).await {
-                                        Ok(w) => new_built.push(w),
-                                        Err(e) => {
-                                            build_failures.push((name.clone(), format!("{e:#}")));
-                                        }
+                        if !sdist_names.is_empty() {
+                            let Some(build) = sdist_build.as_ref() else {
+                                // `sdist-build = "never"`: no wheel can be
+                                // produced (should be unreachable -- Pass B
+                                // keeps `--no-build` under Never so sdist-
+                                // only offenders don't resolve there).
+                                return Err(anyhow!("{}", heal.original_error));
+                            };
+                            let mut build_failures: Vec<(String, String)> = Vec::new();
+                            for (name, version) in &sdist_names {
+                                let spec = format!("=={version}");
+                                // Rung 1: conda-route (skip already-routed).
+                                if !already_routed.contains(name)
+                                    && let Some(hit) =
+                                        sdist_probe(name.clone(), spec.clone()).await
+                                {
+                                    new_routes.push(AutoRoutedPackage {
+                                        pypi_name: name.clone(),
+                                        conda_name: name.clone(),
+                                        pypi_version: hit.conda_version.clone(),
+                                        conda_version: hit.conda_version.clone(),
+                                        channel: hit.channel.clone(),
+                                    });
+                                }
+                                // Rung 2: build from the sdist at the exact
+                                // resolved version.
+                                match build(name.clone(), Some(spec)).await {
+                                    Ok(w) => new_built.push(w),
+                                    Err(be) => {
+                                        build_failures.push((name.clone(), format!("{be:#}")))
                                     }
                                 }
                             }
-                            None => {
-                                let unrouted: Vec<String> = names
-                                    .iter()
-                                    .filter(|n| {
-                                        !routed_now.contains(n.as_str())
-                                            && !already_routed.contains(*n)
-                                    })
-                                    .cloned()
-                                    .collect();
-                                let mut guidance = String::new();
-                                if !unrouted.is_empty() {
-                                    guidance.push_str(&sdist_only_no_route_message(&unrouted));
-                                }
-                                let routed_unbuildable: Vec<String> = names
-                                    .iter()
-                                    .filter(|n| !unrouted.contains(n))
-                                    .cloned()
-                                    .collect();
-                                if !routed_unbuildable.is_empty() {
-                                    guidance.push_str(&format!(
-                                        "\npackage {} has a conda candidate but `sdist-build = \
-                                         \"never\"` -- `uv lock` still requires a real PyPI \
-                                         wheel for it (conda-routing only exempts a package at \
-                                         the later `uv export` step); set `sdist-build = \
-                                         \"auto\"` or vendor a wheel.\n",
-                                        routed_unbuildable.join(", "),
-                                    ));
-                                }
-                                bail!("{msg}{guidance}");
+                            // Rung 3: any build failure aborts loudly (a
+                            // partial success still fails rather than
+                            // silently dropping the failed name).
+                            if !build_failures.is_empty() {
+                                bail!(
+                                    "{}{}",
+                                    heal.original_error,
+                                    sdist_build_failed_message(&build_failures)
+                                );
                             }
                         }
-                        // Rung 3: error. Only the names the build rung
-                        // actually failed for abort — a partial success
-                        // (some names built, one didn't) still fails
-                        // loudly rather than silently dropping the
-                        // failed name.
-                        if !build_failures.is_empty() {
-                            bail!("{msg}{}", sdist_build_failed_message(&build_failures));
-                        }
+
+                        // -- apply discoveries to the request + ledgers --
                         for h in &new_routes {
                             tracing::info!(
                                 bundle = %bundle,
@@ -1558,24 +1444,31 @@ where
                             );
                         }
                         apply_auto_route(&mut req, &new_routes);
-                        {
-                            let mut g = routed.lock().unwrap();
-                            g.extend(new_routes.clone());
-                        }
+                        routed.lock().unwrap().extend(new_routes.clone());
                         for w in &new_built {
                             req.built_wheel_sources
                                 .insert(w.pypi_name.clone(), w.wheel_path.clone());
                         }
-                        {
-                            let mut g = built.lock().unwrap();
-                            g.extend(new_built.clone());
+                        built.lock().unwrap().extend(new_built.clone());
+                        for p in &new_pre {
+                            tracing::info!(
+                                bundle = %bundle,
+                                "transitive prerelease {}=={} pinned as an explicit \
+                                 first-party requirement so uv honors it",
+                                p.pypi_name,
+                                p.version,
+                            );
+                            req.prerelease_pins
+                                .insert(p.pypi_name.clone(), p.version.clone());
                         }
+                        prereleased.lock().unwrap().extend(new_pre.clone());
+
                         attempt = (*solve.lock().unwrap())(req.clone());
                     }
                 }
             }
             bail!(
-                "sdist-only self-heal exceeded {} rounds for bundle `{}`",
+                "self-heal exceeded {} rounds for bundle `{}`",
                 AUTO_ROUTE_MAX_ROUNDS,
                 bundle,
             );
@@ -1624,6 +1517,10 @@ where
 {
     let sdist_routed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let sdist_built = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    // Prerelease pins the heal injects surface naturally in the closure's
+    // `pins`/`wheels` (the offending package keeps its own index wheel); we
+    // collect them here only to log/audit the repair.
+    let sdist_prereleased = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let healed_solve = with_sdist_heal(
         req.bundle.clone(),
         solve,
@@ -1631,6 +1528,7 @@ where
         sdist_build,
         std::sync::Arc::clone(&sdist_routed),
         std::sync::Arc::clone(&sdist_built),
+        std::sync::Arc::clone(&sdist_prereleased),
     );
     let mut closure = auto_route_fixpoint(req, opts, healed_solve, probe).await?;
     let extra = sdist_routed.lock().unwrap();
@@ -1962,9 +1860,19 @@ pub fn synthesize_pyproject(req: &UvClosureRequest) -> String {
         "requires-python = {}\n",
         toml_str(&requires_python)
     ));
+    // Transitive-prerelease repairs are appended to the project's DIRECT
+    // dependencies as explicit `name==version` pins: uv's `explicit`
+    // prerelease policy only honors a pre-release specifier declared
+    // first-party, so this is the least-invasive carrier that makes uv
+    // select the pre-release a transitive dep pinned (see
+    // `with_sdist_heal`). Ephemeral -- never touches the user's manifest.
+    let mut deps = req.dependencies.clone();
+    for (name, version) in &req.prerelease_pins {
+        deps.push(format!("{}=={}", canonical_conda_name(name), version));
+    }
     out.push_str(&format!(
         "dependencies = {}\n",
-        toml_string_array("", &req.dependencies)
+        toml_string_array("", &deps)
     ));
 
     out.push_str("\n[tool.uv]\n");
@@ -2360,6 +2268,130 @@ const PYLOCK_FILE: &str = "pylock.retread.toml";
 const PROVENANCE_FILE: &str = "constraints.provenance.json";
 const CONFLICT_FILE: &str = "retread-conflict.json";
 
+/// The relaxations Pass B may apply over Pass A when `uv lock` fails.
+/// SINGLE-SOURCED so the Pass A and Pass B argument vectors can only
+/// differ by these known bits: any new restrictive flag added to
+/// [`build_lock_args`] appears in BOTH passes automatically (guarded by
+/// `pass_a_and_pass_b_differ_only_by_known_relaxations`), closing the
+/// stderr-regex whack-a-mole that issue #10 kept re-opening.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LockRelaxations {
+    /// Allow uv to build sdists (drop `--no-build`) so sdist-only
+    /// transitive deps can resolve. Gated by `sdist-build` policy.
+    allow_sdist_build: bool,
+    /// `--prerelease` policy value.
+    prerelease: &'static str,
+}
+
+impl LockRelaxations {
+    /// Pass A: retread's normal restrictions -- no sdist builds (retread's
+    /// source_build path owns builds), pre-releases only when strictly
+    /// necessary or explicitly first-party.
+    const PASS_A: Self = Self {
+        allow_sdist_build: false,
+        prerelease: "if-necessary-or-explicit",
+    };
+    /// Pass B under `sdist-build = "auto"`: relax BOTH the build gate and
+    /// the prerelease policy in one retry.
+    const PASS_B_AUTO: Self = Self {
+        allow_sdist_build: true,
+        prerelease: "allow",
+    };
+    /// Pass B under `sdist-build = "never"`: prerelease relaxation ONLY
+    /// (build policy is orthogonal; `--no-build` stays, so sdist-only
+    /// packages still can't resolve -- only transitive-prerelease healing
+    /// works under Never).
+    const PASS_B_NEVER: Self = Self {
+        allow_sdist_build: false,
+        prerelease: "allow",
+    };
+
+    /// Pass B relaxations appropriate for the pack's build policy.
+    fn pass_b_for(policy: crate::config::SdistBuildPolicy) -> Self {
+        match policy {
+            crate::config::SdistBuildPolicy::Auto => Self::PASS_B_AUTO,
+            crate::config::SdistBuildPolicy::Never => Self::PASS_B_NEVER,
+        }
+    }
+}
+
+/// Assemble the `uv lock` argument vector. COMMON args are single-sourced
+/// here; only the [`LockRelaxations`]-controlled bits (`--no-build`
+/// presence and the `--prerelease` value) vary between Pass A and Pass B.
+///
+/// CRITICAL: uv runs with `UV_NO_CONFIG=1` to isolate the resolve from
+/// user-level uv.toml, which on uv 0.11.x ALSO strips config-file-class
+/// keys (`no-build`, `index-strategy`, `prerelease`, `[[tool.uv.index]]`)
+/// from the synthesized pyproject's `[tool.uv]` table -- so every such
+/// setting is passed here as a CLI flag, which `UV_NO_CONFIG` never
+/// touches. Without the index flags uv falls back to pypi.org alone (where
+/// e.g. `isaacsim` is only a stub sdist) and the closure exports zero
+/// wheels.
+fn build_lock_args(
+    project_dir: &Path,
+    python_version: &str,
+    index_urls: &[String],
+    offline: bool,
+    relax: LockRelaxations,
+) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "lock".into(),
+        "--project".into(),
+        project_dir.to_string_lossy().into_owned(),
+        "--python".into(),
+        python_version.to_string(),
+        "--no-progress".into(),
+        "--color".into(),
+        "never".into(),
+    ];
+    // Relaxation-controlled: `--no-build` is a DENY flag, present only when
+    // sdist builds are NOT allowed.
+    if !relax.allow_sdist_build {
+        args.push("--no-build".into());
+    }
+    args.push("--index-strategy".into());
+    args.push("unsafe-best-match".into());
+    // Relaxation-controlled: the `--prerelease` VALUE differs.
+    args.push("--prerelease".into());
+    args.push(relax.prerelease.into());
+    for url in index_urls {
+        args.push("--index".into());
+        args.push(url.clone());
+    }
+    if offline {
+        args.push("--offline".into());
+    }
+    args
+}
+
+/// Assemble the `uv export` argument vector (single-sourced so the green
+/// path and the Pass-B offender-detection export stay identical).
+fn build_export_args(project_dir: &Path, no_emit_packages: &[String], offline: bool) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "export".into(),
+        "--project".into(),
+        project_dir.to_string_lossy().into_owned(),
+        "--format".into(),
+        "pylock.toml".into(),
+        "--frozen".into(),
+        "--no-emit-project".into(),
+        "--no-annotate".into(),
+        "--no-progress".into(),
+        "--color".into(),
+        "never".into(),
+        "--output-file".into(),
+        PYLOCK_FILE.into(),
+    ];
+    for name in no_emit_packages {
+        args.push("--no-emit-package".into());
+        args.push(canonical_conda_name(name));
+    }
+    if offline {
+        args.push("--offline".into());
+    }
+    args
+}
+
 /// Compute the closure for `req` under `project_dir` (created if absent):
 /// write the synthesized project, run `uv lock` + `uv export`, parse the
 /// pylock. `recorded_uv_version` (when Some, e.g. from a committed lock)
@@ -2370,6 +2402,7 @@ pub async fn compute_closure(
     project_dir: &Path,
     uv_cache_dir: &Path,
     recorded_uv_version: Option<&str>,
+    sdist_build_policy: crate::config::SdistBuildPolicy,
 ) -> Result<UvClosure> {
     let (uv_bin, uv_version) = detect_uv().await?;
     tracing::info!(
@@ -2422,44 +2455,17 @@ pub async fn compute_closure(
         }
     };
 
-    // -- uv lock -----------------------------------------------------------
-    let mut lock_args: Vec<String> = vec![
-        "lock".into(),
-        "--project".into(),
-        project_dir.to_string_lossy().into_owned(),
-        "--python".into(),
-        req.python_version.clone(),
-        "--no-progress".into(),
-        "--color".into(),
-        "never".into(),
-    ];
-    // CRITICAL: we run uv with UV_NO_CONFIG=1 to isolate the resolve
-    // from user-level uv.toml. As of uv 0.11.x that ALSO strips the
-    // configuration-file-class keys from the synthesized pyproject's
-    // `[tool.uv]` table -- `[[tool.uv.index]]`, `no-build`,
-    // `index-strategy`, and `prerelease` are silently ignored
-    // (project-only keys like `environments`, `override-dependencies`,
-    // `constraint-dependencies` and `[tool.uv.sources]` still apply).
-    // Without the index flags uv falls back to pypi.org alone, where
-    // e.g. `isaacsim` exists only as a stub sdist (the real
-    // manylinux_2_35 wheels live on pypi.nvidia.com) -- the closure then
-    // exports zero wheels and the whole workspace lock fails. Pass every
-    // config-file-class setting as a CLI flag, which UV_NO_CONFIG never
-    // touches. The `[tool.uv]` copies stay in the synthesized pyproject
-    // for uv versions where --no-config leaves project tables alone
-    // (the flags and the table agree).
-    lock_args.push("--no-build".into());
-    lock_args.push("--index-strategy".into());
-    lock_args.push("unsafe-best-match".into());
-    lock_args.push("--prerelease".into());
-    lock_args.push("if-necessary-or-explicit".into());
-    for url in &req.index_urls {
-        lock_args.push("--index".into());
-        lock_args.push(url.clone());
-    }
-    if req.offline {
-        lock_args.push("--offline".into());
-    }
+    // -- uv lock (Pass A) --------------------------------------------------
+    // Pass A uses retread's normal restrictions. On failure, `compute_
+    // closure` runs a STRUCTURED two-pass detection (Pass B, relaxed) to
+    // name the offenders exactly -- see the `HealNeeded` module doc.
+    let lock_args = build_lock_args(
+        project_dir,
+        &req.python_version,
+        &req.index_urls,
+        req.offline,
+        LockRelaxations::PASS_A,
+    );
 
     // Stale-lock guard: `uv lock` reuses a pre-existing uv.lock whenever
     // it still satisfies the pyproject TEXT -- it cannot see the CLI
@@ -2498,33 +2504,76 @@ pub async fn compute_closure(
             project_dir.join(CONFLICT_FILE),
             serde_json::to_string_pretty(&record).unwrap_or_default(),
         );
-        bail!("{}", format_lock_failure(req, &stderr, &attributions));
+        let original_error = format_lock_failure(req, &stderr, &attributions);
+
+        // The manylinux platform-tag ceiling is a DIFFERENT recovery
+        // layer's job (glibc relaxation, `installer::is_platform_tag_
+        // conflict`) -- never enter the sdist/prerelease two-pass for it
+        // (Pass B could "heal" it by building an sdist for a package that
+        // publishes wheels for other platforms, stealing the glibc-relax
+        // path's ownership).
+        if crate::installer::is_platform_tag_conflict(&stderr) {
+            bail!("{original_error}");
+        }
+
+        // -- uv lock (Pass B): relax the offending restrictions ----------
+        // Same invocation as Pass A, single-sourced through
+        // `build_lock_args`, differing ONLY by the known relaxations
+        // (drop `--no-build` under `sdist-build = "auto"`, and set
+        // `--prerelease allow` always). Pass B may build sdists to extract
+        // metadata; those artifacts are discarded (we only inspect the
+        // resolved lock). Pass B inherits Pass A's `--offline` flag: an
+        // offline replay stays offline (deterministic/sandbox-safe) and
+        // simply fails Pass B if it can't fetch sdist metadata, which then
+        // surfaces Pass A's error below -- exactly the pre-two-pass
+        // behavior.
+        let pass_b_args = build_lock_args(
+            project_dir,
+            &req.python_version,
+            &req.index_urls,
+            req.offline,
+            LockRelaxations::pass_b_for(sdist_build_policy),
+        );
+        let pass_b_out = run(pass_b_args).await?;
+        if !pass_b_out.status.success() {
+            // Pass B also failed: a genuine resolution conflict (not merely
+            // an sdist/prerelease restriction). Surface Pass A's error,
+            // matching pre-two-pass behavior.
+            bail!("{original_error}");
+        }
+
+        // Pass B resolved. Export its lock and read the offenders
+        // STRUCTURALLY from the pylock document (no stderr prose parsing).
+        let pass_b_export =
+            run(build_export_args(project_dir, &req.no_emit_packages, req.offline)).await?;
+        if !pass_b_export.status.success() {
+            // Can't inspect the Pass B lock -> fall back to Pass A's error.
+            bail!("{original_error}");
+        }
+        let pass_b_pylock = tokio::fs::read_to_string(project_dir.join(PYLOCK_FILE))
+            .await
+            .context("reading Pass-B pylock for offender detection")?;
+        let offenders = classify_pylock_offenders(&pass_b_pylock)?;
+        if offenders.sdist_only.is_empty() && offenders.prerelease.is_empty() {
+            // Pass B succeeded but named no healable offender (whatever the
+            // relaxation flipped, it isn't a class we repair) -> surface
+            // Pass A's error rather than loop.
+            bail!("{original_error}");
+        }
+        return Err(anyhow::Error::new(HealNeeded {
+            sdist_only: offenders.sdist_only,
+            prerelease: offenders.prerelease,
+            original_error,
+        }));
     }
 
     // -- uv export ---------------------------------------------------------
-    let mut export_args: Vec<String> = vec![
-        "export".into(),
-        "--project".into(),
-        project_dir.to_string_lossy().into_owned(),
-        "--format".into(),
-        "pylock.toml".into(),
-        "--frozen".into(),
-        "--no-emit-project".into(),
-        "--no-annotate".into(),
-        "--no-progress".into(),
-        "--color".into(),
-        "never".into(),
-        "--output-file".into(),
-        PYLOCK_FILE.into(),
-    ];
-    for name in &req.no_emit_packages {
-        export_args.push("--no-emit-package".into());
-        export_args.push(canonical_conda_name(name));
-    }
-    if req.offline {
-        export_args.push("--offline".into());
-    }
-    let export_out = run(export_args).await?;
+    let export_out = run(build_export_args(
+        project_dir,
+        &req.no_emit_packages,
+        req.offline,
+    ))
+    .await?;
     if !export_out.status.success() {
         bail!(
             "uv export failed for bundle `{}`:\n{}",
@@ -2617,6 +2666,7 @@ mod tests {
                 "https://pypi.org/simple/".to_string(),
             ],
             built_wheel_sources: built,
+            prerelease_pins: BTreeMap::new(),
             offline: false,
         }
     }
@@ -3206,6 +3256,7 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
             no_emit_packages: vec![],
             index_urls: vec!["https://pypi.org/simple/".into()],
             built_wheel_sources: BTreeMap::new(),
+            prerelease_pins: BTreeMap::new(),
             offline: false,
         }
     }
@@ -3911,9 +3962,16 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
             no_emit_packages: vec![],
             index_urls: vec!["https://pypi.org/simple/".into()],
             built_wheel_sources: BTreeMap::new(),
+            prerelease_pins: BTreeMap::new(),
             offline: false,
         };
-        let closure = compute_closure(&req, &tmp.join("project"), &tmp.join("uv-cache"), None)
+        let closure = compute_closure(
+            &req,
+            &tmp.join("project"),
+            &tmp.join("uv-cache"),
+            None,
+            crate::config::SdistBuildPolicy::Auto,
+        )
             .await
             .unwrap();
         let _ = std::fs::remove_dir_all(&tmp);
@@ -3945,6 +4003,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
             no_emit_packages: vec![],
             index_urls: vec!["https://pypi.org/simple/".into()],
             built_wheel_sources: BTreeMap::new(),
+            prerelease_pins: BTreeMap::new(),
             offline: false,
         };
         let opts = AutoRouteOptions {
@@ -3968,7 +4027,16 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
             move |r: UvClosureRequest| {
                 let project = project.clone();
                 let cache = cache.clone();
-                Box::pin(async move { compute_closure(&r, &project, &cache, None).await })
+                Box::pin(async move {
+                    compute_closure(
+                        &r,
+                        &project,
+                        &cache,
+                        None,
+                        crate::config::SdistBuildPolicy::Auto,
+                    )
+                    .await
+                })
                     as futures::future::BoxFuture<'static, Result<UvClosure>>
             }
         };
@@ -4615,350 +4683,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
         assert_eq!(closure.auto_routed[0].pypi_name, "numpy");
     }
 
-    // ---- sdist-only self-heal --------------------------------------------
-
-    const SDIST_ONLY_UV_ERR: &str = "  x No solution found when resolving dependencies:\n  \
-         `-> Because pyperclip has no wheels and you require pyperclip,\n  \
-             we can conclude that your requirements are unsatisfiable.";
-
-    const PLATFORM_TAG_UV_ERR: &str = "× No solution found when resolving dependencies:\n  \
-        ╰─▶ Because isaacsim[all]==6.0.0.1 has no wheels with a matching platform \
-        tag (e.g., `manylinux_2_34_x86_64`) and you require isaacsim[all]==6.0.0.1, \
-        we can conclude that your requirements are unsatisfiable.";
-
-    #[test]
-    fn is_sdist_only_uv_error_matches_no_wheels_class() {
-        assert!(is_sdist_only_uv_error(SDIST_ONLY_UV_ERR));
-        // Platform-tag ceiling: distinct class, must NOT trigger this path
-        // (installer::is_platform_tag_conflict owns glibc relaxation there).
-        assert!(!is_sdist_only_uv_error(PLATFORM_TAG_UV_ERR));
-        assert!(!is_sdist_only_uv_error("unrelated network error"));
-    }
-
-    #[test]
-    fn extract_sdist_only_packages_names_the_package() {
-        assert_eq!(
-            extract_sdist_only_packages(SDIST_ONLY_UV_ERR),
-            vec!["pyperclip".to_string()]
-        );
-        // Platform-tag class extracts nothing -- it is not this class.
-        assert!(extract_sdist_only_packages(PLATFORM_TAG_UV_ERR).is_empty());
-        assert!(extract_sdist_only_packages("unrelated failure").is_empty());
-    }
-
-    #[test]
-    fn extract_sdist_only_packages_handles_extras_and_version() {
-        let text = "Because foo-bar[extra]==1.2.3 has no wheels and you require \
-                     foo-bar, we can conclude that your requirements are unsatisfiable.";
-        assert_eq!(
-            extract_sdist_only_packages(text),
-            vec!["foo-bar".to_string()]
-        );
-    }
-
-    // deps-from proof run 3 (step4-lock-run3.log): a wildcard-pinned
-    // transitive dep (`hydra-core==1.3.2` depends on
-    // `antlr4-python3-runtime==4.9.*`) collapses to a RANGE subject in
-    // uv's prose ("...antlr4-python3-runtime>=4.9,<=4.9.3 has no usable
-    // wheels...") rather than the bare "Because <name> has no wheels"
-    // shape -- distinct phrasing ("usable"), distinct clause shape (the
-    // package sits right before the range/operator, not right after
-    // "Because"). Must still be recognized as the same sdist-only class
-    // so the pre-existing conda-route/auto-build ladder self-heals it.
-    const NO_USABLE_WHEELS_RANGE_UV_ERR: &str = "× No solution found when resolving dependencies for split: \
-         Because only the following versions of antlr4-python3-runtime are \
-         available: antlr4-python3-runtime<4.9.dev0, antlr4-python3-runtime==4.9, \
-         antlr4-python3-runtime==4.9.1, antlr4-python3-runtime==4.9.2, \
-         antlr4-python3-runtime==4.9.3, antlr4-python3-runtime>4.10.dev0 and \
-         antlr4-python3-runtime>=4.9,<=4.9.3 has no usable wheels, we can \
-         conclude that antlr4-python3-runtime>=4.9,<=4.9.3 cannot be used. \
-         And because hydra-core==1.3.2 depends on antlr4-python3-runtime==4.9.* \
-         and your project depends on hydra-core==1.3.2, we can conclude that \
-         your project's requirements are unsatisfiable.";
-
-    #[test]
-    fn is_sdist_only_uv_error_matches_has_no_usable_wheels_range_class() {
-        assert!(is_sdist_only_uv_error(NO_USABLE_WHEELS_RANGE_UV_ERR));
-    }
-
-    #[test]
-    fn extract_sdist_only_packages_names_wildcard_pinned_transitive_dep() {
-        assert_eq!(
-            extract_sdist_only_packages(NO_USABLE_WHEELS_RANGE_UV_ERR),
-            vec!["antlr4-python3-runtime".to_string()]
-        );
-    }
-
-    // ---- run-5 fix: carry the pypi requirement's range into the conda
-    // probe (rather than routing to conda's unconstrained latest) -----
-
-    #[test]
-    fn extract_sdist_only_requirement_finds_wildcard_pin() {
-        assert_eq!(
-            extract_sdist_only_requirement(NO_USABLE_WHEELS_RANGE_UV_ERR, "antlr4-python3-runtime"),
-            Some("==4.9.*".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_sdist_only_requirement_none_when_unpinned() {
-        // The bare "has no wheels" class never names a requirer's own
-        // specifier -- no "depends on <name><spec>" clause exists.
-        assert_eq!(
-            extract_sdist_only_requirement(SDIST_ONLY_UV_ERR, "pyperclip"),
-            None
-        );
-    }
-
-    #[test]
-    fn extract_sdist_only_requirement_is_separator_insensitive() {
-        // uv may spell the requirer's dependency with underscores where
-        // the canonical (PEP 503) name uses hyphens, or vice versa.
-        let text = "Because foo_bar has no wheels, we can conclude that \
-                     foo_bar cannot be used. And because baz depends on \
-                     foo-bar==1.2.* and your project depends on baz, we \
-                     can conclude your requirements are unsatisfiable.";
-        assert_eq!(
-            extract_sdist_only_requirement(text, "foo_bar"),
-            Some("==1.2.*".to_string())
-        );
-    }
-
-    // deps-from proof run 7 (step4-lock-run7.log, ErrorObject message
-    // decoded: pixi display-wrapping undone, `\n` escapes restored to
-    // real newlines -- the shape the backend-side error chain actually
-    // carries): once the wheel-less 4.9.x band is filtered out of uv's
-    // candidate set entirely, uv stops saying "has no (usable) wheels"
-    // and lists the AVAILABLE set as the band's dev-bounded complement
-    // ("antlr4-python3-runtime<4.9.dev0", ">=4.10.dev0"). Third prose
-    // shape of the same sdist-only class.
-    const ONLY_VERSIONS_AVAILABLE_BAND_UV_ERR: &str =
-        include_str!("../tests/fixtures/solve_errors/uv_closure_only_versions_available_band.txt");
-
-    #[test]
-    fn is_sdist_only_uv_error_matches_available_band_class() {
-        assert!(is_sdist_only_uv_error(ONLY_VERSIONS_AVAILABLE_BAND_UV_ERR));
-    }
-
-    #[test]
-    fn extract_sdist_only_packages_names_available_band_subject() {
-        assert_eq!(
-            extract_sdist_only_packages(ONLY_VERSIONS_AVAILABLE_BAND_UV_ERR),
-            vec!["antlr4-python3-runtime".to_string()]
-        );
-    }
-
-    #[test]
-    fn extract_sdist_only_requirement_trims_trailing_sentence_punctuation() {
-        // Run 7's prose runs the specifier straight into a comma
-        // ("...depends on antlr4-python3-runtime==4.9.*, we can...") --
-        // the greedy capture must not keep it.
-        assert_eq!(
-            extract_sdist_only_requirement(
-                ONLY_VERSIONS_AVAILABLE_BAND_UV_ERR,
-                "antlr4-python3-runtime"
-            ),
-            Some("==4.9.*".to_string())
-        );
-    }
-
-    #[test]
-    fn conda_spec_from_pypi_specifier_translates_wildcard() {
-        assert_eq!(conda_spec_from_pypi_specifier(Some("==4.9.*")), "4.9.*");
-    }
-
-    #[test]
-    fn conda_spec_from_pypi_specifier_passes_through_exact_pin() {
-        assert_eq!(conda_spec_from_pypi_specifier(Some("==4.9.3")), "==4.9.3");
-    }
-
-    #[test]
-    fn conda_spec_from_pypi_specifier_passes_through_range() {
-        assert_eq!(
-            conda_spec_from_pypi_specifier(Some(">=4.9,<=4.9.3")),
-            ">=4.9,<=4.9.3"
-        );
-    }
-
-    #[test]
-    fn conda_spec_from_pypi_specifier_none_is_unpinned_wildcard() {
-        assert_eq!(conda_spec_from_pypi_specifier(None), "*");
-    }
-
-    /// Fixture-driven fixpoint reproducing deps-from proof run 5: the
-    /// sdist-route probe must receive the requirement's `==4.9.*` range
-    /// (translated to conda's `4.9.*`) rather than an unconstrained
-    /// `"*"`, so a conda-forge channel carrying BOTH a 4.9.x build and a
-    /// newer 4.13.x build routes to the 4.9.x version instead of
-    /// clashing with hydra-core's own pypi metadata. Run 6 additionally
-    /// proved routing alone can never satisfy `uv lock` for this error
-    /// class, so this fixture's mock `solve` (like real
-    /// `compute_closure`) also requires the rung-2 built wheel source
-    /// before it succeeds.
-    #[tokio::test]
-    async fn sdist_heal_probe_carries_pypi_requirement_range() {
-        let attempts = Arc::new(Mutex::new(0usize));
-        let solve = {
-            let attempts = Arc::clone(&attempts);
-            move |r: UvClosureRequest| {
-                let attempts = Arc::clone(&attempts);
-                Box::pin(async move {
-                    let mut n = attempts.lock().unwrap();
-                    *n += 1;
-                    if !r
-                        .no_emit_packages
-                        .contains(&"antlr4-python3-runtime".to_string())
-                        || !r.built_wheel_sources.contains_key("antlr4-python3-runtime")
-                    {
-                        bail!("{NO_USABLE_WHEELS_RANGE_UV_ERR}");
-                    }
-                    parse_pylock_closure(
-                        PYLOCK_FIXTURE,
-                        &target("3.12", "linux-64"),
-                        &BTreeSet::new(),
-                        "0.11.15",
-                    )
-                }) as futures::future::BoxFuture<'static, Result<UvClosure>>
-            }
-        };
-        let probe = |_name: String, _spec: String| {
-            Box::pin(async { None }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
-        };
-        let seen_specs = Arc::new(Mutex::new(Vec::new()));
-        let sdist_probe = {
-            let seen_specs = Arc::clone(&seen_specs);
-            move |name: String, spec: String| {
-                let seen_specs = Arc::clone(&seen_specs);
-                Box::pin(async move {
-                    seen_specs.lock().unwrap().push(spec.clone());
-                    if name == "antlr4-python3-runtime" && spec == "4.9.*" {
-                        Some(RouteProbeHit {
-                            conda_version: "4.9.3".into(),
-                            channel: "https://conda.anaconda.org/conda-forge/linux-64".into(),
-                            depends: Vec::new(),
-                        })
-                    } else {
-                        None
-                    }
-                }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
-            }
-        };
-        let seen_build_reqs = Arc::new(Mutex::new(Vec::new()));
-        let sdist_build = {
-            let seen_build_reqs = Arc::clone(&seen_build_reqs);
-            move |name: String, req: Option<String>| {
-                let seen_build_reqs = Arc::clone(&seen_build_reqs);
-                Box::pin(async move {
-                    seen_build_reqs.lock().unwrap().push(req);
-                    Ok(BuiltSdistWheel {
-                        pypi_name: name.clone(),
-                        version: "4.9.3".to_string(),
-                        filename: format!("{name}-4.9.3-py3-none-any.whl"),
-                        wheel_path: PathBuf::from(format!("/tmp/wheels/{name}-4.9.3.whl")),
-                        sha256: "d".repeat(64),
-                        sdist_source: sdist_source_fixture(&name, "4.9.3"),
-                    })
-                }) as futures::future::BoxFuture<'static, Result<BuiltSdistWheel>>
-            }
-        };
-        let closure = auto_route_fixpoint_with_sdist_heal(
-            &auto_route_req(),
-            &auto_route_opts(),
-            solve,
-            probe,
-            sdist_probe,
-            Some(sdist_build),
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            seen_specs.lock().unwrap().as_slice(),
-            &["4.9.*".to_string()],
-            "probe must be queried with the translated pypi requirement range, not a bare wildcard"
-        );
-        assert_eq!(
-            seen_build_reqs.lock().unwrap().as_slice(),
-            &[Some("==4.9.*".to_string())],
-            "the build rung must receive the RAW pypi requirement range (run-7 fix: a \
-             match-any selection built the newest sdist instead of one satisfying the requirer)"
-        );
-        assert_eq!(closure.auto_routed.len(), 1);
-        let r = &closure.auto_routed[0];
-        assert_eq!(r.pypi_name, "antlr4-python3-runtime");
-        assert_eq!(r.conda_version, "4.9.3");
-    }
-
-    /// Run-7 end-to-end: the band-complement template (which contains NO
-    /// "has no (usable) wheels" prose at all) must drive the full heal
-    /// ladder, and the build rung must receive the extracted requirement
-    /// range (`==4.9.*`) so the sdist selection builds 4.9.3 rather than
-    /// the newest release.
-    #[tokio::test]
-    async fn sdist_heal_available_band_template_builds_at_required_range() {
-        let solve = move |r: UvClosureRequest| {
-            Box::pin(async move {
-                if !r.built_wheel_sources.contains_key("antlr4-python3-runtime") {
-                    bail!("{ONLY_VERSIONS_AVAILABLE_BAND_UV_ERR}");
-                }
-                parse_pylock_closure(
-                    PYLOCK_FIXTURE,
-                    &target("3.12", "linux-64"),
-                    &BTreeSet::new(),
-                    "0.11.15",
-                )
-            }) as futures::future::BoxFuture<'static, Result<UvClosure>>
-        };
-        let probe = |_name: String, _spec: String| {
-            Box::pin(async { None }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
-        };
-        let sdist_probe = |_name: String, _spec: String| {
-            Box::pin(async { None }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
-        };
-        let seen_build_reqs = Arc::new(Mutex::new(Vec::new()));
-        let sdist_build = {
-            let seen_build_reqs = Arc::clone(&seen_build_reqs);
-            move |name: String, req: Option<String>| {
-                let seen_build_reqs = Arc::clone(&seen_build_reqs);
-                Box::pin(async move {
-                    seen_build_reqs.lock().unwrap().push((name.clone(), req));
-                    Ok(BuiltSdistWheel {
-                        pypi_name: name.clone(),
-                        version: "4.9.3".to_string(),
-                        filename: format!("{name}-4.9.3-py3-none-any.whl"),
-                        wheel_path: PathBuf::from(format!("/tmp/wheels/{name}-4.9.3.whl")),
-                        sha256: "e".repeat(64),
-                        sdist_source: sdist_source_fixture(&name, "4.9.3"),
-                    })
-                }) as futures::future::BoxFuture<'static, Result<BuiltSdistWheel>>
-            }
-        };
-        let closure = auto_route_fixpoint_with_sdist_heal(
-            &auto_route_req(),
-            &auto_route_opts(),
-            solve,
-            probe,
-            sdist_probe,
-            Some(sdist_build),
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            seen_build_reqs.lock().unwrap().as_slice(),
-            &[(
-                "antlr4-python3-runtime".to_string(),
-                Some("==4.9.*".to_string())
-            )],
-            "build rung must be reached from the band-complement template and receive \
-             the requirer's raw range"
-        );
-        let built = closure
-            .wheels
-            .iter()
-            .find(|w| w.name == "antlr4-python3-runtime")
-            .expect("built sdist wheel recorded in the closure");
-        assert_eq!(built.version, "4.9.3");
-        assert!(matches!(built.origin, Origin::Built));
-    }
+    // ---- self-heal: structured two-pass detection ------------------------
 
     /// Concrete "no builder" type for tests that disable the build rung
     /// (`sdist-build = "never"`) — `None::<NoBuild>` is the terse
@@ -4977,148 +4702,259 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
         }
     }
 
-    /// Fixture-driven fixpoint: `uv lock` fails once with the sdist-only
-    /// class naming `pyperclip`; the mock repodata probe has a hit -> the
-    /// package is ALSO routed to conda (excluded from export + pinned).
-    /// Routing alone can never satisfy `uv lock` (`--no-emit-package` is
-    /// an `export`-only flag), so the mock `solve` requires BOTH the
-    /// route AND a built wheel before it succeeds — modeling real
-    /// `compute_closure` behavior — and the build rung MUST still run
-    /// even though rung 1 hit (deps-from proof run 6 regression test:
-    /// an earlier revision skipped rung 2 whenever rung 1 hit and got
-    /// stuck re-surfacing the identical `uv lock` failure every round).
+    /// Build a [`HealNeeded`] the way `compute_closure`'s two-pass would.
+    fn heal_needed(
+        sdist_only: &[(&str, &str)],
+        prerelease: &[(&str, &str)],
+        original_error: &str,
+    ) -> anyhow::Error {
+        anyhow::Error::new(HealNeeded {
+            sdist_only: sdist_only
+                .iter()
+                .map(|(n, v)| (n.to_string(), v.to_string()))
+                .collect(),
+            prerelease: prerelease
+                .iter()
+                .map(|(n, v)| (n.to_string(), v.to_string()))
+                .collect(),
+            original_error: original_error.to_string(),
+        })
+    }
+
+    // ---- offender classification (structured, no prose parsing) ----------
+
+    #[test]
+    fn classify_pylock_offenders_splits_sdist_only_and_prerelease() {
+        // A Pass-B export with four packages: a plain index wheel (not an
+        // offender), an sdist-only package (source dist + no wheels), a
+        // pre-release-versioned wheel, and a local/directory source (never
+        // an offender).
+        let pylock = r#"
+lock-version = "1.0"
+created-by = "uv"
+
+[[packages]]
+name = "requests"
+version = "2.32.0"
+[[packages.wheels]]
+name = "requests-2.32.0-py3-none-any.whl"
+url = "https://files.pythonhosted.org/requests-2.32.0-py3-none-any.whl"
+[packages.wheels.hashes]
+sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
+
+[[packages]]
+name = "pyperclip"
+version = "1.8.2"
+[packages.sdist]
+name = "pyperclip-1.8.2.tar.gz"
+url = "https://files.pythonhosted.org/pyperclip-1.8.2.tar.gz"
+[packages.sdist.hashes]
+sha256 = "2222222222222222222222222222222222222222222222222222222222222222"
+
+[[packages]]
+name = "tinyobjloader"
+version = "2.0.0rc13"
+[[packages.wheels]]
+name = "tinyobjloader-2.0.0rc13-cp312-cp312-manylinux_2_28_x86_64.whl"
+url = "https://files.pythonhosted.org/tinyobjloader-2.0.0rc13.whl"
+[packages.wheels.hashes]
+sha256 = "3333333333333333333333333333333333333333333333333333333333333333"
+
+[[packages]]
+name = "my-editable"
+version = "0.1.0"
+[packages.directory]
+path = "../my-editable"
+"#;
+        let offenders = classify_pylock_offenders(pylock).unwrap();
+        assert_eq!(
+            offenders.sdist_only,
+            vec![("pyperclip".to_string(), "1.8.2".to_string())],
+            "only the source-dist-without-wheels package is sdist-only"
+        );
+        assert_eq!(
+            offenders.prerelease,
+            vec![("tinyobjloader".to_string(), "2.0.0rc13".to_string())],
+            "only the PEP 440 pre-release version is a prerelease offender"
+        );
+    }
+
+    #[test]
+    fn classify_pylock_offenders_flags_wheelless_prerelease_in_both() {
+        // A package that is BOTH sdist-only AND a pre-release lands in
+        // both lists (each rung handles its own concern).
+        let pylock = r#"
+lock-version = "1.0"
+created-by = "uv"
+
+[[packages]]
+name = "weird"
+version = "0.9.0a1"
+[packages.sdist]
+name = "weird-0.9.0a1.tar.gz"
+url = "https://example/weird-0.9.0a1.tar.gz"
+[packages.sdist.hashes]
+sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
+"#;
+        let offenders = classify_pylock_offenders(pylock).unwrap();
+        assert_eq!(offenders.sdist_only, vec![("weird".to_string(), "0.9.0a1".to_string())]);
+        assert_eq!(offenders.prerelease, vec![("weird".to_string(), "0.9.0a1".to_string())]);
+    }
+
+    // ---- Pass A / Pass B lock-arg invariant ------------------------------
+
+    /// Multiset of the tokens in `a` not balanced by `b` and vice versa.
+    fn arg_symmetric_difference(a: &[String], b: &[String]) -> BTreeSet<String> {
+        let mut counts: BTreeMap<String, i64> = BTreeMap::new();
+        for t in a {
+            *counts.entry(t.clone()).or_default() += 1;
+        }
+        for t in b {
+            *counts.entry(t.clone()).or_default() -= 1;
+        }
+        counts
+            .into_iter()
+            .filter(|(_, c)| *c != 0)
+            .map(|(t, _)| t)
+            .collect()
+    }
+
+    /// Drift guard (the coordinator's whack-a-mole close-out): Pass A and
+    /// Pass B lock-arg vectors are single-sourced through `build_lock_args`
+    /// and may differ ONLY by the known relaxations. Any NEW restrictive
+    /// flag added to the shared builder appears in BOTH passes
+    /// automatically; a flag added to only one pass (via a new relaxation
+    /// field) shows up in the symmetric difference and fails this test
+    /// unless deliberately classified here.
+    #[test]
+    fn pass_a_and_pass_b_differ_only_by_known_relaxations() {
+        let dir = Path::new("/tmp/proj");
+        let indexes = vec!["https://pypi.nvidia.com".to_string(), "https://pypi.org/simple/".to_string()];
+        let a = build_lock_args(dir, "3.12", &indexes, false, LockRelaxations::PASS_A);
+        let b_auto = build_lock_args(dir, "3.12", &indexes, false, LockRelaxations::PASS_B_AUTO);
+        let b_never = build_lock_args(dir, "3.12", &indexes, false, LockRelaxations::PASS_B_NEVER);
+
+        // Pass A vs Pass B (auto): drop `--no-build`, flip prerelease value.
+        assert_eq!(
+            arg_symmetric_difference(&a, &b_auto),
+            BTreeSet::from([
+                "--no-build".to_string(),
+                "if-necessary-or-explicit".to_string(),
+                "allow".to_string(),
+            ]),
+            "Pass A/B(auto) may differ ONLY by the no-build gate + prerelease value; \
+             a new deny-style flag added to only one pass would surface here"
+        );
+        // Pass A vs Pass B (never): prerelease value only (`--no-build`
+        // stays -- build policy is orthogonal to prerelease healing).
+        assert_eq!(
+            arg_symmetric_difference(&a, &b_never),
+            BTreeSet::from([
+                "if-necessary-or-explicit".to_string(),
+                "allow".to_string(),
+            ]),
+            "under `sdist-build = never`, Pass B keeps --no-build and relaxes only prerelease"
+        );
+        // `--no-build` really is retained under Never and dropped under Auto.
+        assert!(b_never.iter().any(|t| t == "--no-build"));
+        assert!(!b_auto.iter().any(|t| t == "--no-build"));
+    }
+
+    #[test]
+    fn pass_a_lock_args_carry_prerelease_policy() {
+        // Regression: the CLI args vector must carry the prerelease policy
+        // (UV_NO_CONFIG=1 strips it from the synthesized pyproject table).
+        let dir = Path::new("/tmp/proj");
+        let a = build_lock_args(dir, "3.12", &[], false, LockRelaxations::PASS_A);
+        let idx = a.iter().position(|t| t == "--prerelease").expect("--prerelease flag present");
+        assert_eq!(a.get(idx + 1).map(String::as_str), Some("if-necessary-or-explicit"));
+    }
+
+    // ---- heal ladder driven by the structured verdict --------------------
+
+    /// A non-[`HealNeeded`] error (e.g. a genuine conflict or the
+    /// platform-tag ceiling `compute_closure` refuses to two-pass) passes
+    /// straight through the heal wrapper: no retry, no probe, no build.
     #[tokio::test]
-    async fn sdist_heal_builds_even_after_conda_route_hit() {
-        let attempts = Arc::new(Mutex::new(0usize));
+    async fn heal_passes_through_non_healneeded_errors() {
+        let calls = Arc::new(Mutex::new(0usize));
         let solve = {
-            let attempts = Arc::clone(&attempts);
-            move |r: UvClosureRequest| {
-                let attempts = Arc::clone(&attempts);
+            let calls = Arc::clone(&calls);
+            move |_r: UvClosureRequest| {
+                let calls = Arc::clone(&calls);
                 Box::pin(async move {
-                    let mut n = attempts.lock().unwrap();
-                    *n += 1;
-                    if !r.no_emit_packages.contains(&"pyperclip".to_string())
-                        || !r.built_wheel_sources.contains_key("pyperclip")
-                    {
-                        bail!("{SDIST_ONLY_UV_ERR}");
-                    }
-                    parse_pylock_closure(
-                        PYLOCK_FIXTURE,
-                        &target("3.12", "linux-64"),
-                        &BTreeSet::new(),
-                        "0.11.15",
-                    )
+                    *calls.lock().unwrap() += 1;
+                    bail!("uv lock failed ... has no wheels with a matching platform tag ...")
                 }) as futures::future::BoxFuture<'static, Result<UvClosure>>
             }
         };
-        let probe = |_name: String, _spec: String| {
+        let probe = |_n: String, _s: String| {
             Box::pin(async { None }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
         };
-        let sdist_probe = |name: String, _spec: String| {
-            Box::pin(async move {
-                if name == "pyperclip" {
-                    Some(RouteProbeHit {
-                        conda_version: "1.8.2".into(),
-                        channel: "https://conda.anaconda.org/conda-forge/linux-64".into(),
-                        depends: Vec::new(),
-                    })
-                } else {
-                    None
-                }
-            }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
-        };
-        let build_calls = Arc::new(Mutex::new(0usize));
-        let sdist_build = {
-            let build_calls = Arc::clone(&build_calls);
-            move |name: String, _req: Option<String>| {
-                let build_calls = Arc::clone(&build_calls);
+        let probe_calls = Arc::new(Mutex::new(0usize));
+        let sdist_probe = {
+            let probe_calls = Arc::clone(&probe_calls);
+            move |_n: String, _s: String| {
+                let probe_calls = Arc::clone(&probe_calls);
                 Box::pin(async move {
-                    *build_calls.lock().unwrap() += 1;
-                    assert_eq!(name, "pyperclip");
-                    Ok(BuiltSdistWheel {
-                        pypi_name: name.clone(),
-                        version: "1.8.2".to_string(),
-                        filename: "pyperclip-1.8.2-py3-none-any.whl".to_string(),
-                        wheel_path: PathBuf::from("/tmp/wheels/pyperclip-1.8.2-py3-none-any.whl"),
-                        sha256: "b".repeat(64),
-                        sdist_source: sdist_source_fixture("pyperclip", "1.8.2"),
-                    })
-                }) as futures::future::BoxFuture<'static, Result<BuiltSdistWheel>>
+                    *probe_calls.lock().unwrap() += 1;
+                    None
+                }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
             }
         };
-        let closure = auto_route_fixpoint_with_sdist_heal(
+        let err = auto_route_fixpoint_with_sdist_heal(
             &auto_route_req(),
             &auto_route_opts(),
             solve,
             probe,
             sdist_probe,
-            Some(sdist_build),
+            None::<NoBuild>,
         )
         .await
-        .unwrap();
-
-        assert_eq!(
-            *attempts.lock().unwrap(),
-            2,
-            "one failure + one healed retry"
-        );
-        assert_eq!(closure.auto_routed.len(), 1);
-        let r = &closure.auto_routed[0];
-        assert_eq!(r.pypi_name, "pyperclip");
-        assert_eq!(r.conda_name, "pyperclip");
-        assert_eq!(r.conda_version, "1.8.2");
-        assert!(r.channel.contains("conda-forge"));
-        assert_eq!(
-            *build_calls.lock().unwrap(),
-            1,
-            "rung 2 (build) must run in the SAME round as a rung-1 conda-route hit -- \
-             routing alone can never satisfy `uv lock`",
-        );
+        .unwrap_err();
+        assert!(err.to_string().contains("platform tag"), "{err}");
+        assert_eq!(*calls.lock().unwrap(), 1, "no retry on a non-HealNeeded error");
+        assert_eq!(*probe_calls.lock().unwrap(), 0, "no probe on a non-HealNeeded error");
     }
 
-    /// Regression test for deps-from proof run 6: the SAME package name
-    /// recurs in uv's error across TWO rounds even after being
-    /// conda-routed in round 1 (mirroring a real `uv lock` that still
-    /// needs a wheel despite the conda pin). The old ladder treated
-    /// "routed" as fully healed and, on round 2's identical failure,
-    /// filtered the name out of `names` and returned the original error
-    /// verbatim instead of climbing to rung 2. The fixed ladder must
-    /// still reach the build rung and succeed.
+    /// Sdist-only offender: the mock `compute_closure` reports it as a
+    /// structured [`HealNeeded`] until a wheel source exists, at which
+    /// point the re-solve succeeds. The conda-route rung hits AND the
+    /// build rung runs in the SAME round (routing alone can never satisfy
+    /// `uv lock`).
     #[tokio::test]
-    async fn sdist_heal_recurring_failure_after_route_still_reaches_build_rung() {
+    async fn heal_routes_and_builds_sdist_only_offender() {
         let attempts = Arc::new(Mutex::new(0usize));
         let solve = {
             let attempts = Arc::clone(&attempts);
             move |r: UvClosureRequest| {
                 let attempts = Arc::clone(&attempts);
                 Box::pin(async move {
-                    let mut n = attempts.lock().unwrap();
-                    *n += 1;
-                    if !r.built_wheel_sources.contains_key("antlr4-python3-runtime") {
-                        bail!("{NO_USABLE_WHEELS_RANGE_UV_ERR}");
+                    *attempts.lock().unwrap() += 1;
+                    if !r.built_wheel_sources.contains_key("pyperclip") {
+                        return Err(heal_needed(
+                            &[("pyperclip", "1.8.2")],
+                            &[],
+                            "package `pyperclip` has no usable wheels",
+                        ));
                     }
-                    parse_pylock_closure(
-                        PYLOCK_FIXTURE,
-                        &target("3.12", "linux-64"),
-                        &BTreeSet::new(),
-                        "0.11.15",
-                    )
+                    parse_pylock_closure(PYLOCK_FIXTURE, &target("3.12", "linux-64"), &BTreeSet::new(), "0.11.15")
                 }) as futures::future::BoxFuture<'static, Result<UvClosure>>
             }
         };
-        let probe = |_name: String, _spec: String| {
+        let probe = |_n: String, _s: String| {
             Box::pin(async { None }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
         };
-        let route_calls = Arc::new(Mutex::new(0usize));
+        let seen_specs = Arc::new(Mutex::new(Vec::new()));
         let sdist_probe = {
-            let route_calls = Arc::clone(&route_calls);
-            move |name: String, _spec: String| {
-                let route_calls = Arc::clone(&route_calls);
+            let seen_specs = Arc::clone(&seen_specs);
+            move |name: String, spec: String| {
+                let seen_specs = Arc::clone(&seen_specs);
                 Box::pin(async move {
-                    *route_calls.lock().unwrap() += 1;
-                    if name == "antlr4-python3-runtime" {
+                    seen_specs.lock().unwrap().push(spec.clone());
+                    if name == "pyperclip" {
                         Some(RouteProbeHit {
-                            conda_version: "4.9.3".into(),
+                            conda_version: "1.8.2".into(),
                             channel: "https://conda.anaconda.org/conda-forge/linux-64".into(),
                             depends: Vec::new(),
                         })
@@ -5128,89 +4964,13 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
                 }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
             }
         };
-        let build_calls = Arc::new(Mutex::new(0usize));
+        let seen_build_reqs = Arc::new(Mutex::new(Vec::new()));
         let sdist_build = {
-            let build_calls = Arc::clone(&build_calls);
-            move |name: String, _req: Option<String>| {
-                let build_calls = Arc::clone(&build_calls);
+            let seen_build_reqs = Arc::clone(&seen_build_reqs);
+            move |name: String, req: Option<String>| {
+                let seen_build_reqs = Arc::clone(&seen_build_reqs);
                 Box::pin(async move {
-                    *build_calls.lock().unwrap() += 1;
-                    Ok(BuiltSdistWheel {
-                        pypi_name: name.clone(),
-                        version: "4.9.3".to_string(),
-                        filename: format!("{name}-4.9.3-py3-none-any.whl"),
-                        wheel_path: PathBuf::from(format!("/tmp/wheels/{name}-4.9.3.whl")),
-                        sha256: "c".repeat(64),
-                        sdist_source: sdist_source_fixture(&name, "4.9.3"),
-                    })
-                }) as futures::future::BoxFuture<'static, Result<BuiltSdistWheel>>
-            }
-        };
-        let closure = auto_route_fixpoint_with_sdist_heal(
-            &auto_route_req(),
-            &auto_route_opts(),
-            solve,
-            probe,
-            sdist_probe,
-            Some(sdist_build),
-        )
-        .await
-        .unwrap();
-
-        assert!(
-            *attempts.lock().unwrap() >= 2,
-            "must retry at least once after the conda-route-only round still fails"
-        );
-        assert_eq!(
-            *build_calls.lock().unwrap(),
-            1,
-            "the recurring failure must still climb to rung 2 (build) instead of being \
-             surfaced verbatim as already-handled",
-        );
-        assert_eq!(closure.auto_routed.len(), 1);
-        assert_eq!(closure.auto_routed[0].pypi_name, "antlr4-python3-runtime");
-    }
-
-    /// Double-miss (no conda candidate) with the build rung ENABLED: the
-    /// sdist auto-build is invoked and, on success, the closure gains an
-    /// `Origin::Built` wheel carrying `sdist_source` provenance instead
-    /// of erroring.
-    #[tokio::test]
-    async fn sdist_heal_builds_on_double_miss() {
-        let attempts = Arc::new(Mutex::new(0usize));
-        let solve = {
-            let attempts = Arc::clone(&attempts);
-            move |r: UvClosureRequest| {
-                let attempts = Arc::clone(&attempts);
-                Box::pin(async move {
-                    let mut n = attempts.lock().unwrap();
-                    *n += 1;
-                    if !r.built_wheel_sources.contains_key("pyperclip") {
-                        bail!("{SDIST_ONLY_UV_ERR}");
-                    }
-                    parse_pylock_closure(
-                        PYLOCK_FIXTURE,
-                        &target("3.12", "linux-64"),
-                        &BTreeSet::new(),
-                        "0.11.15",
-                    )
-                }) as futures::future::BoxFuture<'static, Result<UvClosure>>
-            }
-        };
-        let probe = |_name: String, _spec: String| {
-            Box::pin(async { None }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
-        };
-        let sdist_probe = |_name: String, _spec: String| {
-            Box::pin(async { None }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
-        };
-        let build_calls = Arc::new(Mutex::new(0usize));
-        let sdist_build = {
-            let build_calls = Arc::clone(&build_calls);
-            move |name: String, _req: Option<String>| {
-                let build_calls = Arc::clone(&build_calls);
-                Box::pin(async move {
-                    *build_calls.lock().unwrap() += 1;
-                    assert_eq!(name, "pyperclip");
+                    seen_build_reqs.lock().unwrap().push(req);
                     Ok(BuiltSdistWheel {
                         pypi_name: name.clone(),
                         version: "1.8.2".to_string(),
@@ -5232,56 +4992,35 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
         )
         .await
         .unwrap();
-
-        assert_eq!(
-            *attempts.lock().unwrap(),
-            2,
-            "one failure + one healed retry"
-        );
-        assert_eq!(*build_calls.lock().unwrap(), 1);
-        assert!(closure.auto_routed.is_empty(), "no conda route this time");
-        let built = closure
-            .wheels
-            .iter()
-            .find(|w| w.name == "pyperclip")
-            .expect("built sdist wheel recorded in the closure");
-        assert_eq!(built.version, "1.8.2");
+        assert_eq!(*attempts.lock().unwrap(), 2, "one failure + one healed retry");
+        // Both rungs keyed on the EXACT resolved version from Pass B.
+        assert_eq!(seen_specs.lock().unwrap().as_slice(), &["==1.8.2".to_string()]);
+        assert_eq!(seen_build_reqs.lock().unwrap().as_slice(), &[Some("==1.8.2".to_string())]);
+        assert_eq!(closure.auto_routed.len(), 1);
+        assert_eq!(closure.auto_routed[0].pypi_name, "pyperclip");
+        let built = closure.wheels.iter().find(|w| w.name == "pyperclip").expect("built wheel spliced");
         assert!(matches!(built.origin, Origin::Built));
-        assert!(built.must_ship);
-        assert_eq!(built.sha256.as_deref(), Some("a".repeat(64).as_str()));
-        let prov = built
-            .sdist_source
-            .as_ref()
-            .expect("built sdist wheel must carry sdist_source provenance");
-        assert_eq!(prov.name, "pyperclip");
-        assert_eq!(prov.version, "1.8.2");
-        assert_eq!(
-            closure.pins.get("pyperclip").map(String::as_str),
-            Some("1.8.2")
-        );
+        assert_eq!(built.version, "1.8.2");
     }
 
-    /// Build rung enabled but the build ITSELF fails: rung 3 (error)
-    /// fires, surfacing the original uv error plus the build failure's
-    /// log tail and guidance -- never silently drops the dependency.
+    /// A build FAILURE surfaces the original error plus the build log tail
+    /// and never silently drops the dependency.
     #[tokio::test]
-    async fn sdist_heal_surfaces_build_failure_log_tail() {
+    async fn heal_surfaces_build_failure_log_tail() {
         let solve = |_r: UvClosureRequest| {
-            Box::pin(async { bail!("{SDIST_ONLY_UV_ERR}") })
-                as futures::future::BoxFuture<'static, Result<UvClosure>>
-        };
-        let probe = |_name: String, _spec: String| {
-            Box::pin(async { None }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
-        };
-        let sdist_probe = |_name: String, _spec: String| {
-            Box::pin(async { None }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
-        };
-        let sdist_build = |_name: String, _req: Option<String>| {
             Box::pin(async {
-                bail!(
-                    "uv [\"build\", \"--wheel\"] failed (status 1): error: \
-                     failed to build `pyperclip` (missing gcc)"
-                )
+                Err(heal_needed(&[("pyperclip", "1.8.2")], &[], "package `pyperclip` has no usable wheels"))
+            }) as futures::future::BoxFuture<'static, Result<UvClosure>>
+        };
+        let probe = |_n: String, _s: String| {
+            Box::pin(async { None }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
+        };
+        let sdist_probe = |_n: String, _s: String| {
+            Box::pin(async { None }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
+        };
+        let sdist_build = |_n: String, _r: Option<String>| {
+            Box::pin(async {
+                bail!("uv [\"build\", \"--wheel\"] failed (status 1): error: missing gcc")
             }) as futures::future::BoxFuture<'static, Result<BuiltSdistWheel>>
         };
         let err = auto_route_fixpoint_with_sdist_heal(
@@ -5295,27 +5034,24 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
         .await
         .unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("pyperclip has no wheels"), "{msg}");
+        assert!(msg.contains("has no usable wheels"), "{msg}");
         assert!(msg.contains("sdist auto-build failed"), "{msg}");
         assert!(msg.contains("missing gcc"), "{msg}");
     }
 
-    /// `sdist-build = "never"` (build rung disabled, `sdist_build: None`):
-    /// no conda candidate either -> the ORIGINAL uv error surfaces
-    /// verbatim, with the guidance text appended, exactly as before the
-    /// build rung existed. The build closure type itself is never
-    /// constructed (`None::<NoBuild>`), so there is no way for this path
-    /// to attempt a build.
+    /// `sdist-build = "never"` with a (defensive) sdist-only offender and
+    /// no builder: the original error surfaces, no build attempted.
     #[tokio::test]
-    async fn sdist_heal_never_policy_surfaces_original_error_with_guidance_on_miss() {
+    async fn heal_never_policy_surfaces_original_error_for_sdist_only() {
         let solve = |_r: UvClosureRequest| {
-            Box::pin(async { bail!("{SDIST_ONLY_UV_ERR}") })
-                as futures::future::BoxFuture<'static, Result<UvClosure>>
+            Box::pin(async {
+                Err(heal_needed(&[("pyperclip", "1.8.2")], &[], "package `pyperclip` has no usable wheels"))
+            }) as futures::future::BoxFuture<'static, Result<UvClosure>>
         };
-        let probe = |_name: String, _spec: String| {
+        let probe = |_n: String, _s: String| {
             Box::pin(async { None }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
         };
-        let sdist_probe = |_name: String, _spec: String| {
+        let sdist_probe = |_n: String, _s: String| {
             Box::pin(async { None }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
         };
         let err = auto_route_fixpoint_with_sdist_heal(
@@ -5328,45 +5064,42 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
         )
         .await
         .unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("pyperclip has no wheels"), "{msg}");
-        assert!(msg.contains("no conda candidate"), "{msg}");
-        assert!(msg.contains("no-build = false"), "{msg}");
+        assert!(err.to_string().contains("has no usable wheels"), "{err}");
     }
 
-    /// A platform-tag conflict (the manylinux ceiling, already handled
-    /// by `installer::is_platform_tag_conflict` via glibc relaxation)
-    /// must pass straight through unchanged -- the sdist-only heal must
-    /// never misfire on it, and neither the conda-route probe nor the
-    /// build rung is ever consulted.
+    /// Transitive-prerelease offender: the mock reports a [`HealNeeded`]
+    /// with a prerelease entry until the request carries an explicit
+    /// first-party pin, at which point the re-solve succeeds. Heals even
+    /// with the build rung DISABLED (prerelease is orthogonal to
+    /// `sdist-build`).
     #[tokio::test]
-    async fn sdist_heal_ignores_platform_tag_class() {
-        let calls = Arc::new(Mutex::new(0usize));
+    async fn heal_pins_transitive_prerelease_explicitly() {
+        let seen_pins = Arc::new(Mutex::new(Vec::new()));
         let solve = {
-            let calls = Arc::clone(&calls);
-            move |_r: UvClosureRequest| {
-                let calls = Arc::clone(&calls);
+            let seen_pins = Arc::clone(&seen_pins);
+            move |r: UvClosureRequest| {
+                let seen_pins = Arc::clone(&seen_pins);
                 Box::pin(async move {
-                    *calls.lock().unwrap() += 1;
-                    bail!("{PLATFORM_TAG_UV_ERR}")
+                    seen_pins.lock().unwrap().push(r.prerelease_pins.clone());
+                    if r.prerelease_pins.get("tinyobjloader").map(String::as_str) == Some("2.0.0rc13") {
+                        parse_pylock_closure(PYLOCK_FIXTURE, &target("3.12", "linux-64"), &BTreeSet::new(), "0.11.15")
+                    } else {
+                        Err(heal_needed(
+                            &[],
+                            &[("tinyobjloader", "2.0.0rc13")],
+                            "tinyobjloader was requested with a pre-release marker, but pre-releases weren't enabled",
+                        ))
+                    }
                 }) as futures::future::BoxFuture<'static, Result<UvClosure>>
             }
         };
-        let probe = |_name: String, _spec: String| {
+        let probe = |_n: String, _s: String| {
             Box::pin(async { None }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
         };
-        let sdist_probe_calls = Arc::new(Mutex::new(0usize));
-        let sdist_probe = {
-            let sdist_probe_calls = Arc::clone(&sdist_probe_calls);
-            move |_name: String, _spec: String| {
-                let sdist_probe_calls = Arc::clone(&sdist_probe_calls);
-                Box::pin(async move {
-                    *sdist_probe_calls.lock().unwrap() += 1;
-                    None
-                }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
-            }
+        let sdist_probe = |_n: String, _s: String| {
+            Box::pin(async { None }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
         };
-        let err = auto_route_fixpoint_with_sdist_heal(
+        let closure = auto_route_fixpoint_with_sdist_heal(
             &auto_route_req(),
             &auto_route_opts(),
             solve,
@@ -5375,11 +5108,194 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
             None::<NoBuild>,
         )
         .await
-        .unwrap_err();
-        assert!(err.to_string().contains("platform"), "{err}");
-        // The original error propagated straight through: no retry, and
-        // the sdist-heal probe was never issued (wrong error class).
-        assert_eq!(*calls.lock().unwrap(), 1);
-        assert_eq!(*sdist_probe_calls.lock().unwrap(), 0);
+        .unwrap();
+        // The re-solve saw the explicit first-party pin.
+        let pins = seen_pins.lock().unwrap();
+        assert!(pins.iter().any(|p| p.get("tinyobjloader").map(String::as_str) == Some("2.0.0rc13")));
+        // Closure resolved (mock returns the standard fixture on success).
+        assert!(!closure.wheels.is_empty());
     }
+
+    /// The prerelease pin renders into the synthesized project's DIRECT
+    /// dependencies as an explicit `name==version` requirement (uv's
+    /// `explicit` policy only honors first-party pre-release specifiers).
+    #[test]
+    fn synthesize_pyproject_renders_prerelease_pin_as_first_party_dep() {
+        let mut req = sample_request();
+        req.prerelease_pins.insert("tinyobjloader".to_string(), "2.0.0rc13".to_string());
+        let got = synthesize_pyproject(&req);
+        assert!(
+            got.contains("\"tinyobjloader==2.0.0rc13\""),
+            "prerelease pin must appear as a direct dependency:\n{got}"
+        );
+    }
+
+    // ---- live subprocess: two-pass transitive-prerelease heal ------------
+
+    /// Build a minimal, valid py3-none-any wheel (a zip with
+    /// METADATA/WHEEL/RECORD -- no build backend needed) into `dir`, and
+    /// return the PEP 503 index href for it (`<filename>#sha256=<hash>`) so
+    /// uv records a hash in the exported lock (uv leaves `hashes = {}` for
+    /// a bare `file://` wheel, which `parse_pylock_closure` rejects).
+    fn write_test_wheel(dir: &Path, name: &str, version: &str, requires: &[&str]) -> String {
+        use sha2::{Digest, Sha256};
+        use std::io::Write as _;
+        std::fs::create_dir_all(dir).unwrap();
+        let filename = format!("{name}-{version}-py3-none-any.whl");
+        let di = format!("{name}-{version}.dist-info");
+        let mut metadata = format!("Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n");
+        for r in requires {
+            metadata.push_str(&format!("Requires-Dist: {r}\n"));
+        }
+        let path = dir.join(&filename);
+        {
+            let f = std::fs::File::create(&path).unwrap();
+            let mut zip = zip::ZipWriter::new(f);
+            let opts = zip::write::SimpleFileOptions::default();
+            for (entry, body) in [
+                (format!("{di}/METADATA"), metadata.clone()),
+                (
+                    format!("{di}/WHEEL"),
+                    "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n".to_string(),
+                ),
+                (
+                    format!("{di}/RECORD"),
+                    format!("{di}/METADATA,,\n{di}/WHEEL,,\n{di}/RECORD,,\n"),
+                ),
+            ] {
+                zip.start_file(&entry, opts).unwrap();
+                zip.write_all(body.as_bytes()).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        let hash = format!("{:x}", Sha256::digest(std::fs::read(&path).unwrap()));
+        format!("{filename}#sha256={hash}")
+    }
+
+    /// End-to-end reproduction of issue #10's transitive-prerelease half,
+    /// fully offline (local wheels + uv-managed python). `astub==1.0`
+    /// depends on `bstub==1.0rc1` (a TRANSITIVE exact pre-release pin);
+    /// `bstub` also publishes a stable `0.9`. Under `--prerelease
+    /// if-necessary-or-explicit` Pass A FAILS ("if-necessary" doesn't fire
+    /// -- bstub has a stable release -- and "explicit" only honors
+    /// first-party pre-release specifiers). The structured two-pass names
+    /// `bstub==1.0rc1` from Pass B's export, re-pins it explicitly
+    /// first-party, and the heal converges with `bstub` locked at
+    /// `1.0rc1`.
+    #[tokio::test]
+    async fn transitive_prerelease_two_pass_heal_converges_offline() {
+        if detect_uv().await.is_err() {
+            eprintln!("skipping: uv not found on PATH");
+            return;
+        }
+        let tmp = std::env::temp_dir()
+            .join(format!("retread-prerelease-heal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let idx = tmp.join("index");
+        let bstub_dir = idx.join("bstub");
+        let astub_dir = idx.join("astub");
+        let b_stable = write_test_wheel(&bstub_dir, "bstub", "0.9", &[]);
+        let b_pre = write_test_wheel(&bstub_dir, "bstub", "1.0rc1", &[]);
+        let a = write_test_wheel(&astub_dir, "astub", "1.0", &["bstub==1.0rc1"]);
+        std::fs::write(
+            bstub_dir.join("index.html"),
+            format!("<a href=\"{b_stable}\">s</a><a href=\"{b_pre}\">p</a>"),
+        )
+        .unwrap();
+        std::fs::write(astub_dir.join("index.html"), format!("<a href=\"{a}\">a</a>")).unwrap();
+        let index_url = format!("file://{}/", idx.display());
+
+        let mk_req = || UvClosureRequest {
+            bundle: "prerelease-smoke".into(),
+            python_version: "3.12".into(),
+            conda_subdir: "linux-64".into(),
+            dependencies: vec!["astub".into()],
+            constraints: ConstraintSet::default(),
+            overrides: vec![],
+            no_emit_packages: vec![],
+            index_urls: vec![index_url.clone()],
+            built_wheel_sources: BTreeMap::new(),
+            prerelease_pins: BTreeMap::new(),
+            offline: false,
+        };
+
+        // Pass A alone reproduces the bug and the two-pass names the
+        // offender structurally.
+        let err = compute_closure(
+            &mk_req(),
+            &tmp.join("projA"),
+            &tmp.join("cache"),
+            None,
+            crate::config::SdistBuildPolicy::Auto,
+        )
+        .await
+        .expect_err("Pass A must fail: transitive prerelease not honored under if-necessary-or-explicit");
+        let heal = err
+            .downcast_ref::<HealNeeded>()
+            .unwrap_or_else(|| panic!("expected structured HealNeeded, got: {err:#}"));
+        assert!(heal.sdist_only.is_empty(), "no sdist-only offender here");
+        assert_eq!(
+            heal.prerelease,
+            vec![("bstub".to_string(), "1.0rc1".to_string())],
+            "Pass B's export must name the transitive prerelease offender"
+        );
+
+        // Full heal via the production wrapper converges and pins the
+        // prerelease.
+        let project = tmp.join("projB");
+        let cache = tmp.join("cache");
+        let solve = {
+            let project = project.clone();
+            let cache = cache.clone();
+            move |r: UvClosureRequest| {
+                let project = project.clone();
+                let cache = cache.clone();
+                Box::pin(async move {
+                    compute_closure(
+                        &r,
+                        &project,
+                        &cache,
+                        None,
+                        crate::config::SdistBuildPolicy::Auto,
+                    )
+                    .await
+                }) as futures::future::BoxFuture<'static, Result<UvClosure>>
+            }
+        };
+        let probe = |_n: String, _s: String| {
+            Box::pin(async { None }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
+        };
+        let sdist_probe = |_n: String, _s: String| {
+            Box::pin(async { None }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
+        };
+        let opts = AutoRouteOptions {
+            enabled: true,
+            protected: BTreeSet::from(["astub".to_string()]),
+            ..Default::default()
+        };
+        let closure = auto_route_fixpoint_with_sdist_heal(
+            &mk_req(),
+            &opts,
+            solve,
+            probe,
+            sdist_probe,
+            None::<NoBuild>,
+        )
+        .await
+        .expect("two-pass heal must converge");
+        assert_eq!(
+            closure.pins.get("bstub").map(String::as_str),
+            Some("1.0rc1"),
+            "final lock must pin bstub at the transitive prerelease"
+        );
+        assert!(
+            closure
+                .wheels
+                .iter()
+                .any(|w| w.name == "bstub" && w.version == "1.0rc1"),
+            "bstub's 1.0rc1 wheel must be in the closure"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
 }

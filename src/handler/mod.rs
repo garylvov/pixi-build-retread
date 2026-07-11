@@ -2160,18 +2160,16 @@ async fn build_sdist_wheel(
     conda_subdir: String,
     cache_dir: PathBuf,
 ) -> Result<crate::uv_closure::BuiltSdistWheel> {
-    // Constrain sdist selection to the ORIGINATING pypi requirement's
-    // version range when the heal ladder extracted one from uv's error
-    // (`extract_sdist_only_requirement`, e.g. `==4.9.*` -- the same
-    // range rung 1's conda probe uses). uv never produced a closure for
-    // this name, so there is no RESOLVED version to target, but there
-    // IS a required range: a match-any pick here downloaded/built the
-    // newest sdist (antlr4-python3-runtime 4.13.x) for a `==4.9.*`
-    // requirement, and the re-solve failed identically (deps-from proof
-    // run 7). `None` (unpinned dependency) or an unparseable captured
+    // Constrain sdist selection to the EXACT version the structured
+    // two-pass detection resolved for this name (`==<version>`, from Pass
+    // B's export -- see `uv_closure::with_sdist_heal`). Building the newest
+    // sdist instead would re-fail the re-solve when a requirer pinned an
+    // older version (a match-any pick built antlr4-python3-runtime 4.13.x
+    // for a `==4.9.*` requirer and the re-solve failed identically --
+    // deps-from proof run 7). `None` (no version passed) or an unparseable
     // specifier falls back to match-any (empty PEP 440 specifier set is
-    // vacuously satisfied by every version) -- the pre-range behavior,
-    // best-effort rather than refusing to heal at all.
+    // vacuously satisfied by every version), best-effort rather than
+    // refusing to heal at all.
     let match_any = || {
         VersionSpecifiers::from_str("")
             .expect("empty PEP 440 specifier string always parses (match-any)")
@@ -2592,6 +2590,7 @@ async fn uv_group_closure(
         no_emit_packages: no_emit,
         index_urls: index_urls.clone(),
         built_wheel_sources: BTreeMap::new(), // M1: source-built entries stay legacy
+        prerelease_pins: BTreeMap::new(),      // populated by the self-heal
         offline: false,
     };
     let project_dir = cache_dir.join("uv-projects").join(format!(
@@ -2680,11 +2679,19 @@ async fn uv_group_closure(
     let raw_solve = {
         let project_dir = project_dir.clone();
         let uv_cache_dir = uv_cache_dir.clone();
+        let sdist_build_policy = effective.sdist_build;
         move |r: crate::uv_closure::UvClosureRequest| {
             let project_dir = project_dir.clone();
             let uv_cache_dir = uv_cache_dir.clone();
             let fut = async move {
-                crate::uv_closure::compute_closure(&r, &project_dir, &uv_cache_dir, None).await
+                crate::uv_closure::compute_closure(
+                    &r,
+                    &project_dir,
+                    &uv_cache_dir,
+                    None,
+                    sdist_build_policy,
+                )
+                .await
             };
             Box::pin(fut)
                 as futures::future::BoxFuture<'static, Result<crate::uv_closure::UvClosure>>
@@ -2760,6 +2767,10 @@ async fn uv_group_closure(
     });
     let sdist_routed = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sdist_built = Arc::new(std::sync::Mutex::new(Vec::new()));
+    // Transitive-prerelease repairs surface naturally in the closure's
+    // pins/wheels (the offender keeps its own index wheel); collected here
+    // only for logging/audit parity with the route/build ledgers.
+    let sdist_prereleased = Arc::new(std::sync::Mutex::new(Vec::new()));
     let solve = crate::uv_closure::with_sdist_heal(
         group_name.to_string(),
         raw_solve,
@@ -2767,6 +2778,7 @@ async fn uv_group_closure(
         sdist_build,
         Arc::clone(&sdist_routed),
         Arc::clone(&sdist_built),
+        Arc::clone(&sdist_prereleased),
     );
     // Co-installability check for the self-healing un-route step: solve
     // the candidate auto-routed EXACT pins (plus the workspace default
