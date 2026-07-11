@@ -1,0 +1,59 @@
+Error:   × failed to solve requirements of environment 'pm-isaaclab' for platform
+  │ 'linux-64'
+  ├─▶   × failed to solve the environment
+  │   
+  ╰─▶ Cannot solve the request because of: The following packages are
+      incompatible
+      ├─ pytorch-gpu ==2.7.0 can be installed with any of the following
+      options:
+      │  └─ pytorch-gpu 2.7.0 | 2.7.0
+      └─ protomotions-deps-pack * cannot be installed because there are no
+      viable options:
+         └─ protomotions-deps-pack 3.1 would require
+            └─ tensordict >=0.13.0, which cannot be installed because there
+      are no viable options:
+               ├─ tensordict 0.13.0 would require
+               │  └─ libtorch >=2.12.0,<2.13.0a0, which cannot be installed
+      because there are no viable options:
+               │     ├─ libtorch 2.12.0 | 2.12.0 | 2.12.0 | 2.12.0 | 2.12.0
+      | 2.12.0 | 2.12.0 | 2.12.0 | 2.12.1 | 2.12.1 | 2.12.1 | 2.12.1 would
+      require
+               │     │  └─ cuda-version >=12.9,<13, for which no candidates
+      were found.
+               │     └─ libtorch 2.12.0 | 2.12.0 | 2.12.0 | 2.12.0 | 2.12.1 |
+      2.12.1 would constrain
+               │        └─ pytorch-gpu <0.0a0, which conflicts with any
+      installable versions previously reported
+               ├─ tensordict 0.13.0 would require
+               │  └─ libtorch >=2.11.0,<2.12.0a0, which cannot be installed
+      because there are no viable options:
+               │     ├─ libtorch 2.11.0 | 2.11.0 | 2.11.0 | 2.11.0 | 2.11.0
+      | 2.11.0 | 2.11.0 | 2.11.0 | 2.11.0 | 2.11.0 | 2.11.0 | 2.11.0 would
+      require
+               │     │  └─ cuda-version >=12.9,<13, for which no candidates
+      were found.
+               │     └─ libtorch 2.11.0 | 2.11.0 | 2.11.0 | 2.11.0 | 2.11.0 |
+      2.11.0 would constrain
+               │        └─ pytorch-gpu <0.0a0, which conflicts with any
+      installable versions previously reported
+               ├─ tensordict 0.13.0 would require
+               │  └─ libtorch >=2.10.0,<2.11.0a0, which cannot be installed
+      because there are no viable options:
+               │     ├─ libtorch 2.10.0 | 2.10.0 | 2.10.0 | 2.10.0 | 2.10.0 |
+      2.10.0 | 2.10.0 | 2.10.0 | 2.10.0 | 2.10.0 | 2.10.0 | 2.10.0 | 2.10.0 |
+      2.10.0 | 2.10.0 | 2.10.0 | 2.10.0 | 2.10.0 | 2.10.0 | 2.10.0 | 2.10.0 |
+      2.10.0 would require
+               │     │  └─ cuda-version >=12.9,<13, for which no candidates
+      were found.
+               │     └─ libtorch 2.10.0 | 2.10.0 | 2.10.0 | 2.10.0 | 2.10.0
+      | 2.10.0 | 2.10.0 | 2.10.0 | 2.10.0 | 2.10.0 | 2.10.0 | 2.10.0 would
+      constrain
+               │        └─ pytorch-gpu <0.0a0, which conflicts with any
+      installable versions previously reported
+               └─ tensordict 0.13.0 | 0.13.0 | 0.13.0 | 0.13.0 | 0.13.0 |
+      0.13.0 | 0.13.0 | 0.13.0 | 0.13.0 | 0.13.0 | 0.13.0 | 0.13.0 would
+      require
+                  └─ python >=3.12,<3.13.0a0, for which no candidates were
+      found.
+      
+

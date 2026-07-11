@@ -1859,6 +1859,7 @@ fn intersect_range_with_cap(
 
     let mut floor: Option<(String, String)> = None;
     let mut ceil: Option<(String, String)> = None;
+    let mut exact: Option<String> = None;
     for clause in existing.split(',') {
         let clause = clause.trim();
         for op in ["==", ">=", "<=", ">", "<"] {
@@ -1867,11 +1868,32 @@ fn intersect_range_with_cap(
                 match op {
                     ">=" | ">" => floor = Some((op.to_string(), rest)),
                     "<=" | "<" => ceil = Some((op.to_string(), rest)),
-                    _ => {}
+                    _ => exact = Some(rest),
                 }
                 break;
             }
         }
+    }
+
+    // Run-41 fix: an exact-form existing spec (`==2.7.0`) previously set
+    // NEITHER floor nor ceiling, so the empty-intersection check below
+    // never ran and a cap that excludes the pinned version wholesale
+    // (resolvo's `<0.0a0` exclusion sentinel) sailed through as the new
+    // "narrowed" spec -- an impossible range. An exact pin is a
+    // single-point set: a cap either contains that point (in which case
+    // intersecting adds nothing -- return the pin unchanged, callers
+    // treat `narrowed == existing` as a no-op) or excludes it (empty).
+    if let Some(exact_str) = &exact {
+        let exact_v = Version::from_str(exact_str)
+            .map_err(|e| format!("unparseable exact version {exact_str}: {e}"))?;
+        let excluded = match cap_op {
+            "<" => exact_v >= cap_v,
+            _ => exact_v > cap_v,
+        };
+        if excluded {
+            return Err(format!("exact pin =={exact_str} vs cap {cap_op}{cap_version}"));
+        }
+        return Ok(existing.to_string());
     }
 
     let narrower_ceil = match &ceil {
@@ -2486,6 +2508,22 @@ impl RepairPlanner {
                     }
                 }
                 Ownership::LedgeredOverride => {
+                    // Run-41 guardrail: a name governed by a hand-written
+                    // workspace pin (family-aware: `pytorch-gpu ==2.7.0`
+                    // anchors `pytorch`/`torch`/... via the conda name
+                    // family) is TRUTH and exempt from every derived
+                    // narrow. The only ledgered entry such a name can
+                    // carry is tier 1's own confirmation of that pin --
+                    // "narrowing" it means moving off the workspace's
+                    // intent (run 41 scraped resolvo's `would constrain
+                    // pytorch-gpu <0.0a0` exclusion sentinel as a cap and
+                    // wrote an impossible override for the workspace
+                    // pin). The movable knob in such a conflict is always
+                    // some OTHER mention (the pack emission whose chain
+                    // excludes the pin), never the pin itself.
+                    if self.workspace_pin_governs_pack_family(editor, owner_bundle, &m.package) {
+                        continue;
+                    }
                     // Tier 2: a prior repair already narrowed/overrode
                     // this package for this pack; if a tighter
                     // upper-bound cap is visible, intersect (same
@@ -2522,6 +2560,15 @@ impl RepairPlanner {
                         );
                         let mut pushed = false;
                         for (cap_op, cap_version) in caps {
+                            // Resolvo's `<0.0a0` prose ("would constrain X
+                            // <0.0a0, which conflicts with any installable
+                            // versions") is an EXCLUSION sentinel, not a
+                            // real upper bound -- intersecting with it can
+                            // only ever produce an empty or impossible
+                            // range (run 41's poisoned override).
+                            if is_exclusion_sentinel_version(&cap_version) {
+                                continue;
+                            }
                             let Ok(narrowed) =
                                 intersect_range_with_cap(existing, &cap_op, &cap_version)
                             else {
@@ -2564,9 +2611,30 @@ impl RepairPlanner {
                         // (override floor == emitted floor) errors out of
                         // `intersect_range_with_cap` and is skipped --
                         // exact-form emissions never step down.
+                        // Run-41 extension: accept a BARE `>=X` emission
+                        // floor too (`tensordict >=0.13.0`), not only the
+                        // bounded `>=X,<Y` shape `pack_emitted_pin_floor`
+                        // recognizes -- a ledgered floor-only override
+                        // re-emits at whatever uv locked, cap-less.
+                        // Guard: a bare floor that clashes with a SIBLING
+                        // mention of the same package carrying a pack-pin
+                        // shape (`==X` / `>=X,<Y`) is the two-pack
+                        // territory tiers 7/8 own (run-21 sentry-sdk);
+                        // step-down is only for floors whose OWN conda
+                        // chain dead-ends (run 41).
+                        let bare_floor_steppable = || {
+                            bare_floor(&m.spec).filter(|_| {
+                                !mentions.iter().any(|o| {
+                                    o.package.eq_ignore_ascii_case(&m.package)
+                                        && o.spec != m.spec
+                                        && pack_pin_interval(&o.spec).is_some()
+                                })
+                            })
+                        };
                         if !pushed
                             && m.spec.trim_start().starts_with(">=")
-                            && let Some(floor) = pack_emitted_pin_floor(&m.spec)
+                            && let Some(floor) =
+                                pack_emitted_pin_floor(&m.spec).or_else(bare_floor_steppable)
                             && let Ok(narrowed) = intersect_range_with_cap(existing, "<", &floor)
                             && &narrowed != existing
                         {
@@ -2578,7 +2646,17 @@ impl RepairPlanner {
                                 old_spec: Some(existing.clone()),
                                 new_spec: narrowed,
                                 ownership,
-                                tried_key: format!("{}@{owner_bundle}#fallback-narrow", m.package),
+                                // Floor-specific tried key (run 41): each
+                                // strictly-lower failing emitted floor is a
+                                // NEW fact and earns its own step -- the
+                                // ladder walks 0.13 -> 0.12 -> ... within
+                                // one run instead of dead-ending after the
+                                // first step. Monotonically decreasing
+                                // floors cannot oscillate.
+                                tried_key: format!(
+                                    "{}@{owner_bundle}#fallback-narrow@<{floor}",
+                                    m.package
+                                ),
                                 reason: format!(
                                     "generic fallback: ceiling stepped below {}'s failing emitted floor {floor} (uv's top-of-range pick dead-ends in conda)",
                                     m.package
@@ -2588,6 +2666,14 @@ impl RepairPlanner {
                     }
                 }
                 Ownership::DepsFromExactPin => {
+                    // Run-41 guardrail (same as the LedgeredOverride arm):
+                    // hand-written workspace intent is exempt from derived
+                    // relaxes -- a deps-from root that the workspace ALSO
+                    // pins is governed by the workspace pin, not by the
+                    // upstream requirements file.
+                    if self.workspace_pin_governs_pack_family(editor, owner_bundle, &m.package) {
+                        continue;
+                    }
                     // Tier 3: relax the deps-from-owned exact pin to a
                     // `>=` floor (same doctrine as `deps_from_pin_conflict`
                     // / `no_wheel_transitive_conflict`).
@@ -3365,6 +3451,29 @@ fn pack_pin_intervals_disjoint(
     let a_below = a_cap < b_floor || (a_cap == b_floor && !a_incl);
     let b_below = b_cap < a_floor || (b_cap == a_floor && !b_incl);
     a_below || b_below
+}
+
+/// The floor of a BARE single-clause `>=X` spec (no cap, no siblings) --
+/// the shape a ledgered floor-only override re-emits as (run 41:
+/// `tensordict >=0.13.0`). `None` for anything else.
+fn bare_floor(spec: &str) -> Option<String> {
+    let trimmed = spec.trim();
+    trimmed
+        .strip_prefix(">=")
+        .filter(|rest| !rest.contains(','))
+        .map(|rest| rest.trim().to_string())
+}
+
+/// Whether `version` is resolvo's exclusion sentinel (`0.0a0`, printed as
+/// `would constrain X <0.0a0` when a dependency excludes EVERY installable
+/// version of X). Never a real cap; intersecting with it can only yield an
+/// empty or impossible range.
+fn is_exclusion_sentinel_version(version: &str) -> bool {
+    // Literal prose match: resolvo prints exactly `<0.0a0` for the
+    // exclusion case. A lenient conda-version comparison is WRONG here --
+    // rattler parses almost any string (including pure prose) as a
+    // version that sorts below `0.0a0`.
+    matches!(version.trim(), "0.0a0" | "0a0" | "0.0.0a0")
 }
 
 /// The first upper-bound (`<`/`<=`) clause in a possibly-multi-clause
@@ -5556,6 +5665,117 @@ holosoma-gpu = { features = ["holosoma"] }
             "ceiling must step below the failing emitted floor"
         );
         assert_eq!(cand.pack_name, "isaaclab-2.3x-pack");
+    }
+
+    const CONDA_WORKSPACE_PIN_POISON_TENSORDICT_RUN41: &str = include_str!(
+        "../../tests/fixtures/solve_errors/conda_workspace_pin_poison_tensordict_run41.txt"
+    );
+
+    #[test]
+    fn run41_workspace_pin_exempt_and_tensordict_ceiling_steps_below_bare_floor() {
+        // Run-41 fixture verbatim: protomotions-deps-pack emits
+        // `tensordict >=0.13.0`; every conda tensordict 0.13.0 build
+        // chains to `libtorch >=2.10..2.12`, each of which `would
+        // constrain pytorch-gpu <0.0a0` -- resolvo's exclusion sentinel
+        // against the hand-written `pytorch-gpu ==2.7.0` workspace pin.
+        // The live run scraped that sentinel as a tier-2 cap and wrote
+        // the poison override `pytorch-gpu ==2.7.0 -> <0.0a0`, while the
+        // actual knob -- stepping tensordict's ledgered `>=0.9.0` floor
+        // override below the failing bare-floor emission -- never fired
+        // (`pack_emitted_pin_floor` rejected the cap-less `>=0.13.0`).
+        let manifest_text = "[feature.pm-isaaclab.dependencies]\n\
+             pytorch-gpu = \"==2.7.0\"\n\
+             \"protomotions-deps-pack\" = { path = \"./pypi-packs/protomotions-deps-pack\" }\n";
+        let path = temp_manifest(manifest_text);
+        let project_dir = path.parent().unwrap().to_path_buf();
+        let pack_dir = project_dir.join("pypi-packs").join("protomotions-deps-pack");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        std::fs::write(
+            pack_dir.join("pixi.toml"),
+            "[package]\nname = \"protomotions-deps-pack\"\nversion = \"3.1\"\n",
+        )
+        .unwrap();
+        let pack_pixi = pack_dir.join("pixi.toml");
+        // The run-41 ledger state at the failing iteration: tier 1 had
+        // confirmed the workspace pin into the pack, tier 3 had relaxed
+        // the deps-from tensordict pin to its floor.
+        crate::pack_overrides::write_override(
+            &project_dir,
+            &pack_pixi,
+            "protomotions-deps-pack",
+            "pytorch-gpu",
+            "==2.7.0",
+            "GenericFallback",
+        )
+        .unwrap();
+        crate::pack_overrides::write_override(
+            &project_dir,
+            &pack_pixi,
+            "protomotions-deps-pack",
+            "tensordict",
+            ">=0.9.0",
+            "GenericFallback",
+        )
+        .unwrap();
+        let editor = ManifestEditor::open(path).unwrap();
+        let planner = RepairPlanner::new("default".into());
+        let parser = super::super::parse::RegexConflictParser::new();
+        let mentions =
+            parser.extract_generic_mentions(CONDA_WORKSPACE_PIN_POISON_TENSORDICT_RUN41);
+        let bundle = parser.extract_bundle_name(CONDA_WORKSPACE_PIN_POISON_TENSORDICT_RUN41);
+        let candidates =
+            planner.generate_fallback_candidates(&editor, bundle.as_deref(), &mentions);
+        // The workspace pin (and its whole torch family) must be exempt
+        // from every derived repair -- no poison `<0.0a0` narrow.
+        assert!(
+            candidates.iter().all(|c| {
+                c.package != "pytorch-gpu" && c.package != "pytorch" && c.package != "torch"
+            }),
+            "workspace-pinned names must never receive derived repairs: {candidates:?}"
+        );
+        // The movable knob: tensordict's ledgered floor override steps
+        // below the failing bare-floor emission.
+        let cand = candidates
+            .iter()
+            .find(|c| c.package == "tensordict" && c.tier == 2)
+            .unwrap_or_else(|| panic!("tensordict ceiling-step-down expected: {candidates:?}"));
+        assert_eq!(cand.old_spec.as_deref(), Some(">=0.9.0"));
+        assert_eq!(cand.new_spec, ">=0.9.0,<0.13.0");
+        assert_eq!(cand.pack_name, "protomotions-deps-pack");
+        assert!(
+            cand.tried_key.contains("<0.13.0"),
+            "floor-specific tried key so successive lower floors each earn a step: {}",
+            cand.tried_key
+        );
+    }
+
+    #[test]
+    fn intersect_range_with_cap_exact_pin_excluded_by_cap_is_empty() {
+        // Run-41 poison shape: `==2.7.0` intersected with resolvo's
+        // `<0.0a0` sentinel must be refused, not emitted as `<0.0a0`.
+        assert!(intersect_range_with_cap("==2.7.0", "<", "0.0a0").is_err());
+        assert!(intersect_range_with_cap("==2.7.0", "<", "2.7.0").is_err());
+        assert!(intersect_range_with_cap("==2.7.0", "<=", "2.6").is_err());
+    }
+
+    #[test]
+    fn intersect_range_with_cap_exact_pin_within_cap_is_noop() {
+        assert_eq!(
+            intersect_range_with_cap("==2.7.0", "<", "3").unwrap(),
+            "==2.7.0"
+        );
+        assert_eq!(
+            intersect_range_with_cap("==2.7.0", "<=", "2.7.0").unwrap(),
+            "==2.7.0"
+        );
+    }
+
+    #[test]
+    fn exclusion_sentinel_version_matches_resolvo_prose_only() {
+        assert!(is_exclusion_sentinel_version("0.0a0"));
+        assert!(!is_exclusion_sentinel_version("0.1"));
+        assert!(!is_exclusion_sentinel_version("3.11.0"));
+        assert!(!is_exclusion_sentinel_version("not-a-version"));
     }
 
     #[test]
