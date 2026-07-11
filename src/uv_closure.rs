@@ -2363,10 +2363,8 @@ pub fn save_heal_facts(project_dir: &Path, facts: &HealFacts) {
         return;
     };
     let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
-    if std::fs::write(&tmp, json.as_bytes()).is_ok() {
-        if std::fs::rename(&tmp, &path).is_err() {
-            let _ = std::fs::remove_file(&tmp);
-        }
+    if std::fs::write(&tmp, json.as_bytes()).is_ok() && std::fs::rename(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 

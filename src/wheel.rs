@@ -615,6 +615,183 @@ pub fn parse_metadata(
     })
 }
 
+/// Read-ahead window size for [`HttpRangeReader`]. The zip crate reads the
+/// end-of-central-directory, then walks the central directory sequentially;
+/// a 256 KiB window keeps those walks to a handful of range requests even
+/// for a wheel with thousands of members.
+const RANGE_WINDOW: u64 = 256 * 1024;
+
+/// A `Read + Seek` view over a remote file, backed by HTTP Range requests.
+///
+/// Feeding this to `zip::ZipArchive` lets the (battle-tested) zip crate
+/// locate + inflate a single member -- the wheel's `METADATA` -- by reading
+/// only the end-of-central-directory, the central directory, and that one
+/// member's bytes, instead of downloading the whole (multi-GiB) wheel. The
+/// zip crate handles zip64 and deflate correctly, which a hand-rolled EOCD
+/// parser would have to reimplement (isaacsim's 5.5 GiB extscache wheel is
+/// zip64). Blocking by design: driven inside `spawn_blocking`, it issues
+/// range GETs through the async client via the captured runtime handle.
+struct HttpRangeReader {
+    client: reqwest::blocking::Client,
+    url: url::Url,
+    len: u64,
+    pos: u64,
+    /// Cached window: (start offset, bytes).
+    window: Option<(u64, Vec<u8>)>,
+}
+
+impl HttpRangeReader {
+    /// Fetch `[start, start+want)` (clamped to `len`) into the window cache
+    /// if it isn't already covered, then return a slice of the requested
+    /// span from the cache.
+    fn ensure(&mut self, start: u64, want: usize) -> std::io::Result<&[u8]> {
+        let end = (start + want as u64).min(self.len);
+        let covered = matches!(&self.window, Some((ws, wb)) if *ws <= start && start + (want as u64).min(self.len - start) <= *ws + wb.len() as u64);
+        if !covered {
+            let fetch_len = (end - start).max(RANGE_WINDOW).min(self.len - start);
+            let last = start + fetch_len - 1;
+            let resp = self
+                .client
+                .get(self.url.clone())
+                .header(reqwest::header::RANGE, format!("bytes={start}-{last}"))
+                .send()
+                .and_then(|r| r.error_for_status())
+                .map_err(std::io::Error::other)?;
+            // A server ignoring Range answers 200 with the whole body; treat
+            // that as unusable so the caller falls back to a full download.
+            if resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "server ignored Range header (200, not 206)",
+                ));
+            }
+            let bytes = resp.bytes().map_err(std::io::Error::other)?;
+            self.window = Some((start, bytes.to_vec()));
+        }
+        let (ws, wb) = self.window.as_ref().expect("window populated above");
+        let off = (start - ws) as usize;
+        let avail = wb.len().saturating_sub(off);
+        Ok(&wb[off..off + avail.min(want)])
+    }
+}
+
+impl std::io::Read for HttpRangeReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos >= self.len || buf.is_empty() {
+            return Ok(0);
+        }
+        let pos = self.pos;
+        let slice = self.ensure(pos, buf.len())?;
+        let n = slice.len().min(buf.len());
+        buf[..n].copy_from_slice(&slice[..n]);
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl std::io::Seek for HttpRangeReader {
+    fn seek(&mut self, from: std::io::SeekFrom) -> std::io::Result<u64> {
+        let new = match from {
+            std::io::SeekFrom::Start(o) => o as i64,
+            std::io::SeekFrom::End(o) => self.len as i64 + o,
+            std::io::SeekFrom::Current(o) => self.pos as i64 + o,
+        };
+        if new < 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "seek before start",
+            ));
+        }
+        self.pos = new as u64;
+        Ok(self.pos)
+    }
+}
+
+/// Read a wheel's METADATA via HTTP Range requests, transferring only the
+/// zip central directory + the METADATA member instead of the whole wheel.
+///
+/// Caller contract mirrors [`fetch_metadata_sidecar`]: only call with the
+/// wheel's `sha256` (from the index link fragment), since the recipe pins
+/// each source wheel's hash and the ranged read never sees the full bytes
+/// to compute it. Returns `Err` (so the caller falls back to a full
+/// download) when the server doesn't honor Range or the zip can't be read
+/// this way.
+pub async fn fetch_metadata_ranged(
+    wheel_url: &url::Url,
+    wheel_sha256: &str,
+) -> Result<WheelMetadata> {
+    let filename = wheel_filename_from_url(wheel_url)?;
+    let is_pure_python = is_pure_python_wheel_filename(&filename);
+    let mut url = wheel_url.clone();
+    url.set_fragment(None);
+    let sha = wheel_sha256.to_ascii_lowercase();
+
+    // Everything here is blocking (a `reqwest::blocking` client driving the
+    // sync `zip` reader), so it all runs on one blocking thread -- no nested
+    // tokio runtime, works regardless of the caller's runtime flavor.
+    tokio::task::spawn_blocking(move || -> Result<WheelMetadata> {
+        let client = reqwest::blocking::Client::new();
+        // Discover length + Range support. A HEAD keeps this to one tiny
+        // request on the happy path; servers that 405 the HEAD (or omit the
+        // length, or don't advertise byte ranges) error out and the caller
+        // falls back to a full download.
+        let head = client
+            .head(url.clone())
+            .send()
+            .with_context(|| format!("HEAD {url}"))?
+            .error_for_status()
+            .with_context(|| format!("HTTP error for HEAD {url}"))?;
+        let accepts_ranges = head
+            .headers()
+            .get(reqwest::header::ACCEPT_RANGES)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.eq_ignore_ascii_case("bytes"))
+            .unwrap_or(false);
+        // Read the Content-Length HEADER directly: `Response::content_length()`
+        // on a HEAD reflects the (empty) body, not the advertised size.
+        let len = head
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .ok_or_else(|| anyhow!("no Content-Length for {url}; cannot range-fetch"))?;
+        if !accepts_ranges {
+            bail!("server does not advertise `Accept-Ranges: bytes` for {url}");
+        }
+        if len == 0 {
+            bail!("empty body for {url}");
+        }
+
+        let reader = HttpRangeReader {
+            client,
+            url: url.clone(),
+            len,
+            pos: 0,
+            window: None,
+        };
+        let mut archive = zip::ZipArchive::new(reader)
+            .with_context(|| format!("opening remote zip via Range for {filename}"))?;
+        // Root-level `<name>-<version>.dist-info/METADATA` only (wheels may
+        // vendor nested .dist-info trees; ours is the single-slash one).
+        let mut idx = None;
+        for i in 0..archive.len() {
+            let entry = archive.by_index(i)?;
+            let name = entry.name();
+            if name.ends_with(".dist-info/METADATA") && name.matches('/').count() == 1 {
+                idx = Some(i);
+                break;
+            }
+        }
+        let idx = idx.ok_or_else(|| anyhow!("no root-level .dist-info/METADATA in {filename}"))?;
+        let mut entry = archive.by_index(idx)?;
+        let mut buf = String::new();
+        entry.read_to_string(&mut buf)?;
+        parse_metadata(&buf, filename, is_pure_python, sha)
+    })
+    .await
+    .context("ranged metadata reader panicked")?
+}
+
 async fn sha256_file(path: &Path) -> Result<String> {
     let bytes = fs::read(path).await?;
     Ok(hex_sha256(&bytes))
@@ -634,6 +811,175 @@ fn hex_sha256(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a minimal but real wheel zip (deflate-compressed METADATA at a
+    /// root-level `.dist-info`) so the ranged reader exercises central-
+    /// directory + member inflation, not just STORED bytes.
+    fn build_test_wheel_zip() -> Vec<u8> {
+        use std::io::Write as _;
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut zw = zip::ZipWriter::new(&mut cursor);
+            let opts: zip::write::FileOptions<'_, ()> =
+                zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+            // A vendored nested .dist-info (deeper path) must be ignored --
+            // only the single-slash root entry is ours.
+            zw.start_file("vendored/other-9.9.dist-info/METADATA", opts)
+                .unwrap();
+            zw.write_all(b"Name: other\nVersion: 9.9\n").unwrap();
+            zw.start_file("foo-1.0.dist-info/METADATA", opts).unwrap();
+            zw.write_all(
+                b"Metadata-Version: 2.1\nName: foo\nVersion: 1.0\n\
+                  Requires-Dist: bar>=2\nRequires-Dist: baz; extra=='x'\n\nbody\n",
+            )
+            .unwrap();
+            zw.finish().unwrap();
+        }
+        cursor.into_inner()
+    }
+
+    /// A tiny HTTP/1.1 server honoring HEAD + `Range` GETs, for the ranged
+    /// metadata test. Handles keep-alive (multiple requests per connection).
+    async fn serve_ranged(bytes: Vec<u8>) -> (u16, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let bytes = bytes.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 1024];
+                    loop {
+                        // Read one request (headers terminate at \r\n\r\n).
+                        let hdr_end = loop {
+                            if let Some(p) = buf
+                                .windows(4)
+                                .position(|w| w == b"\r\n\r\n")
+                            {
+                                break p + 4;
+                            }
+                            let n = match stream.read(&mut tmp).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => n,
+                            };
+                            buf.extend_from_slice(&tmp[..n]);
+                        };
+                        let req = String::from_utf8_lossy(&buf[..hdr_end]).to_string();
+                        buf.drain(..hdr_end);
+                        let is_head = req.starts_with("HEAD");
+                        let range = req.lines().find_map(|l| {
+                            let l = l.to_ascii_lowercase();
+                            l.strip_prefix("range: bytes=").map(|s| s.trim().to_string())
+                        });
+                        let total = bytes.len();
+                        let resp: Vec<u8> = if is_head {
+                            format!(
+                                "HTTP/1.1 200 OK\r\nAccept-Ranges: bytes\r\nContent-Length: {total}\r\n\r\n"
+                            )
+                            .into_bytes()
+                        } else if let Some(r) = range {
+                            let (a, b) = r.split_once('-').unwrap();
+                            let a: usize = a.parse().unwrap();
+                            let b: usize = if b.is_empty() {
+                                total - 1
+                            } else {
+                                b.parse::<usize>().unwrap().min(total - 1)
+                            };
+                            let slice = &bytes[a..=b];
+                            let mut h = format!(
+                                "HTTP/1.1 206 Partial Content\r\nAccept-Ranges: bytes\r\n\
+                                 Content-Range: bytes {a}-{b}/{total}\r\nContent-Length: {}\r\n\r\n",
+                                slice.len()
+                            )
+                            .into_bytes();
+                            h.extend_from_slice(slice);
+                            h
+                        } else {
+                            let mut h = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {total}\r\n\r\n"
+                            )
+                            .into_bytes();
+                            h.extend_from_slice(&bytes);
+                            h
+                        };
+                        if stream.write_all(&resp).await.is_err() {
+                            return;
+                        }
+                        let _ = stream.flush().await;
+                    }
+                });
+            }
+        });
+        (port, handle)
+    }
+
+    #[tokio::test]
+    async fn ranged_metadata_reads_only_the_metadata_member() {
+        let zip_bytes = build_test_wheel_zip();
+        let (port, server) = serve_ranged(zip_bytes).await;
+        let url: url::Url = format!("http://127.0.0.1:{port}/foo-1.0-py3-none-any.whl")
+            .parse()
+            .unwrap();
+        let sha = "a".repeat(64);
+        let md = fetch_metadata_ranged(&url, &sha).await.unwrap();
+        assert_eq!(md.name, "foo");
+        assert_eq!(md.version, "1.0");
+        // Root-level METADATA parsed; the vendored nested one ignored.
+        assert_eq!(md.requires_dist, vec!["bar>=2", "baz; extra=='x'"]);
+        // sha256 comes from the caller (index fragment), not recomputed.
+        assert_eq!(md.sha256, sha);
+        assert!(md.is_pure_python, "py3-none-any is pure python");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ranged_metadata_errors_when_range_unsupported() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        // Server that ignores Range and always returns 200 full-body: the
+        // ranged reader must error so the caller falls back to a full fetch.
+        let zip_bytes = build_test_wheel_zip();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let bytes = zip_bytes.clone();
+                tokio::spawn(async move {
+                    let mut tmp = [0u8; 1024];
+                    loop {
+                        match stream.read(&mut tmp).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) => {}
+                        }
+                        // No Accept-Ranges, always 200 with the whole body.
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                            bytes.len()
+                        );
+                        if stream.write_all(resp.as_bytes()).await.is_err() {
+                            return;
+                        }
+                        if stream.write_all(&bytes).await.is_err() {
+                            return;
+                        }
+                        let _ = stream.flush().await;
+                    }
+                });
+            }
+        });
+        let url: url::Url = format!("http://127.0.0.1:{port}/foo-1.0-py3-none-any.whl")
+            .parse()
+            .unwrap();
+        let err = fetch_metadata_ranged(&url, &"b".repeat(64)).await;
+        assert!(err.is_err(), "must reject a server that ignores Range");
+        server.abort();
+    }
 
     #[test]
     #[ignore = "live: fetches a PEP 658 sidecar + the full wheel from pypi.org"]

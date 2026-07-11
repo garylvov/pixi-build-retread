@@ -1064,7 +1064,26 @@ pub(crate) async fn metadata_preferring_sidecar(
                 tracing::debug!(
                     url = %resolved.url,
                     error = %format!("{e:#}"),
-                    "metadata sidecar fetch failed; falling back to full wheel download",
+                    "metadata sidecar fetch failed; falling back to ranged/full fetch",
+                );
+            }
+        }
+    }
+    // No sidecar (pypi.nvidia.com, static GitHub-Pages indexes): try a
+    // ranged read of the zip central directory + METADATA member before
+    // resorting to downloading the whole (potentially multi-GiB) wheel just
+    // to read a few KiB of metadata. Index-agnostic: any server honoring
+    // HTTP Range works; anything else errors and we fall through to the full
+    // download. Requires the index-advertised sha256 (the recipe pins it and
+    // the ranged read never computes the full-wheel hash).
+    if let Some(sha) = resolved.sha256.as_deref() {
+        match crate::wheel::fetch_metadata_ranged(&resolved.url, sha).await {
+            Ok(m) => return Ok(m),
+            Err(e) => {
+                tracing::debug!(
+                    url = %resolved.url,
+                    error = %format!("{e:#}"),
+                    "ranged metadata fetch failed; falling back to full wheel download",
                 );
             }
         }
