@@ -2267,11 +2267,29 @@ struct ClosureMeta {
 }
 
 /// Hex sha256 over the resolution inputs recorded in [`ClosureMeta`].
-fn closure_inputs_fingerprint(pyproject: &str, lock_args: &[String], uv_version: &str) -> String {
+///
+/// `export_args` joined (issue #10 perf): the fingerprint now also gates the
+/// full-skip reuse path (fingerprint match -> re-parse the previously
+/// exported pylock, NO uv invocation at all), and the pylock's content
+/// depends on the `--no-emit-package` export set -- a shrunk exclusion list
+/// must invalidate, or the reused pylock would be missing a package that
+/// should now be emitted (the parse-time exclude filter can only REMOVE
+/// packages from a superset, never restore absent ones).
+fn closure_inputs_fingerprint(
+    pyproject: &str,
+    lock_args: &[String],
+    export_args: &[String],
+    uv_version: &str,
+) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     h.update(pyproject.as_bytes());
     for arg in lock_args {
+        h.update([0u8]);
+        h.update(arg.as_bytes());
+    }
+    h.update([1u8]);
+    for arg in export_args {
         h.update([0u8]);
         h.update(arg.as_bytes());
     }
@@ -2601,13 +2619,67 @@ pub async fn compute_closure(
     // the first solve) make Pass A carry the same pins the meta was written
     // for, so the fingerprint matches and this guard KEEPS the lock -> uv
     // fast-relocks instead of re-resolving.
-    let fingerprint = closure_inputs_fingerprint(&pyproject_text, &lock_args, &uv_version);
+    let export_args = build_export_args(project_dir, &req.no_emit_packages, req.offline);
+    let fingerprint =
+        closure_inputs_fingerprint(&pyproject_text, &lock_args, &export_args, &uv_version);
     let lock_file = project_dir.join("uv.lock");
+    let pylock_file = project_dir.join(PYLOCK_FILE);
     let recorded_fingerprint = std::fs::read_to_string(&meta_path)
         .ok()
         .and_then(|s| serde_json::from_str::<ClosureMeta>(&s).ok())
         .map(|m| m.inputs_fingerprint);
-    if lock_file.exists() && recorded_fingerprint.as_deref() != Some(fingerprint.as_str()) {
+    let fingerprint_matches = recorded_fingerprint.as_deref() == Some(fingerprint.as_str());
+
+    // FULL-SKIP reuse (issue #10 perf, the warm path): identical resolution
+    // inputs => identical exported pylock, so re-parse the one on disk and
+    // return WITHOUT invoking uv at all. Measured motivation: even with a
+    // valid uv.lock kept by the guard below, a bare `uv lock` re-validated
+    // every package's metadata against pypi.nvidia.com (no PEP 658 sidecars
+    // -> per-package range reads, ~9.5 min for the isaac closure) -- as
+    // expensive as a cold resolve. The fingerprint covers the pyproject,
+    // the lock flag vector, the export flag vector (`--no-emit-package`
+    // set), and the uv version, so any drift takes the normal path. A parse
+    // failure (corrupt/truncated pylock) also falls through.
+    if fingerprint_matches && lock_file.exists() && pylock_file.exists() {
+        match tokio::fs::read_to_string(&pylock_file).await {
+            Ok(pylock) => {
+                let exclude: BTreeSet<String> = req
+                    .no_emit_packages
+                    .iter()
+                    .map(|n| canonical_conda_name(n))
+                    .collect();
+                let target = WheelTarget::for_subdir(&req.python_version, &req.conda_subdir);
+                match parse_pylock_closure(&pylock, &target, &exclude, &uv_version) {
+                    Ok(closure) => {
+                        tracing::info!(
+                            bundle = %req.bundle,
+                            wheels = closure.wheels.len(),
+                            pins = closure.pins.len(),
+                            "uv closure: inputs unchanged; reusing exported pylock \
+                             (no uv invocation)",
+                        );
+                        return Ok(closure);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            bundle = %req.bundle,
+                            error = %format!("{e:#}"),
+                            "uv closure: cached pylock unusable; re-resolving",
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    bundle = %req.bundle,
+                    error = %e,
+                    "uv closure: cached pylock unreadable; re-resolving",
+                );
+            }
+        }
+    }
+
+    if lock_file.exists() && !fingerprint_matches {
         tracing::info!(
             bundle = %req.bundle,
             "uv closure: resolution inputs changed since the cached uv.lock \
@@ -2696,12 +2768,8 @@ pub async fn compute_closure(
     }
 
     // -- uv export ---------------------------------------------------------
-    let export_out = run(build_export_args(
-        project_dir,
-        &req.no_emit_packages,
-        req.offline,
-    ))
-    .await?;
+    // Same vector the fingerprint above was computed over.
+    let export_out = run(export_args).await?;
     if !export_out.status.success() {
         bail!(
             "uv export failed for bundle `{}`:\n{}",
@@ -5604,31 +5672,50 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
         // resolution inputs must hash to the same fingerprint, or the
         // healed uv.lock is discarded and re-resolved every run.
         let args = vec!["lock".to_string(), "--no-build".to_string()];
-        let a = closure_inputs_fingerprint("[project]\nname='x'\n", &args, "0.11.0");
-        let b = closure_inputs_fingerprint("[project]\nname='x'\n", &args, "0.11.0");
+        let export = vec!["export".to_string()];
+        let a = closure_inputs_fingerprint("[project]\nname='x'\n", &args, &export, "0.11.0");
+        let b = closure_inputs_fingerprint("[project]\nname='x'\n", &args, &export, "0.11.0");
         assert_eq!(a, b);
     }
 
     #[test]
     fn fingerprint_changes_when_manifest_changes() {
         let args = vec!["lock".to_string()];
-        let base = closure_inputs_fingerprint("deps=['a==1']", &args, "0.11.0");
+        let export = vec!["export".to_string()];
+        let base = closure_inputs_fingerprint("deps=['a==1']", &args, &export, "0.11.0");
         // A changed synthesized pyproject (e.g. a new explicit pin) must
         // invalidate: otherwise a pinned lock would be reused for a
         // different (pinless) request.
         assert_ne!(
             base,
-            closure_inputs_fingerprint("deps=['a==2']", &args, "0.11.0")
+            closure_inputs_fingerprint("deps=['a==2']", &args, &export, "0.11.0")
         );
         // A changed flag vector (index set, prerelease policy) invalidates.
         assert_ne!(
             base,
-            closure_inputs_fingerprint("deps=['a==1']", &["lock".into(), "--x".into()], "0.11.0")
+            closure_inputs_fingerprint(
+                "deps=['a==1']",
+                &["lock".into(), "--x".into()],
+                &export,
+                "0.11.0"
+            )
+        );
+        // A changed EXPORT vector (--no-emit-package set) invalidates: the
+        // full-skip path reuses the exported pylock, whose contents depend
+        // on the exclusion list.
+        assert_ne!(
+            base,
+            closure_inputs_fingerprint(
+                "deps=['a==1']",
+                &args,
+                &["export".into(), "--no-emit-package".into(), "x".into()],
+                "0.11.0"
+            )
         );
         // A uv upgrade invalidates.
         assert_ne!(
             base,
-            closure_inputs_fingerprint("deps=['a==1']", &args, "0.12.0")
+            closure_inputs_fingerprint("deps=['a==1']", &args, &export, "0.12.0")
         );
     }
 
