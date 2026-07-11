@@ -791,9 +791,15 @@ impl Handler {
             ));
         }
 
-        // Eagerly validate each entry now so misconfigurations surface at
-        // initialize time rather than mid-build.
-        for (name, entry) in &config.retread_wheels {
+        // Eagerly normalize + validate each entry now so misconfigurations
+        // surface at initialize time rather than mid-build. Normalization
+        // lifts a `#sha256=` URL fragment into the discrete `sha256` field so
+        // the persistent wheel cache can address URL-form wheels (issue #10
+        // perf: otherwise a multi-GiB extscache wheel redownloads every run).
+        for (name, entry) in &mut config.retread_wheels {
+            entry
+                .normalize(name)
+                .map_err(|e| RpcError::invalid_params(e.to_string()))?;
             entry
                 .validate(name)
                 .map_err(|e| RpcError::invalid_params(e.to_string()))?;

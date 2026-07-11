@@ -847,6 +847,57 @@ impl WheelEntry {
         self.from.is_some()
     }
 
+    /// Normalize the entry in place before validation.
+    ///
+    /// URL-form entries may carry the wheel hash as a `#sha256=<hex>` URL
+    /// fragment (the spelling PEP 503 / pip / uv emit) instead of the
+    /// discrete `sha256` field. Such entries deserialize with
+    /// `sha256 = None`, so [`fetch_wheel_cached`](crate::wheel::fetch_wheel_cached)
+    /// has no content key and silently bypasses the persistent wheel store --
+    /// a multi-GiB extscache wheel then redownloads from a flaky CDN on every
+    /// cold run. Lift the fragment hash into the discrete field and strip the
+    /// fragment from the URL so every later fetch/compare site sees one
+    /// canonical key.
+    ///
+    /// Precedence: an explicit discrete `sha256` wins. If both are present and
+    /// disagree, that is a contradiction and we error (a wrong hash would
+    /// either poison the cache or wedge verification).
+    pub fn normalize(&mut self, name: &str) -> Result<()> {
+        let Some(url) = self.url.as_mut() else {
+            return Ok(());
+        };
+        // Pull `sha256=<hex>` out of the URL fragment, if present. The
+        // fragment may in principle carry multiple `&`-joined params; only the
+        // sha256 one is meaningful here.
+        let frag_sha = url.fragment().and_then(|frag| {
+            frag.split('&').find_map(|kv| {
+                kv.strip_prefix("sha256=")
+                    .filter(|h| !h.is_empty())
+                    .map(str::to_string)
+            })
+        });
+        if let Some(frag_sha) = frag_sha {
+            match &self.sha256 {
+                Some(discrete) if !discrete.eq_ignore_ascii_case(&frag_sha) => {
+                    return Err(anyhow!(
+                        "wheel `{name}`: discrete sha256 `{discrete}` disagrees with the \
+                         URL fragment sha256 `{frag_sha}` -- remove one",
+                    ));
+                }
+                // Discrete field present and matching: discrete wins, keep it.
+                Some(_) => {}
+                // Only the fragment carries the hash: adopt it.
+                None => self.sha256 = Some(frag_sha),
+            }
+        }
+        // Strip the fragment unconditionally so the fetched/compared URL is
+        // canonical (reqwest never transmits fragments anyway, but a lingering
+        // `#sha256=` would leak into filenames/logs and diverge from the clean
+        // URL recorded elsewhere).
+        url.set_fragment(None);
+        Ok(())
+    }
+
     /// Validate that the entry has exactly one form.
     pub fn validate(&self, name: &str) -> Result<()> {
         let form_count = [
@@ -934,6 +985,66 @@ mod tests {
         assert_eq!(isaac.normalized_version().unwrap(), "5.1.0");
         assert!(isaac.is_spec());
         assert_eq!(isaac.extras, vec!["all", "extscache"]);
+    }
+
+    #[test]
+    fn normalize_lifts_url_fragment_sha256() {
+        // Fragment-only: the hash rides in `#sha256=` and no discrete field.
+        let mut entry = WheelEntry {
+            url: Some(
+                "https://pypi.nvidia.com/foo/foo-1.0-cp312-none-any.whl#sha256=abc123"
+                    .parse()
+                    .unwrap(),
+            ),
+            ..Default::default()
+        };
+        entry.normalize("foo").unwrap();
+        assert_eq!(entry.sha256.as_deref(), Some("abc123"));
+        // Fragment stripped from the canonical URL.
+        assert_eq!(entry.url.as_ref().unwrap().fragment(), None);
+    }
+
+    #[test]
+    fn normalize_discrete_sha256_wins_over_fragment() {
+        // Both present and equal (ignoring case): discrete field is kept, no error.
+        let mut entry = WheelEntry {
+            url: Some(
+                "https://ex.com/foo-1.0-cp312-none-any.whl#sha256=ABC123"
+                    .parse()
+                    .unwrap(),
+            ),
+            sha256: Some("abc123".to_string()),
+            ..Default::default()
+        };
+        entry.normalize("foo").unwrap();
+        assert_eq!(entry.sha256.as_deref(), Some("abc123"));
+        assert_eq!(entry.url.as_ref().unwrap().fragment(), None);
+    }
+
+    #[test]
+    fn normalize_mismatched_dual_sha256_errors() {
+        // Discrete and fragment disagree: contradiction, must error.
+        let mut entry = WheelEntry {
+            url: Some(
+                "https://ex.com/foo-1.0-cp312-none-any.whl#sha256=deadbeef"
+                    .parse()
+                    .unwrap(),
+            ),
+            sha256: Some("abc123".to_string()),
+            ..Default::default()
+        };
+        let err = entry.normalize("foo").unwrap_err().to_string();
+        assert!(err.contains("disagrees"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn normalize_noop_without_fragment() {
+        let mut entry = WheelEntry {
+            url: Some("https://ex.com/foo-1.0-cp312-none-any.whl".parse().unwrap()),
+            ..Default::default()
+        };
+        entry.normalize("foo").unwrap();
+        assert_eq!(entry.sha256, None);
     }
 
     #[test]
