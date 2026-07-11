@@ -1,0 +1,75 @@
+Error:   × failed to solve the pypi requirements of environment 'viral-gpu' for
+  │ platform 'linux-64'
+  ├─▶ failed to resolve pypi dependencies
+  ╰─▶ Because transformers==4.46.0 was yanked (reason: This version
+      unfortunately does not work with 3.8 but we did not drop the support
+      yet) and only the following versions of transformers are available:
+          transformers<=4.46.0
+          transformers==4.46.1
+          transformers==4.46.2
+          transformers==4.46.3
+          transformers==4.47.0
+          transformers==4.47.1
+          transformers==4.48.0
+          transformers==4.48.1
+          transformers==4.48.2
+          transformers==4.48.3
+          transformers==4.49.0
+          transformers==4.50.0
+          transformers==4.50.1
+          transformers==4.50.2
+          transformers==4.50.3
+          transformers==4.51.0
+          transformers==4.51.1
+          transformers==4.51.2
+          transformers==4.51.3
+          transformers==4.52.0
+          transformers==4.52.1
+          transformers==4.52.2
+          transformers==4.52.3
+          transformers==4.52.4
+          transformers==4.53.0
+          transformers==4.53.1
+          transformers==4.53.2
+          transformers==4.53.3
+          transformers==4.54.0
+          transformers==4.54.1
+          transformers==4.55.0
+          transformers==4.55.1
+          transformers==4.55.2
+          transformers==4.55.3
+          transformers==4.55.4
+          transformers==4.56.0
+          transformers==4.56.1
+          transformers==4.56.2
+          transformers==4.57.0
+          transformers==4.57.1
+          transformers==4.57.2
+          transformers==4.57.3
+          transformers==4.57.4
+          transformers==4.57.5
+          transformers==4.57.6
+          transformers>=5
+      we can conclude that transformers>=4.46.0,<4.46.1 cannot be used. (1)
+      
+      Because transformers>=4.46.1,<=4.46.3 depends on huggingface-
+      hub>=0.23.2,<1.0 and huggingface-hub==1.23.0, we can conclude that
+      transformers>=4.46.1,<=4.46.3 cannot be used.
+      And because we know from (1) that transformers>=4.46.0,<4.46.1 cannot
+      be used, we can conclude that transformers>=4.46.0,<4.47.0 cannot be
+      used. (2)
+      
+      Because transformers>=4.47.0,<=4.48.3 depends on huggingface-
+      hub>=0.24.0,<1.0 and huggingface-hub==1.23.0, we can conclude that
+      transformers>=4.47.0,<=4.48.3 cannot be used.
+      And because we know from (2) that transformers>=4.46.0,<4.47.0 cannot
+      be used, we can conclude that transformers>=4.46.0,<4.49.0 cannot be
+      used. (3)
+      
+      Because transformers>=4.49.0,<=4.50.3 depends on huggingface-
+      hub>=0.26.0,<1.0 and huggingface-hub==1.23.0, we can conclude that
+      transformers>=4.49.0,<=4.50.3 cannot be used.
+      And because we know from (3) that transformers>=4.46.0,<4.49.0 cannot
+      be used, we can conclude that transformers>=4.46.0,<4.51.0 cannot be
+      used. (4)
+      

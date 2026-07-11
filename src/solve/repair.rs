@@ -1891,7 +1891,9 @@ fn intersect_range_with_cap(
             _ => exact_v > cap_v,
         };
         if excluded {
-            return Err(format!("exact pin =={exact_str} vs cap {cap_op}{cap_version}"));
+            return Err(format!(
+                "exact pin =={exact_str} vs cap {cap_op}{cap_version}"
+            ));
         }
         return Ok(existing.to_string());
     }
@@ -3279,7 +3281,7 @@ impl RepairPlanner {
         stderr: &str,
         package: &str,
     ) -> Vec<PackOverrideWrite> {
-        if is_abi_anchor(package) || self.has_workspace_pin_family(editor, package) {
+        if is_abi_anchor(package) {
             return Vec::new();
         }
         let Some(ws) = crate::workspace::WorkspaceManifest::load(editor.project_dir()) else {
@@ -3288,8 +3290,37 @@ impl RepairPlanner {
         let env_name = Regex::new(r"environment '([^']+)'")
             .ok()
             .and_then(|re| re.captures(stderr).map(|c| c[1].to_string()));
+        let env_def = env_name.as_deref().and_then(|e| ws.environments.get(e));
+        // Workspace-pin veto, scoped to the FAILING env's own features
+        // (run-42 recurrence of the run-24 class bug: `huggingface_hub`
+        // pins under [feature.cpu]/[feature.robogen]/[feature.groot-sonic]/
+        // [feature.uwlab] -- features `viral-gpu` never composes -- vetoed
+        // viral-gpu's terminal un-route via the ANY-feature scan and the
+        // ladder exhausted instead). A pin only expresses intent for the
+        // solves it participates in; when the failing env can't be
+        // resolved, fall back to the conservative any-feature veto.
+        let vetoed = match env_def {
+            Some(def) => {
+                let mut feats: Vec<String> = def.features.clone();
+                if !def.no_default_feature {
+                    feats.push("default".to_string());
+                }
+                conda_name_family(package, &self.conda_name_map)
+                    .iter()
+                    .any(|name| {
+                        feats.iter().any(|feature| {
+                            editor.has_user_entry(feature, TableKind::Conda, name)
+                                || editor.has_user_entry(feature, TableKind::Pypi, name)
+                        })
+                    })
+            }
+            None => self.has_workspace_pin_family(editor, package),
+        };
+        if vetoed {
+            return Vec::new();
+        }
         let mut pack_names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        match env_name.as_deref().and_then(|e| ws.environments.get(e)) {
+        match env_def {
             Some(def) => {
                 for feat in &def.features {
                     if let Some(f) = ws.features.get(feat) {
@@ -5688,7 +5719,9 @@ holosoma-gpu = { features = ["holosoma"] }
              \"protomotions-deps-pack\" = { path = \"./pypi-packs/protomotions-deps-pack\" }\n";
         let path = temp_manifest(manifest_text);
         let project_dir = path.parent().unwrap().to_path_buf();
-        let pack_dir = project_dir.join("pypi-packs").join("protomotions-deps-pack");
+        let pack_dir = project_dir
+            .join("pypi-packs")
+            .join("protomotions-deps-pack");
         std::fs::create_dir_all(&pack_dir).unwrap();
         std::fs::write(
             pack_dir.join("pixi.toml"),
@@ -5720,8 +5753,7 @@ holosoma-gpu = { features = ["holosoma"] }
         let editor = ManifestEditor::open(path).unwrap();
         let planner = RepairPlanner::new("default".into());
         let parser = super::super::parse::RegexConflictParser::new();
-        let mentions =
-            parser.extract_generic_mentions(CONDA_WORKSPACE_PIN_POISON_TENSORDICT_RUN41);
+        let mentions = parser.extract_generic_mentions(CONDA_WORKSPACE_PIN_POISON_TENSORDICT_RUN41);
         let bundle = parser.extract_bundle_name(CONDA_WORKSPACE_PIN_POISON_TENSORDICT_RUN41);
         let candidates =
             planner.generate_fallback_candidates(&editor, bundle.as_deref(), &mentions);
@@ -5746,6 +5778,83 @@ holosoma-gpu = { features = ["holosoma"] }
             cand.tried_key.contains("<0.13.0"),
             "floor-specific tried key so successive lower floors each earn a step: {}",
             cand.tried_key
+        );
+    }
+
+    const PYPI_CONDA_PINNED_HF_HUB_FOREIGN_FEATURE_VETO_RUN42: &str = include_str!(
+        "../../tests/fixtures/solve_errors/pypi_conda_pinned_hf_hub_foreign_feature_veto_run42.txt"
+    );
+
+    #[test]
+    fn terminal_unroute_veto_scopes_to_failing_env_features_run42() {
+        // Run-42: the ladder exhausted for huggingface-hub in env
+        // `viral-gpu` because the terminal un-route's ANY-feature
+        // workspace-pin veto saw `huggingface_hub` pins under features
+        // (`cpu`/`robogen`/`groot-sonic`/`uwlab`) that viral-gpu never
+        // composes -- run-24 class bug on the terminal path. A pin only
+        // expresses intent for the solves it participates in.
+        let manifest_text = "[environments]\n\
+             viral-gpu = { features = [\"isaaclab-viral\"], no-default-feature = true }\n\
+             \n\
+             [feature.isaaclab-viral.dependencies]\n\
+             \"isaaclab-2.3x-pack\" = { path = \"./pypi-packs/isaaclab-2.3x-pack\" }\n\
+             \n\
+             [feature.robogen.pypi-dependencies]\n\
+             huggingface-hub = \"==0.15.1\"\n";
+        let path = temp_manifest(manifest_text);
+        let project_dir = path.parent().unwrap().to_path_buf();
+        let pack_dir = project_dir.join("pypi-packs").join("isaaclab-2.3x-pack");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        std::fs::write(
+            pack_dir.join("pixi.toml"),
+            "[package]\nname = \"isaaclab-2.3x-pack\"\nversion = \"1.0\"\n",
+        )
+        .unwrap();
+        let editor = ManifestEditor::open(path).unwrap();
+        let planner = RepairPlanner::new("default".into());
+        // Foreign-feature pin must NOT veto: the failing env's packs get
+        // the un-route (stderr is the run-42 trace verbatim, carrying
+        // `environment 'viral-gpu'`).
+        let writes = planner.terminal_unroute_writes(
+            &editor,
+            PYPI_CONDA_PINNED_HF_HUB_FOREIGN_FEATURE_VETO_RUN42,
+            "huggingface-hub",
+        );
+        assert_eq!(
+            writes.iter().map(|w| w.bundle.as_str()).collect::<Vec<_>>(),
+            vec!["isaaclab-2.3x-pack"],
+            "a pin in a feature the failing env never composes must not veto"
+        );
+        assert!(writes.iter().all(|w| w.kind == PackOverrideKind::Unroute));
+
+        // A pin in a COMPOSING feature still vetoes.
+        let manifest_pinned = "[environments]\n\
+             viral-gpu = { features = [\"isaaclab-viral\"], no-default-feature = true }\n\
+             \n\
+             [feature.isaaclab-viral.dependencies]\n\
+             \"isaaclab-2.3x-pack\" = { path = \"./pypi-packs/isaaclab-2.3x-pack\" }\n\
+             \n\
+             [feature.isaaclab-viral.pypi-dependencies]\n\
+             huggingface-hub = \">=0.24,<1\"\n";
+        let path2 = temp_manifest(manifest_pinned);
+        let project_dir2 = path2.parent().unwrap().to_path_buf();
+        let pack_dir2 = project_dir2.join("pypi-packs").join("isaaclab-2.3x-pack");
+        std::fs::create_dir_all(&pack_dir2).unwrap();
+        std::fs::write(
+            pack_dir2.join("pixi.toml"),
+            "[package]\nname = \"isaaclab-2.3x-pack\"\nversion = \"1.0\"\n",
+        )
+        .unwrap();
+        let editor2 = ManifestEditor::open(path2).unwrap();
+        assert!(
+            planner
+                .terminal_unroute_writes(
+                    &editor2,
+                    PYPI_CONDA_PINNED_HF_HUB_FOREIGN_FEATURE_VETO_RUN42,
+                    "huggingface-hub",
+                )
+                .is_empty(),
+            "a pin in a composing feature is real intent and still vetoes"
         );
     }
 
