@@ -146,10 +146,24 @@ pub struct AutoRoutedPackage {
 }
 
 /// Configuration for the auto-route loop.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct AutoRouteOptions {
     /// Master switch (`auto-route` in `[package.build.config]`; default on).
     pub enabled: bool,
+    /// v4.6 Part A: which candidates the routing sweep may move to conda.
+    /// `Minimal` routes only the ABI/binary whitelist (see
+    /// [`route_policy_admits`]); `Aggressive` is the legacy
+    /// route-anything-conda-has behavior.
+    ///
+    /// NOTE: the struct `Default` here is `Aggressive` (so the extensive
+    /// pre-v4.6 unit-test matrix keeps exercising the legacy sweep it was
+    /// written against); the PRODUCTION default comes from the config
+    /// layer (`crate::config::RoutePolicy::default()` = `Minimal`), which
+    /// the handler wires in explicitly.
+    pub route_policy: crate::config::RoutePolicy,
+    /// v4.6 Part A: extra canonical PyPI names admitted to routing under
+    /// `Minimal` (`retread-route-include`), beyond the built-in whitelist.
+    pub route_include: BTreeSet<String>,
     /// Canonical PyPI names the user opted OUT of auto-routing
     /// (`keep-pypi`). Never routed, no probe issued.
     pub keep_pypi: BTreeSet<String>,
@@ -192,6 +206,68 @@ pub struct AutoRouteOptions {
     /// 2.7.0). Empty (tests / no workspace / workspace solve failed) --
     /// the un-route fallback then behaves exactly as before.
     pub workspace_conda_versions: BTreeMap<String, String>,
+}
+
+impl Default for AutoRouteOptions {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            // Legacy sweep semantics for bare test/probe construction; the
+            // production path wires the config-layer default (`Minimal`)
+            // explicitly. See the `route_policy` field doc.
+            route_policy: crate::config::RoutePolicy::Aggressive,
+            route_include: BTreeSet::new(),
+            keep_pypi: BTreeSet::new(),
+            protected: BTreeSet::new(),
+            name_map: BTreeMap::new(),
+            force_conda: BTreeSet::new(),
+            abi_anchor_pins: BTreeMap::new(),
+            workspace_conda_versions: BTreeMap::new(),
+        }
+    }
+}
+
+/// v4.6 Part A routing-policy gate: may this (pypi name, mapped conda
+/// name) candidate be auto-routed to conda?
+///
+/// `Aggressive` admits everything (legacy). `Minimal` admits only:
+/// - python / python_abi (the interpreter ABI itself),
+/// - the torch family (torch, pytorch, pytorch-gpu, pytorch-cpu,
+///   torchvision, torchaudio -- checked on BOTH the pypi and the mapped
+///   conda spelling, so a `torch -> pytorch-gpu` name-map edge is
+///   covered from either side),
+/// - the cuda-* family (cuda-version, cuda-toolkit, cudatoolkit, ...),
+/// - the pack's explicit `retread-route-include` entries, and
+/// - `force-conda` entries (the user asserts these must be conda).
+///
+/// Everything else ships as a PyPI wheel via the courier -- per-env
+/// versions, no conda arbitration (the 43-run imprint campaign's repair
+/// ladder empirically un-routed wrapt/moviepy/dm-tree/grpcio/cycler/
+/// fsspec/huggingface-hub/...; the fixes converged on this whitelist).
+pub fn route_policy_admits(pypi_name: &str, conda_name: &str, opts: &AutoRouteOptions) -> bool {
+    if opts.route_policy == crate::config::RoutePolicy::Aggressive {
+        return true;
+    }
+    const WHITELIST: &[&str] = &[
+        "python",
+        "python_abi",
+        "python-abi",
+        "torch",
+        "pytorch",
+        "pytorch-gpu",
+        "pytorch-cpu",
+        "torchvision",
+        "torchaudio",
+    ];
+    let admits_name = |n: &str| {
+        WHITELIST.contains(&n) || n.starts_with("cuda-") || n == "cudatoolkit" || n == "cuda"
+    };
+    admits_name(pypi_name)
+        || admits_name(conda_name)
+        || opts.route_include.contains(pypi_name)
+        || opts.route_include.contains(conda_name)
+        || opts.force_conda.contains(pypi_name)
+        || opts.force_conda.contains(conda_name)
 }
 
 /// Hard cap on auto-route discovery rounds (rounds that GROW the
@@ -256,6 +332,12 @@ pub fn plan_auto_route_round(
             .get(name)
             .map(|c| canonical_conda_name(c))
             .unwrap_or_else(|| name.clone());
+        // v4.6 Part A: the routing-policy gate. Under `Minimal`, a
+        // non-whitelisted candidate never routes regardless of conda
+        // availability -- it ships as a wheel.
+        if !route_policy_admits(name, &conda_name, opts) {
+            continue;
+        }
         if let Some(hit) = probe_hits.get(&conda_name) {
             // Route-time metadata-consistency check (prevention for the
             // PyPI-vs-conda-forge metadata-skew class -- run-15's
@@ -453,6 +535,11 @@ pub fn auto_route_probe_specs(
             .get(name)
             .map(|c| canonical_conda_name(c))
             .unwrap_or_else(|| name.clone());
+        // v4.6 Part A: don't even probe repodata for candidates the
+        // routing policy refuses -- they ship as wheels.
+        if !route_policy_admits(name, &conda_name, opts) {
+            continue;
+        }
         let pair = (conda_name, format!("=={}", wheel.version));
         if !out.contains(&pair) {
             out.push(pair);
@@ -3133,6 +3220,7 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
             name_map: BTreeMap::new(),
             abi_anchor_pins: BTreeMap::new(),
             workspace_conda_versions: BTreeMap::new(),
+            ..Default::default()
         }
     }
 
@@ -3488,6 +3576,115 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
         assert_eq!(names, vec!["typing-extensions"]);
     }
 
+    /// v4.6 Part A: the routing-policy decision function. Minimal admits
+    /// only the ABI/binary whitelist (either name side), route-include
+    /// entries, and force-conda entries; aggressive is legacy admit-all.
+    #[test]
+    fn route_policy_minimal_admits_only_whitelist_includes_and_force_conda() {
+        let mut opts = AutoRouteOptions {
+            route_policy: crate::config::RoutePolicy::Minimal,
+            ..Default::default()
+        };
+        for (pypi, conda) in [
+            ("python", "python"),
+            ("torch", "pytorch-gpu"),
+            ("pytorch", "pytorch"),
+            ("torchvision", "torchvision"),
+            ("torchaudio", "torchaudio"),
+            ("cuda-version", "cuda-version"),
+            ("cudatoolkit", "cudatoolkit"),
+            // conda-side spelling alone suffices (name-map edge).
+            ("some-pypi-alias", "cuda-toolkit"),
+        ] {
+            assert!(
+                route_policy_admits(pypi, conda, &opts),
+                "whitelist must admit ({pypi}, {conda})"
+            );
+        }
+        for n in [
+            "wrapt",
+            "fsspec",
+            "huggingface-hub",
+            "grpcio",
+            "cycler",
+            "dm-tree",
+            "moviepy",
+            "matplotlib",
+            "tensordict",
+        ] {
+            assert!(!route_policy_admits(n, n, &opts), "minimal must refuse {n}");
+        }
+        opts.route_include.insert("grpcio".to_string());
+        assert!(route_policy_admits("grpcio", "grpcio", &opts));
+        opts.force_conda.insert("mujoco".to_string());
+        assert!(route_policy_admits("mujoco", "mujoco", &opts));
+    }
+
+    #[test]
+    fn route_policy_aggressive_is_legacy_admit_all() {
+        let opts = AutoRouteOptions::default();
+        assert_eq!(
+            opts.route_policy,
+            crate::config::RoutePolicy::Aggressive,
+            "bare test/probe construction keeps legacy sweep semantics"
+        );
+        assert!(route_policy_admits("wrapt", "wrapt", &opts));
+        assert!(route_policy_admits(
+            "anything-at-all",
+            "anything-at-all",
+            &opts
+        ));
+    }
+
+    /// v4.6 Part A at the sweep level: under Minimal, a conda-available
+    /// non-whitelisted wheel is NOT routed (ships as a wheel) and is not
+    /// even probed; whitelisted/include-listed candidates still route.
+    #[test]
+    fn plan_auto_route_round_minimal_policy_refuses_non_whitelisted() {
+        let req = auto_route_req();
+        let closure = parse_pylock_closure(
+            PYLOCK_FIXTURE,
+            &target("3.12", "linux-64"),
+            &BTreeSet::new(),
+            "x",
+        )
+        .unwrap();
+        let mut hits = BTreeMap::new();
+        for n in ["numpy", "typing-extensions"] {
+            hits.insert(
+                n.to_string(),
+                RouteProbeHit {
+                    conda_version: "1".into(),
+                    channel: "c/linux-64".into(),
+                    depends: Vec::new(),
+                },
+            );
+        }
+        let mut opts = auto_route_opts();
+        opts.route_policy = crate::config::RoutePolicy::Minimal;
+        // Neither numpy nor typing-extensions is whitelist material.
+        let routes = plan_auto_route_round(&closure, &req, &opts, &[], &hits);
+        assert!(
+            routes.is_empty(),
+            "minimal policy must refuse non-whitelisted routes: {routes:?}"
+        );
+        let probes = auto_route_probe_specs(&closure, &req, &opts, &[]);
+        assert!(
+            probes.is_empty(),
+            "refused candidates must not be probed: {probes:?}"
+        );
+        // The include list re-admits a name.
+        opts.route_include.insert("numpy".to_string());
+        let routes = plan_auto_route_round(&closure, &req, &opts, &[], &hits);
+        let names: Vec<&str> = routes.iter().map(|r| r.pypi_name.as_str()).collect();
+        assert_eq!(names, vec!["numpy"]);
+        let probes = auto_route_probe_specs(&closure, &req, &opts, &[]);
+        assert!(
+            probes.iter().all(|(n, _)| n == "numpy"),
+            "only include-listed candidates probed: {probes:?}"
+        );
+    }
+
     /// Run-15 shape, mocked at the repodata layer: conda `moviepy`'s own
     /// recipe still says `pillow <11.0,>=9.2.0`, but the uv closure
     /// already locked `pillow==11.3.0` (uv's legal PyPI-truth pick,
@@ -3758,6 +3955,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
             name_map: BTreeMap::new(),
             abi_anchor_pins: BTreeMap::new(),
             workspace_conda_versions: BTreeMap::new(),
+            ..Default::default()
         };
         let channels: Vec<ChannelUrl> = vec![ChannelUrl::from(
             url::Url::parse("https://conda.anaconda.org/conda-forge/").unwrap(),
@@ -4106,6 +4304,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
                 "pytorch".to_string(),
                 "2.7.0".to_string(),
             )]),
+            ..Default::default()
         }
     }
 

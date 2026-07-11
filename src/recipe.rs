@@ -1112,6 +1112,9 @@ mod tests {
         RetreadConfig {
             resolver: Default::default(),
             auto_route: true,
+            // v4.6: legacy sweep semantics for the pre-v4.6 test matrix.
+            route_policy: crate::config::RoutePolicy::Aggressive,
+            route_include: vec![],
             keep_pypi: vec![],
             force_conda: vec![],
             sdist_build: Default::default(),

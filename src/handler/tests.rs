@@ -294,6 +294,9 @@ fn pythons_for_rejects_bare_major_variant() {
     let cfg = RetreadConfig {
         resolver: Default::default(),
         auto_route: true,
+        // v4.6: legacy sweep semantics for the pre-v4.6 test matrix.
+        route_policy: crate::config::RoutePolicy::Aggressive,
+        route_include: vec![],
         keep_pypi: vec![],
         force_conda: vec![],
         sdist_build: Default::default(),
@@ -340,6 +343,9 @@ fn pythons_for_accepts_dotted_variant() {
     let cfg = RetreadConfig {
         resolver: Default::default(),
         auto_route: true,
+        // v4.6: legacy sweep semantics for the pre-v4.6 test matrix.
+        route_policy: crate::config::RoutePolicy::Aggressive,
+        route_include: vec![],
         keep_pypi: vec![],
         force_conda: vec![],
         sdist_build: Default::default(),
@@ -386,6 +392,9 @@ fn pythons_for_filters_bare_major_keeps_dotted() {
     let cfg = RetreadConfig {
         resolver: Default::default(),
         auto_route: true,
+        // v4.6: legacy sweep semantics for the pre-v4.6 test matrix.
+        route_policy: crate::config::RoutePolicy::Aggressive,
+        route_include: vec![],
         keep_pypi: vec![],
         force_conda: vec![],
         sdist_build: Default::default(),
@@ -440,6 +449,9 @@ fn courier_pure_python_bundle_is_platform_specific_not_noarch() {
     let courier_cfg = RetreadConfig {
         resolver: Default::default(),
         auto_route: true,
+        // v4.6: legacy sweep semantics for the pre-v4.6 test matrix.
+        route_policy: crate::config::RoutePolicy::Aggressive,
+        route_include: vec![],
         keep_pypi: vec![],
         force_conda: vec![],
         sdist_build: Default::default(),
@@ -931,6 +943,9 @@ fn cfg() -> RetreadConfig {
     RetreadConfig {
         resolver: Default::default(),
         auto_route: true,
+        // v4.6: legacy sweep semantics for the pre-v4.6 test matrix.
+        route_policy: crate::config::RoutePolicy::Aggressive,
+        route_include: vec![],
         keep_pypi: vec![],
         force_conda: vec![],
         sdist_build: Default::default(),

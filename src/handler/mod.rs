@@ -2645,6 +2645,14 @@ async fn uv_group_closure(
     }
     let auto_route_opts = crate::uv_closure::AutoRouteOptions {
         enabled: effective.auto_route,
+        // v4.6 Part A: production wiring of the routing policy -- the
+        // config-layer default is `Minimal` (whitelist-only routing).
+        route_policy: effective.route_policy,
+        route_include: effective
+            .route_include
+            .iter()
+            .map(|n| canonical_conda_name(n))
+            .collect(),
         keep_pypi: effective
             .keep_pypi
             .iter()

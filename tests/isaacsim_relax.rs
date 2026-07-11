@@ -53,6 +53,9 @@ fn baseline_config() -> RetreadConfig {
     RetreadConfig {
         resolver: Default::default(),
         auto_route: true,
+        // v4.6: legacy sweep semantics for the pre-v4.6 test matrix.
+        route_policy: pixi_build_retread::config::RoutePolicy::Aggressive,
+        route_include: vec![],
         keep_pypi: vec![],
         force_conda: vec![],
         retread_wheels: BTreeMap::new(),
