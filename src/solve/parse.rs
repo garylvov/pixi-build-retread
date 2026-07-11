@@ -974,6 +974,46 @@ pub fn diagnose_abi_build_tail(stderr: &str) -> Option<String> {
     ))
 }
 
+/// Run-40 companion shape to [`diagnose_abi_build_tail`]: an ABI-anchor
+/// exact pin (`cuda-version ==12.8`) dead-ends on its own
+/// `run_constrained` of a RENAMED/DISCONTINUED companion package --
+///
+/// ```text
+/// cuda-version ==12.8 cannot be installed because there are no viable options:
+/// └─ cuda-version 12.8 would constrain
+///    └─ cudatoolkit ==12.8|12.8.*, which conflicts with any installable
+///       versions previously reported
+/// ```
+///
+/// `cudatoolkit` was renamed to the `cuda-*` split before 12.x, so no
+/// 12.8 build exists: some package's SELECTED build variant is an OLD one
+/// depending on `cudatoolkit` (its newer `cuda-version`-depending builds
+/// were excluded by other constraints earlier in the same tree -- the
+/// run-38 build-variant-exclusion pattern again). The anchor is
+/// immutable; the excluding constraint (visible in the branches above the
+/// clause) is what yields.
+pub fn diagnose_constrained_renamed_companion(stderr: &str) -> Option<String> {
+    let re = Regex::new(
+        r"(?s)([A-Za-z][A-Za-z0-9._-]*)\s*==\s*([0-9][0-9A-Za-z.]*)\s+cannot be\s+installed because there are no viable\s+options:.{0,200}?would constrain[\s│├╰└─▶]*([A-Za-z][A-Za-z0-9._-]*)\s*==\s*([0-9][0-9A-Za-z.]*)\|[0-9][0-9A-Za-z.]*\.\*,\s*which conflicts with any\s+installable\s+versions previously reported",
+    )
+    .ok()?;
+    let caps = re.captures(stderr)?;
+    Some(format!(
+        "retread lock: diagnosis -- the ABI anchor `{anchor} =={ver}` \
+         run_constrains `{companion}` to {ver}, but no such {companion} \
+         build exists (renamed/discontinued line). Some package's SELECTED \
+         build variant is an old one depending on `{companion}` because its \
+         newer `{anchor}`-based builds were excluded by other constraints \
+         earlier in this same tree (build-variant exclusion, run 38/40 \
+         pattern). The anchor is immutable; the excluding constraint in the \
+         branches above this clause is what must yield (widen/un-route the \
+         owning pack's emission).",
+        anchor = &caps[1],
+        ver = &caps[2],
+        companion = &caps[3],
+    ))
+}
+
 impl Default for RegexConflictParser {
     fn default() -> Self {
         Self::new()
@@ -1111,6 +1151,20 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    const CONDA_LEDGERED_RANGE_RUN40: &str = include_str!(
+        "../../tests/fixtures/solve_errors/conda_ledgered_range_top_pick_dead_end_run40.txt"
+    );
+
+    #[test]
+    fn diagnose_constrained_renamed_companion_names_anchor_on_run40_fixture() {
+        let diag = diagnose_constrained_renamed_companion(CONDA_LEDGERED_RANGE_RUN40)
+            .expect("run-40 cudatoolkit constrain shape must be recognized");
+        assert!(diag.contains("cuda-version =="), "{diag}");
+        assert!(diag.contains("12.8"), "{diag}");
+        assert!(diag.contains("cudatoolkit"), "{diag}");
+        assert!(diagnose_constrained_renamed_companion("unrelated solver prose").is_none());
     }
 
     const CONDA_BOUNDARY_SINGLE_LINE: &str =

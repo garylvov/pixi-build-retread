@@ -496,6 +496,9 @@ async fn run_with_pixi_bin(args: LockArgs, pixi_bin: &str) -> Result<i32> {
         if let Some(diag) = super::parse::diagnose_abi_build_tail(&stripped) {
             eprintln!("{diag}");
         }
+        if let Some(diag) = super::parse::diagnose_constrained_renamed_companion(&stripped) {
+            eprintln!("{diag}");
+        }
         eprintln!("{}", tail(&lock.raw_stderr, 4000));
         print_summary(&records);
         return Ok(EXIT_UNPARSEABLE);

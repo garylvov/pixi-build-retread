@@ -2520,6 +2520,7 @@ impl RepairPlanner {
                                 })
                                 .filter_map(|o| extract_cap_clause(&o.spec)),
                         );
+                        let mut pushed = false;
                         for (cap_op, cap_version) in caps {
                             let Ok(narrowed) =
                                 intersect_range_with_cap(existing, &cap_op, &cap_version)
@@ -2543,7 +2544,46 @@ impl RepairPlanner {
                                     m.package
                                 ),
                             });
+                            pushed = true;
                             break;
+                        }
+                        // Run-40 ceiling-step-down: no visible cap clause
+                        // narrows the ledgered override, because the
+                        // failing version IS the emission's own floor --
+                        // uv picked the TOP of the override range
+                        // (`matplotlib >=3.10.3,<4` -> locked 3.11.0 ->
+                        // emitted `>=3.11.0,<4`) and that top pick
+                        // dead-ends in conda (matplotlib-base 3.11.0's
+                        // icu 78.3 chain vs the py-opencv/qt6 chain's
+                        // icu; py313-only remainder builds excluded by
+                        // python==3.11). The tree carries no `<3.11` cap
+                        // mention anywhere. Step the override's ceiling
+                        // BELOW the failing emitted floor so uv re-picks
+                        // inside the still-allowed lower range (3.10.x,
+                        // the previously-green pick). Empty intersection
+                        // (override floor == emitted floor) errors out of
+                        // `intersect_range_with_cap` and is skipped --
+                        // exact-form emissions never step down.
+                        if !pushed
+                            && m.spec.trim_start().starts_with(">=")
+                            && let Some(floor) = pack_emitted_pin_floor(&m.spec)
+                            && let Ok(narrowed) = intersect_range_with_cap(existing, "<", &floor)
+                            && &narrowed != existing
+                        {
+                            out.push(FallbackCandidate {
+                                tier: 2,
+                                package: m.package.clone(),
+                                pack_name: owner_bundle.to_string(),
+                                kind: PackOverrideKind::Override,
+                                old_spec: Some(existing.clone()),
+                                new_spec: narrowed,
+                                ownership,
+                                tried_key: format!("{}@{owner_bundle}#fallback-narrow", m.package),
+                                reason: format!(
+                                    "generic fallback: ceiling stepped below {}'s failing emitted floor {floor} (uv's top-of-range pick dead-ends in conda)",
+                                    m.package
+                                ),
+                            });
                         }
                     }
                 }
@@ -5468,6 +5508,54 @@ holosoma-gpu = { features = ["holosoma"] }
                 .map(|(o, _)| &o.attempt.package)
                 .collect::<Vec<_>>()
         );
+    }
+
+    const CONDA_LEDGERED_RANGE_TOP_PICK_DEAD_END_RUN40: &str = include_str!(
+        "../../tests/fixtures/solve_errors/conda_ledgered_range_top_pick_dead_end_run40.txt"
+    );
+
+    #[test]
+    fn tier2_ceiling_steps_below_failing_emitted_floor_run40_matplotlib() {
+        // Run-40: a tier-1 repair widened matplotlib's ledgered override
+        // to `>=3.10.3,<4`; uv re-picked the TOP of the range (3.11.0),
+        // the pack re-emitted `>=3.11.0,<4`, and conda matplotlib 3.11.0
+        // dead-ends (icu 78.3 chain vs the py-opencv/qt6 chain; py313-only
+        // remainder builds). No `<3.11` cap clause exists anywhere in the
+        // tree, so the run-31 cap scan finds nothing -- the new
+        // ceiling-step-down must narrow the override below the failing
+        // emitted floor so uv re-picks 3.10.x.
+        let (path, project_dir) = run20_two_pack_workspace(false);
+        let pack_pixi = project_dir
+            .join("pypi-packs")
+            .join("isaaclab-2.3x-pack")
+            .join("pixi.toml");
+        crate::pack_overrides::write_override(
+            &project_dir,
+            &pack_pixi,
+            "isaaclab-2.3x-pack",
+            "matplotlib",
+            ">=3.10.3,<4",
+            "GenericFallback",
+        )
+        .unwrap();
+        let editor = ManifestEditor::open(path).unwrap();
+        let planner = RepairPlanner::new("default".into());
+        let parser = super::super::parse::RegexConflictParser::new();
+        let mentions =
+            parser.extract_generic_mentions(CONDA_LEDGERED_RANGE_TOP_PICK_DEAD_END_RUN40);
+        let bundle = parser.extract_bundle_name(CONDA_LEDGERED_RANGE_TOP_PICK_DEAD_END_RUN40);
+        let candidates =
+            planner.generate_fallback_candidates(&editor, bundle.as_deref(), &mentions);
+        let cand = candidates
+            .iter()
+            .find(|c| c.package == "matplotlib" && c.tier == 2)
+            .unwrap_or_else(|| panic!("ceiling-step-down candidate expected: {candidates:?}"));
+        assert_eq!(cand.old_spec.as_deref(), Some(">=3.10.3,<4"));
+        assert_eq!(
+            cand.new_spec, ">=3.10.3,<3.11.0",
+            "ceiling must step below the failing emitted floor"
+        );
+        assert_eq!(cand.pack_name, "isaaclab-2.3x-pack");
     }
 
     #[test]

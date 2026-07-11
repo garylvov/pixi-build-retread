@@ -1,0 +1,203 @@
+Error:   × failed to solve requirements of environment 'viral-gpu' for platform
+  │ 'linux-64'
+  ├─▶   × failed to solve the environment
+  │   
+  ╰─▶ Cannot solve the request because of: py-opencv >=4.9,<5 cannot be
+      installed because there are no viable options:
+      └─ py-opencv 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 |
+      4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0
+      | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0
+      | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0
+      | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0
+      | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0
+      | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0
+      | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0
+      | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0
+      | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0
+      | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0
+      | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0
+      | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0
+      | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0
+      | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0 | 4.9.0
+      | 4.9.0 | 4.9.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 |
+      4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 |
+      4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 |
+      4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 |
+      4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 |
+      4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 |
+      4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 |
+      4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 |
+      4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 |
+      4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 |
+      4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 |
+      4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 |
+      4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 |
+      4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 |
+      4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 |
+      4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 |
+      4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 |
+      4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 |
+      4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 |
+      4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 |
+      4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 |
+      4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 |
+      4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 |
+      4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 |
+      4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 |
+      4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 |
+      4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 | 4.10.0 |
+      4.10.0 | 4.10.0 | 4.11.0 | 4.11.0 | 4.11.0 | 4.11.0 | 4.11.0 | 4.11.0 |
+      4.11.0 | 4.11.0 | 4.11.0 | 4.11.0 | 4.11.0 | 4.11.0 | 4.11.0 | 4.11.0 |
+      4.11.0 | 4.11.0 | 4.11.0 | 4.11.0 | 4.11.0 | 4.11.0 | 4.11.0 | 4.11.0 |
+      4.11.0 | 4.11.0 | 4.11.0 | 4.11.0 | 4.11.0 | 4.11.0 | 4.11.0 | 4.11.0 |
+      4.11.0 | 4.11.0 | 4.11.0 | 4.11.0 | 4.11.0 | 4.11.0 | 4.11.0 | 4.11.0 |
+      4.11.0 | 4.11.0 | 4.11.0 | 4.11.0 | 4.11.0 | 4.11.0 | 4.11.0 | 4.11.0 |
+      4.11.0 | 4.11.0 | 4.11.0 | 4.11.0 | 4.11.0 | 4.11.0 | 4.11.0 | 4.11.0 |
+      4.11.0 | 4.11.0 | 4.11.0 | 4.11.0 | 4.11.0 | 4.11.0 | 4.11.0 | 4.11.0 |
+      4.11.0 | 4.11.0 | 4.11.0 | 4.11.0 | 4.11.0 | 4.11.0 | 4.11.0 | 4.11.0 |
+      4.11.0 | 4.11.0 | 4.11.0 | 4.11.0 | 4.11.0 | 4.11.0 | 4.11.0 | 4.11.0 |
+      4.11.0 | 4.11.0 | 4.12.0 | 4.12.0 | 4.12.0 | 4.12.0 | 4.12.0 | 4.12.0 |
+      4.12.0 | 4.12.0 | 4.12.0 | 4.12.0 | 4.12.0 | 4.12.0 | 4.12.0 | 4.12.0 |
+      4.12.0 | 4.12.0 | 4.12.0 | 4.12.0 | 4.12.0 | 4.12.0 | 4.12.0 | 4.12.0 |
+      4.12.0 | 4.12.0 | 4.12.0 | 4.12.0 | 4.12.0 | 4.12.0 | 4.12.0 | 4.12.0 |
+      4.12.0 | 4.12.0 | 4.12.0 | 4.12.0 | 4.12.0 | 4.12.0 | 4.12.0 | 4.12.0 |
+      4.12.0 | 4.12.0 | 4.12.0 | 4.12.0 | 4.12.0 | 4.12.0 | 4.12.0 | 4.12.0 |
+      4.12.0 | 4.12.0 | 4.12.0 | 4.12.0 | 4.12.0 | 4.12.0 | 4.12.0 | 4.12.0 |
+      4.12.0 | 4.12.0 | 4.12.0 | 4.12.0 | 4.12.0 | 4.12.0 | 4.12.0 | 4.12.0 |
+      4.12.0 | 4.12.0 | 4.12.0 | 4.12.0 | 4.12.0 | 4.12.0 | 4.12.0 | 4.12.0 |
+      4.12.0 | 4.12.0 | 4.12.0 | 4.12.0 | 4.12.0 | 4.12.0 | 4.12.0 | 4.12.0 |
+      4.12.0 | 4.12.0 | 4.12.0 | 4.12.0 | 4.12.0 | 4.12.0 | 4.13.0 | 4.13.0 |
+      4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 |
+      4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 |
+      4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 |
+      4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 |
+      4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 |
+      4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 |
+      4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 |
+      4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 |
+      4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 |
+      4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 |
+      4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 |
+      4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 |
+      4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 |
+      4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 |
+      4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 |
+      4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 |
+      4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 |
+      4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 |
+      4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 |
+      4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 |
+      4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 |
+      4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 |
+      4.13.0 | 4.13.0 | 4.13.0 | 4.13.0 would require
+         └─ python >=3.9,<3.10.0a0, for which no candidates were found.
+      The following packages are incompatible
+      ├─ py-opencv >=4.9,<5 can be installed with any of the following
+      options:
+      │  ├─ py-opencv 4.11.0 would require
+      │  │  └─ libopencv ==4.11.0 qt6_py311h4ff11a6_606, which can be
+      installed with any of the following options:
+      │  │     └─ libopencv 4.11.0 would require
+      │  │        └─ hdf5 >=1.14.6,<1.14.7.0a0 mpi_mvapich_*, which can be
+      installed with any of the following options:
+      │  │           └─ hdf5 1.14.6 | 1.14.6 | 1.14.6 | 1.14.6 would require
+      │  │              └─ mvapich >=4.0,<4.1.0a0, which can be installed with
+      any of the following options:
+      │  │                 └─ mvapich 4.0 | 4.0 | 4.0 | 4.0 | 4.0 | 4.0 | 4.0
+      | 4.0 | 4.0 would require
+      │  │                    └─ libhwloc >=2.11.2,<2.11.3.0a0, which can be
+      installed with any of the following options:
+      │  │                       └─ libhwloc 2.11.2 | 2.11.2 would require
+      │  │                          └─ cudatoolkit >=11.8,<12, which can be
+      installed with any of the following options:
+      │  │                             └─ cudatoolkit 11.8.0 | 11.8.0 | 11.8.0
+      | 11.8.0
+      │  └─ py-opencv 4.11.0 would require
+      │     └─ libopencv ==4.11.0 headless_py311h62cdbed_6, which can be
+      installed with any of the following options:
+      │        └─ libopencv 4.11.0 would require
+      │           └─ hdf5 >=1.14.6,<1.14.7.0a0 mpi_mvapich_*, which can be
+      installed with any of the following options:
+      ├─ __cuda * can be installed with any of the following options:
+      │  └─ __cuda 12
+      ├─ pytorch-gpu ==2.7.0 cannot be installed because there are no viable
+      options:
+      │  ├─ pytorch-gpu 2.7.0 would require
+      │  │  └─ pytorch ==2.7.0 cuda*_mkl*300, which cannot be installed
+      because there are no viable options:
+      │  │     ├─ pytorch 2.7.0 would require
+      │  │     │  └─ libabseil >=20250127.1,<20250128.0a0, which cannot be
+      installed because there are no viable options:
+      │  │     │     └─ libabseil 20250127.1, which conflicts with the
+      versions reported above.
+      │  │     └─ pytorch 2.7.0 | 2.7.0 | 2.7.0 | 2.7.0 would require
+      │  │        └─ python >=3.12,<3.13.0a0, for which no candidates were
+      found.
+      │  └─ pytorch-gpu 2.7.0 would require
+      │     └─ pytorch ==2.7.0 cuda*_generic*200, which cannot be installed
+      because there are no viable options:
+      │        ├─ pytorch 2.7.0 would require
+      │        │  └─ libabseil >=20250127.1,<20250128.0a0, which cannot be
+      installed because there are no viable options:
+      │        │     └─ libabseil 20250127.1, which conflicts with the
+      versions reported above.
+      │        └─ pytorch 2.7.0 | 2.7.0 | 2.7.0 | 2.7.0 would require
+      │           └─ python >=3.13,<3.14.0a0, for which no candidates were
+      found.
+      ├─ isaaclab-2.3x-pack * cannot be installed because there are no viable
+      options:
+      │  └─ isaaclab-2.3x-pack 0.54.2 would require
+      │     └─ matplotlib >=3.11.0,<4, which cannot be installed because there
+      are no viable options:
+      │        ├─ matplotlib 3.11.0 | 3.11.0 would require
+      │        │  ├─ pyside6 >=6.7.2, which can be installed with any of the
+      following options:
+      │        │  │  └─ pyside6 6.10.1 would require
+      │        │  │     └─ qt6-main 6.10.1.*, which can be installed with any
+      of the following options:
+      │        │  │        └─ qt6-main 6.10.1
+      │        │  └─ matplotlib-base >=3.11.0,<3.11.1.0a0, which cannot be
+      installed because there are no viable options:
+      │        │     ├─ matplotlib-base 3.11.0 | 3.11.0 would require
+      │        │     │  └─ libraqm >=0.10.5,<0.11.0a0, which cannot be
+      installed because there are no viable options:
+      │        │     │     ├─ libraqm 0.10.5 would require
+      │        │     │     │  └─ libharfbuzz >=14.2.1, which cannot be
+      installed because there are no viable options:
+      │        │     │     │     └─ libharfbuzz 14.2.1 would require
+      │        │     │     │        └─ icu >=78.3,<79.0a0, which cannot be
+      installed because there are no viable options:
+      │        │     │     │           └─ icu 78.3, which conflicts with the
+      versions reported above.
+      │        │     │     └─ libraqm 0.10.5 would require
+      │        │     │        └─ harfbuzz >=14.2.1, which cannot be installed
+      because there are no viable options:
+      │        │     │           ├─ harfbuzz 14.2.1 would require
+      │        │     │           │  └─ libharfbuzz-devel ==14.2.1 h17a8019_1,
+      which cannot be installed because there are no viable options:
+      │        │     │           │     └─ libharfbuzz-devel 14.2.1 would
+      require
+      │        │     │           │        └─ icu >=78.3,<79.0a0, which cannot
+      be installed because there are no viable options:
+      │        │     │           │           └─ icu 78.3, which conflicts with
+      the versions reported above.
+      │        │     │           └─ harfbuzz 14.2.1 would require
+      │        │     │              └─ icu >=78.3,<79.0a0, which cannot be
+      installed because there are no viable options:
+      │        │     │                 └─ icu 78.3, which conflicts with the
+      versions reported above.
+      │        │     └─ matplotlib-base 3.11.0 | 3.11.0 | 3.11.0 | 3.11.0 |
+      3.11.0 | 3.11.0 would require
+      │        │        └─ python >=3.13,<3.14.0a0, for which no candidates
+      were found.
+      │        └─ matplotlib 3.11.0 | 3.11.0 | 3.11.0 | 3.11.0 | 3.11.0 |
+      3.11.0 would require
+      │           └─ python >=3.13,<3.14.0a0, for which no candidates were
+      found.
+      └─ cuda-version ==12.8 cannot be installed because there are no viable
+      options:
+         └─ cuda-version 12.8 would constrain
+            └─ cudatoolkit ==12.8|12.8.*, which conflicts with any installable
+      versions previously reported
+      
+
