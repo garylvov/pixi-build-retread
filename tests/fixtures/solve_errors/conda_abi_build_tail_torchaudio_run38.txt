@@ -1,0 +1,11 @@
+Error:   × failed to solve requirements of environment 'pm-isaaclab' for platform
+  │ 'linux-64'
+  ├─▶   × failed to solve the environment
+  │   
+  ╰─▶ Cannot solve the request because of: torchaudio ==2.7.0 cannot be
+      installed because there are no viable options:
+      └─ torchaudio 2.7.0 | 2.7.0 | 2.7.0 | 2.7.0 | 2.7.0 | 2.7.0 | 2.7.0 |
+      2.7.0 | 2.7.0 | 2.7.0 | 2.7.0 | 2.7.0 would require
+         └─ python_abi 3.10.* *_cp310, for which no candidates were found.
+      
+

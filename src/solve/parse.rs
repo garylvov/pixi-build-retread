@@ -934,6 +934,46 @@ impl RegexConflictParser {
     }
 }
 
+/// Run-38 shape: a workspace EXACT pin dead-ends on a wrong-python
+/// `python_abi` build tail --
+///
+/// ```text
+/// torchaudio ==2.7.0 cannot be installed because there are no viable options:
+/// └─ torchaudio 2.7.0 | 2.7.0 | ... would require
+///    └─ python_abi 3.10.* *_cp310, for which no candidates were found.
+/// ```
+///
+/// Resolvo elides the constraints that EXCLUDED every env-python-matching
+/// build (typically another pack's emitted torch-family range, run 34/38:
+/// `pytorch >=2.10.0,<3` excluding all pytorch-2.7-built cp311
+/// torchaudios), so there is nothing in the tree for the repair ladder to
+/// act on -- the workspace pin itself is untouchable doctrine and the real
+/// excluder is unnamed. This diagnostic turns the bare "could not parse"
+/// into an actionable message naming the pin and the cause class. Returns
+/// `None` when the text doesn't match the shape.
+pub fn diagnose_abi_build_tail(stderr: &str) -> Option<String> {
+    let re = Regex::new(
+        r"(?s)([A-Za-z][A-Za-z0-9._-]*)\s*==\s*([0-9][0-9A-Za-z.]*)\s+cannot be\s+installed because there are no viable options:.{0,400}?would require[\s│├╰└─▶]*python_abi\s+([0-9.]+)\.\*\s+\*_cp(\d+),\s*for which no\s+candidates were found",
+    )
+    .ok()?;
+    let caps = re.captures(stderr)?;
+    Some(format!(
+        "retread lock: diagnosis -- the workspace pin `{pkg} =={ver}` only \
+         reaches builds for python {abi} (cp{cp}); every build matching the \
+         env's python was excluded by constraints resolvo does not show \
+         (typically a sibling pack's emitted torch-family range at a \
+         different version, e.g. run 34/38's `pytorch >=2.10.0,<3`). The \
+         workspace pin is hand-written truth and is not repaired; the fix \
+         is route-time (the pack's uv closure must be constrained to the \
+         consuming envs' hand-written versions -- check the pack renders' \
+         emitted ranges for the {pkg} family).",
+        pkg = &caps[1],
+        ver = &caps[2],
+        abi = &caps[3],
+        cp = &caps[4],
+    ))
+}
+
 impl Default for RegexConflictParser {
     fn default() -> Self {
         Self::new()
@@ -1051,6 +1091,27 @@ pub fn tail(s: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const CONDA_ABI_BUILD_TAIL_RUN38: &str =
+        include_str!("../../tests/fixtures/solve_errors/conda_abi_build_tail_torchaudio_run38.txt");
+
+    #[test]
+    fn diagnose_abi_build_tail_names_pin_and_abi_on_run38_fixture() {
+        let diag = diagnose_abi_build_tail(CONDA_ABI_BUILD_TAIL_RUN38)
+            .expect("run-38 build-tail shape must be recognized");
+        assert!(diag.contains("torchaudio =="), "{diag}");
+        assert!(diag.contains("2.7.0"), "{diag}");
+        assert!(diag.contains("python 3.10"), "{diag}");
+        assert!(diag.contains("cp310"), "{diag}");
+        // Unrelated conflict prose must NOT match (no python_abi tail).
+        assert!(
+            diagnose_abi_build_tail(
+                "wandb==0.23.0 depends on sentry-sdk>=2.0.0 and your project \
+                 depends on sentry-sdk==1.38.0"
+            )
+            .is_none()
+        );
+    }
 
     const CONDA_BOUNDARY_SINGLE_LINE: &str =
         include_str!("../../tests/fixtures/solve_errors/conda_boundary_single_line.txt");

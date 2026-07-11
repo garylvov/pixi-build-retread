@@ -2439,15 +2439,46 @@ async fn uv_group_closure(
         return Ok((None, std::collections::BTreeSet::new()));
     }
 
-    // Conda pins -> uv constraints, with provenance (spec §2.2 fallback
-    // path: the manifest's effective deps; pixi.lock-gated read is M2+).
+    // Conda pins -> uv constraints, with provenance. Run-38 fix: derive
+    // from the pack's CONSUMING envs (`consuming_env_dependencies`), not
+    // `effective_dependencies("default")` -- the same default-env blind
+    // spot the run-34 sysreqs fix closed for the co-install oracle
+    // existed here: a no-default-feature env's hand-written
+    // `pytorch-gpu ==2.7.0` was invisible, no `torch==2.7.0` uv
+    // constraint was emitted, uv free-picked torch 2.10.0, auto-route
+    // emitted `pytorch >=2.10.0,<3`, and the workspace's own
+    // `torchaudio ==2.7.0` died on a cp310 build tail. Names whose
+    // consuming envs DISAGREE (only possible via the all-features
+    // fallback superset for unreferenced packs) are skipped -- a
+    // constraint can't satisfy two different pins, and skipping
+    // preserves the pre-fix unconstrained behavior for exactly that
+    // ambiguous case.
     let manifest_opt = workspace_dir.and_then(crate::workspace::WorkspaceManifest::load);
-    let mut constraints = match manifest_opt.as_ref() {
-        Some(manifest) => {
-            let deps = manifest.effective_dependencies("default");
-            crate::uv_closure::build_constraints(&deps, &effective.name_map, "manifest", "default")
+    let mut constraints = match (manifest_opt.as_ref(), workspace_dir) {
+        (Some(manifest), Some(ws_dir)) => {
+            let deps = unambiguous_consuming_deps(
+                &manifest.consuming_env_dependencies(ws_dir, source_dir),
+            );
+            let global_map = load_pypi_to_conda_map().await;
+            crate::uv_closure::build_constraints(
+                &deps,
+                &effective.name_map,
+                &global_map,
+                "manifest",
+                "consuming-envs",
+            )
         }
-        None => Default::default(),
+        (Some(manifest), None) => {
+            let deps = manifest.effective_dependencies("default");
+            crate::uv_closure::build_constraints(
+                &deps,
+                &effective.name_map,
+                &PypiToCondaMap::new(),
+                "manifest",
+                "default",
+            )
+        }
+        _ => Default::default(),
     };
     // Proactive cuda-major capping (belt to the auto-route co-install
     // check's suspenders): derive this pack's actual consuming env(s)'
@@ -3022,6 +3053,64 @@ fn restrict_workspace_conda_versions(
         }
     }
     restricted
+}
+
+/// Collapses [`crate::workspace::WorkspaceManifest::consuming_env_dependencies`]'
+/// multi-spec map into the single-spec map [`crate::uv_closure::build_constraints`]
+/// consumes: a name survives only when every consuming env agrees on ONE
+/// spec (after trimming). Disagreeing names (possible via the
+/// all-features fallback superset for packs no env references, e.g.
+/// `pytorch-gpu ==2.7.0` vs `==2.10.0` across unrelated features) are
+/// dropped -- one uv constraint cannot satisfy two pins, and dropping
+/// preserves the pre-run-38 unconstrained behavior for exactly that
+/// ambiguous case. Wildcard/empty specs are dropped too (nothing to
+/// constrain).
+fn unambiguous_consuming_deps(
+    consuming: &BTreeMap<String, Vec<String>>,
+) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for (name, specs) in consuming {
+        let mut distinct: Vec<&str> = specs
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty() && *s != "*")
+            .collect();
+        distinct.sort_unstable();
+        distinct.dedup();
+        if let [only] = distinct.as_slice() {
+            out.insert(name.clone(), (*only).to_string());
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod unambiguous_consuming_deps_tests {
+    use super::unambiguous_consuming_deps;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn keeps_agreed_pins_drops_conflicts_and_wildcards() {
+        let consuming = BTreeMap::from([
+            // All consuming envs agree -> kept.
+            (
+                "pytorch-gpu".to_string(),
+                vec!["==2.7.0".to_string(), "==2.7.0".to_string()],
+            ),
+            // Disagreement (all-features fallback superset) -> dropped:
+            // one uv constraint cannot satisfy two pins.
+            (
+                "torchvision".to_string(),
+                vec!["==0.22.0".to_string(), "==0.25.0".to_string()],
+            ),
+            // Wildcard-only -> dropped (nothing to constrain).
+            ("numpy".to_string(), vec!["*".to_string()]),
+        ]);
+        let deps = unambiguous_consuming_deps(&consuming);
+        assert_eq!(deps.get("pytorch-gpu").map(String::as_str), Some("==2.7.0"));
+        assert!(!deps.contains_key("torchvision"));
+        assert!(!deps.contains_key("numpy"));
+    }
 }
 
 #[cfg(test)]

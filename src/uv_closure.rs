@@ -1651,16 +1651,34 @@ fn is_conda_only_name(name: &str) -> bool {
 pub fn build_constraints(
     conda_deps: &BTreeMap<String, String>,
     name_map: &BTreeMap<String, String>,
+    global_name_map: &crate::handler::PypiToCondaMap,
     source: &str,
     env: &str,
 ) -> ConstraintSet {
     // Invert pypi->conda. BTreeMap iteration is ordered, so on conda-name
     // collisions the alphabetically-first PyPI name wins deterministically.
+    // The pack's own `retread-name-map` is inverted FIRST (its edges win);
+    // the parselmouth-backed global map (run-38 fix) fills the rest so a
+    // hand-written accelerator meta-package pin (`pytorch-gpu ==2.7.0`)
+    // maps to the pypi name uv actually resolves (`torch`) even when the
+    // pack declares no name map of its own -- previously such a pin
+    // produced an inert constraint on a nonexistent pypi name
+    // (`pytorch-gpu==2.7.0`) and uv free-picked torch 2.10.
     let mut conda_to_pypi: BTreeMap<String, String> = BTreeMap::new();
     for (pypi, conda) in name_map {
         conda_to_pypi
             .entry(canonical_conda_name(conda))
             .or_insert_with(|| canonical_conda_name(pypi));
+    }
+    // Deterministic order: sort the HashMap's pypi keys before merging.
+    let mut global_sorted: Vec<(&String, &Vec<String>)> = global_name_map.iter().collect();
+    global_sorted.sort_by_key(|(pypi, _)| (*pypi).clone());
+    for (pypi, condas) in global_sorted {
+        for conda in condas {
+            conda_to_pypi
+                .entry(canonical_conda_name(conda))
+                .or_insert_with(|| canonical_conda_name(pypi));
+        }
     }
 
     let mut set = ConstraintSet::default();
@@ -2481,7 +2499,13 @@ mod tests {
         conda_deps.insert("python".to_string(), "3.12.*".to_string());
         let mut name_map = BTreeMap::new();
         name_map.insert("torch".to_string(), "pytorch-gpu".to_string());
-        let constraints = build_constraints(&conda_deps, &name_map, "manifest", "default");
+        let constraints = build_constraints(
+            &conda_deps,
+            &name_map,
+            &Default::default(),
+            "manifest",
+            "default",
+        );
         let mut built = BTreeMap::new();
         built.insert(
             "isaaclab".to_string(),
@@ -2678,7 +2702,13 @@ isaaclab = { path = "wheels/isaaclab/isaaclab-2.0.0-py3-none-any.whl" }
         name_map.insert("torch".into(), "pytorch-gpu".into());
         name_map.insert("opencv-python-headless".into(), "py-opencv".into());
 
-        let set = build_constraints(&conda_deps, &name_map, "manifest", "default");
+        let set = build_constraints(
+            &conda_deps,
+            &name_map,
+            &Default::default(),
+            "manifest",
+            "default",
+        );
         assert_eq!(
             set.constraints,
             vec![
@@ -2701,6 +2731,45 @@ isaaclab = { path = "wheels/isaaclab/isaaclab-2.0.0-py3-none-any.whl" }
         let json = provenance_json(&set).unwrap();
         assert!(json.contains("\"conda_name\": \"pytorch-gpu\""));
         assert!(json.contains("\"conda_version\": \"==2.10.0\""));
+    }
+
+    /// Run-38 fix: a pack with NO `retread-name-map` of its own must
+    /// still map a hand-written accelerator meta-package pin
+    /// (`pytorch-gpu ==2.7.0`) to the pypi name uv resolves (`torch`)
+    /// via the parselmouth-backed global map -- previously the identity
+    /// fallback emitted an inert `pytorch-gpu==2.7.0` constraint and uv
+    /// free-picked torch 2.10, whose auto-routed `pytorch >=2.10.0,<3`
+    /// emission excluded every cp311 torchaudio-2.7.0 conda build.
+    #[test]
+    fn build_constraints_global_map_maps_meta_package_to_pypi_name() {
+        let mut conda_deps = BTreeMap::new();
+        conda_deps.insert("pytorch-gpu".to_string(), "==2.7.0".to_string());
+        let mut global: crate::handler::PypiToCondaMap = Default::default();
+        global.insert(
+            "torch".to_string(),
+            vec!["pytorch".to_string(), "pytorch-gpu".to_string()],
+        );
+        let set = build_constraints(
+            &conda_deps,
+            &BTreeMap::new(),
+            &global,
+            "manifest",
+            "consuming-envs",
+        );
+        assert_eq!(set.constraints, vec!["torch==2.7.0".to_string()]);
+        assert_eq!(set.provenance["torch"].conda_name, "pytorch-gpu");
+
+        // The pack's own name map still wins over the global one.
+        let mut pack_map = BTreeMap::new();
+        pack_map.insert("my-torch".to_string(), "pytorch-gpu".to_string());
+        let set2 = build_constraints(
+            &conda_deps,
+            &pack_map,
+            &global,
+            "manifest",
+            "consuming-envs",
+        );
+        assert_eq!(set2.constraints, vec!["my-torch==2.7.0".to_string()]);
     }
 
     /// The cuda-bindings incident, at the unit level: a workspace whose
@@ -2746,7 +2815,13 @@ isaaclab = { path = "wheels/isaaclab/isaaclab-2.0.0-py3-none-any.whl" }
         conda_deps.insert("pytorch-gpu".into(), "==2.10.0".into());
         let mut name_map = BTreeMap::new();
         name_map.insert("torch".into(), "pytorch-gpu".into());
-        let set = build_constraints(&conda_deps, &name_map, "manifest", "default");
+        let set = build_constraints(
+            &conda_deps,
+            &name_map,
+            &Default::default(),
+            "manifest",
+            "default",
+        );
         assert_eq!(set.constraints, vec!["torch==2.10.0".to_string()]);
         assert_eq!(set.provenance["torch"].conda_name, "pytorch-gpu");
 
@@ -2941,7 +3016,13 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
         let mut conda_deps = BTreeMap::new();
         conda_deps.insert("mujoco".to_string(), "==3.5.0".to_string());
         conda_deps.insert("numpy".to_string(), "==1.26.4".to_string());
-        let set = build_constraints(&conda_deps, &BTreeMap::new(), "manifest", "default");
+        let set = build_constraints(
+            &conda_deps,
+            &BTreeMap::new(),
+            &Default::default(),
+            "manifest",
+            "default",
+        );
 
         let stderr = "  x No solution found when resolving dependencies:\n  \
              `-> Because dm-control depends on mujoco>=3.7 and you require mujoco==3.5.0,\n  \
@@ -2966,7 +3047,13 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
     fn attribute_conflict_degrades_gracefully_on_unparseable_text() {
         let mut conda_deps = BTreeMap::new();
         conda_deps.insert("torch".to_string(), "==2.10.0".to_string());
-        let set = build_constraints(&conda_deps, &BTreeMap::new(), "manifest", "default");
+        let set = build_constraints(
+            &conda_deps,
+            &BTreeMap::new(),
+            &Default::default(),
+            "manifest",
+            "default",
+        );
         // Name mentioned without a parseable range: record with required=None.
         let attributions = attribute_conflict("something about torch went wrong", &set.provenance);
         assert_eq!(attributions.len(), 1);

@@ -448,6 +448,15 @@ async fn run_with_pixi_bin(args: LockArgs, pixi_bin: &str) -> Result<i32> {
         ledger.finish_run(run_idx, "unparseable");
         ledger.write_atomic(&ledger_path)?;
         eprintln!("retread lock: could not parse solver error; manifest kept as-is");
+        // Run-38 shape recognition: a workspace exact pin reduced to a
+        // wrong-python build tail carries NO repairable chain in the tree
+        // itself (resolvo shows only the leftover cpXX builds' python_abi
+        // dead end), but the shape is diagnosable -- name the pin and
+        // point at the real cause class so the failure isn't a bare
+        // "could not parse".
+        if let Some(diag) = super::parse::diagnose_abi_build_tail(&stripped) {
+            eprintln!("{diag}");
+        }
         eprintln!("{}", tail(&lock.raw_stderr, 4000));
         print_summary(&records);
         return Ok(EXIT_UNPARSEABLE);
