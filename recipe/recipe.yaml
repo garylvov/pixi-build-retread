@@ -28,7 +28,7 @@ build:
     # toolchain lands); the cargo build then fails with E0463 "can't find
     # crate for `std`" for *-musl. Keep rustup/cargo state under $SRC_DIR
     # via RUSTUP_HOME/CARGO_HOME, but let HOME be the real one.
-    - export HOME=$(getent passwd "$(id -u)" | cut -d: -f6)
+    - 'export HOME=$(getent passwd "$(id -u)" | cut -d: -f6)'
     - export RUSTUP_HOME=$SRC_DIR/.rustup CARGO_HOME=$SRC_DIR/.cargo
     - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o rustup-init.sh
     - sh rustup-init.sh -y --profile minimal --default-toolchain stable
