@@ -665,6 +665,42 @@ impl HttpRangeReader {
                     "server ignored Range header (200, not 206)",
                 ));
             }
+            // A 206 alone is not proof the server honored OUR range: a
+            // misbehaving server that always answers 206-from-offset-0
+            // would silently feed the zip reader wrong bytes (the sha is
+            // never recomputed on this path). Require a Content-Range
+            // whose start equals the requested start and whose total
+            // matches the advertised length; anything else errors so the
+            // caller falls back to the full download.
+            let content_range = resp
+                .headers()
+                .get(reqwest::header::CONTENT_RANGE)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "206 response without Content-Range",
+                    )
+                })?;
+            let parsed = parse_content_range(&content_range).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("unparseable Content-Range `{content_range}`"),
+                )
+            })?;
+            let (cr_start, cr_end, cr_total) = parsed;
+            if cr_start != start || cr_end < cr_start || cr_end >= cr_total || cr_total != self.len
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "Content-Range `{content_range}` does not match requested \
+                         bytes={start}-{last} of {}",
+                        self.len
+                    ),
+                ));
+            }
             let bytes = resp.bytes().map_err(std::io::Error::other)?;
             self.window = Some((start, bytes.to_vec()));
         }
@@ -673,6 +709,20 @@ impl HttpRangeReader {
         let avail = wb.len().saturating_sub(off);
         Ok(&wb[off..off + avail.min(want)])
     }
+}
+
+/// Parse `Content-Range: bytes <start>-<end>/<total>` into (start, end,
+/// total). Returns `None` for any other shape (including the valid-but-
+/// useless `bytes */<total>` unsatisfiable form).
+fn parse_content_range(value: &str) -> Option<(u64, u64, u64)> {
+    let rest = value.trim().strip_prefix("bytes ")?;
+    let (span, total) = rest.split_once('/')?;
+    let (start, end) = span.split_once('-')?;
+    Some((
+        start.trim().parse().ok()?,
+        end.trim().parse().ok()?,
+        total.trim().parse().ok()?,
+    ))
 }
 
 impl std::io::Read for HttpRangeReader {
@@ -730,7 +780,17 @@ pub async fn fetch_metadata_ranged(
     // sync `zip` reader), so it all runs on one blocking thread -- no nested
     // tokio runtime, works regardless of the caller's runtime flavor.
     tokio::task::spawn_blocking(move || -> Result<WheelMetadata> {
-        let client = reqwest::blocking::Client::new();
+        // Explicit timeouts (M2): a stalled CDN must become an Err (which
+        // the caller turns into a full-download fallback), not a forever-
+        // blocked thread -- the default blocking client has NO timeout.
+        // Generous values: the largest single transfer here is one
+        // RANGE_WINDOW (256 KiB), so 120s of read headroom is ample even
+        // on a bad link.
+        let client = reqwest::blocking::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(30))
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .context("building ranged-fetch HTTP client")?;
         // Discover length + Range support. A HEAD keeps this to one tiny
         // request on the happy path; servers that 405 the HEAD (or omit the
         // length, or don't advertise byte ranges) error out and the caller
@@ -934,6 +994,110 @@ mod tests {
         assert_eq!(md.sha256, sha);
         assert!(md.is_pure_python, "py3-none-any is pure python");
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn ranged_metadata_rejects_misbehaving_206_wrong_offset() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        // M1: a server that answers 206 but ALWAYS serves from offset 0
+        // (ignoring the requested range while still claiming success) must
+        // be rejected via Content-Range validation -- accepting it would
+        // hand the zip reader silently wrong bytes.
+        //
+        // The zip must be LARGER than the misbehaving server's fixed slice
+        // (1024 B below): a zip that fits entirely in the offset-0 slice
+        // never forces a nonzero-offset request, and offset-0 requests are
+        // the one case this server answers correctly. Pad with a stored
+        // (incompressible-by-construction) member so reads past 1024 occur.
+        let zip_bytes = {
+            use std::io::Write as _;
+            let mut cursor = std::io::Cursor::new(Vec::new());
+            {
+                let mut zw = zip::ZipWriter::new(&mut cursor);
+                let stored: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored);
+                zw.start_file("padding.bin", stored).unwrap();
+                let pad: Vec<u8> = (0..8192u32).map(|i| (i % 251) as u8).collect();
+                zw.write_all(&pad).unwrap();
+                zw.start_file("foo-1.0.dist-info/METADATA", stored).unwrap();
+                zw.write_all(b"Metadata-Version: 2.1\nName: foo\nVersion: 1.0\n\n")
+                    .unwrap();
+                zw.finish().unwrap();
+            }
+            cursor.into_inner()
+        };
+        assert!(zip_bytes.len() > 1024, "padding must exceed the server slice");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let bytes = zip_bytes.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 1024];
+                    loop {
+                        let hdr_end = loop {
+                            if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                break p + 4;
+                            }
+                            let n = match stream.read(&mut tmp).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => n,
+                            };
+                            buf.extend_from_slice(&tmp[..n]);
+                        };
+                        let req = String::from_utf8_lossy(&buf[..hdr_end]).to_string();
+                        buf.drain(..hdr_end);
+                        let total = bytes.len();
+                        let resp: Vec<u8> = if req.starts_with("HEAD") {
+                            format!(
+                                "HTTP/1.1 200 OK\r\nAccept-Ranges: bytes\r\nContent-Length: {total}\r\n\r\n"
+                            )
+                            .into_bytes()
+                        } else {
+                            // Misbehaving: 206, but always from offset 0,
+                            // Content-Range honestly reporting the wrong span.
+                            let n = total.min(1024);
+                            let slice = &bytes[..n];
+                            let mut h = format!(
+                                "HTTP/1.1 206 Partial Content\r\nAccept-Ranges: bytes\r\n\
+                                 Content-Range: bytes 0-{}/{total}\r\nContent-Length: {}\r\n\r\n",
+                                n - 1,
+                                slice.len()
+                            )
+                            .into_bytes();
+                            h.extend_from_slice(slice);
+                            h
+                        };
+                        if stream.write_all(&resp).await.is_err() {
+                            return;
+                        }
+                        let _ = stream.flush().await;
+                    }
+                });
+            }
+        });
+        let url: url::Url = format!("http://127.0.0.1:{port}/foo-1.0-py3-none-any.whl")
+            .parse()
+            .unwrap();
+        let err = fetch_metadata_ranged(&url, &"e".repeat(64)).await;
+        assert!(
+            err.is_err(),
+            "wrong-offset 206 must be rejected, got {err:?}"
+        );
+        server.abort();
+    }
+
+    #[test]
+    fn parse_content_range_shapes() {
+        assert_eq!(parse_content_range("bytes 100-199/500"), Some((100, 199, 500)));
+        assert_eq!(parse_content_range(" bytes 0-0/1"), Some((0, 0, 1)));
+        assert_eq!(parse_content_range("bytes */500"), None);
+        assert_eq!(parse_content_range("items 0-1/2"), None);
+        assert_eq!(parse_content_range("garbage"), None);
     }
 
     #[tokio::test]

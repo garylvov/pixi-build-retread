@@ -886,9 +886,19 @@ impl WheelEntry {
                 }
                 // Discrete field present and matching: discrete wins, keep it.
                 Some(_) => {}
-                // Only the fragment carries the hash: adopt it.
-                None => self.sha256 = Some(frag_sha),
+                // Only the fragment carries the hash: adopt it, lowercased
+                // (the store path and every comparison site use lowercase
+                // hex; a mixed-case fragment must not fork the cache key).
+                None => self.sha256 = Some(frag_sha.to_ascii_lowercase()),
             }
+        } else if let Some(frag) = url.fragment()
+            && !frag.is_empty()
+        {
+            tracing::debug!(
+                wheel = %name,
+                fragment = %frag,
+                "wheel url carries a non-sha256 fragment; stripping it",
+            );
         }
         // Strip the fragment unconditionally so the fetched/compared URL is
         // canonical (reqwest never transmits fragments anyway, but a lingering
@@ -990,9 +1000,11 @@ mod tests {
     #[test]
     fn normalize_lifts_url_fragment_sha256() {
         // Fragment-only: the hash rides in `#sha256=` and no discrete field.
+        // Mixed-case fragment: adopted LOWERCASED (the store path and every
+        // comparison site use lowercase hex).
         let mut entry = WheelEntry {
             url: Some(
-                "https://pypi.nvidia.com/foo/foo-1.0-cp312-none-any.whl#sha256=abc123"
+                "https://pypi.nvidia.com/foo/foo-1.0-cp312-none-any.whl#sha256=ABC123"
                     .parse()
                     .unwrap(),
             ),

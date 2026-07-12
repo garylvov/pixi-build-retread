@@ -2786,7 +2786,11 @@ async fn uv_group_closure(
     // a single lock (and the pyproject fingerprint matches the recorded
     // meta, letting uv reuse the healed uv.lock instead of re-resolving).
     // Stale built-wheel entries (store pruned) are dropped on load.
-    let persisted_facts = crate::uv_closure::load_heal_facts(&heal_facts_path);
+    // Facts are only replayable under the manifest/routing state they were
+    // learned from (B1): stamp over the BASE request + routing options; a
+    // mismatch discards the file (fresh heal), never a stale replay.
+    let facts_stamp = crate::uv_closure::heal_facts_stamp(&req, &auto_route_opts);
+    let persisted_facts = crate::uv_closure::load_heal_facts(&heal_facts_path, &facts_stamp);
     if !persisted_facts.is_empty() {
         tracing::info!(
             bundle = %group_name,
@@ -2991,14 +2995,29 @@ async fn uv_group_closure(
             }
         }
     }
-    let mut closure = crate::uv_closure::auto_route_fixpoint_checked(
+    let mut closure = match crate::uv_closure::auto_route_fixpoint_checked(
         &req,
         &auto_route_opts,
         solve,
         probe,
         co_solve,
     )
-    .await?;
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            // B1: a failed solve may have been poisoned by stale persisted
+            // facts (or is about to change the manifest state via a repair
+            // loop). Remove the facts file so the NEXT run re-heals from
+            // scratch instead of replaying a wedge across runs. Saving
+            // empty facts deletes the file.
+            crate::uv_closure::save_heal_facts(
+                &heal_facts_path,
+                &crate::uv_closure::HealFacts::default(),
+            );
+            return Err(e);
+        }
+    };
     // Splice in the sdist-only self-heal's discoveries (mirrors
     // `uv_closure::auto_route_fixpoint_with_sdist_heal`'s own splice,
     // which this call site can't use directly -- production also needs
@@ -3039,6 +3058,7 @@ async fn uv_group_closure(
     crate::uv_closure::save_heal_facts(
         &heal_facts_path,
         &crate::uv_closure::HealFacts {
+            stamp: facts_stamp,
             // The FULL routing set, not just the sdist-heal ledger:
             // `closure.auto_routed` (post-splice) also carries the M2
             // auto-route fixpoint's discoveries (torch/cuda-* style

@@ -1361,42 +1361,95 @@ where
                             Ok(h) => h,
                             Err(other) => return Err(other),
                         };
-                        let already_built: std::collections::BTreeSet<String> = {
+                        // Name -> version maps (not name sets): whether a
+                        // ledger entry EXHAUSTS an offender depends on the
+                        // version. A ledger fact at the SAME version the
+                        // solve just failed with is genuinely exhausted
+                        // (rebuilding the identical wheel can't help). A
+                        // ledger fact at a DIFFERENT version is STALE state
+                        // -- e.g. persisted facts pin bar==1.5 while the
+                        // graph now needs bar==2.5 -- and must be dropped
+                        // and re-healed fresh, never used to suppress the
+                        // repair (B1 wedge: the old name-set filter emptied
+                        // the rebuild set, surfaced Pass A's error forever,
+                        // and the failed solve never rewrote the poisoned
+                        // facts file).
+                        let already_built: std::collections::BTreeMap<String, String> = {
                             let b = built.lock().unwrap();
-                            b.iter().map(|w| w.pypi_name.clone()).collect()
+                            b.iter()
+                                .map(|w| (w.pypi_name.clone(), w.version.clone()))
+                                .collect()
                         };
                         let already_routed: std::collections::BTreeSet<String> = {
                             let r = routed.lock().unwrap();
                             r.iter().map(|r| r.pypi_name.clone()).collect()
                         };
-                        let already_pre: std::collections::BTreeSet<String> = {
+                        let already_pre: std::collections::BTreeMap<String, String> = {
                             let p = prereleased.lock().unwrap();
-                            p.iter().map(|p| p.pypi_name.clone()).collect()
+                            p.iter()
+                                .map(|p| (p.pypi_name.clone(), p.version.clone()))
+                                .collect()
                         };
-                        // Prerelease offenders not yet pinned this run.
+                        // Prerelease offenders not yet pinned at THIS version.
                         let new_pre: Vec<PrereleasePin> = heal
                             .prerelease
                             .iter()
-                            .filter(|(n, _)| !already_pre.contains(n))
+                            .filter(|(n, v)| already_pre.get(n) != Some(v))
                             .map(|(n, v)| PrereleasePin {
                                 pypi_name: n.clone(),
                                 version: v.clone(),
                             })
                             .collect();
-                        // Sdist-only offenders that still need a wheel. A
-                        // name is fully exhausted only once rung 2 has
-                        // actually BUILT a wheel for it (a rung-1 route
+                        // Sdist-only offenders that still need a wheel at
+                        // the version Pass B resolved. A name is fully
+                        // exhausted only once rung 2 has actually BUILT a
+                        // wheel for it AT THAT VERSION (a rung-1 route
                         // alone can never satisfy `uv lock` -- deps-from
                         // proof run 6).
                         let sdist_names: Vec<(String, String)> = heal
                             .sdist_only
                             .iter()
-                            .filter(|(n, _)| !already_built.contains(n))
+                            .filter(|(n, v)| already_built.get(n) != Some(v))
                             .cloned()
                             .collect();
                         if new_pre.is_empty() && sdist_names.is_empty() {
                             // Nothing new to try -> surface Pass A's error.
                             return Err(anyhow!("{}", heal.original_error));
+                        }
+                        // Drop stale ledger/request state for anything being
+                        // re-healed at a new version, so the fresh fact
+                        // replaces (never coexists with) the old one.
+                        {
+                            let stale_built: Vec<&String> = sdist_names
+                                .iter()
+                                .map(|(n, _)| n)
+                                .filter(|n| already_built.contains_key(*n))
+                                .collect();
+                            if !stale_built.is_empty() {
+                                let mut b = built.lock().unwrap();
+                                b.retain(|w| !stale_built.contains(&&w.pypi_name));
+                                for n in &stale_built {
+                                    req.built_wheel_sources.remove(*n);
+                                    req.explicit_pins.remove(*n);
+                                    tracing::info!(
+                                        bundle = %bundle,
+                                        pkg = %n,
+                                        "stale persisted built-wheel fact dropped; re-healing fresh",
+                                    );
+                                }
+                            }
+                            let stale_pre: Vec<&String> = new_pre
+                                .iter()
+                                .map(|p| &p.pypi_name)
+                                .filter(|n| already_pre.contains_key(*n))
+                                .collect();
+                            if !stale_pre.is_empty() {
+                                let mut p = prereleased.lock().unwrap();
+                                p.retain(|e| !stale_pre.contains(&&e.pypi_name));
+                                for n in &stale_pre {
+                                    req.explicit_pins.remove(*n);
+                                }
+                            }
                         }
 
                         // -- sdist rungs (only when a wheel is needed) --
@@ -2318,6 +2371,17 @@ const CONFLICT_FILE: &str = "retread-conflict.json";
 /// pinless).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HealFacts {
+    /// Hash of the resolution-relevant inputs the facts were learned under
+    /// (see [`heal_facts_stamp`]). Facts are ONLY replayed when the current
+    /// run's stamp matches: they are injected pre-solve as first-party
+    /// explicit pins / path sources / routing constraints, so replaying them
+    /// under a changed manifest or routing config would force stale pins
+    /// into a graph they no longer belong to (phantom pins for removed
+    /// deps, wedged version bumps, ignored keep-pypi/route-policy edits).
+    /// Files written by older binaries deserialize with an empty stamp and
+    /// are discarded (one extra heal, never a stale replay).
+    #[serde(default)]
+    pub stamp: String,
     #[serde(default)]
     pub routed: Vec<AutoRoutedPackage>,
     #[serde(default)]
@@ -2330,6 +2394,70 @@ impl HealFacts {
     pub fn is_empty(&self) -> bool {
         self.routed.is_empty() && self.built.is_empty() && self.prereleased.is_empty()
     }
+}
+
+/// Hex sha256 over every input that decides whether persisted heal facts
+/// are still VALID to replay: the request's roots/constraints/overrides/
+/// exclusions/indexes (manifest-derived resolution inputs) plus the
+/// routing policy knobs (`route-policy`, `route-include`, `keep-pypi`,
+/// `force-conda`, `name-map`, protected roots). Any change to any of these
+/// must discard the facts (cold re-heal) rather than replay them.
+///
+/// Deliberately EXCLUDES per-round mutable state (`explicit_pins`,
+/// `built_wheel_sources`, auto-route constraints applied by
+/// [`apply_auto_route`]) -- the stamp must be computed from the BASE
+/// request, before any facts/heal state is injected, and stay stable
+/// across fixpoint rounds. Also excludes `workspace_conda_versions`
+/// (populated later in the phase and not a fact-validity input).
+pub fn heal_facts_stamp(req: &UvClosureRequest, opts: &AutoRouteOptions) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    let mut field = |tag: &str, vals: &mut dyn Iterator<Item = &str>| {
+        h.update(tag.as_bytes());
+        h.update([0xffu8]);
+        for v in vals {
+            h.update(v.as_bytes());
+            h.update([0u8]);
+        }
+    };
+    field("python", &mut std::iter::once(req.python_version.as_str()));
+    field("subdir", &mut std::iter::once(req.conda_subdir.as_str()));
+    field("deps", &mut req.dependencies.iter().map(String::as_str));
+    field(
+        "constraints",
+        &mut req.constraints.constraints.iter().map(String::as_str),
+    );
+    field("overrides", &mut req.overrides.iter().map(String::as_str));
+    field(
+        "no-emit",
+        &mut req.no_emit_packages.iter().map(String::as_str),
+    );
+    field("indexes", &mut req.index_urls.iter().map(String::as_str));
+    let policy = format!("{:?}|enabled={}", opts.route_policy, opts.enabled);
+    field("route-policy", &mut std::iter::once(policy.as_str()));
+    field(
+        "route-include",
+        &mut opts.route_include.iter().map(String::as_str),
+    );
+    field("keep-pypi", &mut opts.keep_pypi.iter().map(String::as_str));
+    field(
+        "force-conda",
+        &mut opts.force_conda.iter().map(String::as_str),
+    );
+    let name_map: Vec<String> = opts
+        .name_map
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect();
+    field("name-map", &mut name_map.iter().map(String::as_str));
+    field("protected", &mut opts.protected.iter().map(String::as_str));
+    let anchors: Vec<String> = opts
+        .abi_anchor_pins
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect();
+    field("abi-anchors", &mut anchors.iter().map(String::as_str));
+    format!("{:x}", h.finalize())
 }
 
 /// Absolute path of the persisted heal-facts file for a target.
@@ -2355,7 +2483,13 @@ pub fn heal_facts_path(cache_dir: &Path, bundle: &str, python_version: &str, sub
 /// durable, but a pruned cache must fall back to a rebuild rather than feed
 /// uv a `[tool.uv.sources]` path that 404s). Missing/corrupt file -> empty
 /// facts (cold start).
-pub fn load_heal_facts(path: &Path) -> HealFacts {
+///
+/// `expected_stamp` (from [`heal_facts_stamp`] over the CURRENT run's base
+/// request + routing options) gates replay: a mismatch means the manifest
+/// or routing config changed since the facts were learned, and the whole
+/// file is discarded -- replaying pins/routes learned under a different
+/// manifest state can phantom-pin removed deps or wedge version bumps.
+pub fn load_heal_facts(path: &Path, expected_stamp: &str) -> HealFacts {
     let Ok(text) = std::fs::read_to_string(path) else {
         return HealFacts::default();
     };
@@ -2366,6 +2500,14 @@ pub fn load_heal_facts(path: &Path) -> HealFacts {
             return HealFacts::default();
         }
     };
+    if facts.stamp != expected_stamp {
+        tracing::info!(
+            path = %path.display(),
+            "heal facts: resolution inputs (manifest/routing config) changed \
+             since the facts were learned; discarding for a fresh heal",
+        );
+        return HealFacts::default();
+    }
     facts.built.retain(|w| {
         let present = w.wheel_path.exists();
         if !present {
@@ -2396,7 +2538,19 @@ pub fn save_heal_facts(path: &Path, facts: &HealFacts) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    // Tmp name keeps the full destination filename (bundle + python +
+    // subdir) and adds pid + per-process sequence, so concurrent writers --
+    // even for DIFFERENT targets in the same directory -- can never promote
+    // each other's torn temp file.
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tmp = path.with_file_name(format!(
+        "{}.{}.{}.tmp",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("heal-facts.json"),
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+    ));
     if std::fs::write(&tmp, json.as_bytes()).is_ok() && std::fs::rename(&tmp, path).is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
@@ -5736,6 +5890,7 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
         let live_wheel = tmp.join("live-1.0-py3-none-any.whl");
         std::fs::write(&live_wheel, b"pk").unwrap();
         let facts = HealFacts {
+            stamp: "stamp-under-state-1".to_string(),
             routed: vec![AutoRoutedPackage {
                 pypi_name: "routed-pkg".into(),
                 conda_name: "routed-pkg".into(),
@@ -5768,19 +5923,208 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
         };
 
         save_heal_facts(&facts_file, &facts);
-        let loaded = load_heal_facts(&facts_file);
+        let loaded = load_heal_facts(&facts_file, "stamp-under-state-1");
         assert_eq!(loaded.routed.len(), 1);
         assert_eq!(loaded.prereleased.len(), 1);
         // Stale built-wheel (missing from store) is dropped; live one kept.
         assert_eq!(loaded.built.len(), 1);
         assert_eq!(loaded.built[0].pypi_name, "live");
 
+        // B1 (a)/(c): facts stamped under manifest/routing state 1 are
+        // DISCARDED WHOLESALE when loaded under state 2 -- no partial
+        // replay of pins learned under a different manifest.
+        let stale = load_heal_facts(&facts_file, "stamp-under-state-2");
+        assert!(
+            stale.is_empty(),
+            "stamp mismatch must discard all facts, got {stale:?}"
+        );
+
         // Saving empty facts removes the file (a pack that stopped needing
         // a heal must not keep injecting dead pins).
         save_heal_facts(&facts_file, &HealFacts::default());
-        assert!(load_heal_facts(&facts_file).is_empty());
+        assert!(load_heal_facts(&facts_file, "stamp-under-state-1").is_empty());
         assert!(!facts_file.exists());
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// B1: the stamp must move with every fact-validity input class --
+    /// manifest deps, constraints, overrides, and each routing knob.
+    #[test]
+    fn heal_facts_stamp_tracks_resolution_inputs() {
+        let base_req = || UvClosureRequest {
+            bundle: "b".into(),
+            python_version: "3.12".into(),
+            conda_subdir: "linux-64".into(),
+            dependencies: vec!["foo==1.0".into()],
+            constraints: ConstraintSet {
+                constraints: vec!["bar<2".into()],
+                provenance: BTreeMap::new(),
+            },
+            overrides: vec!["baz>=1".into()],
+            no_emit_packages: vec!["python".into()],
+            index_urls: vec!["https://pypi.org/simple/".into()],
+            built_wheel_sources: BTreeMap::new(),
+            explicit_pins: BTreeMap::new(),
+            offline: false,
+        };
+        let base_opts = || AutoRouteOptions {
+            enabled: true,
+            route_policy: crate::config::RoutePolicy::Minimal,
+            route_include: ["inc".to_string()].into(),
+            keep_pypi: ["kp".to_string()].into(),
+            protected: ["root".to_string()].into(),
+            name_map: BTreeMap::new(),
+            force_conda: BTreeSet::new(),
+            abi_anchor_pins: BTreeMap::new(),
+            workspace_conda_versions: BTreeMap::new(),
+        };
+        let base = heal_facts_stamp(&base_req(), &base_opts());
+        // Identical inputs -> identical stamp.
+        assert_eq!(base, heal_facts_stamp(&base_req(), &base_opts()));
+
+        // (a) manifest dep change (add/remove/bump) invalidates.
+        let mut r = base_req();
+        r.dependencies = vec!["foo==2.0".into()];
+        assert_ne!(base, heal_facts_stamp(&r, &base_opts()));
+        let mut r = base_req();
+        r.dependencies.clear();
+        assert_ne!(base, heal_facts_stamp(&r, &base_opts()));
+        // Constraint / override change invalidates.
+        let mut r = base_req();
+        r.constraints.constraints = vec!["bar<3".into()];
+        assert_ne!(base, heal_facts_stamp(&r, &base_opts()));
+        let mut r = base_req();
+        r.overrides.clear();
+        assert_ne!(base, heal_facts_stamp(&r, &base_opts()));
+
+        // (c) each routing knob invalidates.
+        let mut o = base_opts();
+        o.route_policy = crate::config::RoutePolicy::Aggressive;
+        assert_ne!(base, heal_facts_stamp(&base_req(), &o));
+        let mut o = base_opts();
+        o.keep_pypi.insert("torch".into());
+        assert_ne!(base, heal_facts_stamp(&base_req(), &o));
+        let mut o = base_opts();
+        o.force_conda.insert("numpy".into());
+        assert_ne!(base, heal_facts_stamp(&base_req(), &o));
+        let mut o = base_opts();
+        o.route_include.insert("scipy".into());
+        assert_ne!(base, heal_facts_stamp(&base_req(), &o));
+        let mut o = base_opts();
+        o.name_map.insert("torch".into(), "pytorch".into());
+        assert_ne!(base, heal_facts_stamp(&base_req(), &o));
+        // Python bump invalidates.
+        let mut r = base_req();
+        r.python_version = "3.13".into();
+        assert_ne!(base, heal_facts_stamp(&r, &base_opts()));
+    }
+
+    /// B1 (b) wedge self-recovery: a SEEDED built-wheel fact at a stale
+    /// version (bar 1.5, e.g. loaded from a facts file written before a
+    /// dependency bump) must not suppress the heal when the solve fails
+    /// needing bar 2.5 -- the stale ledger entry is dropped, bar is rebuilt
+    /// at 2.5, and the retry succeeds with the fresh fact in the ledger.
+    #[tokio::test]
+    async fn stale_seeded_built_fact_is_dropped_and_rehealed() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let solve = {
+            let attempts = Arc::clone(&attempts);
+            move |req: UvClosureRequest| {
+                let n = attempts.fetch_add(1, Ordering::SeqCst);
+                let fut = async move {
+                    if n == 0 {
+                        // First attempt: the stale bar==1.5 pin is in the
+                        // request (seeded), and the solve fails naming bar
+                        // 2.5 as the sdist-only offender.
+                        assert_eq!(
+                            req.explicit_pins.get("bar").map(String::as_str),
+                            Some("1.5"),
+                            "seeded stale fact must be injected on attempt 0"
+                        );
+                        Err(anyhow::Error::new(HealNeeded {
+                            sdist_only: vec![("bar".to_string(), "2.5".to_string())],
+                            prerelease: vec![],
+                            original_error: "bar needs 2.5".to_string(),
+                        }))
+                    } else {
+                        // Retry: the stale pin must be REPLACED by 2.5.
+                        assert_eq!(
+                            req.explicit_pins.get("bar").map(String::as_str),
+                            Some("2.5"),
+                            "retry must carry the freshly-healed pin"
+                        );
+                        Ok(UvClosure {
+                            wheels: vec![],
+                            pins: BTreeMap::new(),
+                            auto_routed: vec![],
+                            uv_version: "test".into(),
+                        })
+                    }
+                };
+                Box::pin(fut) as futures::future::BoxFuture<'static, Result<UvClosure>>
+            }
+        };
+        let sdist_probe = |_n: String, _s: String| {
+            Box::pin(async { None })
+                as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
+        };
+        let sdist_build = Some(|name: String, req: Option<String>| {
+            Box::pin(async move {
+                assert_eq!(req.as_deref(), Some("==2.5"));
+                Ok(BuiltSdistWheel {
+                    pypi_name: name,
+                    version: "2.5".to_string(),
+                    filename: "bar-2.5-py3-none-any.whl".to_string(),
+                    wheel_path: PathBuf::from("/nonexistent/bar-2.5-py3-none-any.whl"),
+                    sha256: "c".repeat(64),
+                    sdist_source: sdist_source_fixture("bar", "2.5"),
+                })
+            }) as futures::future::BoxFuture<'static, Result<BuiltSdistWheel>>
+        });
+
+        // Ledger seeded with the STALE persisted fact: bar 1.5.
+        let built = Arc::new(std::sync::Mutex::new(vec![BuiltSdistWheel {
+            pypi_name: "bar".to_string(),
+            version: "1.5".to_string(),
+            filename: "bar-1.5-py3-none-any.whl".to_string(),
+            wheel_path: PathBuf::from("/nonexistent/bar-1.5-py3-none-any.whl"),
+            sha256: "d".repeat(64),
+            sdist_source: sdist_source_fixture("bar", "1.5"),
+        }]));
+        let routed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let prereleased = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let mut healing = with_sdist_heal(
+            "wedge-test".to_string(),
+            solve,
+            sdist_probe,
+            sdist_build,
+            Arc::clone(&routed),
+            Arc::clone(&built),
+            Arc::clone(&prereleased),
+        );
+        let req = UvClosureRequest {
+            bundle: "wedge-test".into(),
+            python_version: "3.12".into(),
+            conda_subdir: "linux-64".into(),
+            dependencies: vec!["foo==2.0".into()],
+            constraints: ConstraintSet::default(),
+            overrides: vec![],
+            no_emit_packages: vec![],
+            index_urls: vec![],
+            built_wheel_sources: BTreeMap::new(),
+            explicit_pins: BTreeMap::new(),
+            offline: false,
+        };
+        healing(req).await.expect("wedge must self-recover");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2, "fail once, heal, succeed");
+        // Ledger now holds ONLY the fresh fact.
+        let b = built.lock().unwrap();
+        assert_eq!(b.len(), 1);
+        assert_eq!((b[0].pypi_name.as_str(), b[0].version.as_str()), ("bar", "2.5"));
     }
 }
