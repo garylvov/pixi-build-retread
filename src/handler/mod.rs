@@ -455,17 +455,6 @@ fn courier_inputs_hash(
 
 const DEFAULT_PYTHON: &str = "3.11";
 
-/// PyPI packages that are Windows-only and frequently declared as
-/// unconditional `Requires-Dist` lines by upstream packagers (notably the
-/// Isaac Sim wheels). Auto-dropped from run-deps when the target platform
-/// isn't Windows, so users don't have to enumerate them in retread-drop-deps.
-///
-/// Inclusion criteria: ships wheels only for `win_*` platforms OR the
-/// package is exclusively a shim for a Windows-specific subsystem (Win32
-/// API, COM, registry, ANSI terminal compat, etc.) such that running it
-/// on non-Windows is meaningless. Cross-platform packages (colorama,
-/// chardet) do NOT belong here — they just happen to be most-cited on
-/// Windows.
 /// URL of prefix-dev/parselmouth's canonical conda-forge -> PyPI name
 /// mapping. The JSON is keyed by conda-forge package name with values
 /// equal to a list of PyPI distribution names that this conda package
@@ -576,21 +565,6 @@ pub(crate) async fn load_pypi_to_conda_map() -> PypiToCondaMap {
 
     inverse
 }
-
-const BUILT_IN_WIN_ONLY: &[&str] = &[
-    "comtypes",       // COM bindings
-    "idna-ssl",       // async SSL shim, last release 2017
-    "pyreadline",     // readline replacement (deprecated)
-    "pyreadline3",    // readline replacement (current)
-    "pywin32",        // Win32 API bindings
-    "pywin32-ctypes", // ctypes-only fallback for pywin32
-    "pywinpty",       // Windows pseudo-terminal (jupyter, IPython)
-    "win32-setctime", // ctime setter for Windows files
-    "winregistry",    // registry helper (stdlib winreg on Windows)
-    "winrt-runtime",  // Windows Runtime API
-    "winshell",       // shell helpers
-    "wmi",            // Windows Management Instrumentation
-];
 
 #[derive(Default)]
 struct State {
@@ -2555,6 +2529,33 @@ async fn uv_group_closure(
     // belt-and-braces.
     for name in &effective.drop_deps {
         overrides.push(format!("{name} ; {}", crate::uv_closure::DROP_MARKER));
+    }
+    // Built-in Windows-only shims (idna-ssl, pywin32, ...): NVIDIA's index
+    // strips the `sys_platform == "win32"` marker from these Requires-Dist
+    // lines, so the marker-pruning path (`uv_closure::environment_marker`)
+    // can't drop them and packs would otherwise have to hand-carry every
+    // one in `retread-drop-deps`. Inject the SAME unmatchable-marker
+    // override on non-Windows targets so uv never resolves them. Semantics
+    // mirror the conda run-dep path (`produce_output`'s auto-drop): the user
+    // override always wins (re-enable on Linux), Windows targets inject
+    // nothing, and names a pack already drops are skipped so there is no
+    // duplicate override line.
+    let injected_win_only = crate::uv_closure::built_in_win_only_to_inject(
+        &target.conda_subdir,
+        |name| effective.overrides.contains_key(name),
+        &effective.drop_deps,
+    );
+    for name in &injected_win_only {
+        overrides.push(format!("{name} ; {}", crate::uv_closure::DROP_MARKER));
+    }
+    if !injected_win_only.is_empty() {
+        tracing::debug!(
+            group = %group_name,
+            subdir = %target.conda_subdir,
+            built_in_win_only = ?injected_win_only,
+            "uv closure: injected built-in Windows-only drops (packs need no \
+             retread-drop-deps for these); re-enable any via retread-overrides",
+        );
     }
 
     // Index chain: EXPLICIT entry indexes in group order, then workspace
@@ -5249,7 +5250,7 @@ fn produce_output(
         && host_platform != Platform::Win32
         && host_platform != Platform::WinArm64
     {
-        BUILT_IN_WIN_ONLY
+        crate::config::BUILT_IN_WIN_ONLY
             .iter()
             .map(|p| (*p).to_string())
             .filter(|p| !config.overrides.contains_key(p))

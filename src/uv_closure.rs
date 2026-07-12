@@ -1866,6 +1866,44 @@ pub fn environment_marker(python_version: &str, conda_subdir: &str) -> Option<St
     }
 }
 
+/// Decide which built-in Windows-only shim names
+/// ([`crate::config::BUILT_IN_WIN_ONLY`]) to inject into a target's
+/// override-dependencies as unmatchable-marker drops.
+///
+/// NVIDIA's index strips the `sys_platform == "win32"` marker from these
+/// Requires-Dist lines, so [`environment_marker`] can't prune them; injecting
+/// the same `name ; python_version < '0'` override the `retread-drop-deps`
+/// path uses removes them from uv's resolution graph without packs having to
+/// enumerate them. Semantics mirror the conda run-dep auto-drop:
+///
+/// * Windows targets (`win-64`, `win-32`, `win-arm64`) inject NONE — the
+///   shims are legitimate there.
+/// * A name the user explicitly overrode (`retread-overrides`) is skipped so
+///   the override wins (re-enable on Linux).
+/// * A name already in the pack's `retread-drop-deps` is skipped so there is
+///   no duplicate override line.
+///
+/// Returns the built-in names to inject, in `BUILT_IN_WIN_ONLY` order.
+pub fn built_in_win_only_to_inject<'a>(
+    conda_subdir: &str,
+    is_overridden: impl Fn(&str) -> bool,
+    pack_drop_deps: &[String],
+) -> Vec<&'a str> {
+    if matches!(conda_subdir, "win-64" | "win-32" | "win-arm64") {
+        return Vec::new();
+    }
+    let already_dropped: BTreeSet<String> = pack_drop_deps
+        .iter()
+        .map(|n| canonical_conda_name(n))
+        .collect();
+    crate::config::BUILT_IN_WIN_ONLY
+        .iter()
+        .copied()
+        .filter(|name| !is_overridden(name))
+        .filter(|name| !already_dropped.contains(&canonical_conda_name(name)))
+        .collect()
+}
+
 /// Escape a string for a TOML basic (double-quoted) string.
 fn toml_str(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
@@ -3153,6 +3191,77 @@ isaaclab = { path = "wheels/isaaclab/isaaclab-2.0.0-py3-none-any.whl" }
         );
         // Neither half known: omitted.
         assert_eq!(environment_marker("weird", "noarch"), None);
+    }
+
+    // ---- built-in Windows-only drop injection ----------------------------
+
+    #[test]
+    fn built_in_win_only_injected_on_linux_without_pack_drop_deps() {
+        // (a) A linux-64 closure with NO pack drop-deps still injects the
+        // built-in shims. Assert the marker override is present for both
+        // idna-ssl and pywin32, and that it renders into the pyproject.
+        let names = built_in_win_only_to_inject("linux-64", |_| false, &[]);
+        assert!(names.contains(&"idna-ssl"), "idna-ssl injected: {names:?}");
+        assert!(names.contains(&"pywin32"), "pywin32 injected: {names:?}");
+        assert_eq!(names, crate::config::BUILT_IN_WIN_ONLY.to_vec());
+
+        // End-to-end: the injected override lines render as unmatchable
+        // markers in the synthesized project.
+        let mut req = sample_request();
+        req.overrides = names
+            .iter()
+            .map(|n| format!("{n} ; {DROP_MARKER}"))
+            .collect();
+        let got = synthesize_pyproject(&req);
+        assert!(got.contains("\"idna-ssl ; python_version < '0'\""), "{got}");
+        assert!(got.contains("\"pywin32 ; python_version < '0'\""), "{got}");
+    }
+
+    #[test]
+    fn built_in_win_only_injects_none_on_windows() {
+        // (b) win-64 (and the other win subdirs) inject nothing — the
+        // shims are legitimate there.
+        assert!(built_in_win_only_to_inject("win-64", |_| false, &[]).is_empty());
+        assert!(built_in_win_only_to_inject("win-32", |_| false, &[]).is_empty());
+        assert!(built_in_win_only_to_inject("win-arm64", |_| false, &[]).is_empty());
+    }
+
+    #[test]
+    fn built_in_win_only_user_override_suppresses_injection() {
+        // (c) A user override for one of the names suppresses just that
+        // name; the others still inject.
+        let overridden = |name: &str| name == "pywin32";
+        let names = built_in_win_only_to_inject("linux-64", overridden, &[]);
+        assert!(
+            !names.contains(&"pywin32"),
+            "override must suppress pywin32: {names:?}"
+        );
+        assert!(
+            names.contains(&"idna-ssl"),
+            "un-overridden names still inject: {names:?}"
+        );
+    }
+
+    #[test]
+    fn built_in_win_only_coexists_with_pack_drop_deps() {
+        // (d) A pack that ALREADY drops one built-in (in any name form,
+        // e.g. underscore) does not get a duplicate; a non-built-in
+        // drop-dep is untouched and the remaining built-ins still inject.
+        let drops = vec!["pywin32".to_string(), "some_other_pkg".to_string()];
+        let names = built_in_win_only_to_inject("linux-64", |_| false, &drops);
+        assert!(
+            !names.contains(&"pywin32"),
+            "already-dropped built-in must not duplicate: {names:?}"
+        );
+        assert!(names.contains(&"idna-ssl"), "{names:?}");
+
+        // Non-canonical form of an already-dropped built-in is deduped too.
+        let drops2 = vec!["idna_ssl".to_string()];
+        let names2 = built_in_win_only_to_inject("linux-64", |_| false, &drops2);
+        assert!(
+            !names2.contains(&"idna-ssl"),
+            "canonicalized dedupe against idna_ssl failed: {names2:?}"
+        );
     }
 
     // ---- constraint generation + provenance ------------------------------

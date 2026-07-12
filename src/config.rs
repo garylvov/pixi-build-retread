@@ -7,6 +7,40 @@ use std::collections::BTreeMap;
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 
+/// PyPI packages that are Windows-only and frequently declared as
+/// unconditional `Requires-Dist` lines by upstream packagers (notably the
+/// Isaac Sim wheels). Auto-dropped from run-deps when the target platform
+/// isn't Windows, so users don't have to enumerate them in retread-drop-deps.
+///
+/// Consumed by BOTH resolution paths so there is a single source of truth:
+/// the conda run-dep path (`handler::produce_output`) filters these out of
+/// the emitted `depends`, and the v4 uv-closure path
+/// (`handler::uv_group_closure`) injects them as unmatchable-marker
+/// override-dependencies (the same mechanism as `retread-drop-deps`) so uv
+/// never resolves them. NVIDIA's index strips the `sys_platform == "win32"`
+/// marker from these lines, so the marker-pruning path can't catch them.
+///
+/// Inclusion criteria: ships wheels only for `win_*` platforms OR the
+/// package is exclusively a shim for a Windows-specific subsystem (Win32
+/// API, COM, registry, ANSI terminal compat, etc.) such that running it
+/// on non-Windows is meaningless. Cross-platform packages (colorama,
+/// chardet) do NOT belong here — they just happen to be most-cited on
+/// Windows.
+pub const BUILT_IN_WIN_ONLY: &[&str] = &[
+    "comtypes",       // COM bindings
+    "idna-ssl",       // async SSL shim, last release 2017
+    "pyreadline",     // readline replacement (deprecated)
+    "pyreadline3",    // readline replacement (current)
+    "pywin32",        // Win32 API bindings
+    "pywin32-ctypes", // ctypes-only fallback for pywin32
+    "pywinpty",       // Windows pseudo-terminal (jupyter, IPython)
+    "win32-setctime", // ctime setter for Windows files
+    "winregistry",    // registry helper (stdlib winreg on Windows)
+    "winrt-runtime",  // Windows Runtime API
+    "winshell",       // shell helpers
+    "wmi",            // Windows Management Instrumentation
+];
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct RetreadConfig {
