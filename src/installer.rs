@@ -7,7 +7,7 @@
 //! resolution or index metadata access.
 //! Idempotent: a content-hash marker makes a re-link a no-op.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -356,6 +356,7 @@ async fn materialize_locked_wheels(
     prefix: &Path,
     shipped_wheels_dir: &Path,
     store_root: &Path,
+    conda_owned: &BTreeSet<(String, String)>,
 ) -> Result<Vec<PathBuf>> {
     let fetch_dir = prefix
         .join("share")
@@ -365,6 +366,18 @@ async fn materialize_locked_wheels(
     let store_candidates = built_wheel_store_candidates(lock, store_root);
     let mut files = Vec::with_capacity(lock.wheels.len());
     for wheel in &lock.wheels {
+        // conda already owns this distribution at the exact locked version:
+        // leave it to conda and keep it out of the uv replay entirely (not
+        // even materialized), so uv never uninstalls the conda payload. See
+        // `conda_owned_distributions` for why that uninstall is destructive.
+        if conda_owned.contains(&(normalize_dist_name(&wheel.name), wheel.version.clone())) {
+            eprintln!(
+                "retread install: {}=={} is conda-provided in the prefix; \
+                 skipping wheel replay to avoid clobbering the conda payload",
+                wheel.name, wheel.version
+            );
+            continue;
+        }
         let shipped = shipped_wheels_dir.join(&wheel.filename);
         if shipped.is_file() {
             if let Some(expected) = wheel.sha256.as_deref() {
@@ -545,6 +558,40 @@ fn installed_distributions(
     }
 
     Ok(out)
+}
+
+/// Distributions in `site_packages` that conda already installed, keyed by
+/// (PEP 503 name, version). Ownership is read from each dist-info's
+/// `INSTALLER` marker (`conda` writes the literal string `conda`).
+///
+/// The courier must NOT hand a conda-owned distribution to `uv pip install`:
+/// uv sees the bundle's PyPI wheel as a different distribution (direct-URL vs
+/// the conda-recorded install) and uninstalls the conda one to replace it.
+/// conda lays some payloads out differently than the wheel RECORD expects --
+/// e.g. `pytorch` ships `torch/include/torch` as a *symlink* to the shared
+/// `$PREFIX/include/torch`, so uv's uninstall aborts trying to `rmdir` it
+/// ("Not a directory", ENOTDIR) after already deleting most of the tree,
+/// gutting `torch` (no `__init__.py`, no dist-info) into an empty namespace
+/// package. conda is authoritative for anything it already installed at the
+/// locked version, so those wheels are dropped from the replay; `verify`
+/// still passes because the conda dist-info + RECORD satisfy the payload
+/// check.
+fn conda_owned_distributions(site_packages: &Path) -> BTreeSet<(String, String)> {
+    let mut out = BTreeSet::new();
+    let Ok(installed) = installed_distributions(site_packages) else {
+        return out;
+    };
+    for (name, versions) in &installed {
+        for (version, dist_root) in versions {
+            match std::fs::read_to_string(dist_root.join("INSTALLER")) {
+                Ok(body) if body.trim() == "conda" => {
+                    out.insert((name.clone(), version.clone()));
+                }
+                _ => {}
+            }
+        }
+    }
+    out
 }
 
 pub(crate) fn missing_locked_wheels_from_installed(
@@ -950,81 +997,111 @@ pub async fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
         }
     };
 
-    let wheel_files =
-        materialize_locked_wheels(&lock, prefix, &wheels_dir, &resolve_wheel_store_root(&lock))
-            .await?;
-    let args = build_uv_replay_args(prefix, &wheel_files, None, force_reinstall);
+    // conda-owned distributions are dropped from the replay: uv must never
+    // uninstall a conda-managed distribution to swap in the bundle's PyPI
+    // wheel (that clobbers the conda payload -- see
+    // `conda_owned_distributions`). conda is authoritative at the locked
+    // version and its dist-info still satisfies `verify`.
+    let conda_owned = conda_owned_distributions(&site_packages_dir(prefix, &lock.python));
+    let wheel_files = materialize_locked_wheels(
+        &lock,
+        prefix,
+        &wheels_dir,
+        &resolve_wheel_store_root(&lock),
+        &conda_owned,
+    )
+    .await?;
 
-    let install_msg = format!(
-        "retread install: {} -> {} ({} wheels, zero-resolution replay)",
-        lock.bundle,
-        prefix.display(),
-        wheel_files.len()
-    );
-    eprintln!("{install_msg}");
-    crate::status::phase(
-        lock_path.parent().unwrap_or(std::path::Path::new(".")),
-        &lock.bundle,
-        &install_msg,
-    );
-
-    // Per-PREFIX uv guard: the per-bundle install lock above only
-    // serializes same-bundle installs, so two DIFFERENT bundles can reach
-    // here concurrently for one prefix. uv mutates shared site-packages
-    // state (RECORD files, console scripts, overlapping dist-infos)
-    // non-transactionally, so serialize the uv invocation (and the
-    // verify/audit that reads the freshly installed payload -- the guard
-    // is held until this function returns). Best-effort, like the
-    // install lock.
-    let _uv_guard = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(share.join(".uv.install.lock"))
-        .inspect(|f| {
-            let _ = fs4::fs_std::FileExt::lock_exclusive(f);
-        })
-        .ok();
-
-    let status = Command::new(&uv)
-        .args(&args)
-        .status()
-        .with_context(|| format!("spawning uv ({uv:?})"))?;
     let mut relaxed_platform: Option<String> = None;
     let mut declaration_source: Option<String> = None;
-    if !status.success() {
-        // Relax on a manylinux platform-tag conflict only. Classify the failure
-        // with a captured `--dry-run` resolve; if it is purely the platform tag
-        // and a libc declaration authorizes a higher floor, retry once targeting
-        // exactly that declaration. Any other failure surfaces unchanged.
-        match relax_platform_on_conflict(&uv, &args, &lock)? {
-            Some(outcome) => {
-                let relaxed = build_uv_replay_args(
-                    prefix,
-                    &wheel_files,
-                    Some(&outcome.platform),
-                    force_reinstall,
-                );
-                let status = Command::new(&uv)
-                    .args(&relaxed)
-                    .status()
-                    .with_context(|| format!("spawning uv ({uv:?}) with relaxed platform"))?;
-                if !status.success() {
+
+    if wheel_files.is_empty() {
+        // Every locked wheel is already provided by conda in this prefix;
+        // there is nothing for uv to replay. Fall through to verify/audit,
+        // which the conda dist-infos satisfy.
+        let msg = format!(
+            "retread install: {} -> {} (0 uv wheels; all locked wheels are conda-provided)",
+            lock.bundle,
+            prefix.display()
+        );
+        eprintln!("{msg}");
+        crate::status::phase(
+            lock_path.parent().unwrap_or(std::path::Path::new(".")),
+            &lock.bundle,
+            &msg,
+        );
+    } else {
+        let args = build_uv_replay_args(prefix, &wheel_files, None, force_reinstall);
+
+        let install_msg = format!(
+            "retread install: {} -> {} ({} wheels, zero-resolution replay)",
+            lock.bundle,
+            prefix.display(),
+            wheel_files.len()
+        );
+        eprintln!("{install_msg}");
+        crate::status::phase(
+            lock_path.parent().unwrap_or(std::path::Path::new(".")),
+            &lock.bundle,
+            &install_msg,
+        );
+
+        // Per-PREFIX uv guard: the per-bundle install lock above only
+        // serializes same-bundle installs, so two DIFFERENT bundles can reach
+        // here concurrently for one prefix. uv mutates shared site-packages
+        // state (RECORD files, console scripts, overlapping dist-infos)
+        // non-transactionally, so serialize the uv invocation (and the
+        // verify/audit that reads the freshly installed payload -- the guard
+        // is held until this function returns). Best-effort, like the
+        // install lock.
+        let _uv_guard = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(share.join(".uv.install.lock"))
+            .inspect(|f| {
+                let _ = fs4::fs_std::FileExt::lock_exclusive(f);
+            })
+            .ok();
+
+        let status = Command::new(&uv)
+            .args(&args)
+            .status()
+            .with_context(|| format!("spawning uv ({uv:?})"))?;
+        if !status.success() {
+            // Relax on a manylinux platform-tag conflict only. Classify the failure
+            // with a captured `--dry-run` resolve; if it is purely the platform tag
+            // and a libc declaration authorizes a higher floor, retry once targeting
+            // exactly that declaration. Any other failure surfaces unchanged.
+            match relax_platform_on_conflict(&uv, &args, &lock)? {
+                Some(outcome) => {
+                    let relaxed = build_uv_replay_args(
+                        prefix,
+                        &wheel_files,
+                        Some(&outcome.platform),
+                        force_reinstall,
+                    );
+                    let status = Command::new(&uv)
+                        .args(&relaxed)
+                        .status()
+                        .with_context(|| format!("spawning uv ({uv:?}) with relaxed platform"))?;
+                    if !status.success() {
+                        bail!(
+                            "uv pip install failed for bundle {} even after relaxing the \
+                             manylinux platform tag to {} (status {status})",
+                            lock.bundle,
+                            outcome.platform
+                        );
+                    }
+                    relaxed_platform = Some(outcome.platform);
+                    declaration_source = Some(outcome.declaration_source.to_string());
+                }
+                None => {
                     bail!(
-                        "uv pip install failed for bundle {} even after relaxing the \
-                         manylinux platform tag to {} (status {status})",
-                        lock.bundle,
-                        outcome.platform
+                        "uv pip install failed for bundle {} (status {status})",
+                        lock.bundle
                     );
                 }
-                relaxed_platform = Some(outcome.platform);
-                declaration_source = Some(outcome.declaration_source.to_string());
-            }
-            None => {
-                bail!(
-                    "uv pip install failed for bundle {} (status {status})",
-                    lock.bundle
-                );
             }
         }
     }
@@ -1334,9 +1411,15 @@ mod tests {
             &sha,
         )];
 
-        let files = materialize_locked_wheels(&lock, &prefix, &wheels_dir, &root.join("cache"))
-            .await
-            .unwrap();
+        let files = materialize_locked_wheels(
+            &lock,
+            &prefix,
+            &wheels_dir,
+            &root.join("cache"),
+            &BTreeSet::new(),
+        )
+        .await
+        .unwrap();
         assert_eq!(files, vec![shipped]);
         assert!(
             !prefix
@@ -1381,10 +1464,86 @@ mod tests {
             sdist_source: None,
         }];
 
-        let files = materialize_locked_wheels(&lock, &prefix, &wheels_dir, &store_root)
-            .await
-            .unwrap();
+        let files =
+            materialize_locked_wheels(&lock, &prefix, &wheels_dir, &store_root, &BTreeSet::new())
+                .await
+                .unwrap();
         assert_eq!(files, vec![stored]);
+    }
+
+    /// A dist-info whose INSTALLER marker reads `conda` is reported as
+    /// conda-owned; anything else (uv, missing marker) is not.
+    #[test]
+    fn conda_owned_distributions_reads_installer_marker() {
+        let root = tempdir("conda-owned");
+        let sp = root.join("lib/python3.11/site-packages");
+        let write_dist = |name: &str, ver: &str, installer: Option<&str>| {
+            let di = sp.join(format!("{name}-{ver}.dist-info"));
+            std::fs::create_dir_all(&di).unwrap();
+            std::fs::write(
+                di.join("METADATA"),
+                format!("Name: {name}\nVersion: {ver}\n"),
+            )
+            .unwrap();
+            if let Some(i) = installer {
+                std::fs::write(di.join("INSTALLER"), i).unwrap();
+            }
+        };
+        // conda-owned (note the trailing newline conda writes)
+        write_dist("torch", "2.7.0", Some("conda\n"));
+        // uv-owned
+        write_dist("tensordict", "0.9.0", Some("uv\n"));
+        // no INSTALLER at all
+        write_dist("orphan", "1.0.0", None);
+
+        let owned = conda_owned_distributions(&sp);
+        assert!(owned.contains(&("torch".into(), "2.7.0".into())));
+        assert!(!owned.contains(&("tensordict".into(), "0.9.0".into())));
+        assert!(!owned.contains(&("orphan".into(), "1.0.0".into())));
+        assert_eq!(owned.len(), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A locked wheel whose (name, version) conda already owns in the prefix
+    /// is dropped from the replay entirely -- never materialized, so uv is
+    /// never asked to uninstall the conda payload. Non-owned wheels are
+    /// still materialized.
+    #[tokio::test]
+    async fn materialize_locked_wheels_skips_conda_owned_wheel() {
+        let root = tempdir("skip-conda-owned");
+        let prefix = root.join("prefix");
+        let wheels_dir = root.join("wheels");
+        std::fs::create_dir_all(&wheels_dir).unwrap();
+
+        // Ship both wheels so materialization is a pure offline file lookup.
+        let torch_bytes = b"conda-owned torch wheel bytes";
+        let td_bytes = b"tensordict wheel bytes";
+        std::fs::write(wheels_dir.join("torch-2.7.0-py3-none-any.whl"), torch_bytes).unwrap();
+        let td_shipped = wheels_dir.join("tensordict-0.9.0-py3-none-any.whl");
+        std::fs::write(&td_shipped, td_bytes).unwrap();
+
+        let mut lock = make_lock(vec![], vec![], BTreeMap::new());
+        lock.wheels = vec![
+            lock_wheel("torch", "2.7.0"),
+            lock_wheel("tensordict", "0.9.0"),
+        ];
+
+        let mut conda_owned = BTreeSet::new();
+        conda_owned.insert(("torch".to_string(), "2.7.0".to_string()));
+
+        let files = materialize_locked_wheels(
+            &lock,
+            &prefix,
+            &wheels_dir,
+            &root.join("cache"),
+            &conda_owned,
+        )
+        .await
+        .unwrap();
+
+        // Only the non-owned wheel survives; torch is left to conda.
+        assert_eq!(files, vec![td_shipped]);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// Loose mode failure story: a Built wheel with a sha but an EMPTY store
@@ -1411,9 +1570,10 @@ mod tests {
             sdist_source: None,
         }];
 
-        let err = materialize_locked_wheels(&lock, &prefix, &wheels_dir, &store_root)
-            .await
-            .unwrap_err();
+        let err =
+            materialize_locked_wheels(&lock, &prefix, &wheels_dir, &store_root, &BTreeSet::new())
+                .await
+                .unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("shared wheel store") && msg.contains("rebuild"),
@@ -1532,9 +1692,15 @@ mod tests {
             sdist_source: None,
         }];
 
-        let files = materialize_locked_wheels(&lock, &prefix, &wheels_dir, &primary_store)
-            .await
-            .unwrap();
+        let files = materialize_locked_wheels(
+            &lock,
+            &prefix,
+            &wheels_dir,
+            &primary_store,
+            &BTreeSet::new(),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             files,
             vec![recorded_path],
