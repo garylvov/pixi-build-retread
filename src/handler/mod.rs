@@ -2540,10 +2540,17 @@ async fn uv_group_closure(
     // override always wins (re-enable on Linux), Windows targets inject
     // nothing, and names a pack already drops are skipped so there is no
     // duplicate override line.
+    // First-party/root requirement names (canonical PEP 503): an explicit
+    // top-level requirement for one of the built-in win-only names means the
+    // user wants it resolved deliberately, so the injected graph-wide marker
+    // must NOT suppress it.
+    let first_party_names: Vec<String> =
+        roots.iter().filter_map(|req| root_req_name(req)).collect();
     let injected_win_only = crate::uv_closure::built_in_win_only_to_inject(
         &target.conda_subdir,
         |name| effective.overrides.contains_key(name),
         &effective.drop_deps,
+        &first_party_names,
     );
     for name in &injected_win_only {
         overrides.push(format!("{name} ; {}", crate::uv_closure::DROP_MARKER));

@@ -1882,12 +1882,17 @@ pub fn environment_marker(python_version: &str, conda_subdir: &str) -> Option<St
 ///   the override wins (re-enable on Linux).
 /// * A name already in the pack's `retread-drop-deps` is skipped so there is
 ///   no duplicate override line.
+/// * A name the user declared as an explicit TOP-LEVEL (first-party) root
+///   requirement is skipped -- explicit user intent at the top level means
+///   "resolve this deliberately", and a graph-wide uv override marker would
+///   otherwise suppress it. Normal resolution (incl. sdist heal) handles it.
 ///
 /// Returns the built-in names to inject, in `BUILT_IN_WIN_ONLY` order.
 pub fn built_in_win_only_to_inject<'a>(
     conda_subdir: &str,
     is_overridden: impl Fn(&str) -> bool,
     pack_drop_deps: &[String],
+    first_party: &[String],
 ) -> Vec<&'a str> {
     if matches!(conda_subdir, "win-64" | "win-32" | "win-arm64") {
         return Vec::new();
@@ -1896,11 +1901,16 @@ pub fn built_in_win_only_to_inject<'a>(
         .iter()
         .map(|n| canonical_conda_name(n))
         .collect();
+    let first_party_names: BTreeSet<String> = first_party
+        .iter()
+        .map(|n| canonical_conda_name(n))
+        .collect();
     crate::config::BUILT_IN_WIN_ONLY
         .iter()
         .copied()
         .filter(|name| !is_overridden(name))
         .filter(|name| !already_dropped.contains(&canonical_conda_name(name)))
+        .filter(|name| !first_party_names.contains(&canonical_conda_name(name)))
         .collect()
 }
 
@@ -3200,7 +3210,7 @@ isaaclab = { path = "wheels/isaaclab/isaaclab-2.0.0-py3-none-any.whl" }
         // (a) A linux-64 closure with NO pack drop-deps still injects the
         // built-in shims. Assert the marker override is present for both
         // idna-ssl and pywin32, and that it renders into the pyproject.
-        let names = built_in_win_only_to_inject("linux-64", |_| false, &[]);
+        let names = built_in_win_only_to_inject("linux-64", |_| false, &[], &[]);
         assert!(names.contains(&"idna-ssl"), "idna-ssl injected: {names:?}");
         assert!(names.contains(&"pywin32"), "pywin32 injected: {names:?}");
         assert_eq!(names, crate::config::BUILT_IN_WIN_ONLY.to_vec());
@@ -3221,9 +3231,9 @@ isaaclab = { path = "wheels/isaaclab/isaaclab-2.0.0-py3-none-any.whl" }
     fn built_in_win_only_injects_none_on_windows() {
         // (b) win-64 (and the other win subdirs) inject nothing — the
         // shims are legitimate there.
-        assert!(built_in_win_only_to_inject("win-64", |_| false, &[]).is_empty());
-        assert!(built_in_win_only_to_inject("win-32", |_| false, &[]).is_empty());
-        assert!(built_in_win_only_to_inject("win-arm64", |_| false, &[]).is_empty());
+        assert!(built_in_win_only_to_inject("win-64", |_| false, &[], &[]).is_empty());
+        assert!(built_in_win_only_to_inject("win-32", |_| false, &[], &[]).is_empty());
+        assert!(built_in_win_only_to_inject("win-arm64", |_| false, &[], &[]).is_empty());
     }
 
     #[test]
@@ -3231,7 +3241,7 @@ isaaclab = { path = "wheels/isaaclab/isaaclab-2.0.0-py3-none-any.whl" }
         // (c) A user override for one of the names suppresses just that
         // name; the others still inject.
         let overridden = |name: &str| name == "pywin32";
-        let names = built_in_win_only_to_inject("linux-64", overridden, &[]);
+        let names = built_in_win_only_to_inject("linux-64", overridden, &[], &[]);
         assert!(
             !names.contains(&"pywin32"),
             "override must suppress pywin32: {names:?}"
@@ -3248,7 +3258,7 @@ isaaclab = { path = "wheels/isaaclab/isaaclab-2.0.0-py3-none-any.whl" }
         // e.g. underscore) does not get a duplicate; a non-built-in
         // drop-dep is untouched and the remaining built-ins still inject.
         let drops = vec!["pywin32".to_string(), "some_other_pkg".to_string()];
-        let names = built_in_win_only_to_inject("linux-64", |_| false, &drops);
+        let names = built_in_win_only_to_inject("linux-64", |_| false, &drops, &[]);
         assert!(
             !names.contains(&"pywin32"),
             "already-dropped built-in must not duplicate: {names:?}"
@@ -3257,10 +3267,36 @@ isaaclab = { path = "wheels/isaaclab/isaaclab-2.0.0-py3-none-any.whl" }
 
         // Non-canonical form of an already-dropped built-in is deduped too.
         let drops2 = vec!["idna_ssl".to_string()];
-        let names2 = built_in_win_only_to_inject("linux-64", |_| false, &drops2);
+        let names2 = built_in_win_only_to_inject("linux-64", |_| false, &drops2, &[]);
         assert!(
             !names2.contains(&"idna-ssl"),
             "canonicalized dedupe against idna_ssl failed: {names2:?}"
+        );
+    }
+
+    #[test]
+    fn built_in_win_only_first_party_root_suppresses_injection() {
+        // (e) A user who declares one of the built-in names as an explicit
+        // TOP-LEVEL (first-party) root requirement wants it resolved
+        // deliberately -- the injected graph-wide marker must NOT suppress
+        // it. Just that name is skipped; the other built-ins still inject.
+        let first_party = vec!["idna-ssl".to_string()];
+        let names = built_in_win_only_to_inject("linux-64", |_| false, &[], &first_party);
+        assert!(
+            !names.contains(&"idna-ssl"),
+            "first-party root must suppress idna-ssl injection: {names:?}"
+        );
+        assert!(
+            names.contains(&"pywin32"),
+            "un-declared built-ins still inject: {names:?}"
+        );
+
+        // Non-canonical form of the first-party name is deduped too.
+        let first_party2 = vec!["idna_ssl".to_string()];
+        let names2 = built_in_win_only_to_inject("linux-64", |_| false, &[], &first_party2);
+        assert!(
+            !names2.contains(&"idna-ssl"),
+            "canonicalized dedupe against first-party idna_ssl failed: {names2:?}"
         );
     }
 
