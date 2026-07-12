@@ -791,9 +791,15 @@ impl Handler {
             ));
         }
 
-        // Eagerly validate each entry now so misconfigurations surface at
-        // initialize time rather than mid-build.
-        for (name, entry) in &config.retread_wheels {
+        // Eagerly normalize + validate each entry now so misconfigurations
+        // surface at initialize time rather than mid-build. Normalization
+        // lifts a `#sha256=` URL fragment into the discrete `sha256` field so
+        // the persistent wheel cache can address URL-form wheels (issue #10
+        // perf: otherwise a multi-GiB extscache wheel redownloads every run).
+        for (name, entry) in &mut config.retread_wheels {
+            entry
+                .normalize(name)
+                .map_err(|e| RpcError::invalid_params(e.to_string()))?;
             entry
                 .validate(name)
                 .map_err(|e| RpcError::invalid_params(e.to_string()))?;
@@ -2600,6 +2606,15 @@ async fn uv_group_closure(
         target.conda_subdir,
     ));
     let uv_cache_dir = cache_dir.join("uv-cache");
+    // Persisted heal facts live OUTSIDE uv-projects so they survive a
+    // "delete uv-projects state" cold reset -- that survival is what lets
+    // the post-reset Pass A converge in one lock (issue #10 perf, item 3b).
+    let heal_facts_path = crate::uv_closure::heal_facts_path(
+        cache_dir,
+        group_name,
+        &target.python_version,
+        &target.conda_subdir,
+    );
 
     // M2: auto-route options. Roots (this bundle's own entries) and
     // retread-built wheel sources must never leave the closure; keep-pypi
@@ -2765,12 +2780,32 @@ async fn uv_group_closure(
                 as futures::future::BoxFuture<'static, Result<crate::uv_closure::BuiltSdistWheel>>
         }
     });
-    let sdist_routed = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let sdist_built = Arc::new(std::sync::Mutex::new(Vec::new()));
+    // Seed the heal ledgers from facts persisted by a previous run (issue
+    // #10 perf): with these present, the FIRST Pass A already carries the
+    // learned pins / built-wheel path-sources, so a warm rerun resolves in
+    // a single lock (and the pyproject fingerprint matches the recorded
+    // meta, letting uv reuse the healed uv.lock instead of re-resolving).
+    // Stale built-wheel entries (store pruned) are dropped on load.
+    // Facts are only replayable under the manifest/routing state they were
+    // learned from (B1): stamp over the BASE request + routing options; a
+    // mismatch discards the file (fresh heal), never a stale replay.
+    let facts_stamp = crate::uv_closure::heal_facts_stamp(&req, &auto_route_opts);
+    let persisted_facts = crate::uv_closure::load_heal_facts(&heal_facts_path, &facts_stamp);
+    if !persisted_facts.is_empty() {
+        tracing::info!(
+            bundle = %group_name,
+            routed = persisted_facts.routed.len(),
+            built = persisted_facts.built.len(),
+            prereleased = persisted_facts.prereleased.len(),
+            "uv closure: seeding heal ledgers from persisted facts (warm reuse path)",
+        );
+    }
+    let sdist_routed = Arc::new(std::sync::Mutex::new(persisted_facts.routed));
+    let sdist_built = Arc::new(std::sync::Mutex::new(persisted_facts.built));
     // Transitive-prerelease repairs surface naturally in the closure's
     // pins/wheels (the offender keeps its own index wheel); collected here
     // only for logging/audit parity with the route/build ledgers.
-    let sdist_prereleased = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sdist_prereleased = Arc::new(std::sync::Mutex::new(persisted_facts.prereleased));
     let solve = crate::uv_closure::with_sdist_heal(
         group_name.to_string(),
         raw_solve,
@@ -2960,14 +2995,29 @@ async fn uv_group_closure(
             }
         }
     }
-    let mut closure = crate::uv_closure::auto_route_fixpoint_checked(
+    let mut closure = match crate::uv_closure::auto_route_fixpoint_checked(
         &req,
         &auto_route_opts,
         solve,
         probe,
         co_solve,
     )
-    .await?;
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            // B1: a failed solve may have been poisoned by stale persisted
+            // facts (or is about to change the manifest state via a repair
+            // loop). Remove the facts file so the NEXT run re-heals from
+            // scratch instead of replaying a wedge across runs. Saving
+            // empty facts deletes the file.
+            crate::uv_closure::save_heal_facts(
+                &heal_facts_path,
+                &crate::uv_closure::HealFacts::default(),
+            );
+            return Err(e);
+        }
+    };
     // Splice in the sdist-only self-heal's discoveries (mirrors
     // `uv_closure::auto_route_fixpoint_with_sdist_heal`'s own splice,
     // which this call site can't use directly -- production also needs
@@ -2999,6 +3049,40 @@ async fn uv_group_closure(
             });
         }
     }
+    // Persist the heal facts that produced this successful closure so the
+    // next run's FIRST Pass A carries them (issue #10 perf: warm single-lock
+    // convergence + healed-uv.lock reuse). Only reached on success -- a
+    // failed solve returned via `?` above and never overwrites good facts.
+    // The ledgers now hold the union of persisted + newly-discovered facts
+    // (with_sdist_heal re-injects the seed ledgers each round).
+    crate::uv_closure::save_heal_facts(
+        &heal_facts_path,
+        &crate::uv_closure::HealFacts {
+            stamp: facts_stamp,
+            // The FULL routing set, not just the sdist-heal ledger:
+            // `closure.auto_routed` (post-splice) also carries the M2
+            // auto-route fixpoint's discoveries (torch/cuda-* style
+            // harmonization routes). Persisting those is what lets the next
+            // run's ROUND 0 request already include the routing constraints
+            // -- so its synthesized pyproject matches the recorded
+            // fingerprint, the healed uv.lock is kept, and the fixpoint
+            // converges without a second discovery re-lock (run7 measured
+            // the miss at 2x ~9 min: round 0 pinless-routeless, round 1
+            // re-resolving from scratch after apply_auto_route changed the
+            // constraint set). Deduped by pypi_name (splice can repeat).
+            routed: {
+                let mut seen = std::collections::BTreeSet::new();
+                closure
+                    .auto_routed
+                    .iter()
+                    .filter(|r| seen.insert(r.pypi_name.clone()))
+                    .cloned()
+                    .collect()
+            },
+            built: sdist_built.lock().unwrap().clone(),
+            prereleased: sdist_prereleased.lock().unwrap().clone(),
+        },
+    );
     Ok((Some(closure), deps_from_floor_names))
 }
 
