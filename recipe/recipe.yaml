@@ -23,11 +23,21 @@ build:
     # target via rustup at build time. Networking inside the sandbox is
     # already a given: git deps (pixi_build_types, uv-pep508,
     # uv-normalize) are fetched at build time too.
+    # HOME must match the euid home or rustup-init errors out mid-run and
+    # silently skips installing the extra --target (only the default gnu
+    # toolchain lands); the cargo build then fails with E0463 "can't find
+    # crate for `std`" for *-musl. Keep rustup/cargo state under $SRC_DIR
+    # via RUSTUP_HOME/CARGO_HOME, but let HOME be the real one.
+    - export HOME=$(getent passwd "$(id -u)" | cut -d: -f6)
     - export RUSTUP_HOME=$SRC_DIR/.rustup CARGO_HOME=$SRC_DIR/.cargo
     - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o rustup-init.sh
     - sh rustup-init.sh -y --profile minimal --default-toolchain stable
       --target x86_64-unknown-linux-musl --no-modify-path
     - export PATH=$CARGO_HOME/bin:$PATH
+    # Belt and braces: idempotent explicit target add, then a loud check so
+    # a missing musl std fails here instead of deep inside the cargo build.
+    - rustup target add x86_64-unknown-linux-musl
+    - rustup target list --installed | grep -q '^x86_64-unknown-linux-musl$'
     # ring + zstd-sys compile C; point the cc crate at the conda gcc.
     # The objects only reference unversioned libc symbols, so linking
     # them against musl's static libc.a (rust's self-contained mode,
