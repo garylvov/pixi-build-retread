@@ -1,7 +1,5 @@
 # pixi-build-retread
 
-## this repo is fundamentally flawed and is in the process of being fixed; don't use for now
-
 [![linux-x86_64](https://github.com/garylvov/pixi-build-retread/actions/workflows/ci.yml/badge.svg)](https://github.com/garylvov/pixi-build-retread/actions/workflows/ci.yml)
 
 Bundles PyPI wheel closures into conda packages, crossing the conda↔uv boundary.
