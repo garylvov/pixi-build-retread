@@ -2115,6 +2115,27 @@ async fn resolve_all(
     Ok((bundles, effective))
 }
 
+/// Compose the persisted sdist source URL, appending the advertised
+/// `#sha256=` fragment exactly once.
+///
+/// [`crate::pypi::parse_index_links_any`] LIFTS the discrete `sha256` field
+/// out of the link's `#sha256=` fragment but leaves that fragment ON the
+/// `url` it returns, so `sha256.is_some()` implies `url` already carries a
+/// `#sha256=..` fragment. Re-appending onto `url` verbatim would double it
+/// (`..tar.gz#sha256=h#sha256=h`); strip any existing fragment first so the
+/// stored URL has a single canonical `#sha256=`. No advertised hash -> URL
+/// verbatim (may still carry an unrelated fragment, which we leave alone).
+fn compose_sdist_source_url(url: &url::Url, sha256: Option<&str>) -> String {
+    match sha256 {
+        Some(h) => {
+            let mut base = url.clone();
+            base.set_fragment(None);
+            format!("{base}#sha256={h}")
+        }
+        None => url.to_string(),
+    }
+}
+
 /// Production wiring for the sdist-only self-heal's THIRD rung (v4.4.0;
 /// spec ladder: wheel -> conda-route (existing) -> sdist auto-build (this
 /// fn) -> error). Resolves `name`'s sdist off the first index in
@@ -2253,10 +2274,7 @@ async fn build_sdist_wheel(
             })?
             .to_string();
         let store_path = store_root.join(&sha256).join(&filename);
-        let sdist_url = match &sdist.sha256 {
-            Some(h) => format!("{}#sha256={h}", sdist.url),
-            None => sdist.url.to_string(),
-        };
+        let sdist_url = compose_sdist_source_url(&sdist.url, sdist.sha256.as_deref());
         return Ok(crate::uv_closure::BuiltSdistWheel {
             pypi_name: name.clone(),
             version: version.to_string(),
@@ -3283,6 +3301,37 @@ mod unambiguous_consuming_deps_tests {
         assert_eq!(deps.get("pytorch-gpu").map(String::as_str), Some("==2.7.0"));
         assert!(!deps.contains_key("torchvision"));
         assert!(!deps.contains_key("numpy"));
+    }
+}
+
+#[cfg(test)]
+mod sdist_source_url_tests {
+    use super::compose_sdist_source_url;
+
+    const H: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    #[test]
+    fn compose_sdist_source_url_never_doubles_the_sha_fragment() {
+        // Index advertised a hash: `pypi::parse_index_links_any` lifts the
+        // discrete field but LEAVES the `#sha256=` fragment on the url, so a
+        // naive `format!("{url}#sha256={h}")` would double it. The composer
+        // must emit exactly one fragment.
+        let with_frag =
+            url::Url::parse(&format!("https://ex.org/p/foo-1.0.tar.gz#sha256={H}")).unwrap();
+        let out = compose_sdist_source_url(&with_frag, Some(H));
+        assert_eq!(
+            out.matches("#sha256=").count(),
+            1,
+            "doubled fragment: {out}"
+        );
+        assert_eq!(out, format!("https://ex.org/p/foo-1.0.tar.gz#sha256={H}"));
+
+        // No advertised hash: URL passes through verbatim.
+        let no_hash = url::Url::parse("https://ex.org/p/foo-1.0.tar.gz").unwrap();
+        assert_eq!(
+            compose_sdist_source_url(&no_hash, None),
+            "https://ex.org/p/foo-1.0.tar.gz"
+        );
     }
 }
 
