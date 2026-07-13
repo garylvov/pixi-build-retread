@@ -357,6 +357,7 @@ async fn materialize_locked_wheels(
     shipped_wheels_dir: &Path,
     store_root: &Path,
     conda_owned: &BTreeSet<(String, String)>,
+    editable_owned: &BTreeSet<String>,
 ) -> Result<Vec<PathBuf>> {
     let fetch_dir = prefix
         .join("share")
@@ -375,6 +376,24 @@ async fn materialize_locked_wheels(
                 "retread install: {}=={} is conda-provided in the prefix; \
                  skipping wheel replay to avoid clobbering the conda payload",
                 wheel.name, wheel.version
+            );
+            continue;
+        }
+        // The user has overlaid this distribution as an editable install
+        // (`pip install -e`); replaying the bundled wheel would clobber their
+        // working checkout. Skip on NAME match at ANY version -- the editable
+        // overlay is the user's explicit local-development intent. See
+        // `editable_owned_distributions`. To restore the bundled wheel:
+        // `pip uninstall <name>` then relink the env.
+        if editable_owned.contains(&normalize_dist_name(&wheel.name)) {
+            tracing::info!(
+                bundle = %lock.bundle,
+                dist = %wheel.name,
+                "retread install: {} is editable-installed (pip install -e) in the \
+                 prefix; skipping bundled wheel replay to preserve the user's local \
+                 checkout. To restore the bundled wheel: pip uninstall {} + relink the env",
+                wheel.name,
+                wheel.name
             );
             continue;
         }
@@ -594,6 +613,69 @@ fn conda_owned_distributions(site_packages: &Path) -> BTreeSet<(String, String)>
     out
 }
 
+/// Distributions in `site_packages` the user has overlaid as an EDITABLE
+/// install (`pip install -e <path>`), keyed by PEP 503 name only (version is
+/// intentionally ignored -- see below).
+///
+/// A user who runs `pip install -e third_party/ProtoMotions --no-deps` is
+/// expressing an explicit local-development intent: imports must resolve to
+/// their working checkout, not the bundled wheel in site-packages. But the
+/// courier replays the locked wheel set on EVERY activation self-heal, and
+/// `uv pip install --reinstall <wheel>` would force the bundled wheel back
+/// over the editable overlay -- the pack wheel would always win. So editable
+/// overlays join the same replay skip-set as conda-owned distributions: the
+/// courier never materializes or replays a wheel whose distribution the user
+/// has made editable.
+///
+/// Detection (PEP 660 primary): the editable dist-info's `direct_url.json`
+/// records `{"dir_info": {"editable": true}, ...}`. A legacy setuptools
+/// `develop` install instead drops a `<name>.egg-link` file in site-packages;
+/// that is trivially name-keyed, so it is accepted as a fallback signal.
+///
+/// Unlike conda ownership, this is keyed on NAME ONLY, not (name, version):
+/// the user's checkout may declare any version (often a dev/local version that
+/// differs from the locked wheel), and the overlay is authoritative regardless.
+fn editable_owned_distributions(site_packages: &Path) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    if !site_packages.is_dir() {
+        return out;
+    }
+
+    // PEP 660: dist-info/direct_url.json with dir_info.editable == true.
+    if let Ok(installed) = installed_distributions(site_packages) {
+        for (name, versions) in &installed {
+            for dist_root in versions.values() {
+                let Ok(body) = std::fs::read_to_string(dist_root.join("direct_url.json")) else {
+                    continue;
+                };
+                let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) else {
+                    continue;
+                };
+                if json
+                    .get("dir_info")
+                    .and_then(|d| d.get("editable"))
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+                {
+                    out.insert(name.clone());
+                }
+            }
+        }
+    }
+
+    // Legacy setuptools `develop`: a `<project>.egg-link` in site-packages.
+    if let Ok(entries) = std::fs::read_dir(site_packages) {
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            if let Some(stem) = file_name.to_str().and_then(|n| n.strip_suffix(".egg-link")) {
+                out.insert(normalize_dist_name(stem));
+            }
+        }
+    }
+
+    out
+}
+
 pub(crate) fn missing_locked_wheels_from_installed(
     lock: &RetreadLock,
     installed: &BTreeMap<String, BTreeMap<String, PathBuf>>,
@@ -694,7 +776,22 @@ fn verify_record_payload(site_packages: &Path, dist_root: &Path) -> Result<()> {
 fn verify_payload_installed(lock: &RetreadLock, prefix: &Path) -> Result<()> {
     let site_packages = site_packages_dir(prefix, &lock.python);
     let installed = installed_distributions(&site_packages)?;
-    let missing = missing_locked_wheels_from_installed(lock, &installed);
+    // An editable overlay (`pip install -e`) satisfies a locked distribution
+    // at ANY version: the user has replaced the bundled wheel's dist-info with
+    // the checkout's own (PEP 660 editables ship a real dist-info + RECORD, so
+    // they would already pass the RECORD check -- but the recorded version may
+    // differ from the lock, which would otherwise flag the locked version as
+    // "missing" and trigger a clobbering reinstall). Names the user has made
+    // editable are therefore counted present and skipped from the missing /
+    // RECORD checks entirely.
+    let editable_owned = editable_owned_distributions(&site_packages);
+    let missing: Vec<String> = missing_locked_wheels_from_installed(lock, &installed)
+        .into_iter()
+        .filter(|item| {
+            let name = item.split("==").next().map(normalize_dist_name);
+            name.is_none_or(|n| !editable_owned.contains(&n))
+        })
+        .collect();
     if !missing.is_empty() {
         bail!(
             "retread verify: bundle {} is missing {} locked wheel(s) in {}: {}",
@@ -707,6 +804,9 @@ fn verify_payload_installed(lock: &RetreadLock, prefix: &Path) -> Result<()> {
 
     for wheel in &lock.wheels {
         let name = normalize_dist_name(&wheel.name);
+        if editable_owned.contains(&name) {
+            continue;
+        }
         let dist_root = installed
             .get(&name)
             .and_then(|versions| versions.get(&wheel.version))
@@ -738,9 +838,17 @@ fn installed_payload_libraries(
 ) -> Result<(PathBuf, Vec<crate::glibc::PayloadLib>)> {
     let site_packages = site_packages_dir(prefix, &lock.python);
     let installed = installed_distributions(&site_packages)?;
+    // Editable overlays own their own dist-info (possibly at a different
+    // version than the lock) and their glibc/manylinux posture is the user's
+    // to manage; the courier neither installed nor audits them. Skip so the
+    // (name, version) lookup below does not error on the overlaid version.
+    let editable_owned = editable_owned_distributions(&site_packages);
     let mut out: BTreeMap<String, crate::glibc::PayloadLib> = BTreeMap::new();
     for wheel in &lock.wheels {
         let name = normalize_dist_name(&wheel.name);
+        if editable_owned.contains(&name) {
+            continue;
+        }
         let dist_root = installed
             .get(&name)
             .and_then(|versions| versions.get(&wheel.version))
@@ -1003,12 +1111,17 @@ pub async fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
     // `conda_owned_distributions`). conda is authoritative at the locked
     // version and its dist-info still satisfies `verify`.
     let conda_owned = conda_owned_distributions(&site_packages_dir(prefix, &lock.python));
+    // Editable overlays the user has installed on top of the bundle: the
+    // courier must never replay the bundled wheel over a `pip install -e`
+    // checkout. Dropped from the replay by name at any version.
+    let editable_owned = editable_owned_distributions(&site_packages_dir(prefix, &lock.python));
     let wheel_files = materialize_locked_wheels(
         &lock,
         prefix,
         &wheels_dir,
         &resolve_wheel_store_root(&lock),
         &conda_owned,
+        &editable_owned,
     )
     .await?;
 
@@ -1417,6 +1530,7 @@ mod tests {
             &wheels_dir,
             &root.join("cache"),
             &BTreeSet::new(),
+            &BTreeSet::new(),
         )
         .await
         .unwrap();
@@ -1464,10 +1578,16 @@ mod tests {
             sdist_source: None,
         }];
 
-        let files =
-            materialize_locked_wheels(&lock, &prefix, &wheels_dir, &store_root, &BTreeSet::new())
-                .await
-                .unwrap();
+        let files = materialize_locked_wheels(
+            &lock,
+            &prefix,
+            &wheels_dir,
+            &store_root,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        )
+        .await
+        .unwrap();
         assert_eq!(files, vec![stored]);
     }
 
@@ -1537,12 +1657,137 @@ mod tests {
             &wheels_dir,
             &root.join("cache"),
             &conda_owned,
+            &BTreeSet::new(),
         )
         .await
         .unwrap();
 
         // Only the non-owned wheel survives; torch is left to conda.
         assert_eq!(files, vec![td_shipped]);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Helper: write a dist-info with METADATA and an optional
+    /// direct_url.json. `editable` controls the PEP 660 `dir_info.editable`
+    /// flag; `None` writes no direct_url.json at all.
+    fn write_dist_info(sp: &Path, name: &str, ver: &str, editable: Option<bool>) -> PathBuf {
+        let di = sp.join(format!("{name}-{ver}.dist-info"));
+        std::fs::create_dir_all(&di).unwrap();
+        std::fs::write(
+            di.join("METADATA"),
+            format!("Name: {name}\nVersion: {ver}\n"),
+        )
+        .unwrap();
+        if let Some(is_editable) = editable {
+            let body = if is_editable {
+                r#"{"url": "file:///home/u/checkout", "dir_info": {"editable": true}}"#
+            } else {
+                // A regular directory/url install: dir_info present but not editable.
+                r#"{"url": "file:///home/u/checkout", "dir_info": {}}"#
+            };
+            std::fs::write(di.join("direct_url.json"), body).unwrap();
+        }
+        di
+    }
+
+    /// A dist-info whose direct_url.json carries `dir_info.editable == true`
+    /// (PEP 660) is reported editable-owned; a non-editable url install is
+    /// NOT; and a legacy setuptools `.egg-link` is accepted by name.
+    #[test]
+    fn editable_owned_distributions_reads_direct_url_and_egg_link() {
+        let root = tempdir("editable-owned");
+        let sp = root.join("lib/python3.11/site-packages");
+        std::fs::create_dir_all(&sp).unwrap();
+
+        // (a) PEP 660 editable overlay.
+        write_dist_info(&sp, "protomotions", "0.1.0", Some(true));
+        // (b) non-editable url/dir install -> must NOT be treated as editable.
+        write_dist_info(&sp, "tensordict", "0.9.0", Some(false));
+        // a plain wheel install with no direct_url.json at all.
+        write_dist_info(&sp, "orphan", "1.0.0", None);
+        // legacy setuptools develop overlay (case-folded name).
+        std::fs::write(sp.join("Legacy_Pkg.egg-link"), "/home/u/legacy\n.").unwrap();
+
+        let owned = editable_owned_distributions(&sp);
+        assert!(owned.contains("protomotions"), "PEP 660 editable detected");
+        assert!(
+            !owned.contains("tensordict"),
+            "non-editable url install must not be editable-owned"
+        );
+        assert!(!owned.contains("orphan"), "plain wheel is not editable");
+        assert!(
+            owned.contains(&normalize_dist_name("Legacy_Pkg")),
+            "legacy .egg-link detected by name"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A locked wheel whose distribution the user has overlaid as an editable
+    /// install is dropped from the replay by NAME, even when the editable's
+    /// version differs from the lock -- the overlay is authoritative at any
+    /// version. Non-overlaid wheels are still materialized.
+    #[tokio::test]
+    async fn materialize_locked_wheels_skips_editable_owned_wheel() {
+        let root = tempdir("skip-editable-owned");
+        let prefix = root.join("prefix");
+        let wheels_dir = root.join("wheels");
+        std::fs::create_dir_all(&wheels_dir).unwrap();
+
+        // Ship both wheels so materialization is a pure offline file lookup.
+        std::fs::write(
+            wheels_dir.join("protomotions-2.0.0-py3-none-any.whl"),
+            b"bundled protomotions wheel bytes",
+        )
+        .unwrap();
+        let td_shipped = wheels_dir.join("tensordict-0.9.0-py3-none-any.whl");
+        std::fs::write(&td_shipped, b"tensordict wheel bytes").unwrap();
+
+        let mut lock = make_lock(vec![], vec![], BTreeMap::new());
+        // Lock pins protomotions==2.0.0; the user's editable is a DIFFERENT
+        // version (0.1.0.dev0) -- must still be skipped on name match.
+        lock.wheels = vec![
+            lock_wheel("protomotions", "2.0.0"),
+            lock_wheel("tensordict", "0.9.0"),
+        ];
+
+        let mut editable_owned = BTreeSet::new();
+        editable_owned.insert("protomotions".to_string());
+
+        let files = materialize_locked_wheels(
+            &lock,
+            &prefix,
+            &wheels_dir,
+            &root.join("cache"),
+            &BTreeSet::new(),
+            &editable_owned,
+        )
+        .await
+        .unwrap();
+
+        // Only tensordict survives; the editable protomotions is left alone.
+        assert_eq!(files, vec![td_shipped]);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// verify_payload_installed treats an editable overlay as satisfying the
+    /// locked distribution even when the checkout's version differs from the
+    /// lock -- no "missing wheel" bail, no RECORD requirement.
+    #[test]
+    fn verify_payload_installed_accepts_editable_overlay_at_any_version() {
+        let root = tempdir("verify-editable");
+        let prefix = root.join("prefix");
+        let sp = site_packages_dir(&prefix, "3.11");
+        std::fs::create_dir_all(&sp).unwrap();
+
+        // The lock pins mypackage==1.0.0 (make_lock default). The user has
+        // overlaid an editable checkout that declares 9.9.9.dev0 and ships no
+        // wheel RECORD; verify must still pass.
+        write_dist_info(&sp, "mypackage", "9.9.9.dev0", Some(true));
+
+        let lock = make_lock(vec![], vec![], BTreeMap::new());
+        assert_eq!(lock.wheels[0].version, "1.0.0");
+        verify_payload_installed(&lock, &prefix)
+            .expect("editable overlay at any version satisfies verify");
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1570,10 +1815,16 @@ mod tests {
             sdist_source: None,
         }];
 
-        let err =
-            materialize_locked_wheels(&lock, &prefix, &wheels_dir, &store_root, &BTreeSet::new())
-                .await
-                .unwrap_err();
+        let err = materialize_locked_wheels(
+            &lock,
+            &prefix,
+            &wheels_dir,
+            &store_root,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        )
+        .await
+        .unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("shared wheel store") && msg.contains("rebuild"),
@@ -1697,6 +1948,7 @@ mod tests {
             &prefix,
             &wheels_dir,
             &primary_store,
+            &BTreeSet::new(),
             &BTreeSet::new(),
         )
         .await
