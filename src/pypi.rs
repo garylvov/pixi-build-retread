@@ -1,8 +1,11 @@
-//! PEP 503 simple-index resolver. Turns `(name, version, index)` into a
-//! concrete `(url, sha256)` for the wheel matching our target platform +
-//! python tag.
+//! Simple-index resolver. Turns `(name, version, index)` into a concrete
+//! `(url, sha256)` for the wheel matching our target platform + python tag.
+//! Speaks BOTH the PEP 503 HTML API and the PEP 691 JSON API: it requests
+//! JSON preferentially (pypi.org content-negotiates to JSON by default now,
+//! and JSON hands us the sha256 + PEP 658 sidecar availability as structured
+//! fields) and falls back to HTML for indexes that only serve HTML.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use regex::Regex;
 use std::str::FromStr;
 use std::sync::OnceLock;
@@ -110,13 +113,14 @@ async fn resolve_inner(
 ) -> Result<ResolvedWheel> {
     let index_url = build_index_url(index, name)?;
     tracing::info!(url = %index_url, "fetching simple index");
-    let html = reqwest::get(index_url.clone())
-        .await?
-        .error_for_status()?
-        .text()
-        .await?;
-
-    let mut candidates = parse_index_links(&html, &index_url)?;
+    let (is_json, body) = fetch_simple_index(&index_url).await?;
+    // PEP 691 JSON lists wheels AND sdists; the `.whl` retain below narrows
+    // it, exactly as it does after the HTML `<a href>` parse.
+    let mut candidates = if is_json {
+        parse_index_json(&body, &index_url)?
+    } else {
+        parse_index_links(&body, &index_url)?
+    };
     candidates.retain(|c| c.filename.ends_with(".whl"));
     if candidates.is_empty() {
         bail!("no wheels listed at {index_url}");
@@ -226,13 +230,12 @@ pub async fn resolve_sdist(
 ) -> Result<(uv_pep440::Version, ResolvedWheel)> {
     let index_url = build_index_url(index, name)?;
     tracing::info!(url = %index_url, "sdist fallback: fetching simple index");
-    let html = reqwest::get(index_url.clone())
-        .await?
-        .error_for_status()?
-        .text()
-        .await?;
-
-    let mut candidates = parse_index_links_any(&html, &index_url)?;
+    let (is_json, body) = fetch_simple_index(&index_url).await?;
+    let mut candidates = if is_json {
+        parse_index_json(&body, &index_url)?
+    } else {
+        parse_index_links_any(&body, &index_url)?
+    };
     // sdist suffixes per PEP 625 + the legacy ones still on PyPI.
     candidates.retain(|c| {
         let f = c.filename.to_ascii_lowercase();
@@ -406,6 +409,103 @@ fn parse_index_links(html: &str, base: &url::Url) -> Result<Vec<ResolvedWheel>> 
         bail!("no `<a href=...>` wheel links found at index");
     }
     Ok(out)
+}
+
+/// Simple-API content negotiation. We prefer PEP 691 JSON (structured
+/// sha256 + PEP 658 sidecar availability) and accept PEP 503 HTML as a
+/// fallback for indexes that only serve HTML. Matches what pip/uv send.
+const SIMPLE_ACCEPT: &str = "application/vnd.pypi.simple.v1+json, \
+     application/vnd.pypi.simple.v1+html;q=0.2, text/html;q=0.1";
+
+/// Fetch a simple-index page, returning `(is_json, body)`. `is_json` is
+/// derived from the RESPONSE content-type (not the request): a
+/// `...+json`/`application/json` type is PEP 691 JSON, anything else is
+/// treated as PEP 503 HTML. pypi.org content-negotiates to JSON by default
+/// now, which is why the bare HTML `<a href>` scraper found zero links and
+/// the resolve hard-failed before this dispatch existed.
+async fn fetch_simple_index(index_url: &url::Url) -> Result<(bool, String)> {
+    let resp = reqwest::Client::new()
+        .get(index_url.clone())
+        .header(reqwest::header::ACCEPT, SIMPLE_ACCEPT)
+        .send()
+        .await?
+        .error_for_status()?;
+    let is_json = is_json_simple_response(
+        resp.headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+    );
+    let body = resp.text().await?;
+    Ok((is_json, body))
+}
+
+/// A simple-API response is PEP 691 JSON iff its content-type carries
+/// `json` (`application/vnd.pypi.simple.v1+json`, `...latest+json`, or a
+/// bare `application/json`); every HTML type (`text/html`,
+/// `application/vnd.pypi.simple.v1+html`) and a missing content-type parse
+/// as HTML.
+fn is_json_simple_response(content_type: Option<&str>) -> bool {
+    content_type.is_some_and(|ct| ct.to_ascii_lowercase().contains("json"))
+}
+
+/// Parse a PEP 691 JSON simple-index document (`{"files":[{filename, url,
+/// hashes:{sha256}, core-metadata, ...}]}`). Returns EVERY listed file
+/// (wheels and sdists alike); the caller filters by suffix exactly as it
+/// does after the HTML parsers. sha256 comes straight from `hashes.sha256`
+/// (no `#sha256=` URL fragment needed — that is the HTML-only carrier), and
+/// `has_metadata_sidecar` reflects PEP 658 core-metadata availability.
+fn parse_index_json(body: &str, base: &url::Url) -> Result<Vec<ResolvedWheel>> {
+    let doc: serde_json::Value =
+        serde_json::from_str(body).context("parsing PEP 691 simple-index JSON")?;
+    let files = doc
+        .get("files")
+        .and_then(|f| f.as_array())
+        .ok_or_else(|| anyhow!("PEP 691 simple-index JSON: missing `files` array"))?;
+    let mut out = Vec::new();
+    for f in files {
+        let Some(filename) = f.get("filename").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        // PEP 691 permits `url` to be relative to the index page.
+        let Some(url) = f
+            .get("url")
+            .and_then(|v| v.as_str())
+            .and_then(|u| base.join(u).ok())
+        else {
+            continue;
+        };
+        let sha256 = f
+            .get("hashes")
+            .and_then(|h| h.get("sha256"))
+            .and_then(|v| v.as_str())
+            .filter(|h| h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit()))
+            .map(|h| h.to_ascii_lowercase());
+        // PEP 658: `core-metadata` (or its provisional spelling
+        // `data-dist-info-metadata`) is present and truthy — either the
+        // boolean `true` or a non-empty `{ "sha256": ... }` hash object.
+        let has_metadata_sidecar = metadata_sidecar_present(f.get("core-metadata"))
+            || metadata_sidecar_present(f.get("data-dist-info-metadata"));
+        out.push(ResolvedWheel {
+            url,
+            sha256,
+            filename: filename.to_string(),
+            has_metadata_sidecar,
+        });
+    }
+    if out.is_empty() {
+        bail!("no files listed in PEP 691 simple-index JSON");
+    }
+    Ok(out)
+}
+
+/// Truthiness of a PEP 691 metadata-availability field: `true`, or a
+/// non-empty hash object. Absent / `false` / `{}` -> no sidecar.
+fn metadata_sidecar_present(v: Option<&serde_json::Value>) -> bool {
+    match v {
+        Some(serde_json::Value::Bool(b)) => *b,
+        Some(serde_json::Value::Object(m)) => !m.is_empty(),
+        _ => false,
+    }
 }
 
 fn pick_best(mut candidates: Vec<ResolvedWheel>, target: &WheelTarget) -> Option<ResolvedWheel> {
@@ -763,6 +863,123 @@ platforms = [{ platform = "linux-64", glibc = "2.35" }]
             links[0].sha256.as_deref(),
             Some("ad2c027831ed5d4a62552735bb799dea4e4604530d2ab9b526ddb6cd19a98c11"),
         );
+    }
+
+    /// A trimmed but SHAPE-FAITHFUL capture of pypi.org's PEP 691 JSON
+    /// (`Accept: application/vnd.pypi.simple.v1+json` -> content-type
+    /// `application/vnd.pypi.simple.v1+json`), the format that broke the
+    /// HTML-only scraper in v4.5.7 ("no `<a href=...>` wheel links found").
+    /// One wheel with a PEP 658 core-metadata object, one wheel without,
+    /// and one sdist.
+    const PEP691_TYPING_EXTENSIONS: &str = r#"{
+      "meta": {"api-version": "1.1"},
+      "name": "typing-extensions",
+      "files": [
+        {
+          "filename": "typing_extensions-4.12.2-py3-none-any.whl",
+          "url": "https://files.pythonhosted.org/packages/26/9f/typing_extensions-4.12.2-py3-none-any.whl",
+          "hashes": {"sha256": "04e5ca0351e0f3f85c6853954072df659d0d13fac324d0072316b67d7794700d"},
+          "core-metadata": {"sha256": "b7aa004e79e6acff85421fc2204c492a68d9f80b010bafcaa4ba02af4269b9c7"},
+          "data-dist-info-metadata": {"sha256": "b7aa004e79e6acff85421fc2204c492a68d9f80b010bafcaa4ba02af4269b9c7"}
+        },
+        {
+          "filename": "typing_extensions-3.6.2-py2-none-any.whl",
+          "url": "https://files.pythonhosted.org/packages/7a/d2/typing_extensions-3.6.2-py2-none-any.whl",
+          "hashes": {"sha256": "a13d47e36fb70d00de1fd111beea96cace79f5fcaa2c5381a75fc419ad50907d"}
+        },
+        {
+          "filename": "typing_extensions-4.12.2.tar.gz",
+          "url": "https://files.pythonhosted.org/packages/df/db/typing_extensions-4.12.2.tar.gz",
+          "hashes": {"sha256": "1a7ead55c7e559dd4dee8856e3a88b41225abfe1ce8df57b7c13915fe121ffb8"}
+        }
+      ]
+    }"#;
+
+    #[test]
+    fn parses_pep691_json_files_url_sha_and_sidecar() {
+        let base: url::Url = "https://pypi.org/simple/typing-extensions/"
+            .parse()
+            .unwrap();
+        let files = parse_index_json(PEP691_TYPING_EXTENSIONS, &base).unwrap();
+        // All files returned (wheels AND sdist); the caller filters by suffix.
+        assert_eq!(files.len(), 3);
+
+        let wheel = &files[0];
+        assert_eq!(wheel.filename, "typing_extensions-4.12.2-py3-none-any.whl");
+        assert_eq!(
+            wheel.url.as_str(),
+            "https://files.pythonhosted.org/packages/26/9f/typing_extensions-4.12.2-py3-none-any.whl",
+        );
+        // sha comes from hashes.sha256 (JSON), not a URL fragment.
+        assert_eq!(
+            wheel.sha256.as_deref(),
+            Some("04e5ca0351e0f3f85c6853954072df659d0d13fac324d0072316b67d7794700d"),
+        );
+        assert!(
+            wheel.has_metadata_sidecar,
+            "core-metadata object -> sidecar"
+        );
+        assert!(
+            !files[1].has_metadata_sidecar,
+            "no core-metadata field -> no sidecar",
+        );
+        // The sdist is present with its sha for the resolve_sdist path.
+        assert_eq!(files[2].filename, "typing_extensions-4.12.2.tar.gz");
+        assert!(files[2].sha256.is_some());
+    }
+
+    #[test]
+    fn pep691_json_missing_files_array_errors() {
+        let base: url::Url = "https://pypi.org/simple/foo/".parse().unwrap();
+        assert!(parse_index_json(r#"{"meta":{"api-version":"1.1"}}"#, &base).is_err());
+    }
+
+    #[test]
+    fn content_type_dispatch_json_vs_html() {
+        // Exactly the media types pypi.org / static indexes return.
+        assert!(is_json_simple_response(Some(
+            "application/vnd.pypi.simple.v1+json"
+        )));
+        assert!(is_json_simple_response(Some(
+            "application/vnd.pypi.simple.latest+json; charset=utf-8"
+        )));
+        assert!(is_json_simple_response(Some("application/json")));
+        // HTML (and absent) parse as PEP 503 HTML.
+        assert!(!is_json_simple_response(Some("text/html; charset=utf-8")));
+        assert!(!is_json_simple_response(Some(
+            "application/vnd.pypi.simple.v1+html"
+        )));
+        assert!(!is_json_simple_response(None));
+    }
+
+    #[test]
+    fn json_and_html_agree_on_the_same_wheel() {
+        // The two parsers must produce an equivalent ResolvedWheel for the
+        // same wheel so the content-type branch is transparent downstream.
+        let base: url::Url = "https://pypi.org/simple/foo/".parse().unwrap();
+        let sha = "a".repeat(64);
+        let json = format!(
+            r#"{{"files":[{{"filename":"foo-1.0-py3-none-any.whl",
+                "url":"https://files.example/foo-1.0-py3-none-any.whl",
+                "hashes":{{"sha256":"{sha}"}}}}]}}"#,
+        );
+        let html = format!(
+            r#"<a href="https://files.example/foo-1.0-py3-none-any.whl#sha256={sha}">x</a>"#,
+        );
+        let j = parse_index_json(&json, &base).unwrap();
+        let h = parse_index_links(&html, &base).unwrap();
+        assert_eq!(j.len(), 1);
+        assert_eq!(h.len(), 1);
+        assert_eq!(j[0].filename, h[0].filename);
+        assert_eq!(j[0].sha256, h[0].sha256);
+        // HTML retains the `#sha256=` fragment on the url (JSON carries the
+        // hash out of band), so compare fragment-stripped.
+        let strip = |u: &url::Url| {
+            let mut u = u.clone();
+            u.set_fragment(None);
+            u
+        };
+        assert_eq!(strip(&j[0].url), strip(&h[0].url));
     }
 
     #[test]
