@@ -2354,6 +2354,45 @@ fn root_req_name(req: &str) -> Option<String> {
 /// at the resolved version are moved to the conda side and the lock is
 /// re-run to fixpoint (see `uv_closure::auto_route_fixpoint`). Off via
 /// `auto-route = false`; per-name opt-out via `keep-pypi`.
+/// Wedge-safety cleanup after a FAILED closure solve (fix 00d8e14).
+///
+/// A genuine RESOLUTION/heal failure may have been poisoned by the stale
+/// persisted heal facts this run seeded into its ledgers, so the facts file
+/// must be dropped to force a clean cold re-heal next run rather than replay
+/// a wedge across runs. But a TRANSIENT failure -- a `uv` spawn error, an
+/// NFS/cache I/O blip, a backend crash -- leaves the learned facts perfectly
+/// VALID; deleting them there only forces an expensive cold re-heal next run
+/// for zero wedge-safety benefit (review perf minor). So we PRESERVE the
+/// facts on clearly-transient (io-class) errors and delete on everything
+/// else.
+///
+/// Signal: every transient failure inside [`crate::uv_closure::compute_closure`]
+/// (`spawn`, `create_dir_all`, `read`/`write`) is a `std::io::Error` wrapped
+/// by `.context(..)`, so an `io::Error` anywhere in the anyhow source chain
+/// marks the error transient. A genuine resolution conflict is a
+/// `bail!`/`anyhow!` string with no `io::Error` source. When the signal is
+/// AMBIGUOUS (no io::Error, but not obviously a resolution message) we
+/// CONSERVATIVELY delete -- the wedge-safety invariant (stale facts must
+/// never survive a real heal failure) outranks saving one re-heal.
+fn discard_facts_on_solve_failure(heal_facts_path: &std::path::Path, err: &anyhow::Error) {
+    let transient = err
+        .chain()
+        .any(|cause| cause.downcast_ref::<std::io::Error>().is_some());
+    if transient {
+        tracing::debug!(
+            path = %heal_facts_path.display(),
+            error = %format!("{err:#}"),
+            "uv closure: solve hit a transient (io-class) error; KEEPING persisted \
+             heal facts (still valid -- avoids a needless cold re-heal next run)",
+        );
+        return;
+    }
+    // Resolution-class (or ambiguous): saving empty facts removes the file
+    // so the next run re-heals from scratch instead of replaying a
+    // possibly-wedged fact set.
+    crate::uv_closure::save_heal_facts(heal_facts_path, &crate::uv_closure::HealFacts::default());
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn uv_group_closure(
     group_name: &str,
@@ -3089,15 +3128,14 @@ async fn uv_group_closure(
     {
         Ok(c) => c,
         Err(e) => {
-            // B1: a failed solve may have been poisoned by stale persisted
-            // facts (or is about to change the manifest state via a repair
-            // loop). Remove the facts file so the NEXT run re-heals from
-            // scratch instead of replaying a wedge across runs. Saving
-            // empty facts deletes the file.
-            crate::uv_closure::save_heal_facts(
-                &heal_facts_path,
-                &crate::uv_closure::HealFacts::default(),
-            );
+            // B1: a genuine resolution/heal failure may have been poisoned by
+            // stale persisted facts (or is about to change the manifest state
+            // via a repair loop), so the facts file is dropped to force a
+            // clean re-heal next run. A merely TRANSIENT failure (io/network/
+            // backend crash) leaves the facts valid and keeps them -- see
+            // `discard_facts_on_solve_failure` for the transient-vs-resolution
+            // classification and why "when unsure, delete" stays wedge-safe.
+            discard_facts_on_solve_failure(&heal_facts_path, &e);
             return Err(e);
         }
     };
@@ -3332,6 +3370,51 @@ mod sdist_source_url_tests {
             compose_sdist_source_url(&no_hash, None),
             "https://ex.org/p/foo-1.0.tar.gz"
         );
+    }
+}
+
+#[cfg(test)]
+mod facts_cleanup_tests {
+    use super::discard_facts_on_solve_failure;
+
+    #[test]
+    fn transient_solve_failure_preserves_facts_resolution_failure_deletes() {
+        let tmp = std::env::temp_dir().join(format!(
+            "retread-facts-cleanup-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let facts_path = tmp.join("facts.json");
+        let seed = || std::fs::write(&facts_path, b"{}").unwrap();
+
+        // A transient (io-class) failure -- e.g. a `uv` spawn error wrapping
+        // an io::Error -- must KEEP the still-valid facts.
+        seed();
+        let transient = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "index 5xx / NFS blip",
+        ))
+        .context("spawning `uv lock`");
+        discard_facts_on_solve_failure(&facts_path, &transient);
+        assert!(
+            facts_path.exists(),
+            "transient error must NOT delete valid heal facts",
+        );
+
+        // A genuine resolution conflict (a bail!/anyhow! string, no io::Error
+        // source) must DROP the possibly-poisoned facts (wedge safety).
+        let resolution = anyhow::anyhow!("no solution found: a==1 conflicts with b==2");
+        discard_facts_on_solve_failure(&facts_path, &resolution);
+        assert!(
+            !facts_path.exists(),
+            "resolution failure must delete the facts file",
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
 
