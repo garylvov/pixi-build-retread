@@ -2853,7 +2853,8 @@ async fn uv_group_closure(
     // Facts are only replayable under the manifest/routing state they were
     // learned from (B1): stamp over the BASE request + routing options; a
     // mismatch discards the file (fresh heal), never a stale replay.
-    let facts_stamp = crate::uv_closure::heal_facts_stamp(&req, &auto_route_opts);
+    let facts_stamp =
+        crate::uv_closure::heal_facts_stamp(&req, &auto_route_opts, effective.sdist_build);
     let persisted_facts = crate::uv_closure::load_heal_facts(&heal_facts_path, &facts_stamp);
     if !persisted_facts.is_empty() {
         tracing::info!(

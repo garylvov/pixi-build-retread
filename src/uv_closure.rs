@@ -2446,10 +2446,18 @@ impl HealFacts {
 
 /// Hex sha256 over every input that decides whether persisted heal facts
 /// are still VALID to replay: the request's roots/constraints/overrides/
-/// exclusions/indexes (manifest-derived resolution inputs) plus the
-/// routing policy knobs (`route-policy`, `route-include`, `keep-pypi`,
-/// `force-conda`, `name-map`, protected roots). Any change to any of these
-/// must discard the facts (cold re-heal) rather than replay them.
+/// exclusions/indexes (manifest-derived resolution inputs), the routing
+/// policy knobs (`route-policy`, `route-include`, `keep-pypi`,
+/// `force-conda`, `name-map`, protected roots), AND the `sdist-build`
+/// policy. Any change to any of these must discard the facts (cold
+/// re-heal) rather than replay them.
+///
+/// `sdist_build_policy` is in the stamp because it selects the Pass-B
+/// relaxation ([`LockRelaxations::pass_b_for`]): under `auto` the heal may
+/// build (and persist) sdist wheels that `never` would refuse, so a facts
+/// file learned under one policy can carry built-wheel / route facts that
+/// are invalid to replay under the other. Without it, flipping the policy
+/// between runs could replay a stale facts file as if still valid.
 ///
 /// Deliberately EXCLUDES per-round mutable state (`explicit_pins`,
 /// `built_wheel_sources`, auto-route constraints applied by
@@ -2457,7 +2465,11 @@ impl HealFacts {
 /// request, before any facts/heal state is injected, and stay stable
 /// across fixpoint rounds. Also excludes `workspace_conda_versions`
 /// (populated later in the phase and not a fact-validity input).
-pub fn heal_facts_stamp(req: &UvClosureRequest, opts: &AutoRouteOptions) -> String {
+pub fn heal_facts_stamp(
+    req: &UvClosureRequest,
+    opts: &AutoRouteOptions,
+    sdist_build_policy: crate::config::SdistBuildPolicy,
+) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     let mut field = |tag: &str, vals: &mut dyn Iterator<Item = &str>| {
@@ -2505,6 +2517,8 @@ pub fn heal_facts_stamp(req: &UvClosureRequest, opts: &AutoRouteOptions) -> Stri
         .map(|(k, v)| format!("{k}={v}"))
         .collect();
     field("abi-anchors", &mut anchors.iter().map(String::as_str));
+    let sdist_build = format!("{sdist_build_policy:?}");
+    field("sdist-build", &mut std::iter::once(sdist_build.as_str()));
     format!("{:x}", h.finalize())
 }
 
@@ -6216,45 +6230,72 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
             abi_anchor_pins: BTreeMap::new(),
             workspace_conda_versions: BTreeMap::new(),
         };
-        let base = heal_facts_stamp(&base_req(), &base_opts());
+        // Holds the `sdist-build` policy fixed at the default while probing
+        // the manifest/routing input classes; the policy gets its own
+        // invariant below.
+        let stamp = |req: &UvClosureRequest, opts: &AutoRouteOptions| {
+            heal_facts_stamp(req, opts, crate::config::SdistBuildPolicy::Auto)
+        };
+        let base = stamp(&base_req(), &base_opts());
         // Identical inputs -> identical stamp.
-        assert_eq!(base, heal_facts_stamp(&base_req(), &base_opts()));
+        assert_eq!(base, stamp(&base_req(), &base_opts()));
 
         // (a) manifest dep change (add/remove/bump) invalidates.
         let mut r = base_req();
         r.dependencies = vec!["foo==2.0".into()];
-        assert_ne!(base, heal_facts_stamp(&r, &base_opts()));
+        assert_ne!(base, stamp(&r, &base_opts()));
         let mut r = base_req();
         r.dependencies.clear();
-        assert_ne!(base, heal_facts_stamp(&r, &base_opts()));
+        assert_ne!(base, stamp(&r, &base_opts()));
         // Constraint / override change invalidates.
         let mut r = base_req();
         r.constraints.constraints = vec!["bar<3".into()];
-        assert_ne!(base, heal_facts_stamp(&r, &base_opts()));
+        assert_ne!(base, stamp(&r, &base_opts()));
         let mut r = base_req();
         r.overrides.clear();
-        assert_ne!(base, heal_facts_stamp(&r, &base_opts()));
+        assert_ne!(base, stamp(&r, &base_opts()));
 
         // (c) each routing knob invalidates.
         let mut o = base_opts();
         o.route_policy = crate::config::RoutePolicy::Aggressive;
-        assert_ne!(base, heal_facts_stamp(&base_req(), &o));
+        assert_ne!(base, stamp(&base_req(), &o));
         let mut o = base_opts();
         o.keep_pypi.insert("torch".into());
-        assert_ne!(base, heal_facts_stamp(&base_req(), &o));
+        assert_ne!(base, stamp(&base_req(), &o));
         let mut o = base_opts();
         o.force_conda.insert("numpy".into());
-        assert_ne!(base, heal_facts_stamp(&base_req(), &o));
+        assert_ne!(base, stamp(&base_req(), &o));
         let mut o = base_opts();
         o.route_include.insert("scipy".into());
-        assert_ne!(base, heal_facts_stamp(&base_req(), &o));
+        assert_ne!(base, stamp(&base_req(), &o));
         let mut o = base_opts();
         o.name_map.insert("torch".into(), "pytorch".into());
-        assert_ne!(base, heal_facts_stamp(&base_req(), &o));
+        assert_ne!(base, stamp(&base_req(), &o));
         // Python bump invalidates.
         let mut r = base_req();
         r.python_version = "3.13".into();
-        assert_ne!(base, heal_facts_stamp(&r, &base_opts()));
+        assert_ne!(base, stamp(&r, &base_opts()));
+
+        // (d) the `sdist-build` policy is a fact-validity input: it selects
+        // the Pass-B relaxation, so facts learned under `auto` (which may
+        // build/persist sdist wheels) must not replay under `never`, and
+        // vice versa. Two policies over IDENTICAL request+routing must yield
+        // DIFFERENT stamps.
+        let auto = heal_facts_stamp(
+            &base_req(),
+            &base_opts(),
+            crate::config::SdistBuildPolicy::Auto,
+        );
+        let never = heal_facts_stamp(
+            &base_req(),
+            &base_opts(),
+            crate::config::SdistBuildPolicy::Never,
+        );
+        assert_eq!(base, auto, "default policy stamp must equal the Auto stamp");
+        assert_ne!(
+            auto, never,
+            "sdist-build policy change must move the heal-facts stamp",
+        );
     }
 
     /// B1 (b) wedge self-recovery: a SEEDED built-wheel fact at a stale
