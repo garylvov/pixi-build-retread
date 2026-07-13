@@ -716,6 +716,11 @@ pub async fn stage(
                 // branch's `any_change` guard below; `w.requires_dist` is the
                 // wheel's authoritative METADATA Requires-Dist
                 // (EmitWheel.requires_dist, sourced from w.metadata).
+                //
+                // EMIT-NEUTRAL: this only skips WASTED work -- the pre-fix code
+                // also landed on ShadowSrc::None for these wheels (did_change ==
+                // false), so the emitted lock entry and .conda bytes are
+                // byte-identical. No EMIT_EPOCH bump warranted.
                 let any_change = w
                     .requires_dist
                     .iter()
