@@ -113,14 +113,11 @@ async fn resolve_inner(
 ) -> Result<ResolvedWheel> {
     let index_url = build_index_url(index, name)?;
     tracing::info!(url = %index_url, "fetching simple index");
-    let (is_json, body) = fetch_simple_index(&index_url).await?;
-    // PEP 691 JSON lists wheels AND sdists; the `.whl` retain below narrows
-    // it, exactly as it does after the HTML `<a href>` parse.
-    let mut candidates = if is_json {
-        parse_index_json(&body, &index_url)?
-    } else {
-        parse_index_links(&body, &index_url)?
-    };
+    // Single content-type-aware fetch+parse. JSON lists wheels AND sdists;
+    // the `.whl` retain below narrows it, exactly as it does after the HTML
+    // `<a href>` parse. `parse_index_links` is the wheels-only HTML fallback
+    // (keeps PEP 658 sidecar detection for HTML indexes).
+    let mut candidates = fetch_and_parse_simple_index(&index_url, parse_index_links).await?;
     candidates.retain(|c| c.filename.ends_with(".whl"));
     if candidates.is_empty() {
         bail!("no wheels listed at {index_url}");
@@ -230,12 +227,10 @@ pub async fn resolve_sdist(
 ) -> Result<(uv_pep440::Version, ResolvedWheel)> {
     let index_url = build_index_url(index, name)?;
     tracing::info!(url = %index_url, "sdist fallback: fetching simple index");
-    let (is_json, body) = fetch_simple_index(&index_url).await?;
-    let mut candidates = if is_json {
-        parse_index_json(&body, &index_url)?
-    } else {
-        parse_index_links_any(&body, &index_url)?
-    };
+    // Single content-type-aware fetch+parse; `parse_index_links_any` is the
+    // HTML fallback that returns every link (sdists included), matching the
+    // all-files JSON parse.
+    let mut candidates = fetch_and_parse_simple_index(&index_url, parse_index_links_any).await?;
     // sdist suffixes per PEP 625 + the legacy ones still on PyPI.
     candidates.retain(|c| {
         let f = c.filename.to_ascii_lowercase();
@@ -437,6 +432,33 @@ async fn fetch_simple_index(index_url: &url::Url) -> Result<(bool, String)> {
     );
     let body = resp.text().await?;
     Ok((is_json, body))
+}
+
+/// THE single fetch-and-parse entry point for a PyPI simple index. Every
+/// index resolver (`resolve`/`resolve_preferring` via [`resolve_inner`], and
+/// [`resolve_sdist`] -- and therefore the handler's `bfs_fetch_pypi`, which
+/// calls those) routes through here, so the JSON-vs-HTML content negotiation
+/// happens in exactly ONE place and no call site can accidentally scrape a
+/// PEP 691 JSON body with the HTML `<a href>` regex (the v4.5.7 bug) or vice
+/// versa.
+///
+/// PEP 691 JSON always parses via [`parse_index_json`] (which returns every
+/// listed file -- wheels AND sdists -- with sha256 and PEP 658 sidecar
+/// availability). Only the HTML fallback differs per caller, so the caller
+/// passes the HTML parser it needs: [`parse_index_links`] (wheels only, with
+/// sidecar detection) for the wheel resolve, or [`parse_index_links_any`]
+/// (every link) for the sdist fallback. In both cases the caller then filters
+/// the returned files by suffix.
+async fn fetch_and_parse_simple_index(
+    index_url: &url::Url,
+    parse_html: fn(&str, &url::Url) -> Result<Vec<ResolvedWheel>>,
+) -> Result<Vec<ResolvedWheel>> {
+    let (is_json, body) = fetch_simple_index(index_url).await?;
+    if is_json {
+        parse_index_json(&body, index_url)
+    } else {
+        parse_html(&body, index_url)
+    }
 }
 
 /// A simple-API response is PEP 691 JSON iff its content-type carries
@@ -980,6 +1002,76 @@ platforms = [{ platform = "linux-64", glibc = "2.35" }]
             u
         };
         assert_eq!(strip(&j[0].url), strip(&h[0].url));
+    }
+
+    #[test]
+    fn wheel_only_pep691_body_yields_wheels_no_sdist_fallback() {
+        // A wheel-ONLY package (has wheels, no sdist) served as PEP 691 JSON:
+        // `resolve()`/`bfs_fetch_pypi` reach this via
+        // `fetch_and_parse_simple_index`, then retain `.whl`. The result must
+        // be NON-EMPTY so the wheel resolves DIRECTLY -- a JSON-blind parser
+        // would find zero links, report "no wheels listed", and drop into the
+        // (slow, and for wheel-only packages fatal) sdist fallback.
+        let base: url::Url = "https://pypi.org/simple/setproctitle/".parse().unwrap();
+        let json = r#"{
+          "meta": {"api-version": "1.1"},
+          "name": "setproctitle",
+          "files": [
+            {
+              "filename": "setproctitle-1.3.7-cp311-cp311-manylinux_2_28_x86_64.whl",
+              "url": "https://files.pythonhosted.org/packages/aa/bb/setproctitle-1.3.7-cp311-cp311-manylinux_2_28_x86_64.whl",
+              "hashes": {"sha256": "ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},
+              "core-metadata": true
+            }
+          ]
+        }"#;
+        let mut files = parse_index_json(json, &base).unwrap();
+        files.retain(|c| c.filename.ends_with(".whl")); // the resolve_inner narrow
+        assert_eq!(
+            files.len(),
+            1,
+            "wheel must resolve directly, no sdist fallback"
+        );
+        assert!(
+            files[0].has_metadata_sidecar,
+            "core-metadata:true -> sidecar"
+        );
+    }
+
+    /// Guard against a SECOND, JSON-blind simple-index parser reappearing
+    /// (the whole point of v4.5.9): the HTML `<a href>` scraper regex must
+    /// live ONLY in this module, and every resolver reaches it through the
+    /// single `fetch_and_parse_simple_index` dispatch. If a future call site
+    /// hand-rolls its own `href="([^"]+)"` index parser, this fails.
+    #[test]
+    fn no_second_html_only_simple_index_parser_in_the_crate() {
+        // The exact regex fragment both HTML index parsers use. Test HTML
+        // fixtures elsewhere use literal `<a href="...">` tags, not this
+        // capture-group form, so this uniquely identifies parser code.
+        const HREF_SCRAPER: &str = r#"href="([^"]+)""#;
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut offenders = Vec::new();
+        let mut stack = vec![src.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("rs")
+                    && std::fs::read_to_string(&path)
+                        .unwrap_or_default()
+                        .contains(HREF_SCRAPER)
+                    && path.file_name().and_then(|n| n.to_str()) != Some("pypi.rs")
+                {
+                    offenders.push(path.display().to_string());
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "a simple-index `<a href>` scraper appeared outside pypi.rs -- route it \
+             through pypi::fetch_and_parse_simple_index instead: {offenders:?}",
+        );
     }
 
     #[test]
