@@ -697,7 +697,32 @@ pub async fn stage(
             // (AUDIT B2: relax-changed index wheels must ship as shadows, not
             // stay remote, or strict pins re-emerge at install time).
             let shadow_src: ShadowSrc = if let Some(src) = w.local_path.as_ref() {
-                if use_shadow_cache {
+                // Cheap no-op pre-check (avoids reading a possibly multi-GB
+                // wheel): rewrite_wheel_with only ever mutates Requires-Dist
+                // lines, so if the mapper keeps EVERY one of this wheel's
+                // recorded Requires-Dist lines the rewrite is a provable
+                // byte-identical no-op (did_change == false). Short-circuit to
+                // ShadowSrc::None WITHOUT reading/rewriting/copying the wheel.
+                //
+                // Why this matters: dependency-free multi-GB index wheels
+                // (isaacsim-extscache-*, kit alone ~5.9 GiB) would otherwise be
+                // fully COPIED into the node-local shadow cache purely to
+                // discover did_change == false. The shadow cache lives on the
+                // fast-tmp job-local dir (a SLURM RAM tmpfs) which is a
+                // DIFFERENT filesystem than the NFS source wheels, so
+                // rewrite_wheel_with's no-op hard-link falls back to a full
+                // std::fs::copy -- exhausting the per-job tmpfs (ENOSPC at
+                // install-time materialize_and_pack). Mirrors the remote-only
+                // branch's `any_change` guard below; `w.requires_dist` is the
+                // wheel's authoritative METADATA Requires-Dist
+                // (EmitWheel.requires_dist, sourced from w.metadata).
+                let any_change = w
+                    .requires_dist
+                    .iter()
+                    .any(|l| mapper_for_remote(l) != crate::wheel_rewrite::LineAction::Keep);
+                if !any_change {
+                    ShadowSrc::None
+                } else if use_shadow_cache {
                     // Single-pass through cache: rewrite_wheel_with returns
                     // (sha, did_change). No probe-then-rewrite double pass.
                     let src_bytes = tokio::fs::read(src)
@@ -2210,6 +2235,80 @@ mod tests {
         assert_ne!(
             shadow_bytes, raw_bytes,
             "shadow bytes must differ from raw input (rewrite_wheel_with must have run)"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// v4.5.7 regression guard (second ENOSPC mode): a relax-UNAFFECTED INDEX
+    /// wheel (here dependency-free -> empty Requires-Dist -> provable no-op
+    /// rewrite) must NOT be read, rewritten, or copied into the shadow cache.
+    ///
+    /// The pre-fix code copied the WHOLE wheel into the node-local shadow cache
+    /// (a SLURM RAM tmpfs, cross-device from the NFS source so the no-op
+    /// hard-link falls back to a full std::fs::copy) purely to discover
+    /// did_change == false. For isaacsim-extscache-* (kit ~5.9 GiB) that
+    /// exhausted the per-job tmpfs (ENOSPC at install-time materialize_and_pack).
+    ///
+    /// Env-free proof that the wheel is never touched: point `local_path` at a
+    /// file that DOES NOT EXIST. The pre-fix code did `tokio::fs::read(src)`
+    /// (then a full copy) and would error; the fixed code short-circuits on
+    /// `any_change == false` and never opens it, shipping Origin::Index.
+    #[tokio::test]
+    async fn noop_index_wheel_skips_shadow_copy() {
+        let tmp = make_test_dir("noop-index-shadow");
+        let staging = tmp.join("staging");
+
+        let bundle = "extscache-pkg";
+        // Dependency-free index wheel: empty Requires-Dist => the relax mapper
+        // keeps every (zero) line => provable byte-identical no-op rewrite.
+        let whl_name = format!("{bundle}-1.0.0-py3-none-any.whl");
+        // A local_path that intentionally does not exist: if the staging path
+        // reads or copies the wheel, stage() fails and `.expect` below trips.
+        let missing = tmp.join("does-not-exist").join(&whl_name);
+        // Direct artifact URL + sha256 (make_emit_wheel sets sha256 when
+        // remote_url is Some) so the no-op wheel records as Origin::Index.
+        let url = format!("https://pypi.nvidia.com/x/{whl_name}");
+        let wheel = make_emit_wheel(bundle, "1.0.0", &[], Some(&missing), Some(&url));
+
+        let emit_wheels = vec![wheel];
+        let conda_capable: HashSet<String> = HashSet::new();
+        let config = minimal_config(bundle);
+
+        let result = stage(
+            &config,
+            bundle,
+            "1.0.0",
+            "3.12",
+            &emit_wheels,
+            &conda_capable,
+            &[],
+            &["https://pypi.org/simple/".to_string()],
+            "",
+            &tmp,
+            &staging,
+        )
+        .await
+        .expect("stage must succeed WITHOUT ever reading the no-op index wheel");
+
+        // Ships as Origin::Index with the direct url + sha (no rewrite needed).
+        let w = result
+            .lock
+            .wheels
+            .iter()
+            .find(|w| w.name == bundle)
+            .expect("bundle wheel present in lock");
+        assert_eq!(
+            w.origin,
+            Origin::Index,
+            "no-op index wheel must stay Origin::Index"
+        );
+        assert!(w.url.is_some(), "Index wheel must carry its direct url");
+
+        // No staging artifact was produced for it (no rewrite/copy happened).
+        assert!(
+            !staging.join(&whl_name).exists(),
+            "no-op index wheel must not be staged/copied"
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
