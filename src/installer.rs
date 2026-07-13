@@ -358,6 +358,7 @@ async fn materialize_locked_wheels(
     store_root: &Path,
     conda_owned: &BTreeSet<(String, String)>,
     editable_owned: &BTreeSet<String>,
+    drop_cuda_shadows: bool,
 ) -> Result<Vec<PathBuf>> {
     let fetch_dir = prefix
         .join("share")
@@ -394,6 +395,25 @@ async fn materialize_locked_wheels(
                  checkout. To restore the bundled wheel: pip uninstall {} + relink the env",
                 wheel.name,
                 wheel.name
+            );
+            continue;
+        }
+        // conda owns the CUDA runtime in this prefix and this is a PyPI
+        // `nvidia-*-cu<major>` lib-shim wheel: it duplicates a conda CUDA
+        // library under a different distribution name (conda `nccl` vs PyPI
+        // `nvidia-nccl-cu12`), so `conda_owned_distributions` -- which matches
+        // by shared site-packages dist-info name -- cannot catch it. Left in
+        // the env it SHADOWS the conda lib (conda torch's `_preload_cuda_deps`
+        // globs `site-packages/nvidia/*/lib` and preloads the stale wheel),
+        // breaking `import torch` with `undefined symbol: ncclAlltoAll`. Drop
+        // it so conda's CUDA stack stays authoritative. See
+        // `conda_owns_cuda_runtime` / `is_pypi_cuda_shadow_wheel`.
+        if drop_cuda_shadows && is_pypi_cuda_shadow_wheel(&wheel.name) {
+            eprintln!(
+                "retread install: {}=={} is a PyPI CUDA lib-shim wheel shadowed by \
+                 the conda CUDA stack in the prefix (conda-meta has cuda-version); \
+                 skipping wheel replay so conda's CUDA libraries stay authoritative",
+                wheel.name, wheel.version
             );
             continue;
         }
@@ -611,6 +631,59 @@ fn conda_owned_distributions(site_packages: &Path) -> BTreeSet<(String, String)>
         }
     }
     out
+}
+
+/// True if `name` is one of PyPI's `nvidia-<component>-cu<major>` CUDA-runtime
+/// wheels (e.g. `nvidia-nccl-cu12`, `nvidia-cublas-cu12`,
+/// `nvidia-cuda-runtime-cu12`). These wheels exist only to ship CUDA shared
+/// libraries into `site-packages/nvidia/<component>/lib/` for a PyPI CUDA
+/// framework (they are the transitive deps of the PyPI `torch`/`jax` wheels).
+///
+/// The name is anchored on a trailing `-cu<digits>` tag so genuine CUDA-adjacent
+/// PyPI packages that are NOT lib-shim wheels are never matched:
+/// `nvidia-ml-py`, `nvidia-cudnn-frontend`, etc. fall through.
+fn is_pypi_cuda_shadow_wheel(name: &str) -> bool {
+    let normalized = normalize_dist_name(name);
+    let Some(rest) = normalized.strip_prefix("nvidia-") else {
+        return false;
+    };
+    // rest = "<component>-cu<digits>", component itself may contain '-'
+    // (e.g. "cuda-runtime"). Split on the LAST '-' to isolate the cuNN tag.
+    match rest.rsplit_once('-') {
+        Some((component, tag)) => {
+            !component.is_empty()
+                && tag
+                    .strip_prefix("cu")
+                    .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+        }
+        None => false,
+    }
+}
+
+/// True if conda owns the CUDA runtime in this prefix, signalled by the
+/// conda-forge `cuda-version` metapackage (`conda-meta/cuda-version-*.json`).
+/// Every conda CUDA install pins `cuda-version`, and conda `pytorch-gpu` /
+/// `jaxlib` depend on it, so its presence means conda's CUDA shared libraries
+/// (`$PREFIX/lib/libnccl.so`, `libcublas.so`, ...) are the authoritative stack.
+///
+/// When true, the PyPI `nvidia-*-cu<major>` shadow wheels
+/// (`is_pypi_cuda_shadow_wheel`) must be kept out of the env: conda pytorch's
+/// `_preload_cuda_deps` globs `site-packages/nvidia/*/lib/lib*.so*` and, if a
+/// stale PyPI wheel is present (e.g. `nvidia-nccl-cu12==2.27.5` alongside conda
+/// `nccl==2.30.7`), preloads the OLDER lib with `RTLD_GLOBAL` -- shadowing
+/// conda's. `libtorch_cuda.so` then fails at load with
+/// `undefined symbol: ncclAlltoAll` (a symbol only the newer conda nccl
+/// exports). Dropping the shadow wheels lets the conda lib win.
+fn conda_owns_cuda_runtime(prefix: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(prefix.join("conda-meta")) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.starts_with("cuda-version-") && n.ends_with(".json"))
+    })
 }
 
 /// Distributions in `site_packages` the user has overlaid as an EDITABLE
@@ -1115,6 +1188,11 @@ pub async fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
     // courier must never replay the bundled wheel over a `pip install -e`
     // checkout. Dropped from the replay by name at any version.
     let editable_owned = editable_owned_distributions(&site_packages_dir(prefix, &lock.python));
+    // When conda owns the CUDA runtime (conda-meta has `cuda-version`), the PyPI
+    // `nvidia-*-cu<major>` lib-shim wheels are conda-shadowed duplicates that
+    // break `import torch` if installed alongside conda's CUDA libs -- drop them
+    // from the replay. See `conda_owns_cuda_runtime`.
+    let drop_cuda_shadows = conda_owns_cuda_runtime(prefix);
     let wheel_files = materialize_locked_wheels(
         &lock,
         prefix,
@@ -1122,6 +1200,7 @@ pub async fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
         &resolve_wheel_store_root(&lock),
         &conda_owned,
         &editable_owned,
+        drop_cuda_shadows,
     )
     .await?;
 
@@ -1256,6 +1335,50 @@ mod tests {
 
     use super::*;
     use crate::lock::{CondaDep, LockWheel, Origin};
+
+    #[test]
+    fn cuda_shadow_wheel_matches_nvidia_lib_shims_only() {
+        // The full PyPI CUDA-runtime wheel family torch pulls: all dropped.
+        for name in [
+            "nvidia-nccl-cu12",
+            "nvidia-cublas-cu12",
+            "nvidia-cuda-runtime-cu12",
+            "nvidia-cuda-nvrtc-cu12",
+            "nvidia-cuda-cupti-cu12",
+            "nvidia-cudnn-cu12",
+            "nvidia-cufft-cu12",
+            "nvidia-cufile-cu12",
+            "nvidia-curand-cu12",
+            "nvidia-cusolver-cu12",
+            "nvidia-cusparse-cu12",
+            "nvidia-cusparselt-cu12",
+            "nvidia-nvjitlink-cu12",
+            "nvidia-nvshmem-cu12",
+            "nvidia-nvtx-cu12",
+            // major-version agnostic (cu11/cu13) and underscore-normalized forms
+            "nvidia-nccl-cu11",
+            "nvidia_nccl_cu13",
+        ] {
+            assert!(
+                is_pypi_cuda_shadow_wheel(name),
+                "expected {name} to be treated as a conda-shadowed CUDA lib-shim wheel"
+            );
+        }
+        // NOT lib-shim wheels: must never be dropped.
+        for name in [
+            "nvidia-ml-py",         // pynvml bindings, pure python
+            "nvidia-cudnn-frontend", // C++ header lib, no -cuNN tag
+            "torch",
+            "nccl",       // the conda name, never appears as a wheel here
+            "cupy-cuda12x",
+            "nvidia",
+        ] {
+            assert!(
+                !is_pypi_cuda_shadow_wheel(name),
+                "expected {name} to be left installed"
+            );
+        }
+    }
 
     fn lock_wheel(name: &str, version: &str) -> LockWheel {
         LockWheel {
@@ -1531,6 +1654,7 @@ mod tests {
             &root.join("cache"),
             &BTreeSet::new(),
             &BTreeSet::new(),
+            false,
         )
         .await
         .unwrap();
@@ -1585,6 +1709,7 @@ mod tests {
             &store_root,
             &BTreeSet::new(),
             &BTreeSet::new(),
+            false,
         )
         .await
         .unwrap();
@@ -1658,6 +1783,7 @@ mod tests {
             &root.join("cache"),
             &conda_owned,
             &BTreeSet::new(),
+            false,
         )
         .await
         .unwrap();
@@ -1760,6 +1886,7 @@ mod tests {
             &root.join("cache"),
             &BTreeSet::new(),
             &editable_owned,
+            false,
         )
         .await
         .unwrap();
@@ -1822,6 +1949,7 @@ mod tests {
             &store_root,
             &BTreeSet::new(),
             &BTreeSet::new(),
+            false,
         )
         .await
         .unwrap_err();
@@ -1950,6 +2078,7 @@ mod tests {
             &primary_store,
             &BTreeSet::new(),
             &BTreeSet::new(),
+            false,
         )
         .await
         .unwrap();
