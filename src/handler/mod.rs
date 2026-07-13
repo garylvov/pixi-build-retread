@@ -2352,6 +2352,15 @@ async fn uv_group_closure(
     std::collections::BTreeSet<String>,
 )> {
     let mut roots: Vec<String> = Vec::new();
+    // Direct-URL wheels pre-fetched into the content-addressed store and
+    // emitted as `[tool.uv.sources]` path sources (see below) accumulate here,
+    // then seed `req.built_wheel_sources` at request construction.
+    let mut url_wheel_sources: BTreeMap<String, PathBuf> = BTreeMap::new();
+    // Staging dir for the prefetch download (durable copy lives in the store,
+    // keyed by sha; this dir just holds the initial download, hard-linked into
+    // the store on the same filesystem).
+    let url_prefetch_dir = cache_dir.join("uv-url-wheel-prefetch");
+    let wheel_store_root = crate::courier::retread_wheel_store_root();
     for (name, entry) in group_entries {
         if entry.is_spec() {
             let extras = if entry.extras.is_empty() {
@@ -2369,7 +2378,52 @@ async fn uv_group_closure(
             };
             roots.push(format!("{name}{extras}{spec}"));
         } else if let Some(url) = &entry.url {
-            roots.push(format!("{name} @ {url}"));
+            // Direct-URL wheel: instead of a `name @ https://...` requirement
+            // (which makes uv download+unpack the WHOLE wheel just to read
+            // METADATA -- and re-pay it every lock, since pypi.nvidia.com
+            // serves `no-store` with no PEP 658 sidecar; up to ~5.9 GiB each
+            // for the extscache wheels), pre-fetch the wheel ONCE into the
+            // content-addressed store and emit a local `path =` source so uv
+            // reads METADATA from a seekable local zip. The artifact itself is
+            // still shipped by the phase-1 courier from this same store
+            // (`fetch_wheel_cached`, cache hit), and the pylock records the
+            // wheel as a local `archive` either way (pin-only, no index
+            // wheel), so lock provenance is unchanged.
+            match crate::wheel::prefetch_url_wheel_as_source(
+                url,
+                entry.sha256.as_deref(),
+                &url_prefetch_dir,
+                &wheel_store_root,
+            )
+            .await
+            {
+                Ok(store_path) => {
+                    tracing::info!(
+                        entry = %name,
+                        bundle = %group_name,
+                        path = %store_path.display(),
+                        "uv closure: direct-URL wheel pre-fetched to store; \
+                         emitting a local path source (avoids the no-store \
+                         whole-wheel redownload uv would do to read METADATA)",
+                    );
+                    url_wheel_sources.insert(name.clone(), store_path);
+                    // First-party bare requirement; the path source binds by
+                    // name (uv reads name/version from the local wheel).
+                    roots.push(name.clone());
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        entry = %name,
+                        bundle = %group_name,
+                        url = %url,
+                        err = %e,
+                        "uv closure: direct-URL wheel pre-fetch failed; falling \
+                         back to the direct-URL requirement (uv will download \
+                         the whole wheel to read METADATA)",
+                    );
+                    roots.push(format!("{name} @ {url}"));
+                }
+            }
         } else {
             tracing::info!(
                 entry = %name,
@@ -2603,8 +2657,10 @@ async fn uv_group_closure(
         overrides,
         no_emit_packages: no_emit,
         index_urls: index_urls.clone(),
-        built_wheel_sources: BTreeMap::new(), // M1: source-built entries stay legacy
-        explicit_pins: BTreeMap::new(),      // populated by the self-heal
+        // Direct-URL wheels pre-fetched above as path sources; the self-heal
+        // extends this map (`.insert`) with any heal-built wheels.
+        built_wheel_sources: url_wheel_sources,
+        explicit_pins: BTreeMap::new(), // populated by the self-heal
         offline: false,
     };
     let project_dir = cache_dir.join("uv-projects").join(format!(

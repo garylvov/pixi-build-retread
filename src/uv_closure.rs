@@ -3113,6 +3113,53 @@ isaaclab = { path = "wheels/isaaclab/isaaclab-2.0.0-py3-none-any.whl" }
         toml::from_str::<toml::Value>(&got).expect("synthesized pyproject parses as TOML");
     }
 
+    /// A direct-URL wheel (isaacsim-extscache-kit) that the handler pre-fetched
+    /// into the content-addressed store is emitted as a BARE first-party
+    /// requirement plus a `[tool.uv.sources]` `path =` source -- NOT as a
+    /// `name @ https://...` direct-URL requirement. This is what makes uv read
+    /// METADATA from a local seekable zip instead of downloading the whole
+    /// no-store 5.9 GiB wheel on every lock.
+    #[test]
+    fn synthesize_pyproject_url_wheel_renders_path_source_not_direct_url() {
+        let mut built = BTreeMap::new();
+        built.insert(
+            "isaacsim-extscache-kit".to_string(),
+            PathBuf::from(
+                "/store/deadbeef/isaacsim_extscache_kit-5.1.0-cp312-cp312-manylinux_2_34_x86_64.whl",
+            ),
+        );
+        let req = UvClosureRequest {
+            bundle: "isaac-pack-latest".to_string(),
+            python_version: "3.12".to_string(),
+            conda_subdir: "linux-64".to_string(),
+            // Bare first-party requirement (the path source binds by name).
+            dependencies: vec!["isaacsim-extscache-kit".to_string()],
+            constraints: ConstraintSet::default(),
+            overrides: vec![],
+            no_emit_packages: vec![],
+            index_urls: vec!["https://pypi.nvidia.com".to_string()],
+            built_wheel_sources: built,
+            explicit_pins: BTreeMap::new(),
+            offline: false,
+        };
+        let got = synthesize_pyproject(&req);
+        // No direct-URL requirement leaked into the closure project.
+        assert!(
+            !got.contains(" @ https://"),
+            "url wheel must not be emitted as a direct-URL requirement:\n{got}"
+        );
+        // Bare requirement + local path source.
+        assert!(got.contains("\"isaacsim-extscache-kit\","), "{got}");
+        assert!(
+            got.contains(
+                "isaacsim-extscache-kit = { path = \"/store/deadbeef/\
+                 isaacsim_extscache_kit-5.1.0-cp312-cp312-manylinux_2_34_x86_64.whl\" }"
+            ),
+            "{got}"
+        );
+        toml::from_str::<toml::Value>(&got).expect("synthesized pyproject parses as TOML");
+    }
+
     #[test]
     fn synthesize_pyproject_noarch_keeps_python_environments() {
         // Unknown subdir: the platform clause is dropped but the python
@@ -3593,6 +3640,51 @@ directory = { path = "wheels/isaaclab" }
         assert_eq!(closure.pins.get("numpy").map(String::as_str), Some("2.1.0"));
         assert!(!closure.pins.contains_key("mujoco"));
         assert_eq!(closure.uv_version, "0.11.15");
+    }
+
+    /// A direct-URL wheel is recorded by `uv export` as a PEP 751
+    /// `[packages.archive]`. Whether the archive carries a remote `url` (the
+    /// pre-fix `name @ https://...` shape) OR a local `path` (the pre-fetched
+    /// path-source shape), `parse_pylock_closure` classifies it as a local
+    /// source: pin-only, NO index wheel. This equivalence is what makes the
+    /// URL->path rewrite provenance-preserving for downstream consumers (the
+    /// artifact + upstream URL are threaded through the materialize path, not
+    /// the closure). Guards against a regression in the `is_local` predicate.
+    #[test]
+    fn parse_pylock_archive_url_and_path_are_both_pin_only() {
+        let archive_url = r#"
+[[packages]]
+name = "isaacsim-extscache-kit"
+version = "5.1.0"
+[packages.archive]
+url = "https://pypi.nvidia.com/x/isaacsim_extscache_kit-5.1.0-cp312-cp312-manylinux_2_34_x86_64.whl"
+[packages.archive.hashes]
+sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
+"#;
+        let archive_path = r#"
+[[packages]]
+name = "isaacsim-extscache-kit"
+version = "5.1.0"
+[packages.archive]
+path = "/store/deadbeef/isaacsim_extscache_kit-5.1.0-cp312-cp312-manylinux_2_34_x86_64.whl"
+[packages.archive.hashes]
+sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
+"#;
+        for text in [archive_url, archive_path] {
+            let closure =
+                parse_pylock_closure(text, &target("3.12", "linux-64"), &BTreeSet::new(), "x")
+                    .unwrap();
+            // Pin recorded, but no index wheel emitted from the closure.
+            assert_eq!(
+                closure.pins.get("isaacsim-extscache-kit").map(String::as_str),
+                Some("5.1.0"),
+                "archive package must contribute a pin:\n{text}"
+            );
+            assert!(
+                closure.wheels.is_empty(),
+                "archive package must be pin-only (no index wheel):\n{text}"
+            );
+        }
     }
 
     #[test]

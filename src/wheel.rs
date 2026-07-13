@@ -461,6 +461,78 @@ pub(crate) async fn store_wheel_in_cache(src: &Path, store_root: &Path) -> Resul
     Ok(sha256)
 }
 
+/// Pre-fetch a direct-URL `[retread-wheels]` wheel into the content-addressed
+/// wheel store and return its STABLE store path, for emission as a
+/// `[tool.uv.sources]` `path = "..."` source in the synthesized closure
+/// project instead of a `name @ https://...` direct-URL requirement.
+///
+/// Why: NVIDIA's index (pypi.nvidia.com) serves `cache-control: no-store` and
+/// publishes NO PEP 658 metadata sidecars, so when a wheel is emitted as a
+/// direct-URL requirement uv downloads the WHOLE wheel and fully unpacks it
+/// just to read its METADATA -- and re-pays it on EVERY lock (the response is
+/// uncacheable, so warm == cold). The isaacsim-extscache wheels are up to
+/// ~5.9 GiB each (7.3 GiB across the three). Emitting a local `path =` source
+/// lets uv read METADATA from a seekable local zip: no network, no full
+/// unpack, no no-store penalty.
+///
+/// The returned store path is `<store_root>/<sha256>/<filename>`: content-
+/// addressed and therefore STABLE across locks, so the same path string lands
+/// in the synthesized pyproject every run. The closure input fingerprint and
+/// the full-skip memo are both keyed on the pyproject TEXT
+/// (`closure_inputs_fingerprint`), so a stable path keeps the memo hitting
+/// (repeated locks full-skip) while the URL->path transition itself changes
+/// the text and correctly invalidates any stale pre-transition lock.
+///
+/// sha256: when `expected_sha256` is known (recipe/config pins it, incl. a
+/// `#sha256=` URL fragment) it is verified on fetch by [`fetch_wheel_cached`];
+/// when absent, the sha is computed at first fetch by the content-addressed
+/// store ([`store_wheel_in_cache`]) -- no new hashing scheme. On any
+/// fetch/store failure this returns `Err` and the caller falls back to
+/// emitting the direct URL as before (degraded but functional).
+pub async fn prefetch_url_wheel_as_source(
+    url: &url::Url,
+    expected_sha256: Option<&str>,
+    dest_dir: &Path,
+    store_root: &Path,
+) -> Result<PathBuf> {
+    let filename = wheel_filename_from_url(url)?;
+
+    // Fast path: sha known AND already in the content-addressed store. This is
+    // the steady state -- the wheel store persists across locks (and the
+    // extscache wheels are up to ~5.9 GiB). Emit the store path with NO fetch,
+    // NO copy, and crucially NO hashing: reading a multi-GB wheel into memory
+    // just to re-confirm its sha would spike RSS and can OOM the build backend.
+    if let Some(sha) = expected_sha256 {
+        let sha = sha.to_ascii_lowercase();
+        let store_path = store_root.join(&sha).join(&filename);
+        if store_path.is_file() {
+            return Ok(store_path);
+        }
+        // Cold store: fetch (verifies the sha, streaming/incremental -- never
+        // buffers the whole wheel) and populate the store, then re-check.
+        let fetched = fetch_wheel_cached(url, Some(&sha), dest_dir, store_root).await?;
+        if store_path.is_file() {
+            return Ok(store_path);
+        }
+        // Store populate was best-effort and failed: the freshly fetched local
+        // copy is still a seekable local zip uv can read METADATA from.
+        return Ok(fetched);
+    }
+
+    // No pinned sha: fetch, then content-address via the store (the sha is
+    // computed once by `store_wheel_in_cache` -- no new hashing scheme). Direct
+    // wheel entries normally carry a `#sha256=` fragment, so this branch is the
+    // rare exception, not the multi-GB extscache case.
+    let fetched = fetch_wheel_cached(url, None, dest_dir, store_root).await?;
+    let sha256 = store_wheel_in_cache(&fetched, store_root).await?;
+    let store_path = store_root.join(&sha256).join(&filename);
+    if store_path.is_file() {
+        Ok(store_path)
+    } else {
+        Ok(fetched)
+    }
+}
+
 /// Returns `true` if the wheel filename's PEP 425 platform tag is `any`
 /// (i.e. the wheel is pure-Python and runs on every platform).
 ///
@@ -1521,5 +1593,91 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    // ---- prefetch_url_wheel_as_source (direct-URL -> path source) ----
+
+    /// Stage a fake wheel in `dest_dir` so `fetch_wheel_cached`'s early-return
+    /// (dest exists) fires and no network is touched. Returns (url, sha).
+    fn stage_offline_wheel(dest_dir: &Path, filename: &str) -> (url::Url, String) {
+        std::fs::create_dir_all(dest_dir).unwrap();
+        let bytes = build_test_wheel_zip();
+        std::fs::write(dest_dir.join(filename), &bytes).unwrap();
+        let sha = hex_sha256(&bytes);
+        // Any host: the dest early-return means we never connect.
+        let url = url::Url::parse(&format!("https://pypi.nvidia.com/x/{filename}")).unwrap();
+        (url, sha)
+    }
+
+    #[tokio::test]
+    async fn prefetch_url_wheel_source_with_sha_returns_stable_store_path() {
+        let tmp = std::env::temp_dir().join(format!("retread-prefetch-sha-{}", std::process::id()));
+        let dest = tmp.join("dl");
+        let store = tmp.join("store");
+        let filename = "foo-1.0-py3-none-any.whl";
+        // Warm-store steady state: the wheel already lives in the content-
+        // addressed store. The prefetch must emit the store path with NO fetch
+        // and NO hashing of the (potentially multi-GB) wheel -- so a bogus host
+        // that would fail any network call proves no fetch was attempted.
+        let bytes = build_test_wheel_zip();
+        let sha = hex_sha256(&bytes);
+        std::fs::create_dir_all(store.join(&sha)).unwrap();
+        std::fs::write(store.join(&sha).join(filename), &bytes).unwrap();
+        let url = url::Url::parse(&format!("https://127.0.0.1:1/x/{filename}")).unwrap();
+
+        let path = prefetch_url_wheel_as_source(&url, Some(&sha), &dest, &store)
+            .await
+            .expect("prefetch with known sha (warm store)");
+        // Content-addressed store path, stable across runs.
+        assert_eq!(path, store.join(&sha).join(filename));
+        assert!(path.is_file(), "store path must hold the wheel bytes");
+
+        // Idempotent: a second call yields the identical path (stable
+        // fingerprint -> full-skip memo keeps hitting).
+        let again = prefetch_url_wheel_as_source(&url, Some(&sha), &dest, &store)
+            .await
+            .expect("prefetch again");
+        assert_eq!(again, path);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn prefetch_url_wheel_source_without_sha_records_computed_sha() {
+        let tmp =
+            std::env::temp_dir().join(format!("retread-prefetch-nosha-{}", std::process::id()));
+        let dest = tmp.join("dl");
+        let store = tmp.join("store");
+        let filename = "bar-2.0-py3-none-any.whl";
+        let (url, sha) = stage_offline_wheel(&dest, filename);
+
+        // No configured sha: the content-addressed store computes it at first
+        // fetch (existing store_wheel_in_cache behavior, no new hashing).
+        let path = prefetch_url_wheel_as_source(&url, None, &dest, &store)
+            .await
+            .expect("prefetch without sha");
+        assert_eq!(path, store.join(&sha).join(filename));
+        assert!(path.is_file());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn prefetch_url_wheel_source_errors_on_fetch_failure() {
+        let tmp =
+            std::env::temp_dir().join(format!("retread-prefetch-fail-{}", std::process::id()));
+        let dest = tmp.join("dl");
+        let store = tmp.join("store");
+        // Nothing staged in dest + a closed local port => fetch_wheel's GET
+        // fails fast (connection refused), so the caller falls back to the
+        // direct-URL requirement. Offline + deterministic.
+        let url = url::Url::parse("http://127.0.0.1:1/nope-1.0-py3-none-any.whl").unwrap();
+        let err = prefetch_url_wheel_as_source(&url, None, &dest, &store).await;
+        assert!(
+            err.is_err(),
+            "unreachable fetch must error (caller falls back to URL)"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
