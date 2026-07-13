@@ -5462,6 +5462,22 @@ async fn materialize_and_rewrite(
                 skip_subdirs = ?cfg.skip_subdirs,
                 "phase 1.6: injecting checkout-root tree as wheel .data/data/lib/* (lands at $PREFIX/lib/*)",
             );
+            // Concurrency guard: this walk reads the SHARED git-clone working
+            // tree. A parallel retread process's `ensure_git_checkout` for the
+            // same clone runs a destructive `git clean -fdx` under the clone's
+            // EXCLUSIVE lock; without a reader lock here it could wipe files
+            // mid-walk (a non-deterministic "backend exited prematurely"). Hold
+            // a SHARED lock on the same clone-lock file across the injection so
+            // no clean/checkout runs during it. `cfg.checkout_root` IS the
+            // git_checkout_root clone_dir, so its `.lock` sibling matches the
+            // file ensure_git_checkout locks exclusively. Held until end of scope.
+            let _clone_read_guard =
+                crate::source_build::lock_clone_shared(&cfg.checkout_root).with_context(|| {
+                    format!(
+                        "acquiring shared clone-read lock before checkout-root inject (entry `{entry_name}`, checkout={})",
+                        cfg.checkout_root.display(),
+                    )
+                })?;
             let n = crate::wheel_inject_data::inject_checkout_root_data(
                 &injected_path,
                 &out,

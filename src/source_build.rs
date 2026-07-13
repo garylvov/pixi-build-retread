@@ -372,6 +372,46 @@ pub fn git_checkout_root(url: &str, rev: &str, cache_dir: &Path) -> PathBuf {
     cache_dir.join("retread-git-clones").join(slug).join(sha12)
 }
 
+/// Acquire a SHARED advisory lock on the clone-dir lock file that guards
+/// `clone_dir` (a [`git_checkout_root`] path). Held while a caller READS or
+/// WALKS the shared working tree (e.g. the checkout-root auto-data injection).
+///
+/// # Why this exists
+///
+/// [`ensure_git_checkout`] takes the per-clone_dir EXCLUSIVE lock and, inside
+/// it, runs `clone_and_checkout` -> `checkout_rev_robust`'s `git clean -fdx`
+/// (a destructive working-tree reset). That lock is released the moment
+/// `ensure_git_checkout` returns. Callers then walk the checkout tree WITHOUT
+/// any lock (`inject_checkout_root_data` snapshots ~hundreds of files). Several
+/// `[retread-wheels]` entries commonly share ONE clone_dir (IsaacLab's 14+
+/// `from="isaaclab"` subdirectory entries), and different envs/packs are built
+/// by SEPARATE retread backend processes in parallel. So a second build's
+/// `ensure_git_checkout` can `git clean -fdx` the shared tree WHILE a first
+/// build is mid-walk -- files vanish/change under the walker and the build dies
+/// with a non-deterministic "backend exited prematurely". Holding a SHARED lock
+/// across the walk makes it a reader in a reader/writer pair: walk = shared,
+/// checkout+clean = exclusive, so no clean ever runs during a walk (and
+/// concurrent walks of the same tree still proceed together).
+///
+/// Returns the lock `File`; the lock is held until it is dropped. Best-effort
+/// on the open/lock error path is the CALLER's choice -- here we surface the
+/// error so a lock failure never silently degrades back to the racy path.
+pub(crate) fn lock_clone_shared(clone_dir: &Path) -> Result<std::fs::File> {
+    let lock_path = clone_dir.with_extension("lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("opening git-clone lock file {}", lock_path.display()))?;
+    // Same fs4 blocking-flock mechanism ensure_git_checkout uses for the
+    // exclusive side; a SHARED lock coexists with other shared holders but
+    // blocks (and is blocked by) an exclusive clean/checkout on the same file.
+    fs4::fs_std::FileExt::lock_shared(&file)
+        .with_context(|| format!("shared-locking git-clone lock file {}", lock_path.display()))?;
+    Ok(file)
+}
+
 /// Ensure `clone_dir` is a git clone of `url` checked out at `rev`.
 /// Clones (with `--no-checkout`) only if `clone_dir` doesn't exist yet;
 /// otherwise reuses it. Always runs the checkout dance regardless --
@@ -885,6 +925,38 @@ mod tests {
             "sha12 must be exactly 12 chars; got: {last}"
         );
         assert!(parent.len() <= 24, "slug must be <=24 chars; got {parent}");
+    }
+
+    /// `lock_clone_shared` must (a) create the clone `.lock` sibling file next
+    /// to the clone_dir (matching the path `ensure_git_checkout` locks
+    /// exclusively) and (b) let multiple SHARED holders coexist -- concurrent
+    /// walkers of the same checkout must not block each other. The reader/writer
+    /// EXCLUSION against a `git clean -fdx` under the exclusive lock is flock's
+    /// documented CROSS-PROCESS contract (the same mechanism ensure_git_checkout
+    /// uses on the exclusive side), not something a single-process unit test can
+    /// assert reliably (flock may let a process self-hold shared+exclusive).
+    #[test]
+    fn shared_clone_lock_creates_lock_and_readers_coexist() {
+        let base =
+            std::env::temp_dir().join(format!("retread-sharedlock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let clone_dir = base.join("retread-git-clones").join("slug").join("abcdef012345");
+        std::fs::create_dir_all(&clone_dir).unwrap();
+        let lock_path = clone_dir.with_extension("lock");
+
+        // The lock file must be the clone_dir's `.lock` sibling -- the SAME
+        // path ensure_git_checkout locks exclusively, or the two never rendez-vous.
+        assert_eq!(lock_path, base.join("retread-git-clones").join("slug").join("abcdef012345.lock"));
+
+        // Two shared readers coexist (both return Ok; a naive exclusive lock
+        // would make the second block/deadlock).
+        let g1 = lock_clone_shared(&clone_dir).expect("first shared clone-read lock");
+        let g2 = lock_clone_shared(&clone_dir).expect("second shared clone-read lock coexists");
+        assert!(lock_path.exists(), "lock file must be created on disk");
+
+        drop(g1);
+        drop(g2);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// Different (url, rev) pairs must NOT collide on disk -- the
