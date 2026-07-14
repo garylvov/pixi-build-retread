@@ -1855,10 +1855,8 @@ index-url = "https://pypi.nvidia.com"
         );
     }
 
-    #[tokio::test]
-    async fn extra_indexes_keep_default_pypi_for_flatdict_resolution() {
-        use std::str::FromStr;
-
+    #[test]
+    fn auto_bundle_index_chain_includes_implicit_default_and_honors_override() {
         let ws = ws_toml(
             r#"
 [workspace]
@@ -1868,26 +1866,13 @@ channels = ["conda-forge"]
 extra-index-urls = ["https://pypi.nvidia.com", "https://py.mujoco.org"]
 "#,
         );
-        let indexes = ws.auto_bundle_pypi_index_urls();
-        assert_eq!(indexes[0], DEFAULT_PYPI_INDEX);
-
-        let specifiers =
-            uv_pep508::uv_pep440::VersionSpecifiers::from_str(">=4.0.1,<4.1").unwrap();
-        let mut resolved = None;
-        let mut errors = Vec::new();
-        for index in &indexes {
-            match crate::pypi::resolve_sdist(index, "flatdict", &specifiers).await {
-                Ok((version, _)) => {
-                    resolved = Some(version.to_string());
-                    break;
-                }
-                Err(error) => errors.push(format!("{index}: {error:#}")),
-            }
-        }
         assert_eq!(
-            resolved.as_deref(),
-            Some("4.0.1"),
-            "default PyPI must resolve flatdict before unrelated extras: {errors:?}",
+            ws.auto_bundle_pypi_index_urls(),
+            vec![
+                DEFAULT_PYPI_INDEX.to_string(),
+                "https://pypi.nvidia.com".to_string(),
+                "https://py.mujoco.org".to_string(),
+            ],
         );
 
         let overridden = ws_toml(

@@ -369,6 +369,36 @@ pub(crate) fn merge_index_chain(
     indexes
 }
 
+/// Build the auto-bundle fallback chain for a merged wheel group.
+///
+/// The first non-URL entry owns the primary-index decision. An entry with no
+/// explicit `index` deliberately contributes no primary so the workspace's
+/// implicit default (or explicit `index-url` override) remains first. Using
+/// `find_map` here is incorrect: it skips that entry and can promote a later
+/// sibling's private index ahead of the workspace default.
+fn auto_bundle_group_index_chain<'a>(
+    entries: impl IntoIterator<Item = &'a WheelEntry>,
+    workspace_indexes: &[String],
+) -> Vec<String> {
+    let primary = entries
+        .into_iter()
+        .find(|entry| entry.url.is_none())
+        .and_then(|entry| entry.index.clone());
+    let mut indexes = primary.into_iter().collect::<Vec<_>>();
+    for index in workspace_indexes {
+        if !indexes
+            .iter()
+            .any(|existing| existing.trim_end_matches('/') == index.trim_end_matches('/'))
+        {
+            indexes.push(index.clone());
+        }
+    }
+    if indexes.is_empty() {
+        indexes.push(PUBLIC_PYPI.to_string());
+    }
+    indexes
+}
+
 /// Build a content-addressed build string for courier packages.
 ///
 /// Format: `py{py_short}_h{hash_prefix}_{build_number}` where `hash_prefix`
@@ -2091,13 +2121,6 @@ async fn resolve_all(
         // group. Use the first non-URL entry's index for the candidate
         // fallback chain (URL-form entries can't auto-bundle anyway --
         // they have no PyPI index to resolve from).
-        let auto_index: Option<String> = group_entries.iter().find_map(|(_, e)| {
-            if e.url.is_none() {
-                e.index.clone()
-            } else {
-                None
-            }
-        });
         // uv resolver: the closure is AUTHORITATIVE — every member the
         // auto-route did not move to the conda side must ship in the
         // bundle. The BFS above only walks extras-gated + prefix-family
@@ -2119,15 +2142,10 @@ async fn resolve_all(
                     .collect()
             });
         if effective.auto_bundle || uv_closure.is_some() {
-            let mut auto_indexes = auto_index.into_iter().collect::<Vec<_>>();
-            for index in &auto_bundle_workspace_indexes {
-                if !auto_indexes
-                    .iter()
-                    .any(|existing| existing.trim_end_matches('/') == index.trim_end_matches('/'))
-                {
-                    auto_indexes.push(index.clone());
-                }
-            }
+            let auto_indexes = auto_bundle_group_index_chain(
+                group_entries.iter().map(|(_, entry)| entry),
+                &auto_bundle_workspace_indexes,
+            );
             auto_bundle_transitives(
                 &mut bundle,
                 &auto_indexes,

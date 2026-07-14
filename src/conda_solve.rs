@@ -125,6 +125,31 @@ fn parse_match_specs(specs: &[String]) -> Vec<MatchSpec> {
     parsed_specs
 }
 
+#[cfg(test)]
+pub(crate) fn solve_records_for_test(
+    records: &[RepoDataRecord],
+    specs: &[String],
+    target_python: &str,
+) -> std::result::Result<Vec<RepoDataRecord>, Vec<String>> {
+    let parsed_specs = specs
+        .iter()
+        .map(|raw| {
+            MatchSpec::from_str(raw, ParseStrictness::Lenient)
+                .map_err(|error| format!("invalid test match spec `{raw}`: {error}"))
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| vec![error])?;
+    solve_selected_records_from_records(
+        parsed_specs,
+        records,
+        target_python,
+        ChannelPriority::Strict,
+        &BTreeMap::new(),
+        SolveStrategy::Highest,
+        Vec::new(),
+    )
+}
+
 /// Run a conda solve over the combined spec set. `specs` must include
 /// both retread's emitted run-deps for this output AND the workspace's
 /// effective conda deps for the env this output is built for. Target
