@@ -73,6 +73,7 @@ fn bundle_auto_route(name: &str, version: &str, deps_from_floor: bool) -> Bundle
             pypi_version: version.to_string(),
             conda_version: version.to_string(),
             channel: "https://conda.example.invalid/linux-64".to_string(),
+            input_requirements: Vec::new(),
         },
         deps_from_floor,
     }

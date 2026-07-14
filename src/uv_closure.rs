@@ -75,6 +75,13 @@ pub struct ConstraintSet {
     pub constraints: Vec<String>,
     /// PyPI name -> provenance for every line in `constraints`.
     pub provenance: BTreeMap<String, ConstraintProvenance>,
+    /// Constraint lines synthesized only to keep an already-routed package's
+    /// PyPI selection stable during the next uv round. These are solver
+    /// bookkeeping, not authoritative user/workspace requirements, and must
+    /// not become hard requirements if joint validation later un-routes the
+    /// package.
+    #[serde(skip)]
+    pub auto_route_constraint_indices: BTreeSet<usize>,
 }
 
 /// Everything needed to synthesize + solve one (bundle, python, platform)
@@ -146,6 +153,11 @@ pub struct UvClosure {
     /// already declares and supplies them. This is ephemeral build evidence,
     /// never persisted as part of an [`AutoRoutedPackage`].
     pub auto_dropped: BTreeSet<String>,
+    /// Effective authoritative uv inputs for the exact request that produced
+    /// this closure. `None` is reserved for parser-only/test closures that did
+    /// not cross the request-aware solve boundary; route planning then derives
+    /// the same map from its visible request.
+    pub effective_input_requirements: Option<BTreeMap<String, Vec<AutoRouteInputRequirement>>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -155,6 +167,31 @@ pub struct UvClosure {
 /// One auto-routed package: excluded from the wheel closure, provided by
 /// a conda channel instead. Recorded so the backend emits it as a conda
 /// run-dependency of the stub package.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AutoRouteInputRole {
+    /// A direct/root requirement.
+    #[default]
+    Requirement,
+    /// An additive uv constraint.
+    Constraint,
+    /// A uv override, which replaces ordinary dependency requirements.
+    Override,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutoRouteInputRequirement {
+    /// PEP 440 specifiers from an authoritative uv input (empty means any
+    /// version). This is distinct from the version uv happened to select.
+    pub specifiers: String,
+    /// Human-readable origin retained for source-rich un-route conflicts.
+    pub source: String,
+    /// uv semantic role. Overrides replace ordinary requirements; constraints
+    /// remain additive in either case.
+    #[serde(default)]
+    pub role: AutoRouteInputRole,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AutoRoutedPackage {
     /// PEP 503-canonical PyPI name (closure-side identity).
@@ -167,6 +204,11 @@ pub struct AutoRoutedPackage {
     pub conda_version: String,
     /// `<channel_url>/<subdir>` the match was found on.
     pub channel: String,
+    /// Active root/constraint/override/self-heal inputs that governed uv's
+    /// selection for this package. Empty means the selected PyPI version was
+    /// only solver output and may be used as a soft restoration preference.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input_requirements: Vec<AutoRouteInputRequirement>,
 }
 
 /// Configuration for the auto-route loop.
@@ -333,6 +375,147 @@ pub struct RouteProbeHit {
     pub depends: Vec<String>,
 }
 
+fn active_input_requirement(
+    raw: &str,
+    target: &uv_pep508::MarkerEnvironment,
+) -> Result<Option<(String, String)>> {
+    let requirement: Requirement = Requirement::from_str(raw)
+        .with_context(|| format!("parsing authoritative uv input requirement `{raw}`"))?;
+    if !requirement.marker.evaluate(target, &[]) {
+        return Ok(None);
+    }
+    let specifiers = match requirement.version_or_url.as_ref() {
+        Some(uv_pep508::VersionOrUrl::VersionSpecifier(specifiers)) => specifiers.to_string(),
+        None => String::new(),
+        // Direct URL/path artifacts are protected roots or pin-only archive
+        // records, never index-wheel auto-route candidates.
+        Some(uv_pep508::VersionOrUrl::Url(_)) => return Ok(None),
+    };
+    Ok(Some((
+        canonical_conda_name(requirement.name.as_ref()),
+        specifiers,
+    )))
+}
+
+/// Preserve the effective authoritative uv inputs that produced a closure.
+/// The closure wheel versions are deliberately absent: they are solver output
+/// and become restoration preferences, not hard requirements.
+///
+/// uv override semantics are load-bearing here: an active override replaces
+/// ordinary root/transitive requirements for that package, while constraints
+/// remain additive. Keeping the semantic role lets the later metadata scan
+/// apply the same precedence to newly materialized `Requires-Dist` lines.
+fn effective_auto_route_input_requirements(
+    req: &UvClosureRequest,
+) -> Result<BTreeMap<String, Vec<AutoRouteInputRequirement>>> {
+    let target = crate::relax::marker_env_for(&req.conda_subdir, &req.python_version)?;
+    let mut requirements: BTreeMap<String, Vec<AutoRouteInputRequirement>> = BTreeMap::new();
+    let mut constraints: BTreeMap<String, Vec<AutoRouteInputRequirement>> = BTreeMap::new();
+    let mut overrides: BTreeMap<String, Vec<AutoRouteInputRequirement>> = BTreeMap::new();
+    let push = |destination: &mut BTreeMap<String, Vec<AutoRouteInputRequirement>>,
+                raw: &str,
+                source: String,
+                role: AutoRouteInputRole|
+     -> Result<()> {
+        let Some((name, specifiers)) = active_input_requirement(raw, &target)? else {
+            return Ok(());
+        };
+        let requirement = AutoRouteInputRequirement {
+            specifiers,
+            source,
+            role,
+        };
+        let entries = destination.entry(name).or_default();
+        if !entries.contains(&requirement) {
+            entries.push(requirement);
+        }
+        Ok(())
+    };
+
+    for raw in &req.dependencies {
+        push(
+            &mut requirements,
+            raw,
+            format!("uv root requirement `{raw}`"),
+            AutoRouteInputRole::Requirement,
+        )?;
+    }
+    for (index, raw) in req.constraints.constraints.iter().enumerate() {
+        if req
+            .constraints
+            .auto_route_constraint_indices
+            .contains(&index)
+        {
+            continue;
+        }
+        let provenance = req
+            .constraints
+            .provenance
+            .values()
+            .find(|provenance| provenance.constraint == *raw);
+        let source = match provenance {
+            Some(provenance) => format!(
+                "uv constraint `{raw}` from {} `{}` (conda `{}{}`)",
+                provenance.source, provenance.env, provenance.conda_name, provenance.conda_version
+            ),
+            None => format!("uv constraint `{raw}`"),
+        };
+        push(
+            &mut constraints,
+            raw,
+            source,
+            AutoRouteInputRole::Constraint,
+        )?;
+    }
+    for raw in &req.overrides {
+        push(
+            &mut overrides,
+            raw,
+            format!("uv override requirement `{raw}`"),
+            AutoRouteInputRole::Override,
+        )?;
+    }
+    let names: BTreeSet<String> = requirements
+        .keys()
+        .chain(constraints.keys())
+        .chain(overrides.keys())
+        .cloned()
+        .collect();
+    let mut effective = BTreeMap::new();
+    for name in names {
+        let mut entries = if overrides.contains_key(&name) {
+            overrides.remove(&name).unwrap_or_default()
+        } else {
+            requirements.remove(&name).unwrap_or_default()
+        };
+        entries.extend(constraints.remove(&name).unwrap_or_default());
+        effective.insert(name, entries);
+    }
+    Ok(effective)
+}
+
+fn attach_effective_input_requirements(
+    closure: &mut UvClosure,
+    req: &UvClosureRequest,
+) -> Result<()> {
+    if closure.effective_input_requirements.is_none() {
+        closure.effective_input_requirements = Some(effective_auto_route_input_requirements(req)?);
+    }
+    Ok(())
+}
+
+fn hydrate_route_input_requirements(routes: &mut [AutoRoutedPackage], closure: &UvClosure) {
+    let Some(inputs) = &closure.effective_input_requirements else {
+        return;
+    };
+    for route in routes {
+        route.input_requirements = inputs
+            .get(&canonical_conda_name(&route.pypi_name))
+            .cloned()
+            .unwrap_or_default();
+    }
+}
+
 /// Pure routing sweep over one solved closure: which index wheels can
 /// move to the conda side this round?
 ///
@@ -347,7 +530,11 @@ pub fn plan_auto_route_round(
     opts: &AutoRouteOptions,
     already_routed: &[AutoRoutedPackage],
     probe_hits: &BTreeMap<String, RouteProbeHit>,
-) -> Vec<AutoRoutedPackage> {
+) -> Result<Vec<AutoRoutedPackage>> {
+    let effective_inputs = match &closure.effective_input_requirements {
+        Some(inputs) => inputs.clone(),
+        None => effective_auto_route_input_requirements(req)?,
+    };
     let excluded: BTreeSet<String> = req
         .no_emit_packages
         .iter()
@@ -403,10 +590,11 @@ pub fn plan_auto_route_round(
                 pypi_version: wheel.version.clone(),
                 conda_version: hit.conda_version.clone(),
                 channel: hit.channel.clone(),
+                input_requirements: effective_inputs.get(name).cloned().unwrap_or_default(),
             });
         }
     }
-    out
+    Ok(out)
 }
 
 /// One-level-deep route-time metadata-consistency check (prevention
@@ -593,17 +781,19 @@ pub fn apply_auto_route(req: &mut UvClosureRequest, hits: &[AutoRoutedPackage]) 
     for h in hits {
         req.no_emit_packages.push(h.pypi_name.clone());
         let line = format!("{}=={}", h.pypi_name, h.pypi_version);
+        let index = req.constraints.constraints.len();
         req.constraints.constraints.push(line.clone());
-        req.constraints.provenance.insert(
-            h.pypi_name.clone(),
-            ConstraintProvenance {
+        req.constraints.auto_route_constraint_indices.insert(index);
+        req.constraints
+            .provenance
+            .entry(h.pypi_name.clone())
+            .or_insert_with(|| ConstraintProvenance {
                 constraint: line,
                 conda_name: h.conda_name.clone(),
                 conda_version: format!("=={}", h.conda_version),
                 source: "auto-route".to_string(),
                 env: "default".to_string(),
-            },
-        );
+            });
     }
 }
 
@@ -963,7 +1153,7 @@ where
                 hits.insert(conda_name, hit);
             }
         }
-        let new_routes = plan_auto_route_round(&closure, &req, &eff_opts, &routed, &hits);
+        let new_routes = plan_auto_route_round(&closure, &req, &eff_opts, &routed, &hits)?;
         if new_routes.is_empty() {
             break; // fixpoint
         }
@@ -1519,7 +1709,12 @@ where
             let mut attempt = fut;
             for _ in 0..AUTO_ROUTE_MAX_ROUNDS {
                 match attempt.await {
-                    Ok(closure) => return Ok(closure),
+                    Ok(mut closure) => {
+                        attach_effective_input_requirements(&mut closure, &req)?;
+                        let mut route_facts = routed.lock().unwrap();
+                        hydrate_route_input_requirements(&mut route_facts, &closure);
+                        return Ok(closure);
+                    }
                     Err(e) => {
                         // ONLY the structured two-pass verdict drives the
                         // heal; every other error class (genuine conflict,
@@ -1641,9 +1836,10 @@ where
                                     new_routes.push(AutoRoutedPackage {
                                         pypi_name: name.clone(),
                                         conda_name: name.clone(),
-                                        pypi_version: hit.conda_version.clone(),
+                                        pypi_version: version.clone(),
                                         conda_version: hit.conda_version.clone(),
                                         channel: hit.channel.clone(),
+                                        input_requirements: Vec::new(),
                                     });
                                 }
                                 // Rung 2: build from the sdist at the exact
@@ -2362,6 +2558,7 @@ pub fn parse_pylock_closure(
         uv_version: uv_version.to_string(),
         auto_routed: Vec::new(),
         auto_dropped: BTreeSet::new(),
+        effective_input_requirements: None,
     })
 }
 
@@ -2631,7 +2828,10 @@ where
             let mut attempt = first;
             loop {
                 match attempt.await {
-                    Ok(closure) => return Ok(closure),
+                    Ok(mut closure) => {
+                        attach_effective_input_requirements(&mut closure, &req)?;
+                        return Ok(closure);
+                    }
                     Err(error) => {
                         let needed = match error.downcast::<WorkspaceFactOverrideNeeded>() {
                             Ok(needed) => needed,
@@ -2874,6 +3074,8 @@ impl HealFacts {
     }
 }
 
+const HEAL_FACTS_STAMP_SCHEMA: &str = "v2-sdist-route-version-domains";
+
 /// Hex sha256 over every input that decides whether persisted heal facts
 /// are still VALID to replay: the request's roots/constraints/overrides/
 /// exclusions/indexes (manifest-derived resolution inputs), the routing
@@ -2910,6 +3112,7 @@ pub fn heal_facts_stamp(
             h.update([0u8]);
         }
     };
+    field("schema", &mut std::iter::once(HEAL_FACTS_STAMP_SCHEMA));
     field("python", &mut std::iter::once(req.python_version.as_str()));
     field("subdir", &mut std::iter::once(req.conda_subdir.as_str()));
     field("deps", &mut req.dependencies.iter().map(String::as_str));
@@ -3313,7 +3516,8 @@ pub async fn compute_closure(
                     .collect();
                 let target = WheelTarget::for_subdir(&req.python_version, &req.conda_subdir);
                 match parse_pylock_closure(&pylock, &target, &exclude, &uv_version) {
-                    Ok(closure) => {
+                    Ok(mut closure) => {
+                        attach_effective_input_requirements(&mut closure, req)?;
                         tracing::info!(
                             bundle = %req.bundle,
                             wheels = closure.wheels.len(),
@@ -3469,7 +3673,8 @@ pub async fn compute_closure(
         .map(|n| canonical_conda_name(n))
         .collect();
     let target = WheelTarget::for_subdir(&req.python_version, &req.conda_subdir);
-    let closure = parse_pylock_closure(&pylock, &target, &exclude, &uv_version)?;
+    let mut closure = parse_pylock_closure(&pylock, &target, &exclude, &uv_version)?;
+    attach_effective_input_requirements(&mut closure, req)?;
 
     let _ = std::fs::write(
         &meta_path,
@@ -4308,6 +4513,7 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
         req.constraints = ConstraintSet {
             constraints: vec![attribution.conflicting_constraint.clone()],
             provenance: BTreeMap::from([("torch".to_string(), attribution.conda_source.clone())]),
+            auto_route_constraint_indices: BTreeSet::new(),
         };
         let stderr = "  x No solution found when resolving dependencies:\n  \
              `-> Because isaacsim-core==6.0.0.1 depends on torch==2.11.0 and \
@@ -4437,6 +4643,7 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
                         uv_version: "test".to_string(),
                         auto_routed: vec![],
                         auto_dropped: BTreeSet::new(),
+                        effective_input_requirements: None,
                     })
                 }) as futures::future::BoxFuture<'static, Result<UvClosure>>
             }
@@ -4450,6 +4657,21 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
         assert_eq!(closure.pins["torch"], "2.10.0");
         assert_eq!(closure.pins["torchvision"], "0.25.0");
         assert_eq!(closure.pins["torchaudio"], "2.10.0");
+        let effective_inputs = closure.effective_input_requirements.as_ref().unwrap();
+        assert!(
+            effective_inputs["torch"].iter().any(|input| {
+                input.specifiers == "==2.10.0"
+                    && input.source == "uv override requirement `torch==2.10.0`"
+                    && input.role == AutoRouteInputRole::Override
+            }),
+            "the closure must retain the learned override from the actual successful request"
+        );
+        assert!(
+            effective_inputs["torch"]
+                .iter()
+                .all(|input| input.role != AutoRouteInputRole::Requirement),
+            "the learned override must replace ordinary requirements while retaining constraints"
+        );
 
         let trio = |lines: &[String]| -> BTreeSet<String> {
             lines
@@ -4611,6 +4833,8 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
     #[tokio::test]
     async fn auto_route_routes_hit_and_reaches_fixpoint() {
         let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut req = auto_route_req();
+        req.dependencies.push("numpy>=2,<3".to_string());
         let mut hits = BTreeMap::new();
         hits.insert(
             "numpy".to_string(),
@@ -4621,7 +4845,7 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
             },
         );
         let closure = auto_route_fixpoint(
-            &auto_route_req(),
+            &req,
             &auto_route_opts(),
             canned_solve(Arc::clone(&calls)),
             canned_probe(hits),
@@ -4640,6 +4864,16 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
         assert_eq!(r.pypi_version, "2.1.0");
         assert_eq!(r.conda_version, "2.1.0");
         assert!(r.channel.contains("conda-forge"));
+        assert_eq!(
+            r.input_requirements,
+            vec![AutoRouteInputRequirement {
+                specifiers: uv_pep508::uv_pep440::VersionSpecifiers::from_str(">=2,<3")
+                    .unwrap()
+                    .to_string(),
+                source: "uv root requirement `numpy>=2,<3`".to_string(),
+                role: AutoRouteInputRole::Requirement,
+            }]
+        );
 
         // Initial lock + one re-lock after routing; round 2 found
         // nothing new (no third solve).
@@ -4867,6 +5101,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
                         uv_version: "0.11.15".into(),
                         auto_routed: vec![],
                         auto_dropped: BTreeSet::new(),
+                        effective_input_requirements: None,
                     })
                 }) as futures::future::BoxFuture<'static, Result<UvClosure>>
             }
@@ -4924,6 +5159,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
                         uv_version: "0.11.15".into(),
                         auto_routed: vec![],
                         auto_dropped: BTreeSet::new(),
+                        effective_input_requirements: None,
                     })
                 }) as futures::future::BoxFuture<'static, Result<UvClosure>>
             }
@@ -4987,7 +5223,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
                 },
             );
         }
-        let routes = plan_auto_route_round(&closure, &req, &auto_route_opts(), &[], &hits);
+        let routes = plan_auto_route_round(&closure, &req, &auto_route_opts(), &[], &hits).unwrap();
         let names: Vec<&str> = routes.iter().map(|r| r.pypi_name.as_str()).collect();
         assert_eq!(names, vec!["typing-extensions"]);
     }
@@ -5079,7 +5315,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
         let mut opts = auto_route_opts();
         opts.route_policy = crate::config::RoutePolicy::Minimal;
         // Neither numpy nor typing-extensions is whitelist material.
-        let routes = plan_auto_route_round(&closure, &req, &opts, &[], &hits);
+        let routes = plan_auto_route_round(&closure, &req, &opts, &[], &hits).unwrap();
         assert!(
             routes.is_empty(),
             "minimal policy must refuse non-whitelisted routes: {routes:?}"
@@ -5091,7 +5327,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
         );
         // The include list re-admits a name.
         opts.route_include.insert("numpy".to_string());
-        let routes = plan_auto_route_round(&closure, &req, &opts, &[], &hits);
+        let routes = plan_auto_route_round(&closure, &req, &opts, &[], &hits).unwrap();
         let names: Vec<&str> = routes.iter().map(|r| r.pypi_name.as_str()).collect();
         assert_eq!(names, vec!["numpy"]);
         let probes = auto_route_probe_specs(&closure, &req, &opts, &[]);
@@ -5299,7 +5535,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
                 depends: Vec::new(),
             },
         );
-        let routes = plan_auto_route_round(&closure, &req, &auto_route_opts(), &[], &hits);
+        let routes = plan_auto_route_round(&closure, &req, &auto_route_opts(), &[], &hits).unwrap();
         let names: Vec<&str> = routes.iter().map(|r| r.pypi_name.as_str()).collect();
         assert_eq!(
             names,
@@ -5800,6 +6036,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
                     uv_version: "0.11.15".into(),
                     auto_routed: vec![],
                     auto_dropped: BTreeSet::new(),
+                    effective_input_requirements: None,
                 })
             })
         }
@@ -6446,7 +6683,10 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
                     seen_specs.lock().unwrap().push(spec.clone());
                     if name == "pyperclip" {
                         Some(RouteProbeHit {
-                            conda_version: "1.8.2".into(),
+                            // Deliberately differs from the structured PyPI
+                            // offender version: the two version domains must
+                            // remain distinct in the persisted route fact.
+                            conda_version: "1.8.3".into(),
                             channel: "https://conda.anaconda.org/conda-forge/linux-64".into(),
                             depends: Vec::new(),
                         })
@@ -6500,6 +6740,8 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
         );
         assert_eq!(closure.auto_routed.len(), 1);
         assert_eq!(closure.auto_routed[0].pypi_name, "pyperclip");
+        assert_eq!(closure.auto_routed[0].pypi_version, "1.8.2");
+        assert_eq!(closure.auto_routed[0].conda_version, "1.8.3");
         let built = closure
             .wheels
             .iter()
@@ -7081,6 +7323,11 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
                 pypi_version: "1.0".into(),
                 conda_version: "1.0".into(),
                 channel: "conda-forge".into(),
+                input_requirements: vec![AutoRouteInputRequirement {
+                    specifiers: ">=0.9,<2".into(),
+                    source: "uv constraint `routed-pkg>=0.9,<2`".into(),
+                    role: AutoRouteInputRole::Constraint,
+                }],
             }],
             built: vec![
                 BuiltSdistWheel {
@@ -7109,6 +7356,10 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
         save_heal_facts(&facts_file, &facts);
         let loaded = load_heal_facts(&facts_file, "stamp-under-state-1");
         assert_eq!(loaded.routed.len(), 1);
+        assert_eq!(
+            loaded.routed[0].input_requirements, facts.routed[0].input_requirements,
+            "typed restore provenance must survive persisted heal-facts"
+        );
         assert_eq!(loaded.prereleased.len(), 1);
         // Stale built-wheel (missing from store) is dropped; live one kept.
         assert_eq!(loaded.built.len(), 1);
@@ -7187,6 +7438,7 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
             constraints: ConstraintSet {
                 constraints: vec!["bar<2".into()],
                 provenance: BTreeMap::new(),
+                auto_route_constraint_indices: BTreeSet::new(),
             },
             overrides: vec!["baz>=1".into()],
             no_emit_packages: vec!["python".into()],
@@ -7319,6 +7571,7 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
                             auto_routed: vec![],
                             auto_dropped: BTreeSet::new(),
                             uv_version: "test".into(),
+                            effective_input_requirements: None,
                         })
                     }
                 };

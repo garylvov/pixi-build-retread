@@ -3445,13 +3445,13 @@ async fn uv_group_closure(
     };
     // Sdist-only self-heal (v4.4.0 third rung, spec-uv-restructure
     // follow-up): rung 1 (conda-route) probes for a compatible version
-    // -- `with_sdist_heal` derives the spec from the ORIGINATING pypi
-    // requirement's version range (e.g. `==4.9.*`) when it can extract
-    // one from the uv error, falling back to `"*"` (any version) for an
-    // unpinned dependency. This reuses the same `probe::find_route` the
-    // ordinary auto-route round uses; unlike that round there is no
-    // resolved pypi version to probe AT (uv never produced a closure),
-    // only the requirement range. Rung 2 (sdist auto-build) is gated by
+    // -- `with_sdist_heal` derives an exact spec from the structured
+    // Pass-B offender version. Pass B resolved that PyPI version even
+    // though no compatible wheel was available; the conda probe may select
+    // a differently formatted/equivalent conda version, so both version
+    // domains remain distinct in the route fact. This reuses the same
+    // `probe::find_route` the ordinary auto-route round uses. Rung 2
+    // (sdist auto-build) is gated by
     // `sdist-build` (default "auto"); `"never"` passes `None` so the
     // wrapper reproduces the pre-v4.4.0 conda-route-or-error behavior
     // exactly.
