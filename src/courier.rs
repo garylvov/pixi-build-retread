@@ -112,7 +112,8 @@ pub fn courier_input_specs(config: &RetreadConfig, bundle_name: &str) -> Vec<Str
 ///
 /// Folds in: per-dep overrides, the PyPI->conda name-map, drop-deps,
 /// conda-deps, the route policy and include set, the auto-bundle toggle, the
-/// build-number, AND the conda channel list. Each of these changes the emitted
+/// build-number, deps-from source identity, AND the conda channel list. Each
+/// of these changes the emitted
 /// conda specs or the conda/PyPI routing, so omitting any would let a
 /// manifest/workspace edit leave the hash unchanged and replay a stale,
 /// POISONED lock. (genesis's `retread-name-map` is the canonical config
@@ -147,6 +148,19 @@ pub fn config_fingerprint(
     }
     for (k, v) in &config.shadow_libs {
         parts.push(format!("shadow-lib:{k}={}", v.as_lock_value()));
+    }
+    for (index, source) in config.deps_from.as_slice().iter().enumerate() {
+        match source {
+            crate::deps_from::DepSource::Local(path) => {
+                parts.push(format!("deps-from:{index}:local:{}", path.display()));
+            }
+            crate::deps_from::DepSource::Url(url) => {
+                parts.push(format!("deps-from:{index}:url:{url}"));
+            }
+            crate::deps_from::DepSource::Git { git, rev, path } => {
+                parts.push(format!("deps-from:{index}:git:{git}@{rev}:{path}"));
+            }
+        }
     }
     let mut drop = config.drop_deps.clone();
     drop.sort();
@@ -1354,6 +1368,33 @@ mod tests {
         assert_ne!(
             added, reordered,
             "channel order must change the fingerprint"
+        );
+    }
+
+    #[test]
+    fn fingerprint_covers_deps_from_source_identity() {
+        let base = minimal_config("b");
+        let mut first = base.clone();
+        first.deps_from = crate::config::DepsFromSpec(vec![crate::deps_from::DepSource::Git {
+            git: "https://example.com/project.git".to_string(),
+            rev: "deadbeef".to_string(),
+            path: "environment.yaml".to_string(),
+        }]);
+        let mut changed = first.clone();
+        changed.deps_from = crate::config::DepsFromSpec(vec![crate::deps_from::DepSource::Git {
+            git: "https://example.com/project.git".to_string(),
+            rev: "cafebabe".to_string(),
+            path: "environment.yaml".to_string(),
+        }]);
+
+        let channels = ["conda-forge".to_string()];
+        assert_ne!(
+            config_fingerprint(&base, &channels, ""),
+            config_fingerprint(&first, &channels, ""),
+        );
+        assert_ne!(
+            config_fingerprint(&first, &channels, ""),
+            config_fingerprint(&changed, &channels, ""),
         );
     }
 

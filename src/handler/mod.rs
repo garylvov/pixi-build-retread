@@ -2790,10 +2790,153 @@ fn workspace_fact_constraints(
                 conda_version: format!("=={}", fact.version),
                 source: "workspace-solved".to_string(),
                 env: "precise-consuming-envs".to_string(),
+                advisory: false,
             },
         );
     }
     constraints
+}
+
+/// Apply conda-export floors as non-installing uv hints.
+///
+/// A floor is eligible only through a one-to-one edge in the pack's explicit
+/// PyPI->conda map and only for an active, otherwise-unconstrained deps-from
+/// root. Workspace constraints, configured wheel roots, overrides, and drops
+/// remain authoritative. Advisory provenance is retained for diagnostics but
+/// excluded from repair attribution by `uv_closure::attribute_conflict`.
+#[allow(clippy::too_many_arguments)]
+fn apply_deps_from_conda_floors(
+    constraints: &mut crate::uv_closure::ConstraintSet,
+    floors: &[crate::deps_from::AdvisoryCondaFloor],
+    roots: &[String],
+    explicit_name_map: &BTreeMap<String, String>,
+    protected_root_names: &BTreeSet<String>,
+    overrides: &BTreeMap<String, String>,
+    drops: &[String],
+    conda_subdir: &str,
+    python_version: &str,
+) -> Result<()> {
+    if floors.is_empty() || explicit_name_map.is_empty() {
+        return Ok(());
+    }
+
+    let marker_env = crate::relax::marker_env_for(conda_subdir, python_version)?;
+    let mut eligible_roots = BTreeSet::new();
+    for raw in roots {
+        let Ok(requirement): Result<uv_pep508::Requirement, _> =
+            uv_pep508::Requirement::from_str(raw)
+        else {
+            continue;
+        };
+        if !requirement.marker.evaluate(&marker_env, &[]) || requirement.version_or_url.is_some() {
+            continue;
+        }
+        let name = canonical_conda_name(requirement.name.as_ref());
+        if !protected_root_names.contains(&name) {
+            eligible_roots.insert(name);
+        }
+    }
+
+    // Preserve all normalized aliases so neither direction can silently pick
+    // a winner when an explicit map is ambiguous.
+    let mut pypi_to_conda: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut conda_to_pypi: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (pypi, conda) in explicit_name_map {
+        let pypi = canonical_conda_name(pypi);
+        let conda = canonical_conda_name(conda);
+        pypi_to_conda
+            .entry(pypi.clone())
+            .or_default()
+            .insert(conda.clone());
+        conda_to_pypi.entry(conda).or_default().insert(pypi);
+    }
+
+    let mut blocked: BTreeSet<String> = constraints
+        .constraints
+        .iter()
+        .filter_map(|line| root_req_name(line))
+        .chain(constraints.provenance.keys().cloned())
+        .chain(overrides.keys().map(|name| canonical_conda_name(name)))
+        .chain(drops.iter().map(|name| canonical_conda_name(name)))
+        .chain(protected_root_names.iter().cloned())
+        .collect();
+
+    // Source order is meaningful for deps-from aggregation; retain only the
+    // last eligible floor per mapped PyPI name before mutating either vector.
+    let mut candidates: BTreeMap<String, crate::deps_from::AdvisoryCondaFloor> = BTreeMap::new();
+    for floor in floors {
+        let conda = canonical_conda_name(&floor.conda_name);
+        let Some(mapped_pypi) = conda_to_pypi.get(&conda) else {
+            tracing::debug!(
+                conda_name = %floor.conda_name,
+                floor = %floor.floor_spec,
+                source = %floor.source,
+                "retread-deps-from: conda floor is inert without an explicit name-map edge",
+            );
+            continue;
+        };
+        if mapped_pypi.len() != 1 {
+            tracing::warn!(
+                conda_name = %floor.conda_name,
+                mapped_pypi = ?mapped_pypi,
+                "retread-deps-from: ambiguous explicit conda-to-PyPI mapping; advisory floor skipped",
+            );
+            continue;
+        }
+        let pypi = mapped_pypi
+            .iter()
+            .next()
+            .expect("one-element mapping checked above")
+            .clone();
+        if pypi_to_conda
+            .get(&pypi)
+            .is_none_or(|targets| targets.len() != 1 || !targets.contains(&conda))
+        {
+            tracing::warn!(
+                pypi_name = %pypi,
+                conda_name = %floor.conda_name,
+                "retread-deps-from: ambiguous explicit PyPI-to-conda mapping; advisory floor skipped",
+            );
+            continue;
+        }
+        if !eligible_roots.contains(&pypi) || blocked.contains(&pypi) {
+            tracing::debug!(
+                pypi_name = %pypi,
+                conda_name = %floor.conda_name,
+                floor = %floor.floor_spec,
+                "retread-deps-from: advisory floor deferred to an authoritative root or constraint",
+            );
+            continue;
+        }
+        candidates.insert(pypi, floor.clone());
+    }
+
+    for (pypi, floor) in candidates {
+        let line = format!("{pypi}{}", floor.floor_spec);
+        let _: uv_pep508::Requirement = uv_pep508::Requirement::from_str(&line)
+            .with_context(|| format!("validating deps-from advisory constraint `{line}`"))?;
+        constraints.constraints.push(line.clone());
+        constraints.provenance.insert(
+            pypi.clone(),
+            crate::uv_closure::ConstraintProvenance {
+                constraint: line,
+                conda_name: floor.conda_name.clone(),
+                conda_version: floor.floor_spec.clone(),
+                source: "deps-from-conda-advisory".to_string(),
+                env: floor.source.clone(),
+                advisory: true,
+            },
+        );
+        blocked.insert(pypi.clone());
+        tracing::info!(
+            pypi_name = %pypi,
+            conda_name = %floor.conda_name,
+            floor = %floor.floor_spec,
+            source = %floor.source,
+            "retread-deps-from: applied conda environment advisory floor to active PyPI root",
+        );
+    }
+    Ok(())
 }
 
 /// Solve each precise consuming environment independently. Destructive
@@ -3009,6 +3152,7 @@ async fn uv_group_closure(
     // root below -- these pins are safe to soften at conda run-dep
     // emission time (see `Bundle::auto_routed`'s `deps_from_floor`).
     let mut deps_from_floor_names: std::collections::BTreeSet<String> = Default::default();
+    let mut deps_from_advisory_floors = Vec::new();
     if !effective.deps_from.is_empty() {
         let deps_from = crate::deps_from::resolve_deps_from(
             effective.deps_from.as_slice(),
@@ -3018,6 +3162,7 @@ async fn uv_group_closure(
         .await
         .with_context(|| format!("retread-deps-from: bundle `{group_name}`"))?;
         deps_from_floor_names = deps_from_exact_pinned_names(&deps_from.pypi_roots);
+        deps_from_advisory_floors = deps_from.advisory_conda_floors;
         roots.extend(deps_from.pypi_roots);
         // Dedupe by PEP 503-normalized package name, LAST occurrence wins.
         // deps-from entries are appended after `[retread-wheels]` roots
@@ -3221,11 +3366,28 @@ async fn uv_group_closure(
                         conda_version: format!("{major}.*"),
                         source: "cuda-major-table".to_string(),
                         env: "consuming-envs".to_string(),
+                        advisory: false,
                     },
                 );
             }
         }
     }
+
+    let protected_root_names: BTreeSet<String> = group_entries
+        .iter()
+        .map(|(name, _)| canonical_conda_name(name))
+        .collect();
+    apply_deps_from_conda_floors(
+        &mut constraints,
+        &deps_from_advisory_floors,
+        &roots,
+        fact_name_map,
+        &protected_root_names,
+        &effective.overrides,
+        &effective.drop_deps,
+        &target.conda_subdir,
+        &target.python_version,
+    )?;
 
     // retread-overrides -> override-dependencies where PEP 440-representable.
     // Fix #20: `retread solve`/`retread lock` now WRITE auto-repaired T1

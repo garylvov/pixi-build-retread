@@ -66,6 +66,10 @@ pub struct ConstraintProvenance {
     pub source: String,
     /// Environment the pin belongs to (e.g. `"default"`).
     pub env: String,
+    /// Non-authoritative hint that may constrain an existing root but must not
+    /// authorize repair mutations against a workspace or pack manifest.
+    #[serde(default)]
+    pub advisory: bool,
 }
 
 /// Generated constraint lines + their provenance, keyed by PyPI name.
@@ -793,6 +797,7 @@ pub fn apply_auto_route(req: &mut UvClosureRequest, hits: &[AutoRoutedPackage]) 
                 conda_version: format!("=={}", h.conda_version),
                 source: "auto-route".to_string(),
                 env: "default".to_string(),
+                advisory: false,
             });
     }
 }
@@ -1083,6 +1088,7 @@ fn rebuild_routed_request(
                 conda_version: format!("=={version}"),
                 source: "workspace-harmonize".to_string(),
                 env: "default".to_string(),
+                advisory: false,
             },
         );
     }
@@ -2120,6 +2126,7 @@ pub fn build_constraints(
                 conda_version: conda_spec.clone(),
                 source: source.to_string(),
                 env: env.to_string(),
+                advisory: false,
             },
         );
     }
@@ -2742,6 +2749,9 @@ pub fn attribute_conflict(
 ) -> Vec<ConflictAttribution> {
     let mut out = Vec::new();
     for (pypi_name, prov) in provenance {
+        if prov.advisory {
+            continue;
+        }
         // Word-boundary match on the normalized name.
         let re = regex::Regex::new(&format!(
             r"(?i)\b{}(?:\[[^\]]*\])?((?:===|==|>=|<=|~=|!=|>|<)[0-9][^\s,)`']*)?",
@@ -4500,6 +4510,7 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
                 conda_version: format!("=={fact_version}"),
                 source: source.to_string(),
                 env: "precise-consuming-envs".to_string(),
+                advisory: false,
             },
         }
     }

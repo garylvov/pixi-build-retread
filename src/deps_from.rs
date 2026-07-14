@@ -1,7 +1,9 @@
-//! Dependency-file parser: turns a requirements.txt or PEP 621 pyproject.toml
-//! into typed dependency inputs for a retread closure.
+//! Dependency-file parser: turns requirements.txt, PEP 621 pyproject.toml, or
+//! conda environment YAML into typed dependency inputs for a retread closure.
 //!
-//! The parser (`parse_dep_source`) does no package resolution or relaxation.
+//! The parser (`parse_dep_source`) does no package resolution. Exact versions
+//! from conda environment exports are deliberately translated into advisory
+//! lower bounds rather than reproducing machine-specific solved pins.
 //! It does inspect `[tool.uv.sources]` paths against the fetched file's origin
 //! so nonportable local/editable dependencies never fall back to a same-named
 //! registry package.
@@ -27,14 +29,44 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ParsedDepsFrom {
     pub pypi_roots: Vec<String>,
+    pub advisory_conda_floors: Vec<AdvisoryCondaFloor>,
     pub notices: Vec<DepsFromNotice>,
 }
 
 impl ParsedDepsFrom {
     fn extend(&mut self, mut other: Self) {
         self.pypi_roots.append(&mut other.pypi_roots);
+        self.advisory_conda_floors
+            .append(&mut other.advisory_conda_floors);
         self.notices.append(&mut other.notices);
     }
+}
+
+/// A lower-bound hint extracted from a conda environment export.
+///
+/// These are not roots or conda run dependencies. The handler may translate a
+/// floor into a uv constraint only through an explicit, unambiguous pack
+/// name-map edge to an already-active PyPI root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdvisoryCondaFloor {
+    /// Native conda package spelling; underscores are intentionally retained.
+    pub conda_name: String,
+    /// A positive lower bound such as `>=3.9.16` or `>1.0`.
+    pub floor_spec: String,
+    /// Dependency-file origin retained for diagnostics/provenance.
+    pub source: String,
+}
+
+impl AdvisoryCondaFloor {
+    pub fn as_conda_requirement(&self) -> String {
+        format!("{} {}", self.conda_name, self.floor_spec)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DepsFromNoticeKind {
+    LocalUvSource,
+    CondaEnvironmentEntry,
 }
 
 /// A visible, structured explanation for an input deliberately omitted from
@@ -42,6 +74,7 @@ impl ParsedDepsFrom {
 /// same report without installing a process-global tracing subscriber.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DepsFromNotice {
+    pub kind: DepsFromNoticeKind,
     pub dependency: String,
     pub configured_path: String,
     pub resolved_path: Option<PathBuf>,
@@ -56,14 +89,23 @@ impl DepsFromNotice {
             .as_deref()
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "<unavailable>".to_string());
-        tracing::warn!(
-            dependency = %self.dependency,
-            configured_path = %self.configured_path,
-            resolved_path = %resolved_path,
-            source = %self.source,
-            reason = %self.reason,
-            "retread-deps-from: skipping dependency backed by a local uv source",
-        );
+        match self.kind {
+            DepsFromNoticeKind::LocalUvSource => tracing::warn!(
+                dependency = %self.dependency,
+                configured_path = %self.configured_path,
+                resolved_path = %resolved_path,
+                source = %self.source,
+                reason = %self.reason,
+                "retread-deps-from: skipping dependency backed by a local uv source",
+            ),
+            DepsFromNoticeKind::CondaEnvironmentEntry => tracing::warn!(
+                dependency = %self.dependency,
+                entry = %self.configured_path,
+                source = %self.source,
+                reason = %self.reason,
+                "retread-deps-from: skipping conda environment dependency entry",
+            ),
+        }
     }
 }
 
@@ -82,32 +124,85 @@ pub struct FetchedDepSource {
 ///
 /// `filename_hint` (e.g. `"requirements_isaaclab.txt"` or `"pyproject.toml"`)
 /// selects the format. If the hint is ambiguous, the content is sniffed:
-/// content starting with a `[` section header (TOML-like) is treated as
-/// pyproject; otherwise it falls back to requirements-line parsing.
+/// content with a TOML section header is treated as pyproject, while a
+/// top-level YAML `dependencies` list is treated as a conda environment;
+/// otherwise it falls back to requirements-line parsing.
 pub fn parse_dep_source(source: &FetchedDepSource) -> Result<ParsedDepsFrom> {
-    if is_pyproject(&source.filename_hint, &source.content) {
-        parse_pyproject(source)
-    } else {
-        Ok(ParsedDepsFrom {
+    match detect_format(&source.filename_hint, &source.content)? {
+        DepSourceFormat::PyProject => parse_pyproject(source),
+        DepSourceFormat::CondaEnvironment => parse_conda_environment(source),
+        DepSourceFormat::Requirements => Ok(ParsedDepsFrom {
             pypi_roots: parse_requirements(&source.content),
+            advisory_conda_floors: Vec::new(),
             notices: Vec::new(),
-        })
+        }),
     }
 }
 
-fn is_pyproject(filename_hint: &str, content: &str) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DepSourceFormat {
+    Requirements,
+    PyProject,
+    CondaEnvironment,
+}
+
+fn detect_format(filename_hint: &str, content: &str) -> Result<DepSourceFormat> {
     let lower = filename_hint.to_ascii_lowercase();
     if lower.ends_with(".toml") || lower == "pyproject" {
-        return true;
+        return Ok(DepSourceFormat::PyProject);
     }
     if lower.ends_with(".txt") {
-        return false;
+        return Ok(DepSourceFormat::Requirements);
     }
-    // Ambiguous hint: sniff the content for a TOML `[project]`-style table.
-    content
+    if lower.ends_with(".yaml") || lower.ends_with(".yml") {
+        validate_conda_environment_shape(content)?;
+        return Ok(DepSourceFormat::CondaEnvironment);
+    }
+    // Ambiguous hint: prefer the semantic YAML shape before the broad TOML
+    // section heuristic. A flow-style YAML dependencies list may itself begin
+    // with `[` on a continuation line.
+    if has_conda_environment_shape(content) {
+        return Ok(DepSourceFormat::CondaEnvironment);
+    }
+    if content
         .lines()
         .map(str::trim)
         .any(|l| l.starts_with('[') && l.contains(']') && !l.starts_with("[["))
+    {
+        return Ok(DepSourceFormat::PyProject);
+    }
+    Ok(DepSourceFormat::Requirements)
+}
+
+fn yaml_mapping_value<'a>(
+    mapping: &'a serde_yaml::Mapping,
+    key: &str,
+) -> Option<&'a serde_yaml::Value> {
+    mapping.get(&serde_yaml::Value::String(key.to_string()))
+}
+
+fn has_conda_environment_shape(content: &str) -> bool {
+    let Ok(serde_yaml::Value::Mapping(mapping)) =
+        serde_yaml::from_str::<serde_yaml::Value>(content)
+    else {
+        return false;
+    };
+    yaml_mapping_value(&mapping, "dependencies").is_some_and(serde_yaml::Value::is_sequence)
+}
+
+fn validate_conda_environment_shape(content: &str) -> Result<()> {
+    let value: serde_yaml::Value =
+        serde_yaml::from_str(content).context("parsing conda environment YAML")?;
+    let mapping = value
+        .as_mapping()
+        .ok_or_else(|| anyhow::anyhow!("conda environment YAML must be a top-level mapping"))?;
+    let dependencies = yaml_mapping_value(mapping, "dependencies").ok_or_else(|| {
+        anyhow::anyhow!("conda environment YAML must contain a top-level `dependencies` list")
+    })?;
+    if !dependencies.is_sequence() {
+        bail!("conda environment YAML top-level `dependencies` must be a list");
+    }
+    Ok(())
 }
 
 /// Parse pip-style `requirements.txt` content.
@@ -148,6 +243,164 @@ fn parse_requirements(content: &str) -> Vec<String> {
     out
 }
 
+/// Parse a conda `environment.yaml` export. Pip subsection entries remain
+/// PEP 508 roots; conda entries become non-installing advisory lower bounds.
+fn parse_conda_environment(source: &FetchedDepSource) -> Result<ParsedDepsFrom> {
+    use rattler_conda_types::{EnvironmentYaml, MatchSpecOrSubSection};
+
+    validate_conda_environment_shape(&source.content)?;
+    let environment = EnvironmentYaml::from_yaml_str(&source.content)
+        .context("parsing conda environment dependency entries")?;
+    let mut out = ParsedDepsFrom::default();
+    for dependency in &environment.dependencies {
+        match dependency {
+            MatchSpecOrSubSection::MatchSpec(spec) => {
+                let rendered = spec.to_string();
+                match advisory_floor_from_match_spec(spec, &source.display_origin) {
+                    Ok(Some(floor)) => out.advisory_conda_floors.push(floor),
+                    Ok(None) => {
+                        let dependency = spec
+                            .name
+                            .as_ref()
+                            .and_then(|name| name.as_exact())
+                            .map(|name| name.as_normalized().to_string())
+                            .unwrap_or_else(|| "<unrepresentable>".to_string());
+                        out.notices.push(conda_environment_notice(
+                            dependency,
+                            rendered,
+                            &source.display_origin,
+                            "entry has no safe positive PEP 440 lower bound",
+                        ));
+                    }
+                    Err(reason) => {
+                        let dependency = spec
+                            .name
+                            .as_ref()
+                            .and_then(|name| name.as_exact())
+                            .map(|name| name.as_normalized().to_string())
+                            .unwrap_or_else(|| "<unrepresentable>".to_string());
+                        out.notices.push(conda_environment_notice(
+                            dependency,
+                            rendered,
+                            &source.display_origin,
+                            &reason,
+                        ));
+                    }
+                }
+            }
+            MatchSpecOrSubSection::SubSection(name, specs) if name == "pip" => {
+                out.pypi_roots.extend(parse_requirements(&specs.join("\n")));
+            }
+            MatchSpecOrSubSection::SubSection(name, _) => {
+                bail!(
+                    "unsupported `{name}` subsection in conda environment dependencies; only `pip` is supported"
+                );
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn advisory_floor_from_match_spec(
+    spec: &rattler_conda_types::MatchSpec,
+    source: &str,
+) -> std::result::Result<Option<AdvisoryCondaFloor>, String> {
+    let Some(name) = spec.name.as_ref().and_then(|name| name.as_exact()) else {
+        return Err("entry does not have an exact conda package name".to_string());
+    };
+    let conda_name = name.as_normalized().to_string();
+    if conda_name.starts_with('_') && conda_name.ends_with("_mutex") {
+        return Err("solver mutex package is environment-export noise".to_string());
+    }
+
+    let Some(bound) = spec.version.as_ref().and_then(conda_positive_lower_bound) else {
+        return Ok(None);
+    };
+    let version = bound.version.to_string();
+    let operator = if bound.exclusive { ">" } else { ">=" };
+    let floor_spec = format!("{operator}{version}");
+
+    // Conda accepts version spellings PEP 440 does not. Retain only floors uv
+    // can actually consume; unsupported forms remain visible as notices.
+    let pep_name = crate::relax::canonical_conda_name(&conda_name);
+    let requirement = format!("{pep_name}{floor_spec}");
+    if uv_pep508::Requirement::<uv_pep508::VerbatimUrl>::from_str(&requirement).is_err() {
+        return Err(format!(
+            "conda version `{version}` is not representable as a PEP 440 lower bound"
+        ));
+    }
+
+    Ok(Some(AdvisoryCondaFloor {
+        conda_name,
+        floor_spec,
+        source: source.to_string(),
+    }))
+}
+
+#[derive(Debug, Clone)]
+struct CondaLowerBound {
+    version: rattler_conda_types::Version,
+    exclusive: bool,
+}
+
+/// Extract a lower bound that is true for every version accepted by `spec`.
+/// Conjunctions retain their strongest positive bound; disjunctions contribute
+/// none because neither branch is guaranteed to hold.
+fn conda_positive_lower_bound(spec: &rattler_conda_types::VersionSpec) -> Option<CondaLowerBound> {
+    use rattler_conda_types::VersionSpec;
+    use rattler_conda_types::version_spec::{
+        EqualityOperator, LogicalOperator, RangeOperator, StrictRangeOperator,
+    };
+
+    match spec {
+        VersionSpec::Exact(EqualityOperator::Equals, version) => Some(CondaLowerBound {
+            version: version.clone(),
+            exclusive: false,
+        }),
+        VersionSpec::StrictRange(
+            StrictRangeOperator::StartsWith | StrictRangeOperator::Compatible,
+            version,
+        ) => Some(CondaLowerBound {
+            version: version.0.clone(),
+            exclusive: false,
+        }),
+        VersionSpec::Range(RangeOperator::Greater, version) => Some(CondaLowerBound {
+            version: version.clone(),
+            exclusive: true,
+        }),
+        VersionSpec::Range(RangeOperator::GreaterEquals, version) => Some(CondaLowerBound {
+            version: version.clone(),
+            exclusive: false,
+        }),
+        VersionSpec::Group(LogicalOperator::And, members) => members
+            .iter()
+            .filter_map(conda_positive_lower_bound)
+            .max_by(|left, right| {
+                left.version
+                    .cmp(&right.version)
+                    .then_with(|| left.exclusive.cmp(&right.exclusive))
+            }),
+        VersionSpec::Group(LogicalOperator::Or, _) => None,
+        _ => None,
+    }
+}
+
+fn conda_environment_notice(
+    dependency: String,
+    entry: String,
+    source: &str,
+    reason: &str,
+) -> DepsFromNotice {
+    DepsFromNotice {
+        kind: DepsFromNoticeKind::CondaEnvironmentEntry,
+        dependency,
+        configured_path: entry,
+        resolved_path: None,
+        source: source.to_string(),
+        reason: reason.to_string(),
+    }
+}
+
 fn is_vcs_or_url_line(line: &str) -> bool {
     line.contains(" @ ")
         || line.starts_with("git+")
@@ -178,6 +431,7 @@ fn parse_pyproject(source: &FetchedDepSource) -> Result<ParsedDepsFrom> {
         let uv_sources = collect_uv_sources(&value)?;
         let mut out = ParsedDepsFrom {
             pypi_roots: Vec::with_capacity(deps.len()),
+            advisory_conda_floors: Vec::new(),
             notices: Vec::new(),
         };
         for dep in deps {
@@ -334,6 +588,7 @@ fn inspect_local_uv_source(
     };
 
     Ok(DepsFromNotice {
+        kind: DepsFromNoticeKind::LocalUvSource,
         dependency: dependency.to_string(),
         configured_path: configured_path.to_string(),
         resolved_path: resolved,
@@ -807,6 +1062,155 @@ demo = [
                 .reason
                 .contains("cannot be resolved from a raw URL")
         );
+    }
+
+    const ROBOGEN_ENVIRONMENT: &str = r#"
+name: robogen
+channels:
+  - anaconda
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.9.16=h7a1cb2a_2
+  - cuda-runtime=11.7.1=0
+  - _libgcc_mutex=0.1=conda_forge
+  - _openmp_mutex=4.5=2_gnu
+  - pip:
+      - absl-py==1.4.0
+      - accelerate==0.21.0
+"#;
+
+    #[test]
+    fn conda_environment_pip_list_becomes_pep508_roots() {
+        let parsed = parse_dep_source(&fetched(ROBOGEN_ENVIRONMENT, "environment.yaml"))
+            .expect("conda environment should parse");
+        assert_eq!(
+            parsed.pypi_roots,
+            vec!["absl-py==1.4.0", "accelerate==0.21.0"]
+        );
+    }
+
+    #[test]
+    fn conda_environment_strips_build_strings_and_softens_pins() {
+        let parsed = parse_dep_source(&fetched(ROBOGEN_ENVIRONMENT, "environment.yaml"))
+            .expect("conda environment should parse");
+        let requirements: Vec<String> = parsed
+            .advisory_conda_floors
+            .iter()
+            .map(AdvisoryCondaFloor::as_conda_requirement)
+            .collect();
+
+        assert!(requirements.contains(&"python >=3.9.16".to_string()));
+        assert!(requirements.contains(&"cuda-runtime >=11.7.1".to_string()));
+        assert!(requirements.iter().all(|floor| !floor.contains("==")));
+        assert!(
+            requirements
+                .iter()
+                .all(|floor| !floor.contains("h7a1cb2a_2"))
+        );
+        assert!(requirements.iter().all(|floor| !floor.contains("2_gnu")));
+    }
+
+    #[test]
+    fn conda_environment_preserves_safe_positive_lower_bounds() {
+        let content = r#"
+dependencies:
+  - strict>1.0
+  - compound>=1,<2
+  - strongest>=1,>2
+  - ambiguous>=1|<2
+"#;
+        let parsed = parse_dep_source(&fetched(content, "environment.yaml"))
+            .expect("conda lower bounds should parse");
+        let requirements: Vec<String> = parsed
+            .advisory_conda_floors
+            .iter()
+            .map(AdvisoryCondaFloor::as_conda_requirement)
+            .collect();
+
+        assert!(requirements.contains(&"strict >1.0".to_string()));
+        assert!(requirements.contains(&"compound >=1".to_string()));
+        assert!(requirements.contains(&"strongest >2".to_string()));
+        assert!(
+            requirements
+                .iter()
+                .all(|floor| !floor.starts_with("ambiguous "))
+        );
+        assert!(parsed.notices.iter().any(|notice| {
+            notice.dependency == "ambiguous"
+                && notice
+                    .reason
+                    .contains("no safe positive PEP 440 lower bound")
+        }));
+    }
+
+    #[test]
+    fn conda_environment_skips_and_reports_mutex_noise() {
+        let parsed = parse_dep_source(&fetched(ROBOGEN_ENVIRONMENT, "environment.yaml"))
+            .expect("conda environment should parse");
+        let skipped: Vec<&str> = parsed
+            .notices
+            .iter()
+            .map(|notice| notice.dependency.as_str())
+            .collect();
+
+        assert_eq!(skipped, vec!["_libgcc_mutex", "_openmp_mutex"]);
+        assert!(
+            parsed
+                .notices
+                .iter()
+                .all(|notice| notice.reason.contains("environment-export noise"))
+        );
+    }
+
+    #[test]
+    fn yaml_hint_never_falls_back_to_requirements_parsing() {
+        let content = "name: broken\ndependencies: not-a-list\n  - bogus==1\n";
+        let err = parse_dep_source(&fetched(content, "environment.yml")).unwrap_err();
+        assert!(err.to_string().contains("dependencies"));
+        assert!(err.to_string().contains("list"));
+    }
+
+    #[test]
+    fn ambiguous_filename_sniffs_conda_environment_shape() {
+        let parsed = parse_dep_source(&fetched(ROBOGEN_ENVIRONMENT, "external-dependencies"))
+            .expect("content sniff should recognize conda environment YAML");
+        assert_eq!(
+            parsed.pypi_roots,
+            vec!["absl-py==1.4.0", "accelerate==0.21.0"]
+        );
+        assert_eq!(parsed.advisory_conda_floors.len(), 2);
+        assert!(
+            parsed
+                .pypi_roots
+                .iter()
+                .all(|root| !root.contains("dependencies:") && !root.contains("channels:"))
+        );
+
+        let flow_style = "dependencies:\n  [python=3.9.16=h7a1cb2a_2]\n";
+        let parsed = parse_dep_source(&fetched(flow_style, "external-dependencies"))
+            .expect("semantic YAML sniff should precede TOML section heuristics");
+        assert_eq!(
+            parsed.advisory_conda_floors[0].as_conda_requirement(),
+            "python >=3.9.16"
+        );
+    }
+
+    #[test]
+    fn requirements_and_pyproject_dispatch_remain_distinct() {
+        let requirements = parse_dep_source(&fetched("demo==1\n", "requirements.txt")).unwrap();
+        let pyproject = parse_dep_source(&fetched(
+            "[project]\nname='x'\nversion='0.1'\ndependencies=['demo==1']\n",
+            "pyproject.toml",
+        ))
+        .unwrap();
+
+        assert_eq!(requirements.pypi_roots, vec!["demo==1"]);
+        assert_eq!(pyproject.pypi_roots, vec!["demo==1"]);
+        assert!(requirements.advisory_conda_floors.is_empty());
+        assert!(pyproject.advisory_conda_floors.is_empty());
     }
 
     // --- fetch_dep_source ---------------------------------------------

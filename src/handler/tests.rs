@@ -2604,6 +2604,141 @@ async fn deps_from_roots_reach_closure_input_root_set() {
     std::fs::remove_dir_all(&workspace).ok();
 }
 
+#[test]
+fn deps_from_conda_floors_apply_only_to_explicit_active_bare_roots() {
+    let mut constraints = crate::uv_closure::ConstraintSet::default();
+    let floors = vec![
+        crate::deps_from::AdvisoryCondaFloor {
+            conda_name: "pytorch".to_string(),
+            floor_spec: ">=2.1.0".to_string(),
+            source: "environment.yaml".to_string(),
+        },
+        crate::deps_from::AdvisoryCondaFloor {
+            conda_name: "python".to_string(),
+            floor_spec: ">=3.9.16".to_string(),
+            source: "environment.yaml".to_string(),
+        },
+    ];
+    let roots = vec![
+        "torch ; sys_platform == 'linux'".to_string(),
+        "python-package ; sys_platform == 'win32'".to_string(),
+    ];
+    let name_map = BTreeMap::from([
+        ("torch".to_string(), "pytorch".to_string()),
+        ("python-package".to_string(), "python".to_string()),
+    ]);
+
+    apply_deps_from_conda_floors(
+        &mut constraints,
+        &floors,
+        &roots,
+        &name_map,
+        &BTreeSet::new(),
+        &BTreeMap::new(),
+        &[],
+        "linux-64",
+        "3.11",
+    )
+    .unwrap();
+
+    assert_eq!(constraints.constraints, vec!["torch>=2.1.0"]);
+    let provenance = &constraints.provenance["torch"];
+    assert!(provenance.advisory);
+    assert_eq!(provenance.source, "deps-from-conda-advisory");
+    assert_eq!(provenance.env, "environment.yaml");
+    assert!(
+        crate::uv_closure::attribute_conflict(
+            "torch>=3 is incompatible with torch>=2.1.0",
+            &constraints.provenance,
+        )
+        .is_empty(),
+        "advisory floors must not authorize repair attribution"
+    );
+}
+
+#[test]
+fn deps_from_conda_floors_fail_closed_on_ambiguous_name_map() {
+    let mut constraints = crate::uv_closure::ConstraintSet::default();
+    let floors = vec![crate::deps_from::AdvisoryCondaFloor {
+        conda_name: "pytorch".to_string(),
+        floor_spec: ">=2.1.0".to_string(),
+        source: "environment.yaml".to_string(),
+    }];
+    let name_map = BTreeMap::from([
+        ("torch".to_string(), "pytorch".to_string()),
+        ("torch-alt".to_string(), "pytorch".to_string()),
+    ]);
+
+    apply_deps_from_conda_floors(
+        &mut constraints,
+        &floors,
+        &["torch".to_string()],
+        &name_map,
+        &BTreeSet::new(),
+        &BTreeMap::new(),
+        &[],
+        "linux-64",
+        "3.11",
+    )
+    .unwrap();
+
+    assert!(constraints.constraints.is_empty());
+    assert!(constraints.provenance.is_empty());
+}
+
+#[test]
+fn deps_from_conda_floors_preserve_authoritative_inputs() {
+    let mut constraints = crate::uv_closure::ConstraintSet::default();
+    constraints.constraints.push("numpy>=2".to_string());
+    constraints.provenance.insert(
+        "numpy".to_string(),
+        crate::uv_closure::ConstraintProvenance {
+            constraint: "numpy>=2".to_string(),
+            conda_name: "numpy".to_string(),
+            conda_version: ">=2".to_string(),
+            source: "workspace-solved".to_string(),
+            env: "default".to_string(),
+            advisory: false,
+        },
+    );
+    let original_constraints = constraints.constraints.clone();
+    let original_provenance = constraints.provenance.clone();
+    let floors = ["numpy", "pandas", "scipy", "requests"]
+        .into_iter()
+        .map(|name| crate::deps_from::AdvisoryCondaFloor {
+            conda_name: name.to_string(),
+            floor_spec: ">=1".to_string(),
+            source: "environment.yaml".to_string(),
+        })
+        .collect::<Vec<_>>();
+    let name_map = ["numpy", "pandas", "scipy", "requests"]
+        .into_iter()
+        .map(|name| (name.to_string(), name.to_string()))
+        .collect::<BTreeMap<_, _>>();
+    let roots = vec![
+        "numpy".to_string(),
+        "pandas".to_string(),
+        "scipy".to_string(),
+        "requests==2.32.0".to_string(),
+    ];
+
+    apply_deps_from_conda_floors(
+        &mut constraints,
+        &floors,
+        &roots,
+        &name_map,
+        &BTreeSet::new(),
+        &BTreeMap::from([("pandas".to_string(), "==2.2.0".to_string())]),
+        &["scipy".to_string()],
+        "linux-64",
+        "3.11",
+    )
+    .unwrap();
+
+    assert_eq!(constraints.constraints, original_constraints);
+    assert_eq!(constraints.provenance, original_provenance);
+}
+
 // --- deps_from_exact_pinned_names (conda-as-truth pin-softening) ----------
 
 #[test]

@@ -365,7 +365,11 @@ pub const SCHEMA: u32 = 12;
 /// declarations and omits those nonportable roots instead of resolving a
 /// same-named registry project. Existing locks must cold-resolve once so their
 /// emitted closure reflects the source-aware root set.
-pub const EMIT_EPOCH: u32 = 12;
+///
+/// Epoch 13: conda environment deps-from sources now contribute nested pip
+/// roots and explicitly mapped advisory floors. Existing locks must
+/// cold-resolve so the uv closure reflects the structured YAML inputs.
+pub const EMIT_EPOCH: u32 = 13;
 
 impl RetreadLock {
     /// File name for a bundle's lock next to the pack manifest.
