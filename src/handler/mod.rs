@@ -1955,10 +1955,17 @@ async fn resolve_all(
         // Packaging / courier / lock-write downstream are unchanged.
         // `Ok(None)` = no uv-resolvable roots (all source-built entries);
         // the materialization path then runs unpinned.
-        let (uv_closure, deps_from_floor_names, workspace_facts, conda_co_solve): (
+        let (
+            uv_closure,
+            deps_from_floor_names,
+            workspace_facts,
+            workspace_ownership,
+            conda_co_solve,
+        ): (
             Option<crate::uv_closure::UvClosure>,
             std::collections::BTreeSet<String>,
             WorkspaceCondaFacts,
+            WorkspaceRouteOwnership,
             CondaCoSolveContext,
         ) = uv_group_closure(
             &group_name,
@@ -2156,6 +2163,7 @@ async fn resolve_all(
                 None, // locked-closure seam: incremental-add ONLY (uv pins flow via prefs below)
                 Some(&favored).filter(|m| !m.is_empty()), // favor-lock + uv-closure prefs
                 uv_closure_members.as_ref(),
+                &workspace_ownership,
                 &conda_co_solve,
             )
             .await?;
@@ -2456,6 +2464,10 @@ fn discard_facts_on_solve_failure(heal_facts_path: &std::path::Path, err: &anyho
 /// automatic drop, while the full selected record sets are validation input.
 #[derive(Debug, Clone, Default)]
 struct WorkspaceCondaFacts {
+    /// Canonical conda package names directly declared by every precise
+    /// consumer. Unlike the mapped PyPI view below, these preserve direct
+    /// conda identity for Rule 2 without guessing a cross-ecosystem alias.
+    owned_conda: BTreeSet<String>,
     /// Canonical PyPI names whose mapped conda package is directly declared
     /// by every consuming environment.
     owned_conda_pypi: BTreeSet<String>,
@@ -2474,6 +2486,17 @@ struct WorkspaceCondaFacts {
     env_exact_specs: BTreeMap<String, Vec<String>>,
     /// Stable digest of `env_exact_specs`, for persisted heal-fact validity.
     fingerprint: String,
+}
+
+/// Effective Rule-1 ownership authority shared with Rule 2. Direct conda
+/// names remain distinct from explicitly mapped PyPI names, and PyPI-side
+/// exclusions are carried separately so same-name fallback cannot bypass a
+/// manual override, keep request, or protected first-party source.
+#[derive(Debug, Clone, Default)]
+struct WorkspaceRouteOwnership {
+    pypi_names: BTreeSet<String>,
+    conda_names: BTreeSet<String>,
+    excluded_pypi_names: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2655,6 +2678,11 @@ fn facts_from_solved_records(
     }
 
     let bundle_name = canonical_conda_name(bundle_name);
+    let owned_conda: BTreeSet<String> = owned_conda
+        .into_iter()
+        .map(|name| canonical_conda_name(&name))
+        .filter(|name| name != &bundle_name)
+        .collect();
     let per_env_versions: BTreeMap<String, BTreeMap<String, String>> = env_records
         .iter()
         .map(|(env, records)| {
@@ -2729,6 +2757,7 @@ fn facts_from_solved_records(
     }
 
     WorkspaceCondaFacts {
+        owned_conda,
         owned_conda_pypi,
         owned_pypi,
         common_pypi,
@@ -2882,6 +2911,7 @@ async fn uv_group_closure(
     Option<crate::uv_closure::UvClosure>,
     std::collections::BTreeSet<String>,
     WorkspaceCondaFacts,
+    WorkspaceRouteOwnership,
     CondaCoSolveContext,
 )> {
     let mut roots: Vec<String> = Vec::new();
@@ -3053,6 +3083,47 @@ async fn uv_group_closure(
         );
     }
 
+    // Rule 1's effective workspace ownership is a filtered view of the
+    // precise solved facts, not a mutation of those facts. Carry both mapped
+    // PyPI identity and direct conda identity through the uv and legacy
+    // materialization paths so Rule 2 can honor the same authority.
+    let workspace_ownership =
+        if effective.route_policy == crate::config::RoutePolicy::PreferCondaValidated {
+            let mut excluded_pypi_names: BTreeSet<String> = effective
+                .overrides
+                .keys()
+                .map(|name| canonical_conda_name(name))
+                .collect();
+            excluded_pypi_names.extend(
+                effective
+                    .keep_pypi
+                    .iter()
+                    .map(|name| canonical_conda_name(name)),
+            );
+            excluded_pypi_names.extend(
+                group_entries
+                    .iter()
+                    .map(|(name, _)| canonical_conda_name(name)),
+            );
+            excluded_pypi_names.extend(
+                url_wheel_sources
+                    .keys()
+                    .map(|name| canonical_conda_name(name)),
+            );
+            let pypi_names = workspace_facts
+                .owned_conda_pypi
+                .difference(&excluded_pypi_names)
+                .cloned()
+                .collect();
+            WorkspaceRouteOwnership {
+                pypi_names,
+                conda_names: workspace_facts.owned_conda.clone(),
+                excluded_pypi_names,
+            }
+        } else {
+            WorkspaceRouteOwnership::default()
+        };
+
     // Construct the shared oracle before the roots-empty return so the legacy
     // materialization path and the uv path validate Rule 2 against identical
     // consuming-workspace facts.
@@ -3075,6 +3146,7 @@ async fn uv_group_closure(
             None,
             std::collections::BTreeSet::new(),
             workspace_facts,
+            workspace_ownership,
             conda_co_solve,
         ));
     }
@@ -3353,24 +3425,6 @@ async fn uv_group_closure(
     {
         abi_anchor_pins.insert("python_abi".to_string(), python_pin);
     }
-    let mut workspace_owned = workspace_facts.owned_conda_pypi.clone();
-    if effective.route_policy == crate::config::RoutePolicy::PreferCondaValidated {
-        let manual: BTreeSet<String> = effective
-            .overrides
-            .keys()
-            .map(|name| canonical_conda_name(name))
-            .collect();
-        let keep: BTreeSet<String> = effective
-            .keep_pypi
-            .iter()
-            .map(|name| canonical_conda_name(name))
-            .collect();
-        workspace_owned.retain(|name| {
-            !manual.contains(name) && !keep.contains(name) && !protected.contains(name)
-        });
-    } else {
-        workspace_owned.clear();
-    }
     let auto_route_opts = crate::uv_closure::AutoRouteOptions {
         enabled: effective.auto_route,
         // v4.6 Part A: production wiring of the routing policy -- the
@@ -3397,7 +3451,7 @@ async fn uv_group_closure(
         // Populated below (workspace-deps solve) just before the
         // fixpoint call; empty = un-route fallback only.
         workspace_conda_versions: Default::default(),
-        workspace_owned,
+        workspace_owned: workspace_ownership.pypi_names.clone(),
         workspace_fact_fingerprint: workspace_facts.fingerprint.clone(),
     };
 
@@ -3652,6 +3706,7 @@ async fn uv_group_closure(
         Some(closure),
         deps_from_floor_names,
         workspace_facts,
+        workspace_ownership,
         conda_co_solve,
     ))
 }
@@ -3966,7 +4021,11 @@ gpu = { features = ["gpu"], no-default-feature = true }
         ]);
         let facts = facts_from_solved_records(
             env_records,
-            BTreeSet::from(["numpy".to_string(), "tetgen".to_string()]),
+            BTreeSet::from([
+                "numpy".to_string(),
+                "tetgen".to_string(),
+                "demo_pack".to_string(),
+            ]),
             BTreeSet::from(["gym".to_string(), "rliable".to_string()]),
             &BTreeMap::from([
                 ("numpy".to_string(), "numpy".to_string()),
@@ -3983,6 +4042,11 @@ gpu = { features = ["gpu"], no-default-feature = true }
         assert!(
             !facts.common_pypi.contains_key("tetgen"),
             "same-name conda/PyPI identity must never be guessed without a mapping"
+        );
+        assert_eq!(
+            facts.owned_conda,
+            BTreeSet::from(["numpy".into(), "tetgen".into()]),
+            "direct conda ownership remains available without manufacturing a PyPI mapping, and the generated bundle excludes itself"
         );
         assert_eq!(facts.owned_conda_pypi, BTreeSet::from(["numpy".into()]));
         assert_eq!(
