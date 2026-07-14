@@ -2488,6 +2488,34 @@ struct WorkspaceCondaFacts {
     fingerprint: String,
 }
 
+/// Render one workspace-declared conda dependency as a conda match spec.
+///
+/// The name is emitted RAW, and that is the whole point of this function.
+/// [`canonical_conda_name`] is the PEP 503 *PyPI* normalizer (`_` and `.` both
+/// fold to `-`), but conda package names legitimately carry underscores --
+/// `cuda-nvcc_linux-64`, `gcc_linux-64`, `python_abi`. Normalizing one into a
+/// match spec invents a package that no channel has ever published, and the
+/// solve dies with `No candidates were found for cuda-nvcc-linux-64 12.9.*`.
+///
+/// That is not a hypothetical: it silently emptied Rule 1's entire ownership
+/// set for any workspace whose consuming environment declared a cross-compiler
+/// or CUDA toolchain package. Every precise consuming-env solve failed, so
+/// `solve_workspace_conda_facts` abstained, so `owned_conda` came back empty,
+/// so nothing was ever workspace-owned and no owned dependency could be
+/// dropped -- while the co-solve oracle, mangling the same names, returned
+/// Unsat for every route it was asked about.
+///
+/// Canonical names remain the correct COMPARISON key (ownership sets, routing
+/// identity, dedupe). They are never a solver input.
+fn workspace_dep_match_spec(name: &str, spec: &str) -> String {
+    let spec = spec.trim();
+    if spec.is_empty() || spec == "*" {
+        name.to_string()
+    } else {
+        format!("{name} {spec}")
+    }
+}
+
 /// Effective Rule-1 ownership authority shared with Rule 2. Direct conda
 /// names remain distinct from explicitly mapped PyPI names, and PyPI-side
 /// exclusions are carried separately so same-name fallback cannot bypass a
@@ -2572,18 +2600,20 @@ impl CondaCoSolveContext {
     ) -> crate::uv_closure::CoInstallVerdict {
         let mut specs: Vec<String> = routed.iter().map(|route| route.match_spec()).collect();
         for (name, specs_for_name) in &self.workspace_deps {
-            let conda_name = canonical_conda_name(name);
             // The bundle's own output is being rendered and is not available
-            // on a channel yet.
-            if conda_name == canonical_conda_name(&self.bundle) {
+            // on a channel yet. Compare on the canonical key, but SOLVE on the
+            // raw declared name: `canonical_conda_name` is the PEP 503 PyPI
+            // normalizer, and conda package names legitimately carry
+            // underscores (`cuda-nvcc_linux-64`, `gcc_linux-64`,
+            // `python_abi`). Normalizing them into a match spec invents a
+            // package that no channel has, so every co-solve came back
+            // "No candidates were found for cuda-nvcc-linux-64" -- unsat for a
+            // reason that has nothing to do with the routes under test.
+            if canonical_conda_name(name) == canonical_conda_name(&self.bundle) {
                 continue;
             }
             for spec in specs_for_name {
-                if spec.trim().is_empty() || spec.trim() == "*" {
-                    specs.push(conda_name.clone());
-                } else {
-                    specs.push(format!("{conda_name} {spec}"));
-                }
+                specs.push(workspace_dep_match_spec(name, spec));
             }
         }
         specs.push(format!("python {}.*", self.python));
@@ -2985,16 +3015,17 @@ async fn solve_workspace_conda_facts(
         let mut specs: Vec<String> = deps
             .iter()
             .filter_map(|(name, spec)| {
-                let name = canonical_conda_name(name);
-                if name == canonical_conda_name(bundle_name) {
+                // Canonical key for the bundle comparison, RAW declared name in
+                // the match spec. See `CondaCoSolveContext::solve`: PEP 503
+                // normalization corrupts legitimate conda names that carry
+                // underscores (`cuda-nvcc_linux-64`), which failed this
+                // baseline solve outright ("No candidates were found") and made
+                // `solve_workspace_conda_facts` abstain -- silently emptying
+                // Rule 1's ownership set for the whole workspace.
+                if canonical_conda_name(name) == canonical_conda_name(bundle_name) {
                     return None;
                 }
-                let spec = spec.trim();
-                Some(if spec.is_empty() || spec == "*" {
-                    name
-                } else {
-                    format!("{name} {spec}")
-                })
+                Some(workspace_dep_match_spec(name, spec))
             })
             .collect();
         specs.push(format!("python {}.*", target.python_version));
@@ -4011,7 +4042,7 @@ mod facts_cleanup_tests {
 mod workspace_conda_facts_tests {
     use super::{
         dependency_name_intersection, facts_from_solved_records, precise_consumer_inputs,
-        workspace_fact_constraints,
+        workspace_dep_match_spec, workspace_fact_constraints,
     };
     use rattler_conda_types::{PackageRecord, RepoDataRecord, VersionWithSource};
     use std::collections::{BTreeMap, BTreeSet};
@@ -4034,6 +4065,118 @@ mod workspace_conda_facts_tests {
             ))
             .unwrap(),
             channel: Some("https://example.invalid".into()),
+        }
+    }
+
+    /// The holosoma regression, at the layer that actually broke.
+    ///
+    /// The consuming env is `no-default-feature = true`, so it inherits NOTHING
+    /// from the root `[dependencies]` (which declares its own, different NumPy).
+    /// NumPy is conda-owned solely through the non-default `holosoma` feature,
+    /// and ownership must see it there.
+    ///
+    /// It must ALSO render that environment's baseline solve specs with RAW
+    /// conda names. `cuda-nvcc_linux-64` is a real conda-forge package;
+    /// `canonical_conda_name` is the PEP 503 PyPI normalizer and folds it to
+    /// `cuda-nvcc-linux-64`, which no channel has ever published. The precise
+    /// consuming-env solve then died with "No candidates were found",
+    /// `solve_workspace_conda_facts` abstained, `owned_conda` came back EMPTY --
+    /// and so NumPy was never workspace-owned and could never be dropped, no
+    /// matter how correct the downstream guard was.
+    #[test]
+    fn no_default_feature_env_owns_numpy_and_solves_with_raw_conda_names() {
+        let tmp = std::env::temp_dir().join(format!(
+            "retread-holosoma-owned-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let pack_dir = tmp.join("holosoma-pack");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        std::fs::write(
+            tmp.join("pixi.toml"),
+            r#"[workspace]
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[dependencies]
+python = "==3.12"
+numpy = ">=1.26.4,<3"
+
+[feature.doit-task-runner.dependencies]
+doit = ">=0.36.0,<0.38"
+
+[feature.holosoma.dependencies]
+holosoma-pack = { path = "./holosoma-pack" }
+python = "==3.11"
+numpy = "==1.26.4"
+pytorch-gpu = "==2.10.0"
+cuda-nvcc_linux-64 = "12.9.*"
+
+[environments]
+holosoma = { features = ["doit-task-runner", "holosoma"], no-default-feature = true }
+"#,
+        )
+        .unwrap();
+        let manifest = crate::workspace::WorkspaceManifest::load(&tmp).unwrap();
+        let inputs = precise_consumer_inputs(&manifest, &tmp, &pack_dir).unwrap();
+
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].env, "holosoma");
+        // The non-default feature's NumPy wins; the root's is NOT inherited.
+        assert_eq!(
+            inputs[0].conda_deps.get("numpy").map(String::as_str),
+            Some("==1.26.4"),
+        );
+
+        let owned_conda = dependency_name_intersection(
+            &inputs
+                .iter()
+                .map(|input| input.conda_deps.clone())
+                .collect::<Vec<_>>(),
+        );
+        assert!(
+            owned_conda.contains("numpy"),
+            "NumPy is conda-owned via a non-default feature of a no-default-feature \
+             environment; ownership must see it: {owned_conda:?}"
+        );
+
+        // The baseline solve specs this env is solved against. Underscore-bearing
+        // conda names must survive verbatim, or the whole solve fails and every
+        // fact -- including the NumPy ownership just asserted -- is abstained away.
+        let specs: Vec<String> = inputs[0]
+            .conda_deps
+            .iter()
+            .filter(|(name, _)| name.as_str() != "holosoma-pack")
+            .map(|(name, spec)| workspace_dep_match_spec(name, spec))
+            .collect();
+        assert!(
+            specs.contains(&"cuda-nvcc_linux-64 12.9.*".to_string()),
+            "the raw conda name must reach the solver: {specs:?}"
+        );
+        assert!(
+            !specs
+                .iter()
+                .any(|spec| spec.starts_with("cuda-nvcc-linux-64")),
+            "PEP 503 normalization must never reach a conda match spec: {specs:?}"
+        );
+        assert!(specs.contains(&"numpy ==1.26.4".to_string()), "{specs:?}");
+    }
+
+    /// `workspace_dep_match_spec` is the seam that keeps the PyPI normalizer out
+    /// of conda match specs. Underscores are load-bearing in the conda ecosystem.
+    #[test]
+    fn workspace_dep_match_spec_preserves_underscored_conda_names() {
+        for (name, spec, expected) in [
+            ("cuda-nvcc_linux-64", "12.9.*", "cuda-nvcc_linux-64 12.9.*"),
+            ("gcc_linux-64", "", "gcc_linux-64"),
+            ("python_abi", "3.11.*", "python_abi 3.11.*"),
+            ("numpy", "==1.26.4", "numpy ==1.26.4"),
+            ("pytorch-gpu", "*", "pytorch-gpu"),
+        ] {
+            assert_eq!(workspace_dep_match_spec(name, spec), expected);
         }
     }
 

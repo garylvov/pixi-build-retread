@@ -166,6 +166,71 @@ impl std::fmt::Display for UnsatisfiableRestoreRequirements {
 
 impl std::error::Error for UnsatisfiableRestoreRequirements {}
 
+/// Why an impossible PyPI restore was NOT superseded by a workspace-owned
+/// drop, in the exact terms of the guards that blocked it.
+///
+/// Silence here is what let a no-op ship: v4.6.7 added the drop but fell
+/// through to the v4.6.6 error verbatim whenever a guard declined, so "the
+/// guard never fired" and "the guard does not exist" were byte-identical from
+/// the outside -- through a full publish and a 30-minute relock. Every decline
+/// must now name the dependency and the specific guard.
+fn drop_decline_reasons(
+    pypi_key: &str,
+    workspace_ownership: &super::WorkspaceRouteOwnership,
+    rejected_conda_routes: &BTreeSet<String>,
+    workspace_drop_authorized: bool,
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if !workspace_drop_authorized {
+        reasons.push(
+            "the fixed workspace conda baseline did not solve, so rule 1 abstains \
+             (ownership is indeterminate, not disproven)"
+                .to_string(),
+        );
+    }
+    if workspace_ownership.excluded_pypi_names.contains(pypi_key) {
+        reasons.push(format!(
+            "`{pypi_key}` is held on PyPI by an explicit retread-override, a keep-pypi \
+             entry, a wheel entry of this pack, or a direct-URL wheel source"
+        ));
+    }
+    let owns_pypi_name = workspace_ownership.pypi_names.contains(pypi_key);
+    let unowned_routes: Vec<&String> = rejected_conda_routes
+        .iter()
+        .filter(|name| !workspace_ownership.conda_names.contains(*name))
+        .collect();
+    if !owns_pypi_name && (rejected_conda_routes.is_empty() || !unowned_routes.is_empty()) {
+        if workspace_ownership.conda_names.is_empty() && workspace_ownership.pypi_names.is_empty() {
+            reasons.push(format!(
+                "no precise consuming workspace environment conda-owns `{pypi_key}`: this \
+                 pack's workspace ownership set is EMPTY (the workspace declares no \
+                 consuming environment for this pack, or that environment's conda baseline \
+                 could not be solved)"
+            ));
+        } else if rejected_conda_routes.is_empty() {
+            reasons.push(format!(
+                "no rejected conda route recorded a concrete conda target for `{pypi_key}`, \
+                 so its identity cannot be proven against the workspace"
+            ));
+        } else {
+            reasons.push(format!(
+                "the consuming workspace does not conda-own the rejected conda route(s) {:?} \
+                 behind `{pypi_key}` (workspace conda-owns: {:?})",
+                unowned_routes, workspace_ownership.conda_names,
+            ));
+        }
+    }
+    if reasons.is_empty() {
+        // Defensive: the guard declined for a reason not enumerated above.
+        reasons.push(
+            "an unenumerated workspace-ownership guard declined the drop (this is a bug \
+             in `drop_decline_reasons`)"
+                .to_string(),
+        );
+    }
+    reasons
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum DedupeVersionKey {
     /// Ordinary PEP 440 comparison ignores trailing release zeroes.
@@ -1432,7 +1497,38 @@ where
             {
                 workspace_drops.insert(pypi_key);
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                // An impossible restore that we decline to drop is fatal, but it
+                // must never be silent: name the dep and the guard that blocked
+                // the drop, appended to the v4.6.6 diagnostic verbatim.
+                let Some(unsatisfiable) = error.downcast_ref::<UnsatisfiableRestoreRequirements>()
+                else {
+                    return Err(error);
+                };
+                let empty = BTreeSet::new();
+                let reasons = drop_decline_reasons(
+                    &pypi_key,
+                    workspace_ownership,
+                    restore_conda_routes.get(&pypi_key).unwrap_or(&empty),
+                    workspace_drop_authorized,
+                );
+                tracing::warn!(
+                    pypi = %pypi_key,
+                    reasons = ?reasons,
+                    "PyPI restore is impossible and the dependency was NOT dropped; \
+                     the bundle cannot be resolved",
+                );
+                return Err(anyhow!(
+                    "{unsatisfiable}\n\nretread did NOT drop `{pypi_key}` (dropping it would \
+                     let the consuming workspace's own conda copy satisfy every wheel above) \
+                     because:\n{}",
+                    reasons
+                        .iter()
+                        .map(|reason| format!("  - {reason}"))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ));
+            }
         }
     }
 
@@ -2278,6 +2374,85 @@ mod tests {
             0,
             "semantic conflicts must fail before any index request"
         );
+
+        // The decline must NAME the dep and the guard. A silent fall-through to
+        // the v4.6.6 text is exactly how a no-op fix survived a publish.
+        assert!(
+            message.contains("retread did NOT drop `numpy`"),
+            "the error must say the drop was declined, and for which dep:\n{message}"
+        );
+        assert!(
+            message.contains("conda-own") && message.contains("EMPTY"),
+            "the error must name the ownership guard that blocked the drop:\n{message}"
+        );
+    }
+
+    /// The ownership guard is evaluated PER DEPENDENCY, not all-or-nothing over
+    /// the pack. A second rejected conda route that the workspace does NOT own
+    /// (here `pillow`, which restores to PyPI perfectly well) must not block the
+    /// owned, impossible-to-restore `numpy` from being dropped.
+    #[tokio::test]
+    async fn joint_unroute_drops_owned_dep_alongside_unowned_rejected_route() {
+        let fetched: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let fetch = {
+            let fetched = Arc::clone(&fetched);
+            move |request: PypiFetchRequest, _index: String| {
+                let fetched = Arc::clone(&fetched);
+                async move {
+                    fetched.lock().unwrap().push(request.pypi_name.clone());
+                    Ok(test_wheel("pillow", "pillow", "10.4.0", &[]))
+                }
+            }
+        };
+        // Reject BOTH routes jointly; only `numpy` is workspace-owned.
+        let reject_both = |routes: Vec<crate::uv_closure::CondaRouteSpec>| async move {
+            if routes.iter().any(|route| {
+                matches!(
+                    canonical_conda_name(&route.conda_name).as_str(),
+                    "numpy" | "pillow"
+                )
+            }) {
+                crate::uv_closure::CoInstallVerdict::Unsat(vec![
+                    "test fixture rejects both generated routes".to_string(),
+                ])
+            } else {
+                crate::uv_closure::CoInstallVerdict::Sat
+            }
+        };
+        let target = crate::pypi::WheelTarget::for_subdir("3.11", "linux-64");
+        let mut bundle = holosoma_numpy_conflict_bundle();
+        // `pillow` arrives as a uv auto-route with a perfectly restorable spec.
+        bundle.auto_routed = vec![pillow_auto_route("10.4.0")];
+
+        auto_bundle_transitives_with(
+            &mut bundle,
+            &[crate::workspace::DEFAULT_PYPI_INDEX.to_string()],
+            &target,
+            &test_config(),
+            None,
+            None,
+            None,
+            // NumPy owned; pillow deliberately NOT owned.
+            &workspace_ownership(&["numpy"]),
+            &validated_probe,
+            &reject_both,
+            &fetch,
+            &["conda-forge/linux-64".to_string()],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            bundle.auto_dropped,
+            HashSet::from(["numpy".to_string()]),
+            "the owned dep must drop even though a sibling rejected route is unowned"
+        );
+        assert_eq!(
+            *fetched.lock().unwrap(),
+            vec!["pillow".to_string()],
+            "the unowned rejected route must still restore to PyPI, and the owned \
+             impossible one must never reach an index"
+        );
     }
 
     #[tokio::test]
@@ -2322,6 +2497,17 @@ mod tests {
             "ownership without a positively solved fixed baseline must abstain"
         );
         assert_eq!(fetch_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        // Rule-1 abstain-on-ambiguity is preserved -- but it must SAY so, and
+        // name the baseline as the guard rather than blaming ownership.
+        assert!(
+            message.contains("retread did NOT drop `numpy`"),
+            "{message}"
+        );
+        assert!(
+            message.contains("workspace conda baseline did not solve"),
+            "the abstention must name the baseline guard:\n{message}"
+        );
     }
 
     #[tokio::test]
