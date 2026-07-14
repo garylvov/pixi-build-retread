@@ -360,7 +360,12 @@ pub const SCHEMA: u32 = 12;
 /// final emitted conda dependencies and consuming-workspace pins. Conflicting
 /// routes move back to the PyPI wheel bundle, changing both lock routing and
 /// emitted courier contents for identical manifests.
-pub const EMIT_EPOCH: u32 = 11;
+///
+/// Epoch 12: `retread-deps-from` now honors `[tool.uv.sources]` local-path
+/// declarations and omits those nonportable roots instead of resolving a
+/// same-named registry project. Existing locks must cold-resolve once so their
+/// emitted closure reflects the source-aware root set.
+pub const EMIT_EPOCH: u32 = 12;
 
 impl RetreadLock {
     /// File name for a bundle's lock next to the pack manifest.

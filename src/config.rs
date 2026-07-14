@@ -430,14 +430,23 @@ pub struct RetreadConfig {
     pub sdist_build: SdistBuildPolicy,
 
     /// Extra root PyPI dependencies pulled from an externally-maintained
-    /// requirements/pyproject file, layered on top of (or instead of)
+    /// requirements/PEP 621 pyproject file, layered on top of (or instead of)
     /// `[retread-wheels]` entries. Each source is fetched
     /// (`deps_from::fetch_dep_source`) and parsed
-    /// (`deps_from::parse_dep_source`) into PEP 508 requirement strings,
+    /// (`deps_from::parse_dep_source`) into typed closure inputs. PEP 508
+    /// dependencies become uv roots,
     /// which are added as roots to the bundle's uv closure alongside the
     /// `[retread-wheels]` roots (see `handler::uv_group_closure`). A
     /// bundle's `[retread-wheels]` table may be empty when
     /// `retread-deps-from` alone supplies its roots.
+    ///
+    /// For PEP 621 files, `[tool.uv.sources]` is honored as source metadata.
+    /// Dependencies mapped to local `path` sources are omitted with a warning
+    /// whether the path is missing or exists: retread cannot portably ship an
+    /// arbitrary local/editable source tree, and resolving the same bare name
+    /// from a registry would select a different project. Relative paths are
+    /// resolved against local files and git checkouts; raw URL sources have no
+    /// local base and therefore omit relative path sources with a warning.
     ///
     /// Accepts three TOML shapes (a bare string, a git table, or a list
     /// mixing both -- union of all sources):

@@ -3010,15 +3010,15 @@ async fn uv_group_closure(
     // emission time (see `Bundle::auto_routed`'s `deps_from_floor`).
     let mut deps_from_floor_names: std::collections::BTreeSet<String> = Default::default();
     if !effective.deps_from.is_empty() {
-        let deps_from_roots = crate::deps_from::resolve_deps_from_roots(
+        let deps_from = crate::deps_from::resolve_deps_from(
             effective.deps_from.as_slice(),
             source_dir,
             cache_dir,
         )
         .await
         .with_context(|| format!("retread-deps-from: bundle `{group_name}`"))?;
-        deps_from_floor_names = deps_from_exact_pinned_names(&deps_from_roots);
-        roots.extend(deps_from_roots);
+        deps_from_floor_names = deps_from_exact_pinned_names(&deps_from.pypi_roots);
+        roots.extend(deps_from.pypi_roots);
         // Dedupe by PEP 503-normalized package name, LAST occurrence wins.
         // deps-from entries are appended after `[retread-wheels]` roots
         // above, so on a same-name collision the deps-from requirement

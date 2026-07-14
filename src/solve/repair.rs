@@ -1691,7 +1691,7 @@ fn resolve_pack_feature(
 /// see `handler/mod.rs`), so this reads the bundle's `pixi.toml` straight
 /// off disk (same file the backend would parse into `RetreadConfig`) and
 /// re-fetches its deps-from source(s) via the same
-/// `deps_from::resolve_deps_from_roots` fetcher the backend closure uses
+/// `deps_from::resolve_deps_from` fetcher the backend closure uses
 /// -- cached under `.retread/deps-from-verify-cache` so a second repair
 /// attempt for the same bundle doesn't re-clone/re-fetch. `repair()` is
 /// synchronous (many call sites, including plain `#[test]`s, call it
@@ -1739,14 +1739,15 @@ fn deps_from_owns_exact_pin(project_dir: &Path, bundle: &str, package: &str) -> 
     let cache_dir = retread_dir(project_dir).join("deps-from-verify-cache");
     let sources = cfg.deps_from.as_slice().to_vec();
     let roots = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(crate::deps_from::resolve_deps_from_roots(
+        tokio::runtime::Handle::current().block_on(crate::deps_from::resolve_deps_from(
             &sources, &pack_dir, &cache_dir,
         ))
     });
-    let Ok(roots) = roots else {
+    let Ok(parsed) = roots else {
         return false;
     };
-    crate::handler::deps_from_exact_pinned_names(&roots).contains(&canonical_conda_name(package))
+    crate::handler::deps_from_exact_pinned_names(&parsed.pypi_roots)
+        .contains(&canonical_conda_name(package))
 }
 
 /// Conda-name candidates for a pypi `pkg`, in match order: the name-map

@@ -1,9 +1,10 @@
 //! Dependency-file parser: turns a requirements.txt or PEP 621 pyproject.toml
-//! into a flat list of PEP 508 requirement strings.
+//! into typed dependency inputs for a retread closure.
 //!
-//! The parser (`parse_dep_source`) is intentionally standalone: it does no
-//! relaxation, no resolution, no filesystem I/O beyond what the caller hands
-//! it as a string. It just parses.
+//! The parser (`parse_dep_source`) does no package resolution or relaxation.
+//! It does inspect `[tool.uv.sources]` paths against the fetched file's origin
+//! so nonportable local/editable dependencies never fall back to a same-named
+//! registry package.
 //!
 //! The fetcher (`fetch_dep_source`) below is the layer that gets a
 //! `deps_from`-style source spec (local path / raw URL / git@rev) down to
@@ -11,23 +12,86 @@
 //! `parse_dep_source`. It does no wiring into config/handler/uv_closure --
 //! that's a separate piece.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-/// Parse a dependency source file's content into a Vec of PEP 508
-/// requirement strings.
+/// Parsed inputs contributed by one or more `retread-deps-from` sources.
+///
+/// This is deliberately typed rather than a bare `Vec<String>`: only
+/// `pypi_roots` may enter uv's PEP 508 root set. Other source formats can add
+/// separate advisory metadata without ever being mistaken for a PyPI package.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ParsedDepsFrom {
+    pub pypi_roots: Vec<String>,
+    pub notices: Vec<DepsFromNotice>,
+}
+
+impl ParsedDepsFrom {
+    fn extend(&mut self, mut other: Self) {
+        self.pypi_roots.append(&mut other.pypi_roots);
+        self.notices.append(&mut other.notices);
+    }
+}
+
+/// A visible, structured explanation for an input deliberately omitted from
+/// the closure. The resolver logs every notice; parser tests can assert the
+/// same report without installing a process-global tracing subscriber.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DepsFromNotice {
+    pub dependency: String,
+    pub configured_path: String,
+    pub resolved_path: Option<PathBuf>,
+    pub source: String,
+    pub reason: String,
+}
+
+impl DepsFromNotice {
+    fn log(&self) {
+        let resolved_path = self
+            .resolved_path
+            .as_deref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "<unavailable>".to_string());
+        tracing::warn!(
+            dependency = %self.dependency,
+            configured_path = %self.configured_path,
+            resolved_path = %resolved_path,
+            source = %self.source,
+            reason = %self.reason,
+            "retread-deps-from: skipping dependency backed by a local uv source",
+        );
+    }
+}
+
+/// Fetched source text plus the origin needed to interpret relative paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchedDepSource {
+    pub content: String,
+    pub filename_hint: String,
+    /// Parent directory of a local file or a file in a git checkout. Raw URL
+    /// sources have no consumer-local filesystem base.
+    pub filesystem_base: Option<PathBuf>,
+    pub display_origin: String,
+}
+
+/// Parse a fetched dependency source into typed closure inputs.
 ///
 /// `filename_hint` (e.g. `"requirements_isaaclab.txt"` or `"pyproject.toml"`)
 /// selects the format. If the hint is ambiguous, the content is sniffed:
 /// content starting with a `[` section header (TOML-like) is treated as
 /// pyproject; otherwise it falls back to requirements-line parsing.
-pub fn parse_dep_source(content: &str, filename_hint: &str) -> Result<Vec<String>> {
-    if is_pyproject(filename_hint, content) {
-        parse_pyproject(content)
+pub fn parse_dep_source(source: &FetchedDepSource) -> Result<ParsedDepsFrom> {
+    if is_pyproject(&source.filename_hint, &source.content) {
+        parse_pyproject(source)
     } else {
-        Ok(parse_requirements(content))
+        Ok(ParsedDepsFrom {
+            pypi_roots: parse_requirements(&source.content),
+            notices: Vec::new(),
+        })
     }
 }
 
@@ -100,9 +164,10 @@ fn strip_inline_comment(line: &str) -> &str {
     }
 }
 
-/// Parse a PEP 621 `pyproject.toml`'s `[project] dependencies` array.
-fn parse_pyproject(content: &str) -> Result<Vec<String>> {
-    let value: toml::Value = content.parse()?;
+/// Parse a PEP 621 `pyproject.toml`'s `[project] dependencies` array and
+/// suppress dependencies whose uv source is a local path.
+fn parse_pyproject(source: &FetchedDepSource) -> Result<ParsedDepsFrom> {
+    let value: toml::Value = source.content.parse()?;
 
     if let Some(project) = value.get("project") {
         let deps = project
@@ -110,10 +175,55 @@ fn parse_pyproject(content: &str) -> Result<Vec<String>> {
             .and_then(|d| d.as_array())
             .cloned()
             .unwrap_or_default();
-        let mut out = Vec::with_capacity(deps.len());
+        let uv_sources = collect_uv_sources(&value)?;
+        let mut out = ParsedDepsFrom {
+            pypi_roots: Vec::with_capacity(deps.len()),
+            notices: Vec::new(),
+        };
         for dep in deps {
             match dep.as_str() {
-                Some(s) => out.push(s.to_string()),
+                Some(requirement) => {
+                    let parsed: Option<uv_pep508::Requirement> =
+                        uv_pep508::Requirement::from_str(requirement).ok();
+                    let normalized_name = parsed
+                        .as_ref()
+                        .map(|req| crate::relax::canonical_conda_name(req.name.as_ref()));
+                    let Some(source_variants) = normalized_name
+                        .as_ref()
+                        .and_then(|name| uv_sources.get(name))
+                    else {
+                        out.pypi_roots.push(requirement.to_string());
+                        continue;
+                    };
+
+                    let local_paths: Vec<&str> = source_variants
+                        .iter()
+                        .filter_map(|variant| match variant {
+                            UvSourceVariant::LocalPath(path) => Some(path.as_str()),
+                            UvSourceVariant::NonLocal => None,
+                        })
+                        .collect();
+                    if local_paths.is_empty() {
+                        out.pypi_roots.push(requirement.to_string());
+                        continue;
+                    }
+                    let dependency = parsed
+                        .as_ref()
+                        .expect("normalized name requires a parsed requirement")
+                        .name
+                        .to_string();
+                    for configured_path in local_paths {
+                        out.notices.push(inspect_local_uv_source(
+                            &dependency,
+                            configured_path,
+                            source,
+                        )?);
+                    }
+                    // Local/editable source trees are intentionally omitted
+                    // even when present. Retread does not transport arbitrary
+                    // source directories, and falling back to a registry
+                    // project with the same name is incorrect.
+                }
                 None => bail!("non-string entry in [project.dependencies]: {dep:?}"),
             }
         }
@@ -132,7 +242,104 @@ fn parse_pyproject(content: &str) -> Result<Vec<String>> {
     // No [project] and no poetry deps: nothing to report, but also nothing
     // that looks like a recognized format. Treat as empty (e.g. a bare
     // pyproject.toml with only [build-system]).
-    Ok(Vec::new())
+    Ok(ParsedDepsFrom::default())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UvSourceVariant {
+    LocalPath(String),
+    NonLocal,
+}
+
+/// Collect uv source declarations by normalized distribution name. Values are
+/// appended rather than overwritten so aliases such as `foo-bar` and
+/// `foo_bar` cannot hide a local source through last-wins normalization.
+fn collect_uv_sources(value: &toml::Value) -> Result<BTreeMap<String, Vec<UvSourceVariant>>> {
+    let Some(sources) = value
+        .get("tool")
+        .and_then(|tool| tool.get("uv"))
+        .and_then(|uv| uv.get("sources"))
+    else {
+        return Ok(BTreeMap::new());
+    };
+    let table = sources
+        .as_table()
+        .ok_or_else(|| anyhow::anyhow!("[tool.uv.sources] must be a table"))?;
+    let mut out: BTreeMap<String, Vec<UvSourceVariant>> = BTreeMap::new();
+    for (name, declaration) in table {
+        let normalized = crate::relax::canonical_conda_name(name);
+        let variants = out.entry(normalized).or_default();
+        match declaration {
+            toml::Value::Table(source) => variants.push(parse_uv_source_table(name, source)?),
+            toml::Value::Array(items) => {
+                if items.is_empty() {
+                    bail!("[tool.uv.sources].{name} source array must not be empty");
+                }
+                for item in items {
+                    let table = item.as_table().ok_or_else(|| {
+                        anyhow::anyhow!("[tool.uv.sources].{name} array entries must be tables")
+                    })?;
+                    variants.push(parse_uv_source_table(name, table)?);
+                }
+            }
+            _ => bail!("[tool.uv.sources].{name} must be a table or array of tables"),
+        }
+    }
+    Ok(out)
+}
+
+fn parse_uv_source_table(
+    name: &str,
+    source: &toml::map::Map<String, toml::Value>,
+) -> Result<UvSourceVariant> {
+    match source.get("path") {
+        Some(path) => path
+            .as_str()
+            .map(|path| UvSourceVariant::LocalPath(path.to_string()))
+            .ok_or_else(|| anyhow::anyhow!("[tool.uv.sources].{name}.path must be a string")),
+        None => Ok(UvSourceVariant::NonLocal),
+    }
+}
+
+fn inspect_local_uv_source(
+    dependency: &str,
+    configured_path: &str,
+    source: &FetchedDepSource,
+) -> Result<DepsFromNotice> {
+    let configured = Path::new(configured_path);
+    let resolved = if configured.is_absolute() {
+        Some(configured.to_path_buf())
+    } else {
+        source
+            .filesystem_base
+            .as_ref()
+            .map(|base| base.join(configured))
+    };
+
+    let reason = match resolved.as_deref() {
+        Some(path) => match path.try_exists() {
+            Ok(false) => "configured local path does not exist on this consumer".to_string(),
+            Ok(true) => "configured local path exists, but local/editable source trees are not portable retread closure roots".to_string(),
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "inspecting [tool.uv.sources] path `{configured_path}` for `{dependency}` from {}",
+                        source.display_origin
+                    )
+                });
+            }
+        },
+        None => "relative local path cannot be resolved from a raw URL dependency source"
+            .to_string(),
+    };
+
+    Ok(DepsFromNotice {
+        dependency: dependency.to_string(),
+        configured_path: configured_path.to_string(),
+        resolved_path: resolved,
+        source: source.display_origin.clone(),
+        reason,
+    })
 }
 
 /// A resolved dependency-source spec, i.e. "where does the requirements.txt
@@ -208,11 +415,8 @@ impl Serialize for DepSource {
     }
 }
 
-/// Resolve a `DepSource` to file text, ready to hand to `parse_dep_source`.
-///
-/// Returns `(file_content, filename_hint)`: `filename_hint` is the file's
-/// base name (e.g. `"requirements_isaaclab.txt"`), which is exactly what
-/// `parse_dep_source`'s `filename_hint` parameter wants for format sniffing.
+/// Resolve a `DepSource` to file text and the origin information needed by
+/// `parse_dep_source`.
 ///
 /// - `DepSource::Local(path)`: `path` is resolved relative to
 ///   `workspace_root` (an absolute `path` is used as-is), then read.
@@ -231,7 +435,7 @@ pub async fn fetch_dep_source(
     src: &DepSource,
     workspace_root: &Path,
     cache_dir: &Path,
-) -> Result<(String, String)> {
+) -> Result<FetchedDepSource> {
     match src {
         DepSource::Local(path) => {
             let resolved = if path.is_absolute() {
@@ -243,7 +447,12 @@ pub async fn fetch_dep_source(
                 .await
                 .with_context(|| format!("reading local dep source {}", resolved.display()))?;
             let hint = filename_of(&resolved)?;
-            Ok((content, hint))
+            Ok(FetchedDepSource {
+                content,
+                filename_hint: hint,
+                filesystem_base: resolved.parent().map(Path::to_path_buf),
+                display_origin: resolved.display().to_string(),
+            })
         }
         DepSource::Git { git, rev, path } => {
             let clone_dir = crate::source_build::ensure_git_checkout(git, rev, cache_dir)
@@ -259,7 +468,12 @@ pub async fn fetch_dep_source(
                     )
                 })?;
             let hint = filename_of(Path::new(path))?;
-            Ok((content, hint))
+            Ok(FetchedDepSource {
+                content,
+                filename_hint: hint,
+                filesystem_base: file_path.parent().map(Path::to_path_buf),
+                display_origin: format!("{git}@{rev}:{path}"),
+            })
         }
         DepSource::Url(u) => {
             let content = fetch_url_cached(u, cache_dir).await?;
@@ -271,33 +485,39 @@ pub async fn fetch_dep_source(
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
                 .ok_or_else(|| anyhow::anyhow!("URL has no filename component: {u}"))?;
-            Ok((content, hint))
+            Ok(FetchedDepSource {
+                content,
+                filename_hint: hint,
+                filesystem_base: None,
+                display_origin: u.clone(),
+            })
         }
     }
 }
 
-/// Wiring layer: fetch + parse every `DepSource` in `sources` (in order)
-/// and flatten the results into one PEP 508 root-requirement list, ready
-/// to extend a `uv_closure::UvClosureRequest::dependencies` (or any other
-/// uv-resolvable root set) with. Each source is fetched via
-/// [`fetch_dep_source`] then parsed via [`parse_dep_source`]; a source's
-/// requirements are appended in the source's list order, so later sources
-/// appear later in the returned Vec (relevant for the caller's
-/// last-wins-by-name dedupe against other root sources, e.g.
-/// `[retread-wheels]` entries).
-pub async fn resolve_deps_from_roots(
+/// Wiring layer: fetch + parse every `DepSource` in order, preserving typed
+/// input classes and source diagnostics. PyPI roots retain source/list order,
+/// which is relevant to the caller's last-wins-by-name dedupe.
+pub async fn resolve_deps_from(
     sources: &[DepSource],
     workspace_root: &Path,
     cache_dir: &Path,
-) -> Result<Vec<String>> {
-    let mut out = Vec::new();
+) -> Result<ParsedDepsFrom> {
+    let mut out = ParsedDepsFrom::default();
     for src in sources {
-        let (content, hint) = fetch_dep_source(src, workspace_root, cache_dir)
+        let fetched = fetch_dep_source(src, workspace_root, cache_dir)
             .await
             .with_context(|| format!("retread-deps-from: fetching {src:?}"))?;
-        let deps = parse_dep_source(&content, &hint)
-            .with_context(|| format!("retread-deps-from: parsing {hint} ({src:?})"))?;
-        out.extend(deps);
+        let parsed = parse_dep_source(&fetched).with_context(|| {
+            format!(
+                "retread-deps-from: parsing {} ({src:?})",
+                fetched.filename_hint
+            )
+        })?;
+        for notice in &parsed.notices {
+            notice.log();
+        }
+        out.extend(parsed);
     }
     Ok(out)
 }
@@ -352,6 +572,24 @@ fn filename_of(path: &Path) -> Result<String> {
 mod tests {
     use super::*;
 
+    fn fetched(content: &str, filename_hint: &str) -> FetchedDepSource {
+        FetchedDepSource {
+            content: content.to_string(),
+            filename_hint: filename_hint.to_string(),
+            filesystem_base: None,
+            display_origin: format!("test:{filename_hint}"),
+        }
+    }
+
+    fn fetched_at(content: &str, filename_hint: &str, base: &Path) -> FetchedDepSource {
+        FetchedDepSource {
+            content: content.to_string(),
+            filename_hint: filename_hint.to_string(),
+            filesystem_base: Some(base.to_path_buf()),
+            display_origin: base.join(filename_hint).display().to_string(),
+        }
+    }
+
     /// Modeled on ProtoMotions' requirements_isaaclab.txt.
     const PROTOMOTIONS_REQUIREMENTS: &str = "\
 tensordict==0.9.0
@@ -366,10 +604,13 @@ pkg[cli]>=1.9.4
 
     #[test]
     fn parses_protomotions_style_requirements() {
-        let result = parse_dep_source(PROTOMOTIONS_REQUIREMENTS, "requirements_isaaclab.txt")
-            .expect("requirements parse should succeed");
+        let result = parse_dep_source(&fetched(
+            PROTOMOTIONS_REQUIREMENTS,
+            "requirements_isaaclab.txt",
+        ))
+        .expect("requirements parse should succeed");
         assert_eq!(
-            result,
+            result.pypi_roots,
             vec![
                 "tensordict==0.9.0".to_string(),
                 "lightning".to_string(),
@@ -391,9 +632,9 @@ another>=1,<2  # inline comment
 http://example.com/pkg.tar.gz
 foo @ git+https://example.com/foo.git
 ";
-        let result = parse_dep_source(content, "requirements.txt").unwrap();
+        let result = parse_dep_source(&fetched(content, "requirements.txt")).unwrap();
         assert_eq!(
-            result,
+            result.pypi_roots,
             vec![
                 "pkg==1; python_version<'3.11'".to_string(),
                 "another>=1,<2".to_string(),
@@ -420,10 +661,10 @@ dev = ["pytest>=7.0"]
 
     #[test]
     fn parses_sage_style_pyproject() {
-        let result = parse_dep_source(SAGE_PYPROJECT, "pyproject.toml")
+        let result = parse_dep_source(&fetched(SAGE_PYPROJECT, "pyproject.toml"))
             .expect("pyproject parse should succeed");
         assert_eq!(
-            result,
+            result.pypi_roots,
             vec![
                 "httpx".to_string(),
                 "mcp[cli]>=1.9.4".to_string(),
@@ -435,11 +676,15 @@ dev = ["pytest>=7.0"]
     #[test]
     fn empty_content_yields_empty_vec() {
         assert_eq!(
-            parse_dep_source("", "requirements.txt").unwrap(),
+            parse_dep_source(&fetched("", "requirements.txt"))
+                .unwrap()
+                .pypi_roots,
             Vec::<String>::new()
         );
         assert_eq!(
-            parse_dep_source("", "pyproject.toml").unwrap(),
+            parse_dep_source(&fetched("", "pyproject.toml"))
+                .unwrap()
+                .pypi_roots,
             Vec::<String>::new()
         );
     }
@@ -454,8 +699,114 @@ name = "foo"
 python = "^3.10"
 requests = "^2.28"
 "#;
-        let err = parse_dep_source(content, "pyproject.toml").unwrap_err();
+        let err = parse_dep_source(&fetched(content, "pyproject.toml")).unwrap_err();
         assert!(err.to_string().contains("poetry format not supported"));
+    }
+
+    #[test]
+    fn uv_sources_missing_local_path_is_skipped_and_reported() {
+        let workspace = unique_tmp_dir("uv-source-missing");
+        let content = r#"
+[project]
+name = "example"
+version = "0.1.0"
+dependencies = ["Local_Project", "requests>=2"]
+
+[tool.uv.sources]
+local-project = { path = "missing/local-project", editable = true }
+"#;
+        let parsed = parse_dep_source(&fetched_at(content, "pyproject.toml", &workspace))
+            .expect("pyproject with a missing uv path should parse");
+
+        assert_eq!(parsed.pypi_roots, vec!["requests>=2"]);
+        assert_eq!(parsed.notices.len(), 1);
+        let notice = &parsed.notices[0];
+        assert_eq!(notice.dependency, "local-project");
+        assert_eq!(notice.configured_path, "missing/local-project");
+        assert_eq!(
+            notice.resolved_path.as_deref(),
+            Some(workspace.join("missing/local-project").as_path())
+        );
+        assert!(notice.reason.contains("does not exist"));
+        assert!(notice.source.contains("pyproject.toml"));
+
+        std::fs::remove_dir_all(workspace).ok();
+    }
+
+    #[test]
+    fn uv_sources_existing_local_path_is_explicitly_nonportable() {
+        let workspace = unique_tmp_dir("uv-source-existing");
+        let local_project = workspace.join("local-project");
+        std::fs::create_dir_all(&local_project).unwrap();
+        let content = r#"
+[project]
+name = "example"
+version = "0.1.0"
+dependencies = ["local-project", "httpx"]
+
+[tool.uv.sources]
+local-project = { path = "local-project", editable = true }
+"#;
+        let parsed = parse_dep_source(&fetched_at(content, "pyproject.toml", &workspace))
+            .expect("pyproject with an existing uv path should parse");
+
+        assert_eq!(parsed.pypi_roots, vec!["httpx"]);
+        assert_eq!(parsed.notices.len(), 1);
+        assert!(parsed.notices[0].reason.contains("not portable"));
+
+        std::fs::remove_dir_all(workspace).ok();
+    }
+
+    #[test]
+    fn pyproject_dependencies_without_uv_sources_are_unchanged() {
+        let content = r#"
+[project]
+name = "example"
+version = "0.1.0"
+dependencies = [
+    "nvdiffrast @ git+https://github.com/NVlabs/nvdiffrast.git",
+    "pytorch3d @ git+https://github.com/facebookresearch/pytorch3d.git@stable",
+    "pillow==9.3.0",
+]
+
+[tool.uv.sources]
+unrelated = { index = "private" }
+"#;
+        let parsed = parse_dep_source(&fetched(content, "pyproject.toml")).unwrap();
+        assert_eq!(
+            parsed.pypi_roots,
+            vec![
+                "nvdiffrast @ git+https://github.com/NVlabs/nvdiffrast.git",
+                "pytorch3d @ git+https://github.com/facebookresearch/pytorch3d.git@stable",
+                "pillow==9.3.0",
+            ]
+        );
+        assert!(parsed.notices.is_empty());
+    }
+
+    #[test]
+    fn uv_sources_mixed_local_and_nonlocal_variants_omit_only_the_dependency() {
+        let content = r#"
+[project]
+name = "example"
+version = "0.1.0"
+dependencies = ["demo", "requests"]
+
+[tool.uv.sources]
+demo = [
+    { path = "../demo", marker = "sys_platform == 'linux'" },
+    { index = "private", marker = "sys_platform != 'linux'" },
+]
+"#;
+        let parsed = parse_dep_source(&fetched(content, "pyproject.toml")).unwrap();
+        assert_eq!(parsed.pypi_roots, vec!["requests"]);
+        assert_eq!(parsed.notices.len(), 1);
+        assert_eq!(parsed.notices[0].dependency, "demo");
+        assert!(
+            parsed.notices[0]
+                .reason
+                .contains("cannot be resolved from a raw URL")
+        );
     }
 
     // --- fetch_dep_source ---------------------------------------------
@@ -490,16 +841,20 @@ requests = "^2.28"
 
         let src = DepSource::Local(PathBuf::from("requirements_isaaclab.txt"));
         let cache_dir = workspace.join("cache"); // unused by Local, but must be a valid Path
-        let (content, hint) = fetch_dep_source(&src, &workspace, &cache_dir)
+        let fetched = fetch_dep_source(&src, &workspace, &cache_dir)
             .await
             .expect("fetch_dep_source(Local) should succeed");
 
-        assert_eq!(hint, "requirements_isaaclab.txt");
-        assert_eq!(content, PROTOMOTIONS_REQUIREMENTS);
-
-        let parsed = parse_dep_source(&content, &hint).expect("parse should succeed");
+        assert_eq!(fetched.filename_hint, "requirements_isaaclab.txt");
+        assert_eq!(fetched.content, PROTOMOTIONS_REQUIREMENTS);
         assert_eq!(
-            parsed,
+            fetched.filesystem_base.as_deref(),
+            Some(workspace.as_path())
+        );
+
+        let parsed = parse_dep_source(&fetched).expect("parse should succeed");
+        assert_eq!(
+            parsed.pypi_roots,
             vec![
                 "tensordict==0.9.0".to_string(),
                 "lightning".to_string(),
@@ -522,12 +877,12 @@ requests = "^2.28"
 
         let other_workspace = unique_tmp_dir("local-absolute-workspace");
         let src = DepSource::Local(file.clone());
-        let (content, hint) = fetch_dep_source(&src, &other_workspace, &other_workspace)
+        let fetched = fetch_dep_source(&src, &other_workspace, &other_workspace)
             .await
             .expect("fetch_dep_source(Local, absolute) should succeed");
 
-        assert_eq!(hint, "pyproject.toml");
-        assert_eq!(content, SAGE_PYPROJECT);
+        assert_eq!(fetched.filename_hint, "pyproject.toml");
+        assert_eq!(fetched.content, SAGE_PYPROJECT);
 
         std::fs::remove_dir_all(dir).ok();
         std::fs::remove_dir_all(other_workspace).ok();
@@ -546,11 +901,11 @@ requests = "^2.28"
         std::fs::remove_dir_all(workspace).ok();
     }
 
-    /// Root-assembly test: `resolve_deps_from_roots` over a single Local
+    /// Root-assembly test: `resolve_deps_from` over a single Local
     /// source produces exactly the PEP 508 strings a caller (e.g.
     /// `uv_group_closure`) would extend its root requirement set with.
     #[tokio::test]
-    async fn resolve_deps_from_roots_local_source_yields_requirements() {
+    async fn resolve_deps_from_local_source_yields_requirements() {
         let workspace = unique_tmp_dir("resolve-roots-local");
         std::fs::write(
             workspace.join("requirements_isaaclab.txt"),
@@ -560,12 +915,12 @@ requests = "^2.28"
 
         let sources = vec![DepSource::Local(PathBuf::from("requirements_isaaclab.txt"))];
         let cache_dir = workspace.join("cache");
-        let roots = resolve_deps_from_roots(&sources, &workspace, &cache_dir)
+        let parsed = resolve_deps_from(&sources, &workspace, &cache_dir)
             .await
-            .expect("resolve_deps_from_roots should succeed");
+            .expect("resolve_deps_from should succeed");
 
         assert_eq!(
-            roots,
+            parsed.pypi_roots,
             vec![
                 "tensordict==0.9.0".to_string(),
                 "lightning".to_string(),
@@ -580,7 +935,7 @@ requests = "^2.28"
 
     /// Multiple sources flatten in list order.
     #[tokio::test]
-    async fn resolve_deps_from_roots_multiple_sources_flatten_in_order() {
+    async fn resolve_deps_from_multiple_sources_flatten_in_order() {
         let workspace = unique_tmp_dir("resolve-roots-multi");
         std::fs::write(workspace.join("a.txt"), "foo==1.0\n").expect("write a.txt");
         std::fs::write(workspace.join("b.txt"), "bar==2.0\n").expect("write b.txt");
@@ -590,11 +945,14 @@ requests = "^2.28"
             DepSource::Local(PathBuf::from("b.txt")),
         ];
         let cache_dir = workspace.join("cache");
-        let roots = resolve_deps_from_roots(&sources, &workspace, &cache_dir)
+        let parsed = resolve_deps_from(&sources, &workspace, &cache_dir)
             .await
-            .expect("resolve_deps_from_roots should succeed");
+            .expect("resolve_deps_from should succeed");
 
-        assert_eq!(roots, vec!["foo==1.0".to_string(), "bar==2.0".to_string()]);
+        assert_eq!(
+            parsed.pypi_roots,
+            vec!["foo==1.0".to_string(), "bar==2.0".to_string()]
+        );
 
         std::fs::remove_dir_all(workspace).ok();
     }
@@ -650,19 +1008,19 @@ path = "requirements.txt"
             "https://raw.githubusercontent.com/NVlabs/ProtoMotions/main/requirements_isaaclab.txt"
                 .to_string(),
         );
-        let (content, hint) = fetch_dep_source(&src, &workspace, &cache_dir)
+        let fetched = fetch_dep_source(&src, &workspace, &cache_dir)
             .await
             .expect("fetch_dep_source(Url) should succeed");
-        assert_eq!(hint, "requirements_isaaclab.txt");
-        assert!(!content.is_empty());
-        parse_dep_source(&content, &hint).expect("parse should succeed");
+        assert_eq!(fetched.filename_hint, "requirements_isaaclab.txt");
+        assert!(!fetched.content.is_empty());
+        parse_dep_source(&fetched).expect("parse should succeed");
 
         // Second call should hit the on-disk cache (same URL hash), not
         // the network -- exercised implicitly by not erroring/timing out.
-        let (content2, _) = fetch_dep_source(&src, &workspace, &cache_dir)
+        let fetched2 = fetch_dep_source(&src, &workspace, &cache_dir)
             .await
             .expect("cached fetch_dep_source(Url) should succeed");
-        assert_eq!(content, content2);
+        assert_eq!(fetched.content, fetched2.content);
 
         std::fs::remove_dir_all(cache_dir).ok();
         std::fs::remove_dir_all(workspace).ok();
@@ -681,12 +1039,12 @@ path = "requirements.txt"
             rev: "main".to_string(),
             path: "requirements_isaaclab.txt".to_string(),
         };
-        let (content, hint) = fetch_dep_source(&src, &workspace, &cache_dir)
+        let fetched = fetch_dep_source(&src, &workspace, &cache_dir)
             .await
             .expect("fetch_dep_source(Git) should succeed");
-        assert_eq!(hint, "requirements_isaaclab.txt");
-        assert!(!content.is_empty());
-        parse_dep_source(&content, &hint).expect("parse should succeed");
+        assert_eq!(fetched.filename_hint, "requirements_isaaclab.txt");
+        assert!(!fetched.content.is_empty());
+        parse_dep_source(&fetched).expect("parse should succeed");
 
         std::fs::remove_dir_all(cache_dir).ok();
         std::fs::remove_dir_all(workspace).ok();

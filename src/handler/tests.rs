@@ -2563,7 +2563,7 @@ fn dedupe_roots_last_wins_preserves_order_when_no_collisions() {
 /// combined + deduped against a `[retread-wheels]` root — without driving
 /// an actual uv solve (which `uv_group_closure` would need network /
 /// the `uv` binary for). Exercises the exact two calls `uv_group_closure`
-/// makes: `deps_from::resolve_deps_from_roots` then
+/// makes: `deps_from::resolve_deps_from` then
 /// `dedupe_roots_last_wins`.
 #[tokio::test]
 async fn deps_from_roots_reach_closure_input_root_set() {
@@ -2583,11 +2583,10 @@ async fn deps_from_roots_reach_closure_input_root_set() {
     // Mirrors uv_group_closure: `[retread-wheels]` roots built first...
     let mut roots: Vec<String> = vec!["isaacsim==5.1.0".to_string()];
     // ...then retread-deps-from roots fetched + parsed + appended...
-    let deps_from_roots =
-        crate::deps_from::resolve_deps_from_roots(&deps_from, &workspace, &cache_dir)
-            .await
-            .expect("resolve_deps_from_roots should succeed");
-    roots.extend(deps_from_roots);
+    let deps_from_parsed = crate::deps_from::resolve_deps_from(&deps_from, &workspace, &cache_dir)
+        .await
+        .expect("resolve_deps_from should succeed");
+    roots.extend(deps_from_parsed.pypi_roots);
     // ...then deduped by name (last wins).
     let roots = dedupe_roots_last_wins(roots);
 
