@@ -3282,9 +3282,10 @@ async fn uv_group_closure(
     });
     // Seed the heal ledgers from facts persisted by a previous run (issue
     // #10 perf): with these present, the FIRST Pass A already carries the
-    // learned pins / built-wheel path-sources, so a warm rerun resolves in
-    // a single lock (and the pyproject fingerprint matches the recorded
-    // meta, letting uv reuse the healed uv.lock instead of re-resolving).
+    // learned overrides / pins / built-wheel path-sources, so a warm rerun
+    // resolves in a single lock (and the pyproject fingerprint matches the
+    // recorded meta, letting uv reuse the healed uv.lock instead of
+    // re-resolving).
     // Stale built-wheel entries (store pruned) are dropped on load.
     // Facts are only replayable under the manifest/routing state they were
     // learned from (B1): stamp over the BASE request + routing options; a
@@ -3298,18 +3299,24 @@ async fn uv_group_closure(
             routed = persisted_facts.routed.len(),
             built = persisted_facts.built.len(),
             prereleased = persisted_facts.prereleased.len(),
+            workspace_overrides = persisted_facts.workspace_overrides.len(),
             "uv closure: seeding heal ledgers from persisted facts (warm reuse path)",
         );
     }
+    let workspace_overrides = Arc::new(std::sync::Mutex::new(persisted_facts.workspace_overrides));
     let sdist_routed = Arc::new(std::sync::Mutex::new(persisted_facts.routed));
     let sdist_built = Arc::new(std::sync::Mutex::new(persisted_facts.built));
     // Transitive-prerelease repairs surface naturally in the closure's
     // pins/wheels (the offender keeps its own index wheel); collected here
     // only for logging/audit parity with the route/build ledgers.
     let sdist_prereleased = Arc::new(std::sync::Mutex::new(persisted_facts.prereleased));
+    let solve = crate::uv_closure::with_workspace_fact_overrides(
+        raw_solve,
+        Arc::clone(&workspace_overrides),
+    );
     let solve = crate::uv_closure::with_sdist_heal(
         group_name.to_string(),
-        raw_solve,
+        solve,
         sdist_probe,
         sdist_build,
         Arc::clone(&sdist_routed),
@@ -3561,6 +3568,7 @@ async fn uv_group_closure(
         &heal_facts_path,
         &crate::uv_closure::HealFacts {
             stamp: facts_stamp,
+            workspace_overrides: workspace_overrides.lock().unwrap().clone(),
             // The FULL routing set, not just the sdist-heal ledger:
             // `closure.auto_routed` (post-splice) also carries the M2
             // auto-route fixpoint's discoveries (torch/cuda-* style

@@ -17,10 +17,10 @@
 //! Constraint *provenance* is load-bearing: every generated constraint line
 //! carries a record of the conda source package it came from
 //! (`constraints.provenance.json`), so a `uv lock` conflict can be
-//! attributed to the offending conda pin and `retread solve` knows which
-//! pin to widen. This layer is policy-free: it never widens, never retries
-//! with altered inputs (spec §4c) — on conflict it reports and points at
-//! `retread solve`.
+//! attributed to the offending conda pin. A proven transitive exact pin that
+//! contradicts a precise workspace-solved conda fact is retried with that
+//! fact as a graph-wide uv override; every other conflict is reported for
+//! `retread solve` unchanged.
 //!
 //! uv is the only resolver: this closure computation runs unconditionally
 //! for every bundle with uv-resolvable roots (v4.4.0; the `retread-resolver`
@@ -32,6 +32,7 @@ use std::str::FromStr;
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
+use uv_pep508::Requirement;
 
 use crate::lock::{LockWheel, Origin};
 use crate::pypi::WheelTarget;
@@ -2246,6 +2247,156 @@ pub struct ConflictAttribution {
     pub conda_source: ConstraintProvenance,
 }
 
+/// One graph-wide uv override learned from a proven contradiction between an
+/// upstream exact pin and a precise workspace-solved conda fact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceFactOverride {
+    /// Canonical PyPI name uv resolves.
+    pub pypi_name: String,
+    /// PEP 440 version selected by every precise consuming environment's
+    /// conda solve.
+    pub version: String,
+}
+
+impl WorkspaceFactOverride {
+    fn requirement(&self) -> String {
+        format!("{}=={}", self.pypi_name, self.version)
+    }
+}
+
+/// Structured signal from [`compute_closure`] to
+/// [`with_workspace_fact_overrides`]. Ordinary resolution errors remain
+/// ordinary `anyhow` errors and never enter this recovery path.
+#[derive(Debug, Clone)]
+struct WorkspaceFactOverrideNeeded {
+    fact: WorkspaceFactOverride,
+    upstream_pin: String,
+    original_error: String,
+}
+
+impl std::fmt::Display for WorkspaceFactOverrideNeeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.original_error)
+    }
+}
+
+impl std::error::Error for WorkspaceFactOverrideNeeded {}
+
+/// Parse one atomic, non-wildcard PEP 440 `==`/`===` pin. Returning the full
+/// specifier set lets callers use PEP 440 containment (rather than textual
+/// version inequality) for local versions, epochs, and normalized spellings.
+fn exact_pep440_pin(
+    raw: &str,
+) -> Option<(
+    uv_pep508::uv_pep440::VersionSpecifiers,
+    uv_pep508::uv_pep440::Version,
+)> {
+    use uv_pep508::uv_pep440::{Operator, Version, VersionSpecifiers};
+
+    let specs = VersionSpecifiers::from_str(raw.trim()).ok()?;
+    let one: Vec<_> = specs.iter().collect();
+    if one.len() != 1 || !matches!(one[0].operator(), Operator::Equal | Operator::ExactEqual) {
+        return None;
+    }
+    let raw_version = raw
+        .trim()
+        .strip_prefix("===")
+        .or_else(|| raw.trim().strip_prefix("=="))?
+        .trim();
+    if raw_version.is_empty() || raw_version.contains('*') {
+        return None;
+    }
+    let version = Version::from_str(raw_version).ok()?;
+    Some((specs, version))
+}
+
+fn exact_requirement_pin(
+    raw: &str,
+) -> Option<(
+    String,
+    uv_pep508::uv_pep440::VersionSpecifiers,
+    uv_pep508::uv_pep440::Version,
+)> {
+    let req: Requirement = Requirement::from_str(raw).ok()?;
+    let uv_pep508::VersionOrUrl::VersionSpecifier(specs) = req.version_or_url.as_ref()? else {
+        return None;
+    };
+    let rendered = specs.to_string();
+    let (exact, version) = exact_pep440_pin(&rendered)?;
+    Some((canonical_conda_name(req.name.as_ref()), exact, version))
+}
+
+fn request_has_direct_root(req: &UvClosureRequest, name: &str) -> bool {
+    req.dependencies.iter().any(|raw| {
+        let root: Result<Requirement, _> = Requirement::from_str(raw);
+        root.is_ok_and(|root| {
+            canonical_conda_name(root.name.as_ref()) == canonical_conda_name(name)
+        })
+    })
+}
+
+fn override_name(raw: &str) -> Option<String> {
+    let req: Requirement = Requirement::from_str(raw).ok()?;
+    Some(canonical_conda_name(req.name.as_ref()))
+}
+
+/// Select the first fail-closed Rule-3 repair from attributed uv prose.
+/// Attribution is already joined to constraint provenance; this layer arms
+/// only for precise Rule-1 facts and only when the opposing upstream pin is
+/// provably exact and excludes the conda-selected version.
+fn workspace_fact_override_needed(
+    req: &UvClosureRequest,
+    attributions: &[ConflictAttribution],
+    original_error: &str,
+) -> Option<WorkspaceFactOverrideNeeded> {
+    for attribution in attributions {
+        if attribution.conda_source.source != "workspace-solved"
+            || request_has_direct_root(req, &attribution.package)
+        {
+            continue;
+        }
+        let Some(required) = attribution.required.as_deref() else {
+            continue;
+        };
+        let Some((upstream_specs, _)) = exact_pep440_pin(required) else {
+            continue;
+        };
+        let Some((constraint_name, fact_specs, fact_version)) =
+            exact_requirement_pin(&attribution.conflicting_constraint)
+        else {
+            continue;
+        };
+        if constraint_name != canonical_conda_name(&attribution.package) {
+            continue;
+        }
+        let Some((conda_specs, conda_version)) =
+            exact_pep440_pin(&attribution.conda_source.conda_version)
+        else {
+            continue;
+        };
+        // Provenance must agree with the emitted pypi constraint. If either
+        // exact spec rejects the other's normalized version, the record is
+        // inconsistent and cannot authorize an automatic graph rewrite.
+        if !fact_specs.contains(&conda_version) || !conda_specs.contains(&fact_version) {
+            continue;
+        }
+        // Equal/equivalent exact pins are not contradictions. This also keeps
+        // `==2.10.0` compatible with a local `2.10.0+cu129` fact per PEP 440.
+        if upstream_specs.contains(&fact_version) {
+            continue;
+        }
+        return Some(WorkspaceFactOverrideNeeded {
+            fact: WorkspaceFactOverride {
+                pypi_name: constraint_name,
+                version: fact_version.to_string(),
+            },
+            upstream_pin: required.to_string(),
+            original_error: original_error.to_string(),
+        });
+    }
+    None
+}
+
 /// Best-effort join of uv's conflict prose to the constraint provenance
 /// table: any constrained name appearing in the error text is attributed
 /// to its conda source package. Degrades gracefully — an unparseable
@@ -2258,13 +2409,23 @@ pub fn attribute_conflict(
     for (pypi_name, prov) in provenance {
         // Word-boundary match on the normalized name.
         let re = regex::Regex::new(&format!(
-            r"(?i)\b{}(?:\[[^\]]*\])?((?:==|>=|<=|~=|!=|>|<)[0-9][^\s,)`']*)?",
+            r"(?i)\b{}(?:\[[^\]]*\])?((?:===|==|>=|<=|~=|!=|>|<)[0-9][^\s,)`']*)?",
             regex::escape(pypi_name)
         ))
         .expect("static conflict regex");
         let mut mentioned = false;
         let mut required: Option<String> = None;
         for cap in re.captures_iter(stderr) {
+            let whole = cap.get(0).expect("a regex capture always has group 0");
+            if stderr[whole.end()..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+            {
+                // Project-name end boundary: `torch` must not attribute a
+                // `torchvision` conflict.
+                continue;
+            }
             mentioned = true;
             if let Some(spec) = cap.get(1) {
                 let spec = spec.as_str().trim_end_matches(['.', ',']);
@@ -2286,6 +2447,99 @@ pub fn attribute_conflict(
         }
     }
     out
+}
+
+fn apply_workspace_fact_overrides(req: &mut UvClosureRequest, facts: &[WorkspaceFactOverride]) {
+    for fact in facts {
+        if req
+            .overrides
+            .iter()
+            .filter_map(|line| override_name(line))
+            .any(|name| name == fact.pypi_name)
+        {
+            continue;
+        }
+        req.overrides.push(fact.requirement());
+    }
+}
+
+/// Retry uv closure resolution when a structured Rule-3 signal proves that a
+/// transitive upstream exact pin contradicts a precise workspace conda fact.
+/// Learned facts are shared across calls so auto-route and sdist-heal relocks
+/// always receive the same graph-wide overrides. Progress is monotonic and
+/// finite: a retry occurs only after appending one previously unseen fact.
+pub fn with_workspace_fact_overrides<S>(
+    solve: S,
+    learned: std::sync::Arc<std::sync::Mutex<Vec<WorkspaceFactOverride>>>,
+) -> impl FnMut(UvClosureRequest) -> futures::future::BoxFuture<'static, Result<UvClosure>>
+where
+    S: FnMut(UvClosureRequest) -> futures::future::BoxFuture<'static, Result<UvClosure>>
+        + Send
+        + 'static,
+{
+    let solve = std::sync::Arc::new(std::sync::Mutex::new(solve));
+    move |mut req: UvClosureRequest| {
+        let solve = std::sync::Arc::clone(&solve);
+        let learned = std::sync::Arc::clone(&learned);
+        {
+            let facts = learned.lock().unwrap();
+            apply_workspace_fact_overrides(&mut req, &facts);
+        }
+        let first = {
+            let mut locked = solve.lock().unwrap();
+            (*locked)(req.clone())
+        };
+        Box::pin(async move {
+            let mut attempt = first;
+            loop {
+                match attempt.await {
+                    Ok(closure) => return Ok(closure),
+                    Err(error) => {
+                        let needed = match error.downcast::<WorkspaceFactOverrideNeeded>() {
+                            Ok(needed) => needed,
+                            Err(other) => return Err(other),
+                        };
+                        let original_error = needed.original_error.clone();
+                        let name = needed.fact.pypi_name.clone();
+                        // An existing manual/drop override is explicit intent;
+                        // never stack a second uv override for the same name.
+                        if req
+                            .overrides
+                            .iter()
+                            .filter_map(|line| override_name(line))
+                            .any(|existing| existing == name)
+                        {
+                            return Err(anyhow!(original_error));
+                        }
+                        let inserted = {
+                            let mut facts = learned.lock().unwrap();
+                            if facts.iter().any(|fact| fact.pypi_name == name) {
+                                false
+                            } else {
+                                facts.push(needed.fact.clone());
+                                true
+                            }
+                        };
+                        if !inserted {
+                            return Err(anyhow!(original_error));
+                        }
+                        tracing::info!(
+                            bundle = %req.bundle,
+                            package = %name,
+                            upstream_pin = %needed.upstream_pin,
+                            conda_version = %needed.fact.version,
+                            "uv closure: replacing upstream exact pin with precise workspace conda fact",
+                        );
+                        req.overrides.push(needed.fact.requirement());
+                        attempt = {
+                            let mut locked = solve.lock().unwrap();
+                            (*locked)(req.clone())
+                        };
+                    }
+                }
+            }
+        })
+    }
 }
 
 /// Render the human-facing failure message: verbatim uv stderr (its
@@ -2434,13 +2688,14 @@ const PYLOCK_FILE: &str = "pylock.retread.toml";
 const PROVENANCE_FILE: &str = "constraints.provenance.json";
 const CONFLICT_FILE: &str = "retread-conflict.json";
 
-/// The self-heal facts learned during a heal cycle -- routed sdist-only
-/// packages, sdist-built wheels, and transitive prerelease pins. Persisting
-/// these next to the uv project and re-injecting them on the next run's
-/// FIRST Pass A is what makes a cold rerun converge in a single lock: the
-/// synthesized pyproject already carries the pins/path-sources that made
-/// the previous run's heal succeed, so Pass A resolves immediately AND the
-/// resulting pyproject text matches the fingerprint recorded in
+/// The self-heal facts learned during a heal cycle -- workspace-fact
+/// overrides, routed sdist-only packages, sdist-built wheels, and transitive
+/// prerelease pins. Persisting these next to the uv project and re-injecting
+/// them on the next run's FIRST Pass A is what makes a cold rerun converge in
+/// a single lock: the synthesized pyproject already carries the
+/// overrides/pins/path-sources that made the previous run's heal succeed, so
+/// Pass A resolves immediately AND the resulting pyproject text matches the
+/// fingerprint recorded in
 /// [`ClosureMeta`] -- so uv's own lock-freshness check reuses the healed
 /// `uv.lock` instead of re-resolving the whole closure from scratch (issue
 /// #10 perf: the fingerprint could never match before, because the meta was
@@ -2459,6 +2714,11 @@ pub struct HealFacts {
     /// are discarded (one extra heal, never a stale replay).
     #[serde(default)]
     pub stamp: String,
+    /// Graph-wide overrides learned from exact upstream pins that contradicted
+    /// precise workspace-solved conda facts. Ordered by discovery so warm
+    /// replay emits byte-identical pyproject text.
+    #[serde(default)]
+    pub workspace_overrides: Vec<WorkspaceFactOverride>,
     #[serde(default)]
     pub routed: Vec<AutoRoutedPackage>,
     #[serde(default)]
@@ -2469,7 +2729,10 @@ pub struct HealFacts {
 
 impl HealFacts {
     pub fn is_empty(&self) -> bool {
-        self.routed.is_empty() && self.built.is_empty() && self.prereleased.is_empty()
+        self.workspace_overrides.is_empty()
+            && self.routed.is_empty()
+            && self.built.is_empty()
+            && self.prereleased.is_empty()
     }
 }
 
@@ -2489,11 +2752,11 @@ impl HealFacts {
 /// between runs could replay a stale facts file as if still valid.
 ///
 /// Deliberately EXCLUDES per-round mutable state (`explicit_pins`,
-/// `built_wheel_sources`, auto-route constraints applied by
-/// [`apply_auto_route`]) -- the stamp must be computed from the BASE
-/// request, before any facts/heal state is injected, and stay stable
-/// across fixpoint rounds. Also excludes `workspace_conda_versions`
-/// (populated later in the phase and not a fact-validity input).
+/// `built_wheel_sources`, learned workspace overrides, auto-route constraints
+/// applied by [`apply_auto_route`]) -- the stamp must be computed from the
+/// BASE request, before any facts/heal state is injected, and stay stable
+/// across fixpoint rounds. Also excludes `workspace_conda_versions` (populated
+/// later in the phase and not a fact-validity input).
 pub fn heal_facts_stamp(
     req: &UvClosureRequest,
     opts: &AutoRouteOptions,
@@ -2978,6 +3241,10 @@ pub async fn compute_closure(
             bail!("{original_error}");
         }
 
+        if let Some(needed) = workspace_fact_override_needed(req, &attributions, &original_error) {
+            return Err(anyhow::Error::new(needed));
+        }
+
         // -- uv lock (Pass B): relax the offending restrictions ----------
         // Same invocation as Pass A, single-sourced through
         // `build_lock_args`, differing ONLY by the known relaxations
@@ -2998,9 +3265,19 @@ pub async fn compute_closure(
         );
         let pass_b_out = run(pass_b_args).await?;
         if !pass_b_out.status.success() {
-            // Pass B also failed: a genuine resolution conflict (not merely
-            // an sdist/prerelease restriction). Surface Pass A's error,
-            // matching pre-two-pass behavior.
+            // Pass B can uncover an exact-pin contradiction that Pass A's
+            // no-build/prerelease error masked. Classify that conflict before
+            // falling back to Pass A's error; every non-workspace or non-exact
+            // conflict keeps the historical behavior.
+            let pass_b_stderr = String::from_utf8_lossy(&pass_b_out.stderr).into_owned();
+            let pass_b_attributions =
+                attribute_conflict(&pass_b_stderr, &req.constraints.provenance);
+            let pass_b_error = format_lock_failure(req, &pass_b_stderr, &pass_b_attributions);
+            if let Some(needed) =
+                workspace_fact_override_needed(req, &pass_b_attributions, &pass_b_error)
+            {
+                return Err(anyhow::Error::new(needed));
+            }
             bail!("{original_error}");
         }
 
@@ -3852,11 +4129,272 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
         // Name not mentioned at all: no record.
         let none = attribute_conflict("unrelated failure", &set.provenance);
         assert!(none.is_empty());
+
+        // Project-name boundary: `torch` must not attribute `torchvision`.
+        let none = attribute_conflict(
+            "isaacsim-core depends on torchvision==0.26.0",
+            &set.provenance,
+        );
+        assert!(
+            none.is_empty(),
+            "torch prefix-matched torchvision: {none:?}"
+        );
+    }
+
+    fn workspace_attribution(
+        package: &str,
+        required: Option<&str>,
+        fact_version: &str,
+        source: &str,
+    ) -> ConflictAttribution {
+        ConflictAttribution {
+            package: package.to_string(),
+            required: required.map(str::to_string),
+            conflicting_constraint: format!("{package}=={fact_version}"),
+            conda_source: ConstraintProvenance {
+                constraint: format!("{package}=={fact_version}"),
+                conda_name: package.to_string(),
+                conda_version: format!("=={fact_version}"),
+                source: source.to_string(),
+                env: "precise-consuming-envs".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn workspace_fact_exact_conflict_requests_graph_wide_override() {
+        let mut req = sample_request();
+        req.dependencies = vec!["isaacsim-core==6.0.0.1".to_string()];
+        let attribution =
+            workspace_attribution("torch", Some("==2.11.0"), "2.10.0", "workspace-solved");
+        req.constraints = ConstraintSet {
+            constraints: vec![attribution.conflicting_constraint.clone()],
+            provenance: BTreeMap::from([("torch".to_string(), attribution.conda_source.clone())]),
+        };
+        let stderr = "  x No solution found when resolving dependencies:\n  \
+             `-> Because isaacsim-core==6.0.0.1 depends on torch==2.11.0 and \
+                 you require torch==2.10.0, your requirements are unsatisfiable.";
+        let attributions = attribute_conflict(stderr, &req.constraints.provenance);
+        let needed = workspace_fact_override_needed(&req, &attributions, "original uv error")
+            .expect("a differing upstream exact pin must request a workspace-fact override");
+        assert_eq!(
+            needed.fact,
+            WorkspaceFactOverride {
+                pypi_name: "torch".to_string(),
+                version: "2.10.0".to_string(),
+            }
+        );
+        assert_eq!(needed.upstream_pin, "==2.11.0");
+        assert_eq!(needed.original_error, "original uv error");
+    }
+
+    #[test]
+    fn workspace_fact_override_classifier_abstains_without_proof_or_authority() {
+        let mut req = sample_request();
+        req.dependencies = vec!["isaacsim-core==6.0.0.1".to_string()];
+        let classify = |req: &UvClosureRequest, attribution: ConflictAttribution| {
+            workspace_fact_override_needed(req, &[attribution], "error")
+        };
+
+        for required in [
+            Some("==2.10.0"), // identical
+            Some("==2.10"),   // PEP 440-equivalent
+            Some(">=2.11.0"), // range
+            Some("==2.11.*"), // wildcard equality
+            Some("===not-a-version"),
+            None,
+        ] {
+            assert!(
+                classify(
+                    &req,
+                    workspace_attribution("torch", required, "2.10.0", "workspace-solved")
+                )
+                .is_none(),
+                "classifier must abstain for {required:?}"
+            );
+        }
+
+        // PEP 440 equality without a local segment accepts a local fact on
+        // the same public version, so this is not a contradiction.
+        assert!(
+            classify(
+                &req,
+                workspace_attribution(
+                    "torch",
+                    Some("==2.10.0"),
+                    "2.10.0+cu129",
+                    "workspace-solved"
+                )
+            )
+            .is_none()
+        );
+        for source in ["manifest", "cuda-major-table", "auto-route"] {
+            assert!(
+                classify(
+                    &req,
+                    workspace_attribution("torch", Some("==2.11.0"), "2.10.0", source)
+                )
+                .is_none(),
+                "non-Rule-1 source {source} must not authorize an override"
+            );
+        }
+
+        let mut direct_root = req;
+        direct_root.dependencies.push("torch==2.11.0".to_string());
+        assert!(
+            classify(
+                &direct_root,
+                workspace_attribution("torch", Some("==2.11.0"), "2.10.0", "workspace-solved")
+            )
+            .is_none(),
+            "an explicit direct root pin is user intent, not an upstream pin"
+        );
     }
 
     // ---- auto-route (spec-uv-restructure M2) -------------------------------
 
     use std::sync::{Arc, Mutex};
+
+    fn workspace_fact_needed_error(name: &str, version: &str, upstream_pin: &str) -> anyhow::Error {
+        anyhow::Error::new(WorkspaceFactOverrideNeeded {
+            fact: WorkspaceFactOverride {
+                pypi_name: name.to_string(),
+                version: version.to_string(),
+            },
+            upstream_pin: upstream_pin.to_string(),
+            original_error: format!("{name} exact-pin conflict"),
+        })
+    }
+
+    #[tokio::test]
+    async fn workspace_fact_override_retry_accumulates_torch_family() {
+        let calls = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+        let projects = Arc::new(Mutex::new(Vec::<String>::new()));
+        let solve = {
+            let calls = Arc::clone(&calls);
+            let projects = Arc::clone(&projects);
+            move |req: UvClosureRequest| {
+                let calls = Arc::clone(&calls);
+                let projects = Arc::clone(&projects);
+                Box::pin(async move {
+                    calls.lock().unwrap().push(req.overrides.clone());
+                    for (name, fact, upstream) in [
+                        ("torch", "2.10.0", "==2.11.0"),
+                        ("torchvision", "0.25.0", "==0.26.0"),
+                        ("torchaudio", "2.10.0", "==2.11.0"),
+                    ] {
+                        let line = format!("{name}=={fact}");
+                        if !req.overrides.iter().any(|candidate| candidate == &line) {
+                            return Err(workspace_fact_needed_error(name, fact, upstream));
+                        }
+                    }
+                    projects.lock().unwrap().push(synthesize_pyproject(&req));
+                    Ok(UvClosure {
+                        wheels: vec![],
+                        pins: BTreeMap::from([
+                            ("torch".to_string(), "2.10.0".to_string()),
+                            ("torchvision".to_string(), "0.25.0".to_string()),
+                            ("torchaudio".to_string(), "2.10.0".to_string()),
+                        ]),
+                        uv_version: "test".to_string(),
+                        auto_routed: vec![],
+                        auto_dropped: BTreeSet::new(),
+                    })
+                }) as futures::future::BoxFuture<'static, Result<UvClosure>>
+            }
+        };
+        let learned = Arc::new(Mutex::new(Vec::new()));
+        let mut solve = with_workspace_fact_overrides(solve, Arc::clone(&learned));
+        let mut req = sample_request();
+        req.dependencies = vec!["isaacsim-core==6.0.0.1".to_string()];
+
+        let closure = solve(req.clone()).await.unwrap();
+        assert_eq!(closure.pins["torch"], "2.10.0");
+        assert_eq!(closure.pins["torchvision"], "0.25.0");
+        assert_eq!(closure.pins["torchaudio"], "2.10.0");
+
+        let trio = |lines: &[String]| -> BTreeSet<String> {
+            lines
+                .iter()
+                .filter(|line| {
+                    matches!(
+                        override_name(line).as_deref(),
+                        Some("torch" | "torchvision" | "torchaudio")
+                    )
+                })
+                .cloned()
+                .collect()
+        };
+        let calls_after_first = calls.lock().unwrap().clone();
+        assert_eq!(calls_after_first.len(), 4);
+        assert_eq!(trio(&calls_after_first[0]), BTreeSet::new());
+        assert_eq!(
+            trio(&calls_after_first[1]),
+            BTreeSet::from(["torch==2.10.0".to_string()])
+        );
+        assert_eq!(
+            trio(&calls_after_first[2]),
+            BTreeSet::from([
+                "torch==2.10.0".to_string(),
+                "torchvision==0.25.0".to_string(),
+            ])
+        );
+        let all_three = BTreeSet::from([
+            "torch==2.10.0".to_string(),
+            "torchvision==0.25.0".to_string(),
+            "torchaudio==2.10.0".to_string(),
+        ]);
+        assert_eq!(trio(&calls_after_first[3]), all_three);
+
+        let project = projects.lock().unwrap()[0].clone();
+        let parsed: toml::Value = toml::from_str(&project).unwrap();
+        let rendered = parsed["tool"]["uv"]["override-dependencies"]
+            .as_array()
+            .unwrap();
+        for line in ["torch==2.10.0", "torchvision==0.25.0", "torchaudio==2.10.0"] {
+            assert_eq!(
+                rendered
+                    .iter()
+                    .filter(|value| value.as_str() == Some(line))
+                    .count(),
+                1,
+                "{line} must be emitted exactly once under override-dependencies"
+            );
+        }
+
+        // A later auto-route/sdist outer relock starts from a fresh base
+        // request; the shared ledger must seed all facts before its first raw
+        // solve, with no rediscovery calls.
+        solve(req).await.unwrap();
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 5);
+        assert_eq!(trio(&calls[4]), all_three);
+        assert_eq!(learned.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn workspace_fact_override_retry_respects_existing_override() {
+        for existing in ["torch>=2.9".to_string(), format!("torch ; {DROP_MARKER}")] {
+            let calls = Arc::new(Mutex::new(0usize));
+            let raw = {
+                let calls = Arc::clone(&calls);
+                move |_req: UvClosureRequest| {
+                    *calls.lock().unwrap() += 1;
+                    Box::pin(async {
+                        Err(workspace_fact_needed_error("torch", "2.10.0", "==2.11.0"))
+                    }) as futures::future::BoxFuture<'static, Result<UvClosure>>
+                }
+            };
+            let learned = Arc::new(Mutex::new(Vec::new()));
+            let mut solve = with_workspace_fact_overrides(raw, Arc::clone(&learned));
+            let mut req = sample_request();
+            req.overrides.push(existing);
+            let error = solve(req).await.unwrap_err().to_string();
+            assert!(error.contains("torch exact-pin conflict"), "{error}");
+            assert_eq!(*calls.lock().unwrap(), 1, "must not retry over user intent");
+            assert!(learned.lock().unwrap().is_empty());
+        }
+    }
 
     /// Canned repodata: conda name -> hit. Mirrors how a real channel
     /// would answer `find_route(name, ==version)`.
@@ -6301,6 +6839,7 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
         std::fs::write(&live_wheel, b"pk").unwrap();
         let facts = HealFacts {
             stamp: "stamp-under-state-1".to_string(),
+            workspace_overrides: vec![],
             routed: vec![AutoRoutedPackage {
                 pypi_name: "routed-pkg".into(),
                 conda_name: "routed-pkg".into(),
@@ -6355,6 +6894,49 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
         assert!(load_heal_facts(&facts_file, "stamp-under-state-1").is_empty());
         assert!(!facts_file.exists());
 
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn workspace_fact_override_only_heal_facts_round_trip() {
+        let tmp = std::env::temp_dir().join(format!(
+            "retread-workspace-overrides-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let facts_file = heal_facts_path(&tmp, "isaac-pack", "3.12", "linux-64");
+        let facts = HealFacts {
+            stamp: "workspace-state-1".to_string(),
+            workspace_overrides: vec![
+                WorkspaceFactOverride {
+                    pypi_name: "torch".to_string(),
+                    version: "2.10.0".to_string(),
+                },
+                WorkspaceFactOverride {
+                    pypi_name: "torchvision".to_string(),
+                    version: "0.25.0".to_string(),
+                },
+                WorkspaceFactOverride {
+                    pypi_name: "torchaudio".to_string(),
+                    version: "2.10.0".to_string(),
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(!facts.is_empty(), "override-only facts must be persisted");
+        save_heal_facts(&facts_file, &facts);
+
+        let loaded = load_heal_facts(&facts_file, "workspace-state-1");
+        assert_eq!(loaded.workspace_overrides, facts.workspace_overrides);
+        assert!(loaded.routed.is_empty());
+        assert!(loaded.built.is_empty());
+        assert!(loaded.prereleased.is_empty());
+
+        let stale = load_heal_facts(&facts_file, "workspace-state-2");
+        assert!(
+            stale.is_empty(),
+            "workspace solution changes must discard learned overrides"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
