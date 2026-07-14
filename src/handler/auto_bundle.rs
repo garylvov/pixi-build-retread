@@ -121,8 +121,7 @@ pub(crate) fn pick_conda_target(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn auto_bundle_transitives(
     bundle: &mut Bundle,
-    entry_index: &str,
-    workspace_indexes: &[String],
+    indexes: &[String],
     target: &crate::pypi::WheelTarget,
     download_dir: &Path,
     config: &RetreadConfig,
@@ -183,15 +182,6 @@ pub(crate) async fn auto_bundle_transitives(
     skip.extend(config.overrides.keys().map(|n| canonical_conda_name(n)));
     skip.extend(bundle.auto_dropped.iter().cloned());
 
-    // Fallback chain: entry's index first (for siblings on private
-    // indexes like pypi.nvidia.com), then workspace [pypi-options]
-    // indexes, then public PyPI (for the broader ecosystem -- aiodns,
-    // qdldl, ...). Public PyPI is appended by merge_index_chain when
-    // not already present; ordering and trailing-slash dedup are both
-    // handled there.
-    let indexes =
-        super::merge_index_chain(std::iter::once(entry_index.to_string()), workspace_indexes);
-
     // Fixed-point loop: each newly-bundled wheel has its own
     // Requires-Dist that may name more PyPI-only transitives, which
     // themselves should be auto-bundled (e.g. bundling torch pulls in
@@ -247,7 +237,7 @@ pub(crate) async fn auto_bundle_transitives(
         if candidates.is_empty() && loose_candidates.is_empty() {
             if jointly_unroute_unsolvable(
                 bundle,
-                &indexes,
+                indexes,
                 target,
                 download_dir,
                 config,
@@ -526,7 +516,7 @@ pub(crate) async fn auto_bundle_transitives(
         // the chain is an error because conda routing was already refused.
         let fetched: Vec<Result<(String, String, ResolvedWheel)>> = {
             use futures::stream::{self, StreamExt};
-            let indexes_ref = &indexes;
+            let indexes_ref = indexes;
             stream::iter(to_fetch)
                 .map(
                     |(name, version, conda_name, specifiers, preferred_ver)| async move {
@@ -604,7 +594,7 @@ pub(crate) async fn auto_bundle_transitives(
 
         if jointly_unroute_unsolvable(
             bundle,
-            &indexes,
+            indexes,
             target,
             download_dir,
             config,

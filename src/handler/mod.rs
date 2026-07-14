@@ -332,7 +332,7 @@ const CONDA_BUILD_V1: &str = "conda/build_v1";
 /// required by PEP 503 and kept here so `trim_end_matches('/')` in the
 /// dedup check still works (both with and without the slash normalise to
 /// the same key).
-pub(crate) const PUBLIC_PYPI: &str = "https://pypi.org/simple/";
+pub(crate) const PUBLIC_PYPI: &str = crate::workspace::DEFAULT_PYPI_INDEX;
 
 /// Build a deduplicated PyPI index chain, preserving ORDER semantics:
 /// `primary` items first, then `extra` items, then `PUBLIC_PYPI` if
@@ -1796,13 +1796,14 @@ async fn resolve_all(
 ) -> Result<(Vec<Bundle>, RetreadConfig)> {
     let mut bundles = Vec::with_capacity(config.retread_wheels.len());
 
-    // v1.3.0: workspace [pypi-options] indexes participate in
-    // auto-bundle's fallback chain (between the entry index and public
-    // PyPI), matching the cascade's chain.
-    let workspace_pypi_indexes: Vec<String> = workspace_dir
-        .and_then(crate::workspace::WorkspaceManifest::load)
-        .map(|m| m.all_pypi_index_urls())
-        .unwrap_or_default();
+    // Workspace [pypi-options] participate in wheel resolution. The
+    // auto-bundle path additionally needs the implicit default index when
+    // `index-url` was not overridden.
+    let (workspace_pypi_indexes, auto_bundle_workspace_indexes): (Vec<String>, Vec<String>) =
+        workspace_dir
+            .and_then(crate::workspace::WorkspaceManifest::load)
+            .map(|m| (m.all_pypi_index_urls(), m.auto_bundle_pypi_index_urls()))
+            .unwrap_or_else(|| (Vec::new(), vec![PUBLIC_PYPI.to_string()]));
 
     // Load parselmouth once and reuse across bundles. We also merge it
     // into the effective name-map: when parselmouth says PyPI name X
@@ -2092,7 +2093,7 @@ async fn resolve_all(
         // they have no PyPI index to resolve from).
         let auto_index: Option<String> = group_entries.iter().find_map(|(_, e)| {
             if e.url.is_none() {
-                Some(e.index_url())
+                e.index.clone()
             } else {
                 None
             }
@@ -2118,18 +2119,18 @@ async fn resolve_all(
                     .collect()
             });
         if effective.auto_bundle || uv_closure.is_some() {
-            // An all-URL group has no entry index, but rejected routes still
-            // have to return to PyPI. Start at the workspace indexes/public
-            // PyPI in that case; exhaustion produces the normal explicit
-            // auto-bundle fetch error rather than bypassing validation.
-            let idx = auto_index
-                .as_deref()
-                .or_else(|| workspace_pypi_indexes.first().map(String::as_str))
-                .unwrap_or("https://pypi.org/simple");
+            let mut auto_indexes = auto_index.into_iter().collect::<Vec<_>>();
+            for index in &auto_bundle_workspace_indexes {
+                if !auto_indexes
+                    .iter()
+                    .any(|existing| existing.trim_end_matches('/') == index.trim_end_matches('/'))
+                {
+                    auto_indexes.push(index.clone());
+                }
+            }
             auto_bundle_transitives(
                 &mut bundle,
-                idx,
-                &workspace_pypi_indexes,
+                &auto_indexes,
                 target,
                 download_dir,
                 &effective,

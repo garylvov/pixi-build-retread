@@ -19,6 +19,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+pub(crate) const DEFAULT_PYPI_INDEX: &str = "https://pypi.org/simple/";
+
 /// Parsed workspace pixi.toml. Only the fields retread cares about.
 #[derive(Debug, Default, Clone)]
 pub struct WorkspaceManifest {
@@ -70,6 +72,9 @@ pub struct WorkspaceManifest {
     /// indexes are consulted when bundling PyPI-only deps, not just
     /// the `[retread-wheels]` entry indexes.
     pub pypi_index_urls: Vec<String>,
+    /// Whether top-level `[pypi-options]` explicitly replaces the default
+    /// PyPI index via `index-url`.
+    pypi_index_url_overridden: bool,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -206,7 +211,7 @@ impl WorkspaceManifest {
         }
 
         // v1.3.0: top-level [pypi-options] index URLs.
-        out.pypi_index_urls = parse_pypi_index_urls(parsed);
+        (out.pypi_index_urls, out.pypi_index_url_overridden) = parse_pypi_index_urls(parsed);
 
         if let Some(envs) = parsed.get("environments").and_then(|v| v.as_table()) {
             for (name, value) in envs {
@@ -253,7 +258,7 @@ impl WorkspaceManifest {
                         }
                     }
                     // v1.3.0: per-feature [pypi-options] index URLs.
-                    def.pypi_index_urls = parse_pypi_index_urls(fvalue);
+                    (def.pypi_index_urls, _) = parse_pypi_index_urls(fvalue);
                 }
                 out.features.insert(name.clone(), def);
             }
@@ -336,6 +341,24 @@ impl WorkspaceManifest {
         for url in all {
             if !out.contains(url) {
                 out.push(url.clone());
+            }
+        }
+        out
+    }
+
+    /// Full auto-bundle index chain: the workspace's explicit `index-url`,
+    /// or the implicit public PyPI default, followed by every declared extra.
+    pub fn auto_bundle_pypi_index_urls(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if !self.pypi_index_url_overridden {
+            out.push(DEFAULT_PYPI_INDEX.to_string());
+        }
+        for url in self.all_pypi_index_urls() {
+            if !out
+                .iter()
+                .any(|existing| existing.trim_end_matches('/') == url.trim_end_matches('/'))
+            {
+                out.push(url);
             }
         }
         out
@@ -1110,20 +1133,20 @@ fn parse_pypi_dependencies(container: &toml::Value) -> BTreeMap<String, String> 
 /// `container` (the manifest root, or a `[feature.X]` table value):
 /// `index-url` first (it replaces pixi's default index, so it leads
 /// the fallback chain), then `extra-index-urls` in declaration order.
-fn parse_pypi_index_urls(container: &toml::Value) -> Vec<String> {
+fn parse_pypi_index_urls(container: &toml::Value) -> (Vec<String>, bool) {
     let mut out = Vec::new();
     let Some(opts) = container
         .get("pypi-options")
         .or_else(|| container.get("pypi_options"))
         .and_then(|v| v.as_table())
     else {
-        return out;
+        return (out, false);
     };
-    if let Some(url) = opts
+    let index_url = opts
         .get("index-url")
         .or_else(|| opts.get("index_url"))
-        .and_then(|v| v.as_str())
-    {
+        .and_then(|v| v.as_str());
+    if let Some(url) = index_url {
         out.push(url.to_string());
     }
     if let Some(extra) = opts
@@ -1133,7 +1156,7 @@ fn parse_pypi_index_urls(container: &toml::Value) -> Vec<String> {
     {
         out.extend(extra.iter().filter_map(|v| v.as_str().map(String::from)));
     }
-    out
+    (out, index_url.is_some())
 }
 
 /// v0.37.0+ (D1): parse one `[system-requirements]` value. pixi allows
@@ -1828,6 +1851,57 @@ index-url = "https://pypi.nvidia.com"
                 "https://pypi.nvidia.com".to_string(),
                 "https://download.pytorch.org/whl/cu128".to_string(),
                 "https://py.mujoco.org".to_string(),
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn extra_indexes_keep_default_pypi_for_flatdict_resolution() {
+        use std::str::FromStr;
+
+        let ws = ws_toml(
+            r#"
+[workspace]
+channels = ["conda-forge"]
+
+[pypi-options]
+extra-index-urls = ["https://pypi.nvidia.com", "https://py.mujoco.org"]
+"#,
+        );
+        let indexes = ws.auto_bundle_pypi_index_urls();
+        assert_eq!(indexes[0], DEFAULT_PYPI_INDEX);
+
+        let specifiers =
+            uv_pep508::uv_pep440::VersionSpecifiers::from_str(">=4.0.1,<4.1").unwrap();
+        let mut resolved = None;
+        let mut errors = Vec::new();
+        for index in &indexes {
+            match crate::pypi::resolve_sdist(index, "flatdict", &specifiers).await {
+                Ok((version, _)) => {
+                    resolved = Some(version.to_string());
+                    break;
+                }
+                Err(error) => errors.push(format!("{index}: {error:#}")),
+            }
+        }
+        assert_eq!(
+            resolved.as_deref(),
+            Some("4.0.1"),
+            "default PyPI must resolve flatdict before unrelated extras: {errors:?}",
+        );
+
+        let overridden = ws_toml(
+            r#"
+[pypi-options]
+index-url = "https://packages.example/simple"
+extra-index-urls = ["https://extra.example/simple"]
+"#,
+        );
+        assert_eq!(
+            overridden.auto_bundle_pypi_index_urls(),
+            vec![
+                "https://packages.example/simple".to_string(),
+                "https://extra.example/simple".to_string(),
             ],
         );
     }
