@@ -1923,6 +1923,7 @@ async fn resolve_all(
             &group_name,
             &group_entries,
             &effective,
+            &config.name_map,
             target,
             cache_dir,
             source_dir,
@@ -2426,8 +2427,8 @@ struct WorkspaceCondaFacts {
     /// present only when every consuming environment selected the same
     /// version of the mapped conda package.
     common_pypi: BTreeMap<String, SolvedPypiFact>,
-    /// Common selected versions by canonical conda name (used by the existing
-    /// harmonization path and by source-only compatibility checks).
+    /// Common selected versions for exact conda names directly owned by every
+    /// precise consumer (Rule-3 and harmonization authority).
     common_conda_versions: BTreeMap<String, String>,
     /// Full exact selected specs per consuming environment. These are never
     /// ownership evidence; they are the immutable baseline for route trials.
@@ -2440,6 +2441,34 @@ struct WorkspaceCondaFacts {
 struct SolvedPypiFact {
     conda_name: String,
     version: String,
+}
+
+/// Direct dependency inputs for one concrete environment that consumes the
+/// pack. This is the only manifest-selection seam allowed to authorize
+/// workspace-solved Rule-3 facts; feature-only and all-feature fallbacks are
+/// deliberately excluded.
+#[derive(Debug, Clone)]
+struct PreciseConsumerInput {
+    env: String,
+    conda_deps: BTreeMap<String, String>,
+    pypi_deps: BTreeMap<String, String>,
+}
+
+fn precise_consumer_inputs(
+    manifest: &crate::workspace::WorkspaceManifest,
+    workspace_dir: &Path,
+    source_dir: &Path,
+) -> Option<Vec<PreciseConsumerInput>> {
+    let envs = manifest.precise_consuming_envs(workspace_dir, source_dir)?;
+    Some(
+        envs.into_iter()
+            .map(|env| PreciseConsumerInput {
+                conda_deps: manifest.effective_dependencies(&env),
+                pypi_deps: manifest.effective_pypi_dependencies(&env),
+                env,
+            })
+            .collect(),
+    )
 }
 
 /// Intersection of direct dependency names across every precise consumer.
@@ -2491,14 +2520,23 @@ fn facts_from_solved_records(
         })
         .collect();
 
-    let mut common_conda_versions = per_env_versions
+    let mut common_selected_versions = per_env_versions
         .values()
         .next()
         .cloned()
         .unwrap_or_default();
     for versions in per_env_versions.values().skip(1) {
-        common_conda_versions.retain(|name, version| versions.get(name) == Some(version));
+        common_selected_versions.retain(|name, version| versions.get(name) == Some(version));
     }
+
+    // Only an exact conda package name directly declared by every precise
+    // consumer can authorize Rule 3 or harmonization. Solved transitives stay
+    // in env_exact_specs for route validation/fingerprinting, but a direct
+    // `pytorch-gpu` declaration can never manufacture a `pytorch` fact.
+    let common_conda_versions: BTreeMap<String, String> = common_selected_versions
+        .into_iter()
+        .filter(|(name, _)| owned_conda.contains(name))
+        .collect();
 
     // A mapping edge is the identity/provenance proof. Unmapped conda names
     // are not guessed to be PyPI distributions (tetgen-style same-name
@@ -2551,6 +2589,35 @@ fn facts_from_solved_records(
     }
 }
 
+/// Convert only precise, agreed workspace facts into the provenance-tagged
+/// constraints that can authorize uv Rule 3.
+fn workspace_fact_constraints(
+    facts: &WorkspaceCondaFacts,
+    manual_overrides: &BTreeSet<String>,
+) -> crate::uv_closure::ConstraintSet {
+    let mut constraints = crate::uv_closure::ConstraintSet::default();
+    for (pypi_name, fact) in &facts.common_pypi {
+        if manual_overrides.contains(pypi_name)
+            || uv_pep508::uv_pep440::Version::from_str(&fact.version).is_err()
+        {
+            continue;
+        }
+        let line = format!("{pypi_name}=={}", fact.version);
+        constraints.constraints.push(line.clone());
+        constraints.provenance.insert(
+            pypi_name.clone(),
+            crate::uv_closure::ConstraintProvenance {
+                constraint: line,
+                conda_name: fact.conda_name.clone(),
+                conda_version: format!("=={}", fact.version),
+                source: "workspace-solved".to_string(),
+                env: "precise-consuming-envs".to_string(),
+            },
+        );
+    }
+    constraints
+}
+
 /// Solve each precise consuming environment independently. Destructive
 /// behavior is enabled only when the workspace can map this source package to
 /// concrete active environments and every environment solve succeeds.
@@ -2563,7 +2630,7 @@ async fn solve_workspace_conda_facts(
     name_map: &BTreeMap<String, String>,
     bundle_name: &str,
 ) -> WorkspaceCondaFacts {
-    let Some(envs) = manifest.precise_consuming_envs(workspace_dir, source_dir) else {
+    let Some(inputs) = precise_consumer_inputs(manifest, workspace_dir, source_dir) else {
         tracing::debug!(
             bundle = %bundle_name,
             "conda facts: pack-to-environment ownership is ambiguous; abstaining",
@@ -2571,14 +2638,12 @@ async fn solve_workspace_conda_facts(
         return WorkspaceCondaFacts::default();
     };
 
-    let conda_deps: Vec<BTreeMap<String, String>> = envs
+    let conda_deps: Vec<BTreeMap<String, String>> = inputs
         .iter()
-        .map(|env| manifest.effective_dependencies(env))
+        .map(|input| input.conda_deps.clone())
         .collect();
-    let pypi_deps: Vec<BTreeMap<String, String>> = envs
-        .iter()
-        .map(|env| manifest.effective_pypi_dependencies(env))
-        .collect();
+    let pypi_deps: Vec<BTreeMap<String, String>> =
+        inputs.iter().map(|input| input.pypi_deps.clone()).collect();
     let owned_conda = dependency_name_intersection(&conda_deps);
     let owned_pypi = dependency_name_intersection(&pypi_deps);
 
@@ -2593,40 +2658,41 @@ async fn solve_workspace_conda_facts(
         Some("disabled") => rattler_solve::ChannelPriority::Disabled,
         _ => rattler_solve::ChannelPriority::Strict,
     };
-    let solves =
-        futures::future::join_all(envs.iter().zip(conda_deps.iter()).map(|(env, deps)| {
-            let mut specs: Vec<String> = deps
-                .iter()
-                .filter_map(|(name, spec)| {
-                    let name = canonical_conda_name(name);
-                    if name == canonical_conda_name(bundle_name) {
-                        return None;
-                    }
-                    let spec = spec.trim();
-                    Some(if spec.is_empty() || spec == "*" {
-                        name
-                    } else {
-                        format!("{name} {spec}")
-                    })
+    let solves = futures::future::join_all(inputs.iter().map(|input| {
+        let env = &input.env;
+        let deps = &input.conda_deps;
+        let mut specs: Vec<String> = deps
+            .iter()
+            .filter_map(|(name, spec)| {
+                let name = canonical_conda_name(name);
+                if name == canonical_conda_name(bundle_name) {
+                    return None;
+                }
+                let spec = spec.trim();
+                Some(if spec.is_empty() || spec == "*" {
+                    name
+                } else {
+                    format!("{name} {spec}")
                 })
-                .collect();
-            specs.push(format!("python {}.*", target.python_version));
-            let sysreqs = manifest.effective_system_requirements(env);
-            async move {
-                let result = crate::conda_solve::solve_selected_records(
-                    conda_channels,
-                    &specs,
-                    &target.python_version,
-                    &target.conda_subdir,
-                    channel_priority,
-                    &sysreqs,
-                    rattler_solve::SolveStrategy::Highest,
-                )
-                .await;
-                (env.clone(), result)
-            }
-        }))
-        .await;
+            })
+            .collect();
+        specs.push(format!("python {}.*", target.python_version));
+        let sysreqs = manifest.effective_system_requirements(env);
+        async move {
+            let result = crate::conda_solve::solve_selected_records(
+                conda_channels,
+                &specs,
+                &target.python_version,
+                &target.conda_subdir,
+                channel_priority,
+                &sysreqs,
+                rattler_solve::SolveStrategy::Highest,
+            )
+            .await;
+            (env.clone(), result)
+        }
+    }))
+    .await;
 
     let mut env_records = BTreeMap::new();
     for (env, result) in solves {
@@ -2656,6 +2722,7 @@ async fn uv_group_closure(
     group_name: &str,
     group_entries: &[(String, WheelEntry)],
     effective: &RetreadConfig,
+    fact_name_map: &BTreeMap<String, String>,
     target: &WheelTarget,
     cache_dir: &Path,
     source_dir: &Path,
@@ -2783,26 +2850,26 @@ async fn uv_group_closure(
     }
 
     let manifest_opt = workspace_dir.and_then(crate::workspace::WorkspaceManifest::load);
-    let mut workspace_facts =
-        if effective.route_policy == crate::config::RoutePolicy::PreferCondaValidated {
-            match (manifest_opt.as_ref(), workspace_dir) {
-                (Some(manifest), Some(ws_dir)) => {
-                    solve_workspace_conda_facts(
-                        manifest,
-                        ws_dir,
-                        source_dir,
-                        target,
-                        conda_channels,
-                        &effective.name_map,
-                        group_name,
-                    )
-                    .await
-                }
-                _ => WorkspaceCondaFacts::default(),
-            }
-        } else {
-            WorkspaceCondaFacts::default()
-        };
+    // Solve precise consuming environments for every policy. Ownership/drop
+    // actions remain validated-policy-only below, but Rule 3 and
+    // harmonization must never fall back to non-consuming feature unions.
+    // Only the pack's declared map may establish PyPI -> conda fact identity;
+    // fallback/parselmouth routing aliases are not fact authority.
+    let mut workspace_facts = match (manifest_opt.as_ref(), workspace_dir) {
+        (Some(manifest), Some(ws_dir)) => {
+            solve_workspace_conda_facts(
+                manifest,
+                ws_dir,
+                source_dir,
+                target,
+                conda_channels,
+                fact_name_map,
+                group_name,
+            )
+            .await
+        }
+        _ => WorkspaceCondaFacts::default(),
+    };
     if effective.route_policy == crate::config::RoutePolicy::PreferCondaValidated {
         let manual: BTreeSet<String> = effective
             .overrides
@@ -2845,67 +2912,45 @@ async fn uv_group_closure(
         return Ok((None, std::collections::BTreeSet::new(), workspace_facts));
     }
 
-    // Conda facts -> uv constraints, with provenance. The validated policy
-    // uses exact records selected independently for every precise consuming
-    // environment and keeps only facts shared by all of them. Legacy policies
-    // retain the declared-spec constraint path so their routing semantics do
-    // not silently change.
-    let mut constraints =
-        if effective.route_policy == crate::config::RoutePolicy::PreferCondaValidated {
-            let manual: BTreeSet<String> = effective
-                .overrides
-                .keys()
-                .map(|name| canonical_conda_name(name))
-                .collect();
-            let mut constraints = crate::uv_closure::ConstraintSet::default();
-            for (pypi_name, fact) in &workspace_facts.common_pypi {
-                if manual.contains(pypi_name)
-                    || uv_pep508::uv_pep440::Version::from_str(&fact.version).is_err()
-                {
-                    continue;
-                }
-                let line = format!("{pypi_name}=={}", fact.version);
-                constraints.constraints.push(line.clone());
-                constraints.provenance.insert(
-                    pypi_name.clone(),
-                    crate::uv_closure::ConstraintProvenance {
-                        constraint: line,
-                        conda_name: fact.conda_name.clone(),
-                        conda_version: format!("=={}", fact.version),
-                        source: "workspace-solved".to_string(),
-                        env: "precise-consuming-envs".to_string(),
-                    },
+    // Rule-3-capable policies receive only precise, solved, agreed facts.
+    // Aggressive deliberately retains its legacy declared-constraint input,
+    // whose non-workspace-solved provenance cannot authorize Rule 3.
+    let manual: BTreeSet<String> = effective
+        .overrides
+        .keys()
+        .map(|name| canonical_conda_name(name))
+        .collect();
+    let mut constraints = match effective.route_policy {
+        crate::config::RoutePolicy::PreferCondaValidated | crate::config::RoutePolicy::Minimal => {
+            workspace_fact_constraints(&workspace_facts, &manual)
+        }
+        crate::config::RoutePolicy::Aggressive => match (manifest_opt.as_ref(), workspace_dir) {
+            (Some(manifest), Some(ws_dir)) => {
+                let deps = unambiguous_consuming_deps(
+                    &manifest.consuming_env_dependencies(ws_dir, source_dir),
                 );
+                let global_map = load_pypi_to_conda_map().await;
+                crate::uv_closure::build_constraints(
+                    &deps,
+                    &effective.name_map,
+                    &global_map,
+                    "manifest",
+                    "consuming-envs",
+                )
             }
-            constraints
-        } else {
-            match (manifest_opt.as_ref(), workspace_dir) {
-                (Some(manifest), Some(ws_dir)) => {
-                    let deps = unambiguous_consuming_deps(
-                        &manifest.consuming_env_dependencies(ws_dir, source_dir),
-                    );
-                    let global_map = load_pypi_to_conda_map().await;
-                    crate::uv_closure::build_constraints(
-                        &deps,
-                        &effective.name_map,
-                        &global_map,
-                        "manifest",
-                        "consuming-envs",
-                    )
-                }
-                (Some(manifest), None) => {
-                    let deps = manifest.effective_dependencies("default");
-                    crate::uv_closure::build_constraints(
-                        &deps,
-                        &effective.name_map,
-                        &PypiToCondaMap::new(),
-                        "manifest",
-                        "default",
-                    )
-                }
-                _ => Default::default(),
+            (Some(manifest), None) => {
+                let deps = manifest.effective_dependencies("default");
+                crate::uv_closure::build_constraints(
+                    &deps,
+                    &effective.name_map,
+                    &PypiToCondaMap::new(),
+                    "manifest",
+                    "default",
+                )
             }
-        };
+            _ => Default::default(),
+        },
+    };
     // Proactive cuda-major capping (belt to the auto-route co-install
     // check's suspenders): derive this pack's actual consuming env(s)'
     // `cuda-version` anchor via `consuming_env_dependencies` (env-scoped,
@@ -3443,68 +3488,12 @@ async fn uv_group_closure(
                 as futures::future::BoxFuture<'static, crate::uv_closure::CoInstallVerdict>
         }
     };
-    // Run-34: solve the consuming envs' workspace deps ALONE (no routed
-    // pins) once per bundle, so the fixpoint's unsat path can HARMONIZE a
-    // routed package toward the version the workspace actually provides
-    // (`pytorch` 2.7.0 via the hand-written `pytorch-gpu ==2.7.0`)
-    // instead of un-routing it into a wrong-version wheel. Best-effort:
-    // any failure (no manifest, no repodata, workspace deps themselves
-    // unsat) degrades to an empty map = the pre-harmonization un-route
-    // behavior.
+    // Harmonization shares Rule 3's precise authority: exact conda names
+    // selected identically in every concrete consumer. Ambiguous ownership,
+    // failed solves, transitive-only names, or disagreement leave the map
+    // empty and the fixpoint abstains to its un-route fallback.
     let mut auto_route_opts = auto_route_opts;
-    if effective.route_policy == crate::config::RoutePolicy::PreferCondaValidated {
-        auto_route_opts.workspace_conda_versions = workspace_facts.common_conda_versions.clone();
-    } else if let Some(m) = manifest_opt.as_ref()
-        && let Some(ws_dir) = workspace_dir
-    {
-        let channel_priority = match m.channel_priority.as_deref() {
-            Some("disabled") => rattler_solve::ChannelPriority::Disabled,
-            _ => rattler_solve::ChannelPriority::Strict,
-        };
-        let system_requirements = m.consuming_env_system_requirements(ws_dir, source_dir);
-        let workspace_deps = m.consuming_env_dependencies(ws_dir, source_dir);
-        let mut specs: Vec<String> = Vec::new();
-        for (name, specs_for_name) in &workspace_deps {
-            let conda_name = canonical_conda_name(name);
-            if conda_name == canonical_conda_name(group_name) {
-                continue;
-            }
-            for spec in specs_for_name {
-                if spec.trim().is_empty() || spec.trim() == "*" {
-                    specs.push(conda_name.clone());
-                } else {
-                    specs.push(format!("{conda_name} {spec}"));
-                }
-            }
-        }
-        if !specs.is_empty() {
-            specs.push(format!("python {}.*", target.python_version));
-            match crate::conda_solve::solve_selected_records(
-                conda_channels,
-                &specs,
-                &target.python_version,
-                &target.conda_subdir,
-                channel_priority,
-                &system_requirements,
-                rattler_solve::SolveStrategy::Highest,
-            )
-            .await
-            {
-                Ok(records) => {
-                    auto_route_opts.workspace_conda_versions =
-                        restrict_workspace_conda_versions(&workspace_deps, &records);
-                }
-                Err(reasons) => {
-                    tracing::debug!(
-                        bundle = %group_name,
-                        reasons = ?reasons,
-                        "auto-route: workspace-deps solve for harmonization \
-                         unavailable; un-route fallback only",
-                    );
-                }
-            }
-        }
-    }
+    auto_route_opts.workspace_conda_versions = workspace_facts.common_conda_versions.clone();
     let mut closure = match crate::uv_closure::auto_route_fixpoint_checked(
         &req,
         &auto_route_opts,
@@ -3594,83 +3583,6 @@ async fn uv_group_closure(
         },
     );
     Ok((Some(closure), deps_from_floor_names, workspace_facts))
-}
-
-/// Run-35 fix (design flaw 1 + 2, from the holosoma regression): narrows
-/// the full transitive workspace-deps solve (`records`, hundreds of
-/// packages) down to what hand-written intent actually FORCES, for
-/// [`crate::uv_closure::AutoRouteOptions::workspace_conda_versions`].
-///
-/// The prior implementation took every solved record verbatim as
-/// "workspace truth", so harmonization treated every free-floating
-/// uv/conda pick (e.g. `grpcio`) as a hand-written pin and re-locked
-/// packs' uv closures under many spurious `==` constraints, shifting
-/// Requires-Dist dedup winners and breaking previously-green packs
-/// (holosoma, run 35).
-///
-/// Restricted set = records whose name is a directly-pinned workspace
-/// dependency (a real, non-wildcard spec in `workspace_deps` -- i.e. a
-/// hand-written `[feature.*.dependencies]` entry, not `"*"`), PLUS the
-/// DIRECT `depends` of those pinned records in this solution. The
-/// second half is what makes conda accelerator meta-packages resolve
-/// correctly without a separate name-translation table: the workspace
-/// pin is often on a selector meta-package (e.g. `pytorch-gpu
-/// ==2.7.0`), while auto-route's routed conda name is the underlying
-/// real package (`pytorch`) that the meta-package's own `depends`
-/// names -- so walking one hop of `depends` surfaces `pytorch ==2.7.0`
-/// under the key harmonization actually looks up by
-/// (`pkg.conda_name`), without pulling in the meta-package's other,
-/// un-pinned transitives.
-fn restrict_workspace_conda_versions(
-    workspace_deps: &BTreeMap<String, Vec<String>>,
-    records: &[rattler_conda_types::RepoDataRecord],
-) -> BTreeMap<String, String> {
-    let pinned_names: HashSet<String> = workspace_deps
-        .iter()
-        .filter(|(_, specs_for_name)| {
-            specs_for_name
-                .iter()
-                .any(|s| !(s.trim().is_empty() || s.trim() == "*"))
-        })
-        .map(|(name, _)| canonical_conda_name(name))
-        .collect();
-    let all: std::collections::HashMap<String, String> = records
-        .iter()
-        .map(|r| {
-            (
-                r.package_record.name.as_normalized().to_string(),
-                r.package_record.version.version().to_string(),
-            )
-        })
-        .collect();
-    let mut restricted: BTreeMap<String, String> = BTreeMap::new();
-    for record in records {
-        let name = record.package_record.name.as_normalized();
-        if !pinned_names.contains(name) {
-            continue;
-        }
-        if let Some(v) = all.get(name) {
-            restricted.insert(name.to_string(), v.clone());
-        }
-        for dep in &record.package_record.depends {
-            let Ok(spec) = rattler_conda_types::MatchSpec::from_str(
-                dep,
-                rattler_conda_types::ParseStrictness::Lenient,
-            ) else {
-                continue;
-            };
-            let dep_name = match spec.name.as_ref() {
-                Some(rattler_conda_types::PackageNameMatcher::Exact(n)) => n.as_normalized(),
-                _ => continue,
-            };
-            if let Some(v) = all.get(dep_name) {
-                restricted
-                    .entry(dep_name.to_string())
-                    .or_insert_with(|| v.clone());
-            }
-        }
-    }
-    restricted
 }
 
 /// Collapses [`crate::workspace::WorkspaceManifest::consuming_env_dependencies`]'
@@ -3808,9 +3720,10 @@ mod facts_cleanup_tests {
 }
 
 #[cfg(test)]
-mod restrict_workspace_conda_versions_tests {
+mod workspace_conda_facts_tests {
     use super::{
-        dependency_name_intersection, facts_from_solved_records, restrict_workspace_conda_versions,
+        dependency_name_intersection, facts_from_solved_records, precise_consumer_inputs,
+        workspace_fact_constraints,
     };
     use rattler_conda_types::{PackageRecord, RepoDataRecord, VersionWithSource};
     use std::collections::{BTreeMap, BTreeSet};
@@ -3836,72 +3749,127 @@ mod restrict_workspace_conda_versions_tests {
         }
     }
 
-    /// Run-35 regression guard (design flaw 1): a workspace pin on a
-    /// hand-written package (`pytorch-gpu`) must survive into the
-    /// restricted map, but a free-floating transitive the solve merely
-    /// happened to pick (`grpcio`, unpinned/no workspace entry at all)
-    /// must NOT -- that's exactly the over-broad map that shifted
-    /// holosoma-pack's uv closure and broke a previously-green pack.
     #[test]
-    fn excludes_unpinned_transitives_like_grpcio() {
-        let workspace_deps =
-            BTreeMap::from([("pytorch-gpu".to_string(), vec!["==2.7.0".to_string()])]);
-        let records = vec![
-            repo_record("pytorch-gpu", "2.7.0", &["pytorch ==2.7.0"]),
-            repo_record("pytorch", "2.7.0", &[]),
-            repo_record("grpcio", "1.71.0", &[]),
-        ];
-        let restricted = restrict_workspace_conda_versions(&workspace_deps, &records);
-        assert!(
-            !restricted.contains_key("grpcio"),
-            "unpinned transitive must not enter the harmonization map: {restricted:?}"
-        );
-    }
+    fn rule3_uses_single_precise_consuming_env_fact() {
+        let tmp = std::env::temp_dir().join(format!(
+            "retread-rule3-sage-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let pack_dir = tmp.join("sage-isaac-pack");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        std::fs::write(
+            tmp.join("pixi.toml"),
+            r#"[workspace]
+channels = ["conda-forge"]
+platforms = ["linux-64"]
 
-    /// Run-35 design flaw 2 (name mapping): the workspace pin lives on
-    /// the accelerator meta-package name (`pytorch-gpu`), but auto-route
-    /// looks up harmonization by the REAL routed conda name (`pytorch`,
-    /// what `pytorch-gpu` itself `depends` on). One hop of `depends`
-    /// must surface `pytorch` at the pinned version without requiring a
-    /// separate pypi<->conda translation table.
-    #[test]
-    fn surfaces_meta_package_direct_dependency_by_real_name() {
-        let workspace_deps =
-            BTreeMap::from([("pytorch-gpu".to_string(), vec!["==2.7.0".to_string()])]);
-        let records = vec![
-            repo_record(
-                "pytorch-gpu",
-                "2.7.0",
-                &["pytorch ==2.7.0", "cuda-version >=12"],
-            ),
-            repo_record("pytorch", "2.7.0", &[]),
-            repo_record("cuda-version", "12.4", &[]),
-        ];
-        let restricted = restrict_workspace_conda_versions(&workspace_deps, &records);
+[feature.sage.dependencies]
+sage-isaac-pack = { path = "./sage-isaac-pack" }
+pytorch = "==2.5.1"
+cuda-version = "==12.4"
+python = ">=3.10.12,<3.11"
+
+[feature.gpu.dependencies]
+pytorch-gpu = "==2.10.0"
+
+[environments]
+sage = { features = ["sage"], no-default-feature = true }
+gpu = { features = ["gpu"], no-default-feature = true }
+"#,
+        )
+        .unwrap();
+        let manifest = crate::workspace::WorkspaceManifest::load(&tmp).unwrap();
+        let inputs = precise_consumer_inputs(&manifest, &tmp, &pack_dir).unwrap();
+
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].env, "sage");
         assert_eq!(
-            restricted.get("pytorch").map(String::as_str),
-            Some("2.7.0"),
-            "harmonization lookup keys by the real conda name (pytorch), \
-             not the meta-package (pytorch-gpu) it was pinned under: {restricted:?}"
+            inputs[0].conda_deps.get("pytorch").map(String::as_str),
+            Some("==2.5.1")
         );
+        assert!(!inputs[0].conda_deps.contains_key("pytorch-gpu"));
+
+        let owned_conda = dependency_name_intersection(
+            &inputs
+                .iter()
+                .map(|input| input.conda_deps.clone())
+                .collect::<Vec<_>>(),
+        );
+        let facts = facts_from_solved_records(
+            BTreeMap::from([(
+                inputs[0].env.clone(),
+                vec![repo_record("pytorch", "2.5.1", &[])],
+            )]),
+            owned_conda,
+            BTreeSet::new(),
+            &BTreeMap::from([("torch".to_string(), "pytorch".to_string())]),
+            "sage-isaac-pack",
+        );
+        let constraints = workspace_fact_constraints(&facts, &BTreeSet::new());
+        assert_eq!(constraints.constraints, vec!["torch==2.5.1"]);
+        assert_eq!(constraints.provenance["torch"].source, "workspace-solved");
+        assert_eq!(constraints.provenance["torch"].conda_name, "pytorch");
+
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn rule3_does_not_alias_pytorch_gpu_to_pytorch() {
+        let facts = facts_from_solved_records(
+            BTreeMap::from([(
+                "sage".to_string(),
+                vec![
+                    repo_record("pytorch-gpu", "2.10.0", &["pytorch ==2.10.0"]),
+                    repo_record("pytorch", "2.10.0", &[]),
+                ],
+            )]),
+            BTreeSet::from(["pytorch-gpu".to_string()]),
+            BTreeSet::new(),
+            &BTreeMap::from([("torch".to_string(), "pytorch".to_string())]),
+            "sage-isaac-pack",
+        );
+
         assert!(
-            restricted.contains_key("cuda-version"),
-            "every direct dep of a pinned record is a hand-written-forced \
-             version, not just the first one: {restricted:?}"
+            !facts.common_conda_versions.contains_key("pytorch"),
+            "a transitive pytorch record selected by pytorch-gpu is not direct-name authority"
+        );
+        assert!(!facts.common_pypi.contains_key("torch"));
+        assert!(
+            workspace_fact_constraints(&facts, &BTreeSet::new())
+                .constraints
+                .is_empty()
         );
     }
 
-    /// A workspace entry with a wildcard spec ("*") is NOT hand-written
-    /// intent -- it must not be treated as pinned even if the solve
-    /// happens to pick some version for it.
     #[test]
-    fn wildcard_workspace_entry_is_not_pinned() {
-        let workspace_deps = BTreeMap::from([("numpy".to_string(), vec!["*".to_string()])]);
-        let records = vec![repo_record("numpy", "2.1.0", &[])];
-        let restricted = restrict_workspace_conda_versions(&workspace_deps, &records);
+    fn rule3_abstains_when_precise_consumers_disagree() {
+        let facts = facts_from_solved_records(
+            BTreeMap::from([
+                (
+                    "sage-a".to_string(),
+                    vec![repo_record("pytorch", "2.5.1", &[])],
+                ),
+                (
+                    "sage-b".to_string(),
+                    vec![repo_record("pytorch", "2.6.0", &[])],
+                ),
+            ]),
+            BTreeSet::from(["pytorch".to_string()]),
+            BTreeSet::new(),
+            &BTreeMap::from([("torch".to_string(), "pytorch".to_string())]),
+            "sage-isaac-pack",
+        );
+
+        assert!(!facts.common_conda_versions.contains_key("pytorch"));
+        assert!(!facts.common_pypi.contains_key("torch"));
         assert!(
-            !restricted.contains_key("numpy"),
-            "a wildcard workspace spec is not hand-written intent: {restricted:?}"
+            workspace_fact_constraints(&facts, &BTreeSet::new())
+                .constraints
+                .is_empty()
         );
     }
 

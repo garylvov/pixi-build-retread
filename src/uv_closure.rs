@@ -218,17 +218,12 @@ pub struct AutoRouteOptions {
     /// conflict one iteration later. Empty in tests/probes that don't
     /// supply it -- the check then simply has no anchor to contradict.
     pub abi_anchor_pins: BTreeMap<String, String>,
-    /// Conda name -> version the pack's CONSUMING envs' workspace solve
-    /// picks (hand-written pins + their full transitive closure, solved
-    /// against the workspace channels by the handler before the fixpoint
-    /// runs). Run-34 doctrine source: when the co-install check is unsat
-    /// and names a routed package present in this map at a DIFFERENT
-    /// version, the workspace's pick is truth -- the routed package is
-    /// HARMONIZED (pypi side re-pinned to the workspace version and the
-    /// closure re-locked) instead of un-routed, because un-routing would
-    /// ship a wheel at the wrong version that clobbers the conda package
-    /// the workspace installs (torch 2.10.0 wheel over conda pytorch
-    /// 2.7.0). Empty (tests / no workspace / workspace solve failed) --
+    /// Exact conda name -> version selected identically by every precise
+    /// consuming environment, restricted to packages directly declared by
+    /// all of them. When the co-install check is unsat and names a routed
+    /// package present here at a different version, the route is harmonized
+    /// to this agreed fact. Ambiguous ownership, transitive-only names,
+    /// failed solves, or cross-environment disagreement leave the name out;
     /// the un-route fallback then behaves exactly as before.
     pub workspace_conda_versions: BTreeMap<String, String>,
     /// Canonical PyPI names directly owned by every precisely identified
@@ -5626,13 +5621,10 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
         }
     }
 
-    /// Run-34 doctrine: a routed package the co-install unsat names,
-    /// whose conda name the WORKSPACE solve pins at a different version
-    /// (torch 2.10.0 uv pick vs conda pytorch 2.7.0 via the hand-written
-    /// pytorch-gpu ==2.7.0), is HARMONIZED -- pypi side re-pinned to the
-    /// workspace version and re-routed at that version -- NOT un-routed
-    /// (an un-routed torch wheel at 2.10.0 would clobber the conda
-    /// pytorch 2.7.0 the workspace installs).
+    /// A routed package named by the co-install unsat whose exact conda name
+    /// has a precise, directly-owned workspace fact at another version is
+    /// HARMONIZED -- pypi is re-pinned and re-routed -- rather than un-routed
+    /// into a wheel that would clobber the workspace's conda package.
     #[tokio::test]
     async fn workspace_harmonize_repins_named_route_instead_of_unroute() {
         let calls = Arc::new(Mutex::new(Vec::new()));
