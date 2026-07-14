@@ -265,22 +265,22 @@ pub struct RetreadConfig {
     #[serde(default, rename = "retread-courier-mode", alias = "courier-mode")]
     pub courier_mode: CourierMode,
 
-    /// v4.6 Part A (routing policy inversion): which packages the
-    /// auto-route loop may move from the wheel closure to conda run-deps.
+    /// Which packages the auto-route loop may move from the wheel closure
+    /// to conda run-deps, and how conda candidates are validated.
     ///
-    /// - `"minimal"` (the DEFAULT): route ONLY the ABI/binary whitelist --
+    /// - `"prefer-conda-validated"` (the DEFAULT): consider every closure
+    ///   wheel for conda routing, but route only when an available conda
+    ///   version satisfies the wheel requirement and remains compatible
+    ///   with the consuming workspace's declared conda facts.
+    /// - `"minimal"`: apply the same validation, but cap eligibility at the
+    ///   ABI/binary whitelist --
     ///   python/python_abi, the torch family (torch/pytorch/pytorch-gpu/
     ///   pytorch-cpu/torchvision/torchaudio, checked on both the pypi and
     ///   the mapped conda name), the cuda-* family (cuda-version,
     ///   cudatoolkit, cuda-toolkit, ...) -- plus anything the pack lists
-    ///   in `retread-route-include` or `force-conda`. Everything else
-    ///   ships as PyPI wheels via the courier (per-env versions, no conda
-    ///   arbitration). Evidence: the 43-run imprint campaign's repair
-    ///   ladder empirically UN-routed wrapt, moviepy, dm-tree, grpcio,
-    ///   cycler, fsspec, huggingface-hub, ... -- the fixes converged on
-    ///   exactly this whitelist.
-    /// - `"aggressive"`: legacy behavior -- route any closure wheel whose
-    ///   name exists on the conda channels.
+    ///   in `retread-route-include` or `force-conda`.
+    /// - `"aggressive"`: legacy broad-eligibility behavior -- consider any
+    ///   closure wheel whose name exists on the conda channels.
     ///
     /// ```toml
     /// [package.build.config]
@@ -289,10 +289,12 @@ pub struct RetreadConfig {
     #[serde(default, rename = "retread-route-policy", alias = "route-policy")]
     pub route_policy: RoutePolicy,
 
-    /// v4.6 Part A: extra canonical PyPI names this pack wants routed to
-    /// conda under the `"minimal"` policy (in addition to the built-in
-    /// ABI/binary whitelist). Ignored under `"aggressive"` (everything is
-    /// already eligible).
+    /// Extra canonical PyPI names admitted for routing under the
+    /// `"minimal"` policy, in addition to the built-in ABI/binary
+    /// whitelist. The default `"prefer-conda-validated"` policy already
+    /// considers every name, but still validates requirements and workspace
+    /// conda facts; this list does not bypass that validation. Ignored under
+    /// `"aggressive"`, where every conda-available name is already eligible.
     ///
     /// ```toml
     /// [package.build.config]
@@ -562,18 +564,23 @@ pub enum CourierMode {
 }
 
 /// Which packages the auto-route loop may move to conda
-/// (`retread-route-policy`): the ABI/binary whitelist only (`minimal`,
-/// default -- v4.6 routing inversion), or any conda-available name
-/// (`aggressive`, legacy).
+/// (`retread-route-policy`): any requirement- and workspace-compatible
+/// candidate (`prefer-conda-validated`, default), the ABI/binary whitelist
+/// ceiling (`minimal`), or the legacy broad conda-name eligibility
+/// (`aggressive`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RoutePolicy {
+    /// Prefer conda broadly, but only after the candidate satisfies the wheel
+    /// requirement and the consuming workspace's declared conda facts.
+    #[default]
+    PreferCondaValidated,
     /// Route only the ABI/binary whitelist (python/python_abi, torch
     /// family, cuda-* family) plus `retread-route-include`/`force-conda`
-    /// entries.
-    #[default]
+    /// entries, subject to the same validation as the default policy.
     Minimal,
-    /// Legacy: route any closure wheel whose name exists on conda.
+    /// Legacy broad eligibility: consider any closure wheel whose name exists
+    /// on conda.
     Aggressive,
 }
 
@@ -1113,24 +1120,33 @@ mod tests {
     }
 
     #[test]
-    fn parses_retread_route_policy_and_include_keys() {
-        // v4.6 Part A. Invariant #6: every new config field needs a
-        // serde test. Default (absent) = minimal, the routing inversion.
+    fn route_policy_defaults_to_prefer_conda_validated() {
+        // Invariant #6: every new config field needs a serde test. An absent
+        // policy uses conda-facts-first validated routing.
         let json = serde_json::json!({
             "retread-wheels": { "foo": { "version": "==1.0" } },
         });
         let cfg: RetreadConfig = serde_json::from_value(json).unwrap();
-        assert_eq!(cfg.route_policy, RoutePolicy::Minimal);
+        assert_eq!(cfg.route_policy, RoutePolicy::PreferCondaValidated);
         assert!(cfg.route_include.is_empty());
+    }
 
-        let json = serde_json::json!({
-            "retread-wheels": { "foo": { "version": "==1.0" } },
-            "retread-route-policy": "aggressive",
-            "retread-route-include": ["mujoco", "grpcio"],
-        });
-        let cfg: RetreadConfig = serde_json::from_value(json).unwrap();
-        assert_eq!(cfg.route_policy, RoutePolicy::Aggressive);
-        assert_eq!(cfg.route_include, vec!["mujoco", "grpcio"]);
+    #[test]
+    fn parses_all_retread_route_policies_and_include() {
+        for (serialized, expected) in [
+            ("prefer-conda-validated", RoutePolicy::PreferCondaValidated),
+            ("minimal", RoutePolicy::Minimal),
+            ("aggressive", RoutePolicy::Aggressive),
+        ] {
+            let json = serde_json::json!({
+                "retread-wheels": { "foo": { "version": "==1.0" } },
+                "retread-route-policy": serialized,
+                "retread-route-include": ["mujoco", "grpcio"],
+            });
+            let cfg: RetreadConfig = serde_json::from_value(json).unwrap();
+            assert_eq!(cfg.route_policy, expected);
+            assert_eq!(cfg.route_include, vec!["mujoco", "grpcio"]);
+        }
     }
 
     #[test]

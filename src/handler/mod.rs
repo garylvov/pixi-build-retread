@@ -12,7 +12,7 @@ use auto_bundle::{
 mod resolve_state;
 use resolve_state::{ObserveEdgeResult, ResolveState};
 
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -691,6 +691,12 @@ struct Bundle {
     /// usual exact pin, letting a sibling pack's own conda pin for the
     /// same name win the conda solve instead of hard-conflicting.
     auto_routed: Vec<(String, String, bool)>,
+    /// Canonical PyPI names the precise consuming workspace already owns.
+    /// These are removed from the pack's wheel graph and are not re-emitted
+    /// as generated-pack conda run dependencies. Conda-owned names enter only
+    /// after a validated route; workspace-PyPI names enter from direct
+    /// declarations shared by every consumer.
+    auto_dropped: HashSet<String>,
     /// Canonical names of every package in the exported uv closure
     /// (`UvClosure::pins`). These are provided by the wheel closure /
     /// uv install set at install time, so `produce_output` must NEVER
@@ -1796,7 +1802,9 @@ async fn resolve_all(
     // -name PyPI entries are unambiguous; multi-conda entries are
     // skipped from the merge (user must disambiguate via
     // retread-name-map).
-    let pypi_to_conda = if config.auto_bundle {
+    let pypi_to_conda = if config.auto_bundle
+        || config.route_policy == crate::config::RoutePolicy::PreferCondaValidated
+    {
         load_pypi_to_conda_map().await
     } else {
         Default::default()
@@ -1907,9 +1915,10 @@ async fn resolve_all(
         // Packaging / courier / lock-write downstream are unchanged.
         // `Ok(None)` = no uv-resolvable roots (all source-built entries);
         // the materialization path then runs unpinned.
-        let (uv_closure, deps_from_floor_names): (
+        let (uv_closure, deps_from_floor_names, workspace_facts): (
             Option<crate::uv_closure::UvClosure>,
             std::collections::BTreeSet<String>,
+            WorkspaceCondaFacts,
         ) = uv_group_closure(
             &group_name,
             &group_entries,
@@ -2031,11 +2040,13 @@ async fn resolve_all(
             bundle.auto_routed = closure
                 .auto_routed
                 .iter()
+                .filter(|r| !closure.auto_dropped.contains(&r.pypi_name))
                 .map(|r| {
                     let floor = deps_from_floor_names.contains(&r.pypi_name);
                     (r.conda_name.clone(), r.conda_version.clone(), floor)
                 })
                 .collect();
+            bundle.auto_dropped = closure.auto_dropped.iter().cloned().collect();
             // Closure membership for the run-dep emission gate: any package
             // uv exported into the wheel closure is uv-installed at install
             // time and must never double as a conda run-dep (see
@@ -2046,6 +2057,12 @@ async fn resolve_all(
                 .map(|k| canonical_conda_name(k))
                 .collect();
         }
+        // Workspace PyPI declarations are already installed by Pixi and do
+        // not need a second copy inside this pack. This evidence is precise
+        // direct ownership, independent of whether the group had uv roots.
+        bundle
+            .auto_dropped
+            .extend(workspace_facts.owned_pypi.iter().cloned());
         for sub in sub_bundles {
             bundle.extras.push(sub.primary);
             bundle.extras.extend(sub.extras);
@@ -2393,6 +2410,247 @@ fn discard_facts_on_solve_failure(heal_facts_path: &std::path::Path, err: &anyho
     crate::uv_closure::save_heal_facts(heal_facts_path, &crate::uv_closure::HealFacts::default());
 }
 
+/// Concrete conda facts for the precisely identified environments that
+/// consume one generated pack. Ownership and solved facts deliberately stay
+/// separate: only direct declarations shared by every consumer authorize an
+/// automatic drop, while the full selected record sets are validation input.
+#[derive(Debug, Clone, Default)]
+struct WorkspaceCondaFacts {
+    /// Canonical PyPI names whose mapped conda package is directly declared
+    /// by every consuming environment.
+    owned_conda_pypi: BTreeSet<String>,
+    /// Canonical names directly declared in `[pypi-dependencies]` by every
+    /// consuming environment. Pixi supplies these on the wheel side already.
+    owned_pypi: BTreeSet<String>,
+    /// Common selected conda fact for mapped Python distributions. A fact is
+    /// present only when every consuming environment selected the same
+    /// version of the mapped conda package.
+    common_pypi: BTreeMap<String, SolvedPypiFact>,
+    /// Common selected versions by canonical conda name (used by the existing
+    /// harmonization path and by source-only compatibility checks).
+    common_conda_versions: BTreeMap<String, String>,
+    /// Full exact selected specs per consuming environment. These are never
+    /// ownership evidence; they are the immutable baseline for route trials.
+    env_exact_specs: BTreeMap<String, Vec<String>>,
+    /// Stable digest of `env_exact_specs`, for persisted heal-fact validity.
+    fingerprint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SolvedPypiFact {
+    conda_name: String,
+    version: String,
+}
+
+/// Intersection of direct dependency names across every precise consumer.
+/// A name declared in only one of several consumers cannot be removed from a
+/// shared pack: another consumer would then receive neither ecosystem copy.
+fn dependency_name_intersection(maps: &[BTreeMap<String, String>]) -> BTreeSet<String> {
+    let Some(first) = maps.first() else {
+        return BTreeSet::new();
+    };
+    let mut common: BTreeSet<String> = first
+        .keys()
+        .map(|name| canonical_conda_name(name))
+        .collect();
+    for map in &maps[1..] {
+        let names: BTreeSet<String> = map.keys().map(|name| canonical_conda_name(name)).collect();
+        common.retain(|name| names.contains(name));
+    }
+    common
+}
+
+fn facts_from_solved_records(
+    env_records: BTreeMap<String, Vec<rattler_conda_types::RepoDataRecord>>,
+    owned_conda: BTreeSet<String>,
+    owned_pypi: BTreeSet<String>,
+    name_map: &BTreeMap<String, String>,
+    bundle_name: &str,
+) -> WorkspaceCondaFacts {
+    use sha2::{Digest, Sha256};
+
+    if env_records.is_empty() {
+        return WorkspaceCondaFacts {
+            owned_pypi,
+            ..Default::default()
+        };
+    }
+
+    let bundle_name = canonical_conda_name(bundle_name);
+    let per_env_versions: BTreeMap<String, BTreeMap<String, String>> = env_records
+        .iter()
+        .map(|(env, records)| {
+            let versions = records
+                .iter()
+                .filter_map(|record| {
+                    let name = canonical_conda_name(record.package_record.name.as_normalized());
+                    (name != bundle_name).then(|| (name, record.package_record.version.to_string()))
+                })
+                .collect();
+            (env.clone(), versions)
+        })
+        .collect();
+
+    let mut common_conda_versions = per_env_versions
+        .values()
+        .next()
+        .cloned()
+        .unwrap_or_default();
+    for versions in per_env_versions.values().skip(1) {
+        common_conda_versions.retain(|name, version| versions.get(name) == Some(version));
+    }
+
+    // A mapping edge is the identity/provenance proof. Unmapped conda names
+    // are not guessed to be PyPI distributions (tetgen-style same-name
+    // collisions must fail closed).
+    let mut common_pypi = BTreeMap::new();
+    let mut owned_conda_pypi = BTreeSet::new();
+    for (raw_pypi, raw_conda) in name_map {
+        let pypi_name = canonical_conda_name(raw_pypi);
+        let conda_name = canonical_conda_name(raw_conda);
+        if let Some(version) = common_conda_versions.get(&conda_name) {
+            common_pypi.insert(
+                pypi_name.clone(),
+                SolvedPypiFact {
+                    conda_name: conda_name.clone(),
+                    version: version.clone(),
+                },
+            );
+        }
+        if owned_conda.contains(&conda_name) {
+            owned_conda_pypi.insert(pypi_name);
+        }
+    }
+
+    let mut env_exact_specs = BTreeMap::new();
+    for (env, versions) in per_env_versions {
+        let mut specs: Vec<String> = versions
+            .into_iter()
+            .map(|(name, version)| format!("{name} =={version}"))
+            .collect();
+        specs.sort();
+        env_exact_specs.insert(env, specs);
+    }
+    let mut hasher = Sha256::new();
+    for (env, specs) in &env_exact_specs {
+        hasher.update(env.as_bytes());
+        hasher.update([0xff]);
+        for spec in specs {
+            hasher.update(spec.as_bytes());
+            hasher.update([0]);
+        }
+    }
+
+    WorkspaceCondaFacts {
+        owned_conda_pypi,
+        owned_pypi,
+        common_pypi,
+        common_conda_versions,
+        env_exact_specs,
+        fingerprint: format!("{:x}", hasher.finalize()),
+    }
+}
+
+/// Solve each precise consuming environment independently. Destructive
+/// behavior is enabled only when the workspace can map this source package to
+/// concrete active environments and every environment solve succeeds.
+async fn solve_workspace_conda_facts(
+    manifest: &crate::workspace::WorkspaceManifest,
+    workspace_dir: &Path,
+    source_dir: &Path,
+    target: &WheelTarget,
+    conda_channels: &[ChannelUrl],
+    name_map: &BTreeMap<String, String>,
+    bundle_name: &str,
+) -> WorkspaceCondaFacts {
+    let Some(envs) = manifest.precise_consuming_envs(workspace_dir, source_dir) else {
+        tracing::debug!(
+            bundle = %bundle_name,
+            "conda facts: pack-to-environment ownership is ambiguous; abstaining",
+        );
+        return WorkspaceCondaFacts::default();
+    };
+
+    let conda_deps: Vec<BTreeMap<String, String>> = envs
+        .iter()
+        .map(|env| manifest.effective_dependencies(env))
+        .collect();
+    let pypi_deps: Vec<BTreeMap<String, String>> = envs
+        .iter()
+        .map(|env| manifest.effective_pypi_dependencies(env))
+        .collect();
+    let owned_conda = dependency_name_intersection(&conda_deps);
+    let owned_pypi = dependency_name_intersection(&pypi_deps);
+
+    if conda_deps.iter().all(BTreeMap::is_empty) {
+        return WorkspaceCondaFacts {
+            owned_pypi,
+            ..Default::default()
+        };
+    }
+
+    let channel_priority = match manifest.channel_priority.as_deref() {
+        Some("disabled") => rattler_solve::ChannelPriority::Disabled,
+        _ => rattler_solve::ChannelPriority::Strict,
+    };
+    let solves =
+        futures::future::join_all(envs.iter().zip(conda_deps.iter()).map(|(env, deps)| {
+            let mut specs: Vec<String> = deps
+                .iter()
+                .filter_map(|(name, spec)| {
+                    let name = canonical_conda_name(name);
+                    if name == canonical_conda_name(bundle_name) {
+                        return None;
+                    }
+                    let spec = spec.trim();
+                    Some(if spec.is_empty() || spec == "*" {
+                        name
+                    } else {
+                        format!("{name} {spec}")
+                    })
+                })
+                .collect();
+            specs.push(format!("python {}.*", target.python_version));
+            let sysreqs = manifest.effective_system_requirements(env);
+            async move {
+                let result = crate::conda_solve::solve_selected_records(
+                    conda_channels,
+                    &specs,
+                    &target.python_version,
+                    &target.conda_subdir,
+                    channel_priority,
+                    &sysreqs,
+                    rattler_solve::SolveStrategy::Highest,
+                )
+                .await;
+                (env.clone(), result)
+            }
+        }))
+        .await;
+
+    let mut env_records = BTreeMap::new();
+    for (env, result) in solves {
+        match result {
+            Ok(records) => {
+                env_records.insert(env, records);
+            }
+            Err(reasons) => {
+                tracing::debug!(
+                    bundle = %bundle_name,
+                    env = %env,
+                    reasons = ?reasons,
+                    "conda facts: precise consuming-env solve unavailable; abstaining from conda-owned actions",
+                );
+                return WorkspaceCondaFacts {
+                    owned_pypi,
+                    ..Default::default()
+                };
+            }
+        }
+    }
+    facts_from_solved_records(env_records, owned_conda, owned_pypi, name_map, bundle_name)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn uv_group_closure(
     group_name: &str,
@@ -2407,6 +2665,7 @@ async fn uv_group_closure(
 ) -> Result<(
     Option<crate::uv_closure::UvClosure>,
     std::collections::BTreeSet<String>,
+    WorkspaceCondaFacts,
 )> {
     let mut roots: Vec<String> = Vec::new();
     // Direct-URL wheels pre-fetched into the content-addressed store and
@@ -2523,56 +2782,130 @@ async fn uv_group_closure(
         roots = dedupe_roots_last_wins(roots);
     }
 
+    let manifest_opt = workspace_dir.and_then(crate::workspace::WorkspaceManifest::load);
+    let mut workspace_facts =
+        if effective.route_policy == crate::config::RoutePolicy::PreferCondaValidated {
+            match (manifest_opt.as_ref(), workspace_dir) {
+                (Some(manifest), Some(ws_dir)) => {
+                    solve_workspace_conda_facts(
+                        manifest,
+                        ws_dir,
+                        source_dir,
+                        target,
+                        conda_channels,
+                        &effective.name_map,
+                        group_name,
+                    )
+                    .await
+                }
+                _ => WorkspaceCondaFacts::default(),
+            }
+        } else {
+            WorkspaceCondaFacts::default()
+        };
+    if effective.route_policy == crate::config::RoutePolicy::PreferCondaValidated {
+        let manual: BTreeSet<String> = effective
+            .overrides
+            .keys()
+            .map(|name| canonical_conda_name(name))
+            .collect();
+        let keep: BTreeSet<String> = effective
+            .keep_pypi
+            .iter()
+            .map(|name| canonical_conda_name(name))
+            .collect();
+        let protected_entries: BTreeSet<String> = group_entries
+            .iter()
+            .map(|(name, _)| canonical_conda_name(name))
+            .collect();
+        let first_party: BTreeSet<String> =
+            roots.iter().filter_map(|req| root_req_name(req)).collect();
+        workspace_facts.owned_pypi.retain(|name| {
+            !manual.contains(name)
+                && !keep.contains(name)
+                && !protected_entries.contains(name)
+                && !first_party.contains(name)
+        });
+        tracing::debug!(
+            bundle = %group_name,
+            consuming_envs = workspace_facts.env_exact_specs.len(),
+            mapped_facts = workspace_facts.common_pypi.len(),
+            owned_conda = workspace_facts.owned_conda_pypi.len(),
+            owned_pypi = workspace_facts.owned_pypi.len(),
+            "conda facts: derived precise workspace routing inputs",
+        );
+    }
+
     if roots.is_empty() {
         tracing::info!(
             bundle = %group_name,
             "uv closure: no uv-resolvable roots in this bundle; \
              running the legacy closure path unpinned",
         );
-        return Ok((None, std::collections::BTreeSet::new()));
+        return Ok((None, std::collections::BTreeSet::new(), workspace_facts));
     }
 
-    // Conda pins -> uv constraints, with provenance. Run-38 fix: derive
-    // from the pack's CONSUMING envs (`consuming_env_dependencies`), not
-    // `effective_dependencies("default")` -- the same default-env blind
-    // spot the run-34 sysreqs fix closed for the co-install oracle
-    // existed here: a no-default-feature env's hand-written
-    // `pytorch-gpu ==2.7.0` was invisible, no `torch==2.7.0` uv
-    // constraint was emitted, uv free-picked torch 2.10.0, auto-route
-    // emitted `pytorch >=2.10.0,<3`, and the workspace's own
-    // `torchaudio ==2.7.0` died on a cp310 build tail. Names whose
-    // consuming envs DISAGREE (only possible via the all-features
-    // fallback superset for unreferenced packs) are skipped -- a
-    // constraint can't satisfy two different pins, and skipping
-    // preserves the pre-fix unconstrained behavior for exactly that
-    // ambiguous case.
-    let manifest_opt = workspace_dir.and_then(crate::workspace::WorkspaceManifest::load);
-    let mut constraints = match (manifest_opt.as_ref(), workspace_dir) {
-        (Some(manifest), Some(ws_dir)) => {
-            let deps = unambiguous_consuming_deps(
-                &manifest.consuming_env_dependencies(ws_dir, source_dir),
-            );
-            let global_map = load_pypi_to_conda_map().await;
-            crate::uv_closure::build_constraints(
-                &deps,
-                &effective.name_map,
-                &global_map,
-                "manifest",
-                "consuming-envs",
-            )
-        }
-        (Some(manifest), None) => {
-            let deps = manifest.effective_dependencies("default");
-            crate::uv_closure::build_constraints(
-                &deps,
-                &effective.name_map,
-                &PypiToCondaMap::new(),
-                "manifest",
-                "default",
-            )
-        }
-        _ => Default::default(),
-    };
+    // Conda facts -> uv constraints, with provenance. The validated policy
+    // uses exact records selected independently for every precise consuming
+    // environment and keeps only facts shared by all of them. Legacy policies
+    // retain the declared-spec constraint path so their routing semantics do
+    // not silently change.
+    let mut constraints =
+        if effective.route_policy == crate::config::RoutePolicy::PreferCondaValidated {
+            let manual: BTreeSet<String> = effective
+                .overrides
+                .keys()
+                .map(|name| canonical_conda_name(name))
+                .collect();
+            let mut constraints = crate::uv_closure::ConstraintSet::default();
+            for (pypi_name, fact) in &workspace_facts.common_pypi {
+                if manual.contains(pypi_name)
+                    || uv_pep508::uv_pep440::Version::from_str(&fact.version).is_err()
+                {
+                    continue;
+                }
+                let line = format!("{pypi_name}=={}", fact.version);
+                constraints.constraints.push(line.clone());
+                constraints.provenance.insert(
+                    pypi_name.clone(),
+                    crate::uv_closure::ConstraintProvenance {
+                        constraint: line,
+                        conda_name: fact.conda_name.clone(),
+                        conda_version: format!("=={}", fact.version),
+                        source: "workspace-solved".to_string(),
+                        env: "precise-consuming-envs".to_string(),
+                    },
+                );
+            }
+            constraints
+        } else {
+            match (manifest_opt.as_ref(), workspace_dir) {
+                (Some(manifest), Some(ws_dir)) => {
+                    let deps = unambiguous_consuming_deps(
+                        &manifest.consuming_env_dependencies(ws_dir, source_dir),
+                    );
+                    let global_map = load_pypi_to_conda_map().await;
+                    crate::uv_closure::build_constraints(
+                        &deps,
+                        &effective.name_map,
+                        &global_map,
+                        "manifest",
+                        "consuming-envs",
+                    )
+                }
+                (Some(manifest), None) => {
+                    let deps = manifest.effective_dependencies("default");
+                    crate::uv_closure::build_constraints(
+                        &deps,
+                        &effective.name_map,
+                        &PypiToCondaMap::new(),
+                        "manifest",
+                        "default",
+                    )
+                }
+                _ => Default::default(),
+            }
+        };
     // Proactive cuda-major capping (belt to the auto-route co-install
     // check's suspenders): derive this pack's actual consuming env(s)'
     // `cuda-version` anchor via `consuming_env_dependencies` (env-scoped,
@@ -2705,7 +3038,7 @@ async fn uv_group_closure(
     let mut no_emit: Vec<String> = effective.conda_deps.clone();
     no_emit.extend(effective.drop_deps.iter().cloned());
 
-    let req = crate::uv_closure::UvClosureRequest {
+    let mut req = crate::uv_closure::UvClosureRequest {
         bundle: group_name.to_string(),
         python_version: target.python_version.clone(),
         conda_subdir: target.conda_subdir.clone(),
@@ -2749,6 +3082,32 @@ async fn uv_group_closure(
             .keys()
             .map(|n| canonical_conda_name(n)),
     );
+    if effective.route_policy == crate::config::RoutePolicy::PreferCondaValidated {
+        let manual: BTreeSet<String> = effective
+            .overrides
+            .keys()
+            .map(|name| canonical_conda_name(name))
+            .collect();
+        let keep: BTreeSet<String> = effective
+            .keep_pypi
+            .iter()
+            .map(|name| canonical_conda_name(name))
+            .collect();
+        let first_party: BTreeSet<String> = first_party_names.iter().cloned().collect();
+        workspace_facts.owned_pypi.retain(|name| {
+            !manual.contains(name)
+                && !keep.contains(name)
+                && !protected.contains(name)
+                && !first_party.contains(name)
+        });
+        for name in &workspace_facts.owned_pypi {
+            req.overrides
+                .push(format!("{name} ; {}", crate::uv_closure::DROP_MARKER));
+            req.no_emit_packages.push(name.clone());
+        }
+    } else {
+        workspace_facts.owned_pypi.clear();
+    }
     // ABI-anchor pins (`cuda-version`, `python_abi`, ...) from the
     // consuming env(s) -- same source the proactive cuda-major capping
     // above reads. Passed to the route-time metadata check so a routed
@@ -2782,6 +3141,24 @@ async fn uv_group_closure(
     {
         abi_anchor_pins.insert("python_abi".to_string(), python_pin);
     }
+    let mut workspace_owned = workspace_facts.owned_conda_pypi.clone();
+    if effective.route_policy == crate::config::RoutePolicy::PreferCondaValidated {
+        let manual: BTreeSet<String> = effective
+            .overrides
+            .keys()
+            .map(|name| canonical_conda_name(name))
+            .collect();
+        let keep: BTreeSet<String> = effective
+            .keep_pypi
+            .iter()
+            .map(|name| canonical_conda_name(name))
+            .collect();
+        workspace_owned.retain(|name| {
+            !manual.contains(name) && !keep.contains(name) && !protected.contains(name)
+        });
+    } else {
+        workspace_owned.clear();
+    }
     let auto_route_opts = crate::uv_closure::AutoRouteOptions {
         enabled: effective.auto_route,
         // v4.6 Part A: production wiring of the routing policy -- the
@@ -2808,6 +3185,8 @@ async fn uv_group_closure(
         // Populated below (workspace-deps solve) just before the
         // fixpoint call; empty = un-route fallback only.
         workspace_conda_versions: Default::default(),
+        workspace_owned,
+        workspace_fact_fingerprint: workspace_facts.fingerprint.clone(),
     };
 
     // `'static` closures for the fixpoint driver: clone the inputs each
@@ -3066,7 +3445,9 @@ async fn uv_group_closure(
     // unsat) degrades to an empty map = the pre-harmonization un-route
     // behavior.
     let mut auto_route_opts = auto_route_opts;
-    if let Some(m) = manifest_opt.as_ref()
+    if effective.route_policy == crate::config::RoutePolicy::PreferCondaValidated {
+        auto_route_opts.workspace_conda_versions = workspace_facts.common_conda_versions.clone();
+    } else if let Some(m) = manifest_opt.as_ref()
         && let Some(ws_dir) = workspace_dir
     {
         let channel_priority = match m.channel_priority.as_deref() {
@@ -3204,7 +3585,7 @@ async fn uv_group_closure(
             prereleased: sdist_prereleased.lock().unwrap().clone(),
         },
     );
-    Ok((Some(closure), deps_from_floor_names))
+    Ok((Some(closure), deps_from_floor_names, workspace_facts))
 }
 
 /// Run-35 fix (design flaw 1 + 2, from the holosoma regression): narrows
@@ -3420,9 +3801,11 @@ mod facts_cleanup_tests {
 
 #[cfg(test)]
 mod restrict_workspace_conda_versions_tests {
-    use super::restrict_workspace_conda_versions;
+    use super::{
+        dependency_name_intersection, facts_from_solved_records, restrict_workspace_conda_versions,
+    };
     use rattler_conda_types::{PackageRecord, RepoDataRecord, VersionWithSource};
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::str::FromStr;
     use url::Url;
 
@@ -3512,6 +3895,67 @@ mod restrict_workspace_conda_versions_tests {
             !restricted.contains_key("numpy"),
             "a wildcard workspace spec is not hand-written intent: {restricted:?}"
         );
+    }
+
+    #[test]
+    fn workspace_fact_derivation_requires_mapping_and_cross_env_agreement() {
+        let env_records = BTreeMap::from([
+            (
+                "alpha".to_string(),
+                vec![
+                    repo_record("numpy", "2.1.0", &[]),
+                    repo_record("tetgen", "1.6.0", &[]),
+                    repo_record("pytorch", "2.10.0", &[]),
+                ],
+            ),
+            (
+                "beta".to_string(),
+                vec![
+                    repo_record("numpy", "2.1.0", &[]),
+                    repo_record("tetgen", "1.6.0", &[]),
+                    repo_record("pytorch", "2.9.0", &[]),
+                ],
+            ),
+        ]);
+        let facts = facts_from_solved_records(
+            env_records,
+            BTreeSet::from(["numpy".to_string(), "tetgen".to_string()]),
+            BTreeSet::from(["gym".to_string(), "rliable".to_string()]),
+            &BTreeMap::from([
+                ("numpy".to_string(), "numpy".to_string()),
+                ("torch".to_string(), "pytorch".to_string()),
+            ]),
+            "demo-pack",
+        );
+
+        assert_eq!(facts.common_pypi["numpy"].version, "2.1.0");
+        assert!(
+            !facts.common_pypi.contains_key("torch"),
+            "divergent consuming-env versions must not become a shared fact"
+        );
+        assert!(
+            !facts.common_pypi.contains_key("tetgen"),
+            "same-name conda/PyPI identity must never be guessed without a mapping"
+        );
+        assert_eq!(facts.owned_conda_pypi, BTreeSet::from(["numpy".into()]));
+        assert_eq!(
+            facts.owned_pypi,
+            BTreeSet::from(["gym".into(), "rliable".into()])
+        );
+        assert_eq!(facts.env_exact_specs.len(), 2);
+        assert!(!facts.fingerprint.is_empty());
+    }
+
+    #[test]
+    fn workspace_ownership_requires_every_precise_consumer() {
+        let intersection = dependency_name_intersection(&[
+            BTreeMap::from([
+                ("numpy".to_string(), "==2.1".to_string()),
+                ("gym".to_string(), "*".to_string()),
+            ]),
+            BTreeMap::from([("numpy".to_string(), "==2.1".to_string())]),
+        ]);
+        assert_eq!(intersection, BTreeSet::from(["numpy".to_string()]));
     }
 }
 
@@ -3938,6 +4382,7 @@ async fn resolve_bundle(
             probe_decisions: vec![],
             solve_diagnostics: BTreeMap::new(),
             auto_routed: vec![],
+            auto_dropped: Default::default(),
             uv_closure_names: Default::default(),
         });
     }
@@ -4589,6 +5034,7 @@ async fn resolve_bundle(
         probe_decisions,
         solve_diagnostics: BTreeMap::new(),
         auto_routed: vec![],
+        auto_dropped: Default::default(),
         uv_closure_names: Default::default(),
     };
 
@@ -5442,7 +5888,7 @@ fn produce_output(
     // every isaacsim-style upstream that ships these. Skipped if the user
     // explicitly overrode the dep -- the override always wins, so callers
     // who actually need (say) pyreadline3 on Linux can re-enable it.
-    let auto_dropped: HashSet<String> = if host_platform != Platform::Win64
+    let built_in_auto_dropped: HashSet<String> = if host_platform != Platform::Win64
         && host_platform != Platform::Win32
         && host_platform != Platform::WinArm64
     {
@@ -5579,7 +6025,15 @@ fn produce_output(
                 tracing::debug!(dep = %dep_name, "dropping per retread-drop-deps");
                 continue;
             }
-            if in_set(&auto_dropped) {
+            if in_set(&bundle.auto_dropped) {
+                tracing::info!(
+                    dep = %dep_name,
+                    bundle = %bundle.conda_name,
+                    "dropping dependency already owned by every precise consuming workspace environment",
+                );
+                continue;
+            }
+            if in_set(&built_in_auto_dropped) {
                 // Surface this prominently so the user has a chance to
                 // notice if the auto-drop ate something they actually need.
                 tracing::warn!(
@@ -10539,6 +10993,7 @@ mod emit_wheel_upstream_url_tests {
             probe_decisions: vec![],
             solve_diagnostics: BTreeMap::new(),
             auto_routed: vec![],
+            auto_dropped: Default::default(),
             uv_closure_names: Default::default(),
         };
 
@@ -10653,6 +11108,7 @@ mod emit_wheel_upstream_url_tests {
             probe_decisions: vec![],
             solve_diagnostics: BTreeMap::new(),
             auto_routed: vec![],
+            auto_dropped: Default::default(),
             uv_closure_names: Default::default(),
         };
 

@@ -173,6 +173,7 @@ pub(crate) async fn auto_bundle_transitives(
     skip.extend(config.conda_deps.iter().map(|n| canonical_conda_name(n)));
     skip.extend(config.drop_deps.iter().map(|n| canonical_conda_name(n)));
     skip.extend(config.overrides.keys().map(|n| canonical_conda_name(n)));
+    skip.extend(bundle.auto_dropped.iter().cloned());
 
     // Fallback chain: entry's index first (for siblings on private
     // indexes like pypi.nvidia.com), then workspace [pypi-options]

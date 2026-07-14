@@ -39,6 +39,12 @@ pub struct WorkspaceManifest {
     /// autodiscovery to find which workspace declarations reference
     /// THIS source package.
     pub path_dependencies: BTreeMap<String, String>,
+    /// Top-level `[pypi-dependencies]`, keyed by canonical PEP 503
+    /// package name. Version requirements are preserved verbatim;
+    /// direct URL/path/git declarations are represented by `"*"`
+    /// because the workspace owns their source without declaring a
+    /// registry version constraint.
+    pub pypi_dependencies: BTreeMap<String, String>,
     /// Per-environment definitions from `[environments]`.
     pub environments: BTreeMap<String, EnvironmentDef>,
     /// Per-feature blocks from `[feature.X.*]`.
@@ -85,6 +91,10 @@ pub struct FeatureDef {
     /// autodiscovery walks these to find features that reference the
     /// source package retread is building for.
     pub path_dependencies: BTreeMap<String, String>,
+    /// `[feature.X.pypi-dependencies]`, with the same canonical-name
+    /// and direct-source semantics as
+    /// [`WorkspaceManifest::pypi_dependencies`].
+    pub pypi_dependencies: BTreeMap<String, String>,
     /// v0.37.0+ (D1): `[feature.X.system-requirements]`. Same shape as
     /// the top-level table; unioned per active env with feature-wins
     /// precedence by `effective_system_requirements`.
@@ -177,6 +187,8 @@ impl WorkspaceManifest {
             }
         }
 
+        out.pypi_dependencies = parse_pypi_dependencies(parsed);
+
         // v0.37.0+ (D1): top-level [system-requirements]. Scalar values
         // (`cuda = "12"`) stored verbatim; table form
         // (`libc = { family = "glibc", version = "2.35" }`) takes the
@@ -227,6 +239,7 @@ impl WorkspaceManifest {
                             }
                         }
                     }
+                    def.pypi_dependencies = parse_pypi_dependencies(fvalue);
                     // v0.37.0+ (D1): per-feature system-requirements.
                     if let Some(sysreqs) = fmap
                         .get("system-requirements")
@@ -276,6 +289,31 @@ impl WorkspaceManifest {
         out
     }
 
+    /// Compute the effective PyPI declarations for an environment.
+    /// Top-level `[pypi-dependencies]` is inherited unless the env sets
+    /// `no-default-feature`; active feature declarations then override
+    /// it in feature order, matching [`Self::effective_dependencies`].
+    pub fn effective_pypi_dependencies(&self, env_name: &str) -> BTreeMap<String, String> {
+        let Some(env) = self.environments.get(env_name) else {
+            return BTreeMap::new();
+        };
+        let mut out = BTreeMap::new();
+        if !env.no_default_feature {
+            for (name, spec) in &self.pypi_dependencies {
+                out.insert(name.clone(), spec.clone());
+            }
+        }
+        for feat_name in &env.features {
+            let Some(feat) = self.features.get(feat_name) else {
+                continue;
+            };
+            for (name, spec) in &feat.pypi_dependencies {
+                out.insert(name.clone(), spec.clone());
+            }
+        }
+        out
+    }
+
     /// v0.37.0+ (D1): effective system requirements for an environment.
     /// Top-level requirements first (unless no-default-feature), then
     /// each active feature overrides/extends in declaration order
@@ -308,9 +346,9 @@ impl WorkspaceManifest {
     /// `inputs_hash` (grizzly H1).
     ///
     /// Scoped to the envs that reference `source_dir` via
-    /// `discover_outputs_for_source`: only channels, deps, system-requirements,
-    /// and pypi-index-urls from those envs (computed via the per-env
-    /// `effective_*` getters) are folded. This eliminates over-coupling to
+    /// `discover_outputs_for_source`: only channels, conda/PyPI deps,
+    /// system-requirements, and pypi-index-urls from those envs (computed via
+    /// the per-env `effective_*` getters) are folded. This eliminates over-coupling to
     /// unrelated envs in the same workspace -- pixi solves each env
     /// independently, so non-referencing envs cannot affect THIS pack's
     /// resolution and should not invalidate its cached lock.
@@ -345,6 +383,9 @@ impl WorkspaceManifest {
             }
             for (k, v) in self.effective_dependencies(env) {
                 parts.push(format!("scoped-env:{env}:dep:{k}={v}"));
+            }
+            for (k, v) in self.effective_pypi_dependencies(env) {
+                parts.push(format!("scoped-env:{env}:pypi-dep:{k}={v}"));
             }
             for (k, v) in self.effective_system_requirements(env) {
                 parts.push(format!("scoped-env:{env}:sysreq:{k}={v}"));
@@ -604,6 +645,25 @@ impl WorkspaceManifest {
             });
         }
         out
+    }
+
+    /// Return the concrete workspace environments that consume the pack at
+    /// `source_dir`, but only when path-dependency discovery maps it to at
+    /// least one active `[environments]` entry. `None` deliberately abstains
+    /// for the feature-only and all-features fallback tiers: those supersets
+    /// are useful for validation, but are not precise enough to authorize
+    /// ownership-driven routing or dependency removal.
+    pub fn precise_consuming_envs(
+        &self,
+        workspace_dir: &Path,
+        source_dir: &Path,
+    ) -> Option<Vec<String>> {
+        let envs: BTreeSet<String> = self
+            .discover_outputs_for_source(workspace_dir, source_dir)
+            .into_iter()
+            .flat_map(|output| output.envs)
+            .collect();
+        (!envs.is_empty()).then(|| envs.into_iter().collect())
     }
 
     /// Compute the effective conda deps an environment would solve
@@ -1005,11 +1065,47 @@ fn constraint_lines(depends: &[String], constrains: &[String]) -> Vec<(String, S
     out
 }
 
-/// v0.37.0+ (D1): parse one `[system-requirements]` value. pixi allows
-/// either a bare scalar (`cuda = "12"`, sometimes a number) or a table
-/// (`libc = { family = "glibc", version = "2.35" }`). Scalars are kept
-/// verbatim; tables contribute their `version` field. Anything else
-/// returns `None` so the caller skips it.
+/// Parse one top-level or feature-scoped `[pypi-dependencies]` table.
+/// Names use the same PEP 503 canonical form as routing. Registry version
+/// strings stay intact; direct sources carry ownership but no comparable
+/// registry constraint, so they become `"*"`.
+fn parse_pypi_dependencies(container: &toml::Value) -> BTreeMap<String, String> {
+    let Some(deps) = container
+        .get("pypi-dependencies")
+        .or_else(|| container.get("pypi_dependencies"))
+        .and_then(|v| v.as_table())
+    else {
+        return BTreeMap::new();
+    };
+
+    deps.iter()
+        .filter_map(|(raw_name, value)| {
+            let name = crate::relax::canonical_conda_name(raw_name);
+            if name.is_empty() {
+                return None;
+            }
+            let spec = match value {
+                toml::Value::String(spec) => Some(spec.clone()),
+                toml::Value::Table(detail) => {
+                    if detail.contains_key("url")
+                        || detail.contains_key("path")
+                        || detail.contains_key("git")
+                    {
+                        Some("*".to_string())
+                    } else {
+                        detail
+                            .get("version")
+                            .and_then(|v| v.as_str())
+                            .map(String::from)
+                    }
+                }
+                _ => None,
+            }?;
+            Some((name, spec))
+        })
+        .collect()
+}
+
 /// Pull index URLs out of a `[pypi-options]` table nested under
 /// `container` (the manifest root, or a `[feature.X]` table value):
 /// `index-url` first (it replaces pixi's default index, so it leads
@@ -1040,6 +1136,11 @@ fn parse_pypi_index_urls(container: &toml::Value) -> Vec<String> {
     out
 }
 
+/// v0.37.0+ (D1): parse one `[system-requirements]` value. pixi allows
+/// either a bare scalar (`cuda = "12"`, sometimes a number) or a table
+/// (`libc = { family = "glibc", version = "2.35" }`). Scalars are kept
+/// verbatim; tables contribute their `version` field. Anything else
+/// returns `None` so the caller skips it.
 fn parse_system_requirement_value(key: &str, v: &toml::Value) -> Option<String> {
     if let Some(s) = v.as_str() {
         return Some(s.to_string());
@@ -1262,6 +1363,73 @@ isaac-pack = { path = "./isaac-pack" }
         );
         // path-form entries are not version pins; skipped.
         assert!(!ws.dependencies.contains_key("isaac-pack"));
+    }
+
+    #[test]
+    fn parses_pypi_dependencies_with_canonical_owned_specs() {
+        let ws = ws_toml(
+            r#"
+[pypi-dependencies]
+NumPy = ">=1.26,<3"
+"direct.git" = { git = "https://example.com/direct.git", rev = "abc123" }
+direct_url = { url = "https://example.com/archive.whl" }
+local-path = { path = "../local-project", editable = true }
+with-extras = { version = "~=4.0", extras = ["speedups"] }
+
+[feature.gpu.pypi-dependencies]
+Torch_Vision = "==0.24"
+"feature.direct" = { git = "https://example.com/feature.git" }
+"#,
+        );
+
+        assert_eq!(
+            ws.pypi_dependencies.get("numpy").map(String::as_str),
+            Some(">=1.26,<3")
+        );
+        assert_eq!(
+            ws.pypi_dependencies.get("with-extras").map(String::as_str),
+            Some("~=4.0")
+        );
+        for direct in ["direct-git", "direct-url", "local-path"] {
+            assert_eq!(
+                ws.pypi_dependencies.get(direct).map(String::as_str),
+                Some("*"),
+                "direct source {direct} must remain workspace-owned"
+            );
+        }
+        let gpu = &ws.features["gpu"].pypi_dependencies;
+        assert_eq!(gpu.get("torch-vision").map(String::as_str), Some("==0.24"));
+        assert_eq!(gpu.get("feature-direct").map(String::as_str), Some("*"));
+    }
+
+    #[test]
+    fn effective_pypi_dependencies_merge_features_and_respect_no_default() {
+        let ws = ws_toml(
+            r#"
+[pypi-dependencies]
+Shared_Dep = ">=1"
+top-only = "==1"
+
+[environments]
+layered = { features = ["gpu"] }
+isolated = { features = ["gpu"], no-default-feature = true }
+
+[feature.gpu.pypi-dependencies]
+shared-dep = "==2"
+feature_only = { path = "../feature-only" }
+"#,
+        );
+
+        let layered = ws.effective_pypi_dependencies("layered");
+        assert_eq!(layered.get("shared-dep").map(String::as_str), Some("==2"));
+        assert_eq!(layered.get("top-only").map(String::as_str), Some("==1"));
+        assert_eq!(layered.get("feature-only").map(String::as_str), Some("*"));
+
+        let isolated = ws.effective_pypi_dependencies("isolated");
+        assert_eq!(isolated.get("shared-dep").map(String::as_str), Some("==2"));
+        assert_eq!(isolated.get("feature-only").map(String::as_str), Some("*"));
+        assert!(!isolated.contains_key("top-only"));
+        assert!(ws.effective_pypi_dependencies("missing").is_empty());
     }
 
     #[test]
@@ -1830,6 +1998,77 @@ some-pkg = "==1.0"
     }
 
     #[test]
+    fn precise_consuming_envs_returns_sorted_active_envs() {
+        let tmp = std::env::temp_dir().join(format!(
+            "retread-ws-precise-envs-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(tmp.join("demo-pack")).unwrap();
+        let ws = ws_toml(
+            r#"
+[environments]
+zeta = { features = ["pack"] }
+alpha = { features = ["pack"] }
+unrelated = { features = ["other"] }
+
+[feature.pack.dependencies]
+demo-pack = { path = "./demo-pack" }
+
+[feature.other.dependencies]
+unrelated = "*"
+"#,
+        );
+
+        assert_eq!(
+            ws.precise_consuming_envs(&tmp, &tmp.join("demo-pack")),
+            Some(vec!["alpha".to_string(), "zeta".to_string()])
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn precise_consuming_envs_abstains_for_ambiguous_fallbacks() {
+        let tmp = std::env::temp_dir().join(format!(
+            "retread-ws-ambiguous-envs-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(tmp.join("demo-pack")).unwrap();
+        std::fs::create_dir_all(tmp.join("unmapped-pack")).unwrap();
+        let ws = ws_toml(
+            r#"
+[environments]
+active = { features = ["other"] }
+
+[feature.pack.dependencies]
+demo-pack = { path = "./demo-pack" }
+
+[feature.other.dependencies]
+unrelated = "*"
+"#,
+        );
+
+        // Tier 3: the source is declared, but no concrete env activates it.
+        assert_eq!(
+            ws.precise_consuming_envs(&tmp, &tmp.join("demo-pack")),
+            None
+        );
+        // Tier 4: no declaration maps to this source at all.
+        assert_eq!(
+            ws.precise_consuming_envs(&tmp, &tmp.join("unmapped-pack")),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn consuming_env_dependencies_scopes_to_the_pack_env_range() {
         // envoracle fix fixture: the workspace declares `pillow >=11,<12`
         // for the env that consumes `hover-pack` (not the top-level
@@ -2171,6 +2410,61 @@ torch = ">=2.7"
         assert_eq!(
             fp_empty, "",
             "no env references the pack -> fingerprint must be empty"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn solve_fingerprint_tracks_scoped_pypi_dependencies() {
+        let tmp = std::env::temp_dir().join(format!(
+            "retread-ws-fp-pypi-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(tmp.join("my-pack")).unwrap();
+        let src = tmp.join("my-pack");
+
+        let ws_v1 = ws_toml(
+            r#"
+[workspace]
+channels = ["conda-forge"]
+
+[environments]
+consumer = { features = ["pack"] }
+
+[feature.pack.dependencies]
+my-pack = { path = "./my-pack" }
+
+[feature.pack.pypi-dependencies]
+FSSpec = "==1.0"
+"#,
+        );
+        let ws_v2 = ws_toml(
+            r#"
+[workspace]
+channels = ["conda-forge"]
+
+[environments]
+consumer = { features = ["pack"] }
+
+[feature.pack.dependencies]
+my-pack = { path = "./my-pack" }
+
+[feature.pack.pypi-dependencies]
+fsspec = "==2.0"
+"#,
+        );
+
+        let fp_v1 = ws_v1.solve_fingerprint(&tmp, &src);
+        let fp_v2 = ws_v2.solve_fingerprint(&tmp, &src);
+        assert!(fp_v1.contains("scoped-env:consumer:pypi-dep:fsspec===1.0"));
+        assert_ne!(
+            fp_v1, fp_v2,
+            "changing a consuming env's PyPI declaration must invalidate its solve fingerprint"
         );
 
         let _ = std::fs::remove_dir_all(&tmp);

@@ -443,6 +443,7 @@ fn courier_pure_python_bundle_is_platform_specific_not_noarch() {
         probe_decisions: vec![],
         solve_diagnostics: BTreeMap::new(),
         auto_routed: vec![],
+        auto_dropped: Default::default(),
         uv_closure_names: Default::default(),
     };
 
@@ -507,6 +508,7 @@ fn produce_output_emits_auto_routed_conda_run_deps() {
             ("numpy".to_string(), "2.1.0".to_string(), false),
             ("scipy".to_string(), "1.14.1".to_string(), false),
         ],
+        auto_dropped: Default::default(),
         uv_closure_names: Default::default(),
     };
     let out = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
@@ -556,6 +558,29 @@ fn produce_output_emits_auto_routed_conda_run_deps() {
 }
 
 #[test]
+fn produce_output_omits_workspace_owned_auto_drops() {
+    let mut bundle = solo_bundle(
+        "owned-pack",
+        vec!["numpy>=2", "gym==0.23.1", "requests>=2.31"],
+    );
+    bundle.auto_dropped = ["numpy", "gym"]
+        .into_iter()
+        .map(crate::relax::canonical_conda_name)
+        .collect();
+
+    let out = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
+    let names: Vec<&str> = out
+        .run_dependencies
+        .depends
+        .iter()
+        .map(|dep| dep.name.as_str())
+        .collect();
+    assert!(!names.contains(&"numpy"), "{names:?}");
+    assert!(!names.contains(&"gym"), "{names:?}");
+    assert!(names.contains(&"requests"), "{names:?}");
+}
+
+#[test]
 fn produce_output_softens_deps_from_floor_pin_to_floor_spec() {
     // conda-as-truth fix: an auto-routed package whose root ORIGINATED
     // from a `retread-deps-from` exact pin (the third tuple element)
@@ -576,6 +601,7 @@ fn produce_output_softens_deps_from_floor_pin_to_floor_spec() {
             ("setuptools".to_string(), "69.5.1".to_string(), true),
             ("numpy".to_string(), "2.1.0".to_string(), false),
         ],
+        auto_dropped: Default::default(),
         uv_closure_names: Default::default(),
     };
     let out = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
@@ -1015,6 +1041,7 @@ fn solo_bundle(name: &str, requires: Vec<&str>) -> Bundle {
         probe_decisions: vec![],
         solve_diagnostics: BTreeMap::new(),
         auto_routed: vec![],
+        auto_dropped: Default::default(),
         uv_closure_names: Default::default(),
     }
 }
@@ -1460,6 +1487,7 @@ fn vendored_sub_packages_dropped_from_run_deps() {
         probe_decisions: vec![],
         solve_diagnostics: BTreeMap::new(),
         auto_routed: vec![],
+        auto_dropped: Default::default(),
         uv_closure_names: Default::default(),
     };
 
@@ -1614,6 +1642,7 @@ fn bundle_field_groups_entries_into_one_output() {
         probe_decisions: vec![],
         solve_diagnostics: BTreeMap::new(),
         auto_routed: vec![],
+        auto_dropped: Default::default(),
         uv_closure_names: Default::default(),
     };
 
@@ -1706,6 +1735,7 @@ fn relaxed_pure_python_primary_pins_python_to_workspace_variant() {
         probe_decisions: vec![],
         solve_diagnostics: BTreeMap::new(),
         auto_routed: vec![],
+        auto_dropped: Default::default(),
         uv_closure_names: Default::default(),
     };
 

@@ -139,6 +139,12 @@ pub struct UvClosure {
     /// the wheel closure onto the conda side. Empty when auto-route is
     /// off (or the plain [`compute_closure`] driver was used).
     pub auto_routed: Vec<AutoRoutedPackage>,
+    /// Workspace-owned packages removed from the wheel side after a
+    /// validated conda route. Unlike `auto_routed`, these are not emitted as
+    /// run dependencies of the generated pack: the consuming workspace
+    /// already declares and supplies them. This is ephemeral build evidence,
+    /// never persisted as part of an [`AutoRoutedPackage`].
+    pub auto_dropped: BTreeSet<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -167,16 +173,17 @@ pub struct AutoRoutedPackage {
 pub struct AutoRouteOptions {
     /// Master switch (`auto-route` in `[package.build.config]`; default on).
     pub enabled: bool,
-    /// v4.6 Part A: which candidates the routing sweep may move to conda.
-    /// `Minimal` routes only the ABI/binary whitelist (see
-    /// [`route_policy_admits`]); `Aggressive` is the legacy
-    /// route-anything-conda-has behavior.
+    /// Which candidates the routing sweep may move to conda.
+    /// `PreferCondaValidated` considers every candidate but accepts only
+    /// fact-validated routes; `Minimal` caps eligibility at the ABI/binary
+    /// whitelist (see [`route_policy_admits`]); `Aggressive` preserves the
+    /// legacy route-anything-conda-has behavior.
     ///
     /// NOTE: the struct `Default` here is `Aggressive` (so the extensive
     /// pre-v4.6 unit-test matrix keeps exercising the legacy sweep it was
     /// written against); the PRODUCTION default comes from the config
-    /// layer (`crate::config::RoutePolicy::default()` = `Minimal`), which
-    /// the handler wires in explicitly.
+    /// layer (`crate::config::RoutePolicy::default()` =
+    /// `PreferCondaValidated`), which the handler wires in explicitly.
     pub route_policy: crate::config::RoutePolicy,
     /// v4.6 Part A: extra canonical PyPI names admitted to routing under
     /// `Minimal` (`retread-route-include`), beyond the built-in whitelist.
@@ -223,6 +230,15 @@ pub struct AutoRouteOptions {
     /// 2.7.0). Empty (tests / no workspace / workspace solve failed) --
     /// the un-route fallback then behaves exactly as before.
     pub workspace_conda_versions: BTreeMap<String, String>,
+    /// Canonical PyPI names directly owned by every precisely identified
+    /// consuming workspace environment. Populated only for the validated
+    /// routing policy. A successful route for one of these names is an
+    /// automatic drop rather than a generated-pack run dependency.
+    pub workspace_owned: BTreeSet<String>,
+    /// Stable digest of the concrete per-environment conda facts used to
+    /// validate routing. It participates in the persisted heal-facts stamp so
+    /// a changed workspace solution cannot replay stale routes.
+    pub workspace_fact_fingerprint: String,
 }
 
 impl Default for AutoRouteOptions {
@@ -240,6 +256,8 @@ impl Default for AutoRouteOptions {
             force_conda: BTreeSet::new(),
             abi_anchor_pins: BTreeMap::new(),
             workspace_conda_versions: BTreeMap::new(),
+            workspace_owned: BTreeSet::new(),
+            workspace_fact_fingerprint: String::new(),
         }
     }
 }
@@ -247,7 +265,9 @@ impl Default for AutoRouteOptions {
 /// v4.6 Part A routing-policy gate: may this (pypi name, mapped conda
 /// name) candidate be auto-routed to conda?
 ///
-/// `Aggressive` admits everything (legacy). `Minimal` admits only:
+/// `PreferCondaValidated` and `Aggressive` admit every name; the former is
+/// subsequently required to pass the fact-validation gates. `Minimal`
+/// admits only:
 /// - python / python_abi (the interpreter ABI itself),
 /// - the torch family (torch, pytorch, pytorch-gpu, pytorch-cpu,
 ///   torchvision, torchaudio -- checked on BOTH the pypi and the mapped
@@ -262,7 +282,10 @@ impl Default for AutoRouteOptions {
 /// ladder empirically un-routed wrapt/moviepy/dm-tree/grpcio/cycler/
 /// fsspec/huggingface-hub/...; the fixes converged on this whitelist).
 pub fn route_policy_admits(pypi_name: &str, conda_name: &str, opts: &AutoRouteOptions) -> bool {
-    if opts.route_policy == crate::config::RoutePolicy::Aggressive {
+    if matches!(
+        opts.route_policy,
+        crate::config::RoutePolicy::PreferCondaValidated | crate::config::RoutePolicy::Aggressive
+    ) {
         return true;
     }
     const WHITELIST: &[&str] = &[
@@ -1029,6 +1052,12 @@ where
             break;
         }
     }
+    closure.auto_dropped.extend(
+        routed
+            .iter()
+            .filter(|route| opts.workspace_owned.contains(&route.pypi_name))
+            .map(|route| route.pypi_name.clone()),
+    );
     closure.auto_routed = routed;
     Ok(closure)
 }
@@ -1122,8 +1151,8 @@ impl std::error::Error for HealNeeded {}
 /// BOTH lists (a wheel-less pre-release); each list is then handled by its
 /// own rung.
 pub fn classify_pylock_offenders(pylock_text: &str) -> Result<ClosureOffenders> {
-    let doc: toml::Value = toml::from_str(pylock_text)
-        .context("parsing Pass-B pylock.toml for offender detection")?;
+    let doc: toml::Value =
+        toml::from_str(pylock_text).context("parsing Pass-B pylock.toml for offender detection")?;
     let packages = doc
         .get("packages")
         .and_then(|p| p.as_array())
@@ -1468,8 +1497,7 @@ where
                                 let spec = format!("=={version}");
                                 // Rung 1: conda-route (skip already-routed).
                                 if !already_routed.contains(name)
-                                    && let Some(hit) =
-                                        sdist_probe(name.clone(), spec.clone()).await
+                                    && let Some(hit) = sdist_probe(name.clone(), spec.clone()).await
                                 {
                                     new_routes.push(AutoRoutedPackage {
                                         pypi_name: name.clone(),
@@ -2194,6 +2222,7 @@ pub fn parse_pylock_closure(
         pins,
         uv_version: uv_version.to_string(),
         auto_routed: Vec::new(),
+        auto_dropped: BTreeSet::new(),
     })
 }
 
@@ -2511,6 +2540,14 @@ pub fn heal_facts_stamp(
         .collect();
     field("name-map", &mut name_map.iter().map(String::as_str));
     field("protected", &mut opts.protected.iter().map(String::as_str));
+    field(
+        "workspace-owned",
+        &mut opts.workspace_owned.iter().map(String::as_str),
+    );
+    field(
+        "workspace-facts",
+        &mut std::iter::once(opts.workspace_fact_fingerprint.as_str()),
+    );
     let anchors: Vec<String> = opts
         .abi_anchor_pins
         .iter()
@@ -2531,7 +2568,12 @@ pub fn heal_facts_stamp(
 /// uv.lock, the persisted facts still seed the first Pass A so it converges
 /// in a single lock (issue #10 perf, item 3b). Keyed identically to the uv
 /// project dir (bundle + python minor + subdir) so each target has its own.
-pub fn heal_facts_path(cache_dir: &Path, bundle: &str, python_version: &str, subdir: &str) -> PathBuf {
+pub fn heal_facts_path(
+    cache_dir: &Path,
+    bundle: &str,
+    python_version: &str,
+    subdir: &str,
+) -> PathBuf {
     cache_dir.join("retread-heal-facts").join(format!(
         "{}-py{}-{}.json",
         canonical_conda_name(bundle),
@@ -2716,7 +2758,11 @@ fn build_lock_args(
 
 /// Assemble the `uv export` argument vector (single-sourced so the green
 /// path and the Pass-B offender-detection export stay identical).
-fn build_export_args(project_dir: &Path, no_emit_packages: &[String], offline: bool) -> Vec<String> {
+fn build_export_args(
+    project_dir: &Path,
+    no_emit_packages: &[String],
+    offline: bool,
+) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "export".into(),
         "--project".into(),
@@ -2960,8 +3006,12 @@ pub async fn compute_closure(
 
         // Pass B resolved. Export its lock and read the offenders
         // STRUCTURALLY from the pylock document (no stderr prose parsing).
-        let pass_b_export =
-            run(build_export_args(project_dir, &req.no_emit_packages, req.offline)).await?;
+        let pass_b_export = run(build_export_args(
+            project_dir,
+            &req.no_emit_packages,
+            req.offline,
+        ))
+        .await?;
         if !pass_b_export.status.success() {
             // Can't inspect the Pass B lock -> fall back to Pass A's error.
             bail!("{original_error}");
@@ -3690,7 +3740,10 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
                     .unwrap();
             // Pin recorded, but no index wheel emitted from the closure.
             assert_eq!(
-                closure.pins.get("isaacsim-extscache-kit").map(String::as_str),
+                closure
+                    .pins
+                    .get("isaacsim-extscache-kit")
+                    .map(String::as_str),
                 Some("5.1.0"),
                 "archive package must contribute a pin:\n{text}"
             );
@@ -3932,6 +3985,39 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
         assert_eq!(prov.conda_version, "==2.1.0");
     }
 
+    #[tokio::test]
+    async fn workspace_owned_validated_route_becomes_auto_drop() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let hits = BTreeMap::from([(
+            "numpy".to_string(),
+            RouteProbeHit {
+                conda_version: "2.1.0".into(),
+                channel: "https://conda.anaconda.org/conda-forge/linux-64".into(),
+                depends: Vec::new(),
+            },
+        )]);
+        let mut opts = auto_route_opts();
+        opts.route_policy = crate::config::RoutePolicy::PreferCondaValidated;
+        opts.workspace_owned.insert("numpy".to_string());
+
+        let closure = auto_route_fixpoint_checked(
+            &auto_route_req(),
+            &opts,
+            canned_solve(calls),
+            canned_probe(hits),
+            canned_co_solve(Vec::new()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(closure.auto_routed.len(), 1);
+        assert_eq!(
+            closure.auto_dropped,
+            BTreeSet::from(["numpy".to_string()]),
+            "only a successfully probed and co-solvable owned route may be dropped"
+        );
+    }
+
     /// `keep-pypi` names are never routed (and never probed).
     #[tokio::test]
     async fn auto_route_respects_keep_pypi() {
@@ -4104,6 +4190,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
                         pins: BTreeMap::new(),
                         uv_version: "0.11.15".into(),
                         auto_routed: vec![],
+                        auto_dropped: BTreeSet::new(),
                     })
                 }) as futures::future::BoxFuture<'static, Result<UvClosure>>
             }
@@ -4160,6 +4247,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
                         pins: BTreeMap::new(),
                         uv_version: "0.11.15".into(),
                         auto_routed: vec![],
+                        auto_dropped: BTreeSet::new(),
                     })
                 }) as futures::future::BoxFuture<'static, Result<UvClosure>>
             }
@@ -4573,8 +4661,8 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
             None,
             crate::config::SdistBuildPolicy::Auto,
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         let _ = std::fs::remove_dir_all(&tmp);
         assert_eq!(
             closure.pins.get("typing-extensions").map(String::as_str),
@@ -4637,8 +4725,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
                         crate::config::SdistBuildPolicy::Auto,
                     )
                     .await
-                })
-                    as futures::future::BoxFuture<'static, Result<UvClosure>>
+                }) as futures::future::BoxFuture<'static, Result<UvClosure>>
             }
         };
         let probe = move |name: String, spec: String| {
@@ -4936,6 +5023,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
                     pins,
                     uv_version: "0.11.15".into(),
                     auto_routed: vec![],
+                    auto_dropped: BTreeSet::new(),
                 })
             })
         }
@@ -5398,8 +5486,14 @@ url = "https://example/weird-0.9.0a1.tar.gz"
 sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
 "#;
         let offenders = classify_pylock_offenders(pylock).unwrap();
-        assert_eq!(offenders.sdist_only, vec![("weird".to_string(), "0.9.0a1".to_string())]);
-        assert_eq!(offenders.prerelease, vec![("weird".to_string(), "0.9.0a1".to_string())]);
+        assert_eq!(
+            offenders.sdist_only,
+            vec![("weird".to_string(), "0.9.0a1".to_string())]
+        );
+        assert_eq!(
+            offenders.prerelease,
+            vec![("weird".to_string(), "0.9.0a1".to_string())]
+        );
     }
 
     // ---- Pass A / Pass B lock-arg invariant ------------------------------
@@ -5430,7 +5524,10 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
     #[test]
     fn pass_a_and_pass_b_differ_only_by_known_relaxations() {
         let dir = Path::new("/tmp/proj");
-        let indexes = vec!["https://pypi.nvidia.com".to_string(), "https://pypi.org/simple/".to_string()];
+        let indexes = vec![
+            "https://pypi.nvidia.com".to_string(),
+            "https://pypi.org/simple/".to_string(),
+        ];
         let a = build_lock_args(dir, "3.12", &indexes, false, LockRelaxations::PASS_A);
         let b_auto = build_lock_args(dir, "3.12", &indexes, false, LockRelaxations::PASS_B_AUTO);
         let b_never = build_lock_args(dir, "3.12", &indexes, false, LockRelaxations::PASS_B_NEVER);
@@ -5450,10 +5547,7 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
         // stays -- build policy is orthogonal to prerelease healing).
         assert_eq!(
             arg_symmetric_difference(&a, &b_never),
-            BTreeSet::from([
-                "if-necessary-or-explicit".to_string(),
-                "allow".to_string(),
-            ]),
+            BTreeSet::from(["if-necessary-or-explicit".to_string(), "allow".to_string(),]),
             "under `sdist-build = never`, Pass B keeps --no-build and relaxes only prerelease"
         );
         // `--no-build` really is retained under Never and dropped under Auto.
@@ -5467,8 +5561,14 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
         // (UV_NO_CONFIG=1 strips it from the synthesized pyproject table).
         let dir = Path::new("/tmp/proj");
         let a = build_lock_args(dir, "3.12", &[], false, LockRelaxations::PASS_A);
-        let idx = a.iter().position(|t| t == "--prerelease").expect("--prerelease flag present");
-        assert_eq!(a.get(idx + 1).map(String::as_str), Some("if-necessary-or-explicit"));
+        let idx = a
+            .iter()
+            .position(|t| t == "--prerelease")
+            .expect("--prerelease flag present");
+        assert_eq!(
+            a.get(idx + 1).map(String::as_str),
+            Some("if-necessary-or-explicit")
+        );
     }
 
     // ---- heal ladder driven by the structured verdict --------------------
@@ -5514,8 +5614,16 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
         .await
         .unwrap_err();
         assert!(err.to_string().contains("platform tag"), "{err}");
-        assert_eq!(*calls.lock().unwrap(), 1, "no retry on a non-HealNeeded error");
-        assert_eq!(*probe_calls.lock().unwrap(), 0, "no probe on a non-HealNeeded error");
+        assert_eq!(
+            *calls.lock().unwrap(),
+            1,
+            "no retry on a non-HealNeeded error"
+        );
+        assert_eq!(
+            *probe_calls.lock().unwrap(),
+            0,
+            "no probe on a non-HealNeeded error"
+        );
     }
 
     /// Sdist-only offender: the mock `compute_closure` reports it as a
@@ -5544,7 +5652,12 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
                             "package `pyperclip` has no usable wheels",
                         ));
                     }
-                    parse_pylock_closure(PYLOCK_FIXTURE, &target("3.12", "linux-64"), &BTreeSet::new(), "0.11.15")
+                    parse_pylock_closure(
+                        PYLOCK_FIXTURE,
+                        &target("3.12", "linux-64"),
+                        &BTreeSet::new(),
+                        "0.11.15",
+                    )
                 }) as futures::future::BoxFuture<'static, Result<UvClosure>>
             }
         };
@@ -5598,13 +5711,27 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
         )
         .await
         .unwrap();
-        assert_eq!(*attempts.lock().unwrap(), 2, "one failure + one healed retry");
+        assert_eq!(
+            *attempts.lock().unwrap(),
+            2,
+            "one failure + one healed retry"
+        );
         // Both rungs keyed on the EXACT resolved version from Pass B.
-        assert_eq!(seen_specs.lock().unwrap().as_slice(), &["==1.8.2".to_string()]);
-        assert_eq!(seen_build_reqs.lock().unwrap().as_slice(), &[Some("==1.8.2".to_string())]);
+        assert_eq!(
+            seen_specs.lock().unwrap().as_slice(),
+            &["==1.8.2".to_string()]
+        );
+        assert_eq!(
+            seen_build_reqs.lock().unwrap().as_slice(),
+            &[Some("==1.8.2".to_string())]
+        );
         assert_eq!(closure.auto_routed.len(), 1);
         assert_eq!(closure.auto_routed[0].pypi_name, "pyperclip");
-        let built = closure.wheels.iter().find(|w| w.name == "pyperclip").expect("built wheel spliced");
+        let built = closure
+            .wheels
+            .iter()
+            .find(|w| w.name == "pyperclip")
+            .expect("built wheel spliced");
         assert!(matches!(built.origin, Origin::Built));
         assert_eq!(built.version, "1.8.2");
     }
@@ -5615,7 +5742,11 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
     async fn heal_surfaces_build_failure_log_tail() {
         let solve = |_r: UvClosureRequest| {
             Box::pin(async {
-                Err(heal_needed(&[("pyperclip", "1.8.2")], &[], "package `pyperclip` has no usable wheels"))
+                Err(heal_needed(
+                    &[("pyperclip", "1.8.2")],
+                    &[],
+                    "package `pyperclip` has no usable wheels",
+                ))
             }) as futures::future::BoxFuture<'static, Result<UvClosure>>
         };
         let probe = |_n: String, _s: String| {
@@ -5651,7 +5782,11 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
     async fn heal_never_policy_surfaces_original_error_for_sdist_only() {
         let solve = |_r: UvClosureRequest| {
             Box::pin(async {
-                Err(heal_needed(&[("pyperclip", "1.8.2")], &[], "package `pyperclip` has no usable wheels"))
+                Err(heal_needed(
+                    &[("pyperclip", "1.8.2")],
+                    &[],
+                    "package `pyperclip` has no usable wheels",
+                ))
             }) as futures::future::BoxFuture<'static, Result<UvClosure>>
         };
         let probe = |_n: String, _s: String| {
@@ -5687,8 +5822,14 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
                 let seen_pins = Arc::clone(&seen_pins);
                 Box::pin(async move {
                     seen_pins.lock().unwrap().push(r.explicit_pins.clone());
-                    if r.explicit_pins.get("tinyobjloader").map(String::as_str) == Some("2.0.0rc13") {
-                        parse_pylock_closure(PYLOCK_FIXTURE, &target("3.12", "linux-64"), &BTreeSet::new(), "0.11.15")
+                    if r.explicit_pins.get("tinyobjloader").map(String::as_str) == Some("2.0.0rc13")
+                    {
+                        parse_pylock_closure(
+                            PYLOCK_FIXTURE,
+                            &target("3.12", "linux-64"),
+                            &BTreeSet::new(),
+                            "0.11.15",
+                        )
                     } else {
                         Err(heal_needed(
                             &[],
@@ -5717,7 +5858,10 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
         .unwrap();
         // The re-solve saw the explicit first-party pin.
         let pins = seen_pins.lock().unwrap();
-        assert!(pins.iter().any(|p| p.get("tinyobjloader").map(String::as_str) == Some("2.0.0rc13")));
+        assert!(
+            pins.iter()
+                .any(|p| p.get("tinyobjloader").map(String::as_str) == Some("2.0.0rc13"))
+        );
         // Closure resolved (mock returns the standard fixture on success).
         assert!(!closure.wheels.is_empty());
     }
@@ -5728,7 +5872,8 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
     #[test]
     fn synthesize_pyproject_renders_prerelease_pin_as_first_party_dep() {
         let mut req = sample_request();
-        req.explicit_pins.insert("tinyobjloader".to_string(), "2.0.0rc13".to_string());
+        req.explicit_pins
+            .insert("tinyobjloader".to_string(), "2.0.0rc13".to_string());
         let got = synthesize_pyproject(&req);
         assert!(
             got.contains("\"tinyobjloader==2.0.0rc13\""),
@@ -5794,8 +5939,8 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
             eprintln!("skipping: uv not found on PATH");
             return;
         }
-        let tmp = std::env::temp_dir()
-            .join(format!("retread-prerelease-heal-{}", std::process::id()));
+        let tmp =
+            std::env::temp_dir().join(format!("retread-prerelease-heal-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let idx = tmp.join("index");
         let bstub_dir = idx.join("bstub");
@@ -5808,7 +5953,11 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
             format!("<a href=\"{b_stable}\">s</a><a href=\"{b_pre}\">p</a>"),
         )
         .unwrap();
-        std::fs::write(astub_dir.join("index.html"), format!("<a href=\"{a}\">a</a>")).unwrap();
+        std::fs::write(
+            astub_dir.join("index.html"),
+            format!("<a href=\"{a}\">a</a>"),
+        )
+        .unwrap();
         let index_url = format!("file://{}/", idx.display());
 
         let mk_req = || UvClosureRequest {
@@ -5835,7 +5984,9 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
             crate::config::SdistBuildPolicy::Auto,
         )
         .await
-        .expect_err("Pass A must fail: transitive prerelease not honored under if-necessary-or-explicit");
+        .expect_err(
+            "Pass A must fail: transitive prerelease not honored under if-necessary-or-explicit",
+        );
         let heal = err
             .downcast_ref::<HealNeeded>()
             .unwrap_or_else(|| panic!("expected structured HealNeeded, got: {err:#}"));
@@ -5963,8 +6114,16 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
         let tstub_dir = idx.join("tstub");
         let a = write_test_wheel(&astub_dir, "astub", "1.0", &["tstub==1.0"]);
         let t = write_test_sdist(&tstub_dir, "tstub", "1.0");
-        std::fs::write(astub_dir.join("index.html"), format!("<a href=\"{a}\">a</a>")).unwrap();
-        std::fs::write(tstub_dir.join("index.html"), format!("<a href=\"{t}\">t</a>")).unwrap();
+        std::fs::write(
+            astub_dir.join("index.html"),
+            format!("<a href=\"{a}\">a</a>"),
+        )
+        .unwrap();
+        std::fs::write(
+            tstub_dir.join("index.html"),
+            format!("<a href=\"{t}\">t</a>"),
+        )
+        .unwrap();
         let index_url = format!("file://{}/", idx.display());
 
         let req = UvClosureRequest {
@@ -6229,6 +6388,8 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
             force_conda: BTreeSet::new(),
             abi_anchor_pins: BTreeMap::new(),
             workspace_conda_versions: BTreeMap::new(),
+            workspace_owned: BTreeSet::new(),
+            workspace_fact_fingerprint: String::new(),
         };
         // Holds the `sdist-build` policy fixed at the default while probing
         // the manifest/routing input classes; the policy gets its own
@@ -6339,6 +6500,7 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
                             wheels: vec![],
                             pins: BTreeMap::new(),
                             auto_routed: vec![],
+                            auto_dropped: BTreeSet::new(),
                             uv_version: "test".into(),
                         })
                     }
@@ -6347,8 +6509,7 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
             }
         };
         let sdist_probe = |_n: String, _s: String| {
-            Box::pin(async { None })
-                as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
+            Box::pin(async { None }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
         };
         let sdist_build = Some(|name: String, req: Option<String>| {
             Box::pin(async move {
@@ -6399,10 +6560,17 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
             offline: false,
         };
         healing(req).await.expect("wedge must self-recover");
-        assert_eq!(attempts.load(Ordering::SeqCst), 2, "fail once, heal, succeed");
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "fail once, heal, succeed"
+        );
         // Ledger now holds ONLY the fresh fact.
         let b = built.lock().unwrap();
         assert_eq!(b.len(), 1);
-        assert_eq!((b[0].pypi_name.as_str(), b[0].version.as_str()), ("bar", "2.5"));
+        assert_eq!(
+            (b[0].pypi_name.as_str(), b[0].version.as_str()),
+            ("bar", "2.5")
+        );
     }
 }
