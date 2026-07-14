@@ -372,10 +372,11 @@ impl RetreadLock {
     ///
     /// `config_fingerprint` folds in EVERY remaining resolution-affecting
     /// manifest input that is not already covered above -- overrides,
-    /// name-map, drop-deps, conda-deps, auto-bundle, build-number, and the
-    /// conda channel list. Without it, editing any of those (e.g. genesis's
-    /// `retread-name-map`) would leave the hash unchanged and a stale,
-    /// POISONED lock would replay. It is produced by the shared
+    /// name-map, shadow-libs, drop-deps, conda-deps, route-policy,
+    /// route-include, auto-bundle, build-number, the conda channel list, and
+    /// the workspace solve fingerprint. Without it, editing any of those
+    /// (e.g. genesis's `retread-name-map`) would leave the hash unchanged and
+    /// a stale, POISONED lock would replay. It is produced by the shared
     /// `courier::config_fingerprint` so producer and replayer always agree.
     ///
     /// The hash folds the emit epoch (+ the exact retread version when

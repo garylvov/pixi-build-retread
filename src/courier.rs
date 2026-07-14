@@ -19,7 +19,7 @@ use anyhow::Context as _;
 use sha2::{Digest, Sha256};
 use uv_pep508::Requirement;
 
-use crate::config::{NamedGitSource, RetreadConfig, WheelEntry};
+use crate::config::{NamedGitSource, RetreadConfig, RoutePolicy, WheelEntry};
 use crate::emit_pypi::{
     EmitWheel, build_meta_wheel, collect_prerelease_pins, insert_build_tag, override_line_map,
     plan, standard_wheel_filename,
@@ -111,13 +111,14 @@ pub fn courier_input_specs(config: &RetreadConfig, bundle_name: &str) -> Vec<Str
 /// stale.
 ///
 /// Folds in: per-dep overrides, the PyPI->conda name-map, drop-deps,
-/// conda-deps, the auto-bundle toggle, the build-number, AND the conda channel
-/// list. Each of these changes the emitted conda specs or the conda/PyPI
-/// routing, so omitting any would let a manifest/workspace edit leave the hash
-/// unchanged and replay a stale, POISONED lock. (genesis's `retread-name-map`
-/// is the canonical config regression case; a workspace channel addition is
-/// the canonical channel case -- a newly-added channel can make a previously
-/// auto-bundled wheel conda-capable, flipping its lock classification.)
+/// conda-deps, the route policy and include set, the auto-bundle toggle, the
+/// build-number, AND the conda channel list. Each of these changes the emitted
+/// conda specs or the conda/PyPI routing, so omitting any would let a
+/// manifest/workspace edit leave the hash unchanged and replay a stale,
+/// POISONED lock. (genesis's `retread-name-map` is the canonical config
+/// regression case; a workspace channel addition is the canonical channel
+/// case -- a newly-added channel can make a previously auto-bundled wheel
+/// conda-capable, flipping its lock classification.)
 ///
 /// `conda_channels` is the channel set pixi forwards (`params.channels`,
 /// stringified). Order is SIGNIFICANT (conda channel priority), so it is NOT
@@ -156,6 +157,17 @@ pub fn config_fingerprint(
     conda.sort();
     for c in &conda {
         parts.push(format!("conda-dep:{c}"));
+    }
+    let route_policy = match config.route_policy {
+        RoutePolicy::PreferCondaValidated => "prefer-conda-validated",
+        RoutePolicy::Minimal => "minimal",
+        RoutePolicy::Aggressive => "aggressive",
+    };
+    parts.push(format!("route-policy:{route_policy}"));
+    let mut route_include = config.route_include.clone();
+    route_include.sort();
+    for name in &route_include {
+        parts.push(format!("route-include:{name}"));
     }
     parts.push(format!("auto-bundle:{}", config.auto_bundle));
     parts.push(format!("build-number:{}", config.build_number));
@@ -1342,6 +1354,56 @@ mod tests {
         assert_ne!(
             added, reordered,
             "channel order must change the fingerprint"
+        );
+    }
+
+    /// Routing policy changes must invalidate locks, including the v5 default
+    /// transition from legacy aggressive routing to validated conda routing.
+    #[test]
+    fn fingerprint_covers_route_policy() {
+        let cfg = minimal_config("b");
+        let chans = ["conda-forge".to_string()];
+        let validated = config_fingerprint(&cfg, &chans, "");
+        assert!(
+            validated
+                .lines()
+                .any(|line| line == "route-policy:prefer-conda-validated"),
+            "the default policy must be encoded explicitly to invalidate legacy fingerprints"
+        );
+
+        let mut aggressive = cfg;
+        aggressive.route_policy = RoutePolicy::Aggressive;
+        let aggressive = config_fingerprint(&aggressive, &chans, "");
+        assert_ne!(
+            validated, aggressive,
+            "changing route policy must change the fingerprint"
+        );
+    }
+
+    /// `route_include` affects routing under the minimal policy, but its order
+    /// is semantically irrelevant because routing consumes it as a set.
+    #[test]
+    fn fingerprint_covers_route_include() {
+        let mut first = minimal_config("b");
+        first.route_policy = RoutePolicy::Minimal;
+        first.route_include = vec!["mujoco".to_string(), "grpcio".to_string()];
+        let chans = ["conda-forge".to_string()];
+        let first_fp = config_fingerprint(&first, &chans, "");
+
+        let mut changed = first.clone();
+        changed.route_include = vec!["mujoco".to_string(), "scipy".to_string()];
+        assert_ne!(
+            first_fp,
+            config_fingerprint(&changed, &chans, ""),
+            "changing route includes must change the fingerprint"
+        );
+
+        let mut reordered = first;
+        reordered.route_include.reverse();
+        assert_eq!(
+            first_fp,
+            config_fingerprint(&reordered, &chans, ""),
+            "route include order must not change the fingerprint"
         );
     }
 
