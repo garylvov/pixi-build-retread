@@ -470,9 +470,9 @@ mod tests {
             ..yes
         };
         assert!(!indecisive.is_satisfied());
-        // Indecisive is NOT "definitively unsatisfied". Callers must
-        // not trigger a fallback on indecisive results -- a network
-        // outage shouldn't reshape routing.
+        // Indecisive is distinct from a proven miss. Routing callers still
+        // fail closed unless `is_satisfied()` is backed by a real candidate;
+        // other callers can preserve the outage-vs-unsat distinction.
         assert!(!indecisive.is_definitively_unsatisfied());
     }
 

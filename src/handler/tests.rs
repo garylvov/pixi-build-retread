@@ -1,6 +1,7 @@
 use super::audit_report::format_packagespec;
 use super::auto_bundle::{
-    ExtraDepSource, extra_dep_source_from_url, pep508_extra_dep, prefer_conda_match,
+    ExtraDepSource, conda_probe_spec, extra_dep_source_from_url, pep508_extra_dep,
+    prefer_conda_match, validated_conda_route,
 };
 use super::{merge_index_chain, *};
 use crate::config::RelaxPolicy;
@@ -1895,14 +1896,10 @@ fn cross_output_siblings_appear_as_run_deps() {
 }
 
 #[test]
-fn prefer_conda_skips_parselmouth_known_deps() {
-    // Contract: anything in the effective name_map (parselmouth +
-    // FALLBACK + user retread-name-map) is NOT auto-bundled -- it
-    // flows to emission as a conda run-dep via translate. This is
-    // the prefer-conda default. Concretely: torch in the bundle's
-    // candidates should be skipped because parselmouth maps it to
-    // pytorch; a niche pure-PyPI helper with no conda equivalent
-    // (e.g. qdldl) should not be skipped.
+fn prefer_conda_match_identifies_mapped_targets() {
+    // Contract: entries in the effective name map are eligible for a
+    // requirement-specific conda probe. The probe result, not this name-only
+    // lookup, makes the final routing decision.
     let mut name_map: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
     name_map.insert("torch".to_string(), "pytorch".to_string());
@@ -1912,17 +1909,91 @@ fn prefer_conda_skips_parselmouth_known_deps() {
         "py-opencv".to_string(),
     );
 
-    // Parselmouth-known => prefer conda, don't bundle.
+    // Parselmouth-known => probe the mapped conda target.
     assert!(prefer_conda_match("torch", &name_map));
     assert!(prefer_conda_match("numpy", &name_map));
     // FALLBACK_PYPI_TO_CONDA entry survives the same way.
     assert!(prefer_conda_match("opencv-python-headless", &name_map));
 
-    // Unknown to parselmouth => fall through to auto-bundle path.
-    // (These are the long tail retread should still vendor.)
+    // Unknown to parselmouth => no mapped conda target from this lookup.
     assert!(!prefer_conda_match("qdldl", &name_map));
     assert!(!prefer_conda_match("asteval", &name_map));
     assert!(!prefer_conda_match("aiodns", &name_map));
+}
+
+#[test]
+fn source_wheel_auto_bundle_empty_conda_candidates_stays_on_pypi() {
+    let bare = uv_pep508::uv_pep440::VersionSpecifiers::empty();
+    assert_eq!(conda_probe_spec(&bare), "*");
+
+    let empty = crate::probe::ProbeResult {
+        package: "zmq".into(),
+        spec: "*".into(),
+        channels_consulted: vec!["https://conda.example/noarch".into()],
+        satisfiable: Some(false),
+        matching_candidates: 0,
+    };
+    assert!(
+        !validated_conda_route(&empty),
+        "an empty requirement-specific candidate set must take the auto-bundle PyPI path"
+    );
+
+    let indecisive = crate::probe::ProbeResult {
+        satisfiable: None,
+        channels_consulted: Vec::new(),
+        ..empty.clone()
+    };
+    assert!(
+        !validated_conda_route(&indecisive),
+        "routing without a validated candidate must fail closed to PyPI"
+    );
+
+    let inconsistent = crate::probe::ProbeResult {
+        satisfiable: Some(true),
+        ..empty.clone()
+    };
+    assert!(
+        !validated_conda_route(&inconsistent),
+        "a true verdict without a candidate must not authorize conda routing"
+    );
+
+    let matched = crate::probe::ProbeResult {
+        satisfiable: Some(true),
+        matching_candidates: 1,
+        ..empty
+    };
+    assert!(validated_conda_route(&matched));
+}
+
+#[test]
+fn auto_bundle_sdist_fetch_preserves_replay_provenance() {
+    let built_url = url::Url::from_file_path("/cache/zmq-0.0.0-py3-none-any.whl").unwrap();
+    let sdist_url =
+        url::Url::parse("https://files.pythonhosted.org/packages/zmq-0.0.0.tar.gz#sha256=abc123")
+            .unwrap();
+    let (upstream, source) = bfs_fetch_provenance(
+        &built_url,
+        Some(SdistProv {
+            index: "https://pypi.org/simple/".into(),
+            name: "zmq".into(),
+            version: "0.0.0".into(),
+            sdist_url: sdist_url.clone(),
+        }),
+    );
+
+    assert!(
+        upstream.is_none(),
+        "machine-local built wheel URL must not become replay provenance"
+    );
+    let source = source.expect("sdist replay source");
+    assert_eq!(source.name, "zmq");
+    assert_eq!(source.version, "0.0.0");
+    assert_eq!(source.sdist_url, sdist_url.to_string());
+
+    let wheel_url = url::Url::parse("https://files.pythonhosted.org/zmq-1.0.whl").unwrap();
+    let (upstream, source) = bfs_fetch_provenance(&wheel_url, None);
+    assert_eq!(upstream.as_ref(), Some(&wheel_url));
+    assert!(source.is_none());
 }
 
 #[test]

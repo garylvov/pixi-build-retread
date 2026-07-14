@@ -12,7 +12,7 @@ use anyhow::{Context, Result, anyhow};
 use rattler_conda_types::ChannelUrl;
 use uv_pep508::uv_pep440::VersionSpecifiers;
 
-use crate::config::{RelaxPolicy, RetreadConfig};
+use crate::config::RetreadConfig;
 use crate::pypi;
 use crate::relax::{canonical_conda_name, default_marker_env};
 use crate::wheel::WheelMetadata;
@@ -43,14 +43,34 @@ impl std::error::Error for IncrementalRipple {}
 
 /// Returns `true` if `conda_normalized_pypi_name` has an unambiguous conda
 /// equivalent in the effective name_map (parselmouth + FALLBACK + user
-/// retread-name-map). When true, the prefer-conda policy in
-/// [`auto_bundle_transitives`] skips bundling so the dep flows through to
-/// emission as a conda run-dep.
+/// retread-name-map). This identifies a conda target; the requirement-specific
+/// probe must still pass [`validated_conda_route`] before auto-bundling is
+/// skipped.
 pub(crate) fn prefer_conda_match(
     conda_normalized_pypi_name: &str,
     name_map: &BTreeMap<String, String>,
 ) -> bool {
     name_map.contains_key(conda_normalized_pypi_name)
+}
+
+/// A conda route is valid only when the requirement-specific probe found at
+/// least one matching candidate. Indecisive probes and internally
+/// inconsistent `Some(true)`/zero-candidate results stay on the PyPI path.
+pub(crate) fn validated_conda_route(probe: &crate::probe::ProbeResult) -> bool {
+    probe.satisfiable == Some(true) && probe.matching_candidates > 0
+}
+
+/// Render the original PEP 440 requirement for conda's match-spec parser.
+/// `VersionSpecifiers` inserts a space after commas; rattler's lenient parser
+/// can silently lose the following clause unless that space is removed.
+/// Empty specifiers are the genuinely unconstrained `*` case.
+pub(crate) fn conda_probe_spec(specifiers: &VersionSpecifiers) -> String {
+    let normalized = specifiers.to_string().replace(", ", ",");
+    if normalized.trim().is_empty() {
+        "*".to_string()
+    } else {
+        normalized
+    }
 }
 
 /// v0.46.0: pick the conda target name for a PyPI dep in the BFS
@@ -87,20 +107,6 @@ pub(crate) fn pick_conda_target(
     }
 }
 
-/// Build the conda match-spec string the channel probe should look
-/// for, given a resolved PyPI version and the active relax policy.
-/// Mirrors what `translate(==<version>)` would emit, since that's
-/// the spec the conda solver will eventually face. Falls back to
-/// `*` (any version) when the version can't be parsed -- a generous
-/// default that lets the probe succeed if ANY build of the package
-/// exists on the channel.
-fn probe_spec_for(version_str: &str, policy: RelaxPolicy) -> String {
-    match uv_pep508::uv_pep440::Version::from_str(version_str) {
-        Ok(v) => crate::relax::widen_exact(&v, policy).unwrap_or_else(|| "*".to_string()),
-        Err(_) => "*".to_string(),
-    }
-}
-
 /// This is the "pip autoresolve" path: deps that exist on PyPI but might
 /// not be on the workspace's conda channels (`aiodns`, `qdldl`, etc.) get
 /// pip-installed into the conda package alongside the primary wheel.
@@ -109,8 +115,9 @@ fn probe_spec_for(version_str: &str, policy: RelaxPolicy) -> String {
 /// knows a conda equivalent for is skipped here and emitted as a conda
 /// run-dep instead.
 ///
-/// Best-effort: a resolve failure logs at debug and leaves the dep to be
-/// emitted as a conda run-dep (current fallback behavior).
+/// Once validated routing chooses PyPI, resolution failure is fatal: silently
+/// returning the dependency to conda would reintroduce a route already proven
+/// unsatisfiable.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn auto_bundle_transitives(
     bundle: &mut Bundle,
@@ -134,11 +141,8 @@ pub(crate) async fn auto_bundle_transitives(
     // these from PyPI under no-build, the auto-route probe already
     // declined to move them to conda at the resolved version, so they
     // MUST ship in the bundle. Candidates in this set bypass the
-    // prefer-conda probes below — the name-level "conda has it at SOME
-    // version, keep it conda-side" arm otherwise emits a relaxed
-    // run-dep spec that no channel can satisfy (aiodns==3.1.1 ->
-    // `>=3.1.1,<3.2` -> "no candidates"), and the pre-emission solve
-    // cascade that used to rescue that died in v4.2.0.
+    // prefer-conda probes below because uv already ran the validated route
+    // decision for their exact resolved versions.
     //
     // v4.6 Part A follow-up (run-44 smoke failure): the map's entries
     // are ALSO seeded as first-round candidates. Requires-Dist scans
@@ -212,10 +216,8 @@ pub(crate) async fn auto_bundle_transitives(
     loop {
         // Collect new candidates from wheels we haven't scanned yet.
         let mut candidates: Vec<(String, String)> = Vec::new();
-        // v1.7.0: ALSO consider bare/ranged base deps. They get the
-        // step-8 gate below: bundle only when a definitive name-level
-        // probe says conda has ZERO candidates (a true PyPI-only dep);
-        // otherwise they stay conda-side exactly as before.
+        // v1.7.0: ALSO consider bare/ranged base deps. They use the same
+        // requirement-specific validated-routing gate as exact deps.
         let mut loose_candidates: Vec<(String, VersionSpecifiers)> = Vec::new();
         for wheel in bundle.all_wheels().skip(processed_wheel_count) {
             for raw in &wheel.metadata.requires_dist {
@@ -275,10 +277,7 @@ pub(crate) async fn auto_bundle_transitives(
         // (it's your code).
 
         // v1.4.0: batch this round's prefer-conda probes (16-way
-        // bounded) instead of one serial await per candidate. The
-        // name-level + PyPI fallback steps below stay serial -- they
-        // only run for the few definitively-unsat candidates, against
-        // the already-warm in-memory repodata cache.
+        // bounded) instead of one serial await per candidate.
         let is_closure_member = |name: &str| {
             uv_closure_wheels.is_some_and(|s| s.contains_key(&canonical_conda_name(name)))
         };
@@ -288,10 +287,7 @@ pub(crate) async fn auto_bundle_transitives(
             .filter(|(name, _)| prefer_conda_match(&canonical_conda_name(name), &config.name_map))
             .map(|(name, version)| {
                 let conda_name = canonical_conda_name(name);
-                (
-                    config.name_map[&conda_name].clone(),
-                    probe_spec_for(version, config.relax),
-                )
+                (config.name_map[&conda_name].clone(), format!("=={version}"))
             })
             .collect();
         let prefer_probes: std::collections::HashMap<(String, String), crate::probe::ProbeResult> =
@@ -333,14 +329,10 @@ pub(crate) async fn auto_bundle_transitives(
                 // Probe the workspace's conda channels for whether the
                 // spec retread would emit is actually satisfiable. If
                 // ANY channel has a matching candidate, keep on conda.
-                // If every channel was reachable and returned versions
-                // but NONE matched, fall through to auto-bundle. An
-                // indecisive probe (no prefix.dev channels, or all
-                // probes errored) keeps the legacy prefer-conda
-                // behavior so a prefix.dev outage doesn't silently
-                // reshape routing.
+                // Only a concrete match may route to conda. Empty,
+                // unsatisfied, or indecisive results stay on PyPI.
                 let conda_target_name = config.name_map[&conda_name].clone();
-                let probe_spec = probe_spec_for(&version, config.relax);
+                let probe_spec = format!("=={version}");
                 let probe_result =
                     match prefer_probes.get(&(conda_target_name.clone(), probe_spec.clone())) {
                         Some(r) => r.clone(),
@@ -357,12 +349,11 @@ pub(crate) async fn auto_bundle_transitives(
                             .await
                         }
                     };
-                let routing_decision = if probe_result.is_definitively_unsatisfied() {
-                    "fall-through-to-pypi"
-                } else if probe_result.is_satisfied() {
+                let route_to_conda = validated_conda_route(&probe_result);
+                let routing_decision = if route_to_conda {
                     "short-circuit"
                 } else {
-                    "indecisive-short-circuit"
+                    "fall-through-to-pypi"
                 };
                 bundle
                     .probe_decisions
@@ -375,65 +366,14 @@ pub(crate) async fn auto_bundle_transitives(
                         &probe_result,
                         routing_decision,
                     ));
-                if probe_result.is_definitively_unsatisfied() {
-                    // v0.46.0: the EXACT resolved version isn't on conda --
-                    // but that's usually because the transitive was resolved
-                    // to PyPI-latest in isolation (e.g. a bundled `pytorch3d`
-                    // pulls `torch`, which resolves to 2.12.0 while conda
-                    // tops out at pytorch 2.7.x). Bundling that too-new wheel
-                    // SHADOWS conda's ABI-correct copy (a cu130 torch wheel
-                    // over the env's cu128 pytorch) AND double-installs a dep
-                    // retread also emits as a conda run-dep -- the bundled
-                    // wheel then clobbers the conda build at install time.
-                    //
-                    // So before bundling, probe whether conda has the package
-                    // at ANY (python-compatible) version. If it does, keep it
-                    // on the conda side: the run-dep emission + solve cascade
-                    // pick the ABI-correct conda build, derived from the
-                    // wheel's ORIGINAL requirement (not PyPI-latest). Only
-                    // bundle when conda genuinely lacks the package -- a true
-                    // PyPI-only dependency. (Escape hatch if this picks wrong:
-                    // retread-overrides to force a spec, or retread-drop-deps.)
-                    let name_level = crate::probe::probe(
-                        conda_channels,
-                        &conda_target_name,
-                        "*",
-                        Some(&target.python_version),
-                    )
-                    .await;
-                    bundle
-                        .probe_decisions
-                        .push(crate::audit::ProbeDecision::from_probe(
-                            "auto_bundle_name_level",
-                            &name,
-                            &conda_target_name,
-                            "*",
-                            &target.python_version,
-                            &name_level,
-                            if name_level.is_satisfied() {
-                                "name-level-conda-keep"
-                            } else {
-                                "fall-through-to-pypi"
-                            },
-                        ));
-                    if name_level.is_satisfied() {
-                        tracing::info!(
-                            dep = %name,
-                            conda = %conda_target_name,
-                            resolved_version = %version,
-                            conda_matches = name_level.matching_candidates,
-                            "prefer-conda: exact resolved version absent on conda, but the package exists at other versions -- keeping on conda (ABI-correct) instead of bundling a too-new PyPI build",
-                        );
-                        continue;
-                    }
+                if !route_to_conda {
                     tracing::info!(
                         dep = %name,
                         conda = %conda_target_name,
                         spec = %probe_spec,
                         channels = ?probe_result.channels_consulted,
-                        "prefer-conda: conda has no build of this package at any version; falling back to auto-bundle from PyPI",
+                        "prefer-conda: no validated conda candidate satisfies the dependency; auto-bundling from PyPI",
                     );
-                    // intentional fall-through: continue with bundle path
                 } else {
                     tracing::info!(
                         dep = %name,
@@ -464,22 +404,19 @@ pub(crate) async fn auto_bundle_transitives(
             to_fetch.push((name, version, conda_name, specifiers, preferred_ver));
         }
 
-        // Loose (bare/ranged) candidates: the step-8 gate. A name-level
-        // probe with definitive ZERO conda candidates means conda can
-        // never satisfy the dep -- bundle it from PyPI (newest version
-        // matching the line's specifiers). Anything conda CAN ship
-        // stays conda-side (the cascade translates the line).
+        // Loose (bare/ranged) candidates use the same requirement-specific,
+        // fail-closed routing rule as exact candidates.
         let loose_pairs: Vec<(String, String)> = loose_candidates
             .iter()
             .filter(|(name, _)| !is_closure_member(name))
-            .map(|(name, _)| {
+            .map(|(name, specs)| {
                 let conda_name = canonical_conda_name(name);
                 let target_name = config
                     .name_map
                     .get(&conda_name)
                     .cloned()
                     .unwrap_or(conda_name);
-                (target_name, "*".to_string())
+                (target_name, conda_probe_spec(specs))
             })
             .collect();
         let loose_probes: std::collections::HashMap<(String, String), crate::probe::ProbeResult> =
@@ -518,41 +455,42 @@ pub(crate) async fn auto_bundle_transitives(
                 .get(&conda_name)
                 .cloned()
                 .unwrap_or_else(|| conda_name.clone());
-            let probe_result = match loose_probes.get(&(target_name.clone(), "*".to_string())) {
+            let probe_spec = conda_probe_spec(&specs);
+            let probe_result = match loose_probes.get(&(target_name.clone(), probe_spec.clone())) {
                 Some(r) => r.clone(),
                 None => {
                     crate::probe::probe(
                         conda_channels,
                         &target_name,
-                        "*",
+                        &probe_spec,
                         Some(&target.python_version),
                     )
                     .await
                 }
             };
-            let bundle_it = probe_result.is_definitively_unsatisfied();
+            let route_to_conda = validated_conda_route(&probe_result);
             bundle
                 .probe_decisions
                 .push(crate::audit::ProbeDecision::from_probe(
                     "auto_bundle_loose",
                     &name,
                     &target_name,
-                    "*",
+                    &probe_spec,
                     &target.python_version,
                     &probe_result,
-                    if bundle_it {
-                        "auto-pypi-no-conda-candidates"
+                    if route_to_conda {
+                        "short-circuit"
                     } else {
-                        "conda-keep"
+                        "fall-through-to-pypi"
                     },
                 ));
-            if !bundle_it {
+            if route_to_conda {
                 continue;
             }
             tracing::info!(
                 dep = %name,
                 specs = %specs,
-                "auto-bundle: bare/ranged dep has zero conda candidates; bundling from PyPI",
+                "auto-bundle: no validated conda candidate satisfies bare/ranged dep; bundling from PyPI",
             );
             // favor-lock: look up preferred version for this dep by canonical name.
             let preferred_ver = favor_lock_prefs
@@ -565,11 +503,10 @@ pub(crate) async fn auto_bundle_transitives(
         // (8-way bounded). `buffered` (not buffer_unordered) preserves
         // candidate order, so extras order -- and therefore the next
         // round's Requires-Dist scan order -- stays deterministic.
-        // Per item, the index fallback chain is still walked serially
-        // exactly as before: a resolve failure tries the next index, a
-        // FETCH failure gives up on the candidate (leaves it as a
-        // conda dep), exhaustion logs the retread-drop-deps hint.
-        let fetched: Vec<Option<(String, String, ResolvedWheel)>> = {
+        // Per item, the index fallback chain is walked serially. The shared
+        // BFS fetcher supplies the wheel -> sdist-build fallback. Exhausting
+        // the chain is an error because conda routing was already refused.
+        let fetched: Vec<Result<(String, String, ResolvedWheel)>> = {
             use futures::stream::{self, StreamExt};
             let indexes_ref = &indexes;
             stream::iter(to_fetch)
@@ -580,73 +517,63 @@ pub(crate) async fn auto_bundle_transitives(
                         // `preferred_ver` is pre-looked-up before the async block to
                         // avoid capturing a reference to the prefs map.
                         let preferred: Option<&str> = preferred_ver.as_deref();
+                        let mut last_error = None;
                         for index in indexes_ref {
-                            let resolved_result = if let Some(pv) = preferred {
-                                pypi::resolve_preferring(index, &name, &specifiers, target, pv)
-                                    .await
-                            } else {
-                                pypi::resolve(index, &name, &specifiers, target).await
-                            };
-                            match resolved_result {
-                                Ok(resolved) => {
-                                    match metadata_preferring_sidecar(&resolved, download_dir).await
-                                    {
-                                        Ok(metadata) => {
-                                            // resolved.url is the pristine index
-                                            // URL; clone it for upstream_url
-                                            // before moving into the struct.
-                                            let upstream = Some(resolved.url.clone());
-                                            return Some((
-                                                name,
-                                                version,
-                                                ResolvedWheel {
-                                                    pypi_name: conda_name,
-                                                    url: resolved.url,
-                                                    upstream_url: upstream,
-                                                    git_source: None,
-                                                    sdist_source: None,
-                                                    metadata,
-                                                    extras_requested: vec![],
-                                                    auto_data: None,
-                                                    auto_data_dedup_skipped_root: None,
-                                                },
-                                            ));
-                                        }
-                                        Err(e) => {
-                                            tracing::debug!(
-                                                dep = %name,
-                                                error = %format!("{e:#}"),
-                                                "auto-bundle fetch failed; leaving as conda dep"
-                                            );
-                                            return None;
-                                        }
-                                    }
+                            match super::bfs_fetch_pypi(
+                                &name,
+                                &specifiers,
+                                index,
+                                target,
+                                download_dir,
+                                config.relax,
+                                preferred,
+                            )
+                            .await
+                            {
+                                Ok((resolved_url, metadata, _resolved_index, sdist_prov)) => {
+                                    let (upstream_url, sdist_source) =
+                                        super::bfs_fetch_provenance(&resolved_url, sdist_prov);
+                                    return Ok((
+                                        name,
+                                        version,
+                                        ResolvedWheel {
+                                            pypi_name: conda_name,
+                                            url: resolved_url,
+                                            upstream_url,
+                                            git_source: None,
+                                            sdist_source,
+                                            metadata,
+                                            extras_requested: vec![],
+                                            auto_data: None,
+                                            auto_data_dedup_skipped_root: None,
+                                        },
+                                    ));
                                 }
-                                Err(e) => {
+                                Err(error) => {
                                     tracing::debug!(
                                         dep = %name,
                                         version = %version,
                                         index = %index,
-                                        error = %format!("{e:#}"),
-                                        "auto-bundle resolve failed on this index"
+                                        error = %format!("{error:#}"),
+                                        "auto-bundle PyPI fetch failed on this index"
                                     );
+                                    last_error = Some(error);
                                 }
                             }
                         }
-                        tracing::debug!(
-                            dep = %name,
-                            version = %version,
-                            "auto-bundle exhausted all indexes; leaving as conda dep. \
-                             If conda can't satisfy it, add to retread-drop-deps."
-                        );
-                        None
+                        Err(last_error
+                            .unwrap_or_else(|| anyhow!("no PyPI index configured for `{name}`"))
+                            .context(format!(
+                                "auto-bundle: no PyPI index could resolve `{name}{specifiers}` after conda routing was refused"
+                            )))
                     },
                 )
                 .buffered(8)
                 .collect()
                 .await
         };
-        for (name, version, wheel) in fetched.into_iter().flatten() {
+        for result in fetched {
+            let (name, version, wheel) = result?;
             tracing::info!(
                 dep = %name,
                 version = %version,

@@ -5,8 +5,8 @@ use audit_report::{build_bundle_audit, write_probe_trace};
 
 mod auto_bundle;
 use auto_bundle::{
-    BfsFetched, Pending, PendingSource, auto_bundle_transitives, metadata_preferring_sidecar,
-    pick_conda_target, seed_worklist,
+    BfsFetched, Pending, PendingSource, auto_bundle_transitives, conda_probe_spec,
+    metadata_preferring_sidecar, pick_conda_target, seed_worklist, validated_conda_route,
 };
 
 mod resolve_state;
@@ -4578,8 +4578,8 @@ async fn resolve_bundle(
             //           via retread-name-map.
             //   (d) Probe workspace conda channels for that name under
             //       wheel's spec + target python.
-            //   (e) satisfied / indecisive -> short-circuit.
-            //       unsatisfiable -> fall through to PyPI.
+            //   (e) one or more requirement-matching candidates ->
+            //       short-circuit. Empty, unsatisfied, or indecisive -> PyPI.
             //
             // The v0.13.10 `.first()` candidate picker was wrong: the
             // inverted parselmouth map has many false positives (a conda
@@ -4621,34 +4621,7 @@ async fn resolve_bundle(
                             // routed_to_conda stays false -> falls through to pypi::resolve below
                         }
                         Some(conda_target_name) => {
-                            // Normalize the spec for conda's matchspec
-                            // parser:
-                            //   * Strip the space after `,` --
-                            //     `VersionSpecifiers::to_string()`
-                            //     produces `>=0.23.0, <0.24.0` (space)
-                            //     which lenient parsing accepted but
-                            //     silently dropped the second clause for
-                            //     some inputs -> probe returned satisfied
-                            //     when it shouldn't.
-                            //   * Coerce empty-spec to `*` -- bare-name
-                            //     `Requires-Dist: gym` produces empty
-                            //     VersionSpecifiers, which conda
-                            //     matchspec can't parse -> probe returned
-                            //     indecisive -> BFS short-circuited
-                            //     ("indecisive-short-circuit") instead of
-                            //     bundling. `*` means "any version" which
-                            //     is what PEP 508 bare-name means, and it
-                            //     lets the python-compat filter do its
-                            //     real job. (gym now: probe with "*"
-                            //     finds many gym versions but NONE have a
-                            //     py3.11 build -> satisfiable=false ->
-                            //     fall through to PyPI bundle.)
-                            let normalized = specifiers.to_string().replace(", ", ",");
-                            let probe_spec = if normalized.trim().is_empty() {
-                                "*".to_string()
-                            } else {
-                                normalized
-                            };
+                            let probe_spec = conda_probe_spec(specifiers);
                             let probe_result = crate::probe::probe(
                                 conda_channels,
                                 &conda_target_name,
@@ -4656,12 +4629,11 @@ async fn resolve_bundle(
                                 Some(&target.python_version),
                             )
                             .await;
-                            let routing_decision = if probe_result.is_definitively_unsatisfied() {
-                                "fall-through-to-pypi"
-                            } else if probe_result.is_satisfied() {
+                            let route_to_conda = validated_conda_route(&probe_result);
+                            let routing_decision = if route_to_conda {
                                 "short-circuit"
                             } else {
-                                "indecisive-short-circuit"
+                                "fall-through-to-pypi"
                             };
                             probe_decisions.push(crate::audit::ProbeDecision {
                                 stage: "bfs".into(),
@@ -4683,54 +4655,8 @@ async fn resolve_bundle(
                                 channels = ?probe_result.channels_consulted,
                                 "BFS prefer-conda probe result",
                             );
-                            if routing_decision != "fall-through-to-pypi" {
+                            if route_to_conda {
                                 routed_to_conda = true;
-                            } else {
-                                // v0.46.0: the EXACT wheel spec isn't on conda
-                                // (e.g. wheel pins torch==2.7.0 but conda has
-                                // 2.7.1, or the dep resolved to PyPI-latest in
-                                // isolation). Bundling here vendors a PyPI build
-                                // that SHADOWS conda's ABI-correct copy and
-                                // double-installs a dep we also emit as a conda
-                                // run-dep. Before falling through to PyPI, probe
-                                // whether conda has the package at ANY (py-compat)
-                                // version; if so, keep it on conda and let the
-                                // run-dep emission + solve cascade pick the
-                                // ABI-correct build. Only bundle when conda truly
-                                // lacks the package.
-                                let name_level = crate::probe::probe(
-                                    conda_channels,
-                                    &conda_target_name,
-                                    "*",
-                                    Some(&target.python_version),
-                                )
-                                .await;
-                                probe_decisions.push(crate::audit::ProbeDecision {
-                                    stage: "bfs_name_level".into(),
-                                    pypi_name: pending.pypi_name.clone(),
-                                    conda_name: conda_target_name.clone(),
-                                    spec: "*".into(),
-                                    target_python: target.python_version.clone(),
-                                    channels_consulted: name_level.channels_consulted.clone(),
-                                    satisfiable: name_level.satisfiable,
-                                    matching_candidates: name_level.matching_candidates,
-                                    routing_decision: if name_level.is_satisfied() {
-                                        "name-level-conda-keep"
-                                    } else {
-                                        "fall-through-to-pypi"
-                                    }
-                                    .into(),
-                                });
-                                if name_level.is_satisfied() {
-                                    tracing::info!(
-                                        dep = %pending.pypi_name,
-                                        conda_name = %conda_target_name,
-                                        wheel_spec = %probe_spec,
-                                        conda_matches = name_level.matching_candidates,
-                                        "BFS prefer-conda: exact wheel spec absent on conda but the package exists at other versions -- keeping on conda (ABI-correct) instead of bundling a PyPI build",
-                                    );
-                                    routed_to_conda = true;
-                                }
                             }
                         }
                     }
@@ -4835,27 +4761,7 @@ async fn resolve_bundle(
                     // Pypi-form sub-wheels are NOT D-rewritten, so
                     // their metadata IS the original Requires-Dist.
                     let seed_rd = metadata.requires_dist.clone();
-                    // Build the sdist provenance descriptor (None for normal wheel fetches).
-                    let sub_sdist_src = sdist_prov.map(|p| crate::lock::SdistWheelSource {
-                        index: p.index,
-                        name: p.name,
-                        version: p.version,
-                        // Store the EXACT resolved sdist URL with #sha256 (Amendment 4:
-                        // freeze the URL so replay builds the identical tarball without
-                        // re-resolving, which is neither yank-safe nor reorder-deterministic).
-                        sdist_url: p.sdist_url.to_string(),
-                    });
-                    // When the wheel was built from an sdist, DO NOT store the file://
-                    // built_url as upstream_url (it is machine-local and non-portable).
-                    // For normal index wheels, record resolved_url as upstream_url.
-                    let upstream = if sub_sdist_src.is_some() {
-                        None // sdist-built: upstream_url suppressed; use sdist_source instead
-                    } else {
-                        // resolved_url is the pristine https index URL; record it as
-                        // upstream_url so build_one can populate EmitWheel.upstream_url
-                        // without deriving from w.url.
-                        Some(resolved_url.clone())
-                    };
+                    let (upstream, sub_sdist_src) = bfs_fetch_provenance(&resolved_url, sdist_prov);
                     (
                         resolved_url,
                         upstream,
@@ -5093,6 +4999,23 @@ pub(super) struct SdistProv {
     /// simple index (pypi.rs:197). This is the preferred replay key:
     /// build_wheel_from_sdist_url(stored_url) skips the re-resolve.
     pub(super) sdist_url: url::Url,
+}
+
+/// Convert the shared PyPI fetcher's provenance into the lock representation.
+/// A locally built `file://` wheel is never an upstream URL; its immutable
+/// sdist URL is the replay source instead.
+fn bfs_fetch_provenance(
+    resolved_url: &url::Url,
+    sdist_prov: Option<SdistProv>,
+) -> (Option<url::Url>, Option<crate::lock::SdistWheelSource>) {
+    let sdist_source = sdist_prov.map(|p| crate::lock::SdistWheelSource {
+        index: p.index,
+        name: p.name,
+        version: p.version,
+        sdist_url: p.sdist_url.to_string(),
+    });
+    let upstream_url = sdist_source.is_none().then(|| resolved_url.clone());
+    (upstream_url, sdist_source)
 }
 
 async fn bfs_fetch_pypi(
