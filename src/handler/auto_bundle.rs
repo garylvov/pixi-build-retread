@@ -156,6 +156,10 @@ pub(crate) async fn auto_bundle_transitives(
     // invisible: the sweep moved them all to conda.
     // Legacy resolver path: None (probes decide, unchanged).
     uv_closure_wheels: Option<&std::collections::BTreeMap<String, String>>,
+    // Shared Rule-1/Rule-2 workspace-aware conda co-solve oracle. Rule 2
+    // finalizes mutable uv routes only after the merged bundle's actual
+    // emitted sibling constraints are known.
+    conda_co_solve: &super::CondaCoSolveContext,
 ) -> Result<()> {
     // Build the skip set: anything already in the bundle, plus the user's
     // `retread-conda-deps` allowlist (deps that should stay as conda
@@ -241,6 +245,20 @@ pub(crate) async fn auto_bundle_transitives(
         // candidates (first iteration; empty afterwards).
         candidates.append(&mut closure_seed);
         if candidates.is_empty() && loose_candidates.is_empty() {
+            if jointly_unroute_unsolvable(
+                bundle,
+                &indexes,
+                target,
+                download_dir,
+                config,
+                conda_co_solve,
+            )
+            .await?
+            {
+                // Rejected routes were restored as wheels. Scan their metadata
+                // before accepting the remaining conda routes.
+                continue;
+            }
             break;
         }
 
@@ -584,6 +602,19 @@ pub(crate) async fn auto_bundle_transitives(
             added_any = true;
         }
 
+        if jointly_unroute_unsolvable(
+            bundle,
+            &indexes,
+            target,
+            download_dir,
+            config,
+            conda_co_solve,
+        )
+        .await?
+        {
+            added_any = true;
+        }
+
         // Loop again only if we added at least one wheel; the new
         // wheels' Requires-Dist may need further auto-bundling.
         if !added_any {
@@ -591,6 +622,183 @@ pub(crate) async fn auto_bundle_transitives(
         }
     }
     Ok(())
+}
+
+/// Finalize mutable uv routes against the exact dependency set this bundle
+/// would emit. Rejected routes are removed monotonically and restored through
+/// the existing exact PyPI index fallback/fetch pipeline. Returning `true`
+/// asks the caller's fixed-point loop to scan the newly added wheel metadata
+/// before validating again.
+async fn jointly_unroute_unsolvable(
+    bundle: &mut Bundle,
+    indexes: &[String],
+    target: &crate::pypi::WheelTarget,
+    download_dir: &Path,
+    config: &RetreadConfig,
+    conda_co_solve: &super::CondaCoSolveContext,
+) -> Result<bool> {
+    if bundle.auto_routed.is_empty() {
+        return Ok(false);
+    }
+
+    let emitted = super::emitted_bundle_route_specs(bundle, config, target)?;
+    let force_conda: HashSet<String> = config
+        .force_conda
+        .iter()
+        .map(|name| canonical_conda_name(name))
+        .collect();
+    let mut mutable_candidates = Vec::new();
+    for auto_route in &bundle.auto_routed {
+        let pypi_name = canonical_conda_name(&auto_route.route.pypi_name);
+        let conda_name = canonical_conda_name(&auto_route.route.conda_name);
+        if force_conda.contains(&pypi_name) || force_conda.contains(&conda_name) {
+            continue;
+        }
+        // Use the post-relaxation spec that produce_output actually emits
+        // (bounded range, deps-from floor, ABI/manual exact pin), never a
+        // parallel approximation of it.
+        if let Some(spec) = emitted.iter().find(|spec| {
+            canonical_conda_name(&spec.pypi_name) == pypi_name
+                && canonical_conda_name(&spec.conda_name) == conda_name
+        }) {
+            mutable_candidates.push(spec.clone());
+        }
+    }
+    if mutable_candidates.is_empty() {
+        return Ok(false);
+    }
+
+    let mutable_keys: HashSet<(String, String)> = mutable_candidates
+        .iter()
+        .map(|route| {
+            (
+                canonical_conda_name(&route.pypi_name),
+                canonical_conda_name(&route.conda_name),
+            )
+        })
+        .collect();
+    let fixed: Vec<_> = emitted
+        .into_iter()
+        .filter(|route| {
+            !mutable_keys.contains(&(
+                canonical_conda_name(&route.pypi_name),
+                canonical_conda_name(&route.conda_name),
+            ))
+        })
+        .collect();
+    let context = conda_co_solve.clone();
+    let oracle = move |routes| {
+        let context = context.clone();
+        async move { context.solve(routes).await }
+    };
+    let selection = crate::uv_closure::select_jointly_solvable_routes(
+        fixed,
+        mutable_candidates.clone(),
+        &oracle,
+    )
+    .await;
+    // Rule 2 is fail-closed: an unsatisfiable/indeterminate baseline cannot
+    // authorize any mutable conda route.
+    let rejected = selection
+        .map(|selection| selection.rejected)
+        .unwrap_or(mutable_candidates);
+    if rejected.is_empty() {
+        return Ok(false);
+    }
+    let rejected_keys: HashSet<(String, String)> = rejected
+        .iter()
+        .map(|route| {
+            (
+                canonical_conda_name(&route.pypi_name),
+                canonical_conda_name(&route.conda_name),
+            )
+        })
+        .collect();
+    let mut restore = Vec::new();
+    bundle.auto_routed.retain(|auto_route| {
+        let key = (
+            canonical_conda_name(&auto_route.route.pypi_name),
+            canonical_conda_name(&auto_route.route.conda_name),
+        );
+        if rejected_keys.contains(&key) {
+            restore.push(auto_route.route.clone());
+            false
+        } else {
+            true
+        }
+    });
+
+    for route in restore {
+        let probe_spec = format!("=={}", route.conda_version);
+        bundle.probe_decisions.push(crate::audit::ProbeDecision {
+            stage: "auto_route_joint_solve".into(),
+            pypi_name: route.pypi_name.clone(),
+            conda_name: route.conda_name.clone(),
+            spec: probe_spec.clone(),
+            target_python: target.python_version.clone(),
+            channels_consulted: conda_co_solve.channels_consulted(),
+            satisfiable: Some(false),
+            matching_candidates: 0,
+            routing_decision: "joint-co-solve-rejected-to-pypi".into(),
+        });
+        tracing::warn!(
+            pypi = %route.pypi_name,
+            conda = %route.conda_name,
+            version = %route.conda_version,
+            "auto-route: individually valid conda route rejected by final joint solve; restoring exact PyPI wheel",
+        );
+
+        let pypi_spec = format!("=={}", route.pypi_version);
+        let specifiers = VersionSpecifiers::from_str(&pypi_spec).with_context(|| {
+            format!(
+                "parsing exact PyPI restore spec for rejected route `{} {pypi_spec}`",
+                route.pypi_name
+            )
+        })?;
+        let mut last_error = None;
+        let mut restored = None;
+        for index in indexes {
+            match super::bfs_fetch_pypi(
+                &route.pypi_name,
+                &specifiers,
+                index,
+                target,
+                download_dir,
+                config.relax,
+                Some(&route.pypi_version),
+            )
+            .await
+            {
+                Ok((resolved_url, metadata, _resolved_index, sdist_prov)) => {
+                    let (upstream_url, sdist_source) =
+                        super::bfs_fetch_provenance(&resolved_url, sdist_prov);
+                    restored = Some(ResolvedWheel {
+                        pypi_name: canonical_conda_name(&route.pypi_name),
+                        url: resolved_url,
+                        upstream_url,
+                        git_source: None,
+                        sdist_source,
+                        metadata,
+                        extras_requested: vec![],
+                        auto_data: None,
+                        auto_data_dedup_skipped_root: None,
+                    });
+                    break;
+                }
+                Err(error) => last_error = Some(error),
+            }
+        }
+        let wheel = restored.ok_or_else(|| {
+            last_error
+                .unwrap_or_else(|| anyhow!("no PyPI index configured"))
+                .context(format!(
+                    "joint route validation kept `{}` on PyPI, but no configured index could fetch its exact wheel at =={}",
+                    route.pypi_name, route.pypi_version
+                ))
+        })?;
+        bundle.extras.push(wheel);
+    }
+    Ok(true)
 }
 
 /// Returns Some((name, exact_version)) if `raw` is a base dep (no

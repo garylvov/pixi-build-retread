@@ -65,6 +65,19 @@ fn pypi_map(pairs: &[(&str, &[&str])]) -> PypiToCondaMap {
         .collect()
 }
 
+fn bundle_auto_route(name: &str, version: &str, deps_from_floor: bool) -> BundleAutoRoute {
+    BundleAutoRoute {
+        route: crate::uv_closure::AutoRoutedPackage {
+            pypi_name: name.to_string(),
+            conda_name: name.to_string(),
+            pypi_version: version.to_string(),
+            conda_version: version.to_string(),
+            channel: "https://conda.example.invalid/linux-64".to_string(),
+        },
+        deps_from_floor,
+    }
+}
+
 #[test]
 fn spec_from_str_handles_build_string() {
     // Cold-solve replay round-trips emitted conda run-deps (incl. a
@@ -506,8 +519,8 @@ fn produce_output_emits_auto_routed_conda_run_deps() {
         probe_decisions: vec![],
         solve_diagnostics: BTreeMap::new(),
         auto_routed: vec![
-            ("numpy".to_string(), "2.1.0".to_string(), false),
-            ("scipy".to_string(), "1.14.1".to_string(), false),
+            bundle_auto_route("numpy", "2.1.0", false),
+            bundle_auto_route("scipy", "1.14.1", false),
         ],
         auto_dropped: Default::default(),
         uv_closure_names: Default::default(),
@@ -584,7 +597,7 @@ fn produce_output_omits_workspace_owned_auto_drops() {
 #[test]
 fn produce_output_softens_deps_from_floor_pin_to_floor_spec() {
     // conda-as-truth fix: an auto-routed package whose root ORIGINATED
-    // from a `retread-deps-from` exact pin (the third tuple element)
+    // from a `retread-deps-from` exact pin (`deps_from_floor`)
     // must be emitted as a `>=` floor, not the usual exact `==` pin --
     // otherwise a sibling pack's own exact conda pin for the same name
     // (e.g. `setuptools ==83.0.0`) hard-conflicts with this pack's
@@ -599,8 +612,8 @@ fn produce_output_softens_deps_from_floor_pin_to_floor_spec() {
         probe_decisions: vec![],
         solve_diagnostics: BTreeMap::new(),
         auto_routed: vec![
-            ("setuptools".to_string(), "69.5.1".to_string(), true),
-            ("numpy".to_string(), "2.1.0".to_string(), false),
+            bundle_auto_route("setuptools", "69.5.1", true),
+            bundle_auto_route("numpy", "2.1.0", false),
         ],
         auto_dropped: Default::default(),
         uv_closure_names: Default::default(),
@@ -658,7 +671,7 @@ fn produce_output_auto_routed_pin_widens_to_bounded_range() {
     // resolved against still installs, capped so the conda solver can't
     // pick something wildly newer than what the pack was ever tested with.
     let bundle = Bundle {
-        auto_routed: vec![("pandas".to_string(), "2.2.3".to_string(), false)],
+        auto_routed: vec![bundle_auto_route("pandas", "2.2.3", false)],
         ..solo_bundle("range-pack", vec![])
     };
     let out = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
@@ -677,7 +690,7 @@ fn produce_output_auto_routed_pin_widens_to_bounded_range() {
 #[test]
 fn produce_output_auto_routed_pin_zero_x_widens_to_next_minor() {
     let bundle = Bundle {
-        auto_routed: vec![("etgen".to_string(), "0.20.1".to_string(), false)],
+        auto_routed: vec![bundle_auto_route("etgen", "0.20.1", false)],
         ..solo_bundle("range-pack-zero-x", vec![])
     };
     let out = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
@@ -699,7 +712,7 @@ fn produce_output_auto_routed_abi_anchor_stays_exact() {
     // "any newer build" is a lie about what this pack's wheels actually
     // run on.
     let bundle = Bundle {
-        auto_routed: vec![("cuda-version".to_string(), "12.8".to_string(), false)],
+        auto_routed: vec![bundle_auto_route("cuda-version", "12.8", false)],
         ..solo_bundle("anchor-pack", vec![])
     };
     let out = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
@@ -732,7 +745,7 @@ fn produce_output_auto_routed_ledger_override_still_widens() {
         .insert("setuptools".to_string(), ">=68,<81".to_string());
     config.ledger_overrides.insert("setuptools".to_string());
     let bundle = Bundle {
-        auto_routed: vec![("setuptools".to_string(), "80.10.2".to_string(), false)],
+        auto_routed: vec![bundle_auto_route("setuptools", "80.10.2", false)],
         ..solo_bundle("ledger-pack", vec![])
     };
     let out = produce_output(&bundle, &config, Platform::Linux64, "3.11", &[], None, None).unwrap();
@@ -758,7 +771,7 @@ fn produce_output_auto_routed_manual_override_stays_exact() {
         .overrides
         .insert("sentry-sdk".to_string(), "==1.2.3".to_string());
     let bundle = Bundle {
-        auto_routed: vec![("sentry-sdk".to_string(), "1.2.3".to_string(), false)],
+        auto_routed: vec![bundle_auto_route("sentry-sdk", "1.2.3", false)],
         ..solo_bundle("override-pack", vec![])
     };
     let out = produce_output(&bundle, &config, Platform::Linux64, "3.11", &[], None, None).unwrap();
@@ -832,7 +845,7 @@ fn produce_output_closure_gate_keeps_auto_routed_pins_and_base_deps_undoubled() 
             "isaacsim-kernel==6.0.0", // base-dep in the closure: no conda dep
         ],
     );
-    bundle.auto_routed = vec![("numpy".to_string(), "2.1.0".to_string(), false)];
+    bundle.auto_routed = vec![bundle_auto_route("numpy", "2.1.0", false)];
     bundle.uv_closure_names = ["isaacsim-kernel", "numpy"]
         .iter()
         .map(|n| crate::relax::canonical_conda_name(n))

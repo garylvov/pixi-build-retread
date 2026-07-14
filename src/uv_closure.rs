@@ -656,6 +656,149 @@ pub enum CoInstallVerdict {
     Skipped(String),
 }
 
+/// One conda route considered for generated run-dependency emission.
+///
+/// Unlike [`AutoRoutedPackage`], this type also represents dependencies
+/// which were already destined for conda before Rule 2 considered moving a
+/// PyPI dependency there. `spec` is the version portion of the conda match
+/// spec; an empty string and `*` both mean unconstrained.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CondaRouteSpec {
+    pub pypi_name: String,
+    pub conda_name: String,
+    pub spec: String,
+}
+
+impl CondaRouteSpec {
+    /// Render this route as a conda match spec suitable for the shared
+    /// co-installability oracle.
+    pub fn match_spec(&self) -> String {
+        let spec = self.spec.trim();
+        if spec.is_empty() || spec == "*" {
+            self.conda_name.clone()
+        } else {
+            format!("{} {spec}", self.conda_name)
+        }
+    }
+}
+
+/// Strict Rule 2 routing outcome. Accepted dependencies may be emitted as
+/// conda routes; rejected dependencies must remain on PyPI.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JointRouteSelection {
+    pub accepted: Vec<CondaRouteSpec>,
+    pub rejected: Vec<CondaRouteSpec>,
+}
+
+/// Select Rule 2 conda routes only when they co-solve with the dependencies
+/// already fixed on the conda side.
+///
+/// The common case costs one solve over the complete set. If that set is not
+/// satisfiable, the fixed baseline must first prove satisfiable; otherwise
+/// there is no sound candidate-level decision and `None` is returned. From a
+/// satisfiable baseline, deletion-minimal unsatisfiable candidate groups are
+/// isolated and rejected together until the remaining set co-solves. This
+/// preserves unrelated routes while handling conflicts that cannot be healed
+/// by removing only one member. Only a positive [`CoInstallVerdict::Sat`]
+/// may move a dependency to conda; skipped probes conservatively keep every
+/// unresolved candidate on PyPI.
+pub async fn select_jointly_solvable_routes<C, F>(
+    fixed: Vec<CondaRouteSpec>,
+    candidates: Vec<CondaRouteSpec>,
+    co_solve: &C,
+) -> Option<JointRouteSelection>
+where
+    C: Fn(Vec<CondaRouteSpec>) -> F,
+    F: std::future::Future<Output = CoInstallVerdict>,
+{
+    let fixed: Vec<CondaRouteSpec> = fixed
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let candidates: Vec<CondaRouteSpec> = candidates
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+
+    let combined = |accepted: &[CondaRouteSpec]| {
+        fixed
+            .iter()
+            .chain(accepted)
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+    };
+
+    if matches!(
+        co_solve(combined(&candidates)).await,
+        CoInstallVerdict::Sat
+    ) {
+        return Some(JointRouteSelection {
+            accepted: candidates,
+            rejected: Vec::new(),
+        });
+    }
+
+    if !matches!(co_solve(fixed.clone()).await, CoInstallVerdict::Sat) {
+        return None;
+    }
+
+    let mut rejected = Vec::new();
+    let mut remaining = candidates;
+    loop {
+        match co_solve(combined(&remaining)).await {
+            CoInstallVerdict::Sat => {
+                return Some(JointRouteSelection {
+                    accepted: remaining,
+                    rejected,
+                });
+            }
+            CoInstallVerdict::Skipped(_) => {
+                rejected.extend(remaining);
+                return Some(JointRouteSelection {
+                    accepted: Vec::new(),
+                    rejected,
+                });
+            }
+            CoInstallVerdict::Unsat(_) => {}
+        }
+
+        // Reduce the failing set to a deletion-minimal unsatisfiable core:
+        // if removing one route leaves the trial unsatisfiable, that route
+        // is unrelated to this core and stays eligible for a later round.
+        let mut core = remaining.clone();
+        for candidate in remaining.clone() {
+            let Some(pos) = core.iter().position(|route| route == &candidate) else {
+                continue;
+            };
+            let mut trial = core.clone();
+            trial.remove(pos);
+            if matches!(
+                co_solve(combined(&trial)).await,
+                CoInstallVerdict::Unsat(_)
+            ) {
+                core = trial;
+            }
+        }
+
+        // A satisfiable fixed baseline makes an empty unsat core impossible,
+        // but fail closed if an inconsistent oracle reports one.
+        if core.is_empty() {
+            rejected.extend(remaining);
+            return Some(JointRouteSelection {
+                accepted: Vec::new(),
+                rejected,
+            });
+        }
+        let core_set: BTreeSet<_> = core.iter().cloned().collect();
+        rejected.extend(core);
+        remaining.retain(|route| !core_set.contains(route));
+    }
+}
+
 /// Does one resolvo unsat-reason line name this conda package?
 ///
 /// Reasons embed names either as `name ==ver` / `name >=ver` match
@@ -5364,6 +5507,106 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
                 .unwrap_or(CoInstallVerdict::Sat);
             Box::pin(async move { verdict })
         }
+    }
+
+    fn emitted_route(pypi_name: &str, conda_name: &str, spec: &str) -> CondaRouteSpec {
+        CondaRouteSpec {
+            pypi_name: pypi_name.to_string(),
+            conda_name: conda_name.to_string(),
+            spec: spec.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn rule2_joint_solve_keeps_individually_valid_conflicting_route_on_pypi() {
+        let sibling = emitted_route("sibling-runtime", "sibling-runtime", ">=4,<5");
+        let candidate = emitted_route("candidate-addon", "candidate-addon", "==2.1");
+        let co_solve = |routes: Vec<CondaRouteSpec>| async move {
+            let names: BTreeSet<String> =
+                routes.into_iter().map(|route| route.conda_name).collect();
+            if names.contains("sibling-runtime") && names.contains("candidate-addon") {
+                CoInstallVerdict::Unsat(vec!["incompatible transitive constraints".to_string()])
+            } else {
+                CoInstallVerdict::Sat
+            }
+        };
+
+        assert_eq!(
+            co_solve(vec![candidate.clone()]).await,
+            CoInstallVerdict::Sat,
+            "the candidate is individually satisfiable"
+        );
+        let selection = select_jointly_solvable_routes(
+            vec![sibling],
+            vec![candidate.clone(), candidate.clone()],
+            &co_solve,
+        )
+        .await
+        .expect("the fixed conda baseline is satisfiable");
+
+        assert!(selection.accepted.is_empty());
+        assert_eq!(selection.rejected, vec![candidate]);
+    }
+
+    #[tokio::test]
+    async fn rule2_joint_solve_unroutes_conflicting_group_to_pypi() {
+        let left = emitted_route("worker-left", "worker-left", "==1");
+        let right = emitted_route("worker-right", "worker-right", "==1");
+        let unrelated = emitted_route("utility", "utility", ">=7");
+        let co_solve = |routes: Vec<CondaRouteSpec>| async move {
+            let names: BTreeSet<String> =
+                routes.into_iter().map(|route| route.conda_name).collect();
+            if names.contains("worker-left") && names.contains("worker-right") {
+                CoInstallVerdict::Unsat(vec!["incompatible transitive constraints".to_string()])
+            } else {
+                CoInstallVerdict::Sat
+            }
+        };
+
+        let selection = select_jointly_solvable_routes(
+            Vec::new(),
+            vec![right.clone(), unrelated.clone(), left.clone()],
+            &co_solve,
+        )
+        .await
+        .expect("the fixed conda baseline is satisfiable");
+
+        assert_eq!(selection.accepted, vec![unrelated]);
+        assert_eq!(selection.rejected, vec![left, right]);
+    }
+
+    #[tokio::test]
+    async fn rule2_joint_solve_keeps_cosolvable_route_on_conda() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = AtomicUsize::new(0);
+        let fixed = emitted_route("runtime", "runtime", "*");
+        let candidate = emitted_route("extension", "extension", ">=2,<3");
+        let co_solve = |routes: Vec<CondaRouteSpec>| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                assert_eq!(
+                    routes
+                        .iter()
+                        .map(CondaRouteSpec::match_spec)
+                        .collect::<Vec<_>>(),
+                    vec!["extension >=2,<3", "runtime"]
+                );
+                CoInstallVerdict::Sat
+            }
+        };
+
+        let selection = select_jointly_solvable_routes(
+            vec![fixed],
+            vec![candidate.clone(), candidate.clone()],
+            &co_solve,
+        )
+        .await
+        .expect("the complete route set co-solves");
+
+        assert_eq!(selection.accepted, vec![candidate]);
+        assert!(selection.rejected.is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "happy path is one batch solve");
     }
 
     /// The blocker-class fixture: BOTH numpy and typing-extensions have

@@ -677,8 +677,7 @@ struct Bundle {
     /// features' transitives in the union).
     solve_diagnostics: BTreeMap<String, crate::audit::SolveDiagnostics>,
     /// v4.3.0 (spec-uv-restructure M2): packages the uv auto-route loop
-    /// moved from the wheel closure to the conda side, as
-    /// (conda_name, conda_version, deps_from_floor) triples. Each
+    /// moved from the wheel closure to the conda side. Each
     /// becomes a conda run-dep of the stub output (`produce_output`) so
     /// conda — not a shipped wheel — provides it at install time. Empty
     /// on the legacy path and when `auto-route = false`.
@@ -690,7 +689,7 @@ struct Bundle {
     /// emitted conda run-dep is softened to a `>=` floor instead of the
     /// usual exact pin, letting a sibling pack's own conda pin for the
     /// same name win the conda solve instead of hard-conflicting.
-    auto_routed: Vec<(String, String, bool)>,
+    auto_routed: Vec<BundleAutoRoute>,
     /// Canonical PyPI names the precise consuming workspace already owns.
     /// These are removed from the pack's wheel graph and are not re-emitted
     /// as generated-pack conda run dependencies. Conda-owned names enter only
@@ -706,6 +705,16 @@ struct Bundle {
     /// Empty on the legacy (non-uv) path, where the BFS bundles the
     /// full closure and the `vendored` set already covers members.
     uv_closure_names: std::collections::HashSet<String>,
+}
+
+/// One mutable uv auto-route retained on a bundle until the final emitted
+/// conda dependency set has passed the joint co-solvability check. Keeping the
+/// complete route (rather than only its conda name/version) preserves the PyPI
+/// identity needed to put a rejected route back into the wheel bundle.
+#[derive(Debug, Clone)]
+struct BundleAutoRoute {
+    route: crate::uv_closure::AutoRoutedPackage,
+    deps_from_floor: bool,
 }
 
 impl Bundle {
@@ -1915,10 +1924,11 @@ async fn resolve_all(
         // Packaging / courier / lock-write downstream are unchanged.
         // `Ok(None)` = no uv-resolvable roots (all source-built entries);
         // the materialization path then runs unpinned.
-        let (uv_closure, deps_from_floor_names, workspace_facts): (
+        let (uv_closure, deps_from_floor_names, workspace_facts, conda_co_solve): (
             Option<crate::uv_closure::UvClosure>,
             std::collections::BTreeSet<String>,
             WorkspaceCondaFacts,
+            CondaCoSolveContext,
         ) = uv_group_closure(
             &group_name,
             &group_entries,
@@ -2044,7 +2054,10 @@ async fn resolve_all(
                 .filter(|r| !closure.auto_dropped.contains(&r.pypi_name))
                 .map(|r| {
                     let floor = deps_from_floor_names.contains(&r.pypi_name);
-                    (r.conda_name.clone(), r.conda_version.clone(), floor)
+                    BundleAutoRoute {
+                        route: r.clone(),
+                        deps_from_floor: floor,
+                    }
                 })
                 .collect();
             bundle.auto_dropped = closure.auto_dropped.iter().cloned().collect();
@@ -2104,12 +2117,18 @@ async fn resolve_all(
                     .map(|w| (w.name.clone(), w.version.clone()))
                     .collect()
             });
-        if (effective.auto_bundle || uv_closure.is_some())
-            && let Some(idx) = auto_index
-        {
+        if effective.auto_bundle || uv_closure.is_some() {
+            // An all-URL group has no entry index, but rejected routes still
+            // have to return to PyPI. Start at the workspace indexes/public
+            // PyPI in that case; exhaustion produces the normal explicit
+            // auto-bundle fetch error rather than bypassing validation.
+            let idx = auto_index
+                .as_deref()
+                .or_else(|| workspace_pypi_indexes.first().map(String::as_str))
+                .unwrap_or("https://pypi.org/simple");
             auto_bundle_transitives(
                 &mut bundle,
-                &idx,
+                idx,
                 &workspace_pypi_indexes,
                 target,
                 download_dir,
@@ -2118,6 +2137,7 @@ async fn resolve_all(
                 None, // locked-closure seam: incremental-add ONLY (uv pins flow via prefs below)
                 Some(&favored).filter(|m| !m.is_empty()), // favor-lock + uv-closure prefs
                 uv_closure_members.as_ref(),
+                &conda_co_solve,
             )
             .await?;
         }
@@ -2443,6 +2463,116 @@ struct SolvedPypiFact {
     version: String,
 }
 
+/// Cloneable workspace-aware conda solver oracle shared by Rule 1's uv
+/// auto-route healing and Rule 2's final emitted-route validation. Both rules
+/// must ask the same question: can these route specs solve together with every
+/// consuming workspace constraint, target Python, system requirements, and
+/// channel-priority setting?
+#[derive(Debug, Clone)]
+pub(crate) struct CondaCoSolveContext {
+    channels: Vec<ChannelUrl>,
+    python: String,
+    subdir: String,
+    bundle: String,
+    channel_priority: rattler_solve::ChannelPriority,
+    system_requirements: BTreeMap<String, String>,
+    workspace_deps: BTreeMap<String, Vec<String>>,
+}
+
+impl CondaCoSolveContext {
+    fn new(
+        manifest: Option<&crate::workspace::WorkspaceManifest>,
+        workspace_dir: Option<&Path>,
+        source_dir: &Path,
+        target: &WheelTarget,
+        conda_channels: &[ChannelUrl],
+        bundle: &str,
+    ) -> Self {
+        let (channel_priority, system_requirements, workspace_deps) = match manifest {
+            Some(manifest) => (
+                match manifest.channel_priority.as_deref() {
+                    Some("disabled") => rattler_solve::ChannelPriority::Disabled,
+                    _ => rattler_solve::ChannelPriority::Strict,
+                },
+                match workspace_dir {
+                    Some(workspace_dir) => {
+                        manifest.consuming_env_system_requirements(workspace_dir, source_dir)
+                    }
+                    None => manifest.effective_system_requirements("default"),
+                },
+                match workspace_dir {
+                    Some(workspace_dir) => {
+                        manifest.consuming_env_dependencies(workspace_dir, source_dir)
+                    }
+                    None => Default::default(),
+                },
+            ),
+            None => (
+                rattler_solve::ChannelPriority::Strict,
+                Default::default(),
+                Default::default(),
+            ),
+        };
+        Self {
+            channels: conda_channels.to_vec(),
+            python: target.python_version.clone(),
+            subdir: target.conda_subdir.clone(),
+            bundle: bundle.to_string(),
+            channel_priority,
+            system_requirements,
+            workspace_deps,
+        }
+    }
+
+    pub(crate) async fn solve(
+        &self,
+        routed: Vec<crate::uv_closure::CondaRouteSpec>,
+    ) -> crate::uv_closure::CoInstallVerdict {
+        let mut specs: Vec<String> = routed.iter().map(|route| route.match_spec()).collect();
+        for (name, specs_for_name) in &self.workspace_deps {
+            let conda_name = canonical_conda_name(name);
+            // The bundle's own output is being rendered and is not available
+            // on a channel yet.
+            if conda_name == canonical_conda_name(&self.bundle) {
+                continue;
+            }
+            for spec in specs_for_name {
+                if spec.trim().is_empty() || spec.trim() == "*" {
+                    specs.push(conda_name.clone());
+                } else {
+                    specs.push(format!("{conda_name} {spec}"));
+                }
+            }
+        }
+        specs.push(format!("python {}.*", self.python));
+        match crate::conda_solve::solve_selected_records(
+            &self.channels,
+            &specs,
+            &self.python,
+            &self.subdir,
+            self.channel_priority,
+            &self.system_requirements,
+            rattler_solve::SolveStrategy::Highest,
+        )
+        .await
+        {
+            Ok(_) => crate::uv_closure::CoInstallVerdict::Sat,
+            Err(reasons)
+                if reasons
+                    .iter()
+                    .any(|reason| reason.contains("no repodata available from disk cache")) =>
+            {
+                crate::uv_closure::CoInstallVerdict::Skipped(reasons.join("; "))
+            }
+            Err(reasons) => crate::uv_closure::CoInstallVerdict::Unsat(reasons),
+        }
+    }
+
+    pub(crate) fn channels_consulted(&self) -> Vec<String> {
+        self.channels.iter().map(ToString::to_string).collect()
+    }
+}
+
 /// Direct dependency inputs for one concrete environment that consumes the
 /// pack. This is the only manifest-selection seam allowed to authorize
 /// workspace-solved Rule-3 facts; feature-only and all-feature fallbacks are
@@ -2733,6 +2863,7 @@ async fn uv_group_closure(
     Option<crate::uv_closure::UvClosure>,
     std::collections::BTreeSet<String>,
     WorkspaceCondaFacts,
+    CondaCoSolveContext,
 )> {
     let mut roots: Vec<String> = Vec::new();
     // Direct-URL wheels pre-fetched into the content-addressed store and
@@ -2903,13 +3034,30 @@ async fn uv_group_closure(
         );
     }
 
+    // Construct the shared oracle before the roots-empty return so the legacy
+    // materialization path and the uv path validate Rule 2 against identical
+    // consuming-workspace facts.
+    let conda_co_solve = CondaCoSolveContext::new(
+        manifest_opt.as_ref(),
+        workspace_dir,
+        source_dir,
+        target,
+        conda_channels,
+        group_name,
+    );
+
     if roots.is_empty() {
         tracing::info!(
             bundle = %group_name,
             "uv closure: no uv-resolvable roots in this bundle; \
              running the legacy closure path unpinned",
         );
-        return Ok((None, std::collections::BTreeSet::new(), workspace_facts));
+        return Ok((
+            None,
+            std::collections::BTreeSet::new(),
+            workspace_facts,
+            conda_co_solve,
+        ));
     }
 
     // Rule-3-capable policies receive only precise, solved, agreed facts.
@@ -3368,123 +3516,22 @@ async fn uv_group_closure(
         Arc::clone(&sdist_built),
         Arc::clone(&sdist_prereleased),
     );
-    // Co-installability check for the self-healing un-route step: solve
-    // the candidate auto-routed EXACT pins (plus the workspace default
-    // env's own conda deps, mirroring the constraint source above, plus
-    // the target python) together against the workspace channels. This
-    // is the same rattler solve the workspace lock will run, restricted
-    // to the pins auto-route introduces, so a conda-forge build-matrix
-    // skew between two exact pins (aioboto3/cryptography-style) is
-    // caught HERE — where the conflicting package can still be un-routed
-    // back to its wheel — instead of failing `pixi lock`. Deterministic:
-    // the verdict depends only on the pin set + the cached repodata
-    // snapshot; when no repodata is on disk the check reports Skipped
-    // and routing proceeds unchecked (pre-check behavior).
+    // Rule 1 adapts its exact auto-route pins to the shared route-spec oracle.
+    // Rule 2 receives this same context after bundle materialization, avoiding
+    // a second solver path with subtly different workspace inputs.
     let co_solve = {
-        let channels = conda_channels.to_vec();
-        let python = target.python_version.clone();
-        let subdir = target.conda_subdir.clone();
-        let bundle = group_name.to_string();
-        // envoracle fix: the co-installability check must see the
-        // conda deps of the envs that actually CONSUME this bundle's
-        // pack, not just the workspace's `default` env. Using
-        // `default` unconditionally left an "env-scoped oracle blind
-        // spot" -- an exact auto-routed pin (e.g. `pillow ==12.3.0`)
-        // that satisfied `default` but violated another consuming
-        // env's declared range (`pillow >=11,<12`) sailed through
-        // this check and only surfaced as a hard unsat in the
-        // workspace lock. `consuming_env_dependencies` maps this
-        // pack's `source_dir` to its consuming envs (falling back to
-        // a conservative superset when the mapping is ambiguous) and
-        // returns every distinct spec per package name; feeding all
-        // of them into the same solve forces one version to satisfy
-        // every consuming env at once.
-        let (channel_priority, system_requirements, workspace_deps) = match manifest_opt.as_ref() {
-            Some(m) => (
-                match m.channel_priority.as_deref() {
-                    Some("disabled") => rattler_solve::ChannelPriority::Disabled,
-                    _ => rattler_solve::ChannelPriority::Strict,
-                },
-                // Run-34: system requirements must come from the pack's
-                // CONSUMING envs, not `default` -- a no-default-feature
-                // env's feature-scoped `cuda = "12"` was invisible here,
-                // so the trial set containing that env's cuda-only pins
-                // (pytorch-gpu ==2.7.0) was unsat regardless of the
-                // routed candidates and the whole co-install check
-                // degraded to "cannot heal, applying unchanged".
-                match workspace_dir {
-                    Some(ws_dir) => m.consuming_env_system_requirements(ws_dir, source_dir),
-                    None => m.effective_system_requirements("default"),
-                },
-                match workspace_dir {
-                    Some(ws_dir) => m.consuming_env_dependencies(ws_dir, source_dir),
-                    None => Default::default(),
-                },
-            ),
-            None => (
-                rattler_solve::ChannelPriority::Strict,
-                Default::default(),
-                Default::default(),
-            ),
-        };
+        let context = conda_co_solve.clone();
         move |routed: Vec<crate::uv_closure::AutoRoutedPackage>| {
-            let channels = channels.clone();
-            let python = python.clone();
-            let subdir = subdir.clone();
-            let bundle = bundle.clone();
-            let system_requirements = system_requirements.clone();
-            let workspace_deps = workspace_deps.clone();
-            let fut = async move {
-                let mut specs: Vec<String> = routed
-                    .iter()
-                    .map(|r| format!("{} =={}", r.conda_name, r.conda_version))
-                    .collect();
-                for (name, specs_for_name) in &workspace_deps {
-                    let conda_name = canonical_conda_name(name);
-                    // The bundle's own outputs aren't on any channel yet.
-                    if conda_name == canonical_conda_name(&bundle) {
-                        continue;
-                    }
-                    // Every distinct spec across the pack's consuming
-                    // envs is fed in; the solver must pick one version
-                    // satisfying all of them (a plain intersection, not
-                    // a special case) -- this is what actually catches
-                    // an exact pin that violates just ONE consuming
-                    // env's range.
-                    for spec in specs_for_name {
-                        if spec.trim().is_empty() || spec.trim() == "*" {
-                            specs.push(conda_name.clone());
-                        } else {
-                            specs.push(format!("{conda_name} {spec}"));
-                        }
-                    }
-                }
-                specs.push(format!("python {python}.*"));
-                match crate::conda_solve::solve_selected_records(
-                    &channels,
-                    &specs,
-                    &python,
-                    &subdir,
-                    channel_priority,
-                    &system_requirements,
-                    rattler_solve::SolveStrategy::Highest,
-                )
-                .await
-                {
-                    Ok(_) => crate::uv_closure::CoInstallVerdict::Sat,
-                    Err(reasons) => {
-                        if reasons
-                            .iter()
-                            .any(|r| r.contains("no repodata available from disk cache"))
-                        {
-                            crate::uv_closure::CoInstallVerdict::Skipped(reasons.join("; "))
-                        } else {
-                            crate::uv_closure::CoInstallVerdict::Unsat(reasons)
-                        }
-                    }
-                }
-            };
-            Box::pin(fut)
+            let context = context.clone();
+            let routed = routed
+                .into_iter()
+                .map(|route| crate::uv_closure::CondaRouteSpec {
+                    pypi_name: route.pypi_name,
+                    conda_name: route.conda_name,
+                    spec: format!("=={}", route.conda_version),
+                })
+                .collect();
+            Box::pin(async move { context.solve(routed).await })
                 as futures::future::BoxFuture<'static, crate::uv_closure::CoInstallVerdict>
         }
     };
@@ -3582,7 +3629,12 @@ async fn uv_group_closure(
             prereleased: sdist_prereleased.lock().unwrap().clone(),
         },
     );
-    Ok((Some(closure), deps_from_floor_names, workspace_facts))
+    Ok((
+        Some(closure),
+        deps_from_floor_names,
+        workspace_facts,
+        conda_co_solve,
+    ))
 }
 
 /// Collapses [`crate::workspace::WorkspaceManifest::consuming_env_dependencies`]'
@@ -4207,10 +4259,13 @@ fn apply_emission(
 ) -> (Bundle, RetreadConfig) {
     let mut bundle = base_bundle.clone();
     bundle.conda_name = emission.output_name.clone();
-    // Reset the per-bundle probe trace: env-specific cascade decisions
-    // get recorded fresh. Materialize-phase decisions belong to the
-    // shared materialization, not this env's solve.
-    bundle.probe_decisions.clear();
+    // Reset ordinary materialization probes before env-specific decisions are
+    // recorded, but retain final joint-route rejections: those are the durable
+    // explanation for why an individually valid conda candidate ships as a
+    // PyPI wheel and must remain visible in every emitted audit.
+    bundle
+        .probe_decisions
+        .retain(|decision| decision.stage == "auto_route_joint_solve");
 
     let mut config = base_config.clone();
     for (dep, spec) in &emission.transitive_overrides {
@@ -5864,7 +5919,10 @@ fn produce_output(
     // wheels actually run on) and names the user gave an explicit
     // `retread-overrides` entry for (hand-written intent always wins over
     // an auto-derived range).
-    for (conda_name, conda_version, floor) in &bundle.auto_routed {
+    for auto_route in &bundle.auto_routed {
+        let conda_name = &auto_route.route.conda_name;
+        let conda_version = &auto_route.route.conda_version;
+        let floor = auto_route.deps_from_floor;
         let canon = canonical_conda_name(conda_name);
         if seen_dep_names.insert(canon.clone()) {
             // Manual-override exemption: only a HAND-WRITTEN
@@ -5876,7 +5934,7 @@ fn produce_output(
             // exact-pin conflict class the ranges exist to prevent).
             let manual_override =
                 config.overrides.contains_key(&canon) && !config.ledger_overrides.contains(&canon);
-            let spec = if *floor {
+            let spec = if floor {
                 format!("{canon} >={conda_version}")
             } else if crate::solve::is_abi_anchor(&canon) || manual_override {
                 format!("{canon} =={conda_version}")
@@ -5888,7 +5946,7 @@ fn produce_output(
                     None => format!("{canon} =={conda_version}"),
                 }
             };
-            if *floor {
+            if floor {
                 tracing::info!(
                     bundle = %bundle.conda_name,
                     package = %canon,
@@ -6016,6 +6074,49 @@ fn produce_output(
         config.bundle_mode == crate::config::BundleMode::Loose,
         siblings,
     )
+}
+
+/// Render the bundle's actual emitted run-dependency set into the generic
+/// route-spec representation consumed by the shared co-solve oracle. This is
+/// deliberately derived from `produce_output`, the single emission authority,
+/// so marker evaluation, name mapping, relaxation, overrides, vendoring,
+/// closure filtering, and first-name-wins dedup cannot drift from Rule 2's
+/// validation input.
+fn emitted_bundle_route_specs(
+    bundle: &Bundle,
+    config: &RetreadConfig,
+    target: &WheelTarget,
+) -> Result<Vec<crate::uv_closure::CondaRouteSpec>> {
+    let host_platform = Platform::from_str(&target.conda_subdir)
+        .with_context(|| format!("parsing target conda subdir `{}`", target.conda_subdir))?;
+    let output = produce_output(
+        bundle,
+        config,
+        host_platform,
+        &target.python_version,
+        &[],
+        None,
+        None,
+    )?;
+    Ok(output
+        .run_dependencies
+        .depends
+        .into_iter()
+        .map(|dependency| {
+            let conda_name = canonical_conda_name(&dependency.name);
+            let pypi_name = bundle
+                .auto_routed
+                .iter()
+                .find(|route| canonical_conda_name(&route.route.conda_name) == conda_name)
+                .map(|route| route.route.pypi_name.clone())
+                .unwrap_or_else(|| conda_name.clone());
+            crate::uv_closure::CondaRouteSpec {
+                pypi_name,
+                conda_name,
+                spec: audit_report::format_packagespec(&dependency.spec),
+            }
+        })
+        .collect())
 }
 
 /// v1.4.5: swap an http(s) wheel source for `file://` of retread's

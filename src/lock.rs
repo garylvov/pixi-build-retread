@@ -355,7 +355,12 @@ pub const SCHEMA: u32 = 12;
 /// wheel, and install-time replay uses explicit wheel files with --no-deps
 /// instead of resolver-backed root requirements. Existing packs must cold
 /// rebuild once so their locks contain direct-fetch hashes.
-pub const EMIT_EPOCH: u32 = 10;
+///
+/// Epoch 11: Rule-2 conda routes are validated jointly against the pack's
+/// final emitted conda dependencies and consuming-workspace pins. Conflicting
+/// routes move back to the PyPI wheel bundle, changing both lock routing and
+/// emitted courier contents for identical manifests.
+pub const EMIT_EPOCH: u32 = 11;
 
 impl RetreadLock {
     /// File name for a bundle's lock next to the pack manifest.

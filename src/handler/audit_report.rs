@@ -7,7 +7,6 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-#[cfg(test)]
 use pixi_build_types::PackageSpec;
 
 use super::Bundle;
@@ -72,7 +71,6 @@ pub(crate) fn build_bundle_audit(
 
 /// Render a PackageSpec to its conda match-spec string form (just the
 /// version-constraint half, name not included).
-#[cfg(test)]
 pub(crate) fn format_packagespec(spec: &PackageSpec) -> String {
     match spec {
         PackageSpec::Binary(b) => b
