@@ -11782,7 +11782,9 @@ mod resolve_bundle_bfs_tests {
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    use super::{PypiToCondaMap, WheelTarget, merge_uv_pins_into_prefs, resolve_bundle};
+    use super::{
+        PypiToCondaMap, ResolvedWheel, WheelTarget, merge_uv_pins_into_prefs, resolve_bundle,
+    };
     use crate::config::{RelaxPolicy, WheelEntry};
 
     fn unique_tmp_dir() -> std::path::PathBuf {
@@ -11836,23 +11838,36 @@ mod resolve_bundle_bfs_tests {
     ///     versions of that name as `<a href="/{filename}">` links.
     ///   GET /{filename}  → raw wheel bytes.
     ///
+    /// `advertise_sha256`: when true, every href carries the PEP 503
+    /// `#sha256=<hex>` fragment, exactly as pypi.nvidia.com and pypi.org do.
+    /// The default (false) models the minority of indexes that omit it
+    /// (py.mujoco.org, some static self-hosted simple repos).
+    ///
     /// Returns (port, task-handle). The task accepts up to `max_requests`
     /// connections then stops.
-    async fn spawn_index_server(packages: Vec<(String, String, Vec<u8>)>, max_requests: u8) -> u16 {
+    async fn spawn_index_server(
+        packages: Vec<(String, String, Vec<u8>)>,
+        max_requests: u8,
+        advertise_sha256: bool,
+    ) -> u16 {
         use std::collections::HashMap;
 
         // Build lookup tables.
-        let mut by_name: HashMap<String, Vec<(String, Vec<u8>)>> = HashMap::new();
+        let mut by_name: HashMap<String, Vec<(String, String, Vec<u8>)>> = HashMap::new();
         let mut by_filename: HashMap<String, Vec<u8>> = HashMap::new();
 
         for (name, version, bytes) in packages {
             let norm_name = name.to_ascii_lowercase().replace(['-', '_', '.'], "-");
             let normalized_dist = name.replace('-', "_");
             let filename = format!("{normalized_dist}-{version}-py3-none-any.whl");
+            // The digest the index advertises == the digest of the bytes it
+            // serves. Computing it here (rather than hardcoding) is what makes
+            // "the lock digest equals the artifact digest" a real assertion.
+            let sha = crate::wheel_rewrite::sha256_hex(&bytes);
             by_name
                 .entry(norm_name)
                 .or_default()
-                .push((filename.clone(), bytes.clone()));
+                .push((filename.clone(), sha, bytes.clone()));
             by_filename.insert(filename, bytes);
         }
 
@@ -11880,31 +11895,37 @@ mod resolve_bundle_bfs_tests {
                         .and_then(|l| l.split_whitespace().nth(1))
                         .unwrap_or("/");
 
-                    let (status, content_type, body) = if let Some(rest) =
-                        path.strip_prefix("/simple/")
-                    {
-                        // Strip trailing slash, get normalized name.
-                        let pkg_name = rest.trim_end_matches('/');
-                        if let Some(entries) = by_name.get(pkg_name) {
-                            let links: String = entries
-                                .iter()
-                                .map(|(fname, _)| format!("<a href=\"/{fname}\">{fname}</a>\n",))
-                                .collect();
-                            let html =
-                                format!("<!DOCTYPE html><html><body>\n{links}</body></html>\n");
-                            ("200 OK", "text/html", html.into_bytes())
+                    let (status, content_type, body) =
+                        if let Some(rest) = path.strip_prefix("/simple/") {
+                            // Strip trailing slash, get normalized name.
+                            let pkg_name = rest.trim_end_matches('/');
+                            if let Some(entries) = by_name.get(pkg_name) {
+                                let links: String = entries
+                                    .iter()
+                                    .map(|(fname, sha, _)| {
+                                        let frag = if advertise_sha256 {
+                                            format!("#sha256={sha}")
+                                        } else {
+                                            String::new()
+                                        };
+                                        format!("<a href=\"/{fname}{frag}\">{fname}</a>\n")
+                                    })
+                                    .collect();
+                                let html =
+                                    format!("<!DOCTYPE html><html><body>\n{links}</body></html>\n");
+                                ("200 OK", "text/html", html.into_bytes())
+                            } else {
+                                ("404 Not Found", "text/plain", b"not found".to_vec())
+                            }
                         } else {
-                            ("404 Not Found", "text/plain", b"not found".to_vec())
-                        }
-                    } else {
-                        // Wheel file request: /filename.whl
-                        let fname = path.trim_start_matches('/');
-                        if let Some(bytes) = by_filename.get(fname) {
-                            ("200 OK", "application/octet-stream", bytes.clone())
-                        } else {
-                            ("404 Not Found", "text/plain", b"not found".to_vec())
-                        }
-                    };
+                            // Wheel file request: /filename.whl
+                            let fname = path.trim_start_matches('/');
+                            if let Some(bytes) = by_filename.get(fname) {
+                                ("200 OK", "application/octet-stream", bytes.clone())
+                            } else {
+                                ("404 Not Found", "text/plain", b"not found".to_vec())
+                            }
+                        };
 
                     let resp = format!(
                         "HTTP/1.0 {status}\r\nContent-Length: {}\r\nContent-Type: {content_type}\r\n\r\n",
@@ -11969,7 +11990,8 @@ mod resolve_bundle_bfs_tests {
                 ),
                 (sub_name.to_string(), sub_version.to_string(), sub_bytes),
             ],
-            32, // enough for primary + sub index + wheel fetches + sidecar attempts
+            32,    // enough for primary + sub index + wheel fetches + sidecar attempts
+            false, // index advertises no #sha256 (legacy fixture behavior)
         )
         .await;
 
@@ -12045,6 +12067,484 @@ mod resolve_bundle_bfs_tests {
         assert_eq!(
             sub_wheel.metadata.version, sub_version,
             "transitive dep must be at version {sub_version}"
+        );
+    }
+
+    /// auto-extscache TASK 1+2+3: an `extras`-only entry must pull the extra's
+    /// transitive wheels into the bundle, each carrying the INDEX-ADVERTISED
+    /// `#sha256=` digest — with NO hand-written `url = "...#sha256=..."` roots.
+    ///
+    /// This is the exact production shape from imprint's
+    /// `pypi-packs/isaac-pack-latest/pixi.toml`:
+    ///
+    /// ```toml
+    /// isaacsim = { version = "==6.0.0.1", index = "...", extras = ["all", "extscache"] }
+    /// ```
+    ///
+    /// where isaacsim's METADATA declares
+    /// `Requires-Dist: isaacsim-extscache-kit==6.0.0.1; extra == "extscache"`
+    /// (and -kit-sdk / -physics), and the three extscache wheels are
+    /// dependency-free index wheels.
+    ///
+    /// The manifest ALSO carried three explicit URL roots with hand-pasted
+    /// sha256 digests, commented "explicit URL roots keep them in the lock".
+    /// This test is the falsifier for that claim: with the URL roots gone (no
+    /// sibling entries at all), the extras BFS must still land all three in
+    /// `bundle.extras`, each with `metadata.sha256` equal to the digest the
+    /// index advertised in its href fragment.
+    #[tokio::test]
+    async fn resolve_bundle_extras_pull_transitive_wheels_with_index_sha256() {
+        let dir = unique_tmp_dir();
+        let download_dir = dir.join("download");
+        let source_dir = dir.join("source");
+        let cache_dir = dir.join("cache");
+        std::fs::create_dir_all(&download_dir).unwrap();
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        let version = "6.0.0.1";
+        let extscache = [
+            "isaacsim-extscache-kit",
+            "isaacsim-extscache-kit-sdk",
+            "isaacsim-extscache-physics",
+        ];
+
+        // Primary: isaacsim, whose extscache extra gates the three wheels.
+        let primary_bytes = make_wheel_bytes(
+            "isaacsim",
+            version,
+            &extscache
+                .iter()
+                .map(|n| format!("{n}=={version} ; extra == \"extscache\""))
+                .collect::<Vec<_>>()
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        );
+
+        // The three extscache wheels are dependency-free index wheels.
+        let mut packages = vec![(
+            "isaacsim".to_string(),
+            version.to_string(),
+            primary_bytes.clone(),
+        )];
+        let mut want_sha: BTreeMap<String, String> = BTreeMap::new();
+        for name in extscache {
+            let bytes = make_wheel_bytes(name, version, &[]);
+            want_sha.insert(name.to_string(), crate::wheel_rewrite::sha256_hex(&bytes));
+            packages.push((name.to_string(), version.to_string(), bytes));
+        }
+
+        // advertise_sha256 = true: a PEP 503 index that publishes digests in
+        // the href fragment, exactly like pypi.nvidia.com.
+        let port = spawn_index_server(packages, 64, true).await;
+        let index_url = format!("http://127.0.0.1:{port}/simple/");
+
+        let entry = WheelEntry {
+            version: Some(format!("=={version}")),
+            index: Some(index_url),
+            // The ONLY thing the user writes. No url/sha256 anywhere.
+            extras: vec!["all".into(), "extscache".into()],
+            ..Default::default()
+        };
+        let target = WheelTarget {
+            python_version: "3.12".to_string(),
+            conda_subdir: "linux-64".to_string(),
+            max_glibc: None,
+        };
+        let pypi_to_conda: PypiToCondaMap = HashMap::new();
+        let name_map: BTreeMap<String, String> = BTreeMap::new();
+        let git_sources: BTreeMap<String, crate::config::NamedGitSource> = BTreeMap::new();
+        let conda_channels: Vec<rattler_conda_types::ChannelUrl> = vec![];
+
+        let bundle = resolve_bundle(
+            "isaacsim",
+            &entry,
+            &target,
+            &download_dir,
+            &source_dir,
+            &cache_dir,
+            RelaxPolicy::default(),
+            &git_sources,
+            None,
+            &pypi_to_conda,
+            &name_map,
+            &conda_channels,
+            &[],
+            None,
+            None,
+            // NO siblings: the three URL roots are GONE from the manifest.
+            &std::collections::HashSet::new(),
+        )
+        .await
+        .expect("resolve_bundle must succeed");
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        let got: BTreeMap<&str, &ResolvedWheel> = bundle
+            .extras
+            .iter()
+            .map(|w| (w.pypi_name.as_str(), w))
+            .collect();
+
+        for name in extscache {
+            let w = got.get(name).unwrap_or_else(|| {
+                panic!(
+                    "extra's transitive wheel `{name}` FELL OUT of the bundle; \
+                     bundle.extras = {:?}. The extras BFS did not follow the \
+                     `; extra == \"extscache\"` edge.",
+                    got.keys().collect::<Vec<_>>()
+                )
+            });
+            assert_eq!(w.metadata.version, version, "{name} version");
+
+            // TASK 2: the digest must be the one the INDEX advertised, never
+            // fabricated and never absent.
+            let want = &want_sha[name];
+            assert_eq!(
+                &w.metadata.sha256, want,
+                "{name}: digest must equal the index-advertised sha256"
+            );
+
+            // TASK 3: the artifact URL must be recorded so the lock entry is
+            // a direct, digest-pinned fetch (Origin::Index).
+            let upstream = w.upstream_url.as_ref().unwrap_or_else(|| {
+                panic!("{name}: no upstream_url -> no Origin::Index lock entry")
+            });
+            assert!(
+                upstream
+                    .as_str()
+                    .contains(&format!("{}-{version}", name.replace('-', "_"))),
+                "{name}: upstream_url must point at the wheel artifact; got {upstream}"
+            );
+        }
+
+        // ---- Close the chain: bundle -> EmitWheel -> courier::stage -> LOCK.
+        // This is the assertion the task actually asks for ("lock entries"),
+        // and it is the step the hand-written URL roots claimed to be
+        // necessary for. Mirrors build_one's emit-wheel mapping verbatim.
+        let stage_dir = unique_tmp_dir();
+        let staging = stage_dir.join("staging");
+        let emit_wheels: Vec<crate::emit_pypi::EmitWheel> = bundle
+            .all_wheels()
+            .map(|w| crate::emit_pypi::EmitWheel {
+                pypi_name: w.pypi_name.clone(),
+                version: w.metadata.version.clone(),
+                requires_dist: w.metadata.requires_dist.clone(),
+                sha256: Some(w.metadata.sha256.clone()),
+                // Index wheels were never localized to file:// in this path.
+                local_path: None,
+                wheel_filename: w.metadata.filename.clone(),
+                remote_url: w.upstream_url.clone(),
+                upstream_url: w.upstream_url.clone(),
+                git_source: None,
+                sdist_source: None,
+            })
+            .collect();
+
+        let config: crate::config::RetreadConfig = serde_json::from_value(serde_json::json!({
+            "retread-wheels": { "isaacsim": { "version": format!("=={version}") } },
+            "retread-bundle-mode": "fat",
+        }))
+        .unwrap();
+
+        let staged = crate::courier::stage(
+            &config,
+            "isaac-pack-latest",
+            version,
+            "3.12",
+            &emit_wheels,
+            &std::collections::HashSet::new(),
+            &[],
+            &["https://pypi.org/simple/".to_string()],
+            "",
+            &stage_dir,
+            &staging,
+        )
+        .await
+        .expect("courier::stage must write a replayable lock");
+
+        let locked: BTreeMap<&str, &crate::lock::LockWheel> = staged
+            .lock
+            .wheels
+            .iter()
+            .map(|w| (w.name.as_str(), w))
+            .collect();
+
+        std::fs::remove_dir_all(&stage_dir).ok();
+
+        for name in extscache {
+            let lw = locked.get(name).unwrap_or_else(|| {
+                panic!(
+                    "extra's transitive wheel `{name}` FELL OUT of the LOCK; \
+                     lock wheels = {:?}",
+                    locked.keys().collect::<Vec<_>>()
+                )
+            });
+            assert_eq!(
+                lw.origin,
+                crate::lock::Origin::Index,
+                "{name}: dependency-free index wheel must lock as Origin::Index"
+            );
+            assert_eq!(
+                lw.sha256.as_deref(),
+                Some(want_sha[name].as_str()),
+                "{name}: LOCK digest must be the index-advertised sha256 — \
+                 no hand-pasted URL root required"
+            );
+            let url = lw
+                .url
+                .as_deref()
+                .unwrap_or_else(|| panic!("{name}: Index lock entry must carry its artifact url"));
+            assert!(
+                url.contains(&format!("{}-{version}", name.replace('-', "_"))),
+                "{name}: lock url must be the direct artifact url; got {url}"
+            );
+        }
+    }
+
+    /// auto-extscache: an index that advertises NO digest is handled
+    /// gracefully — the digest is never fabricated, and resolution still
+    /// succeeds with the TRUE digest of the bytes actually fetched.
+    ///
+    /// PEP 503 recommends but does not require the `#sha256=` fragment;
+    /// py.mujoco.org and various static self-hosted simple repos omit it. The
+    /// parser leaves `ResolvedWheel.sha256 = None` there (see
+    /// `pypi::tests::parses_links_without_sha256`), and the resolver falls back
+    /// to a full download and hashes the bytes itself. The lock must therefore
+    /// still be digest-pinned — with a COMPUTED digest, not an invented one.
+    #[tokio::test]
+    async fn resolve_bundle_extras_handle_index_without_advertised_digest() {
+        let dir = unique_tmp_dir();
+        let download_dir = dir.join("download");
+        let source_dir = dir.join("source");
+        let cache_dir = dir.join("cache");
+        std::fs::create_dir_all(&download_dir).unwrap();
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        let version = "6.0.0.1";
+        let sub = "isaacsim-extscache-kit";
+        let primary_bytes = make_wheel_bytes(
+            "isaacsim",
+            version,
+            &[&format!("{sub}=={version} ; extra == \"extscache\"")],
+        );
+        let sub_bytes = make_wheel_bytes(sub, version, &[]);
+        let true_sha = crate::wheel_rewrite::sha256_hex(&sub_bytes);
+
+        // advertise_sha256 = false: index publishes no digests at all.
+        let port = spawn_index_server(
+            vec![
+                ("isaacsim".to_string(), version.to_string(), primary_bytes),
+                (sub.to_string(), version.to_string(), sub_bytes),
+            ],
+            64,
+            false,
+        )
+        .await;
+
+        let entry = WheelEntry {
+            version: Some(format!("=={version}")),
+            index: Some(format!("http://127.0.0.1:{port}/simple/")),
+            extras: vec!["extscache".into()],
+            ..Default::default()
+        };
+        let target = WheelTarget {
+            python_version: "3.12".to_string(),
+            conda_subdir: "linux-64".to_string(),
+            max_glibc: None,
+        };
+        let bundle = resolve_bundle(
+            "isaacsim",
+            &entry,
+            &target,
+            &download_dir,
+            &source_dir,
+            &cache_dir,
+            RelaxPolicy::default(),
+            &BTreeMap::new(),
+            None,
+            &PypiToCondaMap::new(),
+            &BTreeMap::new(),
+            &[],
+            &[],
+            None,
+            None,
+            &std::collections::HashSet::new(),
+        )
+        .await
+        .expect("a digest-less index must not break resolution");
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        let w = bundle
+            .extras
+            .iter()
+            .find(|w| w.pypi_name == sub)
+            .unwrap_or_else(|| panic!("`{sub}` must still resolve from a digest-less index"));
+        // The digest is the REAL hash of the fetched bytes — computed, never
+        // invented, and never a placeholder.
+        assert_eq!(
+            w.metadata.sha256, true_sha,
+            "digest must be the true hash of the bytes actually fetched"
+        );
+    }
+
+    /// auto-extscache TASK 4: the escape hatch survives. A deliberate
+    /// `url = "...#sha256=..."` entry must still resolve, must pin the EXACT
+    /// artifact named (not whatever the index thinks is newest), and its
+    /// digest must be enforced rather than decorative.
+    #[tokio::test]
+    async fn explicit_url_entry_pins_exact_artifact_and_wins_over_index() {
+        let dir = unique_tmp_dir();
+        let download_dir = dir.join("download");
+        let source_dir = dir.join("source");
+        let cache_dir = dir.join("cache");
+        std::fs::create_dir_all(&download_dir).unwrap();
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        let name = "isaacsim-extscache-kit";
+        // The index serves BOTH 6.0.0.1 and a newer 6.0.0.2.
+        let old_bytes = make_wheel_bytes(name, "6.0.0.1", &[]);
+        let new_bytes = make_wheel_bytes(name, "6.0.0.2", &[]);
+        let old_sha = crate::wheel_rewrite::sha256_hex(&old_bytes);
+
+        let port = spawn_index_server(
+            vec![
+                (name.to_string(), "6.0.0.1".to_string(), old_bytes),
+                (name.to_string(), "6.0.0.2".to_string(), new_bytes),
+            ],
+            64,
+            true,
+        )
+        .await;
+
+        let file = format!("{}-6.0.0.1-py3-none-any.whl", name.replace('-', "_"));
+        let pinned = format!("http://127.0.0.1:{port}/{file}#sha256={old_sha}");
+
+        let mut entry = WheelEntry {
+            url: Some(pinned.parse().unwrap()),
+            ..Default::default()
+        };
+        // normalize() lifts `#sha256=` out of the fragment into the discrete
+        // field — this is what makes the hand-written pin enforceable.
+        entry
+            .normalize(name)
+            .expect("normalize must accept the pin");
+        assert_eq!(
+            entry.sha256.as_deref(),
+            Some(old_sha.as_str()),
+            "fragment digest must be lifted into the discrete field"
+        );
+
+        let target = WheelTarget {
+            python_version: "3.12".to_string(),
+            conda_subdir: "linux-64".to_string(),
+            max_glibc: None,
+        };
+        let bundle = resolve_bundle(
+            name,
+            &entry,
+            &target,
+            &download_dir,
+            &source_dir,
+            &cache_dir,
+            RelaxPolicy::default(),
+            &BTreeMap::new(),
+            None,
+            &PypiToCondaMap::new(),
+            &BTreeMap::new(),
+            &[],
+            &[],
+            None,
+            None,
+            &std::collections::HashSet::new(),
+        )
+        .await
+        .expect("explicit URL entry must still resolve");
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        // Precedence: the hand-pinned 6.0.0.1 artifact wins; the index's newer
+        // 6.0.0.2 is NOT substituted.
+        assert_eq!(
+            bundle.primary.metadata.version, "6.0.0.1",
+            "explicit URL must pin the exact artifact, not the index's newest"
+        );
+        assert_eq!(
+            bundle.primary.metadata.sha256, old_sha,
+            "explicit URL entry must carry its pinned digest"
+        );
+    }
+
+    /// auto-extscache TASK 4 (negative): the pin is ENFORCED, not decorative.
+    /// A `url = "...#sha256=<wrong>"` entry must fail loudly rather than
+    /// silently install bytes that do not match the digest the user pinned.
+    #[tokio::test]
+    async fn explicit_url_entry_with_wrong_digest_is_rejected() {
+        let dir = unique_tmp_dir();
+        let download_dir = dir.join("download");
+        let source_dir = dir.join("source");
+        let cache_dir = dir.join("cache");
+        std::fs::create_dir_all(&download_dir).unwrap();
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        let name = "isaacsim-extscache-kit";
+        let bytes = make_wheel_bytes(name, "6.0.0.1", &[]);
+        let port = spawn_index_server(
+            vec![(name.to_string(), "6.0.0.1".to_string(), bytes)],
+            32,
+            true,
+        )
+        .await;
+
+        let file = format!("{}-6.0.0.1-py3-none-any.whl", name.replace('-', "_"));
+        let wrong = "0".repeat(64);
+        let mut entry = WheelEntry {
+            url: Some(
+                format!("http://127.0.0.1:{port}/{file}#sha256={wrong}")
+                    .parse()
+                    .unwrap(),
+            ),
+            ..Default::default()
+        };
+        entry.normalize(name).unwrap();
+
+        let target = WheelTarget {
+            python_version: "3.12".to_string(),
+            conda_subdir: "linux-64".to_string(),
+            max_glibc: None,
+        };
+        let err = resolve_bundle(
+            name,
+            &entry,
+            &target,
+            &download_dir,
+            &source_dir,
+            &cache_dir,
+            RelaxPolicy::default(),
+            &BTreeMap::new(),
+            None,
+            &PypiToCondaMap::new(),
+            &BTreeMap::new(),
+            &[],
+            &[],
+            None,
+            None,
+            &std::collections::HashSet::new(),
+        )
+        .await
+        .expect_err("a wheel whose bytes do not match the pinned digest must be rejected");
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        let msg = format!("{err:#}").to_lowercase();
+        assert!(
+            msg.contains("sha256") || msg.contains("hash") || msg.contains("mismatch"),
+            "error must name the digest mismatch; got: {err:#}"
         );
     }
 
@@ -12125,6 +12625,7 @@ mod resolve_bundle_bfs_tests {
                 (sub_name.to_string(), "2.0".to_string(), sub_20_bytes),
             ],
             32,
+            false, // index advertises no #sha256 (legacy fixture behavior)
         )
         .await;
 
@@ -12260,7 +12761,8 @@ mod resolve_bundle_bfs_tests {
                 (sub_name.to_string(), "1.0".to_string(), sub_10_bytes),
                 (sub_name.to_string(), "2.0".to_string(), sub_20_bytes),
             ],
-            64, // two resolve_bundle passes share one server
+            64,    // two resolve_bundle passes share one server
+            false, // index advertises no #sha256 (legacy fixture behavior)
         )
         .await;
 
@@ -12454,6 +12956,7 @@ mod resolve_bundle_bfs_tests {
                 (sub_name.to_string(), "2.0".to_string(), sub_v2_bytes),
             ],
             48,
+            false, // index advertises no #sha256 (legacy fixture behavior)
         )
         .await;
 
@@ -12567,6 +13070,7 @@ mod resolve_bundle_bfs_tests {
                 (sub_name.to_string(), "2.0".to_string(), sub_v2_bytes),
             ],
             48,
+            false, // index advertises no #sha256 (legacy fixture behavior)
         )
         .await;
 
