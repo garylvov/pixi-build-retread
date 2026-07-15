@@ -297,12 +297,12 @@ impl ResolveState {
         tighter: Option<VersionSpecifiers>,
     ) -> Result<Pending> {
         match original.source {
-            PendingSource::Pypi { index, .. } => {
+            PendingSource::Pypi { indexes, .. } => {
                 let new_specs = tighter.unwrap_or_default();
                 Ok(Pending {
                     source: PendingSource::Pypi {
                         specifiers: new_specs,
-                        index,
+                        indexes,
                     },
                     ..original
                 })
@@ -364,7 +364,7 @@ mod tests {
             pypi_name: name.to_string(),
             source: PendingSource::Pypi {
                 specifiers: specs(spec_str),
-                index: "https://pypi.org/simple/".to_string(),
+                indexes: vec!["https://pypi.org/simple/".to_string()],
             },
             extras: vec![],
         }
@@ -440,7 +440,7 @@ mod tests {
                     pypi_name: canonical.to_string(),
                     source: PendingSource::Pypi {
                         specifiers: VersionSpecifiers::from_str(spec_str).unwrap(),
-                        index: "https://pypi.org/simple/".to_string(),
+                        indexes: vec!["https://pypi.org/simple/".to_string()],
                     },
                     extras: vec![],
                 };

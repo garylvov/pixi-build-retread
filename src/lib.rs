@@ -13,6 +13,7 @@ pub mod emit_pypi;
 pub mod fasttmp;
 pub mod glibc;
 pub mod handler;
+mod index_chain;
 pub mod installer;
 pub mod lock;
 pub mod pack_overrides;

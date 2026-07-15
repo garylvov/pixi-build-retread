@@ -751,7 +751,7 @@ pub(crate) async fn auto_bundle_transitives(
         let target = fetch_target.clone();
         let download_dir = download_dir.clone();
         async move {
-            let (resolved_url, metadata, _resolved_index, sdist_prov) = super::bfs_fetch_pypi(
+            let (resolved_url, metadata, sdist_prov) = super::bfs_fetch_pypi(
                 &request.pypi_name,
                 &request.specifiers,
                 &index,
@@ -1770,12 +1770,12 @@ fn pep508_loose_base_dep(
     }
 }
 
-/// (wheel URL, parsed METADATA, index to recurse with, optional sdist
-/// provenance) for one PyPI-form BFS item fetched in the level loop's
-/// phase 2. The 4th element is `Some` only when the item was built from
+/// (wheel URL, parsed METADATA, optional sdist provenance) for one PyPI-form
+/// BFS item fetched in the level loop's phase 2. The 3rd element is `Some`
+/// only when the item was built from
 /// a PyPI sdist (no compatible wheel on the index); `None` for normal
 /// index-wheel fetches.
-pub(crate) type BfsFetched = (url::Url, WheelMetadata, String, Option<super::SdistProv>);
+pub(crate) type BfsFetched = (url::Url, WheelMetadata, Option<super::SdistProv>);
 
 /// One unit of pending work in the resolver BFS.
 #[derive(Debug, Clone)]
@@ -1796,7 +1796,7 @@ pub(crate) enum PendingSource {
     /// `Requires-Dist: <name> <specifiers>` -- resolve via PyPI Simple.
     Pypi {
         specifiers: VersionSpecifiers,
-        index: String,
+        indexes: Vec<String>,
     },
     /// `Requires-Dist: <name> @ git+<scheme>://<host>/<path>@<rev>[#subdirectory=<sub>]` --
     /// clone + `pip wheel --no-deps`.
@@ -1833,7 +1833,7 @@ pub(crate) enum PendingSource {
 pub(crate) fn seed_worklist(
     requires_dist: &[String],
     extras_requested: &[String],
-    index: &str,
+    indexes: &[String],
     bundle_prefix: &str,
     seen: &HashSet<String>,
     work: &mut VecDeque<Pending>,
@@ -1906,14 +1906,14 @@ pub(crate) fn seed_worklist(
                 if seen.contains(&dn) {
                     let pending = Pending {
                         pypi_name: dep.name.clone(),
-                        source: extra_dep_source_to_pending(dep.source.clone(), index),
+                        source: extra_dep_source_to_pending(dep.source.clone(), indexes),
                         extras: dep.extras.clone(),
                     };
                     check_locked_seen!(&dn, pending, state);
                 }
                 work.push_back(Pending {
                     pypi_name: dep.name,
-                    source: extra_dep_source_to_pending(dep.source, index),
+                    source: extra_dep_source_to_pending(dep.source, indexes),
                     extras: dep.extras,
                 });
                 added = true;
@@ -1938,14 +1938,14 @@ pub(crate) fn seed_worklist(
             if seen.contains(&dn) {
                 let pending = Pending {
                     pypi_name: dep.name.clone(),
-                    source: extra_dep_source_to_pending(dep.source.clone(), index),
+                    source: extra_dep_source_to_pending(dep.source.clone(), indexes),
                     extras: dep.extras.clone(),
                 };
                 check_locked_seen!(&dn, pending, state);
             }
             work.push_back(Pending {
                 pypi_name: dep.name,
-                source: extra_dep_source_to_pending(dep.source, index),
+                source: extra_dep_source_to_pending(dep.source, indexes),
                 extras: dep.extras,
             });
         }
@@ -1953,11 +1953,11 @@ pub(crate) fn seed_worklist(
     Ok(())
 }
 
-fn extra_dep_source_to_pending(src: ExtraDepSource, default_index: &str) -> PendingSource {
+fn extra_dep_source_to_pending(src: ExtraDepSource, indexes: &[String]) -> PendingSource {
     match src {
         ExtraDepSource::Pypi(specifiers) => PendingSource::Pypi {
             specifiers,
-            index: default_index.to_string(),
+            indexes: indexes.to_vec(),
         },
         ExtraDepSource::Git {
             url,
@@ -3344,21 +3344,14 @@ pillow = ">=10,<13"
             index: Some("https://pypi.nvidia.com".to_string()),
             ..Default::default()
         };
-        let workspace_indexes = vec![
-            crate::workspace::DEFAULT_PYPI_INDEX.to_string(),
-            "https://pypi.nvidia.com".to_string(),
-        ];
-        assert_eq!(
-            super::super::auto_bundle_group_index_chain(
-                [&source_entry, &private_entry],
-                &workspace_indexes,
-            ),
-            workspace_indexes,
-            "an implicit-default first entry must not be skipped for a later private index"
+        let explicit_private_chain = crate::index_chain::index_chain(
+            [&source_entry, &private_entry]
+                .into_iter()
+                .filter(|entry| !entry.is_url())
+                .filter_map(|entry| entry.index.clone()),
+            &[],
+            crate::index_chain::IndexPurpose::Resolve,
         );
-
-        let explicit_private_chain =
-            super::super::auto_bundle_group_index_chain([&private_entry], &workspace_indexes);
         assert_eq!(
             explicit_private_chain,
             vec![
@@ -3462,7 +3455,7 @@ pillow = ">=10,<13"
         seed_worklist(
             &requires_dist,
             &[], // no extras requested
-            "https://pypi.org/simple/",
+            &["https://pypi.org/simple/".to_string()],
             "", // empty prefix: all base deps match
             &seen,
             &mut work,
@@ -3511,7 +3504,7 @@ pillow = ">=10,<13"
         seed_worklist(
             &requires_dist,
             &extras_requested,
-            "https://pypi.org/simple/",
+            &["https://pypi.org/simple/".to_string()],
             "", // empty prefix
             &seen,
             &mut work,
@@ -3548,7 +3541,7 @@ pillow = ">=10,<13"
         seed_worklist(
             &requires_dist,
             &[],
-            "https://pypi.org/simple/",
+            &["https://pypi.org/simple/".to_string()],
             "",
             &seen,
             &mut work,

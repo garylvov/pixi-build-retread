@@ -72,9 +72,6 @@ pub struct WorkspaceManifest {
     /// indexes are consulted when bundling PyPI-only deps, not just
     /// the `[retread-wheels]` entry indexes.
     pub pypi_index_urls: Vec<String>,
-    /// Whether top-level `[pypi-options]` explicitly replaces the default
-    /// PyPI index via `index-url`.
-    pypi_index_url_overridden: bool,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -211,7 +208,7 @@ impl WorkspaceManifest {
         }
 
         // v1.3.0: top-level [pypi-options] index URLs.
-        (out.pypi_index_urls, out.pypi_index_url_overridden) = parse_pypi_index_urls(parsed);
+        out.pypi_index_urls = parse_pypi_index_urls(parsed);
 
         if let Some(envs) = parsed.get("environments").and_then(|v| v.as_table()) {
             for (name, value) in envs {
@@ -258,7 +255,7 @@ impl WorkspaceManifest {
                         }
                     }
                     // v1.3.0: per-feature [pypi-options] index URLs.
-                    (def.pypi_index_urls, _) = parse_pypi_index_urls(fvalue);
+                    def.pypi_index_urls = parse_pypi_index_urls(fvalue);
                 }
                 out.features.insert(name.clone(), def);
             }
@@ -341,24 +338,6 @@ impl WorkspaceManifest {
         for url in all {
             if !out.contains(url) {
                 out.push(url.clone());
-            }
-        }
-        out
-    }
-
-    /// Full auto-bundle index chain: the workspace's explicit `index-url`,
-    /// or the implicit public PyPI default, followed by every declared extra.
-    pub fn auto_bundle_pypi_index_urls(&self) -> Vec<String> {
-        let mut out = Vec::new();
-        if !self.pypi_index_url_overridden {
-            out.push(DEFAULT_PYPI_INDEX.to_string());
-        }
-        for url in self.all_pypi_index_urls() {
-            if !out
-                .iter()
-                .any(|existing| existing.trim_end_matches('/') == url.trim_end_matches('/'))
-            {
-                out.push(url);
             }
         }
         out
@@ -1131,16 +1110,17 @@ fn parse_pypi_dependencies(container: &toml::Value) -> BTreeMap<String, String> 
 
 /// Pull index URLs out of a `[pypi-options]` table nested under
 /// `container` (the manifest root, or a `[feature.X]` table value):
-/// `index-url` first (it replaces pixi's default index, so it leads
-/// the fallback chain), then `extra-index-urls` in declaration order.
-fn parse_pypi_index_urls(container: &toml::Value) -> (Vec<String>, bool) {
+/// `index-url` first (the preferred workspace index), then
+/// `extra-index-urls` in declaration order. The shared index-chain builder
+/// adds public PyPI as a terminal fetch fallback.
+fn parse_pypi_index_urls(container: &toml::Value) -> Vec<String> {
     let mut out = Vec::new();
     let Some(opts) = container
         .get("pypi-options")
         .or_else(|| container.get("pypi_options"))
         .and_then(|v| v.as_table())
     else {
-        return (out, false);
+        return out;
     };
     let index_url = opts
         .get("index-url")
@@ -1156,7 +1136,7 @@ fn parse_pypi_index_urls(container: &toml::Value) -> (Vec<String>, bool) {
     {
         out.extend(extra.iter().filter_map(|v| v.as_str().map(String::from)));
     }
-    (out, index_url.is_some())
+    out
 }
 
 /// v0.37.0+ (D1): parse one `[system-requirements]` value. pixi allows
@@ -1867,11 +1847,15 @@ extra-index-urls = ["https://pypi.nvidia.com", "https://py.mujoco.org"]
 "#,
         );
         assert_eq!(
-            ws.auto_bundle_pypi_index_urls(),
+            crate::index_chain::index_chain(
+                Vec::<String>::new(),
+                &ws.all_pypi_index_urls(),
+                crate::index_chain::IndexPurpose::Resolve,
+            ),
             vec![
-                DEFAULT_PYPI_INDEX.to_string(),
                 "https://pypi.nvidia.com".to_string(),
                 "https://py.mujoco.org".to_string(),
+                DEFAULT_PYPI_INDEX.to_string(),
             ],
         );
 
@@ -1883,10 +1867,15 @@ extra-index-urls = ["https://extra.example/simple"]
 "#,
         );
         assert_eq!(
-            overridden.auto_bundle_pypi_index_urls(),
+            crate::index_chain::index_chain(
+                Vec::<String>::new(),
+                &overridden.all_pypi_index_urls(),
+                crate::index_chain::IndexPurpose::Resolve,
+            ),
             vec![
                 "https://packages.example/simple".to_string(),
                 "https://extra.example/simple".to_string(),
+                DEFAULT_PYPI_INDEX.to_string(),
             ],
         );
     }

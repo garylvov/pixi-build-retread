@@ -3,8 +3,9 @@ use super::auto_bundle::{
     ExtraDepSource, conda_probe_spec, extra_dep_source_from_url, pep508_extra_dep,
     prefer_conda_match, validated_conda_route,
 };
-use super::{merge_index_chain, *};
+use super::*;
 use crate::config::RelaxPolicy;
+use crate::index_chain::{IndexPurpose, PUBLIC_PYPI, index_chain};
 use std::collections::BTreeMap;
 
 #[cfg(unix)]
@@ -1292,16 +1293,17 @@ fn bundle_group_default_and_precedence() {
 }
 
 // -----------------------------------------------------------------
-// merge_index_chain: order and dedup semantics
+// index_chain: order, dedup, and terminal fallback semantics
 // -----------------------------------------------------------------
 
 #[test]
-fn merge_index_chain_preserves_order_primary_then_extra_then_public() {
+fn index_chain_entry_before_workspace() {
     // The canonical use case: entry index + workspace indexes.
     // Public PyPI should land last, entry index first.
-    let result = merge_index_chain(
+    let result = index_chain(
         ["https://pypi.nvidia.com".to_string()],
         &["https://download.pytorch.org/whl/cu128".to_string()],
+        IndexPurpose::Resolve,
     );
     assert_eq!(
         result,
@@ -1314,12 +1316,13 @@ fn merge_index_chain_preserves_order_primary_then_extra_then_public() {
 }
 
 #[test]
-fn merge_index_chain_deduplicates_trailing_slash_insensitive() {
+fn index_chain_dedups_trailing_slash() {
     // public PyPI appears in extra without trailing slash -- must not
     // be added twice even though the stored constant has a trailing slash.
-    let result = merge_index_chain(
+    let result = index_chain(
         ["https://pypi.nvidia.com".to_string()],
         &["https://pypi.org/simple".to_string()],
+        IndexPurpose::Resolve,
     );
     assert_eq!(
         result,
@@ -1332,21 +1335,22 @@ fn merge_index_chain_deduplicates_trailing_slash_insensitive() {
 }
 
 #[test]
-fn merge_index_chain_empty_primary_appends_public() {
-    let result = merge_index_chain(std::iter::empty::<String>(), &[]);
+fn index_chain_empty_inputs_append_public() {
+    let result = index_chain(std::iter::empty::<String>(), &[], IndexPurpose::Resolve);
     assert_eq!(result, vec![PUBLIC_PYPI.to_string()]);
 }
 
 #[test]
-fn merge_index_chain_deduplicates_repeated_primary() {
+fn index_chain_deduplicates_repeated_entry_indexes() {
     // Two primary items that are the same URL (one with, one without slash)
     // should only appear once.
-    let result = merge_index_chain(
+    let result = index_chain(
         [
             "https://pypi.nvidia.com".to_string(),
             "https://pypi.nvidia.com/".to_string(),
         ],
         &[],
+        IndexPurpose::Resolve,
     );
     assert_eq!(
         result,
@@ -1355,6 +1359,134 @@ fn merge_index_chain_deduplicates_repeated_primary() {
             PUBLIC_PYPI.to_string(),
         ],
     );
+}
+
+#[test]
+fn index_chain_override_keeps_pypi_terminal() {
+    let workspace = vec![
+        "https://packages.example/simple".to_string(),
+        "https://extra.example/simple".to_string(),
+    ];
+    assert_eq!(
+        index_chain(
+            std::iter::empty::<String>(),
+            &workspace,
+            IndexPurpose::Resolve,
+        ),
+        vec![
+            "https://packages.example/simple".to_string(),
+            "https://extra.example/simple".to_string(),
+            PUBLIC_PYPI.to_string(),
+        ],
+        "an explicit workspace index-url changes preference but cannot remove public PyPI",
+    );
+}
+
+#[tokio::test]
+async fn resolve_bundle_bfs_falls_back_to_default() {
+    let workspace = vec!["https://workspace.example/simple".to_string()];
+    let indexes = index_chain(
+        ["https://entry.example/simple".to_string()],
+        &workspace,
+        IndexPurpose::Resolve,
+    );
+    let requires_dist = vec!["root-child>=1".to_string()];
+    let mut work = std::collections::VecDeque::new();
+    seed_worklist(
+        &requires_dist,
+        &[],
+        &indexes,
+        "root-",
+        &std::collections::HashSet::new(),
+        &mut work,
+        None,
+        &std::collections::HashSet::new(),
+    )
+    .unwrap();
+    let pending = work.pop_front().expect("the BFS must seed root-child");
+    assert_eq!(pending.pypi_name, "root-child");
+    let PendingSource::Pypi {
+        specifiers,
+        indexes: pending_indexes,
+    } = &pending.source
+    else {
+        panic!("an ordinary Requires-Dist must seed a PyPI pending source");
+    };
+    assert_eq!(specifiers.to_string(), ">=1");
+    assert_eq!(pending_indexes, &indexes);
+
+    let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let fetch = {
+        let calls = std::sync::Arc::clone(&calls);
+        move |name: String, specs: VersionSpecifiers, index: String| {
+            let calls = std::sync::Arc::clone(&calls);
+            async move {
+                assert_eq!(name, "root-child");
+                assert_eq!(specs.to_string(), ">=1");
+                calls.lock().unwrap().push(index.clone());
+                if index.trim_end_matches('/') == PUBLIC_PYPI.trim_end_matches('/') {
+                    Ok(index)
+                } else {
+                    Err(anyhow::anyhow!("root-child is absent from {index}"))
+                }
+            }
+        }
+    };
+    let selected = fetch_pending_pypi_with(&pending, &fetch)
+        .await
+        .unwrap()
+        .expect("a PyPI pending source must be fetched");
+    assert_eq!(selected, PUBLIC_PYPI);
+    assert_eq!(*calls.lock().unwrap(), indexes);
+}
+
+#[test]
+fn resolve_bundle_bfs_descendants_inherit_full_chain() {
+    let indexes = index_chain(
+        ["https://entry.example/simple".to_string()],
+        &["https://workspace.example/simple".to_string()],
+        IndexPurpose::Resolve,
+    );
+    let parent = PendingSource::Pypi {
+        specifiers: VersionSpecifiers::empty(),
+        indexes: indexes.clone(),
+    };
+    let inherited = bfs_descendant_indexes(&parent, &[]);
+    assert_eq!(inherited, indexes);
+    let git_parent = PendingSource::Git {
+        url: "https://example.com/project.git".to_string(),
+        rev: Some("abc123".to_string()),
+        subdirectory: None,
+    };
+    assert_eq!(bfs_descendant_indexes(&git_parent, &indexes), indexes);
+    let url_parent = PendingSource::Url {
+        wheel_url: url::Url::parse("https://example.com/project.whl").unwrap(),
+    };
+    assert_eq!(bfs_descendant_indexes(&url_parent, &indexes), indexes);
+
+    let mut grandchildren = std::collections::VecDeque::new();
+    seed_worklist(
+        &["root-grandchild>=1".to_string()],
+        &[],
+        &inherited,
+        "root-",
+        &std::collections::HashSet::new(),
+        &mut grandchildren,
+        None,
+        &std::collections::HashSet::new(),
+    )
+    .unwrap();
+    let grandchild = grandchildren
+        .pop_front()
+        .expect("the descendant BFS must seed root-grandchild");
+    let PendingSource::Pypi {
+        indexes: grandchild_indexes,
+        ..
+    } = grandchild.source
+    else {
+        panic!("the grandchild must remain a PyPI pending source");
+    };
+    assert_eq!(grandchild_indexes, indexes);
 }
 
 #[test]

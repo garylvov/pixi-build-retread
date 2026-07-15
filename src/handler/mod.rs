@@ -38,6 +38,7 @@ use tokio::sync::RwLock;
 use uv_pep508::uv_pep440::VersionSpecifiers;
 
 use crate::config::{RelaxPolicy, RetreadConfig, WheelEntry};
+use crate::index_chain::{IndexPurpose, index_chain};
 use crate::pypi::{self, WheelTarget};
 use crate::recipe::{BundleSource, build_bundle_recipe, build_courier_recipe_with_mode, to_yaml};
 use crate::relax::{canonical_conda_name, emit_python_version, marker_env_for};
@@ -327,78 +328,6 @@ const INITIALIZE: &str = "initialize";
 const CONDA_OUTPUTS: &str = "conda/outputs";
 const CONDA_BUILD_V1: &str = "conda/build_v1";
 
-/// Canonical public PyPI Simple index. Both the auto-bundle BFS and the
-/// tiered-cascade need it as the final fallback. Trailing slash is
-/// required by PEP 503 and kept here so `trim_end_matches('/')` in the
-/// dedup check still works (both with and without the slash normalise to
-/// the same key).
-pub(crate) const PUBLIC_PYPI: &str = crate::workspace::DEFAULT_PYPI_INDEX;
-
-/// Build a deduplicated PyPI index chain, preserving ORDER semantics:
-/// `primary` items first, then `extra` items, then `PUBLIC_PYPI` if
-/// not already present. Deduplication is trailing-slash-insensitive so
-/// `"https://pypi.org/simple"` and `"https://pypi.org/simple/"` are
-/// treated as the same index.
-///
-/// This is the shared core extracted from two independent inline
-/// implementations:
-/// - `cascade::pypi_fallback_indexes` (entry indexes + workspace indexes)
-/// - `auto_bundle::auto_bundle_transitives` (entry_index + workspace_indexes)
-///
-/// Both had identical push-unique + append-public-PyPI logic.
-pub(crate) fn merge_index_chain(
-    primary: impl IntoIterator<Item = String>,
-    extra: &[String],
-) -> Vec<String> {
-    fn push_unique(list: &mut Vec<String>, idx: String) {
-        if !list
-            .iter()
-            .any(|e| e.trim_end_matches('/') == idx.trim_end_matches('/'))
-        {
-            list.push(idx);
-        }
-    }
-    let mut indexes: Vec<String> = Vec::new();
-    for idx in primary {
-        push_unique(&mut indexes, idx);
-    }
-    for idx in extra {
-        push_unique(&mut indexes, idx.clone());
-    }
-    push_unique(&mut indexes, PUBLIC_PYPI.to_string());
-    indexes
-}
-
-/// Build the auto-bundle fallback chain for a merged wheel group.
-///
-/// The first non-URL entry owns the primary-index decision. An entry with no
-/// explicit `index` deliberately contributes no primary so the workspace's
-/// implicit default (or explicit `index-url` override) remains first. Using
-/// `find_map` here is incorrect: it skips that entry and can promote a later
-/// sibling's private index ahead of the workspace default.
-fn auto_bundle_group_index_chain<'a>(
-    entries: impl IntoIterator<Item = &'a WheelEntry>,
-    workspace_indexes: &[String],
-) -> Vec<String> {
-    let primary = entries
-        .into_iter()
-        .find(|entry| entry.url.is_none())
-        .and_then(|entry| entry.index.clone());
-    let mut indexes = primary.into_iter().collect::<Vec<_>>();
-    for index in workspace_indexes {
-        if !indexes
-            .iter()
-            .any(|existing| existing.trim_end_matches('/') == index.trim_end_matches('/'))
-        {
-            indexes.push(index.clone());
-        }
-    }
-    if indexes.is_empty() {
-        indexes.push(PUBLIC_PYPI.to_string());
-    }
-    indexes
-}
-
 /// Build a content-addressed build string for courier packages.
 ///
 /// Format: `py{py_short}_h{hash_prefix}_{build_number}` where `hash_prefix`
@@ -465,9 +394,10 @@ fn courier_inputs_hash(
     let entry_indexes: Vec<String> = config
         .retread_wheels
         .values()
-        .map(|e| e.index_url())
+        .filter(|entry| entry.url.is_none())
+        .filter_map(|entry| entry.index.clone())
         .collect();
-    let index_urls = merge_index_chain(entry_indexes, &ws_indexes);
+    let index_urls = index_chain(entry_indexes, &ws_indexes, IndexPurpose::Resolve);
     let workspace_fp = workspace_manifest
         .map(|m| m.solve_fingerprint(workspace_dir, source_dir))
         .unwrap_or_default();
@@ -1826,14 +1756,12 @@ async fn resolve_all(
 ) -> Result<(Vec<Bundle>, RetreadConfig)> {
     let mut bundles = Vec::with_capacity(config.retread_wheels.len());
 
-    // Workspace [pypi-options] participate in wheel resolution. The
-    // auto-bundle path additionally needs the implicit default index when
-    // `index-url` was not overridden.
-    let (workspace_pypi_indexes, auto_bundle_workspace_indexes): (Vec<String>, Vec<String>) =
-        workspace_dir
-            .and_then(crate::workspace::WorkspaceManifest::load)
-            .map(|m| (m.all_pypi_index_urls(), m.auto_bundle_pypi_index_urls()))
-            .unwrap_or_else(|| (Vec::new(), vec![PUBLIC_PYPI.to_string()]));
+    // Raw workspace [pypi-options] participate in every resolution path.
+    // `index_chain` adds the public terminal fallback at each consumer.
+    let workspace_pypi_indexes = workspace_dir
+        .and_then(crate::workspace::WorkspaceManifest::load)
+        .map(|manifest| manifest.all_pypi_index_urls())
+        .unwrap_or_default();
 
     // Load parselmouth once and reuse across bundles. We also merge it
     // into the effective name-map: when parselmouth says PyPI name X
@@ -2125,9 +2053,8 @@ async fn resolve_all(
         }
         // Auto-bundle scans the whole merged bundle's Requires-Dist, so
         // it naturally handles transitives pulled by any wheel in the
-        // group. Use the first non-URL entry's index for the candidate
-        // fallback chain (URL-form entries can't auto-bundle anyway --
-        // they have no PyPI index to resolve from).
+        // group. Every explicit non-URL entry index joins the candidate
+        // fallback chain; URL-form entries have no PyPI index to contribute.
         // uv resolver: the closure is AUTHORITATIVE — every member the
         // auto-route did not move to the conda side must ship in the
         // bundle. The BFS above only walks extras-gated + prefix-family
@@ -2149,9 +2076,14 @@ async fn resolve_all(
                     .collect()
             });
         if effective.auto_bundle || uv_closure.is_some() {
-            let auto_indexes = auto_bundle_group_index_chain(
-                group_entries.iter().map(|(_, entry)| entry),
-                &auto_bundle_workspace_indexes,
+            let auto_indexes = index_chain(
+                group_entries
+                    .iter()
+                    .map(|(_, entry)| entry)
+                    .filter(|entry| entry.url.is_none())
+                    .filter_map(|entry| entry.index.clone()),
+                &workspace_pypi_indexes,
+                IndexPurpose::Resolve,
             );
             auto_bundle_transitives(
                 &mut bundle,
@@ -3486,7 +3418,7 @@ async fn uv_group_closure(
         );
     }
 
-    // Index chain: EXPLICIT entry indexes in group order, then workspace
+    // Index chain: explicit entry indexes in group order, then workspace
     // [pypi-options] indexes, then public PyPI. Deduped, order-preserving.
     //
     // Only explicitly-declared entry indexes join the priority chain --
@@ -3498,18 +3430,14 @@ async fn uv_group_closure(
     // pypi.org while the real manylinux wheels live only on
     // pypi.nvidia.com, so pypi.org-first made uv lock the useless stub
     // (-> "has no usable wheels" under no-build).
-    let mut index_urls: Vec<String> = Vec::new();
-    for url in group_entries
-        .iter()
-        .filter(|(_, e)| e.url.is_none())
-        .filter_map(|(_, e)| e.index.clone())
-        .chain(workspace_pypi_indexes.iter().cloned())
-        .chain(std::iter::once(PUBLIC_PYPI.to_string()))
-    {
-        if !index_urls.contains(&url) {
-            index_urls.push(url);
-        }
-    }
+    let index_urls = index_chain(
+        group_entries
+            .iter()
+            .filter(|(_, entry)| entry.url.is_none())
+            .filter_map(|(_, entry)| entry.index.clone()),
+        workspace_pypi_indexes,
+        IndexPurpose::Resolve,
+    );
 
     // retread-drop-deps also excluded from the parsed closure.
     let mut no_emit: Vec<String> = effective.conda_deps.clone();
@@ -4667,6 +4595,61 @@ fn apply_emission(
     (bundle, config)
 }
 
+/// Fetch one PyPI-form BFS item from its complete ordered index chain.
+///
+/// The callback performs the existing single-index wheel-then-sdist operation;
+/// this wrapper advances only after that complete attempt fails. Keeping the
+/// `Pending` as the input makes phase 2 consume the chain that `seed_worklist`
+/// attached to the dependency.
+async fn fetch_pending_pypi_with<T, X, XF>(pending: &Pending, fetch_pypi: &X) -> Result<Option<T>>
+where
+    X: Fn(String, VersionSpecifiers, String) -> XF,
+    XF: std::future::Future<Output = Result<T>>,
+{
+    let PendingSource::Pypi {
+        specifiers,
+        indexes,
+    } = &pending.source
+    else {
+        return Ok(None);
+    };
+
+    let mut last_error = None;
+    for index in indexes {
+        match fetch_pypi(pending.pypi_name.clone(), specifiers.clone(), index.clone()).await {
+            Ok(fetched) => return Ok(Some(fetched)),
+            Err(error) => {
+                tracing::debug!(
+                    dep = %pending.pypi_name,
+                    index = %index,
+                    error = %format!("{error:#}"),
+                    "BFS PyPI fetch failed on this index"
+                );
+                last_error = Some(error);
+            }
+        }
+    }
+
+    Err(last_error
+        .unwrap_or_else(|| anyhow!("no PyPI index configured for `{}`", pending.pypi_name))
+        .context(format!(
+            "BFS could not resolve `{}` from any configured PyPI index",
+            pending.pypi_name
+        )))
+}
+
+/// Select the full chain inherited by ordinary PyPI descendants.
+///
+/// A PyPI parent retains its original chain regardless of which index supplied
+/// its wheel. Direct URL and git parents have no index field, so their
+/// metadata-discovered PyPI children inherit the bundle chain.
+fn bfs_descendant_indexes(source: &PendingSource, bundle_indexes: &[String]) -> Vec<String> {
+    match source {
+        PendingSource::Pypi { indexes, .. } => indexes.clone(),
+        PendingSource::Git { .. } | PendingSource::Url { .. } => bundle_indexes.to_vec(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn resolve_bundle(
     entry_name: &str,
@@ -4699,9 +4682,9 @@ async fn resolve_bundle(
     // this map; the BFS now matches it.
     name_map: &std::collections::BTreeMap<String, String>,
     conda_channels: &[ChannelUrl],
-    // Workspace PyPI index chain (kept for call-site symmetry with
-    // auto_bundle_transitives; unused by this BFS).
-    _workspace_indexes: &[String],
+    // Raw workspace PyPI indexes. The BFS combines these with the entry's
+    // explicit index and the public terminal fallback exactly once below.
+    workspace_indexes: &[String],
     // incremental-add path: locked closure from the committed lock
     // (name → version_str for every wheel EXCEPT the new dep being added).
     // When Some, seeds ResolveState with ==V pinned constraints so ripples
@@ -4721,6 +4704,11 @@ async fn resolve_bundle(
     sibling_names: &std::collections::HashSet<String>,
 ) -> Result<Bundle> {
     let conda_name = canonical_conda_name(entry_name);
+    let bundle_indexes = index_chain(
+        entry.index.clone().filter(|_| !entry.is_url()).into_iter(),
+        workspace_indexes,
+        IndexPurpose::Resolve,
+    );
     let mut state = ResolveState::default();
     let mut work: BTreeMap<String, Pending> = BTreeMap::new();
     // v0.14.1+: collect every probe + routing decision so the audit
@@ -4833,7 +4821,7 @@ async fn resolve_bundle(
         seed_worklist(
             &primary_original_rd,
             &entry.extras,
-            &entry.index_url(),
+            &bundle_indexes,
             &prefix,
             &seen_set,
             &mut tmp_queue,
@@ -5096,10 +5084,10 @@ async fn resolve_bundle(
         // Phase 2: fetch this level's PyPI-form wheels concurrently
         // (8-way bounded, order-preserving `buffered`). Git/URL forms
         // pass through untouched and materialize serially in phase 3.
-        // Per item the semantics are byte-identical to the old serial
-        // arm: wheel resolve -> fetch, with sdist fallback on
-        // wheel-resolve failure; the first error fails the whole
-        // bundle exactly as `?` did.
+        // Each index keeps the old single-index order: wheel resolve -> fetch,
+        // then sdist fallback on wheel-resolve failure. A complete per-index
+        // failure advances to the next index; exhausting the chain fails the
+        // bundle with the final error.
         // favor-lock: build a snapshot of the preferred versions for this fetch
         // sweep.  We only look versions up (no mutation), so a cheap reference
         // to the caller's BTreeMap is enough -- but async closures capture by
@@ -5123,29 +5111,27 @@ async fn resolve_bundle(
             let favor_lock_snap_ref = &favor_lock_snap;
             stream::iter(to_materialize)
                 .map(|pending| async move {
-                    let result = match &pending.source {
-                        PendingSource::Pypi { specifiers, index } => {
-                            // Look up the preferred locked version for this
-                            // dep (canonical-normalized name).  Returns None
-                            // on the cold path (empty snapshot) so bfs_fetch_pypi
-                            // falls back to the normal highest-version selection.
-                            let dep_canon = crate::relax::canonical_conda_name(&pending.pypi_name);
-                            let prefer_version: Option<&str> =
-                                favor_lock_snap_ref.get(&dep_canon).map(String::as_str);
-                            bfs_fetch_pypi(
-                                &pending.pypi_name,
-                                specifiers,
-                                index,
-                                target,
-                                download_dir,
-                                relax,
-                                prefer_version,
-                            )
-                            .await
-                            .map(Some)
-                        }
-                        _ => Ok(None),
-                    };
+                    // A preferred lock version remains only a per-index hint;
+                    // the complete pending chain still decides fallback order.
+                    let dep_canon = crate::relax::canonical_conda_name(&pending.pypi_name);
+                    let prefer_version = favor_lock_snap_ref.get(&dep_canon).cloned();
+                    let result =
+                        fetch_pending_pypi_with(&pending, &|pypi_name, specifiers, index| {
+                            let prefer_version = prefer_version.clone();
+                            async move {
+                                bfs_fetch_pypi(
+                                    &pypi_name,
+                                    &specifiers,
+                                    &index,
+                                    target,
+                                    download_dir,
+                                    relax,
+                                    prefer_version.as_deref(),
+                                )
+                                .await
+                            }
+                        })
+                        .await;
                     (pending, result)
                 })
                 .buffered(8)
@@ -5158,17 +5144,17 @@ async fn resolve_bundle(
         // old pop order exactly.
         for (pending, fetch_result) in fetched {
             let dep_conda_name = canonical_conda_name(&pending.pypi_name);
-            // 7-tuple: (url, upstream_url, git_source, sdist_source, metadata, index, seed_rd)
+            let sub_indexes_for_recurse = bfs_descendant_indexes(&pending.source, &bundle_indexes);
+            // 6-tuple: (url, upstream_url, git_source, sdist_source, metadata, seed_rd)
             let (
                 sub_url,
                 sub_upstream_url,
                 sub_git_source,
                 sub_sdist_source,
                 sub_metadata,
-                sub_index_for_recurse,
                 sub_seed_rd,
             ) = match (&pending.source, fetch_result?) {
-                (PendingSource::Pypi { .. }, Some((resolved_url, metadata, index, sdist_prov))) => {
+                (PendingSource::Pypi { .. }, Some((resolved_url, metadata, sdist_prov))) => {
                     // Pypi-form sub-wheels are NOT D-rewritten, so
                     // their metadata IS the original Requires-Dist.
                     let seed_rd = metadata.requires_dist.clone();
@@ -5179,7 +5165,6 @@ async fn resolve_bundle(
                         None,
                         sub_sdist_src,
                         metadata,
-                        index,
                         seed_rd,
                     )
                 }
@@ -5224,11 +5209,6 @@ async fn resolve_bundle(
                             rev.as_deref().unwrap_or("HEAD"),
                         )
                     })?;
-                    // For the recurse, use the parent ENTRY's index (not
-                    // `prefix` -- that's a name-prefix string, NOT a URL).
-                    // The recurse fires for Pypi-form Requires-Dist of the
-                    // sub-wheel; those go through pypi::resolve which needs
-                    // a real Simple index URL.
                     let sub_gs = sub.git_source.clone();
                     let sub_up = sub.upstream_url.clone();
                     (
@@ -5237,7 +5217,6 @@ async fn resolve_bundle(
                         sub_gs,
                         None, // Git-form: no sdist provenance
                         sub.metadata,
-                        entry.index_url(),
                         sub_original_rd,
                     )
                 }
@@ -5266,8 +5245,6 @@ async fn resolve_bundle(
                             pending.pypi_name, wheel_url,
                         )
                     })?;
-                    // Same fix as the Git arm: recurse uses the parent
-                    // entry's PyPI Simple index, not the name `prefix`.
                     let sub_up = sub.upstream_url.clone();
                     (
                         sub.url,
@@ -5275,7 +5252,6 @@ async fn resolve_bundle(
                         None, // Url-form: no git source
                         None, // Url-form: no sdist provenance
                         sub.metadata,
-                        entry.index_url(),
                         sub_original_rd,
                     )
                 }
@@ -5292,7 +5268,7 @@ async fn resolve_bundle(
                 seed_worklist(
                     &sub_seed_rd,
                     &pending.extras,
-                    &sub_index_for_recurse,
+                    &sub_indexes_for_recurse,
                     &prefix,
                     &seen_set,
                     &mut tmp_seed,
@@ -5440,7 +5416,7 @@ async fn bfs_fetch_pypi(
     // back to highest-version selection. Propagated from favor_lock_prefs by the
     // BFS phase-2 fetch loop when RETREAD_FAVOR_LOCK=1. None on the cold path.
     prefer_version: Option<&str>,
-) -> Result<(url::Url, WheelMetadata, String, Option<SdistProv>)> {
+) -> Result<BfsFetched> {
     // v1.5.9 exact-first: `specifiers` are the ORIGINAL (pre-D)
     // upstream pins, so exact family pins (isaacsim-kernel==6.0.0.0)
     // resolve the exact version and the installed family stays
@@ -5552,7 +5528,7 @@ async fn bfs_fetch_pypi(
             (built_url, metadata, Some(prov))
         }
     };
-    Ok((resolved_url, metadata, index.to_string(), sdist_prov))
+    Ok((resolved_url, metadata, sdist_prov))
 }
 
 /// True if `output` exists on disk and is newer than `input`. Used to
@@ -8055,9 +8031,10 @@ async fn build_one(
         let entry_indexes: Vec<String> = config
             .retread_wheels
             .values()
-            .map(|e| e.index_url())
+            .filter(|entry| entry.url.is_none())
+            .filter_map(|entry| entry.index.clone())
             .collect();
-        let index_urls = merge_index_chain(entry_indexes, &workspace_indexes);
+        let index_urls = index_chain(entry_indexes, &workspace_indexes, IndexPurpose::Resolve);
         // B-1 (lock-poisoning): in courier mode the committed lock's
         // `conda_run_deps` MUST be the run-deps pixi actually solved and
         // locked (forwarded as `run_override`). The legacy fallback re-derived
@@ -8419,9 +8396,11 @@ fn detect_incremental_add(
                 let spec = crate::courier::spec_for_entry(key, entry, &config.git_sources);
                 !added_set.contains(spec.as_str())
             })
-            .map(|(_, entry)| entry.index_url())
+            .map(|(_, entry)| entry)
+            .filter(|entry| entry.url.is_none())
+            .filter_map(|entry| entry.index.clone())
             .collect();
-        let locked_chain = merge_index_chain(locked_entry_indexes, ws_indexes);
+        let locked_chain = index_chain(locked_entry_indexes, ws_indexes, IndexPurpose::Resolve);
         if locked_chain != lock.index_urls {
             tracing::debug!(
                 ?locked_chain,
@@ -8435,8 +8414,8 @@ fn detect_incremental_add(
 
     // Gate 3 — STEP B: external-input hash check.
     // STEP A proved lock.index_urls == current locked chain, so it is safe to
-    // use lock.index_urls as the index term (reproduces the original chain
-    // order exactly, including implicit PUBLIC_PYPI position).
+    // use lock.index_urls as the index term, reproducing the canonical chain
+    // order exactly, including the public terminal fallback.
     let recomputed_hash = crate::lock::RetreadLock::compute_inputs_hash(
         &lock.entry_specs,
         &lock.index_urls,
@@ -11760,12 +11739,10 @@ mod load_favored_versions_tests {
 // the ResolveState-level tests cannot make).
 //
 // Two tests:
-//   (1) resolve_bundle_bfs_fetches_prefix_transitive — localhost fixture,
-//       non-ignored. Exercises the full BFS loop end-to-end: primary wheel
-//       seeds a transitive dep via prefix matching; transitive ends up in
-//       bundle.extras. Regression guard for the FIX 1 vanish bug: if the
-//       re-resolve path had silently deleted deps, this test would catch
-//       any future regression in bundle.extras membership.
+//   (1) resolve_bundle_bfs_uses_workspace_fallback — two localhost indexes,
+//       non-ignored. Exercises the full BFS loop end-to-end: the entry index
+//       supplies the primary, the workspace index supplies its prefix-matched
+//       transitive, and the transitive ends up in bundle.extras.
 //
 //   (2) resolve_bundle_reresolve_tighter_version_live — #[ignore], live
 //       PyPI. Drives the actual NeedsReResolve cycle: primary requires
@@ -11786,6 +11763,7 @@ mod resolve_bundle_bfs_tests {
         PypiToCondaMap, ResolvedWheel, WheelTarget, merge_uv_pins_into_prefs, resolve_bundle,
     };
     use crate::config::{RelaxPolicy, WheelEntry};
+    use crate::index_chain::{IndexPurpose, PUBLIC_PYPI, index_chain};
 
     fn unique_tmp_dir() -> std::path::PathBuf {
         let base = std::env::temp_dir();
@@ -11942,14 +11920,15 @@ mod resolve_bundle_bfs_tests {
 
     /// Task A (FIX 3 completion): resolve_bundle-loop-level integration test.
     ///
-    /// Drives the FULL BFS loop inside resolve_bundle with a localhost fixture
-    /// index. Verifies that a transitive dep reachable via prefix matching ends
-    /// up in bundle.extras.
+    /// Drives the FULL BFS loop inside resolve_bundle with two localhost fixture
+    /// indexes. The entry index contains only the primary; the workspace index
+    /// contains only its transitive, so old single-entry-index BFS wiring fails.
     ///
     /// Scenario:
     ///   - Primary: `rtest-pkg==1.0` (Requires-Dist: `rtest-pkg-sub>=1.0`)
     ///   - Transitive: `rtest-pkg-sub==1.0` (no further deps)
-    ///   - Both served by a localhost PEP 503 simple index.
+    ///   - Primary served only by the entry's private index.
+    ///   - Transitive served only by the workspace fallback index.
     ///
     /// Assert: bundle.extras contains exactly one entry: rtest-pkg-sub 1.0.
     ///
@@ -11959,7 +11938,7 @@ mod resolve_bundle_bfs_tests {
     /// goes through NeedsReResolve must still appear in bundle.extras, not
     /// vanish silently).
     #[tokio::test]
-    async fn resolve_bundle_bfs_fetches_prefix_transitive() {
+    async fn resolve_bundle_bfs_uses_workspace_fallback() {
         let dir = unique_tmp_dir();
         let download_dir = dir.join("download");
         let source_dir = dir.join("source");
@@ -11981,25 +11960,42 @@ mod resolve_bundle_bfs_tests {
         );
         let sub_bytes = make_wheel_bytes(sub_name, sub_version, &[]);
 
-        let port = spawn_index_server(
-            vec![
-                (
-                    primary_name.to_string(),
-                    primary_version.to_string(),
-                    primary_bytes,
-                ),
-                (sub_name.to_string(), sub_version.to_string(), sub_bytes),
-            ],
-            32,    // enough for primary + sub index + wheel fetches + sidecar attempts
-            false, // index advertises no #sha256 (legacy fixture behavior)
+        let entry_port = spawn_index_server(
+            vec![(
+                primary_name.to_string(),
+                primary_version.to_string(),
+                primary_bytes,
+            )],
+            32,
+            false,
+        )
+        .await;
+        let workspace_port = spawn_index_server(
+            vec![(sub_name.to_string(), sub_version.to_string(), sub_bytes)],
+            32,
+            false,
         )
         .await;
 
-        let index_url = format!("http://127.0.0.1:{port}/simple/");
+        let entry_index = format!("http://127.0.0.1:{entry_port}/simple/");
+        let workspace_index = format!("http://127.0.0.1:{workspace_port}/simple/");
+        let workspace_indexes = vec![workspace_index.clone()];
+        assert_eq!(
+            index_chain(
+                [entry_index.clone()],
+                &workspace_indexes,
+                IndexPurpose::Resolve,
+            ),
+            vec![
+                entry_index.clone(),
+                workspace_index.clone(),
+                PUBLIC_PYPI.to_string(),
+            ],
+        );
 
         let entry = WheelEntry {
             version: Some(primary_version.to_string()),
-            index: Some(index_url),
+            index: Some(entry_index),
             ..Default::default()
         };
         let target = WheelTarget {
@@ -12025,7 +12021,7 @@ mod resolve_bundle_bfs_tests {
             &pypi_to_conda,
             &name_map,
             &conda_channels,
-            &[],                               // workspace_indexes
+            &workspace_indexes,
             None,                              // cold path: no locked closure
             None,                              // cold path: no favor-lock prefs
             &std::collections::HashSet::new(), // no sibling context
@@ -12067,6 +12063,14 @@ mod resolve_bundle_bfs_tests {
         assert_eq!(
             sub_wheel.metadata.version, sub_version,
             "transitive dep must be at version {sub_version}"
+        );
+        assert!(
+            sub_wheel
+                .upstream_url
+                .as_ref()
+                .is_some_and(|url| url.port() == Some(workspace_port)),
+            "the transitive must come from the workspace fallback, not the entry index: {:?}",
+            sub_wheel.upstream_url,
         );
     }
 
@@ -13375,7 +13379,7 @@ mod incremental_add_tests {
 
     // The "nvidia" entry index used in isaac tests.
     const NVIDIA_INDEX: &str = "https://pypi.nvidia.com/simple/";
-    // PUBLIC_PYPI as stored by merge_index_chain.
+    // PUBLIC_PYPI as stored by index_chain.
     const PYPI: &str = "https://pypi.org/simple/";
 
     /// (a) isaac case: add a dep with a NEW index while existing entries keep
@@ -13700,7 +13704,8 @@ mod incremental_add_tests {
 
         // Config: pkga (nvidia, bundle A) + pkgb (pypi, bundle B) + new pkgc (pypi, bundle B).
         // STEP A: locked entries = all entries MINUS added = pkga + pkgb (both).
-        // locked_chain = merge([nvidia, pypi], []) = [nvidia, pypi] == lock.index_urls → PASS.
+        // locked_chain = index_chain([nvidia], []) = [nvidia, pypi]
+        // == lock.index_urls → PASS.
         let config: RetreadConfig = serde_json::from_value(serde_json::json!({
             "retread-wheels": {
                 "pkga": {"version": "1.0", "index": NVIDIA_INDEX, "bundle": "bundle-a"},
@@ -13785,11 +13790,10 @@ mod incremental_add_tests {
         );
     }
 
-    /// (i) dedup/order-masking: a locked entry's index moves from implicit
-    /// PUBLIC_PYPI (appended last by merge_index_chain) to explicit-entry-inserted
-    /// (same set, different ORDER) → STEP A detects the position change → COLD.
+    /// (i) a locked entry moves from an explicit private index to implicit
+    /// public PyPI, so STEP A detects the changed index universe and goes cold.
     #[test]
-    fn step_a_index_position_change_is_cold() {
+    fn step_a_existing_index_change_is_cold() {
         let dir = tmp_incr("i");
         let lock_path = dir.join(RetreadLock::file_name("test-bundle"));
 
@@ -13810,10 +13814,9 @@ mod incremental_add_tests {
             &h,
         );
 
-        // Now: entry A (pypi, switched!) + entry C added (nvidia, explicit).
-        // locked_entry_indexes for existing entries (all minus added) = [pypi].
-        // locked_chain = merge([pypi], []) = [pypi, nvidia? No — nvidia not in locked].
-        // Actually: locked chain = [pypi] ≠ [nvidia, pypi] → COLD.
+        // Now: entry A switched to implicit public PyPI, while entry C is the
+        // newly added NVIDIA entry. Excluding the added entry leaves no explicit
+        // indexes, so index_chain returns [pypi] != [nvidia, pypi] → COLD.
         let config: RetreadConfig = serde_json::from_value(serde_json::json!({
             "retread-bundle": "test-bundle",
             "retread-wheels": {
@@ -13836,7 +13839,7 @@ mod incremental_add_tests {
         unsafe { std::env::remove_var("RETREAD_INCREMENTAL") };
         assert!(
             result.is_none(),
-            "(i) index position change (order-sensitive) must be COLD"
+            "(i) changing an existing entry's index must be COLD"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
