@@ -643,6 +643,14 @@ struct State {
     /// the cascade's last-resort step to mirror the workspace's
     /// `[dependencies]` pin (if any) instead of widening to `*`.
     workspace_dir: Option<PathBuf>,
+    /// Monotonic initialize generation. Prepared output plans are valid only
+    /// for the exact configuration generation that advertised them.
+    generation: u64,
+    /// Monotonic output-computation transaction. A newer conda/outputs call
+    /// invalidates any older in-flight publication in the same generation.
+    prepared_transaction: u64,
+    prepared_cache_key: Option<String>,
+    prepared_builds: Vec<PreparedBuild>,
 }
 
 #[derive(Clone, Default)]
@@ -651,6 +659,7 @@ pub struct Handler {
 }
 
 struct Snapshot {
+    generation: u64,
     config: RetreadConfig,
     download_dir: PathBuf,
     source_dir: PathBuf,
@@ -1077,6 +1086,16 @@ impl Handler {
             .source_directory
             .or_else(|| params.manifest_path.parent().map(PathBuf::from));
         state.workspace_dir = workspace_dir;
+        state.generation = state
+            .generation
+            .checked_add(1)
+            .expect("handler generation counter exhausted");
+        state.prepared_transaction = state
+            .prepared_transaction
+            .checked_add(1)
+            .expect("prepared transaction counter exhausted");
+        state.prepared_cache_key = None;
+        state.prepared_builds.clear();
         Ok(InitializeResult {})
     }
 
@@ -1102,13 +1121,16 @@ impl Handler {
         let mtime = workspace_manifest_mtime(pre_key_workspace_dir.as_deref());
         let auto_overrides_fp = auto_overrides_fingerprint(pre_key_workspace_dir.as_deref());
         let cache_key = conda_outputs_cache_key(&params, mtime, &auto_overrides_fp);
-        if let Some(cached) = CONDA_OUTPUTS_CACHE
-            .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
-            .lock()
-            .unwrap()
-            .get(&cache_key)
-            .cloned()
-        {
+        let memory_cached = {
+            let cache = CONDA_OUTPUTS_CACHE
+                .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+                .lock()
+                .unwrap();
+            cache.get(&cache_key).cloned()
+        };
+        if let Some(cached) = memory_cached {
+            self.retain_prepared_for_memory_cache_hit(&cache_key, &params.work_directory)
+                .await;
             tracing::info!(
                 "retread: conda/outputs cache hit -- returning memoized result (pixi re-requested for another env)",
             );
@@ -1120,6 +1142,7 @@ impl Handler {
         // Fetched early (cheap: just clones handler state) so the DISK
         // cache below can be consulted before the expensive solve.
         let Snapshot {
+            generation,
             config,
             download_dir,
             source_dir,
@@ -1159,9 +1182,17 @@ impl Handler {
                 .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
                 .lock()
                 .unwrap()
-                .insert(cache_key, cached.clone());
+                .insert(cache_key.clone(), cached.clone());
+            self.invalidate_prepared_builds().await;
             return Ok(cached);
         }
+        let prepared_transaction = self.begin_prepared_transaction(generation).await;
+        let mut prepared_builds = Vec::new();
+        // Re-read from the snapshot's workspace path. The cache-key probes
+        // above happen before snapshotting handler state and are not a safe
+        // lifecycle boundary for the typed plan itself.
+        let prepared_workspace_mtime = workspace_manifest_mtime(workspace_dir.as_deref());
+        let prepared_auto_overrides_fp = auto_overrides_fingerprint(workspace_dir.as_deref());
         tracing::info!(
             retread_version = env!("CARGO_PKG_VERSION"),
             "retread: computing conda outputs (resolving wheels + probing channels; large wheels may download here)",
@@ -1258,15 +1289,33 @@ impl Handler {
                 emissions = emissions.len(),
                 "bench: discover_emissions (workspace transitive extraction) finished",
             );
+            let local_wheel_stamps = capture_local_wheel_stamps(&materialized);
+            if local_wheel_stamps.is_none() {
+                tracing::debug!(
+                    python = %python_version,
+                    "resolved wheel could not be stamped; build will resolve normally"
+                );
+            }
+            let plan = Arc::new(ResolvedTargetPlan {
+                materialized,
+                base_config,
+                declared_config: config.clone(),
+                python_version: python_version.clone(),
+                work_directory: params.work_directory.clone(),
+                workspace_manifest_mtime: prepared_workspace_mtime,
+                auto_overrides_fingerprint: prepared_auto_overrides_fp.clone(),
+                local_wheel_stamps,
+            });
             let workspace_manifest = workspace_dir
                 .as_deref()
                 .and_then(crate::workspace::WorkspaceManifest::load);
             // Cross-output siblings: per-emission so envs only link
             // to their own siblings (not other envs' renames).
             for emission in &emissions {
-                let env_bundles: Vec<Bundle> = materialized
+                let env_bundles: Vec<Bundle> = plan
+                    .materialized
                     .iter()
-                    .map(|b| apply_emission(b, &base_config, emission).0)
+                    .map(|b| apply_emission(b, &plan.base_config, emission).0)
                     .collect();
                 // When courier mode is active and RETREAD_INCREMENTAL=1, the
                 // metadata phase must use `lock.version` as the pack version for
@@ -1337,8 +1386,9 @@ impl Handler {
                         (b.conda_name.clone(), ver)
                     })
                     .collect();
-                for base_bundle in &materialized {
-                    let (bundle, effective) = apply_emission(base_bundle, &base_config, emission);
+                for (bundle_index, base_bundle) in plan.materialized.iter().enumerate() {
+                    let (bundle, effective) =
+                        apply_emission(base_bundle, &plan.base_config, emission);
                     // WS-B: cold-solve replay. When courier mode is active and
                     // a committed lock exists whose inputs_hash matches the
                     // current resolution inputs (resolved wheel set + index
@@ -1455,6 +1505,17 @@ impl Handler {
                             "probe trace write failed (non-fatal)",
                         );
                     }
+                    if version_override_for_bundle.is_none()
+                        && plan.local_wheel_stamps.is_some()
+                    {
+                        prepared_builds.push(PreparedBuild {
+                            locator_id: prepared_builds.len(),
+                            plan: Arc::clone(&plan),
+                            bundle_index,
+                            emission: emission.clone(),
+                            advertised: PreparedOutputIdentity::from_metadata(&output.metadata),
+                        });
+                    }
                     outputs.push(output);
                 }
             }
@@ -1475,13 +1536,28 @@ impl Handler {
             .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
             .lock()
             .unwrap()
-            .insert(cache_key, result.clone());
+            .insert(cache_key.clone(), result.clone());
         // Cross-process: persist so a DIFFERENT retread process solving
         // another environment that shares this exact (params, workspace
         // mtime) key can skip the recompute too. Best-effort -- a write
         // failure (read-only cache dir, disk full) just means the next
         // process falls back to a cold compute, same as today.
         write_conda_outputs_disk_cache(&disk_cache_path, &result).await;
+        if let Some(transaction) = prepared_transaction {
+            if !self
+                .publish_prepared_builds(
+                    generation,
+                    transaction,
+                    cache_key,
+                    prepared_builds,
+                )
+                .await
+            {
+                tracing::debug!(
+                    "discarded prepared build plans from a superseded conda/outputs transaction"
+                );
+            }
+        }
         Ok(result)
     }
 
@@ -1502,6 +1578,7 @@ impl Handler {
             params.output.name.as_normalized()
         ));
         let Snapshot {
+            generation,
             config,
             download_dir,
             source_dir,
@@ -1527,6 +1604,7 @@ impl Handler {
             .as_ref()
             .and_then(|s| s.as_versions().into_iter().next());
         let raw = params.output.variant.get("python").map(|v| v.to_string());
+        let exact_variant_python = raw.as_deref().filter(|value| value.contains('.'));
         let python_version = match raw.as_deref() {
             Some(v) if v.contains('.') => v.to_string(),
             Some(other) => {
@@ -1776,6 +1854,78 @@ impl Handler {
             }
         }
 
+        // Build the recipe's run-deps from the exact specs pixi solved and
+        // locked with (forwarded in `params.run_dependencies`). Both the
+        // advertised-plan handoff and the normal cold path consume this same
+        // authoritative list.
+        let run_override: Option<Vec<String>> = params
+            .run_dependencies
+            .as_ref()
+            .map(|deps| deps.iter().map(|d| d.spec.to_string()).collect());
+
+        // On the first cold build, conda/outputs has already produced the
+        // complete typed resolution that advertised this exact output. Reuse
+        // that immutable plan only when lifecycle, identity, workspace inputs,
+        // and localized wheel stamps still match. Replay and incremental-add
+        // deliberately stay ahead of this handoff.
+        if let Some(PreparedBuildSelection {
+            transaction,
+            prepared,
+            bundle,
+            effective,
+        }) = self
+            .lookup_prepared_build(
+                generation,
+                &params.work_directory,
+                workspace_dir.as_deref(),
+                exact_variant_python,
+                &params.output,
+            )
+            .await
+        {
+            tracing::info!(
+                bundle = %bundle.conda_name,
+                "prepared build plan hit: reusing conda/outputs resolution (resolve_all skipped)"
+            );
+            crate::status::tty(&format!(
+                "building '{}': reusing the resolution that advertised this output.",
+                bundle.conda_name,
+            ));
+            let expected_build = params
+                .output
+                .build
+                .as_deref()
+                .unwrap_or(&prepared.advertised.build);
+            let result = build_one(
+                &bundle,
+                &effective,
+                &prepared.plan.declared_config,
+                &params.work_directory,
+                &build_output_dir,
+                params.output.subdir,
+                &prepared.plan.python_version,
+                &source_dir,
+                workspace_dir.as_deref(),
+                Some(expected_build),
+                run_override.as_deref(),
+            )
+            .await
+            .map_err(|e| RpcError::internal(format!("build {}: {e:#}", bundle.conda_name)))?;
+            let result = finalize_fasttmp_build_output(
+                result,
+                stage_output_dir.as_deref(),
+                &output_dir,
+            )
+            .await?;
+            self.consume_prepared_build(
+                generation,
+                transaction,
+                prepared.locator_id,
+            )
+            .await;
+            return Ok(result);
+        }
+
         // Re-resolve materialized bundles, then autodiscover emissions
         // and pick the one matching the requested output name.
         let (materialized, base_config) = resolve_all(
@@ -1828,19 +1978,6 @@ impl Handler {
         })?;
         let (bundle, effective) = apply_emission(base_bundle, &base_config, picked_emission);
 
-        // Build the recipe's run-deps from the EXACT specs pixi solved and
-        // locked with (forwarded in `params.run_dependencies`), not by
-        // re-deriving from the wheels' requires_dist. This keeps the built
-        // package's run-deps identical to what `conda/outputs` emitted +
-        // the solver locked (including cascade widenings like `pytorch >=1`),
-        // and avoids re-emitting the raw transitive override that
-        // rattler-build rejects as a malformed spec. Falls back to
-        // requires_dist derivation if pixi didn't forward run-deps.
-        let run_override: Option<Vec<String>> = params
-            .run_dependencies
-            .as_ref()
-            .map(|deps| deps.iter().map(|d| d.spec.to_string()).collect());
-
         let result = build_one(
             &bundle,
             &effective,
@@ -1859,8 +1996,145 @@ impl Handler {
         finalize_fasttmp_build_output(result, stage_output_dir.as_deref(), &output_dir).await
     }
 
+    async fn begin_prepared_transaction(&self, generation: u64) -> Option<u64> {
+        let mut state = self.state.write().await;
+        if state.generation != generation {
+            return None;
+        }
+        state.prepared_transaction = state
+            .prepared_transaction
+            .checked_add(1)
+            .expect("prepared transaction counter exhausted");
+        state.prepared_cache_key = None;
+        state.prepared_builds.clear();
+        Some(state.prepared_transaction)
+    }
+
+    async fn publish_prepared_builds(
+        &self,
+        generation: u64,
+        transaction: u64,
+        cache_key: String,
+        prepared_builds: Vec<PreparedBuild>,
+    ) -> bool {
+        let mut state = self.state.write().await;
+        if state.generation != generation || state.prepared_transaction != transaction {
+            return false;
+        }
+        state.prepared_cache_key = Some(cache_key);
+        state.prepared_builds = prepared_builds;
+        true
+    }
+
+    async fn retain_prepared_for_memory_cache_hit(&self, cache_key: &str, work_dir: &Path) {
+        let mut state = self.state.write().await;
+        let reusable = state.prepared_cache_key.as_deref() == Some(cache_key)
+            && !state.prepared_builds.is_empty()
+            && state
+                .prepared_builds
+                .iter()
+                .all(|prepared| prepared.plan.work_directory == work_dir);
+        if reusable {
+            return;
+        }
+        state.prepared_transaction = state
+            .prepared_transaction
+            .checked_add(1)
+            .expect("prepared transaction counter exhausted");
+        state.prepared_cache_key = None;
+        state.prepared_builds.clear();
+    }
+
+    async fn invalidate_prepared_builds(&self) {
+        let mut state = self.state.write().await;
+        state.prepared_transaction = state
+            .prepared_transaction
+            .checked_add(1)
+            .expect("prepared transaction counter exhausted");
+        state.prepared_cache_key = None;
+        state.prepared_builds.clear();
+    }
+
+    async fn lookup_prepared_build(
+        &self,
+        generation: u64,
+        work_dir: &Path,
+        workspace_dir: Option<&Path>,
+        exact_python_version: Option<&str>,
+        output: &pixi_build_types::procedures::conda_build_v1::CondaBuildV1Output,
+    ) -> Option<PreparedBuildSelection> {
+        let (transaction, mut candidates): (u64, Vec<PreparedBuild>) = {
+            let state = self.state.read().await;
+            if state.generation != generation {
+                return None;
+            }
+            (
+                state.prepared_transaction,
+                state
+                    .prepared_builds
+                    .iter()
+                    .filter(|prepared| {
+                        prepared.matches(work_dir, exact_python_version, output)
+                    })
+                    .cloned()
+                    .collect(),
+            )
+        };
+        if candidates.len() != 1 {
+            tracing::debug!(
+                candidates = candidates.len(),
+                output = %output.name.as_normalized(),
+                "prepared build plan unavailable or ambiguous; resolving normally"
+            );
+            return None;
+        }
+        let prepared = candidates.pop().expect("one candidate");
+        if prepared.plan.workspace_manifest_mtime != workspace_manifest_mtime(workspace_dir)
+            || prepared.plan.auto_overrides_fingerprint
+                != auto_overrides_fingerprint(workspace_dir)
+        {
+            tracing::debug!(
+                output = %output.name.as_normalized(),
+                "prepared build plan inputs changed; resolving normally"
+            );
+            return None;
+        }
+        let stamps = prepared.plan.local_wheel_stamps.as_ref()?;
+        if !local_wheel_stamps_are_current(stamps) {
+            tracing::debug!(
+                output = %output.name.as_normalized(),
+                "prepared build plan wheel changed or is unreadable; resolving normally"
+            );
+            return None;
+        }
+        let (bundle, effective) = prepared.reapply()?;
+        let state = self.state.read().await;
+        if state.generation != generation || state.prepared_transaction != transaction {
+            return None;
+        }
+        Some(PreparedBuildSelection {
+            transaction,
+            prepared,
+            bundle,
+            effective,
+        })
+    }
+
+    async fn consume_prepared_build(&self, generation: u64, transaction: u64, locator_id: usize) {
+        let mut state = self.state.write().await;
+        if state.generation != generation || state.prepared_transaction != transaction {
+            return;
+        }
+        state
+            .prepared_builds
+            .retain(|prepared| prepared.locator_id != locator_id);
+        if state.prepared_builds.is_empty() {
+            state.prepared_cache_key = None;
+        }
+    }
+
     async fn snapshot(&self, work_dir: &Path) -> Result<Snapshot, RpcError> {
-        let (config, state_cache_dir, source_dir, workspace_dir) = {
+        let (generation, config, state_cache_dir, source_dir, workspace_dir) = {
             let state = self.state.read().await;
             let config = state
                 .config
@@ -1871,6 +2145,7 @@ impl Handler {
                 .clone()
                 .unwrap_or_else(|| work_dir.to_path_buf());
             (
+                state.generation,
                 config,
                 state.cache_dir.clone(),
                 source_dir,
@@ -1899,6 +2174,7 @@ impl Handler {
             }
         }
         Ok(Snapshot {
+            generation,
             config,
             download_dir,
             source_dir,
@@ -4829,6 +5105,129 @@ struct DiscoveredEmission {
     transitive_overrides: BTreeMap<String, String>,
     #[allow(dead_code)]
     envs: Vec<String>,
+}
+
+/// One exact typed resolution retained between output advertisement and the
+/// matching build request. The complete bundles/config preserve 4.8.x
+/// constraint authority, ownership facts, and metadata provenance; locators
+/// below share this graph through `Arc` rather than cloning it per output.
+struct ResolvedTargetPlan {
+    materialized: Vec<Bundle>,
+    base_config: RetreadConfig,
+    declared_config: RetreadConfig,
+    python_version: String,
+    work_directory: PathBuf,
+    workspace_manifest_mtime: Option<std::time::SystemTime>,
+    auto_overrides_fingerprint: String,
+    local_wheel_stamps: Option<Vec<LocalWheelStamp>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LocalWheelStamp {
+    path: PathBuf,
+    len: u64,
+    modified: std::time::SystemTime,
+}
+
+#[derive(Clone)]
+struct PreparedOutputIdentity {
+    name: String,
+    version: String,
+    build: String,
+    subdir: Platform,
+}
+
+impl PreparedOutputIdentity {
+    fn from_metadata(metadata: &CondaOutputMetadata) -> Self {
+        Self {
+            name: metadata.name.as_normalized().to_string(),
+            version: metadata.version.to_string(),
+            build: metadata.build.clone(),
+            subdir: metadata.subdir,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct PreparedBuild {
+    locator_id: usize,
+    plan: Arc<ResolvedTargetPlan>,
+    bundle_index: usize,
+    emission: DiscoveredEmission,
+    advertised: PreparedOutputIdentity,
+}
+
+struct PreparedBuildSelection {
+    transaction: u64,
+    prepared: PreparedBuild,
+    bundle: Bundle,
+    effective: RetreadConfig,
+}
+
+impl PreparedBuild {
+    fn matches(
+        &self,
+        work_directory: &Path,
+        exact_python_version: Option<&str>,
+        output: &pixi_build_types::procedures::conda_build_v1::CondaBuildV1Output,
+    ) -> bool {
+        self.plan.work_directory == work_directory
+            && exact_python_version
+                .is_none_or(|python_version| self.plan.python_version == python_version)
+            && self.advertised.name == output.name.as_normalized()
+            && self.advertised.subdir == output.subdir
+            && output
+                .version
+                .as_ref()
+                .is_none_or(|version| self.advertised.version == version.to_string())
+            && output
+                .build
+                .as_ref()
+                .is_none_or(|build| self.advertised.build == *build)
+    }
+
+    fn reapply(&self) -> Option<(Bundle, RetreadConfig)> {
+        let base_bundle = self.plan.materialized.get(self.bundle_index)?;
+        let (bundle, effective) =
+            apply_emission(base_bundle, &self.plan.base_config, &self.emission);
+        let applied_name = PackageName::new_unchecked(bundle.conda_name.clone());
+        (applied_name.as_normalized() == self.advertised.name
+            && bundle.primary.metadata.version == self.advertised.version)
+            .then_some((bundle, effective))
+    }
+}
+
+fn capture_local_wheel_stamps(bundles: &[Bundle]) -> Option<Vec<LocalWheelStamp>> {
+    let mut stamps = Vec::new();
+    for wheel in bundles.iter().flat_map(Bundle::all_wheels) {
+        if wheel.url.scheme() != "file" {
+            continue;
+        }
+        let path = wheel.url.to_file_path().ok()?;
+        let metadata = std::fs::metadata(&path).ok()?;
+        if !metadata.is_file() {
+            return None;
+        }
+        stamps.push(LocalWheelStamp {
+            path,
+            len: metadata.len(),
+            modified: metadata.modified().ok()?,
+        });
+    }
+    stamps.sort_unstable_by(|left, right| left.path.cmp(&right.path));
+    stamps.dedup();
+    Some(stamps)
+}
+
+fn local_wheel_stamps_are_current(stamps: &[LocalWheelStamp]) -> bool {
+    stamps.iter().all(|stamp| {
+        std::fs::metadata(&stamp.path).is_ok_and(|metadata| {
+            metadata.is_file()
+                && metadata.len() == stamp.len
+                && metadata.modified().ok().as_ref() == Some(&stamp.modified)
+                && crate::wheel::is_valid_zip(&stamp.path)
+        })
+    })
 }
 
 /// Autodiscovery-based emission planner. Walks the workspace

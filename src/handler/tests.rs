@@ -3102,7 +3102,7 @@ fn auto_overrides_fingerprint_tracks_ledger_content_not_mtime() {
 // -----------------------------------------------------------------
 
 #[tokio::test]
-async fn conda_outputs_disk_cache_round_trips() {
+async fn conda_outputs_cache_and_prepared_handoff_round_trip() {
     use pixi_build_types::procedures::conda_outputs::CondaOutputsResult;
 
     let cache_dir = std::env::temp_dir().join(format!(
@@ -3137,6 +3137,259 @@ async fn conda_outputs_disk_cache_round_trips() {
     assert!(
         leftovers.is_empty(),
         "temp file must be renamed away, not left behind"
+    );
+
+    // A real outputs computation may hand its exact typed resolution to the
+    // matching build request. Optional version/build fields narrow only when
+    // present; duplicates are deliberately ambiguous and fall back.
+    let work_dir = cache_dir.join("prepared-work");
+    let mut declared_config = cfg();
+    declared_config.courier = true;
+    let base_bundle = solo_bundle("prepared-pack", vec![]);
+    let emission = DiscoveredEmission {
+        output_name: "prepared-pack-env".to_string(),
+        channels: Vec::new(),
+        transitive_overrides: BTreeMap::new(),
+        envs: Vec::new(),
+    };
+    let (advertised_bundle, advertised_config) =
+        apply_emission(&base_bundle, &declared_config, &emission);
+    let advertised_output = produce_output(
+        &advertised_bundle,
+        &advertised_config,
+        Platform::Linux64,
+        "3.11",
+        &[],
+        Some("prepared-hash"),
+        None,
+    )
+    .unwrap();
+    let plan = Arc::new(ResolvedTargetPlan {
+        local_wheel_stamps: capture_local_wheel_stamps(std::slice::from_ref(&base_bundle)),
+        materialized: vec![base_bundle],
+        base_config: declared_config.clone(),
+        declared_config: declared_config.clone(),
+        python_version: "3.11".to_string(),
+        work_directory: work_dir.clone(),
+        workspace_manifest_mtime: None,
+        auto_overrides_fingerprint: "none".to_string(),
+    });
+    let prepared = PreparedBuild {
+        locator_id: 0,
+        plan,
+        bundle_index: 0,
+        emission,
+        advertised: PreparedOutputIdentity::from_metadata(&advertised_output.metadata),
+    };
+    let request = pixi_build_types::procedures::conda_build_v1::CondaBuildV1Output {
+        name: advertised_output.metadata.name.clone(),
+        version: None,
+        build: None,
+        subdir: advertised_output.metadata.subdir,
+        variant: advertised_output.metadata.variant.clone(),
+    };
+    let handler = Handler::default();
+    {
+        let mut state = handler.state.write().await;
+        state.generation = 7;
+    }
+    let transaction = handler.begin_prepared_transaction(7).await.unwrap();
+    assert!(
+        handler
+            .publish_prepared_builds(
+                7,
+                transaction,
+                "prepared-key".to_string(),
+                vec![prepared.clone()],
+            )
+            .await
+    );
+    let hit = handler
+        .lookup_prepared_build(7, &work_dir, None, None, &request)
+        .await
+        .expect("one partial-identity candidate must reuse the advertised plan");
+    assert_eq!(hit.bundle.conda_name, "prepared-pack-env");
+    assert!(matches!(
+        hit.bundle.primary.metadata_provenance,
+        Provenance::IndexWheelMetadata
+    ));
+    assert_eq!(
+        hit.prepared.advertised.build,
+        advertised_output.metadata.build,
+        "a dynamic build request must retain the advertised content-addressed build"
+    );
+    handler
+        .retain_prepared_for_memory_cache_hit("prepared-key", &work_dir)
+        .await;
+    assert!(
+        handler
+            .lookup_prepared_build(7, &work_dir, None, Some("3.11"), &request)
+            .await
+            .is_some(),
+        "the same handler/cache key may retain its typed plan"
+    );
+    assert!(
+        handler
+            .lookup_prepared_build(
+                7,
+                Path::new("/other-work"),
+                None,
+                Some("3.11"),
+                &request,
+            )
+            .await
+            .is_none(),
+        "work directories must not share prepared plans"
+    );
+    handler
+        .consume_prepared_build(7, hit.transaction, hit.prepared.locator_id)
+        .await;
+    assert!(
+        handler
+            .lookup_prepared_build(7, &work_dir, None, Some("3.11"), &request)
+            .await
+            .is_none(),
+        "a successful build must release its locator and final plan Arc"
+    );
+
+    let transaction = handler.begin_prepared_transaction(7).await.unwrap();
+    let py312_bundle = solo_bundle("prepared-pack", vec![]);
+    let py312_plan = Arc::new(ResolvedTargetPlan {
+        local_wheel_stamps: capture_local_wheel_stamps(std::slice::from_ref(&py312_bundle)),
+        materialized: vec![py312_bundle],
+        base_config: declared_config.clone(),
+        declared_config: declared_config.clone(),
+        python_version: "3.12".to_string(),
+        work_directory: work_dir.clone(),
+        workspace_manifest_mtime: None,
+        auto_overrides_fingerprint: "none".to_string(),
+    });
+    let py312_prepared = PreparedBuild {
+        locator_id: 1,
+        plan: py312_plan,
+        bundle_index: 0,
+        emission: prepared.emission.clone(),
+        advertised: prepared.advertised.clone(),
+    };
+    handler
+        .publish_prepared_builds(
+            7,
+            transaction,
+            "ambiguous-key".to_string(),
+            vec![prepared.clone(), py312_prepared],
+        )
+        .await;
+    assert!(
+        handler
+            .lookup_prepared_build(7, &work_dir, None, None, &request)
+            .await
+            .is_none(),
+        "a missing Python minor must not guess among advertised Python plans"
+    );
+    assert!(
+        handler
+            .lookup_prepared_build(7, &work_dir, None, Some("3.11"), &request)
+            .await
+            .is_some(),
+        "an explicit Python minor may uniquely select its advertised plan"
+    );
+
+    // A newer initialize/output transaction must reject an older in-flight
+    // publication, and an unrelated memory-cache hit must clear prior plans.
+    let stale_transaction = handler.begin_prepared_transaction(7).await.unwrap();
+    {
+        let mut state = handler.state.write().await;
+        state.generation = 8;
+        state.prepared_transaction += 1;
+        state.prepared_builds.clear();
+    }
+    assert!(
+        !handler
+            .publish_prepared_builds(
+                7,
+                stale_transaction,
+                "stale-key".to_string(),
+                vec![prepared.clone()],
+            )
+            .await
+    );
+    let transaction = handler.begin_prepared_transaction(8).await.unwrap();
+    handler
+        .publish_prepared_builds(
+            8,
+            transaction,
+            "prepared-key".to_string(),
+            vec![prepared.clone()],
+        )
+        .await;
+    handler
+        .retain_prepared_for_memory_cache_hit("other-key", &work_dir)
+        .await;
+    assert!(
+        handler
+            .lookup_prepared_build(8, &work_dir, None, Some("3.11"), &request)
+            .await
+            .is_none()
+    );
+
+    // Local wheel reuse additionally requires the exact file stamp and a
+    // readable ZIP central directory. Corruption must return to resolve_all.
+    let local_wheel = cache_dir.join("prepared-pack-1.0.0-py3-none-any.whl");
+    {
+        use std::io::Write;
+        let file = std::fs::File::create(&local_wheel).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file(
+            "prepared_pack-1.0.0.dist-info/METADATA",
+            zip::write::FileOptions::<'_, ()>::default(),
+        )
+        .unwrap();
+        zip.write_all(b"Metadata-Version: 2.1\nName: prepared-pack\nVersion: 1.0.0\n")
+            .unwrap();
+        zip.finish().unwrap();
+    }
+    let mut local_bundle = solo_bundle("prepared-pack", vec![]);
+    local_bundle.primary.url = url::Url::from_file_path(&local_wheel).unwrap();
+    let local_stamps = capture_local_wheel_stamps(std::slice::from_ref(&local_bundle));
+    let local_plan = Arc::new(ResolvedTargetPlan {
+        materialized: vec![local_bundle],
+        base_config: declared_config.clone(),
+        declared_config,
+        python_version: "3.11".to_string(),
+        work_directory: work_dir.clone(),
+        workspace_manifest_mtime: None,
+        auto_overrides_fingerprint: "none".to_string(),
+        local_wheel_stamps: local_stamps,
+    });
+    let local_prepared = PreparedBuild {
+        locator_id: 0,
+        plan: local_plan,
+        bundle_index: 0,
+        emission: hit.prepared.emission.clone(),
+        advertised: hit.prepared.advertised.clone(),
+    };
+    let transaction = handler.begin_prepared_transaction(8).await.unwrap();
+    handler
+        .publish_prepared_builds(
+            8,
+            transaction,
+            "local-key".to_string(),
+            vec![local_prepared],
+        )
+        .await;
+    assert!(
+        handler
+            .lookup_prepared_build(8, &work_dir, None, Some("3.11"), &request)
+            .await
+            .is_some()
+    );
+    std::fs::write(&local_wheel, b"not a wheel").unwrap();
+    assert!(
+        handler
+            .lookup_prepared_build(8, &work_dir, None, Some("3.11"), &request)
+            .await
+            .is_none(),
+        "a replaced/corrupt localized wheel must force normal resolution"
     );
 
     let _ = std::fs::remove_dir_all(&cache_dir);
