@@ -423,6 +423,9 @@ struct ProcessCloneLock {
 }
 
 fn process_clone_locks() -> &'static Mutex<HashMap<ProcessLockKey, Arc<ProcessCloneLock>>> {
+    // Strong entries intentionally retain one fd per checkout touched by this
+    // backend process. That bounded process-lifetime cost is what guarantees a
+    // later worker can never reopen and flock the same inode a second time.
     static LOCKS: OnceLock<Mutex<HashMap<ProcessLockKey, Arc<ProcessCloneLock>>>> =
         OnceLock::new();
     LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
@@ -858,14 +861,6 @@ async fn initialize_process_clone_lock(
     Ok(())
 }
 
-/// Clone a git URL at a specific revision into `cache_dir`, then build
-/// the wheel for `subdirectory` (relative to the repo root, defaulting
-/// to ".").
-///
-/// Clones are cached by (url, rev) so repeated `conda/outputs` calls
-/// for the same workspace don't re-clone. `rev` can be a commit SHA,
-/// tag, or branch name.
-///
 /// Return a reader lease for an immutable, published `(url, rev)` checkout.
 ///
 /// The first process to observe a missing ready marker takes EX, performs the
@@ -973,6 +968,12 @@ impl GitWheelBuild {
     }
 }
 
+/// Build a wheel from a clone-once git checkout and return the resolved commit
+/// SHA plus the reader lease. `rev` may be a commit, tag, or branch; callers
+/// that continue reading the checkout must keep the returned value alive.
+///
+/// The emitted wheel filename is also checked for non-reproducible
+/// `setuptools_scm` markers (`.devN`, `.dYYYYMMDD`, and `+g<sha>`).
 pub async fn build_wheel_from_git(
     url: &str,
     rev: &str,
@@ -1210,9 +1211,9 @@ async fn try_run_silent(cmd: &mut Command) -> Result<bool> {
 /// self-healing the two corruption modes a pre-v3.0.0 concurrent-resolve
 /// race could leave behind (#8): stray untracked files blocking the
 /// checkout ("untracked working tree files would be overwritten"), or a
-/// previous checkout simply parked on the wrong commit. A plain `git
-/// checkout` on an already-correct tree is a fast no-op, so this is safe
-/// to call unconditionally rather than only on a fresh clone.
+/// previous checkout simply parked on the wrong commit. This helper is only
+/// used by the one-time EX initializer before it publishes readiness; it must
+/// never run against a warm checkout that readers can access.
 ///
 /// Returns `Ok(false)` (not an error) when `target` isn't resolvable at
 /// all in this clone_dir -- the caller's fallback is to `git fetch` first.
@@ -1389,6 +1390,37 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn process_clone_registry_unifies_path_aliases_by_inode() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "retread-clone-alias-{}-{unique}",
+            std::process::id()
+        ));
+        let real_cache = base.join("real-cache");
+        let alias_cache = base.join("alias-cache");
+        let real_parent = real_cache.join("retread-git-clones").join("slug");
+        std::fs::create_dir_all(&real_parent).unwrap();
+        std::os::unix::fs::symlink(&real_cache, &alias_cache).unwrap();
+        let real_lock = real_parent.join("abcdef012345.lock");
+        let alias_lock = alias_cache
+            .join("retread-git-clones")
+            .join("slug")
+            .join("abcdef012345.lock");
+        let identity = CloneIdentity::new("https://example.com/alias.git", "rev");
+        let real = registered_clone_lock(&real_lock, &identity).unwrap();
+        let alias = registered_clone_lock(&alias_lock, &identity).unwrap();
+        assert!(
+            Arc::ptr_eq(&real, &alias),
+            "two paths to one lock inode created separate process entries"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// Different (url, rev) pairs must NOT collide on disk -- the
     /// rev is the only thing distinguishing two checkouts of the same
     /// repo at different revisions.
@@ -1493,7 +1525,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Local git fixture: build_wheel_from_git returns (path, resolved_sha)
+    // Local git fixture: build_wheel_from_git resolves and retains checkout
     // ---------------------------------------------------------------------------
 
     /// Verifies that `build_wheel_from_git` returns a 40-character resolved
@@ -1596,209 +1628,220 @@ version = "0.1.0"
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// v3.0.2 regression (#8): a clone_dir that survived a prior
-    /// corrupted run -- e.g. one left an UNTRACKED file at a path the
-    /// target commit also tracks -- must self-heal on the next
-    /// `build_wheel_from_git` call instead of failing forever with
-    /// "untracked working tree files would be overwritten by checkout."
-    #[tokio::test]
-    #[ignore = "live: builds a git wheel via uv (needs uv + git on PATH); run with --include-ignored"]
-    async fn build_wheel_from_git_self_heals_untracked_file_conflict() {
-        let pid = std::process::id();
-        let base = std::env::temp_dir().join(format!("retread-githeal-{pid}"));
-        let repo = base.join("repo");
-        std::fs::create_dir_all(&repo).expect("create repo dir");
-
-        let run_git = |args: &[&str], dir: &std::path::Path| {
-            let status = std::process::Command::new("git")
-                .args(args)
-                .current_dir(dir)
-                .env("GIT_AUTHOR_NAME", "test")
-                .env("GIT_AUTHOR_EMAIL", "test@example.com")
-                .env("GIT_COMMITTER_NAME", "test")
-                .env("GIT_COMMITTER_EMAIL", "test@example.com")
-                .status()
-                .expect("git");
-            assert!(status.success(), "git {args:?} failed");
-        };
-        let rev_parse_head = |dir: &std::path::Path| -> String {
-            let out = std::process::Command::new("git")
-                .args(["rev-parse", "HEAD"])
-                .current_dir(dir)
-                .output()
-                .expect("git rev-parse");
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
-        };
-
-        run_git(&["init", "-b", "main"], &repo);
-        run_git(&["config", "user.email", "test@example.com"], &repo);
-        run_git(&["config", "user.name", "test"], &repo);
-        std::fs::write(
-            repo.join("pyproject.toml"),
-            r#"[build-system]
-requires = ["setuptools>=61"]
-build-backend = "setuptools.build_meta"
-
-[project]
-name = "retread-test-fixture"
-version = "0.1.0"
-"#,
-        )
-        .expect("write pyproject");
-        run_git(&["add", "."], &repo);
-        run_git(&["commit", "-m", "initial"], &repo);
-        let rev1 = rev_parse_head(&repo);
-
-        // Second commit adds a TRACKED "extra.txt". This is the rev every
-        // resolve below asks for -- matching the real bug, where every
-        // racing [retread-wheels] entry names the exact SAME `rev`, so
-        // they all hash to the exact same clone_dir (git_checkout_root
-        // keys on url+rev; different revs never collide, which is correct
-        // and is NOT what's under test here).
-        std::fs::write(repo.join("extra.txt"), "tracked-content").expect("write extra.txt");
-        run_git(&["add", "."], &repo);
-        run_git(&["commit", "-m", "add extra.txt"], &repo);
-        let rev2 = rev_parse_head(&repo);
-
-        let cache_dir = base.join("cache");
-        let out_dir = base.join("out");
-        std::fs::create_dir_all(&cache_dir).expect("cache dir");
-        std::fs::create_dir_all(&out_dir).expect("out dir");
-        let repo_url = format!("file://{}", repo.display());
-
-        // First resolve: populates clone_dir at rev2 (the rev every call
-        // below will keep asking for).
-        build_wheel_from_git(&repo_url, &rev2, ".", &cache_dir, &out_dir, "3.11")
-            .await
-            .expect("initial build_wheel_from_git");
-        let clone_dir = git_checkout_root(&repo_url, &rev2, &cache_dir);
-
-        // Simulate the corruption a pre-v3.0.2 race could leave behind:
-        // HEAD parked on an EARLIER commit (rev1, which lacks extra.txt)
-        // plus a stray UNTRACKED extra.txt with different content sitting
-        // in the working tree. `git checkout rev2` from this state must
-        // create extra.txt (rev1 -> rev2 changes it), but an untracked
-        // file already occupies that path -- exactly reproducing "The
-        // following untracked working tree files would be overwritten by
-        // checkout: extra.txt" from issue #8, without needing real
-        // concurrency to trigger it.
-        run_git(&["checkout", "--force", &rev1], &clone_dir);
-        assert_eq!(
-            rev_parse_head(&clone_dir),
-            rev1,
-            "setup: clone_dir must be parked on rev1"
-        );
-        std::fs::write(clone_dir.join("extra.txt"), "stray-untracked-content")
-            .expect("write stray untracked file");
-
-        // Resolving rev2 again now must self-heal (clean + checkout)
-        // rather than failing with "untracked working tree files would be
-        // overwritten".
-        let (_, resolved_sha, _checkout) =
-            build_wheel_from_git(&repo_url, &rev2, ".", &cache_dir, &out_dir, "3.11")
-                .await
-                .expect("self-healing build_wheel_from_git must succeed")
-                .into_parts();
-        assert_eq!(resolved_sha, rev2);
-        assert_eq!(
-            std::fs::read_to_string(clone_dir.join("extra.txt")).expect("read extra.txt"),
-            "tracked-content",
-            "the stray untracked file must be replaced by the tracked one, not left in place"
-        );
-
-        let _ = std::fs::remove_dir_all(&base);
+    struct GitCheckoutFixture {
+        base: PathBuf,
+        cache: PathBuf,
+        url: String,
+        rev1: String,
+        rev2: String,
     }
 
-    /// v3.0.3 regression (#8): when a clone_dir is corrupted at the
-    /// `.git` level (not just the working tree), `checkout_rev_robust`'s
-    /// working-tree-only repair (`git clean -fdx`) can't fix it and
-    /// every checkout attempt keeps failing -- exactly what #8 hit next:
-    /// "git checkout FETCH_HEAD failed even after cleaning the working
-    /// tree." `build_wheel_from_git` must fall back to wiping clone_dir
-    /// and re-cloning from scratch rather than erroring out forever.
-    /// Simulated here with a stale `.git/index.lock` (a realistic
-    /// leftover from a process killed mid-checkout before the flock fix
-    /// existed): git refuses EVERY checkout while it's present, and
-    /// `git clean` doesn't touch `.git/` at all, so only a full wipe
-    /// recovers.
-    #[tokio::test]
-    #[ignore = "live: builds a git wheel via uv (needs uv + git on PATH); run with --include-ignored"]
-    async fn build_wheel_from_git_recovers_from_corrupted_git_dir_by_recloning() {
-        let pid = std::process::id();
-        let base = std::env::temp_dir().join(format!("retread-gitrecover-{pid}"));
-        let repo = base.join("repo");
-        std::fs::create_dir_all(&repo).expect("create repo dir");
+    impl Drop for GitCheckoutFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.base);
+        }
+    }
 
-        let run_git = |args: &[&str], dir: &std::path::Path| {
-            let status = std::process::Command::new("git")
-                .args(args)
-                .current_dir(dir)
-                .env("GIT_AUTHOR_NAME", "test")
-                .env("GIT_AUTHOR_EMAIL", "test@example.com")
-                .env("GIT_COMMITTER_NAME", "test")
-                .env("GIT_COMMITTER_EMAIL", "test@example.com")
-                .status()
-                .expect("git");
-            assert!(status.success(), "git {args:?} failed");
-        };
-
-        run_git(&["init", "-b", "main"], &repo);
-        run_git(&["config", "user.email", "test@example.com"], &repo);
-        run_git(&["config", "user.name", "test"], &repo);
-        std::fs::write(
-            repo.join("pyproject.toml"),
-            r#"[build-system]
-requires = ["setuptools>=61"]
-build-backend = "setuptools.build_meta"
-
-[project]
-name = "retread-test-fixture"
-version = "0.1.0"
-"#,
-        )
-        .expect("write pyproject");
-        run_git(&["add", "."], &repo);
-        run_git(&["commit", "-m", "initial"], &repo);
-        let sha_output = std::process::Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .current_dir(&repo)
+    fn run_fixture_git(args: &[&str], directory: &Path) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(directory)
+            .env("GIT_AUTHOR_NAME", "retread-test")
+            .env("GIT_AUTHOR_EMAIL", "retread-test@example.com")
+            .env("GIT_COMMITTER_NAME", "retread-test")
+            .env("GIT_COMMITTER_EMAIL", "retread-test@example.com")
             .output()
-            .expect("git rev-parse");
-        let rev = String::from_utf8_lossy(&sha_output.stdout)
-            .trim()
-            .to_string();
-
-        let cache_dir = base.join("cache");
-        let out_dir = base.join("out");
-        std::fs::create_dir_all(&cache_dir).expect("cache dir");
-        std::fs::create_dir_all(&out_dir).expect("out dir");
-        let repo_url = format!("file://{}", repo.display());
-
-        // First resolve: populates clone_dir correctly.
-        build_wheel_from_git(&repo_url, &rev, ".", &cache_dir, &out_dir, "3.11")
-            .await
-            .expect("initial build_wheel_from_git");
-        let clone_dir = git_checkout_root(&repo_url, &rev, &cache_dir);
-
-        // Corrupt at the .git level: a stale index.lock blocks EVERY
-        // checkout attempt, and `git clean` never touches `.git/`, so
-        // checkout_rev_robust's working-tree repair cannot fix this --
-        // only wiping clone_dir and recloning can.
-        std::fs::write(clone_dir.join(".git").join("index.lock"), "")
-            .expect("write stale index.lock");
-
-        let (_, resolved_sha, _checkout) =
-            build_wheel_from_git(&repo_url, &rev, ".", &cache_dir, &out_dir, "3.11")
-                .await
-                .expect("must recover by wiping and re-cloning, not error out")
-                .into_parts();
-        assert_eq!(resolved_sha, rev);
+            .expect("spawn fixture git");
         assert!(
-            !clone_dir.join(".git").join("index.lock").exists(),
-            "the fresh clone must not carry over the stale lock file"
+            output.status.success(),
+            "git {args:?} failed in {}: {}",
+            directory.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn git_checkout_fixture(label: &str) -> GitCheckoutFixture {
+        static NEXT_FIXTURE: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+        let base = std::env::temp_dir().join(format!(
+            "retread-{label}-{}-{sequence}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo = base.join("repo");
+        let cache = base.join("cache");
+        std::fs::create_dir_all(&repo).expect("create fixture repo");
+        std::fs::create_dir_all(&cache).expect("create fixture cache");
+        run_fixture_git(&["init", "-b", "main"], &repo);
+        std::fs::write(repo.join("base.txt"), "base\n").expect("write base file");
+        run_fixture_git(&["add", "."], &repo);
+        run_fixture_git(&["commit", "-m", "base"], &repo);
+        let rev1 = run_fixture_git(&["rev-parse", "HEAD"], &repo);
+        std::fs::write(repo.join("extra.txt"), "tracked-content\n")
+            .expect("write second-revision file");
+        run_fixture_git(&["add", "."], &repo);
+        run_fixture_git(&["commit", "-m", "add extra"], &repo);
+        let rev2 = run_fixture_git(&["rev-parse", "HEAD"], &repo);
+        let url = format!("file://{}", repo.display());
+        GitCheckoutFixture {
+            base,
+            cache,
+            url,
+            rev1,
+            rev2,
+        }
+    }
+
+    fn seed_unmarked_checkout(fixture: &GitCheckoutFixture, checkout_rev: &str) -> PathBuf {
+        let clone_dir = git_checkout_root(&fixture.url, &fixture.rev2, &fixture.cache);
+        std::fs::create_dir_all(clone_dir.parent().unwrap()).expect("create clone parent");
+        let clone_arg = clone_dir.to_str().expect("utf8 clone path");
+        run_fixture_git(
+            &["clone", "--no-checkout", &fixture.url, clone_arg],
+            &fixture.base,
+        );
+        run_fixture_git(&["checkout", "--force", checkout_rev], &clone_dir);
+        assert!(
+            !checkout_ready_marker(&clone_dir).exists(),
+            "legacy fixture must begin unpublished"
+        );
+        clone_dir
+    }
+
+    /// The first access repairs an unmarked legacy tree and publishes it. Any
+    /// later warm access is read-only: a sentinel that `git clean -fdx` would
+    /// remove and an index lock that would force wipe/reclone both survive.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn git_checkout_repairs_once_then_warm_tree_is_immutable() {
+        let fixture = git_checkout_fixture("clone-once");
+        let clone_dir = seed_unmarked_checkout(&fixture, &fixture.rev1);
+        std::fs::write(clone_dir.join("extra.txt"), "stray-untracked\n")
+            .expect("write checkout conflict");
+
+        let first = tokio::time::timeout(
+            Duration::from_secs(10),
+            ensure_git_checkout(&fixture.url, &fixture.rev2, &fixture.cache),
+        )
+        .await
+        .expect("initial checkout repair timed out")
+        .expect("initial checkout repair failed");
+        assert_eq!(
+            std::fs::read_to_string(clone_dir.join("extra.txt")).unwrap(),
+            "tracked-content\n"
+        );
+        assert!(matches!(
+            checkout_marker_state(&clone_dir, &CloneIdentity::new(&fixture.url, &fixture.rev2))
+                .unwrap(),
+            CheckoutMarkerState::Matching
+        ));
+        assert_eq!(
+            first
+                .lease
+                .lock
+                .os_acquisitions
+                .load(Ordering::Relaxed),
+            1,
+            "initialization must take the OS flock exactly once"
         );
 
-        let _ = std::fs::remove_dir_all(&base);
+        let sentinel = clone_dir.join("warm-sentinel.txt");
+        let index_lock = clone_dir.join(".git").join("index.lock");
+        std::fs::write(&sentinel, "preserve me\n").unwrap();
+        std::fs::write(&index_lock, "force any checkout to fail\n").unwrap();
+        let marker_before = std::fs::read(checkout_ready_marker(&clone_dir)).unwrap();
+        let head_log = clone_dir.join(".git").join("logs").join("HEAD");
+        let head_log_before = std::fs::read(&head_log).unwrap();
+
+        let url = fixture.url.clone();
+        let rev = fixture.rev2.clone();
+        let cache = fixture.cache.clone();
+        let second_task = tokio::spawn(async move { ensure_git_checkout(&url, &rev, &cache).await });
+        let second = tokio::time::timeout(Duration::from_secs(2), second_task)
+            .await
+            .expect("same-process warm reader deadlocked")
+            .expect("warm reader task panicked")
+            .expect("warm reader failed");
+        assert!(Arc::ptr_eq(&first.lease.lock, &second.lease.lock));
+        assert_eq!(
+            second
+                .lease
+                .lock
+                .os_acquisitions
+                .load(Ordering::Relaxed),
+            1,
+            "warm reader must reuse the process's one OS flock"
+        );
+        assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "preserve me\n");
+        assert!(index_lock.exists(), "warm access ran checkout or recloned");
+        assert_eq!(
+            std::fs::read(checkout_ready_marker(&clone_dir)).unwrap(),
+            marker_before
+        );
+        assert_eq!(std::fs::read(&head_log).unwrap(), head_log_before);
+    }
+
+    /// Two cold callers in separate Tokio workers single-flight through the
+    /// production entry and both become readers without reopening/re-flocking.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn same_process_two_thread_checkout_reads_do_not_deadlock() {
+        let fixture = git_checkout_fixture("two-readers");
+        let first_url = fixture.url.clone();
+        let first_rev = fixture.rev2.clone();
+        let first_cache = fixture.cache.clone();
+        let second_url = fixture.url.clone();
+        let second_rev = fixture.rev2.clone();
+        let second_cache = fixture.cache.clone();
+        let first = tokio::spawn(async move {
+            ensure_git_checkout(&first_url, &first_rev, &first_cache).await
+        });
+        let second = tokio::spawn(async move {
+            ensure_git_checkout(&second_url, &second_rev, &second_cache).await
+        });
+        let (first, second) = tokio::time::timeout(Duration::from_secs(10), async {
+            (first.await, second.await)
+        })
+        .await
+        .expect("same-process checkout readers deadlocked");
+        let first = first.expect("first reader task panicked").expect("first reader failed");
+        let second = second
+            .expect("second reader task panicked")
+            .expect("second reader failed");
+        assert!(Arc::ptr_eq(&first.lease.lock, &second.lease.lock));
+        assert_eq!(
+            first
+                .lease
+                .lock
+                .os_acquisitions
+                .load(Ordering::Relaxed),
+            1,
+            "same-process callers took more than one OS flock"
+        );
+    }
+
+    /// Preserve v3.0.3's deep-corruption recovery only at the migration
+    /// boundary: an unmarked legacy clone may be wiped once, before readers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unmarked_git_dir_corruption_is_recloned_before_publication() {
+        let fixture = git_checkout_fixture("legacy-reclone");
+        let clone_dir = seed_unmarked_checkout(&fixture, &fixture.rev1);
+        std::fs::write(clone_dir.join(".git").join("index.lock"), "stale\n").unwrap();
+
+        let checkout = tokio::time::timeout(
+            Duration::from_secs(10),
+            ensure_git_checkout(&fixture.url, &fixture.rev2, &fixture.cache),
+        )
+        .await
+        .expect("legacy re-clone timed out")
+        .expect("legacy re-clone failed");
+        assert_eq!(checkout.root(), clone_dir);
+        assert!(!clone_dir.join(".git").join("index.lock").exists());
+        assert!(matches!(
+            checkout_marker_state(&clone_dir, &CloneIdentity::new(&fixture.url, &fixture.rev2))
+                .unwrap(),
+            CheckoutMarkerState::Matching
+        ));
     }
     #[test]
     fn git_wheel_cache_dir_is_keyed_by_all_inputs() {
