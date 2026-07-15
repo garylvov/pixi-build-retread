@@ -68,12 +68,10 @@ pub struct WorkspaceManifest {
     /// `effective_system_requirements` (rich wins over the deprecated
     /// `[system-requirements]` table, mirroring `declared_glibc`).
     pub platform_cuda: BTreeMap<String, String>,
-    /// v1.3.0: top-level `[pypi-options]` index URLs -- `index-url`
-    /// first, then `extra-index-urls` in declaration order. Feeds the
-    /// cascade's PyPI fallback chain so workspace-declared private
-    /// indexes are consulted when bundling PyPI-only deps, not just
-    /// the `[retread-wheels]` entry indexes.
-    pub pypi_index_urls: Vec<String>,
+    /// Top-level `[pypi-options]`. Keeping the primary index separate
+    /// from extras preserves whether pixi's implicit public-PyPI default
+    /// was explicitly replaced by `index-url`.
+    pub pypi_options: PypiOptions,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -83,6 +81,24 @@ pub struct EnvironmentDef {
     /// If true, the implicit "default" feature (top-level
     /// `[dependencies]` etc.) is NOT inherited.
     pub no_default_feature: bool,
+}
+
+/// The index-bearing subset of a pixi `[pypi-options]` table.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PypiOptions {
+    /// Explicit replacement for pixi's default PyPI index.
+    pub index_url: Option<String>,
+    /// Additional indexes, in declaration order.
+    pub extra_index_urls: Vec<String>,
+}
+
+impl PypiOptions {
+    /// Raw declared index candidates, retaining the historical
+    /// `index-url`-then-extras order used by fingerprints and effective
+    /// environment views.
+    fn declared_index_urls(&self) -> impl Iterator<Item = &String> {
+        self.index_url.iter().chain(self.extra_index_urls.iter())
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -103,9 +119,9 @@ pub struct FeatureDef {
     /// the top-level table; unioned per active env with feature-wins
     /// precedence by `effective_system_requirements`.
     pub system_requirements: BTreeMap<String, String>,
-    /// v1.3.0: `[feature.X.pypi-options]` index URLs, same shape as
-    /// the top-level field.
-    pub pypi_index_urls: Vec<String>,
+    /// `[feature.X.pypi-options]`, with primary and extra indexes kept
+    /// distinct for the same reason as the top-level options.
+    pub pypi_options: PypiOptions,
 }
 
 impl WorkspaceManifest {
@@ -209,8 +225,7 @@ impl WorkspaceManifest {
             }
         }
 
-        // v1.3.0: top-level [pypi-options] index URLs.
-        out.pypi_index_urls = parse_pypi_index_urls(parsed);
+        out.pypi_options = parse_pypi_options(parsed);
 
         if let Some(envs) = parsed.get("environments").and_then(|v| v.as_table()) {
             for (name, value) in envs {
@@ -256,8 +271,7 @@ impl WorkspaceManifest {
                             }
                         }
                     }
-                    // v1.3.0: per-feature [pypi-options] index URLs.
-                    def.pypi_index_urls = parse_pypi_index_urls(fvalue);
+                    def.pypi_options = parse_pypi_options(fvalue);
                 }
                 out.features.insert(name.clone(), def);
             }
@@ -318,12 +332,6 @@ impl WorkspaceManifest {
         out
     }
 
-    /// v0.37.0+ (D1): effective system requirements for an environment.
-    /// Top-level requirements first (unless no-default-feature), then
-    /// each active feature overrides/extends in declaration order
-    /// (pixi precedence). Keys are pixi-schema names (`cuda`, `libc`,
-    /// ...); translation to rattler virtual-package names (`__cuda`,
-    /// `__glibc`, ...) happens at the solve_check boundary.
     /// Every PyPI index the workspace declares anywhere: top-level
     /// `[pypi-options]` first, then each feature's in name order,
     /// deduped preserving first occurrence. The cascade's PyPI
@@ -331,15 +339,39 @@ impl WorkspaceManifest {
     /// the right shape -- consulting an env-inactive feature's index
     /// can only find a wheel, never mis-route a dep.
     pub fn all_pypi_index_urls(&self) -> Vec<String> {
-        let mut out: Vec<String> = Vec::new();
-        let all = self.pypi_index_urls.iter().chain(
+        let mut out = Vec::new();
+        let all = self.pypi_options.declared_index_urls().chain(
             self.features
                 .values()
-                .flat_map(|f| f.pypi_index_urls.iter()),
+                .flat_map(|f| f.pypi_options.declared_index_urls()),
         );
         for url in all {
-            if !out.contains(url) {
-                out.push(url.clone());
+            push_unique_index_url(&mut out, url.clone());
+        }
+        out
+    }
+
+    /// Complete workspace-wide PyPI resolution chain.
+    ///
+    /// Top-level extras retain declaration priority. They are followed by
+    /// the explicitly configured primary index, or public PyPI when pixi's
+    /// default has not been suppressed. Feature candidates follow in stable
+    /// feature-name order. Equivalent trailing-slash spellings are deduped.
+    pub fn resolution_pypi_index_urls(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for url in &self.pypi_options.extra_index_urls {
+            push_unique_index_url(&mut out, url.clone());
+        }
+        push_unique_index_url(
+            &mut out,
+            self.pypi_options
+                .index_url
+                .clone()
+                .unwrap_or_else(|| DEFAULT_PYPI_INDEX.to_string()),
+        );
+        for feature in self.features.values() {
+            for url in feature.pypi_options.declared_index_urls() {
+                push_unique_index_url(&mut out, url.clone());
             }
         }
         out
@@ -484,8 +516,9 @@ impl WorkspaceManifest {
         let mut seen = std::collections::HashSet::new();
         let mut out = Vec::new();
         if !env.no_default_feature {
-            for u in &self.pypi_index_urls {
-                if seen.insert(u.clone()) {
+            for u in self.pypi_options.declared_index_urls() {
+                let normalized = u.trim_end_matches('/').to_string();
+                if seen.insert(normalized) {
                     out.push(u.clone());
                 }
             }
@@ -494,8 +527,9 @@ impl WorkspaceManifest {
             let Some(feat) = self.features.get(feat_name) else {
                 continue;
             };
-            for u in &feat.pypi_index_urls {
-                if seen.insert(u.clone()) {
+            for u in feat.pypi_options.declared_index_urls() {
+                let normalized = u.trim_end_matches('/').to_string();
+                if seen.insert(normalized) {
                     out.push(u.clone());
                 }
             }
@@ -1121,35 +1155,45 @@ fn parse_pypi_dependencies(container: &toml::Value) -> BTreeMap<String, String> 
         .collect()
 }
 
-/// Pull index URLs out of a `[pypi-options]` table nested under
-/// `container` (the manifest root, or a `[feature.X]` table value):
-/// `index-url` first (the preferred workspace index), then
-/// `extra-index-urls` in declaration order. The shared index-chain builder
-/// adds public PyPI as a terminal fetch fallback.
-fn parse_pypi_index_urls(container: &toml::Value) -> Vec<String> {
-    let mut out = Vec::new();
+/// Parse the index-bearing fields from a `[pypi-options]` table nested
+/// under `container` (the manifest root or a `[feature.X]` value).
+fn parse_pypi_options(container: &toml::Value) -> PypiOptions {
     let Some(opts) = container
         .get("pypi-options")
         .or_else(|| container.get("pypi_options"))
         .and_then(|v| v.as_table())
     else {
-        return out;
+        return PypiOptions::default();
     };
     let index_url = opts
         .get("index-url")
         .or_else(|| opts.get("index_url"))
-        .and_then(|v| v.as_str());
-    if let Some(url) = index_url {
-        out.push(url.to_string());
-    }
-    if let Some(extra) = opts
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let extra_index_urls = opts
         .get("extra-index-urls")
         .or_else(|| opts.get("extra_index_urls"))
         .and_then(|v| v.as_array())
-    {
-        out.extend(extra.iter().filter_map(|v| v.as_str().map(String::from)));
+        .map(|extra| {
+            extra
+                .iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    PypiOptions {
+        index_url,
+        extra_index_urls,
     }
-    out
+}
+
+fn push_unique_index_url(indexes: &mut Vec<String>, index: String) {
+    if !indexes
+        .iter()
+        .any(|existing| existing.trim_end_matches('/') == index.trim_end_matches('/'))
+    {
+        indexes.push(index);
+    }
 }
 
 /// v0.37.0+ (D1): parse one `[system-requirements]` value. pixi allows
@@ -1895,20 +1939,22 @@ extra-index-urls = ["https://py.mujoco.org"]
 index-url = "https://pypi.nvidia.com"
 "#,
         );
-        // Top-level: index-url leads, extra-index-urls follow.
         assert_eq!(
-            ws.pypi_index_urls,
-            vec![
-                "https://pypi.nvidia.com".to_string(),
-                "https://download.pytorch.org/whl/cu128".to_string(),
-            ],
+            ws.pypi_options,
+            PypiOptions {
+                index_url: Some("https://pypi.nvidia.com".to_string()),
+                extra_index_urls: vec!["https://download.pytorch.org/whl/cu128".to_string()],
+            },
         );
         assert_eq!(
-            ws.features["sim"].pypi_index_urls,
-            vec!["https://py.mujoco.org".to_string()],
+            ws.features["sim"].pypi_options,
+            PypiOptions {
+                index_url: None,
+                extra_index_urls: vec!["https://py.mujoco.org".to_string()],
+            },
         );
-        // Rollup: top-level first, features in name order, deduped
-        // (gpu's nvidia index already present from top-level).
+        // Raw rollup retains historical index-url-then-extras order;
+        // feature names are stable because the manifest uses a BTreeMap.
         assert_eq!(
             ws.all_pypi_index_urls(),
             vec![
@@ -1920,47 +1966,73 @@ index-url = "https://pypi.nvidia.com"
     }
 
     #[test]
-    fn auto_bundle_index_chain_includes_implicit_default_and_honors_override() {
+    fn resolution_indexes_preserve_explicit_extra_priority() {
         let ws = ws_toml(
             r#"
 [workspace]
 channels = ["conda-forge"]
 
 [pypi-options]
+extra-index-urls = ["https://pypi.org/simple", "https://pypi.nvidia.com", "https://py.mujoco.org"]
+"#,
+        );
+        assert_eq!(
+            ws.resolution_pypi_index_urls(),
+            vec![
+                "https://pypi.org/simple".to_string(),
+                "https://pypi.nvidia.com".to_string(),
+                "https://py.mujoco.org".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn resolution_indexes_append_implicit_default_after_extras() {
+        let ws = ws_toml(
+            r#"
+[pypi-options]
 extra-index-urls = ["https://pypi.nvidia.com", "https://py.mujoco.org"]
 "#,
         );
         assert_eq!(
-            crate::index_chain::index_chain(
-                Vec::<String>::new(),
-                &ws.all_pypi_index_urls(),
-                crate::index_chain::IndexPurpose::Resolve,
-            ),
+            ws.resolution_pypi_index_urls(),
             vec![
                 "https://pypi.nvidia.com".to_string(),
                 "https://py.mujoco.org".to_string(),
                 DEFAULT_PYPI_INDEX.to_string(),
             ],
         );
+    }
 
-        let overridden = ws_toml(
+    #[test]
+    fn resolution_indexes_honor_explicit_default_override() {
+        let ws = ws_toml(
             r#"
 [pypi-options]
 index-url = "https://packages.example/simple"
 extra-index-urls = ["https://extra.example/simple"]
+
+[feature.zeta.pypi-options]
+extra-index-urls = ["https://zeta.example/simple"]
+
+[feature.alpha.pypi-options]
+index-url = "https://alpha.example/simple"
 "#,
         );
+        let indexes = ws.resolution_pypi_index_urls();
         assert_eq!(
-            crate::index_chain::index_chain(
-                Vec::<String>::new(),
-                &overridden.all_pypi_index_urls(),
-                crate::index_chain::IndexPurpose::Resolve,
-            ),
+            indexes,
             vec![
-                "https://packages.example/simple".to_string(),
                 "https://extra.example/simple".to_string(),
-                DEFAULT_PYPI_INDEX.to_string(),
+                "https://packages.example/simple".to_string(),
+                "https://alpha.example/simple".to_string(),
+                "https://zeta.example/simple".to_string(),
             ],
+        );
+        assert!(
+            !indexes.iter().any(|url| {
+                url.trim_end_matches('/') == DEFAULT_PYPI_INDEX.trim_end_matches('/')
+            })
         );
     }
 
@@ -1972,8 +2044,12 @@ extra-index-urls = ["https://extra.example/simple"]
 channels = ["conda-forge"]
 "#,
         );
-        assert!(ws.pypi_index_urls.is_empty());
+        assert_eq!(ws.pypi_options, PypiOptions::default());
         assert!(ws.all_pypi_index_urls().is_empty());
+        assert_eq!(
+            ws.resolution_pypi_index_urls(),
+            vec![DEFAULT_PYPI_INDEX.to_string()]
+        );
     }
 
     #[test]
