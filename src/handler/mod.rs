@@ -782,9 +782,10 @@ struct Bundle {
     /// Canonical PyPI names the precise consuming workspace already owns.
     /// These are removed from the pack's wheel graph and are not re-emitted
     /// as generated-pack conda run dependencies. Conda-owned names enter only
-    /// after a validated route or from an exact conda fact shared by every
-    /// precise consumer; workspace-PyPI names enter from direct declarations
-    /// shared by every consumer.
+    /// after a validated route or from workspace-solved conda provider facts;
+    /// partial-consumer providers retain an explicit conda route.
+    /// Workspace-PyPI names enter from direct declarations shared by every
+    /// consumer.
     auto_dropped: HashSet<String>,
     /// Canonical names of every package in the exported uv closure
     /// (`UvClosure::pins`). These are provided by the wheel closure /
@@ -797,10 +798,15 @@ struct Bundle {
     uv_closure_names: std::collections::HashSet<String>,
     /// Exact conda versions selected identically in every precise consuming
     /// environment, including transitives. Membership in this map is the
-    /// workspace-side fact boundary: unless an explicit PyPI-side exclusion
-    /// applies, the fact owns the corresponding wheel dependency through
-    /// `auto_dropped` and the workspace conda solve supplies the package.
+    /// exact validation boundary; ownership evidence is carried separately in
+    /// `workspace_conda_provider_facts`.
     workspace_conda_versions: BTreeMap<String, String>,
+    /// Conda-provider evidence derived from every successful precise-consumer
+    /// solve. Unlike `workspace_conda_versions`, these facts retain providers
+    /// selected by only some consumers and providers whose selected versions
+    /// differ across consumers, together with the direct workspace specs that
+    /// constrain them.
+    workspace_conda_provider_facts: BTreeMap<String, WorkspaceCondaProviderFact>,
 }
 
 /// One mutable uv auto-route retained on a bundle until the final emitted
@@ -811,6 +817,20 @@ struct Bundle {
 struct BundleAutoRoute {
     route: crate::uv_closure::AutoRoutedPackage,
     provenance: Provenance,
+    /// A partial workspace-provider fact replaces this route's stale PyPI
+    /// selection and inputs with one authoritative conda provider constraint.
+    /// The route itself remains the normal emission and joint-validation path.
+    workspace_provider: Option<WorkspaceCondaProviderRoute>,
+}
+
+/// Typed partial-provider override carried by an existing auto-route. The
+/// selected versions are provider evidence; `constraint` is the conjunction of
+/// direct workspace specs and is the only clause emitted for this route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkspaceCondaProviderRoute {
+    conda_name: CondaName,
+    selected_versions: BTreeSet<String>,
+    constraint: Constraint,
 }
 
 impl Bundle {
@@ -818,17 +838,19 @@ impl Bundle {
         std::iter::once(&self.primary).chain(self.extras.iter())
     }
 
-    /// Promote agreed workspace conda facts into the same typed drop ownership
-    /// used by Rule 1. This happens before joint route validation so a wheel's
-    /// incompatible `Requires-Dist` cannot manufacture a PyPI restore request
-    /// for a package the consuming workspace already supplies through conda.
+    /// Promote workspace-solved conda providers into the same typed drop
+    /// ownership used by Rule 1. Providers present in every precise consumer
+    /// need no emitted dependency; partial providers retain an existing route
+    /// annotated with the conjunction of direct workspace constraints so the
+    /// shared pack supplies the provider to consumers that did not select it
+    /// before the pack was present.
     ///
     /// Explicit PyPI intent remains authoritative: manual overrides,
     /// keep-PyPI requests, first-party roots, and wheels already materialized
-    /// in this bundle exclude their entire configured provider group. Only the
-    /// declared fact map projects ownership; the effective map is consulted
-    /// solely to widen exclusions to names emission would translate. Thus a
-    /// uv preference or inferred route cannot acquire ownership.
+    /// in this bundle exclude their entire configured provider group. Vetoes
+    /// are resolved before either the typed drop or route annotation mutates.
+    /// Only the declared fact map projects ownership; the effective map is
+    /// consulted solely to widen exclusions to names emission would translate.
     fn apply_workspace_conda_fact_ownership(
         &mut self,
         config: &RetreadConfig,
@@ -836,11 +858,12 @@ impl Bundle {
         dynamic_keep_pypi: &BTreeSet<PypiKey>,
         protected_roots: &BTreeSet<String>,
     ) {
-        if self.workspace_conda_versions.is_empty() {
+        if self.workspace_conda_provider_facts.is_empty() {
             return;
         }
 
-        let mut owned = workspace_conda_fact_owners(&self.workspace_conda_versions, fact_name_map);
+        let mut owned =
+            workspace_conda_provider_owners(&self.workspace_conda_provider_facts, fact_name_map);
 
         let ledger_overrides: HashSet<String> = config
             .ledger_overrides
@@ -917,22 +940,62 @@ impl Bundle {
             return;
         }
 
+        let mut drop_only = BTreeSet::new();
+        let mut routed = Vec::new();
+        for (pypi_name, provider) in owned {
+            let Some(fact) = self.workspace_conda_provider_facts.get(&provider) else {
+                continue;
+            };
+            if fact.present_in_all_consumers {
+                drop_only.insert(pypi_name);
+                continue;
+            }
+            let Some(workspace_provider) = workspace_conda_provider_route(&provider, fact) else {
+                continue;
+            };
+            let has_matching_route = self.auto_routed.iter().any(|route| {
+                canonical_conda_name(&route.route.pypi_name) == pypi_name
+                    && canonical_conda_name(&route.route.conda_name) == provider
+            });
+            if has_matching_route {
+                routed.push((pypi_name, provider, workspace_provider));
+            }
+        }
+
+        // Mutate only after every candidate has passed its provider-evidence,
+        // direct-spec, and existing-route checks. A partial fact can never
+        // suppress a wheel edge without also retaining conda provision.
+        for (pypi_name, provider, mut workspace_provider) in routed {
+            if let Some(route) = self.auto_routed.iter_mut().find(|route| {
+                canonical_conda_name(&route.route.pypi_name) == pypi_name
+                    && canonical_conda_name(&route.route.conda_name) == provider
+            }) {
+                // Provider facts use canonical lookup keys; emission retains
+                // the matched route's raw conda spelling (underscores are
+                // significant conda package-name characters).
+                workspace_provider.conda_name = CondaName::new(&route.route.conda_name);
+                route.provenance = workspace_provider.constraint.provenance.clone();
+                route.workspace_provider = Some(workspace_provider);
+                self.auto_dropped.insert(pypi_name);
+            }
+        }
         self.auto_routed
-            .retain(|route| !owned.contains_key(&canonical_conda_name(&route.route.pypi_name)));
-        self.auto_dropped.extend(owned.into_keys());
+            .retain(|route| !drop_only.contains(&canonical_conda_name(&route.route.pypi_name)));
+        self.auto_dropped.extend(drop_only);
     }
 }
 
-/// Project exact conda facts into the PyPI identities they can provide.
+/// Project workspace-solved conda providers into the PyPI identities they can
+/// provide.
 /// Explicit mappings are directional: `foo -> bar` means only a `bar` conda
 /// fact owns PyPI `foo`. A `foo` conda fact cannot reverse that edge, and an
 /// explicitly disabled PyPI key has no conda owner even when a same-named fact
 /// exists. Unmapped names retain the ordinary same-name identity boundary.
-fn workspace_conda_fact_owners(
-    workspace_conda_versions: &BTreeMap<String, String>,
+fn workspace_conda_provider_owners(
+    workspace_conda_provider_facts: &BTreeMap<String, WorkspaceCondaProviderFact>,
     fact_name_map: &NameMap,
 ) -> BTreeMap<String, String> {
-    let fact_names: HashSet<String> = workspace_conda_versions
+    let fact_names: HashSet<String> = workspace_conda_provider_facts
         .keys()
         .map(|name| canonical_conda_name(name))
         .collect();
@@ -960,6 +1023,67 @@ fn workspace_conda_fact_owners(
                 .then_some((pypi_name, provider))
         })
         .collect()
+}
+
+/// Build the single authoritative route constraint for a provider selected in
+/// only some precise consumers. The selected versions prove concrete conda
+/// providers; direct declarations are intersected through the common typed
+/// finalizer. Transitive-only and wildcard declarations intentionally emit an
+/// unconstrained provider dependency.
+fn workspace_conda_provider_route(
+    provider: &str,
+    fact: &WorkspaceCondaProviderFact,
+) -> Option<WorkspaceCondaProviderRoute> {
+    if fact.selected_versions.is_empty() {
+        return None;
+    }
+    let provenance = Provenance::WorkspaceCondaFact("precise-consuming-envs".to_string());
+    let mut declared_constraints = Vec::new();
+    for declared_spec in &fact.declared_specs {
+        let trimmed = declared_spec.trim();
+        let specifiers = if trimmed.is_empty() || matches!(trimmed, "*" | "==*") {
+            VersionSpecifiers::empty()
+        } else {
+            let pep440 = crate::uv_closure::conda_spec_to_pep440(trimmed)?;
+            VersionSpecifiers::from_str(&pep440).ok()?
+        };
+        declared_constraints.push(Constraint {
+            specifiers,
+            provenance: provenance.clone(),
+            source: format!("workspace conda declaration `{provider} {trimmed}`"),
+        });
+    }
+    if declared_constraints.is_empty() {
+        declared_constraints.push(Constraint {
+            specifiers: VersionSpecifiers::empty(),
+            provenance: provenance.clone(),
+            source: format!("workspace-selected transitive conda provider `{provider}`"),
+        });
+    }
+    let provider_key = PypiKey::from_pypi(provider);
+    let specifiers = finalize(&provider_key, &declared_constraints).ok()?;
+    let rendered = if specifiers.is_empty() {
+        "*".to_string()
+    } else {
+        specifiers.to_string().replace(", ", ",")
+    };
+    let selected_versions = fact
+        .selected_versions
+        .iter()
+        .map(|version| format!("`{version}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(WorkspaceCondaProviderRoute {
+        conda_name: CondaName::new(provider),
+        selected_versions: fact.selected_versions.clone(),
+        constraint: Constraint {
+            specifiers,
+            provenance,
+            source: format!(
+                "workspace conda provider `{provider} {rendered}` selected as {selected_versions} in precise consuming environments"
+            ),
+        },
+    })
 }
 
 impl Handler {
@@ -2572,6 +2696,7 @@ async fn resolve_all(
                     } else {
                         Provenance::PriorSelection
                     },
+                    workspace_provider: None,
                 })
                 .collect();
             bundle.auto_dropped = closure.auto_dropped.iter().cloned().collect();
@@ -2586,6 +2711,7 @@ async fn resolve_all(
                 .collect();
         }
         bundle.workspace_conda_versions = workspace_facts.common_selected_versions.clone();
+        bundle.workspace_conda_provider_facts = workspace_facts.provider_facts.clone();
         bundle.auto_dropped.extend(prelock_owned_drops);
         for sub in sub_bundles {
             bundle.extras.push(sub.primary);
@@ -2595,11 +2721,12 @@ async fn resolve_all(
             // dep that was probed across the whole group.
             bundle.probe_decisions.extend(sub.probe_decisions);
         }
-        // Conda-facts-first: an agreed exact conda record in every precise
-        // consuming environment owns that dependency unless the pack carries
-        // explicit PyPI-side intent for it. Promote through `auto_dropped`
-        // before auto-bundle scans or joint route validation, and remove any
-        // stale uv route for the same identity so emission has one owner.
+        // Conda-facts-first: workspace-solved provider evidence owns a wheel
+        // dependency unless the pack carries explicit PyPI-side intent. An
+        // all-consumer provider needs no emitted route; a partial provider
+        // replaces a matching stale uv route with the workspace conjunction.
+        // Both flow through `auto_dropped` before auto-bundle scans and joint
+        // route validation.
         bundle.apply_workspace_conda_fact_ownership(
             &effective,
             &config.name_map,
@@ -2971,8 +3098,8 @@ fn discard_facts_on_solve_failure(heal_facts_path: &std::path::Path, err: &anyho
 
 /// Concrete conda facts for the precisely identified environments that
 /// consume one generated pack. Direct declarations retain their stronger
-/// pre-lock route authority, while an exact selected record shared by every
-/// consumer becomes post-materialization drop ownership through
+/// pre-lock route authority, while selected conda provider records become
+/// post-materialization drop ownership through
 /// `Bundle::apply_workspace_conda_fact_ownership`.
 #[derive(Debug, Clone, Default)]
 struct WorkspaceCondaFacts {
@@ -2998,11 +3125,25 @@ struct WorkspaceCondaFacts {
     /// wheel requirements after materialization. A uv preference or other
     /// PyPI-side solver selection never enters this map.
     common_selected_versions: BTreeMap<String, String>,
+    /// Provider evidence keyed by canonical conda package name. This is kept
+    /// separate from exact selected versions so ownership can reason about
+    /// ranged and transitive providers without weakening exact validation.
+    provider_facts: BTreeMap<String, WorkspaceCondaProviderFact>,
     /// Full exact selected specs per consuming environment. These are never
     /// ownership evidence; they are the immutable baseline for route trials.
     env_exact_specs: BTreeMap<String, Vec<String>>,
     /// Stable digest of `env_exact_specs`, for persisted heal-fact validity.
     fingerprint: String,
+}
+
+/// Workspace-solved evidence for one conda provider across every precise
+/// consumer. Selected versions come only from successful conda solves;
+/// declared specs annotate those records with direct workspace intent.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct WorkspaceCondaProviderFact {
+    selected_versions: BTreeSet<String>,
+    declared_specs: BTreeSet<String>,
+    present_in_all_consumers: bool,
 }
 
 /// Effective Rule-1 ownership authority shared with Rule 2. Direct conda
@@ -3213,7 +3354,7 @@ fn dependency_name_intersection(maps: &[BTreeMap<String, String>]) -> BTreeSet<S
 
 fn facts_from_solved_records(
     env_records: BTreeMap<String, Vec<rattler_conda_types::RepoDataRecord>>,
-    owned_conda: BTreeSet<String>,
+    env_conda_deps: BTreeMap<String, BTreeMap<String, String>>,
     owned_pypi: BTreeSet<String>,
     name_map: &NameMap,
     bundle_name: &str,
@@ -3228,7 +3369,14 @@ fn facts_from_solved_records(
     }
 
     let bundle_name = canonical_conda_name(bundle_name);
-    let owned_conda: BTreeSet<String> = owned_conda
+    // Missing direct-dependency input for a solved consumer is treated as an
+    // empty declaration set. That preserves fail-closed direct ownership if
+    // callers ever provide mismatched environment maps.
+    let direct_deps_for_consumers: Vec<BTreeMap<String, String>> = env_records
+        .keys()
+        .map(|env| env_conda_deps.get(env).cloned().unwrap_or_default())
+        .collect();
+    let owned_conda: BTreeSet<String> = dependency_name_intersection(&direct_deps_for_consumers)
         .into_iter()
         .map(|name| canonical_conda_name(&name))
         .filter(|name| name != &bundle_name)
@@ -3246,6 +3394,32 @@ fn facts_from_solved_records(
             (env.clone(), versions)
         })
         .collect();
+
+    let mut provider_facts: BTreeMap<String, WorkspaceCondaProviderFact> = BTreeMap::new();
+    for versions in per_env_versions.values() {
+        for (name, version) in versions {
+            provider_facts
+                .entry(name.clone())
+                .or_default()
+                .selected_versions
+                .insert(version.clone());
+        }
+    }
+    for (name, fact) in &mut provider_facts {
+        fact.present_in_all_consumers = per_env_versions
+            .values()
+            .all(|versions| versions.contains_key(name));
+    }
+    for env in per_env_versions.keys() {
+        if let Some(deps) = env_conda_deps.get(env) {
+            for (name, spec) in deps {
+                let name = canonical_conda_name(name);
+                if let Some(fact) = provider_facts.get_mut(&name) {
+                    fact.declared_specs.insert(spec.trim().to_string());
+                }
+            }
+        }
+    }
 
     let mut common_selected_versions = per_env_versions
         .values()
@@ -3317,6 +3491,7 @@ fn facts_from_solved_records(
         common_pypi,
         common_conda_versions,
         common_selected_versions,
+        provider_facts,
         env_exact_specs,
         fingerprint: format!("{:x}", hasher.finalize()),
     }
@@ -3517,13 +3692,13 @@ async fn solve_workspace_conda_facts(
         return WorkspaceCondaFacts::default();
     };
 
-    let conda_deps: Vec<BTreeMap<String, String>> = inputs
+    let env_conda_deps: BTreeMap<String, BTreeMap<String, String>> = inputs
         .iter()
-        .map(|input| input.conda_deps.clone())
+        .map(|input| (input.env.clone(), input.conda_deps.clone()))
         .collect();
+    let conda_deps: Vec<BTreeMap<String, String>> = env_conda_deps.values().cloned().collect();
     let pypi_deps: Vec<BTreeMap<String, String>> =
         inputs.iter().map(|input| input.pypi_deps.clone()).collect();
-    let owned_conda = dependency_name_intersection(&conda_deps);
     let owned_pypi = dependency_name_intersection(&pypi_deps);
 
     if conda_deps.iter().all(BTreeMap::is_empty) {
@@ -3589,7 +3764,13 @@ async fn solve_workspace_conda_facts(
             }
         }
     }
-    facts_from_solved_records(env_records, owned_conda, owned_pypi, name_map, bundle_name)
+    facts_from_solved_records(
+        env_records,
+        env_conda_deps,
+        owned_pypi,
+        name_map,
+        bundle_name,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4881,18 +5062,12 @@ gpu = { features = ["gpu"], no-default-feature = true }
         );
         assert!(!inputs[0].conda_deps.contains_key("pytorch-gpu"));
 
-        let owned_conda = dependency_name_intersection(
-            &inputs
-                .iter()
-                .map(|input| input.conda_deps.clone())
-                .collect::<Vec<_>>(),
-        );
         let facts = facts_from_solved_records(
             BTreeMap::from([(
                 inputs[0].env.clone(),
                 vec![repo_record("pytorch", "2.5.1", &[])],
             )]),
-            owned_conda,
+            BTreeMap::from([(inputs[0].env.clone(), inputs[0].conda_deps.clone())]),
             BTreeSet::new(),
             &name_map(&[("torch", "pytorch")]),
             "sage-isaac-pack",
@@ -4915,7 +5090,10 @@ gpu = { features = ["gpu"], no-default-feature = true }
                     repo_record("pytorch", "2.10.0", &[]),
                 ],
             )]),
-            BTreeSet::from(["pytorch-gpu".to_string()]),
+            BTreeMap::from([(
+                "sage".to_string(),
+                BTreeMap::from([("pytorch-gpu".to_string(), "==2.10.0".to_string())]),
+            )]),
             BTreeSet::new(),
             &name_map(&[("torch", "pytorch")]),
             "sage-isaac-pack",
@@ -4954,7 +5132,16 @@ gpu = { features = ["gpu"], no-default-feature = true }
                     vec![repo_record("pytorch", "2.6.0", &[])],
                 ),
             ]),
-            BTreeSet::from(["pytorch".to_string()]),
+            BTreeMap::from([
+                (
+                    "sage-a".to_string(),
+                    BTreeMap::from([("pytorch".to_string(), "==2.5.1".to_string())]),
+                ),
+                (
+                    "sage-b".to_string(),
+                    BTreeMap::from([("pytorch".to_string(), "==2.6.0".to_string())]),
+                ),
+            ]),
             BTreeSet::new(),
             &name_map(&[("torch", "pytorch")]),
             "sage-isaac-pack",
@@ -4963,10 +5150,131 @@ gpu = { features = ["gpu"], no-default-feature = true }
         assert!(!facts.common_conda_versions.contains_key("pytorch"));
         assert!(!facts.common_selected_versions.contains_key("pytorch"));
         assert!(!facts.common_pypi.contains_key("torch"));
+        assert_eq!(
+            facts.provider_facts["pytorch"],
+            super::WorkspaceCondaProviderFact {
+                selected_versions: BTreeSet::from(["2.5.1".into(), "2.6.0".into()]),
+                declared_specs: BTreeSet::from(["==2.5.1".into(), "==2.6.0".into()]),
+                present_in_all_consumers: true,
+            },
+            "provider presence is independent of exact cross-env version agreement"
+        );
         assert!(
             workspace_fact_constraints(&facts, &BTreeSet::new())
                 .constraints
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn partial_psutil_provider_fact_retains_ranges_and_selected_version() {
+        let env_records = BTreeMap::from([
+            (
+                "groot".to_string(),
+                vec![
+                    repo_record("python", "3.11.14", &[]),
+                    repo_record("psutil", "7.2.2", &[]),
+                ],
+            ),
+            (
+                "pace".to_string(),
+                vec![
+                    repo_record("python", "3.11.14", &[]),
+                    repo_record("psutil", "7.2.2", &[]),
+                ],
+            ),
+            (
+                "pm".to_string(),
+                vec![
+                    repo_record("python", "3.11.14", &[]),
+                    repo_record("psutil", "7.2.2", &[]),
+                ],
+            ),
+            (
+                "unitree-rl-lab-gpu".to_string(),
+                vec![
+                    repo_record("python", "3.11.14", &[]),
+                    repo_record("psutil", "7.2.2", &[]),
+                ],
+            ),
+            (
+                "uwlab-gpu".to_string(),
+                vec![
+                    repo_record("python", "3.11.14", &[]),
+                    repo_record("psutil", "7.2.2", &[]),
+                ],
+            ),
+            (
+                "viral".to_string(),
+                vec![repo_record("python", "3.11.14", &[])],
+            ),
+        ]);
+        let env_conda_deps = BTreeMap::from([
+            ("groot".to_string(), BTreeMap::new()),
+            (
+                "pace".to_string(),
+                BTreeMap::from([("psutil".to_string(), ">=5.9".to_string())]),
+            ),
+            ("pm".to_string(), BTreeMap::new()),
+            (
+                "unitree-rl-lab-gpu".to_string(),
+                BTreeMap::from([("psutil".to_string(), ">=5.9,<8".to_string())]),
+            ),
+            ("uwlab-gpu".to_string(), BTreeMap::new()),
+            ("viral".to_string(), BTreeMap::new()),
+        ]);
+
+        let facts = facts_from_solved_records(
+            env_records,
+            env_conda_deps,
+            BTreeSet::new(),
+            &NameMap::default(),
+            "isaaclab-2.3x-pack",
+        );
+
+        assert_eq!(
+            facts.provider_facts["psutil"],
+            super::WorkspaceCondaProviderFact {
+                selected_versions: BTreeSet::from(["7.2.2".to_string()]),
+                declared_specs: BTreeSet::from([">=5.9".to_string(), ">=5.9,<8".to_string(),]),
+                present_in_all_consumers: false,
+            }
+        );
+        assert!(
+            !facts.common_selected_versions.contains_key("psutil"),
+            "a provider missing from one consumer is not an exact common fact"
+        );
+        assert!(!facts.common_conda_versions.contains_key("psutil"));
+    }
+
+    #[test]
+    fn package_absent_from_all_solves_has_no_provider_fact() {
+        let facts = facts_from_solved_records(
+            BTreeMap::from([
+                (
+                    "alpha".to_string(),
+                    vec![repo_record("python", "3.11.14", &[])],
+                ),
+                (
+                    "beta".to_string(),
+                    vec![repo_record("python", "3.11.14", &[])],
+                ),
+            ]),
+            BTreeMap::from([
+                (
+                    "alpha".to_string(),
+                    BTreeMap::from([("numpy".to_string(), ">=2".to_string())]),
+                ),
+                ("beta".to_string(), BTreeMap::new()),
+            ]),
+            BTreeSet::new(),
+            &NameMap::default(),
+            "demo-pack",
+        );
+
+        assert!(
+            !facts.provider_facts.contains_key("numpy"),
+            "a declaration without a selected conda record is not provider evidence"
         );
     }
 
@@ -4992,10 +5300,23 @@ gpu = { features = ["gpu"], no-default-feature = true }
         ]);
         let facts = facts_from_solved_records(
             env_records,
-            BTreeSet::from([
-                "numpy".to_string(),
-                "tetgen".to_string(),
-                "demo_pack".to_string(),
+            BTreeMap::from([
+                (
+                    "alpha".to_string(),
+                    BTreeMap::from([
+                        ("numpy".to_string(), "==2.1.0".to_string()),
+                        ("tetgen".to_string(), "==1.6.0".to_string()),
+                        ("demo_pack".to_string(), "*".to_string()),
+                    ]),
+                ),
+                (
+                    "beta".to_string(),
+                    BTreeMap::from([
+                        ("numpy".to_string(), "==2.1.0".to_string()),
+                        ("tetgen".to_string(), "==1.6.0".to_string()),
+                        ("demo_pack".to_string(), "*".to_string()),
+                    ]),
+                ),
             ]),
             BTreeSet::from(["gym".to_string(), "rliable".to_string()]),
             &NameMap::from([
@@ -5675,6 +5996,7 @@ async fn resolve_bundle(
             auto_dropped: Default::default(),
             uv_closure_names: Default::default(),
             workspace_conda_versions: Default::default(),
+            workspace_conda_provider_facts: Default::default(),
         });
     }
 
@@ -6230,6 +6552,7 @@ async fn resolve_bundle(
         auto_dropped: Default::default(),
         uv_closure_names: Default::default(),
         workspace_conda_versions: Default::default(),
+        workspace_conda_provider_facts: Default::default(),
     };
 
     Ok(bfs_bundle)
@@ -7330,10 +7653,28 @@ fn produce_output_with_conflicts(
     // `retread-overrides` entry for (hand-written intent always wins over
     // an auto-derived range).
     for auto_route in &bundle.auto_routed {
+        let pypi_name = PypiKey::from_pypi(&auto_route.route.pypi_name);
+        if let Some(workspace_provider) = &auto_route.workspace_provider {
+            // A partial workspace fact retains the ordinary route so the
+            // generated pack supplies conda provision to consumers that did
+            // not select it in their pre-pack solve. Its typed workspace
+            // conjunction wholly replaces the stale uv-selected version and
+            // PyPI route inputs; wheel requirements are suppressed through
+            // the same `auto_dropped` ownership path below.
+            add_emission_constraint(
+                &mut emission_groups,
+                &mut emission_group_indexes,
+                pypi_name,
+                workspace_provider.conda_name.clone(),
+                workspace_provider.constraint.clone(),
+                None,
+            );
+            continue;
+        }
+
         let conda_name = CondaName::new(auto_route.route.conda_name.as_str());
         let conda_version = &auto_route.route.conda_version;
         let conda_key = conda_name.key();
-        let pypi_name = PypiKey::from_pypi(&auto_route.route.pypi_name);
 
         // Preserve the existing conda route contract. The selected version is
         // not restored as a hard PyPI `==`: it becomes either a deps-from
@@ -7477,7 +7818,7 @@ fn produce_output_with_conflicts(
                 tracing::info!(
                     dep = %dep_name,
                     bundle = %bundle.conda_name,
-                    "dropping dependency already owned by every precise consuming workspace environment",
+                    "dropping wheel dependency owned by a workspace conda provider",
                 );
                 continue;
             }
@@ -12610,6 +12951,7 @@ mod emit_wheel_upstream_url_tests {
             auto_dropped: Default::default(),
             uv_closure_names: Default::default(),
             workspace_conda_versions: Default::default(),
+            workspace_conda_provider_facts: Default::default(),
         };
 
         // Reproduce the exact mapping from build_one that populates EmitWheel.
@@ -12728,6 +13070,7 @@ mod emit_wheel_upstream_url_tests {
             auto_dropped: Default::default(),
             uv_closure_names: Default::default(),
             workspace_conda_versions: Default::default(),
+            workspace_conda_provider_facts: Default::default(),
         };
 
         let emit_wheels: Vec<crate::emit_pypi::EmitWheel> = bundle

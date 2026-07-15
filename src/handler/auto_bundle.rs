@@ -2039,6 +2039,7 @@ mod tests {
             auto_dropped: HashSet::new(),
             uv_closure_names: HashSet::new(),
             workspace_conda_versions: BTreeMap::new(),
+            workspace_conda_provider_facts: BTreeMap::new(),
         }
     }
 
@@ -2263,6 +2264,43 @@ mod tests {
         }
     }
 
+    /// Build provider evidence through the production fact derivation path.
+    /// Each tuple is `(environment, selected version, direct conda spec)`;
+    /// absent versions model a successful consumer solve that did not select
+    /// this provider, while absent specs model transitive conda provision.
+    fn single_provider_facts(
+        provider: &str,
+        consumers: &[(&str, Option<&str>, Option<&str>)],
+    ) -> super::super::WorkspaceCondaFacts {
+        let env_records = consumers
+            .iter()
+            .map(|(env, version, _)| {
+                (
+                    (*env).to_string(),
+                    version
+                        .map(|version| vec![repo_record(provider, version, &[])])
+                        .unwrap_or_default(),
+                )
+            })
+            .collect();
+        let env_conda_deps = consumers
+            .iter()
+            .map(|(env, _, spec)| {
+                let deps = spec
+                    .map(|spec| BTreeMap::from([(provider.to_string(), spec.to_string())]))
+                    .unwrap_or_default();
+                ((*env).to_string(), deps)
+            })
+            .collect();
+        super::super::facts_from_solved_records(
+            env_records,
+            env_conda_deps,
+            BTreeSet::new(),
+            &NameMap::new(),
+            "regression-pack",
+        )
+    }
+
     async fn validated_probe(pairs: Vec<(String, String)>) -> Vec<crate::probe::ProbeResult> {
         pairs
             .into_iter()
@@ -2314,6 +2352,7 @@ mod tests {
                 input_requirements: Vec::new(),
             },
             provenance: Provenance::PriorSelection,
+            workspace_provider: None,
         }
     }
 
@@ -2576,6 +2615,24 @@ mod tests {
         bundle
     }
 
+    fn isaaclab_psutil_conflict_bundle() -> Bundle {
+        let mut bundle = test_bundle(&[]);
+        bundle.conda_name = "isaaclab-2.3x-pack".to_string();
+        bundle.primary = test_wheel(
+            "isaacsim-kernel",
+            "isaacsim-kernel",
+            "5.1.0.0",
+            &["psutil==5.9.8"],
+        );
+        bundle.extras = vec![test_wheel(
+            "rl-games",
+            "rl_games",
+            "1.6.1",
+            &["psutil (>=5.9.0,<6.0.0)"],
+        )];
+        bundle
+    }
+
     fn prior_selection_route(name: &str, version: &str) -> super::super::BundleAutoRoute {
         super::super::BundleAutoRoute {
             route: crate::uv_closure::AutoRoutedPackage {
@@ -2587,7 +2644,27 @@ mod tests {
                 input_requirements: Vec::new(),
             },
             provenance: Provenance::PriorSelection,
+            workspace_provider: None,
         }
+    }
+
+    fn conflicting_psutil_auto_route() -> super::super::BundleAutoRoute {
+        let mut route = prior_selection_route("psutil", "5.9.8");
+        route.route.input_requirements = vec![
+            crate::uv_closure::AutoRouteInputRequirement {
+                specifiers: "==5.9.8".to_string(),
+                source: "auto-route `psutil==5.9.8` to conda `psutil==5.9.8`".to_string(),
+                provenance: Provenance::UvRoot,
+                role: crate::uv_closure::AutoRouteInputRole::Requirement,
+            },
+            crate::uv_closure::AutoRouteInputRequirement {
+                specifiers: ">=7,<8".to_string(),
+                source: "workspace/conda side constrains psutil to >=7,<8".to_string(),
+                provenance: Provenance::WorkspaceCondaFact("precise-consuming-envs".to_string()),
+                role: crate::uv_closure::AutoRouteInputRole::Constraint,
+            },
+        ];
+        route
     }
 
     fn assert_workspace_fact_conflict_before_ownership(
@@ -2649,9 +2726,9 @@ mod tests {
         let target = crate::pypi::WheelTarget::for_subdir("3.11", "linux-64");
         let config = test_config();
         let mut bundle = pace_packaging_conflict_bundle();
-        bundle
-            .workspace_conda_versions
-            .insert("packaging".to_string(), "26.2".to_string());
+        let facts = single_provider_facts("packaging", &[("pace", Some("26.2"), Some("==26.2"))]);
+        bundle.workspace_conda_versions = facts.common_selected_versions;
+        bundle.workspace_conda_provider_facts = facts.provider_facts;
         bundle
             .auto_routed
             .push(prior_selection_route("packaging", "23.0"));
@@ -2746,9 +2823,10 @@ mod tests {
         let target = crate::pypi::WheelTarget::for_subdir("3.11", "linux-64");
         let config = test_config();
         let mut bundle = holosoma_numpy_conflict_bundle();
-        bundle
-            .workspace_conda_versions
-            .insert("numpy".to_string(), "1.26.4".to_string());
+        let facts =
+            single_provider_facts("numpy", &[("holosoma", Some("1.26.4"), Some("==1.26.4"))]);
+        bundle.workspace_conda_versions = facts.common_selected_versions;
+        bundle.workspace_conda_provider_facts = facts.provider_facts;
         assert_workspace_fact_conflict_before_ownership(
             &bundle, &config, &target, "numpy", "1.26.4",
         );
@@ -2797,6 +2875,222 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn partial_workspace_psutil_provider_replaces_conflicting_wheel_pins() {
+        let target = crate::pypi::WheelTarget::for_subdir("3.11", "linux-64");
+        let config = test_config();
+        let mut bundle = isaaclab_psutil_conflict_bundle();
+        let facts = single_provider_facts(
+            "psutil",
+            &[
+                ("groot-sonic-gpu", Some("7.2.2"), None),
+                ("pace", Some("7.2.2"), Some(">=5.9")),
+                ("pm-isaaclab", Some("7.2.2"), None),
+                ("unitree-rl-lab-gpu", Some("7.2.2"), Some(">=5.9,<8")),
+                ("uwlab-gpu", Some("7.2.2"), None),
+                ("viral-gpu", None, None),
+            ],
+        );
+        assert!(
+            !facts.common_selected_versions.contains_key("psutil"),
+            "a provider absent from one consumer is not an exact shared fact"
+        );
+        let provider_fact = facts
+            .provider_facts
+            .get("psutil")
+            .expect("the five successful conda selections must retain provider evidence");
+        assert_eq!(
+            provider_fact.selected_versions,
+            BTreeSet::from(["7.2.2".to_string()])
+        );
+        assert_eq!(
+            provider_fact.declared_specs,
+            BTreeSet::from([">=5.9".to_string(), ">=5.9,<8".to_string()])
+        );
+        assert!(!provider_fact.present_in_all_consumers);
+
+        let divergent_facts = single_provider_facts(
+            "psutil",
+            &[
+                ("selected-7.1", Some("7.1.0"), Some(">=7,<8")),
+                ("selected-7.2", Some("7.2.2"), Some(">=7,<8")),
+                ("missing", None, None),
+            ],
+        );
+        let mut divergent_bundle = isaaclab_psutil_conflict_bundle();
+        divergent_bundle.workspace_conda_provider_facts = divergent_facts.provider_facts;
+        divergent_bundle
+            .auto_routed
+            .push(conflicting_psutil_auto_route());
+        divergent_bundle.apply_workspace_conda_fact_ownership(
+            &config,
+            &config.name_map,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
+        assert_eq!(
+            divergent_bundle.auto_dropped,
+            HashSet::from(["psutil".to_string()])
+        );
+        let divergent_route = divergent_bundle.auto_routed[0]
+            .workspace_provider
+            .as_ref()
+            .expect("compatible divergent selections must retain a ranged provider route");
+        assert_eq!(
+            divergent_route.selected_versions,
+            BTreeSet::from(["7.1.0".to_string(), "7.2.2".to_string()])
+        );
+        assert_eq!(
+            divergent_route.constraint.specifiers,
+            VersionSpecifiers::from_str(">=7,<8").unwrap()
+        );
+        assert_eq!(
+            super::super::emitted_bundle_route_specs(&divergent_bundle, &config, &target)
+                .unwrap()
+                .into_iter()
+                .find(|route| route.conda_name.key().as_str() == "psutil")
+                .expect("the missing consumer must receive explicit conda provision")
+                .spec,
+            ">=7,<8"
+        );
+
+        bundle.workspace_conda_versions = facts.common_selected_versions;
+        bundle.workspace_conda_provider_facts = facts.provider_facts;
+        bundle.auto_routed.push(conflicting_psutil_auto_route());
+
+        let error = super::super::emitted_bundle_route_specs(&bundle, &config, &target)
+            .expect_err("the unowned stale psutil route must reproduce the cold-lock conflict");
+        assert!(
+            error
+                .downcast_ref::<crate::constraint::Conflict>()
+                .is_some(),
+            "pre-ownership assembly must retain the typed conflict: {error:#}"
+        );
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("cannot restore `psutil` to PyPI"),
+            "{message}"
+        );
+        assert!(message.contains("mutually unsatisfiable"), "{message}");
+        for source in [
+            "auto-route `psutil==5.9.8` to conda `psutil==5.9.8`",
+            "wheel `isaacsim-kernel==5.1.0.0` Requires-Dist `psutil==5.9.8`",
+            "wheel `rl_games==1.6.1` Requires-Dist `psutil (>=5.9.0,<6.0.0)`",
+            "workspace/conda side constrains psutil to >=7,<8",
+        ] {
+            assert!(
+                message.contains(source),
+                "missing `{source}` in:\n{message}"
+            );
+        }
+
+        bundle.apply_workspace_conda_fact_ownership(
+            &config,
+            &config.name_map,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
+        assert_eq!(bundle.auto_dropped, HashSet::from(["psutil".to_string()]));
+        assert_eq!(
+            bundle.auto_routed.len(),
+            1,
+            "a partial provider must retain explicit conda provision"
+        );
+        assert!(matches!(
+            &bundle.auto_routed[0].provenance,
+            Provenance::WorkspaceCondaFact(_)
+        ));
+        let workspace_route = bundle.auto_routed[0]
+            .workspace_provider
+            .as_ref()
+            .expect("the stale exact route must become a typed workspace-provider route");
+        assert_eq!(workspace_route.conda_name.key().as_str(), "psutil");
+        assert_eq!(
+            workspace_route.selected_versions,
+            BTreeSet::from(["7.2.2".to_string()])
+        );
+        assert_eq!(
+            workspace_route.constraint.specifiers,
+            VersionSpecifiers::from_str(">=5.9,<8").unwrap()
+        );
+        assert!(matches!(
+            &workspace_route.constraint.provenance,
+            Provenance::WorkspaceCondaFact(_)
+        ));
+
+        let emitted = super::super::emitted_bundle_route_specs(&bundle, &config, &target).unwrap();
+        let psutil = emitted
+            .iter()
+            .find(|route| route.conda_name.key().as_str() == "psutil")
+            .expect("a partial provider must emit conda provision for the missing consumer");
+        assert_eq!(psutil.spec, ">=5.9,<8");
+
+        let probe_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let probe = {
+            let probe_calls = Arc::clone(&probe_calls);
+            move |pairs: Vec<(String, String)>| {
+                probe_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move { validated_probe(pairs).await }
+            }
+        };
+        let solve_routes = Arc::new(Mutex::new(
+            Vec::<Vec<crate::uv_closure::CondaRouteSpec>>::new(),
+        ));
+        let co_solve = {
+            let solve_routes = Arc::clone(&solve_routes);
+            move |routes: Vec<crate::uv_closure::CondaRouteSpec>| {
+                solve_routes.lock().unwrap().push(routes);
+                async { crate::uv_closure::CoInstallVerdict::Sat }
+            }
+        };
+        let fetch_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fetch = {
+            let fetch_calls = Arc::clone(&fetch_calls);
+            move |_request: PypiFetchRequest, _index: String| {
+                fetch_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { Err(anyhow!("workspace-owned psutil must not restore from PyPI")) }
+            }
+        };
+
+        let outcome = auto_bundle_transitives_with(
+            &mut bundle,
+            &[crate::workspace::DEFAULT_PYPI_INDEX.to_string()],
+            &target,
+            &config,
+            None,
+            None,
+            None,
+            &probe,
+            &co_solve,
+            &fetch,
+            &["conda-forge/linux-64".to_string()],
+            &UvReresolveContext::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, AutoBundleOutcome::Complete);
+        assert_eq!(probe_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(fetch_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(bundle.all_wheels().count(), 2, "parent wheels must remain");
+        assert_eq!(
+            bundle.auto_routed.len(),
+            1,
+            "the conda provider route stays"
+        );
+        let solve_routes = solve_routes.lock().unwrap();
+        assert_eq!(
+            solve_routes.len(),
+            1,
+            "the provider must pass joint co-solve"
+        );
+        let solved_psutil = solve_routes[0]
+            .iter()
+            .find(|route| route.conda_name.key().as_str() == "psutil")
+            .expect("joint validation must receive the workspace psutil provider");
+        assert_eq!(solved_psutil.spec, ">=5.9,<8");
+    }
+
+    #[tokio::test]
     async fn no_workspace_fact_holosoma_conflict_still_fail_closes() {
         let fetch_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let fetch = {
@@ -2809,6 +3103,10 @@ mod tests {
         let target = crate::pypi::WheelTarget::for_subdir("3.11", "linux-64");
         let config = test_config();
         let mut bundle = holosoma_numpy_conflict_bundle();
+        let unrelated =
+            single_provider_facts("packaging", &[("holosoma", Some("26.2"), Some(">=24"))]);
+        bundle.workspace_conda_versions = unrelated.common_selected_versions;
+        bundle.workspace_conda_provider_facts = unrelated.provider_facts;
         let favor_lock_prefs = BTreeMap::from([("numpy".to_string(), "1.26.4".to_string())]);
         bundle.apply_workspace_conda_fact_ownership(
             &config,
@@ -2817,8 +3115,8 @@ mod tests {
             &BTreeSet::new(),
         );
         assert!(
-            bundle.auto_dropped.is_empty(),
-            "a prior uv/favor-lock selection is not workspace conda ownership"
+            !bundle.auto_dropped.contains("numpy"),
+            "an unrelated conda provider cannot own numpy"
         );
 
         let error = auto_bundle_transitives_with(
@@ -2861,7 +3159,10 @@ mod tests {
                 "missing `{source}` in:\n{message}"
             );
         }
-        assert!(bundle.auto_dropped.is_empty());
+        assert!(
+            !bundle.auto_dropped.contains("numpy"),
+            "the genuine wheel conflict must remain unowned"
+        );
         assert_eq!(
             fetch_calls.load(std::sync::atomic::Ordering::SeqCst),
             0,
@@ -3044,9 +3345,12 @@ mod tests {
         let mut bundle = test_bundle(&["starlette>=0.49.1,<0.50"]);
         bundle.primary.metadata.name = "isaaclab".to_string();
         bundle.primary.metadata_provenance = Provenance::SourceBuiltRelaxed;
-        bundle
-            .workspace_conda_versions
-            .insert("starlette".to_string(), "0.45.3".to_string());
+        let facts = single_provider_facts(
+            "starlette",
+            &[("isaaclab", Some("0.45.3"), Some("==0.45.3"))],
+        );
+        bundle.workspace_conda_versions = facts.common_selected_versions;
+        bundle.workspace_conda_provider_facts = facts.provider_facts;
         bundle.apply_workspace_conda_fact_ownership(
             &config,
             &config.name_map,
