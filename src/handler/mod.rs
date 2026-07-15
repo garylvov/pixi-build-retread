@@ -4918,7 +4918,10 @@ gpu = { features = ["gpu"], no-default-feature = true }
             "demo-pack",
         );
 
-        assert!(!facts.provider_facts.contains_key("psutil"));
+        assert!(
+            !facts.provider_facts.contains_key("numpy"),
+            "a declaration without a selected conda record is not provider evidence"
+        );
     }
 
     #[test]
