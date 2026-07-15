@@ -2907,6 +2907,52 @@ mod tests {
             BTreeSet::from([">=5.9".to_string(), ">=5.9,<8".to_string()])
         );
         assert!(!provider_fact.present_in_all_consumers);
+
+        let divergent_facts = single_provider_facts(
+            "psutil",
+            &[
+                ("selected-7.1", Some("7.1.0"), Some(">=7,<8")),
+                ("selected-7.2", Some("7.2.2"), Some(">=7,<8")),
+                ("missing", None, None),
+            ],
+        );
+        let mut divergent_bundle = isaaclab_psutil_conflict_bundle();
+        divergent_bundle.workspace_conda_provider_facts = divergent_facts.provider_facts;
+        divergent_bundle
+            .auto_routed
+            .push(conflicting_psutil_auto_route());
+        divergent_bundle.apply_workspace_conda_fact_ownership(
+            &config,
+            &config.name_map,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
+        assert_eq!(
+            divergent_bundle.auto_dropped,
+            HashSet::from(["psutil".to_string()])
+        );
+        let divergent_route = divergent_bundle.auto_routed[0]
+            .workspace_provider
+            .as_ref()
+            .expect("compatible divergent selections must retain a ranged provider route");
+        assert_eq!(
+            divergent_route.selected_versions,
+            BTreeSet::from(["7.1.0".to_string(), "7.2.2".to_string()])
+        );
+        assert_eq!(
+            divergent_route.constraint.specifiers,
+            VersionSpecifiers::from_str(">=7,<8").unwrap()
+        );
+        assert_eq!(
+            super::super::emitted_bundle_route_specs(&divergent_bundle, &config, &target)
+                .unwrap()
+                .into_iter()
+                .find(|route| route.conda_name.key().as_str() == "psutil")
+                .expect("the missing consumer must receive explicit conda provision")
+                .spec,
+            ">=7,<8"
+        );
+
         bundle.workspace_conda_versions = facts.common_selected_versions;
         bundle.workspace_conda_provider_facts = facts.provider_facts;
         bundle.auto_routed.push(conflicting_psutil_auto_route());
@@ -2958,7 +3004,10 @@ mod tests {
             .as_ref()
             .expect("the stale exact route must become a typed workspace-provider route");
         assert_eq!(workspace_route.conda_name.key().as_str(), "psutil");
-        assert_eq!(workspace_route.selected_version, "7.2.2");
+        assert_eq!(
+            workspace_route.selected_versions,
+            BTreeSet::from(["7.2.2".to_string()])
+        );
         assert_eq!(
             workspace_route.constraint.specifiers,
             VersionSpecifiers::from_str(">=5.9,<8").unwrap()

@@ -738,12 +738,12 @@ struct BundleAutoRoute {
 }
 
 /// Typed partial-provider override carried by an existing auto-route. The
-/// selected version is provider evidence; `constraint` is the conjunction of
+/// selected versions are provider evidence; `constraint` is the conjunction of
 /// direct workspace specs and is the only clause emitted for this route.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WorkspaceCondaProviderRoute {
     conda_name: CondaName,
-    selected_version: String,
+    selected_versions: BTreeSet<String>,
     constraint: Constraint,
 }
 
@@ -940,19 +940,17 @@ fn workspace_conda_provider_owners(
 }
 
 /// Build the single authoritative route constraint for a provider selected in
-/// only some precise consumers. The selected version proves one concrete conda
-/// provider; direct declarations are intersected through the common typed
+/// only some precise consumers. The selected versions prove concrete conda
+/// providers; direct declarations are intersected through the common typed
 /// finalizer. Transitive-only and wildcard declarations intentionally emit an
 /// unconstrained provider dependency.
 fn workspace_conda_provider_route(
     provider: &str,
     fact: &WorkspaceCondaProviderFact,
 ) -> Option<WorkspaceCondaProviderRoute> {
-    if fact.selected_versions.len() != 1 {
+    if fact.selected_versions.is_empty() {
         return None;
     }
-    let selected_version = fact.selected_versions.iter().next()?.clone();
-    let selected = uv_pep508::uv_pep440::Version::from_str(&selected_version).ok()?;
     let provenance = Provenance::WorkspaceCondaFact("precise-consuming-envs".to_string());
     let mut declared_constraints = Vec::new();
     for declared_spec in &fact.declared_specs {
@@ -978,22 +976,25 @@ fn workspace_conda_provider_route(
     }
     let provider_key = PypiKey::from_pypi(provider);
     let specifiers = finalize(&provider_key, &declared_constraints).ok()?;
-    if !specifiers.contains(&selected) {
-        return None;
-    }
     let rendered = if specifiers.is_empty() {
         "*".to_string()
     } else {
         specifiers.to_string().replace(", ", ",")
     };
+    let selected_versions = fact
+        .selected_versions
+        .iter()
+        .map(|version| format!("`{version}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
     Some(WorkspaceCondaProviderRoute {
         conda_name: CondaName::new(provider),
-        selected_version: selected_version.clone(),
+        selected_versions: fact.selected_versions.clone(),
         constraint: Constraint {
             specifiers,
             provenance,
             source: format!(
-                "workspace conda provider `{provider} {rendered}` selected as `{selected_version}` in precise consuming environments"
+                "workspace conda provider `{provider} {rendered}` selected as {selected_versions} in precise consuming environments"
             ),
         },
     })
