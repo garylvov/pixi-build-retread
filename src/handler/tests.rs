@@ -718,6 +718,31 @@ fn pypi_conda_only_constraint_still_fails_closed() {
         message.contains("PyPI-origin constraints may not bypass shared finalization"),
         "{message}"
     );
+
+    let exact_bundle = solo_bundle("exact-pack", vec!["synthetic===1.2"]);
+    let exact_error = produce_output(
+        &exact_bundle,
+        &cfg(),
+        Platform::Linux64,
+        "3.11",
+        &[],
+        None,
+        None,
+    )
+    .expect_err("conda-inexpressible valid PEP 440 must also fail closed");
+    let exact_message = format!("{exact_error:#}");
+    assert!(
+        exact_message.contains("preserved PEP 440 constraint `===1.2`"),
+        "{exact_message}"
+    );
+    assert!(
+        exact_message.contains("has no conda representation"),
+        "{exact_message}"
+    );
+    assert!(
+        exact_message.contains("PyPI-origin constraints may not bypass shared finalization"),
+        "{exact_message}"
+    );
 }
 
 #[test]

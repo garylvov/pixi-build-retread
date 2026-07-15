@@ -490,9 +490,7 @@ fn convert_specifiers(
     let mut conda = Vec::with_capacity(effective.len());
     let mut pep440 = Vec::with_capacity(effective.len());
     for specifier in &effective {
-        if *specifier.operator() != Operator::ExactEqual {
-            pep440.push(specifier.to_string());
-        }
+        pep440.push(specifier.to_string());
         if let Some(rendered) = convert_one(specifier) {
             conda.push(rendered);
         }
@@ -559,14 +557,21 @@ fn convert_one(spec: &uv_pep440::VersionSpecifier) -> Option<String> {
             let mut upper = release[..release.len() - 1].to_vec();
             let last = upper.len() - 1;
             upper[last] += 1;
-            let upper = upper
+            let upper_release = upper
                 .iter()
                 .map(ToString::to_string)
                 .collect::<Vec<_>>()
                 .join(".");
+            let upper = if spec.version().epoch() == 0 {
+                upper_release
+            } else {
+                format!("{}!{upper_release}", spec.version().epoch())
+            };
             return Some(format!(">={lower},<{upper}"));
         }
-        // `===` (arbitrary equality, PEP 440) — drop the spec; let any version match.
+        // `===` (arbitrary equality) has no conda rendering. It remains in
+        // the preserved PEP 440 form so constraint-aware emission fails
+        // closed; legacy Display-only callers retain the existing warning.
         Operator::ExactEqual => {
             tracing::warn!(spec = %spec, "dropping `===` specifier (no conda equivalent)");
             return None;
@@ -1156,6 +1161,9 @@ mod tests {
         let prerelease = translated("demo~=1.4.5a1", RelaxPolicy::None);
         assert_eq!(prerelease.spec, ">=1.4.5a1,<1.5");
 
+        let epoch = translated("demo~=1!2.1.4", RelaxPolicy::None);
+        assert_eq!(epoch.spec, ">=1!2.1.4,<1!2.2");
+
         let strong = translated("demo~=2.1.4", RelaxPolicy::StrongMajor);
         assert_eq!(strong.spec, ">=2.1.4");
         assert_eq!(
@@ -1185,9 +1193,9 @@ mod tests {
             arbitrary.constraint_origin,
             CondaConstraintOrigin::Pypi {
                 original_specifiers: "===0.9.0".to_string(),
-                effective_specifiers: String::new(),
+                effective_specifiers: "===0.9.0".to_string(),
             },
-            "the deliberate conda-inexpressible === drop must remain unchanged"
+            "conda-inexpressible PEP 440 must remain visible to the fail-closed emission guard"
         );
     }
 

@@ -6477,7 +6477,7 @@ fn translated_emission_constraint(
             effective_specifiers,
         } => {
             if effective_specifiers.trim().is_empty() {
-                if dep.spec.trim().is_empty() {
+                if original_specifiers.trim().is_empty() && dep.spec.trim().is_empty() {
                     return Ok(TranslatedEmissionConstraint {
                         specifiers: VersionSpecifiers::empty(),
                         native_conda_override: None,
@@ -6501,6 +6501,14 @@ fn translated_emission_constraint(
                         dep.spec
                     )
                 })?;
+            if dep.spec.trim().is_empty() {
+                return Err(anyhow!(
+                    "translated PyPI requirement `{raw}` preserved PEP 440 constraint \
+                     `{effective_specifiers}` from source `{original_specifiers}`, but it has no \
+                     conda representation; PyPI-origin constraints may not bypass shared \
+                     finalization"
+                ));
+            }
             Ok(TranslatedEmissionConstraint {
                 specifiers,
                 native_conda_override: None,
