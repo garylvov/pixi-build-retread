@@ -739,10 +739,10 @@ impl Bundle {
     ///
     /// Explicit PyPI intent remains authoritative: manual overrides,
     /// keep-PyPI requests, first-party roots, and wheels already materialized
-    /// in this bundle exclude their entire configured alias group. The name
-    /// map used here is the declared fact map, not a uv preference or a
-    /// transitive resolver selection, so those weaker signals cannot acquire
-    /// ownership.
+    /// in this bundle exclude their entire configured provider group. Only the
+    /// declared fact map projects ownership; the effective map is consulted
+    /// solely to widen exclusions to names emission would translate. Thus a
+    /// uv preference or inferred route cannot acquire ownership.
     fn apply_workspace_conda_fact_ownership(
         &mut self,
         config: &RetreadConfig,
@@ -761,7 +761,7 @@ impl Bundle {
             .iter()
             .map(|name| canonical_conda_name(name))
             .collect();
-        let excluded_pypi: HashSet<String> = config
+        let explicit_exclusions: HashSet<String> = config
             .overrides
             .keys()
             .map(|name| canonical_conda_name(name))
@@ -787,27 +787,44 @@ impl Bundle {
                     .map(|wheel| canonical_conda_name(&wheel.pypi_name)),
             )
             .chain(std::iter::once(canonical_conda_name(&self.conda_name)))
-            .chain(fact_name_map.iter().filter_map(|(pypi_name, target)| {
+            .collect();
+        let disabled_pypi: HashSet<String> = fact_name_map
+            .iter()
+            .filter_map(|(pypi_name, target)| {
                 target
                     .mapped_name()
                     .is_none()
                     .then(|| pypi_name.as_str().to_string())
-            }))
+            })
             .collect();
-        let excluded_providers: HashSet<String> = excluded_pypi
+        let excluded_pypi: HashSet<String> = explicit_exclusions
             .iter()
-            .filter_map(|pypi_name| {
-                let key = PypiKey::from_pypi(pypi_name);
-                match fact_name_map.get(&key) {
-                    Some(target) => target
-                        .mapped_name()
-                        .map(|conda_name| conda_name.key().into_string()),
-                    None => Some(pypi_name.clone()),
-                }
+            .cloned()
+            .chain(disabled_pypi)
+            .collect();
+        let excluded_providers: HashSet<String> = explicit_exclusions
+            .iter()
+            .flat_map(|name| {
+                let mapped = config
+                    .name_map
+                    .get(&PypiKey::from_pypi(name))
+                    .and_then(|target| target.mapped_name())
+                    .map(|conda_name| conda_name.key().into_string());
+                std::iter::once(name.clone()).chain(mapped)
             })
             .collect();
         owned.retain(|pypi_name, provider| {
-            !excluded_pypi.contains(pypi_name) && !excluded_providers.contains(provider)
+            let effective_provider = config
+                .name_map
+                .get(&PypiKey::from_pypi(pypi_name))
+                .and_then(|target| target.mapped_name())
+                .map_or_else(
+                    || pypi_name.clone(),
+                    |conda_name| conda_name.key().into_string(),
+                );
+            !excluded_pypi.contains(pypi_name)
+                && !excluded_providers.contains(provider)
+                && !excluded_providers.contains(&effective_provider)
         });
 
         if owned.is_empty() {

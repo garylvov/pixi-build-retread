@@ -743,6 +743,48 @@ fn workspace_fact_ownership_respects_pypi_intent_and_mapping_direction() {
         HashSet::from(["bar".to_string(), "baz".to_string()])
     );
 
+    // Overrides may be keyed by the translated conda provider. With
+    // `foo -> bar`, an override named bar must veto ownership of PyPI foo even
+    // when bar is also a PyPI key mapped onward to baz.
+    let mut provider_override_bundle = solo_bundle("source-pack", vec!["foo>=1"]);
+    provider_override_bundle
+        .workspace_conda_versions
+        .insert("bar".to_string(), "1.0.0".to_string());
+    let mut provider_override_config = cfg();
+    provider_override_config.name_map = name_map(&[("foo", "bar"), ("bar", "baz")]);
+    provider_override_config
+        .overrides
+        .insert("bar".to_string(), "*".to_string());
+    provider_override_bundle.apply_workspace_conda_fact_ownership(
+        &provider_override_config,
+        &provider_override_config.name_map,
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+    );
+    assert!(provider_override_bundle.auto_dropped.is_empty());
+
+    // Inferred mappings cannot create ownership, but they still participate
+    // in exclusions because emission honors conda-provider-keyed overrides
+    // under the effective map. Here the explicit fact map is intentionally
+    // empty: foo owns only by same-name identity, then the effective
+    // `foo -> bar` emission edge lets the manual bar override veto that drop.
+    let mut inferred_override_bundle = solo_bundle("source-pack", vec!["foo>=1"]);
+    inferred_override_bundle
+        .workspace_conda_versions
+        .insert("foo".to_string(), "1.0.0".to_string());
+    let mut inferred_override_config = cfg();
+    inferred_override_config.name_map = name_map(&[("foo", "bar")]);
+    inferred_override_config
+        .overrides
+        .insert("bar".to_string(), "*".to_string());
+    inferred_override_bundle.apply_workspace_conda_fact_ownership(
+        &inferred_override_config,
+        &NameMap::new(),
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+    );
+    assert!(inferred_override_bundle.auto_dropped.is_empty());
+
     // An explicit disabled mapping is wheel-side intent and vetoes same-name
     // fact ownership.
     let mut disabled_bundle = solo_bundle("source-pack", vec!["numpy>=2"]);
@@ -760,6 +802,31 @@ fn workspace_fact_ownership_respects_pypi_intent_and_mapping_direction() {
         &BTreeSet::new(),
     );
     assert!(disabled_bundle.auto_dropped.is_empty());
+
+    // A disabled PyPI key is not a provider-wide veto. Another explicit edge
+    // may still use the same-named conda fact.
+    let mut disabled_alias_bundle = solo_bundle("source-pack", vec!["bar>=1"]);
+    disabled_alias_bundle
+        .workspace_conda_versions
+        .insert("foo".to_string(), "1.0.0".to_string());
+    let mut disabled_alias_config = cfg();
+    disabled_alias_config
+        .name_map
+        .insert(PypiKey::from_pypi("foo"), CondaTarget::Disabled);
+    disabled_alias_config.name_map.insert(
+        PypiKey::from_pypi("bar"),
+        CondaTarget::Mapped(CondaName::new("foo")),
+    );
+    disabled_alias_bundle.apply_workspace_conda_fact_ownership(
+        &disabled_alias_config,
+        &disabled_alias_config.name_map,
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+    );
+    assert_eq!(
+        disabled_alias_bundle.auto_dropped,
+        HashSet::from(["bar".to_string()])
+    );
 
     // Auto-dropped identities remain PyPI-typed at emission. Owning PyPI bar
     // must not suppress a different raw PyPI foo requirement merely because
