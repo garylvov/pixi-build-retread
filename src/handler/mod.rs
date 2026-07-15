@@ -44,8 +44,8 @@ use crate::index_chain::{IndexPurpose, index_chain};
 use crate::pypi::{self, WheelTarget};
 use crate::recipe::{BundleSource, build_bundle_recipe, build_courier_recipe_with_mode, to_yaml};
 use crate::relax::{
-    CondaName, CondaTarget, NameMap, PypiKey, canonical_conda_name, emit_python_version,
-    marker_env_for,
+    CondaConstraintOrigin, CondaDep, CondaName, CondaTarget, NameMap, PypiKey,
+    canonical_conda_name, emit_python_version, marker_env_for,
 };
 use crate::rpc::{RpcError, ok, parse_params};
 use crate::wheel::WheelMetadata;
@@ -6452,6 +6452,83 @@ struct PypiEmissionGroup {
     native_conda_override: Option<String>,
 }
 
+#[derive(Debug)]
+struct TranslatedEmissionConstraint {
+    specifiers: VersionSpecifiers,
+    native_conda_override: Option<String>,
+    provenance: Provenance,
+}
+
+/// Recover the typed constraint from the translation boundary without
+/// reverse-translating conda syntax back into PyPI syntax.
+///
+/// Ordinary PyPI requirements must carry a valid effective PEP 440 form into
+/// shared finalization. Explicit overrides are the sole native-conda boundary;
+/// representable ones still participate in PEP 440 override replacement, and
+/// genuinely conda-only syntax remains attached as the final native spec.
+fn translated_emission_constraint(
+    raw: &str,
+    dep: &CondaDep,
+    metadata_provenance: &Provenance,
+) -> Result<TranslatedEmissionConstraint> {
+    match &dep.constraint_origin {
+        CondaConstraintOrigin::Pypi {
+            original_specifiers,
+            effective_specifiers,
+        } => {
+            if effective_specifiers.trim().is_empty() {
+                if dep.spec.trim().is_empty() {
+                    return Ok(TranslatedEmissionConstraint {
+                        specifiers: VersionSpecifiers::empty(),
+                        native_conda_override: None,
+                        provenance: metadata_provenance.clone(),
+                    });
+                }
+                return Err(anyhow!(
+                    "translated PyPI requirement `{raw}` produced conda-only spec `{}` without \
+                     a preserved PEP 440 constraint (source `{original_specifiers}`); \
+                     PyPI-origin constraints may not bypass shared finalization",
+                    dep.spec
+                ));
+            }
+            let specifiers =
+                VersionSpecifiers::from_str(effective_specifiers).map_err(|error| {
+                    anyhow!(
+                        "translated PyPI requirement `{raw}` produced conda-only spec `{}` with \
+                     invalid preserved PEP 440 constraint `{effective_specifiers}` from source \
+                     `{original_specifiers}` ({error}); PyPI-origin constraints may not bypass \
+                     shared finalization",
+                        dep.spec
+                    )
+                })?;
+            Ok(TranslatedEmissionConstraint {
+                specifiers,
+                native_conda_override: None,
+                provenance: metadata_provenance.clone(),
+            })
+        }
+        CondaConstraintOrigin::ExplicitOverride => {
+            let (specifiers, native_conda_override) = if dep.spec.trim().is_empty() {
+                (VersionSpecifiers::empty(), None)
+            } else if let Some(pep) = crate::uv_closure::conda_spec_to_pep440(&dep.spec) {
+                (
+                    VersionSpecifiers::from_str(&pep).with_context(|| {
+                        format!("parsing explicit conda override `{}` as `{pep}`", dep.spec)
+                    })?,
+                    None,
+                )
+            } else {
+                (VersionSpecifiers::empty(), Some(dep.spec.clone()))
+            };
+            Ok(TranslatedEmissionConstraint {
+                specifiers,
+                native_conda_override,
+                provenance: Provenance::UvOverride,
+            })
+        }
+    }
+}
+
 fn add_emission_constraint(
     groups: &mut Vec<PypiEmissionGroup>,
     indexes: &mut BTreeMap<PypiKey, usize>,
@@ -6728,13 +6805,11 @@ fn produce_output_with_conflicts(
             // alongside the already-bundled wheel -- found via
             // examples/isaac6 (isaacsim 6.0's tinyobjloader dep).
             let dep_name = dep.name.clone();
-            let parsed_raw: uv_pep508::Requirement = uv_pep508::Requirement::from_str(raw)
-                .with_context(|| format!("parsing emitted PyPI requirement `{raw}`"))?;
-            let raw_pypi_name = parsed_raw.name.to_string();
+            let raw_pypi_name = dep.pypi_name.as_str();
             // P2: one dual-namespace membership helper for all three
             // filters (canonicalizes both query names internally).
             let in_set = |set: &HashSet<String>| {
-                crate::relax::already_covered(set, &dep_name, Some(&raw_pypi_name))
+                crate::relax::already_covered(set, &dep_name, Some(raw_pypi_name))
             };
             if in_set(&vendored) {
                 continue;
@@ -6786,52 +6861,22 @@ fn produce_output_with_conflicts(
                 continue;
             }
             let conda_name = CondaName::new(dep_name.as_str());
-            let pypi_name = PypiKey::from_pypi(&raw_pypi_name);
-            let explicit_override = config
-                .overrides
-                .get(&raw_pypi_name)
-                .or_else(|| config.overrides.get(conda_name.as_spec()));
-            let (specifiers, native_conda_override) = if dep.spec.trim().is_empty() {
-                (VersionSpecifiers::empty(), None)
-            } else if let Some(pep) = crate::uv_closure::conda_spec_to_pep440(&dep.spec) {
-                (
-                    VersionSpecifiers::from_str(&pep).with_context(|| {
-                        format!("parsing translated PyPI constraint `{raw}` as `{pep}`")
-                    })?,
-                    None,
-                )
-            } else if explicit_override.is_some() {
-                // Explicit native conda syntax (build strings/alternations)
-                // cannot participate in PEP 440 algebra. It is the sole
-                // documented non-PyPI boundary: the typed UvOverride still
-                // passes through finalize for replacement semantics, while
-                // rattler remains responsible for the native match spec.
-                (VersionSpecifiers::empty(), Some(dep.spec.clone()))
-            } else {
-                return Err(anyhow!(
-                    "translated PyPI requirement `{raw}` produced conda-only spec `{}`; \
-                     PyPI-origin constraints may not bypass shared finalization",
-                    dep.spec
-                ));
-            };
+            let pypi_name = dep.pypi_name.clone();
+            let translated = translated_emission_constraint(raw, &dep, &wheel.metadata_provenance)?;
             add_emission_constraint(
                 &mut emission_groups,
                 &mut emission_group_indexes,
                 pypi_name,
                 conda_name,
                 Constraint {
-                    specifiers,
-                    provenance: if explicit_override.is_some() {
-                        Provenance::UvOverride
-                    } else {
-                        wheel.metadata_provenance.clone()
-                    },
+                    specifiers: translated.specifiers,
+                    provenance: translated.provenance,
                     source: format!(
                         "wheel `{}=={}` Requires-Dist `{raw}`",
                         wheel.metadata.name, wheel.metadata.version
                     ),
                 },
-                native_conda_override,
+                translated.native_conda_override,
             );
         }
     }

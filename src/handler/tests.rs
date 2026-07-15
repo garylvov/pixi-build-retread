@@ -651,6 +651,92 @@ fn compatible_workspace_fact_does_not_exact_pin_advisory_range() {
 }
 
 #[test]
+fn pypi_wildcard_exclusion_round_trips_through_conda_emission() {
+    let bundle = solo_bundle("jupyter-pack", vec!["jupyter-core!=5.0.*,>=4.12"]);
+
+    let output =
+        produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
+    let dependency = output
+        .run_dependencies
+        .depends
+        .iter()
+        .find(|dependency| dependency.name == "jupyter-core")
+        .expect("the routed PyPI dependency must be emitted to conda");
+    let rendered = format_packagespec(&dependency.spec);
+    let conda_spec =
+        VersionSpec::from_str(&rendered, rattler_conda_types::ParseStrictness::Lenient)
+            .unwrap_or_else(|error| panic!("emitted constraint `{rendered}` is invalid: {error}"));
+    for accepted in ["4.12", "4.99", "5.1", "6.0"] {
+        let version = rattler_conda_types::Version::from_str(accepted).unwrap();
+        assert!(
+            conda_spec.matches(&version),
+            "{rendered} rejected {accepted}"
+        );
+    }
+    for rejected in ["4.11.9", "5.0", "5.0.9"] {
+        let version = rattler_conda_types::Version::from_str(rejected).unwrap();
+        assert!(
+            !conda_spec.matches(&version),
+            "{rendered} accepted excluded {rejected}"
+        );
+    }
+
+    let target = WheelTarget {
+        python_version: "3.11".to_string(),
+        conda_subdir: "linux-64".to_string(),
+        max_glibc: None,
+    };
+    let routes = emitted_bundle_route_specs(&bundle, &cfg(), &target).unwrap();
+    assert!(
+        routes
+            .iter()
+            .any(|route| route.pypi_name == PypiKey::from_pypi("jupyter-core")),
+        "joint route assembly must accept the preserved PyPI constraint: {routes:?}"
+    );
+}
+
+#[test]
+fn pypi_conda_only_constraint_still_fails_closed() {
+    let dep = CondaDep {
+        pypi_name: PypiKey::from_pypi("synthetic"),
+        name: "synthetic".to_string(),
+        spec: "1.2|1.3".to_string(),
+        constraint_origin: CondaConstraintOrigin::Pypi {
+            original_specifiers: "1.2|1.3".to_string(),
+            effective_specifiers: "1.2|1.3".to_string(),
+        },
+    };
+    let error = translated_emission_constraint(
+        "synthetic (1.2|1.3)",
+        &dep,
+        &Provenance::IndexWheelMetadata,
+    )
+    .expect_err("non-PEP PyPI-origin syntax must not bypass finalization");
+    let message = format!("{error:#}");
+    assert!(message.contains("conda-only spec `1.2|1.3`"), "{message}");
+    assert!(
+        message.contains("PyPI-origin constraints may not bypass shared finalization"),
+        "{message}"
+    );
+}
+
+#[test]
+fn explicit_native_conda_alternation_remains_allowed() {
+    let dep = CondaDep {
+        pypi_name: PypiKey::from_pypi("synthetic"),
+        name: "synthetic".to_string(),
+        spec: "1.2|1.3".to_string(),
+        constraint_origin: CondaConstraintOrigin::ExplicitOverride,
+    };
+    let translated =
+        translated_emission_constraint("synthetic>=1", &dep, &Provenance::IndexWheelMetadata)
+            .expect("explicit override is the documented native-conda boundary");
+    assert!(translated.specifiers.is_empty());
+    assert_eq!(translated.native_conda_override.as_deref(), Some("1.2|1.3"));
+    assert_eq!(translated.provenance, Provenance::UvOverride);
+}
+
+#[test]
 fn produce_output_omits_workspace_owned_auto_drops() {
     let mut bundle = solo_bundle(
         "owned-pack",
