@@ -5,9 +5,9 @@ use audit_report::{build_bundle_audit, write_probe_trace};
 
 mod auto_bundle;
 use auto_bundle::{
-    AutoBundleOutcome, BfsFetched, Pending, PendingSource, UvReresolveContext,
-    UvReresolveMode, auto_bundle_transitives, conda_probe_spec, metadata_preferring_sidecar,
-    pick_conda_target, seed_worklist, validated_conda_route,
+    AutoBundleOutcome, BfsFetched, Pending, PendingSource, UvReresolveContext, UvReresolveMode,
+    auto_bundle_transitives, conda_probe_spec, metadata_preferring_sidecar, pick_conda_target,
+    seed_worklist, validated_conda_route,
 };
 
 mod resolve_state;
@@ -1933,13 +1933,13 @@ async fn resolve_all(
             uv_closure,
             deps_from_floor_names,
             workspace_facts,
-            workspace_ownership,
+            prelock_owned_drops,
             conda_co_solve,
         ): (
             Option<crate::uv_closure::UvClosure>,
             std::collections::BTreeSet<String>,
             WorkspaceCondaFacts,
-            WorkspaceRouteOwnership,
+            BTreeSet<String>,
             CondaCoSolveContext,
         ) = uv_group_closure(
             &group_name,
@@ -2086,12 +2086,7 @@ async fn resolve_all(
                 .collect();
         }
         bundle.workspace_conda_versions = workspace_facts.common_selected_versions.clone();
-        // Workspace PyPI declarations are already installed by Pixi and do
-        // not need a second copy inside this pack. This evidence is precise
-        // direct ownership, independent of whether the group had uv roots.
-        bundle
-            .auto_dropped
-            .extend(workspace_facts.owned_pypi.iter().cloned());
+        bundle.auto_dropped.extend(prelock_owned_drops);
         for sub in sub_bundles {
             bundle.extras.push(sub.primary);
             bundle.extras.extend(sub.extras);
@@ -2144,7 +2139,6 @@ async fn resolve_all(
                 None, // locked-closure seam: incremental-add ONLY (uv pins flow via prefs below)
                 Some(&favored).filter(|m| !m.is_empty()), // favor-lock + uv-closure prefs
                 uv_closure_members.as_ref(),
-                &workspace_ownership,
                 &conda_co_solve,
                 &UvReresolveContext {
                     mode: uv_reresolve_mode,
@@ -2513,6 +2507,38 @@ struct WorkspaceRouteOwnership {
 struct SolvedPypiFact {
     conda_name: String,
     version: String,
+}
+
+fn workspace_conda_provider_candidates(
+    has_uv_roots: bool,
+    workspace_facts: &WorkspaceCondaFacts,
+    workspace_ownership: &WorkspaceRouteOwnership,
+    fact_name_map: &NameMap,
+) -> Vec<crate::uv_closure::WorkspaceCondaProvider> {
+    if !has_uv_roots {
+        return Vec::new();
+    }
+    workspace_ownership
+        .pypi_names
+        .iter()
+        .filter_map(|pypi_name| {
+            let fact = workspace_facts.common_pypi.get(pypi_name.as_str())?;
+            let conda_name = fact_name_map
+                .get(pypi_name)
+                .and_then(CondaTarget::mapped_name)?
+                .clone();
+            (workspace_ownership.conda_names.contains(&conda_name.key())
+                && conda_name.key().as_str() == fact.conda_name)
+                .then(|| crate::uv_closure::WorkspaceCondaProvider {
+                    pypi_name: pypi_name.clone(),
+                    conda_name,
+                    version: fact.version.clone(),
+                    provenance: Provenance::WorkspaceCondaFact(
+                        "precise-consuming-envs".to_string(),
+                    ),
+                })
+        })
+        .collect()
 }
 
 /// Cloneable workspace-aware conda solver oracle shared by Rule 1's uv
@@ -3070,7 +3096,7 @@ async fn uv_group_closure(
     Option<crate::uv_closure::UvClosure>,
     std::collections::BTreeSet<String>,
     WorkspaceCondaFacts,
-    WorkspaceRouteOwnership,
+    BTreeSet<String>,
     CondaCoSolveContext,
 )> {
     let uv_retry_keep_names: BTreeSet<String> = uv_retry_keep
@@ -3308,21 +3334,6 @@ async fn uv_group_closure(
         group_name,
     );
 
-    if roots.is_empty() {
-        tracing::info!(
-            bundle = %group_name,
-            "uv closure: no uv-resolvable roots in this bundle; \
-             running the legacy closure path unpinned",
-        );
-        return Ok((
-            None,
-            std::collections::BTreeSet::new(),
-            workspace_facts,
-            workspace_ownership,
-            conda_co_solve,
-        ));
-    }
-
     // Rule-3-capable policies receive only precise, solved, agreed facts.
     // Aggressive deliberately retains its legacy declared-constraint input,
     // whose non-workspace-solved provenance cannot authorize Rule 3.
@@ -3525,6 +3536,7 @@ async fn uv_group_closure(
         // extends this map (`.insert`) with any heal-built wheels.
         built_wheel_sources: url_wheel_sources,
         explicit_pins: BTreeMap::new(), // populated by the self-heal
+        workspace_owned: crate::uv_closure::WorkspaceOwnedPlan::default(),
         offline: false,
     };
     let project_dir = cache_dir.join("uv-projects").join(format!(
@@ -3575,13 +3587,53 @@ async fn uv_group_closure(
                 && !protected.contains(name)
                 && !first_party.contains(name)
         });
-        for name in &workspace_facts.owned_pypi {
-            req.overrides
-                .push(format!("{name} ; {}", crate::uv_closure::DROP_MARKER));
-            req.no_emit_packages.push(name.clone());
-        }
     } else {
         workspace_facts.owned_pypi.clear();
+    }
+
+    let direct_workspace_pypi: BTreeSet<PypiKey> = workspace_facts
+        .owned_pypi
+        .iter()
+        .map(|name| PypiKey::from_pypi(name))
+        .collect();
+    let conda_candidates = workspace_conda_provider_candidates(
+        !req.dependencies.is_empty(),
+        &workspace_facts,
+        &workspace_ownership,
+        fact_name_map,
+    );
+    let planning_context = conda_co_solve.clone();
+    let planning_co_solve = move |routes: Vec<crate::uv_closure::CondaRouteSpec>| {
+        let context = planning_context.clone();
+        async move { context.solve(routes).await }
+    };
+    // Ownership planning is deliberately mode-independent: it replaces the
+    // three unconditional pre-P4 drop implementations and preserves their
+    // default-off behavior. RETREAD_UV_RERESOLVE gates only the rejected-route
+    // handoff that bypasses the legacy reconstruct/fetch path.
+    req.workspace_owned = crate::uv_closure::plan_workspace_owned_prelock(
+        &req,
+        &direct_workspace_pypi,
+        conda_candidates,
+        &workspace_ownership.excluded_pypi_names,
+        &planning_co_solve,
+    )
+    .await;
+    let prelock_owned_drops = req.workspace_owned.dropped_without_uv();
+
+    if req.dependencies.is_empty() {
+        tracing::info!(
+            bundle = %group_name,
+            "uv closure: no uv-resolvable roots in this bundle; \
+             running the legacy closure path unpinned",
+        );
+        return Ok((
+            None,
+            std::collections::BTreeSet::new(),
+            workspace_facts,
+            prelock_owned_drops,
+            conda_co_solve,
+        ));
     }
     // ABI-anchor pins (`cuda-version`, `python_abi`, ...) from the
     // consuming env(s) -- same source the proactive cuda-major capping
@@ -3643,7 +3695,6 @@ async fn uv_group_closure(
         // Populated below (workspace-deps solve) just before the
         // fixpoint call; empty = un-route fallback only.
         workspace_conda_versions: Default::default(),
-        workspace_owned: workspace_ownership.pypi_names.clone(),
         workspace_fact_fingerprint: workspace_facts.fingerprint.clone(),
     };
 
@@ -3770,9 +3821,7 @@ async fn uv_group_closure(
     let persisted_routes = persisted_facts
         .routed
         .into_iter()
-        .filter(|route| {
-            !uv_retry_keep_names.contains(&canonical_conda_name(&route.pypi_name))
-        })
+        .filter(|route| !uv_retry_keep_names.contains(&canonical_conda_name(&route.pypi_name)))
         .collect();
     let sdist_routed = Arc::new(std::sync::Mutex::new(persisted_routes));
     let sdist_built = Arc::new(std::sync::Mutex::new(persisted_facts.built));
@@ -3910,7 +3959,7 @@ async fn uv_group_closure(
         Some(closure),
         deps_from_floor_names,
         workspace_facts,
-        workspace_ownership,
+        prelock_owned_drops,
         conda_co_solve,
     ))
 }
@@ -4052,9 +4101,11 @@ mod facts_cleanup_tests {
 #[cfg(test)]
 mod workspace_conda_facts_tests {
     use super::{
-        WorkspaceRouteOwnership, dependency_name_intersection, facts_from_solved_records,
-        precise_consumer_inputs, workspace_fact_constraints,
+        SolvedPypiFact, WorkspaceCondaFacts, WorkspaceRouteOwnership, dependency_name_intersection,
+        facts_from_solved_records, precise_consumer_inputs, workspace_conda_provider_candidates,
+        workspace_fact_constraints,
     };
+    use crate::constraint::Provenance;
     use crate::relax::{CondaName, CondaTarget, NameMap, PypiKey};
     use rattler_conda_types::{PackageRecord, RepoDataRecord, VersionWithSource};
     use std::collections::{BTreeMap, BTreeSet};
@@ -4225,6 +4276,47 @@ holosoma = { features = ["doit-task-runner", "holosoma"], no-default-feature = t
             ownership
                 .conda_names
                 .contains(&CondaName::new("cuda-nvcc_linux-64").key())
+        );
+    }
+
+    #[test]
+    fn opencv_name_map_builds_unified_prelock_provider() {
+        let mut facts = WorkspaceCondaFacts::default();
+        facts.common_pypi.insert(
+            "opencv-python".to_string(),
+            SolvedPypiFact {
+                conda_name: "py-opencv".to_string(),
+                version: "4.11.0".to_string(),
+            },
+        );
+        let ownership = WorkspaceRouteOwnership {
+            pypi_names: BTreeSet::from([PypiKey::from_pypi("opencv_python")]),
+            conda_names: BTreeSet::from([CondaName::new("py-opencv").key()]),
+            excluded_pypi_names: BTreeSet::new(),
+        };
+        let candidates = workspace_conda_provider_candidates(
+            true,
+            &facts,
+            &ownership,
+            &name_map(&[("opencv-python", "py-opencv")]),
+        );
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].pypi_name.as_str(), "opencv-python");
+        assert_eq!(candidates[0].conda_name.as_spec(), "py-opencv");
+        assert_eq!(candidates[0].version, "4.11.0");
+        assert!(matches!(
+            &candidates[0].provenance,
+            Provenance::WorkspaceCondaFact(_)
+        ));
+        assert!(
+            workspace_conda_provider_candidates(
+                false,
+                &facts,
+                &ownership,
+                &name_map(&[("opencv-python", "py-opencv")]),
+            )
+            .is_empty(),
+            "a non-uv group has no pre-lock provider boundary"
         );
     }
 
