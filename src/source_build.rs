@@ -332,6 +332,14 @@ async fn git_wheel_cache_store(wheel: &Path, cache_wheel_dir: &Path) {
     }
 }
 
+/// Compute a git wheel entry's source directory without accessing it.
+///
+/// This is path derivation only; callers that read the returned tree must hold
+/// the checkout lease obtained by this module's build/checkout boundary.
+pub fn git_source_root(url: &str, rev: &str, subdirectory: &str, cache_dir: &Path) -> PathBuf {
+    git_checkout_root(url, rev, cache_dir).join(subdirectory)
+}
+
 /// Compute the on-disk *checkout* directory for a (url, rev) pair --
 /// the parent of each wheel entry's source subdirectory. Used as a pure
 /// identity/grouping key by auto-data planning so the WHOLE upstream repo (minus
@@ -341,7 +349,7 @@ async fn git_wheel_cache_store(wheel: &Path, cache_wheel_dir: &Path) {
 ///
 /// This function performs no synchronization and confers no permission to read
 /// the returned path. Checkout consumers must retain the [`GitCheckout`] lease
-/// returned by [`ensure_git_checkout`] or a [`GitWheelBuild`].
+/// returned by the internal checkout/build boundary.
 ///
 /// Layout (v0.13.3+): cache_dir / retread-git-clones / <slug> /
 /// <sha12> / ... -- a HIERARCHY rather than a single flat dirname.
@@ -377,6 +385,62 @@ pub fn git_checkout_root(url: &str, rev: &str, cache_dir: &Path) -> PathBuf {
 const CHECKOUT_READY_MARKER: &str = ".retread-checkout-ready-v1";
 const CHECKOUT_LOCK_POLL: Duration = Duration::from_millis(10);
 
+#[cfg(test)]
+static CHECKOUT_REPAIRS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+
+#[cfg(test)]
+fn record_checkout_repair(clone_dir: &Path) {
+    let mut repairs = CHECKOUT_REPAIRS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("checkout-repair test counter poisoned");
+    *repairs.entry(clone_dir.to_path_buf()).or_default() += 1;
+}
+
+#[cfg(test)]
+fn checkout_repair_count(clone_dir: &Path) -> usize {
+    CHECKOUT_REPAIRS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("checkout-repair test counter poisoned")
+        .get(clone_dir)
+        .copied()
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+fn signal_checkout_test_path(variable: &str) -> Result<()> {
+    let Some(path) = std::env::var_os(variable) else {
+        return Ok(());
+    };
+    std::fs::write(PathBuf::from(&path), b"ready\n").with_context(|| {
+        format!(
+            "writing checkout test signal {} from {variable}",
+            PathBuf::from(path).display()
+        )
+    })
+}
+
+#[cfg(test)]
+async fn pause_initializer_after_exclusive_for_test() -> Result<()> {
+    let Some(release) = std::env::var_os("RETREAD_TEST_EXCLUSIVE_RELEASE") else {
+        return Ok(());
+    };
+    signal_checkout_test_path("RETREAD_TEST_EXCLUSIVE_HELD")?;
+    let release = PathBuf::from(release);
+    loop {
+        if release.try_exists().with_context(|| {
+            format!(
+                "checking checkout test release signal {}",
+                release.display()
+            )
+        })? {
+            return Ok(());
+        }
+        tokio::time::sleep(CHECKOUT_LOCK_POLL).await;
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CloneIdentity {
     digest: [u8; 32],
@@ -393,7 +457,8 @@ impl CloneIdentity {
         hasher.update(rev.as_bytes());
         let digest: [u8; 32] = hasher.finalize().into();
         let digest_hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
-        let marker_contents = format!("pixi-build-retread-checkout-v1\n{digest_hex}\n").into_bytes();
+        let marker_contents =
+            format!("pixi-build-retread-checkout-v1\n{digest_hex}\n").into_bytes();
         Self {
             digest,
             marker_contents,
@@ -426,8 +491,7 @@ fn process_clone_locks() -> &'static Mutex<HashMap<ProcessLockKey, Arc<ProcessCl
     // Strong entries intentionally retain one fd per checkout touched by this
     // backend process. That bounded process-lifetime cost is what guarantees a
     // later worker can never reopen and flock the same inode a second time.
-    static LOCKS: OnceLock<Mutex<HashMap<ProcessLockKey, Arc<ProcessCloneLock>>>> =
-        OnceLock::new();
+    static LOCKS: OnceLock<Mutex<HashMap<ProcessLockKey, Arc<ProcessCloneLock>>>> = OnceLock::new();
     LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -473,8 +537,11 @@ fn registered_clone_lock(
                 existing.lock_path.display(),
             );
         }
+        #[cfg(test)]
+        signal_checkout_test_path("RETREAD_TEST_SECOND_REGISTRATION")?;
         // `candidate` is dropped here without ever being flocked. Every worker
-        // in this process therefore shares the registry's one open description.
+        // in this process therefore flocks only the registry's one open
+        // description, even though identifying an alias requires opening it.
         return Ok(Arc::clone(existing));
     }
 
@@ -541,7 +608,10 @@ fn checkout_ready_marker(clone_dir: &Path) -> PathBuf {
     clone_dir.join(".git").join(CHECKOUT_READY_MARKER)
 }
 
-fn checkout_marker_state(clone_dir: &Path, identity: &CloneIdentity) -> Result<CheckoutMarkerState> {
+fn checkout_marker_state(
+    clone_dir: &Path,
+    identity: &CloneIdentity,
+) -> Result<CheckoutMarkerState> {
     let marker = checkout_ready_marker(clone_dir);
     match std::fs::read(&marker) {
         Ok(contents) if contents == identity.marker_contents => Ok(CheckoutMarkerState::Matching),
@@ -549,8 +619,9 @@ fn checkout_marker_state(clone_dir: &Path, identity: &CloneIdentity) -> Result<C
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             Ok(CheckoutMarkerState::Missing)
         }
-        Err(error) => Err(error)
-            .with_context(|| format!("reading git-checkout marker {}", marker.display())),
+        Err(error) => {
+            Err(error).with_context(|| format!("reading git-checkout marker {}", marker.display()))
+        }
     }
 }
 
@@ -654,12 +725,14 @@ fn acquire_initial_os_access(
         match checkout_marker_state(clone_dir, &lock.identity)? {
             CheckoutMarkerState::Invalid => return Err(invalid_marker_error(clone_dir)),
             CheckoutMarkerState::Matching => {
-                if fs4::fs_std::FileExt::try_lock_shared(&lock.file).with_context(|| {
-                    format!(
-                        "try-shared-locking git-clone lock file {}",
-                        lock.lock_path.display()
-                    )
-                })? {
+                let acquired =
+                    fs4::fs_std::FileExt::try_lock_shared(&lock.file).with_context(|| {
+                        format!(
+                            "try-shared-locking git-clone lock file {}",
+                            lock.lock_path.display()
+                        )
+                    })?;
+                if acquired {
                     let pending = PendingOsLock::acquired(Arc::clone(&lock));
                     match checkout_marker_state(clone_dir, &lock.identity)? {
                         CheckoutMarkerState::Matching => {
@@ -674,6 +747,9 @@ fn acquire_initial_os_access(
                             return Err(invalid_marker_error(clone_dir));
                         }
                     }
+                } else {
+                    #[cfg(test)]
+                    signal_checkout_test_path("RETREAD_TEST_SHARED_BLOCKED")?;
                 }
             }
             CheckoutMarkerState::Missing => {
@@ -734,7 +810,12 @@ fn publish_checkout_ready(clone_dir: &Path, identity: &CloneIdentity) -> Result<
         #[cfg(unix)]
         File::open(marker_parent)
             .and_then(|directory| directory.sync_all())
-            .with_context(|| format!("syncing git-checkout marker dir {}", marker_parent.display()))?;
+            .with_context(|| {
+                format!(
+                    "syncing git-checkout marker dir {}",
+                    marker_parent.display()
+                )
+            })?;
         Ok(())
     };
     if let Err(error) = publish() {
@@ -793,8 +874,14 @@ async fn clone_and_checkout(clone_dir: &Path, url: &str, rev: &str) -> Result<()
 /// Perform the legacy working-tree repair and full-reclone fallback exactly
 /// once, before publishing this `(url, rev)` checkout. Existing v4.8.1 cache
 /// directories have no marker, so their first access under the new protocol
-/// receives this one migration repair.
-async fn initialize_checkout_once(clone_dir: &Path, url: &str, rev: &str) -> Result<()> {
+/// receives this one migration repair. `pending` is threaded through every
+/// unabortable filesystem job so none can continue after EX is released.
+async fn initialize_checkout_once(
+    clone_dir: &Path,
+    url: &str,
+    rev: &str,
+    pending: PendingOsLock,
+) -> Result<PendingOsLock> {
     if let Err(error) = clone_and_checkout(clone_dir, url, rev).await {
         tracing::warn!(
             url = %url, rev = %rev, error = %format!("{error:#}"),
@@ -802,16 +889,22 @@ async fn initialize_checkout_once(clone_dir: &Path, url: &str, rev: &str) -> Res
             "unpublished git clone/checkout failed after working-tree repair; \
              wiping the clone dir and re-cloning once before publication",
         );
-        tokio::fs::remove_dir_all(clone_dir)
-            .await
-            .with_context(|| format!("wiping corrupted clone dir {}", clone_dir.display()))?;
+        let remove_dir = clone_dir.to_path_buf();
+        let pending = tokio::task::spawn_blocking(move || -> Result<PendingOsLock> {
+            std::fs::remove_dir_all(&remove_dir)
+                .with_context(|| format!("wiping corrupted clone dir {}", remove_dir.display()))?;
+            Ok(pending)
+        })
+        .await
+        .context("git-checkout wipe task panicked")??;
         clone_and_checkout(clone_dir, url, rev)
             .await
             .with_context(|| {
                 format!("re-clone after wiping corrupted dir still failed for {url}@{rev}")
             })?;
+        return Ok(pending);
     }
-    Ok(())
+    Ok(pending)
 }
 
 async fn initialize_process_clone_lock(
@@ -842,16 +935,22 @@ async fn initialize_process_clone_lock(
         return Ok(());
     };
 
+    #[cfg(test)]
+    pause_initializer_after_exclusive_for_test().await?;
+
     // `pending` is cancellation-safe and the outer caller awaits this work via
     // a detached Tokio task. The EX lock therefore spans clone/repair, marker
     // publication, and the same-fd EX->SH transition as one transaction.
-    initialize_checkout_once(&clone_dir, &url, &rev).await?;
+    let pending = initialize_checkout_once(&clone_dir, &url, &rev, pending).await?;
 
     let identity = lock.identity.clone();
     let marker_clone_dir = clone_dir.clone();
-    tokio::task::spawn_blocking(move || publish_checkout_ready(&marker_clone_dir, &identity))
-        .await
-        .context("git-checkout marker task panicked")??;
+    let pending = tokio::task::spawn_blocking(move || -> Result<PendingOsLock> {
+        publish_checkout_ready(&marker_clone_dir, &identity)?;
+        Ok(pending)
+    })
+    .await
+    .context("git-checkout marker task panicked")??;
 
     // Downgrade and publish the in-process Shared state inside one blocking
     // closure: no async cancellation point may split those two state changes.
@@ -867,7 +966,7 @@ async fn initialize_process_clone_lock(
 /// one-time clone/repair, publishes the marker, and downgrades its ONE registry
 /// fd to SH. Other processes poll nonblocking until they can take SH. Within a
 /// process, all tasks share that one fd through an async RwLock; no task ever
-/// opens or flocks the inode a second time.
+/// flocks the inode a second time.
 pub(crate) async fn ensure_git_checkout(
     url: &str,
     rev: &str,
@@ -929,7 +1028,7 @@ pub(crate) async fn ensure_git_checkout(
     }
 
     // Validate the full identity even on the process-local Shared fast path.
-    // This catches a truncated checkout-path hash collision or external cache
+    // This catches a truncated checkout-path hash collision or marker
     // deletion/corruption without ever re-enabling a destructive writer.
     let marker = checkout_ready_marker(&clone_dir);
     let marker_contents = tokio::fs::read(&marker)
@@ -952,29 +1051,53 @@ pub(crate) async fn ensure_git_checkout(
 /// process-local reader lease alive; internal callers pass that same lease
 /// through all subsequent source-tree injection reads.
 #[derive(Debug)]
-pub struct GitWheelBuild {
-    pub wheel_path: PathBuf,
-    pub resolved_sha: String,
+pub(crate) struct GitWheelBuild {
+    wheel_path: PathBuf,
+    resolved_sha: String,
     checkout: GitCheckout,
 }
 
 impl GitWheelBuild {
-    pub fn checkout_root(&self) -> &Path {
-        self.checkout.root()
-    }
-
     pub(crate) fn into_parts(self) -> (PathBuf, String, GitCheckout) {
         (self.wheel_path, self.resolved_sha, self.checkout)
     }
 }
 
-/// Build a wheel from a clone-once git checkout and return the resolved commit
-/// SHA plus the reader lease. `rev` may be a commit, tag, or branch; callers
-/// that continue reading the checkout must keep the returned value alive.
+/// Internal leased build boundary. The handler retains this result across its
+/// subsequent source-tree injection phases.
+pub(crate) async fn build_wheel_from_git_leased(
+    url: &str,
+    rev: &str,
+    subdirectory: &str,
+    cache_dir: &Path,
+    out_dir: &Path,
+    python_version: &str,
+) -> Result<GitWheelBuild> {
+    build_wheel_from_git_inner(url, rev, subdirectory, cache_dir, out_dir, python_version).await
+}
+
+/// Build a wheel from a clone-once git checkout and return its path plus the
+/// resolved commit SHA. The checkout stays under the process's retained SH
+/// lock for this complete operation. `rev` may be a commit, tag, or branch.
 ///
 /// The emitted wheel filename is also checked for non-reproducible
 /// `setuptools_scm` markers (`.devN`, `.dYYYYMMDD`, and `+g<sha>`).
 pub async fn build_wheel_from_git(
+    url: &str,
+    rev: &str,
+    subdirectory: &str,
+    cache_dir: &Path,
+    out_dir: &Path,
+    python_version: &str,
+) -> Result<(PathBuf, String)> {
+    let build =
+        build_wheel_from_git_inner(url, rev, subdirectory, cache_dir, out_dir, python_version)
+            .await?;
+    let (wheel_path, resolved_sha, _checkout) = build.into_parts();
+    Ok((wheel_path, resolved_sha))
+}
+
+async fn build_wheel_from_git_inner(
     url: &str,
     rev: &str,
     subdirectory: &str,
@@ -1233,6 +1356,8 @@ async fn checkout_rev_robust(clone_dir: &Path, target: &str) -> Result<bool> {
     // checkout itself, wheel output lands in a separate out_dir), then
     // retry once. If `target` still isn't resolvable locally, this
     // second attempt fails the same way a doomed checkout always would.
+    #[cfg(test)]
+    record_checkout_repair(clone_dir);
     run_silent(
         Command::new("git")
             .args(["clean", "-fdx"])
@@ -1278,6 +1403,147 @@ fn git_slug(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const CHECKOUT_SUBPROCESS_HELPER: &str = "source_build::tests::git_checkout_subprocess_helper";
+
+    struct CheckoutTestChild {
+        child: Option<std::process::Child>,
+        label: String,
+    }
+
+    impl CheckoutTestChild {
+        fn spawn(label: &str, mode: &str, environment: &[(&str, String)]) -> Self {
+            let mut command = std::process::Command::new(
+                std::env::current_exe().expect("locate current Rust test executable"),
+            );
+            command
+                .args([
+                    "--exact",
+                    CHECKOUT_SUBPROCESS_HELPER,
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("RETREAD_TEST_CHILD_MODE", mode)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            for (name, value) in environment {
+                command.env(name, value);
+            }
+            let child = command.spawn().expect("spawn checkout test subprocess");
+            Self {
+                child: Some(child),
+                label: label.to_string(),
+            }
+        }
+
+        fn wait_for_signal(&mut self, path: &Path, timeout: Duration) {
+            let deadline = std::time::Instant::now() + timeout;
+            loop {
+                if path.exists() {
+                    return;
+                }
+                if let Some(status) = self
+                    .child
+                    .as_mut()
+                    .expect("checkout test child already consumed")
+                    .try_wait()
+                    .expect("poll checkout test subprocess")
+                {
+                    let output = self
+                        .child
+                        .take()
+                        .expect("checkout test child already consumed")
+                        .wait_with_output()
+                        .expect("collect checkout test subprocess output");
+                    panic!(
+                        "{} exited before signal {} ({status}):\nstdout:\n{}\nstderr:\n{}",
+                        self.label,
+                        path.display(),
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr),
+                    );
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{} timed out waiting for signal {}",
+                    self.label,
+                    path.display(),
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        fn finish(mut self, timeout: Duration) {
+            let deadline = std::time::Instant::now() + timeout;
+            loop {
+                let status = self
+                    .child
+                    .as_mut()
+                    .expect("checkout test child already consumed")
+                    .try_wait()
+                    .expect("poll checkout test subprocess");
+                if let Some(status) = status {
+                    let output = self
+                        .child
+                        .take()
+                        .expect("checkout test child already consumed")
+                        .wait_with_output()
+                        .expect("collect checkout test subprocess output");
+                    assert!(
+                        status.success(),
+                        "{} failed ({status}):\nstdout:\n{}\nstderr:\n{}",
+                        self.label,
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr),
+                    );
+                    return;
+                }
+                if std::time::Instant::now() >= deadline {
+                    let mut child = self
+                        .child
+                        .take()
+                        .expect("checkout test child already consumed");
+                    let _ = child.kill();
+                    let output = child
+                        .wait_with_output()
+                        .expect("collect timed-out checkout test subprocess output");
+                    panic!(
+                        "{} timed out and was killed:\nstdout:\n{}\nstderr:\n{}",
+                        self.label,
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr),
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    impl Drop for CheckoutTestChild {
+        fn drop(&mut self) {
+            let Some(child) = self.child.as_mut() else {
+                return;
+            };
+            if child.try_wait().ok().flatten().is_none() {
+                let _ = child.kill();
+            }
+            let _ = child.wait();
+        }
+    }
+
+    async fn wait_for_checkout_signal(variable: &str) {
+        let path = PathBuf::from(
+            std::env::var_os(variable)
+                .unwrap_or_else(|| panic!("checkout test subprocess missing {variable}")),
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !path.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {variable} at {}", path.display()));
+    }
 
     #[test]
     fn git_slug_strips_github_prefix() {
@@ -1597,11 +1863,10 @@ version = "0.1.0"
         std::fs::create_dir_all(&out_dir).expect("out dir");
         let repo_url = format!("file://{}", repo.display());
 
-        let (wheel_path, resolved_sha, _checkout) =
+        let (wheel_path, resolved_sha) =
             build_wheel_from_git(&repo_url, &expected_sha, ".", &cache_dir, &out_dir, "3.11")
                 .await
-                .expect("build_wheel_from_git")
-                .into_parts();
+                .expect("build_wheel_from_git");
 
         // The returned SHA must match what git reports.
         assert_eq!(
@@ -1662,13 +1927,10 @@ version = "0.1.0"
     }
 
     fn git_checkout_fixture(label: &str) -> GitCheckoutFixture {
-        static NEXT_FIXTURE: std::sync::atomic::AtomicU64 =
-            std::sync::atomic::AtomicU64::new(0);
+        static NEXT_FIXTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
-        let base = std::env::temp_dir().join(format!(
-            "retread-{label}-{}-{sequence}",
-            std::process::id()
-        ));
+        let base =
+            std::env::temp_dir().join(format!("retread-{label}-{}-{sequence}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let repo = base.join("repo");
         let cache = base.join("cache");
@@ -1710,6 +1972,94 @@ version = "0.1.0"
         clone_dir
     }
 
+    /// Entry point used only by parent tests that need a killable process
+    /// boundary. Running it without a mode is an intentional no-op so the
+    /// normal libtest pass can include this helper safely.
+    #[test]
+    fn git_checkout_subprocess_helper() {
+        let Ok(mode) = std::env::var("RETREAD_TEST_CHILD_MODE") else {
+            return;
+        };
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build checkout test runtime");
+
+        match mode.as_str() {
+            "same-process-readers" => runtime.block_on(async {
+                let fixture = git_checkout_fixture("child-two-readers");
+                let barrier = Arc::new(tokio::sync::Barrier::new(3));
+
+                let first_barrier = Arc::clone(&barrier);
+                let first_url = fixture.url.clone();
+                let first_rev = fixture.rev2.clone();
+                let first_cache = fixture.cache.clone();
+                let first = tokio::spawn(async move {
+                    first_barrier.wait().await;
+                    ensure_git_checkout(&first_url, &first_rev, &first_cache).await
+                });
+
+                let second_barrier = Arc::clone(&barrier);
+                let second_url = fixture.url.clone();
+                let second_rev = fixture.rev2.clone();
+                let second_cache = fixture.cache.clone();
+                let second = tokio::spawn(async move {
+                    second_barrier.wait().await;
+                    ensure_git_checkout(&second_url, &second_rev, &second_cache).await
+                });
+
+                barrier.wait().await;
+                wait_for_checkout_signal("RETREAD_TEST_EXCLUSIVE_HELD").await;
+                wait_for_checkout_signal("RETREAD_TEST_SECOND_REGISTRATION").await;
+                assert!(
+                    !first.is_finished() && !second.is_finished(),
+                    "a checkout reader completed while initialization was paused under EX"
+                );
+                let release = PathBuf::from(
+                    std::env::var_os("RETREAD_TEST_EXCLUSIVE_RELEASE")
+                        .expect("missing initializer release path"),
+                );
+                std::fs::write(&release, b"release\n").expect("release checkout initializer");
+
+                let (first, second) = tokio::time::timeout(Duration::from_secs(10), async {
+                    (first.await, second.await)
+                })
+                .await
+                .expect("same-process checkout readers deadlocked");
+                let first = first
+                    .expect("first reader task panicked")
+                    .expect("first reader failed");
+                let second = second
+                    .expect("second reader task panicked")
+                    .expect("second reader failed");
+                assert!(Arc::ptr_eq(&first.lease.lock, &second.lease.lock));
+                assert_eq!(
+                    first.lease.lock.os_acquisitions.load(Ordering::Relaxed),
+                    1,
+                    "same-process callers took more than one OS flock"
+                );
+            }),
+            "warm-reader" => runtime.block_on(async {
+                let url = std::env::var("RETREAD_TEST_GIT_URL").expect("missing git URL");
+                let rev = std::env::var("RETREAD_TEST_GIT_REV").expect("missing git rev");
+                let cache = PathBuf::from(
+                    std::env::var_os("RETREAD_TEST_GIT_CACHE").expect("missing git cache"),
+                );
+                let _checkout = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    ensure_git_checkout(&url, &rev, &cache),
+                )
+                .await
+                .expect("warm reader timed out")
+                .expect("warm reader failed");
+                signal_checkout_test_path("RETREAD_TEST_READER_ENTERED")
+                    .expect("signal warm reader entry");
+            }),
+            other => panic!("unknown checkout test child mode `{other}`"),
+        }
+    }
+
     /// The first access repairs an unmarked legacy tree and publishes it. Any
     /// later warm access is read-only: a sentinel that `git clean -fdx` would
     /// remove and an index lock that would force wipe/reclone both survive.
@@ -1737,13 +2087,14 @@ version = "0.1.0"
             CheckoutMarkerState::Matching
         ));
         assert_eq!(
-            first
-                .lease
-                .lock
-                .os_acquisitions
-                .load(Ordering::Relaxed),
+            first.lease.lock.os_acquisitions.load(Ordering::Relaxed),
             1,
             "initialization must take the OS flock exactly once"
+        );
+        assert_eq!(
+            checkout_repair_count(&clone_dir),
+            1,
+            "the unpublished checkout must run destructive repair exactly once"
         );
 
         let sentinel = clone_dir.join("warm-sentinel.txt");
@@ -1757,7 +2108,8 @@ version = "0.1.0"
         let url = fixture.url.clone();
         let rev = fixture.rev2.clone();
         let cache = fixture.cache.clone();
-        let second_task = tokio::spawn(async move { ensure_git_checkout(&url, &rev, &cache).await });
+        let second_task =
+            tokio::spawn(async move { ensure_git_checkout(&url, &rev, &cache).await });
         let second = tokio::time::timeout(Duration::from_secs(2), second_task)
             .await
             .expect("same-process warm reader deadlocked")
@@ -1765,13 +2117,31 @@ version = "0.1.0"
             .expect("warm reader failed");
         assert!(Arc::ptr_eq(&first.lease.lock, &second.lease.lock));
         assert_eq!(
-            second
-                .lease
-                .lock
-                .os_acquisitions
-                .load(Ordering::Relaxed),
+            second.lease.lock.os_acquisitions.load(Ordering::Relaxed),
             1,
             "warm reader must reuse the process's one OS flock"
+        );
+        let fresh_reader_entered = fixture.base.join("fresh-reader-entered");
+        CheckoutTestChild::spawn(
+            "fresh-process warm checkout reader",
+            "warm-reader",
+            &[
+                ("RETREAD_TEST_GIT_URL", fixture.url.clone()),
+                ("RETREAD_TEST_GIT_REV", fixture.rev2.clone()),
+                (
+                    "RETREAD_TEST_GIT_CACHE",
+                    fixture.cache.display().to_string(),
+                ),
+                (
+                    "RETREAD_TEST_READER_ENTERED",
+                    fresh_reader_entered.display().to_string(),
+                ),
+            ],
+        )
+        .finish(Duration::from_secs(15));
+        assert!(
+            fresh_reader_entered.exists(),
+            "fresh process never acquired the warm shared-reader path"
         );
         assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "preserve me\n");
         assert!(index_lock.exists(), "warm access ran checkout or recloned");
@@ -1780,43 +2150,109 @@ version = "0.1.0"
             marker_before
         );
         assert_eq!(std::fs::read(&head_log).unwrap(), head_log_before);
+        assert_eq!(
+            checkout_repair_count(&clone_dir),
+            1,
+            "warm access must not run destructive repair again"
+        );
     }
 
-    /// Two cold callers in separate Tokio workers single-flight through the
-    /// production entry and both become readers without reopening/re-flocking.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn same_process_two_thread_checkout_reads_do_not_deadlock() {
-        let fixture = git_checkout_fixture("two-readers");
-        let first_url = fixture.url.clone();
-        let first_rev = fixture.rev2.clone();
-        let first_cache = fixture.cache.clone();
-        let second_url = fixture.url.clone();
-        let second_rev = fixture.rev2.clone();
-        let second_cache = fixture.cache.clone();
-        let first = tokio::spawn(async move {
-            ensure_git_checkout(&first_url, &first_rev, &first_cache).await
-        });
-        let second = tokio::spawn(async move {
-            ensure_git_checkout(&second_url, &second_rev, &second_cache).await
-        });
-        let (first, second) = tokio::time::timeout(Duration::from_secs(10), async {
-            (first.await, second.await)
-        })
-        .await
-        .expect("same-process checkout readers deadlocked");
-        let first = first.expect("first reader task panicked").expect("first reader failed");
-        let second = second
-            .expect("second reader task panicked")
-            .expect("second reader failed");
-        assert!(Arc::ptr_eq(&first.lease.lock, &second.lease.lock));
-        assert_eq!(
-            first
-                .lease
-                .lock
-                .os_acquisitions
-                .load(Ordering::Relaxed),
-            1,
-            "same-process callers took more than one OS flock"
+    /// The subprocess boundary makes this regression killable even if a future
+    /// implementation blocks a runtime thread in `flock`. Test hooks pause the
+    /// winner after EX and prove the second worker registered before release.
+    #[test]
+    fn same_process_two_thread_checkout_reads_do_not_deadlock() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let signals = std::env::temp_dir().join(format!(
+            "retread-two-reader-signals-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&signals).unwrap();
+        let exclusive_held = signals.join("exclusive-held");
+        let exclusive_release = signals.join("exclusive-release");
+        let second_registration = signals.join("second-registration");
+        CheckoutTestChild::spawn(
+            "same-process checkout reader probe",
+            "same-process-readers",
+            &[
+                (
+                    "RETREAD_TEST_EXCLUSIVE_HELD",
+                    exclusive_held.display().to_string(),
+                ),
+                (
+                    "RETREAD_TEST_EXCLUSIVE_RELEASE",
+                    exclusive_release.display().to_string(),
+                ),
+                (
+                    "RETREAD_TEST_SECOND_REGISTRATION",
+                    second_registration.display().to_string(),
+                ),
+            ],
+        )
+        .finish(Duration::from_secs(15));
+        assert!(exclusive_held.exists());
+        assert!(second_registration.exists());
+        assert!(exclusive_release.exists());
+        let _ = std::fs::remove_dir_all(&signals);
+    }
+
+    /// A production reader must observe the same cross-process writer lock as
+    /// the one-time initializer. The child signals only after an SH attempt is
+    /// denied, so the exclusion assertion does not depend on scheduler timing.
+    #[cfg(unix)]
+    #[test]
+    fn published_checkout_reader_waits_for_cross_process_writer() {
+        let fixture = git_checkout_fixture("cross-process-rw");
+        let clone_dir = seed_unmarked_checkout(&fixture, &fixture.rev2);
+        publish_checkout_ready(&clone_dir, &CloneIdentity::new(&fixture.url, &fixture.rev2))
+            .expect("publish cross-process reader fixture");
+
+        let lock_path = clone_dir.with_extension("lock");
+        let writer = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("open cross-process writer lock");
+        fs4::fs_std::FileExt::lock_exclusive(&writer).expect("acquire cross-process writer lock");
+
+        let shared_blocked = fixture.base.join("shared-blocked");
+        let reader_entered = fixture.base.join("reader-entered");
+        let mut child = CheckoutTestChild::spawn(
+            "cross-process shared-reader probe",
+            "warm-reader",
+            &[
+                ("RETREAD_TEST_GIT_URL", fixture.url.clone()),
+                ("RETREAD_TEST_GIT_REV", fixture.rev2.clone()),
+                (
+                    "RETREAD_TEST_GIT_CACHE",
+                    fixture.cache.display().to_string(),
+                ),
+                (
+                    "RETREAD_TEST_SHARED_BLOCKED",
+                    shared_blocked.display().to_string(),
+                ),
+                (
+                    "RETREAD_TEST_READER_ENTERED",
+                    reader_entered.display().to_string(),
+                ),
+            ],
+        );
+        child.wait_for_signal(&shared_blocked, Duration::from_secs(5));
+        assert!(
+            !reader_entered.exists(),
+            "shared reader entered while the cross-process writer held EX"
+        );
+
+        fs4::fs_std::FileExt::unlock(&writer).expect("release cross-process writer lock");
+        child.finish(Duration::from_secs(10));
+        assert!(
+            reader_entered.exists(),
+            "shared reader did not enter after the writer released EX"
         );
     }
 
@@ -1843,6 +2279,64 @@ version = "0.1.0"
             CheckoutMarkerState::Matching
         ));
     }
+
+    /// A failed initializer must release EX and leave the process registry
+    /// retryable on the same fd. Otherwise one bad clone attempt permanently
+    /// wedges every later worker in the same backend process.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_checkout_initialization_releases_lock_for_retry() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "retread-retry-init-{}-{unique}",
+            std::process::id()
+        ));
+        let repo = base.join("repo-created-after-failure");
+        let cache = base.join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        let url = format!("file://{}", repo.display());
+
+        let first = tokio::time::timeout(
+            Duration::from_secs(10),
+            ensure_git_checkout(&url, "main", &cache),
+        )
+        .await
+        .expect("failing checkout attempt deadlocked");
+        assert!(first.is_err(), "missing source unexpectedly initialized");
+        let clone_dir = git_checkout_root(&url, "main", &cache);
+        assert!(
+            !checkout_ready_marker(&clone_dir).exists(),
+            "failed initialization published readiness"
+        );
+
+        std::fs::create_dir_all(&repo).unwrap();
+        run_fixture_git(&["init", "-b", "main"], &repo);
+        std::fs::write(repo.join("after-retry.txt"), "ready\n").unwrap();
+        run_fixture_git(&["add", "."], &repo);
+        run_fixture_git(&["commit", "-m", "available"], &repo);
+
+        let checkout = tokio::time::timeout(
+            Duration::from_secs(10),
+            ensure_git_checkout(&url, "main", &cache),
+        )
+        .await
+        .expect("retry after failed initialization deadlocked")
+        .expect("retry after failed initialization failed");
+        assert_eq!(checkout.root(), clone_dir);
+        assert_eq!(
+            std::fs::read_to_string(clone_dir.join("after-retry.txt")).unwrap(),
+            "ready\n"
+        );
+        assert_eq!(
+            checkout.lease.lock.os_acquisitions.load(Ordering::Relaxed),
+            2,
+            "retry must reuse the registry fd after releasing the failed EX"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn git_wheel_cache_dir_is_keyed_by_all_inputs() {
         let a = git_wheel_cache_dir(

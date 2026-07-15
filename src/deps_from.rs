@@ -110,7 +110,7 @@ impl DepsFromNotice {
 }
 
 /// Fetched source text plus the origin needed to interpret relative paths.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct FetchedDepSource {
     pub content: String,
     pub filename_hint: String,
@@ -121,6 +121,41 @@ pub struct FetchedDepSource {
     /// Retains the git checkout reader while parsing may inspect paths
     /// relative to `filesystem_base`. Non-git sources do not need a lease.
     _git_checkout: Option<crate::source_build::GitCheckout>,
+}
+
+impl PartialEq for FetchedDepSource {
+    fn eq(&self, other: &Self) -> bool {
+        self.content == other.content
+            && self.filename_hint == other.filename_hint
+            && self.filesystem_base == other.filesystem_base
+            && self.display_origin == other.display_origin
+    }
+}
+
+impl Eq for FetchedDepSource {}
+
+impl FetchedDepSource {
+    /// Construct a fetched local or URL source. Git fetches use the same
+    /// public value type internally while attaching their checkout lease.
+    pub fn new(
+        content: String,
+        filename_hint: String,
+        filesystem_base: Option<PathBuf>,
+        display_origin: String,
+    ) -> Self {
+        Self {
+            content,
+            filename_hint,
+            filesystem_base,
+            display_origin,
+            _git_checkout: None,
+        }
+    }
+
+    fn with_git_checkout(mut self, checkout: crate::source_build::GitCheckout) -> Self {
+        self._git_checkout = Some(checkout);
+        self
+    }
 }
 
 /// Parse a fetched dependency source into typed closure inputs.
@@ -705,13 +740,12 @@ pub async fn fetch_dep_source(
                 .await
                 .with_context(|| format!("reading local dep source {}", resolved.display()))?;
             let hint = filename_of(&resolved)?;
-            Ok(FetchedDepSource {
+            Ok(FetchedDepSource::new(
                 content,
-                filename_hint: hint,
-                filesystem_base: resolved.parent().map(Path::to_path_buf),
-                display_origin: resolved.display().to_string(),
-                _git_checkout: None,
-            })
+                hint,
+                resolved.parent().map(Path::to_path_buf),
+                resolved.display().to_string(),
+            ))
         }
         DepSource::Git { git, rev, path } => {
             let checkout = crate::source_build::ensure_git_checkout(git, rev, cache_dir)
@@ -727,13 +761,13 @@ pub async fn fetch_dep_source(
                     )
                 })?;
             let hint = filename_of(Path::new(path))?;
-            Ok(FetchedDepSource {
+            Ok(FetchedDepSource::new(
                 content,
-                filename_hint: hint,
-                filesystem_base: file_path.parent().map(Path::to_path_buf),
-                display_origin: format!("{git}@{rev}:{path}"),
-                _git_checkout: Some(checkout),
-            })
+                hint,
+                file_path.parent().map(Path::to_path_buf),
+                format!("{git}@{rev}:{path}"),
+            )
+            .with_git_checkout(checkout))
         }
         DepSource::Url(u) => {
             let content = fetch_url_cached(u, cache_dir).await?;
@@ -745,13 +779,7 @@ pub async fn fetch_dep_source(
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
                 .ok_or_else(|| anyhow::anyhow!("URL has no filename component: {u}"))?;
-            Ok(FetchedDepSource {
-                content,
-                filename_hint: hint,
-                filesystem_base: None,
-                display_origin: u.clone(),
-                _git_checkout: None,
-            })
+            Ok(FetchedDepSource::new(content, hint, None, u.clone()))
         }
     }
 }
@@ -834,23 +862,21 @@ mod tests {
     use super::*;
 
     fn fetched(content: &str, filename_hint: &str) -> FetchedDepSource {
-        FetchedDepSource {
-            content: content.to_string(),
-            filename_hint: filename_hint.to_string(),
-            filesystem_base: None,
-            display_origin: format!("test:{filename_hint}"),
-            _git_checkout: None,
-        }
+        FetchedDepSource::new(
+            content.to_string(),
+            filename_hint.to_string(),
+            None,
+            format!("test:{filename_hint}"),
+        )
     }
 
     fn fetched_at(content: &str, filename_hint: &str, base: &Path) -> FetchedDepSource {
-        FetchedDepSource {
-            content: content.to_string(),
-            filename_hint: filename_hint.to_string(),
-            filesystem_base: Some(base.to_path_buf()),
-            display_origin: base.join(filename_hint).display().to_string(),
-            _git_checkout: None,
-        }
+        FetchedDepSource::new(
+            content.to_string(),
+            filename_hint.to_string(),
+            Some(base.to_path_buf()),
+            base.join(filename_hint).display().to_string(),
+        )
     }
 
     /// Modeled on ProtoMotions' requirements_isaaclab.txt.

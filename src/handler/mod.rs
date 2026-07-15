@@ -5940,7 +5940,7 @@ async fn materialize_and_rewrite(
         })?;
         let subdir = entry.subdirectory.as_deref().unwrap_or(".");
         let out = download_dir.join(entry_name);
-        let build = crate::source_build::build_wheel_from_git(
+        let build = crate::source_build::build_wheel_from_git_leased(
             &src.url,
             &src.rev,
             subdir,
@@ -6013,7 +6013,7 @@ async fn materialize_and_rewrite(
             .ok_or_else(|| anyhow!("git source `{entry_name}` missing rev"))?;
         let subdir = entry.subdirectory.as_deref().unwrap_or(".");
         let out = download_dir.join(entry_name);
-        let build = crate::source_build::build_wheel_from_git(
+        let build = crate::source_build::build_wheel_from_git_leased(
             git_url,
             rev,
             subdir,
@@ -6133,9 +6133,7 @@ async fn materialize_and_rewrite(
     let mut auto_data_file_count: Option<usize> = None;
     let with_data_path = if let Some(cfg) = auto_data.as_ref() {
         let checkout = git_checkout.as_ref().ok_or_else(|| {
-            anyhow!(
-                "phase 1.6 checkout-root auto-data requested for non-git entry `{entry_name}`"
-            )
+            anyhow!("phase 1.6 checkout-root auto-data requested for non-git entry `{entry_name}`")
         })?;
         if cfg.checkout_root.as_path() != checkout.root() {
             bail!(
@@ -7248,8 +7246,8 @@ async fn emit_wheels_from_lock(
                     // Build a synthetic WheelEntry{git:url, rev:resolved-SHA, subdirectory,
                     // extras} and hand it to materialize_and_rewrite exactly as the
                     // produce path would. Named-vs-inline parity is pre-resolved (DESIGN A):
-                    // both arms call the identical build_wheel_from_git via
-                    // checkout_root_for_entry; extras do not reach the wheel build (they
+                    // both arms call the identical leased git build through
+                    // materialize_and_rewrite; extras do not reach the wheel build (they
                     // drive BFS closure only), so collapsing a named-git entry to an inline
                     // synth {git:url, rev:SHA} yields a byte-identical wheel.
                     //
