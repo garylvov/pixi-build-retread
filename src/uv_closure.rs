@@ -2589,20 +2589,42 @@ pub struct ConflictAttribution {
     pub conda_source: ConstraintProvenance,
 }
 
-/// One graph-wide uv override learned from a proven contradiction between an
-/// upstream exact pin and a precise workspace-solved conda fact.
+/// One graph-wide uv override learned from a precise workspace-solved conda
+/// fact. Two shapes: a Rule-3 version override (an upstream exact pin proven to
+/// contradict the fact is replaced with the conda-selected version), or a
+/// Rule-1 drop (the workspace conda-OWNS the dep and its PyPI requirement is
+/// unsatisfiable, so the wheel-side requirement is removed graph-wide and the
+/// conda owner provides it at runtime).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceFactOverride {
     /// Canonical PyPI name uv resolves.
     pub pypi_name: String,
     /// PEP 440 version selected by every precise consuming environment's
-    /// conda solve.
+    /// conda solve. For a `drop`, this is retained only as the owning conda
+    /// version for provenance/logging -- the emitted requirement carries no
+    /// version.
     pub version: String,
+    /// When true this is a Rule-1 DROP, not a Rule-3 version pin: the workspace
+    /// conda-owns `pypi_name` (through a retread-name-map edge, possibly the
+    /// identity edge) and its PyPI requirement could not be satisfied, so the
+    /// requirement is removed from uv's graph entirely (unmatchable marker) and
+    /// the conda package owns the import at runtime. Defaulted for back-compat
+    /// with heal-fact files written before drops existed.
+    #[serde(default)]
+    pub drop: bool,
 }
 
 impl WorkspaceFactOverride {
     fn requirement(&self) -> String {
-        format!("{}=={}", self.pypi_name, self.version)
+        if self.drop {
+            // Graph-wide unmatchable-marker override: same mechanism as
+            // `retread-drop-deps` and the workspace-owned `[pypi-dependencies]`
+            // drop, so the removal covers a transitive `Requires-Dist` exact
+            // pin, not just a direct root.
+            format!("{} ; {DROP_MARKER}", self.pypi_name)
+        } else {
+            format!("{}=={}", self.pypi_name, self.version)
+        }
     }
 }
 
@@ -2731,8 +2753,84 @@ fn workspace_fact_override_needed(
             fact: WorkspaceFactOverride {
                 pypi_name: constraint_name,
                 version: fact_version.to_string(),
+                drop: false,
             },
             upstream_pin: required.to_string(),
+            original_error: original_error.to_string(),
+        });
+    }
+    None
+}
+
+/// Select the first Rule-1 DROP the failed lock authorizes: a transitive
+/// dependency the workspace conda-OWNS (through a precise workspace-solved
+/// fact, i.e. a retread-name-map edge whose conda target every consuming
+/// environment declares) whose PyPI requirement neither Pass A nor Pass B
+/// could satisfy. The conda owner provides the import at runtime, so the
+/// wheel-side requirement is removed graph-wide rather than erroring.
+///
+/// This is the Rule-1 complement of [`workspace_fact_override_needed`]: Rule 3
+/// fires when an upstream EXACT pin CONTRADICTS the fact (replace it with the
+/// conda version, which exists on PyPI); this fires when the conda version
+/// SATISFIES the upstream requirement but PyPI cannot supply it (e.g. conda
+/// `py-opencv==4.11.0` maps to PyPI `opencv-python`, whose versions are
+/// `4.11.0.86`-style -- `opencv-python==4.11.0` simply does not exist). It is
+/// invoked only after Rule 3 declines and after Pass B also fails, so an
+/// ordinary conflict, an sdist-only heal, or a version override always wins
+/// first.
+///
+/// Guards preserved: only a `workspace-solved` provenance (never a routing
+/// alias) is ownership authority; a first-party direct root is user intent and
+/// is never dropped; and a DIFFERING upstream requirement must actually be
+/// SATISFIED by the conda version, or this is a genuine version conflict that
+/// keeps erroring rather than a conda-owned drop.
+fn workspace_owned_drop_needed(
+    req: &UvClosureRequest,
+    attributions: &[ConflictAttribution],
+    original_error: &str,
+) -> Option<WorkspaceFactOverrideNeeded> {
+    for attribution in attributions {
+        // Only a precise workspace-solved conda fact is ownership authority.
+        if attribution.conda_source.source != "workspace-solved" {
+            continue;
+        }
+        // A first-party direct root is the user's explicit intent, not an
+        // upstream requirement -- never silently drop it.
+        if request_has_direct_root(req, &attribution.package) {
+            continue;
+        }
+        // The owning conda version (an exact `==` from the workspace solve).
+        let Some((_, conda_version)) = exact_pep440_pin(&attribution.conda_source.conda_version)
+        else {
+            continue;
+        };
+        // Relying on the conda package at runtime is only correct when the
+        // conda-selected version SATISFIES what the wheel required. `required
+        // == None` means uv's upstream pin equalled our conda-derived
+        // constraint (attribute_conflict elides the echo of our own line), so
+        // the conda version trivially satisfies it -- exactly the
+        // `opencv-python==4.11.0` shape. A differing range/pin must actually
+        // contain the conda version.
+        if let Some(required) = attribution.required.as_deref() {
+            let Ok(required_specs) =
+                uv_pep508::uv_pep440::VersionSpecifiers::from_str(required)
+            else {
+                continue;
+            };
+            if !required_specs.contains(&conda_version) {
+                continue;
+            }
+        }
+        return Some(WorkspaceFactOverrideNeeded {
+            fact: WorkspaceFactOverride {
+                pypi_name: canonical_conda_name(&attribution.package),
+                version: conda_version.to_string(),
+                drop: true,
+            },
+            upstream_pin: attribution
+                .required
+                .clone()
+                .unwrap_or_else(|| attribution.conflicting_constraint.clone()),
             original_error: original_error.to_string(),
         });
     }
@@ -2871,13 +2969,24 @@ where
                         if !inserted {
                             return Err(anyhow!(original_error));
                         }
-                        tracing::info!(
-                            bundle = %req.bundle,
-                            package = %name,
-                            upstream_pin = %needed.upstream_pin,
-                            conda_version = %needed.fact.version,
-                            "uv closure: replacing upstream exact pin with precise workspace conda fact",
-                        );
+                        if needed.fact.drop {
+                            tracing::info!(
+                                bundle = %req.bundle,
+                                package = %name,
+                                upstream_requirement = %needed.upstream_pin,
+                                conda_version = %needed.fact.version,
+                                "uv closure: dropping workspace-conda-owned dependency whose PyPI \
+                                 requirement is unsatisfiable; the conda owner provides it",
+                            );
+                        } else {
+                            tracing::info!(
+                                bundle = %req.bundle,
+                                package = %name,
+                                upstream_pin = %needed.upstream_pin,
+                                conda_version = %needed.fact.version,
+                                "uv closure: replacing upstream exact pin with precise workspace conda fact",
+                            );
+                        }
                         req.overrides.push(needed.fact.requirement());
                         attempt = {
                             let mut locked = solve.lock().unwrap();
@@ -3628,6 +3737,17 @@ pub async fn compute_closure(
             if let Some(needed) =
                 workspace_fact_override_needed(req, &pass_b_attributions, &pass_b_error)
             {
+                return Err(anyhow::Error::new(needed));
+            }
+            // Rule 1 (last resort, both passes failed): a transitive dependency
+            // the workspace conda-OWNS whose PyPI requirement neither pass could
+            // satisfy (e.g. an exact `Requires-Dist` pin on a version that only
+            // exists in conda's numbering, `opencv-python==4.11.0` -> conda
+            // `py-opencv`). Drop it graph-wide so the closure succeeds and the
+            // conda owner supplies the import. Uses Pass A's attributions/error
+            // -- the surfaced diagnostic's provenance. Declines to the ordinary
+            // error for any non-owned or genuinely-conflicting name.
+            if let Some(needed) = workspace_owned_drop_needed(req, &attributions, &original_error) {
                 return Err(anyhow::Error::new(needed));
             }
             bail!("{original_error}");
@@ -4537,6 +4657,7 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
             WorkspaceFactOverride {
                 pypi_name: "torch".to_string(),
                 version: "2.10.0".to_string(),
+                drop: false,
             }
         );
         assert_eq!(needed.upstream_pin, "==2.11.0");
@@ -4606,15 +4727,221 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
         );
     }
 
+    // ---- Rule 1: conda-owned drop on an unsatisfiable PyPI requirement -----
+
+    /// A `workspace-solved` attribution whose conda owner (`conda_name`) may
+    /// differ from the PyPI name -- the retread-name-map case.
+    fn conda_owned_attribution(
+        package: &str,
+        conda_name: &str,
+        required: Option<&str>,
+        fact_version: &str,
+    ) -> ConflictAttribution {
+        ConflictAttribution {
+            package: package.to_string(),
+            required: required.map(str::to_string),
+            conflicting_constraint: format!("{package}=={fact_version}"),
+            conda_source: ConstraintProvenance {
+                constraint: format!("{package}=={fact_version}"),
+                conda_name: conda_name.to_string(),
+                conda_version: format!("=={fact_version}"),
+                source: "workspace-solved".to_string(),
+                env: "precise-consuming-envs".to_string(),
+                advisory: false,
+            },
+        }
+    }
+
+    /// The exact `sage` regression: a TRANSITIVE wheel (`isaacsim-core`) pins
+    /// `opencv-python==4.11.0`, a version that does not exist on PyPI (its
+    /// releases are `4.11.0.86`-style). The workspace conda-OWNS it through the
+    /// retread-name-map edge `opencv-python -> py-opencv`. Rule 3 cannot fire
+    /// (the upstream pin equals the conda-derived constraint, so `required` is
+    /// None), so Rule 1 must drop it -- graph-wide, reaching the transitive
+    /// `Requires-Dist` pin, not just a direct root.
+    #[test]
+    fn workspace_owned_impossible_transitive_pin_requests_drop() {
+        let mut req = sample_request();
+        req.dependencies = vec!["isaacsim-core==4.2.0.2".to_string()];
+        let prov = ConstraintProvenance {
+            constraint: "opencv-python==4.11.0".to_string(),
+            conda_name: "py-opencv".to_string(),
+            conda_version: "==4.11.0".to_string(),
+            source: "workspace-solved".to_string(),
+            env: "precise-consuming-envs".to_string(),
+            advisory: false,
+        };
+        req.constraints = ConstraintSet {
+            constraints: vec!["opencv-python==4.11.0".to_string()],
+            provenance: BTreeMap::from([("opencv-python".to_string(), prov)]),
+            auto_route_constraint_indices: BTreeSet::new(),
+        };
+        let stderr = "  x No solution found when resolving dependencies:\n  \
+             `-> Because there is no version of opencv-python==4.11.0 and \
+                 isaacsim-core==4.2.0.2 depends on opencv-python==4.11.0, we can \
+                 conclude that isaacsim-core==4.2.0.2 cannot be used.";
+        let attributions = attribute_conflict(stderr, &req.constraints.provenance);
+        // Faithful to the surfaced diagnostic ("is named in the conflict"):
+        // no differing upstream spec, so `required` is None.
+        assert_eq!(attributions.len(), 1, "{attributions:?}");
+        assert_eq!(attributions[0].required, None);
+        // Rule 3 correctly declines: there is no exact-pin CONTRADICTION.
+        assert!(
+            workspace_fact_override_needed(&req, &attributions, "err").is_none(),
+            "no contradiction, so Rule 3 must not fire"
+        );
+
+        let needed = workspace_owned_drop_needed(&req, &attributions, "uv lock failed")
+            .expect("conda-owned opencv-python with an impossible PyPI pin must request a drop");
+        assert_eq!(
+            needed.fact,
+            WorkspaceFactOverride {
+                pypi_name: "opencv-python".to_string(),
+                version: "4.11.0".to_string(),
+                drop: true,
+            }
+        );
+        // The emitted uv requirement removes it from the graph entirely.
+        assert_eq!(
+            needed.fact.requirement(),
+            format!("opencv-python ; {DROP_MARKER}")
+        );
+    }
+
+    /// The drop bridges the name-map for the DIRECT-name shape too, but a
+    /// first-party direct ROOT is the user's explicit intent and is never
+    /// dropped out from under them.
+    #[test]
+    fn workspace_owned_drop_declines_for_first_party_direct_root() {
+        let mut req = sample_request();
+        req.dependencies = vec!["opencv-python==4.11.0".to_string()];
+        let attribution = conda_owned_attribution("opencv-python", "py-opencv", None, "4.11.0");
+        assert!(
+            workspace_owned_drop_needed(&req, &[attribution], "err").is_none(),
+            "a first-party direct root is user intent, never a conda-owned drop"
+        );
+    }
+
+    /// A dep that is NOT conda-owned (no workspace-solved fact) with an
+    /// impossible pin still errors clearly -- the drop path must not fire and
+    /// the diagnostic is preserved.
+    #[test]
+    fn workspace_owned_drop_declines_without_ownership_authority() {
+        let mut req = sample_request();
+        req.dependencies = vec!["isaacsim-core==4.2.0.2".to_string()];
+        // A non-`workspace-solved` provenance is a routing alias, not fact
+        // authority, and cannot authorize a drop.
+        for source in ["manifest", "cuda-major-table", "auto-route", "deps-from-conda-advisory"] {
+            let attribution = workspace_attribution("opencv-python", None, "4.11.0", source);
+            assert!(
+                workspace_owned_drop_needed(&req, &[attribution], "err").is_none(),
+                "source `{source}` is not conda-ownership authority"
+            );
+        }
+        // A name uv mentions that is in NO provenance table yields no
+        // attribution at all -> the clear PyPI-unsatisfiable error survives.
+        let stderr = "  x No solution found: there is no version of totally-unowned==9.9.9";
+        let attributions = attribute_conflict(stderr, &req.constraints.provenance);
+        assert!(attributions.is_empty(), "{attributions:?}");
+        assert!(workspace_owned_drop_needed(&req, &attributions, "err").is_none());
+    }
+
+    /// The co-solvability guard is preserved: a DIFFERING upstream requirement
+    /// the conda owner's version does NOT satisfy is a genuine version conflict
+    /// (installing the conda version would violate the wheel), so Rule 1
+    /// abstains. A differing requirement the conda version DOES satisfy is a
+    /// legitimate conda-owned drop (PyPI can't supply it, conda can).
+    #[test]
+    fn workspace_owned_drop_respects_upstream_satisfiability() {
+        let mut req = sample_request();
+        req.dependencies = vec!["isaacsim-core==4.2.0.2".to_string()];
+
+        // conda `pytorch-gpu==2.10.0` (-> PyPI `torch`) cannot satisfy an
+        // upstream `>=2.11` requirement: dropping would install a forbidden
+        // version, so abstain (leave it to error / a real reconciliation).
+        let conflicting = conda_owned_attribution("torch", "pytorch-gpu", Some(">=2.11"), "2.10.0");
+        assert!(
+            workspace_owned_drop_needed(&req, &[conflicting], "err").is_none(),
+            "a conda version that violates the upstream range is a real conflict"
+        );
+
+        // A `>=2.0` requirement IS satisfied by the conda version 2.10.0: PyPI
+        // can't supply it but conda can, so this is a legitimate drop.
+        let satisfiable = conda_owned_attribution("torch", "pytorch-gpu", Some(">=2.0"), "2.10.0");
+        let needed = workspace_owned_drop_needed(&req, &[satisfiable], "err")
+            .expect("a satisfied-by-conda requirement is a legitimate conda-owned drop");
+        assert!(needed.fact.drop);
+        assert_eq!(needed.fact.pypi_name, "torch");
+    }
+
     // ---- auto-route (spec-uv-restructure M2) -------------------------------
 
     use std::sync::{Arc, Mutex};
+
+    /// The drop signal flows through the SAME retry wrapper as Rule 3: the
+    /// first solve fails asking for the drop, the retry injects the
+    /// unmatchable-marker override, the second solve succeeds, and the drop is
+    /// recorded as a learned (persistable) fact.
+    #[tokio::test]
+    async fn workspace_owned_drop_retry_injects_unmatchable_override() {
+        let seen = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+        let drop_line = format!("opencv-python ; {DROP_MARKER}");
+        let solve = {
+            let seen = Arc::clone(&seen);
+            let drop_line = drop_line.clone();
+            move |req: UvClosureRequest| {
+                let seen = Arc::clone(&seen);
+                let drop_line = drop_line.clone();
+                Box::pin(async move {
+                    seen.lock().unwrap().push(req.overrides.clone());
+                    if !req.overrides.iter().any(|o| o == &drop_line) {
+                        return Err(anyhow::Error::new(WorkspaceFactOverrideNeeded {
+                            fact: WorkspaceFactOverride {
+                                pypi_name: "opencv-python".to_string(),
+                                version: "4.11.0".to_string(),
+                                drop: true,
+                            },
+                            upstream_pin: "opencv-python==4.11.0".to_string(),
+                            original_error: "opencv-python unsatisfiable on PyPI".to_string(),
+                        }));
+                    }
+                    Ok(UvClosure {
+                        wheels: vec![],
+                        pins: BTreeMap::new(),
+                        uv_version: "test".to_string(),
+                        auto_routed: vec![],
+                        auto_dropped: BTreeSet::new(),
+                        effective_input_requirements: None,
+                    })
+                }) as futures::future::BoxFuture<'static, Result<UvClosure>>
+            }
+        };
+        let learned = Arc::new(Mutex::new(Vec::new()));
+        let mut solve = with_workspace_fact_overrides(solve, Arc::clone(&learned));
+        let _ = solve(sample_request()).await.unwrap();
+
+        let calls = seen.lock().unwrap();
+        assert_eq!(calls.len(), 2, "one failed attempt, one healed retry");
+        assert!(
+            !calls[0].iter().any(|o| o == &drop_line),
+            "first attempt is pre-drop"
+        );
+        assert!(
+            calls[1].iter().any(|o| o == &drop_line),
+            "retry carries the unmatchable-marker drop override"
+        );
+        let facts = learned.lock().unwrap();
+        assert_eq!(facts.len(), 1);
+        assert!(facts[0].drop, "the drop is recorded as a learned/persistable fact");
+        assert_eq!(facts[0].pypi_name, "opencv-python");
+    }
 
     fn workspace_fact_needed_error(name: &str, version: &str, upstream_pin: &str) -> anyhow::Error {
         anyhow::Error::new(WorkspaceFactOverrideNeeded {
             fact: WorkspaceFactOverride {
                 pypi_name: name.to_string(),
                 version: version.to_string(),
+                drop: false,
             },
             upstream_pin: upstream_pin.to_string(),
             original_error: format!("{name} exact-pin conflict"),
@@ -7408,14 +7735,17 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
                 WorkspaceFactOverride {
                     pypi_name: "torch".to_string(),
                     version: "2.10.0".to_string(),
+                    drop: false,
                 },
                 WorkspaceFactOverride {
                     pypi_name: "torchvision".to_string(),
                     version: "0.25.0".to_string(),
+                    drop: false,
                 },
                 WorkspaceFactOverride {
                     pypi_name: "torchaudio".to_string(),
                     version: "2.10.0".to_string(),
+                    drop: false,
                 },
             ],
             ..Default::default()
