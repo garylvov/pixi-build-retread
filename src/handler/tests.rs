@@ -530,6 +530,16 @@ fn courier_pure_python_bundle_is_platform_specific_not_noarch() {
         out.metadata.noarch.is_none(),
         "courier output must not be noarch"
     );
+    let advertised_host = out
+        .host_dependencies
+        .as_ref()
+        .expect("courier metadata must preserve host run-export derivation");
+    let advertised_host_names: Vec<&str> = advertised_host
+        .depends
+        .iter()
+        .map(|dep| dep.name.as_str())
+        .collect();
+    assert_eq!(advertised_host_names, ["python", "pip"]);
 
     // Control: the legacy (non-courier) path still emits noarch for a
     // pure-python bundle.

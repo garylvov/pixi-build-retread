@@ -464,7 +464,11 @@ pub fn build_courier_recipe_with_mode(
             script,
         },
         requirements: Requirements {
-            host: vec![python_pin],
+            // Courier's build script only stages files with shell commands;
+            // Python is a consumer/runtime requirement, not a build input.
+            // The protocol-level advertised host requirements stay intact so
+            // pixi can keep deriving and forwarding host run exports.
+            host: Vec::new(),
             run,
         },
         about: About {
@@ -503,6 +507,10 @@ mod courier_tests {
                 .any(|s| s == "torchaudio >=2.7,<3")
         );
         assert!(r.requirements.run.iter().any(|s| s == "uv"));
+        assert!(
+            r.requirements.host.is_empty(),
+            "courier packaging must not solve a redundant Python host prefix"
+        );
         // The installer binary SHIPS in the package (not a run-dep), so the
         // heavy backend never pollutes the consumer env.
         assert!(

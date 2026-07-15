@@ -369,7 +369,12 @@ pub const SCHEMA: u32 = 12;
 /// Epoch 13: conda environment deps-from sources now contribute nested pip
 /// roots and explicitly mapped advisory floors. Existing locks must
 /// cold-resolve so the uv closure reflects the structured YAML inputs.
-pub const EMIT_EPOCH: u32 = 13;
+///
+/// Epoch 14: courier recipes no longer create a redundant Python host prefix.
+/// Existing locks must rebuild so package metadata is derived from the
+/// runtime-only Python requirement while advertised host run exports remain
+/// available to pixi.
+pub const EMIT_EPOCH: u32 = 14;
 
 impl RetreadLock {
     /// File name for a bundle's lock next to the pack manifest.
