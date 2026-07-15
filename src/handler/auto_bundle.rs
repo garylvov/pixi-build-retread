@@ -1103,10 +1103,55 @@ fn route_group_is_fully_mutable(
             .all(|conflict| conflict.conda_name.key().as_str() != conda_name))
 }
 
+/// Does this canonical conda dependency have metadata supplied by a
+/// source-built wheel? Those requirements belong to the source package's
+/// natural run-dependency emission: the source wheel already ships in the
+/// bundle and is not a uv root that can be restored through Rule 2.
+///
+/// Route ownership is grouped by canonical conda identity because emission
+/// deduplicates at that boundary. One source-built PyPI alias therefore fixes
+/// the whole group; partially restoring another alias would still remove the
+/// shared conda dependency.
+fn metadata_route_group_has_source_built_origin(
+    metadata_routes: &ProvisionalMetadataRoutes,
+    observed_requirements: &ObservedRequirements,
+    conda_name: &str,
+) -> Result<bool> {
+    let Some(origins) = metadata_routes.get(conda_name) else {
+        return Ok(false);
+    };
+    for origin in origins {
+        let pypi_key = PypiKey::from_pypi(&origin.pypi_name);
+        let requirements = observed_requirements.get(&pypi_key).ok_or_else(|| {
+            anyhow!(
+                "provisional metadata route `{} -> {}` has no recorded Requires-Dist provenance",
+                origin.pypi_name,
+                origin.conda_name
+            )
+        })?;
+        if requirements.is_empty() {
+            return Err(anyhow!(
+                "provisional metadata route `{} -> {}` has an empty Requires-Dist provenance set",
+                origin.pypi_name,
+                origin.conda_name
+            ));
+        }
+        if requirements
+            .iter()
+            .any(|requirement| matches!(requirement.provenance, Provenance::SourceBuiltRelaxed))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Finalize every provisional conda route against the exact dependency set
-/// this bundle would emit. Both uv routes and metadata-probe routes are
-/// mutable until this check succeeds. Rejected routes are restored through
-/// the same ordered PyPI fallback chain before the bundle is changed.
+/// this bundle would emit. Uv routes and index-backed metadata routes are
+/// mutable until this check succeeds; source-built metadata routes remain
+/// owned by natural conda run-dependency emission. Rejected mutable routes are
+/// restored through the same ordered PyPI fallback chain before the bundle is
+/// changed.
 async fn jointly_unroute_unsolvable<C, CF, X, XF>(
     bundle: &mut Bundle,
     metadata_routes: &mut ProvisionalMetadataRoutes,
@@ -1180,6 +1225,13 @@ where
                 .any(|origin| fixed_by_config.contains(&canonical_conda_name(&origin.pypi_name)))
         });
         if uv_forced || metadata_forced {
+            continue;
+        }
+        if metadata_route_group_has_source_built_origin(
+            metadata_routes,
+            observed_requirements,
+            &conda_name,
+        )? {
             continue;
         }
         if route_group_is_fully_mutable(bundle, metadata_routes, &conda_name, config, target)? {
@@ -2081,6 +2133,85 @@ mod tests {
         }
     }
 
+    #[test]
+    fn source_built_metadata_alias_fixes_entire_conda_route_group() {
+        let specifiers = VersionSpecifiers::from_str(">=4.0.1,<4.1").unwrap();
+        let mut routes = ProvisionalMetadataRoutes::new();
+        let mut observed = ObservedRequirements::new();
+
+        record_metadata_route(
+            &mut routes,
+            "index-alias".to_string(),
+            "shared-conda-dep".to_string(),
+            None,
+        );
+        observe_requirement(
+            &mut observed,
+            "index-alias",
+            &specifiers,
+            "index wheel metadata".to_string(),
+            Provenance::IndexWheelMetadata,
+        );
+        assert!(
+            !metadata_route_group_has_source_built_origin(&routes, &observed, "shared-conda-dep")
+                .unwrap(),
+            "an index-only metadata route must remain mutable"
+        );
+
+        record_metadata_route(
+            &mut routes,
+            "source-alias".to_string(),
+            "shared-conda-dep".to_string(),
+            None,
+        );
+        observe_requirement(
+            &mut observed,
+            "source-alias",
+            &specifiers,
+            "source-built wheel metadata".to_string(),
+            Provenance::SourceBuiltRelaxed,
+        );
+        assert!(
+            metadata_route_group_has_source_built_origin(&routes, &observed, "shared-conda-dep")
+                .unwrap(),
+            "one source-built alias must fix the shared conda identity"
+        );
+    }
+
+    #[test]
+    fn metadata_route_source_ownership_requires_recorded_provenance() {
+        let mut routes = ProvisionalMetadataRoutes::new();
+        record_metadata_route(
+            &mut routes,
+            "orphan-origin".to_string(),
+            "orphan-conda-dep".to_string(),
+            None,
+        );
+
+        let missing = metadata_route_group_has_source_built_origin(
+            &routes,
+            &ObservedRequirements::new(),
+            "orphan-conda-dep",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            missing.contains("no recorded Requires-Dist provenance"),
+            "{missing}"
+        );
+
+        let mut empty = ObservedRequirements::new();
+        empty.insert(PypiKey::from_pypi("orphan-origin"), Vec::new());
+        let empty =
+            metadata_route_group_has_source_built_origin(&routes, &empty, "orphan-conda-dep")
+                .unwrap_err()
+                .to_string();
+        assert!(
+            empty.contains("empty Requires-Dist provenance set"),
+            "{empty}"
+        );
+    }
+
     fn repo_record(name: &str, version: &str, depends: &[&str]) -> RepoDataRecord {
         let mut package_record = PackageRecord::new(
             name.parse().unwrap(),
@@ -2176,6 +2307,14 @@ mod tests {
             "pillow".to_string(),
             None,
         );
+        let mut observed_requirements = ObservedRequirements::new();
+        observe_requirement(
+            &mut observed_requirements,
+            "pillow-metadata-alias",
+            &VersionSpecifiers::empty(),
+            "test index metadata route origin".to_string(),
+            Provenance::IndexWheelMetadata,
+        );
         let target = crate::pypi::WheelTarget::for_subdir("3.11", "linux-64");
         let context = UvReresolveContext {
             mode: UvReresolveMode::Enabled,
@@ -2186,7 +2325,7 @@ mod tests {
         let outcome = jointly_unroute_unsolvable(
             &mut bundle,
             &mut metadata_routes,
-            &ObservedRequirements::new(),
+            &observed_requirements,
             &[crate::workspace::DEFAULT_PYPI_INDEX.to_string()],
             &target,
             &test_config(),
@@ -2488,6 +2627,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn source_built_serveable_transitive_emits_conda_run_dependency() {
+        const NAME: &str = "serveable-transitive";
+        const RANGE: &str = ">=4.0.1,<4.1";
+
+        let probe_inputs = Arc::new(Mutex::new(Vec::<Vec<(String, String)>>::new()));
+        let probe = {
+            let probe_inputs = Arc::clone(&probe_inputs);
+            move |pairs: Vec<(String, String)>| {
+                probe_inputs.lock().unwrap().push(pairs.clone());
+                async move { validated_probe(pairs).await }
+            }
+        };
+        let solve_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let co_solve = {
+            let solve_calls = Arc::clone(&solve_calls);
+            move |_routes: Vec<crate::uv_closure::CondaRouteSpec>| {
+                solve_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async {
+                    crate::uv_closure::CoInstallVerdict::Unsat(vec![
+                        "unrelated fixed baseline is unsatisfiable".to_string(),
+                    ])
+                }
+            }
+        };
+        let fetch_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fetch = {
+            let fetch_calls = Arc::clone(&fetch_calls);
+            move |_request: PypiFetchRequest, _index: String| {
+                fetch_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { Ok(test_wheel(NAME, NAME, "4.0.1", &[])) }
+            }
+        };
+        let target = crate::pypi::WheelTarget::for_subdir("3.11", "linux-64");
+        let config = test_config();
+        let mut bundle = test_bundle(&[&format!("{NAME}{RANGE}")]);
+        bundle.primary.metadata.name = "source-built-pack".to_string();
+        bundle.primary.metadata_provenance = Provenance::SourceBuiltRelaxed;
+
+        auto_bundle_transitives_with(
+            &mut bundle,
+            &[crate::workspace::DEFAULT_PYPI_INDEX.to_string()],
+            &target,
+            &config,
+            None,
+            None,
+            None,
+            &probe,
+            &co_solve,
+            &fetch,
+            &["conda-forge/linux-64".to_string()],
+            &UvReresolveContext::default(),
+        )
+        .await
+        .unwrap();
+
+        let probed = probe_inputs
+            .lock()
+            .unwrap()
+            .iter()
+            .flatten()
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(probed, vec![(NAME.to_string(), RANGE.to_string())]);
+        assert_eq!(
+            solve_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "source-built metadata routes must not enter Rule-2 candidate selection"
+        );
+        assert_eq!(
+            fetch_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a conda-serveable source-built transitive must never reach the wheel fetch path"
+        );
+        assert!(bundle.extras.is_empty());
+        assert!(bundle.probe_decisions.iter().any(|decision| {
+            decision.stage == "auto_bundle_loose"
+                && decision.pypi_name == NAME
+                && decision.routing_decision == "short-circuit"
+        }));
+
+        let emitted = super::super::emitted_bundle_route_specs(&bundle, &config, &target).unwrap();
+        let emitted_spec = emitted
+            .iter()
+            .find(|route| route.conda_name.key().as_str() == NAME)
+            .map(|route| route.spec.as_str())
+            .expect("the serveable transitive must be emitted on conda");
+        assert_eq!(emitted_spec, RANGE);
+
+        let output = super::super::produce_output(
+            &bundle,
+            &config,
+            rattler_conda_types::Platform::Linux64,
+            &target.python_version,
+            &[],
+            None,
+            None,
+        )
+        .unwrap();
+        let output_spec = output
+            .run_dependencies
+            .depends
+            .iter()
+            .find(|dependency| dependency.name.as_str() == NAME)
+            .map(|dependency| super::super::audit_report::format_packagespec(&dependency.spec))
+            .expect("recipe output must contain the serveable transitive");
+        assert_eq!(output_spec, RANGE);
+    }
+
+    #[tokio::test]
     async fn advisory_floor_does_not_veto_conda_route() {
         let fetch_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let fetch = {
@@ -2497,13 +2745,11 @@ mod tests {
                 async { Err(anyhow!("a softened conda route must not fetch PyPI")) }
             }
         };
-        let solve_inputs = Arc::new(Mutex::new(
-            Vec::<Vec<crate::uv_closure::CondaRouteSpec>>::new(),
-        ));
+        let solve_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let co_solve = {
-            let solve_inputs = Arc::clone(&solve_inputs);
-            move |routes: Vec<crate::uv_closure::CondaRouteSpec>| {
-                solve_inputs.lock().unwrap().push(routes);
+            let solve_calls = Arc::clone(&solve_calls);
+            move |_routes: Vec<crate::uv_closure::CondaRouteSpec>| {
+                solve_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 async { crate::uv_closure::CoInstallVerdict::Sat }
             }
         };
@@ -2534,16 +2780,11 @@ mod tests {
         .unwrap();
 
         assert_eq!(fetch_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
-        let solved_spec = solve_inputs
-            .lock()
-            .unwrap()
-            .iter()
-            .flat_map(|routes| routes.iter())
-            .find(|route| route.conda_name.key().as_str() == "starlette")
-            .map(|route| route.spec.clone())
-            .expect("co-solve must receive the starlette route");
-        assert!(solved_spec.contains("==0.45.3"), "{solved_spec}");
-        assert!(!solved_spec.contains(">=0.49"), "{solved_spec}");
+        assert_eq!(
+            solve_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "source-built metadata routes must remain outside Rule 2"
+        );
 
         let emitted = super::super::emitted_bundle_route_specs(&bundle, &config, &target).unwrap();
         let emitted_spec = emitted
@@ -2551,7 +2792,8 @@ mod tests {
             .find(|route| route.conda_name.key().as_str() == "starlette")
             .map(|route| route.spec.clone())
             .expect("final output must retain starlette");
-        assert_eq!(emitted_spec, solved_spec);
+        assert!(emitted_spec.contains("==0.45.3"), "{emitted_spec}");
+        assert!(!emitted_spec.contains(">=0.49"), "{emitted_spec}");
 
         let output = super::super::produce_output(
             &bundle,
@@ -2570,7 +2812,7 @@ mod tests {
             .find(|dependency| dependency.name.as_str() == "starlette")
             .map(|dependency| super::super::audit_report::format_packagespec(&dependency.spec))
             .expect("recipe output must retain starlette");
-        assert_eq!(output_spec, solved_spec);
+        assert_eq!(output_spec, emitted_spec);
     }
 
     #[tokio::test]
