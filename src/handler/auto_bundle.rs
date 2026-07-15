@@ -2531,6 +2531,8 @@ mod tests {
             test_wheel("mujoco-warp", "mujoco-warp", "0.0.1", &["numpy"]),
             test_wheel("smplx", "smplx", "0.1.28", &["numpy (>=1.16.2)"]),
         ];
+        bundle.primary.metadata_provenance = Provenance::SourceBuiltRelaxed;
+        bundle.extras[0].metadata_provenance = Provenance::SourceBuiltRelaxed;
         bundle
     }
 
@@ -2550,6 +2552,7 @@ mod tests {
             test_wheel("matplotlib", "matplotlib", "3.10.3", &["packaging>=20.0"]),
             test_wheel("skrl", "skrl", "2.1.0", &["packaging"]),
         ];
+        bundle.extras[0].metadata_provenance = Provenance::SourceBuiltRelaxed;
         bundle
     }
 
@@ -2565,6 +2568,32 @@ mod tests {
             },
             provenance: Provenance::PriorSelection,
         }
+    }
+
+    fn assert_workspace_fact_conflict_before_ownership(
+        bundle: &Bundle,
+        config: &RetreadConfig,
+        target: &crate::pypi::WheelTarget,
+        package: &str,
+        version: &str,
+    ) {
+        let error = super::super::emitted_bundle_route_specs(bundle, config, target)
+            .expect_err("the unowned workspace fact must reproduce the typed route conflict");
+        assert!(
+            error
+                .downcast_ref::<crate::constraint::Conflict>()
+                .is_some(),
+            "pre-ownership assembly must return the typed conflict: {error:#}"
+        );
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(&format!("cannot restore `{package}` to PyPI")),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("workspace conda fact `{package}=={version}`")),
+            "the fixture must include the workspace fact in the conflict:\n{message}"
+        );
     }
 
     #[tokio::test]
@@ -2606,6 +2635,13 @@ mod tests {
         bundle
             .auto_routed
             .push(prior_selection_route("packaging", "23.0"));
+        assert_workspace_fact_conflict_before_ownership(
+            &bundle,
+            &config,
+            &target,
+            "packaging",
+            "26.2",
+        );
 
         bundle.apply_workspace_conda_fact_ownership(
             &config,
@@ -2693,6 +2729,9 @@ mod tests {
         bundle
             .workspace_conda_versions
             .insert("numpy".to_string(), "1.26.4".to_string());
+        assert_workspace_fact_conflict_before_ownership(
+            &bundle, &config, &target, "numpy", "1.26.4",
+        );
 
         bundle.apply_workspace_conda_fact_ownership(
             &config,
