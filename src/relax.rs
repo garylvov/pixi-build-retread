@@ -1,13 +1,180 @@
 //! PEP 508 -> conda match-spec translation with version-pin widening.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::str::FromStr;
 
 use anyhow::{Result, anyhow};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use uv_pep508::uv_pep440::{self, Operator, Version};
 use uv_pep508::{MarkerEnvironment, MarkerEnvironmentBuilder, Requirement, VersionOrUrl};
 
 use crate::config::RelaxPolicy;
+
+/// A conda package name exactly as declared.
+///
+/// Conda names legitimately contain underscores (for example,
+/// `cuda-nvcc_linux-64`). This raw form is the only name domain from which a
+/// conda solver match spec can be constructed. Identity comparisons use
+/// [`CondaName::key`] instead.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CondaName(String);
+
+impl CondaName {
+    /// Preserve a conda package name exactly as declared.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self(name.into())
+    }
+
+    /// Return the raw conda name that is valid at the solver boundary.
+    pub fn as_spec(&self) -> &str {
+        &self.0
+    }
+
+    /// Return the canonical identity key used for comparisons and dedupe.
+    pub fn key(&self) -> PypiKey {
+        PypiKey::from_pypi(&self.0)
+    }
+
+    /// Build a conda match spec while preserving this raw conda name.
+    ///
+    /// This is intentionally the only constructor for [`CondaMatchSpec`]. A
+    /// [`PypiKey`] therefore cannot be passed to the conda solver by mistake.
+    pub fn match_spec(&self, spec: &str) -> CondaMatchSpec {
+        let spec = spec.trim();
+        if spec.is_empty() || spec == "*" {
+            CondaMatchSpec(self.0.clone())
+        } else {
+            CondaMatchSpec(format!("{} {spec}", self.0))
+        }
+    }
+}
+
+impl fmt::Display for CondaName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// A PEP 503-normalized PyPI identity key.
+///
+/// This type is for comparisons, ownership sets, dedupe, and map keys only.
+/// It deliberately has no conversion into [`CondaName`] or
+/// [`CondaMatchSpec`].
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PypiKey(String);
+
+impl PypiKey {
+    /// Canonicalize a PyPI spelling into its PEP 503 identity key.
+    pub fn from_pypi(name: &str) -> Self {
+        Self(canonical_conda_name(name))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl fmt::Display for PypiKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Serialize for PypiKey {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for PypiKey {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Ok(Self::from_pypi(&raw))
+    }
+}
+
+/// A rendered conda solver match spec.
+///
+/// The private field and lack of a public constructor make arbitrary strings
+/// ineligible for production conda solves. Construct one only through
+/// [`CondaName::match_spec`].
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CondaMatchSpec(String);
+
+impl CondaMatchSpec {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for CondaMatchSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// The configured conda target for a canonical PyPI key.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CondaTarget {
+    Mapped(CondaName),
+    Disabled,
+}
+
+impl CondaTarget {
+    pub fn mapped_name(&self) -> Option<&CondaName> {
+        match self {
+            Self::Mapped(name) => Some(name),
+            Self::Disabled => None,
+        }
+    }
+}
+
+impl fmt::Display for CondaTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Mapped(name) => name.fmt(f),
+            Self::Disabled => Ok(()),
+        }
+    }
+}
+
+impl Serialize for CondaTarget {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for CondaTarget {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        if raw.is_empty() {
+            Ok(Self::Disabled)
+        } else {
+            Ok(Self::Mapped(CondaName::new(raw)))
+        }
+    }
+}
+
+/// Canonical PyPI identity to raw conda target mapping.
+pub type NameMap = BTreeMap<PypiKey, CondaTarget>;
 
 /// A single conda dependency line ready to drop into recipe.yaml `run:` list.
 ///
@@ -75,7 +242,7 @@ pub(crate) fn parse_named_spec(line: &str) -> (String, String) {
 pub fn translate(
     raw: &str,
     env: &MarkerEnvironment,
-    name_map: &BTreeMap<String, String>,
+    name_map: &NameMap,
     overrides: &BTreeMap<String, String>,
     policy: RelaxPolicy,
 ) -> Result<Option<CondaDep>> {
@@ -95,9 +262,9 @@ pub fn translate(
     // User override wins, full replacement.
     if let Some(spec) = overrides
         .get(pypi_name)
-        .or_else(|| overrides.get(&conda_name))
+        .or_else(|| overrides.get(conda_name.as_spec()))
     {
-        return Ok(Some(CondaDep::new(conda_name, spec.clone())));
+        return Ok(Some(CondaDep::new(conda_name.to_string(), spec.clone())));
     }
 
     // `python` is fully off-limits to relax: every widened form
@@ -106,7 +273,7 @@ pub fn translate(
     // `==X.Y.Z`) is either meaningless or rejected by the conda solver
     // (`python 3` => "missing range specifier"). Pass python through
     // untouched under every policy.
-    let effective_policy = if conda_name == "python" {
+    let effective_policy = if conda_name.as_spec() == "python" {
         RelaxPolicy::None
     } else {
         policy
@@ -124,7 +291,7 @@ pub fn translate(
         }
     };
 
-    Ok(Some(CondaDep::new(conda_name, spec)))
+    Ok(Some(CondaDep::new(conda_name.to_string(), spec)))
 }
 
 /// v1.5.x cleanup 0c: THE canonical conda-name normalizer -- full
@@ -135,9 +302,9 @@ pub fn translate(
 /// the two normalizations disagreed on dotted names (`ruamel.yaml`),
 /// so a user's `retread-name-map` entry could be keyed under one form
 /// and looked up under the other and silently never match. One fn,
-/// one canonical form, bug class closed. NOTE: `map_name` does its
-/// override lookup on the RAW pypi string BEFORE canonicalizing, so
-/// user map keys written in any spelling keep matching.
+/// one canonical form, bug class closed. `map_name` now constructs a
+/// [`PypiKey`] before lookup, so every equivalent user spelling matches the
+/// same canonical config key.
 pub(crate) fn canonical_conda_name(name: &str) -> String {
     // Rattler virtual packages (`__cuda`, `__glibc`, ...) are
     // conda-side specials, never PyPI names -- PEP 503's
@@ -178,11 +345,12 @@ pub(crate) fn already_covered(
         || pypi_name.is_some_and(|p| set.contains(&canonical_conda_name(p)))
 }
 
-fn map_name(pypi: &str, overrides: &BTreeMap<String, String>) -> String {
-    if let Some(mapped) = overrides.get(pypi) {
+fn map_name(pypi: &str, overrides: &NameMap) -> CondaName {
+    let key = PypiKey::from_pypi(pypi);
+    if let Some(mapped) = overrides.get(&key).and_then(CondaTarget::mapped_name) {
         return mapped.clone();
     }
-    canonical_conda_name(pypi)
+    CondaName::new(key.into_string())
 }
 
 /// v1.5.x cleanup 0c (grizzly finding #7): debug-time contract that a
@@ -694,16 +862,47 @@ mod tests {
     }
 
     #[test]
-    fn name_map_override_keyed_on_raw_string_still_resolves() {
-        // Name-map class (grizzly guard): map_name does the override
-        // lookup on the RAW pypi string BEFORE canonicalizing, so a
-        // user key written as "ruamel.yaml" keeps matching even though
-        // the canonical form is "ruamel-yaml".
+    fn name_map_override_uses_canonical_pypi_key() {
+        // Config load canonicalizes user spellings before translation, so all
+        // equivalent PyPI spellings hit the same typed key.
         let mut overrides = BTreeMap::new();
-        overrides.insert("ruamel.yaml".to_string(), "custom-target".to_string());
-        assert_eq!(map_name("ruamel.yaml", &overrides), "custom-target");
+        overrides.insert(
+            PypiKey::from_pypi("ruamel.yaml"),
+            CondaTarget::Mapped(CondaName::new("custom_target")),
+        );
+        assert_eq!(
+            map_name("ruamel_yaml", &overrides).as_spec(),
+            "custom_target"
+        );
         // Without an override, the canonical form is produced.
-        assert_eq!(map_name("ruamel.yaml", &BTreeMap::new()), "ruamel-yaml");
+        assert_eq!(
+            map_name("ruamel.yaml", &BTreeMap::new()).as_spec(),
+            "ruamel-yaml"
+        );
+
+        overrides.insert(PypiKey::from_pypi("wheel_only"), CondaTarget::Disabled);
+        assert_eq!(
+            map_name("wheel.only", &overrides).as_spec(),
+            "wheel-only",
+            "a disabled mapping keeps the key occupied but translation uses identity"
+        );
+    }
+
+    #[test]
+    fn underscored_conda_name_solves_raw() {
+        let name = CondaName::new("cuda-nvcc_linux-64");
+
+        assert_eq!(name.as_spec(), "cuda-nvcc_linux-64");
+        assert_eq!(name.key().as_str(), "cuda-nvcc-linux-64");
+        assert_eq!(
+            name.match_spec(">=12.9,<13").as_str(),
+            "cuda-nvcc_linux-64 >=12.9,<13"
+        );
+        assert_eq!(
+            name.match_spec("*").as_str(),
+            "cuda-nvcc_linux-64",
+            "an unconstrained match spec must still retain the raw conda name"
+        );
     }
 
     #[test]

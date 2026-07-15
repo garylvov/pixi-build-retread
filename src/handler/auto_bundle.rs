@@ -18,7 +18,10 @@ use uv_pep508::uv_pep440::{
 
 use crate::config::RetreadConfig;
 use crate::pypi;
-use crate::relax::{canonical_conda_name, default_marker_env, marker_env_for};
+use crate::relax::{
+    CondaName, CondaTarget, NameMap, PypiKey, canonical_conda_name, default_marker_env,
+    marker_env_for,
+};
 use crate::wheel::WheelMetadata;
 
 use super::resolve_state::ResolveState;
@@ -45,16 +48,15 @@ impl std::fmt::Display for IncrementalRipple {
 
 impl std::error::Error for IncrementalRipple {}
 
-/// Returns `true` if `conda_normalized_pypi_name` has an unambiguous conda
-/// equivalent in the effective name_map (parselmouth + FALLBACK + user
+/// Returns `true` if `pypi_key` has an enabled, unambiguous conda equivalent
+/// in the effective name map (parselmouth + FALLBACK + user
 /// retread-name-map). This identifies a conda target; the requirement-specific
 /// probe must still pass [`validated_conda_route`] before auto-bundling is
 /// skipped.
-pub(crate) fn prefer_conda_match(
-    conda_normalized_pypi_name: &str,
-    name_map: &BTreeMap<String, String>,
-) -> bool {
-    name_map.contains_key(conda_normalized_pypi_name)
+pub(crate) fn prefer_conda_match(pypi_key: &PypiKey, name_map: &NameMap) -> bool {
+    name_map
+        .get(pypi_key)
+        .is_some_and(|target| target.mapped_name().is_some())
 }
 
 /// A conda route is valid only when the requirement-specific probe found at
@@ -104,18 +106,21 @@ pub(crate) fn conda_probe_spec(specifiers: &VersionSpecifiers) -> String {
 /// Returns the conda package name to probe/route to, or `None` to keep the
 /// dep on the PyPI side.
 pub(crate) fn pick_conda_target(
-    dep_conda_name: &str,
-    name_map: &BTreeMap<String, String>,
+    dep_pypi_key: &PypiKey,
+    name_map: &NameMap,
     pypi_to_conda: &PypiToCondaMap,
-) -> Option<String> {
-    if let Some(target) = name_map.get(dep_conda_name) {
-        return Some(target.clone());
+) -> Option<CondaName> {
+    if let Some(target) = name_map.get(dep_pypi_key) {
+        return target.mapped_name().cloned();
     }
-    let candidates = pypi_to_conda.get(dep_conda_name)?;
-    if candidates.iter().any(|c| c == dep_conda_name) {
-        Some(dep_conda_name.to_string())
+    let candidates = pypi_to_conda.get(dep_pypi_key.as_str())?;
+    if let Some(identity) = candidates
+        .iter()
+        .find(|candidate| PypiKey::from_pypi(candidate) == *dep_pypi_key)
+    {
+        Some(CondaName::new(identity.clone()))
     } else if candidates.len() == 1 {
-        Some(candidates[0].clone())
+        Some(CondaName::new(candidates[0].clone()))
     } else {
         None
     }
@@ -191,6 +196,7 @@ fn drop_decline_reasons(
     workspace_drop_authorized: bool,
 ) -> Vec<String> {
     let mut reasons = Vec::new();
+    let typed_pypi_key = PypiKey::from_pypi(pypi_key);
     if !workspace_drop_authorized {
         reasons.push(
             "the fixed workspace conda baseline did not solve, so rule 1 abstains \
@@ -198,16 +204,23 @@ fn drop_decline_reasons(
                 .to_string(),
         );
     }
-    if workspace_ownership.excluded_pypi_names.contains(pypi_key) {
+    if workspace_ownership
+        .excluded_pypi_names
+        .contains(&typed_pypi_key)
+    {
         reasons.push(format!(
             "`{pypi_key}` is held on PyPI by an explicit retread-override, a keep-pypi \
              entry, a wheel entry of this pack, or a direct-URL wheel source"
         ));
     }
-    let owns_pypi_name = workspace_ownership.pypi_names.contains(pypi_key);
+    let owns_pypi_name = workspace_ownership.pypi_names.contains(&typed_pypi_key);
     let unowned_routes: Vec<&String> = rejected_conda_routes
         .iter()
-        .filter(|name| !workspace_ownership.conda_names.contains(*name))
+        .filter(|name| {
+            !workspace_ownership
+                .conda_names
+                .contains(&PypiKey::from_pypi(name))
+        })
         .collect();
     if !owns_pypi_name && (rejected_conda_routes.is_empty() || !unowned_routes.is_empty()) {
         if workspace_ownership.conda_names.is_empty() && workspace_ownership.pypi_names.is_empty() {
@@ -658,12 +671,15 @@ fn record_metadata_route(
     });
 }
 
-fn expand_name_map_groups(names: &mut HashSet<String>, name_map: &BTreeMap<String, String>) {
+fn expand_name_map_groups(names: &mut HashSet<String>, name_map: &NameMap) {
     loop {
         let mut changed = false;
-        for (pypi_name, conda_name) in name_map {
-            let pypi_name = canonical_conda_name(pypi_name);
-            let conda_name = canonical_conda_name(conda_name);
+        for (pypi_name, target) in name_map {
+            let Some(conda_name) = target.mapped_name() else {
+                continue;
+            };
+            let pypi_name = pypi_name.as_str().to_string();
+            let conda_name = conda_name.key().as_str().to_string();
             if names.contains(&pypi_name) || names.contains(&conda_name) {
                 changed |= names.insert(pypi_name);
                 changed |= names.insert(conda_name);
@@ -1001,10 +1017,13 @@ where
         let prefer_pairs: Vec<(String, String)> = candidates
             .iter()
             .filter(|(name, _)| !is_closure_member(name))
-            .filter(|(name, _)| prefer_conda_match(&canonical_conda_name(name), &config.name_map))
-            .map(|(name, version)| {
-                let conda_name = canonical_conda_name(name);
-                (config.name_map[&conda_name].clone(), format!("=={version}"))
+            .filter_map(|(name, version)| {
+                let pypi_key = PypiKey::from_pypi(name);
+                config
+                    .name_map
+                    .get(&pypi_key)
+                    .and_then(CondaTarget::mapped_name)
+                    .map(|target| (target.as_spec().to_string(), format!("=={version}")))
             })
             .collect();
         let prefer_probes: std::collections::HashMap<(String, String), crate::probe::ProbeResult> =
@@ -1022,6 +1041,7 @@ where
             Vec::new();
         for (name, version) in candidates {
             let conda_name = canonical_conda_name(&name);
+            let pypi_key = PypiKey::from_pypi(&name);
             let specifiers = match VersionSpecifiers::from_str(&format!("=={version}")) {
                 Ok(specifiers) => specifiers,
                 Err(error) => {
@@ -1056,13 +1076,17 @@ where
                     "auto-bundle: uv closure member not moved to conda by the \
                      auto-route; bundling from PyPI (closure is authoritative)",
                 );
-            } else if prefer_conda_match(&conda_name, &config.name_map) {
+            } else if prefer_conda_match(&pypi_key, &config.name_map) {
                 // Probe the workspace's conda channels for whether the
                 // spec retread would emit is actually satisfiable. If
                 // ANY channel has a matching candidate, keep on conda.
                 // Only a concrete match may route to conda. Empty,
                 // unsatisfied, or indecisive results stay on PyPI.
-                let conda_target_name = config.name_map[&conda_name].clone();
+                let conda_target_name = config.name_map[&pypi_key]
+                    .mapped_name()
+                    .expect("prefer_conda_match accepted only a mapped target")
+                    .as_spec()
+                    .to_string();
                 let probe_spec = format!("=={version}");
                 let probe_result =
                     match prefer_probes.get(&(conda_target_name.clone(), probe_spec.clone())) {
@@ -1129,14 +1153,15 @@ where
         let loose_pairs: Vec<(String, String)> = loose_candidates
             .iter()
             .filter(|(name, _)| !is_closure_member(name))
-            .map(|(name, specs)| {
-                let conda_name = canonical_conda_name(name);
-                let target_name = config
-                    .name_map
-                    .get(&conda_name)
-                    .cloned()
-                    .unwrap_or(conda_name);
-                (target_name, conda_probe_spec(specs))
+            .filter_map(|(name, specs)| {
+                let pypi_key = PypiKey::from_pypi(name);
+                let target_name = match config.name_map.get(&pypi_key) {
+                    Some(target) => target
+                        .mapped_name()
+                        .map(|target| target.as_spec().to_string()),
+                    None => Some(pypi_key.as_str().to_string()),
+                }?;
+                Some((target_name, conda_probe_spec(specs)))
             })
             .collect();
         let loose_probes: std::collections::HashMap<(String, String), crate::probe::ProbeResult> =
@@ -1147,6 +1172,7 @@ where
                 .collect();
         for (name, specs) in loose_candidates {
             let conda_name = canonical_conda_name(&name);
+            let pypi_key = PypiKey::from_pypi(&name);
             let preferred_ver = favor_lock_prefs
                 .and_then(|preferences| preferences.get(&conda_name))
                 .cloned();
@@ -1172,11 +1198,16 @@ where
                 to_fetch.push((name, specs.to_string(), conda_name, specs, preferred_ver));
                 continue;
             }
-            let target_name = config
-                .name_map
-                .get(&conda_name)
-                .cloned()
-                .unwrap_or_else(|| conda_name.clone());
+            let target_name = match config.name_map.get(&pypi_key) {
+                Some(target) => match target.mapped_name() {
+                    Some(target) => target.as_spec().to_string(),
+                    None => {
+                        to_fetch.push((name, specs.to_string(), conda_name, specs, preferred_ver));
+                        continue;
+                    }
+                },
+                None => conda_name.clone(),
+            };
             let probe_spec = conda_probe_spec(&specs);
             let probe_result = match loose_probes.get(&(target_name.clone(), probe_spec.clone())) {
                 Some(r) => r.clone(),
@@ -1339,7 +1370,7 @@ fn route_group_is_fully_mutable(
 
     Ok(super::emitted_bundle_route_specs(&trial, config, target)?
         .into_iter()
-        .all(|route| canonical_conda_name(&route.conda_name) != conda_name))
+        .all(|route| route.conda_name.key().as_str() != conda_name))
 }
 
 /// Finalize every provisional conda route against the exact dependency set
@@ -1372,7 +1403,7 @@ where
     let emitted_by_conda: BTreeMap<String, crate::uv_closure::CondaRouteSpec> = emitted
         .iter()
         .cloned()
-        .map(|route| (canonical_conda_name(&route.conda_name), route))
+        .map(|route| (route.conda_name.key().into_string(), route))
         .collect();
     let mut fixed_by_config: HashSet<String> = config
         .force_conda
@@ -1433,11 +1464,11 @@ where
 
     let mutable_keys: HashSet<String> = mutable_candidates
         .iter()
-        .map(|route| canonical_conda_name(&route.conda_name))
+        .map(|route| route.conda_name.key().into_string())
         .collect();
     let fixed: Vec<_> = emitted
         .into_iter()
-        .filter(|route| !mutable_keys.contains(&canonical_conda_name(&route.conda_name)))
+        .filter(|route| !mutable_keys.contains(route.conda_name.key().as_str()))
         .collect();
     let selection = crate::uv_closure::select_jointly_solvable_routes(
         fixed,
@@ -1459,12 +1490,12 @@ where
     }
     let rejected_keys: BTreeSet<String> = rejected
         .iter()
-        .map(|route| canonical_conda_name(&route.conda_name))
+        .map(|route| route.conda_name.key().into_string())
         .collect();
 
     let rejected_specs: BTreeMap<String, String> = rejected
         .iter()
-        .map(|route| (canonical_conda_name(&route.conda_name), route.spec.clone()))
+        .map(|route| (route.conda_name.key().into_string(), route.spec.clone()))
         .collect();
     let mut restore_requests: BTreeMap<String, RestoreRequestBuilder> = BTreeMap::new();
     // Route-specific identity proof for direct conda ownership. Global
@@ -1589,12 +1620,17 @@ where
                 .get(&pypi_key)
                 .is_some_and(|conda_names| {
                     !conda_names.is_empty()
-                        && conda_names
-                            .iter()
-                            .all(|name| workspace_ownership.conda_names.contains(name))
+                        && conda_names.iter().all(|name| {
+                            workspace_ownership
+                                .conda_names
+                                .contains(&PypiKey::from_pypi(name))
+                        })
                 });
-        let workspace_owns_request = !workspace_ownership.excluded_pypi_names.contains(&pypi_key)
-            && (workspace_ownership.pypi_names.contains(&pypi_key)
+        let typed_pypi_key = PypiKey::from_pypi(&pypi_key);
+        let workspace_owns_request = !workspace_ownership
+            .excluded_pypi_names
+            .contains(&typed_pypi_key)
+            && (workspace_ownership.pypi_names.contains(&typed_pypi_key)
                 || owns_every_concrete_conda_route);
         match request.finish() {
             Ok(request) => finalized_restore_requests.push(request),
@@ -1699,7 +1735,7 @@ where
 
     let still_emitted: Vec<String> = super::emitted_bundle_route_specs(&trial, config, target)?
         .into_iter()
-        .map(|route| canonical_conda_name(&route.conda_name))
+        .map(|route| route.conda_name.key().into_string())
         .filter(|name| rejected_keys.contains(name))
         .collect();
     if !still_emitted.is_empty() {
@@ -2232,7 +2268,7 @@ mod tests {
         super::super::WorkspaceRouteOwnership {
             conda_names: direct_conda_names
                 .iter()
-                .map(|name| canonical_conda_name(name))
+                .map(|name| PypiKey::from_pypi(name))
                 .collect(),
             ..Default::default()
         }
@@ -2285,6 +2321,80 @@ mod tests {
         }
     }
 
+    #[test]
+    fn namemap_noncanonical_key_matches() {
+        let mut configured: RetreadConfig = serde_json::from_value(serde_json::json!({
+            "retread-wheels": {},
+            "retread-relax": "none",
+            "retread-name-map": {
+                "opencv_python_headless": "py-opencv"
+            }
+        }))
+        .unwrap();
+        let key = PypiKey::from_pypi("opencv-python-headless");
+        assert_eq!(
+            configured
+                .name_map
+                .get(&key)
+                .and_then(CondaTarget::mapped_name)
+                .map(CondaName::as_spec),
+            Some("py-opencv")
+        );
+
+        let mut global = PypiToCondaMap::new();
+        global.insert(
+            key.as_str().to_string(),
+            vec!["opencv-python-headless-fallback".to_string()],
+        );
+        let effective = super::super::effective_name_map(&configured.name_map, &global);
+        assert_eq!(
+            effective
+                .get(&key)
+                .and_then(CondaTarget::mapped_name)
+                .map(CondaName::as_spec),
+            Some("py-opencv"),
+            "the canonicalized user entry must beat the global fallback"
+        );
+        assert_eq!(
+            pick_conda_target(&key, &effective, &global)
+                .expect("the configured route should be selected")
+                .as_spec(),
+            "py-opencv",
+            "the BFS must preserve the mapped conda spelling"
+        );
+
+        configured.name_map = effective;
+        let bundle = test_bundle(&["opencv-python-headless==4.11.0"]);
+        let target = crate::pypi::WheelTarget::for_subdir("3.11", "linux-64");
+        let emitted =
+            super::super::emitted_bundle_route_specs(&bundle, &configured, &target).unwrap();
+        assert!(
+            emitted
+                .iter()
+                .any(|route| route.conda_name.as_spec() == "py-opencv"),
+            "actual dependency emission must preserve the raw configured target: {emitted:?}"
+        );
+    }
+
+    #[test]
+    fn disabled_namemap_vetoes_global_route() {
+        let configured: RetreadConfig = serde_json::from_value(serde_json::json!({
+            "retread-wheels": {},
+            "retread-name-map": {
+                "torch": ""
+            }
+        }))
+        .unwrap();
+        let key = PypiKey::from_pypi("torch");
+        let mut global = PypiToCondaMap::new();
+        global.insert(key.as_str().to_string(), vec!["pytorch".to_string()]);
+
+        let effective = super::super::effective_name_map(&configured.name_map, &global);
+        assert!(matches!(effective.get(&key), Some(CondaTarget::Disabled)));
+        assert!(!prefer_conda_match(&key, &effective));
+        assert_eq!(pick_conda_target(&key, &effective, &global), None);
+    }
+
     fn repo_record(name: &str, version: &str, depends: &[&str]) -> RepoDataRecord {
         let mut package_record = PackageRecord::new(
             name.parse().unwrap(),
@@ -2334,7 +2444,7 @@ mod tests {
     ) -> crate::uv_closure::CoInstallVerdict {
         if routes
             .iter()
-            .any(|route| canonical_conda_name(&route.conda_name) == "numpy")
+            .any(|route| route.conda_name.key().as_str() == "numpy")
         {
             crate::uv_closure::CoInstallVerdict::Unsat(vec![
                 "test fixture rejects the generated NumPy route".to_string(),
@@ -2422,7 +2532,7 @@ mod tests {
         assert!(
             emitted
                 .iter()
-                .all(|route| canonical_conda_name(&route.conda_name) != "numpy"),
+                .all(|route| route.conda_name.key().as_str() != "numpy"),
             "the generated pack must not re-emit the workspace-owned NumPy route: {emitted:?}"
         );
         assert!(bundle.probe_decisions.iter().any(|decision| {
@@ -2516,12 +2626,10 @@ mod tests {
         };
         // Reject BOTH routes jointly; only `numpy` is workspace-owned.
         let reject_both = |routes: Vec<crate::uv_closure::CondaRouteSpec>| async move {
-            if routes.iter().any(|route| {
-                matches!(
-                    canonical_conda_name(&route.conda_name).as_str(),
-                    "numpy" | "pillow"
-                )
-            }) {
+            if routes
+                .iter()
+                .any(|route| matches!(route.conda_name.key().as_str(), "numpy" | "pillow"))
+            {
                 crate::uv_closure::CoInstallVerdict::Unsat(vec![
                     "test fixture rejects both generated routes".to_string(),
                 ])
@@ -2658,7 +2766,7 @@ mod tests {
         assert!(
             emitted
                 .iter()
-                .any(|route| canonical_conda_name(&route.conda_name) == "numpy"),
+                .any(|route| route.conda_name.key().as_str() == "numpy"),
             "a jointly solvable metadata route must remain on conda: {emitted:?}"
         );
     }
@@ -2901,7 +3009,7 @@ pillow = ">=10,<13"
             "hover-pack",
         );
         assert_eq!(
-            context.workspace_deps.get("pillow"),
+            context.workspace_deps.get(&CondaName::new("pillow")),
             Some(&vec![">=11.0.0,<12".to_string()]),
             "only the environment that consumes hover-pack may constrain its route validation"
         );
@@ -2962,11 +3070,9 @@ pillow = ">=10,<13"
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
         assert!(
-            solve_calls
-                .lock()
-                .unwrap()
+            solve_calls.lock().unwrap().iter().any(|routes| routes
                 .iter()
-                .any(|routes| routes.iter().any(|route| route.pypi_name == "pillow")),
+                .any(|route| route.pypi_name.as_str() == "pillow")),
             "the scoped co-solve must validate the provisional Pillow route"
         );
         assert_eq!(requests[0].pypi_name, "pillow");
@@ -3235,8 +3341,10 @@ pillow = ">=10,<13"
                 let records = Arc::clone(&records);
                 let solve_inputs = Arc::clone(&solve_inputs);
                 async move {
-                    let specs: Vec<String> =
-                        routes.iter().map(|route| route.match_spec()).collect();
+                    let specs: Vec<String> = routes
+                        .iter()
+                        .map(|route| route.match_spec().to_string())
+                        .collect();
                     solve_inputs.lock().unwrap().push(specs.clone());
                     match crate::conda_solve::solve_records_for_test(&records, &specs, "3.11") {
                         Ok(_) => crate::uv_closure::CoInstallVerdict::Sat,
@@ -3306,7 +3414,7 @@ pillow = ">=10,<13"
         assert!(
             emitted
                 .iter()
-                .all(|route| canonical_conda_name(&route.conda_name) != "pyglet"),
+                .all(|route| route.conda_name.key().as_str() != "pyglet"),
             "the incompatible conda pyglet route must be absent after restoration: {emitted:?}"
         );
         assert!(bundle.probe_decisions.iter().any(|decision| {

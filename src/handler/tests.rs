@@ -6,6 +6,7 @@ use super::auto_bundle::{
 use super::*;
 use crate::config::RelaxPolicy;
 use crate::index_chain::{IndexPurpose, PUBLIC_PYPI, index_chain};
+use crate::relax::{CondaName, CondaTarget, NameMap, PypiKey};
 use std::collections::BTreeMap;
 
 #[cfg(unix)]
@@ -66,6 +67,18 @@ fn pypi_map(pairs: &[(&str, &[&str])]) -> PypiToCondaMap {
         .collect()
 }
 
+fn name_map(pairs: &[(&str, &str)]) -> NameMap {
+    pairs
+        .iter()
+        .map(|(pypi, conda)| {
+            (
+                PypiKey::from_pypi(pypi),
+                CondaTarget::Mapped(CondaName::new(*conda)),
+            )
+        })
+        .collect()
+}
+
 fn bundle_auto_route(name: &str, version: &str, deps_from_floor: bool) -> BundleAutoRoute {
     BundleAutoRoute {
         route: crate::uv_closure::AutoRoutedPackage {
@@ -109,10 +122,11 @@ fn pick_conda_target_name_map_wins_over_ambiguous_parselmouth() {
     // torch->pytorch in the merged name_map, the picker returns
     // pytorch so the BFS routes it to conda instead of bundling.
     let parselmouth = pypi_map(&[("torch", &["pytorch", "pytorch-cpu", "pytorch-gpu"])]);
-    let mut name_map: BTreeMap<String, String> = BTreeMap::new();
-    name_map.insert("torch".into(), "pytorch".into());
+    let name_map = name_map(&[("torch", "pytorch")]);
     assert_eq!(
-        pick_conda_target("torch", &name_map, &parselmouth).as_deref(),
+        pick_conda_target(&PypiKey::from_pypi("torch"), &name_map, &parselmouth)
+            .as_ref()
+            .map(CondaName::as_spec),
         Some("pytorch"),
     );
 }
@@ -123,8 +137,11 @@ fn pick_conda_target_ambiguous_parselmouth_without_name_map_is_none() {
     // curated answer -> None (caller leaves it on the PyPI/bundle
     // path). This is exactly why the FALLBACK entry is load-bearing.
     let parselmouth = pypi_map(&[("torch", &["pytorch", "pytorch-cpu", "pytorch-gpu"])]);
-    let name_map: BTreeMap<String, String> = BTreeMap::new();
-    assert_eq!(pick_conda_target("torch", &name_map, &parselmouth), None);
+    let name_map = NameMap::new();
+    assert_eq!(
+        pick_conda_target(&PypiKey::from_pypi("torch"), &name_map, &parselmouth),
+        None
+    );
 }
 
 #[test]
@@ -132,9 +149,11 @@ fn pick_conda_target_parselmouth_identity_match_wins() {
     // numpy -> numpy is an identity match among the candidates; no
     // name_map entry needed.
     let parselmouth = pypi_map(&[("numpy", &["numpy", "manifpy"])]);
-    let name_map: BTreeMap<String, String> = BTreeMap::new();
+    let name_map = NameMap::new();
     assert_eq!(
-        pick_conda_target("numpy", &name_map, &parselmouth).as_deref(),
+        pick_conda_target(&PypiKey::from_pypi("numpy"), &name_map, &parselmouth)
+            .as_ref()
+            .map(CondaName::as_spec),
         Some("numpy"),
     );
 }
@@ -142,9 +161,15 @@ fn pick_conda_target_parselmouth_identity_match_wins() {
 #[test]
 fn pick_conda_target_single_parselmouth_candidate() {
     let parselmouth = pypi_map(&[("some-pypi-only", &["the-conda-name"])]);
-    let name_map: BTreeMap<String, String> = BTreeMap::new();
+    let name_map = NameMap::new();
     assert_eq!(
-        pick_conda_target("some-pypi-only", &name_map, &parselmouth).as_deref(),
+        pick_conda_target(
+            &PypiKey::from_pypi("some-pypi-only"),
+            &name_map,
+            &parselmouth,
+        )
+        .as_ref()
+        .map(CondaName::as_spec),
         Some("the-conda-name"),
     );
 }
@@ -153,9 +178,13 @@ fn pick_conda_target_single_parselmouth_candidate() {
 fn pick_conda_target_unknown_dep_is_none() {
     // Not in name_map and not in parselmouth -> stays on PyPI.
     let parselmouth = pypi_map(&[("torch", &["pytorch"])]);
-    let name_map: BTreeMap<String, String> = BTreeMap::new();
+    let name_map = NameMap::new();
     assert_eq!(
-        pick_conda_target("totally-unknown-pkg", &name_map, &parselmouth),
+        pick_conda_target(
+            &PypiKey::from_pypi("totally-unknown-pkg"),
+            &name_map,
+            &parselmouth,
+        ),
         None,
     );
 }
@@ -165,10 +194,15 @@ fn pick_conda_target_user_name_map_overrides_parselmouth_identity() {
     // A user retread-name-map entry beats even a parselmouth identity
     // match -- the curated answer is authoritative.
     let parselmouth = pypi_map(&[("opencv-python-headless", &["opencv-python-headless"])]);
-    let mut name_map: BTreeMap<String, String> = BTreeMap::new();
-    name_map.insert("opencv-python-headless".into(), "py-opencv".into());
+    let name_map = name_map(&[("opencv-python-headless", "py-opencv")]);
     assert_eq!(
-        pick_conda_target("opencv-python-headless", &name_map, &parselmouth).as_deref(),
+        pick_conda_target(
+            &PypiKey::from_pypi("opencv-python-headless"),
+            &name_map,
+            &parselmouth,
+        )
+        .as_ref()
+        .map(CondaName::as_spec),
         Some("py-opencv"),
     );
 }
@@ -1062,6 +1096,60 @@ fn solo_bundle(name: &str, requires: Vec<&str>) -> Bundle {
     }
 }
 
+#[test]
+fn auto_routed_underscored_conda_name_emits_raw() {
+    let mut bundle = solo_bundle(
+        "underscore-pack",
+        vec!["cuda-nvcc-linux-64==12.9.1"],
+    );
+    bundle.auto_routed.push(BundleAutoRoute {
+        route: crate::uv_closure::AutoRoutedPackage {
+            pypi_name: "cuda-nvcc-linux-64".to_string(),
+            conda_name: "cuda-nvcc_linux-64".to_string(),
+            pypi_version: "12.9.1".to_string(),
+            conda_version: "12.9.1".to_string(),
+            channel: "https://conda.example.invalid/linux-64".to_string(),
+            input_requirements: Vec::new(),
+        },
+        deps_from_floor: false,
+    });
+
+    let output = produce_output(
+        &bundle,
+        &cfg(),
+        Platform::Linux64,
+        "3.11",
+        &[],
+        None,
+        None,
+    )
+    .unwrap();
+    let routed = output
+        .run_dependencies
+        .depends
+        .iter()
+        .filter(|dependency| dependency.name.as_str() != "python")
+        .collect::<Vec<_>>();
+    assert_eq!(routed.len(), 1, "raw/folded aliases must dedupe by key");
+    assert_eq!(routed[0].name.as_str(), "cuda-nvcc_linux-64");
+
+    let target = WheelTarget {
+        python_version: "3.11".to_string(),
+        conda_subdir: "linux-64".to_string(),
+        max_glibc: None,
+    };
+    let route_specs = emitted_bundle_route_specs(&bundle, &cfg(), &target).unwrap();
+    let route = route_specs
+        .iter()
+        .find(|route| route.pypi_name == PypiKey::from_pypi("cuda-nvcc-linux-64"))
+        .expect("the raw auto-route must reach the co-solve boundary");
+    assert_eq!(route.conda_name.as_spec(), "cuda-nvcc_linux-64");
+    assert_eq!(
+        route.match_spec().as_str(),
+        "cuda-nvcc_linux-64 >=12.9.1,<13"
+    );
+}
+
 // -----------------------------------------------------------------
 // v1.3.0: cascade PyPI index fallback chain + step-8 auto-bundle
 // gating. The chain must mirror auto_bundle_transitives' (entry
@@ -1204,9 +1292,10 @@ fn name_mapped_dep_dropped_by_pypi_name() {
     // and the solve died with "No candidates were found for
     // tinyobjloader-python".
     let mut config = cfg();
-    config
-        .name_map
-        .insert("tinyobjloader".into(), "tinyobjloader-python".into());
+    config.name_map.insert(
+        PypiKey::from_pypi("tinyobjloader"),
+        CondaTarget::Mapped(CondaName::new("tinyobjloader-python")),
+    );
 
     // Case 1: drop recorded under the PyPI name (what the cascade
     // pushes).
@@ -2046,25 +2135,31 @@ fn prefer_conda_match_identifies_mapped_targets() {
     // Contract: entries in the effective name map are eligible for a
     // requirement-specific conda probe. The probe result, not this name-only
     // lookup, makes the final routing decision.
-    let mut name_map: std::collections::BTreeMap<String, String> =
-        std::collections::BTreeMap::new();
-    name_map.insert("torch".to_string(), "pytorch".to_string());
-    name_map.insert("numpy".to_string(), "numpy".to_string());
-    name_map.insert(
-        "opencv-python-headless".to_string(),
-        "py-opencv".to_string(),
-    );
+    let name_map = name_map(&[
+        ("torch", "pytorch"),
+        ("numpy", "numpy"),
+        ("opencv-python-headless", "py-opencv"),
+    ]);
 
     // Parselmouth-known => probe the mapped conda target.
-    assert!(prefer_conda_match("torch", &name_map));
-    assert!(prefer_conda_match("numpy", &name_map));
+    assert!(prefer_conda_match(&PypiKey::from_pypi("torch"), &name_map));
+    assert!(prefer_conda_match(&PypiKey::from_pypi("numpy"), &name_map));
     // FALLBACK_PYPI_TO_CONDA entry survives the same way.
-    assert!(prefer_conda_match("opencv-python-headless", &name_map));
+    assert!(prefer_conda_match(
+        &PypiKey::from_pypi("opencv-python-headless"),
+        &name_map
+    ));
 
     // Unknown to parselmouth => no mapped conda target from this lookup.
-    assert!(!prefer_conda_match("qdldl", &name_map));
-    assert!(!prefer_conda_match("asteval", &name_map));
-    assert!(!prefer_conda_match("aiodns", &name_map));
+    assert!(!prefer_conda_match(&PypiKey::from_pypi("qdldl"), &name_map));
+    assert!(!prefer_conda_match(
+        &PypiKey::from_pypi("asteval"),
+        &name_map
+    ));
+    assert!(!prefer_conda_match(
+        &PypiKey::from_pypi("aiodns"),
+        &name_map
+    ));
 }
 
 #[test]
@@ -2755,10 +2850,7 @@ fn deps_from_conda_floors_apply_only_to_explicit_active_bare_roots() {
         "torch ; sys_platform == 'linux'".to_string(),
         "python-package ; sys_platform == 'win32'".to_string(),
     ];
-    let name_map = BTreeMap::from([
-        ("torch".to_string(), "pytorch".to_string()),
-        ("python-package".to_string(), "python".to_string()),
-    ]);
+    let name_map = name_map(&[("torch", "pytorch"), ("python-package", "python")]);
 
     apply_deps_from_conda_floors(
         &mut constraints,
@@ -2796,10 +2888,7 @@ fn deps_from_conda_floors_fail_closed_on_ambiguous_name_map() {
         floor_spec: ">=2.1.0".to_string(),
         source: "environment.yaml".to_string(),
     }];
-    let name_map = BTreeMap::from([
-        ("torch".to_string(), "pytorch".to_string()),
-        ("torch-alt".to_string(), "pytorch".to_string()),
-    ]);
+    let name_map = name_map(&[("torch", "pytorch"), ("torch-alt", "pytorch")]);
 
     apply_deps_from_conda_floors(
         &mut constraints,
@@ -2845,8 +2934,13 @@ fn deps_from_conda_floors_preserve_authoritative_inputs() {
         .collect::<Vec<_>>();
     let name_map = ["numpy", "pandas", "scipy", "requests"]
         .into_iter()
-        .map(|name| (name.to_string(), name.to_string()))
-        .collect::<BTreeMap<_, _>>();
+        .map(|name| {
+            (
+                PypiKey::from_pypi(name),
+                CondaTarget::Mapped(CondaName::new(name)),
+            )
+        })
+        .collect::<NameMap>();
     let roots = vec![
         "numpy".to_string(),
         "pandas".to_string(),

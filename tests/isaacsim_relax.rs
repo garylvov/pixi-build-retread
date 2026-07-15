@@ -25,6 +25,7 @@ use std::path::PathBuf;
 
 use pixi_build_retread::config::{RelaxPolicy, RetreadConfig};
 use pixi_build_retread::recipe::{BundleSource, build_bundle_recipe, to_yaml};
+use pixi_build_retread::relax::{CondaName, CondaTarget, PypiKey};
 use pixi_build_retread::wheel::parse_metadata;
 
 fn fixtures_dir() -> PathBuf {
@@ -222,8 +223,10 @@ fn name_map_remaps_opencv_to_conda() {
 
     // gigastrap-style: PyPI opencv-python-headless -> conda py-opencv.
     let mut cfg = baseline_config();
-    cfg.name_map
-        .insert("opencv-python-headless".into(), "py-opencv".into());
+    cfg.name_map.insert(
+        PypiKey::from_pypi("opencv-python-headless"),
+        CondaTarget::Mapped(CondaName::new("py-opencv")),
+    );
     let recipe = build_bundle_recipe(
         "isaacsim-test",
         &[BundleSource {

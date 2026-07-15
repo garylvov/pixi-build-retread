@@ -36,7 +36,9 @@ use uv_pep508::Requirement;
 
 use crate::lock::{LockWheel, Origin};
 use crate::pypi::WheelTarget;
-use crate::relax::canonical_conda_name;
+use crate::relax::{
+    CondaMatchSpec, CondaName, CondaTarget, NameMap, PypiKey, canonical_conda_name,
+};
 
 /// Env var overriding the uv binary path (spec §2.5).
 pub const UV_BIN_ENV: &str = "RETREAD_UV";
@@ -242,9 +244,10 @@ pub struct AutoRouteOptions {
     /// conda availability: the bundle's own root entries and retread-built
     /// wheels. Routing a root to conda would hollow out the pack.
     pub protected: BTreeSet<String>,
-    /// Effective pypi -> conda name map (user retread-name-map + fallback
-    /// table + parselmouth merge). Missing names use the identity mapping.
-    pub name_map: BTreeMap<String, String>,
+    /// Effective pypi -> conda target map (user retread-name-map + fallback
+    /// table + parselmouth merge). Missing names use the identity mapping;
+    /// disabled entries are never routed or probed.
+    pub name_map: NameMap,
     /// Canonical PyPI names the self-healing un-route step must NEVER
     /// move back to the wheel closure (`force-conda`), even when the
     /// co-installability solve names them in an unsat core. The user
@@ -276,7 +279,7 @@ pub struct AutoRouteOptions {
     /// consuming workspace environment. Populated only for the validated
     /// routing policy. A successful route for one of these names is an
     /// automatic drop rather than a generated-pack run dependency.
-    pub workspace_owned: BTreeSet<String>,
+    pub workspace_owned: BTreeSet<PypiKey>,
     /// Stable digest of the concrete per-environment conda facts used to
     /// validate routing. It participates in the persisted heal-facts stamp so
     /// a changed workspace solution cannot replay stale routes.
@@ -554,18 +557,20 @@ pub fn plan_auto_route_round(
         {
             continue;
         }
-        let conda_name = opts
-            .name_map
-            .get(name)
-            .map(|c| canonical_conda_name(c))
-            .unwrap_or_else(|| name.clone());
+        let pypi_key = PypiKey::from_pypi(name);
+        let conda_name = match opts.name_map.get(&pypi_key) {
+            Some(CondaTarget::Mapped(conda_name)) => conda_name.clone(),
+            Some(CondaTarget::Disabled) => continue,
+            None => CondaName::new(name.clone()),
+        };
+        let conda_key = conda_name.key();
         // v4.6 Part A: the routing-policy gate. Under `Minimal`, a
         // non-whitelisted candidate never routes regardless of conda
         // availability -- it ships as a wheel.
-        if !route_policy_admits(name, &conda_name, opts) {
+        if !route_policy_admits(name, conda_key.as_str(), opts) {
             continue;
         }
-        if let Some(hit) = probe_hits.get(&conda_name) {
+        if let Some(hit) = probe_hits.get(conda_name.as_spec()) {
             // Route-time metadata-consistency check (prevention for the
             // PyPI-vs-conda-forge metadata-skew class -- run-15's
             // moviepy==2.2.1/pillow==11.3.0 shape): the routed build's
@@ -590,7 +595,7 @@ pub fn plan_auto_route_round(
             }
             out.push(AutoRoutedPackage {
                 pypi_name: name.clone(),
-                conda_name,
+                conda_name: conda_name.as_spec().to_string(),
                 pypi_version: wheel.version.clone(),
                 conda_version: hit.conda_version.clone(),
                 channel: hit.channel.clone(),
@@ -749,6 +754,7 @@ pub fn auto_route_probe_specs(
         .map(|n| canonical_conda_name(n))
         .collect();
     let mut out: Vec<(String, String)> = Vec::new();
+    let mut seen: BTreeSet<(PypiKey, String)> = BTreeSet::new();
     for wheel in &closure.wheels {
         let name = &wheel.name;
         if excluded.contains(name)
@@ -758,19 +764,21 @@ pub fn auto_route_probe_specs(
         {
             continue;
         }
-        let conda_name = opts
-            .name_map
-            .get(name)
-            .map(|c| canonical_conda_name(c))
-            .unwrap_or_else(|| name.clone());
+        let pypi_key = PypiKey::from_pypi(name);
+        let conda_name = match opts.name_map.get(&pypi_key) {
+            Some(CondaTarget::Mapped(conda_name)) => conda_name.clone(),
+            Some(CondaTarget::Disabled) => continue,
+            None => CondaName::new(name.clone()),
+        };
+        let conda_key = conda_name.key();
         // v4.6 Part A: don't even probe repodata for candidates the
         // routing policy refuses -- they ship as wheels.
-        if !route_policy_admits(name, &conda_name, opts) {
+        if !route_policy_admits(name, conda_key.as_str(), opts) {
             continue;
         }
-        let pair = (conda_name, format!("=={}", wheel.version));
-        if !out.contains(&pair) {
-            out.push(pair);
+        let spec = format!("=={}", wheel.version);
+        if seen.insert((conda_key, spec.clone())) {
+            out.push((conda_name.as_spec().to_string(), spec));
         }
     }
     out
@@ -859,21 +867,16 @@ pub enum CoInstallVerdict {
 /// spec; an empty string and `*` both mean unconstrained.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct CondaRouteSpec {
-    pub pypi_name: String,
-    pub conda_name: String,
+    pub pypi_name: PypiKey,
+    pub conda_name: CondaName,
     pub spec: String,
 }
 
 impl CondaRouteSpec {
     /// Render this route as a conda match spec suitable for the shared
     /// co-installability oracle.
-    pub fn match_spec(&self) -> String {
-        let spec = self.spec.trim();
-        if spec.is_empty() || spec == "*" {
-            self.conda_name.clone()
-        } else {
-            format!("{} {spec}", self.conda_name)
-        }
+    pub fn match_spec(&self) -> CondaMatchSpec {
+        self.conda_name.match_spec(&self.spec)
     }
 }
 
@@ -1206,7 +1209,8 @@ where
                 // named again afterwards -> un-route fallback.
                 let mut round_harmonized: Vec<String> = Vec::new();
                 for pkg in &named {
-                    let ws_version = opts.workspace_conda_versions.get(&pkg.conda_name);
+                    let conda_key = CondaName::new(pkg.conda_name.clone()).key();
+                    let ws_version = opts.workspace_conda_versions.get(conda_key.as_str());
                     if let Some(ws_version) = ws_version
                         && ws_version != &pkg.conda_version
                         && !harmonize_tried.contains(&pkg.pypi_name)
@@ -1390,7 +1394,10 @@ where
     closure.auto_dropped.extend(
         routed
             .iter()
-            .filter(|route| opts.workspace_owned.contains(&route.pypi_name))
+            .filter(|route| {
+                opts.workspace_owned
+                    .contains(&PypiKey::from_pypi(&route.pypi_name))
+            })
             .map(|route| route.pypi_name.clone()),
     );
     closure.auto_routed = routed;
@@ -2075,7 +2082,7 @@ fn is_conda_only_name(name: &str) -> bool {
 /// * `source` / `env`: recorded verbatim into provenance.
 pub fn build_constraints(
     conda_deps: &BTreeMap<String, String>,
-    name_map: &BTreeMap<String, String>,
+    name_map: &NameMap,
     global_name_map: &crate::handler::PypiToCondaMap,
     source: &str,
     env: &str,
@@ -2089,11 +2096,14 @@ pub fn build_constraints(
     // pack declares no name map of its own -- previously such a pin
     // produced an inert constraint on a nonexistent pypi name
     // (`pytorch-gpu==2.7.0`) and uv free-picked torch 2.10.
-    let mut conda_to_pypi: BTreeMap<String, String> = BTreeMap::new();
-    for (pypi, conda) in name_map {
+    let mut conda_to_pypi: BTreeMap<PypiKey, PypiKey> = BTreeMap::new();
+    for (pypi, target) in name_map {
+        let Some(conda) = target.mapped_name() else {
+            continue;
+        };
         conda_to_pypi
-            .entry(canonical_conda_name(conda))
-            .or_insert_with(|| canonical_conda_name(pypi));
+            .entry(conda.key())
+            .or_insert_with(|| pypi.clone());
     }
     // Deterministic order: sort the HashMap's pypi keys before merging.
     let mut global_sorted: Vec<(&String, &Vec<String>)> = global_name_map.iter().collect();
@@ -2101,8 +2111,8 @@ pub fn build_constraints(
     for (pypi, condas) in global_sorted {
         for conda in condas {
             conda_to_pypi
-                .entry(canonical_conda_name(conda))
-                .or_insert_with(|| canonical_conda_name(pypi));
+                .entry(CondaName::new(conda.clone()).key())
+                .or_insert_with(|| PypiKey::from_pypi(pypi));
         }
     }
 
@@ -2114,12 +2124,12 @@ pub fn build_constraints(
         let Some(pep) = conda_spec_to_pep440(conda_spec) else {
             continue;
         };
-        let canon = canonical_conda_name(conda_name);
-        let pypi_name = conda_to_pypi.get(&canon).cloned().unwrap_or(canon);
-        let line = format!("{pypi_name}{pep}");
+        let conda_key = CondaName::new(conda_name.clone()).key();
+        let pypi_name = conda_to_pypi.get(&conda_key).cloned().unwrap_or(conda_key);
+        let line = format!("{}{pep}", pypi_name.as_str());
         set.constraints.push(line.clone());
         set.provenance.insert(
-            pypi_name,
+            pypi_name.into_string(),
             ConstraintProvenance {
                 constraint: line,
                 conda_name: conda_name.clone(),
@@ -3259,13 +3269,13 @@ pub fn heal_facts_stamp(
     let name_map: Vec<String> = opts
         .name_map
         .iter()
-        .map(|(k, v)| format!("{k}={v}"))
+        .map(|(k, v)| format!("{}={v}", k.as_str()))
         .collect();
     field("name-map", &mut name_map.iter().map(String::as_str));
     field("protected", &mut opts.protected.iter().map(String::as_str));
     field(
         "workspace-owned",
-        &mut opts.workspace_owned.iter().map(String::as_str),
+        &mut opts.workspace_owned.iter().map(PypiKey::as_str),
     );
     field(
         "workspace-facts",
@@ -3840,13 +3850,24 @@ mod tests {
         }
     }
 
+    fn mapped_name_map(entries: &[(&str, &str)]) -> NameMap {
+        entries
+            .iter()
+            .map(|(pypi, conda)| {
+                (
+                    PypiKey::from_pypi(pypi),
+                    CondaTarget::Mapped(CondaName::new(*conda)),
+                )
+            })
+            .collect()
+    }
+
     fn sample_request() -> UvClosureRequest {
         let mut conda_deps = BTreeMap::new();
         conda_deps.insert("pytorch-gpu".to_string(), "==2.10.0".to_string());
         conda_deps.insert("numpy".to_string(), ">=1.26,<3".to_string());
         conda_deps.insert("python".to_string(), "3.12.*".to_string());
-        let mut name_map = BTreeMap::new();
-        name_map.insert("torch".to_string(), "pytorch-gpu".to_string());
+        let name_map = mapped_name_map(&[("torch", "pytorch-gpu")]);
         let constraints = build_constraints(
             &conda_deps,
             &name_map,
@@ -4191,9 +4212,10 @@ isaaclab = { path = "wheels/isaaclab/isaaclab-2.0.0-py3-none-any.whl" }
         conda_deps.insert("__glibc".into(), ">=2.28".into()); // skipped
         conda_deps.insert("scipy".into(), "*".into()); // unrepresentable spec
 
-        let mut name_map = BTreeMap::new();
-        name_map.insert("torch".into(), "pytorch-gpu".into());
-        name_map.insert("opencv-python-headless".into(), "py-opencv".into());
+        let name_map = mapped_name_map(&[
+            ("torch", "pytorch-gpu"),
+            ("opencv-python-headless", "py-opencv"),
+        ]);
 
         let set = build_constraints(
             &conda_deps,
@@ -4253,8 +4275,7 @@ isaaclab = { path = "wheels/isaaclab/isaaclab-2.0.0-py3-none-any.whl" }
         assert_eq!(set.provenance["torch"].conda_name, "pytorch-gpu");
 
         // The pack's own name map still wins over the global one.
-        let mut pack_map = BTreeMap::new();
-        pack_map.insert("my-torch".to_string(), "pytorch-gpu".to_string());
+        let pack_map = mapped_name_map(&[("my-torch", "pytorch-gpu")]);
         let set2 = build_constraints(
             &conda_deps,
             &pack_map,
@@ -4306,8 +4327,7 @@ isaaclab = { path = "wheels/isaaclab/isaaclab-2.0.0-py3-none-any.whl" }
         // (a) conda pin -> uv constraint with provenance.
         let mut conda_deps = BTreeMap::new();
         conda_deps.insert("pytorch-gpu".into(), "==2.10.0".into());
-        let mut name_map = BTreeMap::new();
-        name_map.insert("torch".into(), "pytorch-gpu".into());
+        let name_map = mapped_name_map(&[("torch", "pytorch-gpu")]);
         let set = build_constraints(
             &conda_deps,
             &name_map,
@@ -5246,7 +5266,7 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
         )]);
         let mut opts = auto_route_opts();
         opts.route_policy = crate::config::RoutePolicy::PreferCondaValidated;
-        opts.workspace_owned.insert("numpy".to_string());
+        opts.workspace_owned.insert(PypiKey::from_pypi("numpy"));
 
         let closure = auto_route_fixpoint_checked(
             &auto_route_req(),
@@ -5349,6 +5369,76 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
         assert_eq!(calls.lock().unwrap().len(), 1);
     }
 
+    #[test]
+    fn mapped_underscored_conda_target_probes_raw() {
+        let closure = parse_pylock_closure(
+            PYLOCK_FIXTURE,
+            &target("3.12", "linux-64"),
+            &BTreeSet::new(),
+            "x",
+        )
+        .unwrap();
+        let req = auto_route_req();
+        let mut opts = auto_route_opts();
+        opts.name_map = mapped_name_map(&[("numpy", "cuda-nvcc_linux-64")]);
+
+        let probes = auto_route_probe_specs(&closure, &req, &opts, &[]);
+        assert!(
+            probes.contains(&("cuda-nvcc_linux-64".to_string(), "==2.1.0".to_string())),
+            "mapped conda targets must reach the probe in their raw spelling: {probes:?}"
+        );
+        assert!(
+            probes.iter().all(|(name, _)| name != "cuda-nvcc-linux-64"),
+            "a PyPI identity key must never become a conda probe name: {probes:?}"
+        );
+
+        let hits = BTreeMap::from([(
+            "cuda-nvcc_linux-64".to_string(),
+            RouteProbeHit {
+                conda_version: "2.1.0".into(),
+                channel: "c/linux-64".into(),
+                depends: Vec::new(),
+            },
+        )]);
+        let routes = plan_auto_route_round(&closure, &req, &opts, &[], &hits).unwrap();
+        let numpy = routes
+            .iter()
+            .find(|route| route.pypi_name == "numpy")
+            .expect("the raw underscored target should route on its matching hit");
+        assert_eq!(numpy.conda_name, "cuda-nvcc_linux-64");
+    }
+
+    #[test]
+    fn disabled_name_map_target_is_neither_probed_nor_routed() {
+        let closure = parse_pylock_closure(
+            PYLOCK_FIXTURE,
+            &target("3.12", "linux-64"),
+            &BTreeSet::new(),
+            "x",
+        )
+        .unwrap();
+        let req = auto_route_req();
+        let mut opts = auto_route_opts();
+        opts.name_map
+            .insert(PypiKey::from_pypi("numpy"), CondaTarget::Disabled);
+
+        let probes = auto_route_probe_specs(&closure, &req, &opts, &[]);
+        assert!(
+            probes.iter().all(|(name, _)| name != "numpy"),
+            "disabled names must not be probed: {probes:?}"
+        );
+        let hits = BTreeMap::from([(
+            "numpy".to_string(),
+            RouteProbeHit {
+                conda_version: "2.1.0".into(),
+                channel: "c/linux-64".into(),
+                depends: Vec::new(),
+            },
+        )]);
+        let routes = plan_auto_route_round(&closure, &req, &opts, &[], &hits).unwrap();
+        assert!(routes.iter().all(|route| route.pypi_name != "numpy"));
+    }
+
     /// The name-map is honored: `torch` routes via conda's `pytorch`.
     #[tokio::test]
     async fn auto_route_maps_pypi_to_conda_names() {
@@ -5388,8 +5478,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
             },
         );
         let mut opts = auto_route_opts();
-        opts.name_map
-            .insert("torch".to_string(), "pytorch".to_string());
+        opts.name_map = mapped_name_map(&[("torch", "pytorch")]);
         let closure = auto_route_fixpoint(&auto_route_req(), &opts, solve, canned_probe(hits))
             .await
             .unwrap();
@@ -6085,8 +6174,8 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
 
     fn emitted_route(pypi_name: &str, conda_name: &str, spec: &str) -> CondaRouteSpec {
         CondaRouteSpec {
-            pypi_name: pypi_name.to_string(),
-            conda_name: conda_name.to_string(),
+            pypi_name: PypiKey::from_pypi(pypi_name),
+            conda_name: CondaName::new(conda_name),
             spec: spec.to_string(),
         }
     }
@@ -6096,8 +6185,10 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
         let sibling = emitted_route("sibling-runtime", "sibling-runtime", ">=4,<5");
         let candidate = emitted_route("candidate-addon", "candidate-addon", "==2.1");
         let co_solve = |routes: Vec<CondaRouteSpec>| async move {
-            let names: BTreeSet<String> =
-                routes.into_iter().map(|route| route.conda_name).collect();
+            let names: BTreeSet<String> = routes
+                .into_iter()
+                .map(|route| route.conda_name.as_spec().to_string())
+                .collect();
             if names.contains("sibling-runtime") && names.contains("candidate-addon") {
                 CoInstallVerdict::Unsat(vec!["incompatible transitive constraints".to_string()])
             } else {
@@ -6128,8 +6219,10 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
         let right = emitted_route("worker-right", "worker-right", "==1");
         let unrelated = emitted_route("utility", "utility", ">=7");
         let co_solve = |routes: Vec<CondaRouteSpec>| async move {
-            let names: BTreeSet<String> =
-                routes.into_iter().map(|route| route.conda_name).collect();
+            let names: BTreeSet<String> = routes
+                .into_iter()
+                .map(|route| route.conda_name.as_spec().to_string())
+                .collect();
             if names.contains("worker-left") && names.contains("worker-right") {
                 CoInstallVerdict::Unsat(vec!["incompatible transitive constraints".to_string()])
             } else {
@@ -6163,6 +6256,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
                     routes
                         .iter()
                         .map(CondaRouteSpec::match_spec)
+                        .map(|spec| spec.as_str().to_string())
                         .collect::<Vec<_>>(),
                     vec!["extension >=2,<3", "runtime"]
                 );
@@ -6406,7 +6500,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
             keep_pypi: BTreeSet::new(),
             force_conda: BTreeSet::new(),
             protected: BTreeSet::from(["mujoco".to_string()]),
-            name_map: BTreeMap::from([("torch".to_string(), "pytorch".to_string())]),
+            name_map: mapped_name_map(&[("torch", "pytorch")]),
             abi_anchor_pins: BTreeMap::new(),
             workspace_conda_versions: BTreeMap::from([(
                 "pytorch".to_string(),
@@ -7840,7 +7934,7 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
         o.route_include.insert("scipy".into());
         assert_ne!(base, stamp(&base_req(), &o));
         let mut o = base_opts();
-        o.name_map.insert("torch".into(), "pytorch".into());
+        o.name_map = mapped_name_map(&[("torch", "pytorch")]);
         assert_ne!(base, stamp(&base_req(), &o));
         // Python bump invalidates.
         let mut r = base_req();

@@ -7,6 +7,60 @@ use std::collections::BTreeMap;
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 
+use crate::relax::{CondaName, CondaTarget, NameMap, PypiKey};
+
+fn deserialize_name_map<'de, D>(deserializer: D) -> std::result::Result<NameMap, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = BTreeMap::<String, String>::deserialize(deserializer)?;
+    let mut canonical = NameMap::new();
+    let mut source_keys = BTreeMap::<PypiKey, String>::new();
+
+    for (raw_key, raw_target) in raw {
+        let key = PypiKey::from_pypi(&raw_key);
+        if raw_key != key.as_str() {
+            tracing::warn!(
+                key = %raw_key,
+                canonical = %key,
+                "retread-name-map key is non-canonical; using its canonical PyPI key",
+            );
+        }
+
+        let target = if raw_target.is_empty() {
+            CondaTarget::Disabled
+        } else {
+            CondaTarget::Mapped(CondaName::new(raw_target))
+        };
+
+        if let Some(existing) = canonical.get(&key) {
+            let existing_key = source_keys
+                .get(&key)
+                .expect("source key accompanies every canonical name-map entry");
+            if existing == &target {
+                tracing::warn!(
+                    canonical = %key,
+                    first_key = %existing_key,
+                    duplicate_key = %raw_key,
+                    target = %target,
+                    "duplicate retread-name-map aliases have the same target; deduplicating",
+                );
+                continue;
+            }
+
+            return Err(serde::de::Error::custom(format!(
+                "conflicting retread-name-map entries `{existing_key}` = `{existing}` and \
+                 `{raw_key}` = `{target}` canonicalize to the same key `{key}`"
+            )));
+        }
+
+        source_keys.insert(key.clone(), raw_key);
+        canonical.insert(key, target);
+    }
+
+    Ok(canonical)
+}
+
 /// PyPI packages that are Windows-only and frequently declared as
 /// unconditional `Requires-Dist` lines by upstream packagers (notably the
 /// Isaac Sim wheels). Auto-dropped from run-deps when the target platform
@@ -84,11 +138,12 @@ pub struct RetreadConfig {
     /// `py-opencv`, etc.).
     #[serde(
         default,
+        deserialize_with = "deserialize_name_map",
         rename = "retread-name-map",
         alias = "name-map",
         alias = "name_map"
     )]
-    pub name_map: BTreeMap<String, String>,
+    pub name_map: NameMap,
 
     /// Shared-library payload replacements applied by the courier installer
     /// after uv installs the wheel payload. Keys are site-packages-relative
@@ -1029,6 +1084,83 @@ impl WheelEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn name_map_noncanonical_key_is_canonicalized() {
+        let json = serde_json::json!({
+            "retread-wheels": { "foo": { "version": "==1.0" } },
+            "retread-name-map": {
+                "opencv_python_headless": "py-opencv"
+            },
+        });
+
+        let cfg: RetreadConfig = serde_json::from_value(json).unwrap();
+        let target = cfg
+            .name_map
+            .get(&PypiKey::from_pypi("opencv-python-headless"))
+            .and_then(CondaTarget::mapped_name)
+            .expect("non-canonical user key must remain live after config load");
+        assert_eq!(target.as_spec(), "py-opencv");
+    }
+
+    #[test]
+    fn name_map_equal_canonical_aliases_are_deduplicated() {
+        let json = serde_json::json!({
+            "retread-wheels": { "foo": { "version": "==1.0" } },
+            "retread-name-map": {
+                "opencv-python-headless": "py-opencv",
+                "opencv_python_headless": "py-opencv"
+            },
+        });
+
+        let cfg: RetreadConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.name_map.len(), 1);
+        assert_eq!(
+            cfg.name_map
+                .get(&PypiKey::from_pypi("opencv.python.headless"))
+                .and_then(CondaTarget::mapped_name)
+                .map(CondaName::as_spec),
+            Some("py-opencv")
+        );
+    }
+
+    #[test]
+    fn name_map_conflicting_canonical_aliases_are_rejected() {
+        let json = serde_json::json!({
+            "retread-wheels": { "foo": { "version": "==1.0" } },
+            "retread-name-map": {
+                "opencv-python-headless": "",
+                "opencv_python_headless": "py-opencv"
+            },
+        });
+
+        let error = serde_json::from_value::<RetreadConfig>(json).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("conflicting retread-name-map entries"));
+        assert!(message.contains("opencv-python-headless"));
+    }
+
+    #[test]
+    fn typed_name_map_json_round_trip_preserves_targets() {
+        let expected = NameMap::from([
+            (
+                PypiKey::from_pypi("opencv_python_headless"),
+                CondaTarget::Mapped(CondaName::new("py_opencv")),
+            ),
+            (PypiKey::from_pypi("wheel-only"), CondaTarget::Disabled),
+        ]);
+
+        let json = serde_json::to_value(&expected).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "opencv-python-headless": "py_opencv",
+                "wheel-only": ""
+            })
+        );
+        let round_trip: NameMap = serde_json::from_value(json).unwrap();
+        assert_eq!(round_trip, expected);
+    }
 
     #[test]
     fn parses_retread_wheels_key() {

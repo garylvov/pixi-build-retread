@@ -1269,6 +1269,7 @@ pub async fn stage(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::relax::{CondaName, CondaTarget, PypiKey};
     use std::io::Write as _;
 
     /// Build a minimal valid wheel zip in memory for the given dist/version/requires.
@@ -1513,12 +1514,14 @@ mod tests {
             .overrides
             .insert("torchvision".to_string(), ">=0.18".to_string());
         // Mimic FALLBACK + parselmouth name_map entries added by resolve_all
-        effective
-            .name_map
-            .insert("FALLBACK".to_string(), "mypkg".to_string());
-        effective
-            .name_map
-            .insert("Pillow".to_string(), "pillow".to_string());
+        effective.name_map.insert(
+            PypiKey::from_pypi("FALLBACK"),
+            CondaTarget::Mapped(CondaName::new("mypkg")),
+        );
+        effective.name_map.insert(
+            PypiKey::from_pypi("Pillow"),
+            CondaTarget::Mapped(CondaName::new("pillow")),
+        );
 
         let fp_declared = config_fingerprint(&declared, &chans, ws_fp);
         let fp_effective = config_fingerprint(&effective, &chans, ws_fp);
