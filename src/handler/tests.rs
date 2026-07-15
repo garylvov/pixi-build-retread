@@ -91,6 +91,7 @@ fn bundle_auto_route(name: &str, version: &str, provenance: Provenance) -> Bundl
             input_requirements: Vec::new(),
         },
         provenance,
+        workspace_provider: None,
     }
 }
 
@@ -630,13 +631,25 @@ fn auto_route_envelope_does_not_override_index_metadata_cap() {
     assert!(message.contains("<13"), "{message}");
 }
 
+fn insert_exact_workspace_provider(bundle: &mut Bundle, name: &str, version: &str) {
+    bundle
+        .workspace_conda_versions
+        .insert(name.to_string(), version.to_string());
+    bundle.workspace_conda_provider_facts.insert(
+        name.to_string(),
+        WorkspaceCondaProviderFact {
+            selected_versions: BTreeSet::from([version.to_string()]),
+            declared_specs: BTreeSet::new(),
+            present_in_all_consumers: true,
+        },
+    );
+}
+
 #[test]
 fn workspace_fact_ownership_respects_pypi_intent_and_mapping_direction() {
     let mut bundle = solo_bundle("source-pack", vec!["starlette>=0.40,<0.46"]);
     bundle.primary.metadata_provenance = Provenance::SourceBuiltRelaxed;
-    bundle
-        .workspace_conda_versions
-        .insert("starlette".to_string(), "0.45.3".to_string());
+    insert_exact_workspace_provider(&mut bundle, "starlette", "0.45.3");
     let mut config = cfg();
     config.keep_pypi.push("starlette".to_string());
     bundle.apply_workspace_conda_fact_ownership(
@@ -663,9 +676,7 @@ fn workspace_fact_ownership_respects_pypi_intent_and_mapping_direction() {
     // Exclusions apply to the whole declared alias group: a PyPI-side keep
     // for torch also protects its mapped pytorch conda fact and route.
     let mut bundle = solo_bundle("source-pack", vec!["torch>=2"]);
-    bundle
-        .workspace_conda_versions
-        .insert("pytorch".to_string(), "2.7.0".to_string());
+    insert_exact_workspace_provider(&mut bundle, "pytorch", "2.7.0");
     bundle.auto_routed.push(BundleAutoRoute {
         route: crate::uv_closure::AutoRoutedPackage {
             pypi_name: "torch".to_string(),
@@ -676,6 +687,7 @@ fn workspace_fact_ownership_respects_pypi_intent_and_mapping_direction() {
             input_requirements: Vec::new(),
         },
         provenance: Provenance::PriorSelection,
+        workspace_provider: None,
     });
     let mapped_bundle = bundle.clone();
     let mut config = cfg();
@@ -713,9 +725,8 @@ fn workspace_fact_ownership_respects_pypi_intent_and_mapping_direction() {
     // conda fact provide PyPI torch when the configured provider is absent.
     let mut reverse_bundle = mapped_bundle;
     reverse_bundle.workspace_conda_versions.clear();
-    reverse_bundle
-        .workspace_conda_versions
-        .insert("torch".to_string(), "2.7.0".to_string());
+    reverse_bundle.workspace_conda_provider_facts.clear();
+    insert_exact_workspace_provider(&mut reverse_bundle, "torch", "2.7.0");
     reverse_bundle.apply_workspace_conda_fact_ownership(
         &config,
         &config.name_map,
@@ -729,9 +740,7 @@ fn workspace_fact_ownership_respects_pypi_intent_and_mapping_direction() {
     // provider is bar, must not exclude the independent baz fact that owns
     // PyPI bar through the separate `bar -> baz` edge.
     let mut chained_bundle = solo_bundle("source-pack", vec!["bar>=1"]);
-    chained_bundle
-        .workspace_conda_versions
-        .insert("baz".to_string(), "1.0.0".to_string());
+    insert_exact_workspace_provider(&mut chained_bundle, "baz", "1.0.0");
     let mut chained_config = cfg();
     chained_config.name_map = name_map(&[("foo", "bar"), ("bar", "baz")]);
     chained_bundle.apply_workspace_conda_fact_ownership(
@@ -749,9 +758,7 @@ fn workspace_fact_ownership_respects_pypi_intent_and_mapping_direction() {
     // `foo -> bar`, an override named bar must veto ownership of PyPI foo even
     // when bar is also a PyPI key mapped onward to baz.
     let mut provider_override_bundle = solo_bundle("source-pack", vec!["foo>=1"]);
-    provider_override_bundle
-        .workspace_conda_versions
-        .insert("bar".to_string(), "1.0.0".to_string());
+    insert_exact_workspace_provider(&mut provider_override_bundle, "bar", "1.0.0");
     let mut provider_override_config = cfg();
     provider_override_config.name_map = name_map(&[("foo", "bar"), ("bar", "baz")]);
     provider_override_config
@@ -767,13 +774,11 @@ fn workspace_fact_ownership_respects_pypi_intent_and_mapping_direction() {
 
     // Inferred mappings cannot create ownership, but they still participate
     // in exclusions because emission honors conda-provider-keyed overrides
-    // under the effective map. Here the explicit fact map is intentionally
+    // under the effective map. Here the explicit fact name map is intentionally
     // empty: foo owns only by same-name identity, then the effective
     // `foo -> bar` emission edge lets the manual bar override veto that drop.
     let mut inferred_override_bundle = solo_bundle("source-pack", vec!["foo>=1"]);
-    inferred_override_bundle
-        .workspace_conda_versions
-        .insert("foo".to_string(), "1.0.0".to_string());
+    insert_exact_workspace_provider(&mut inferred_override_bundle, "foo", "1.0.0");
     let mut inferred_override_config = cfg();
     inferred_override_config.name_map = name_map(&[("foo", "bar")]);
     inferred_override_config
@@ -790,9 +795,7 @@ fn workspace_fact_ownership_respects_pypi_intent_and_mapping_direction() {
     // An explicit disabled mapping is wheel-side intent and vetoes same-name
     // fact ownership.
     let mut disabled_bundle = solo_bundle("source-pack", vec!["numpy>=2"]);
-    disabled_bundle
-        .workspace_conda_versions
-        .insert("numpy".to_string(), "2.1.0".to_string());
+    insert_exact_workspace_provider(&mut disabled_bundle, "numpy", "2.1.0");
     let mut disabled_config = cfg();
     disabled_config
         .name_map
@@ -808,9 +811,7 @@ fn workspace_fact_ownership_respects_pypi_intent_and_mapping_direction() {
     // A disabled PyPI key is not a provider-wide veto. Another explicit edge
     // may still use the same-named conda fact.
     let mut disabled_alias_bundle = solo_bundle("source-pack", vec!["bar>=1"]);
-    disabled_alias_bundle
-        .workspace_conda_versions
-        .insert("foo".to_string(), "1.0.0".to_string());
+    insert_exact_workspace_provider(&mut disabled_alias_bundle, "foo", "1.0.0");
     let mut disabled_alias_config = cfg();
     disabled_alias_config
         .name_map
@@ -854,6 +855,139 @@ fn workspace_fact_ownership_respects_pypi_intent_and_mapping_direction() {
             .iter()
             .any(|dependency| dependency.name.as_str() == "bar"),
         "PyPI bar ownership must not drop a distinct PyPI foo requirement"
+    );
+}
+
+fn partial_psutil_provider_bundle() -> Bundle {
+    let mut bundle = solo_bundle("source-pack", vec!["psutil==5.9.8"]);
+    bundle.workspace_conda_provider_facts.insert(
+        "psutil".to_string(),
+        WorkspaceCondaProviderFact {
+            selected_versions: BTreeSet::from(["7.2.2".to_string()]),
+            declared_specs: BTreeSet::from([">=7,<8".to_string()]),
+            present_in_all_consumers: false,
+        },
+    );
+    bundle.auto_routed.push(bundle_auto_route(
+        "psutil",
+        "5.9.8",
+        Provenance::PriorSelection,
+    ));
+    bundle
+}
+
+fn assert_partial_provider_veto_preserves_route(
+    label: &str,
+    mut bundle: Bundle,
+    config: RetreadConfig,
+    dynamic_keep_pypi: BTreeSet<PypiKey>,
+    protected_roots: BTreeSet<String>,
+) {
+    assert!(
+        bundle.workspace_conda_versions.is_empty(),
+        "{label}: this guard must exercise provider-only ownership"
+    );
+    assert_eq!(bundle.auto_routed.len(), 1, "{label}: stale route fixture");
+    assert!(
+        bundle.auto_routed[0].workspace_provider.is_none(),
+        "{label}: fixture route must start unannotated"
+    );
+    let original_route = bundle.auto_routed[0].route.clone();
+    let original_provenance = bundle.auto_routed[0].provenance.clone();
+
+    bundle.apply_workspace_conda_fact_ownership(
+        &config,
+        &config.name_map,
+        &dynamic_keep_pypi,
+        &protected_roots,
+    );
+
+    assert!(
+        bundle.auto_dropped.is_empty(),
+        "{label}: explicit PyPI intent must veto the typed drop"
+    );
+    assert_eq!(
+        bundle.auto_routed.len(),
+        1,
+        "{label}: veto must preserve the original route"
+    );
+    assert_eq!(
+        bundle.auto_routed[0].route, original_route,
+        "{label}: veto must not replace the route"
+    );
+    assert_eq!(
+        bundle.auto_routed[0].provenance, original_provenance,
+        "{label}: veto must preserve route provenance"
+    );
+    assert!(
+        bundle.auto_routed[0].workspace_provider.is_none(),
+        "{label}: veto must not annotate the route as workspace-owned"
+    );
+}
+
+#[test]
+fn partial_workspace_provider_ownership_respects_every_pypi_veto() {
+    let mut override_config = cfg();
+    override_config
+        .overrides
+        .insert("psutil".to_string(), "*".to_string());
+    assert!(override_config.ledger_overrides.is_empty());
+    assert_partial_provider_veto_preserves_route(
+        "manual non-ledger override",
+        partial_psutil_provider_bundle(),
+        override_config,
+        BTreeSet::new(),
+        BTreeSet::new(),
+    );
+
+    let mut keep_config = cfg();
+    keep_config.keep_pypi.push("psutil".to_string());
+    assert_partial_provider_veto_preserves_route(
+        "configured keep-pypi",
+        partial_psutil_provider_bundle(),
+        keep_config,
+        BTreeSet::new(),
+        BTreeSet::new(),
+    );
+
+    assert_partial_provider_veto_preserves_route(
+        "dynamic keep-pypi",
+        partial_psutil_provider_bundle(),
+        cfg(),
+        BTreeSet::from([PypiKey::from_pypi("psutil")]),
+        BTreeSet::new(),
+    );
+
+    assert_partial_provider_veto_preserves_route(
+        "protected root",
+        partial_psutil_provider_bundle(),
+        cfg(),
+        BTreeSet::new(),
+        BTreeSet::from(["psutil".to_string()]),
+    );
+
+    let mut materialized_bundle = partial_psutil_provider_bundle();
+    materialized_bundle
+        .extras
+        .push(rw("psutil", meta("psutil", "7.2.2", Vec::new(), false)));
+    assert_partial_provider_veto_preserves_route(
+        "materialized wheel",
+        materialized_bundle,
+        cfg(),
+        BTreeSet::new(),
+        BTreeSet::new(),
+    );
+
+    let mut disabled_config = cfg();
+    disabled_config
+        .name_map
+        .insert(PypiKey::from_pypi("psutil"), CondaTarget::Disabled);
+    assert_partial_provider_veto_preserves_route(
+        "disabled name mapping",
+        partial_psutil_provider_bundle(),
+        disabled_config,
+        BTreeSet::new(),
+        BTreeSet::new(),
     );
 }
 
@@ -1510,6 +1644,7 @@ fn auto_routed_underscored_conda_name_emits_raw() {
             input_requirements: Vec::new(),
         },
         provenance: Provenance::PriorSelection,
+        workspace_provider: None,
     });
 
     let output =
