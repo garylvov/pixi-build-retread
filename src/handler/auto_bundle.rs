@@ -5,6 +5,7 @@
 //! identical whole-function moves; no logic changes.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::ffi::OsStr;
 use std::future::Future;
 use std::path::Path;
 use std::str::FromStr;
@@ -48,6 +49,44 @@ impl std::fmt::Display for IncrementalRipple {
 }
 
 impl std::error::Error for IncrementalRipple {}
+
+/// Exact opt-in for the P4 uv re-resolve path. Every value except the literal
+/// `1` preserves the legacy reconstruct-and-fetch behavior.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum UvReresolveMode {
+    #[default]
+    Disabled,
+    Enabled,
+}
+
+impl UvReresolveMode {
+    pub(crate) fn from_env_value(value: Option<&OsStr>) -> Self {
+        if value == Some(OsStr::new("1")) {
+            Self::Enabled
+        } else {
+            Self::Disabled
+        }
+    }
+
+    fn is_enabled(self) -> bool {
+        self == Self::Enabled
+    }
+}
+
+/// Per-group state needed to hand a rejected conda route back to the outer uv
+/// auto-route fixpoint. `keep_pypi` is monotonic across group retries.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct UvReresolveContext {
+    pub(crate) mode: UvReresolveMode,
+    pub(crate) uv_backed: bool,
+    pub(crate) keep_pypi: BTreeSet<PypiKey>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum AutoBundleOutcome {
+    Complete,
+    RetryKeepPypi { keep_pypi: BTreeSet<PypiKey> },
+}
 
 /// Returns `true` if `pypi_key` has an enabled, unambiguous conda equivalent
 /// in the effective name map (parselmouth + FALLBACK + user
@@ -334,6 +373,13 @@ struct ProvisionalMetadataRoute {
 
 type ProvisionalMetadataRoutes = BTreeMap<String, Vec<ProvisionalMetadataRoute>>;
 
+#[derive(Debug, PartialEq, Eq)]
+enum JointRouteOutcome {
+    Unchanged,
+    Mutated,
+    RetryKeepPypi { keep_pypi: BTreeSet<PypiKey> },
+}
+
 async fn fetch_from_index_chain<X, XF>(
     indexes: &[String],
     request: PypiFetchRequest,
@@ -465,7 +511,8 @@ pub(crate) async fn auto_bundle_transitives(
     // finalizes mutable uv routes only after the merged bundle's actual
     // emitted sibling constraints are known.
     conda_co_solve: &super::CondaCoSolveContext,
-) -> Result<()> {
+    uv_reresolve: &UvReresolveContext,
+) -> Result<AutoBundleOutcome> {
     let probe_channels = conda_channels.to_vec();
     let probe_python = target.python_version.clone();
     let probe_many = move |pairs: Vec<(String, String)>| {
@@ -526,6 +573,7 @@ pub(crate) async fn auto_bundle_transitives(
         &co_solve,
         &fetch_pypi,
         &channels_consulted,
+        uv_reresolve,
     )
     .await
 }
@@ -544,7 +592,8 @@ async fn auto_bundle_transitives_with<P, PF, C, CF, X, XF>(
     co_solve: &C,
     fetch_pypi: &X,
     channels_consulted: &[String],
-) -> Result<()>
+    uv_reresolve: &UvReresolveContext,
+) -> Result<AutoBundleOutcome>
 where
     P: Fn(Vec<(String, String)>) -> PF,
     PF: Future<Output = Vec<crate::probe::ProbeResult>>,
@@ -670,7 +719,7 @@ where
         // candidates (first iteration; empty afterwards).
         candidates.append(&mut closure_seed);
         if candidates.is_empty() && loose_candidates.is_empty() {
-            if jointly_unroute_unsolvable(
+            match jointly_unroute_unsolvable(
                 bundle,
                 &mut provisional_metadata_routes,
                 &observed_requirements,
@@ -681,15 +730,21 @@ where
                 co_solve,
                 fetch_pypi,
                 channels_consulted,
+                uv_reresolve,
             )
             .await?
             {
-                // Rejected routes were restored as wheels or safely dropped
-                // to a precise workspace owner. Scan any restored metadata
-                // before accepting the remaining conda routes.
-                continue;
+                JointRouteOutcome::Unchanged => break,
+                JointRouteOutcome::Mutated => {
+                    // The legacy path restored wheels or safely dropped a
+                    // precise workspace owner. Scan restored metadata before
+                    // accepting the remaining conda routes.
+                    continue;
+                }
+                JointRouteOutcome::RetryKeepPypi { keep_pypi } => {
+                    return Ok(AutoBundleOutcome::RetryKeepPypi { keep_pypi });
+                }
             }
-            break;
         }
 
         // PR-1 (Site 2): sort candidates by canonical name so routing is
@@ -729,9 +784,12 @@ where
         let is_closure_member = |name: &str| {
             uv_closure_wheels.is_some_and(|s| s.contains_key(&canonical_conda_name(name)))
         };
+        let held_by_uv_reresolve =
+            |name: &str| uv_reresolve.keep_pypi.contains(&PypiKey::from_pypi(name));
         let prefer_pairs: Vec<(String, String)> = candidates
             .iter()
             .filter(|(name, _)| !is_closure_member(name))
+            .filter(|(name, _)| !held_by_uv_reresolve(name))
             .filter_map(|(name, version)| {
                 let pypi_key = PypiKey::from_pypi(name);
                 config
@@ -791,6 +849,18 @@ where
                     "auto-bundle: uv closure member not moved to conda by the \
                      auto-route; bundling from PyPI (closure is authoritative)",
                 );
+            } else if held_by_uv_reresolve(&name) {
+                bundle.probe_decisions.push(crate::audit::ProbeDecision {
+                    stage: "auto_bundle".into(),
+                    pypi_name: name.clone(),
+                    conda_name: conda_name.clone(),
+                    spec: format!("=={version}"),
+                    target_python: target.python_version.clone(),
+                    channels_consulted: vec![],
+                    satisfiable: None,
+                    matching_candidates: 0,
+                    routing_decision: "uv-reresolve-keep-pypi".into(),
+                });
             } else if prefer_conda_match(&pypi_key, &config.name_map) {
                 // Probe the workspace's conda channels for whether the
                 // spec retread would emit is actually satisfiable. If
@@ -868,6 +938,7 @@ where
         let loose_pairs: Vec<(String, String)> = loose_candidates
             .iter()
             .filter(|(name, _)| !is_closure_member(name))
+            .filter(|(name, _)| !held_by_uv_reresolve(name))
             .filter_map(|(name, specs)| {
                 let pypi_key = PypiKey::from_pypi(name);
                 let target_name = match config.name_map.get(&pypi_key) {
@@ -910,6 +981,21 @@ where
                     "auto-bundle: uv closure member (loose spec) not moved to conda \
                      by the auto-route; bundling from PyPI (closure is authoritative)",
                 );
+                to_fetch.push((name, specs.to_string(), conda_name, specs, preferred_ver));
+                continue;
+            }
+            if held_by_uv_reresolve(&name) {
+                bundle.probe_decisions.push(crate::audit::ProbeDecision {
+                    stage: "auto_bundle_loose".into(),
+                    pypi_name: name.clone(),
+                    conda_name: conda_name.clone(),
+                    spec: specs.to_string(),
+                    target_python: target.python_version.clone(),
+                    channels_consulted: vec![],
+                    satisfiable: None,
+                    matching_candidates: 0,
+                    routing_decision: "uv-reresolve-keep-pypi".into(),
+                });
                 to_fetch.push((name, specs.to_string(), conda_name, specs, preferred_ver));
                 continue;
             }
@@ -1016,8 +1102,8 @@ where
         // Scan metadata from every wheel fetched this round before finalizing
         // routes. Otherwise a later wheel can tighten a requirement after its
         // conda route has already been rejected and restored from PyPI.
-        if !added_any
-            && jointly_unroute_unsolvable(
+        if !added_any {
+            match jointly_unroute_unsolvable(
                 bundle,
                 &mut provisional_metadata_routes,
                 &observed_requirements,
@@ -1028,10 +1114,16 @@ where
                 co_solve,
                 fetch_pypi,
                 channels_consulted,
+                uv_reresolve,
             )
             .await?
-        {
-            added_any = true;
+            {
+                JointRouteOutcome::Unchanged => {}
+                JointRouteOutcome::Mutated => added_any = true,
+                JointRouteOutcome::RetryKeepPypi { keep_pypi } => {
+                    return Ok(AutoBundleOutcome::RetryKeepPypi { keep_pypi });
+                }
+            }
         }
 
         // Loop again only if we added at least one wheel; the new
@@ -1040,7 +1132,7 @@ where
             break;
         }
     }
-    Ok(())
+    Ok(AutoBundleOutcome::Complete)
 }
 
 /// Does this canonical conda dependency disappear if every provisional
@@ -1109,7 +1201,8 @@ async fn jointly_unroute_unsolvable<C, CF, X, XF>(
     co_solve: &C,
     fetch_pypi: &X,
     channels_consulted: &[String],
-) -> Result<bool>
+    uv_reresolve: &UvReresolveContext,
+) -> Result<JointRouteOutcome>
 where
     C: Fn(Vec<crate::uv_closure::CondaRouteSpec>) -> CF,
     CF: Future<Output = crate::uv_closure::CoInstallVerdict>,
@@ -1117,7 +1210,7 @@ where
     XF: Future<Output = Result<ResolvedWheel>>,
 {
     if bundle.auto_routed.is_empty() && metadata_routes.is_empty() {
-        return Ok(false);
+        return Ok(JointRouteOutcome::Unchanged);
     }
 
     let assembly = super::emitted_bundle_route_assembly(bundle, config, target)?;
@@ -1197,7 +1290,7 @@ where
         .filter_map(|name| emitted_by_conda.get(name).cloned())
         .collect();
     if mutable_candidates.is_empty() && pre_rejected.is_empty() {
-        return Ok(false);
+        return Ok(JointRouteOutcome::Unchanged);
     }
 
     let mutable_keys: HashSet<String> = mutable_conda_names.iter().cloned().collect();
@@ -1225,12 +1318,42 @@ where
     let mut seen_rejected = BTreeSet::new();
     rejected.retain(|route| seen_rejected.insert(route.conda_name.key().into_string()));
     if rejected.is_empty() {
-        return Ok(false);
+        return Ok(JointRouteOutcome::Unchanged);
     }
     let rejected_keys: BTreeSet<String> = rejected
         .iter()
         .map(|route| route.conda_name.key().into_string())
         .collect();
+
+    if uv_reresolve.mode.is_enabled() && uv_reresolve.uv_backed {
+        // Preserve every PyPI origin, not just CondaRouteSpec::pypi_name:
+        // emission groups aliases by conda identity, while uv's keep-pypi
+        // policy is keyed by the original PyPI identity.
+        let mut rejected_pypi_origins = BTreeSet::new();
+        for route in &bundle.auto_routed {
+            if rejected_keys.contains(&canonical_conda_name(&route.route.conda_name)) {
+                rejected_pypi_origins.insert(PypiKey::from_pypi(&route.route.pypi_name));
+            }
+        }
+        for conda_name in &rejected_keys {
+            if let Some(origins) = metadata_routes.get(conda_name) {
+                rejected_pypi_origins.extend(
+                    origins
+                        .iter()
+                        .map(|origin| PypiKey::from_pypi(&origin.pypi_name)),
+                );
+            }
+        }
+        if rejected_pypi_origins.is_empty() {
+            return Err(anyhow!(
+                "joint route validation rejected {:?}, but no PyPI route provenance was available for uv re-resolve",
+                rejected_keys
+            ));
+        }
+        let mut keep_pypi = uv_reresolve.keep_pypi.clone();
+        keep_pypi.extend(rejected_pypi_origins);
+        return Ok(JointRouteOutcome::RetryKeepPypi { keep_pypi });
+    }
 
     let rejected_specs: BTreeMap<String, String> = rejected
         .iter()
@@ -1478,7 +1601,7 @@ where
 
     *bundle = trial;
     metadata_routes.retain(|conda_name, _| !rejected_keys.contains(conda_name));
-    Ok(true)
+    Ok(JointRouteOutcome::Mutated)
 }
 
 /// Returns Some((name, exact_version)) if `raw` is a base dep (no
@@ -2128,6 +2251,21 @@ mod tests {
         assert_eq!(pick_conda_target(&key, &effective, &global), None);
     }
 
+    #[test]
+    fn uv_reresolve_mode_requires_exact_literal_one() {
+        assert_eq!(
+            UvReresolveMode::from_env_value(Some(OsStr::new("1"))),
+            UvReresolveMode::Enabled
+        );
+        for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
+            assert_eq!(
+                UvReresolveMode::from_env_value(value.map(OsStr::new)),
+                UvReresolveMode::Disabled,
+                "{value:?} must preserve the default legacy path"
+            );
+        }
+    }
+
     fn repo_record(name: &str, version: &str, depends: &[&str]) -> RepoDataRecord {
         let mut package_record = PackageRecord::new(
             name.parse().unwrap(),
@@ -2201,6 +2339,68 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn rejected_uv_route_returns_all_keep_pypi_origins_without_shadow_fetch() {
+        let fetch_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fetch = {
+            let fetch_calls = Arc::clone(&fetch_calls);
+            move |_request: PypiFetchRequest, _index: String| {
+                fetch_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { Err(anyhow!("uv re-resolve must return before shadow fetch")) }
+            }
+        };
+        let mut bundle = test_bundle(&[]);
+        bundle.auto_routed.push(pillow_auto_route("10.4.0"));
+        let mut alias = pillow_auto_route("10.4.0");
+        alias.route.pypi_name = "Pillow_SIMD".to_string();
+        bundle.auto_routed.push(alias);
+        let mut metadata_routes = ProvisionalMetadataRoutes::new();
+        record_metadata_route(
+            &mut metadata_routes,
+            "pillow-metadata-alias".to_string(),
+            "pillow".to_string(),
+            None,
+        );
+        let target = crate::pypi::WheelTarget::for_subdir("3.11", "linux-64");
+        let context = UvReresolveContext {
+            mode: UvReresolveMode::Enabled,
+            uv_backed: true,
+            keep_pypi: [PypiKey::from_pypi("already-kept")].into(),
+        };
+
+        let outcome = jointly_unroute_unsolvable(
+            &mut bundle,
+            &mut metadata_routes,
+            &ObservedRequirements::new(),
+            &[crate::workspace::DEFAULT_PYPI_INDEX.to_string()],
+            &target,
+            &test_config(),
+            &workspace_ownership(&[]),
+            &reject_every_mutable_route,
+            &fetch,
+            &["conda-forge/linux-64".to_string()],
+            &context,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            JointRouteOutcome::RetryKeepPypi {
+                keep_pypi: [
+                    PypiKey::from_pypi("already-kept"),
+                    PypiKey::from_pypi("pillow"),
+                    PypiKey::from_pypi("Pillow_SIMD"),
+                    PypiKey::from_pypi("pillow-metadata-alias"),
+                ]
+                .into(),
+            }
+        );
+        assert_eq!(fetch_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(bundle.auto_routed.len(), 2, "retry must not mutate bundle");
+        assert!(metadata_routes.contains_key("pillow"));
+    }
+
     fn holosoma_numpy_conflict_bundle() -> Bundle {
         let mut bundle = test_bundle(&[]);
         bundle.conda_name = "holosoma-pack".to_string();
@@ -2244,6 +2444,7 @@ mod tests {
             &reject_numpy_route,
             &fetch,
             &["conda-forge/linux-64".to_string()],
+            &UvReresolveContext::default(),
         )
         .await
         .unwrap();
@@ -2300,6 +2501,7 @@ mod tests {
             &reject_numpy_route,
             &fetch,
             &["conda-forge/linux-64".to_string()],
+            &UvReresolveContext::default(),
         )
         .await
         .unwrap_err();
@@ -2389,6 +2591,7 @@ mod tests {
             &reject_both,
             &fetch,
             &["conda-forge/linux-64".to_string()],
+            &UvReresolveContext::default(),
         )
         .await
         .unwrap();
@@ -2437,6 +2640,7 @@ mod tests {
             &indeterminate,
             &fetch,
             &["conda-forge/linux-64".to_string()],
+            &UvReresolveContext::default(),
         )
         .await
         .unwrap_err();
@@ -2488,6 +2692,7 @@ mod tests {
             &cosolvable,
             &fetch,
             &["conda-forge/linux-64".to_string()],
+            &UvReresolveContext::default(),
         )
         .await
         .unwrap();
@@ -2546,6 +2751,7 @@ mod tests {
             &co_solve,
             &fetch,
             &["conda-forge/linux-64".to_string()],
+            &UvReresolveContext::default(),
         )
         .await
         .unwrap();
@@ -2663,7 +2869,7 @@ mod tests {
         ));
         let target = crate::pypi::WheelTarget::for_subdir("3.10", "linux-64");
 
-        auto_bundle_transitives_with(
+        let outcome = auto_bundle_transitives_with(
             &mut bundle,
             &[crate::workspace::DEFAULT_PYPI_INDEX.to_string()],
             &target,
@@ -2676,9 +2882,16 @@ mod tests {
             &reject_every_mutable_route,
             &fetch,
             &["conda-forge/linux-64".to_string()],
+            &UvReresolveContext {
+                mode: UvReresolveMode::from_env_value(None),
+                uv_backed: true,
+                keep_pypi: BTreeSet::new(),
+            },
         )
         .await
         .unwrap();
+
+        assert_eq!(outcome, AutoBundleOutcome::Complete);
 
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
@@ -2882,6 +3095,7 @@ pillow = ">=10,<13"
             &scoped_reject,
             &fetch,
             &["conda-forge/linux-64".to_string()],
+            &UvReresolveContext::default(),
         )
         .await
         .unwrap();
@@ -2950,6 +3164,7 @@ pillow = ">=10,<13"
             &reject_every_mutable_route,
             &fetch,
             &["conda-forge/linux-64".to_string()],
+            &UvReresolveContext::default(),
         )
         .await
         .unwrap_err();
@@ -3083,6 +3298,7 @@ pillow = ">=10,<13"
             &reject_every_mutable_route,
             &fetch,
             &["conda-forge/linux-64".to_string()],
+            &UvReresolveContext::default(),
         )
         .await
         .unwrap();
@@ -3239,6 +3455,7 @@ pillow = ">=10,<13"
             &solve,
             &fetch,
             &["conda-forge/linux-64".to_string()],
+            &UvReresolveContext::default(),
         )
         .await
         .unwrap();
@@ -3361,6 +3578,7 @@ pillow = ">=10,<13"
             &solve,
             &fetch,
             &["conda-forge/linux-64".to_string()],
+            &UvReresolveContext::default(),
         )
         .await
         .unwrap();

@@ -5,8 +5,9 @@ use audit_report::{build_bundle_audit, write_probe_trace};
 
 mod auto_bundle;
 use auto_bundle::{
-    BfsFetched, Pending, PendingSource, auto_bundle_transitives, conda_probe_spec,
-    metadata_preferring_sidecar, pick_conda_target, seed_worklist, validated_conda_route,
+    AutoBundleOutcome, BfsFetched, Pending, PendingSource, UvReresolveContext,
+    UvReresolveMode, auto_bundle_transitives, conda_probe_spec, metadata_preferring_sidecar,
+    pick_conda_target, seed_worklist, validated_conda_route,
 };
 
 mod resolve_state;
@@ -1857,7 +1858,15 @@ async fn resolve_all(
             .push((entry_name.clone(), entry.clone()));
     }
 
-    for (group_name, group_entries) in groups {
+    let uv_reresolve_env = std::env::var_os("RETREAD_UV_RERESOLVE");
+    let uv_reresolve_mode = UvReresolveMode::from_env_value(uv_reresolve_env.as_deref());
+    let mut uv_retry_keep_by_group: BTreeMap<String, BTreeSet<PypiKey>> = BTreeMap::new();
+
+    while let Some((group_name, group_entries)) = groups.pop_first() {
+        let uv_retry_keep = uv_retry_keep_by_group
+            .get(&group_name)
+            .cloned()
+            .unwrap_or_default();
         // Build each entry's sub-bundle (primary + BFS extras + D rewrite)
         // independently, then fold them into one merged bundle named
         // after the group. The first entry in BTreeMap order becomes the
@@ -1943,6 +1952,7 @@ async fn resolve_all(
             workspace_dir,
             &workspace_pypi_indexes,
             conda_channels,
+            &uv_retry_keep,
         )
         .await
         .with_context(|| format!("computing uv closure for bundle `{group_name}`"))?;
@@ -2124,7 +2134,7 @@ async fn resolve_all(
                 &workspace_pypi_indexes,
                 IndexPurpose::Resolve,
             );
-            auto_bundle_transitives(
+            let outcome = auto_bundle_transitives(
                 &mut bundle,
                 &auto_indexes,
                 target,
@@ -2136,8 +2146,33 @@ async fn resolve_all(
                 uv_closure_members.as_ref(),
                 &workspace_ownership,
                 &conda_co_solve,
+                &UvReresolveContext {
+                    mode: uv_reresolve_mode,
+                    uv_backed: uv_closure.is_some(),
+                    keep_pypi: uv_retry_keep.clone(),
+                },
             )
             .await?;
+            match outcome {
+                AutoBundleOutcome::Complete => {}
+                AutoBundleOutcome::RetryKeepPypi { keep_pypi } => {
+                    let accumulated = uv_retry_keep_by_group
+                        .entry(group_name.clone())
+                        .or_default();
+                    let previous_len = accumulated.len();
+                    accumulated.extend(keep_pypi);
+                    if accumulated.len() == previous_len {
+                        bail!(
+                            "uv re-resolve for bundle `{group_name}` rejected conda routes but added no new keep-pypi names"
+                        );
+                    }
+                    // The materialized bundle reflects the rejected lock. Drop
+                    // the whole attempt and re-enter this group's ordinary uv
+                    // closure/fixpoint path from its original inputs.
+                    groups.insert(group_name, group_entries);
+                    continue;
+                }
+            }
         }
         // v0.32.0+: pre_emit_widen_pass moved OUT of resolve_all into
         // the per-env emission loop in conda_outputs. Materialization
@@ -3030,6 +3065,7 @@ async fn uv_group_closure(
     workspace_dir: Option<&Path>,
     workspace_pypi_indexes: &[String],
     conda_channels: &[ChannelUrl],
+    uv_retry_keep: &BTreeSet<PypiKey>,
 ) -> Result<(
     Option<crate::uv_closure::UvClosure>,
     std::collections::BTreeSet<String>,
@@ -3037,6 +3073,10 @@ async fn uv_group_closure(
     WorkspaceRouteOwnership,
     CondaCoSolveContext,
 )> {
+    let uv_retry_keep_names: BTreeSet<String> = uv_retry_keep
+        .iter()
+        .map(|name| name.as_str().to_string())
+        .collect();
     let mut roots: Vec<String> = Vec::new();
     // Direct-URL wheels pre-fetched into the content-addressed store and
     // emitted as `[tool.uv.sources]` path sources (see below) accumulate here,
@@ -3185,6 +3225,7 @@ async fn uv_group_closure(
             .keep_pypi
             .iter()
             .map(|name| canonical_conda_name(name))
+            .chain(uv_retry_keep_names.iter().cloned())
             .collect();
         let protected_entries: BTreeSet<String> = group_entries
             .iter()
@@ -3225,6 +3266,7 @@ async fn uv_group_closure(
                     .iter()
                     .map(|name| PypiKey::from_pypi(name)),
             );
+            excluded_pypi_names.extend(uv_retry_keep.iter().cloned());
             excluded_pypi_names.extend(
                 group_entries
                     .iter()
@@ -3524,6 +3566,7 @@ async fn uv_group_closure(
             .keep_pypi
             .iter()
             .map(|name| canonical_conda_name(name))
+            .chain(uv_retry_keep_names.iter().cloned())
             .collect();
         let first_party: BTreeSet<String> = first_party_names.iter().cloned().collect();
         workspace_facts.owned_pypi.retain(|name| {
@@ -3587,6 +3630,7 @@ async fn uv_group_closure(
             .keep_pypi
             .iter()
             .map(|n| canonical_conda_name(n))
+            .chain(uv_retry_keep_names.iter().cloned())
             .collect(),
         protected,
         name_map: effective.name_map.clone(),
@@ -3660,10 +3704,15 @@ async fn uv_group_closure(
     let sdist_probe = {
         let channels = conda_channels.to_vec();
         let python = target.python_version.clone();
+        let keep_pypi = uv_retry_keep_names.clone();
         move |conda_name: String, spec: String| {
             let channels = channels.clone();
             let python = python.clone();
+            let keep_pypi = keep_pypi.clone();
             let fut = async move {
+                if keep_pypi.contains(&canonical_conda_name(&conda_name)) {
+                    return None;
+                }
                 crate::probe::find_route(&channels, &conda_name, &spec, Some(&python))
                     .await
                     .map(|hit| crate::uv_closure::RouteProbeHit {
@@ -3718,7 +3767,14 @@ async fn uv_group_closure(
         );
     }
     let workspace_overrides = Arc::new(std::sync::Mutex::new(persisted_facts.workspace_overrides));
-    let sdist_routed = Arc::new(std::sync::Mutex::new(persisted_facts.routed));
+    let persisted_routes = persisted_facts
+        .routed
+        .into_iter()
+        .filter(|route| {
+            !uv_retry_keep_names.contains(&canonical_conda_name(&route.pypi_name))
+        })
+        .collect();
+    let sdist_routed = Arc::new(std::sync::Mutex::new(persisted_routes));
     let sdist_built = Arc::new(std::sync::Mutex::new(persisted_facts.built));
     // Transitive-prerelease repairs surface naturally in the closure's
     // pins/wheels (the offender keeps its own index wheel); collected here

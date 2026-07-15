@@ -5605,6 +5605,120 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
         assert_eq!(calls.lock().unwrap().len(), 1);
     }
 
+    /// A name rejected by final joint validation re-enters the ordinary
+    /// fixpoint as `keep_pypi`. Starting that retry from the clean base
+    /// request is equivalent to a direct keep-PyPI solve: a prior route's
+    /// selected version remains a preference, never an injected exact pin.
+    #[tokio::test]
+    async fn rejected_route_reenters_fixpoint_as_keep_pypi() {
+        let prior_selection = "4.0.1";
+        let make_solve = |calls: Arc<Mutex<Vec<UvClosureRequest>>>| {
+            move |req: UvClosureRequest| {
+                let calls = Arc::clone(&calls);
+                Box::pin(async move {
+                    calls.lock().unwrap().push(req.clone());
+                    let hard_pinned_to_prior = req
+                        .constraints
+                        .constraints
+                        .iter()
+                        .chain(req.overrides.iter())
+                        .chain(req.dependencies.iter())
+                        .any(|line| line == "flatdict==4.0.1");
+                    let version = if hard_pinned_to_prior {
+                        "4.0.1"
+                    } else {
+                        "4.6.3"
+                    };
+                    let wheel = LockWheel {
+                        name: "flatdict".into(),
+                        version: version.into(),
+                        origin: Origin::Index,
+                        filename: format!("flatdict-{version}-py3-none-any.whl"),
+                        url: Some(format!("https://example.com/flatdict-{version}.whl")),
+                        sha256: Some("00".repeat(32)),
+                        requires_dist: vec![],
+                        must_ship: false,
+                        upstream_url: None,
+                        git_source: None,
+                        sdist_source: None,
+                    };
+                    Ok(UvClosure {
+                        pins: BTreeMap::from([("flatdict".into(), version.into())]),
+                        wheels: vec![wheel],
+                        uv_version: "0.11.26".into(),
+                        auto_routed: vec![],
+                        auto_dropped: BTreeSet::new(),
+                        effective_input_requirements: None,
+                    })
+                }) as futures::future::BoxFuture<'static, Result<UvClosure>>
+            }
+        };
+        let probe = |_name: String, _spec: String| {
+            Box::pin(async {
+                panic!("keep-pypi names must not be probed");
+                #[allow(unreachable_code)]
+                None
+            })
+                as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
+        };
+        let mut opts = auto_route_opts();
+        opts.keep_pypi.insert("flatdict".into());
+
+        let retry_calls = Arc::new(Mutex::new(Vec::new()));
+        let retry = auto_route_fixpoint_checked(
+            &auto_route_req(),
+            &opts,
+            make_solve(Arc::clone(&retry_calls)),
+            probe,
+            canned_co_solve(Vec::new()),
+        )
+        .await
+        .unwrap();
+        let direct_calls = Arc::new(Mutex::new(Vec::new()));
+        let direct = auto_route_fixpoint_checked(
+            &auto_route_req(),
+            &opts,
+            make_solve(Arc::clone(&direct_calls)),
+            |_name, _spec| {
+                Box::pin(async { None })
+                    as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
+            },
+            canned_co_solve(Vec::new()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(retry.pins, direct.pins);
+        assert_eq!(
+            retry
+                .wheels
+                .iter()
+                .map(|wheel| (&wheel.name, &wheel.version))
+                .collect::<Vec<_>>(),
+            direct
+                .wheels
+                .iter()
+                .map(|wheel| (&wheel.name, &wheel.version))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(retry.pins["flatdict"], "4.6.3");
+        assert_ne!(retry.pins["flatdict"], prior_selection);
+        let retry_calls = retry_calls.lock().unwrap();
+        let direct_calls = direct_calls.lock().unwrap();
+        for request in retry_calls.iter().chain(direct_calls.iter()) {
+            assert!(
+                !request
+                    .constraints
+                    .constraints
+                    .iter()
+                    .chain(request.overrides.iter())
+                    .chain(request.dependencies.iter())
+                    .any(|line| line == "flatdict==4.0.1"),
+                "a prior selection must not become a hard pin: {request:?}"
+            );
+        }
+    }
+
     /// Root entries (protected) are never routed even on a conda hit.
     #[tokio::test]
     async fn auto_route_never_routes_protected_roots() {
