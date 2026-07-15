@@ -2534,8 +2534,211 @@ mod tests {
         bundle
     }
 
+    fn pace_packaging_conflict_bundle() -> Bundle {
+        let mut bundle = test_bundle(&[]);
+        bundle.conda_name = "isaac-pack".to_string();
+        bundle.primary = test_wheel("isaaclab", "isaaclab", "0.54.2", &["packaging"]);
+        bundle.primary.metadata_provenance = Provenance::SourceBuiltRelaxed;
+        bundle.extras = vec![
+            test_wheel("isaaclab-rl", "isaaclab_rl", "0.4.7", &["packaging<24"]),
+            test_wheel(
+                "isaacsim-core",
+                "isaacsim-core",
+                "5.1.0.0",
+                &["packaging==23.0"],
+            ),
+            test_wheel("matplotlib", "matplotlib", "3.10.3", &["packaging>=20.0"]),
+            test_wheel("skrl", "skrl", "2.1.0", &["packaging"]),
+        ];
+        bundle
+    }
+
+    fn prior_selection_route(name: &str, version: &str) -> super::super::BundleAutoRoute {
+        super::super::BundleAutoRoute {
+            route: crate::uv_closure::AutoRoutedPackage {
+                pypi_name: name.to_string(),
+                conda_name: name.to_string(),
+                pypi_version: version.to_string(),
+                conda_version: version.to_string(),
+                channel: "https://conda.example.invalid/linux-64".to_string(),
+                input_requirements: Vec::new(),
+            },
+            provenance: Provenance::PriorSelection,
+        }
+    }
+
     #[tokio::test]
-    async fn legacy_joint_unroute_returns_typed_conflict_with_all_sources() {
+    async fn workspace_packaging_fact_drop_owns_pace_conflict() {
+        let probe_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let probe = {
+            let probe_calls = Arc::clone(&probe_calls);
+            move |pairs: Vec<(String, String)>| {
+                probe_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move { validated_probe(pairs).await }
+            }
+        };
+        let solve_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let co_solve = {
+            let solve_calls = Arc::clone(&solve_calls);
+            move |_routes: Vec<crate::uv_closure::CondaRouteSpec>| {
+                solve_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async {
+                    crate::uv_closure::CoInstallVerdict::Unsat(vec![
+                        "the workspace packaging pin conflicts with wheel metadata".to_string(),
+                    ])
+                }
+            }
+        };
+        let fetch_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fetch = {
+            let fetch_calls = Arc::clone(&fetch_calls);
+            move |_request: PypiFetchRequest, _index: String| {
+                fetch_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { Err(anyhow!("workspace-owned packaging must never fetch PyPI")) }
+            }
+        };
+        let target = crate::pypi::WheelTarget::for_subdir("3.11", "linux-64");
+        let config = test_config();
+        let mut bundle = pace_packaging_conflict_bundle();
+        bundle
+            .workspace_conda_versions
+            .insert("packaging".to_string(), "26.2".to_string());
+        bundle
+            .auto_routed
+            .push(prior_selection_route("packaging", "23.0"));
+
+        bundle.apply_workspace_conda_fact_ownership(
+            &config,
+            &config.name_map,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
+        assert_eq!(
+            bundle.auto_dropped,
+            HashSet::from(["packaging".to_string()])
+        );
+        assert!(
+            bundle.auto_routed.is_empty(),
+            "fact ownership must remove the stale uv route before emission"
+        );
+
+        let outcome = auto_bundle_transitives_with(
+            &mut bundle,
+            &[crate::workspace::DEFAULT_PYPI_INDEX.to_string()],
+            &target,
+            &config,
+            None,
+            None,
+            None,
+            &probe,
+            &co_solve,
+            &fetch,
+            &["conda-forge/linux-64".to_string()],
+            &UvReresolveContext::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, AutoBundleOutcome::Complete);
+        assert_eq!(probe_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(solve_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(fetch_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            bundle.all_wheels().count(),
+            5,
+            "the parent wheels remain installed"
+        );
+        let emitted = super::super::emitted_bundle_route_specs(&bundle, &config, &target).unwrap();
+        assert!(
+            emitted
+                .iter()
+                .all(|route| route.conda_name.key().as_str() != "packaging"),
+            "the generated pack must not re-emit workspace-owned packaging: {emitted:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_numpy_fact_drop_owns_holosoma_conflict() {
+        let probe_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let probe = {
+            let probe_calls = Arc::clone(&probe_calls);
+            move |pairs: Vec<(String, String)>| {
+                probe_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move { validated_probe(pairs).await }
+            }
+        };
+        let solve_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let co_solve = {
+            let solve_calls = Arc::clone(&solve_calls);
+            move |_routes: Vec<crate::uv_closure::CondaRouteSpec>| {
+                solve_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async {
+                    crate::uv_closure::CoInstallVerdict::Unsat(vec![
+                        "the workspace NumPy pin conflicts with wheel metadata".to_string(),
+                    ])
+                }
+            }
+        };
+        let fetch_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fetch = {
+            let fetch_calls = Arc::clone(&fetch_calls);
+            move |_request: PypiFetchRequest, _index: String| {
+                fetch_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { Err(anyhow!("workspace-owned numpy must never fetch PyPI")) }
+            }
+        };
+        let target = crate::pypi::WheelTarget::for_subdir("3.11", "linux-64");
+        let config = test_config();
+        let mut bundle = holosoma_numpy_conflict_bundle();
+        bundle
+            .workspace_conda_versions
+            .insert("numpy".to_string(), "1.26.4".to_string());
+
+        bundle.apply_workspace_conda_fact_ownership(
+            &config,
+            &config.name_map,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
+        assert_eq!(bundle.auto_dropped, HashSet::from(["numpy".to_string()]));
+
+        let outcome = auto_bundle_transitives_with(
+            &mut bundle,
+            &[crate::workspace::DEFAULT_PYPI_INDEX.to_string()],
+            &target,
+            &config,
+            None,
+            None,
+            None,
+            &probe,
+            &co_solve,
+            &fetch,
+            &["conda-forge/linux-64".to_string()],
+            &UvReresolveContext::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, AutoBundleOutcome::Complete);
+        assert_eq!(probe_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(solve_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(fetch_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            bundle.all_wheels().count(),
+            4,
+            "the parent wheels remain installed"
+        );
+        let emitted = super::super::emitted_bundle_route_specs(&bundle, &config, &target).unwrap();
+        assert!(
+            emitted
+                .iter()
+                .all(|route| route.conda_name.key().as_str() != "numpy"),
+            "the generated pack must not re-emit workspace-owned numpy: {emitted:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_workspace_fact_holosoma_conflict_still_fail_closes() {
         let fetch_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let fetch = {
             let fetch_calls = Arc::clone(&fetch_calls);
@@ -2545,15 +2748,27 @@ mod tests {
             }
         };
         let target = crate::pypi::WheelTarget::for_subdir("3.11", "linux-64");
+        let config = test_config();
         let mut bundle = holosoma_numpy_conflict_bundle();
+        let favor_lock_prefs = BTreeMap::from([("numpy".to_string(), "1.26.4".to_string())]);
+        bundle.apply_workspace_conda_fact_ownership(
+            &config,
+            &config.name_map,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
+        assert!(
+            bundle.auto_dropped.is_empty(),
+            "a prior uv/favor-lock selection is not workspace conda ownership"
+        );
 
         let error = auto_bundle_transitives_with(
             &mut bundle,
             &[crate::workspace::DEFAULT_PYPI_INDEX.to_string()],
             &target,
-            &test_config(),
+            &config,
             None,
-            None,
+            Some(&favor_lock_prefs),
             None,
             &validated_probe,
             &reject_numpy_route,

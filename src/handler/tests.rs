@@ -657,10 +657,9 @@ fn keep_pypi_workspace_fact_retains_advisory_range() {
     assert!(spec.contains(">=0.40"), "{spec}");
     assert!(spec.contains("<0.46"), "{spec}");
     assert!(!spec.contains("==0.45.3"), "{spec}");
-}
 
-#[test]
-fn mapped_keep_pypi_excludes_the_entire_workspace_fact_alias_group() {
+    // Exclusions apply to the whole declared alias group: a PyPI-side keep
+    // for torch also protects its mapped pytorch conda fact and route.
     let mut bundle = solo_bundle("source-pack", vec!["torch>=2"]);
     bundle
         .workspace_conda_versions
