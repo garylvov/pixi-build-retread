@@ -2737,10 +2737,11 @@ version = "1.0.0"
         std::fs::create_dir_all(&cold_out).unwrap();
         std::fs::create_dir_all(&cache_dir).unwrap();
 
-        let (cold_wheel_path, resolved_sha) =
+        let (cold_wheel_path, resolved_sha, _checkout) =
             build_wheel_from_git(&repo_url, &sha, ".", &cache_dir, &cold_out, "3.11")
                 .await
-                .expect("produce: build_wheel_from_git");
+                .expect("produce: build_wheel_from_git")
+                .into_parts();
         assert_eq!(
             resolved_sha, sha,
             "resolved_sha must equal the expected SHA"
@@ -2864,7 +2865,7 @@ version = "1.0.0"
 
         let replay_out = base.join("replay-out");
         std::fs::create_dir_all(&replay_out).unwrap();
-        let (replay_wheel_path, replay_sha) = build_wheel_from_git(
+        let (replay_wheel_path, replay_sha, _checkout) = build_wheel_from_git(
             &lock_gs.url,
             &lock_gs.rev,
             ".",
@@ -2873,7 +2874,8 @@ version = "1.0.0"
             "3.11",
         )
         .await
-        .expect("replay: build_wheel_from_git");
+        .expect("replay: build_wheel_from_git")
+        .into_parts();
 
         // (a) wheel re-built on the replay path.
         assert!(

@@ -118,6 +118,9 @@ pub struct FetchedDepSource {
     /// sources have no consumer-local filesystem base.
     pub filesystem_base: Option<PathBuf>,
     pub display_origin: String,
+    /// Retains the git checkout reader while parsing may inspect paths
+    /// relative to `filesystem_base`. Non-git sources do not need a lease.
+    _git_checkout: Option<crate::source_build::GitCheckout>,
 }
 
 /// Parse a fetched dependency source into typed closure inputs.
@@ -676,13 +679,13 @@ impl Serialize for DepSource {
 /// - `DepSource::Local(path)`: `path` is resolved relative to
 ///   `workspace_root` (an absolute `path` is used as-is), then read.
 /// - `DepSource::Git { git, rev, path }`: reuses
-///   `source_build::ensure_git_checkout`, the same clone + per-(url, rev)
-///   flock dance `build_wheel_from_git` uses, so concurrent resolvers don't
-///   race on the same on-disk clone and repeated calls for the same (git,
-///   rev) are a cheap no-op. `rev` should be a pinned commit SHA for
-///   reproducibility (a moving branch/tag ref means the fetched content can
-///   change between calls); this function does not itself resolve a moving
-///   ref to a SHA.
+///   `source_build::ensure_git_checkout`, which performs the one-time clone
+///   or legacy-checkout repair before returning a shared reader lease. The
+///   lease is retained through parsing because relative uv-source inspection
+///   can read the checkout after the dependency file itself was fetched.
+///   `rev` should be a pinned commit SHA for reproducibility (a moving
+///   branch/tag ref means the fetched content can change between calls); this
+///   function does not itself resolve a moving ref to a SHA.
 /// - `DepSource::Url(u)`: plain HTTP GET via `reqwest` (same client
 ///   `wheel::fetch_wheel` / `pypi` use), cached under `cache_dir` keyed by a
 ///   hash of the URL so repeated calls don't re-fetch.
@@ -707,13 +710,14 @@ pub async fn fetch_dep_source(
                 filename_hint: hint,
                 filesystem_base: resolved.parent().map(Path::to_path_buf),
                 display_origin: resolved.display().to_string(),
+                _git_checkout: None,
             })
         }
         DepSource::Git { git, rev, path } => {
-            let clone_dir = crate::source_build::ensure_git_checkout(git, rev, cache_dir)
+            let checkout = crate::source_build::ensure_git_checkout(git, rev, cache_dir)
                 .await
                 .with_context(|| format!("cloning {git}@{rev} for dep source {path}"))?;
-            let file_path = clone_dir.join(path);
+            let file_path = checkout.root().join(path);
             let content = tokio::fs::read_to_string(&file_path)
                 .await
                 .with_context(|| {
@@ -728,6 +732,7 @@ pub async fn fetch_dep_source(
                 filename_hint: hint,
                 filesystem_base: file_path.parent().map(Path::to_path_buf),
                 display_origin: format!("{git}@{rev}:{path}"),
+                _git_checkout: Some(checkout),
             })
         }
         DepSource::Url(u) => {
@@ -745,6 +750,7 @@ pub async fn fetch_dep_source(
                 filename_hint: hint,
                 filesystem_base: None,
                 display_origin: u.clone(),
+                _git_checkout: None,
             })
         }
     }
@@ -833,6 +839,7 @@ mod tests {
             filename_hint: filename_hint.to_string(),
             filesystem_base: None,
             display_origin: format!("test:{filename_hint}"),
+            _git_checkout: None,
         }
     }
 
@@ -842,6 +849,7 @@ mod tests {
             filename_hint: filename_hint.to_string(),
             filesystem_base: Some(base.to_path_buf()),
             display_origin: base.join(filename_hint).display().to_string(),
+            _git_checkout: None,
         }
     }
 

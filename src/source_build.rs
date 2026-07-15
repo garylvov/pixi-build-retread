@@ -5,8 +5,14 @@
 //! produced wheel goes through the same auto-bundle + METADATA-rewrite
 //! pipeline as any PyPI-resolved wheel.
 
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use tokio::process::Command;
@@ -326,20 +332,16 @@ async fn git_wheel_cache_store(wheel: &Path, cache_wheel_dir: &Path) {
     }
 }
 
-/// Compute the on-disk source-tree directory that
-/// [`build_wheel_from_git`] will (or did) build from, without doing
-/// any clone work. Lets callers feed the same directory into
-/// `wheel_inject::inject` after the wheel is built.
-pub fn git_source_root(url: &str, rev: &str, subdirectory: &str, cache_dir: &Path) -> PathBuf {
-    git_checkout_root(url, rev, cache_dir).join(subdirectory)
-}
-
 /// Compute the on-disk *checkout* directory for a (url, rev) pair --
-/// the parent of [`git_source_root`]'s subdirectory join. Used by the
-/// v0.12.0 auto-data-files inject so the WHOLE upstream repo (minus
+/// the parent of each wheel entry's source subdirectory. Used as a pure
+/// identity/grouping key by auto-data planning so the WHOLE upstream repo (minus
 /// `.gitignore`'d paths and minus subdirectories already shipped as
 /// wheels by sibling entries in the same bundle) can ride along into
 /// the conda env at `$PREFIX/lib/<rel>`.
+///
+/// This function performs no synchronization and confers no permission to read
+/// the returned path. Checkout consumers must retain the [`GitCheckout`] lease
+/// returned by [`ensure_git_checkout`] or a [`GitWheelBuild`].
 ///
 /// Layout (v0.13.3+): cache_dir / retread-git-clones / <slug> /
 /// <sha12> / ... -- a HIERARCHY rather than a single flat dirname.
@@ -372,52 +374,376 @@ pub fn git_checkout_root(url: &str, rev: &str, cache_dir: &Path) -> PathBuf {
     cache_dir.join("retread-git-clones").join(slug).join(sha12)
 }
 
-/// Acquire a SHARED advisory lock on the clone-dir lock file that guards
-/// `clone_dir` (a [`git_checkout_root`] path). Held while a caller READS or
-/// WALKS the shared working tree (e.g. the checkout-root auto-data injection).
-///
-/// # Why this exists
-///
-/// [`ensure_git_checkout`] takes the per-clone_dir EXCLUSIVE lock and, inside
-/// it, runs `clone_and_checkout` -> `checkout_rev_robust`'s `git clean -fdx`
-/// (a destructive working-tree reset). That lock is released the moment
-/// `ensure_git_checkout` returns. Callers then walk the checkout tree WITHOUT
-/// any lock (`inject_checkout_root_data` snapshots ~hundreds of files). Several
-/// `[retread-wheels]` entries commonly share ONE clone_dir (IsaacLab's 14+
-/// `from="isaaclab"` subdirectory entries), and different envs/packs are built
-/// by SEPARATE retread backend processes in parallel. So a second build's
-/// `ensure_git_checkout` can `git clean -fdx` the shared tree WHILE a first
-/// build is mid-walk -- files vanish/change under the walker and the build dies
-/// with a non-deterministic "backend exited prematurely". Holding a SHARED lock
-/// across the walk makes it a reader in a reader/writer pair: walk = shared,
-/// checkout+clean = exclusive, so no clean ever runs during a walk (and
-/// concurrent walks of the same tree still proceed together).
-///
-/// Returns the lock `File`; the lock is held until it is dropped. Best-effort
-/// on the open/lock error path is the CALLER's choice -- here we surface the
-/// error so a lock failure never silently degrades back to the racy path.
-pub(crate) fn lock_clone_shared(clone_dir: &Path) -> Result<std::fs::File> {
-    let lock_path = clone_dir.with_extension("lock");
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&lock_path)
-        .with_context(|| format!("opening git-clone lock file {}", lock_path.display()))?;
-    // Same fs4 blocking-flock mechanism ensure_git_checkout uses for the
-    // exclusive side; a SHARED lock coexists with other shared holders but
-    // blocks (and is blocked by) an exclusive clean/checkout on the same file.
-    fs4::fs_std::FileExt::lock_shared(&file)
-        .with_context(|| format!("shared-locking git-clone lock file {}", lock_path.display()))?;
-    Ok(file)
+const CHECKOUT_READY_MARKER: &str = ".retread-checkout-ready-v1";
+const CHECKOUT_LOCK_POLL: Duration = Duration::from_millis(10);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CloneIdentity {
+    digest: [u8; 32],
+    marker_contents: Vec<u8>,
 }
 
-/// Ensure `clone_dir` is a git clone of `url` checked out at `rev`.
-/// Clones (with `--no-checkout`) only if `clone_dir` doesn't exist yet;
-/// otherwise reuses it. Always runs the checkout dance regardless --
-/// see the v3.0.2 comment at the call site for why an existing
-/// clone_dir can't be trusted blindly. Callers hold the per-clone_dir
-/// lock for the duration; this function does not lock.
+impl CloneIdentity {
+    fn new(url: &str, rev: &str) -> Self {
+        use sha2::{Digest, Sha256};
+
+        let mut hasher = Sha256::new();
+        hasher.update(url.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(rev.as_bytes());
+        let digest: [u8; 32] = hasher.finalize().into();
+        let digest_hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+        let marker_contents = format!("pixi-build-retread-checkout-v1\n{digest_hex}\n").into_bytes();
+        Self {
+            digest,
+            marker_contents,
+        }
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct ProcessLockKey {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(not(unix))]
+type ProcessLockKey = PathBuf;
+
+struct ProcessCloneLock {
+    file: File,
+    lock_path: PathBuf,
+    identity: CloneIdentity,
+    local: Arc<tokio::sync::RwLock<()>>,
+    shared: AtomicBool,
+    poisoned: AtomicBool,
+    #[cfg(test)]
+    os_acquisitions: std::sync::atomic::AtomicUsize,
+}
+
+fn process_clone_locks() -> &'static Mutex<HashMap<ProcessLockKey, Arc<ProcessCloneLock>>> {
+    static LOCKS: OnceLock<Mutex<HashMap<ProcessLockKey, Arc<ProcessCloneLock>>>> =
+        OnceLock::new();
+    LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(unix)]
+fn process_lock_key(file: &File, _lock_path: &Path) -> std::io::Result<ProcessLockKey> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file.metadata()?;
+    Ok(ProcessLockKey {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(not(unix))]
+fn process_lock_key(_file: &File, lock_path: &Path) -> std::io::Result<ProcessLockKey> {
+    std::fs::canonicalize(lock_path)
+}
+
+/// Open the clone lock and merge it into the process registry before any
+/// `flock` call. On Unix the key is the opened file's `(st_dev, st_ino)`, so
+/// symlink/path aliases cannot make this process lock the same inode twice.
+fn registered_clone_lock(
+    lock_path: &Path,
+    identity: &CloneIdentity,
+) -> Result<Arc<ProcessCloneLock>> {
+    let candidate = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .with_context(|| format!("opening git-clone lock file {}", lock_path.display()))?;
+    let key = process_lock_key(&candidate, lock_path)
+        .with_context(|| format!("identifying git-clone lock file {}", lock_path.display()))?;
+    let mut locks = process_clone_locks()
+        .lock()
+        .map_err(|_| anyhow!("git-clone process lock registry is poisoned"))?;
+    if let Some(existing) = locks.get(&key) {
+        if existing.identity.digest != identity.digest {
+            bail!(
+                "git-clone cache-key collision: lock inode {} is already bound to a different full (url, rev) digest",
+                existing.lock_path.display(),
+            );
+        }
+        // `candidate` is dropped here without ever being flocked. Every worker
+        // in this process therefore shares the registry's one open description.
+        return Ok(Arc::clone(existing));
+    }
+
+    let lock = Arc::new(ProcessCloneLock {
+        file: candidate,
+        lock_path: lock_path.to_path_buf(),
+        identity: identity.clone(),
+        local: Arc::new(tokio::sync::RwLock::new(())),
+        shared: AtomicBool::new(false),
+        poisoned: AtomicBool::new(false),
+        #[cfg(test)]
+        os_acquisitions: std::sync::atomic::AtomicUsize::new(0),
+    });
+    locks.insert(key, Arc::clone(&lock));
+    Ok(lock)
+}
+
+struct CloneReadLease {
+    _local: tokio::sync::OwnedRwLockReadGuard<()>,
+    lock: Arc<ProcessCloneLock>,
+}
+
+/// A checked-out source tree plus its process-local reader lease. The process
+/// registry retains one cross-process SH flock for the life of the process;
+/// this lease multiplexes that one OS lock across worker tasks without any
+/// worker reopening or re-flocking the lock inode.
+#[derive(Clone)]
+pub(crate) struct GitCheckout {
+    root: PathBuf,
+    lease: Arc<CloneReadLease>,
+}
+
+impl GitCheckout {
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+}
+
+impl std::fmt::Debug for GitCheckout {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GitCheckout")
+            .field("root", &self.root)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for GitCheckout {
+    fn eq(&self, other: &Self) -> bool {
+        self.root == other.root && self.lease.lock.identity == other.lease.lock.identity
+    }
+}
+
+impl Eq for GitCheckout {}
+
+#[derive(Debug)]
+enum CheckoutMarkerState {
+    Missing,
+    Matching,
+    Invalid,
+}
+
+fn checkout_ready_marker(clone_dir: &Path) -> PathBuf {
+    clone_dir.join(".git").join(CHECKOUT_READY_MARKER)
+}
+
+fn checkout_marker_state(clone_dir: &Path, identity: &CloneIdentity) -> Result<CheckoutMarkerState> {
+    let marker = checkout_ready_marker(clone_dir);
+    match std::fs::read(&marker) {
+        Ok(contents) if contents == identity.marker_contents => Ok(CheckoutMarkerState::Matching),
+        Ok(_) => Ok(CheckoutMarkerState::Invalid),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(CheckoutMarkerState::Missing)
+        }
+        Err(error) => Err(error)
+            .with_context(|| format!("reading git-checkout marker {}", marker.display())),
+    }
+}
+
+fn invalid_marker_error(clone_dir: &Path) -> anyhow::Error {
+    anyhow!(
+        "git-checkout marker {} is malformed or belongs to a different full (url, rev) identity; refusing to mutate a published checkout",
+        checkout_ready_marker(clone_dir).display(),
+    )
+}
+
+struct PendingOsLock {
+    lock: Arc<ProcessCloneLock>,
+    armed: bool,
+}
+
+impl PendingOsLock {
+    fn acquired(lock: Arc<ProcessCloneLock>) -> Self {
+        #[cfg(test)]
+        lock.os_acquisitions.fetch_add(1, Ordering::Relaxed);
+        Self { lock, armed: true }
+    }
+
+    fn commit_shared(mut self) {
+        self.lock.shared.store(true, Ordering::Release);
+        self.armed = false;
+    }
+
+    fn downgrade_and_commit(mut self) -> Result<()> {
+        #[cfg(unix)]
+        fs4::fs_std::FileExt::lock_shared(&self.lock.file).with_context(|| {
+            format!(
+                "downgrading git-clone lock to shared {}",
+                self.lock.lock_path.display()
+            )
+        })?;
+
+        // Windows LockFileEx layers a SH lock over an EX lock rather than
+        // replacing it. Keep the same File/open description, but transition
+        // through an unlock after the marker is published. Any interposing EX
+        // owner rechecks that marker and therefore performs no mutation.
+        #[cfg(not(unix))]
+        {
+            fs4::fs_std::FileExt::unlock(&self.lock.file).with_context(|| {
+                format!(
+                    "unlocking exclusive git-clone lock before shared transition {}",
+                    self.lock.lock_path.display()
+                )
+            })?;
+            self.armed = false;
+            fs4::fs_std::FileExt::lock_shared(&self.lock.file).with_context(|| {
+                format!(
+                    "shared-locking git-clone lock after transition {}",
+                    self.lock.lock_path.display()
+                )
+            })?;
+            self.armed = true;
+        }
+
+        self.lock.shared.store(true, Ordering::Release);
+        self.armed = false;
+        Ok(())
+    }
+}
+
+impl Drop for PendingOsLock {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Err(error) = fs4::fs_std::FileExt::unlock(&self.lock.file) {
+            self.lock.poisoned.store(true, Ordering::Release);
+            tracing::error!(
+                lock = %self.lock.lock_path.display(),
+                error = %error,
+                "failed to release uncommitted git-clone lock; process entry poisoned",
+            );
+        }
+    }
+}
+
+enum InitialOsAccess {
+    Ready,
+    Initialize(PendingOsLock),
+}
+
+/// Establish this process's one OS lock for a clone. All probes are
+/// nonblocking: cold losers never queue an EX request that the winner's
+/// process-lifetime SH lock could strand forever.
+fn acquire_initial_os_access(
+    lock: Arc<ProcessCloneLock>,
+    clone_dir: &Path,
+) -> Result<InitialOsAccess> {
+    loop {
+        if lock.poisoned.load(Ordering::Acquire) {
+            bail!(
+                "git-clone lock {} is poisoned after an unlock failure",
+                lock.lock_path.display()
+            );
+        }
+
+        match checkout_marker_state(clone_dir, &lock.identity)? {
+            CheckoutMarkerState::Invalid => return Err(invalid_marker_error(clone_dir)),
+            CheckoutMarkerState::Matching => {
+                if fs4::fs_std::FileExt::try_lock_shared(&lock.file).with_context(|| {
+                    format!(
+                        "try-shared-locking git-clone lock file {}",
+                        lock.lock_path.display()
+                    )
+                })? {
+                    let pending = PendingOsLock::acquired(Arc::clone(&lock));
+                    match checkout_marker_state(clone_dir, &lock.identity)? {
+                        CheckoutMarkerState::Matching => {
+                            pending.commit_shared();
+                            return Ok(InitialOsAccess::Ready);
+                        }
+                        CheckoutMarkerState::Missing => {
+                            drop(pending);
+                        }
+                        CheckoutMarkerState::Invalid => {
+                            drop(pending);
+                            return Err(invalid_marker_error(clone_dir));
+                        }
+                    }
+                }
+            }
+            CheckoutMarkerState::Missing => {
+                if fs4::fs_std::FileExt::try_lock_exclusive(&lock.file).with_context(|| {
+                    format!(
+                        "try-exclusive-locking git-clone lock file {}",
+                        lock.lock_path.display()
+                    )
+                })? {
+                    let pending = PendingOsLock::acquired(Arc::clone(&lock));
+                    // EX->SH replacement is not atomic on every flock
+                    // implementation. An interposing process may have published
+                    // readiness since our unlocked observation, so recheck under EX.
+                    match checkout_marker_state(clone_dir, &lock.identity)? {
+                        CheckoutMarkerState::Missing => {
+                            return Ok(InitialOsAccess::Initialize(pending));
+                        }
+                        CheckoutMarkerState::Matching => {
+                            pending.downgrade_and_commit()?;
+                            return Ok(InitialOsAccess::Ready);
+                        }
+                        CheckoutMarkerState::Invalid => {
+                            drop(pending);
+                            return Err(invalid_marker_error(clone_dir));
+                        }
+                    }
+                }
+            }
+        }
+        std::thread::sleep(CHECKOUT_LOCK_POLL);
+    }
+}
+
+fn publish_checkout_ready(clone_dir: &Path, identity: &CloneIdentity) -> Result<()> {
+    let marker = checkout_ready_marker(clone_dir);
+    let marker_parent = marker
+        .parent()
+        .ok_or_else(|| anyhow!("git-checkout marker has no parent: {}", marker.display()))?;
+    let temporary = marker_parent.join(format!("{CHECKOUT_READY_MARKER}.tmp"));
+    let publish = || -> Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temporary)
+            .with_context(|| format!("creating git-checkout marker {}", temporary.display()))?;
+        file.write_all(&identity.marker_contents)
+            .with_context(|| format!("writing git-checkout marker {}", temporary.display()))?;
+        file.sync_all()
+            .with_context(|| format!("syncing git-checkout marker {}", temporary.display()))?;
+        std::fs::rename(&temporary, &marker).with_context(|| {
+            format!(
+                "publishing git-checkout marker {} -> {}",
+                temporary.display(),
+                marker.display()
+            )
+        })?;
+        #[cfg(unix)]
+        File::open(marker_parent)
+            .and_then(|directory| directory.sync_all())
+            .with_context(|| format!("syncing git-checkout marker dir {}", marker_parent.display()))?;
+        Ok(())
+    };
+    if let Err(error) = publish() {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Populate or repair an UNPUBLISHED checkout while its one-time initializer
+/// holds the clone's EX lock. This is never called after the ready marker has
+/// been published; published warm checkouts are read-only cache entries.
 async fn clone_and_checkout(clone_dir: &Path, url: &str, rev: &str) -> Result<()> {
     if !clone_dir.exists() {
         tracing::info!(url = %url, rev = %rev, "cloning git source");
@@ -461,6 +787,77 @@ async fn clone_and_checkout(clone_dir: &Path, url: &str, rev: &str) -> Result<()
     Ok(())
 }
 
+/// Perform the legacy working-tree repair and full-reclone fallback exactly
+/// once, before publishing this `(url, rev)` checkout. Existing v4.8.1 cache
+/// directories have no marker, so their first access under the new protocol
+/// receives this one migration repair.
+async fn initialize_checkout_once(clone_dir: &Path, url: &str, rev: &str) -> Result<()> {
+    if let Err(error) = clone_and_checkout(clone_dir, url, rev).await {
+        tracing::warn!(
+            url = %url, rev = %rev, error = %format!("{error:#}"),
+            path = %clone_dir.display(),
+            "unpublished git clone/checkout failed after working-tree repair; \
+             wiping the clone dir and re-cloning once before publication",
+        );
+        tokio::fs::remove_dir_all(clone_dir)
+            .await
+            .with_context(|| format!("wiping corrupted clone dir {}", clone_dir.display()))?;
+        clone_and_checkout(clone_dir, url, rev)
+            .await
+            .with_context(|| {
+                format!("re-clone after wiping corrupted dir still failed for {url}@{rev}")
+            })?;
+    }
+    Ok(())
+}
+
+async fn initialize_process_clone_lock(
+    lock: Arc<ProcessCloneLock>,
+    clone_dir: PathBuf,
+    url: String,
+    rev: String,
+    _writer: tokio::sync::OwnedRwLockWriteGuard<()>,
+) -> Result<()> {
+    if lock.shared.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    if lock.poisoned.load(Ordering::Acquire) {
+        bail!(
+            "git-clone lock {} is poisoned after an unlock failure",
+            lock.lock_path.display()
+        );
+    }
+
+    let access = {
+        let lock = Arc::clone(&lock);
+        let clone_dir = clone_dir.clone();
+        tokio::task::spawn_blocking(move || acquire_initial_os_access(lock, &clone_dir))
+            .await
+            .context("git-clone OS-lock task panicked")??
+    };
+    let InitialOsAccess::Initialize(pending) = access else {
+        return Ok(());
+    };
+
+    // `pending` is cancellation-safe and the outer caller awaits this work via
+    // a detached Tokio task. The EX lock therefore spans clone/repair, marker
+    // publication, and the same-fd EX->SH transition as one transaction.
+    initialize_checkout_once(&clone_dir, &url, &rev).await?;
+
+    let identity = lock.identity.clone();
+    let marker_clone_dir = clone_dir.clone();
+    tokio::task::spawn_blocking(move || publish_checkout_ready(&marker_clone_dir, &identity))
+        .await
+        .context("git-checkout marker task panicked")??;
+
+    // Downgrade and publish the in-process Shared state inside one blocking
+    // closure: no async cancellation point may split those two state changes.
+    tokio::task::spawn_blocking(move || pending.downgrade_and_commit())
+        .await
+        .context("git-clone downgrade task panicked")??;
+    Ok(())
+}
+
 /// Clone a git URL at a specific revision into `cache_dir`, then build
 /// the wheel for `subdirectory` (relative to the repo root, defaulting
 /// to ".").
@@ -469,35 +866,18 @@ async fn clone_and_checkout(clone_dir: &Path, url: &str, rev: &str) -> Result<()
 /// for the same workspace don't re-clone. `rev` can be a commit SHA,
 /// tag, or branch name.
 ///
-/// Returns `(wheel_path, resolved_sha)` where `resolved_sha` is the
-/// 40-character git SHA obtained from `git rev-parse HEAD` after
-/// checkout. This is the **canonical** commit identity that should be
-/// stored in `GitWheelSource.rev` so that a branch/tag/HEAD ref at
-/// produce time is pinned to a specific commit in the lock.
+/// Return a reader lease for an immutable, published `(url, rev)` checkout.
 ///
-/// # Determinism guard
-///
-/// After the build, the emitted wheel filename is checked for markers
-/// that indicate a non-reproducible `setuptools_scm` version:
-/// - `.devN` segments (e.g. `1.0.dev4`)
-/// - `.dYYYYMMDD` date segments (e.g. `1.0.dev4+g1234567.d20250101`)
-/// - local `+g<sha>` segments
-///
-/// When detected, `tracing::warn!` is emitted. Such versions drift
-/// across calendar days even when the commit SHA is pinned, causing
-/// `lock drift` (the filename/version in the lock changes every day
-/// even though the inputs have not changed). To fix this the upstream
-/// project must tag a release or set `SETUPTOOLS_SCM_PRETEND_VERSION`.
-/// Ensure a git clone of `url` at `rev` exists (and is checked out) under
-/// `cache_dir`, guarded by a per-(url, rev) exclusive file lock so
-/// concurrent resolvers don't race on the same working tree. Returns the
-/// clone directory (the repo root, not a subdirectory).
-///
-/// Extracted out of `build_wheel_from_git` (which used to inline this)
-/// so callers that just need file contents out of a pinned git rev --
-/// not a built wheel, e.g. `deps_from::fetch_dep_source` -- can reuse the
-/// exact same clone + locking dance instead of re-implementing it.
-pub(crate) async fn ensure_git_checkout(url: &str, rev: &str, cache_dir: &Path) -> Result<PathBuf> {
+/// The first process to observe a missing ready marker takes EX, performs the
+/// one-time clone/repair, publishes the marker, and downgrades its ONE registry
+/// fd to SH. Other processes poll nonblocking until they can take SH. Within a
+/// process, all tasks share that one fd through an async RwLock; no task ever
+/// opens or flocks the inode a second time.
+pub(crate) async fn ensure_git_checkout(
+    url: &str,
+    rev: &str,
+    cache_dir: &Path,
+) -> Result<GitCheckout> {
     // Delegate to git_checkout_root so the layout stays in sync. (Was
     // duplicated here before v0.13.3 -- update both or the resolver
     // half stops finding the cached clone the cloner half just made.)
@@ -511,89 +891,86 @@ pub(crate) async fn ensure_git_checkout(url: &str, rev: &str, cache_dir: &Path) 
         )
     })?;
 
-    // Multiple [retread-wheels] entries commonly share one (url, rev) --
-    // e.g. IsaacLab's 14+ `from = "isaaclab"` entries that differ only by
-    // `subdirectory` -- and clone into the SAME clone_dir. Without a lock,
-    // concurrent resolves (either multiple retread backend processes
-    // solving different environments in parallel, since one retread
-    // process only serializes RPCs within itself, or overlapping
-    // sibling-entry resolves) race on that one shared working tree:
-    // one's `git checkout` can land mid-way through another's `git
-    // fetch`, leaving HEAD parked on the wrong commit or aborting with
-    // "untracked working tree files would be overwritten". A per-(url,
-    // rev) exclusive file lock (same mechanism rattler_cache uses to
-    // guard its package cache dir) serializes clone/fetch/checkout so
-    // only one resolver ever mutates a given clone_dir at a time; the
-    // rest block on the lock, then see the completed checkout below.
     let lock_path = clone_dir.with_extension("lock");
-    let lock_file = {
+    let identity = CloneIdentity::new(url, rev);
+    let lock = {
         let lock_path = lock_path.clone();
-        tokio::task::spawn_blocking(move || -> Result<std::fs::File> {
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .write(true)
-                .open(&lock_path)
-                .with_context(|| format!("opening git-clone lock file {}", lock_path.display()))?;
-            // fs4's lock_exclusive is a blocking syscall (flock/LockFileEx)
-            // regardless of file type, so it must run on a blocking thread
-            // rather than the async executor -- same pattern rattler_cache
-            // uses for its own package-cache global lock.
-            fs4::fs_std::FileExt::lock_exclusive(&file)
-                .with_context(|| format!("locking git-clone lock file {}", lock_path.display()))?;
-            Ok(file)
-        })
-        .await
-        .context("git-clone lock task panicked")??
+        let identity = identity.clone();
+        tokio::task::spawn_blocking(move || registered_clone_lock(&lock_path, &identity))
+            .await
+            .context("git-clone registry task panicked")??
     };
 
-    // v3.0.2 (#8 follow-up): ALWAYS run the full clone-if-missing +
-    // checkout dance, even when clone_dir already existed. A directory
-    // that survived a pre-v3.0.0 race (fetched `rev` but never actually
-    // checked it out, checked out an unrelated commit, or left untracked
-    // files mid-checkout that block any future `git checkout`)
-    // previously slipped past unrepaired -- every subsequent run reused
-    // that broken checkout forever, since `clone_dir.exists()` alone
-    // can't tell a healthy checkout from a corrupted one.
-    // `clone_and_checkout` is a cheap, safe no-op when the tree is
-    // already correct (common case), and self-heals a corrupted
-    // WORKING TREE via `checkout_rev_robust`'s `git clean -fdx` retry.
-    //
-    // v3.0.3: `git clean -fdx` only repairs the working tree -- it can't
-    // fix a corrupted `.git` itself (bad refs, missing objects, a stale
-    // `index.lock`), which is what #8 hit next: "git checkout FETCH_HEAD
-    // failed even after cleaning the working tree." A clone_dir that
-    // took concurrent hits from multiple pre-lock resolvers over its
-    // lifetime can end up broken at that deeper level. When the
-    // working-tree-level repair still isn't enough, wipe clone_dir
-    // entirely and re-clone from scratch once -- the only fix that's
-    // correct regardless of what kind of corruption is actually there.
-    if let Err(e) = clone_and_checkout(&clone_dir, url, rev).await {
-        tracing::warn!(
-            url = %url, rev = %rev, error = %format!("{e:#}"),
-            path = %clone_dir.display(),
-            "git clone/checkout failed even after working-tree repair; \
-             wiping the clone dir and re-cloning from scratch",
-        );
-        tokio::fs::remove_dir_all(&clone_dir)
-            .await
-            .with_context(|| format!("wiping corrupted clone dir {}", clone_dir.display()))?;
-        clone_and_checkout(&clone_dir, url, rev)
-            .await
-            .with_context(|| {
-                format!("re-clone after wiping corrupted dir still failed for {url}@{rev}")
-            })?;
+    if !lock.shared.load(Ordering::Acquire) {
+        let writer = Arc::clone(&lock.local).write_owned().await;
+        if !lock.shared.load(Ordering::Acquire) {
+            // The spawned task owns `writer`. Dropping this caller's JoinHandle
+            // detaches rather than cancels an in-flight mutating transaction.
+            let initializer = tokio::spawn(initialize_process_clone_lock(
+                Arc::clone(&lock),
+                clone_dir.clone(),
+                url.to_string(),
+                rev.to_string(),
+                writer,
+            ));
+            initializer
+                .await
+                .context("git-clone initializer task panicked")??;
+        }
     }
 
-    // Release the lock now that the clone_dir holds a complete checkout;
-    // remaining reads of the tree are safe to run concurrently with other
-    // entries once the checkout itself is settled.
-    tokio::task::spawn_blocking(move || fs4::fs_std::FileExt::unlock(&lock_file))
-        .await
-        .context("git-clone unlock task panicked")?
-        .with_context(|| format!("unlocking git-clone lock file {}", lock_path.display()))?;
+    if lock.poisoned.load(Ordering::Acquire) {
+        bail!(
+            "git-clone lock {} is poisoned after an unlock failure",
+            lock.lock_path.display()
+        );
+    }
+    let local = Arc::clone(&lock.local).read_owned().await;
+    if !lock.shared.load(Ordering::Acquire) {
+        bail!(
+            "git-clone lock {} reached reader path before SH initialization",
+            lock.lock_path.display()
+        );
+    }
 
-    Ok(clone_dir)
+    // Validate the full identity even on the process-local Shared fast path.
+    // This catches a truncated checkout-path hash collision or external cache
+    // deletion/corruption without ever re-enabling a destructive writer.
+    let marker = checkout_ready_marker(&clone_dir);
+    let marker_contents = tokio::fs::read(&marker)
+        .await
+        .with_context(|| format!("reading published git-checkout marker {}", marker.display()))?;
+    if marker_contents != identity.marker_contents {
+        return Err(invalid_marker_error(&clone_dir));
+    }
+
+    Ok(GitCheckout {
+        root: clone_dir,
+        lease: Arc::new(CloneReadLease {
+            _local: local,
+            lock,
+        }),
+    })
+}
+
+/// Result of a git wheel build. Keeping this value alive keeps the checkout's
+/// process-local reader lease alive; internal callers pass that same lease
+/// through all subsequent source-tree injection reads.
+#[derive(Debug)]
+pub struct GitWheelBuild {
+    pub wheel_path: PathBuf,
+    pub resolved_sha: String,
+    checkout: GitCheckout,
+}
+
+impl GitWheelBuild {
+    pub fn checkout_root(&self) -> &Path {
+        self.checkout.root()
+    }
+
+    pub(crate) fn into_parts(self) -> (PathBuf, String, GitCheckout) {
+        (self.wheel_path, self.resolved_sha, self.checkout)
+    }
 }
 
 pub async fn build_wheel_from_git(
@@ -603,14 +980,15 @@ pub async fn build_wheel_from_git(
     cache_dir: &Path,
     out_dir: &Path,
     python_version: &str,
-) -> Result<(PathBuf, String)> {
+) -> Result<GitWheelBuild> {
     // NOTE on the shared cross-pack wheel cache: the lookup deliberately
     // happens AFTER clone+checkout (below), not here. Callers derive
     // `source_root` from the checkout for the auto-data inject phase, so the
     // clone must exist even on a cache hit. The clone is machine-shared per
     // (url, rev) and a no-op when warm; the cache only needs to skip the
     // expensive per-pack `uv build`.
-    let clone_dir = ensure_git_checkout(url, rev, cache_dir).await?;
+    let checkout = ensure_git_checkout(url, rev, cache_dir).await?;
+    let clone_dir = checkout.root();
 
     let source_dir = clone_dir.join(subdirectory);
     if !source_dir.exists() {
@@ -639,7 +1017,11 @@ pub async fn build_wheel_from_git(
     // expensive part; the clone above was needed anyway to resolve the sha).
     let shared = git_wheel_cache_dir(url, &resolved_sha, subdirectory, python_version);
     if let Some(wheel) = git_wheel_cache_lookup(&shared, out_dir).await? {
-        return Ok((wheel, resolved_sha));
+        return Ok(GitWheelBuild {
+            wheel_path: wheel,
+            resolved_sha,
+            checkout,
+        });
     }
 
     // DETERMINISM GUARD: detect non-reproducible setuptools_scm versions.
@@ -672,7 +1054,11 @@ pub async fn build_wheel_from_git(
     // Populate the shared cross-pack cache (best-effort).
     git_wheel_cache_store(&wheel_path, &shared).await;
 
-    Ok((wheel_path, resolved_sha))
+    Ok(GitWheelBuild {
+        wheel_path,
+        resolved_sha,
+        checkout,
+    })
 }
 
 /// Returns `true` when a wheel filename contains markers of a
@@ -767,6 +1153,10 @@ async fn run_capturing_uv(args: &[&str]) -> Result<()> {
 /// issues like ENAMETOOLONG on git checkout.
 async fn run_silent(cmd: &mut Command, label: &str) -> Result<()> {
     let output = cmd
+        // Clone/checkout/clean/fetch run while the one-time EX transaction is
+        // armed. If that task is aborted during runtime shutdown, do not let a
+        // detached git child continue mutating after the RAII guard unlocks.
+        .kill_on_drop(true)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -806,6 +1196,7 @@ async fn run_silent(cmd: &mut Command, label: &str) -> Result<()> {
 /// `git checkout` -> `git fetch` -> `git checkout`).
 async fn try_run_silent(cmd: &mut Command) -> Result<bool> {
     let output = cmd
+        .kill_on_drop(true)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -927,35 +1318,74 @@ mod tests {
         assert!(parent.len() <= 24, "slug must be <=24 chars; got {parent}");
     }
 
-    /// `lock_clone_shared` must (a) create the clone `.lock` sibling file next
-    /// to the clone_dir (matching the path `ensure_git_checkout` locks
-    /// exclusively) and (b) let multiple SHARED holders coexist -- concurrent
-    /// walkers of the same checkout must not block each other. The reader/writer
-    /// EXCLUSION against a `git clean -fdx` under the exclusive lock is flock's
-    /// documented CROSS-PROCESS contract (the same mechanism ensure_git_checkout
-    /// uses on the exclusive side), not something a single-process unit test can
-    /// assert reliably (flock may let a process self-hold shared+exclusive).
-    #[test]
-    fn shared_clone_lock_creates_lock_and_readers_coexist() {
-        let base =
-            std::env::temp_dir().join(format!("retread-sharedlock-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        let clone_dir = base.join("retread-git-clones").join("slug").join("abcdef012345");
-        std::fs::create_dir_all(&clone_dir).unwrap();
+    /// The process registry must unify repeated opens before flocking, and its
+    /// actual production RwLock must exclude the one-time writer from readers
+    /// in both directions.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn process_clone_reader_and_writer_guards_never_overlap() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "retread-clone-rwlock-{}-{unique}",
+            std::process::id()
+        ));
+        let clone_dir = base
+            .join("retread-git-clones")
+            .join("slug")
+            .join("abcdef012345");
+        std::fs::create_dir_all(clone_dir.parent().unwrap()).unwrap();
         let lock_path = clone_dir.with_extension("lock");
+        let identity = CloneIdentity::new("https://example.com/repo.git", "rev");
+        let first = registered_clone_lock(&lock_path, &identity).unwrap();
+        let second = registered_clone_lock(&lock_path, &identity).unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "same inode must map to one process lock entry"
+        );
 
-        // The lock file must be the clone_dir's `.lock` sibling -- the SAME
-        // path ensure_git_checkout locks exclusively, or the two never rendez-vous.
-        assert_eq!(lock_path, base.join("retread-git-clones").join("slug").join("abcdef012345.lock"));
+        let writer = Arc::clone(&first.local).write_owned().await;
+        let (reader_entered_tx, mut reader_entered_rx) = tokio::sync::oneshot::channel();
+        let (reader_release_tx, reader_release_rx) = tokio::sync::oneshot::channel();
+        let reader_lock = Arc::clone(&second.local);
+        let reader_task = tokio::spawn(async move {
+            let _reader = reader_lock.read_owned().await;
+            let _ = reader_entered_tx.send(());
+            let _ = reader_release_rx.await;
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut reader_entered_rx)
+                .await
+                .is_err(),
+            "reader entered while the one-time writer was held"
+        );
+        drop(writer);
+        tokio::time::timeout(Duration::from_secs(2), &mut reader_entered_rx)
+            .await
+            .expect("reader did not enter after writer release")
+            .expect("reader entry sender dropped");
 
-        // Two shared readers coexist (both return Ok; a naive exclusive lock
-        // would make the second block/deadlock).
-        let g1 = lock_clone_shared(&clone_dir).expect("first shared clone-read lock");
-        let g2 = lock_clone_shared(&clone_dir).expect("second shared clone-read lock coexists");
-        assert!(lock_path.exists(), "lock file must be created on disk");
+        let (writer_entered_tx, mut writer_entered_rx) = tokio::sync::oneshot::channel();
+        let writer_lock = Arc::clone(&first.local);
+        let writer_task = tokio::spawn(async move {
+            let _writer = writer_lock.write_owned().await;
+            let _ = writer_entered_tx.send(());
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut writer_entered_rx)
+                .await
+                .is_err(),
+            "writer entered while a reader was held"
+        );
+        let _ = reader_release_tx.send(());
+        reader_task.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), &mut writer_entered_rx)
+            .await
+            .expect("writer did not enter after reader release")
+            .expect("writer entry sender dropped");
+        writer_task.await.unwrap();
 
-        drop(g1);
-        drop(g2);
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -1135,10 +1565,11 @@ version = "0.1.0"
         std::fs::create_dir_all(&out_dir).expect("out dir");
         let repo_url = format!("file://{}", repo.display());
 
-        let (wheel_path, resolved_sha) =
+        let (wheel_path, resolved_sha, _checkout) =
             build_wheel_from_git(&repo_url, &expected_sha, ".", &cache_dir, &out_dir, "3.11")
                 .await
-                .expect("build_wheel_from_git");
+                .expect("build_wheel_from_git")
+                .into_parts();
 
         // The returned SHA must match what git reports.
         assert_eq!(
@@ -1263,10 +1694,11 @@ version = "0.1.0"
         // Resolving rev2 again now must self-heal (clean + checkout)
         // rather than failing with "untracked working tree files would be
         // overwritten".
-        let (_, resolved_sha) =
+        let (_, resolved_sha, _checkout) =
             build_wheel_from_git(&repo_url, &rev2, ".", &cache_dir, &out_dir, "3.11")
                 .await
-                .expect("self-healing build_wheel_from_git must succeed");
+                .expect("self-healing build_wheel_from_git must succeed")
+                .into_parts();
         assert_eq!(resolved_sha, rev2);
         assert_eq!(
             std::fs::read_to_string(clone_dir.join("extra.txt")).expect("read extra.txt"),
@@ -1355,10 +1787,11 @@ version = "0.1.0"
         std::fs::write(clone_dir.join(".git").join("index.lock"), "")
             .expect("write stale index.lock");
 
-        let (_, resolved_sha) =
+        let (_, resolved_sha, _checkout) =
             build_wheel_from_git(&repo_url, &rev, ".", &cache_dir, &out_dir, "3.11")
                 .await
-                .expect("must recover by wiping and re-cloning, not error out");
+                .expect("must recover by wiping and re-cloning, not error out")
+                .into_parts();
         assert_eq!(resolved_sha, rev);
         assert!(
             !clone_dir.join(".git").join("index.lock").exists(),

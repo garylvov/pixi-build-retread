@@ -5870,6 +5870,8 @@ fn checkout_root_for_entry(
 /// content (apps/, tools/, share/, etc.) lands at `$PREFIX/lib/<rel>`
 /// when pip installs the wheel. Computed by the caller in
 /// [`resolve_all`] so dedup across the bundle's entries is centralized.
+/// `checkout_root` is planning identity, not authority to read the tree;
+/// materialization validates it against the active build-returned lease.
 #[derive(Debug, Clone)]
 pub(crate) struct AutoDataConfig {
     pub checkout_root: PathBuf,
@@ -5914,6 +5916,11 @@ async fn materialize_and_rewrite(
     // (path / git / from), also remember the source root so phase 1.5
     // can inject any files pip wheel failed to ship.
     let mut source_root: Option<PathBuf> = None;
+    // Git source-tree reads must retain the checkout's logical reader lease.
+    // The lease returned by phase 1 stays alive through both injection phases;
+    // dropping it after the wheel build would leave those later tree walks
+    // outside the clone cache's synchronization boundary.
+    let mut git_checkout: Option<crate::source_build::GitCheckout> = None;
     // Pristine upstream URL captured BEFORE localization to file://.
     // Set for index (PyPI version-spec) and direct-URL entry forms only.
     // Source-built forms (git / path / from) leave this None.
@@ -5933,7 +5940,7 @@ async fn materialize_and_rewrite(
         })?;
         let subdir = entry.subdirectory.as_deref().unwrap_or(".");
         let out = download_dir.join(entry_name);
-        let (wheel, resolved_sha) = crate::source_build::build_wheel_from_git(
+        let build = crate::source_build::build_wheel_from_git(
             &src.url,
             &src.rev,
             subdir,
@@ -5952,9 +5959,9 @@ async fn materialize_and_rewrite(
                 out.display(),
             )
         })?;
-        source_root = Some(crate::source_build::git_source_root(
-            &src.url, &src.rev, subdir, cache_dir,
-        ));
+        let (wheel, resolved_sha, checkout) = build.into_parts();
+        source_root = Some(checkout.root().join(subdir));
+        git_checkout = Some(checkout);
         // Record git provenance with the RESOLVED SHA (not the config rev,
         // which may be a branch/tag) so replay is manifest-independent.
         // POISONING: the config rev IS in inputs_hash via courier_input_specs
@@ -6006,7 +6013,7 @@ async fn materialize_and_rewrite(
             .ok_or_else(|| anyhow!("git source `{entry_name}` missing rev"))?;
         let subdir = entry.subdirectory.as_deref().unwrap_or(".");
         let out = download_dir.join(entry_name);
-        let (wheel, resolved_sha) = crate::source_build::build_wheel_from_git(
+        let build = crate::source_build::build_wheel_from_git(
             git_url,
             rev,
             subdir,
@@ -6022,9 +6029,9 @@ async fn materialize_and_rewrite(
                 out.display(),
             )
         })?;
-        source_root = Some(crate::source_build::git_source_root(
-            git_url, rev, subdir, cache_dir,
-        ));
+        let (wheel, resolved_sha, checkout) = build.into_parts();
+        source_root = Some(checkout.root().join(subdir));
+        git_checkout = Some(checkout);
         // Record git provenance with the RESOLVED SHA (not the config rev,
         // which may be a branch/tag) so replay is manifest-independent.
         // POISONING: the config rev IS in inputs_hash via courier_input_specs
@@ -6125,6 +6132,19 @@ async fn materialize_and_rewrite(
     // backend-cache invalidation step).
     let mut auto_data_file_count: Option<usize> = None;
     let with_data_path = if let Some(cfg) = auto_data.as_ref() {
+        let checkout = git_checkout.as_ref().ok_or_else(|| {
+            anyhow!(
+                "phase 1.6 checkout-root auto-data requested for non-git entry `{entry_name}`"
+            )
+        })?;
+        if cfg.checkout_root.as_path() != checkout.root() {
+            bail!(
+                "phase 1.6 checkout-root mismatch for entry `{entry_name}`: planned={}, built={}",
+                cfg.checkout_root.display(),
+                checkout.root().display(),
+            );
+        }
+        let checkout_root = checkout.root();
         let out = injected_path.with_extension("autodata.whl");
         if is_fresh(&out, &injected_path)? {
             tracing::info!(
@@ -6139,37 +6159,21 @@ async fn materialize_and_rewrite(
         } else {
             tracing::info!(
                 entry = %entry_name,
-                checkout = %cfg.checkout_root.display(),
+                checkout = %checkout_root.display(),
                 skip_subdirs = ?cfg.skip_subdirs,
                 "phase 1.6: injecting checkout-root tree as wheel .data/data/lib/* (lands at $PREFIX/lib/*)",
             );
-            // Concurrency guard: this walk reads the SHARED git-clone working
-            // tree. A parallel retread process's `ensure_git_checkout` for the
-            // same clone runs a destructive `git clean -fdx` under the clone's
-            // EXCLUSIVE lock; without a reader lock here it could wipe files
-            // mid-walk (a non-deterministic "backend exited prematurely"). Hold
-            // a SHARED lock on the same clone-lock file across the injection so
-            // no clean/checkout runs during it. `cfg.checkout_root` IS the
-            // git_checkout_root clone_dir, so its `.lock` sibling matches the
-            // file ensure_git_checkout locks exclusively. Held until end of scope.
-            let _clone_read_guard =
-                crate::source_build::lock_clone_shared(&cfg.checkout_root).with_context(|| {
-                    format!(
-                        "acquiring shared clone-read lock before checkout-root inject (entry `{entry_name}`, checkout={})",
-                        cfg.checkout_root.display(),
-                    )
-                })?;
             let n = crate::wheel_inject_data::inject_checkout_root_data(
                 &injected_path,
                 &out,
-                &cfg.checkout_root,
+                checkout_root,
                 &cfg.skip_subdirs,
             )
             .with_context(|| {
                 format!(
                     "phase 1.6 checkout-root auto-data inject for entry `{entry_name}` \
                      (checkout={}, skip_subdirs={:?}, input={}, output={})",
-                    cfg.checkout_root.display(),
+                    checkout_root.display(),
                     cfg.skip_subdirs,
                     injected_path.display(),
                     out.display(),
@@ -6181,6 +6185,9 @@ async fn materialize_and_rewrite(
     } else {
         injected_path
     };
+    // No later phase reads the checkout. Release the logical reader before
+    // metadata rewriting so unrelated work does not retain it unnecessarily.
+    drop(git_checkout);
 
     // Phase 2: apply D (rewrite METADATA per the relax policy). For
     // policies that aren't 'none', the output is a new wheel file with
