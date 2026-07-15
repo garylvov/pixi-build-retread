@@ -696,8 +696,9 @@ struct Bundle {
     /// Canonical PyPI names the precise consuming workspace already owns.
     /// These are removed from the pack's wheel graph and are not re-emitted
     /// as generated-pack conda run dependencies. Conda-owned names enter only
-    /// after a validated route; workspace-PyPI names enter from direct
-    /// declarations shared by every consumer.
+    /// after a validated route or from an exact conda fact shared by every
+    /// precise consumer; workspace-PyPI names enter from direct declarations
+    /// shared by every consumer.
     auto_dropped: HashSet<String>,
     /// Canonical names of every package in the exported uv closure
     /// (`UvClosure::pins`). These are provided by the wheel closure /
@@ -708,10 +709,11 @@ struct Bundle {
     /// Empty on the legacy (non-uv) path, where the BFS bundles the
     /// full closure and the `vendored` set already covers members.
     uv_closure_names: std::collections::HashSet<String>,
-    /// Conda versions selected identically in every precise consuming
-    /// environment, including transitives. These are validation facts, not
-    /// ownership evidence; emission attaches one only through the group's
-    /// explicit PyPI-to-conda route edge.
+    /// Exact conda versions selected identically in every precise consuming
+    /// environment, including transitives. Membership in this map is the
+    /// workspace-side fact boundary: unless an explicit PyPI-side exclusion
+    /// applies, the fact owns the corresponding wheel dependency through
+    /// `auto_dropped` and the workspace conda solve supplies the package.
     workspace_conda_versions: BTreeMap<String, String>,
 }
 
@@ -728,6 +730,101 @@ struct BundleAutoRoute {
 impl Bundle {
     fn all_wheels(&self) -> impl Iterator<Item = &ResolvedWheel> {
         std::iter::once(&self.primary).chain(self.extras.iter())
+    }
+
+    /// Promote agreed workspace conda facts into the same typed drop ownership
+    /// used by Rule 1. This happens before joint route validation so a wheel's
+    /// incompatible `Requires-Dist` cannot manufacture a PyPI restore request
+    /// for a package the consuming workspace already supplies through conda.
+    ///
+    /// Explicit PyPI intent remains authoritative: manual overrides,
+    /// keep-PyPI requests, first-party roots, and wheels already materialized
+    /// in this bundle exclude their entire configured alias group. The name
+    /// map used here is the declared fact map, not a uv preference or a
+    /// transitive resolver selection, so those weaker signals cannot acquire
+    /// ownership.
+    fn apply_workspace_conda_fact_ownership(
+        &mut self,
+        config: &RetreadConfig,
+        fact_name_map: &NameMap,
+        dynamic_keep_pypi: &BTreeSet<PypiKey>,
+        protected_roots: &BTreeSet<String>,
+    ) {
+        if self.workspace_conda_versions.is_empty() {
+            return;
+        }
+
+        let mut owned: HashSet<String> = self
+            .workspace_conda_versions
+            .keys()
+            .map(|name| canonical_conda_name(name))
+            .collect();
+        expand_name_map_groups(&mut owned, fact_name_map);
+
+        let ledger_overrides: HashSet<String> = config
+            .ledger_overrides
+            .iter()
+            .map(|name| canonical_conda_name(name))
+            .collect();
+        let mut excluded: HashSet<String> = config
+            .overrides
+            .keys()
+            .map(|name| canonical_conda_name(name))
+            .filter(|name| !ledger_overrides.contains(name))
+            .chain(
+                config
+                    .keep_pypi
+                    .iter()
+                    .map(|name| canonical_conda_name(name)),
+            )
+            .chain(
+                dynamic_keep_pypi
+                    .iter()
+                    .map(|name| name.as_str().to_string()),
+            )
+            .chain(
+                protected_roots
+                    .iter()
+                    .map(|name| canonical_conda_name(name)),
+            )
+            .chain(
+                self.all_wheels()
+                    .map(|wheel| canonical_conda_name(&wheel.pypi_name)),
+            )
+            .chain(std::iter::once(canonical_conda_name(&self.conda_name)))
+            .collect();
+        expand_name_map_groups(&mut excluded, fact_name_map);
+        owned.retain(|name| !excluded.contains(name));
+
+        if owned.is_empty() {
+            return;
+        }
+
+        self.auto_routed.retain(|route| {
+            !owned.contains(&canonical_conda_name(&route.route.pypi_name))
+                && !owned.contains(&canonical_conda_name(&route.route.conda_name))
+        });
+        self.auto_dropped.extend(owned);
+    }
+}
+
+fn expand_name_map_groups(names: &mut HashSet<String>, name_map: &NameMap) {
+    loop {
+        let mut changed = false;
+        for (pypi_name, target) in name_map {
+            let Some(conda_name) = target.mapped_name() else {
+                continue;
+            };
+            let pypi_name = pypi_name.as_str().to_string();
+            let conda_name = conda_name.key().as_str().to_string();
+            if names.contains(&pypi_name) || names.contains(&conda_name) {
+                changed |= names.insert(pypi_name);
+                changed |= names.insert(conda_name);
+            }
+        }
+        if !changed {
+            break;
+        }
     }
 }
 
@@ -1934,11 +2031,13 @@ async fn resolve_all(
             deps_from_floor_names,
             workspace_facts,
             prelock_owned_drops,
+            protected_workspace_fact_names,
             conda_co_solve,
         ): (
             Option<crate::uv_closure::UvClosure>,
             std::collections::BTreeSet<String>,
             WorkspaceCondaFacts,
+            BTreeSet<String>,
             BTreeSet<String>,
             CondaCoSolveContext,
         ) = uv_group_closure(
@@ -2095,6 +2194,17 @@ async fn resolve_all(
             // dep that was probed across the whole group.
             bundle.probe_decisions.extend(sub.probe_decisions);
         }
+        // Conda-facts-first: an agreed exact conda record in every precise
+        // consuming environment owns that dependency unless the pack carries
+        // explicit PyPI-side intent for it. Promote through `auto_dropped`
+        // before auto-bundle scans or joint route validation, and remove any
+        // stale uv route for the same identity so emission has one owner.
+        bundle.apply_workspace_conda_fact_ownership(
+            &effective,
+            &config.name_map,
+            &uv_retry_keep,
+            &protected_workspace_fact_names,
+        );
         // Auto-bundle scans the whole merged bundle's Requires-Dist, so
         // it naturally handles transitives pulled by any wheel in the
         // group. Every explicit non-URL entry index joins the candidate
@@ -2459,9 +2569,10 @@ fn discard_facts_on_solve_failure(heal_facts_path: &std::path::Path, err: &anyho
 }
 
 /// Concrete conda facts for the precisely identified environments that
-/// consume one generated pack. Ownership and solved facts deliberately stay
-/// separate: only direct declarations shared by every consumer authorize an
-/// automatic drop, while the full selected record sets are validation input.
+/// consume one generated pack. Direct declarations retain their stronger
+/// pre-lock route authority, while an exact selected record shared by every
+/// consumer becomes post-materialization drop ownership through
+/// `Bundle::apply_workspace_conda_fact_ownership`.
 #[derive(Debug, Clone, Default)]
 struct WorkspaceCondaFacts {
     /// Canonical conda package names directly declared by every precise
@@ -2482,8 +2593,9 @@ struct WorkspaceCondaFacts {
     /// precise consumer (Rule-3 and harmonization authority).
     common_conda_versions: BTreeMap<String, String>,
     /// Common selected versions for all conda records, including transitives.
-    /// These are never ownership evidence. They become typed emission facts
-    /// only when an emitted PyPI dependency supplies a conda route edge.
+    /// This is the exact workspace fact boundary used to drop-own matching
+    /// wheel requirements after materialization. A uv preference or other
+    /// PyPI-side solver selection never enters this map.
     common_selected_versions: BTreeMap<String, String>,
     /// Full exact selected specs per consuming environment. These are never
     /// ownership evidence; they are the immutable baseline for route trials.
@@ -3097,6 +3209,7 @@ async fn uv_group_closure(
     std::collections::BTreeSet<String>,
     WorkspaceCondaFacts,
     BTreeSet<String>,
+    BTreeSet<String>,
     CondaCoSolveContext,
 )> {
     let uv_retry_keep_names: BTreeSet<String> = uv_retry_keep
@@ -3411,10 +3524,11 @@ async fn uv_group_closure(
         }
     }
 
-    let protected_root_names: BTreeSet<String> = group_entries
+    let mut protected_root_names: BTreeSet<String> = group_entries
         .iter()
         .map(|(name, _)| canonical_conda_name(name))
         .collect();
+    protected_root_names.extend(roots.iter().filter_map(|req| root_req_name(req)));
     apply_deps_from_conda_floors(
         &mut constraints,
         &deps_from_advisory_floors,
@@ -3632,6 +3746,7 @@ async fn uv_group_closure(
             std::collections::BTreeSet::new(),
             workspace_facts,
             prelock_owned_drops,
+            protected_root_names,
             conda_co_solve,
         ));
     }
@@ -3960,6 +4075,7 @@ async fn uv_group_closure(
         deps_from_floor_names,
         workspace_facts,
         prelock_owned_drops,
+        protected_root_names,
         conda_co_solve,
     ))
 }
@@ -6889,11 +7005,12 @@ fn produce_output_with_conflicts(
         }
     }
 
-    // A common solved workspace record is authoritative validation input even
-    // when it is transitive. Attach it only when a concrete emission route's
-    // advisory clause excludes that record: compatible advisory ranges keep
-    // their portable range, while a same-named conda record can never
-    // manufacture cross-ecosystem identity, ownership, or an exact pin.
+    // Workspace facts normally disappeared through `auto_dropped` before this
+    // assembly. A fact retained by an explicit PyPI-side exclusion remains
+    // authoritative validation input: attach it only when a concrete
+    // emission route's advisory clause excludes that record. Compatible
+    // advisory ranges keep their portable range, and cross-ecosystem identity
+    // still requires the configured route edge used by translation.
     for group in &mut emission_groups {
         let conda_key = group.conda_name.key();
         let Some(version) = bundle.workspace_conda_versions.get(conda_key.as_str()) else {
@@ -6906,12 +7023,13 @@ fn produce_output_with_conflicts(
         {
             continue;
         }
-        let workspace_version = uv_pep508::uv_pep440::Version::from_str(version).with_context(|| {
-            format!(
-                "parsing common workspace conda version `{version}` for PyPI `{}`",
-                group.pypi_name
-            )
-        })?;
+        let workspace_version =
+            uv_pep508::uv_pep440::Version::from_str(version).with_context(|| {
+                format!(
+                    "parsing common workspace conda version `{version}` for PyPI `{}`",
+                    group.pypi_name
+                )
+            })?;
         if !group.constraints.iter().any(|constraint| {
             constraint.authority() == Authority::Advisory
                 && !constraint.specifiers.contains(&workspace_version)

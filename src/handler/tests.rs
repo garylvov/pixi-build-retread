@@ -629,15 +629,24 @@ fn auto_route_envelope_does_not_override_index_metadata_cap() {
 }
 
 #[test]
-fn compatible_workspace_fact_does_not_exact_pin_advisory_range() {
+fn keep_pypi_workspace_fact_retains_advisory_range() {
     let mut bundle = solo_bundle("source-pack", vec!["starlette>=0.40,<0.46"]);
     bundle.primary.metadata_provenance = Provenance::SourceBuiltRelaxed;
     bundle
         .workspace_conda_versions
         .insert("starlette".to_string(), "0.45.3".to_string());
+    let mut config = cfg();
+    config.keep_pypi.push("starlette".to_string());
+    bundle.apply_workspace_conda_fact_ownership(
+        &config,
+        &config.name_map,
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+    );
+    assert!(bundle.auto_dropped.is_empty());
 
     let output =
-        produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
+        produce_output(&bundle, &config, Platform::Linux64, "3.11", &[], None, None).unwrap();
     let spec = output
         .run_dependencies
         .depends
@@ -648,6 +657,38 @@ fn compatible_workspace_fact_does_not_exact_pin_advisory_range() {
     assert!(spec.contains(">=0.40"), "{spec}");
     assert!(spec.contains("<0.46"), "{spec}");
     assert!(!spec.contains("==0.45.3"), "{spec}");
+}
+
+#[test]
+fn mapped_keep_pypi_excludes_the_entire_workspace_fact_alias_group() {
+    let mut bundle = solo_bundle("source-pack", vec!["torch>=2"]);
+    bundle
+        .workspace_conda_versions
+        .insert("pytorch".to_string(), "2.7.0".to_string());
+    bundle.auto_routed.push(BundleAutoRoute {
+        route: crate::uv_closure::AutoRoutedPackage {
+            pypi_name: "torch".to_string(),
+            conda_name: "pytorch".to_string(),
+            pypi_version: "2.7.0".to_string(),
+            conda_version: "2.7.0".to_string(),
+            channel: "https://conda.example.invalid/linux-64".to_string(),
+            input_requirements: Vec::new(),
+        },
+        provenance: Provenance::PriorSelection,
+    });
+    let mut config = cfg();
+    config.name_map = name_map(&[("torch", "pytorch")]);
+    config.keep_pypi.push("torch".to_string());
+
+    bundle.apply_workspace_conda_fact_ownership(
+        &config,
+        &config.name_map,
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+    );
+
+    assert!(bundle.auto_dropped.is_empty());
+    assert_eq!(bundle.auto_routed.len(), 1);
 }
 
 #[test]

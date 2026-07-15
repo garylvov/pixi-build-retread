@@ -27,7 +27,7 @@ use crate::relax::{
 use crate::wheel::WheelMetadata;
 
 use super::resolve_state::ResolveState;
-use super::{Bundle, DEFAULT_PYTHON, PypiToCondaMap, ResolvedWheel};
+use super::{Bundle, DEFAULT_PYTHON, PypiToCondaMap, ResolvedWheel, expand_name_map_groups};
 
 /// Sentinel error returned when the incremental-add BFS detects that a new
 /// dep's transitive subtree would force a version change on a dep already
@@ -361,26 +361,6 @@ fn record_metadata_route(
         conda_name,
         preferred_versions,
     });
-}
-
-fn expand_name_map_groups(names: &mut HashSet<String>, name_map: &NameMap) {
-    loop {
-        let mut changed = false;
-        for (pypi_name, target) in name_map {
-            let Some(conda_name) = target.mapped_name() else {
-                continue;
-            };
-            let pypi_name = pypi_name.as_str().to_string();
-            let conda_name = conda_name.key().as_str().to_string();
-            if names.contains(&pypi_name) || names.contains(&conda_name) {
-                changed |= names.insert(pypi_name);
-                changed |= names.insert(conda_name);
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
 }
 
 /// This is the "pip autoresolve" path: deps that exist on PyPI but might
@@ -2768,7 +2748,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn advisory_floor_does_not_veto_conda_route() {
+    async fn workspace_fact_owns_source_built_advisory_dependency() {
         let fetch_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let fetch = {
             let fetch_calls = Arc::clone(&fetch_calls);
@@ -2793,6 +2773,18 @@ mod tests {
         bundle
             .workspace_conda_versions
             .insert("starlette".to_string(), "0.45.3".to_string());
+        bundle.apply_workspace_conda_fact_ownership(
+            &config,
+            &config.name_map,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
+
+        assert_eq!(
+            bundle.auto_dropped,
+            HashSet::from(["starlette".to_string()]),
+            "the shared workspace conda fact must enter Rule-1 drop ownership"
+        );
 
         auto_bundle_transitives_with(
             &mut bundle,
@@ -2819,13 +2811,12 @@ mod tests {
         );
 
         let emitted = super::super::emitted_bundle_route_specs(&bundle, &config, &target).unwrap();
-        let emitted_spec = emitted
-            .iter()
-            .find(|route| route.conda_name.key().as_str() == "starlette")
-            .map(|route| route.spec.clone())
-            .expect("final output must retain starlette");
-        assert!(emitted_spec.contains("==0.45.3"), "{emitted_spec}");
-        assert!(!emitted_spec.contains(">=0.49"), "{emitted_spec}");
+        assert!(
+            emitted
+                .iter()
+                .all(|route| route.conda_name.key().as_str() != "starlette"),
+            "the generated pack must not re-emit a workspace-owned dependency: {emitted:?}"
+        );
 
         let output = super::super::produce_output(
             &bundle,
@@ -2837,14 +2828,14 @@ mod tests {
             None,
         )
         .unwrap();
-        let output_spec = output
-            .run_dependencies
-            .depends
-            .iter()
-            .find(|dependency| dependency.name.as_str() == "starlette")
-            .map(|dependency| super::super::audit_report::format_packagespec(&dependency.spec))
-            .expect("recipe output must retain starlette");
-        assert_eq!(output_spec, emitted_spec);
+        assert!(
+            output
+                .run_dependencies
+                .depends
+                .iter()
+                .all(|dependency| dependency.name.as_str() != "starlette"),
+            "recipe output must leave the workspace-owned conda fact to the workspace"
+        );
     }
 
     #[tokio::test]
