@@ -629,7 +629,7 @@ fn auto_route_envelope_does_not_override_index_metadata_cap() {
 }
 
 #[test]
-fn keep_pypi_workspace_fact_retains_advisory_range() {
+fn workspace_fact_ownership_respects_pypi_intent_and_mapping_direction() {
     let mut bundle = solo_bundle("source-pack", vec!["starlette>=0.40,<0.46"]);
     bundle.primary.metadata_provenance = Provenance::SourceBuiltRelaxed;
     bundle
@@ -675,6 +675,7 @@ fn keep_pypi_workspace_fact_retains_advisory_range() {
         },
         provenance: Provenance::PriorSelection,
     });
+    let mapped_bundle = bundle.clone();
     let mut config = cfg();
     config.name_map = name_map(&[("torch", "pytorch")]);
     config.keep_pypi.push("torch".to_string());
@@ -688,6 +689,103 @@ fn keep_pypi_workspace_fact_retains_advisory_range() {
 
     assert!(bundle.auto_dropped.is_empty());
     assert_eq!(bundle.auto_routed.len(), 1);
+
+    // Positive direction: a pytorch conda fact provides both the explicitly
+    // mapped PyPI torch identity and the otherwise-unmapped PyPI pytorch
+    // identity. The stale torch -> pytorch route is pruned by its PyPI key.
+    let mut owned_bundle = mapped_bundle.clone();
+    config.keep_pypi.clear();
+    owned_bundle.apply_workspace_conda_fact_ownership(
+        &config,
+        &config.name_map,
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+    );
+    assert_eq!(
+        owned_bundle.auto_dropped,
+        HashSet::from(["pytorch".to_string(), "torch".to_string()])
+    );
+    assert!(owned_bundle.auto_routed.is_empty());
+
+    // Reverse direction is invalid: `torch -> pytorch` does not let a torch
+    // conda fact provide PyPI torch when the configured provider is absent.
+    let mut reverse_bundle = mapped_bundle;
+    reverse_bundle.workspace_conda_versions.clear();
+    reverse_bundle
+        .workspace_conda_versions
+        .insert("torch".to_string(), "2.7.0".to_string());
+    reverse_bundle.apply_workspace_conda_fact_ownership(
+        &config,
+        &config.name_map,
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+    );
+    assert!(reverse_bundle.auto_dropped.is_empty());
+    assert_eq!(reverse_bundle.auto_routed.len(), 1);
+
+    // Mapping chains are not equivalence classes. Protecting PyPI foo, whose
+    // provider is bar, must not exclude the independent baz fact that owns
+    // PyPI bar through the separate `bar -> baz` edge.
+    let mut chained_bundle = solo_bundle("source-pack", vec!["bar>=1"]);
+    chained_bundle
+        .workspace_conda_versions
+        .insert("baz".to_string(), "1.0.0".to_string());
+    let mut chained_config = cfg();
+    chained_config.name_map = name_map(&[("foo", "bar"), ("bar", "baz")]);
+    chained_bundle.apply_workspace_conda_fact_ownership(
+        &chained_config,
+        &chained_config.name_map,
+        &BTreeSet::new(),
+        &BTreeSet::from(["foo".to_string()]),
+    );
+    assert_eq!(
+        chained_bundle.auto_dropped,
+        HashSet::from(["bar".to_string(), "baz".to_string()])
+    );
+
+    // An explicit disabled mapping is wheel-side intent and vetoes same-name
+    // fact ownership.
+    let mut disabled_bundle = solo_bundle("source-pack", vec!["numpy>=2"]);
+    disabled_bundle
+        .workspace_conda_versions
+        .insert("numpy".to_string(), "2.1.0".to_string());
+    let mut disabled_config = cfg();
+    disabled_config
+        .name_map
+        .insert(PypiKey::from_pypi("numpy"), CondaTarget::Disabled);
+    disabled_bundle.apply_workspace_conda_fact_ownership(
+        &disabled_config,
+        &disabled_config.name_map,
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+    );
+    assert!(disabled_bundle.auto_dropped.is_empty());
+
+    // Auto-dropped identities remain PyPI-typed at emission. Owning PyPI bar
+    // must not suppress a different raw PyPI foo requirement merely because
+    // an effective routing map translates foo to conda bar.
+    let mut typed_bundle = solo_bundle("source-pack", vec!["foo>=1"]);
+    typed_bundle.auto_dropped.insert("bar".to_string());
+    let mut typed_config = cfg();
+    typed_config.name_map = name_map(&[("foo", "bar")]);
+    let typed_output = produce_output(
+        &typed_bundle,
+        &typed_config,
+        Platform::Linux64,
+        "3.11",
+        &[],
+        None,
+        None,
+    )
+    .unwrap();
+    assert!(
+        typed_output
+            .run_dependencies
+            .depends
+            .iter()
+            .any(|dependency| dependency.name.as_str() == "bar"),
+        "PyPI bar ownership must not drop a distinct PyPI foo requirement"
+    );
 }
 
 #[test]

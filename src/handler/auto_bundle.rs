@@ -27,7 +27,7 @@ use crate::relax::{
 use crate::wheel::WheelMetadata;
 
 use super::resolve_state::ResolveState;
-use super::{Bundle, DEFAULT_PYTHON, PypiToCondaMap, ResolvedWheel, expand_name_map_groups};
+use super::{Bundle, DEFAULT_PYTHON, PypiToCondaMap, ResolvedWheel};
 
 /// Sentinel error returned when the incremental-add BFS detects that a new
 /// dep's transitive subtree would force a version change on a dep already
@@ -361,6 +361,26 @@ fn record_metadata_route(
         conda_name,
         preferred_versions,
     });
+}
+
+fn expand_name_map_groups(names: &mut HashSet<String>, name_map: &NameMap) {
+    loop {
+        let mut changed = false;
+        for (pypi_name, target) in name_map {
+            let Some(conda_name) = target.mapped_name() else {
+                continue;
+            };
+            let pypi_name = pypi_name.as_str().to_string();
+            let conda_name = conda_name.key().as_str().to_string();
+            if names.contains(&pypi_name) || names.contains(&conda_name) {
+                changed |= names.insert(pypi_name);
+                changed |= names.insert(conda_name);
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
 }
 
 /// This is the "pip autoresolve" path: deps that exist on PyPI but might

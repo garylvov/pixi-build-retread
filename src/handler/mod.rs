@@ -754,19 +754,14 @@ impl Bundle {
             return;
         }
 
-        let mut owned: HashSet<String> = self
-            .workspace_conda_versions
-            .keys()
-            .map(|name| canonical_conda_name(name))
-            .collect();
-        expand_name_map_groups(&mut owned, fact_name_map);
+        let mut owned = workspace_conda_fact_owners(&self.workspace_conda_versions, fact_name_map);
 
         let ledger_overrides: HashSet<String> = config
             .ledger_overrides
             .iter()
             .map(|name| canonical_conda_name(name))
             .collect();
-        let mut excluded: HashSet<String> = config
+        let excluded_pypi: HashSet<String> = config
             .overrides
             .keys()
             .map(|name| canonical_conda_name(name))
@@ -792,40 +787,76 @@ impl Bundle {
                     .map(|wheel| canonical_conda_name(&wheel.pypi_name)),
             )
             .chain(std::iter::once(canonical_conda_name(&self.conda_name)))
+            .chain(fact_name_map.iter().filter_map(|(pypi_name, target)| {
+                target
+                    .mapped_name()
+                    .is_none()
+                    .then(|| pypi_name.as_str().to_string())
+            }))
             .collect();
-        expand_name_map_groups(&mut excluded, fact_name_map);
-        owned.retain(|name| !excluded.contains(name));
+        let excluded_providers: HashSet<String> = excluded_pypi
+            .iter()
+            .filter_map(|pypi_name| {
+                let key = PypiKey::from_pypi(pypi_name);
+                match fact_name_map.get(&key) {
+                    Some(target) => target
+                        .mapped_name()
+                        .map(|conda_name| conda_name.key().into_string()),
+                    None => Some(pypi_name.clone()),
+                }
+            })
+            .collect();
+        owned.retain(|pypi_name, provider| {
+            !excluded_pypi.contains(pypi_name) && !excluded_providers.contains(provider)
+        });
 
         if owned.is_empty() {
             return;
         }
 
-        self.auto_routed.retain(|route| {
-            !owned.contains(&canonical_conda_name(&route.route.pypi_name))
-                && !owned.contains(&canonical_conda_name(&route.route.conda_name))
-        });
-        self.auto_dropped.extend(owned);
+        self.auto_routed
+            .retain(|route| !owned.contains_key(&canonical_conda_name(&route.route.pypi_name)));
+        self.auto_dropped.extend(owned.into_keys());
     }
 }
 
-fn expand_name_map_groups(names: &mut HashSet<String>, name_map: &NameMap) {
-    loop {
-        let mut changed = false;
-        for (pypi_name, target) in name_map {
-            let Some(conda_name) = target.mapped_name() else {
-                continue;
+/// Project exact conda facts into the PyPI identities they can provide.
+/// Explicit mappings are directional: `foo -> bar` means only a `bar` conda
+/// fact owns PyPI `foo`. A `foo` conda fact cannot reverse that edge, and an
+/// explicitly disabled PyPI key has no conda owner even when a same-named fact
+/// exists. Unmapped names retain the ordinary same-name identity boundary.
+fn workspace_conda_fact_owners(
+    workspace_conda_versions: &BTreeMap<String, String>,
+    fact_name_map: &NameMap,
+) -> BTreeMap<String, String> {
+    let fact_names: HashSet<String> = workspace_conda_versions
+        .keys()
+        .map(|name| canonical_conda_name(name))
+        .collect();
+    let candidates: BTreeSet<String> = fact_names
+        .iter()
+        .cloned()
+        .chain(
+            fact_name_map
+                .keys()
+                .map(|pypi_name| pypi_name.as_str().to_string()),
+        )
+        .collect();
+    candidates
+        .into_iter()
+        .filter_map(|pypi_name| {
+            let key = PypiKey::from_pypi(&pypi_name);
+            let provider = match fact_name_map.get(&key) {
+                Some(target) => target
+                    .mapped_name()
+                    .map(|conda_name| conda_name.key().into_string())?,
+                None => pypi_name.clone(),
             };
-            let pypi_name = pypi_name.as_str().to_string();
-            let conda_name = conda_name.key().as_str().to_string();
-            if names.contains(&pypi_name) || names.contains(&conda_name) {
-                changed |= names.insert(pypi_name);
-                changed |= names.insert(conda_name);
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
+            fact_names
+                .contains(&provider)
+                .then_some((pypi_name, provider))
+        })
+        .collect()
 }
 
 impl Handler {
@@ -6930,8 +6961,8 @@ fn produce_output_with_conflicts(
             // examples/isaac6 (isaacsim 6.0's tinyobjloader dep).
             let dep_name = dep.name.clone();
             let raw_pypi_name = dep.pypi_name.as_str();
-            // P2: one dual-namespace membership helper for all three
-            // filters (canonicalizes both query names internally).
+            // Vendored and explicit drop sets predate typed ecosystem names,
+            // so retain their dual-namespace compatibility check.
             let in_set = |set: &HashSet<String>| {
                 crate::relax::already_covered(set, &dep_name, Some(raw_pypi_name))
             };
@@ -6942,7 +6973,14 @@ fn produce_output_with_conflicts(
                 tracing::debug!(dep = %dep_name, "dropping per retread-drop-deps");
                 continue;
             }
-            if in_set(&bundle.auto_dropped) {
+            // `auto_dropped` is typed PyPI ownership evidence. Matching the
+            // translated conda name here would let an inferred name-map edge
+            // turn an unrelated PyPI owner into ownership of this raw wheel
+            // requirement.
+            if bundle
+                .auto_dropped
+                .contains(&canonical_conda_name(raw_pypi_name))
+            {
                 tracing::info!(
                     dep = %dep_name,
                     bundle = %bundle.conda_name,
