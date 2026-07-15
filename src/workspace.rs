@@ -16,8 +16,10 @@
 //! files or malformed sections don't kill the build. Callers treat
 //! `None` as "no info; behave like the workspace doesn't exist."
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
+
+use crate::relax::{CondaMatchSpec, CondaName, PypiKey};
 
 pub(crate) const DEFAULT_PYPI_INDEX: &str = "https://pypi.org/simple/";
 
@@ -72,9 +74,6 @@ pub struct WorkspaceManifest {
     /// indexes are consulted when bundling PyPI-only deps, not just
     /// the `[retread-wheels]` entry indexes.
     pub pypi_index_urls: Vec<String>,
-    /// Whether top-level `[pypi-options]` explicitly replaces the default
-    /// PyPI index via `index-url`.
-    pypi_index_url_overridden: bool,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -211,7 +210,7 @@ impl WorkspaceManifest {
         }
 
         // v1.3.0: top-level [pypi-options] index URLs.
-        (out.pypi_index_urls, out.pypi_index_url_overridden) = parse_pypi_index_urls(parsed);
+        out.pypi_index_urls = parse_pypi_index_urls(parsed);
 
         if let Some(envs) = parsed.get("environments").and_then(|v| v.as_table()) {
             for (name, value) in envs {
@@ -258,7 +257,7 @@ impl WorkspaceManifest {
                         }
                     }
                     // v1.3.0: per-feature [pypi-options] index URLs.
-                    (def.pypi_index_urls, _) = parse_pypi_index_urls(fvalue);
+                    def.pypi_index_urls = parse_pypi_index_urls(fvalue);
                 }
                 out.features.insert(name.clone(), def);
             }
@@ -341,24 +340,6 @@ impl WorkspaceManifest {
         for url in all {
             if !out.contains(url) {
                 out.push(url.clone());
-            }
-        }
-        out
-    }
-
-    /// Full auto-bundle index chain: the workspace's explicit `index-url`,
-    /// or the implicit public PyPI default, followed by every declared extra.
-    pub fn auto_bundle_pypi_index_urls(&self) -> Vec<String> {
-        let mut out = Vec::new();
-        if !self.pypi_index_url_overridden {
-            out.push(DEFAULT_PYPI_INDEX.to_string());
-        }
-        for url in self.all_pypi_index_urls() {
-            if !out
-                .iter()
-                .any(|existing| existing.trim_end_matches('/') == url.trim_end_matches('/'))
-            {
-                out.push(url);
             }
         }
         out
@@ -986,60 +967,29 @@ fn path_matches(workspace_dir: &Path, raw_path: &str, source_canon: &Path) -> bo
 /// Self-references (deps the bundle is itself producing) are filtered
 /// by the caller via `bundle_names`. Path/git deps are already
 /// filtered at parse time (no version pin to query).
-pub async fn extract_transitive_constraints(
-    manifest: &WorkspaceManifest,
-    env_name: &str,
-    target_python: &str,
-    conda_channels: &[rattler_conda_types::ChannelUrl],
-    bundle_names: &std::collections::HashSet<String>,
-) -> BTreeMap<String, Vec<String>> {
-    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let deps = manifest.effective_dependencies(env_name);
-    let channel_priority = match manifest.channel_priority.as_deref() {
-        Some("disabled") => rattler_solve::ChannelPriority::Disabled,
-        _ => rattler_solve::ChannelPriority::Strict,
-    };
-    let system_requirements = manifest.effective_system_requirements(env_name);
-    let solve_specs: Vec<String> = deps
-        .iter()
+fn transitive_solve_specs(
+    deps: &BTreeMap<String, String>,
+    bundle_names: &HashSet<PypiKey>,
+) -> Vec<CondaMatchSpec> {
+    deps.iter()
         .filter_map(|(dep_name, dep_spec)| {
-            let conda_name = crate::relax::canonical_conda_name(dep_name);
-            if bundle_names.contains(&conda_name) {
+            let conda_name = CondaName::new(dep_name.as_str());
+            if bundle_names.contains(&conda_name.key()) {
                 return None;
             }
-            if dep_spec.is_empty() || dep_spec == "*" {
-                Some(conda_name)
-            } else {
-                Some(format!("{conda_name} {dep_spec}"))
-            }
+            Some(conda_name.match_spec(dep_spec.as_str()))
         })
-        .collect();
+        .collect()
+}
 
-    let solved_records = match crate::conda_solve::solve_selected_records(
-        conda_channels,
-        &solve_specs,
-        target_python,
-        "linux-64",
-        channel_priority,
-        &system_requirements,
-        rattler_solve::SolveStrategy::LowestVersionDirect,
-    )
-    .await
-    {
-        Ok(records) => records,
-        Err(reasons) => {
-            tracing::debug!(
-                env = %env_name,
-                reasons = ?reasons,
-                "workspace: coherent solve for transitive extraction failed; skipping transitive constraints"
-            );
-            return out;
-        }
-    };
-
+fn fold_transitive_constraints(
+    solved_records: &[rattler_conda_types::RepoDataRecord],
+    bundle_names: &HashSet<PypiKey>,
+) -> BTreeMap<PypiKey, Vec<String>> {
+    let mut out: BTreeMap<PypiKey, Vec<String>> = BTreeMap::new();
     for record in solved_records {
-        let conda_name = record.package_record.name.as_normalized();
-        if bundle_names.contains(conda_name) {
+        let selected_name = CondaName::new(record.package_record.name.as_normalized());
+        if bundle_names.contains(&selected_name.key()) {
             continue;
         }
         // P3 (grizzly #6): walk `depends` AND `constrains`. A
@@ -1056,10 +1006,52 @@ pub async fn extract_transitive_constraints(
             &record.package_record.depends,
             &record.package_record.constrains,
         ) {
-            out.entry(trans_name).or_default().push(trans_spec);
+            let transitive_key = CondaName::new(trans_name.as_str()).key();
+            out.entry(transitive_key).or_default().push(trans_spec);
         }
     }
     out
+}
+
+pub async fn extract_transitive_constraints(
+    manifest: &WorkspaceManifest,
+    env_name: &str,
+    target_python: &str,
+    conda_channels: &[rattler_conda_types::ChannelUrl],
+    bundle_names: &HashSet<PypiKey>,
+) -> BTreeMap<PypiKey, Vec<String>> {
+    let deps = manifest.effective_dependencies(env_name);
+    let channel_priority = match manifest.channel_priority.as_deref() {
+        Some("disabled") => rattler_solve::ChannelPriority::Disabled,
+        _ => rattler_solve::ChannelPriority::Strict,
+    };
+    let system_requirements = manifest.effective_system_requirements(env_name);
+    let solve_specs = transitive_solve_specs(&deps, bundle_names);
+
+    let solved_records = match crate::conda_solve::solve_selected_records(
+        conda_channels,
+        &solve_specs,
+        target_python,
+        // TODO(target-subdir): derive this from the requested workspace platform.
+        "linux-64",
+        channel_priority,
+        &system_requirements,
+        rattler_solve::SolveStrategy::LowestVersionDirect,
+    )
+    .await
+    {
+        Ok(records) => records,
+        Err(reasons) => {
+            tracing::warn!(
+                env = %env_name,
+                reasons = ?reasons,
+                "workspace: coherent solve for transitive extraction failed; skipping transitive constraints"
+            );
+            return BTreeMap::new();
+        }
+    };
+
+    fold_transitive_constraints(&solved_records, bundle_names)
 }
 
 /// P3 (grizzly #6): the depends + constrains line walk for one solved
@@ -1131,16 +1123,17 @@ fn parse_pypi_dependencies(container: &toml::Value) -> BTreeMap<String, String> 
 
 /// Pull index URLs out of a `[pypi-options]` table nested under
 /// `container` (the manifest root, or a `[feature.X]` table value):
-/// `index-url` first (it replaces pixi's default index, so it leads
-/// the fallback chain), then `extra-index-urls` in declaration order.
-fn parse_pypi_index_urls(container: &toml::Value) -> (Vec<String>, bool) {
+/// `index-url` first (the preferred workspace index), then
+/// `extra-index-urls` in declaration order. The shared index-chain builder
+/// adds public PyPI as a terminal fetch fallback.
+fn parse_pypi_index_urls(container: &toml::Value) -> Vec<String> {
     let mut out = Vec::new();
     let Some(opts) = container
         .get("pypi-options")
         .or_else(|| container.get("pypi_options"))
         .and_then(|v| v.as_table())
     else {
-        return (out, false);
+        return out;
     };
     let index_url = opts
         .get("index-url")
@@ -1156,7 +1149,7 @@ fn parse_pypi_index_urls(container: &toml::Value) -> (Vec<String>, bool) {
     {
         out.extend(extra.iter().filter_map(|v| v.as_str().map(String::from)));
     }
-    (out, index_url.is_some())
+    out
 }
 
 /// v0.37.0+ (D1): parse one `[system-requirements]` value. pixi allows
@@ -1297,10 +1290,81 @@ fn parse_env_def(value: &toml::Value) -> Option<EnvironmentDef> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rattler_conda_types::{PackageRecord, RepoDataRecord, VersionWithSource};
+    use std::str::FromStr;
+    use url::Url;
 
     fn ws_toml(text: &str) -> WorkspaceManifest {
         let parsed: toml::Value = toml::from_str(text).unwrap();
         WorkspaceManifest::from_toml(&parsed)
+    }
+
+    fn repo_record(name: &str, version: &str, depends: &[&str]) -> RepoDataRecord {
+        let mut package_record = PackageRecord::new(
+            name.parse().unwrap(),
+            VersionWithSource::from_str(version).unwrap(),
+            "h123456_0".to_string(),
+        );
+        package_record.subdir = "linux-64".to_string();
+        package_record.depends = depends.iter().map(|dep| (*dep).to_string()).collect();
+        RepoDataRecord {
+            package_record,
+            file_name: format!("{name}-{version}-h123456_0.conda"),
+            url: Url::parse(&format!(
+                "https://example.invalid/linux-64/{name}-{version}-h123456_0.conda"
+            ))
+            .unwrap(),
+            channel: Some("https://example.invalid".into()),
+        }
+    }
+
+    #[test]
+    fn extract_transitive_constraints_underscored_env() {
+        let ws = ws_toml(
+            r#"
+[environments]
+cuda-env = { features = ["cuda"], no-default-feature = true }
+
+[feature.cuda.dependencies]
+cuda-nvcc_linux-64 = "12.9.*"
+"#,
+        );
+        let deps = ws.effective_dependencies("cuda-env");
+        let bundle_names = HashSet::new();
+        let solve_specs = transitive_solve_specs(&deps, &bundle_names);
+
+        assert_eq!(solve_specs.len(), 1);
+        assert_eq!(
+            solve_specs[0].as_str(),
+            "cuda-nvcc_linux-64 12.9.*",
+            "conda solver input must preserve the declared underscore"
+        );
+
+        let records = vec![
+            repo_record("cuda-nvcc_linux-64", "12.9.1", &["cuda-version >=12.9,<13"]),
+            repo_record("cuda-version", "12.9", &[]),
+        ];
+        // The test-only solver helper predates the production type wall and
+        // still accepts rendered strings. Keep this conversion adjacent to
+        // that cfg(test)-only boundary; production receives CondaMatchSpec.
+        let rendered_specs = solve_specs
+            .iter()
+            .map(|spec| spec.as_str().to_owned())
+            .collect::<Vec<_>>();
+        let solved = crate::conda_solve::solve_records_for_test(&records, &rendered_specs, "3.11")
+            .expect("raw underscored conda dependency should solve");
+        assert!(
+            solved.iter().any(|record| {
+                record.package_record.name.as_normalized() == "cuda-nvcc_linux-64"
+            })
+        );
+
+        let constraints = fold_transitive_constraints(&solved, &bundle_names);
+        assert_eq!(
+            constraints.get(&PypiKey::from_pypi("cuda-version")),
+            Some(&vec![">=12.9,<13".to_string()]),
+            "the selected underscored package's transitive constraint must survive"
+        );
     }
 
     /// pixi 0.71 introduced a STRUCTURED `[workspace.conda-pypi-map]`
@@ -1867,11 +1931,15 @@ extra-index-urls = ["https://pypi.nvidia.com", "https://py.mujoco.org"]
 "#,
         );
         assert_eq!(
-            ws.auto_bundle_pypi_index_urls(),
+            crate::index_chain::index_chain(
+                Vec::<String>::new(),
+                &ws.all_pypi_index_urls(),
+                crate::index_chain::IndexPurpose::Resolve,
+            ),
             vec![
-                DEFAULT_PYPI_INDEX.to_string(),
                 "https://pypi.nvidia.com".to_string(),
                 "https://py.mujoco.org".to_string(),
+                DEFAULT_PYPI_INDEX.to_string(),
             ],
         );
 
@@ -1883,10 +1951,15 @@ extra-index-urls = ["https://extra.example/simple"]
 "#,
         );
         assert_eq!(
-            overridden.auto_bundle_pypi_index_urls(),
+            crate::index_chain::index_chain(
+                Vec::<String>::new(),
+                &overridden.all_pypi_index_urls(),
+                crate::index_chain::IndexPurpose::Resolve,
+            ),
             vec![
                 "https://packages.example/simple".to_string(),
                 "https://extra.example/simple".to_string(),
+                DEFAULT_PYPI_INDEX.to_string(),
             ],
         );
     }

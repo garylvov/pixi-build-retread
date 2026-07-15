@@ -5,6 +5,7 @@
 //! identical whole-function moves; no logic changes.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::ffi::OsStr;
 use std::future::Future;
 use std::path::Path;
 use std::str::FromStr;
@@ -12,13 +13,17 @@ use std::str::FromStr;
 use anyhow::{Context, Result, anyhow};
 use rattler_conda_types::ChannelUrl;
 use uv_pep508::MarkerEnvironment;
-use uv_pep508::uv_pep440::{
-    Operator, Version, VersionSpecifier, VersionSpecifiers, release_specifiers_to_ranges,
-};
+#[cfg(test)]
+use uv_pep508::uv_pep440::Version;
+use uv_pep508::uv_pep440::VersionSpecifiers;
 
 use crate::config::RetreadConfig;
+use crate::constraint::{Constraint, Provenance, finalize};
 use crate::pypi;
-use crate::relax::{canonical_conda_name, default_marker_env, marker_env_for};
+use crate::relax::{
+    CondaName, CondaTarget, NameMap, PypiKey, canonical_conda_name, default_marker_env,
+    marker_env_for,
+};
 use crate::wheel::WheelMetadata;
 
 use super::resolve_state::ResolveState;
@@ -45,16 +50,53 @@ impl std::fmt::Display for IncrementalRipple {
 
 impl std::error::Error for IncrementalRipple {}
 
-/// Returns `true` if `conda_normalized_pypi_name` has an unambiguous conda
-/// equivalent in the effective name_map (parselmouth + FALLBACK + user
+/// Exact opt-in for the P4 uv re-resolve path. Every value except the literal
+/// `1` preserves the legacy reconstruct-and-fetch behavior.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum UvReresolveMode {
+    #[default]
+    Disabled,
+    Enabled,
+}
+
+impl UvReresolveMode {
+    pub(crate) fn from_env_value(value: Option<&OsStr>) -> Self {
+        if value == Some(OsStr::new("1")) {
+            Self::Enabled
+        } else {
+            Self::Disabled
+        }
+    }
+
+    fn is_enabled(self) -> bool {
+        self == Self::Enabled
+    }
+}
+
+/// Per-group state needed to hand a rejected conda route back to the outer uv
+/// auto-route fixpoint. `keep_pypi` is monotonic across group retries.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct UvReresolveContext {
+    pub(crate) mode: UvReresolveMode,
+    pub(crate) uv_backed: bool,
+    pub(crate) keep_pypi: BTreeSet<PypiKey>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum AutoBundleOutcome {
+    Complete,
+    RetryKeepPypi { keep_pypi: BTreeSet<PypiKey> },
+}
+
+/// Returns `true` if `pypi_key` has an enabled, unambiguous conda equivalent
+/// in the effective name map (parselmouth + FALLBACK + user
 /// retread-name-map). This identifies a conda target; the requirement-specific
 /// probe must still pass [`validated_conda_route`] before auto-bundling is
 /// skipped.
-pub(crate) fn prefer_conda_match(
-    conda_normalized_pypi_name: &str,
-    name_map: &BTreeMap<String, String>,
-) -> bool {
-    name_map.contains_key(conda_normalized_pypi_name)
+pub(crate) fn prefer_conda_match(pypi_key: &PypiKey, name_map: &NameMap) -> bool {
+    name_map
+        .get(pypi_key)
+        .is_some_and(|target| target.mapped_name().is_some())
 }
 
 /// A conda route is valid only when the requirement-specific probe found at
@@ -104,18 +146,21 @@ pub(crate) fn conda_probe_spec(specifiers: &VersionSpecifiers) -> String {
 /// Returns the conda package name to probe/route to, or `None` to keep the
 /// dep on the PyPI side.
 pub(crate) fn pick_conda_target(
-    dep_conda_name: &str,
-    name_map: &BTreeMap<String, String>,
+    dep_pypi_key: &PypiKey,
+    name_map: &NameMap,
     pypi_to_conda: &PypiToCondaMap,
-) -> Option<String> {
-    if let Some(target) = name_map.get(dep_conda_name) {
-        return Some(target.clone());
+) -> Option<CondaName> {
+    if let Some(target) = name_map.get(dep_pypi_key) {
+        return target.mapped_name().cloned();
     }
-    let candidates = pypi_to_conda.get(dep_conda_name)?;
-    if candidates.iter().any(|c| c == dep_conda_name) {
-        Some(dep_conda_name.to_string())
+    let candidates = pypi_to_conda.get(dep_pypi_key.as_str())?;
+    if let Some(identity) = candidates
+        .iter()
+        .find(|candidate| PypiKey::from_pypi(candidate) == *dep_pypi_key)
+    {
+        Some(CondaName::new(identity.clone()))
     } else if candidates.len() == 1 {
-        Some(candidates[0].clone())
+        Some(CondaName::new(candidates[0].clone()))
     } else {
         None
     }
@@ -133,335 +178,34 @@ struct PypiFetchRequest {
     preferred_version: Option<String>,
 }
 
-/// One active, target-marker-matched dependency declaration. The source text
-/// stays attached until the complete restore requirement has been proven
-/// satisfiable, so an empty intersection can name the wheels and raw
-/// `Requires-Dist` lines that created it.
-///
-/// `advisory` is true when this declaration comes from a wheel retread BUILT
-/// ITSELF from source (a `[retread-wheels]` git/`from`/sdist entry, e.g.
-/// IsaacLab). retread already relaxes such a wheel's exact upstream pins, so
-/// they are pip-world *advisories*, not authoritative constraints: when an
-/// advisory lower bound is the only reason a rejected route's PyPI restore is
-/// unsatisfiable against an authoritative (index wheel / workspace / closure)
-/// constraint, the advisory floor yields to the composed workspace's solve
-/// (conda-as-truth). See `finalize_observed_requirement`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct ObservedRequirement {
-    specifiers: VersionSpecifiers,
-    source: String,
-    advisory: bool,
-}
-
-type ObservedRequirements = BTreeMap<String, Vec<ObservedRequirement>>;
-
-/// Structural identity for the one restore failure that a precise workspace
-/// conda owner can safely supersede. The display text intentionally preserves
-/// the v4.6.6 diagnostic verbatim.
-#[derive(Debug)]
-struct UnsatisfiableRestoreRequirements {
-    pypi_name: String,
-    sources: String,
-}
-
-impl std::fmt::Display for UnsatisfiableRestoreRequirements {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "joint route validation cannot restore `{}` to PyPI: active requirements are mutually unsatisfiable:\n{}",
-            self.pypi_name, self.sources
-        )
-    }
-}
-
-impl std::error::Error for UnsatisfiableRestoreRequirements {}
-
-/// Why an impossible PyPI restore was NOT superseded by a workspace-owned
-/// drop, in the exact terms of the guards that blocked it.
-///
-/// Silence here is what let a no-op ship: v4.6.7 added the drop but fell
-/// through to the v4.6.6 error verbatim whenever a guard declined, so "the
-/// guard never fired" and "the guard does not exist" were byte-identical from
-/// the outside -- through a full publish and a 30-minute relock. Every decline
-/// must now name the dependency and the specific guard.
-fn drop_decline_reasons(
-    pypi_key: &str,
-    workspace_ownership: &super::WorkspaceRouteOwnership,
-    rejected_conda_routes: &BTreeSet<String>,
-    workspace_drop_authorized: bool,
-) -> Vec<String> {
-    let mut reasons = Vec::new();
-    if !workspace_drop_authorized {
-        reasons.push(
-            "the fixed workspace conda baseline did not solve, so rule 1 abstains \
-             (ownership is indeterminate, not disproven)"
-                .to_string(),
-        );
-    }
-    if workspace_ownership.excluded_pypi_names.contains(pypi_key) {
-        reasons.push(format!(
-            "`{pypi_key}` is held on PyPI by an explicit retread-override, a keep-pypi \
-             entry, a wheel entry of this pack, or a direct-URL wheel source"
-        ));
-    }
-    let owns_pypi_name = workspace_ownership.pypi_names.contains(pypi_key);
-    let unowned_routes: Vec<&String> = rejected_conda_routes
-        .iter()
-        .filter(|name| !workspace_ownership.conda_names.contains(*name))
-        .collect();
-    if !owns_pypi_name && (rejected_conda_routes.is_empty() || !unowned_routes.is_empty()) {
-        if workspace_ownership.conda_names.is_empty() && workspace_ownership.pypi_names.is_empty() {
-            reasons.push(format!(
-                "no precise consuming workspace environment conda-owns `{pypi_key}`: this \
-                 pack's workspace ownership set is EMPTY (the workspace declares no \
-                 consuming environment for this pack, or that environment's conda baseline \
-                 could not be solved)"
-            ));
-        } else if rejected_conda_routes.is_empty() {
-            reasons.push(format!(
-                "no rejected conda route recorded a concrete conda target for `{pypi_key}`, \
-                 so its identity cannot be proven against the workspace"
-            ));
-        } else {
-            reasons.push(format!(
-                "the consuming workspace does not conda-own the rejected conda route(s) {:?} \
-                 behind `{pypi_key}` (workspace conda-owns: {:?})",
-                unowned_routes, workspace_ownership.conda_names,
-            ));
-        }
-    }
-    if reasons.is_empty() {
-        // Defensive: the guard declined for a reason not enumerated above.
-        reasons.push(
-            "an unenumerated workspace-ownership guard declined the drop (this is a bug \
-             in `drop_decline_reasons`)"
-                .to_string(),
-        );
-    }
-    reasons
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum DedupeVersionKey {
-    /// Ordinary PEP 440 comparison ignores trailing release zeroes.
-    Pep440(Version),
-    /// Compatible-release and wildcard operators also depend on how many
-    /// release segments were written.
-    ReleaseLength(Version, usize),
-    /// Arbitrary equality compares the retained version spelling.
-    Arbitrary(String),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct SpecifierDedupeKey {
-    operator: Operator,
-    version: DedupeVersionKey,
-}
-
-fn specifier_dedupe_key(specifier: &VersionSpecifier) -> SpecifierDedupeKey {
-    let operator = *specifier.operator();
-    let version = match operator {
-        Operator::TildeEqual | Operator::EqualStar | Operator::NotEqualStar => {
-            DedupeVersionKey::ReleaseLength(
-                specifier.version().clone(),
-                specifier.version().release().len(),
-            )
-        }
-        Operator::ExactEqual => DedupeVersionKey::Arbitrary(specifier.to_string()),
-        Operator::Equal
-        | Operator::NotEqual
-        | Operator::LessThan
-        | Operator::LessThanEqual
-        | Operator::GreaterThan
-        | Operator::GreaterThanEqual => DedupeVersionKey::Pep440(specifier.version().clone()),
-    };
-    SpecifierDedupeKey { operator, version }
-}
+/// Active, target-marker-matched dependency declarations keyed in the PyPI
+/// identity domain. Provenance remains attached until the shared finalizer has
+/// resolved authority and produced a source-rich conflict, if any.
+type ObservedRequirements = BTreeMap<PypiKey, Vec<Constraint>>;
 
 fn observe_requirement(
     observed: &mut ObservedRequirements,
     pypi_name: &str,
     specifiers: &VersionSpecifiers,
     source: String,
-    advisory: bool,
+    provenance: Provenance,
 ) {
-    let observations = observed.entry(canonical_conda_name(pypi_name)).or_default();
-    let observation = ObservedRequirement {
+    let observations = observed.entry(PypiKey::from_pypi(pypi_name)).or_default();
+    let observation = Constraint {
         specifiers: specifiers.clone(),
         source,
-        advisory,
+        provenance,
     };
     if !observations.contains(&observation) {
         observations.push(observation);
     }
 }
 
-/// Deduplicate a clause set into `VersionSpecifiers`.
-///
-/// Ordinary bounds are semantically equal across trailing release zeroes
-/// (`>=11` == `>=11.0`), but compatible-release/wildcard semantics depend on
-/// the written release length and `===` depends on spelling. Use an
-/// operator-sensitive key and retain the shortest deterministic spelling for
-/// ordinary aliases.
-fn dedup_specifier_clauses(
-    clauses_iter: impl Iterator<Item = VersionSpecifier>,
-) -> VersionSpecifiers {
-    let mut clauses: BTreeMap<SpecifierDedupeKey, (String, VersionSpecifier)> = BTreeMap::new();
-    for specifier in clauses_iter {
-        let rendered = specifier.to_string();
-        let key = specifier_dedupe_key(&specifier);
-        match clauses.entry(key) {
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert((rendered, specifier));
-            }
-            std::collections::btree_map::Entry::Occupied(mut entry) => {
-                let current = &entry.get().0;
-                if (rendered.len(), rendered.as_str()) < (current.len(), current.as_str()) {
-                    entry.insert((rendered, specifier));
-                }
-            }
-        }
-    }
-    clauses
-        .into_values()
-        .map(|(_, specifier)| specifier)
-        .collect()
-}
-
-/// True when the intersection of `specifiers` is empty (unsatisfiable) or has
-/// an arbitrary-exact (`===`) contradiction.
-fn specifiers_unsatisfiable(specifiers: &VersionSpecifiers) -> bool {
-    // `Ranges` is intentionally not named/re-exported by uv-pep440. An empty
-    // release-only conversion yields a full range of the inferred type; the
-    // following `Into` uses the full PEP 440 conversion (including pre/post/
-    // local and wildcard semantics), not release-only semantics.
-    let full = release_specifiers_to_ranges(VersionSpecifiers::empty());
-    let range_is_empty = full.intersection(&specifiers.clone().into()).is_empty();
-    // uv's ordered Version equality also ignores trailing release zeroes,
-    // while arbitrary equality (`===`) compares the preserved spelling. A
-    // singleton range therefore cannot distinguish `===1` from `===1.0`;
-    // validate every arbitrary-exact candidate against the original clauses.
-    let arbitrary_exact_conflict = specifiers.iter().any(|specifier| {
-        *specifier.operator() == Operator::ExactEqual && !specifiers.contains(specifier.version())
-    });
-    range_is_empty || arbitrary_exact_conflict
-}
-
-/// True when `operator` fixes (or raises) a lower bound: an upstream floor a
-/// source-built wheel's relaxed pin can be asked to yield. Strict upper bounds
-/// (`<`, `<=`) and exclusions (`!=`) never force a HIGHER version, so they are
-/// always retained.
-fn operator_forces_floor(operator: Operator) -> bool {
-    matches!(
-        operator,
-        Operator::GreaterThan
-            | Operator::GreaterThanEqual
-            | Operator::Equal
-            | Operator::ExactEqual
-            | Operator::TildeEqual
-            | Operator::EqualStar
-    )
-}
-
-/// conda-as-truth softening. A wheel retread built itself from source declares
-/// UPSTREAM pins retread already relaxes; those are advisories, not authority.
-/// When the ONLY reason the restore intersection is empty is an advisory lower
-/// bound conflicting with an authoritative (index wheel / workspace / closure)
-/// constraint, drop the advisory floors and re-intersect so the dependency
-/// resolves to a workspace-compatible version -- exactly what the pre-4.6.5
-/// line did before metadata routes were jointly validated (e.g. IsaacLab's
-/// `starlette==0.49.1` -> relaxed `>=0.49.1,<0.50` yielding to a workspace
-/// `fastapi==0.115.7`'s `starlette<0.46`). Returns `None` (keep the hard
-/// error) unless there is BOTH an advisory and an authoritative declaration
-/// and dropping the advisory floors actually yields a satisfiable set: a
-/// conflict among authoritative constraints, or among advisories with no
-/// authoritative anchor, is a genuine incompatibility the user must resolve.
-fn soften_advisory_floor_conflict(
-    observations: &[ObservedRequirement],
-) -> Option<VersionSpecifiers> {
-    let has_advisory = observations.iter().any(|observation| observation.advisory);
-    let has_authoritative = observations.iter().any(|observation| !observation.advisory);
-    if !has_advisory || !has_authoritative {
-        return None;
-    }
-    let mut dropped_floor = false;
-    let mut kept: Vec<VersionSpecifier> = Vec::new();
-    for observation in observations {
-        for specifier in observation.specifiers.iter() {
-            if observation.advisory && operator_forces_floor(*specifier.operator()) {
-                dropped_floor = true;
-                continue;
-            }
-            kept.push(specifier.clone());
-        }
-    }
-    if !dropped_floor {
-        return None;
-    }
-    let softened = dedup_specifier_clauses(kept.into_iter());
-    if softened.is_empty() || specifiers_unsatisfiable(&softened) {
-        return None;
-    }
-    Some(softened)
-}
-
-/// Canonicalize an intersection without losing its source declarations.
-/// `VersionSpecifiers` sorts but does not deduplicate, and parsing a combined
-/// string accepts semantically empty intersections. Deduplicate parsed clauses,
-/// then use uv-pep440's full PEP 440 range conversion to reject emptiness before
-/// any index request is attempted.
-fn finalize_observed_requirement(
-    pypi_name: &str,
-    observations: &[ObservedRequirement],
-) -> std::result::Result<VersionSpecifiers, UnsatisfiableRestoreRequirements> {
-    let specifiers = dedup_specifier_clauses(
-        observations
-            .iter()
-            .flat_map(|observation| observation.specifiers.iter().cloned()),
-    );
-
-    if !specifiers_unsatisfiable(&specifiers) {
-        return Ok(specifiers);
-    }
-
-    // conda-as-truth: before failing, let a source-built wheel's advisory
-    // floor yield to the authoritative constraints (see the fn's doc).
-    if let Some(softened) = soften_advisory_floor_conflict(observations) {
-        tracing::warn!(
-            package = %pypi_name,
-            softened = %softened,
-            "restore: a source-built wheel's advisory lower bound conflicted \
-             with an authoritative constraint; dropped the floor so the \
-             composed workspace resolves the version (conda-as-truth)",
-        );
-        return Ok(softened);
-    }
-
-    let sources = observations
-        .iter()
-        .map(|observation| {
-            let spec = if observation.specifiers.is_empty() {
-                "*".to_string()
-            } else {
-                observation.specifiers.to_string()
-            };
-            format!("  - `{spec}` from {}", observation.source)
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    Err(UnsatisfiableRestoreRequirements {
-        pypi_name: pypi_name.to_string(),
-        sources,
-    })
-}
-
 #[derive(Clone, Debug)]
 struct RestoreRequestBuilder {
     pypi_name: String,
     bundle_name: String,
-    requirements: Vec<ObservedRequirement>,
-    constraints: Vec<ObservedRequirement>,
-    overrides: Vec<ObservedRequirement>,
+    constraints: Vec<Constraint>,
     route_preferences: BTreeMap<String, BTreeSet<String>>,
     lock_preferences: BTreeMap<String, BTreeSet<String>>,
 }
@@ -471,26 +215,15 @@ impl RestoreRequestBuilder {
         Self {
             pypi_name: pypi_name.to_string(),
             bundle_name: canonical_conda_name(pypi_name),
-            requirements: Vec::new(),
             constraints: Vec::new(),
-            overrides: Vec::new(),
             route_preferences: BTreeMap::new(),
             lock_preferences: BTreeMap::new(),
         }
     }
 
-    fn add_input(
-        &mut self,
-        role: crate::uv_closure::AutoRouteInputRole,
-        requirement: ObservedRequirement,
-    ) {
-        let destination = match role {
-            crate::uv_closure::AutoRouteInputRole::Requirement => &mut self.requirements,
-            crate::uv_closure::AutoRouteInputRole::Constraint => &mut self.constraints,
-            crate::uv_closure::AutoRouteInputRole::Override => &mut self.overrides,
-        };
-        if !destination.contains(&requirement) {
-            destination.push(requirement);
+    fn add_constraint(&mut self, constraint: Constraint) {
+        if !self.constraints.contains(&constraint) {
+            self.constraints.push(constraint);
         }
     }
 
@@ -502,81 +235,46 @@ impl RestoreRequestBuilder {
         preferences.entry(version).or_default().insert(source);
     }
 
-    fn unique_preference(
-        pypi_name: &str,
-        kind: &str,
-        preferences: BTreeMap<String, BTreeSet<String>>,
-        conflict_is_error: bool,
-    ) -> Result<Option<String>> {
+    fn unique_preference(preferences: &BTreeMap<String, BTreeSet<String>>) -> Option<String> {
         if preferences.len() > 1 {
-            if !conflict_is_error {
-                return Ok(None);
-            }
-            let details = preferences
-                .iter()
-                .map(|(version, sources)| {
-                    format!(
-                        "{version} from {}",
-                        sources.iter().cloned().collect::<Vec<_>>().join(", ")
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("; ");
-            return Err(anyhow!(
-                "joint route validation found conflicting {kind} versions for \
-                 PyPI package `{pypi_name}`: {details}"
-            ));
+            return None;
         }
-        Ok(preferences.into_keys().next())
+        preferences.keys().next().cloned()
     }
 
     fn finish(mut self) -> Result<PypiFetchRequest> {
-        // uv overrides replace ordinary dependency requirements, including
-        // `Requires-Dist` lines materialized only after the closure solve.
-        // Constraints remain additive in either case.
-        let mut hard_requirements = if self.overrides.is_empty() {
-            std::mem::take(&mut self.requirements)
-        } else {
-            std::mem::take(&mut self.overrides)
-        };
-        hard_requirements.extend(std::mem::take(&mut self.constraints));
-        let has_requirements = !hard_requirements.is_empty();
-        let route_preference = Self::unique_preference(
-            &self.pypi_name,
-            "prior uv-route",
-            std::mem::take(&mut self.route_preferences),
-            !has_requirements,
-        )?;
-        let lock_preference = Self::unique_preference(
-            &self.pypi_name,
-            "favor-lock",
-            std::mem::take(&mut self.lock_preferences),
-            false,
-        )?;
-
-        // A previously selected uv version is a solver output, not an input
-        // requirement. When active wheel metadata declares this dependency,
-        // keep the old version only as a soft preference; the index resolver
-        // ignores it when it no longer satisfies the newly complete graph.
-        // With no declaration available, retain the exact version as the only
-        // safe reconstruction of the earlier route.
-        let specifiers = if !has_requirements {
-            let version = route_preference.as_ref().ok_or_else(|| {
-                anyhow!(
-                    "joint route validation rejected `{}`, but no active PyPI \
-                     requirement or prior uv-route version was available",
-                    self.pypi_name
-                )
-            })?;
-            VersionSpecifiers::from_str(&format!("=={version}")).with_context(|| {
-                format!(
-                    "parsing exact PyPI restore spec for rejected route `{} =={version}`",
-                    self.pypi_name
-                )
-            })?
-        } else {
-            finalize_observed_requirement(&self.pypi_name, &hard_requirements)?
-        };
+        let prior_constraints = self
+            .route_preferences
+            .iter()
+            .chain(self.lock_preferences.iter())
+            .map(|(version, sources)| {
+                let specifiers = VersionSpecifiers::from_str(&format!("=={version}"))
+                    .with_context(|| {
+                        format!(
+                            "parsing prior selection `{version}` for `{}`",
+                            self.pypi_name
+                        )
+                    })?;
+                Ok(Constraint {
+                    specifiers,
+                    provenance: Provenance::PriorSelection,
+                    source: sources.iter().cloned().collect::<Vec<_>>().join(", "),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for constraint in prior_constraints {
+            self.add_constraint(constraint);
+        }
+        if self.constraints.is_empty() {
+            return Err(anyhow!(
+                "joint route validation rejected `{}`, but no active PyPI \
+                 requirement or prior selection was available",
+                self.pypi_name
+            ));
+        }
+        let route_preference = Self::unique_preference(&self.route_preferences);
+        let lock_preference = Self::unique_preference(&self.lock_preferences);
+        let specifiers = finalize(&PypiKey::from_pypi(&self.pypi_name), &self.constraints)?;
 
         Ok(PypiFetchRequest {
             pypi_name: self.pypi_name,
@@ -601,6 +299,13 @@ struct ProvisionalMetadataRoute {
 }
 
 type ProvisionalMetadataRoutes = BTreeMap<String, Vec<ProvisionalMetadataRoute>>;
+
+#[derive(Debug, PartialEq, Eq)]
+enum JointRouteOutcome {
+    Unchanged,
+    Mutated,
+    RetryKeepPypi { keep_pypi: BTreeSet<PypiKey> },
+}
 
 async fn fetch_from_index_chain<X, XF>(
     indexes: &[String],
@@ -658,12 +363,15 @@ fn record_metadata_route(
     });
 }
 
-fn expand_name_map_groups(names: &mut HashSet<String>, name_map: &BTreeMap<String, String>) {
+fn expand_name_map_groups(names: &mut HashSet<String>, name_map: &NameMap) {
     loop {
         let mut changed = false;
-        for (pypi_name, conda_name) in name_map {
-            let pypi_name = canonical_conda_name(pypi_name);
-            let conda_name = canonical_conda_name(conda_name);
+        for (pypi_name, target) in name_map {
+            let Some(conda_name) = target.mapped_name() else {
+                continue;
+            };
+            let pypi_name = pypi_name.as_str().to_string();
+            let conda_name = conda_name.key().as_str().to_string();
             if names.contains(&pypi_name) || names.contains(&conda_name) {
                 changed |= names.insert(pypi_name);
                 changed |= names.insert(conda_name);
@@ -683,10 +391,7 @@ fn expand_name_map_groups(names: &mut HashSet<String>, name_map: &BTreeMap<Strin
 /// knows a conda equivalent for is skipped here and emitted as a conda
 /// run-dep instead.
 ///
-/// Once validated routing chooses PyPI, resolution failure is fatal. The sole
-/// exception is a semantically impossible restore with a precise workspace
-/// conda owner and a positively solved fixed baseline; that dependency is
-/// dropped rather than returned to a rejected generated conda route.
+/// Once validated routing chooses PyPI, resolution failure is fatal.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn auto_bundle_transitives(
     bundle: &mut Bundle,
@@ -724,13 +429,12 @@ pub(crate) async fn auto_bundle_transitives(
     // invisible: the sweep moved them all to conda.
     // Legacy resolver path: None (probes decide, unchanged).
     uv_closure_wheels: Option<&std::collections::BTreeMap<String, String>>,
-    // Exact Rule-1 ownership authority, already policy-filtered by the caller.
-    workspace_ownership: &super::WorkspaceRouteOwnership,
     // Shared Rule-1/Rule-2 workspace-aware conda co-solve oracle. Rule 2
     // finalizes mutable uv routes only after the merged bundle's actual
     // emitted sibling constraints are known.
     conda_co_solve: &super::CondaCoSolveContext,
-) -> Result<()> {
+    uv_reresolve: &UvReresolveContext,
+) -> Result<AutoBundleOutcome> {
     let probe_channels = conda_channels.to_vec();
     let probe_python = target.python_version.clone();
     let probe_many = move |pairs: Vec<(String, String)>| {
@@ -751,7 +455,7 @@ pub(crate) async fn auto_bundle_transitives(
         let target = fetch_target.clone();
         let download_dir = download_dir.clone();
         async move {
-            let (resolved_url, metadata, _resolved_index, sdist_prov) = super::bfs_fetch_pypi(
+            let (resolved_url, metadata, sdist_prov) = super::bfs_fetch_pypi(
                 &request.pypi_name,
                 &request.specifiers,
                 &index,
@@ -761,7 +465,7 @@ pub(crate) async fn auto_bundle_transitives(
                 request.preferred_version.as_deref(),
             )
             .await?;
-            let (upstream_url, sdist_source) =
+            let (upstream_url, sdist_source, metadata_provenance) =
                 super::bfs_fetch_provenance(&resolved_url, sdist_prov);
             Ok(ResolvedWheel {
                 pypi_name: request.bundle_name,
@@ -769,6 +473,7 @@ pub(crate) async fn auto_bundle_transitives(
                 upstream_url,
                 git_source: None,
                 sdist_source,
+                metadata_provenance,
                 metadata,
                 extras_requested: vec![],
                 auto_data: None,
@@ -785,11 +490,11 @@ pub(crate) async fn auto_bundle_transitives(
         locked_closure,
         favor_lock_prefs,
         uv_closure_wheels,
-        workspace_ownership,
         &probe_many,
         &co_solve,
         &fetch_pypi,
         &channels_consulted,
+        uv_reresolve,
     )
     .await
 }
@@ -803,12 +508,12 @@ async fn auto_bundle_transitives_with<P, PF, C, CF, X, XF>(
     locked_closure: Option<&BTreeMap<String, String>>,
     favor_lock_prefs: Option<&BTreeMap<String, String>>,
     uv_closure_wheels: Option<&BTreeMap<String, String>>,
-    workspace_ownership: &super::WorkspaceRouteOwnership,
     probe_many: &P,
     co_solve: &C,
     fetch_pypi: &X,
     channels_consulted: &[String],
-) -> Result<()>
+    uv_reresolve: &UvReresolveContext,
+) -> Result<AutoBundleOutcome>
 where
     P: Fn(Vec<(String, String)>) -> PF,
     PF: Future<Output = Vec<crate::probe::ProbeResult>>,
@@ -889,11 +594,6 @@ where
         // requirement-specific validated-routing gate as exact deps.
         let mut loose_candidates: Vec<(String, VersionSpecifiers)> = Vec::new();
         for wheel in bundle.all_wheels().skip(processed_wheel_count) {
-            // A wheel retread built itself from source (git/`from`/sdist entry)
-            // carries UPSTREAM pins retread already relaxed -- treat its
-            // Requires-Dist as advisory so an unresolvable advisory floor can
-            // yield to authoritative constraints (see `ObservedRequirement`).
-            let advisory = wheel.git_source.is_some() || wheel.sdist_source.is_some();
             for raw in &wheel.metadata.requires_dist {
                 if let Some((name, version)) = pep508_exact_base_dep(raw, &marker_env)? {
                     let specifiers = VersionSpecifiers::from_str(&format!("=={version}"))
@@ -908,7 +608,7 @@ where
                             "wheel `{}=={}` Requires-Dist `{raw}`",
                             wheel.metadata.name, wheel.metadata.version
                         ),
-                        advisory,
+                        wheel.metadata_provenance.clone(),
                     );
                     let conda_name = canonical_conda_name(&name);
                     if !seen_candidate.insert(conda_name) {
@@ -924,7 +624,7 @@ where
                             "wheel `{}=={}` Requires-Dist `{raw}`",
                             wheel.metadata.name, wheel.metadata.version
                         ),
-                        advisory,
+                        wheel.metadata_provenance.clone(),
                     );
                     let conda_name = canonical_conda_name(&name);
                     if !seen_candidate.insert(conda_name) {
@@ -939,26 +639,30 @@ where
         // candidates (first iteration; empty afterwards).
         candidates.append(&mut closure_seed);
         if candidates.is_empty() && loose_candidates.is_empty() {
-            if jointly_unroute_unsolvable(
+            match jointly_unroute_unsolvable(
                 bundle,
                 &mut provisional_metadata_routes,
                 &observed_requirements,
                 indexes,
                 target,
                 config,
-                workspace_ownership,
                 co_solve,
                 fetch_pypi,
                 channels_consulted,
+                uv_reresolve,
             )
             .await?
             {
-                // Rejected routes were restored as wheels or safely dropped
-                // to a precise workspace owner. Scan any restored metadata
-                // before accepting the remaining conda routes.
-                continue;
+                JointRouteOutcome::Unchanged => break,
+                JointRouteOutcome::Mutated => {
+                    // The legacy path restored wheels. Scan restored metadata
+                    // before accepting the remaining conda routes.
+                    continue;
+                }
+                JointRouteOutcome::RetryKeepPypi { keep_pypi } => {
+                    return Ok(AutoBundleOutcome::RetryKeepPypi { keep_pypi });
+                }
             }
-            break;
         }
 
         // PR-1 (Site 2): sort candidates by canonical name so routing is
@@ -998,13 +702,19 @@ where
         let is_closure_member = |name: &str| {
             uv_closure_wheels.is_some_and(|s| s.contains_key(&canonical_conda_name(name)))
         };
+        let held_by_uv_reresolve =
+            |name: &str| uv_reresolve.keep_pypi.contains(&PypiKey::from_pypi(name));
         let prefer_pairs: Vec<(String, String)> = candidates
             .iter()
             .filter(|(name, _)| !is_closure_member(name))
-            .filter(|(name, _)| prefer_conda_match(&canonical_conda_name(name), &config.name_map))
-            .map(|(name, version)| {
-                let conda_name = canonical_conda_name(name);
-                (config.name_map[&conda_name].clone(), format!("=={version}"))
+            .filter(|(name, _)| !held_by_uv_reresolve(name))
+            .filter_map(|(name, version)| {
+                let pypi_key = PypiKey::from_pypi(name);
+                config
+                    .name_map
+                    .get(&pypi_key)
+                    .and_then(CondaTarget::mapped_name)
+                    .map(|target| (target.as_spec().to_string(), format!("=={version}")))
             })
             .collect();
         let prefer_probes: std::collections::HashMap<(String, String), crate::probe::ProbeResult> =
@@ -1022,6 +732,7 @@ where
             Vec::new();
         for (name, version) in candidates {
             let conda_name = canonical_conda_name(&name);
+            let pypi_key = PypiKey::from_pypi(&name);
             let specifiers = match VersionSpecifiers::from_str(&format!("=={version}")) {
                 Ok(specifiers) => specifiers,
                 Err(error) => {
@@ -1056,13 +767,29 @@ where
                     "auto-bundle: uv closure member not moved to conda by the \
                      auto-route; bundling from PyPI (closure is authoritative)",
                 );
-            } else if prefer_conda_match(&conda_name, &config.name_map) {
+            } else if held_by_uv_reresolve(&name) {
+                bundle.probe_decisions.push(crate::audit::ProbeDecision {
+                    stage: "auto_bundle".into(),
+                    pypi_name: name.clone(),
+                    conda_name: conda_name.clone(),
+                    spec: format!("=={version}"),
+                    target_python: target.python_version.clone(),
+                    channels_consulted: vec![],
+                    satisfiable: None,
+                    matching_candidates: 0,
+                    routing_decision: "uv-reresolve-keep-pypi".into(),
+                });
+            } else if prefer_conda_match(&pypi_key, &config.name_map) {
                 // Probe the workspace's conda channels for whether the
                 // spec retread would emit is actually satisfiable. If
                 // ANY channel has a matching candidate, keep on conda.
                 // Only a concrete match may route to conda. Empty,
                 // unsatisfied, or indecisive results stay on PyPI.
-                let conda_target_name = config.name_map[&conda_name].clone();
+                let conda_target_name = config.name_map[&pypi_key]
+                    .mapped_name()
+                    .expect("prefer_conda_match accepted only a mapped target")
+                    .as_spec()
+                    .to_string();
                 let probe_spec = format!("=={version}");
                 let probe_result =
                     match prefer_probes.get(&(conda_target_name.clone(), probe_spec.clone())) {
@@ -1129,14 +856,16 @@ where
         let loose_pairs: Vec<(String, String)> = loose_candidates
             .iter()
             .filter(|(name, _)| !is_closure_member(name))
-            .map(|(name, specs)| {
-                let conda_name = canonical_conda_name(name);
-                let target_name = config
-                    .name_map
-                    .get(&conda_name)
-                    .cloned()
-                    .unwrap_or(conda_name);
-                (target_name, conda_probe_spec(specs))
+            .filter(|(name, _)| !held_by_uv_reresolve(name))
+            .filter_map(|(name, specs)| {
+                let pypi_key = PypiKey::from_pypi(name);
+                let target_name = match config.name_map.get(&pypi_key) {
+                    Some(target) => target
+                        .mapped_name()
+                        .map(|target| target.as_spec().to_string()),
+                    None => Some(pypi_key.as_str().to_string()),
+                }?;
+                Some((target_name, conda_probe_spec(specs)))
             })
             .collect();
         let loose_probes: std::collections::HashMap<(String, String), crate::probe::ProbeResult> =
@@ -1147,6 +876,7 @@ where
                 .collect();
         for (name, specs) in loose_candidates {
             let conda_name = canonical_conda_name(&name);
+            let pypi_key = PypiKey::from_pypi(&name);
             let preferred_ver = favor_lock_prefs
                 .and_then(|preferences| preferences.get(&conda_name))
                 .cloned();
@@ -1172,11 +902,31 @@ where
                 to_fetch.push((name, specs.to_string(), conda_name, specs, preferred_ver));
                 continue;
             }
-            let target_name = config
-                .name_map
-                .get(&conda_name)
-                .cloned()
-                .unwrap_or_else(|| conda_name.clone());
+            if held_by_uv_reresolve(&name) {
+                bundle.probe_decisions.push(crate::audit::ProbeDecision {
+                    stage: "auto_bundle_loose".into(),
+                    pypi_name: name.clone(),
+                    conda_name: conda_name.clone(),
+                    spec: specs.to_string(),
+                    target_python: target.python_version.clone(),
+                    channels_consulted: vec![],
+                    satisfiable: None,
+                    matching_candidates: 0,
+                    routing_decision: "uv-reresolve-keep-pypi".into(),
+                });
+                to_fetch.push((name, specs.to_string(), conda_name, specs, preferred_ver));
+                continue;
+            }
+            let target_name = match config.name_map.get(&pypi_key) {
+                Some(target) => match target.mapped_name() {
+                    Some(target) => target.as_spec().to_string(),
+                    None => {
+                        to_fetch.push((name, specs.to_string(), conda_name, specs, preferred_ver));
+                        continue;
+                    }
+                },
+                None => conda_name.clone(),
+            };
             let probe_spec = conda_probe_spec(&specs);
             let probe_result = match loose_probes.get(&(target_name.clone(), probe_spec.clone())) {
                 Some(r) => r.clone(),
@@ -1270,22 +1020,27 @@ where
         // Scan metadata from every wheel fetched this round before finalizing
         // routes. Otherwise a later wheel can tighten a requirement after its
         // conda route has already been rejected and restored from PyPI.
-        if !added_any
-            && jointly_unroute_unsolvable(
+        if !added_any {
+            match jointly_unroute_unsolvable(
                 bundle,
                 &mut provisional_metadata_routes,
                 &observed_requirements,
                 indexes,
                 target,
                 config,
-                workspace_ownership,
                 co_solve,
                 fetch_pypi,
                 channels_consulted,
+                uv_reresolve,
             )
             .await?
-        {
-            added_any = true;
+            {
+                JointRouteOutcome::Unchanged => {}
+                JointRouteOutcome::Mutated => added_any = true,
+                JointRouteOutcome::RetryKeepPypi { keep_pypi } => {
+                    return Ok(AutoBundleOutcome::RetryKeepPypi { keep_pypi });
+                }
+            }
         }
 
         // Loop again only if we added at least one wheel; the new
@@ -1294,7 +1049,7 @@ where
             break;
         }
     }
-    Ok(())
+    Ok(AutoBundleOutcome::Complete)
 }
 
 /// Does this canonical conda dependency disappear if every provisional
@@ -1337,9 +1092,15 @@ fn route_group_is_fully_mutable(
         trial.extras.push(placeholder);
     }
 
-    Ok(super::emitted_bundle_route_specs(&trial, config, target)?
-        .into_iter()
-        .all(|route| canonical_conda_name(&route.conda_name) != conda_name))
+    let assembly = super::emitted_bundle_route_assembly(&trial, config, target)?;
+    Ok(assembly
+        .routes
+        .iter()
+        .all(|route| route.conda_name.key().as_str() != conda_name)
+        && assembly
+            .conflicts
+            .iter()
+            .all(|conflict| conflict.conda_name.key().as_str() != conda_name))
 }
 
 /// Finalize every provisional conda route against the exact dependency set
@@ -1353,11 +1114,11 @@ async fn jointly_unroute_unsolvable<C, CF, X, XF>(
     indexes: &[String],
     target: &crate::pypi::WheelTarget,
     config: &RetreadConfig,
-    workspace_ownership: &super::WorkspaceRouteOwnership,
     co_solve: &C,
     fetch_pypi: &X,
     channels_consulted: &[String],
-) -> Result<bool>
+    uv_reresolve: &UvReresolveContext,
+) -> Result<JointRouteOutcome>
 where
     C: Fn(Vec<crate::uv_closure::CondaRouteSpec>) -> CF,
     CF: Future<Output = crate::uv_closure::CoInstallVerdict>,
@@ -1365,14 +1126,16 @@ where
     XF: Future<Output = Result<ResolvedWheel>>,
 {
     if bundle.auto_routed.is_empty() && metadata_routes.is_empty() {
-        return Ok(false);
+        return Ok(JointRouteOutcome::Unchanged);
     }
 
-    let emitted = super::emitted_bundle_route_specs(bundle, config, target)?;
+    let assembly = super::emitted_bundle_route_assembly(bundle, config, target)?;
+    let emitted = assembly.routes;
+    let assembly_conflicts = assembly.conflicts;
     let emitted_by_conda: BTreeMap<String, crate::uv_closure::CondaRouteSpec> = emitted
         .iter()
         .cloned()
-        .map(|route| (canonical_conda_name(&route.conda_name), route))
+        .map(|route| (route.conda_name.key().into_string(), route))
         .collect();
     let mut fixed_by_config: HashSet<String> = config
         .force_conda
@@ -1423,21 +1186,33 @@ where
             mutable_conda_names.insert(conda_name);
         }
     }
-    let mutable_candidates: Vec<_> = mutable_conda_names
+    for conflict in &assembly_conflicts {
+        let conda_key = conflict.conda_name.key().into_string();
+        if !mutable_conda_names.contains(&conda_key) {
+            return Err(anyhow::Error::new(conflict.conflict.clone()));
+        }
+    }
+    let conflicted_keys: BTreeSet<String> = assembly_conflicts
+        .iter()
+        .map(|conflict| conflict.conda_name.key().into_string())
+        .collect();
+    let pre_rejected: Vec<_> = conflicted_keys
         .iter()
         .filter_map(|name| emitted_by_conda.get(name).cloned())
         .collect();
-    if mutable_candidates.is_empty() {
-        return Ok(false);
+    let mutable_candidates: Vec<_> = mutable_conda_names
+        .iter()
+        .filter(|name| !conflicted_keys.contains(*name))
+        .filter_map(|name| emitted_by_conda.get(name).cloned())
+        .collect();
+    if mutable_candidates.is_empty() && pre_rejected.is_empty() {
+        return Ok(JointRouteOutcome::Unchanged);
     }
 
-    let mutable_keys: HashSet<String> = mutable_candidates
-        .iter()
-        .map(|route| canonical_conda_name(&route.conda_name))
-        .collect();
+    let mutable_keys: HashSet<String> = mutable_conda_names.iter().cloned().collect();
     let fixed: Vec<_> = emitted
         .into_iter()
-        .filter(|route| !mutable_keys.contains(&canonical_conda_name(&route.conda_name)))
+        .filter(|route| !mutable_keys.contains(route.conda_name.key().as_str()))
         .collect();
     let selection = crate::uv_closure::select_jointly_solvable_routes(
         fixed,
@@ -1445,32 +1220,58 @@ where
         co_solve,
     )
     .await;
-    // `Some` proves the fixed workspace baseline solved positively. A `None`
-    // result is deliberately not enough authority to drop even a precisely
-    // owned dependency: Rule 1 abstains when that baseline is indeterminate.
-    let workspace_drop_authorized = selection.is_some();
     // Rule 2 is fail-closed: an unsatisfiable/indeterminate baseline cannot
-    // authorize any mutable conda route.
-    let rejected = selection
+    // authorize any mutable conda route. Typed assembly conflicts are always
+    // pre-rejected, then pass through the same restore gate below.
+    let mut rejected = selection
         .map(|selection| selection.rejected)
         .unwrap_or(mutable_candidates);
+    rejected.extend(pre_rejected);
+    let mut seen_rejected = BTreeSet::new();
+    rejected.retain(|route| seen_rejected.insert(route.conda_name.key().into_string()));
     if rejected.is_empty() {
-        return Ok(false);
+        return Ok(JointRouteOutcome::Unchanged);
     }
     let rejected_keys: BTreeSet<String> = rejected
         .iter()
-        .map(|route| canonical_conda_name(&route.conda_name))
+        .map(|route| route.conda_name.key().into_string())
         .collect();
+
+    if uv_reresolve.mode.is_enabled() && uv_reresolve.uv_backed {
+        // Preserve every PyPI origin, not just CondaRouteSpec::pypi_name:
+        // emission groups aliases by conda identity, while uv's keep-pypi
+        // policy is keyed by the original PyPI identity.
+        let mut rejected_pypi_origins = BTreeSet::new();
+        for route in &bundle.auto_routed {
+            if rejected_keys.contains(&canonical_conda_name(&route.route.conda_name)) {
+                rejected_pypi_origins.insert(PypiKey::from_pypi(&route.route.pypi_name));
+            }
+        }
+        for conda_name in &rejected_keys {
+            if let Some(origins) = metadata_routes.get(conda_name) {
+                rejected_pypi_origins.extend(
+                    origins
+                        .iter()
+                        .map(|origin| PypiKey::from_pypi(&origin.pypi_name)),
+                );
+            }
+        }
+        if rejected_pypi_origins.is_empty() {
+            return Err(anyhow!(
+                "joint route validation rejected {:?}, but no PyPI route provenance was available for uv re-resolve",
+                rejected_keys
+            ));
+        }
+        let mut keep_pypi = uv_reresolve.keep_pypi.clone();
+        keep_pypi.extend(rejected_pypi_origins);
+        return Ok(JointRouteOutcome::RetryKeepPypi { keep_pypi });
+    }
 
     let rejected_specs: BTreeMap<String, String> = rejected
         .iter()
-        .map(|route| (canonical_conda_name(&route.conda_name), route.spec.clone()))
+        .map(|route| (route.conda_name.key().into_string(), route.spec.clone()))
         .collect();
     let mut restore_requests: BTreeMap<String, RestoreRequestBuilder> = BTreeMap::new();
-    // Route-specific identity proof for direct conda ownership. Global
-    // same-name inference remains forbidden; only the concrete rejected route
-    // edges that produced each restore request participate.
-    let mut restore_conda_routes: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut audit_origins: BTreeSet<(String, String)> = BTreeSet::new();
     for route in &bundle.auto_routed {
         let conda_name = canonical_conda_name(&route.route.conda_name);
@@ -1478,10 +1279,6 @@ where
             continue;
         }
         let key = canonical_conda_name(&route.route.pypi_name);
-        restore_conda_routes
-            .entry(key.clone())
-            .or_default()
-            .insert(conda_name.clone());
         let request = restore_requests
             .entry(key)
             .or_insert_with(|| RestoreRequestBuilder::new(&route.route.pypi_name));
@@ -1496,23 +1293,18 @@ where
                     )
                 })?
             };
-            let requirement = ObservedRequirement {
+            let requirement = Constraint {
                 specifiers,
                 source: input.source.clone(),
-                // uv closure inputs (roots/constraints/overrides) are
-                // authoritative -- they came from the workspace / user config,
-                // not from a source-built wheel's relaxed upstream pins.
-                advisory: false,
+                provenance: input.effective_provenance(),
             };
-            request.add_input(input.role, requirement);
+            request.add_constraint(requirement);
         }
         if let Some(requirements) =
-            observed_requirements.get(&canonical_conda_name(&route.route.pypi_name))
+            observed_requirements.get(&PypiKey::from_pypi(&route.route.pypi_name))
         {
             for requirement in requirements {
-                if !request.requirements.contains(requirement) {
-                    request.requirements.push(requirement.clone());
-                }
+                request.add_constraint(requirement.clone());
             }
         }
         RestoreRequestBuilder::add_preference(
@@ -1536,25 +1328,21 @@ where
         if let Some(origins) = metadata_routes.get(conda_name) {
             for origin in origins {
                 let key = canonical_conda_name(&origin.pypi_name);
-                restore_conda_routes
-                    .entry(key.clone())
-                    .or_default()
-                    .insert(canonical_conda_name(&origin.conda_name));
                 let request = restore_requests
                     .entry(key.clone())
                     .or_insert_with(|| RestoreRequestBuilder::new(&origin.pypi_name));
-                let requirements = observed_requirements.get(&key).ok_or_else(|| {
-                    anyhow!(
-                        "joint route validation rejected metadata route `{} -> {}`, \
-                         but no active Requires-Dist provenance was recorded",
-                        origin.pypi_name,
-                        origin.conda_name
-                    )
-                })?;
+                let requirements = observed_requirements
+                    .get(&PypiKey::from_pypi(&key))
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "joint route validation rejected metadata route `{} -> {}`, \
+                             but no active Requires-Dist provenance was recorded",
+                            origin.pypi_name,
+                            origin.conda_name
+                        )
+                    })?;
                 for requirement in requirements {
-                    if !request.requirements.contains(requirement) {
-                        request.requirements.push(requirement.clone());
-                    }
+                    request.add_constraint(requirement.clone());
                 }
                 for preferred_version in &origin.preferred_versions {
                     RestoreRequestBuilder::add_preference(
@@ -1578,68 +1366,11 @@ where
     }
     // Finalize every requirement (dedupe + semantic satisfiability) before
     // the first index request, so one genuine conflict cannot be obscured by
-    // a network error for another rejected route. Only the exact semantic
-    // impossibility proven here can fall back to a precise workspace owner;
-    // preference/provenance/parse failures remain fatal.
+    // a network error for another rejected route. Conflicts retain the P3
+    // typed diagnostic and fail before any fetch.
     let mut finalized_restore_requests = Vec::new();
-    let mut workspace_drops = BTreeSet::new();
-    for (pypi_key, request) in restore_requests {
-        let owns_every_concrete_conda_route =
-            restore_conda_routes
-                .get(&pypi_key)
-                .is_some_and(|conda_names| {
-                    !conda_names.is_empty()
-                        && conda_names
-                            .iter()
-                            .all(|name| workspace_ownership.conda_names.contains(name))
-                });
-        let workspace_owns_request = !workspace_ownership.excluded_pypi_names.contains(&pypi_key)
-            && (workspace_ownership.pypi_names.contains(&pypi_key)
-                || owns_every_concrete_conda_route);
-        match request.finish() {
-            Ok(request) => finalized_restore_requests.push(request),
-            Err(error)
-                if workspace_drop_authorized
-                    && workspace_owns_request
-                    && error
-                        .downcast_ref::<UnsatisfiableRestoreRequirements>()
-                        .is_some() =>
-            {
-                workspace_drops.insert(pypi_key);
-            }
-            Err(error) => {
-                // An impossible restore that we decline to drop is fatal, but it
-                // must never be silent: name the dep and the guard that blocked
-                // the drop, appended to the v4.6.6 diagnostic verbatim.
-                let Some(unsatisfiable) = error.downcast_ref::<UnsatisfiableRestoreRequirements>()
-                else {
-                    return Err(error);
-                };
-                let empty = BTreeSet::new();
-                let reasons = drop_decline_reasons(
-                    &pypi_key,
-                    workspace_ownership,
-                    restore_conda_routes.get(&pypi_key).unwrap_or(&empty),
-                    workspace_drop_authorized,
-                );
-                tracing::warn!(
-                    pypi = %pypi_key,
-                    reasons = ?reasons,
-                    "PyPI restore is impossible and the dependency was NOT dropped; \
-                     the bundle cannot be resolved",
-                );
-                return Err(anyhow!(
-                    "{unsatisfiable}\n\nretread did NOT drop `{pypi_key}` (dropping it would \
-                     let the consuming workspace's own conda copy satisfy every wheel above) \
-                     because:\n{}",
-                    reasons
-                        .iter()
-                        .map(|reason| format!("  - {reason}"))
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                ));
-            }
-        }
+    for request in restore_requests.into_values() {
+        finalized_restore_requests.push(request.finish()?);
     }
 
     // Fetch every wheel before changing routing. A missing index candidate
@@ -1659,11 +1390,9 @@ where
     trial
         .auto_routed
         .retain(|route| !rejected_keys.contains(&canonical_conda_name(&route.route.conda_name)));
-    trial.auto_dropped.extend(workspace_drops.iter().cloned());
     trial.extras.extend(restored_wheels);
     for (pypi_name, conda_name) in audit_origins {
         let conda_key = canonical_conda_name(&conda_name);
-        let dropped = workspace_drops.contains(&canonical_conda_name(&pypi_name));
         let spec = rejected_specs.get(&conda_key).cloned().unwrap_or_default();
         trial.probe_decisions.push(crate::audit::ProbeDecision {
             stage: "auto_route_joint_solve".into(),
@@ -1674,32 +1403,18 @@ where
             channels_consulted: channels_consulted.to_vec(),
             satisfiable: Some(false),
             matching_candidates: 0,
-            routing_decision: if dropped {
-                "joint-co-solve-rejected-workspace-owned-drop".into()
-            } else {
-                "joint-co-solve-rejected-to-pypi".into()
-            },
+            routing_decision: "joint-co-solve-rejected-to-pypi".into(),
         });
-        if dropped {
-            tracing::warn!(
-                pypi = %pypi_name,
-                conda = %conda_name,
-                "individually valid conda route rejected by final joint solve; \
-                 PyPI restore is impossible, so dropping the dependency owned \
-                 by every precise consuming workspace environment",
-            );
-        } else {
-            tracing::warn!(
-                pypi = %pypi_name,
-                conda = %conda_name,
-                "individually valid conda route rejected by final joint solve; restoring PyPI wheel",
-            );
-        }
+        tracing::warn!(
+            pypi = %pypi_name,
+            conda = %conda_name,
+            "individually valid conda route rejected by final joint solve; restoring PyPI wheel",
+        );
     }
 
     let still_emitted: Vec<String> = super::emitted_bundle_route_specs(&trial, config, target)?
         .into_iter()
-        .map(|route| canonical_conda_name(&route.conda_name))
+        .map(|route| route.conda_name.key().into_string())
         .filter(|name| rejected_keys.contains(name))
         .collect();
     if !still_emitted.is_empty() {
@@ -1711,7 +1426,7 @@ where
 
     *bundle = trial;
     metadata_routes.retain(|conda_name, _| !rejected_keys.contains(conda_name));
-    Ok(true)
+    Ok(JointRouteOutcome::Mutated)
 }
 
 /// Returns Some((name, exact_version)) if `raw` is a base dep (no
@@ -1770,12 +1485,12 @@ fn pep508_loose_base_dep(
     }
 }
 
-/// (wheel URL, parsed METADATA, index to recurse with, optional sdist
-/// provenance) for one PyPI-form BFS item fetched in the level loop's
-/// phase 2. The 4th element is `Some` only when the item was built from
+/// (wheel URL, parsed METADATA, optional sdist provenance) for one PyPI-form
+/// BFS item fetched in the level loop's phase 2. The 3rd element is `Some`
+/// only when the item was built from
 /// a PyPI sdist (no compatible wheel on the index); `None` for normal
 /// index-wheel fetches.
-pub(crate) type BfsFetched = (url::Url, WheelMetadata, String, Option<super::SdistProv>);
+pub(crate) type BfsFetched = (url::Url, WheelMetadata, Option<super::SdistProv>);
 
 /// One unit of pending work in the resolver BFS.
 #[derive(Debug, Clone)]
@@ -1796,7 +1511,7 @@ pub(crate) enum PendingSource {
     /// `Requires-Dist: <name> <specifiers>` -- resolve via PyPI Simple.
     Pypi {
         specifiers: VersionSpecifiers,
-        index: String,
+        indexes: Vec<String>,
     },
     /// `Requires-Dist: <name> @ git+<scheme>://<host>/<path>@<rev>[#subdirectory=<sub>]` --
     /// clone + `pip wheel --no-deps`.
@@ -1833,7 +1548,7 @@ pub(crate) enum PendingSource {
 pub(crate) fn seed_worklist(
     requires_dist: &[String],
     extras_requested: &[String],
-    index: &str,
+    indexes: &[String],
     bundle_prefix: &str,
     seen: &HashSet<String>,
     work: &mut VecDeque<Pending>,
@@ -1906,14 +1621,14 @@ pub(crate) fn seed_worklist(
                 if seen.contains(&dn) {
                     let pending = Pending {
                         pypi_name: dep.name.clone(),
-                        source: extra_dep_source_to_pending(dep.source.clone(), index),
+                        source: extra_dep_source_to_pending(dep.source.clone(), indexes),
                         extras: dep.extras.clone(),
                     };
                     check_locked_seen!(&dn, pending, state);
                 }
                 work.push_back(Pending {
                     pypi_name: dep.name,
-                    source: extra_dep_source_to_pending(dep.source, index),
+                    source: extra_dep_source_to_pending(dep.source, indexes),
                     extras: dep.extras,
                 });
                 added = true;
@@ -1938,14 +1653,14 @@ pub(crate) fn seed_worklist(
             if seen.contains(&dn) {
                 let pending = Pending {
                     pypi_name: dep.name.clone(),
-                    source: extra_dep_source_to_pending(dep.source.clone(), index),
+                    source: extra_dep_source_to_pending(dep.source.clone(), indexes),
                     extras: dep.extras.clone(),
                 };
                 check_locked_seen!(&dn, pending, state);
             }
             work.push_back(Pending {
                 pypi_name: dep.name,
-                source: extra_dep_source_to_pending(dep.source, index),
+                source: extra_dep_source_to_pending(dep.source, indexes),
                 extras: dep.extras,
             });
         }
@@ -1953,11 +1668,11 @@ pub(crate) fn seed_worklist(
     Ok(())
 }
 
-fn extra_dep_source_to_pending(src: ExtraDepSource, default_index: &str) -> PendingSource {
+fn extra_dep_source_to_pending(src: ExtraDepSource, indexes: &[String]) -> PendingSource {
     match src {
         ExtraDepSource::Pypi(specifiers) => PendingSource::Pypi {
             specifiers,
-            index: default_index.to_string(),
+            indexes: indexes.to_vec(),
         },
         ExtraDepSource::Git {
             url,
@@ -2228,16 +1943,6 @@ mod tests {
         .unwrap()
     }
 
-    fn workspace_ownership(direct_conda_names: &[&str]) -> super::super::WorkspaceRouteOwnership {
-        super::super::WorkspaceRouteOwnership {
-            conda_names: direct_conda_names
-                .iter()
-                .map(|name| canonical_conda_name(name))
-                .collect(),
-            ..Default::default()
-        }
-    }
-
     fn test_wheel(
         bundle_name: &str,
         metadata_name: &str,
@@ -2255,6 +1960,7 @@ mod tests {
             upstream_url: Some(url),
             git_source: None,
             sdist_source: None,
+            metadata_provenance: Provenance::IndexWheelMetadata,
             metadata: WheelMetadata {
                 name: metadata_name.to_string(),
                 version: version.to_string(),
@@ -2282,6 +1988,96 @@ mod tests {
             auto_routed: vec![],
             auto_dropped: HashSet::new(),
             uv_closure_names: HashSet::new(),
+            workspace_conda_versions: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn namemap_noncanonical_key_matches() {
+        let mut configured: RetreadConfig = serde_json::from_value(serde_json::json!({
+            "retread-wheels": {},
+            "retread-relax": "none",
+            "retread-name-map": {
+                "opencv_python_headless": "py-opencv"
+            }
+        }))
+        .unwrap();
+        let key = PypiKey::from_pypi("opencv-python-headless");
+        assert_eq!(
+            configured
+                .name_map
+                .get(&key)
+                .and_then(CondaTarget::mapped_name)
+                .map(CondaName::as_spec),
+            Some("py-opencv")
+        );
+
+        let mut global = PypiToCondaMap::new();
+        global.insert(
+            key.as_str().to_string(),
+            vec!["opencv-python-headless-fallback".to_string()],
+        );
+        let effective = super::super::effective_name_map(&configured.name_map, &global);
+        assert_eq!(
+            effective
+                .get(&key)
+                .and_then(CondaTarget::mapped_name)
+                .map(CondaName::as_spec),
+            Some("py-opencv"),
+            "the canonicalized user entry must beat the global fallback"
+        );
+        assert_eq!(
+            pick_conda_target(&key, &effective, &global)
+                .expect("the configured route should be selected")
+                .as_spec(),
+            "py-opencv",
+            "the BFS must preserve the mapped conda spelling"
+        );
+
+        configured.name_map = effective;
+        let bundle = test_bundle(&["opencv-python-headless==4.11.0"]);
+        let target = crate::pypi::WheelTarget::for_subdir("3.11", "linux-64");
+        let emitted =
+            super::super::emitted_bundle_route_specs(&bundle, &configured, &target).unwrap();
+        assert!(
+            emitted
+                .iter()
+                .any(|route| route.conda_name.as_spec() == "py-opencv"),
+            "actual dependency emission must preserve the raw configured target: {emitted:?}"
+        );
+    }
+
+    #[test]
+    fn disabled_namemap_vetoes_global_route() {
+        let configured: RetreadConfig = serde_json::from_value(serde_json::json!({
+            "retread-wheels": {},
+            "retread-name-map": {
+                "torch": ""
+            }
+        }))
+        .unwrap();
+        let key = PypiKey::from_pypi("torch");
+        let mut global = PypiToCondaMap::new();
+        global.insert(key.as_str().to_string(), vec!["pytorch".to_string()]);
+
+        let effective = super::super::effective_name_map(&configured.name_map, &global);
+        assert!(matches!(effective.get(&key), Some(CondaTarget::Disabled)));
+        assert!(!prefer_conda_match(&key, &effective));
+        assert_eq!(pick_conda_target(&key, &effective, &global), None);
+    }
+
+    #[test]
+    fn uv_reresolve_mode_requires_exact_literal_one() {
+        assert_eq!(
+            UvReresolveMode::from_env_value(Some(OsStr::new("1"))),
+            UvReresolveMode::Enabled
+        );
+        for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
+            assert_eq!(
+                UvReresolveMode::from_env_value(value.map(OsStr::new)),
+                UvReresolveMode::Disabled,
+                "{value:?} must preserve the default legacy path"
+            );
         }
     }
 
@@ -2334,7 +2130,7 @@ mod tests {
     ) -> crate::uv_closure::CoInstallVerdict {
         if routes
             .iter()
-            .any(|route| canonical_conda_name(&route.conda_name) == "numpy")
+            .any(|route| route.conda_name.key().as_str() == "numpy")
         {
             crate::uv_closure::CoInstallVerdict::Unsat(vec![
                 "test fixture rejects the generated NumPy route".to_string(),
@@ -2354,8 +2150,220 @@ mod tests {
                 channel: "https://conda.anaconda.org/conda-forge/linux-64".to_string(),
                 input_requirements: Vec::new(),
             },
-            deps_from_floor: false,
+            provenance: Provenance::PriorSelection,
         }
+    }
+
+    #[tokio::test]
+    async fn rejected_uv_route_returns_all_keep_pypi_origins_without_shadow_fetch() {
+        let fetch_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fetch = {
+            let fetch_calls = Arc::clone(&fetch_calls);
+            move |_request: PypiFetchRequest, _index: String| {
+                fetch_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { Err(anyhow!("uv re-resolve must return before shadow fetch")) }
+            }
+        };
+        let mut bundle = test_bundle(&[]);
+        bundle.auto_routed.push(pillow_auto_route("10.4.0"));
+        let mut alias = pillow_auto_route("10.4.0");
+        alias.route.pypi_name = "Pillow_SIMD".to_string();
+        bundle.auto_routed.push(alias);
+        let mut metadata_routes = ProvisionalMetadataRoutes::new();
+        record_metadata_route(
+            &mut metadata_routes,
+            "pillow-metadata-alias".to_string(),
+            "pillow".to_string(),
+            None,
+        );
+        let target = crate::pypi::WheelTarget::for_subdir("3.11", "linux-64");
+        let context = UvReresolveContext {
+            mode: UvReresolveMode::Enabled,
+            uv_backed: true,
+            keep_pypi: [PypiKey::from_pypi("already-kept")].into(),
+        };
+
+        let outcome = jointly_unroute_unsolvable(
+            &mut bundle,
+            &mut metadata_routes,
+            &ObservedRequirements::new(),
+            &[crate::workspace::DEFAULT_PYPI_INDEX.to_string()],
+            &target,
+            &test_config(),
+            &reject_every_mutable_route,
+            &fetch,
+            &["conda-forge/linux-64".to_string()],
+            &context,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            JointRouteOutcome::RetryKeepPypi {
+                keep_pypi: [
+                    PypiKey::from_pypi("already-kept"),
+                    PypiKey::from_pypi("pillow"),
+                    PypiKey::from_pypi("Pillow_SIMD"),
+                    PypiKey::from_pypi("pillow-metadata-alias"),
+                ]
+                .into(),
+            }
+        );
+        assert_eq!(fetch_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(bundle.auto_routed.len(), 2, "retry must not mutate bundle");
+        assert!(metadata_routes.contains_key("pillow"));
+    }
+
+    /// The production auto-bundle outcome is consumed as the next uv
+    /// fixpoint's dynamic keep set. The retry starts from the clean base
+    /// request, so the rejected route's prior selection cannot become a hard
+    /// equality; its lock must match a fresh direct keep-PyPI solve.
+    #[tokio::test]
+    async fn rejected_route_reenters_fixpoint_as_keep_pypi() {
+        let fetch_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fetch = {
+            let fetch_calls = Arc::clone(&fetch_calls);
+            move |_request: PypiFetchRequest, _index: String| {
+                fetch_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { Err(anyhow!("uv re-resolve must bypass shadow fetch")) }
+            }
+        };
+        let mut prior_route = pillow_auto_route("3.0.0");
+        prior_route.route.pypi_name = "flatdict".to_string();
+        prior_route.route.conda_name = "flatdict".to_string();
+        prior_route.route.pypi_version = "3.0.0".to_string();
+        prior_route.route.conda_version = "3.0.0".to_string();
+        let mut bundle = test_bundle(&[]);
+        bundle.auto_routed.push(prior_route);
+        let target = crate::pypi::WheelTarget::for_subdir("3.12", "linux-64");
+        let closure_members = BTreeMap::new();
+
+        let outcome = auto_bundle_transitives_with(
+            &mut bundle,
+            &[crate::workspace::DEFAULT_PYPI_INDEX.to_string()],
+            &target,
+            &test_config(),
+            None,
+            None,
+            Some(&closure_members),
+            &validated_probe,
+            &reject_every_mutable_route,
+            &fetch,
+            &["conda-forge/linux-64".to_string()],
+            &UvReresolveContext {
+                mode: UvReresolveMode::Enabled,
+                uv_backed: true,
+                keep_pypi: BTreeSet::new(),
+            },
+        )
+        .await
+        .unwrap();
+        let AutoBundleOutcome::RetryKeepPypi { keep_pypi } = outcome else {
+            panic!("rejected uv route must schedule a fixpoint retry")
+        };
+        assert_eq!(keep_pypi, BTreeSet::from([PypiKey::from_pypi("flatdict")]));
+        assert_eq!(fetch_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        let request = crate::uv_closure::UvClosureRequest {
+            bundle: "flatdict-pack".to_string(),
+            python_version: "3.12".to_string(),
+            conda_subdir: "linux-64".to_string(),
+            // `root` stands in for the wheel whose hidden metadata pulls
+            // flatdict; the mock solve returns that transitive selection.
+            dependencies: vec!["root==1.0".to_string()],
+            dependency_provenance: BTreeMap::new(),
+            constraints: crate::uv_closure::ConstraintSet::default(),
+            overrides: Vec::new(),
+            no_emit_packages: Vec::new(),
+            index_urls: vec![crate::workspace::DEFAULT_PYPI_INDEX.to_string()],
+            built_wheel_sources: BTreeMap::new(),
+            explicit_pins: BTreeMap::new(),
+            workspace_owned: crate::uv_closure::WorkspaceOwnedPlan::default(),
+            offline: false,
+        };
+        let retry_options = crate::uv_closure::AutoRouteOptions {
+            enabled: true,
+            keep_pypi: keep_pypi
+                .iter()
+                .map(|name| name.as_str().to_string())
+                .collect(),
+            ..Default::default()
+        };
+        let make_solve = |calls: Arc<Mutex<Vec<crate::uv_closure::UvClosureRequest>>>| {
+            move |request: crate::uv_closure::UvClosureRequest| {
+                let calls = Arc::clone(&calls);
+                Box::pin(async move {
+                    calls.lock().unwrap().push(request.clone());
+                    assert!(
+                        !request
+                            .constraints
+                            .constraints
+                            .iter()
+                            .chain(request.overrides.iter())
+                            .chain(request.dependencies.iter())
+                            .any(|line| line == "flatdict==3.0.0"),
+                        "the rejected prior selection must not enter the clean retry as a hard pin"
+                    );
+                    let version = "4.0.1";
+                    Ok(crate::uv_closure::UvClosure {
+                        wheels: vec![crate::lock::LockWheel {
+                            name: "flatdict".to_string(),
+                            version: version.to_string(),
+                            origin: crate::lock::Origin::Index,
+                            filename: format!("flatdict-{version}-py3-none-any.whl"),
+                            url: Some(format!("https://example.invalid/flatdict-{version}.whl")),
+                            sha256: Some("00".repeat(32)),
+                            requires_dist: Vec::new(),
+                            must_ship: false,
+                            upstream_url: None,
+                            git_source: None,
+                            sdist_source: None,
+                        }],
+                        pins: BTreeMap::from([("flatdict".to_string(), version.to_string())]),
+                        uv_version: "0.11.26".to_string(),
+                        auto_routed: Vec::new(),
+                        auto_dropped: BTreeSet::new(),
+                        effective_input_requirements: None,
+                    })
+                })
+                    as futures::future::BoxFuture<'static, Result<crate::uv_closure::UvClosure>>
+            }
+        };
+        let probe = |_name: String, _spec: String| {
+            Box::pin(async {
+                panic!("the dynamic keep set must veto flatdict before probing");
+                #[allow(unreachable_code)]
+                None
+            })
+                as futures::future::BoxFuture<'static, Option<crate::uv_closure::RouteProbeHit>>
+        };
+        let retry_calls = Arc::new(Mutex::new(Vec::new()));
+        let retry = crate::uv_closure::auto_route_fixpoint_checked(
+            &request,
+            &retry_options,
+            make_solve(Arc::clone(&retry_calls)),
+            probe,
+            |_| Box::pin(async { crate::uv_closure::CoInstallVerdict::Sat }),
+        )
+        .await
+        .unwrap();
+        let direct_calls = Arc::new(Mutex::new(Vec::new()));
+        let direct = crate::uv_closure::auto_route_fixpoint_checked(
+            &request,
+            &retry_options,
+            make_solve(Arc::clone(&direct_calls)),
+            |_name, _spec| Box::pin(async { None }),
+            |_| Box::pin(async { crate::uv_closure::CoInstallVerdict::Sat }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(retry.pins, direct.pins);
+        assert_eq!(retry.pins["flatdict"], "4.0.1");
+        assert_ne!(retry.pins["flatdict"], "3.0.0");
+        assert_eq!(retry_calls.lock().unwrap().len(), 1);
+        assert_eq!(direct_calls.lock().unwrap().len(), 1);
     }
 
     fn holosoma_numpy_conflict_bundle() -> Bundle {
@@ -2376,69 +2384,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn joint_unroute_drops_workspace_owned_unsatisfiable_numpy_restore() {
+    async fn legacy_joint_unroute_returns_typed_conflict_with_all_sources() {
         let fetch_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let fetch = {
             let fetch_calls = Arc::clone(&fetch_calls);
             move |_request: PypiFetchRequest, _index: String| {
                 fetch_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                async { Err(anyhow!("owned impossible restore must not fetch PyPI")) }
-            }
-        };
-        let target = crate::pypi::WheelTarget::for_subdir("3.11", "linux-64");
-        let mut bundle = holosoma_numpy_conflict_bundle();
-
-        auto_bundle_transitives_with(
-            &mut bundle,
-            &[crate::workspace::DEFAULT_PYPI_INDEX.to_string()],
-            &target,
-            &test_config(),
-            None,
-            None,
-            None,
-            &workspace_ownership(&["numpy"]),
-            &validated_probe,
-            &reject_numpy_route,
-            &fetch,
-            &["conda-forge/linux-64".to_string()],
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(
-            fetch_calls.load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "a semantically impossible owned restore must never reach an index"
-        );
-        assert_eq!(bundle.auto_dropped, HashSet::from(["numpy".to_string()]));
-        assert!(
-            bundle
-                .all_wheels()
-                .all(|wheel| canonical_conda_name(&wheel.pypi_name) != "numpy"),
-            "no NumPy wheel may be restored over the workspace's conda owner"
-        );
-        let emitted =
-            super::super::emitted_bundle_route_specs(&bundle, &test_config(), &target).unwrap();
-        assert!(
-            emitted
-                .iter()
-                .all(|route| canonical_conda_name(&route.conda_name) != "numpy"),
-            "the generated pack must not re-emit the workspace-owned NumPy route: {emitted:?}"
-        );
-        assert!(bundle.probe_decisions.iter().any(|decision| {
-            decision.pypi_name == "numpy"
-                && decision.routing_decision == "joint-co-solve-rejected-workspace-owned-drop"
-        }));
-    }
-
-    #[tokio::test]
-    async fn joint_unroute_errors_for_unowned_unsatisfiable_numpy_with_all_sources() {
-        let fetch_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let fetch = {
-            let fetch_calls = Arc::clone(&fetch_calls);
-            move |_request: PypiFetchRequest, _index: String| {
-                fetch_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                async { Err(anyhow!("unowned semantic conflict must fail before fetch")) }
+                async { Err(anyhow!("semantic conflict must fail before fetch")) }
             }
         };
         let target = crate::pypi::WheelTarget::for_subdir("3.11", "linux-64");
@@ -2452,15 +2404,21 @@ mod tests {
             None,
             None,
             None,
-            &workspace_ownership(&[]),
             &validated_probe,
             &reject_numpy_route,
             &fetch,
             &["conda-forge/linux-64".to_string()],
+            &UvReresolveContext::default(),
         )
         .await
         .unwrap_err();
 
+        assert!(
+            error
+                .downcast_ref::<crate::constraint::Conflict>()
+                .is_some(),
+            "legacy reconstruction must preserve the typed P3 conflict: {error:#}"
+        );
         let message = format!("{error:#}");
         assert!(
             message.contains("cannot restore `numpy` to PyPI"),
@@ -2483,140 +2441,6 @@ mod tests {
             fetch_calls.load(std::sync::atomic::Ordering::SeqCst),
             0,
             "semantic conflicts must fail before any index request"
-        );
-
-        // The decline must NAME the dep and the guard. A silent fall-through to
-        // the v4.6.6 text is exactly how a no-op fix survived a publish.
-        assert!(
-            message.contains("retread did NOT drop `numpy`"),
-            "the error must say the drop was declined, and for which dep:\n{message}"
-        );
-        assert!(
-            message.contains("conda-own") && message.contains("EMPTY"),
-            "the error must name the ownership guard that blocked the drop:\n{message}"
-        );
-    }
-
-    /// The ownership guard is evaluated PER DEPENDENCY, not all-or-nothing over
-    /// the pack. A second rejected conda route that the workspace does NOT own
-    /// (here `pillow`, which restores to PyPI perfectly well) must not block the
-    /// owned, impossible-to-restore `numpy` from being dropped.
-    #[tokio::test]
-    async fn joint_unroute_drops_owned_dep_alongside_unowned_rejected_route() {
-        let fetched: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let fetch = {
-            let fetched = Arc::clone(&fetched);
-            move |request: PypiFetchRequest, _index: String| {
-                let fetched = Arc::clone(&fetched);
-                async move {
-                    fetched.lock().unwrap().push(request.pypi_name.clone());
-                    Ok(test_wheel("pillow", "pillow", "10.4.0", &[]))
-                }
-            }
-        };
-        // Reject BOTH routes jointly; only `numpy` is workspace-owned.
-        let reject_both = |routes: Vec<crate::uv_closure::CondaRouteSpec>| async move {
-            if routes.iter().any(|route| {
-                matches!(
-                    canonical_conda_name(&route.conda_name).as_str(),
-                    "numpy" | "pillow"
-                )
-            }) {
-                crate::uv_closure::CoInstallVerdict::Unsat(vec![
-                    "test fixture rejects both generated routes".to_string(),
-                ])
-            } else {
-                crate::uv_closure::CoInstallVerdict::Sat
-            }
-        };
-        let target = crate::pypi::WheelTarget::for_subdir("3.11", "linux-64");
-        let mut bundle = holosoma_numpy_conflict_bundle();
-        // `pillow` arrives as a uv auto-route with a perfectly restorable spec.
-        bundle.auto_routed = vec![pillow_auto_route("10.4.0")];
-
-        auto_bundle_transitives_with(
-            &mut bundle,
-            &[crate::workspace::DEFAULT_PYPI_INDEX.to_string()],
-            &target,
-            &test_config(),
-            None,
-            None,
-            None,
-            // NumPy owned; pillow deliberately NOT owned.
-            &workspace_ownership(&["numpy"]),
-            &validated_probe,
-            &reject_both,
-            &fetch,
-            &["conda-forge/linux-64".to_string()],
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(
-            bundle.auto_dropped,
-            HashSet::from(["numpy".to_string()]),
-            "the owned dep must drop even though a sibling rejected route is unowned"
-        );
-        assert_eq!(
-            *fetched.lock().unwrap(),
-            vec!["pillow".to_string()],
-            "the unowned rejected route must still restore to PyPI, and the owned \
-             impossible one must never reach an index"
-        );
-    }
-
-    #[tokio::test]
-    async fn joint_unroute_abstains_from_owned_drop_when_fixed_baseline_is_indeterminate() {
-        let fetch_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let fetch = {
-            let fetch_calls = Arc::clone(&fetch_calls);
-            move |_request: PypiFetchRequest, _index: String| {
-                fetch_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                async { Err(anyhow!("indeterminate baseline must fail before fetch")) }
-            }
-        };
-        let indeterminate = |_| async {
-            crate::uv_closure::CoInstallVerdict::Skipped(
-                "test fixture has no authoritative baseline solve".to_string(),
-            )
-        };
-        let target = crate::pypi::WheelTarget::for_subdir("3.11", "linux-64");
-        let mut bundle = holosoma_numpy_conflict_bundle();
-
-        let error = auto_bundle_transitives_with(
-            &mut bundle,
-            &[crate::workspace::DEFAULT_PYPI_INDEX.to_string()],
-            &target,
-            &test_config(),
-            None,
-            None,
-            None,
-            &workspace_ownership(&["numpy"]),
-            &validated_probe,
-            &indeterminate,
-            &fetch,
-            &["conda-forge/linux-64".to_string()],
-        )
-        .await
-        .unwrap_err();
-
-        let message = format!("{error:#}");
-        assert!(message.contains("mutually unsatisfiable"), "{message}");
-        assert!(
-            bundle.auto_dropped.is_empty(),
-            "ownership without a positively solved fixed baseline must abstain"
-        );
-        assert_eq!(fetch_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
-
-        // Rule-1 abstain-on-ambiguity is preserved -- but it must SAY so, and
-        // name the baseline as the guard rather than blaming ownership.
-        assert!(
-            message.contains("retread did NOT drop `numpy`"),
-            "{message}"
-        );
-        assert!(
-            message.contains("workspace conda baseline did not solve"),
-            "the abstention must name the baseline guard:\n{message}"
         );
     }
 
@@ -2642,11 +2466,11 @@ mod tests {
             None,
             None,
             None,
-            &workspace_ownership(&[]),
             &validated_probe,
             &cosolvable,
             &fetch,
             &["conda-forge/linux-64".to_string()],
+            &UvReresolveContext::default(),
         )
         .await
         .unwrap();
@@ -2658,23 +2482,109 @@ mod tests {
         assert!(
             emitted
                 .iter()
-                .any(|route| canonical_conda_name(&route.conda_name) == "numpy"),
+                .any(|route| route.conda_name.key().as_str() == "numpy"),
             "a jointly solvable metadata route must remain on conda: {emitted:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn advisory_floor_does_not_veto_conda_route() {
+        let fetch_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fetch = {
+            let fetch_calls = Arc::clone(&fetch_calls);
+            move |_request: PypiFetchRequest, _index: String| {
+                fetch_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { Err(anyhow!("a softened conda route must not fetch PyPI")) }
+            }
+        };
+        let solve_inputs = Arc::new(Mutex::new(
+            Vec::<Vec<crate::uv_closure::CondaRouteSpec>>::new(),
+        ));
+        let co_solve = {
+            let solve_inputs = Arc::clone(&solve_inputs);
+            move |routes: Vec<crate::uv_closure::CondaRouteSpec>| {
+                solve_inputs.lock().unwrap().push(routes);
+                async { crate::uv_closure::CoInstallVerdict::Sat }
+            }
+        };
+        let target = crate::pypi::WheelTarget::for_subdir("3.11", "linux-64");
+        let config = test_config();
+        let mut bundle = test_bundle(&["starlette>=0.49.1,<0.50"]);
+        bundle.primary.metadata.name = "isaaclab".to_string();
+        bundle.primary.metadata_provenance = Provenance::SourceBuiltRelaxed;
+        bundle
+            .workspace_conda_versions
+            .insert("starlette".to_string(), "0.45.3".to_string());
+
+        auto_bundle_transitives_with(
+            &mut bundle,
+            &[crate::workspace::DEFAULT_PYPI_INDEX.to_string()],
+            &target,
+            &config,
+            None,
+            None,
+            None,
+            &validated_probe,
+            &co_solve,
+            &fetch,
+            &["conda-forge/linux-64".to_string()],
+            &UvReresolveContext::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(fetch_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let solved_spec = solve_inputs
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|routes| routes.iter())
+            .find(|route| route.conda_name.key().as_str() == "starlette")
+            .map(|route| route.spec.clone())
+            .expect("co-solve must receive the starlette route");
+        assert!(solved_spec.contains("==0.45.3"), "{solved_spec}");
+        assert!(!solved_spec.contains(">=0.49"), "{solved_spec}");
+
+        let emitted = super::super::emitted_bundle_route_specs(&bundle, &config, &target).unwrap();
+        let emitted_spec = emitted
+            .iter()
+            .find(|route| route.conda_name.key().as_str() == "starlette")
+            .map(|route| route.spec.clone())
+            .expect("final output must retain starlette");
+        assert_eq!(emitted_spec, solved_spec);
+
+        let output = super::super::produce_output(
+            &bundle,
+            &config,
+            rattler_conda_types::Platform::Linux64,
+            &target.python_version,
+            &[],
+            None,
+            None,
+        )
+        .unwrap();
+        let output_spec = output
+            .run_dependencies
+            .depends
+            .iter()
+            .find(|dependency| dependency.name.as_str() == "starlette")
+            .map(|dependency| super::super::audit_report::format_packagespec(&dependency.spec))
+            .expect("recipe output must retain starlette");
+        assert_eq!(output_spec, solved_spec);
     }
 
     #[tokio::test]
     async fn joint_unroute_deduplicates_repeated_requires_dist_clauses() {
         let ordinary_aliases = [">=11.0,>=11,<11.1.0,<11.1"]
             .into_iter()
-            .map(|raw| ObservedRequirement {
+            .map(|raw| Constraint {
                 specifiers: VersionSpecifiers::from_str(raw).unwrap(),
                 source: format!("test source `{raw}`"),
-                advisory: false,
+                provenance: Provenance::IndexWheelMetadata,
             })
             .collect::<Vec<_>>();
         let ordinary =
-            finalize_observed_requirement("ordinary-aliases", &ordinary_aliases).unwrap();
+            finalize(&PypiKey::from_pypi("ordinary-aliases"), &ordinary_aliases).unwrap();
         assert_eq!(
             ordinary.len(),
             2,
@@ -2682,14 +2592,14 @@ mod tests {
         );
         let length_sensitive = ["~=1.0", "~=1.0.0"]
             .into_iter()
-            .map(|raw| ObservedRequirement {
+            .map(|raw| Constraint {
                 specifiers: VersionSpecifiers::from_str(raw).unwrap(),
                 source: format!("test source `{raw}`"),
-                advisory: false,
+                provenance: Provenance::IndexWheelMetadata,
             })
             .collect::<Vec<_>>();
         assert_eq!(
-            finalize_observed_requirement("length-sensitive", &length_sensitive)
+            finalize(&PypiKey::from_pypi("length-sensitive"), &length_sensitive)
                 .unwrap()
                 .len(),
             2,
@@ -2697,14 +2607,14 @@ mod tests {
         );
         let arbitrary_exact = ["===1", "===1.0"]
             .into_iter()
-            .map(|raw| ObservedRequirement {
+            .map(|raw| Constraint {
                 specifiers: VersionSpecifiers::from_str(raw).unwrap(),
                 source: format!("test source `{raw}`"),
-                advisory: false,
+                provenance: Provenance::IndexWheelMetadata,
             })
             .collect::<Vec<_>>();
         assert!(
-            finalize_observed_requirement("arbitrary-exact", &arbitrary_exact)
+            finalize(&PypiKey::from_pypi("arbitrary-exact"), &arbitrary_exact)
                 .unwrap_err()
                 .to_string()
                 .contains("mutually unsatisfiable"),
@@ -2736,7 +2646,7 @@ mod tests {
         ));
         let target = crate::pypi::WheelTarget::for_subdir("3.10", "linux-64");
 
-        auto_bundle_transitives_with(
+        let outcome = auto_bundle_transitives_with(
             &mut bundle,
             &[crate::workspace::DEFAULT_PYPI_INDEX.to_string()],
             &target,
@@ -2744,14 +2654,20 @@ mod tests {
             None,
             None,
             None,
-            &workspace_ownership(&[]),
             &validated_probe,
             &reject_every_mutable_route,
             &fetch,
             &["conda-forge/linux-64".to_string()],
+            &UvReresolveContext {
+                mode: UvReresolveMode::from_env_value(None),
+                uv_backed: true,
+                keep_pypi: BTreeSet::new(),
+            },
         )
         .await
         .unwrap();
+
+        assert_eq!(outcome, AutoBundleOutcome::Complete);
 
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
@@ -2765,11 +2681,11 @@ mod tests {
         assert_eq!(rendered.matches("<11.1").count(), 1, "{rendered}");
     }
 
-    fn observed(specifiers: &str, source: &str, advisory: bool) -> ObservedRequirement {
-        ObservedRequirement {
+    fn observed(specifiers: &str, source: &str, provenance: Provenance) -> Constraint {
+        Constraint {
             specifiers: VersionSpecifiers::from_str(specifiers).unwrap(),
             source: source.to_string(),
-            advisory,
+            provenance,
         }
     }
 
@@ -2787,17 +2703,17 @@ mod tests {
             observed(
                 ">=0.49.1,<0.50",
                 "wheel `isaaclab==0.54.2` Requires-Dist `starlette>=0.49.1,<0.50`",
-                true,
+                Provenance::SourceBuiltRelaxed,
             ),
             // Index wheel `fastapi==0.115.7` -> authoritative.
             observed(
                 ">=0.40.0,<0.46.0",
                 "wheel `fastapi==0.115.7` Requires-Dist `starlette<0.46.0,>=0.40.0`",
-                false,
+                Provenance::IndexWheelMetadata,
             ),
         ];
         let softened =
-            finalize_observed_requirement("starlette", &observations).expect("floor must soften");
+            finalize(&PypiKey::from_pypi("starlette"), &observations).expect("floor must soften");
         // The authoritative cap is honored; a `<0.46` version resolves.
         assert!(
             softened.contains(&Version::from_str("0.45.3").unwrap()),
@@ -2813,23 +2729,23 @@ mod tests {
     /// Softening is scoped: a conflict among AUTHORITATIVE constraints (no
     /// source-built advisory involved) still fails loudly -- the user must
     /// resolve a genuine incompatibility, not have it silently softened. This
-    /// is the `holosoma`/`numpy` behavior the ownership-drop path protects.
+    /// is the `holosoma`/`numpy` behavior the legacy restore finalizer protects.
     #[test]
     fn authoritative_only_conflict_still_errors() {
         let observations = vec![
             observed(
                 ">=0.49.1,<0.50",
                 "wheel `a==1` Requires-Dist `x>=0.49.1`",
-                false,
+                Provenance::IndexWheelMetadata,
             ),
             observed(
                 ">=0.40.0,<0.46.0",
                 "wheel `b==1` Requires-Dist `x<0.46`",
-                false,
+                Provenance::UvConstraint,
             ),
         ];
         let error =
-            finalize_observed_requirement("x", &observations).expect_err("must stay unsatisfiable");
+            finalize(&PypiKey::from_pypi("x"), &observations).expect_err("must stay unsatisfiable");
         assert!(error.to_string().contains("mutually unsatisfiable"));
     }
 
@@ -2842,15 +2758,15 @@ mod tests {
             observed(
                 ">=2.3.5,<2.4",
                 "wheel `pkg-a==1` Requires-Dist `x>=2.3.5,<2.4`",
-                true,
+                Provenance::SourceBuiltRelaxed,
             ),
             observed(
                 "<2,>=1.23.5",
                 "wheel `pkg-b==1` Requires-Dist `x<2,>=1.23.5`",
-                true,
+                Provenance::DepsFromRelaxed,
             ),
         ];
-        let error = finalize_observed_requirement("x", &observations)
+        let error = finalize(&PypiKey::from_pypi("x"), &observations)
             .expect_err("advisory-only conflict must stay unsatisfiable");
         assert!(error.to_string().contains("mutually unsatisfiable"));
     }
@@ -2901,7 +2817,7 @@ pillow = ">=10,<13"
             "hover-pack",
         );
         assert_eq!(
-            context.workspace_deps.get("pillow"),
+            context.workspace_deps.get(&CondaName::new("pillow")),
             Some(&vec![">=11.0.0,<12".to_string()]),
             "only the environment that consumes hover-pack may constrain its route validation"
         );
@@ -2950,11 +2866,11 @@ pillow = ">=10,<13"
             None,
             None,
             None,
-            &workspace_ownership(&[]),
             &validated_probe,
             &scoped_reject,
             &fetch,
             &["conda-forge/linux-64".to_string()],
+            &UvReresolveContext::default(),
         )
         .await
         .unwrap();
@@ -2962,11 +2878,9 @@ pillow = ">=10,<13"
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
         assert!(
-            solve_calls
-                .lock()
-                .unwrap()
+            solve_calls.lock().unwrap().iter().any(|routes| routes
                 .iter()
-                .any(|routes| routes.iter().any(|route| route.pypi_name == "pillow")),
+                .any(|route| route.pypi_name.as_str() == "pillow")),
             "the scoped co-solve must validate the provisional Pillow route"
         );
         assert_eq!(requests[0].pypi_name, "pillow");
@@ -3000,11 +2914,12 @@ pillow = ">=10,<13"
             &["pillow>=12,<13"],
         ));
         let mut deps_from_route = pillow_auto_route("12.3.0");
-        deps_from_route.deps_from_floor = true;
+        deps_from_route.provenance = Provenance::DepsFromRelaxed;
         deps_from_route.route.input_requirements.push(
             crate::uv_closure::AutoRouteInputRequirement {
                 specifiers: "==12.3.0".to_string(),
                 source: "uv root requirement `pillow==12.3.0`".to_string(),
+                provenance: Provenance::UvRoot,
                 role: crate::uv_closure::AutoRouteInputRole::Requirement,
             },
         );
@@ -3019,11 +2934,11 @@ pillow = ">=10,<13"
             None,
             None,
             None,
-            &workspace_ownership(&[]),
             &validated_probe,
             &reject_every_mutable_route,
             &fetch,
             &["conda-forge/linux-64".to_string()],
+            &UvReresolveContext::default(),
         )
         .await
         .unwrap_err();
@@ -3049,27 +2964,21 @@ pillow = ">=10,<13"
     #[tokio::test]
     async fn joint_unroute_restores_compatible_pypi_requirement() {
         let mut overridden = RestoreRequestBuilder::new("overridden");
-        overridden.requirements.push(ObservedRequirement {
+        overridden.add_constraint(Constraint {
             specifiers: VersionSpecifiers::from_str("<2").unwrap(),
             source: "wheel metadata requires overridden<2".to_string(),
-            advisory: false,
+            provenance: Provenance::IndexWheelMetadata,
         });
-        overridden.add_input(
-            crate::uv_closure::AutoRouteInputRole::Override,
-            ObservedRequirement {
-                specifiers: VersionSpecifiers::from_str("==3").unwrap(),
-                source: "uv override requirement `overridden==3`".to_string(),
-                advisory: false,
-            },
-        );
-        overridden.add_input(
-            crate::uv_closure::AutoRouteInputRole::Constraint,
-            ObservedRequirement {
-                specifiers: VersionSpecifiers::from_str("<4").unwrap(),
-                source: "uv constraint `overridden<4`".to_string(),
-                advisory: false,
-            },
-        );
+        overridden.add_constraint(Constraint {
+            specifiers: VersionSpecifiers::from_str("==3").unwrap(),
+            source: "uv override requirement `overridden==3`".to_string(),
+            provenance: Provenance::UvOverride,
+        });
+        overridden.add_constraint(Constraint {
+            specifiers: VersionSpecifiers::from_str("<4").unwrap(),
+            source: "uv constraint `overridden<4`".to_string(),
+            provenance: Provenance::UvConstraint,
+        });
         let overridden = overridden.finish().unwrap();
         assert!(
             overridden
@@ -3083,10 +2992,10 @@ pillow = ">=10,<13"
         );
 
         let mut soft_hints = RestoreRequestBuilder::new("soft-hints");
-        soft_hints.requirements.push(ObservedRequirement {
+        soft_hints.add_constraint(Constraint {
             specifiers: VersionSpecifiers::from_str(">=1").unwrap(),
             source: "wheel `root==1` Requires-Dist `soft-hints>=1`".to_string(),
-            advisory: false,
+            provenance: Provenance::IndexWheelMetadata,
         });
         RestoreRequestBuilder::add_preference(
             &mut soft_hints.route_preferences,
@@ -3102,6 +3011,32 @@ pillow = ">=10,<13"
             soft_hints.finish().unwrap().preferred_version,
             None,
             "conflicting soft hints must not make satisfiable hard requirements fail"
+        );
+
+        let mut prior_only = RestoreRequestBuilder::new("s3transfer");
+        RestoreRequestBuilder::add_preference(
+            &mut prior_only.route_preferences,
+            "0.13.1".to_string(),
+            "prior uv route selected s3transfer==0.13.1".to_string(),
+        );
+        let prior_only = prior_only.finish().unwrap();
+        assert!(
+            prior_only.specifiers.is_empty(),
+            "PriorSelection must never become a hard ==: {}",
+            prior_only.specifiers
+        );
+        assert_eq!(prior_only.preferred_version.as_deref(), Some("0.13.1"));
+
+        let mut index_pin = RestoreRequestBuilder::new("s3transfer");
+        index_pin.add_constraint(Constraint {
+            specifiers: VersionSpecifiers::from_str("==0.13.1").unwrap(),
+            provenance: Provenance::IndexWheelMetadata,
+            source: "index wheel Requires-Dist `s3transfer==0.13.1`".to_string(),
+        });
+        assert_eq!(
+            index_pin.finish().unwrap().specifiers,
+            VersionSpecifiers::from_str("==0.13.1").unwrap(),
+            "an index-wheel exact requirement remains authoritative"
         );
 
         let requests = Arc::new(Mutex::new(Vec::<PypiFetchRequest>::new()));
@@ -3132,11 +3067,11 @@ pillow = ">=10,<13"
             None,
             None,
             None,
-            &workspace_ownership(&[]),
             &validated_probe,
             &reject_every_mutable_route,
             &fetch,
             &["conda-forge/linux-64".to_string()],
+            &UvReresolveContext::default(),
         )
         .await
         .unwrap();
@@ -3235,8 +3170,10 @@ pillow = ">=10,<13"
                 let records = Arc::clone(&records);
                 let solve_inputs = Arc::clone(&solve_inputs);
                 async move {
-                    let specs: Vec<String> =
-                        routes.iter().map(|route| route.match_spec()).collect();
+                    let specs: Vec<String> = routes
+                        .iter()
+                        .map(|route| route.match_spec().to_string())
+                        .collect();
                     solve_inputs.lock().unwrap().push(specs.clone());
                     match crate::conda_solve::solve_records_for_test(&records, &specs, "3.11") {
                         Ok(_) => crate::uv_closure::CoInstallVerdict::Sat,
@@ -3286,11 +3223,11 @@ pillow = ">=10,<13"
             None,
             None,
             None,
-            &workspace_ownership(&[]),
             &probe,
             &solve,
             &fetch,
             &["conda-forge/linux-64".to_string()],
+            &UvReresolveContext::default(),
         )
         .await
         .unwrap();
@@ -3306,7 +3243,7 @@ pillow = ">=10,<13"
         assert!(
             emitted
                 .iter()
-                .all(|route| canonical_conda_name(&route.conda_name) != "pyglet"),
+                .all(|route| route.conda_name.key().as_str() != "pyglet"),
             "the incompatible conda pyglet route must be absent after restoration: {emitted:?}"
         );
         assert!(bundle.probe_decisions.iter().any(|decision| {
@@ -3344,21 +3281,14 @@ pillow = ">=10,<13"
             index: Some("https://pypi.nvidia.com".to_string()),
             ..Default::default()
         };
-        let workspace_indexes = vec![
-            crate::workspace::DEFAULT_PYPI_INDEX.to_string(),
-            "https://pypi.nvidia.com".to_string(),
-        ];
-        assert_eq!(
-            super::super::auto_bundle_group_index_chain(
-                [&source_entry, &private_entry],
-                &workspace_indexes,
-            ),
-            workspace_indexes,
-            "an implicit-default first entry must not be skipped for a later private index"
+        let explicit_private_chain = crate::index_chain::index_chain(
+            [&source_entry, &private_entry]
+                .into_iter()
+                .filter(|entry| !entry.is_url())
+                .filter_map(|entry| entry.index.clone()),
+            &[],
+            crate::index_chain::IndexPurpose::Resolve,
         );
-
-        let explicit_private_chain =
-            super::super::auto_bundle_group_index_chain([&private_entry], &workspace_indexes);
         assert_eq!(
             explicit_private_chain,
             vec![
@@ -3415,11 +3345,11 @@ pillow = ">=10,<13"
             None,
             None,
             None,
-            &workspace_ownership(&[]),
             &probe,
             &solve,
             &fetch,
             &["conda-forge/linux-64".to_string()],
+            &UvReresolveContext::default(),
         )
         .await
         .unwrap();
@@ -3462,7 +3392,7 @@ pillow = ">=10,<13"
         seed_worklist(
             &requires_dist,
             &[], // no extras requested
-            "https://pypi.org/simple/",
+            &["https://pypi.org/simple/".to_string()],
             "", // empty prefix: all base deps match
             &seen,
             &mut work,
@@ -3511,7 +3441,7 @@ pillow = ">=10,<13"
         seed_worklist(
             &requires_dist,
             &extras_requested,
-            "https://pypi.org/simple/",
+            &["https://pypi.org/simple/".to_string()],
             "", // empty prefix
             &seen,
             &mut work,
@@ -3548,7 +3478,7 @@ pillow = ">=10,<13"
         seed_worklist(
             &requires_dist,
             &[],
-            "https://pypi.org/simple/",
+            &["https://pypi.org/simple/".to_string()],
             "",
             &seen,
             &mut work,

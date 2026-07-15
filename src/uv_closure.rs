@@ -34,9 +34,12 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use uv_pep508::Requirement;
 
+use crate::constraint::{Authority, Provenance, authority};
 use crate::lock::{LockWheel, Origin};
 use crate::pypi::WheelTarget;
-use crate::relax::canonical_conda_name;
+use crate::relax::{
+    CondaMatchSpec, CondaName, CondaTarget, NameMap, PypiKey, canonical_conda_name,
+};
 
 /// Env var overriding the uv binary path (spec §2.5).
 pub const UV_BIN_ENV: &str = "RETREAD_UV";
@@ -66,10 +69,9 @@ pub struct ConstraintProvenance {
     pub source: String,
     /// Environment the pin belongs to (e.g. `"default"`).
     pub env: String,
-    /// Non-authoritative hint that may constrain an existing root but must not
-    /// authorize repair mutations against a workspace or pack manifest.
+    /// Typed origin used to derive constraint authority centrally.
     #[serde(default)]
-    pub advisory: bool,
+    pub provenance: Provenance,
 }
 
 /// Generated constraint lines + their provenance, keyed by PyPI name.
@@ -88,6 +90,63 @@ pub struct ConstraintSet {
     pub auto_route_constraint_indices: BTreeSet<usize>,
 }
 
+/// Precise conda-side provider eligible to satisfy one PyPI dependency before
+/// uv's first lock. Construction requires a typed workspace fact; routing
+/// aliases and prior selections are never ownership authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceCondaProvider {
+    pub pypi_name: PypiKey,
+    pub conda_name: CondaName,
+    pub version: String,
+    pub provenance: Provenance,
+}
+
+/// The single pre-lock representation of "the consuming workspace already
+/// supplies this dependency". Direct workspace PyPI ownership uses the same
+/// graph-wide marker as an explicit drop. Mapped conda ownership is exposed
+/// to uv as an exact local wheel plus an additive constraint, so uv itself
+/// validates every hidden upstream range before the package can be omitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkspaceOwnedProvider {
+    WorkspacePypi,
+    WorkspaceConda {
+        conda_name: CondaName,
+        version: String,
+        provenance: Provenance,
+    },
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkspaceOwnedPlan {
+    pub providers: BTreeMap<PypiKey, WorkspaceOwnedProvider>,
+}
+
+impl WorkspaceOwnedPlan {
+    pub fn dropped_without_uv(&self) -> BTreeSet<String> {
+        self.providers
+            .iter()
+            .filter_map(|(name, provider)| {
+                matches!(provider, WorkspaceOwnedProvider::WorkspacePypi)
+                    .then(|| name.as_str().to_string())
+            })
+            .collect()
+    }
+
+    fn conda_providers(&self) -> impl Iterator<Item = (&PypiKey, &CondaName, &str, &Provenance)> {
+        self.providers.iter().filter_map(|(name, provider)| {
+            let WorkspaceOwnedProvider::WorkspaceConda {
+                conda_name,
+                version,
+                provenance,
+            } = provider
+            else {
+                return None;
+            };
+            Some((name, conda_name, version.as_str(), provenance))
+        })
+    }
+}
+
 /// Everything needed to synthesize + solve one (bundle, python, platform)
 /// closure.
 #[derive(Debug, Clone)]
@@ -100,6 +159,10 @@ pub struct UvClosureRequest {
     pub conda_subdir: String,
     /// PEP 508 root requirements (the bundle's `[retread-wheels]` entries).
     pub dependencies: Vec<String>,
+    /// Typed origins for roots whose authority differs from an ordinary uv
+    /// root, keyed by canonical PyPI name. In particular, an exact
+    /// `retread-deps-from` root remains advisory after uv selects it.
+    pub dependency_provenance: BTreeMap<String, Provenance>,
     /// Conda pins as uv constraints, with provenance.
     pub constraints: ConstraintSet,
     /// PEP 508 `override-dependencies` lines (user `retread-overrides`
@@ -130,6 +193,11 @@ pub struct UvClosureRequest {
     /// Empty on the green path; kept out of the user's manifest (the
     /// synthesized project is ephemeral).
     pub explicit_pins: BTreeMap<String, String>,
+    /// Structured workspace-owned providers applied before the first lock.
+    /// This is the sole ownership/drop state; effective constraints,
+    /// overrides, local provider wheels, no-emit arguments, fingerprints,
+    /// and downstream `auto_dropped` evidence are derived from it.
+    pub workspace_owned: WorkspaceOwnedPlan,
     /// Append `--offline` to uv invocations (replay mode).
     pub offline: bool,
 }
@@ -157,10 +225,10 @@ pub struct UvClosure {
     /// already declares and supplies them. This is ephemeral build evidence,
     /// never persisted as part of an [`AutoRoutedPackage`].
     pub auto_dropped: BTreeSet<String>,
-    /// Effective authoritative uv inputs for the exact request that produced
-    /// this closure. `None` is reserved for parser-only/test closures that did
-    /// not cross the request-aware solve boundary; route planning then derives
-    /// the same map from its visible request.
+    /// Effective typed uv inputs for the exact request that produced this
+    /// closure. `None` is reserved for parser-only/test closures that did not
+    /// cross the request-aware solve boundary; route planning then derives the
+    /// same map from its visible request.
     pub effective_input_requirements: Option<BTreeMap<String, Vec<AutoRouteInputRequirement>>>,
 }
 
@@ -185,15 +253,43 @@ pub enum AutoRouteInputRole {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AutoRouteInputRequirement {
-    /// PEP 440 specifiers from an authoritative uv input (empty means any
-    /// version). This is distinct from the version uv happened to select.
+    /// PEP 440 specifiers from an active uv input (empty means any version).
+    /// This is distinct from the version uv happened to select.
     pub specifiers: String,
     /// Human-readable origin retained for source-rich un-route conflicts.
     pub source: String,
+    /// Typed origin used to derive authority when a route is restored.
+    ///
+    /// Older persisted route records predate this field. Their semantic role
+    /// is normalized by [`Self::effective_provenance`] at the restore
+    /// boundary; newly produced records always carry an explicit provenance.
+    #[serde(default)]
+    pub provenance: Provenance,
     /// uv semantic role. Overrides replace ordinary requirements; constraints
     /// remain additive in either case.
     #[serde(default)]
     pub role: AutoRouteInputRole,
+}
+
+impl AutoRouteInputRequirement {
+    /// Bridge persisted pre-provenance records into the typed model.
+    ///
+    /// A missing provenance deserializes as `IndexWheelMetadata`. For legacy
+    /// constraint/override records, the retained uv role supplies the missing
+    /// origin. Any explicit non-default provenance wins unchanged. Authority
+    /// is still derived only by [`authority`], never by this compatibility
+    /// normalization.
+    pub fn effective_provenance(&self) -> Provenance {
+        match (&self.provenance, self.role) {
+            (Provenance::IndexWheelMetadata, AutoRouteInputRole::Constraint) => {
+                Provenance::UvConstraint
+            }
+            (Provenance::IndexWheelMetadata, AutoRouteInputRole::Override) => {
+                Provenance::UvOverride
+            }
+            _ => self.provenance.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -242,9 +338,10 @@ pub struct AutoRouteOptions {
     /// conda availability: the bundle's own root entries and retread-built
     /// wheels. Routing a root to conda would hollow out the pack.
     pub protected: BTreeSet<String>,
-    /// Effective pypi -> conda name map (user retread-name-map + fallback
-    /// table + parselmouth merge). Missing names use the identity mapping.
-    pub name_map: BTreeMap<String, String>,
+    /// Effective pypi -> conda target map (user retread-name-map + fallback
+    /// table + parselmouth merge). Missing names use the identity mapping;
+    /// disabled entries are never routed or probed.
+    pub name_map: NameMap,
     /// Canonical PyPI names the self-healing un-route step must NEVER
     /// move back to the wheel closure (`force-conda`), even when the
     /// co-installability solve names them in an unsat core. The user
@@ -272,11 +369,6 @@ pub struct AutoRouteOptions {
     /// failed solves, or cross-environment disagreement leave the name out;
     /// the un-route fallback then behaves exactly as before.
     pub workspace_conda_versions: BTreeMap<String, String>,
-    /// Canonical PyPI names directly owned by every precisely identified
-    /// consuming workspace environment. Populated only for the validated
-    /// routing policy. A successful route for one of these names is an
-    /// automatic drop rather than a generated-pack run dependency.
-    pub workspace_owned: BTreeSet<String>,
     /// Stable digest of the concrete per-environment conda facts used to
     /// validate routing. It participates in the persisted heal-facts stamp so
     /// a changed workspace solution cannot replay stale routes.
@@ -298,7 +390,6 @@ impl Default for AutoRouteOptions {
             force_conda: BTreeSet::new(),
             abi_anchor_pins: BTreeMap::new(),
             workspace_conda_versions: BTreeMap::new(),
-            workspace_owned: BTreeSet::new(),
             workspace_fact_fingerprint: String::new(),
         }
     }
@@ -401,7 +492,21 @@ fn active_input_requirement(
     )))
 }
 
-/// Preserve the effective authoritative uv inputs that produced a closure.
+/// `retread-deps-from` exact roots stay exact while uv chooses a compatible
+/// prior selection, but the retained constraint is the relaxed lower bound
+/// used by restoration and conda emission.
+fn relax_deps_from_root_specifiers(specifiers: String) -> String {
+    if specifiers.contains(',') {
+        return specifiers;
+    }
+    specifiers
+        .strip_prefix("===")
+        .or_else(|| specifiers.strip_prefix("=="))
+        .map(|version| format!(">={version}"))
+        .unwrap_or(specifiers)
+}
+
+/// Preserve the effective typed uv inputs that produced a closure.
 /// The closure wheel versions are deliberately absent: they are solver output
 /// and become restoration preferences, not hard requirements.
 ///
@@ -419,14 +524,21 @@ fn effective_auto_route_input_requirements(
     let push = |destination: &mut BTreeMap<String, Vec<AutoRouteInputRequirement>>,
                 raw: &str,
                 source: String,
+                provenance: Provenance,
                 role: AutoRouteInputRole|
      -> Result<()> {
         let Some((name, specifiers)) = active_input_requirement(raw, &target)? else {
             return Ok(());
         };
+        let specifiers = if matches!(&provenance, Provenance::DepsFromRelaxed) {
+            relax_deps_from_root_specifiers(specifiers)
+        } else {
+            specifiers
+        };
         let requirement = AutoRouteInputRequirement {
             specifiers,
             source,
+            provenance,
             role,
         };
         let entries = destination.entry(name).or_default();
@@ -437,45 +549,62 @@ fn effective_auto_route_input_requirements(
     };
 
     for raw in &req.dependencies {
+        let provenance = Requirement::from_str(raw)
+            .ok()
+            .and_then(|requirement: Requirement| {
+                req.dependency_provenance
+                    .get(&canonical_conda_name(requirement.name.as_ref()))
+            })
+            .cloned()
+            .unwrap_or(Provenance::UvRoot);
         push(
             &mut requirements,
             raw,
             format!("uv root requirement `{raw}`"),
+            provenance,
             AutoRouteInputRole::Requirement,
         )?;
     }
-    for (index, raw) in req.constraints.constraints.iter().enumerate() {
-        if req
-            .constraints
+    let effective_constraints = effective_constraints(req);
+    for (index, raw) in effective_constraints.constraints.iter().enumerate() {
+        if effective_constraints
             .auto_route_constraint_indices
             .contains(&index)
         {
             continue;
         }
-        let provenance = req
-            .constraints
-            .provenance
-            .values()
-            .find(|provenance| provenance.constraint == *raw);
-        let source = match provenance {
+        let recorded_provenance = Requirement::from_str(raw)
+            .ok()
+            .and_then(|requirement: Requirement| {
+                effective_constraints
+                    .provenance
+                    .get(&canonical_conda_name(requirement.name.as_ref()))
+            })
+            .filter(|provenance| provenance.constraint == *raw);
+        let source = match recorded_provenance {
             Some(provenance) => format!(
                 "uv constraint `{raw}` from {} `{}` (conda `{}{}`)",
                 provenance.source, provenance.env, provenance.conda_name, provenance.conda_version
             ),
             None => format!("uv constraint `{raw}`"),
         };
+        let provenance = recorded_provenance
+            .map(|record| record.provenance.clone())
+            .unwrap_or(Provenance::UvConstraint);
         push(
             &mut constraints,
             raw,
             source,
+            provenance,
             AutoRouteInputRole::Constraint,
         )?;
     }
-    for raw in &req.overrides {
+    for raw in effective_overrides(req) {
         push(
             &mut overrides,
-            raw,
+            &raw,
             format!("uv override requirement `{raw}`"),
+            Provenance::UvOverride,
             AutoRouteInputRole::Override,
         )?;
     }
@@ -554,18 +683,20 @@ pub fn plan_auto_route_round(
         {
             continue;
         }
-        let conda_name = opts
-            .name_map
-            .get(name)
-            .map(|c| canonical_conda_name(c))
-            .unwrap_or_else(|| name.clone());
+        let pypi_key = PypiKey::from_pypi(name);
+        let conda_name = match opts.name_map.get(&pypi_key) {
+            Some(CondaTarget::Mapped(conda_name)) => conda_name.clone(),
+            Some(CondaTarget::Disabled) => continue,
+            None => CondaName::new(name.clone()),
+        };
+        let conda_key = conda_name.key();
         // v4.6 Part A: the routing-policy gate. Under `Minimal`, a
         // non-whitelisted candidate never routes regardless of conda
         // availability -- it ships as a wheel.
-        if !route_policy_admits(name, &conda_name, opts) {
+        if !route_policy_admits(name, conda_key.as_str(), opts) {
             continue;
         }
-        if let Some(hit) = probe_hits.get(&conda_name) {
+        if let Some(hit) = probe_hits.get(conda_name.as_spec()) {
             // Route-time metadata-consistency check (prevention for the
             // PyPI-vs-conda-forge metadata-skew class -- run-15's
             // moviepy==2.2.1/pillow==11.3.0 shape): the routed build's
@@ -590,7 +721,7 @@ pub fn plan_auto_route_round(
             }
             out.push(AutoRoutedPackage {
                 pypi_name: name.clone(),
-                conda_name,
+                conda_name: conda_name.as_spec().to_string(),
                 pypi_version: wheel.version.clone(),
                 conda_version: hit.conda_version.clone(),
                 channel: hit.channel.clone(),
@@ -749,6 +880,7 @@ pub fn auto_route_probe_specs(
         .map(|n| canonical_conda_name(n))
         .collect();
     let mut out: Vec<(String, String)> = Vec::new();
+    let mut seen: BTreeSet<(PypiKey, String)> = BTreeSet::new();
     for wheel in &closure.wheels {
         let name = &wheel.name;
         if excluded.contains(name)
@@ -758,19 +890,21 @@ pub fn auto_route_probe_specs(
         {
             continue;
         }
-        let conda_name = opts
-            .name_map
-            .get(name)
-            .map(|c| canonical_conda_name(c))
-            .unwrap_or_else(|| name.clone());
+        let pypi_key = PypiKey::from_pypi(name);
+        let conda_name = match opts.name_map.get(&pypi_key) {
+            Some(CondaTarget::Mapped(conda_name)) => conda_name.clone(),
+            Some(CondaTarget::Disabled) => continue,
+            None => CondaName::new(name.clone()),
+        };
+        let conda_key = conda_name.key();
         // v4.6 Part A: don't even probe repodata for candidates the
         // routing policy refuses -- they ship as wheels.
-        if !route_policy_admits(name, &conda_name, opts) {
+        if !route_policy_admits(name, conda_key.as_str(), opts) {
             continue;
         }
-        let pair = (conda_name, format!("=={}", wheel.version));
-        if !out.contains(&pair) {
-            out.push(pair);
+        let spec = format!("=={}", wheel.version);
+        if seen.insert((conda_key, spec.clone())) {
+            out.push((conda_name.as_spec().to_string(), spec));
         }
     }
     out
@@ -797,7 +931,7 @@ pub fn apply_auto_route(req: &mut UvClosureRequest, hits: &[AutoRoutedPackage]) 
                 conda_version: format!("=={}", h.conda_version),
                 source: "auto-route".to_string(),
                 env: "default".to_string(),
-                advisory: false,
+                provenance: Provenance::PriorSelection,
             });
     }
 }
@@ -859,21 +993,16 @@ pub enum CoInstallVerdict {
 /// spec; an empty string and `*` both mean unconstrained.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct CondaRouteSpec {
-    pub pypi_name: String,
-    pub conda_name: String,
+    pub pypi_name: PypiKey,
+    pub conda_name: CondaName,
     pub spec: String,
 }
 
 impl CondaRouteSpec {
     /// Render this route as a conda match spec suitable for the shared
     /// co-installability oracle.
-    pub fn match_spec(&self) -> String {
-        let spec = self.spec.trim();
-        if spec.is_empty() || spec == "*" {
-            self.conda_name.clone()
-        } else {
-            format!("{} {spec}", self.conda_name)
-        }
+    pub fn match_spec(&self) -> CondaMatchSpec {
+        self.conda_name.match_spec(&self.spec)
     }
 }
 
@@ -927,10 +1056,7 @@ where
             .collect::<Vec<_>>()
     };
 
-    if matches!(
-        co_solve(combined(&candidates)).await,
-        CoInstallVerdict::Sat
-    ) {
+    if matches!(co_solve(combined(&candidates)).await, CoInstallVerdict::Sat) {
         return Some(JointRouteSelection {
             accepted: candidates,
             rejected: Vec::new(),
@@ -971,10 +1097,7 @@ where
             };
             let mut trial = core.clone();
             trial.remove(pos);
-            if matches!(
-                co_solve(combined(&trial)).await,
-                CoInstallVerdict::Unsat(_)
-            ) {
+            if matches!(co_solve(combined(&trial)).await, CoInstallVerdict::Unsat(_)) {
                 core = trial;
             }
         }
@@ -1088,7 +1211,7 @@ fn rebuild_routed_request(
                 conda_version: format!("=={version}"),
                 source: "workspace-harmonize".to_string(),
                 env: "default".to_string(),
-                advisory: false,
+                provenance: Provenance::WorkspaceCondaFact("default".to_string()),
             },
         );
     }
@@ -1206,7 +1329,8 @@ where
                 // named again afterwards -> un-route fallback.
                 let mut round_harmonized: Vec<String> = Vec::new();
                 for pkg in &named {
-                    let ws_version = opts.workspace_conda_versions.get(&pkg.conda_name);
+                    let conda_key = CondaName::new(pkg.conda_name.clone()).key();
+                    let ws_version = opts.workspace_conda_versions.get(conda_key.as_str());
                     if let Some(ws_version) = ws_version
                         && ws_version != &pkg.conda_version
                         && !harmonize_tried.contains(&pkg.pypi_name)
@@ -1387,12 +1511,6 @@ where
             break;
         }
     }
-    closure.auto_dropped.extend(
-        routed
-            .iter()
-            .filter(|route| opts.workspace_owned.contains(&route.pypi_name))
-            .map(|route| route.pypi_name.clone()),
-    );
     closure.auto_routed = routed;
     Ok(closure)
 }
@@ -2075,7 +2193,7 @@ fn is_conda_only_name(name: &str) -> bool {
 /// * `source` / `env`: recorded verbatim into provenance.
 pub fn build_constraints(
     conda_deps: &BTreeMap<String, String>,
-    name_map: &BTreeMap<String, String>,
+    name_map: &NameMap,
     global_name_map: &crate::handler::PypiToCondaMap,
     source: &str,
     env: &str,
@@ -2089,11 +2207,14 @@ pub fn build_constraints(
     // pack declares no name map of its own -- previously such a pin
     // produced an inert constraint on a nonexistent pypi name
     // (`pytorch-gpu==2.7.0`) and uv free-picked torch 2.10.
-    let mut conda_to_pypi: BTreeMap<String, String> = BTreeMap::new();
-    for (pypi, conda) in name_map {
+    let mut conda_to_pypi: BTreeMap<PypiKey, PypiKey> = BTreeMap::new();
+    for (pypi, target) in name_map {
+        let Some(conda) = target.mapped_name() else {
+            continue;
+        };
         conda_to_pypi
-            .entry(canonical_conda_name(conda))
-            .or_insert_with(|| canonical_conda_name(pypi));
+            .entry(conda.key())
+            .or_insert_with(|| pypi.clone());
     }
     // Deterministic order: sort the HashMap's pypi keys before merging.
     let mut global_sorted: Vec<(&String, &Vec<String>)> = global_name_map.iter().collect();
@@ -2101,8 +2222,8 @@ pub fn build_constraints(
     for (pypi, condas) in global_sorted {
         for conda in condas {
             conda_to_pypi
-                .entry(canonical_conda_name(conda))
-                .or_insert_with(|| canonical_conda_name(pypi));
+                .entry(CondaName::new(conda.clone()).key())
+                .or_insert_with(|| PypiKey::from_pypi(pypi));
         }
     }
 
@@ -2114,19 +2235,19 @@ pub fn build_constraints(
         let Some(pep) = conda_spec_to_pep440(conda_spec) else {
             continue;
         };
-        let canon = canonical_conda_name(conda_name);
-        let pypi_name = conda_to_pypi.get(&canon).cloned().unwrap_or(canon);
-        let line = format!("{pypi_name}{pep}");
+        let conda_key = CondaName::new(conda_name.clone()).key();
+        let pypi_name = conda_to_pypi.get(&conda_key).cloned().unwrap_or(conda_key);
+        let line = format!("{}{pep}", pypi_name.as_str());
         set.constraints.push(line.clone());
         set.provenance.insert(
-            pypi_name,
+            pypi_name.into_string(),
             ConstraintProvenance {
                 constraint: line,
                 conda_name: conda_name.clone(),
                 conda_version: conda_spec.clone(),
                 source: source.to_string(),
                 env: env.to_string(),
-                advisory: false,
+                provenance: Provenance::UvConstraint,
             },
         );
     }
@@ -2325,6 +2446,56 @@ fn project_name(bundle: &str) -> String {
     format!("retread-closure-{canon}")
 }
 
+fn effective_constraints(req: &UvClosureRequest) -> ConstraintSet {
+    let mut constraints = req.constraints.clone();
+    for (pypi_name, conda_name, version, provenance) in req.workspace_owned.conda_providers() {
+        let line = format!("{}=={version}", pypi_name.as_str());
+        if !constraints.constraints.contains(&line) {
+            constraints.constraints.push(line.clone());
+        }
+        let env = match provenance {
+            Provenance::WorkspaceCondaFact(env) => env.clone(),
+            _ => "precise-consuming-envs".to_string(),
+        };
+        constraints.provenance.insert(
+            pypi_name.as_str().to_string(),
+            ConstraintProvenance {
+                constraint: line,
+                conda_name: conda_name.as_spec().to_string(),
+                conda_version: format!("=={version}"),
+                source: "workspace-owned-prelock".to_string(),
+                env,
+                provenance: provenance.clone(),
+            },
+        );
+    }
+    constraints
+}
+
+fn effective_overrides(req: &UvClosureRequest) -> Vec<String> {
+    let mut overrides = req.overrides.clone();
+    for (name, provider) in &req.workspace_owned.providers {
+        if matches!(provider, WorkspaceOwnedProvider::WorkspacePypi) {
+            overrides.push(format!("{} ; {DROP_MARKER}", name.as_str()));
+        }
+    }
+    overrides
+}
+
+fn effective_no_emit(req: &UvClosureRequest) -> Vec<String> {
+    let mut no_emit = req.no_emit_packages.clone();
+    let mut seen: BTreeSet<String> = no_emit
+        .iter()
+        .map(|name| canonical_conda_name(name))
+        .collect();
+    for name in req.workspace_owned.providers.keys() {
+        if seen.insert(name.as_str().to_string()) {
+            no_emit.push(name.as_str().to_string());
+        }
+    }
+    no_emit
+}
+
 /// Render the ephemeral project's `pyproject.toml` (spec §2.1). Pure and
 /// deterministic — golden-snapshot tested.
 pub fn synthesize_pyproject(req: &UvClosureRequest) -> String {
@@ -2379,17 +2550,19 @@ pub fn synthesize_pyproject(req: &UvClosureRequest) -> String {
     // a CLI flag on `uv lock` (see compute_closure) because UV_NO_CONFIG
     // strips it from this table on uv 0.11.x.
     out.push_str("prerelease = \"if-necessary-or-explicit\"\n");
-    if !req.constraints.constraints.is_empty() {
+    let constraints = effective_constraints(req);
+    if !constraints.constraints.is_empty() {
         out.push_str(&format!(
             "constraint-dependencies = {}\n",
-            toml_string_array("", &req.constraints.constraints)
+            toml_string_array("", &constraints.constraints)
         ));
     }
     // User overrides first, then drop-dep unmatchable markers (A3).
-    if !req.overrides.is_empty() {
+    let overrides = effective_overrides(req);
+    if !overrides.is_empty() {
         out.push_str(&format!(
             "override-dependencies = {}\n",
-            toml_string_array("", &req.overrides)
+            toml_string_array("", &overrides)
         ));
     }
 
@@ -2589,42 +2762,20 @@ pub struct ConflictAttribution {
     pub conda_source: ConstraintProvenance,
 }
 
-/// One graph-wide uv override learned from a precise workspace-solved conda
-/// fact. Two shapes: a Rule-3 version override (an upstream exact pin proven to
-/// contradict the fact is replaced with the conda-selected version), or a
-/// Rule-1 drop (the workspace conda-OWNS the dep and its PyPI requirement is
-/// unsatisfiable, so the wheel-side requirement is removed graph-wide and the
-/// conda owner provides it at runtime).
+/// One graph-wide Rule-3 uv override learned from a precise workspace-solved
+/// conda fact. Workspace-owned drops are planned separately before locking.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceFactOverride {
     /// Canonical PyPI name uv resolves.
     pub pypi_name: String,
     /// PEP 440 version selected by every precise consuming environment's
-    /// conda solve. For a `drop`, this is retained only as the owning conda
-    /// version for provenance/logging -- the emitted requirement carries no
-    /// version.
+    /// conda solve.
     pub version: String,
-    /// When true this is a Rule-1 DROP, not a Rule-3 version pin: the workspace
-    /// conda-owns `pypi_name` (through a retread-name-map edge, possibly the
-    /// identity edge) and its PyPI requirement could not be satisfied, so the
-    /// requirement is removed from uv's graph entirely (unmatchable marker) and
-    /// the conda package owns the import at runtime. Defaulted for back-compat
-    /// with heal-fact files written before drops existed.
-    #[serde(default)]
-    pub drop: bool,
 }
 
 impl WorkspaceFactOverride {
     fn requirement(&self) -> String {
-        if self.drop {
-            // Graph-wide unmatchable-marker override: same mechanism as
-            // `retread-drop-deps` and the workspace-owned `[pypi-dependencies]`
-            // drop, so the removal covers a transitive `Requires-Dist` exact
-            // pin, not just a direct root.
-            format!("{} ; {DROP_MARKER}", self.pypi_name)
-        } else {
-            format!("{}=={}", self.pypi_name, self.version)
-        }
+        format!("{}=={}", self.pypi_name, self.version)
     }
 }
 
@@ -2704,6 +2855,83 @@ fn override_name(raw: &str) -> Option<String> {
     Some(canonical_conda_name(req.name.as_ref()))
 }
 
+/// Decide every workspace-owned omission before uv's first lock from typed
+/// ownership and a positive structured conda co-solve. The plan is inert for
+/// unrelated packages: conda providers are constraints/local candidates, not
+/// synthetic roots, so they participate only when uv's real graph names them.
+pub async fn plan_workspace_owned_prelock<C, CF>(
+    req: &UvClosureRequest,
+    direct_pypi: &BTreeSet<PypiKey>,
+    conda_candidates: Vec<WorkspaceCondaProvider>,
+    excluded: &BTreeSet<PypiKey>,
+    co_solve: &C,
+) -> WorkspaceOwnedPlan
+where
+    C: Fn(Vec<CondaRouteSpec>) -> CF,
+    CF: std::future::Future<Output = CoInstallVerdict>,
+{
+    let has_explicit_override = |name: &PypiKey| {
+        req.overrides
+            .iter()
+            .filter_map(|line| override_name(line))
+            .any(|existing| existing == name.as_str())
+    };
+    let mut plan = WorkspaceOwnedPlan::default();
+    for name in direct_pypi {
+        if excluded.contains(name)
+            || request_has_direct_root(req, name.as_str())
+            || has_explicit_override(name)
+        {
+            continue;
+        }
+        plan.providers
+            .insert(name.clone(), WorkspaceOwnedProvider::WorkspacePypi);
+    }
+
+    let mut eligible = BTreeMap::new();
+    for candidate in conda_candidates {
+        if plan.providers.contains_key(&candidate.pypi_name)
+            || excluded.contains(&candidate.pypi_name)
+            || request_has_direct_root(req, candidate.pypi_name.as_str())
+            || has_explicit_override(&candidate.pypi_name)
+            || !matches!(&candidate.provenance, Provenance::WorkspaceCondaFact(_))
+            || uv_pep508::uv_pep440::Version::from_str(&candidate.version).is_err()
+        {
+            continue;
+        }
+        eligible.insert(candidate.pypi_name.clone(), candidate);
+    }
+    if eligible.is_empty() {
+        return plan;
+    }
+
+    let routes: Vec<CondaRouteSpec> = eligible
+        .values()
+        .map(|candidate| CondaRouteSpec {
+            pypi_name: candidate.pypi_name.clone(),
+            conda_name: candidate.conda_name.clone(),
+            spec: format!("=={}", candidate.version),
+        })
+        .collect();
+    let Some(selection) = select_jointly_solvable_routes(Vec::new(), routes, co_solve).await else {
+        return plan;
+    };
+    for route in selection.accepted {
+        let Some(candidate) = eligible.remove(&route.pypi_name) else {
+            continue;
+        };
+        plan.providers.insert(
+            candidate.pypi_name,
+            WorkspaceOwnedProvider::WorkspaceConda {
+                conda_name: candidate.conda_name,
+                version: candidate.version,
+                provenance: candidate.provenance,
+            },
+        );
+    }
+    plan
+}
+
 /// Select the first fail-closed Rule-3 repair from attributed uv prose.
 /// Attribution is already joined to constraint provenance; this layer arms
 /// only for precise Rule-1 facts and only when the opposing upstream pin is
@@ -2714,8 +2942,10 @@ fn workspace_fact_override_needed(
     original_error: &str,
 ) -> Option<WorkspaceFactOverrideNeeded> {
     for attribution in attributions {
-        if attribution.conda_source.source != "workspace-solved"
-            || request_has_direct_root(req, &attribution.package)
+        if !matches!(
+            &attribution.conda_source.provenance,
+            Provenance::WorkspaceCondaFact(_)
+        ) || request_has_direct_root(req, &attribution.package)
         {
             continue;
         }
@@ -2753,84 +2983,8 @@ fn workspace_fact_override_needed(
             fact: WorkspaceFactOverride {
                 pypi_name: constraint_name,
                 version: fact_version.to_string(),
-                drop: false,
             },
             upstream_pin: required.to_string(),
-            original_error: original_error.to_string(),
-        });
-    }
-    None
-}
-
-/// Select the first Rule-1 DROP the failed lock authorizes: a transitive
-/// dependency the workspace conda-OWNS (through a precise workspace-solved
-/// fact, i.e. a retread-name-map edge whose conda target every consuming
-/// environment declares) whose PyPI requirement neither Pass A nor Pass B
-/// could satisfy. The conda owner provides the import at runtime, so the
-/// wheel-side requirement is removed graph-wide rather than erroring.
-///
-/// This is the Rule-1 complement of [`workspace_fact_override_needed`]: Rule 3
-/// fires when an upstream EXACT pin CONTRADICTS the fact (replace it with the
-/// conda version, which exists on PyPI); this fires when the conda version
-/// SATISFIES the upstream requirement but PyPI cannot supply it (e.g. conda
-/// `py-opencv==4.11.0` maps to PyPI `opencv-python`, whose versions are
-/// `4.11.0.86`-style -- `opencv-python==4.11.0` simply does not exist). It is
-/// invoked only after Rule 3 declines and after Pass B also fails, so an
-/// ordinary conflict, an sdist-only heal, or a version override always wins
-/// first.
-///
-/// Guards preserved: only a `workspace-solved` provenance (never a routing
-/// alias) is ownership authority; a first-party direct root is user intent and
-/// is never dropped; and a DIFFERING upstream requirement must actually be
-/// SATISFIED by the conda version, or this is a genuine version conflict that
-/// keeps erroring rather than a conda-owned drop.
-fn workspace_owned_drop_needed(
-    req: &UvClosureRequest,
-    attributions: &[ConflictAttribution],
-    original_error: &str,
-) -> Option<WorkspaceFactOverrideNeeded> {
-    for attribution in attributions {
-        // Only a precise workspace-solved conda fact is ownership authority.
-        if attribution.conda_source.source != "workspace-solved" {
-            continue;
-        }
-        // A first-party direct root is the user's explicit intent, not an
-        // upstream requirement -- never silently drop it.
-        if request_has_direct_root(req, &attribution.package) {
-            continue;
-        }
-        // The owning conda version (an exact `==` from the workspace solve).
-        let Some((_, conda_version)) = exact_pep440_pin(&attribution.conda_source.conda_version)
-        else {
-            continue;
-        };
-        // Relying on the conda package at runtime is only correct when the
-        // conda-selected version SATISFIES what the wheel required. `required
-        // == None` means uv's upstream pin equalled our conda-derived
-        // constraint (attribute_conflict elides the echo of our own line), so
-        // the conda version trivially satisfies it -- exactly the
-        // `opencv-python==4.11.0` shape. A differing range/pin must actually
-        // contain the conda version.
-        if let Some(required) = attribution.required.as_deref() {
-            let Ok(required_specs) =
-                uv_pep508::uv_pep440::VersionSpecifiers::from_str(required)
-            else {
-                continue;
-            };
-            if !required_specs.contains(&conda_version) {
-                continue;
-            }
-        }
-        return Some(WorkspaceFactOverrideNeeded {
-            fact: WorkspaceFactOverride {
-                pypi_name: canonical_conda_name(&attribution.package),
-                version: conda_version.to_string(),
-                drop: true,
-            },
-            upstream_pin: attribution
-                .required
-                .clone()
-                .unwrap_or_else(|| attribution.conflicting_constraint.clone()),
             original_error: original_error.to_string(),
         });
     }
@@ -2847,7 +3001,7 @@ pub fn attribute_conflict(
 ) -> Vec<ConflictAttribution> {
     let mut out = Vec::new();
     for (pypi_name, prov) in provenance {
-        if prov.advisory {
+        if authority(&prov.provenance) != Authority::Authoritative {
             continue;
         }
         // Word-boundary match on the normalized name.
@@ -2969,24 +3123,13 @@ where
                         if !inserted {
                             return Err(anyhow!(original_error));
                         }
-                        if needed.fact.drop {
-                            tracing::info!(
-                                bundle = %req.bundle,
-                                package = %name,
-                                upstream_requirement = %needed.upstream_pin,
-                                conda_version = %needed.fact.version,
-                                "uv closure: dropping workspace-conda-owned dependency whose PyPI \
-                                 requirement is unsatisfiable; the conda owner provides it",
-                            );
-                        } else {
-                            tracing::info!(
-                                bundle = %req.bundle,
-                                package = %name,
-                                upstream_pin = %needed.upstream_pin,
-                                conda_version = %needed.fact.version,
-                                "uv closure: replacing upstream exact pin with precise workspace conda fact",
-                            );
-                        }
+                        tracing::info!(
+                            bundle = %req.bundle,
+                            package = %name,
+                            upstream_pin = %needed.upstream_pin,
+                            conda_version = %needed.fact.version,
+                            "uv closure: replacing upstream exact pin with precise workspace conda fact",
+                        );
                         req.overrides.push(needed.fact.requirement());
                         attempt = {
                             let mut locked = solve.lock().unwrap();
@@ -3193,7 +3336,7 @@ impl HealFacts {
     }
 }
 
-const HEAL_FACTS_STAMP_SCHEMA: &str = "v2-sdist-route-version-domains";
+const HEAL_FACTS_STAMP_SCHEMA: &str = "v4-prelock-owned-provider";
 
 /// Hex sha256 over every input that decides whether persisted heal facts
 /// are still VALID to replay: the request's roots/constraints/overrides/
@@ -3235,6 +3378,15 @@ pub fn heal_facts_stamp(
     field("python", &mut std::iter::once(req.python_version.as_str()));
     field("subdir", &mut std::iter::once(req.conda_subdir.as_str()));
     field("deps", &mut req.dependencies.iter().map(String::as_str));
+    let dependency_provenance: Vec<String> = req
+        .dependency_provenance
+        .iter()
+        .map(|(name, provenance)| format!("{name}={provenance:?}"))
+        .collect();
+    field(
+        "dependency-provenance",
+        &mut dependency_provenance.iter().map(String::as_str),
+    );
     field(
         "constraints",
         &mut req.constraints.constraints.iter().map(String::as_str),
@@ -3243,6 +3395,30 @@ pub fn heal_facts_stamp(
     field(
         "no-emit",
         &mut req.no_emit_packages.iter().map(String::as_str),
+    );
+    let workspace_owned: Vec<String> = req
+        .workspace_owned
+        .providers
+        .iter()
+        .map(|(name, provider)| match provider {
+            WorkspaceOwnedProvider::WorkspacePypi => {
+                format!("{}=workspace-pypi", name.as_str())
+            }
+            WorkspaceOwnedProvider::WorkspaceConda {
+                conda_name,
+                version,
+                provenance,
+            } => format!(
+                "{}=workspace-conda:{}=={}:{provenance:?}",
+                name.as_str(),
+                conda_name.as_spec(),
+                version
+            ),
+        })
+        .collect();
+    field(
+        "prelock-owned",
+        &mut workspace_owned.iter().map(String::as_str),
     );
     field("indexes", &mut req.index_urls.iter().map(String::as_str));
     let policy = format!("{:?}|enabled={}", opts.route_policy, opts.enabled);
@@ -3259,14 +3435,10 @@ pub fn heal_facts_stamp(
     let name_map: Vec<String> = opts
         .name_map
         .iter()
-        .map(|(k, v)| format!("{k}={v}"))
+        .map(|(k, v)| format!("{}={v}", k.as_str()))
         .collect();
     field("name-map", &mut name_map.iter().map(String::as_str));
     field("protected", &mut opts.protected.iter().map(String::as_str));
-    field(
-        "workspace-owned",
-        &mut opts.workspace_owned.iter().map(String::as_str),
-    );
     field(
         "workspace-facts",
         &mut std::iter::once(opts.workspace_fact_fingerprint.as_str()),
@@ -3430,6 +3602,124 @@ impl LockRelaxations {
     }
 }
 
+const WORKSPACE_PROVIDER_DIR: &str = ".retread-workspace-providers";
+
+fn write_workspace_provider_wheel(
+    provider_dir: &Path,
+    pypi_name: &PypiKey,
+    version: &str,
+) -> Result<()> {
+    use std::io::Write;
+
+    let wheel_dist = pypi_name.as_str().replace('-', "_");
+    let wheel_version = version.replace('-', "_");
+    let filename = format!("{wheel_dist}-{wheel_version}-py3-none-any.whl");
+    let destination = provider_dir.join(&filename);
+    if destination.is_file() {
+        return Ok(());
+    }
+    static TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let temporary = provider_dir.join(format!(
+        ".{filename}.{}.{}.tmp",
+        std::process::id(),
+        TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+    ));
+    let result = (|| -> Result<()> {
+        let dist_info = format!("{wheel_dist}-{wheel_version}.dist-info");
+        let metadata_path = format!("{dist_info}/METADATA");
+        let wheel_path = format!("{dist_info}/WHEEL");
+        let record_path = format!("{dist_info}/RECORD");
+        let metadata = format!(
+            "Metadata-Version: 2.3\nName: {}\nVersion: {version}\n\n",
+            pypi_name.as_str()
+        );
+        let wheel = "Wheel-Version: 1.0\nGenerator: pixi-build-retread\n\
+                     Root-Is-Purelib: true\nTag: py3-none-any\n";
+        let record = format!(
+            "{metadata_path},sha256={},{}\n\
+             {wheel_path},sha256={},{}\n\
+             {record_path},,\n",
+            crate::wheel_inject::sha256_base64_urlsafe_nopad(metadata.as_bytes()),
+            metadata.len(),
+            crate::wheel_inject::sha256_base64_urlsafe_nopad(wheel.as_bytes()),
+            wheel.len(),
+        );
+        let file = std::fs::File::create(&temporary)
+            .with_context(|| format!("creating workspace provider wheel `{filename}`"))?;
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored)
+            .last_modified_time(zip::DateTime::default());
+        zip.start_file(metadata_path, options)?;
+        zip.write_all(metadata.as_bytes())?;
+        zip.start_file(wheel_path, options)?;
+        zip.write_all(wheel.as_bytes())?;
+        zip.start_file(record_path, options)?;
+        zip.write_all(record.as_bytes())?;
+        let file = zip.finish()?;
+        file.sync_all()?;
+        if destination.is_file() {
+            std::fs::remove_file(&temporary)?;
+        } else {
+            std::fs::rename(&temporary, &destination).with_context(|| {
+                format!("publishing workspace provider wheel `{filename}` atomically")
+            })?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+/// Materialize deterministic minimal wheels for the exact conda-selected
+/// versions in the pre-lock ownership plan. They are resolver inputs only;
+/// `--no-emit-package` keeps them out of the exported wheel closure.
+fn materialize_workspace_owned_providers(
+    req: &UvClosureRequest,
+    project_dir: &Path,
+) -> Result<Option<PathBuf>> {
+    use sha2::{Digest, Sha256};
+
+    let providers: Vec<(&PypiKey, String)> = req
+        .workspace_owned
+        .conda_providers()
+        .map(|(pypi_name, _conda_name, version, _provenance)| {
+            uv_pep508::uv_pep440::Version::from_str(version)
+                .map(|version| (pypi_name, version.to_string()))
+                .with_context(|| {
+                    format!(
+                        "parsing workspace-owned provider version `{version}` for `{}`",
+                        pypi_name.as_str()
+                    )
+                })
+        })
+        .collect::<Result<_>>()?;
+    if providers.is_empty() {
+        return Ok(None);
+    }
+    let mut digest = Sha256::new();
+    for (pypi_name, version) in &providers {
+        digest.update(pypi_name.as_str().as_bytes());
+        digest.update([0]);
+        digest.update(version.as_bytes());
+        digest.update([0xff]);
+    }
+    // A plan-addressed directory is immutable once published. Concurrent
+    // backend processes can resolve the same project without one deleting
+    // another process's active --find-links input.
+    let provider_dir = project_dir
+        .join(WORKSPACE_PROVIDER_DIR)
+        .join(format!("{:x}", digest.finalize()));
+    std::fs::create_dir_all(&provider_dir)
+        .with_context(|| format!("creating workspace provider dir {}", provider_dir.display()))?;
+    for (pypi_name, version) in providers {
+        write_workspace_provider_wheel(&provider_dir, pypi_name, &version)?;
+    }
+    Ok(Some(provider_dir))
+}
+
 /// Assemble the `uv lock` argument vector. COMMON args are single-sourced
 /// here; only the [`LockRelaxations`]-controlled bits (`--no-build`
 /// presence and the `--prerelease` value) vary between Pass A and Pass B.
@@ -3446,6 +3736,7 @@ fn build_lock_args(
     project_dir: &Path,
     python_version: &str,
     index_urls: &[String],
+    workspace_provider_dir: Option<&Path>,
     offline: bool,
     relax: LockRelaxations,
 ) -> Vec<String> {
@@ -3472,6 +3763,10 @@ fn build_lock_args(
     for url in index_urls {
         args.push("--index".into());
         args.push(url.clone());
+    }
+    if let Some(provider_dir) = workspace_provider_dir {
+        args.push("--find-links".into());
+        args.push(provider_dir.to_string_lossy().into_owned());
     }
     if offline {
         args.push("--offline".into());
@@ -3511,6 +3806,44 @@ fn build_export_args(
     args
 }
 
+fn workspace_owned_drops_from_lock(
+    req: &UvClosureRequest,
+    uv_lock: &str,
+) -> Result<BTreeSet<String>> {
+    let mut dropped = req.workspace_owned.dropped_without_uv();
+    if req.workspace_owned.conda_providers().next().is_none() {
+        return Ok(dropped);
+    }
+    let document: toml::Value =
+        toml::from_str(uv_lock).context("parsing uv.lock for workspace-owned providers")?;
+    let selected: BTreeSet<(String, uv_pep508::uv_pep440::Version)> = document
+        .get("package")
+        .and_then(toml::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|package| {
+            let version =
+                uv_pep508::uv_pep440::Version::from_str(package.get("version")?.as_str()?).ok()?;
+            Some((
+                canonical_conda_name(package.get("name")?.as_str()?),
+                version,
+            ))
+        })
+        .collect();
+    for (name, _conda_name, version, _provenance) in req.workspace_owned.conda_providers() {
+        let version = uv_pep508::uv_pep440::Version::from_str(version).with_context(|| {
+            format!(
+                "parsing workspace-owned provider version `{version}` for `{}`",
+                name.as_str()
+            )
+        })?;
+        if selected.contains(&(name.as_str().to_string(), version)) {
+            dropped.insert(name.as_str().to_string());
+        }
+    }
+    Ok(dropped)
+}
+
 /// Compute the closure for `req` under `project_dir` (created if absent):
 /// write the synthesized project, run `uv lock` + `uv export`, parse the
 /// pylock. `recorded_uv_version` (when Some, e.g. from a committed lock)
@@ -3547,13 +3880,16 @@ pub async fn compute_closure(
     tokio::fs::create_dir_all(uv_cache_dir)
         .await
         .with_context(|| format!("creating uv cache dir {}", uv_cache_dir.display()))?;
+    let workspace_provider_dir = materialize_workspace_owned_providers(req, project_dir)?;
+    let resolved_constraints = effective_constraints(req);
+    let no_emit_packages = effective_no_emit(req);
     let pyproject_text = synthesize_pyproject(req);
     tokio::fs::write(project_dir.join("pyproject.toml"), &pyproject_text)
         .await
         .context("writing synthesized pyproject.toml")?;
     tokio::fs::write(
         project_dir.join(PROVENANCE_FILE),
-        provenance_json(&req.constraints)?,
+        provenance_json(&resolved_constraints)?,
     )
     .await
     .context("writing constraints.provenance.json")?;
@@ -3582,6 +3918,7 @@ pub async fn compute_closure(
         project_dir,
         &req.python_version,
         &req.index_urls,
+        workspace_provider_dir.as_deref(),
         req.offline,
         LockRelaxations::PASS_A,
     );
@@ -3604,7 +3941,7 @@ pub async fn compute_closure(
     // the first solve) make Pass A carry the same pins the meta was written
     // for, so the fingerprint matches and this guard KEEPS the lock -> uv
     // fast-relocks instead of re-resolving.
-    let export_args = build_export_args(project_dir, &req.no_emit_packages, req.offline);
+    let export_args = build_export_args(project_dir, &no_emit_packages, req.offline);
     let fingerprint =
         closure_inputs_fingerprint(&pyproject_text, &lock_args, &export_args, &uv_version);
     let lock_file = project_dir.join("uv.lock");
@@ -3628,24 +3965,45 @@ pub async fn compute_closure(
     if fingerprint_matches && lock_file.exists() && pylock_file.exists() {
         match tokio::fs::read_to_string(&pylock_file).await {
             Ok(pylock) => {
-                let exclude: BTreeSet<String> = req
-                    .no_emit_packages
+                let exclude: BTreeSet<String> = no_emit_packages
                     .iter()
                     .map(|n| canonical_conda_name(n))
                     .collect();
                 let target = WheelTarget::for_subdir(&req.python_version, &req.conda_subdir);
                 match parse_pylock_closure(&pylock, &target, &exclude, &uv_version) {
-                    Ok(mut closure) => {
-                        attach_effective_input_requirements(&mut closure, req)?;
-                        tracing::info!(
-                            bundle = %req.bundle,
-                            wheels = closure.wheels.len(),
-                            pins = closure.pins.len(),
-                            "uv closure: inputs unchanged; reusing exported pylock \
-                             (no uv invocation)",
-                        );
-                        return Ok(closure);
-                    }
+                    Ok(mut closure) => match tokio::fs::read_to_string(&lock_file).await {
+                        Ok(uv_lock) => match workspace_owned_drops_from_lock(req, &uv_lock) {
+                            Ok(owned_drops) => {
+                                closure.auto_dropped.extend(owned_drops);
+                                attach_effective_input_requirements(&mut closure, req)?;
+                                tracing::info!(
+                                    bundle = %req.bundle,
+                                    wheels = closure.wheels.len(),
+                                    pins = closure.pins.len(),
+                                    "uv closure: inputs unchanged; reusing exported pylock \
+                                     (no uv invocation)",
+                                );
+                                return Ok(closure);
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    bundle = %req.bundle,
+                                    error = %format!("{error:#}"),
+                                    "uv closure: cached uv.lock unusable for workspace providers; \
+                                     re-resolving",
+                                );
+                                let _ = std::fs::remove_file(&lock_file);
+                            }
+                        },
+                        Err(error) => {
+                            tracing::warn!(
+                                bundle = %req.bundle,
+                                error = %error,
+                                "uv closure: cached uv.lock unreadable; re-resolving",
+                            );
+                            let _ = std::fs::remove_file(&lock_file);
+                        }
+                    },
                     Err(e) => {
                         tracing::warn!(
                             bundle = %req.bundle,
@@ -3677,7 +4035,7 @@ pub async fn compute_closure(
     let lock_out = run(lock_args).await?;
     if !lock_out.status.success() {
         let stderr = String::from_utf8_lossy(&lock_out.stderr).into_owned();
-        let attributions = attribute_conflict(&stderr, &req.constraints.provenance);
+        let attributions = attribute_conflict(&stderr, &resolved_constraints.provenance);
         // Machine-readable record next to the project (spec §4a).
         let record = serde_json::json!({
             "bundle": req.bundle,
@@ -3721,6 +4079,7 @@ pub async fn compute_closure(
             project_dir,
             &req.python_version,
             &req.index_urls,
+            workspace_provider_dir.as_deref(),
             req.offline,
             LockRelaxations::pass_b_for(sdist_build_policy),
         );
@@ -3732,22 +4091,11 @@ pub async fn compute_closure(
             // conflict keeps the historical behavior.
             let pass_b_stderr = String::from_utf8_lossy(&pass_b_out.stderr).into_owned();
             let pass_b_attributions =
-                attribute_conflict(&pass_b_stderr, &req.constraints.provenance);
+                attribute_conflict(&pass_b_stderr, &resolved_constraints.provenance);
             let pass_b_error = format_lock_failure(req, &pass_b_stderr, &pass_b_attributions);
             if let Some(needed) =
                 workspace_fact_override_needed(req, &pass_b_attributions, &pass_b_error)
             {
-                return Err(anyhow::Error::new(needed));
-            }
-            // Rule 1 (last resort, both passes failed): a transitive dependency
-            // the workspace conda-OWNS whose PyPI requirement neither pass could
-            // satisfy (e.g. an exact `Requires-Dist` pin on a version that only
-            // exists in conda's numbering, `opencv-python==4.11.0` -> conda
-            // `py-opencv`). Drop it graph-wide so the closure succeeds and the
-            // conda owner supplies the import. Uses Pass A's attributions/error
-            // -- the surfaced diagnostic's provenance. Declines to the ordinary
-            // error for any non-owned or genuinely-conflicting name.
-            if let Some(needed) = workspace_owned_drop_needed(req, &attributions, &original_error) {
                 return Err(anyhow::Error::new(needed));
             }
             bail!("{original_error}");
@@ -3757,7 +4105,7 @@ pub async fn compute_closure(
         // STRUCTURALLY from the pylock document (no stderr prose parsing).
         let pass_b_export = run(build_export_args(
             project_dir,
-            &req.no_emit_packages,
+            &no_emit_packages,
             req.offline,
         ))
         .await?;
@@ -3797,13 +4145,18 @@ pub async fn compute_closure(
         .await
         .context("reading exported pylock.retread.toml")?;
     // Belt-and-braces authoritative post-filter (AMENDMENT A1).
-    let exclude: BTreeSet<String> = req
-        .no_emit_packages
+    let exclude: BTreeSet<String> = no_emit_packages
         .iter()
         .map(|n| canonical_conda_name(n))
         .collect();
     let target = WheelTarget::for_subdir(&req.python_version, &req.conda_subdir);
     let mut closure = parse_pylock_closure(&pylock, &target, &exclude, &uv_version)?;
+    let uv_lock = tokio::fs::read_to_string(&lock_file)
+        .await
+        .context("reading uv.lock for workspace-owned providers")?;
+    closure
+        .auto_dropped
+        .extend(workspace_owned_drops_from_lock(req, &uv_lock)?);
     attach_effective_input_requirements(&mut closure, req)?;
 
     let _ = std::fs::write(
@@ -3840,13 +4193,24 @@ mod tests {
         }
     }
 
+    fn mapped_name_map(entries: &[(&str, &str)]) -> NameMap {
+        entries
+            .iter()
+            .map(|(pypi, conda)| {
+                (
+                    PypiKey::from_pypi(pypi),
+                    CondaTarget::Mapped(CondaName::new(*conda)),
+                )
+            })
+            .collect()
+    }
+
     fn sample_request() -> UvClosureRequest {
         let mut conda_deps = BTreeMap::new();
         conda_deps.insert("pytorch-gpu".to_string(), "==2.10.0".to_string());
         conda_deps.insert("numpy".to_string(), ">=1.26,<3".to_string());
         conda_deps.insert("python".to_string(), "3.12.*".to_string());
-        let mut name_map = BTreeMap::new();
-        name_map.insert("torch".to_string(), "pytorch-gpu".to_string());
+        let name_map = mapped_name_map(&[("torch", "pytorch-gpu")]);
         let constraints = build_constraints(
             &conda_deps,
             &name_map,
@@ -3867,6 +4231,7 @@ mod tests {
                 "isaacsim[all,extscache]==5.1.0".to_string(),
                 "mujoco==3.5.0".to_string(),
             ],
+            dependency_provenance: BTreeMap::new(),
             constraints,
             overrides: vec![
                 "protobuf>=4".to_string(),
@@ -3879,6 +4244,7 @@ mod tests {
             ],
             built_wheel_sources: built,
             explicit_pins: BTreeMap::new(),
+            workspace_owned: WorkspaceOwnedPlan::default(),
             offline: false,
         }
     }
@@ -3948,12 +4314,14 @@ isaaclab = { path = "wheels/isaaclab/isaaclab-2.0.0-py3-none-any.whl" }
             conda_subdir: "linux-64".to_string(),
             // Bare first-party requirement (the path source binds by name).
             dependencies: vec!["isaacsim-extscache-kit".to_string()],
+            dependency_provenance: BTreeMap::new(),
             constraints: ConstraintSet::default(),
             overrides: vec![],
             no_emit_packages: vec![],
             index_urls: vec!["https://pypi.nvidia.com".to_string()],
             built_wheel_sources: built,
             explicit_pins: BTreeMap::new(),
+            workspace_owned: WorkspaceOwnedPlan::default(),
             offline: false,
         };
         let got = synthesize_pyproject(&req);
@@ -4191,9 +4559,10 @@ isaaclab = { path = "wheels/isaaclab/isaaclab-2.0.0-py3-none-any.whl" }
         conda_deps.insert("__glibc".into(), ">=2.28".into()); // skipped
         conda_deps.insert("scipy".into(), "*".into()); // unrepresentable spec
 
-        let mut name_map = BTreeMap::new();
-        name_map.insert("torch".into(), "pytorch-gpu".into());
-        name_map.insert("opencv-python-headless".into(), "py-opencv".into());
+        let name_map = mapped_name_map(&[
+            ("torch", "pytorch-gpu"),
+            ("opencv-python-headless", "py-opencv"),
+        ]);
 
         let set = build_constraints(
             &conda_deps,
@@ -4215,6 +4584,7 @@ isaaclab = { path = "wheels/isaaclab/isaaclab-2.0.0-py3-none-any.whl" }
         assert_eq!(torch.conda_version, "==2.10.0");
         assert_eq!(torch.source, "manifest");
         assert_eq!(torch.env, "default");
+        assert_eq!(torch.provenance, Provenance::UvConstraint);
         // conda name with no mapping would fall back to identity; the
         // skipped ones must not appear at all.
         assert!(!set.provenance.contains_key("python"));
@@ -4224,6 +4594,135 @@ isaaclab = { path = "wheels/isaaclab/isaaclab-2.0.0-py3-none-any.whl" }
         let json = provenance_json(&set).unwrap();
         assert!(json.contains("\"conda_name\": \"pytorch-gpu\""));
         assert!(json.contains("\"conda_version\": \"==2.10.0\""));
+    }
+
+    #[test]
+    fn deps_from_floor_is_advisory_after_effective_input_bridge() {
+        let mut req = sample_request();
+        req.dependencies.push("setuptools==69.5.1".to_string());
+        req.dependency_provenance
+            .insert("setuptools".to_string(), Provenance::DepsFromRelaxed);
+        let line = "starlette>=0.49.1".to_string();
+        req.constraints.constraints.push(line.clone());
+        req.constraints.provenance.insert(
+            "starlette".to_string(),
+            ConstraintProvenance {
+                constraint: line,
+                conda_name: "starlette".to_string(),
+                conda_version: ">=0.49.1".to_string(),
+                source: "deps-from-conda-advisory".to_string(),
+                env: "default".to_string(),
+                provenance: Provenance::DepsFromRelaxed,
+            },
+        );
+
+        let effective = effective_auto_route_input_requirements(&req).unwrap();
+        assert!(
+            effective["mujoco"]
+                .iter()
+                .any(|input| input.provenance == Provenance::UvRoot)
+        );
+        assert!(
+            effective["torch"]
+                .iter()
+                .any(|input| input.provenance == Provenance::UvConstraint)
+        );
+        assert!(
+            effective["starlette"]
+                .iter()
+                .any(|input| input.provenance == Provenance::DepsFromRelaxed)
+        );
+        let deps_from_root = effective["setuptools"]
+            .iter()
+            .find(|input| input.provenance == Provenance::DepsFromRelaxed)
+            .expect("exact deps-from root must retain typed provenance");
+        assert_eq!(
+            deps_from_root.specifiers, ">=69.5.1",
+            "the exact uv selection input must cross the typed boundary as an advisory floor"
+        );
+        assert!(
+            effective["protobuf"]
+                .iter()
+                .any(|input| input.provenance == Provenance::UvOverride)
+        );
+
+        let routed = effective["starlette"]
+            .iter()
+            .find(|input| input.provenance == Provenance::DepsFromRelaxed)
+            .expect("deps-from requirement must survive the routing bridge");
+        let constraints = vec![
+            crate::constraint::Constraint {
+                specifiers: routed.specifiers.parse().unwrap(),
+                provenance: routed.effective_provenance(),
+                source: routed.source.clone(),
+            },
+            crate::constraint::Constraint {
+                specifiers: ">=0.40,<0.46".parse().unwrap(),
+                provenance: Provenance::IndexWheelMetadata,
+                source: "index wheel `fastapi` Requires-Dist".to_string(),
+            },
+        ];
+        let finalized = crate::constraint::finalize(&PypiKey::from_pypi("starlette"), &constraints)
+            .expect("deps-from floor must yield after crossing the routing bridge");
+        assert!(finalized.contains(&"0.45.3".parse().unwrap()));
+        assert!(!finalized.contains(&"0.49.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn legacy_auto_route_input_roles_bridge_missing_provenance() {
+        let legacy_constraint: AutoRouteInputRequirement =
+            serde_json::from_str(r#"{"specifiers":">=1","source":"legacy","role":"constraint"}"#)
+                .unwrap();
+        assert_eq!(legacy_constraint.provenance, Provenance::IndexWheelMetadata);
+        assert_eq!(
+            legacy_constraint.effective_provenance(),
+            Provenance::UvConstraint
+        );
+
+        let legacy_override: AutoRouteInputRequirement =
+            serde_json::from_str(r#"{"specifiers":"==2","source":"legacy","role":"override"}"#)
+                .unwrap();
+        assert_eq!(
+            legacy_override.effective_provenance(),
+            Provenance::UvOverride
+        );
+
+        let explicit_advisory = AutoRouteInputRequirement {
+            specifiers: ">=3".to_string(),
+            source: "typed".to_string(),
+            provenance: Provenance::DepsFromRelaxed,
+            role: AutoRouteInputRole::Constraint,
+        };
+        assert_eq!(
+            explicit_advisory.effective_provenance(),
+            Provenance::DepsFromRelaxed,
+            "an explicit typed provenance must not be reclassified from its legacy role"
+        );
+    }
+
+    #[test]
+    fn legacy_constraint_provenance_defaults_to_index_metadata() {
+        let raw = r#"{
+            "constraint":"torch==2.10.0",
+            "conda_name":"pytorch-gpu",
+            "conda_version":"==2.10.0",
+            "source":"manifest",
+            "env":"default"
+        }"#;
+        let legacy: ConstraintProvenance = serde_json::from_str(raw).unwrap();
+        assert_eq!(legacy.provenance, Provenance::IndexWheelMetadata);
+
+        let raw_set = format!(
+            r#"{{
+                "constraints":["torch==2.10.0"],
+                "provenance":{{"torch":{raw}}}
+            }}"#
+        );
+        let legacy_set: ConstraintSet = serde_json::from_str(&raw_set).unwrap();
+        assert_eq!(
+            legacy_set.provenance["torch"].provenance,
+            Provenance::IndexWheelMetadata
+        );
     }
 
     /// Run-38 fix: a pack with NO `retread-name-map` of its own must
@@ -4253,8 +4752,7 @@ isaaclab = { path = "wheels/isaaclab/isaaclab-2.0.0-py3-none-any.whl" }
         assert_eq!(set.provenance["torch"].conda_name, "pytorch-gpu");
 
         // The pack's own name map still wins over the global one.
-        let mut pack_map = BTreeMap::new();
-        pack_map.insert("my-torch".to_string(), "pytorch-gpu".to_string());
+        let pack_map = mapped_name_map(&[("my-torch", "pytorch-gpu")]);
         let set2 = build_constraints(
             &conda_deps,
             &pack_map,
@@ -4306,8 +4804,7 @@ isaaclab = { path = "wheels/isaaclab/isaaclab-2.0.0-py3-none-any.whl" }
         // (a) conda pin -> uv constraint with provenance.
         let mut conda_deps = BTreeMap::new();
         conda_deps.insert("pytorch-gpu".into(), "==2.10.0".into());
-        let mut name_map = BTreeMap::new();
-        name_map.insert("torch".into(), "pytorch-gpu".into());
+        let name_map = mapped_name_map(&[("torch", "pytorch-gpu")]);
         let set = build_constraints(
             &conda_deps,
             &name_map,
@@ -4614,11 +5111,43 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
         );
     }
 
+    #[test]
+    fn attribute_conflict_ignores_non_authoritative_provenance() {
+        let make = |provenance| {
+            BTreeMap::from([(
+                "starlette".to_string(),
+                ConstraintProvenance {
+                    constraint: "starlette>=0.49.1".to_string(),
+                    conda_name: "starlette".to_string(),
+                    conda_version: ">=0.49.1".to_string(),
+                    source: "typed test".to_string(),
+                    env: "default".to_string(),
+                    provenance,
+                },
+            )])
+        };
+        let stderr = "fastapi requires starlette<0.46 but starlette>=0.49.1 was requested";
+        assert!(
+            attribute_conflict(stderr, &make(Provenance::DepsFromRelaxed)).is_empty(),
+            "an advisory deps-from floor must not authorize a workspace repair"
+        );
+        assert!(
+            attribute_conflict(stderr, &make(Provenance::PriorSelection)).is_empty(),
+            "a prior selection is only a preference"
+        );
+        assert_eq!(
+            attribute_conflict(stderr, &make(Provenance::UvConstraint)).len(),
+            1,
+            "an authoritative uv constraint remains attributable"
+        );
+    }
+
     fn workspace_attribution(
         package: &str,
         required: Option<&str>,
         fact_version: &str,
         source: &str,
+        provenance: Provenance,
     ) -> ConflictAttribution {
         ConflictAttribution {
             package: package.to_string(),
@@ -4630,7 +5159,7 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
                 conda_version: format!("=={fact_version}"),
                 source: source.to_string(),
                 env: "precise-consuming-envs".to_string(),
-                advisory: false,
+                provenance,
             },
         }
     }
@@ -4639,8 +5168,13 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
     fn workspace_fact_exact_conflict_requests_graph_wide_override() {
         let mut req = sample_request();
         req.dependencies = vec!["isaacsim-core==6.0.0.1".to_string()];
-        let attribution =
-            workspace_attribution("torch", Some("==2.11.0"), "2.10.0", "workspace-solved");
+        let attribution = workspace_attribution(
+            "torch",
+            Some("==2.11.0"),
+            "2.10.0",
+            "workspace-solved",
+            Provenance::WorkspaceCondaFact("precise-consuming-envs".to_string()),
+        );
         req.constraints = ConstraintSet {
             constraints: vec![attribution.conflicting_constraint.clone()],
             provenance: BTreeMap::from([("torch".to_string(), attribution.conda_source.clone())]),
@@ -4657,7 +5191,6 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
             WorkspaceFactOverride {
                 pypi_name: "torch".to_string(),
                 version: "2.10.0".to_string(),
-                drop: false,
             }
         );
         assert_eq!(needed.upstream_pin, "==2.11.0");
@@ -4683,7 +5216,13 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
             assert!(
                 classify(
                     &req,
-                    workspace_attribution("torch", required, "2.10.0", "workspace-solved")
+                    workspace_attribution(
+                        "torch",
+                        required,
+                        "2.10.0",
+                        "workspace-solved",
+                        Provenance::WorkspaceCondaFact("precise-consuming-envs".to_string()),
+                    )
                 )
                 .is_none(),
                 "classifier must abstain for {required:?}"
@@ -4699,249 +5238,344 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
                     "torch",
                     Some("==2.10.0"),
                     "2.10.0+cu129",
-                    "workspace-solved"
+                    "workspace-solved",
+                    Provenance::WorkspaceCondaFact("precise-consuming-envs".to_string()),
                 )
             )
             .is_none()
         );
-        for source in ["manifest", "cuda-major-table", "auto-route"] {
+        for (source, provenance) in [
+            ("manifest", Provenance::UvConstraint),
+            ("cuda-major-table", Provenance::UvConstraint),
+            ("auto-route", Provenance::PriorSelection),
+        ] {
             assert!(
                 classify(
                     &req,
-                    workspace_attribution("torch", Some("==2.11.0"), "2.10.0", source)
+                    workspace_attribution("torch", Some("==2.11.0"), "2.10.0", source, provenance,)
                 )
                 .is_none(),
                 "non-Rule-1 source {source} must not authorize an override"
             );
         }
+        assert!(
+            classify(
+                &req,
+                workspace_attribution(
+                    "torch",
+                    Some("==2.11.0"),
+                    "2.10.0",
+                    "workspace-solved",
+                    Provenance::UvConstraint,
+                )
+            )
+            .is_none(),
+            "a legacy source label must not substitute for typed workspace provenance"
+        );
 
         let mut direct_root = req;
         direct_root.dependencies.push("torch==2.11.0".to_string());
         assert!(
             classify(
                 &direct_root,
-                workspace_attribution("torch", Some("==2.11.0"), "2.10.0", "workspace-solved")
+                workspace_attribution(
+                    "torch",
+                    Some("==2.11.0"),
+                    "2.10.0",
+                    "workspace-solved",
+                    Provenance::WorkspaceCondaFact("precise-consuming-envs".to_string()),
+                )
             )
             .is_none(),
             "an explicit direct root pin is user intent, not an upstream pin"
         );
     }
 
-    // ---- Rule 1: conda-owned drop on an unsatisfiable PyPI requirement -----
+    // ---- Rule 1: one structured pre-lock workspace-owned plan -------------
 
-    /// A `workspace-solved` attribution whose conda owner (`conda_name`) may
-    /// differ from the PyPI name -- the retread-name-map case.
-    fn conda_owned_attribution(
-        package: &str,
+    fn workspace_conda_provider(
+        pypi_name: &str,
         conda_name: &str,
-        required: Option<&str>,
-        fact_version: &str,
-    ) -> ConflictAttribution {
-        ConflictAttribution {
-            package: package.to_string(),
-            required: required.map(str::to_string),
-            conflicting_constraint: format!("{package}=={fact_version}"),
-            conda_source: ConstraintProvenance {
-                constraint: format!("{package}=={fact_version}"),
-                conda_name: conda_name.to_string(),
-                conda_version: format!("=={fact_version}"),
-                source: "workspace-solved".to_string(),
-                env: "precise-consuming-envs".to_string(),
-                advisory: false,
-            },
+        version: &str,
+        provenance: Provenance,
+    ) -> WorkspaceCondaProvider {
+        WorkspaceCondaProvider {
+            pypi_name: PypiKey::from_pypi(pypi_name),
+            conda_name: CondaName::new(conda_name),
+            version: version.to_string(),
+            provenance,
         }
     }
 
-    /// The exact `sage` regression: a TRANSITIVE wheel (`isaacsim-core`) pins
-    /// `opencv-python==4.11.0`, a version that does not exist on PyPI (its
-    /// releases are `4.11.0.86`-style). The workspace conda-OWNS it through the
-    /// retread-name-map edge `opencv-python -> py-opencv`. Rule 3 cannot fire
-    /// (the upstream pin equals the conda-derived constraint, so `required` is
-    /// None), so Rule 1 must drop it -- graph-wide, reaching the transitive
-    /// `Requires-Dist` pin, not just a direct root.
-    #[test]
-    fn workspace_owned_impossible_transitive_pin_requests_drop() {
-        let mut req = sample_request();
-        req.dependencies = vec!["isaacsim-core==4.2.0.2".to_string()];
-        let prov = ConstraintProvenance {
-            constraint: "opencv-python==4.11.0".to_string(),
-            conda_name: "py-opencv".to_string(),
-            conda_version: "==4.11.0".to_string(),
-            source: "workspace-solved".to_string(),
-            env: "precise-consuming-envs".to_string(),
-            advisory: false,
-        };
-        req.constraints = ConstraintSet {
-            constraints: vec!["opencv-python==4.11.0".to_string()],
-            provenance: BTreeMap::from([("opencv-python".to_string(), prov)]),
-            auto_route_constraint_indices: BTreeSet::new(),
-        };
-        let stderr = "  x No solution found when resolving dependencies:\n  \
-             `-> Because there is no version of opencv-python==4.11.0 and \
-                 isaacsim-core==4.2.0.2 depends on opencv-python==4.11.0, we can \
-                 conclude that isaacsim-core==4.2.0.2 cannot be used.";
-        let attributions = attribute_conflict(stderr, &req.constraints.provenance);
-        // Faithful to the surfaced diagnostic ("is named in the conflict"):
-        // no differing upstream spec, so `required` is None.
-        assert_eq!(attributions.len(), 1, "{attributions:?}");
-        assert_eq!(attributions[0].required, None);
-        // Rule 3 correctly declines: there is no exact-pin CONTRADICTION.
-        assert!(
-            workspace_fact_override_needed(&req, &attributions, "err").is_none(),
-            "no contradiction, so Rule 3 must not fire"
-        );
-
-        let needed = workspace_owned_drop_needed(&req, &attributions, "uv lock failed")
-            .expect("conda-owned opencv-python with an impossible PyPI pin must request a drop");
-        assert_eq!(
-            needed.fact,
-            WorkspaceFactOverride {
-                pypi_name: "opencv-python".to_string(),
-                version: "4.11.0".to_string(),
-                drop: true,
-            }
-        );
-        // The emitted uv requirement removes it from the graph entirely.
-        assert_eq!(
-            needed.fact.requirement(),
-            format!("opencv-python ; {DROP_MARKER}")
-        );
-    }
-
-    /// The drop bridges the name-map for the DIRECT-name shape too, but a
-    /// first-party direct ROOT is the user's explicit intent and is never
-    /// dropped out from under them.
-    #[test]
-    fn workspace_owned_drop_declines_for_first_party_direct_root() {
-        let mut req = sample_request();
-        req.dependencies = vec!["opencv-python==4.11.0".to_string()];
-        let attribution = conda_owned_attribution("opencv-python", "py-opencv", None, "4.11.0");
-        assert!(
-            workspace_owned_drop_needed(&req, &[attribution], "err").is_none(),
-            "a first-party direct root is user intent, never a conda-owned drop"
-        );
-    }
-
-    /// A dep that is NOT conda-owned (no workspace-solved fact) with an
-    /// impossible pin still errors clearly -- the drop path must not fire and
-    /// the diagnostic is preserved.
-    #[test]
-    fn workspace_owned_drop_declines_without_ownership_authority() {
-        let mut req = sample_request();
-        req.dependencies = vec!["isaacsim-core==4.2.0.2".to_string()];
-        // A non-`workspace-solved` provenance is a routing alias, not fact
-        // authority, and cannot authorize a drop.
-        for source in ["manifest", "cuda-major-table", "auto-route", "deps-from-conda-advisory"] {
-            let attribution = workspace_attribution("opencv-python", None, "4.11.0", source);
-            assert!(
-                workspace_owned_drop_needed(&req, &[attribution], "err").is_none(),
-                "source `{source}` is not conda-ownership authority"
-            );
-        }
-        // A name uv mentions that is in NO provenance table yields no
-        // attribution at all -> the clear PyPI-unsatisfiable error survives.
-        let stderr = "  x No solution found: there is no version of totally-unowned==9.9.9";
-        let attributions = attribute_conflict(stderr, &req.constraints.provenance);
-        assert!(attributions.is_empty(), "{attributions:?}");
-        assert!(workspace_owned_drop_needed(&req, &attributions, "err").is_none());
-    }
-
-    /// The co-solvability guard is preserved: a DIFFERING upstream requirement
-    /// the conda owner's version does NOT satisfy is a genuine version conflict
-    /// (installing the conda version would violate the wheel), so Rule 1
-    /// abstains. A differing requirement the conda version DOES satisfy is a
-    /// legitimate conda-owned drop (PyPI can't supply it, conda can).
-    #[test]
-    fn workspace_owned_drop_respects_upstream_satisfiability() {
-        let mut req = sample_request();
-        req.dependencies = vec!["isaacsim-core==4.2.0.2".to_string()];
-
-        // conda `pytorch-gpu==2.10.0` (-> PyPI `torch`) cannot satisfy an
-        // upstream `>=2.11` requirement: dropping would install a forbidden
-        // version, so abstain (leave it to error / a real reconciliation).
-        let conflicting = conda_owned_attribution("torch", "pytorch-gpu", Some(">=2.11"), "2.10.0");
-        assert!(
-            workspace_owned_drop_needed(&req, &[conflicting], "err").is_none(),
-            "a conda version that violates the upstream range is a real conflict"
-        );
-
-        // A `>=2.0` requirement IS satisfied by the conda version 2.10.0: PyPI
-        // can't supply it but conda can, so this is a legitimate drop.
-        let satisfiable = conda_owned_attribution("torch", "pytorch-gpu", Some(">=2.0"), "2.10.0");
-        let needed = workspace_owned_drop_needed(&req, &[satisfiable], "err")
-            .expect("a satisfied-by-conda requirement is a legitimate conda-owned drop");
-        assert!(needed.fact.drop);
-        assert_eq!(needed.fact.pypi_name, "torch");
-    }
-
-    // ---- auto-route (spec-uv-restructure M2) -------------------------------
-
-    use std::sync::{Arc, Mutex};
-
-    /// The drop signal flows through the SAME retry wrapper as Rule 3: the
-    /// first solve fails asking for the drop, the retry injects the
-    /// unmatchable-marker override, the second solve succeeds, and the drop is
-    /// recorded as a learned (persistable) fact.
     #[tokio::test]
-    async fn workspace_owned_drop_retry_injects_unmatchable_override() {
-        let seen = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
-        let drop_line = format!("opencv-python ; {DROP_MARKER}");
+    async fn workspace_owned_impossible_transitive_pin_requests_drop() {
+        let mut req = sample_request();
+        req.dependencies = vec!["isaacsim-core==4.2.0.2".to_string()];
+        let plan = plan_workspace_owned_prelock(
+            &req,
+            &BTreeSet::new(),
+            vec![workspace_conda_provider(
+                "opencv-python",
+                "py-opencv",
+                "4.11.0",
+                Provenance::WorkspaceCondaFact("precise-consuming-envs".to_string()),
+            )],
+            &BTreeSet::new(),
+            &|routes| async move {
+                assert_eq!(routes[0].conda_name.as_spec(), "py-opencv");
+                CoInstallVerdict::Sat
+            },
+        )
+        .await;
+        req.workspace_owned = plan;
+
+        assert!(matches!(
+            req.workspace_owned
+                .providers
+                .get(&PypiKey::from_pypi("opencv-python")),
+            Some(WorkspaceOwnedProvider::WorkspaceConda { version, .. }) if version == "4.11.0"
+        ));
+        let project = synthesize_pyproject(&req);
+        assert!(project.contains("\"opencv-python==4.11.0\""), "{project}");
+        assert!(
+            !project.contains(&format!("opencv-python ; {DROP_MARKER}")),
+            "mapped conda ownership uses an exact provider, not a false marker"
+        );
+        assert!(effective_no_emit(&req).contains(&"opencv-python".to_string()));
+    }
+
+    #[tokio::test]
+    async fn opencv_owned_drop_is_pre_lock() {
+        let mut req = sample_request();
+        req.dependencies = vec!["isaacsim-core==4.2.0.2".to_string()];
+        req.workspace_owned = plan_workspace_owned_prelock(
+            &req,
+            &BTreeSet::new(),
+            vec![workspace_conda_provider(
+                "opencv-python",
+                "py-opencv",
+                "4.11.0",
+                Provenance::WorkspaceCondaFact("precise-consuming-envs".to_string()),
+            )],
+            &BTreeSet::new(),
+            &|_| async { CoInstallVerdict::Sat },
+        )
+        .await;
+        let calls = Arc::new(Mutex::new(0usize));
         let solve = {
-            let seen = Arc::clone(&seen);
-            let drop_line = drop_line.clone();
-            move |req: UvClosureRequest| {
-                let seen = Arc::clone(&seen);
-                let drop_line = drop_line.clone();
+            let calls = Arc::clone(&calls);
+            move |request: UvClosureRequest| {
+                let calls = Arc::clone(&calls);
                 Box::pin(async move {
-                    seen.lock().unwrap().push(req.overrides.clone());
-                    if !req.overrides.iter().any(|o| o == &drop_line) {
-                        return Err(anyhow::Error::new(WorkspaceFactOverrideNeeded {
-                            fact: WorkspaceFactOverride {
-                                pypi_name: "opencv-python".to_string(),
-                                version: "4.11.0".to_string(),
-                                drop: true,
-                            },
-                            upstream_pin: "opencv-python==4.11.0".to_string(),
-                            original_error: "opencv-python unsatisfiable on PyPI".to_string(),
-                        }));
-                    }
+                    *calls.lock().unwrap() += 1;
+                    assert!(
+                        effective_constraints(&request)
+                            .constraints
+                            .contains(&"opencv-python==4.11.0".to_string())
+                    );
+                    assert!(effective_no_emit(&request).contains(&"opencv-python".to_string()));
                     Ok(UvClosure {
                         wheels: vec![],
                         pins: BTreeMap::new(),
                         uv_version: "test".to_string(),
                         auto_routed: vec![],
-                        auto_dropped: BTreeSet::new(),
+                        auto_dropped: BTreeSet::from(["opencv-python".to_string()]),
+                        effective_input_requirements: None,
+                    })
+                }) as futures::future::BoxFuture<'static, Result<UvClosure>>
+            }
+        };
+        let closure = auto_route_fixpoint_checked(
+            &req,
+            &AutoRouteOptions::default(),
+            solve,
+            |_name, _spec| Box::pin(async { None }),
+            |_| Box::pin(async { CoInstallVerdict::Sat }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(*calls.lock().unwrap(), 1);
+        assert!(closure.auto_dropped.contains("opencv-python"));
+    }
+
+    #[tokio::test]
+    async fn workspace_owned_drop_declines_for_first_party_direct_root() {
+        let mut req = sample_request();
+        req.dependencies = vec!["opencv-python==4.11.0".to_string()];
+        let plan = plan_workspace_owned_prelock(
+            &req,
+            &BTreeSet::new(),
+            vec![workspace_conda_provider(
+                "opencv-python",
+                "py-opencv",
+                "4.11.0",
+                Provenance::WorkspaceCondaFact("precise-consuming-envs".to_string()),
+            )],
+            &BTreeSet::new(),
+            &|_| async { CoInstallVerdict::Sat },
+        )
+        .await;
+        assert!(plan.providers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn workspace_owned_drop_declines_without_ownership_authority() {
+        let mut req = sample_request();
+        req.dependencies = vec!["isaacsim-core==4.2.0.2".to_string()];
+        for provenance in [
+            Provenance::UvConstraint,
+            Provenance::PriorSelection,
+            Provenance::DepsFromRelaxed,
+        ] {
+            let plan = plan_workspace_owned_prelock(
+                &req,
+                &BTreeSet::new(),
+                vec![workspace_conda_provider(
+                    "opencv-python",
+                    "py-opencv",
+                    "4.11.0",
+                    provenance,
+                )],
+                &BTreeSet::new(),
+                &|_| async {
+                    panic!("non-authoritative candidates must not reach co-solve");
+                    #[allow(unreachable_code)]
+                    CoInstallVerdict::Sat
+                },
+            )
+            .await;
+            assert!(plan.providers.is_empty());
+        }
+    }
+
+    /// The exact provider remains an additive uv constraint. Therefore uv,
+    /// not an error-string classifier, decides whether a hidden upstream
+    /// range accepts the workspace's selected conda version.
+    #[tokio::test]
+    async fn workspace_owned_drop_respects_upstream_satisfiability() {
+        if detect_uv().await.is_err() {
+            eprintln!("skipping: uv not found on PATH");
+            return;
+        }
+        let tmp =
+            std::env::temp_dir().join(format!("retread-workspace-provider-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let index = tmp.join("index");
+        for (root, requirement) in [("goodroot", "torch>=2.0"), ("badroot", "torch>=2.11")] {
+            let root_dir = index.join(root);
+            let href = write_test_wheel(&root_dir, root, "1.0", &[requirement]);
+            std::fs::write(
+                root_dir.join("index.html"),
+                format!("<a href=\"{href}\">{root}</a>"),
+            )
+            .unwrap();
+        }
+        let index_url = format!("file://{}/", index.display());
+        let make_req = |root: &str| {
+            let mut req = auto_route_req();
+            req.dependencies = vec![format!("{root}==1.0")];
+            req.index_urls = vec![index_url.clone()];
+            req.workspace_owned.providers.insert(
+                PypiKey::from_pypi("torch"),
+                WorkspaceOwnedProvider::WorkspaceConda {
+                    conda_name: CondaName::new("pytorch-gpu"),
+                    version: "2.10.0".to_string(),
+                    provenance: Provenance::WorkspaceCondaFact(
+                        "precise-consuming-envs".to_string(),
+                    ),
+                },
+            );
+            req
+        };
+
+        let good = compute_closure(
+            &make_req("goodroot"),
+            &tmp.join("good-project"),
+            &tmp.join("cache"),
+            None,
+            crate::config::SdistBuildPolicy::Never,
+        )
+        .await
+        .unwrap();
+        assert_eq!(good.auto_dropped, BTreeSet::from(["torch".to_string()]));
+        assert!(!good.wheels.iter().any(|wheel| wheel.name == "torch"));
+
+        let error = compute_closure(
+            &make_req("badroot"),
+            &tmp.join("bad-project"),
+            &tmp.join("cache"),
+            None,
+            crate::config::SdistBuildPolicy::Never,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("uv lock failed"), "{error:#}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn workspace_owned_drop_retry_injects_unmatchable_override() {
+        let mut req = sample_request();
+        req.dependencies = vec!["isaacsim-core==4.2.0.2".to_string()];
+        req.workspace_owned = plan_workspace_owned_prelock(
+            &req,
+            &BTreeSet::from([PypiKey::from_pypi("opencv-python")]),
+            Vec::new(),
+            &BTreeSet::new(),
+            &|_| async {
+                panic!("direct workspace PyPI ownership needs no conda solve");
+                #[allow(unreachable_code)]
+                CoInstallVerdict::Sat
+            },
+        )
+        .await;
+        let calls = Arc::new(Mutex::new(0usize));
+        let raw = {
+            let calls = Arc::clone(&calls);
+            move |req: UvClosureRequest| {
+                let calls = Arc::clone(&calls);
+                Box::pin(async move {
+                    *calls.lock().unwrap() += 1;
+                    let project = synthesize_pyproject(&req);
+                    assert!(project.contains(&format!("opencv-python ; {DROP_MARKER}")));
+                    Ok(UvClosure {
+                        wheels: vec![],
+                        pins: BTreeMap::new(),
+                        uv_version: "test".to_string(),
+                        auto_routed: vec![],
+                        auto_dropped: req.workspace_owned.dropped_without_uv(),
                         effective_input_requirements: None,
                     })
                 }) as futures::future::BoxFuture<'static, Result<UvClosure>>
             }
         };
         let learned = Arc::new(Mutex::new(Vec::new()));
-        let mut solve = with_workspace_fact_overrides(solve, Arc::clone(&learned));
-        let _ = solve(sample_request()).await.unwrap();
-
-        let calls = seen.lock().unwrap();
-        assert_eq!(calls.len(), 2, "one failed attempt, one healed retry");
-        assert!(
-            !calls[0].iter().any(|o| o == &drop_line),
-            "first attempt is pre-drop"
+        let mut solve = with_workspace_fact_overrides(raw, Arc::clone(&learned));
+        let closure = solve(req).await.unwrap();
+        assert_eq!(
+            *calls.lock().unwrap(),
+            1,
+            "drop is present before first lock"
         );
         assert!(
-            calls[1].iter().any(|o| o == &drop_line),
-            "retry carries the unmatchable-marker drop override"
+            learned.lock().unwrap().is_empty(),
+            "drop is not a heal fact"
         );
-        let facts = learned.lock().unwrap();
-        assert_eq!(facts.len(), 1);
-        assert!(facts[0].drop, "the drop is recorded as a learned/persistable fact");
-        assert_eq!(facts[0].pypi_name, "opencv-python");
+        assert_eq!(
+            closure.auto_dropped,
+            BTreeSet::from(["opencv-python".to_string()])
+        );
     }
+
+    // ---- auto-route (spec-uv-restructure M2) -------------------------------
 
     fn workspace_fact_needed_error(name: &str, version: &str, upstream_pin: &str) -> anyhow::Error {
         anyhow::Error::new(WorkspaceFactOverrideNeeded {
             fact: WorkspaceFactOverride {
                 pypi_name: name.to_string(),
                 version: version.to_string(),
-                drop: false,
             },
             upstream_pin: upstream_pin.to_string(),
             original_error: format!("{name} exact-pin conflict"),
@@ -5000,6 +5634,7 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
             effective_inputs["torch"].iter().any(|input| {
                 input.specifiers == "==2.10.0"
                     && input.source == "uv override requirement `torch==2.10.0`"
+                    && input.provenance == Provenance::UvOverride
                     && input.role == AutoRouteInputRole::Override
             }),
             "the closure must retain the learned override from the actual successful request"
@@ -5141,12 +5776,14 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
             python_version: "3.12".into(),
             conda_subdir: "linux-64".into(),
             dependencies: vec!["mujoco==3.5.0".into()],
+            dependency_provenance: BTreeMap::new(),
             constraints: ConstraintSet::default(),
             overrides: vec![],
             no_emit_packages: vec![],
             index_urls: vec!["https://pypi.org/simple/".into()],
             built_wheel_sources: BTreeMap::new(),
             explicit_pins: BTreeMap::new(),
+            workspace_owned: WorkspaceOwnedPlan::default(),
             offline: false,
         }
     }
@@ -5209,6 +5846,7 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
                     .unwrap()
                     .to_string(),
                 source: "uv root requirement `numpy>=2,<3`".to_string(),
+                provenance: Provenance::UvRoot,
                 role: AutoRouteInputRole::Requirement,
             }]
         );
@@ -5231,38 +5869,60 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
         assert_eq!(prov.source, "auto-route");
         assert_eq!(prov.conda_name, "numpy");
         assert_eq!(prov.conda_version, "==2.1.0");
+        assert_eq!(prov.provenance, Provenance::PriorSelection);
     }
 
-    #[tokio::test]
-    async fn workspace_owned_validated_route_becomes_auto_drop() {
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let hits = BTreeMap::from([(
-            "numpy".to_string(),
-            RouteProbeHit {
-                conda_version: "2.1.0".into(),
-                channel: "https://conda.anaconda.org/conda-forge/linux-64".into(),
-                depends: Vec::new(),
+    #[test]
+    fn workspace_owned_validated_route_becomes_auto_drop() {
+        let mut req = auto_route_req();
+        req.workspace_owned.providers.insert(
+            PypiKey::from_pypi("numpy"),
+            WorkspaceOwnedProvider::WorkspaceConda {
+                conda_name: CondaName::new("numpy"),
+                version: "2.1.0".to_string(),
+                provenance: Provenance::WorkspaceCondaFact("precise-consuming-envs".to_string()),
             },
-        )]);
-        let mut opts = auto_route_opts();
-        opts.route_policy = crate::config::RoutePolicy::PreferCondaValidated;
-        opts.workspace_owned.insert("numpy".to_string());
+        );
+        let uv_lock = r#"
+            version = 1
+            revision = 3
+            requires-python = ">=3.12,<3.13"
 
-        let closure = auto_route_fixpoint_checked(
-            &auto_route_req(),
-            &opts,
-            canned_solve(calls),
-            canned_probe(hits),
-            canned_co_solve(Vec::new()),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(closure.auto_routed.len(), 1);
+            [[package]]
+            name = "numpy"
+            version = "2.1.0"
+            source = { registry = "https://example.invalid/simple" }
+        "#;
         assert_eq!(
-            closure.auto_dropped,
-            BTreeSet::from(["numpy".to_string()]),
-            "only a successfully probed and co-solvable owned route may be dropped"
+            workspace_owned_drops_from_lock(&req, uv_lock).unwrap(),
+            BTreeSet::from(["numpy".to_string()])
+        );
+    }
+
+    #[test]
+    fn workspace_owned_drop_matches_normalized_pep440_version() {
+        let mut req = auto_route_req();
+        req.workspace_owned.providers.insert(
+            PypiKey::from_pypi("provider"),
+            WorkspaceOwnedProvider::WorkspaceConda {
+                conda_name: CondaName::new("provider-conda"),
+                version: "1.0-1".to_string(),
+                provenance: Provenance::WorkspaceCondaFact("precise-consuming-envs".to_string()),
+            },
+        );
+        let uv_lock = r#"
+            version = 1
+            revision = 3
+            requires-python = ">=3.12,<3.13"
+
+            [[package]]
+            name = "provider"
+            version = "1.0.post1"
+            source = { registry = "https://example.invalid/simple" }
+        "#;
+        assert_eq!(
+            workspace_owned_drops_from_lock(&req, uv_lock).unwrap(),
+            BTreeSet::from(["provider".to_string()])
         );
     }
 
@@ -5293,6 +5953,30 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
         assert!(closure.wheels.iter().any(|w| w.name == "numpy"));
         // Fixpoint on round 1 with zero routes: no re-lock.
         assert_eq!(calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn genuine_conflict_surfaces_uv_error() {
+        let mut opts = auto_route_opts();
+        opts.keep_pypi.insert("flatdict".to_string());
+        let error = auto_route_fixpoint_checked(
+            &auto_route_req(),
+            &opts,
+            |_request| {
+                Box::pin(async {
+                    bail!("uv lock failed: authoritative requirement A conflicts with B")
+                })
+            },
+            |_name, _spec| Box::pin(async { None }),
+            |_| Box::pin(async { CoInstallVerdict::Sat }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "uv lock failed: authoritative requirement A conflicts with B"
+        );
+        assert!(!error.to_string().contains("PyPI restore"));
     }
 
     /// Root entries (protected) are never routed even on a conda hit.
@@ -5349,6 +6033,76 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
         assert_eq!(calls.lock().unwrap().len(), 1);
     }
 
+    #[test]
+    fn mapped_underscored_conda_target_probes_raw() {
+        let closure = parse_pylock_closure(
+            PYLOCK_FIXTURE,
+            &target("3.12", "linux-64"),
+            &BTreeSet::new(),
+            "x",
+        )
+        .unwrap();
+        let req = auto_route_req();
+        let mut opts = auto_route_opts();
+        opts.name_map = mapped_name_map(&[("numpy", "cuda-nvcc_linux-64")]);
+
+        let probes = auto_route_probe_specs(&closure, &req, &opts, &[]);
+        assert!(
+            probes.contains(&("cuda-nvcc_linux-64".to_string(), "==2.1.0".to_string())),
+            "mapped conda targets must reach the probe in their raw spelling: {probes:?}"
+        );
+        assert!(
+            probes.iter().all(|(name, _)| name != "cuda-nvcc-linux-64"),
+            "a PyPI identity key must never become a conda probe name: {probes:?}"
+        );
+
+        let hits = BTreeMap::from([(
+            "cuda-nvcc_linux-64".to_string(),
+            RouteProbeHit {
+                conda_version: "2.1.0".into(),
+                channel: "c/linux-64".into(),
+                depends: Vec::new(),
+            },
+        )]);
+        let routes = plan_auto_route_round(&closure, &req, &opts, &[], &hits).unwrap();
+        let numpy = routes
+            .iter()
+            .find(|route| route.pypi_name == "numpy")
+            .expect("the raw underscored target should route on its matching hit");
+        assert_eq!(numpy.conda_name, "cuda-nvcc_linux-64");
+    }
+
+    #[test]
+    fn disabled_name_map_target_is_neither_probed_nor_routed() {
+        let closure = parse_pylock_closure(
+            PYLOCK_FIXTURE,
+            &target("3.12", "linux-64"),
+            &BTreeSet::new(),
+            "x",
+        )
+        .unwrap();
+        let req = auto_route_req();
+        let mut opts = auto_route_opts();
+        opts.name_map
+            .insert(PypiKey::from_pypi("numpy"), CondaTarget::Disabled);
+
+        let probes = auto_route_probe_specs(&closure, &req, &opts, &[]);
+        assert!(
+            probes.iter().all(|(name, _)| name != "numpy"),
+            "disabled names must not be probed: {probes:?}"
+        );
+        let hits = BTreeMap::from([(
+            "numpy".to_string(),
+            RouteProbeHit {
+                conda_version: "2.1.0".into(),
+                channel: "c/linux-64".into(),
+                depends: Vec::new(),
+            },
+        )]);
+        let routes = plan_auto_route_round(&closure, &req, &opts, &[], &hits).unwrap();
+        assert!(routes.iter().all(|route| route.pypi_name != "numpy"));
+    }
+
     /// The name-map is honored: `torch` routes via conda's `pytorch`.
     #[tokio::test]
     async fn auto_route_maps_pypi_to_conda_names() {
@@ -5388,8 +6142,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
             },
         );
         let mut opts = auto_route_opts();
-        opts.name_map
-            .insert("torch".to_string(), "pytorch".to_string());
+        opts.name_map = mapped_name_map(&[("torch", "pytorch")]);
         let closure = auto_route_fixpoint(&auto_route_req(), &opts, solve, canned_probe(hits))
             .await
             .unwrap();
@@ -5896,12 +6649,14 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
             python_version: "3.12".into(),
             conda_subdir: "linux-64".into(),
             dependencies: vec!["typing-extensions==4.12.2".into()],
+            dependency_provenance: BTreeMap::new(),
             constraints: ConstraintSet::default(),
             overrides: vec![],
             no_emit_packages: vec![],
             index_urls: vec!["https://pypi.org/simple/".into()],
             built_wheel_sources: BTreeMap::new(),
             explicit_pins: BTreeMap::new(),
+            workspace_owned: WorkspaceOwnedPlan::default(),
             offline: false,
         };
         let closure = compute_closure(
@@ -5937,12 +6692,14 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
             python_version: "3.12".into(),
             conda_subdir: "linux-64".into(),
             dependencies: vec!["python-dateutil==2.9.0.post0".into()],
+            dependency_provenance: BTreeMap::new(),
             constraints: ConstraintSet::default(),
             overrides: vec![],
             no_emit_packages: vec![],
             index_urls: vec!["https://pypi.org/simple/".into()],
             built_wheel_sources: BTreeMap::new(),
             explicit_pins: BTreeMap::new(),
+            workspace_owned: WorkspaceOwnedPlan::default(),
             offline: false,
         };
         let opts = AutoRouteOptions {
@@ -6085,8 +6842,8 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
 
     fn emitted_route(pypi_name: &str, conda_name: &str, spec: &str) -> CondaRouteSpec {
         CondaRouteSpec {
-            pypi_name: pypi_name.to_string(),
-            conda_name: conda_name.to_string(),
+            pypi_name: PypiKey::from_pypi(pypi_name),
+            conda_name: CondaName::new(conda_name),
             spec: spec.to_string(),
         }
     }
@@ -6096,8 +6853,10 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
         let sibling = emitted_route("sibling-runtime", "sibling-runtime", ">=4,<5");
         let candidate = emitted_route("candidate-addon", "candidate-addon", "==2.1");
         let co_solve = |routes: Vec<CondaRouteSpec>| async move {
-            let names: BTreeSet<String> =
-                routes.into_iter().map(|route| route.conda_name).collect();
+            let names: BTreeSet<String> = routes
+                .into_iter()
+                .map(|route| route.conda_name.as_spec().to_string())
+                .collect();
             if names.contains("sibling-runtime") && names.contains("candidate-addon") {
                 CoInstallVerdict::Unsat(vec!["incompatible transitive constraints".to_string()])
             } else {
@@ -6128,8 +6887,10 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
         let right = emitted_route("worker-right", "worker-right", "==1");
         let unrelated = emitted_route("utility", "utility", ">=7");
         let co_solve = |routes: Vec<CondaRouteSpec>| async move {
-            let names: BTreeSet<String> =
-                routes.into_iter().map(|route| route.conda_name).collect();
+            let names: BTreeSet<String> = routes
+                .into_iter()
+                .map(|route| route.conda_name.as_spec().to_string())
+                .collect();
             if names.contains("worker-left") && names.contains("worker-right") {
                 CoInstallVerdict::Unsat(vec!["incompatible transitive constraints".to_string()])
             } else {
@@ -6163,6 +6924,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
                     routes
                         .iter()
                         .map(CondaRouteSpec::match_spec)
+                        .map(|spec| spec.as_str().to_string())
                         .collect::<Vec<_>>(),
                     vec!["extension >=2,<3", "runtime"]
                 );
@@ -6180,7 +6942,11 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
 
         assert_eq!(selection.accepted, vec![candidate]);
         assert!(selection.rejected.is_empty());
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "happy path is one batch solve");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "happy path is one batch solve"
+        );
     }
 
     /// The blocker-class fixture: BOTH numpy and typing-extensions have
@@ -6406,7 +7172,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
             keep_pypi: BTreeSet::new(),
             force_conda: BTreeSet::new(),
             protected: BTreeSet::from(["mujoco".to_string()]),
-            name_map: BTreeMap::from([("torch".to_string(), "pytorch".to_string())]),
+            name_map: mapped_name_map(&[("torch", "pytorch")]),
             abi_anchor_pins: BTreeMap::new(),
             workspace_conda_versions: BTreeMap::from([(
                 "pytorch".to_string(),
@@ -6876,9 +7642,23 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
             "https://pypi.nvidia.com".to_string(),
             "https://pypi.org/simple/".to_string(),
         ];
-        let a = build_lock_args(dir, "3.12", &indexes, false, LockRelaxations::PASS_A);
-        let b_auto = build_lock_args(dir, "3.12", &indexes, false, LockRelaxations::PASS_B_AUTO);
-        let b_never = build_lock_args(dir, "3.12", &indexes, false, LockRelaxations::PASS_B_NEVER);
+        let a = build_lock_args(dir, "3.12", &indexes, None, false, LockRelaxations::PASS_A);
+        let b_auto = build_lock_args(
+            dir,
+            "3.12",
+            &indexes,
+            None,
+            false,
+            LockRelaxations::PASS_B_AUTO,
+        );
+        let b_never = build_lock_args(
+            dir,
+            "3.12",
+            &indexes,
+            None,
+            false,
+            LockRelaxations::PASS_B_NEVER,
+        );
 
         // Pass A vs Pass B (auto): drop `--no-build`, flip prerelease value.
         assert_eq!(
@@ -6908,7 +7688,7 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
         // Regression: the CLI args vector must carry the prerelease policy
         // (UV_NO_CONFIG=1 strips it from the synthesized pyproject table).
         let dir = Path::new("/tmp/proj");
-        let a = build_lock_args(dir, "3.12", &[], false, LockRelaxations::PASS_A);
+        let a = build_lock_args(dir, "3.12", &[], None, false, LockRelaxations::PASS_A);
         let idx = a
             .iter()
             .position(|t| t == "--prerelease")
@@ -7318,12 +8098,14 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
             python_version: "3.12".into(),
             conda_subdir: "linux-64".into(),
             dependencies: vec!["astub".into()],
+            dependency_provenance: BTreeMap::new(),
             constraints: ConstraintSet::default(),
             overrides: vec![],
             no_emit_packages: vec![],
             index_urls: vec![index_url.clone()],
             built_wheel_sources: BTreeMap::new(),
             explicit_pins: BTreeMap::new(),
+            workspace_owned: WorkspaceOwnedPlan::default(),
             offline: false,
         };
 
@@ -7484,12 +8266,14 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
             python_version: "3.12".into(),
             conda_subdir: "linux-64".into(),
             dependencies: vec!["astub".into()],
+            dependency_provenance: BTreeMap::new(),
             constraints: ConstraintSet::default(),
             overrides: vec![],
             no_emit_packages: vec![],
             index_urls: vec![index_url],
             built_wheel_sources: BTreeMap::new(),
             explicit_pins: BTreeMap::new(),
+            workspace_owned: WorkspaceOwnedPlan::default(),
             offline: false,
         };
         let project = tmp.join("proj");
@@ -7664,6 +8448,7 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
                 input_requirements: vec![AutoRouteInputRequirement {
                     specifiers: ">=0.9,<2".into(),
                     source: "uv constraint `routed-pkg>=0.9,<2`".into(),
+                    provenance: Provenance::UvConstraint,
                     role: AutoRouteInputRole::Constraint,
                 }],
             }],
@@ -7735,17 +8520,14 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
                 WorkspaceFactOverride {
                     pypi_name: "torch".to_string(),
                     version: "2.10.0".to_string(),
-                    drop: false,
                 },
                 WorkspaceFactOverride {
                     pypi_name: "torchvision".to_string(),
                     version: "0.25.0".to_string(),
-                    drop: false,
                 },
                 WorkspaceFactOverride {
                     pypi_name: "torchaudio".to_string(),
                     version: "2.10.0".to_string(),
-                    drop: false,
                 },
             ],
             ..Default::default()
@@ -7767,6 +8549,39 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    #[test]
+    fn legacy_drop_heal_fact_is_rejected_by_prelock_schema() {
+        let tmp =
+            std::env::temp_dir().join(format!("retread-legacy-drop-facts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let facts_file = heal_facts_path(&tmp, "opencv-pack", "3.12", "linux-64");
+        let legacy = serde_json::json!({
+            "stamp": "legacy-v3-owned-drop",
+            "workspace_overrides": [{
+                "pypi_name": "opencv-python",
+                "version": "4.10.0",
+                "drop": true
+            }],
+            "routed": [],
+            "built": [],
+            "prereleased": []
+        });
+        std::fs::create_dir_all(facts_file.parent().unwrap()).unwrap();
+        std::fs::write(&facts_file, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        let current_stamp = heal_facts_stamp(
+            &sample_request(),
+            &AutoRouteOptions::default(),
+            crate::config::SdistBuildPolicy::Auto,
+        );
+        assert_ne!(current_stamp, legacy["stamp"].as_str().unwrap());
+        assert!(
+            load_heal_facts(&facts_file, &current_stamp).is_empty(),
+            "the removed late-drop fact must never replay into the pre-lock design"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     /// B1: the stamp must move with every fact-validity input class --
     /// manifest deps, constraints, overrides, and each routing knob.
     #[test]
@@ -7776,6 +8591,7 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
             python_version: "3.12".into(),
             conda_subdir: "linux-64".into(),
             dependencies: vec!["foo==1.0".into()],
+            dependency_provenance: BTreeMap::new(),
             constraints: ConstraintSet {
                 constraints: vec!["bar<2".into()],
                 provenance: BTreeMap::new(),
@@ -7786,6 +8602,7 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
             index_urls: vec!["https://pypi.org/simple/".into()],
             built_wheel_sources: BTreeMap::new(),
             explicit_pins: BTreeMap::new(),
+            workspace_owned: WorkspaceOwnedPlan::default(),
             offline: false,
         };
         let base_opts = || AutoRouteOptions {
@@ -7798,7 +8615,6 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
             force_conda: BTreeSet::new(),
             abi_anchor_pins: BTreeMap::new(),
             workspace_conda_versions: BTreeMap::new(),
-            workspace_owned: BTreeSet::new(),
             workspace_fact_fingerprint: String::new(),
         };
         // Holds the `sdist-build` policy fixed at the default while probing
@@ -7840,7 +8656,7 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
         o.route_include.insert("scipy".into());
         assert_ne!(base, stamp(&base_req(), &o));
         let mut o = base_opts();
-        o.name_map.insert("torch".into(), "pytorch".into());
+        o.name_map = mapped_name_map(&[("torch", "pytorch")]);
         assert_ne!(base, stamp(&base_req(), &o));
         // Python bump invalidates.
         let mut r = base_req();
@@ -7962,12 +8778,14 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
             python_version: "3.12".into(),
             conda_subdir: "linux-64".into(),
             dependencies: vec!["foo==2.0".into()],
+            dependency_provenance: BTreeMap::new(),
             constraints: ConstraintSet::default(),
             overrides: vec![],
             no_emit_packages: vec![],
             index_urls: vec![],
             built_wheel_sources: BTreeMap::new(),
             explicit_pins: BTreeMap::new(),
+            workspace_owned: WorkspaceOwnedPlan::default(),
             offline: false,
         };
         healing(req).await.expect("wedge must self-recover");

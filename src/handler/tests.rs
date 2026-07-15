@@ -3,8 +3,11 @@ use super::auto_bundle::{
     ExtraDepSource, conda_probe_spec, extra_dep_source_from_url, pep508_extra_dep,
     prefer_conda_match, validated_conda_route,
 };
-use super::{merge_index_chain, *};
+use super::*;
 use crate::config::RelaxPolicy;
+use crate::constraint::Provenance;
+use crate::index_chain::{IndexPurpose, PUBLIC_PYPI, index_chain};
+use crate::relax::{CondaName, CondaTarget, NameMap, PypiKey};
 use std::collections::BTreeMap;
 
 #[cfg(unix)]
@@ -65,7 +68,19 @@ fn pypi_map(pairs: &[(&str, &[&str])]) -> PypiToCondaMap {
         .collect()
 }
 
-fn bundle_auto_route(name: &str, version: &str, deps_from_floor: bool) -> BundleAutoRoute {
+fn name_map(pairs: &[(&str, &str)]) -> NameMap {
+    pairs
+        .iter()
+        .map(|(pypi, conda)| {
+            (
+                PypiKey::from_pypi(pypi),
+                CondaTarget::Mapped(CondaName::new(*conda)),
+            )
+        })
+        .collect()
+}
+
+fn bundle_auto_route(name: &str, version: &str, provenance: Provenance) -> BundleAutoRoute {
     BundleAutoRoute {
         route: crate::uv_closure::AutoRoutedPackage {
             pypi_name: name.to_string(),
@@ -75,7 +90,7 @@ fn bundle_auto_route(name: &str, version: &str, deps_from_floor: bool) -> Bundle
             channel: "https://conda.example.invalid/linux-64".to_string(),
             input_requirements: Vec::new(),
         },
-        deps_from_floor,
+        provenance,
     }
 }
 
@@ -108,10 +123,11 @@ fn pick_conda_target_name_map_wins_over_ambiguous_parselmouth() {
     // torch->pytorch in the merged name_map, the picker returns
     // pytorch so the BFS routes it to conda instead of bundling.
     let parselmouth = pypi_map(&[("torch", &["pytorch", "pytorch-cpu", "pytorch-gpu"])]);
-    let mut name_map: BTreeMap<String, String> = BTreeMap::new();
-    name_map.insert("torch".into(), "pytorch".into());
+    let name_map = name_map(&[("torch", "pytorch")]);
     assert_eq!(
-        pick_conda_target("torch", &name_map, &parselmouth).as_deref(),
+        pick_conda_target(&PypiKey::from_pypi("torch"), &name_map, &parselmouth)
+            .as_ref()
+            .map(CondaName::as_spec),
         Some("pytorch"),
     );
 }
@@ -122,8 +138,11 @@ fn pick_conda_target_ambiguous_parselmouth_without_name_map_is_none() {
     // curated answer -> None (caller leaves it on the PyPI/bundle
     // path). This is exactly why the FALLBACK entry is load-bearing.
     let parselmouth = pypi_map(&[("torch", &["pytorch", "pytorch-cpu", "pytorch-gpu"])]);
-    let name_map: BTreeMap<String, String> = BTreeMap::new();
-    assert_eq!(pick_conda_target("torch", &name_map, &parselmouth), None);
+    let name_map = NameMap::new();
+    assert_eq!(
+        pick_conda_target(&PypiKey::from_pypi("torch"), &name_map, &parselmouth),
+        None
+    );
 }
 
 #[test]
@@ -131,9 +150,11 @@ fn pick_conda_target_parselmouth_identity_match_wins() {
     // numpy -> numpy is an identity match among the candidates; no
     // name_map entry needed.
     let parselmouth = pypi_map(&[("numpy", &["numpy", "manifpy"])]);
-    let name_map: BTreeMap<String, String> = BTreeMap::new();
+    let name_map = NameMap::new();
     assert_eq!(
-        pick_conda_target("numpy", &name_map, &parselmouth).as_deref(),
+        pick_conda_target(&PypiKey::from_pypi("numpy"), &name_map, &parselmouth)
+            .as_ref()
+            .map(CondaName::as_spec),
         Some("numpy"),
     );
 }
@@ -141,9 +162,15 @@ fn pick_conda_target_parselmouth_identity_match_wins() {
 #[test]
 fn pick_conda_target_single_parselmouth_candidate() {
     let parselmouth = pypi_map(&[("some-pypi-only", &["the-conda-name"])]);
-    let name_map: BTreeMap<String, String> = BTreeMap::new();
+    let name_map = NameMap::new();
     assert_eq!(
-        pick_conda_target("some-pypi-only", &name_map, &parselmouth).as_deref(),
+        pick_conda_target(
+            &PypiKey::from_pypi("some-pypi-only"),
+            &name_map,
+            &parselmouth,
+        )
+        .as_ref()
+        .map(CondaName::as_spec),
         Some("the-conda-name"),
     );
 }
@@ -152,9 +179,13 @@ fn pick_conda_target_single_parselmouth_candidate() {
 fn pick_conda_target_unknown_dep_is_none() {
     // Not in name_map and not in parselmouth -> stays on PyPI.
     let parselmouth = pypi_map(&[("torch", &["pytorch"])]);
-    let name_map: BTreeMap<String, String> = BTreeMap::new();
+    let name_map = NameMap::new();
     assert_eq!(
-        pick_conda_target("totally-unknown-pkg", &name_map, &parselmouth),
+        pick_conda_target(
+            &PypiKey::from_pypi("totally-unknown-pkg"),
+            &name_map,
+            &parselmouth,
+        ),
         None,
     );
 }
@@ -164,10 +195,15 @@ fn pick_conda_target_user_name_map_overrides_parselmouth_identity() {
     // A user retread-name-map entry beats even a parselmouth identity
     // match -- the curated answer is authoritative.
     let parselmouth = pypi_map(&[("opencv-python-headless", &["opencv-python-headless"])]);
-    let mut name_map: BTreeMap<String, String> = BTreeMap::new();
-    name_map.insert("opencv-python-headless".into(), "py-opencv".into());
+    let name_map = name_map(&[("opencv-python-headless", "py-opencv")]);
     assert_eq!(
-        pick_conda_target("opencv-python-headless", &name_map, &parselmouth).as_deref(),
+        pick_conda_target(
+            &PypiKey::from_pypi("opencv-python-headless"),
+            &name_map,
+            &parselmouth,
+        )
+        .as_ref()
+        .map(CondaName::as_spec),
         Some("py-opencv"),
     );
 }
@@ -460,6 +496,7 @@ fn courier_pure_python_bundle_is_platform_specific_not_noarch() {
         auto_routed: vec![],
         auto_dropped: Default::default(),
         uv_closure_names: Default::default(),
+        workspace_conda_versions: Default::default(),
     };
 
     let courier_cfg = RetreadConfig {
@@ -520,11 +557,12 @@ fn produce_output_emits_auto_routed_conda_run_deps() {
         probe_decisions: vec![],
         solve_diagnostics: BTreeMap::new(),
         auto_routed: vec![
-            bundle_auto_route("numpy", "2.1.0", false),
-            bundle_auto_route("scipy", "1.14.1", false),
+            bundle_auto_route("numpy", "2.1.0", Provenance::PriorSelection),
+            bundle_auto_route("scipy", "1.14.1", Provenance::PriorSelection),
         ],
         auto_dropped: Default::default(),
         uv_closure_names: Default::default(),
+        workspace_conda_versions: Default::default(),
     };
     let out = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
     let deps: Vec<(String, String)> = out
@@ -573,6 +611,46 @@ fn produce_output_emits_auto_routed_conda_run_deps() {
 }
 
 #[test]
+fn auto_route_envelope_does_not_override_index_metadata_cap() {
+    let mut bundle = solo_bundle("pillow-cap-pack", vec!["pillow<11.1"]);
+    bundle.auto_routed.push(bundle_auto_route(
+        "pillow",
+        "12.3.0",
+        Provenance::PriorSelection,
+    ));
+
+    let error = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None)
+        .expect_err("the generated compatibility envelope must not replace wheel metadata");
+    let message = format!("{error:#}");
+    assert!(message.contains("mutually unsatisfiable"), "{message}");
+    assert!(message.contains("pillow<11.1"), "{message}");
+    assert!(message.contains(">=12.3.0"), "{message}");
+    assert!(message.contains("<13"), "{message}");
+}
+
+#[test]
+fn compatible_workspace_fact_does_not_exact_pin_advisory_range() {
+    let mut bundle = solo_bundle("source-pack", vec!["starlette>=0.40,<0.46"]);
+    bundle.primary.metadata_provenance = Provenance::SourceBuiltRelaxed;
+    bundle
+        .workspace_conda_versions
+        .insert("starlette".to_string(), "0.45.3".to_string());
+
+    let output =
+        produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
+    let spec = output
+        .run_dependencies
+        .depends
+        .iter()
+        .find(|dependency| dependency.name.as_str() == "starlette")
+        .map(|dependency| format_packagespec(&dependency.spec))
+        .expect("starlette must remain emitted");
+    assert!(spec.contains(">=0.40"), "{spec}");
+    assert!(spec.contains("<0.46"), "{spec}");
+    assert!(!spec.contains("==0.45.3"), "{spec}");
+}
+
+#[test]
 fn produce_output_omits_workspace_owned_auto_drops() {
     let mut bundle = solo_bundle(
         "owned-pack",
@@ -603,6 +681,17 @@ fn produce_output_softens_deps_from_floor_pin_to_floor_spec() {
     // otherwise a sibling pack's own exact conda pin for the same name
     // (e.g. `setuptools ==83.0.0`) hard-conflicts with this pack's
     // `setuptools ==69.5.1` at workspace conda-solve time.
+    let mut deps_from_route =
+        bundle_auto_route("setuptools", "69.5.1", Provenance::DepsFromRelaxed);
+    deps_from_route
+        .route
+        .input_requirements
+        .push(crate::uv_closure::AutoRouteInputRequirement {
+            specifiers: ">=69.5.1".to_string(),
+            source: "retread-deps-from root `setuptools==69.5.1`".to_string(),
+            provenance: Provenance::DepsFromRelaxed,
+            role: crate::uv_closure::AutoRouteInputRole::Requirement,
+        });
     let bundle = Bundle {
         conda_name: "protomotions-pack".into(),
         primary: rw(
@@ -613,11 +702,12 @@ fn produce_output_softens_deps_from_floor_pin_to_floor_spec() {
         probe_decisions: vec![],
         solve_diagnostics: BTreeMap::new(),
         auto_routed: vec![
-            bundle_auto_route("setuptools", "69.5.1", true),
-            bundle_auto_route("numpy", "2.1.0", false),
+            deps_from_route,
+            bundle_auto_route("numpy", "2.1.0", Provenance::PriorSelection),
         ],
         auto_dropped: Default::default(),
         uv_closure_names: Default::default(),
+        workspace_conda_versions: Default::default(),
     };
     let out = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
     let deps: Vec<(String, String)> = out
@@ -672,7 +762,11 @@ fn produce_output_auto_routed_pin_widens_to_bounded_range() {
     // resolved against still installs, capped so the conda solver can't
     // pick something wildly newer than what the pack was ever tested with.
     let bundle = Bundle {
-        auto_routed: vec![bundle_auto_route("pandas", "2.2.3", false)],
+        auto_routed: vec![bundle_auto_route(
+            "pandas",
+            "2.2.3",
+            Provenance::PriorSelection,
+        )],
         ..solo_bundle("range-pack", vec![])
     };
     let out = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
@@ -691,7 +785,11 @@ fn produce_output_auto_routed_pin_widens_to_bounded_range() {
 #[test]
 fn produce_output_auto_routed_pin_zero_x_widens_to_next_minor() {
     let bundle = Bundle {
-        auto_routed: vec![bundle_auto_route("etgen", "0.20.1", false)],
+        auto_routed: vec![bundle_auto_route(
+            "etgen",
+            "0.20.1",
+            Provenance::PriorSelection,
+        )],
         ..solo_bundle("range-pack-zero-x", vec![])
     };
     let out = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
@@ -713,7 +811,11 @@ fn produce_output_auto_routed_abi_anchor_stays_exact() {
     // "any newer build" is a lie about what this pack's wheels actually
     // run on.
     let bundle = Bundle {
-        auto_routed: vec![bundle_auto_route("cuda-version", "12.8", false)],
+        auto_routed: vec![bundle_auto_route(
+            "cuda-version",
+            "12.8",
+            Provenance::PriorSelection,
+        )],
         ..solo_bundle("anchor-pack", vec![])
     };
     let out = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
@@ -746,7 +848,11 @@ fn produce_output_auto_routed_ledger_override_still_widens() {
         .insert("setuptools".to_string(), ">=68,<81".to_string());
     config.ledger_overrides.insert("setuptools".to_string());
     let bundle = Bundle {
-        auto_routed: vec![bundle_auto_route("setuptools", "80.10.2", false)],
+        auto_routed: vec![bundle_auto_route(
+            "setuptools",
+            "80.10.2",
+            Provenance::PriorSelection,
+        )],
         ..solo_bundle("ledger-pack", vec![])
     };
     let out = produce_output(&bundle, &config, Platform::Linux64, "3.11", &[], None, None).unwrap();
@@ -772,7 +878,11 @@ fn produce_output_auto_routed_manual_override_stays_exact() {
         .overrides
         .insert("sentry-sdk".to_string(), "==1.2.3".to_string());
     let bundle = Bundle {
-        auto_routed: vec![bundle_auto_route("sentry-sdk", "1.2.3", false)],
+        auto_routed: vec![bundle_auto_route(
+            "sentry-sdk",
+            "1.2.3",
+            Provenance::PriorSelection,
+        )],
         ..solo_bundle("override-pack", vec![])
     };
     let out = produce_output(&bundle, &config, Platform::Linux64, "3.11", &[], None, None).unwrap();
@@ -846,7 +956,11 @@ fn produce_output_closure_gate_keeps_auto_routed_pins_and_base_deps_undoubled() 
             "isaacsim-kernel==6.0.0", // base-dep in the closure: no conda dep
         ],
     );
-    bundle.auto_routed = vec![bundle_auto_route("numpy", "2.1.0", false)];
+    bundle.auto_routed = vec![bundle_auto_route(
+        "numpy",
+        "2.1.0",
+        Provenance::PriorSelection,
+    )];
     bundle.uv_closure_names = ["isaacsim-kernel", "numpy"]
         .iter()
         .map(|n| crate::relax::canonical_conda_name(n))
@@ -1040,6 +1154,7 @@ fn rw(pypi: &str, m: WheelMetadata) -> ResolvedWheel {
         upstream_url: Some(url.clone()),
         git_source: None,
         sdist_source: None,
+        metadata_provenance: Provenance::IndexWheelMetadata,
         url,
         metadata: m,
         extras_requested: vec![],
@@ -1058,7 +1173,51 @@ fn solo_bundle(name: &str, requires: Vec<&str>) -> Bundle {
         auto_routed: vec![],
         auto_dropped: Default::default(),
         uv_closure_names: Default::default(),
+        workspace_conda_versions: Default::default(),
     }
+}
+
+#[test]
+fn auto_routed_underscored_conda_name_emits_raw() {
+    let mut bundle = solo_bundle("underscore-pack", vec!["cuda-nvcc-linux-64==12.9.1"]);
+    bundle.auto_routed.push(BundleAutoRoute {
+        route: crate::uv_closure::AutoRoutedPackage {
+            pypi_name: "cuda-nvcc-linux-64".to_string(),
+            conda_name: "cuda-nvcc_linux-64".to_string(),
+            pypi_version: "12.9.1".to_string(),
+            conda_version: "12.9.1".to_string(),
+            channel: "https://conda.example.invalid/linux-64".to_string(),
+            input_requirements: Vec::new(),
+        },
+        provenance: Provenance::PriorSelection,
+    });
+
+    let output =
+        produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
+    let routed = output
+        .run_dependencies
+        .depends
+        .iter()
+        .filter(|dependency| dependency.name.as_str() != "python")
+        .collect::<Vec<_>>();
+    assert_eq!(routed.len(), 1, "raw/folded aliases must dedupe by key");
+    assert_eq!(routed[0].name.as_str(), "cuda-nvcc_linux-64");
+
+    let target = WheelTarget {
+        python_version: "3.11".to_string(),
+        conda_subdir: "linux-64".to_string(),
+        max_glibc: None,
+    };
+    let route_specs = emitted_bundle_route_specs(&bundle, &cfg(), &target).unwrap();
+    let route = route_specs
+        .iter()
+        .find(|route| route.pypi_name == PypiKey::from_pypi("cuda-nvcc-linux-64"))
+        .expect("the raw auto-route must reach the co-solve boundary");
+    assert_eq!(route.conda_name.as_spec(), "cuda-nvcc_linux-64");
+    assert_eq!(
+        route.match_spec().as_str(),
+        "cuda-nvcc_linux-64 >=12.9.1,<13"
+    );
 }
 
 // -----------------------------------------------------------------
@@ -1203,9 +1362,10 @@ fn name_mapped_dep_dropped_by_pypi_name() {
     // and the solve died with "No candidates were found for
     // tinyobjloader-python".
     let mut config = cfg();
-    config
-        .name_map
-        .insert("tinyobjloader".into(), "tinyobjloader-python".into());
+    config.name_map.insert(
+        PypiKey::from_pypi("tinyobjloader"),
+        CondaTarget::Mapped(CondaName::new("tinyobjloader-python")),
+    );
 
     // Case 1: drop recorded under the PyPI name (what the cascade
     // pushes).
@@ -1292,16 +1452,17 @@ fn bundle_group_default_and_precedence() {
 }
 
 // -----------------------------------------------------------------
-// merge_index_chain: order and dedup semantics
+// index_chain: order, dedup, and terminal fallback semantics
 // -----------------------------------------------------------------
 
 #[test]
-fn merge_index_chain_preserves_order_primary_then_extra_then_public() {
+fn index_chain_entry_before_workspace() {
     // The canonical use case: entry index + workspace indexes.
     // Public PyPI should land last, entry index first.
-    let result = merge_index_chain(
+    let result = index_chain(
         ["https://pypi.nvidia.com".to_string()],
         &["https://download.pytorch.org/whl/cu128".to_string()],
+        IndexPurpose::Resolve,
     );
     assert_eq!(
         result,
@@ -1314,12 +1475,13 @@ fn merge_index_chain_preserves_order_primary_then_extra_then_public() {
 }
 
 #[test]
-fn merge_index_chain_deduplicates_trailing_slash_insensitive() {
+fn index_chain_dedups_trailing_slash() {
     // public PyPI appears in extra without trailing slash -- must not
     // be added twice even though the stored constant has a trailing slash.
-    let result = merge_index_chain(
+    let result = index_chain(
         ["https://pypi.nvidia.com".to_string()],
         &["https://pypi.org/simple".to_string()],
+        IndexPurpose::Resolve,
     );
     assert_eq!(
         result,
@@ -1332,21 +1494,22 @@ fn merge_index_chain_deduplicates_trailing_slash_insensitive() {
 }
 
 #[test]
-fn merge_index_chain_empty_primary_appends_public() {
-    let result = merge_index_chain(std::iter::empty::<String>(), &[]);
+fn index_chain_empty_inputs_append_public() {
+    let result = index_chain(std::iter::empty::<String>(), &[], IndexPurpose::Resolve);
     assert_eq!(result, vec![PUBLIC_PYPI.to_string()]);
 }
 
 #[test]
-fn merge_index_chain_deduplicates_repeated_primary() {
+fn index_chain_deduplicates_repeated_entry_indexes() {
     // Two primary items that are the same URL (one with, one without slash)
     // should only appear once.
-    let result = merge_index_chain(
+    let result = index_chain(
         [
             "https://pypi.nvidia.com".to_string(),
             "https://pypi.nvidia.com/".to_string(),
         ],
         &[],
+        IndexPurpose::Resolve,
     );
     assert_eq!(
         result,
@@ -1355,6 +1518,134 @@ fn merge_index_chain_deduplicates_repeated_primary() {
             PUBLIC_PYPI.to_string(),
         ],
     );
+}
+
+#[test]
+fn index_chain_override_keeps_pypi_terminal() {
+    let workspace = vec![
+        "https://packages.example/simple".to_string(),
+        "https://extra.example/simple".to_string(),
+    ];
+    assert_eq!(
+        index_chain(
+            std::iter::empty::<String>(),
+            &workspace,
+            IndexPurpose::Resolve,
+        ),
+        vec![
+            "https://packages.example/simple".to_string(),
+            "https://extra.example/simple".to_string(),
+            PUBLIC_PYPI.to_string(),
+        ],
+        "an explicit workspace index-url changes preference but cannot remove public PyPI",
+    );
+}
+
+#[tokio::test]
+async fn resolve_bundle_bfs_falls_back_to_default() {
+    let workspace = vec!["https://workspace.example/simple".to_string()];
+    let indexes = index_chain(
+        ["https://entry.example/simple".to_string()],
+        &workspace,
+        IndexPurpose::Resolve,
+    );
+    let requires_dist = vec!["root-child>=1".to_string()];
+    let mut work = std::collections::VecDeque::new();
+    seed_worklist(
+        &requires_dist,
+        &[],
+        &indexes,
+        "root-",
+        &std::collections::HashSet::new(),
+        &mut work,
+        None,
+        &std::collections::HashSet::new(),
+    )
+    .unwrap();
+    let pending = work.pop_front().expect("the BFS must seed root-child");
+    assert_eq!(pending.pypi_name, "root-child");
+    let PendingSource::Pypi {
+        specifiers,
+        indexes: pending_indexes,
+    } = &pending.source
+    else {
+        panic!("an ordinary Requires-Dist must seed a PyPI pending source");
+    };
+    assert_eq!(specifiers.to_string(), ">=1");
+    assert_eq!(pending_indexes, &indexes);
+
+    let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let fetch = {
+        let calls = std::sync::Arc::clone(&calls);
+        move |name: String, specs: VersionSpecifiers, index: String| {
+            let calls = std::sync::Arc::clone(&calls);
+            async move {
+                assert_eq!(name, "root-child");
+                assert_eq!(specs.to_string(), ">=1");
+                calls.lock().unwrap().push(index.clone());
+                if index.trim_end_matches('/') == PUBLIC_PYPI.trim_end_matches('/') {
+                    Ok(index)
+                } else {
+                    Err(anyhow::anyhow!("root-child is absent from {index}"))
+                }
+            }
+        }
+    };
+    let selected = fetch_pending_pypi_with(&pending, &fetch)
+        .await
+        .unwrap()
+        .expect("a PyPI pending source must be fetched");
+    assert_eq!(selected, PUBLIC_PYPI);
+    assert_eq!(*calls.lock().unwrap(), indexes);
+}
+
+#[test]
+fn resolve_bundle_bfs_descendants_inherit_full_chain() {
+    let indexes = index_chain(
+        ["https://entry.example/simple".to_string()],
+        &["https://workspace.example/simple".to_string()],
+        IndexPurpose::Resolve,
+    );
+    let parent = PendingSource::Pypi {
+        specifiers: VersionSpecifiers::empty(),
+        indexes: indexes.clone(),
+    };
+    let inherited = bfs_descendant_indexes(&parent, &[]);
+    assert_eq!(inherited, indexes);
+    let git_parent = PendingSource::Git {
+        url: "https://example.com/project.git".to_string(),
+        rev: Some("abc123".to_string()),
+        subdirectory: None,
+    };
+    assert_eq!(bfs_descendant_indexes(&git_parent, &indexes), indexes);
+    let url_parent = PendingSource::Url {
+        wheel_url: url::Url::parse("https://example.com/project.whl").unwrap(),
+    };
+    assert_eq!(bfs_descendant_indexes(&url_parent, &indexes), indexes);
+
+    let mut grandchildren = std::collections::VecDeque::new();
+    seed_worklist(
+        &["root-grandchild>=1".to_string()],
+        &[],
+        &inherited,
+        "root-",
+        &std::collections::HashSet::new(),
+        &mut grandchildren,
+        None,
+        &std::collections::HashSet::new(),
+    )
+    .unwrap();
+    let grandchild = grandchildren
+        .pop_front()
+        .expect("the descendant BFS must seed root-grandchild");
+    let PendingSource::Pypi {
+        indexes: grandchild_indexes,
+        ..
+    } = grandchild.source
+    else {
+        panic!("the grandchild must remain a PyPI pending source");
+    };
+    assert_eq!(grandchild_indexes, indexes);
 }
 
 #[test]
@@ -1504,6 +1795,7 @@ fn vendored_sub_packages_dropped_from_run_deps() {
         auto_routed: vec![],
         auto_dropped: Default::default(),
         uv_closure_names: Default::default(),
+        workspace_conda_versions: Default::default(),
     };
 
     let output =
@@ -1659,6 +1951,7 @@ fn bundle_field_groups_entries_into_one_output() {
         auto_routed: vec![],
         auto_dropped: Default::default(),
         uv_closure_names: Default::default(),
+        workspace_conda_versions: Default::default(),
     };
 
     let output =
@@ -1741,6 +2034,7 @@ fn relaxed_pure_python_primary_pins_python_to_workspace_variant() {
             ),
             git_source: None,
             sdist_source: None,
+            metadata_provenance: Provenance::SourceBuiltRelaxed,
             metadata: primary,
             extras_requested: vec![],
             auto_data: None,
@@ -1752,6 +2046,7 @@ fn relaxed_pure_python_primary_pins_python_to_workspace_variant() {
         auto_routed: vec![],
         auto_dropped: Default::default(),
         uv_closure_names: Default::default(),
+        workspace_conda_versions: Default::default(),
     };
 
     let output =
@@ -1914,25 +2209,31 @@ fn prefer_conda_match_identifies_mapped_targets() {
     // Contract: entries in the effective name map are eligible for a
     // requirement-specific conda probe. The probe result, not this name-only
     // lookup, makes the final routing decision.
-    let mut name_map: std::collections::BTreeMap<String, String> =
-        std::collections::BTreeMap::new();
-    name_map.insert("torch".to_string(), "pytorch".to_string());
-    name_map.insert("numpy".to_string(), "numpy".to_string());
-    name_map.insert(
-        "opencv-python-headless".to_string(),
-        "py-opencv".to_string(),
-    );
+    let name_map = name_map(&[
+        ("torch", "pytorch"),
+        ("numpy", "numpy"),
+        ("opencv-python-headless", "py-opencv"),
+    ]);
 
     // Parselmouth-known => probe the mapped conda target.
-    assert!(prefer_conda_match("torch", &name_map));
-    assert!(prefer_conda_match("numpy", &name_map));
+    assert!(prefer_conda_match(&PypiKey::from_pypi("torch"), &name_map));
+    assert!(prefer_conda_match(&PypiKey::from_pypi("numpy"), &name_map));
     // FALLBACK_PYPI_TO_CONDA entry survives the same way.
-    assert!(prefer_conda_match("opencv-python-headless", &name_map));
+    assert!(prefer_conda_match(
+        &PypiKey::from_pypi("opencv-python-headless"),
+        &name_map
+    ));
 
     // Unknown to parselmouth => no mapped conda target from this lookup.
-    assert!(!prefer_conda_match("qdldl", &name_map));
-    assert!(!prefer_conda_match("asteval", &name_map));
-    assert!(!prefer_conda_match("aiodns", &name_map));
+    assert!(!prefer_conda_match(&PypiKey::from_pypi("qdldl"), &name_map));
+    assert!(!prefer_conda_match(
+        &PypiKey::from_pypi("asteval"),
+        &name_map
+    ));
+    assert!(!prefer_conda_match(
+        &PypiKey::from_pypi("aiodns"),
+        &name_map
+    ));
 }
 
 #[test]
@@ -1985,7 +2286,7 @@ fn auto_bundle_sdist_fetch_preserves_replay_provenance() {
     let sdist_url =
         url::Url::parse("https://files.pythonhosted.org/packages/zmq-0.0.0.tar.gz#sha256=abc123")
             .unwrap();
-    let (upstream, source) = bfs_fetch_provenance(
+    let (upstream, source, metadata_provenance) = bfs_fetch_provenance(
         &built_url,
         Some(SdistProv {
             index: "https://pypi.org/simple/".into(),
@@ -2000,14 +2301,83 @@ fn auto_bundle_sdist_fetch_preserves_replay_provenance() {
         "machine-local built wheel URL must not become replay provenance"
     );
     let source = source.expect("sdist replay source");
+    assert_eq!(metadata_provenance, Provenance::SourceBuiltRelaxed);
     assert_eq!(source.name, "zmq");
     assert_eq!(source.version, "0.0.0");
     assert_eq!(source.sdist_url, sdist_url.to_string());
 
     let wheel_url = url::Url::parse("https://files.pythonhosted.org/zmq-1.0.whl").unwrap();
-    let (upstream, source) = bfs_fetch_provenance(&wheel_url, None);
+    let (upstream, source, metadata_provenance) = bfs_fetch_provenance(&wheel_url, None);
     assert_eq!(upstream.as_ref(), Some(&wheel_url));
     assert!(source.is_none());
+    assert_eq!(metadata_provenance, Provenance::IndexWheelMetadata);
+}
+
+#[test]
+fn wheel_entry_origin_marks_every_source_build_advisory() {
+    let path = WheelEntry {
+        path: Some("../isaaclab".to_string()),
+        ..WheelEntry::default()
+    };
+    let git = WheelEntry {
+        git: Some("https://example.invalid/project.git".to_string()),
+        rev: Some("deadbeef".to_string()),
+        ..WheelEntry::default()
+    };
+    let named_git = WheelEntry {
+        from: Some("upstream".to_string()),
+        ..WheelEntry::default()
+    };
+    for entry in [&path, &git, &named_git] {
+        let provenance = wheel_entry_metadata_provenance(entry);
+        assert_eq!(provenance, Provenance::SourceBuiltRelaxed);
+        assert_eq!(
+            crate::constraint::authority(&provenance),
+            crate::constraint::Authority::Advisory,
+        );
+    }
+
+    let direct_url = WheelEntry {
+        url: Some("https://example.invalid/project.whl".parse().unwrap()),
+        ..WheelEntry::default()
+    };
+    let index = WheelEntry {
+        version: Some("1.2.3".to_string()),
+        ..WheelEntry::default()
+    };
+    for entry in [&direct_url, &index] {
+        let provenance = wheel_entry_metadata_provenance(entry);
+        assert_eq!(provenance, Provenance::IndexWheelMetadata);
+        assert_eq!(
+            crate::constraint::authority(&provenance),
+            crate::constraint::Authority::Authoritative,
+        );
+    }
+}
+
+#[test]
+fn path_built_wheel_floor_is_advisory_during_finalization() {
+    let path = WheelEntry {
+        path: Some("../isaaclab".to_string()),
+        ..WheelEntry::default()
+    };
+    let path_provenance = wheel_entry_metadata_provenance(&path);
+    let constraints = vec![
+        crate::constraint::Constraint {
+            specifiers: ">=0.49.1,<0.50".parse().unwrap(),
+            provenance: path_provenance,
+            source: "path-built wheel `isaaclab` Requires-Dist".to_string(),
+        },
+        crate::constraint::Constraint {
+            specifiers: ">=0.40,<0.46".parse().unwrap(),
+            provenance: Provenance::IndexWheelMetadata,
+            source: "index wheel `fastapi` Requires-Dist".to_string(),
+        },
+    ];
+    let finalized = crate::constraint::finalize(&PypiKey::from_pypi("starlette"), &constraints)
+        .expect("a path-built wheel floor must yield to an authoritative cap");
+    assert!(finalized.contains(&"0.45.3".parse().unwrap()));
+    assert!(!finalized.contains(&"0.49.1".parse().unwrap()));
 }
 
 #[test]
@@ -2623,10 +2993,7 @@ fn deps_from_conda_floors_apply_only_to_explicit_active_bare_roots() {
         "torch ; sys_platform == 'linux'".to_string(),
         "python-package ; sys_platform == 'win32'".to_string(),
     ];
-    let name_map = BTreeMap::from([
-        ("torch".to_string(), "pytorch".to_string()),
-        ("python-package".to_string(), "python".to_string()),
-    ]);
+    let name_map = name_map(&[("torch", "pytorch"), ("python-package", "python")]);
 
     apply_deps_from_conda_floors(
         &mut constraints,
@@ -2643,7 +3010,7 @@ fn deps_from_conda_floors_apply_only_to_explicit_active_bare_roots() {
 
     assert_eq!(constraints.constraints, vec!["torch>=2.1.0"]);
     let provenance = &constraints.provenance["torch"];
-    assert!(provenance.advisory);
+    assert_eq!(provenance.provenance, Provenance::DepsFromRelaxed);
     assert_eq!(provenance.source, "deps-from-conda-advisory");
     assert_eq!(provenance.env, "environment.yaml");
     assert!(
@@ -2664,10 +3031,7 @@ fn deps_from_conda_floors_fail_closed_on_ambiguous_name_map() {
         floor_spec: ">=2.1.0".to_string(),
         source: "environment.yaml".to_string(),
     }];
-    let name_map = BTreeMap::from([
-        ("torch".to_string(), "pytorch".to_string()),
-        ("torch-alt".to_string(), "pytorch".to_string()),
-    ]);
+    let name_map = name_map(&[("torch", "pytorch"), ("torch-alt", "pytorch")]);
 
     apply_deps_from_conda_floors(
         &mut constraints,
@@ -2698,7 +3062,7 @@ fn deps_from_conda_floors_preserve_authoritative_inputs() {
             conda_version: ">=2".to_string(),
             source: "workspace-solved".to_string(),
             env: "default".to_string(),
-            advisory: false,
+            provenance: Provenance::WorkspaceCondaFact("default".to_string()),
         },
     );
     let original_constraints = constraints.constraints.clone();
@@ -2713,8 +3077,13 @@ fn deps_from_conda_floors_preserve_authoritative_inputs() {
         .collect::<Vec<_>>();
     let name_map = ["numpy", "pandas", "scipy", "requests"]
         .into_iter()
-        .map(|name| (name.to_string(), name.to_string()))
-        .collect::<BTreeMap<_, _>>();
+        .map(|name| {
+            (
+                PypiKey::from_pypi(name),
+                CondaTarget::Mapped(CondaName::new(name)),
+            )
+        })
+        .collect::<NameMap>();
     let roots = vec![
         "numpy".to_string(),
         "pandas".to_string(),

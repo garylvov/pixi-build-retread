@@ -18,6 +18,8 @@ use rattler_conda_types::{
 };
 use rattler_solve::{ChannelPriority, SolveStrategy, SolverImpl, SolverTask, resolvo};
 
+use crate::relax::CondaMatchSpec;
+
 /// Solve a spec set against already-loaded records and return the
 /// concrete records the solver selected. Shared by the pre-emission
 /// solve check and workspace transitive extraction so both reason
@@ -336,14 +338,19 @@ async fn load_selected_records_sparse(
 /// package generations and create impossible merged constraints.
 pub async fn solve_selected_records(
     channels: &[ChannelUrl],
-    specs: &[String],
+    specs: &[CondaMatchSpec],
     target_python: &str,
     target_subdir: &str,
     channel_priority: ChannelPriority,
     system_requirements: &BTreeMap<String, String>,
     strategy: SolveStrategy,
 ) -> std::result::Result<Vec<RepoDataRecord>, Vec<String>> {
-    let parsed_specs = parse_match_specs(specs);
+    // The only production entrance to conda's MatchSpec parser is the typed
+    // raw-name boundary. Test helpers retain String input so solver fixtures
+    // can express arbitrary malformed/diagnostic cases without weakening the
+    // production API.
+    let rendered_specs: Vec<String> = specs.iter().map(ToString::to_string).collect();
+    let parsed_specs = parse_match_specs(&rendered_specs);
     let (records, _consulted) =
         load_selected_records_sparse(channels, target_subdir, &parsed_specs).await;
     if records.is_empty() {
