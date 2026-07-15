@@ -137,10 +137,20 @@ struct PypiFetchRequest {
 /// stays attached until the complete restore requirement has been proven
 /// satisfiable, so an empty intersection can name the wheels and raw
 /// `Requires-Dist` lines that created it.
+///
+/// `advisory` is true when this declaration comes from a wheel retread BUILT
+/// ITSELF from source (a `[retread-wheels]` git/`from`/sdist entry, e.g.
+/// IsaacLab). retread already relaxes such a wheel's exact upstream pins, so
+/// they are pip-world *advisories*, not authoritative constraints: when an
+/// advisory lower bound is the only reason a rejected route's PyPI restore is
+/// unsatisfiable against an authoritative (index wheel / workspace / closure)
+/// constraint, the advisory floor yields to the composed workspace's solve
+/// (conda-as-truth). See `finalize_observed_requirement`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ObservedRequirement {
     specifiers: VersionSpecifiers,
     source: String,
+    advisory: bool,
 }
 
 type ObservedRequirements = BTreeMap<String, Vec<ObservedRequirement>>;
@@ -273,36 +283,31 @@ fn observe_requirement(
     pypi_name: &str,
     specifiers: &VersionSpecifiers,
     source: String,
+    advisory: bool,
 ) {
     let observations = observed.entry(canonical_conda_name(pypi_name)).or_default();
     let observation = ObservedRequirement {
         specifiers: specifiers.clone(),
         source,
+        advisory,
     };
     if !observations.contains(&observation) {
         observations.push(observation);
     }
 }
 
-/// Canonicalize an intersection without losing its source declarations.
-/// `VersionSpecifiers` sorts but does not deduplicate, and parsing a combined
-/// string accepts semantically empty intersections. Deduplicate parsed clauses,
-/// then use uv-pep440's full PEP 440 range conversion to reject emptiness before
-/// any index request is attempted.
-fn finalize_observed_requirement(
-    pypi_name: &str,
-    observations: &[ObservedRequirement],
-) -> std::result::Result<VersionSpecifiers, UnsatisfiableRestoreRequirements> {
-    // Ordinary bounds are semantically equal across trailing release zeroes
-    // (`>=11` == `>=11.0`), but compatible-release/wildcard semantics depend
-    // on the written release length and `===` depends on spelling. Use an
-    // operator-sensitive key and retain the shortest deterministic spelling
-    // for ordinary aliases.
+/// Deduplicate a clause set into `VersionSpecifiers`.
+///
+/// Ordinary bounds are semantically equal across trailing release zeroes
+/// (`>=11` == `>=11.0`), but compatible-release/wildcard semantics depend on
+/// the written release length and `===` depends on spelling. Use an
+/// operator-sensitive key and retain the shortest deterministic spelling for
+/// ordinary aliases.
+fn dedup_specifier_clauses(
+    clauses_iter: impl Iterator<Item = VersionSpecifier>,
+) -> VersionSpecifiers {
     let mut clauses: BTreeMap<SpecifierDedupeKey, (String, VersionSpecifier)> = BTreeMap::new();
-    for specifier in observations
-        .iter()
-        .flat_map(|observation| observation.specifiers.iter().cloned())
-    {
+    for specifier in clauses_iter {
         let rendered = specifier.to_string();
         let key = specifier_dedupe_key(&specifier);
         match clauses.entry(key) {
@@ -317,11 +322,15 @@ fn finalize_observed_requirement(
             }
         }
     }
-    let specifiers: VersionSpecifiers = clauses
+    clauses
         .into_values()
         .map(|(_, specifier)| specifier)
-        .collect();
+        .collect()
+}
 
+/// True when the intersection of `specifiers` is empty (unsatisfiable) or has
+/// an arbitrary-exact (`===`) contradiction.
+fn specifiers_unsatisfiable(specifiers: &VersionSpecifiers) -> bool {
     // `Ranges` is intentionally not named/re-exported by uv-pep440. An empty
     // release-only conversion yields a full range of the inferred type; the
     // following `Into` uses the full PEP 440 conversion (including pre/post/
@@ -335,25 +344,115 @@ fn finalize_observed_requirement(
     let arbitrary_exact_conflict = specifiers.iter().any(|specifier| {
         *specifier.operator() == Operator::ExactEqual && !specifiers.contains(specifier.version())
     });
-    if range_is_empty || arbitrary_exact_conflict {
-        let sources = observations
-            .iter()
-            .map(|observation| {
-                let spec = if observation.specifiers.is_empty() {
-                    "*".to_string()
-                } else {
-                    observation.specifiers.to_string()
-                };
-                format!("  - `{spec}` from {}", observation.source)
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        return Err(UnsatisfiableRestoreRequirements {
-            pypi_name: pypi_name.to_string(),
-            sources,
-        });
+    range_is_empty || arbitrary_exact_conflict
+}
+
+/// True when `operator` fixes (or raises) a lower bound: an upstream floor a
+/// source-built wheel's relaxed pin can be asked to yield. Strict upper bounds
+/// (`<`, `<=`) and exclusions (`!=`) never force a HIGHER version, so they are
+/// always retained.
+fn operator_forces_floor(operator: Operator) -> bool {
+    matches!(
+        operator,
+        Operator::GreaterThan
+            | Operator::GreaterThanEqual
+            | Operator::Equal
+            | Operator::ExactEqual
+            | Operator::TildeEqual
+            | Operator::EqualStar
+    )
+}
+
+/// conda-as-truth softening. A wheel retread built itself from source declares
+/// UPSTREAM pins retread already relaxes; those are advisories, not authority.
+/// When the ONLY reason the restore intersection is empty is an advisory lower
+/// bound conflicting with an authoritative (index wheel / workspace / closure)
+/// constraint, drop the advisory floors and re-intersect so the dependency
+/// resolves to a workspace-compatible version -- exactly what the pre-4.6.5
+/// line did before metadata routes were jointly validated (e.g. IsaacLab's
+/// `starlette==0.49.1` -> relaxed `>=0.49.1,<0.50` yielding to a workspace
+/// `fastapi==0.115.7`'s `starlette<0.46`). Returns `None` (keep the hard
+/// error) unless there is BOTH an advisory and an authoritative declaration
+/// and dropping the advisory floors actually yields a satisfiable set: a
+/// conflict among authoritative constraints, or among advisories with no
+/// authoritative anchor, is a genuine incompatibility the user must resolve.
+fn soften_advisory_floor_conflict(
+    observations: &[ObservedRequirement],
+) -> Option<VersionSpecifiers> {
+    let has_advisory = observations.iter().any(|observation| observation.advisory);
+    let has_authoritative = observations.iter().any(|observation| !observation.advisory);
+    if !has_advisory || !has_authoritative {
+        return None;
     }
-    Ok(specifiers)
+    let mut dropped_floor = false;
+    let mut kept: Vec<VersionSpecifier> = Vec::new();
+    for observation in observations {
+        for specifier in observation.specifiers.iter() {
+            if observation.advisory && operator_forces_floor(*specifier.operator()) {
+                dropped_floor = true;
+                continue;
+            }
+            kept.push(specifier.clone());
+        }
+    }
+    if !dropped_floor {
+        return None;
+    }
+    let softened = dedup_specifier_clauses(kept.into_iter());
+    if softened.is_empty() || specifiers_unsatisfiable(&softened) {
+        return None;
+    }
+    Some(softened)
+}
+
+/// Canonicalize an intersection without losing its source declarations.
+/// `VersionSpecifiers` sorts but does not deduplicate, and parsing a combined
+/// string accepts semantically empty intersections. Deduplicate parsed clauses,
+/// then use uv-pep440's full PEP 440 range conversion to reject emptiness before
+/// any index request is attempted.
+fn finalize_observed_requirement(
+    pypi_name: &str,
+    observations: &[ObservedRequirement],
+) -> std::result::Result<VersionSpecifiers, UnsatisfiableRestoreRequirements> {
+    let specifiers = dedup_specifier_clauses(
+        observations
+            .iter()
+            .flat_map(|observation| observation.specifiers.iter().cloned()),
+    );
+
+    if !specifiers_unsatisfiable(&specifiers) {
+        return Ok(specifiers);
+    }
+
+    // conda-as-truth: before failing, let a source-built wheel's advisory
+    // floor yield to the authoritative constraints (see the fn's doc).
+    if let Some(softened) = soften_advisory_floor_conflict(observations) {
+        tracing::warn!(
+            package = %pypi_name,
+            softened = %softened,
+            "restore: a source-built wheel's advisory lower bound conflicted \
+             with an authoritative constraint; dropped the floor so the \
+             composed workspace resolves the version (conda-as-truth)",
+        );
+        return Ok(softened);
+    }
+
+    let sources = observations
+        .iter()
+        .map(|observation| {
+            let spec = if observation.specifiers.is_empty() {
+                "*".to_string()
+            } else {
+                observation.specifiers.to_string()
+            };
+            format!("  - `{spec}` from {}", observation.source)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    Err(UnsatisfiableRestoreRequirements {
+        pypi_name: pypi_name.to_string(),
+        sources,
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -790,6 +889,11 @@ where
         // requirement-specific validated-routing gate as exact deps.
         let mut loose_candidates: Vec<(String, VersionSpecifiers)> = Vec::new();
         for wheel in bundle.all_wheels().skip(processed_wheel_count) {
+            // A wheel retread built itself from source (git/`from`/sdist entry)
+            // carries UPSTREAM pins retread already relaxed -- treat its
+            // Requires-Dist as advisory so an unresolvable advisory floor can
+            // yield to authoritative constraints (see `ObservedRequirement`).
+            let advisory = wheel.git_source.is_some() || wheel.sdist_source.is_some();
             for raw in &wheel.metadata.requires_dist {
                 if let Some((name, version)) = pep508_exact_base_dep(raw, &marker_env)? {
                     let specifiers = VersionSpecifiers::from_str(&format!("=={version}"))
@@ -804,6 +908,7 @@ where
                             "wheel `{}=={}` Requires-Dist `{raw}`",
                             wheel.metadata.name, wheel.metadata.version
                         ),
+                        advisory,
                     );
                     let conda_name = canonical_conda_name(&name);
                     if !seen_candidate.insert(conda_name) {
@@ -819,6 +924,7 @@ where
                             "wheel `{}=={}` Requires-Dist `{raw}`",
                             wheel.metadata.name, wheel.metadata.version
                         ),
+                        advisory,
                     );
                     let conda_name = canonical_conda_name(&name);
                     if !seen_candidate.insert(conda_name) {
@@ -1393,6 +1499,10 @@ where
             let requirement = ObservedRequirement {
                 specifiers,
                 source: input.source.clone(),
+                // uv closure inputs (roots/constraints/overrides) are
+                // authoritative -- they came from the workspace / user config,
+                // not from a source-built wheel's relaxed upstream pins.
+                advisory: false,
             };
             request.add_input(input.role, requirement);
         }
@@ -2560,6 +2670,7 @@ mod tests {
             .map(|raw| ObservedRequirement {
                 specifiers: VersionSpecifiers::from_str(raw).unwrap(),
                 source: format!("test source `{raw}`"),
+                advisory: false,
             })
             .collect::<Vec<_>>();
         let ordinary =
@@ -2574,6 +2685,7 @@ mod tests {
             .map(|raw| ObservedRequirement {
                 specifiers: VersionSpecifiers::from_str(raw).unwrap(),
                 source: format!("test source `{raw}`"),
+                advisory: false,
             })
             .collect::<Vec<_>>();
         assert_eq!(
@@ -2588,6 +2700,7 @@ mod tests {
             .map(|raw| ObservedRequirement {
                 specifiers: VersionSpecifiers::from_str(raw).unwrap(),
                 source: format!("test source `{raw}`"),
+                advisory: false,
             })
             .collect::<Vec<_>>();
         assert!(
@@ -2650,6 +2763,96 @@ mod tests {
         let rendered = requests[0].specifiers.to_string();
         assert_eq!(rendered.matches(">=11").count(), 1, "{rendered}");
         assert_eq!(rendered.matches("<11.1").count(), 1, "{rendered}");
+    }
+
+    fn observed(specifiers: &str, source: &str, advisory: bool) -> ObservedRequirement {
+        ObservedRequirement {
+            specifiers: VersionSpecifiers::from_str(specifiers).unwrap(),
+            source: source.to_string(),
+            advisory,
+        }
+    }
+
+    /// The IsaacLab regression (integration relock relocks against the imprint
+    /// workspace): a source-built wheel (`isaaclab`, git `[retread-wheels]`
+    /// entry) declares `starlette==0.49.1`, which retread relaxes to
+    /// `>=0.49.1,<0.50`. A workspace-authoritative `fastapi==0.115.7` caps
+    /// `starlette<0.46`. The intersection is empty, but the advisory floor is
+    /// the ONLY reason: conda-as-truth drops it so `starlette` resolves to a
+    /// `<0.46` version (0.45.3 on the real relock) instead of failing the pack.
+    #[test]
+    fn advisory_source_built_floor_yields_to_authoritative_cap() {
+        let observations = vec![
+            // Source-built IsaacLab wheel -> advisory (retread-relaxed floor).
+            observed(
+                ">=0.49.1,<0.50",
+                "wheel `isaaclab==0.54.2` Requires-Dist `starlette>=0.49.1,<0.50`",
+                true,
+            ),
+            // Index wheel `fastapi==0.115.7` -> authoritative.
+            observed(
+                ">=0.40.0,<0.46.0",
+                "wheel `fastapi==0.115.7` Requires-Dist `starlette<0.46.0,>=0.40.0`",
+                false,
+            ),
+        ];
+        let softened =
+            finalize_observed_requirement("starlette", &observations).expect("floor must soften");
+        // The authoritative cap is honored; a `<0.46` version resolves.
+        assert!(
+            softened.contains(&Version::from_str("0.45.3").unwrap()),
+            "0.45.3 must satisfy the softened spec: {softened}"
+        );
+        // The advisory floor is gone: no `>=0.49` version can satisfy it.
+        assert!(
+            !softened.contains(&Version::from_str("0.49.1").unwrap()),
+            "advisory floor must not survive: {softened}"
+        );
+    }
+
+    /// Softening is scoped: a conflict among AUTHORITATIVE constraints (no
+    /// source-built advisory involved) still fails loudly -- the user must
+    /// resolve a genuine incompatibility, not have it silently softened. This
+    /// is the `holosoma`/`numpy` behavior the ownership-drop path protects.
+    #[test]
+    fn authoritative_only_conflict_still_errors() {
+        let observations = vec![
+            observed(
+                ">=0.49.1,<0.50",
+                "wheel `a==1` Requires-Dist `x>=0.49.1`",
+                false,
+            ),
+            observed(
+                ">=0.40.0,<0.46.0",
+                "wheel `b==1` Requires-Dist `x<0.46`",
+                false,
+            ),
+        ];
+        let error =
+            finalize_observed_requirement("x", &observations).expect_err("must stay unsatisfiable");
+        assert!(error.to_string().contains("mutually unsatisfiable"));
+    }
+
+    /// Softening needs an authoritative anchor. Two advisory (both source-built)
+    /// pins that mutually conflict are NOT silently reconciled: without an
+    /// authoritative constraint to defer to there is no principled winner.
+    #[test]
+    fn advisory_only_conflict_still_errors() {
+        let observations = vec![
+            observed(
+                ">=2.3.5,<2.4",
+                "wheel `pkg-a==1` Requires-Dist `x>=2.3.5,<2.4`",
+                true,
+            ),
+            observed(
+                "<2,>=1.23.5",
+                "wheel `pkg-b==1` Requires-Dist `x<2,>=1.23.5`",
+                true,
+            ),
+        ];
+        let error = finalize_observed_requirement("x", &observations)
+            .expect_err("advisory-only conflict must stay unsatisfiable");
+        assert!(error.to_string().contains("mutually unsatisfiable"));
     }
 
     #[tokio::test]
@@ -2849,12 +3052,14 @@ pillow = ">=10,<13"
         overridden.requirements.push(ObservedRequirement {
             specifiers: VersionSpecifiers::from_str("<2").unwrap(),
             source: "wheel metadata requires overridden<2".to_string(),
+            advisory: false,
         });
         overridden.add_input(
             crate::uv_closure::AutoRouteInputRole::Override,
             ObservedRequirement {
                 specifiers: VersionSpecifiers::from_str("==3").unwrap(),
                 source: "uv override requirement `overridden==3`".to_string(),
+                advisory: false,
             },
         );
         overridden.add_input(
@@ -2862,6 +3067,7 @@ pillow = ">=10,<13"
             ObservedRequirement {
                 specifiers: VersionSpecifiers::from_str("<4").unwrap(),
                 source: "uv constraint `overridden<4`".to_string(),
+                advisory: false,
             },
         );
         let overridden = overridden.finish().unwrap();
@@ -2880,6 +3086,7 @@ pillow = ">=10,<13"
         soft_hints.requirements.push(ObservedRequirement {
             specifiers: VersionSpecifiers::from_str(">=1").unwrap(),
             source: "wheel `root==1` Requires-Dist `soft-hints>=1`".to_string(),
+            advisory: false,
         });
         RestoreRequestBuilder::add_preference(
             &mut soft_hints.route_preferences,
