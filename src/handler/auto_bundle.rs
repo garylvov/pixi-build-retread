@@ -2882,9 +2882,9 @@ mod tests {
         let facts = single_provider_facts(
             "psutil",
             &[
-                ("groot-gpu", Some("7.2.2"), None),
-                ("pace-gpu", Some("7.2.2"), Some(">=5.9")),
-                ("pm-gpu", Some("7.2.2"), None),
+                ("groot-sonic-gpu", Some("7.2.2"), None),
+                ("pace", Some("7.2.2"), Some(">=5.9")),
+                ("pm-isaaclab", Some("7.2.2"), None),
                 ("unitree-rl-lab-gpu", Some("7.2.2"), Some(">=5.9,<8")),
                 ("uwlab-gpu", Some("7.2.2"), None),
                 ("viral-gpu", None, None),
