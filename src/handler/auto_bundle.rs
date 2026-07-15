@@ -1120,6 +1120,7 @@ fn metadata_route_group_has_source_built_origin(
     let Some(origins) = metadata_routes.get(conda_name) else {
         return Ok(false);
     };
+    let mut has_source_built_origin = false;
     for origin in origins {
         let pypi_key = PypiKey::from_pypi(&origin.pypi_name);
         let requirements = observed_requirements.get(&pypi_key).ok_or_else(|| {
@@ -1136,14 +1137,11 @@ fn metadata_route_group_has_source_built_origin(
                 origin.conda_name
             ));
         }
-        if requirements
+        has_source_built_origin |= requirements
             .iter()
-            .any(|requirement| matches!(requirement.provenance, Provenance::SourceBuiltRelaxed))
-        {
-            return Ok(true);
-        }
+            .any(|requirement| matches!(requirement.provenance, Provenance::SourceBuiltRelaxed));
     }
-    Ok(false)
+    Ok(has_source_built_origin)
 }
 
 /// Finalize every provisional conda route against the exact dependency set
@@ -2209,6 +2207,40 @@ mod tests {
         assert!(
             empty.contains("empty Requires-Dist provenance set"),
             "{empty}"
+        );
+
+        let mut mixed_routes = ProvisionalMetadataRoutes::new();
+        record_metadata_route(
+            &mut mixed_routes,
+            "source-first".to_string(),
+            "mixed-conda-dep".to_string(),
+            None,
+        );
+        record_metadata_route(
+            &mut mixed_routes,
+            "orphan-second".to_string(),
+            "mixed-conda-dep".to_string(),
+            None,
+        );
+        let mut source_only = ObservedRequirements::new();
+        observe_requirement(
+            &mut source_only,
+            "source-first",
+            &VersionSpecifiers::empty(),
+            "source-built wheel metadata".to_string(),
+            Provenance::SourceBuiltRelaxed,
+        );
+        let later_missing = metadata_route_group_has_source_built_origin(
+            &mixed_routes,
+            &source_only,
+            "mixed-conda-dep",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(later_missing.contains("orphan-second"), "{later_missing}");
+        assert!(
+            later_missing.contains("no recorded Requires-Dist provenance"),
+            "{later_missing}"
         );
     }
 
