@@ -2039,6 +2039,7 @@ mod tests {
             auto_dropped: HashSet::new(),
             uv_closure_names: HashSet::new(),
             workspace_conda_versions: BTreeMap::new(),
+            workspace_conda_provider_facts: BTreeMap::new(),
         }
     }
 
@@ -2261,6 +2262,43 @@ mod tests {
             .unwrap(),
             channel: Some("https://example.invalid".into()),
         }
+    }
+
+    /// Build provider evidence through the production fact derivation path.
+    /// Each tuple is `(environment, selected version, direct conda spec)`;
+    /// absent versions model a successful consumer solve that did not select
+    /// this provider, while absent specs model transitive conda provision.
+    fn single_provider_facts(
+        provider: &str,
+        consumers: &[(&str, Option<&str>, Option<&str>)],
+    ) -> super::super::WorkspaceCondaFacts {
+        let env_records = consumers
+            .iter()
+            .map(|(env, version, _)| {
+                (
+                    (*env).to_string(),
+                    version
+                        .map(|version| vec![repo_record(provider, version, &[])])
+                        .unwrap_or_default(),
+                )
+            })
+            .collect();
+        let env_conda_deps = consumers
+            .iter()
+            .map(|(env, _, spec)| {
+                let deps = spec
+                    .map(|spec| BTreeMap::from([(provider.to_string(), spec.to_string())]))
+                    .unwrap_or_default();
+                ((*env).to_string(), deps)
+            })
+            .collect();
+        super::super::facts_from_solved_records(
+            env_records,
+            env_conda_deps,
+            BTreeSet::new(),
+            &NameMap::new(),
+            "regression-pack",
+        )
     }
 
     async fn validated_probe(pairs: Vec<(String, String)>) -> Vec<crate::probe::ProbeResult> {
@@ -2649,9 +2687,12 @@ mod tests {
         let target = crate::pypi::WheelTarget::for_subdir("3.11", "linux-64");
         let config = test_config();
         let mut bundle = pace_packaging_conflict_bundle();
-        bundle
-            .workspace_conda_versions
-            .insert("packaging".to_string(), "26.2".to_string());
+        let facts = single_provider_facts(
+            "packaging",
+            &[("pace", Some("26.2"), Some("==26.2"))],
+        );
+        bundle.workspace_conda_versions = facts.common_selected_versions;
+        bundle.workspace_conda_provider_facts = facts.provider_facts;
         bundle
             .auto_routed
             .push(prior_selection_route("packaging", "23.0"));
@@ -2746,9 +2787,12 @@ mod tests {
         let target = crate::pypi::WheelTarget::for_subdir("3.11", "linux-64");
         let config = test_config();
         let mut bundle = holosoma_numpy_conflict_bundle();
-        bundle
-            .workspace_conda_versions
-            .insert("numpy".to_string(), "1.26.4".to_string());
+        let facts = single_provider_facts(
+            "numpy",
+            &[("holosoma", Some("1.26.4"), Some("==1.26.4"))],
+        );
+        bundle.workspace_conda_versions = facts.common_selected_versions;
+        bundle.workspace_conda_provider_facts = facts.provider_facts;
         assert_workspace_fact_conflict_before_ownership(
             &bundle, &config, &target, "numpy", "1.26.4",
         );
@@ -2809,6 +2853,12 @@ mod tests {
         let target = crate::pypi::WheelTarget::for_subdir("3.11", "linux-64");
         let config = test_config();
         let mut bundle = holosoma_numpy_conflict_bundle();
+        let unrelated = single_provider_facts(
+            "packaging",
+            &[("holosoma", Some("26.2"), Some(">=24"))],
+        );
+        bundle.workspace_conda_versions = unrelated.common_selected_versions;
+        bundle.workspace_conda_provider_facts = unrelated.provider_facts;
         let favor_lock_prefs = BTreeMap::from([("numpy".to_string(), "1.26.4".to_string())]);
         bundle.apply_workspace_conda_fact_ownership(
             &config,
@@ -2817,8 +2867,8 @@ mod tests {
             &BTreeSet::new(),
         );
         assert!(
-            bundle.auto_dropped.is_empty(),
-            "a prior uv/favor-lock selection is not workspace conda ownership"
+            !bundle.auto_dropped.contains("numpy"),
+            "an unrelated conda provider cannot own numpy"
         );
 
         let error = auto_bundle_transitives_with(
@@ -2861,7 +2911,10 @@ mod tests {
                 "missing `{source}` in:\n{message}"
             );
         }
-        assert!(bundle.auto_dropped.is_empty());
+        assert!(
+            !bundle.auto_dropped.contains("numpy"),
+            "the genuine wheel conflict must remain unowned"
+        );
         assert_eq!(
             fetch_calls.load(std::sync::atomic::Ordering::SeqCst),
             0,
@@ -3044,9 +3097,12 @@ mod tests {
         let mut bundle = test_bundle(&["starlette>=0.49.1,<0.50"]);
         bundle.primary.metadata.name = "isaaclab".to_string();
         bundle.primary.metadata_provenance = Provenance::SourceBuiltRelaxed;
-        bundle
-            .workspace_conda_versions
-            .insert("starlette".to_string(), "0.45.3".to_string());
+        let facts = single_provider_facts(
+            "starlette",
+            &[("isaaclab", Some("0.45.3"), Some("==0.45.3"))],
+        );
+        bundle.workspace_conda_versions = facts.common_selected_versions;
+        bundle.workspace_conda_provider_facts = facts.provider_facts;
         bundle.apply_workspace_conda_fact_ownership(
             &config,
             &config.name_map,
