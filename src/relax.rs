@@ -176,27 +176,60 @@ impl<'de> Deserialize<'de> for CondaTarget {
 /// Canonical PyPI identity to raw conda target mapping.
 pub type NameMap = BTreeMap<PypiKey, CondaTarget>;
 
-/// A single conda dependency line ready to drop into recipe.yaml `run:` list.
+/// Constraint origin retained across the PyPI-to-conda syntax boundary.
 ///
-/// Structured as separate `name` and `spec` fields so callers can access
-/// either side without re-parsing the joined string. The `Display` impl
-/// reproduces the EXACT joined form the old `CondaDep(String)` produced:
-/// `"<name> <spec>"` when spec is non-empty, bare `"<name>"` otherwise.
-/// This means all code that previously passed `dep.0` as a string can now
-/// pass `&dep.to_string()`, and code that split on whitespace to get the
-/// name can use `&dep.name` directly.
+/// PyPI requirements carry both their source specifiers and the effective
+/// PEP 440 form after the configured relaxation policy. Explicit overrides
+/// are the sole boundary where native conda syntax may enter instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CondaConstraintOrigin {
+    Pypi {
+        original_specifiers: String,
+        effective_specifiers: String,
+    },
+    ExplicitOverride,
+}
+
+/// A single translated dependency with both PyPI and conda identities.
+///
+/// `name` and `spec` are ready to drop into recipe.yaml's `run:` list. The
+/// `Display` impl renders `"<name> <spec>"` when constrained and a bare name
+/// otherwise, while `constraint_origin` preserves the PyPI-side constraint
+/// needed by shared finalization.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CondaDep {
+    pub pypi_name: PypiKey,
     pub name: String,
     pub spec: String,
+    pub constraint_origin: CondaConstraintOrigin,
 }
 
 impl CondaDep {
-    /// Construct from separate name + spec strings. Use this in `translate`
-    /// (which already has both sides), since `translate` now builds `CondaDep`
-    /// directly rather than formatting a joined string first.
-    pub fn new(name: String, spec: String) -> Self {
-        Self { name, spec }
+    fn from_pypi(
+        pypi_name: PypiKey,
+        name: String,
+        spec: String,
+        original_specifiers: String,
+        effective_specifiers: String,
+    ) -> Self {
+        Self {
+            pypi_name,
+            name,
+            spec,
+            constraint_origin: CondaConstraintOrigin::Pypi {
+                original_specifiers,
+                effective_specifiers,
+            },
+        }
+    }
+
+    fn from_explicit_override(pypi_name: PypiKey, name: String, spec: String) -> Self {
+        Self {
+            pypi_name,
+            name,
+            spec,
+            constraint_origin: CondaConstraintOrigin::ExplicitOverride,
+        }
     }
 }
 
@@ -257,6 +290,7 @@ pub fn translate(
     }
 
     let pypi_name = req.name.as_ref();
+    let pypi_key = PypiKey::from_pypi(pypi_name);
     let conda_name = map_name(pypi_name, name_map);
 
     // User override wins, full replacement.
@@ -264,7 +298,11 @@ pub fn translate(
         .get(pypi_name)
         .or_else(|| overrides.get(conda_name.as_spec()))
     {
-        return Ok(Some(CondaDep::new(conda_name.to_string(), spec.clone())));
+        return Ok(Some(CondaDep::from_explicit_override(
+            pypi_key,
+            conda_name.to_string(),
+            spec.clone(),
+        )));
     }
 
     // `python` is fully off-limits to relax: every widened form
@@ -279,10 +317,15 @@ pub fn translate(
         policy
     };
 
-    let spec = match &req.version_or_url {
-        None => String::new(),
+    let (spec, original_specifiers, effective_specifiers) = match &req.version_or_url {
+        None => (String::new(), String::new(), String::new()),
         Some(VersionOrUrl::VersionSpecifier(specifiers)) => {
-            convert_specifiers(specifiers, effective_policy)
+            let translated = convert_specifiers(specifiers, effective_policy)?;
+            (
+                translated.conda,
+                render_pep440(specifiers.iter()),
+                translated.pep440,
+            )
         }
         Some(VersionOrUrl::Url(_)) => {
             // URL deps aren't expressible as conda match specs.
@@ -291,7 +334,13 @@ pub fn translate(
         }
     };
 
-    Ok(Some(CondaDep::new(conda_name.to_string(), spec)))
+    Ok(Some(CondaDep::from_pypi(
+        pypi_key,
+        conda_name.to_string(),
+        spec,
+        original_specifiers,
+        effective_specifiers,
+    )))
 }
 
 /// v1.5.x cleanup 0c: THE canonical conda-name normalizer -- full
@@ -392,16 +441,44 @@ pub(crate) fn assert_spec_roundtrips(name: &str, spec: &str) {
     }
 }
 
-fn convert_specifiers(specifiers: &uv_pep440::VersionSpecifiers, policy: RelaxPolicy) -> String {
-    // Detect single `==X.Y.Z` pin -> apply relax policy.
-    let specs: Vec<_> = specifiers.iter().collect();
-    if specs.len() == 1
+struct ConvertedSpecifiers {
+    conda: String,
+    pep440: String,
+}
+
+fn render_pep440<'a>(
+    specifiers: impl IntoIterator<Item = &'a uv_pep440::VersionSpecifier>,
+) -> String {
+    specifiers
+        .into_iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn convert_specifiers(
+    specifiers: &uv_pep440::VersionSpecifiers,
+    policy: RelaxPolicy,
+) -> Result<ConvertedSpecifiers> {
+    // Apply policy while the constraint is still PEP 440. The resulting
+    // representation is retained for shared finalization; conda lowering is
+    // a separate rendering step and is never used to reconstruct it.
+    let specs: Vec<uv_pep440::VersionSpecifier> = specifiers.iter().cloned().collect();
+    let effective: Vec<uv_pep440::VersionSpecifier> = if specs.len() == 1
         && *specs[0].operator() == Operator::Equal
         && policy != RelaxPolicy::None
         && let Some(widened) = widen_exact(specs[0].version(), policy)
     {
-        return widened;
-    }
+        uv_pep440::VersionSpecifiers::from_str(&widened)
+            .map_err(|error| anyhow!("parsing generated relaxed constraint `{widened}`: {error}"))?
+            .into_iter()
+            .collect()
+    } else if matches!(policy, RelaxPolicy::StrongMajor | RelaxPolicy::CondaAware) {
+        let refs: Vec<_> = specs.iter().collect();
+        strip_upper_bounds(&refs)
+    } else {
+        specs
+    };
 
     // TODO(conda-aware): CondaAware currently behaves IDENTICALLY to
     // StrongMajor here -- both unconditionally strip every upper bound
@@ -410,20 +487,18 @@ fn convert_specifiers(specifiers: &uv_pep440::VersionSpecifiers, policy: RelaxPo
     // candidates satisfy the bound; see RelaxPolicy::CondaAware doc.
     // Until that probe lands, conda-aware silently degrades to
     // strong-major.
-    if matches!(policy, RelaxPolicy::StrongMajor | RelaxPolicy::CondaAware) {
-        return strip_upper_bounds(&specs)
-            .iter()
-            .filter_map(convert_one)
-            .collect::<Vec<_>>()
-            .join(",");
+    let mut conda = Vec::with_capacity(effective.len());
+    let mut pep440 = Vec::with_capacity(effective.len());
+    for specifier in &effective {
+        if let Some(rendered) = convert_one(specifier) {
+            conda.push(rendered);
+            pep440.push(specifier.to_string());
+        }
     }
-
-    // Otherwise pass through, converting each specifier individually.
-    specs
-        .iter()
-        .filter_map(|s| convert_one(s))
-        .collect::<Vec<_>>()
-        .join(",")
+    Ok(ConvertedSpecifiers {
+        conda: conda.join(","),
+        pep440: pep440.join(","),
+    })
 }
 
 /// Drop specifiers that impose an upper bound, expand `~=` to its
@@ -945,13 +1020,25 @@ mod tests {
     #[test]
     fn conda_dep_display_roundtrip() {
         // Spec-bearing: `to_string()` must produce the joined form.
-        let dep = CondaDep::new("numpy".to_string(), ">=1.26,<2".to_string());
+        let dep = CondaDep::from_pypi(
+            PypiKey::from_pypi("numpy"),
+            "numpy".to_string(),
+            ">=1.26,<2".to_string(),
+            ">=1.26,<2".to_string(),
+            ">=1.26,<2".to_string(),
+        );
         assert_eq!(dep.to_string(), "numpy >=1.26,<2");
         assert_eq!(dep.name, "numpy");
         assert_eq!(dep.spec, ">=1.26,<2");
 
         // Empty spec -> bare name, NO trailing space.
-        let bare = CondaDep::new("pyglet".to_string(), "".to_string());
+        let bare = CondaDep::from_pypi(
+            PypiKey::from_pypi("pyglet"),
+            "pyglet".to_string(),
+            String::new(),
+            String::new(),
+            String::new(),
+        );
         assert_eq!(bare.to_string(), "pyglet");
         assert!(
             !bare.to_string().ends_with(' '),
@@ -971,6 +1058,20 @@ mod tests {
         .unwrap();
         assert_eq!(from_translate.to_string(), "numpy >=1.26,<2");
         assert_eq!(from_translate.name, "numpy");
+        assert_eq!(from_translate.pypi_name, PypiKey::from_pypi("numpy"));
+        assert_eq!(
+            from_translate.constraint_origin,
+            CondaConstraintOrigin::Pypi {
+                original_specifiers: "==1.26.4".to_string(),
+                effective_specifiers: ">=1.26,<2".to_string(),
+            }
+        );
+    }
+
+    fn translated(req: &str, policy: RelaxPolicy) -> CondaDep {
+        translate(req, &env(), &BTreeMap::new(), &BTreeMap::new(), policy)
+            .unwrap()
+            .unwrap()
     }
 
     fn t(req: &str, policy: RelaxPolicy) -> Option<String> {
@@ -984,6 +1085,49 @@ mod tests {
         assert_eq!(
             t("numpy==1.26.4", RelaxPolicy::Minor).as_deref(),
             Some("numpy >=1.26,<2")
+        );
+    }
+
+    #[test]
+    fn pypi_wildcard_exclusion_retains_pep440_before_conda_lowering() {
+        let dep = translated("jupyter-core!=5.0.*,>=4.12", RelaxPolicy::Minor);
+        assert_eq!(dep.spec, ">=4.12,<5.0|>=5.1");
+        let CondaConstraintOrigin::Pypi {
+            original_specifiers,
+            effective_specifiers,
+        } = dep.constraint_origin
+        else {
+            panic!("ordinary PyPI metadata must retain PyPI constraint origin");
+        };
+        for preserved in [original_specifiers, effective_specifiers] {
+            assert!(preserved.contains(">=4.12"), "{preserved}");
+            assert!(preserved.contains("!=5.0.*"), "{preserved}");
+            uv_pep440::VersionSpecifiers::from_str(&preserved)
+                .expect("preserved constraint must remain valid PEP 440");
+        }
+    }
+
+    #[test]
+    fn effective_pep440_tracks_strong_major_and_unsupported_exact_equal() {
+        let strong = translated("numpy>=1.26,<2", RelaxPolicy::StrongMajor);
+        assert_eq!(strong.spec, ">=1.26");
+        assert_eq!(
+            strong.constraint_origin,
+            CondaConstraintOrigin::Pypi {
+                original_specifiers: ">=1.26,<2".to_string(),
+                effective_specifiers: ">=1.26".to_string(),
+            }
+        );
+
+        let arbitrary = translated("tensordict===0.9.0", RelaxPolicy::None);
+        assert!(arbitrary.spec.is_empty());
+        assert_eq!(
+            arbitrary.constraint_origin,
+            CondaConstraintOrigin::Pypi {
+                original_specifiers: "===0.9.0".to_string(),
+                effective_specifiers: String::new(),
+            },
+            "the deliberate conda-inexpressible === drop must remain unchanged"
         );
     }
 
@@ -1036,7 +1180,12 @@ mod tests {
             RelaxPolicy::Minor,
         )
         .unwrap();
-        assert_eq!(r.unwrap().to_string(), "torch >=2.7");
+        let dep = r.unwrap();
+        assert_eq!(dep.to_string(), "torch >=2.7");
+        assert_eq!(
+            dep.constraint_origin,
+            CondaConstraintOrigin::ExplicitOverride
+        );
     }
 
     #[test]
