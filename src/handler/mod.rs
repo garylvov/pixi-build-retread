@@ -38,6 +38,7 @@ use tokio::sync::RwLock;
 use uv_pep508::uv_pep440::VersionSpecifiers;
 
 use crate::config::{RelaxPolicy, RetreadConfig, WheelEntry};
+use crate::constraint::{Authority, Conflict, Constraint, Provenance, finalize};
 use crate::index_chain::{IndexPurpose, index_chain};
 use crate::pypi::{self, WheelTarget};
 use crate::recipe::{BundleSource, build_bundle_recipe, build_courier_recipe_with_mode, to_yaml};
@@ -611,6 +612,12 @@ struct ResolvedWheel {
     /// (schema 9+). Set in the BFS phase-3 handler when bfs_fetch_pypi
     /// returns a `SdistProv`. `None` for index-fetched and git-built wheels.
     sdist_source: Option<crate::lock::SdistWheelSource>,
+    /// Authority-bearing origin of this wheel's relaxed metadata.
+    ///
+    /// This is recorded explicitly at materialization time because a local
+    /// path build has neither git nor sdist replay provenance and therefore
+    /// cannot be classified correctly from those fields after the fact.
+    metadata_provenance: Provenance,
     metadata: WheelMetadata,
     /// v0.12.0+: extras the user requested on the originating
     /// `[retread-wheels]` entry. Surfaced in the audit so debugging
@@ -632,6 +639,17 @@ struct ResolvedWheel {
     /// WHY this wheel didn't ship the repo-root tree.
     #[allow(dead_code)] // read at audit time
     auto_data_dedup_skipped_root: Option<PathBuf>,
+}
+
+/// Record wheel metadata authority at the source boundary. Source-built
+/// wheels include local paths, whose replay fields are intentionally empty,
+/// so downstream code must not try to reconstruct this fact from URL shape.
+fn wheel_entry_metadata_provenance(entry: &WheelEntry) -> Provenance {
+    if entry.path.is_some() || entry.git.is_some() || entry.from.is_some() {
+        Provenance::SourceBuiltRelaxed
+    } else {
+        Provenance::IndexWheelMetadata
+    }
 }
 
 /// One conda output's worth of wheels: a "bundle" produced by a single
@@ -669,13 +687,10 @@ struct Bundle {
     /// conda — not a shipped wheel — provides it at install time. Empty
     /// on the legacy path and when `auto-route = false`.
     ///
-    /// `deps_from_floor`: true when this root ORIGINATED from a
-    /// `retread-deps-from` source file as an exact `==`/`===` pin
-    /// (conda-as-truth doctrine, see `deps_from_exact_pinned_names`):
-    /// upstream requirement-file pins are pip-world advisories, so the
-    /// emitted conda run-dep is softened to a `>=` floor instead of the
-    /// usual exact pin, letting a sibling pack's own conda pin for the
-    /// same name win the conda solve instead of hard-conflicting.
+    /// Each route carries the typed origin of its selected version. Exact
+    /// pins originating in `retread-deps-from` are advisory; ordinary uv
+    /// selections remain preferences until the common constraint finalizer
+    /// derives an emitted spec.
     auto_routed: Vec<BundleAutoRoute>,
     /// Canonical PyPI names the precise consuming workspace already owns.
     /// These are removed from the pack's wheel graph and are not re-emitted
@@ -692,6 +707,11 @@ struct Bundle {
     /// Empty on the legacy (non-uv) path, where the BFS bundles the
     /// full closure and the `vendored` set already covers members.
     uv_closure_names: std::collections::HashSet<String>,
+    /// Conda versions selected identically in every precise consuming
+    /// environment, including transitives. These are validation facts, not
+    /// ownership evidence; emission attaches one only through the group's
+    /// explicit PyPI-to-conda route edge.
+    workspace_conda_versions: BTreeMap<String, String>,
 }
 
 /// One mutable uv auto-route retained on a bundle until the final emitted
@@ -701,7 +721,7 @@ struct Bundle {
 #[derive(Debug, Clone)]
 struct BundleAutoRoute {
     route: crate::uv_closure::AutoRoutedPackage,
-    deps_from_floor: bool,
+    provenance: Provenance,
 }
 
 impl Bundle {
@@ -2035,12 +2055,13 @@ async fn resolve_all(
                 .auto_routed
                 .iter()
                 .filter(|r| !closure.auto_dropped.contains(&r.pypi_name))
-                .map(|r| {
-                    let floor = deps_from_floor_names.contains(&r.pypi_name);
-                    BundleAutoRoute {
-                        route: r.clone(),
-                        deps_from_floor: floor,
-                    }
+                .map(|r| BundleAutoRoute {
+                    route: r.clone(),
+                    provenance: if deps_from_floor_names.contains(&r.pypi_name) {
+                        Provenance::DepsFromRelaxed
+                    } else {
+                        Provenance::PriorSelection
+                    },
                 })
                 .collect();
             bundle.auto_dropped = closure.auto_dropped.iter().cloned().collect();
@@ -2054,6 +2075,7 @@ async fn resolve_all(
                 .map(|k| canonical_conda_name(k))
                 .collect();
         }
+        bundle.workspace_conda_versions = workspace_facts.common_selected_versions.clone();
         // Workspace PyPI declarations are already installed by Pixi and do
         // not need a second copy inside this pack. This evidence is precise
         // direct ownership, independent of whether the group had uv roots.
@@ -2430,6 +2452,10 @@ struct WorkspaceCondaFacts {
     /// Common selected versions for exact conda names directly owned by every
     /// precise consumer (Rule-3 and harmonization authority).
     common_conda_versions: BTreeMap<String, String>,
+    /// Common selected versions for all conda records, including transitives.
+    /// These are never ownership evidence. They become typed emission facts
+    /// only when an emitted PyPI dependency supplies a conda route edge.
+    common_selected_versions: BTreeMap<String, String>,
     /// Full exact selected specs per consuming environment. These are never
     /// ownership evidence; they are the immutable baseline for route trials.
     env_exact_specs: BTreeMap<String, Vec<String>>,
@@ -2661,8 +2687,9 @@ fn facts_from_solved_records(
     // in env_exact_specs for route validation/fingerprinting, but a direct
     // `pytorch-gpu` declaration can never manufacture a `pytorch` fact.
     let common_conda_versions: BTreeMap<String, String> = common_selected_versions
-        .into_iter()
-        .filter(|(name, _)| owned_conda.contains(name))
+        .iter()
+        .filter(|(name, _)| owned_conda.contains(*name))
+        .map(|(name, version)| (name.clone(), version.clone()))
         .collect();
 
     // A mapping edge is the identity/provenance proof. Unmapped conda names
@@ -2715,6 +2742,7 @@ fn facts_from_solved_records(
         owned_pypi,
         common_pypi,
         common_conda_versions,
+        common_selected_versions,
         env_exact_specs,
         fingerprint: format!("{:x}", hasher.finalize()),
     }
@@ -2743,7 +2771,7 @@ fn workspace_fact_constraints(
                 conda_version: format!("=={}", fact.version),
                 source: "workspace-solved".to_string(),
                 env: "precise-consuming-envs".to_string(),
-                advisory: false,
+                provenance: Provenance::WorkspaceCondaFact("precise-consuming-envs".to_string()),
             },
         );
     }
@@ -2880,7 +2908,7 @@ fn apply_deps_from_conda_floors(
                 conda_version: floor.floor_spec.clone(),
                 source: "deps-from-conda-advisory".to_string(),
                 env: floor.source.clone(),
-                advisory: true,
+                provenance: Provenance::DepsFromRelaxed,
             },
         );
         blocked.insert(pypi.clone());
@@ -3102,7 +3130,7 @@ async fn uv_group_closure(
     // roots and `dedupe_roots_last_wins` keeps the last occurrence per
     // name, so any name present here is guaranteed to be the winning
     // root below -- these pins are safe to soften at conda run-dep
-    // emission time (see `Bundle::auto_routed`'s `deps_from_floor`).
+    // emission time (see `BundleAutoRoute::provenance`).
     let mut deps_from_floor_names: std::collections::BTreeSet<String> = Default::default();
     let mut deps_from_advisory_floors = Vec::new();
     if !effective.deps_from.is_empty() {
@@ -3323,7 +3351,7 @@ async fn uv_group_closure(
                         conda_version: format!("{major}.*"),
                         source: "cuda-major-table".to_string(),
                         env: "consuming-envs".to_string(),
-                        advisory: false,
+                        provenance: Provenance::UvConstraint,
                     },
                 );
             }
@@ -3442,6 +3470,11 @@ async fn uv_group_closure(
         python_version: target.python_version.clone(),
         conda_subdir: target.conda_subdir.clone(),
         dependencies: roots,
+        dependency_provenance: deps_from_floor_names
+            .iter()
+            .cloned()
+            .map(|name| (name, Provenance::DepsFromRelaxed))
+            .collect(),
         constraints,
         overrides,
         no_emit_packages: no_emit,
@@ -4227,6 +4260,14 @@ gpu = { features = ["gpu"], no-default-feature = true }
             !facts.common_conda_versions.contains_key("pytorch"),
             "a transitive pytorch record selected by pytorch-gpu is not direct-name authority"
         );
+        assert_eq!(
+            facts
+                .common_selected_versions
+                .get("pytorch")
+                .map(String::as_str),
+            Some("2.10.0"),
+            "the agreed transitive stays available as validation input without becoming ownership"
+        );
         assert!(!facts.common_pypi.contains_key("torch"));
         assert!(
             workspace_fact_constraints(&facts, &BTreeSet::new())
@@ -4255,6 +4296,7 @@ gpu = { features = ["gpu"], no-default-feature = true }
         );
 
         assert!(!facts.common_conda_versions.contains_key("pytorch"));
+        assert!(!facts.common_selected_versions.contains_key("pytorch"));
         assert!(!facts.common_pypi.contains_key("torch"));
         assert!(
             workspace_fact_constraints(&facts, &BTreeSet::new())
@@ -4305,6 +4347,22 @@ gpu = { features = ["gpu"], no-default-feature = true }
         );
 
         assert_eq!(facts.common_pypi["numpy"].version, "2.1.0");
+        assert_eq!(
+            facts
+                .common_selected_versions
+                .get("numpy")
+                .map(String::as_str),
+            Some("2.1.0")
+        );
+        assert_eq!(
+            facts
+                .common_selected_versions
+                .get("tetgen")
+                .map(String::as_str),
+            Some("1.6.0"),
+            "a same-version transitive fact is retained without guessing PyPI identity"
+        );
+        assert!(!facts.common_selected_versions.contains_key("pytorch"));
         assert!(
             !facts.common_pypi.contains_key("torch"),
             "divergent consuming-env versions must not become a shared fact"
@@ -4828,6 +4886,7 @@ async fn resolve_bundle(
             auto_routed: vec![],
             auto_dropped: Default::default(),
             uv_closure_names: Default::default(),
+            workspace_conda_versions: Default::default(),
         });
     }
 
@@ -5182,12 +5241,15 @@ async fn resolve_bundle(
         for (pending, fetch_result) in fetched {
             let dep_conda_name = canonical_conda_name(&pending.pypi_name);
             let sub_indexes_for_recurse = bfs_descendant_indexes(&pending.source, &bundle_indexes);
-            // 6-tuple: (url, upstream_url, git_source, sdist_source, metadata, seed_rd)
+            // Materialization plus explicit metadata origin. The origin cannot
+            // be recovered later from replay fields because path builds carry
+            // neither git nor sdist provenance.
             let (
                 sub_url,
                 sub_upstream_url,
                 sub_git_source,
                 sub_sdist_source,
+                sub_metadata_provenance,
                 sub_metadata,
                 sub_seed_rd,
             ) = match (&pending.source, fetch_result?) {
@@ -5195,12 +5257,14 @@ async fn resolve_bundle(
                     // Pypi-form sub-wheels are NOT D-rewritten, so
                     // their metadata IS the original Requires-Dist.
                     let seed_rd = metadata.requires_dist.clone();
-                    let (upstream, sub_sdist_src) = bfs_fetch_provenance(&resolved_url, sdist_prov);
+                    let (upstream, sub_sdist_src, metadata_provenance) =
+                        bfs_fetch_provenance(&resolved_url, sdist_prov);
                     (
                         resolved_url,
                         upstream,
                         None,
                         sub_sdist_src,
+                        metadata_provenance,
                         metadata,
                         seed_rd,
                     )
@@ -5253,6 +5317,7 @@ async fn resolve_bundle(
                         sub_up,
                         sub_gs,
                         None, // Git-form: no sdist provenance
+                        Provenance::SourceBuiltRelaxed,
                         sub.metadata,
                         sub_original_rd,
                     )
@@ -5288,6 +5353,7 @@ async fn resolve_bundle(
                         sub_up,
                         None, // Url-form: no git source
                         None, // Url-form: no sdist provenance
+                        Provenance::IndexWheelMetadata,
                         sub.metadata,
                         sub_original_rd,
                     )
@@ -5354,6 +5420,7 @@ async fn resolve_bundle(
                 // fired for this sub-wheel; None for normal index-wheel fetches
                 // and git/url-form sub-wheels.
                 sdist_source: sub_sdist_source,
+                metadata_provenance: sub_metadata_provenance,
                 metadata: sub_metadata,
                 extras_requested: vec![],
                 auto_data: None,
@@ -5374,6 +5441,7 @@ async fn resolve_bundle(
         auto_routed: vec![],
         auto_dropped: Default::default(),
         uv_closure_names: Default::default(),
+        workspace_conda_versions: Default::default(),
     };
 
     Ok(bfs_bundle)
@@ -5431,7 +5499,16 @@ pub(super) struct SdistProv {
 fn bfs_fetch_provenance(
     resolved_url: &url::Url,
     sdist_prov: Option<SdistProv>,
-) -> (Option<url::Url>, Option<crate::lock::SdistWheelSource>) {
+) -> (
+    Option<url::Url>,
+    Option<crate::lock::SdistWheelSource>,
+    Provenance,
+) {
+    let metadata_provenance = if sdist_prov.is_some() {
+        Provenance::SourceBuiltRelaxed
+    } else {
+        Provenance::IndexWheelMetadata
+    };
     let sdist_source = sdist_prov.map(|p| crate::lock::SdistWheelSource {
         index: p.index,
         name: p.name,
@@ -5439,7 +5516,7 @@ fn bfs_fetch_provenance(
         sdist_url: p.sdist_url.to_string(),
     });
     let upstream_url = sdist_source.is_none().then(|| resolved_url.clone());
-    (upstream_url, sdist_source)
+    (upstream_url, sdist_source, metadata_provenance)
 }
 
 async fn bfs_fetch_pypi(
@@ -6050,6 +6127,7 @@ async fn materialize_and_rewrite(
             // (set in the BFS phase-3 loop). materialize_and_rewrite handles git/path/
             // url/version entries — none of those are sdist BFS transitives.
             sdist_source: None,
+            metadata_provenance: wheel_entry_metadata_provenance(entry),
             extras_requested: audit_info.extras_requested,
             auto_data: auto_data_report,
             auto_data_dedup_skipped_root: audit_info.dedup_skipped_root,
@@ -6201,7 +6279,58 @@ fn assemble_conda_output(
 /// content-addressed form `py{XY}_h{hash_prefix}_{build_number}`.
 /// When `None` (non-courier path), the legacy `py{XY}_{build_number}`
 /// string is emitted unchanged.
-fn produce_output(
+#[derive(Clone, Debug)]
+struct EmissionConstraintConflict {
+    conda_name: CondaName,
+    conflict: Conflict,
+}
+
+#[derive(Debug)]
+struct EmittedBundleRouteAssembly {
+    routes: Vec<crate::uv_closure::CondaRouteSpec>,
+    conflicts: Vec<EmissionConstraintConflict>,
+}
+
+#[derive(Clone, Debug)]
+struct PypiEmissionGroup {
+    pypi_name: PypiKey,
+    conda_name: CondaName,
+    constraints: Vec<Constraint>,
+    native_conda_override: Option<String>,
+}
+
+fn add_emission_constraint(
+    groups: &mut Vec<PypiEmissionGroup>,
+    indexes: &mut BTreeMap<PypiKey, usize>,
+    pypi_name: PypiKey,
+    conda_name: CondaName,
+    constraint: Constraint,
+    native_conda_override: Option<String>,
+) {
+    let index = match indexes.get(&pypi_name) {
+        Some(index) => *index,
+        None => {
+            let index = groups.len();
+            indexes.insert(pypi_name.clone(), index);
+            groups.push(PypiEmissionGroup {
+                pypi_name,
+                conda_name,
+                constraints: Vec::new(),
+                native_conda_override: None,
+            });
+            index
+        }
+    };
+    let group = &mut groups[index];
+    if !group.constraints.contains(&constraint) {
+        group.constraints.push(constraint);
+    }
+    if native_conda_override.is_some() {
+        group.native_conda_override = native_conda_override;
+    }
+}
+
+fn produce_output_with_conflicts(
     bundle: &Bundle,
     config: &RetreadConfig,
     host_platform: Platform,
@@ -6213,7 +6342,7 @@ fn produce_output(
     // on an incremental add).  `None` → use bundle.primary.metadata.version
     // (today's behaviour, always chosen when RETREAD_INCREMENTAL is unset).
     version_override: Option<&str>,
-) -> Result<CondaOutput> {
+) -> Result<(CondaOutput, Vec<EmissionConstraintConflict>)> {
     // Python version for the emitted variant/build/`python` dep. Shared with
     // the build recipe via `emit_python_version` so the metadata and the
     // recipe can never disagree. NEVER bare-major: a `py3-none-manylinux`
@@ -6288,6 +6417,8 @@ fn produce_output(
     let env = marker_env_for(&host_platform.to_string(), &python_version)?;
     let mut run_dep_specs: Vec<NamedSpec<PackageSpec>> = vec![spec_from_str(&python_dep)?];
     let mut seen_dep_names: HashSet<String> = HashSet::from(["python".to_string()]);
+    let mut emission_groups = Vec::new();
+    let mut emission_group_indexes = BTreeMap::new();
 
     // M2 (v4.3.0): auto-routed packages FIRST, exact-pinned. The uv
     // closure was resolved against exactly these versions, and the probe
@@ -6323,41 +6454,99 @@ fn produce_output(
     for auto_route in &bundle.auto_routed {
         let conda_name = CondaName::new(auto_route.route.conda_name.as_str());
         let conda_version = &auto_route.route.conda_version;
-        let floor = auto_route.deps_from_floor;
         let conda_key = conda_name.key();
-        if seen_dep_names.insert(conda_key.as_str().to_owned()) {
-            // Manual-override exemption: only a HAND-WRITTEN
-            // `[retread-overrides]` entry counts as intent -- a ledgered
-            // override merged from `.retread/auto-overrides.json` is a
-            // repair-derived pypi steering knob and must NOT freeze the
-            // conda pin back to exact (run-31 regression: every package
-            // ANY repair touched re-emitted `==locked`, resurrecting the
-            // exact-pin conflict class the ranges exist to prevent).
-            let manual_override = config.overrides.contains_key(conda_key.as_str())
-                && !config.ledger_overrides.contains(conda_key.as_str());
-            let spec = if floor {
-                format!("{} >={conda_version}", conda_name.as_spec())
+        let pypi_name = PypiKey::from_pypi(&auto_route.route.pypi_name);
+
+        // Preserve the existing conda route contract. The selected version is
+        // not restored as a hard PyPI `==`: it becomes either a deps-from
+        // advisory floor or the bounded/exact compatibility envelope the
+        // emitted conda package has always declared.
+        let manual_override = config.overrides.contains_key(conda_key.as_str())
+            && !config.ledger_overrides.contains(conda_key.as_str());
+        let (route_spec, provenance) =
+            if matches!(auto_route.provenance, Provenance::DepsFromRelaxed) {
+                (format!(">={conda_version}"), Provenance::DepsFromRelaxed)
             } else if crate::solve::is_abi_anchor(conda_key.as_str()) || manual_override {
-                format!("{} =={conda_version}", conda_name.as_spec())
+                (format!("=={conda_version}"), Provenance::UvConstraint)
             } else {
                 match bounded_range_ceiling(conda_version) {
-                    Some(ceiling) => {
-                        format!("{} >={conda_version},<{ceiling}", conda_name.as_spec())
-                    }
-                    // Unparseable version (no leading numeric component) --
-                    // fall back to the exact pin rather than emit garbage.
-                    None => format!("{} =={conda_version}", conda_name.as_spec()),
+                    Some(ceiling) => (
+                        format!(">={conda_version},<{ceiling}"),
+                        Provenance::UvConstraint,
+                    ),
+                    None => (format!("=={conda_version}"), Provenance::UvConstraint),
                 }
             };
-            if floor {
-                tracing::info!(
-                    bundle = %bundle.conda_name,
-                    package = %conda_name,
-                    version = %conda_version,
-                    "retread: deps-from pin softened {conda_name} =={conda_version} -> >={conda_version} (conda-as-truth)",
-                );
-            }
-            run_dep_specs.push(spec_from_str(&spec)?);
+        let specifiers = VersionSpecifiers::from_str(&route_spec).with_context(|| {
+            format!(
+                "parsing generated conda route constraint `{} {route_spec}`",
+                auto_route.route.pypi_name
+            )
+        })?;
+        add_emission_constraint(
+            &mut emission_groups,
+            &mut emission_group_indexes,
+            pypi_name.clone(),
+            conda_name.clone(),
+            Constraint {
+                specifiers,
+                provenance,
+                source: format!(
+                    "auto-route `{}=={}` to conda `{}=={}`",
+                    auto_route.route.pypi_name,
+                    auto_route.route.pypi_version,
+                    auto_route.route.conda_name,
+                    auto_route.route.conda_version
+                ),
+            },
+            None,
+        );
+        let prior_specifiers =
+            VersionSpecifiers::from_str(&format!("=={}", auto_route.route.pypi_version))
+                .with_context(|| {
+                    format!(
+                        "parsing prior uv selection `{}=={}`",
+                        auto_route.route.pypi_name, auto_route.route.pypi_version
+                    )
+                })?;
+        add_emission_constraint(
+            &mut emission_groups,
+            &mut emission_group_indexes,
+            pypi_name.clone(),
+            conda_name.clone(),
+            Constraint {
+                specifiers: prior_specifiers,
+                provenance: Provenance::PriorSelection,
+                source: format!(
+                    "prior uv selection `{}=={}`",
+                    auto_route.route.pypi_name, auto_route.route.pypi_version
+                ),
+            },
+            None,
+        );
+        for input in &auto_route.route.input_requirements {
+            let specifiers = if input.specifiers.trim().is_empty() {
+                VersionSpecifiers::empty()
+            } else {
+                VersionSpecifiers::from_str(&input.specifiers).with_context(|| {
+                    format!(
+                        "parsing auto-route input `{}` for `{}`",
+                        input.specifiers, auto_route.route.pypi_name
+                    )
+                })?
+            };
+            add_emission_constraint(
+                &mut emission_groups,
+                &mut emission_group_indexes,
+                pypi_name.clone(),
+                conda_name.clone(),
+                Constraint {
+                    specifiers,
+                    provenance: input.effective_provenance(),
+                    source: input.source.clone(),
+                },
+                None,
+            );
         }
     }
 
@@ -6386,13 +6575,13 @@ fn produce_output(
             // alongside the already-bundled wheel -- found via
             // examples/isaac6 (isaacsim 6.0's tinyobjloader dep).
             let dep_name = dep.name.clone();
-            let parsed_raw: Option<uv_pep508::Requirement> =
-                uv_pep508::Requirement::from_str(raw).ok();
-            let raw_pypi_name: Option<String> = parsed_raw.map(|r| r.name.to_string());
+            let parsed_raw: uv_pep508::Requirement = uv_pep508::Requirement::from_str(raw)
+                .with_context(|| format!("parsing emitted PyPI requirement `{raw}`"))?;
+            let raw_pypi_name = parsed_raw.name.to_string();
             // P2: one dual-namespace membership helper for all three
             // filters (canonicalizes both query names internally).
             let in_set = |set: &HashSet<String>| {
-                crate::relax::already_covered(set, &dep_name, raw_pypi_name.as_deref())
+                crate::relax::already_covered(set, &dep_name, Some(&raw_pypi_name))
             };
             if in_set(&vendored) {
                 continue;
@@ -6443,10 +6632,131 @@ fn produce_output(
                 );
                 continue;
             }
-            if !seen_dep_names.insert(CondaName::new(dep_name.as_str()).key().into_string()) {
-                continue;
+            let conda_name = CondaName::new(dep_name.as_str());
+            let pypi_name = PypiKey::from_pypi(&raw_pypi_name);
+            let explicit_override = config
+                .overrides
+                .get(&raw_pypi_name)
+                .or_else(|| config.overrides.get(conda_name.as_spec()));
+            let (specifiers, native_conda_override) = if dep.spec.trim().is_empty() {
+                (VersionSpecifiers::empty(), None)
+            } else if let Some(pep) = crate::uv_closure::conda_spec_to_pep440(&dep.spec) {
+                (
+                    VersionSpecifiers::from_str(&pep).with_context(|| {
+                        format!("parsing translated PyPI constraint `{raw}` as `{pep}`")
+                    })?,
+                    None,
+                )
+            } else if explicit_override.is_some() {
+                // Explicit native conda syntax (build strings/alternations)
+                // cannot participate in PEP 440 algebra. It is the sole
+                // documented non-PyPI boundary: the typed UvOverride still
+                // passes through finalize for replacement semantics, while
+                // rattler remains responsible for the native match spec.
+                (VersionSpecifiers::empty(), Some(dep.spec.clone()))
+            } else {
+                return Err(anyhow!(
+                    "translated PyPI requirement `{raw}` produced conda-only spec `{}`; \
+                     PyPI-origin constraints may not bypass shared finalization",
+                    dep.spec
+                ));
+            };
+            add_emission_constraint(
+                &mut emission_groups,
+                &mut emission_group_indexes,
+                pypi_name,
+                conda_name,
+                Constraint {
+                    specifiers,
+                    provenance: if explicit_override.is_some() {
+                        Provenance::UvOverride
+                    } else {
+                        wheel.metadata_provenance.clone()
+                    },
+                    source: format!(
+                        "wheel `{}=={}` Requires-Dist `{raw}`",
+                        wheel.metadata.name, wheel.metadata.version
+                    ),
+                },
+                native_conda_override,
+            );
+        }
+    }
+
+    // A common solved workspace record is authoritative validation input even
+    // when it is transitive. Attach it only when a concrete emission route's
+    // advisory clause excludes that record: compatible advisory ranges keep
+    // their portable range, while a same-named conda record can never
+    // manufacture cross-ecosystem identity, ownership, or an exact pin.
+    for group in &mut emission_groups {
+        let conda_key = group.conda_name.key();
+        let Some(version) = bundle.workspace_conda_versions.get(conda_key.as_str()) else {
+            continue;
+        };
+        if !group
+            .constraints
+            .iter()
+            .any(|constraint| constraint.authority() == Authority::Advisory)
+        {
+            continue;
+        }
+        let workspace_version = uv_pep508::uv_pep440::Version::from_str(version).with_context(|| {
+            format!(
+                "parsing common workspace conda version `{version}` for PyPI `{}`",
+                group.pypi_name
+            )
+        })?;
+        if !group.constraints.iter().any(|constraint| {
+            constraint.authority() == Authority::Advisory
+                && !constraint.specifiers.contains(&workspace_version)
+        }) {
+            continue;
+        }
+        let specifiers =
+            VersionSpecifiers::from_str(&format!("=={version}")).with_context(|| {
+                format!(
+                    "parsing common workspace conda fact `{}=={version}` for PyPI `{}`",
+                    group.conda_name, group.pypi_name
+                )
+            })?;
+        let constraint = Constraint {
+            specifiers,
+            provenance: Provenance::WorkspaceCondaFact("precise-consuming-envs".to_string()),
+            source: format!(
+                "workspace conda fact `{}=={version}` shared by precise consuming environments",
+                group.conda_name
+            ),
+        };
+        if !group.constraints.contains(&constraint) {
+            group.constraints.push(constraint);
+        }
+    }
+
+    let mut conflicts = Vec::new();
+    for group in emission_groups {
+        let conda_key = group.conda_name.key().into_string();
+        if !seen_dep_names.insert(conda_key) {
+            continue;
+        }
+        match finalize(&group.pypi_name, &group.constraints) {
+            Ok(specifiers) => {
+                let rendered = group
+                    .native_conda_override
+                    .unwrap_or_else(|| specifiers.to_string().replace(", ", ","));
+                let spec = group.conda_name.match_spec(&rendered);
+                run_dep_specs.push(spec_from_str(spec.as_str())?);
             }
-            run_dep_specs.push(spec_from_str(&dep.to_string())?);
+            Err(conflict) => {
+                // Keep a name-only placeholder in the tolerant assembly so
+                // Rule 2 can identify and reject a wholly mutable route. The
+                // strict `produce_output` wrapper below always returns the
+                // structural conflict instead of emitting this placeholder.
+                run_dep_specs.push(spec_from_str(group.conda_name.as_spec())?);
+                conflicts.push(EmissionConstraintConflict {
+                    conda_name: group.conda_name,
+                    conflict,
+                });
+            }
         }
     }
 
@@ -6463,7 +6773,7 @@ fn produce_output(
     );
 
     let effective_version = version_override.unwrap_or(&bundle.primary.metadata.version);
-    assemble_conda_output(
+    let output = assemble_conda_output(
         &bundle.conda_name,
         effective_version,
         &python_version,
@@ -6476,7 +6786,32 @@ fn produce_output(
         courier_build_hash,
         config.bundle_mode == crate::config::BundleMode::Loose,
         siblings,
-    )
+    )?;
+    Ok((output, conflicts))
+}
+
+fn produce_output(
+    bundle: &Bundle,
+    config: &RetreadConfig,
+    host_platform: Platform,
+    workspace_python_version: &str,
+    siblings: &[(String, String)],
+    courier_build_hash: Option<&str>,
+    version_override: Option<&str>,
+) -> Result<CondaOutput> {
+    let (output, conflicts) = produce_output_with_conflicts(
+        bundle,
+        config,
+        host_platform,
+        workspace_python_version,
+        siblings,
+        courier_build_hash,
+        version_override,
+    )?;
+    if let Some(conflict) = conflicts.into_iter().next() {
+        return Err(anyhow::Error::new(conflict.conflict));
+    }
+    Ok(output)
 }
 
 /// Render the bundle's actual emitted run-dependency set into the generic
@@ -6485,14 +6820,14 @@ fn produce_output(
 /// so marker evaluation, name mapping, relaxation, overrides, vendoring,
 /// closure filtering, and first-name-wins dedup cannot drift from Rule 2's
 /// validation input.
-fn emitted_bundle_route_specs(
+fn emitted_bundle_route_assembly(
     bundle: &Bundle,
     config: &RetreadConfig,
     target: &WheelTarget,
-) -> Result<Vec<crate::uv_closure::CondaRouteSpec>> {
+) -> Result<EmittedBundleRouteAssembly> {
     let host_platform = Platform::from_str(&target.conda_subdir)
         .with_context(|| format!("parsing target conda subdir `{}`", target.conda_subdir))?;
-    let output = produce_output(
+    let (output, conflicts) = produce_output_with_conflicts(
         bundle,
         config,
         host_platform,
@@ -6501,10 +6836,10 @@ fn emitted_bundle_route_specs(
         None,
         None,
     )?;
-    Ok(output
+    let routes = output
         .run_dependencies
         .depends
-        .into_iter()
+        .iter()
         .map(|dependency| {
             let conda_name = CondaName::new(dependency.name.as_str());
             let conda_key = conda_name.key();
@@ -6520,7 +6855,20 @@ fn emitted_bundle_route_specs(
                 spec: audit_report::format_packagespec(&dependency.spec),
             }
         })
-        .collect())
+        .collect();
+    Ok(EmittedBundleRouteAssembly { routes, conflicts })
+}
+
+fn emitted_bundle_route_specs(
+    bundle: &Bundle,
+    config: &RetreadConfig,
+    target: &WheelTarget,
+) -> Result<Vec<crate::uv_closure::CondaRouteSpec>> {
+    let assembly = emitted_bundle_route_assembly(bundle, config, target)?;
+    if let Some(conflict) = assembly.conflicts.into_iter().next() {
+        return Err(anyhow::Error::new(conflict.conflict));
+    }
+    Ok(assembly.routes)
 }
 
 /// v1.4.5: swap an http(s) wheel source for `file://` of retread's
@@ -11389,6 +11737,7 @@ mod emit_wheel_upstream_url_tests {
             upstream_url: Some(upstream.clone()), // https:// — captured BEFORE localization
             git_source: None,
             sdist_source: None,
+            metadata_provenance: crate::constraint::Provenance::IndexWheelMetadata,
             metadata: dummy_metadata("isaacsim", "6.0.0"),
             extras_requested: vec![],
             auto_data: None,
@@ -11404,6 +11753,7 @@ mod emit_wheel_upstream_url_tests {
             auto_routed: vec![],
             auto_dropped: Default::default(),
             uv_closure_names: Default::default(),
+            workspace_conda_versions: Default::default(),
         };
 
         // Reproduce the exact mapping from build_one that populates EmitWheel.
@@ -11487,6 +11837,7 @@ mod emit_wheel_upstream_url_tests {
             upstream_url: Some(upstream.clone()),
             git_source: None,
             sdist_source: None,
+            metadata_provenance: crate::constraint::Provenance::IndexWheelMetadata,
             metadata: dummy_metadata("isaacsim-kernel", "6.0.0"),
             extras_requested: vec![],
             auto_data: None,
@@ -11508,6 +11859,7 @@ mod emit_wheel_upstream_url_tests {
                 ),
                 git_source: None,
                 sdist_source: None,
+                metadata_provenance: crate::constraint::Provenance::IndexWheelMetadata,
                 metadata: dummy_metadata("isaacsim", "6.0.0"),
                 extras_requested: vec![],
                 auto_data: None,
@@ -11519,6 +11871,7 @@ mod emit_wheel_upstream_url_tests {
             auto_routed: vec![],
             auto_dropped: Default::default(),
             uv_closure_names: Default::default(),
+            workspace_conda_versions: Default::default(),
         };
 
         let emit_wheels: Vec<crate::emit_pypi::EmitWheel> = bundle

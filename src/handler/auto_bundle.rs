@@ -12,11 +12,12 @@ use std::str::FromStr;
 use anyhow::{Context, Result, anyhow};
 use rattler_conda_types::ChannelUrl;
 use uv_pep508::MarkerEnvironment;
-use uv_pep508::uv_pep440::{
-    Operator, Version, VersionSpecifier, VersionSpecifiers, release_specifiers_to_ranges,
-};
+#[cfg(test)]
+use uv_pep508::uv_pep440::Version;
+use uv_pep508::uv_pep440::VersionSpecifiers;
 
 use crate::config::RetreadConfig;
+use crate::constraint::{Conflict, Constraint, Provenance, finalize};
 use crate::pypi;
 use crate::relax::{
     CondaName, CondaTarget, NameMap, PypiKey, canonical_conda_name, default_marker_env,
@@ -138,48 +139,10 @@ struct PypiFetchRequest {
     preferred_version: Option<String>,
 }
 
-/// One active, target-marker-matched dependency declaration. The source text
-/// stays attached until the complete restore requirement has been proven
-/// satisfiable, so an empty intersection can name the wheels and raw
-/// `Requires-Dist` lines that created it.
-///
-/// `advisory` is true when this declaration comes from a wheel retread BUILT
-/// ITSELF from source (a `[retread-wheels]` git/`from`/sdist entry, e.g.
-/// IsaacLab). retread already relaxes such a wheel's exact upstream pins, so
-/// they are pip-world *advisories*, not authoritative constraints: when an
-/// advisory lower bound is the only reason a rejected route's PyPI restore is
-/// unsatisfiable against an authoritative (index wheel / workspace / closure)
-/// constraint, the advisory floor yields to the composed workspace's solve
-/// (conda-as-truth). See `finalize_observed_requirement`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct ObservedRequirement {
-    specifiers: VersionSpecifiers,
-    source: String,
-    advisory: bool,
-}
-
-type ObservedRequirements = BTreeMap<String, Vec<ObservedRequirement>>;
-
-/// Structural identity for the one restore failure that a precise workspace
-/// conda owner can safely supersede. The display text intentionally preserves
-/// the v4.6.6 diagnostic verbatim.
-#[derive(Debug)]
-struct UnsatisfiableRestoreRequirements {
-    pypi_name: String,
-    sources: String,
-}
-
-impl std::fmt::Display for UnsatisfiableRestoreRequirements {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "joint route validation cannot restore `{}` to PyPI: active requirements are mutually unsatisfiable:\n{}",
-            self.pypi_name, self.sources
-        )
-    }
-}
-
-impl std::error::Error for UnsatisfiableRestoreRequirements {}
+/// Active, target-marker-matched dependency declarations keyed in the PyPI
+/// identity domain. Provenance remains attached until the shared finalizer has
+/// resolved authority and produced a source-rich conflict, if any.
+type ObservedRequirements = BTreeMap<PypiKey, Vec<Constraint>>;
 
 /// Why an impossible PyPI restore was NOT superseded by a workspace-owned
 /// drop, in the exact terms of the guards that blocked it.
@@ -254,227 +217,29 @@ fn drop_decline_reasons(
     reasons
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum DedupeVersionKey {
-    /// Ordinary PEP 440 comparison ignores trailing release zeroes.
-    Pep440(Version),
-    /// Compatible-release and wildcard operators also depend on how many
-    /// release segments were written.
-    ReleaseLength(Version, usize),
-    /// Arbitrary equality compares the retained version spelling.
-    Arbitrary(String),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct SpecifierDedupeKey {
-    operator: Operator,
-    version: DedupeVersionKey,
-}
-
-fn specifier_dedupe_key(specifier: &VersionSpecifier) -> SpecifierDedupeKey {
-    let operator = *specifier.operator();
-    let version = match operator {
-        Operator::TildeEqual | Operator::EqualStar | Operator::NotEqualStar => {
-            DedupeVersionKey::ReleaseLength(
-                specifier.version().clone(),
-                specifier.version().release().len(),
-            )
-        }
-        Operator::ExactEqual => DedupeVersionKey::Arbitrary(specifier.to_string()),
-        Operator::Equal
-        | Operator::NotEqual
-        | Operator::LessThan
-        | Operator::LessThanEqual
-        | Operator::GreaterThan
-        | Operator::GreaterThanEqual => DedupeVersionKey::Pep440(specifier.version().clone()),
-    };
-    SpecifierDedupeKey { operator, version }
-}
-
 fn observe_requirement(
     observed: &mut ObservedRequirements,
     pypi_name: &str,
     specifiers: &VersionSpecifiers,
     source: String,
-    advisory: bool,
+    provenance: Provenance,
 ) {
-    let observations = observed.entry(canonical_conda_name(pypi_name)).or_default();
-    let observation = ObservedRequirement {
+    let observations = observed.entry(PypiKey::from_pypi(pypi_name)).or_default();
+    let observation = Constraint {
         specifiers: specifiers.clone(),
         source,
-        advisory,
+        provenance,
     };
     if !observations.contains(&observation) {
         observations.push(observation);
     }
 }
 
-/// Deduplicate a clause set into `VersionSpecifiers`.
-///
-/// Ordinary bounds are semantically equal across trailing release zeroes
-/// (`>=11` == `>=11.0`), but compatible-release/wildcard semantics depend on
-/// the written release length and `===` depends on spelling. Use an
-/// operator-sensitive key and retain the shortest deterministic spelling for
-/// ordinary aliases.
-fn dedup_specifier_clauses(
-    clauses_iter: impl Iterator<Item = VersionSpecifier>,
-) -> VersionSpecifiers {
-    let mut clauses: BTreeMap<SpecifierDedupeKey, (String, VersionSpecifier)> = BTreeMap::new();
-    for specifier in clauses_iter {
-        let rendered = specifier.to_string();
-        let key = specifier_dedupe_key(&specifier);
-        match clauses.entry(key) {
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert((rendered, specifier));
-            }
-            std::collections::btree_map::Entry::Occupied(mut entry) => {
-                let current = &entry.get().0;
-                if (rendered.len(), rendered.as_str()) < (current.len(), current.as_str()) {
-                    entry.insert((rendered, specifier));
-                }
-            }
-        }
-    }
-    clauses
-        .into_values()
-        .map(|(_, specifier)| specifier)
-        .collect()
-}
-
-/// True when the intersection of `specifiers` is empty (unsatisfiable) or has
-/// an arbitrary-exact (`===`) contradiction.
-fn specifiers_unsatisfiable(specifiers: &VersionSpecifiers) -> bool {
-    // `Ranges` is intentionally not named/re-exported by uv-pep440. An empty
-    // release-only conversion yields a full range of the inferred type; the
-    // following `Into` uses the full PEP 440 conversion (including pre/post/
-    // local and wildcard semantics), not release-only semantics.
-    let full = release_specifiers_to_ranges(VersionSpecifiers::empty());
-    let range_is_empty = full.intersection(&specifiers.clone().into()).is_empty();
-    // uv's ordered Version equality also ignores trailing release zeroes,
-    // while arbitrary equality (`===`) compares the preserved spelling. A
-    // singleton range therefore cannot distinguish `===1` from `===1.0`;
-    // validate every arbitrary-exact candidate against the original clauses.
-    let arbitrary_exact_conflict = specifiers.iter().any(|specifier| {
-        *specifier.operator() == Operator::ExactEqual && !specifiers.contains(specifier.version())
-    });
-    range_is_empty || arbitrary_exact_conflict
-}
-
-/// True when `operator` fixes (or raises) a lower bound: an upstream floor a
-/// source-built wheel's relaxed pin can be asked to yield. Strict upper bounds
-/// (`<`, `<=`) and exclusions (`!=`) never force a HIGHER version, so they are
-/// always retained.
-fn operator_forces_floor(operator: Operator) -> bool {
-    matches!(
-        operator,
-        Operator::GreaterThan
-            | Operator::GreaterThanEqual
-            | Operator::Equal
-            | Operator::ExactEqual
-            | Operator::TildeEqual
-            | Operator::EqualStar
-    )
-}
-
-/// conda-as-truth softening. A wheel retread built itself from source declares
-/// UPSTREAM pins retread already relaxes; those are advisories, not authority.
-/// When the ONLY reason the restore intersection is empty is an advisory lower
-/// bound conflicting with an authoritative (index wheel / workspace / closure)
-/// constraint, drop the advisory floors and re-intersect so the dependency
-/// resolves to a workspace-compatible version -- exactly what the pre-4.6.5
-/// line did before metadata routes were jointly validated (e.g. IsaacLab's
-/// `starlette==0.49.1` -> relaxed `>=0.49.1,<0.50` yielding to a workspace
-/// `fastapi==0.115.7`'s `starlette<0.46`). Returns `None` (keep the hard
-/// error) unless there is BOTH an advisory and an authoritative declaration
-/// and dropping the advisory floors actually yields a satisfiable set: a
-/// conflict among authoritative constraints, or among advisories with no
-/// authoritative anchor, is a genuine incompatibility the user must resolve.
-fn soften_advisory_floor_conflict(
-    observations: &[ObservedRequirement],
-) -> Option<VersionSpecifiers> {
-    let has_advisory = observations.iter().any(|observation| observation.advisory);
-    let has_authoritative = observations.iter().any(|observation| !observation.advisory);
-    if !has_advisory || !has_authoritative {
-        return None;
-    }
-    let mut dropped_floor = false;
-    let mut kept: Vec<VersionSpecifier> = Vec::new();
-    for observation in observations {
-        for specifier in observation.specifiers.iter() {
-            if observation.advisory && operator_forces_floor(*specifier.operator()) {
-                dropped_floor = true;
-                continue;
-            }
-            kept.push(specifier.clone());
-        }
-    }
-    if !dropped_floor {
-        return None;
-    }
-    let softened = dedup_specifier_clauses(kept.into_iter());
-    if softened.is_empty() || specifiers_unsatisfiable(&softened) {
-        return None;
-    }
-    Some(softened)
-}
-
-/// Canonicalize an intersection without losing its source declarations.
-/// `VersionSpecifiers` sorts but does not deduplicate, and parsing a combined
-/// string accepts semantically empty intersections. Deduplicate parsed clauses,
-/// then use uv-pep440's full PEP 440 range conversion to reject emptiness before
-/// any index request is attempted.
-fn finalize_observed_requirement(
-    pypi_name: &str,
-    observations: &[ObservedRequirement],
-) -> std::result::Result<VersionSpecifiers, UnsatisfiableRestoreRequirements> {
-    let specifiers = dedup_specifier_clauses(
-        observations
-            .iter()
-            .flat_map(|observation| observation.specifiers.iter().cloned()),
-    );
-
-    if !specifiers_unsatisfiable(&specifiers) {
-        return Ok(specifiers);
-    }
-
-    // conda-as-truth: before failing, let a source-built wheel's advisory
-    // floor yield to the authoritative constraints (see the fn's doc).
-    if let Some(softened) = soften_advisory_floor_conflict(observations) {
-        tracing::warn!(
-            package = %pypi_name,
-            softened = %softened,
-            "restore: a source-built wheel's advisory lower bound conflicted \
-             with an authoritative constraint; dropped the floor so the \
-             composed workspace resolves the version (conda-as-truth)",
-        );
-        return Ok(softened);
-    }
-
-    let sources = observations
-        .iter()
-        .map(|observation| {
-            let spec = if observation.specifiers.is_empty() {
-                "*".to_string()
-            } else {
-                observation.specifiers.to_string()
-            };
-            format!("  - `{spec}` from {}", observation.source)
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    Err(UnsatisfiableRestoreRequirements {
-        pypi_name: pypi_name.to_string(),
-        sources,
-    })
-}
-
 #[derive(Clone, Debug)]
 struct RestoreRequestBuilder {
     pypi_name: String,
     bundle_name: String,
-    requirements: Vec<ObservedRequirement>,
-    constraints: Vec<ObservedRequirement>,
-    overrides: Vec<ObservedRequirement>,
+    constraints: Vec<Constraint>,
     route_preferences: BTreeMap<String, BTreeSet<String>>,
     lock_preferences: BTreeMap<String, BTreeSet<String>>,
 }
@@ -484,26 +249,15 @@ impl RestoreRequestBuilder {
         Self {
             pypi_name: pypi_name.to_string(),
             bundle_name: canonical_conda_name(pypi_name),
-            requirements: Vec::new(),
             constraints: Vec::new(),
-            overrides: Vec::new(),
             route_preferences: BTreeMap::new(),
             lock_preferences: BTreeMap::new(),
         }
     }
 
-    fn add_input(
-        &mut self,
-        role: crate::uv_closure::AutoRouteInputRole,
-        requirement: ObservedRequirement,
-    ) {
-        let destination = match role {
-            crate::uv_closure::AutoRouteInputRole::Requirement => &mut self.requirements,
-            crate::uv_closure::AutoRouteInputRole::Constraint => &mut self.constraints,
-            crate::uv_closure::AutoRouteInputRole::Override => &mut self.overrides,
-        };
-        if !destination.contains(&requirement) {
-            destination.push(requirement);
+    fn add_constraint(&mut self, constraint: Constraint) {
+        if !self.constraints.contains(&constraint) {
+            self.constraints.push(constraint);
         }
     }
 
@@ -515,81 +269,46 @@ impl RestoreRequestBuilder {
         preferences.entry(version).or_default().insert(source);
     }
 
-    fn unique_preference(
-        pypi_name: &str,
-        kind: &str,
-        preferences: BTreeMap<String, BTreeSet<String>>,
-        conflict_is_error: bool,
-    ) -> Result<Option<String>> {
+    fn unique_preference(preferences: &BTreeMap<String, BTreeSet<String>>) -> Option<String> {
         if preferences.len() > 1 {
-            if !conflict_is_error {
-                return Ok(None);
-            }
-            let details = preferences
-                .iter()
-                .map(|(version, sources)| {
-                    format!(
-                        "{version} from {}",
-                        sources.iter().cloned().collect::<Vec<_>>().join(", ")
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("; ");
-            return Err(anyhow!(
-                "joint route validation found conflicting {kind} versions for \
-                 PyPI package `{pypi_name}`: {details}"
-            ));
+            return None;
         }
-        Ok(preferences.into_keys().next())
+        preferences.keys().next().cloned()
     }
 
     fn finish(mut self) -> Result<PypiFetchRequest> {
-        // uv overrides replace ordinary dependency requirements, including
-        // `Requires-Dist` lines materialized only after the closure solve.
-        // Constraints remain additive in either case.
-        let mut hard_requirements = if self.overrides.is_empty() {
-            std::mem::take(&mut self.requirements)
-        } else {
-            std::mem::take(&mut self.overrides)
-        };
-        hard_requirements.extend(std::mem::take(&mut self.constraints));
-        let has_requirements = !hard_requirements.is_empty();
-        let route_preference = Self::unique_preference(
-            &self.pypi_name,
-            "prior uv-route",
-            std::mem::take(&mut self.route_preferences),
-            !has_requirements,
-        )?;
-        let lock_preference = Self::unique_preference(
-            &self.pypi_name,
-            "favor-lock",
-            std::mem::take(&mut self.lock_preferences),
-            false,
-        )?;
-
-        // A previously selected uv version is a solver output, not an input
-        // requirement. When active wheel metadata declares this dependency,
-        // keep the old version only as a soft preference; the index resolver
-        // ignores it when it no longer satisfies the newly complete graph.
-        // With no declaration available, retain the exact version as the only
-        // safe reconstruction of the earlier route.
-        let specifiers = if !has_requirements {
-            let version = route_preference.as_ref().ok_or_else(|| {
-                anyhow!(
-                    "joint route validation rejected `{}`, but no active PyPI \
-                     requirement or prior uv-route version was available",
-                    self.pypi_name
-                )
-            })?;
-            VersionSpecifiers::from_str(&format!("=={version}")).with_context(|| {
-                format!(
-                    "parsing exact PyPI restore spec for rejected route `{} =={version}`",
-                    self.pypi_name
-                )
-            })?
-        } else {
-            finalize_observed_requirement(&self.pypi_name, &hard_requirements)?
-        };
+        let prior_constraints = self
+            .route_preferences
+            .iter()
+            .chain(self.lock_preferences.iter())
+            .map(|(version, sources)| {
+                let specifiers = VersionSpecifiers::from_str(&format!("=={version}"))
+                    .with_context(|| {
+                        format!(
+                            "parsing prior selection `{version}` for `{}`",
+                            self.pypi_name
+                        )
+                    })?;
+                Ok(Constraint {
+                    specifiers,
+                    provenance: Provenance::PriorSelection,
+                    source: sources.iter().cloned().collect::<Vec<_>>().join(", "),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for constraint in prior_constraints {
+            self.add_constraint(constraint);
+        }
+        if self.constraints.is_empty() {
+            return Err(anyhow!(
+                "joint route validation rejected `{}`, but no active PyPI \
+                 requirement or prior selection was available",
+                self.pypi_name
+            ));
+        }
+        let route_preference = Self::unique_preference(&self.route_preferences);
+        let lock_preference = Self::unique_preference(&self.lock_preferences);
+        let specifiers = finalize(&PypiKey::from_pypi(&self.pypi_name), &self.constraints)?;
 
         Ok(PypiFetchRequest {
             pypi_name: self.pypi_name,
@@ -777,7 +496,7 @@ pub(crate) async fn auto_bundle_transitives(
                 request.preferred_version.as_deref(),
             )
             .await?;
-            let (upstream_url, sdist_source) =
+            let (upstream_url, sdist_source, metadata_provenance) =
                 super::bfs_fetch_provenance(&resolved_url, sdist_prov);
             Ok(ResolvedWheel {
                 pypi_name: request.bundle_name,
@@ -785,6 +504,7 @@ pub(crate) async fn auto_bundle_transitives(
                 upstream_url,
                 git_source: None,
                 sdist_source,
+                metadata_provenance,
                 metadata,
                 extras_requested: vec![],
                 auto_data: None,
@@ -905,11 +625,6 @@ where
         // requirement-specific validated-routing gate as exact deps.
         let mut loose_candidates: Vec<(String, VersionSpecifiers)> = Vec::new();
         for wheel in bundle.all_wheels().skip(processed_wheel_count) {
-            // A wheel retread built itself from source (git/`from`/sdist entry)
-            // carries UPSTREAM pins retread already relaxed -- treat its
-            // Requires-Dist as advisory so an unresolvable advisory floor can
-            // yield to authoritative constraints (see `ObservedRequirement`).
-            let advisory = wheel.git_source.is_some() || wheel.sdist_source.is_some();
             for raw in &wheel.metadata.requires_dist {
                 if let Some((name, version)) = pep508_exact_base_dep(raw, &marker_env)? {
                     let specifiers = VersionSpecifiers::from_str(&format!("=={version}"))
@@ -924,7 +639,7 @@ where
                             "wheel `{}=={}` Requires-Dist `{raw}`",
                             wheel.metadata.name, wheel.metadata.version
                         ),
-                        advisory,
+                        wheel.metadata_provenance.clone(),
                     );
                     let conda_name = canonical_conda_name(&name);
                     if !seen_candidate.insert(conda_name) {
@@ -940,7 +655,7 @@ where
                             "wheel `{}=={}` Requires-Dist `{raw}`",
                             wheel.metadata.name, wheel.metadata.version
                         ),
-                        advisory,
+                        wheel.metadata_provenance.clone(),
                     );
                     let conda_name = canonical_conda_name(&name);
                     if !seen_candidate.insert(conda_name) {
@@ -1368,9 +1083,15 @@ fn route_group_is_fully_mutable(
         trial.extras.push(placeholder);
     }
 
-    Ok(super::emitted_bundle_route_specs(&trial, config, target)?
-        .into_iter()
-        .all(|route| route.conda_name.key().as_str() != conda_name))
+    let assembly = super::emitted_bundle_route_assembly(&trial, config, target)?;
+    Ok(assembly
+        .routes
+        .iter()
+        .all(|route| route.conda_name.key().as_str() != conda_name)
+        && assembly
+            .conflicts
+            .iter()
+            .all(|conflict| conflict.conda_name.key().as_str() != conda_name))
 }
 
 /// Finalize every provisional conda route against the exact dependency set
@@ -1399,7 +1120,9 @@ where
         return Ok(false);
     }
 
-    let emitted = super::emitted_bundle_route_specs(bundle, config, target)?;
+    let assembly = super::emitted_bundle_route_assembly(bundle, config, target)?;
+    let emitted = assembly.routes;
+    let assembly_conflicts = assembly.conflicts;
     let emitted_by_conda: BTreeMap<String, crate::uv_closure::CondaRouteSpec> = emitted
         .iter()
         .cloned()
@@ -1454,18 +1177,30 @@ where
             mutable_conda_names.insert(conda_name);
         }
     }
-    let mutable_candidates: Vec<_> = mutable_conda_names
+    for conflict in &assembly_conflicts {
+        let conda_key = conflict.conda_name.key().into_string();
+        if !mutable_conda_names.contains(&conda_key) {
+            return Err(anyhow::Error::new(conflict.conflict.clone()));
+        }
+    }
+    let conflicted_keys: BTreeSet<String> = assembly_conflicts
+        .iter()
+        .map(|conflict| conflict.conda_name.key().into_string())
+        .collect();
+    let pre_rejected: Vec<_> = conflicted_keys
         .iter()
         .filter_map(|name| emitted_by_conda.get(name).cloned())
         .collect();
-    if mutable_candidates.is_empty() {
+    let mutable_candidates: Vec<_> = mutable_conda_names
+        .iter()
+        .filter(|name| !conflicted_keys.contains(*name))
+        .filter_map(|name| emitted_by_conda.get(name).cloned())
+        .collect();
+    if mutable_candidates.is_empty() && pre_rejected.is_empty() {
         return Ok(false);
     }
 
-    let mutable_keys: HashSet<String> = mutable_candidates
-        .iter()
-        .map(|route| route.conda_name.key().into_string())
-        .collect();
+    let mutable_keys: HashSet<String> = mutable_conda_names.iter().cloned().collect();
     let fixed: Vec<_> = emitted
         .into_iter()
         .filter(|route| !mutable_keys.contains(route.conda_name.key().as_str()))
@@ -1481,10 +1216,14 @@ where
     // owned dependency: Rule 1 abstains when that baseline is indeterminate.
     let workspace_drop_authorized = selection.is_some();
     // Rule 2 is fail-closed: an unsatisfiable/indeterminate baseline cannot
-    // authorize any mutable conda route.
-    let rejected = selection
+    // authorize any mutable conda route. Typed assembly conflicts are always
+    // pre-rejected, then pass through the same restore/drop gate below.
+    let mut rejected = selection
         .map(|selection| selection.rejected)
         .unwrap_or(mutable_candidates);
+    rejected.extend(pre_rejected);
+    let mut seen_rejected = BTreeSet::new();
+    rejected.retain(|route| seen_rejected.insert(route.conda_name.key().into_string()));
     if rejected.is_empty() {
         return Ok(false);
     }
@@ -1527,23 +1266,18 @@ where
                     )
                 })?
             };
-            let requirement = ObservedRequirement {
+            let requirement = Constraint {
                 specifiers,
                 source: input.source.clone(),
-                // uv closure inputs (roots/constraints/overrides) are
-                // authoritative -- they came from the workspace / user config,
-                // not from a source-built wheel's relaxed upstream pins.
-                advisory: false,
+                provenance: input.effective_provenance(),
             };
-            request.add_input(input.role, requirement);
+            request.add_constraint(requirement);
         }
         if let Some(requirements) =
-            observed_requirements.get(&canonical_conda_name(&route.route.pypi_name))
+            observed_requirements.get(&PypiKey::from_pypi(&route.route.pypi_name))
         {
             for requirement in requirements {
-                if !request.requirements.contains(requirement) {
-                    request.requirements.push(requirement.clone());
-                }
+                request.add_constraint(requirement.clone());
             }
         }
         RestoreRequestBuilder::add_preference(
@@ -1574,18 +1308,18 @@ where
                 let request = restore_requests
                     .entry(key.clone())
                     .or_insert_with(|| RestoreRequestBuilder::new(&origin.pypi_name));
-                let requirements = observed_requirements.get(&key).ok_or_else(|| {
-                    anyhow!(
-                        "joint route validation rejected metadata route `{} -> {}`, \
-                         but no active Requires-Dist provenance was recorded",
-                        origin.pypi_name,
-                        origin.conda_name
-                    )
-                })?;
+                let requirements = observed_requirements
+                    .get(&PypiKey::from_pypi(&key))
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "joint route validation rejected metadata route `{} -> {}`, \
+                             but no active Requires-Dist provenance was recorded",
+                            origin.pypi_name,
+                            origin.conda_name
+                        )
+                    })?;
                 for requirement in requirements {
-                    if !request.requirements.contains(requirement) {
-                        request.requirements.push(requirement.clone());
-                    }
+                    request.add_constraint(requirement.clone());
                 }
                 for preferred_version in &origin.preferred_versions {
                     RestoreRequestBuilder::add_preference(
@@ -1637,9 +1371,7 @@ where
             Err(error)
                 if workspace_drop_authorized
                     && workspace_owns_request
-                    && error
-                        .downcast_ref::<UnsatisfiableRestoreRequirements>()
-                        .is_some() =>
+                    && error.downcast_ref::<Conflict>().is_some() =>
             {
                 workspace_drops.insert(pypi_key);
             }
@@ -1647,8 +1379,7 @@ where
                 // An impossible restore that we decline to drop is fatal, but it
                 // must never be silent: name the dep and the guard that blocked
                 // the drop, appended to the v4.6.6 diagnostic verbatim.
-                let Some(unsatisfiable) = error.downcast_ref::<UnsatisfiableRestoreRequirements>()
-                else {
+                let Some(unsatisfiable) = error.downcast_ref::<Conflict>() else {
                     return Err(error);
                 };
                 let empty = BTreeSet::new();
@@ -2291,6 +2022,7 @@ mod tests {
             upstream_url: Some(url),
             git_source: None,
             sdist_source: None,
+            metadata_provenance: Provenance::IndexWheelMetadata,
             metadata: WheelMetadata {
                 name: metadata_name.to_string(),
                 version: version.to_string(),
@@ -2318,6 +2050,7 @@ mod tests {
             auto_routed: vec![],
             auto_dropped: HashSet::new(),
             uv_closure_names: HashSet::new(),
+            workspace_conda_versions: BTreeMap::new(),
         }
     }
 
@@ -2464,7 +2197,7 @@ mod tests {
                 channel: "https://conda.anaconda.org/conda-forge/linux-64".to_string(),
                 input_requirements: Vec::new(),
             },
-            deps_from_floor: false,
+            provenance: Provenance::PriorSelection,
         }
     }
 
@@ -2772,17 +2505,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn advisory_floor_does_not_veto_conda_route() {
+        let fetch_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fetch = {
+            let fetch_calls = Arc::clone(&fetch_calls);
+            move |_request: PypiFetchRequest, _index: String| {
+                fetch_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { Err(anyhow!("a softened conda route must not fetch PyPI")) }
+            }
+        };
+        let solve_inputs = Arc::new(Mutex::new(
+            Vec::<Vec<crate::uv_closure::CondaRouteSpec>>::new(),
+        ));
+        let co_solve = {
+            let solve_inputs = Arc::clone(&solve_inputs);
+            move |routes: Vec<crate::uv_closure::CondaRouteSpec>| {
+                solve_inputs.lock().unwrap().push(routes);
+                async { crate::uv_closure::CoInstallVerdict::Sat }
+            }
+        };
+        let target = crate::pypi::WheelTarget::for_subdir("3.11", "linux-64");
+        let config = test_config();
+        let mut bundle = test_bundle(&["starlette>=0.49.1,<0.50"]);
+        bundle.primary.metadata.name = "isaaclab".to_string();
+        bundle.primary.metadata_provenance = Provenance::SourceBuiltRelaxed;
+        bundle
+            .workspace_conda_versions
+            .insert("starlette".to_string(), "0.45.3".to_string());
+
+        auto_bundle_transitives_with(
+            &mut bundle,
+            &[crate::workspace::DEFAULT_PYPI_INDEX.to_string()],
+            &target,
+            &config,
+            None,
+            None,
+            None,
+            &workspace_ownership(&[]),
+            &validated_probe,
+            &co_solve,
+            &fetch,
+            &["conda-forge/linux-64".to_string()],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(fetch_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let solved_spec = solve_inputs
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|routes| routes.iter())
+            .find(|route| route.conda_name.key().as_str() == "starlette")
+            .map(|route| route.spec.clone())
+            .expect("co-solve must receive the starlette route");
+        assert!(solved_spec.contains("==0.45.3"), "{solved_spec}");
+        assert!(!solved_spec.contains(">=0.49"), "{solved_spec}");
+
+        let emitted = super::super::emitted_bundle_route_specs(&bundle, &config, &target).unwrap();
+        let emitted_spec = emitted
+            .iter()
+            .find(|route| route.conda_name.key().as_str() == "starlette")
+            .map(|route| route.spec.clone())
+            .expect("final output must retain starlette");
+        assert_eq!(emitted_spec, solved_spec);
+
+        let output = super::super::produce_output(
+            &bundle,
+            &config,
+            rattler_conda_types::Platform::Linux64,
+            &target.python_version,
+            &[],
+            None,
+            None,
+        )
+        .unwrap();
+        let output_spec = output
+            .run_dependencies
+            .depends
+            .iter()
+            .find(|dependency| dependency.name.as_str() == "starlette")
+            .map(|dependency| super::super::audit_report::format_packagespec(&dependency.spec))
+            .expect("recipe output must retain starlette");
+        assert_eq!(output_spec, solved_spec);
+    }
+
+    #[tokio::test]
     async fn joint_unroute_deduplicates_repeated_requires_dist_clauses() {
         let ordinary_aliases = [">=11.0,>=11,<11.1.0,<11.1"]
             .into_iter()
-            .map(|raw| ObservedRequirement {
+            .map(|raw| Constraint {
                 specifiers: VersionSpecifiers::from_str(raw).unwrap(),
                 source: format!("test source `{raw}`"),
-                advisory: false,
+                provenance: Provenance::IndexWheelMetadata,
             })
             .collect::<Vec<_>>();
         let ordinary =
-            finalize_observed_requirement("ordinary-aliases", &ordinary_aliases).unwrap();
+            finalize(&PypiKey::from_pypi("ordinary-aliases"), &ordinary_aliases).unwrap();
         assert_eq!(
             ordinary.len(),
             2,
@@ -2790,14 +2609,14 @@ mod tests {
         );
         let length_sensitive = ["~=1.0", "~=1.0.0"]
             .into_iter()
-            .map(|raw| ObservedRequirement {
+            .map(|raw| Constraint {
                 specifiers: VersionSpecifiers::from_str(raw).unwrap(),
                 source: format!("test source `{raw}`"),
-                advisory: false,
+                provenance: Provenance::IndexWheelMetadata,
             })
             .collect::<Vec<_>>();
         assert_eq!(
-            finalize_observed_requirement("length-sensitive", &length_sensitive)
+            finalize(&PypiKey::from_pypi("length-sensitive"), &length_sensitive)
                 .unwrap()
                 .len(),
             2,
@@ -2805,14 +2624,14 @@ mod tests {
         );
         let arbitrary_exact = ["===1", "===1.0"]
             .into_iter()
-            .map(|raw| ObservedRequirement {
+            .map(|raw| Constraint {
                 specifiers: VersionSpecifiers::from_str(raw).unwrap(),
                 source: format!("test source `{raw}`"),
-                advisory: false,
+                provenance: Provenance::IndexWheelMetadata,
             })
             .collect::<Vec<_>>();
         assert!(
-            finalize_observed_requirement("arbitrary-exact", &arbitrary_exact)
+            finalize(&PypiKey::from_pypi("arbitrary-exact"), &arbitrary_exact)
                 .unwrap_err()
                 .to_string()
                 .contains("mutually unsatisfiable"),
@@ -2873,11 +2692,11 @@ mod tests {
         assert_eq!(rendered.matches("<11.1").count(), 1, "{rendered}");
     }
 
-    fn observed(specifiers: &str, source: &str, advisory: bool) -> ObservedRequirement {
-        ObservedRequirement {
+    fn observed(specifiers: &str, source: &str, provenance: Provenance) -> Constraint {
+        Constraint {
             specifiers: VersionSpecifiers::from_str(specifiers).unwrap(),
             source: source.to_string(),
-            advisory,
+            provenance,
         }
     }
 
@@ -2895,17 +2714,17 @@ mod tests {
             observed(
                 ">=0.49.1,<0.50",
                 "wheel `isaaclab==0.54.2` Requires-Dist `starlette>=0.49.1,<0.50`",
-                true,
+                Provenance::SourceBuiltRelaxed,
             ),
             // Index wheel `fastapi==0.115.7` -> authoritative.
             observed(
                 ">=0.40.0,<0.46.0",
                 "wheel `fastapi==0.115.7` Requires-Dist `starlette<0.46.0,>=0.40.0`",
-                false,
+                Provenance::IndexWheelMetadata,
             ),
         ];
         let softened =
-            finalize_observed_requirement("starlette", &observations).expect("floor must soften");
+            finalize(&PypiKey::from_pypi("starlette"), &observations).expect("floor must soften");
         // The authoritative cap is honored; a `<0.46` version resolves.
         assert!(
             softened.contains(&Version::from_str("0.45.3").unwrap()),
@@ -2928,16 +2747,16 @@ mod tests {
             observed(
                 ">=0.49.1,<0.50",
                 "wheel `a==1` Requires-Dist `x>=0.49.1`",
-                false,
+                Provenance::IndexWheelMetadata,
             ),
             observed(
                 ">=0.40.0,<0.46.0",
                 "wheel `b==1` Requires-Dist `x<0.46`",
-                false,
+                Provenance::UvConstraint,
             ),
         ];
         let error =
-            finalize_observed_requirement("x", &observations).expect_err("must stay unsatisfiable");
+            finalize(&PypiKey::from_pypi("x"), &observations).expect_err("must stay unsatisfiable");
         assert!(error.to_string().contains("mutually unsatisfiable"));
     }
 
@@ -2950,15 +2769,15 @@ mod tests {
             observed(
                 ">=2.3.5,<2.4",
                 "wheel `pkg-a==1` Requires-Dist `x>=2.3.5,<2.4`",
-                true,
+                Provenance::SourceBuiltRelaxed,
             ),
             observed(
                 "<2,>=1.23.5",
                 "wheel `pkg-b==1` Requires-Dist `x<2,>=1.23.5`",
-                true,
+                Provenance::DepsFromRelaxed,
             ),
         ];
-        let error = finalize_observed_requirement("x", &observations)
+        let error = finalize(&PypiKey::from_pypi("x"), &observations)
             .expect_err("advisory-only conflict must stay unsatisfiable");
         assert!(error.to_string().contains("mutually unsatisfiable"));
     }
@@ -3106,11 +2925,12 @@ pillow = ">=10,<13"
             &["pillow>=12,<13"],
         ));
         let mut deps_from_route = pillow_auto_route("12.3.0");
-        deps_from_route.deps_from_floor = true;
+        deps_from_route.provenance = Provenance::DepsFromRelaxed;
         deps_from_route.route.input_requirements.push(
             crate::uv_closure::AutoRouteInputRequirement {
                 specifiers: "==12.3.0".to_string(),
                 source: "uv root requirement `pillow==12.3.0`".to_string(),
+                provenance: Provenance::UvRoot,
                 role: crate::uv_closure::AutoRouteInputRole::Requirement,
             },
         );
@@ -3155,27 +2975,21 @@ pillow = ">=10,<13"
     #[tokio::test]
     async fn joint_unroute_restores_compatible_pypi_requirement() {
         let mut overridden = RestoreRequestBuilder::new("overridden");
-        overridden.requirements.push(ObservedRequirement {
+        overridden.add_constraint(Constraint {
             specifiers: VersionSpecifiers::from_str("<2").unwrap(),
             source: "wheel metadata requires overridden<2".to_string(),
-            advisory: false,
+            provenance: Provenance::IndexWheelMetadata,
         });
-        overridden.add_input(
-            crate::uv_closure::AutoRouteInputRole::Override,
-            ObservedRequirement {
-                specifiers: VersionSpecifiers::from_str("==3").unwrap(),
-                source: "uv override requirement `overridden==3`".to_string(),
-                advisory: false,
-            },
-        );
-        overridden.add_input(
-            crate::uv_closure::AutoRouteInputRole::Constraint,
-            ObservedRequirement {
-                specifiers: VersionSpecifiers::from_str("<4").unwrap(),
-                source: "uv constraint `overridden<4`".to_string(),
-                advisory: false,
-            },
-        );
+        overridden.add_constraint(Constraint {
+            specifiers: VersionSpecifiers::from_str("==3").unwrap(),
+            source: "uv override requirement `overridden==3`".to_string(),
+            provenance: Provenance::UvOverride,
+        });
+        overridden.add_constraint(Constraint {
+            specifiers: VersionSpecifiers::from_str("<4").unwrap(),
+            source: "uv constraint `overridden<4`".to_string(),
+            provenance: Provenance::UvConstraint,
+        });
         let overridden = overridden.finish().unwrap();
         assert!(
             overridden
@@ -3189,10 +3003,10 @@ pillow = ">=10,<13"
         );
 
         let mut soft_hints = RestoreRequestBuilder::new("soft-hints");
-        soft_hints.requirements.push(ObservedRequirement {
+        soft_hints.add_constraint(Constraint {
             specifiers: VersionSpecifiers::from_str(">=1").unwrap(),
             source: "wheel `root==1` Requires-Dist `soft-hints>=1`".to_string(),
-            advisory: false,
+            provenance: Provenance::IndexWheelMetadata,
         });
         RestoreRequestBuilder::add_preference(
             &mut soft_hints.route_preferences,
@@ -3208,6 +3022,32 @@ pillow = ">=10,<13"
             soft_hints.finish().unwrap().preferred_version,
             None,
             "conflicting soft hints must not make satisfiable hard requirements fail"
+        );
+
+        let mut prior_only = RestoreRequestBuilder::new("s3transfer");
+        RestoreRequestBuilder::add_preference(
+            &mut prior_only.route_preferences,
+            "0.13.1".to_string(),
+            "prior uv route selected s3transfer==0.13.1".to_string(),
+        );
+        let prior_only = prior_only.finish().unwrap();
+        assert!(
+            prior_only.specifiers.is_empty(),
+            "PriorSelection must never become a hard ==: {}",
+            prior_only.specifiers
+        );
+        assert_eq!(prior_only.preferred_version.as_deref(), Some("0.13.1"));
+
+        let mut index_pin = RestoreRequestBuilder::new("s3transfer");
+        index_pin.add_constraint(Constraint {
+            specifiers: VersionSpecifiers::from_str("==0.13.1").unwrap(),
+            provenance: Provenance::IndexWheelMetadata,
+            source: "index wheel Requires-Dist `s3transfer==0.13.1`".to_string(),
+        });
+        assert_eq!(
+            index_pin.finish().unwrap().specifiers,
+            VersionSpecifiers::from_str("==0.13.1").unwrap(),
+            "an index-wheel exact requirement remains authoritative"
         );
 
         let requests = Arc::new(Mutex::new(Vec::<PypiFetchRequest>::new()));

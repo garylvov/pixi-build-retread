@@ -34,6 +34,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use uv_pep508::Requirement;
 
+use crate::constraint::{Authority, Provenance, authority};
 use crate::lock::{LockWheel, Origin};
 use crate::pypi::WheelTarget;
 use crate::relax::{
@@ -68,10 +69,9 @@ pub struct ConstraintProvenance {
     pub source: String,
     /// Environment the pin belongs to (e.g. `"default"`).
     pub env: String,
-    /// Non-authoritative hint that may constrain an existing root but must not
-    /// authorize repair mutations against a workspace or pack manifest.
+    /// Typed origin used to derive constraint authority centrally.
     #[serde(default)]
-    pub advisory: bool,
+    pub provenance: Provenance,
 }
 
 /// Generated constraint lines + their provenance, keyed by PyPI name.
@@ -102,6 +102,10 @@ pub struct UvClosureRequest {
     pub conda_subdir: String,
     /// PEP 508 root requirements (the bundle's `[retread-wheels]` entries).
     pub dependencies: Vec<String>,
+    /// Typed origins for roots whose authority differs from an ordinary uv
+    /// root, keyed by canonical PyPI name. In particular, an exact
+    /// `retread-deps-from` root remains advisory after uv selects it.
+    pub dependency_provenance: BTreeMap<String, Provenance>,
     /// Conda pins as uv constraints, with provenance.
     pub constraints: ConstraintSet,
     /// PEP 508 `override-dependencies` lines (user `retread-overrides`
@@ -159,10 +163,10 @@ pub struct UvClosure {
     /// already declares and supplies them. This is ephemeral build evidence,
     /// never persisted as part of an [`AutoRoutedPackage`].
     pub auto_dropped: BTreeSet<String>,
-    /// Effective authoritative uv inputs for the exact request that produced
-    /// this closure. `None` is reserved for parser-only/test closures that did
-    /// not cross the request-aware solve boundary; route planning then derives
-    /// the same map from its visible request.
+    /// Effective typed uv inputs for the exact request that produced this
+    /// closure. `None` is reserved for parser-only/test closures that did not
+    /// cross the request-aware solve boundary; route planning then derives the
+    /// same map from its visible request.
     pub effective_input_requirements: Option<BTreeMap<String, Vec<AutoRouteInputRequirement>>>,
 }
 
@@ -187,15 +191,43 @@ pub enum AutoRouteInputRole {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AutoRouteInputRequirement {
-    /// PEP 440 specifiers from an authoritative uv input (empty means any
-    /// version). This is distinct from the version uv happened to select.
+    /// PEP 440 specifiers from an active uv input (empty means any version).
+    /// This is distinct from the version uv happened to select.
     pub specifiers: String,
     /// Human-readable origin retained for source-rich un-route conflicts.
     pub source: String,
+    /// Typed origin used to derive authority when a route is restored.
+    ///
+    /// Older persisted route records predate this field. Their semantic role
+    /// is normalized by [`Self::effective_provenance`] at the restore
+    /// boundary; newly produced records always carry an explicit provenance.
+    #[serde(default)]
+    pub provenance: Provenance,
     /// uv semantic role. Overrides replace ordinary requirements; constraints
     /// remain additive in either case.
     #[serde(default)]
     pub role: AutoRouteInputRole,
+}
+
+impl AutoRouteInputRequirement {
+    /// Bridge persisted pre-provenance records into the typed model.
+    ///
+    /// A missing provenance deserializes as `IndexWheelMetadata`. For legacy
+    /// constraint/override records, the retained uv role supplies the missing
+    /// origin. Any explicit non-default provenance wins unchanged. Authority
+    /// is still derived only by [`authority`], never by this compatibility
+    /// normalization.
+    pub fn effective_provenance(&self) -> Provenance {
+        match (&self.provenance, self.role) {
+            (Provenance::IndexWheelMetadata, AutoRouteInputRole::Constraint) => {
+                Provenance::UvConstraint
+            }
+            (Provenance::IndexWheelMetadata, AutoRouteInputRole::Override) => {
+                Provenance::UvOverride
+            }
+            _ => self.provenance.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -404,7 +436,21 @@ fn active_input_requirement(
     )))
 }
 
-/// Preserve the effective authoritative uv inputs that produced a closure.
+/// `retread-deps-from` exact roots stay exact while uv chooses a compatible
+/// prior selection, but the retained constraint is the relaxed lower bound
+/// used by restoration and conda emission.
+fn relax_deps_from_root_specifiers(specifiers: String) -> String {
+    if specifiers.contains(',') {
+        return specifiers;
+    }
+    specifiers
+        .strip_prefix("===")
+        .or_else(|| specifiers.strip_prefix("=="))
+        .map(|version| format!(">={version}"))
+        .unwrap_or(specifiers)
+}
+
+/// Preserve the effective typed uv inputs that produced a closure.
 /// The closure wheel versions are deliberately absent: they are solver output
 /// and become restoration preferences, not hard requirements.
 ///
@@ -422,14 +468,21 @@ fn effective_auto_route_input_requirements(
     let push = |destination: &mut BTreeMap<String, Vec<AutoRouteInputRequirement>>,
                 raw: &str,
                 source: String,
+                provenance: Provenance,
                 role: AutoRouteInputRole|
      -> Result<()> {
         let Some((name, specifiers)) = active_input_requirement(raw, &target)? else {
             return Ok(());
         };
+        let specifiers = if matches!(&provenance, Provenance::DepsFromRelaxed) {
+            relax_deps_from_root_specifiers(specifiers)
+        } else {
+            specifiers
+        };
         let requirement = AutoRouteInputRequirement {
             specifiers,
             source,
+            provenance,
             role,
         };
         let entries = destination.entry(name).or_default();
@@ -440,10 +493,19 @@ fn effective_auto_route_input_requirements(
     };
 
     for raw in &req.dependencies {
+        let provenance = Requirement::from_str(raw)
+            .ok()
+            .and_then(|requirement: Requirement| {
+                req.dependency_provenance
+                    .get(&canonical_conda_name(requirement.name.as_ref()))
+            })
+            .cloned()
+            .unwrap_or(Provenance::UvRoot);
         push(
             &mut requirements,
             raw,
             format!("uv root requirement `{raw}`"),
+            provenance,
             AutoRouteInputRole::Requirement,
         )?;
     }
@@ -455,22 +517,29 @@ fn effective_auto_route_input_requirements(
         {
             continue;
         }
-        let provenance = req
-            .constraints
-            .provenance
-            .values()
-            .find(|provenance| provenance.constraint == *raw);
-        let source = match provenance {
+        let recorded_provenance = Requirement::from_str(raw)
+            .ok()
+            .and_then(|requirement: Requirement| {
+                req.constraints
+                    .provenance
+                    .get(&canonical_conda_name(requirement.name.as_ref()))
+            })
+            .filter(|provenance| provenance.constraint == *raw);
+        let source = match recorded_provenance {
             Some(provenance) => format!(
                 "uv constraint `{raw}` from {} `{}` (conda `{}{}`)",
                 provenance.source, provenance.env, provenance.conda_name, provenance.conda_version
             ),
             None => format!("uv constraint `{raw}`"),
         };
+        let provenance = recorded_provenance
+            .map(|record| record.provenance.clone())
+            .unwrap_or(Provenance::UvConstraint);
         push(
             &mut constraints,
             raw,
             source,
+            provenance,
             AutoRouteInputRole::Constraint,
         )?;
     }
@@ -479,6 +548,7 @@ fn effective_auto_route_input_requirements(
             &mut overrides,
             raw,
             format!("uv override requirement `{raw}`"),
+            Provenance::UvOverride,
             AutoRouteInputRole::Override,
         )?;
     }
@@ -805,7 +875,7 @@ pub fn apply_auto_route(req: &mut UvClosureRequest, hits: &[AutoRoutedPackage]) 
                 conda_version: format!("=={}", h.conda_version),
                 source: "auto-route".to_string(),
                 env: "default".to_string(),
-                advisory: false,
+                provenance: Provenance::PriorSelection,
             });
     }
 }
@@ -930,10 +1000,7 @@ where
             .collect::<Vec<_>>()
     };
 
-    if matches!(
-        co_solve(combined(&candidates)).await,
-        CoInstallVerdict::Sat
-    ) {
+    if matches!(co_solve(combined(&candidates)).await, CoInstallVerdict::Sat) {
         return Some(JointRouteSelection {
             accepted: candidates,
             rejected: Vec::new(),
@@ -974,10 +1041,7 @@ where
             };
             let mut trial = core.clone();
             trial.remove(pos);
-            if matches!(
-                co_solve(combined(&trial)).await,
-                CoInstallVerdict::Unsat(_)
-            ) {
+            if matches!(co_solve(combined(&trial)).await, CoInstallVerdict::Unsat(_)) {
                 core = trial;
             }
         }
@@ -1091,7 +1155,7 @@ fn rebuild_routed_request(
                 conda_version: format!("=={version}"),
                 source: "workspace-harmonize".to_string(),
                 env: "default".to_string(),
-                advisory: false,
+                provenance: Provenance::WorkspaceCondaFact("default".to_string()),
             },
         );
     }
@@ -2136,7 +2200,7 @@ pub fn build_constraints(
                 conda_version: conda_spec.clone(),
                 source: source.to_string(),
                 env: env.to_string(),
-                advisory: false,
+                provenance: Provenance::UvConstraint,
             },
         );
     }
@@ -2724,8 +2788,10 @@ fn workspace_fact_override_needed(
     original_error: &str,
 ) -> Option<WorkspaceFactOverrideNeeded> {
     for attribution in attributions {
-        if attribution.conda_source.source != "workspace-solved"
-            || request_has_direct_root(req, &attribution.package)
+        if !matches!(
+            &attribution.conda_source.provenance,
+            Provenance::WorkspaceCondaFact(_)
+        ) || request_has_direct_root(req, &attribution.package)
         {
             continue;
         }
@@ -2801,7 +2867,10 @@ fn workspace_owned_drop_needed(
 ) -> Option<WorkspaceFactOverrideNeeded> {
     for attribution in attributions {
         // Only a precise workspace-solved conda fact is ownership authority.
-        if attribution.conda_source.source != "workspace-solved" {
+        if !matches!(
+            &attribution.conda_source.provenance,
+            Provenance::WorkspaceCondaFact(_)
+        ) {
             continue;
         }
         // A first-party direct root is the user's explicit intent, not an
@@ -2822,8 +2891,7 @@ fn workspace_owned_drop_needed(
         // `opencv-python==4.11.0` shape. A differing range/pin must actually
         // contain the conda version.
         if let Some(required) = attribution.required.as_deref() {
-            let Ok(required_specs) =
-                uv_pep508::uv_pep440::VersionSpecifiers::from_str(required)
+            let Ok(required_specs) = uv_pep508::uv_pep440::VersionSpecifiers::from_str(required)
             else {
                 continue;
             };
@@ -2857,7 +2925,7 @@ pub fn attribute_conflict(
 ) -> Vec<ConflictAttribution> {
     let mut out = Vec::new();
     for (pypi_name, prov) in provenance {
-        if prov.advisory {
+        if authority(&prov.provenance) != Authority::Authoritative {
             continue;
         }
         // Word-boundary match on the normalized name.
@@ -3203,7 +3271,7 @@ impl HealFacts {
     }
 }
 
-const HEAL_FACTS_STAMP_SCHEMA: &str = "v2-sdist-route-version-domains";
+const HEAL_FACTS_STAMP_SCHEMA: &str = "v3-typed-root-provenance";
 
 /// Hex sha256 over every input that decides whether persisted heal facts
 /// are still VALID to replay: the request's roots/constraints/overrides/
@@ -3245,6 +3313,15 @@ pub fn heal_facts_stamp(
     field("python", &mut std::iter::once(req.python_version.as_str()));
     field("subdir", &mut std::iter::once(req.conda_subdir.as_str()));
     field("deps", &mut req.dependencies.iter().map(String::as_str));
+    let dependency_provenance: Vec<String> = req
+        .dependency_provenance
+        .iter()
+        .map(|(name, provenance)| format!("{name}={provenance:?}"))
+        .collect();
+    field(
+        "dependency-provenance",
+        &mut dependency_provenance.iter().map(String::as_str),
+    );
     field(
         "constraints",
         &mut req.constraints.constraints.iter().map(String::as_str),
@@ -3888,6 +3965,7 @@ mod tests {
                 "isaacsim[all,extscache]==5.1.0".to_string(),
                 "mujoco==3.5.0".to_string(),
             ],
+            dependency_provenance: BTreeMap::new(),
             constraints,
             overrides: vec![
                 "protobuf>=4".to_string(),
@@ -3969,6 +4047,7 @@ isaaclab = { path = "wheels/isaaclab/isaaclab-2.0.0-py3-none-any.whl" }
             conda_subdir: "linux-64".to_string(),
             // Bare first-party requirement (the path source binds by name).
             dependencies: vec!["isaacsim-extscache-kit".to_string()],
+            dependency_provenance: BTreeMap::new(),
             constraints: ConstraintSet::default(),
             overrides: vec![],
             no_emit_packages: vec![],
@@ -4237,6 +4316,7 @@ isaaclab = { path = "wheels/isaaclab/isaaclab-2.0.0-py3-none-any.whl" }
         assert_eq!(torch.conda_version, "==2.10.0");
         assert_eq!(torch.source, "manifest");
         assert_eq!(torch.env, "default");
+        assert_eq!(torch.provenance, Provenance::UvConstraint);
         // conda name with no mapping would fall back to identity; the
         // skipped ones must not appear at all.
         assert!(!set.provenance.contains_key("python"));
@@ -4246,6 +4326,135 @@ isaaclab = { path = "wheels/isaaclab/isaaclab-2.0.0-py3-none-any.whl" }
         let json = provenance_json(&set).unwrap();
         assert!(json.contains("\"conda_name\": \"pytorch-gpu\""));
         assert!(json.contains("\"conda_version\": \"==2.10.0\""));
+    }
+
+    #[test]
+    fn deps_from_floor_is_advisory_after_effective_input_bridge() {
+        let mut req = sample_request();
+        req.dependencies.push("setuptools==69.5.1".to_string());
+        req.dependency_provenance
+            .insert("setuptools".to_string(), Provenance::DepsFromRelaxed);
+        let line = "starlette>=0.49.1".to_string();
+        req.constraints.constraints.push(line.clone());
+        req.constraints.provenance.insert(
+            "starlette".to_string(),
+            ConstraintProvenance {
+                constraint: line,
+                conda_name: "starlette".to_string(),
+                conda_version: ">=0.49.1".to_string(),
+                source: "deps-from-conda-advisory".to_string(),
+                env: "default".to_string(),
+                provenance: Provenance::DepsFromRelaxed,
+            },
+        );
+
+        let effective = effective_auto_route_input_requirements(&req).unwrap();
+        assert!(
+            effective["mujoco"]
+                .iter()
+                .any(|input| input.provenance == Provenance::UvRoot)
+        );
+        assert!(
+            effective["torch"]
+                .iter()
+                .any(|input| input.provenance == Provenance::UvConstraint)
+        );
+        assert!(
+            effective["starlette"]
+                .iter()
+                .any(|input| input.provenance == Provenance::DepsFromRelaxed)
+        );
+        let deps_from_root = effective["setuptools"]
+            .iter()
+            .find(|input| input.provenance == Provenance::DepsFromRelaxed)
+            .expect("exact deps-from root must retain typed provenance");
+        assert_eq!(
+            deps_from_root.specifiers, ">=69.5.1",
+            "the exact uv selection input must cross the typed boundary as an advisory floor"
+        );
+        assert!(
+            effective["protobuf"]
+                .iter()
+                .any(|input| input.provenance == Provenance::UvOverride)
+        );
+
+        let routed = effective["starlette"]
+            .iter()
+            .find(|input| input.provenance == Provenance::DepsFromRelaxed)
+            .expect("deps-from requirement must survive the routing bridge");
+        let constraints = vec![
+            crate::constraint::Constraint {
+                specifiers: routed.specifiers.parse().unwrap(),
+                provenance: routed.effective_provenance(),
+                source: routed.source.clone(),
+            },
+            crate::constraint::Constraint {
+                specifiers: ">=0.40,<0.46".parse().unwrap(),
+                provenance: Provenance::IndexWheelMetadata,
+                source: "index wheel `fastapi` Requires-Dist".to_string(),
+            },
+        ];
+        let finalized = crate::constraint::finalize(&PypiKey::from_pypi("starlette"), &constraints)
+            .expect("deps-from floor must yield after crossing the routing bridge");
+        assert!(finalized.contains(&"0.45.3".parse().unwrap()));
+        assert!(!finalized.contains(&"0.49.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn legacy_auto_route_input_roles_bridge_missing_provenance() {
+        let legacy_constraint: AutoRouteInputRequirement =
+            serde_json::from_str(r#"{"specifiers":">=1","source":"legacy","role":"constraint"}"#)
+                .unwrap();
+        assert_eq!(legacy_constraint.provenance, Provenance::IndexWheelMetadata);
+        assert_eq!(
+            legacy_constraint.effective_provenance(),
+            Provenance::UvConstraint
+        );
+
+        let legacy_override: AutoRouteInputRequirement =
+            serde_json::from_str(r#"{"specifiers":"==2","source":"legacy","role":"override"}"#)
+                .unwrap();
+        assert_eq!(
+            legacy_override.effective_provenance(),
+            Provenance::UvOverride
+        );
+
+        let explicit_advisory = AutoRouteInputRequirement {
+            specifiers: ">=3".to_string(),
+            source: "typed".to_string(),
+            provenance: Provenance::DepsFromRelaxed,
+            role: AutoRouteInputRole::Constraint,
+        };
+        assert_eq!(
+            explicit_advisory.effective_provenance(),
+            Provenance::DepsFromRelaxed,
+            "an explicit typed provenance must not be reclassified from its legacy role"
+        );
+    }
+
+    #[test]
+    fn legacy_constraint_provenance_defaults_to_index_metadata() {
+        let raw = r#"{
+            "constraint":"torch==2.10.0",
+            "conda_name":"pytorch-gpu",
+            "conda_version":"==2.10.0",
+            "source":"manifest",
+            "env":"default"
+        }"#;
+        let legacy: ConstraintProvenance = serde_json::from_str(raw).unwrap();
+        assert_eq!(legacy.provenance, Provenance::IndexWheelMetadata);
+
+        let raw_set = format!(
+            r#"{{
+                "constraints":["torch==2.10.0"],
+                "provenance":{{"torch":{raw}}}
+            }}"#
+        );
+        let legacy_set: ConstraintSet = serde_json::from_str(&raw_set).unwrap();
+        assert_eq!(
+            legacy_set.provenance["torch"].provenance,
+            Provenance::IndexWheelMetadata
+        );
     }
 
     /// Run-38 fix: a pack with NO `retread-name-map` of its own must
@@ -4634,11 +4843,43 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
         );
     }
 
+    #[test]
+    fn attribute_conflict_ignores_non_authoritative_provenance() {
+        let make = |provenance| {
+            BTreeMap::from([(
+                "starlette".to_string(),
+                ConstraintProvenance {
+                    constraint: "starlette>=0.49.1".to_string(),
+                    conda_name: "starlette".to_string(),
+                    conda_version: ">=0.49.1".to_string(),
+                    source: "typed test".to_string(),
+                    env: "default".to_string(),
+                    provenance,
+                },
+            )])
+        };
+        let stderr = "fastapi requires starlette<0.46 but starlette>=0.49.1 was requested";
+        assert!(
+            attribute_conflict(stderr, &make(Provenance::DepsFromRelaxed)).is_empty(),
+            "an advisory deps-from floor must not authorize a workspace repair"
+        );
+        assert!(
+            attribute_conflict(stderr, &make(Provenance::PriorSelection)).is_empty(),
+            "a prior selection is only a preference"
+        );
+        assert_eq!(
+            attribute_conflict(stderr, &make(Provenance::UvConstraint)).len(),
+            1,
+            "an authoritative uv constraint remains attributable"
+        );
+    }
+
     fn workspace_attribution(
         package: &str,
         required: Option<&str>,
         fact_version: &str,
         source: &str,
+        provenance: Provenance,
     ) -> ConflictAttribution {
         ConflictAttribution {
             package: package.to_string(),
@@ -4650,7 +4891,7 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
                 conda_version: format!("=={fact_version}"),
                 source: source.to_string(),
                 env: "precise-consuming-envs".to_string(),
-                advisory: false,
+                provenance,
             },
         }
     }
@@ -4659,8 +4900,13 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
     fn workspace_fact_exact_conflict_requests_graph_wide_override() {
         let mut req = sample_request();
         req.dependencies = vec!["isaacsim-core==6.0.0.1".to_string()];
-        let attribution =
-            workspace_attribution("torch", Some("==2.11.0"), "2.10.0", "workspace-solved");
+        let attribution = workspace_attribution(
+            "torch",
+            Some("==2.11.0"),
+            "2.10.0",
+            "workspace-solved",
+            Provenance::WorkspaceCondaFact("precise-consuming-envs".to_string()),
+        );
         req.constraints = ConstraintSet {
             constraints: vec![attribution.conflicting_constraint.clone()],
             provenance: BTreeMap::from([("torch".to_string(), attribution.conda_source.clone())]),
@@ -4703,7 +4949,13 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
             assert!(
                 classify(
                     &req,
-                    workspace_attribution("torch", required, "2.10.0", "workspace-solved")
+                    workspace_attribution(
+                        "torch",
+                        required,
+                        "2.10.0",
+                        "workspace-solved",
+                        Provenance::WorkspaceCondaFact("precise-consuming-envs".to_string()),
+                    )
                 )
                 .is_none(),
                 "classifier must abstain for {required:?}"
@@ -4719,28 +4971,53 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
                     "torch",
                     Some("==2.10.0"),
                     "2.10.0+cu129",
-                    "workspace-solved"
+                    "workspace-solved",
+                    Provenance::WorkspaceCondaFact("precise-consuming-envs".to_string()),
                 )
             )
             .is_none()
         );
-        for source in ["manifest", "cuda-major-table", "auto-route"] {
+        for (source, provenance) in [
+            ("manifest", Provenance::UvConstraint),
+            ("cuda-major-table", Provenance::UvConstraint),
+            ("auto-route", Provenance::PriorSelection),
+        ] {
             assert!(
                 classify(
                     &req,
-                    workspace_attribution("torch", Some("==2.11.0"), "2.10.0", source)
+                    workspace_attribution("torch", Some("==2.11.0"), "2.10.0", source, provenance,)
                 )
                 .is_none(),
                 "non-Rule-1 source {source} must not authorize an override"
             );
         }
+        assert!(
+            classify(
+                &req,
+                workspace_attribution(
+                    "torch",
+                    Some("==2.11.0"),
+                    "2.10.0",
+                    "workspace-solved",
+                    Provenance::UvConstraint,
+                )
+            )
+            .is_none(),
+            "a legacy source label must not substitute for typed workspace provenance"
+        );
 
         let mut direct_root = req;
         direct_root.dependencies.push("torch==2.11.0".to_string());
         assert!(
             classify(
                 &direct_root,
-                workspace_attribution("torch", Some("==2.11.0"), "2.10.0", "workspace-solved")
+                workspace_attribution(
+                    "torch",
+                    Some("==2.11.0"),
+                    "2.10.0",
+                    "workspace-solved",
+                    Provenance::WorkspaceCondaFact("precise-consuming-envs".to_string()),
+                )
             )
             .is_none(),
             "an explicit direct root pin is user intent, not an upstream pin"
@@ -4767,7 +5044,7 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
                 conda_version: format!("=={fact_version}"),
                 source: "workspace-solved".to_string(),
                 env: "precise-consuming-envs".to_string(),
-                advisory: false,
+                provenance: Provenance::WorkspaceCondaFact("precise-consuming-envs".to_string()),
             },
         }
     }
@@ -4789,7 +5066,7 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
             conda_version: "==4.11.0".to_string(),
             source: "workspace-solved".to_string(),
             env: "precise-consuming-envs".to_string(),
-            advisory: false,
+            provenance: Provenance::WorkspaceCondaFact("precise-consuming-envs".to_string()),
         };
         req.constraints = ConstraintSet {
             constraints: vec!["opencv-python==4.11.0".to_string()],
@@ -4851,8 +5128,14 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
         req.dependencies = vec!["isaacsim-core==4.2.0.2".to_string()];
         // A non-`workspace-solved` provenance is a routing alias, not fact
         // authority, and cannot authorize a drop.
-        for source in ["manifest", "cuda-major-table", "auto-route", "deps-from-conda-advisory"] {
-            let attribution = workspace_attribution("opencv-python", None, "4.11.0", source);
+        for (source, provenance) in [
+            ("manifest", Provenance::UvConstraint),
+            ("cuda-major-table", Provenance::UvConstraint),
+            ("auto-route", Provenance::PriorSelection),
+            ("deps-from-conda-advisory", Provenance::DepsFromRelaxed),
+        ] {
+            let attribution =
+                workspace_attribution("opencv-python", None, "4.11.0", source, provenance);
             assert!(
                 workspace_owned_drop_needed(&req, &[attribution], "err").is_none(),
                 "source `{source}` is not conda-ownership authority"
@@ -4952,7 +5235,10 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
         );
         let facts = learned.lock().unwrap();
         assert_eq!(facts.len(), 1);
-        assert!(facts[0].drop, "the drop is recorded as a learned/persistable fact");
+        assert!(
+            facts[0].drop,
+            "the drop is recorded as a learned/persistable fact"
+        );
         assert_eq!(facts[0].pypi_name, "opencv-python");
     }
 
@@ -5020,6 +5306,7 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
             effective_inputs["torch"].iter().any(|input| {
                 input.specifiers == "==2.10.0"
                     && input.source == "uv override requirement `torch==2.10.0`"
+                    && input.provenance == Provenance::UvOverride
                     && input.role == AutoRouteInputRole::Override
             }),
             "the closure must retain the learned override from the actual successful request"
@@ -5161,6 +5448,7 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
             python_version: "3.12".into(),
             conda_subdir: "linux-64".into(),
             dependencies: vec!["mujoco==3.5.0".into()],
+            dependency_provenance: BTreeMap::new(),
             constraints: ConstraintSet::default(),
             overrides: vec![],
             no_emit_packages: vec![],
@@ -5229,6 +5517,7 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
                     .unwrap()
                     .to_string(),
                 source: "uv root requirement `numpy>=2,<3`".to_string(),
+                provenance: Provenance::UvRoot,
                 role: AutoRouteInputRole::Requirement,
             }]
         );
@@ -5251,6 +5540,7 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
         assert_eq!(prov.source, "auto-route");
         assert_eq!(prov.conda_name, "numpy");
         assert_eq!(prov.conda_version, "==2.1.0");
+        assert_eq!(prov.provenance, Provenance::PriorSelection);
     }
 
     #[tokio::test]
@@ -5985,6 +6275,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
             python_version: "3.12".into(),
             conda_subdir: "linux-64".into(),
             dependencies: vec!["typing-extensions==4.12.2".into()],
+            dependency_provenance: BTreeMap::new(),
             constraints: ConstraintSet::default(),
             overrides: vec![],
             no_emit_packages: vec![],
@@ -6026,6 +6317,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
             python_version: "3.12".into(),
             conda_subdir: "linux-64".into(),
             dependencies: vec!["python-dateutil==2.9.0.post0".into()],
+            dependency_provenance: BTreeMap::new(),
             constraints: ConstraintSet::default(),
             overrides: vec![],
             no_emit_packages: vec![],
@@ -6274,7 +6566,11 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
 
         assert_eq!(selection.accepted, vec![candidate]);
         assert!(selection.rejected.is_empty());
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "happy path is one batch solve");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "happy path is one batch solve"
+        );
     }
 
     /// The blocker-class fixture: BOTH numpy and typing-extensions have
@@ -7412,6 +7708,7 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
             python_version: "3.12".into(),
             conda_subdir: "linux-64".into(),
             dependencies: vec!["astub".into()],
+            dependency_provenance: BTreeMap::new(),
             constraints: ConstraintSet::default(),
             overrides: vec![],
             no_emit_packages: vec![],
@@ -7578,6 +7875,7 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
             python_version: "3.12".into(),
             conda_subdir: "linux-64".into(),
             dependencies: vec!["astub".into()],
+            dependency_provenance: BTreeMap::new(),
             constraints: ConstraintSet::default(),
             overrides: vec![],
             no_emit_packages: vec![],
@@ -7758,6 +8056,7 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
                 input_requirements: vec![AutoRouteInputRequirement {
                     specifiers: ">=0.9,<2".into(),
                     source: "uv constraint `routed-pkg>=0.9,<2`".into(),
+                    provenance: Provenance::UvConstraint,
                     role: AutoRouteInputRole::Constraint,
                 }],
             }],
@@ -7870,6 +8169,7 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
             python_version: "3.12".into(),
             conda_subdir: "linux-64".into(),
             dependencies: vec!["foo==1.0".into()],
+            dependency_provenance: BTreeMap::new(),
             constraints: ConstraintSet {
                 constraints: vec!["bar<2".into()],
                 provenance: BTreeMap::new(),
@@ -8056,6 +8356,7 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
             python_version: "3.12".into(),
             conda_subdir: "linux-64".into(),
             dependencies: vec!["foo==2.0".into()],
+            dependency_provenance: BTreeMap::new(),
             constraints: ConstraintSet::default(),
             overrides: vec![],
             no_emit_packages: vec![],
