@@ -297,7 +297,8 @@ fn op_str(op: Operator) -> &'static str {
 
 /// Same shape as relax.rs's strip_upper_bounds but emits PEP 508
 /// spec strings rather than VersionSpecifier objects. Dropped: `<X`,
-/// `<=X`. `~=X.Y` -> `>=X.Y`. Everything else passes through.
+/// `<=X`. `~=X.Y[.Z...]` keeps its full lower bound. Everything else
+/// passes through.
 fn strip_upper_bounds_pep508(specs: &[&uv_pep508::uv_pep440::VersionSpecifier]) -> Vec<String> {
     let mut kept = Vec::with_capacity(specs.len());
     for spec in specs {
@@ -308,9 +309,7 @@ fn strip_upper_bounds_pep508(specs: &[&uv_pep508::uv_pep440::VersionSpecifier]) 
                 if r.is_empty() {
                     continue;
                 }
-                let major = r[0];
-                let minor = r.get(1).copied().unwrap_or(0);
-                kept.push(format!(">={major}.{minor}"));
+                kept.push(format!(">={}", spec.version()));
             }
             other => kept.push(format!("{}{}", op_str(*other), spec.version())),
         }
@@ -529,6 +528,9 @@ mod tests {
 
         let out = relax_pep508("requests~=2.0", RelaxPolicy::StrongMajor).unwrap();
         assert_eq!(out, "requests>=2.0", "got: {out}");
+
+        let out = relax_pep508("requests~=2.0.4", RelaxPolicy::StrongMajor).unwrap();
+        assert_eq!(out, "requests>=2.0.4", "got: {out}");
 
         // Exact pins still widen.
         let out = relax_pep508("numpy==1.26.4", RelaxPolicy::StrongMajor).unwrap();

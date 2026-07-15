@@ -490,9 +490,11 @@ fn convert_specifiers(
     let mut conda = Vec::with_capacity(effective.len());
     let mut pep440 = Vec::with_capacity(effective.len());
     for specifier in &effective {
+        if *specifier.operator() != Operator::ExactEqual {
+            pep440.push(specifier.to_string());
+        }
         if let Some(rendered) = convert_one(specifier) {
             conda.push(rendered);
-            pep440.push(specifier.to_string());
         }
     }
     Ok(ConvertedSpecifiers {
@@ -511,7 +513,7 @@ fn convert_specifiers(
 /// would still satisfy any candidate).
 ///
 /// Stripped: `<X`, `<=X`, the `<` half of `>=X,<Y`, the implicit upper
-/// of `~=X.Y`.
+/// of `~=X.Y[.Z...]`.
 fn strip_upper_bounds(specs: &[&uv_pep440::VersionSpecifier]) -> Vec<uv_pep440::VersionSpecifier> {
     use std::str::FromStr;
     let mut kept: Vec<uv_pep440::VersionSpecifier> = Vec::with_capacity(specs.len());
@@ -521,14 +523,13 @@ fn strip_upper_bounds(specs: &[&uv_pep440::VersionSpecifier]) -> Vec<uv_pep440::
                 // Drop entirely -- this is a pure upper bound.
             }
             Operator::TildeEqual => {
-                // `~=X.Y` means `>=X.Y,<X.(Y+1)`. Keep the lower half.
+                // Keep the full written version as the lower bound; only the
+                // compatible release's implicit cap is stripped.
                 let r = spec.version().release();
                 if r.is_empty() {
                     continue;
                 }
-                let major = r[0];
-                let minor = r.get(1).copied().unwrap_or(0);
-                let lower = format!(">={major}.{minor}");
+                let lower = format!(">={}", spec.version());
                 if let Ok(parsed) = uv_pep440::VersionSpecifier::from_str(&lower) {
                     kept.push(parsed);
                 }
@@ -554,9 +555,16 @@ fn convert_one(spec: &uv_pep440::VersionSpecifier) -> Option<String> {
             if release.len() < 2 {
                 return None;
             }
-            let major = release[0];
-            let minor = release[1];
-            return Some(format!(">={major}.{minor},<{}", major + 1));
+            let lower = spec.version();
+            let mut upper = release[..release.len() - 1].to_vec();
+            let last = upper.len() - 1;
+            upper[last] += 1;
+            let upper = upper
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(".");
+            return Some(format!(">={lower},<{upper}"));
         }
         // `===` (arbitrary equality, PEP 440) — drop the spec; let any version match.
         Operator::ExactEqual => {
@@ -619,7 +627,7 @@ pub fn widen_exact(v: &Version, policy: RelaxPolicy) -> Option<String> {
 fn widen_star(v: &Version, negate: bool) -> Option<String> {
     // `==1.2.*` -> `>=1.2,<1.3`
     let r = v.release();
-    if r.len() < 2 {
+    if r.is_empty() {
         return None;
     }
     let lo = r
@@ -1105,6 +1113,58 @@ mod tests {
             uv_pep440::VersionSpecifiers::from_str(&preserved)
                 .expect("preserved constraint must remain valid PEP 440");
         }
+    }
+
+    #[test]
+    fn one_component_wildcards_remain_represented_in_both_domains() {
+        let excluded = translated("demo!=1.*", RelaxPolicy::None);
+        assert_eq!(excluded.spec, "<1|>=2");
+        assert_eq!(
+            excluded.constraint_origin,
+            CondaConstraintOrigin::Pypi {
+                original_specifiers: "!=1.*".to_string(),
+                effective_specifiers: "!=1.*".to_string(),
+            }
+        );
+
+        let included = translated("demo==1.*", RelaxPolicy::None);
+        assert_eq!(included.spec, ">=1,<2");
+        assert_eq!(
+            included.constraint_origin,
+            CondaConstraintOrigin::Pypi {
+                original_specifiers: "==1.*".to_string(),
+                effective_specifiers: "==1.*".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn compatible_release_lowering_preserves_full_pep440_version() {
+        let two_part = translated("demo~=2.1", RelaxPolicy::None);
+        assert_eq!(two_part.spec, ">=2.1,<3");
+
+        let three_part = translated("demo~=2.1.4", RelaxPolicy::None);
+        assert_eq!(three_part.spec, ">=2.1.4,<2.2");
+        assert_eq!(
+            three_part.constraint_origin,
+            CondaConstraintOrigin::Pypi {
+                original_specifiers: "~=2.1.4".to_string(),
+                effective_specifiers: "~=2.1.4".to_string(),
+            }
+        );
+
+        let prerelease = translated("demo~=1.4.5a1", RelaxPolicy::None);
+        assert_eq!(prerelease.spec, ">=1.4.5a1,<1.5");
+
+        let strong = translated("demo~=2.1.4", RelaxPolicy::StrongMajor);
+        assert_eq!(strong.spec, ">=2.1.4");
+        assert_eq!(
+            strong.constraint_origin,
+            CondaConstraintOrigin::Pypi {
+                original_specifiers: "~=2.1.4".to_string(),
+                effective_specifiers: ">=2.1.4".to_string(),
+            }
+        );
     }
 
     #[test]
