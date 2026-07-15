@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 
 use anyhow::Result;
 use tokio::io::AsyncReadExt;
@@ -202,7 +203,7 @@ struct EnvRunCtx<'a> {
     parser: &'a RegexConflictParser,
     ledger_path: &'a Path,
     run_idx: Option<usize>,
-    conda_name_map: &'a crate::handler::PypiToCondaMap,
+    conda_name_map: &'a Arc<crate::handler::PypiToCondaMap>,
 }
 
 async fn run_env(

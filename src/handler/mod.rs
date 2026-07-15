@@ -476,6 +476,126 @@ const FALLBACK_PYPI_TO_CONDA: &[(&str, &str)] = &[
 /// like `airflow` -> `apache-airflow`).
 pub(crate) type PypiToCondaMap = std::collections::HashMap<String, Vec<String>>;
 
+const PARSELMOUTH_MAPPING_MAX_BYTES: usize = 16 * 1024 * 1024;
+const PARSELMOUTH_MAPPING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// One immutable mapping snapshot per backend process. Caching the complete
+/// first result, including the curated-only fallback after a fetch failure,
+/// keeps route selection stable between output advertisement and build.
+static PYPI_TO_CONDA_MAP: tokio::sync::OnceCell<Arc<PypiToCondaMap>> =
+    tokio::sync::OnceCell::const_new();
+
+fn finalize_pypi_to_conda_map(mut inverse: PypiToCondaMap) -> PypiToCondaMap {
+    // Patch in known-missing entries from FALLBACK on top of parselmouth.
+    // These are gaps in parselmouth's data (see each entry's comment for
+    // the corresponding upstream issue). When the upstream issues are
+    // fixed, canonicalization below makes them harmless duplicates.
+    for (pypi, conda) in FALLBACK_PYPI_TO_CONDA {
+        inverse
+            .entry(canonical_conda_name(pypi))
+            .or_default()
+            .push((*conda).to_string());
+    }
+    for candidates in inverse.values_mut() {
+        candidates.sort_unstable();
+        candidates.dedup();
+    }
+    inverse
+}
+
+async fn fetch_pypi_to_conda_map() -> Result<PypiToCondaMap> {
+    use futures::StreamExt;
+
+    let client = reqwest::Client::builder()
+        .timeout(PARSELMOUTH_MAPPING_TIMEOUT)
+        .build()
+        .context("building parselmouth HTTP client")?;
+    let response = client
+        .get(PARSELMOUTH_MAPPING_URL)
+        .send()
+        .await
+        .context("fetching parselmouth mapping")?
+        .error_for_status()
+        .context("parselmouth mapping HTTP status")?;
+    if response
+        .content_length()
+        .is_some_and(|len| len > PARSELMOUTH_MAPPING_MAX_BYTES as u64)
+    {
+        bail!(
+            "parselmouth mapping exceeds {} bytes",
+            PARSELMOUTH_MAPPING_MAX_BYTES
+        );
+    }
+
+    let mut bytes = Vec::with_capacity(
+        response
+            .content_length()
+            .unwrap_or_default()
+            .min(PARSELMOUTH_MAPPING_MAX_BYTES as u64) as usize,
+    );
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("reading parselmouth mapping body")?;
+        if bytes.len().saturating_add(chunk.len()) > PARSELMOUTH_MAPPING_MAX_BYTES {
+            bail!(
+                "parselmouth mapping exceeds {} bytes",
+                PARSELMOUTH_MAPPING_MAX_BYTES
+            );
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+
+    let forward: std::collections::HashMap<String, Option<Vec<String>>> =
+        serde_json::from_slice(&bytes).context("parsing parselmouth mapping JSON")?;
+    if forward.is_empty() {
+        bail!("parselmouth mapping is empty");
+    }
+
+    let mut inverse: PypiToCondaMap = std::collections::HashMap::new();
+    for (conda_name, pypi_list) in forward {
+        for pypi in pypi_list.unwrap_or_default() {
+            inverse
+                .entry(canonical_conda_name(&pypi))
+                .or_default()
+                .push(conda_name.clone());
+        }
+    }
+    if inverse.is_empty() {
+        bail!("parselmouth mapping contains no PyPI names");
+    }
+    tracing::info!(
+        entries = inverse.len(),
+        bytes = bytes.len(),
+        "loaded parselmouth PyPI<->conda mapping"
+    );
+    Ok(inverse)
+}
+
+async fn load_pypi_to_conda_map_with<F, Fut>(
+    cell: &tokio::sync::OnceCell<Arc<PypiToCondaMap>>,
+    fetch: F,
+) -> Arc<PypiToCondaMap>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<PypiToCondaMap>>,
+{
+    cell.get_or_init(|| async move {
+        let inverse = match fetch().await {
+            Ok(inverse) => inverse,
+            Err(error) => {
+                tracing::warn!(
+                    error = %format!("{error:#}"),
+                    "parselmouth mapping unavailable; using curated fallback for this process"
+                );
+                PypiToCondaMap::new()
+            }
+        };
+        Arc::new(finalize_pypi_to_conda_map(inverse))
+    })
+    .await
+    .clone()
+}
+
 /// Best-effort fetch of the parselmouth mapping. Returns a fallback map
 /// if the network call fails -- never errors. Async because it makes an
 /// HTTP request.
@@ -484,51 +604,8 @@ pub(crate) type PypiToCondaMap = std::collections::HashMap<String, Vec<String>>;
 /// the SAME parselmouth-backed name family (torch -> [pytorch, pytorch-cpu,
 /// pytorch-gpu], etc.) that the courier/auto-route path uses to build its
 /// `name_map`, instead of hand-rolling a second conda<->pypi name table.
-pub(crate) async fn load_pypi_to_conda_map() -> PypiToCondaMap {
-    let mut inverse: PypiToCondaMap = std::collections::HashMap::new();
-
-    match reqwest::get(PARSELMOUTH_MAPPING_URL).await {
-        Ok(resp) => match resp.error_for_status() {
-            Ok(resp) => {
-                match resp
-                    .json::<std::collections::HashMap<String, Option<Vec<String>>>>()
-                    .await
-                {
-                    Ok(forward) => {
-                        for (conda_name, pypi_list) in forward {
-                            for pypi in pypi_list.unwrap_or_default() {
-                                inverse
-                                    .entry(canonical_conda_name(&pypi))
-                                    .or_default()
-                                    .push(conda_name.clone());
-                            }
-                        }
-                        tracing::info!(
-                            entries = inverse.len(),
-                            "loaded parselmouth PyPI<->conda mapping"
-                        );
-                    }
-                    Err(e) => tracing::warn!(error = %e, "parselmouth JSON parse failed"),
-                }
-            }
-            Err(e) => tracing::warn!(error = %e, "parselmouth fetch failed"),
-        },
-        Err(e) => tracing::warn!(error = %e, "parselmouth fetch failed"),
-    }
-
-    // Patch in known-missing entries from FALLBACK on top of parselmouth.
-    // These are gaps in parselmouth's data (see each entry's comment for
-    // the corresponding upstream issue). When the upstream issues are
-    // fixed, the entries become harmless duplicates.
-    for (pypi, conda) in FALLBACK_PYPI_TO_CONDA {
-        let key = canonical_conda_name(pypi);
-        let entry = inverse.entry(key).or_default();
-        if !entry.iter().any(|c| c == conda) {
-            entry.push((*conda).to_string());
-        }
-    }
-
-    inverse
+pub(crate) async fn load_pypi_to_conda_map() -> Arc<PypiToCondaMap> {
+    load_pypi_to_conda_map_with(&PYPI_TO_CONDA_MAP, fetch_pypi_to_conda_map).await
 }
 
 /// Merge the user-declared name map with retread's curated fallbacks and
@@ -8384,7 +8461,7 @@ async fn resolve_incremental_add(
                 .map(|d| canonical_conda_name(&d.pypi_name)),
         );
         new_conda_capable.extend(effective.name_map.keys().map(|key| key.as_str().to_owned()));
-        new_conda_capable.extend(load_pypi_to_conda_map().await.into_keys());
+        new_conda_capable.extend(pypi_to_conda.keys().cloned());
     }
 
     // ── Step C: auto_bundle_transitives for each new bundle (if applicable) ─
@@ -8769,7 +8846,8 @@ async fn build_one(
             .map(|d| canonical_conda_name(&d.pypi_name))
             .collect();
         conda_capable.extend(config.name_map.keys().map(|key| key.as_str().to_owned()));
-        conda_capable.extend(load_pypi_to_conda_map().await.into_keys());
+        let pypi_to_conda = load_pypi_to_conda_map().await;
+        conda_capable.extend(pypi_to_conda.keys().cloned());
         let ws_manifest = workspace_dir.and_then(crate::workspace::WorkspaceManifest::load);
         let workspace_indexes: Vec<String> = ws_manifest
             .as_ref()

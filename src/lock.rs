@@ -374,7 +374,11 @@ pub const SCHEMA: u32 = 12;
 /// Existing locks must rebuild so package metadata is derived from the
 /// runtime-only Python requirement while advertised host run exports remain
 /// available to pixi.
-pub const EMIT_EPOCH: u32 = 14;
+///
+/// Epoch 15: parselmouth candidate families are sorted and deduplicated before
+/// route and repair selection. Existing locks must cold-resolve once so their
+/// chosen provider cannot depend on hash-map iteration order.
+pub const EMIT_EPOCH: u32 = 15;
 
 impl RetreadLock {
     /// File name for a bundle's lock next to the pack manifest.

@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use regex::Regex;
@@ -319,7 +320,7 @@ pub struct RepairPlanner {
     /// differently-named variant package (e.g. `pytorch-gpu`). Empty by
     /// default -- callers that don't wire it in (tests, `--offline`-style
     /// use) fall back to exact-name matching only.
-    conda_name_map: PypiToCondaMap,
+    conda_name_map: Arc<PypiToCondaMap>,
 }
 
 /// One conflict target flowing through the repair tiers: which package and
@@ -409,7 +410,7 @@ impl RepairPlanner {
             ceiling_policy: WidenCeilingPolicy::NextMajor,
             relax_preference: RelaxPreference::Conda,
             current_run_attempts: HashSet::new(),
-            conda_name_map: PypiToCondaMap::new(),
+            conda_name_map: Arc::new(PypiToCondaMap::new()),
         }
     }
 
@@ -417,7 +418,7 @@ impl RepairPlanner {
     /// `conda_name_map` doc comment). `driver::run` loads this once per
     /// invocation via `crate::handler::load_pypi_to_conda_map` and passes it
     /// down so conflict matching agrees with the courier/auto-route path.
-    pub fn with_conda_name_map(mut self, map: PypiToCondaMap) -> Self {
+    pub fn with_conda_name_map(mut self, map: Arc<PypiToCondaMap>) -> Self {
         self.conda_name_map = map;
         self
     }
@@ -429,7 +430,7 @@ impl RepairPlanner {
     /// bare planner and silently lost both fixes).
     pub fn configured(
         feature: String,
-        conda_name_map: PypiToCondaMap,
+        conda_name_map: Arc<PypiToCondaMap>,
         relax_preference: RelaxPreference,
     ) -> Self {
         Self::new(feature)
@@ -6088,7 +6089,8 @@ holosoma-gpu = { features = ["holosoma"] }
         let mentions_torch = parser.extract_generic_mentions(text_torch);
         let mut map = PypiToCondaMap::new();
         map.insert("torch".to_string(), vec!["pytorch".to_string()]);
-        let planner_mapped = RepairPlanner::new("default".into()).with_conda_name_map(map);
+        let planner_mapped =
+            RepairPlanner::new("default".into()).with_conda_name_map(Arc::new(map));
         let candidates_torch = planner_mapped.generate_fallback_candidates(
             &editor,
             Some("protomotions-deps-pack"),

@@ -159,8 +159,8 @@ fn pick_conda_target_parselmouth_identity_match_wins() {
     );
 }
 
-#[test]
-fn pick_conda_target_single_parselmouth_candidate() {
+#[tokio::test]
+async fn pick_conda_target_single_parselmouth_candidate() {
     let parselmouth = pypi_map(&[("some-pypi-only", &["the-conda-name"])]);
     let name_map = NameMap::new();
     assert_eq!(
@@ -172,6 +172,53 @@ fn pick_conda_target_single_parselmouth_candidate() {
         .as_ref()
         .map(CondaName::as_spec),
         Some("the-conda-name"),
+    );
+
+    // The process snapshot canonicalizes candidate order and shares one Arc
+    // across concurrent consumers instead of cloning the full mapping.
+    let canonical = finalize_pypi_to_conda_map(pypi_map(&[(
+        "unordered",
+        &["z-provider", "a-provider", "z-provider"],
+    )]));
+    assert_eq!(canonical["unordered"], ["a-provider", "z-provider"]);
+
+    let cell = Arc::new(tokio::sync::OnceCell::new());
+    let fetches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let spawn_load = |cell: Arc<tokio::sync::OnceCell<Arc<PypiToCondaMap>>>,
+                      fetches: Arc<std::sync::atomic::AtomicUsize>| {
+        tokio::spawn(async move {
+            load_pypi_to_conda_map_with(&cell, || async move {
+                fetches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::task::yield_now().await;
+                Ok(pypi_map(&[("shared", &["provider"])]))
+            })
+            .await
+        })
+    };
+    let first = spawn_load(cell.clone(), fetches.clone());
+    let second = spawn_load(cell, fetches.clone());
+    let first = first.await.unwrap();
+    let second = second.await.unwrap();
+    assert!(Arc::ptr_eq(&first, &second));
+    assert_eq!(fetches.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // A failed first fetch publishes one stable fallback snapshot rather than
+    // allowing route semantics to change later in the same backend process.
+    let fallback_cell = tokio::sync::OnceCell::new();
+    let fallback = load_pypi_to_conda_map_with(&fallback_cell, || async {
+        Err(anyhow!("injected fetch failure"))
+    })
+    .await;
+    let cached = load_pypi_to_conda_map_with(&fallback_cell, || async {
+        panic!("cached fallback must suppress a later fetch");
+        #[allow(unreachable_code)]
+        Ok(PypiToCondaMap::new())
+    })
+    .await;
+    assert!(Arc::ptr_eq(&fallback, &cached));
+    assert!(
+        cached["torch"].iter().any(|candidate| candidate == "pytorch-gpu"),
+        "the process-stable fallback must retain curated mappings"
     );
 }
 
