@@ -4,13 +4,13 @@
 //! point is [`engage_backend`], which prepares the same job-scoped namespace
 //! without mutating workspace symlinks.
 
-use std::collections::HashMap;
-use std::ffi::CString;
+use std::collections::{HashMap, HashSet};
+use std::ffi::{CString, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -20,21 +20,47 @@ use sha2::{Digest, Sha256};
 const DEFAULT_TMP_ROOT: &str = "/tmp";
 const DEFAULT_ESTIMATE_BYTES: u64 = 80 * 1024 * 1024 * 1024;
 const PROBE_THRESHOLD_MS: f64 = 5.0;
-/// Relative (to workspace root) default location of NFS-persisted env snapshots.
-const DEFAULT_PERSIST_DIR: &str = ".pixi/envs-persist";
-/// Hash file written alongside each snapshot; contains the sha256 hex of the
-/// workspace lock(s) the snapshot was built from.
-const ENV_HASH_FILE: &str = ".retread-env-hash";
-/// Cap on parallel copy workers (benchmarked sweet spot on NFS: ~60).
-const MAX_COPY_WORKERS: usize = 60;
+/// Job-local Pixi config overlay. Pixi 0.70 no longer reads the legacy
+/// `PIXI_DETACHED_ENVIRONMENTS` variable; detached environments must be
+/// enabled in config, while the cache directory has a supported env override.
+const PIXI_FASTTMP_CONFIG: &str = "pixi-fasttmp-config.toml";
+/// Tracks the overlay installed by retread so a later job can distinguish it
+/// from a user-supplied `PIXI_CONFIG_FILE` and restore the latter.
+const RETREAD_PIXI_CONFIG_MARKER: &str = "RETREAD_FAST_TMP_PIXI_CONFIG_FILE";
+const RETREAD_BASE_PIXI_CONFIG: &str = "RETREAD_FAST_TMP_BASE_PIXI_CONFIG_FILE";
+const RETREAD_MANAGED_KEYS: &str = "RETREAD_FAST_TMP_MANAGED_KEYS";
+const RETREAD_BASE_ENV_JSON: &str = "RETREAD_FAST_TMP_BASE_ENV_JSON";
+const RETREAD_EXPECTED_ENV_JSON: &str = "RETREAD_FAST_TMP_EXPECTED_ENV_JSON";
 
+/// User-facing variables Retread may own. Inherited ownership metadata is
+/// untrusted because `--print-env` is evaluated by a shell, so cleanup must
+/// never emit an inherited key outside this fixed allowlist.
+const MANAGEABLE_ENV_KEYS: &[&str] = &[
+    "PIXI_CACHE_DIR",
+    "RATTLER_CACHE_DIR",
+    "UV_CACHE_DIR",
+    "RETREAD_CACHE_DIR",
+    "UV_LOCK_TIMEOUT",
+    "PIXI_CONFIG_FILE",
+    "PIXI_CACHE_DETACHED_ENVIRONMENTS_DIR",
+    "PIXI_DETACHED_ENVIRONMENTS",
+];
+
+#[cfg(test)]
 const FAST_ENV_KEYS: &[&str] = &[
     "PIXI_CACHE_DIR",
     "RATTLER_CACHE_DIR",
     "UV_CACHE_DIR",
     "RETREAD_CACHE_DIR",
     "UV_LOCK_TIMEOUT",
+    "PIXI_CONFIG_FILE",
+    "PIXI_CACHE_DETACHED_ENVIRONMENTS_DIR",
     "PIXI_DETACHED_ENVIRONMENTS",
+    RETREAD_PIXI_CONFIG_MARKER,
+    RETREAD_BASE_PIXI_CONFIG,
+    RETREAD_MANAGED_KEYS,
+    RETREAD_BASE_ENV_JSON,
+    RETREAD_EXPECTED_ENV_JSON,
     "RETREAD_FAST_TMP_NS_JOB",
 ];
 
@@ -65,12 +91,6 @@ pub struct FastTmpConfig {
     pub budget_bytes: Option<u64>,
     pub blob_caches: BlobCacheMode,
     pub shared_cache_dir: Option<PathBuf>,
-    /// Where env snapshots persist on the shared/NFS side. Relative paths are
-    /// resolved against the workspace root. Default: `.pixi/envs-persist`.
-    pub persist_dir: Option<PathBuf>,
-    /// Worker count for parallel env copies. Default: min(60, 4*allocated
-    /// cpus) — SLURM/cgroup-aware, ncpu fallback; see effective_copy_workers.
-    pub copy_workers: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -98,6 +118,10 @@ impl Namespace {
     pub fn envs_dir(&self) -> PathBuf {
         self.root.join("envs")
     }
+
+    pub fn pixi_config_file(&self) -> PathBuf {
+        self.root.join(PIXI_FASTTMP_CONFIG)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -112,6 +136,13 @@ struct BackendEnv {
     remove_fast_vars: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackendEnvOverride {
+    Unchanged,
+    Set(String),
+    Remove,
+}
+
 static BACKEND_ENV: OnceLock<Mutex<BackendEnv>> = OnceLock::new();
 static PROBE_CACHE: OnceLock<Mutex<HashMap<PathBuf, bool>>> = OnceLock::new();
 static CORRUPT_COPYBACK_ONCE_USED: AtomicBool = AtomicBool::new(false);
@@ -124,8 +155,6 @@ impl Default for FastTmpConfig {
             budget_bytes: None,
             blob_caches: BlobCacheMode::Shared,
             shared_cache_dir: None,
-            persist_dir: None,
-            copy_workers: None,
         }
     }
 }
@@ -166,16 +195,10 @@ impl FastTmpConfig {
         if let Ok(shared) = std::env::var("RETREAD_SHARED_CACHE_DIR") {
             cfg.shared_cache_dir = Some(PathBuf::from(shared));
         }
-        if let Ok(dir) = std::env::var("RETREAD_FAST_TMP_PERSIST_DIR") {
-            cfg.persist_dir = Some(PathBuf::from(dir));
-        }
-        if let Ok(workers) = std::env::var("RETREAD_FAST_TMP_COPY_WORKERS") {
-            match workers.trim().parse::<usize>() {
-                Ok(n) if n > 0 => cfg.copy_workers = Some(n),
-                _ => warn_msg(&format!(
-                    "retread fast-tmp: ignoring invalid RETREAD_FAST_TMP_COPY_WORKERS={workers:?}"
-                )),
-            }
+        if cfg.tmp_root.is_relative() {
+            cfg.tmp_root = std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(&cfg.tmp_root);
         }
         cfg
     }
@@ -240,29 +263,6 @@ impl FastTmpConfig {
                 );
             }
         }
-        if let Some(v) = table
-            .get("persist-dir")
-            .or_else(|| table.get("persist_dir"))
-        {
-            if let Some(s) = v.as_str() {
-                self.persist_dir = Some(PathBuf::from(s));
-            } else {
-                warn_msg("retread fast-tmp: ignoring invalid tool.retread.fast-tmp.persist-dir");
-            }
-        }
-        if let Some(v) = table
-            .get("copy-workers")
-            .or_else(|| table.get("copy_workers"))
-        {
-            match v.as_integer() {
-                Some(n) if n > 0 => self.copy_workers = Some(n as usize),
-                _ => {
-                    warn_msg(
-                        "retread fast-tmp: ignoring invalid tool.retread.fast-tmp.copy-workers",
-                    );
-                }
-            }
-        }
     }
 }
 
@@ -273,6 +273,15 @@ fn parse_mode(s: &str) -> Option<FastTmpMode> {
         "off" | "0" | "false" => Some(FastTmpMode::Off),
         _ => None,
     }
+}
+
+fn env_flag_truthy(key: &str) -> bool {
+    std::env::var(key).ok().is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on" | "y" | "t"
+        )
+    })
 }
 
 fn parse_blob_mode(s: &str) -> Option<BlobCacheMode> {
@@ -483,7 +492,7 @@ pub fn engage_backend(
     let engaged = engage_inner(workspace_root, cfg, false)?;
     let backend = BackendEnv {
         pairs: engaged.as_ref().map(|e| e.env.clone()).unwrap_or_default(),
-        remove_fast_vars: engaged.is_none() && inherited_fasttmp_stale(),
+        remove_fast_vars: engaged.is_none() && inherited_fasttmp_cleanup_needed(),
     };
     *BACKEND_ENV
         .get_or_init(|| Mutex::new(BackendEnv::default()))
@@ -498,19 +507,28 @@ fn engage_inner(
     wrapper_side_effects: bool,
 ) -> Result<Option<EngagedFastTmp>> {
     if cfg.mode == FastTmpMode::Off {
+        if wrapper_side_effects {
+            cleanup_owned_workspace_links(workspace_root)?;
+        }
         return Ok(None);
     }
     let stale = inherited_fasttmp_stale();
     if stale {
         warn_msg(&format!(
-            "retread fast-tmp: inherited namespace for job {:?} is stale under current job {}; re-engaging",
+            "retread fast-tmp: inherited namespace for job {:?} is stale under current job {}; refreshing fast-tmp state",
             std::env::var("RETREAD_FAST_TMP_NS_JOB").ok(),
             current_job_marker()
         ));
     }
-    if cfg.mode == FastTmpMode::Auto && !stale && !is_slow(workspace_root, cfg) {
+    if cfg.mode == FastTmpMode::Auto && !is_slow(workspace_root, cfg) {
+        if wrapper_side_effects {
+            cleanup_owned_workspace_links(workspace_root)?;
+        }
         return Ok(None);
     }
+
+    ensure_valid_managed_metadata()?;
+    validate_pixi_version()?;
 
     let canonical = fs::canonicalize(workspace_root)
         .with_context(|| format!("canonicalizing workspace {}", workspace_root.display()))?;
@@ -521,23 +539,93 @@ fn engage_inner(
 
     let ns = namespace(cfg, &canonical);
     prepare_namespace_dirs(&ns, &canonical, cfg, workspace_root)?;
+    if wrapper_side_effects {
+        validate_workspace_local_detached_config(workspace_root, &ns)?;
+    }
     let engaged = with_file_lock(&ns.root.join(".engage.lock"), || {
+        let env = desired_env_pairs(cfg, workspace_root, &ns)?;
         if wrapper_side_effects && !in_slurm_job() {
-            setup_bld_symlink(workspace_root, &ns)?;
-        } else if wrapper_side_effects && in_slurm_job() {
+            let pixi = workspace_root.join(".pixi");
+            fs::create_dir_all(&pixi).with_context(|| format!("creating {}", pixi.display()))?;
+            with_file_lock(&pixi.join(".retread-fast-envs-link.lock"), || {
+                setup_bld_symlink(workspace_root, &ns)
+            })?;
+        } else if wrapper_side_effects {
             tracing::info!(
                 workspace = %workspace_root.display(),
                 namespace = %ns.root.display(),
-                "retread fast-tmp: SLURM job context; not touching workspace .pixi/bld or .pixi/envs symlinks"
+                "retread fast-tmp: SLURM job context; leaving workspace .pixi/envs and .pixi/bld untouched"
             );
         }
-        warn_if_real_envs_dir(workspace_root);
+        if wrapper_side_effects && !in_slurm_job() {
+            warn_if_real_envs_dir(workspace_root);
+        }
         Ok(EngagedFastTmp {
-            env: desired_env_pairs(cfg, workspace_root, &ns, stale),
-            ns,
+            env,
+            ns: ns.clone(),
         })
     })?;
     Ok(Some(engaged))
+}
+
+fn validate_workspace_local_detached_config(workspace_root: &Path, ns: &Namespace) -> Result<()> {
+    let path = workspace_root.join(".pixi").join("config.toml");
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading {}", path.display()));
+        }
+    };
+    let config: toml::Table =
+        toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    let Some(detached) = config.get("detached-environments") else {
+        return Ok(());
+    };
+    match detached {
+        toml::Value::Boolean(true) => Ok(()),
+        toml::Value::String(raw) => {
+            let configured = if raw == "~" || raw.starts_with("~/") {
+                let home = std::env::var_os("HOME").ok_or_else(|| {
+                    anyhow!(
+                        "{} uses ~ for detached-environments but HOME is unset",
+                        path.display()
+                    )
+                })?;
+                PathBuf::from(home).join(raw.trim_start_matches('~').trim_start_matches('/'))
+            } else {
+                PathBuf::from(raw)
+            };
+            let configured = if configured.is_absolute() {
+                configured
+            } else {
+                // This is workspace-local `.pixi/config.toml`; Pixi resolves
+                // its relative path values from that config's directory, not
+                // from whichever cwd happened to invoke `--workspace`.
+                path.parent().unwrap_or(workspace_root).join(configured)
+            };
+            let expected = fs::canonicalize(ns.envs_dir()).with_context(|| {
+                format!("canonicalizing detached root {}", ns.envs_dir().display())
+            })?;
+            let compatible = fs::canonicalize(&configured)
+                .ok()
+                .is_some_and(|resolved| resolved == expected);
+            if compatible {
+                Ok(())
+            } else {
+                bail!(
+                    "{} sets detached-environments to {}, which overrides retread fast-tmp's job-local root {}. Remove the local setting or set it to true.",
+                    path.display(),
+                    configured.display(),
+                    expected.display()
+                )
+            }
+        }
+        _ => bail!(
+            "{} has incompatible detached-environments={detached}; remove the local setting or set it to true so retread fast-tmp can select the job-local root",
+            path.display()
+        ),
+    }
 }
 
 fn prepare_namespace_dirs(
@@ -571,6 +659,222 @@ fn prepare_namespace_dirs(
         fs::create_dir_all(&shared)
             .with_context(|| format!("creating shared retread blob cache {}", shared.display()))?;
     }
+    prepare_pixi_config_overlay(ns)?;
+    Ok(())
+}
+
+/// Return the Pixi config file that was active before retread installed its
+/// overlay. A sourced `fast --print-env` can outlive a SLURM job; in that case
+/// `PIXI_CONFIG_FILE` still names our old overlay, while the base marker keeps
+/// the user's original override (if any).
+fn base_pixi_config_file() -> Option<OsString> {
+    let current = std::env::var_os("PIXI_CONFIG_FILE");
+    let marker = std::env::var_os(RETREAD_PIXI_CONFIG_MARKER);
+    let base = if current.is_some() && current == marker && current_managed_env_state().is_some() {
+        std::env::var_os(RETREAD_BASE_PIXI_CONFIG).filter(|value| !value.is_empty())
+    } else {
+        current
+    }?;
+    let path = PathBuf::from(base);
+    if path.is_absolute() {
+        Some(path.into_os_string())
+    } else {
+        // The overlay query runs from the job namespace, not the caller's
+        // cwd. Resolve first so a relative user PIXI_CONFIG_FILE keeps the
+        // exact meaning it had when `fast` was invoked.
+        Some(
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(path)
+                .into_os_string(),
+        )
+    }
+}
+
+/// Build a private, job-local Pixi config overlay from Pixi's *effective*
+/// configuration. `PIXI_CONFIG_FILE` replaces Pixi's normal system/user
+/// config search, so a minimal file would silently discard authentication,
+/// mirrors, TLS policy, proxy settings, and `run-post-link-scripts`. Asking
+/// Pixi to render the base (system + user/override) config first preserves
+/// those settings. The query deliberately runs outside the workspace: Pixi
+/// will merge `.pixi/config.toml` on top of this overlay later, exactly once.
+fn prepare_pixi_config_overlay(ns: &Namespace) -> Result<()> {
+    if env_flag_truthy("PIXI_NO_CONFIG") {
+        bail!(
+            "retread fast-tmp cannot enable supported Pixi detached environments while PIXI_NO_CONFIG is set; unset PIXI_NO_CONFIG or turn fast-tmp off"
+        );
+    }
+
+    let rendered = if let Some(base_path) = base_pixi_config_file() {
+        // Pixi 0.70.2's install/info commands honor PIXI_CONFIG_FILE, but its
+        // `config list` subcommand does not. Because an explicit override
+        // replaces the system/user search layer, parsing that one file is the
+        // exact base layer we need to preserve.
+        let base_path = PathBuf::from(base_path);
+        let base = fs::read_to_string(&base_path)
+            .with_context(|| format!("reading base Pixi config {}", base_path.display()))?;
+        render_pixi_config_overlay_from_toml(&base)
+            .with_context(|| format!("parsing base Pixi config {}", base_path.display()))?
+    } else {
+        let mut command = Command::new("pixi");
+        command
+            .args(["config", "list", "--json"])
+            .current_dir(&ns.root)
+            .stdin(Stdio::null())
+            .env_remove("PIXI_CONFIG_FILE")
+            .env_remove("PIXI_CACHE_DETACHED_ENVIRONMENTS_DIR")
+            .env_remove("PIXI_DETACHED_ENVIRONMENTS")
+            .env_remove(RETREAD_PIXI_CONFIG_MARKER)
+            .env_remove(RETREAD_BASE_PIXI_CONFIG);
+        let effective_json = match command.output() {
+            Ok(output) if output.status.success() => output.stdout,
+            Ok(output) => {
+                bail!(
+                    "`pixi config list --json` failed while preparing fast-tmp config ({}): {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+            #[cfg(test)]
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => b"{}".to_vec(),
+            Err(error) => {
+                return Err(error).context("reading effective Pixi config for fast-tmp overlay");
+            }
+        };
+        render_pixi_config_overlay(&effective_json)?
+    };
+    atomic_write_private(&ns.pixi_config_file(), rendered.as_bytes())
+        .context("writing job-local Pixi fast-tmp config overlay")
+}
+
+fn render_pixi_config_overlay(effective_json: &[u8]) -> Result<String> {
+    let config: toml::Table = serde_json::from_slice(effective_json)
+        .context("parsing effective Pixi config JSON for fast-tmp overlay")?;
+    render_pixi_config_table(config)
+}
+
+fn render_pixi_config_overlay_from_toml(effective_toml: &str) -> Result<String> {
+    let config: toml::Table =
+        toml::from_str(effective_toml).context("parsing effective Pixi config TOML")?;
+    render_pixi_config_table(config)
+}
+
+fn render_pixi_config_table(mut config: toml::Table) -> Result<String> {
+    // Pixi 0.70 requires this config switch. The supported cache env below
+    // supplies the job-local path; retaining a boolean here also avoids
+    // baking a redundant path into the effective user configuration.
+    config.insert(
+        "detached-environments".to_string(),
+        toml::Value::Boolean(true),
+    );
+    toml::to_string_pretty(&config)
+        .context("serializing effective Pixi config for fast-tmp overlay")
+}
+
+fn atomic_write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("config overlay path {} has no parent", path.display()))?;
+    let tmp = parent.join(format!(
+        ".{PIXI_FASTTMP_CONFIG}.{}.{}",
+        std::process::id(),
+        unique_nonce()
+    ));
+    let result = (|| -> Result<()> {
+        fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
+        set_file_mode_0600(&tmp);
+        fs::rename(&tmp, path).with_context(|| {
+            format!(
+                "atomically replacing {} with {}",
+                path.display(),
+                tmp.display()
+            )
+        })?;
+        let _ = fsync_dir(parent);
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+#[cfg(unix)]
+fn set_file_mode_0600(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+}
+
+#[cfg(not(unix))]
+fn set_file_mode_0600(_path: &Path) {}
+
+#[derive(Debug, Clone)]
+struct ManagedEnvState {
+    managed: HashSet<String>,
+    base: HashMap<String, Option<String>>,
+    expected: HashMap<String, String>,
+}
+
+fn current_managed_env_state() -> Option<ManagedEnvState> {
+    let managed_raw = std::env::var(RETREAD_MANAGED_KEYS).ok()?;
+    let base_raw = std::env::var(RETREAD_BASE_ENV_JSON).ok()?;
+    let expected_raw = std::env::var(RETREAD_EXPECTED_ENV_JSON).ok()?;
+    let base: HashMap<String, Option<String>> = serde_json::from_str(&base_raw).ok()?;
+    let expected: HashMap<String, String> = serde_json::from_str(&expected_raw).ok()?;
+    let managed = managed_raw
+        .split(',')
+        .filter(|key| MANAGEABLE_ENV_KEYS.contains(key))
+        .map(str::to_owned)
+        .collect::<HashSet<_>>();
+    if managed
+        .iter()
+        .any(|key| !base.contains_key(key) || !expected.contains_key(key))
+    {
+        return None;
+    }
+    for (key, current) in [
+        (RETREAD_MANAGED_KEYS, managed_raw.as_str()),
+        (RETREAD_BASE_ENV_JSON, base_raw.as_str()),
+    ] {
+        if expected.get(key).map(String::as_str) != Some(current) {
+            return None;
+        }
+    }
+    for key in [
+        RETREAD_PIXI_CONFIG_MARKER,
+        RETREAD_BASE_PIXI_CONFIG,
+        "RETREAD_FAST_TMP_NS_JOB",
+    ] {
+        let current = std::env::var(key).ok()?;
+        if expected.get(key) != Some(&current) {
+            return None;
+        }
+    }
+    Some(ManagedEnvState {
+        managed,
+        base,
+        expected,
+    })
+}
+
+fn has_new_managed_metadata() -> bool {
+    [
+        RETREAD_MANAGED_KEYS,
+        RETREAD_BASE_ENV_JSON,
+        RETREAD_EXPECTED_ENV_JSON,
+        RETREAD_PIXI_CONFIG_MARKER,
+        RETREAD_BASE_PIXI_CONFIG,
+    ]
+    .iter()
+    .any(|key| std::env::var_os(key).is_some())
+}
+
+fn ensure_valid_managed_metadata() -> Result<()> {
+    if has_new_managed_metadata() && current_managed_env_state().is_none() {
+        bail!(
+            "retread fast-tmp: inherited environment ownership metadata is missing, malformed, or changed; refusing to re-engage and overwrite inherited Pixi values"
+        );
+    }
     Ok(())
 }
 
@@ -578,64 +882,265 @@ fn desired_env_pairs(
     cfg: &FastTmpConfig,
     workspace_root: &Path,
     ns: &Namespace,
-    stale: bool,
-) -> Vec<(String, String)> {
+) -> Result<Vec<(String, String)>> {
+    ensure_valid_managed_metadata()?;
     let blob_cache = match cfg.blob_caches {
         BlobCacheMode::Shared => shared_blob_cache_dir(cfg, workspace_root),
         BlobCacheMode::Tmp => ns.rattler_cache_dir(),
     };
+    let previous = current_managed_env_state();
     let mut out = Vec::new();
-    push_env_if_needed(&mut out, "PIXI_CACHE_DIR", &blob_cache, stale);
-    push_env_if_needed(&mut out, "RATTLER_CACHE_DIR", &blob_cache, stale);
-    push_env_if_needed(&mut out, "UV_CACHE_DIR", &ns.uv_cache_dir(), stale);
+    let mut managed = Vec::new();
+    let mut base = HashMap::new();
+    let mut expected = HashMap::new();
+    push_managed_env(
+        &mut out,
+        &mut managed,
+        &mut base,
+        &mut expected,
+        previous.as_ref(),
+        "PIXI_CACHE_DIR",
+        blob_cache.to_string_lossy().into_owned(),
+        false,
+    );
+    push_managed_env(
+        &mut out,
+        &mut managed,
+        &mut base,
+        &mut expected,
+        previous.as_ref(),
+        "RATTLER_CACHE_DIR",
+        blob_cache.to_string_lossy().into_owned(),
+        false,
+    );
+    push_managed_env(
+        &mut out,
+        &mut managed,
+        &mut base,
+        &mut expected,
+        previous.as_ref(),
+        "UV_CACHE_DIR",
+        ns.uv_cache_dir().to_string_lossy().into_owned(),
+        false,
+    );
     // NOTE: this redirect deliberately does NOT move the loose-bundle wheel
     // store. The store is resolved by courier::retread_wheel_store_root(),
     // which ignores RETREAD_CACHE_DIR precisely so blob stores stay SHARED
     // while scratch caches go job-local (a job-local store dies with the
     // job, breaking `retread install` on other nodes / later jobs).
-    push_env_if_needed(
+    push_managed_env(
         &mut out,
+        &mut managed,
+        &mut base,
+        &mut expected,
+        previous.as_ref(),
         "RETREAD_CACHE_DIR",
-        &ns.retread_cache_dir(),
-        stale,
+        ns.retread_cache_dir().to_string_lossy().into_owned(),
+        false,
     );
-    push_env_str_if_needed(&mut out, "UV_LOCK_TIMEOUT", "1800", stale);
-    push_env_if_needed(
+    push_managed_env(
         &mut out,
-        "PIXI_DETACHED_ENVIRONMENTS",
-        &ns.envs_dir(),
-        stale,
+        &mut managed,
+        &mut base,
+        &mut expected,
+        previous.as_ref(),
+        "UV_LOCK_TIMEOUT",
+        "1800".to_string(),
+        false,
     );
-    push_env_str_if_needed(
+    // Pixi 0.70+ requires detached-environments in config and exposes the
+    // destination through PIXI_CACHE_DETACHED_ENVIRONMENTS_DIR. Retain the
+    // old variable only for shell-level backward compatibility; correctness
+    // is version-gated on the supported 0.70+ interface below.
+    push_managed_env(
         &mut out,
-        "RETREAD_FAST_TMP_NS_JOB",
-        &current_job_marker(),
+        &mut managed,
+        &mut base,
+        &mut expected,
+        previous.as_ref(),
+        "PIXI_CONFIG_FILE",
+        ns.pixi_config_file().to_string_lossy().into_owned(),
         true,
     );
-    out
-}
-
-fn push_env_if_needed(out: &mut Vec<(String, String)>, key: &str, value: &Path, stale: bool) {
-    if stale || std::env::var_os(key).is_none() {
-        out.push((key.to_string(), value.to_string_lossy().to_string()));
-    }
-}
-
-fn push_env_str_if_needed(out: &mut Vec<(String, String)>, key: &str, value: &str, stale: bool) {
-    if stale || std::env::var_os(key).is_none() {
+    push_managed_env(
+        &mut out,
+        &mut managed,
+        &mut base,
+        &mut expected,
+        previous.as_ref(),
+        "PIXI_CACHE_DETACHED_ENVIRONMENTS_DIR",
+        ns.envs_dir().to_string_lossy().into_owned(),
+        true,
+    );
+    push_managed_env(
+        &mut out,
+        &mut managed,
+        &mut base,
+        &mut expected,
+        previous.as_ref(),
+        "PIXI_DETACHED_ENVIRONMENTS",
+        ns.envs_dir().to_string_lossy().into_owned(),
+        true,
+    );
+    managed.sort();
+    managed.dedup();
+    let config_marker = ns.pixi_config_file().to_string_lossy().into_owned();
+    let base_config_marker = base
+        .get("PIXI_CONFIG_FILE")
+        .cloned()
+        .flatten()
+        .unwrap_or_default();
+    let managed_marker = managed.join(",");
+    let base_json = serde_json::to_string(&base).expect("serializing fast-tmp base environment");
+    let job_marker = current_job_marker();
+    for (key, value) in [
+        (RETREAD_PIXI_CONFIG_MARKER, config_marker.as_str()),
+        (RETREAD_BASE_PIXI_CONFIG, base_config_marker.as_str()),
+        (RETREAD_MANAGED_KEYS, managed_marker.as_str()),
+        (RETREAD_BASE_ENV_JSON, base_json.as_str()),
+        ("RETREAD_FAST_TMP_NS_JOB", job_marker.as_str()),
+    ] {
+        expected.insert(key.to_string(), value.to_string());
         out.push((key.to_string(), value.to_string()));
     }
+    out.push((
+        RETREAD_EXPECTED_ENV_JSON.to_string(),
+        serde_json::to_string(&expected).expect("serializing fast-tmp expected environment"),
+    ));
+    Ok(out)
 }
 
-pub fn backend_env_value(key: &str) -> Option<String> {
-    BACKEND_ENV.get().and_then(|env| {
-        env.lock()
-            .unwrap()
-            .pairs
-            .iter()
-            .find(|(k, _)| k == key)
-            .map(|(_, v)| v.clone())
-    })
+fn push_managed_env(
+    out: &mut Vec<(String, String)>,
+    managed: &mut Vec<String>,
+    base: &mut HashMap<String, Option<String>>,
+    expected: &mut HashMap<String, String>,
+    previous: Option<&ManagedEnvState>,
+    key: &str,
+    value: String,
+    force: bool,
+) {
+    let current = std::env::var_os(key).map(|value| value.to_string_lossy().into_owned());
+    let previous_claimed = previous.is_some_and(|state| state.managed.contains(key));
+    let previous_owned = previous_claimed
+        && previous
+            .and_then(|state| state.expected.get(key))
+            .is_some_and(|expected| current.as_deref() == Some(expected.as_str()));
+    if !force && previous_claimed && !previous_owned {
+        return;
+    }
+    let legacy_owned = previous.is_none()
+        && std::env::var_os("RETREAD_FAST_TMP_NS_JOB").is_some()
+        && current.as_deref().is_some_and(|current| {
+            looks_like_retread_namespace_value(current)
+                || (key == "UV_LOCK_TIMEOUT" && current == "1800")
+        });
+    if force || previous_owned || legacy_owned || current.is_none() {
+        let original = if previous_owned {
+            previous
+                .and_then(|state| state.base.get(key))
+                .cloned()
+                .flatten()
+        } else if legacy_owned {
+            None
+        } else if key == "PIXI_CONFIG_FILE" {
+            current.map(|current| {
+                let path = PathBuf::from(&current);
+                if path.is_absolute() {
+                    current
+                } else {
+                    std::env::current_dir()
+                        .unwrap_or_else(|_| PathBuf::from("."))
+                        .join(path)
+                        .to_string_lossy()
+                        .into_owned()
+                }
+            })
+        } else {
+            current
+        };
+        base.insert(key.to_string(), original);
+        expected.insert(key.to_string(), value.clone());
+        managed.push(key.to_string());
+        out.push((key.to_string(), value));
+    }
+}
+
+fn validate_pixi_version() -> Result<()> {
+    let output = Command::new("pixi")
+        .arg("--version")
+        .stdin(Stdio::null())
+        .output();
+    let stdout = match output {
+        Ok(output) if output.status.success() => output.stdout,
+        Ok(output) => {
+            bail!(
+                "`pixi --version` failed while validating fast-tmp compatibility ({}): {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            )
+        }
+        #[cfg(test)]
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => b"pixi 0.70.2\n".to_vec(),
+        Err(error) => return Err(error).context("running `pixi --version` for fast-tmp"),
+    };
+    validate_pixi_version_text(&String::from_utf8_lossy(&stdout))
+}
+
+fn validate_pixi_version_text(output: &str) -> Result<()> {
+    let version = output
+        .split_whitespace()
+        .find(|part| part.chars().next().is_some_and(|ch| ch.is_ascii_digit()))
+        .ok_or_else(|| anyhow!("could not parse Pixi version from {output:?}"))?;
+    let mut parts = version.split('.');
+    let major = parts.next().and_then(|part| part.parse::<u64>().ok());
+    let minor = parts.next().and_then(|part| part.parse::<u64>().ok());
+    if !matches!((major, minor), (Some(major), Some(minor)) if major > 0 || minor >= 70) {
+        bail!(
+            "retread fast-tmp requires Pixi >=0.70 for supported detached-environments config; found {version}"
+        );
+    }
+    Ok(())
+}
+
+/// Return true only for an absolute path whose lexical representation has no
+/// `.` or `..` components. This deliberately does not require the path to
+/// exist, so dangling legacy Retread links can still be identified safely.
+fn is_normalized_absolute_path(path: &Path) -> bool {
+    if !path.is_absolute() {
+        return false;
+    }
+    let mut rebuilt = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => rebuilt.push(prefix.as_os_str()),
+            Component::RootDir => rebuilt.push(component.as_os_str()),
+            Component::Normal(value) => rebuilt.push(value),
+            Component::CurDir | Component::ParentDir => return false,
+        }
+    }
+    rebuilt.as_os_str() == path.as_os_str()
+}
+
+pub fn backend_env_override(key: &str) -> BackendEnvOverride {
+    let Some(env) = BACKEND_ENV.get() else {
+        return BackendEnvOverride::Unchanged;
+    };
+    let env = env.lock().unwrap().clone();
+    if let Some((_, value)) = env.pairs.iter().find(|(candidate, _)| candidate == key) {
+        return BackendEnvOverride::Set(value.clone());
+    }
+    if env.remove_fast_vars
+        && let Some((_, value)) = cleanup_env_actions()
+            .into_iter()
+            .find(|(candidate, _)| candidate == key)
+    {
+        return match value {
+            Some(value) => BackendEnvOverride::Set(value),
+            None => BackendEnvOverride::Remove,
+        };
+    }
+    BackendEnvOverride::Unchanged
 }
 
 pub fn apply_backend_env(cmd: &mut tokio::process::Command) {
@@ -645,8 +1150,15 @@ pub fn apply_backend_env(cmd: &mut tokio::process::Command) {
         .unwrap()
         .clone();
     if env.remove_fast_vars {
-        for key in FAST_ENV_KEYS {
-            cmd.env_remove(key);
+        for (key, value) in cleanup_env_actions() {
+            match value {
+                Some(value) => {
+                    cmd.env(key, value);
+                }
+                None => {
+                    cmd.env_remove(key);
+                }
+            }
         }
     }
     for (key, value) in env.pairs {
@@ -658,6 +1170,90 @@ pub fn inherited_fasttmp_stale() -> bool {
     std::env::var("RETREAD_FAST_TMP_NS_JOB")
         .ok()
         .is_some_and(|seen| seen != current_job_marker())
+}
+
+pub fn inherited_fasttmp_cleanup_needed() -> bool {
+    has_new_managed_metadata() || std::env::var_os("RETREAD_FAST_TMP_NS_JOB").is_some()
+}
+
+fn cleanup_env_actions() -> Vec<(String, Option<String>)> {
+    let mut actions: HashMap<String, Option<String>> = HashMap::new();
+    if has_new_managed_metadata() {
+        let Some(state) = current_managed_env_state() else {
+            warn_msg(
+                "retread fast-tmp: inherited environment ownership metadata is missing, malformed, or changed; preserving all environment values",
+            );
+            return Vec::new();
+        };
+        for key in &state.managed {
+            let Some(expected) = state.expected.get(key) else {
+                continue;
+            };
+            if std::env::var(key).ok().as_deref() == Some(expected.as_str()) {
+                actions.insert(key.clone(), state.base.get(key).cloned().unwrap_or(None));
+            }
+        }
+        for key in [
+            RETREAD_PIXI_CONFIG_MARKER,
+            RETREAD_BASE_PIXI_CONFIG,
+            RETREAD_MANAGED_KEYS,
+            RETREAD_BASE_ENV_JSON,
+            RETREAD_EXPECTED_ENV_JSON,
+            "RETREAD_FAST_TMP_NS_JOB",
+        ] {
+            actions.insert(key.to_string(), None);
+        }
+    } else if std::env::var_os("RETREAD_FAST_TMP_NS_JOB").is_some() {
+        // Committed pre-marker releases only set variables that were absent.
+        // Remove values whose current shape still proves they are Retread's;
+        // shared/user cache paths and any values changed later are preserved.
+        for key in [
+            "PIXI_CACHE_DIR",
+            "RATTLER_CACHE_DIR",
+            "PIXI_CACHE_DETACHED_ENVIRONMENTS_DIR",
+            "PIXI_DETACHED_ENVIRONMENTS",
+            "UV_CACHE_DIR",
+            "RETREAD_CACHE_DIR",
+        ] {
+            if std::env::var(key)
+                .ok()
+                .as_deref()
+                .is_some_and(looks_like_retread_namespace_value)
+            {
+                actions.insert(key.to_string(), None);
+            }
+        }
+        if std::env::var("UV_LOCK_TIMEOUT").ok().as_deref() == Some("1800") {
+            actions.insert("UV_LOCK_TIMEOUT".to_string(), None);
+        }
+        actions.insert("RETREAD_FAST_TMP_NS_JOB".to_string(), None);
+    }
+    let mut actions = actions.into_iter().collect::<Vec<_>>();
+    actions.sort_by(|a, b| a.0.cmp(&b.0));
+    actions
+}
+
+fn looks_like_retread_namespace_value(value: &str) -> bool {
+    let path = Path::new(value);
+    if !is_normalized_absolute_path(path) {
+        return false;
+    }
+    let parts = path
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => value.to_str(),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    parts.windows(4).any(|parts| {
+        parts[0].starts_with("retread-")
+            && parts[1].len() == 12
+            && parts[1].bytes().all(|byte| byte.is_ascii_hexdigit())
+            && (parts[2] == "nojob"
+                || parts[2]
+                    .strip_prefix("job-")
+                    .is_some_and(|job| !job.is_empty()))
+    })
 }
 
 pub fn current_job_marker() -> String {
@@ -744,19 +1340,267 @@ fn enforce_tmp_user_dir(tmp_root: &Path) -> Result<()> {
     Ok(())
 }
 
+fn workspace_link_target_is_owned(workspace_root: &Path, raw_target: &Path) -> Result<bool> {
+    if !is_normalized_absolute_path(raw_target) {
+        return Ok(false);
+    }
+    let canonical_workspace = fs::canonicalize(workspace_root)
+        .with_context(|| format!("canonicalizing workspace {}", workspace_root.display()))?;
+    for candidate_root in raw_target.ancestors().skip(1) {
+        let Ok(relative) = raw_target.strip_prefix(candidate_root) else {
+            continue;
+        };
+        if relative != Path::new("bld") {
+            continue;
+        }
+        let Some(job) = candidate_root.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if job != "nojob" && !job.strip_prefix("job-").is_some_and(|id| !id.is_empty()) {
+            continue;
+        }
+
+        // Strongest proof: a live namespace breadcrumb identifies the exact
+        // canonical workspace even across tmp-root/user naming changes.
+        if fs::read_to_string(candidate_root.join("workspace-path"))
+            .ok()
+            .is_some_and(|recorded| Path::new(&recorded) == canonical_workspace)
+        {
+            return Ok(true);
+        }
+
+        // Strict fallback for an evicted/dangling legacy namespace: reproduce
+        // the exact user + canonical-workspace hash portion of Retread's path.
+        let hash_matches = candidate_root
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|value| value.to_str())
+            .is_some_and(|hash| hash == workspace_hash(&canonical_workspace));
+        let user_matches = candidate_root
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            .and_then(|value| value.to_str())
+            .is_some_and(|user| user == user_namespace_component());
+        if hash_matches && user_matches {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Atomically move `source` to an absent `destination`. Linux's
+/// `RENAME_NOREPLACE` is the only primitive used for workspace bld mutation:
+/// it works for symlinks, files, and directories without ever replacing a
+/// concurrently installed user path.
+#[cfg(target_os = "linux")]
+fn rename_noreplace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use rustix::fs::{RenameFlags, renameat_with};
+
+    let source_parent = source.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} has no parent", source.display()),
+        )
+    })?;
+    let destination_parent = destination.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} has no parent", destination.display()),
+        )
+    })?;
+    if source_parent != destination_parent {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "safe no-replace rename requires one lexical parent: {} != {}",
+                source_parent.display(),
+                destination_parent.display()
+            ),
+        ));
+    }
+    let source_name = source.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} has no file name", source.display()),
+        )
+    })?;
+    let destination_name = destination.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} has no file name", destination.display()),
+        )
+    })?;
+    // Open once: even if `.pixi` itself is concurrently renamed/replaced, both
+    // operands remain anchored to the exact same directory inode.
+    let directory = File::open(source_parent)?;
+    renameat_with(
+        &directory,
+        source_name,
+        &directory,
+        destination_name,
+        RenameFlags::NOREPLACE,
+    )
+    .map_err(std::io::Error::from)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn rename_noreplace(_source: &Path, _destination: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "safe workspace bld mutation requires Linux renameat2(RENAME_NOREPLACE)",
+    ))
+}
+
+fn restore_quarantined_path(quarantine: &Path, link: &Path) -> Result<()> {
+    match rename_noreplace(quarantine, link) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => bail!(
+            "retread fast-tmp: {} changed concurrently; preserved the displaced path at {} without replacing the newer workspace path",
+            link.display(),
+            quarantine.display()
+        ),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "restoring concurrently displaced path {} from {}; the path remains quarantined",
+                link.display(),
+                quarantine.display()
+            )
+        }),
+    }
+}
+
+/// On non-SLURM wrapper disengage, remove only a `.pixi/bld` symlink proven to
+/// be ours. SLURM never mutates either workspace link.
+fn cleanup_owned_workspace_links(workspace_root: &Path) -> Result<()> {
+    if in_slurm_job() {
+        return Ok(());
+    }
+    let pixi = workspace_root.join(".pixi");
+    match fs::metadata(&pixi) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).with_context(|| format!("checking {}", pixi.display())),
+    }
+    with_file_lock(&pixi.join(".retread-fast-envs-link.lock"), || {
+        remove_owned_workspace_symlink(workspace_root, &pixi.join("bld"))
+    })
+}
+
+fn remove_owned_workspace_symlink(workspace_root: &Path, link: &Path) -> Result<()> {
+    remove_owned_workspace_symlink_with_hook(workspace_root, link, || {})
+}
+
+fn remove_owned_workspace_symlink_with_hook(
+    workspace_root: &Path,
+    link: &Path,
+    before_quarantine: impl FnOnce(),
+) -> Result<()> {
+    let Ok(metadata) = fs::symlink_metadata(link) else {
+        return Ok(());
+    };
+    if !metadata.file_type().is_symlink() {
+        return Ok(());
+    }
+    let initial = fs::read_link(link)
+        .with_context(|| format!("reading existing symlink {}", link.display()))?;
+    if !workspace_link_target_is_owned(workspace_root, &initial)? {
+        return Ok(());
+    }
+
+    // Ownership must still hold at the actual mutation point. Move the path
+    // aside atomically, inspect exactly what moved, and delete only the same
+    // Retread-owned symlink we observed. If a user raced us, restore their
+    // inode only when the original name is still free; never replace a newer
+    // path they installed there.
+    before_quarantine();
+    let parent = link
+        .parent()
+        .ok_or_else(|| anyhow!("symlink path {} has no parent", link.display()))?;
+    let quarantine = parent.join(format!(
+        ".{}.retread-quarantine.{}.{}",
+        link.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("link"),
+        std::process::id(),
+        unique_nonce()
+    ));
+    match rename_noreplace(link, &quarantine) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "quarantining candidate Retread symlink {} as {}",
+                    link.display(),
+                    quarantine.display()
+                )
+            });
+        }
+    }
+
+    let moved_target = fs::symlink_metadata(&quarantine)
+        .ok()
+        .filter(|metadata| metadata.file_type().is_symlink())
+        .and_then(|_| fs::read_link(&quarantine).ok());
+    let unchanged_and_owned = if moved_target.as_deref() == Some(initial.as_path()) {
+        match workspace_link_target_is_owned(workspace_root, &initial) {
+            Ok(owned) => owned,
+            Err(error) => {
+                restore_quarantined_path(&quarantine, link)?;
+                return Err(error).context(
+                    "revalidating Retread bld ownership after quarantine; restored the workspace path",
+                );
+            }
+        }
+    } else {
+        false
+    };
+    if unchanged_and_owned {
+        return fs::remove_file(&quarantine).with_context(|| {
+            format!(
+                "removing quarantined Retread-owned symlink {}",
+                quarantine.display()
+            )
+        });
+    }
+
+    restore_quarantined_path(&quarantine, link)?;
+    bail!(
+        "retread fast-tmp: {} changed concurrently; restored it and refused cleanup",
+        link.display()
+    )
+}
+
 fn setup_bld_symlink(workspace_root: &Path, ns: &Namespace) -> Result<()> {
+    setup_bld_symlink_with_hook(workspace_root, ns, || {})
+}
+
+fn setup_bld_symlink_with_hook(
+    workspace_root: &Path,
+    ns: &Namespace,
+    before_mutation: impl FnOnce(),
+) -> Result<()> {
     let pixi = workspace_root.join(".pixi");
     fs::create_dir_all(&pixi).with_context(|| format!("creating {}", pixi.display()))?;
     let link = pixi.join("bld");
     let target = ns.bld_dir();
-    match fs::symlink_metadata(&link) {
+    let expected_current = match fs::symlink_metadata(&link) {
         Ok(meta) if meta.file_type().is_symlink() => {
             let current = fs::read_link(&link)
                 .with_context(|| format!("reading build symlink {}", link.display()))?;
             if current == target {
                 return Ok(());
             }
-            atomic_symlink_replace(&target, &link)?;
+            if !workspace_link_target_is_owned(workspace_root, &current)? {
+                bail!(
+                    "retread fast-tmp refuses to replace unowned symlink {} -> {}. Move it aside or remove it before enabling fast-tmp.",
+                    link.display(),
+                    current.display()
+                );
+            }
+            Some(current)
         }
         Ok(_) => {
             bail!(
@@ -764,11 +1608,11 @@ fn setup_bld_symlink(workspace_root: &Path, ns: &Namespace) -> Result<()> {
                 link.display()
             );
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            atomic_symlink_replace(&target, &link)?;
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(e).with_context(|| format!("checking {}", link.display())),
-    }
+    };
+    before_mutation();
+    atomic_symlink_replace(workspace_root, &target, &link, expected_current.as_deref())?;
     let now = fs::read_link(&link).with_context(|| format!("reading {}", link.display()))?;
     if now != target {
         bail!(
@@ -782,7 +1626,12 @@ fn setup_bld_symlink(workspace_root: &Path, ns: &Namespace) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn atomic_symlink_replace(target: &Path, link: &Path) -> Result<()> {
+fn atomic_symlink_replace(
+    workspace_root: &Path,
+    target: &Path,
+    link: &Path,
+    expected_current: Option<&Path>,
+) -> Result<()> {
     let parent = link
         .parent()
         .ok_or_else(|| anyhow!("symlink path {} has no parent", link.display()))?;
@@ -799,23 +1648,106 @@ fn atomic_symlink_replace(target: &Path, link: &Path) -> Result<()> {
             target.display()
         )
     })?;
-    match fs::rename(&tmp, link) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = fs::remove_file(&tmp);
-            Err(e).with_context(|| {
-                format!(
-                    "atomically replacing symlink {} with target {}",
-                    link.display(),
-                    target.display()
-                )
-            })
+    let result = (|| -> Result<()> {
+        let Some(expected) = expected_current else {
+            return match rename_noreplace(&tmp, link) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => bail!(
+                    "retread fast-tmp: {} changed concurrently; refusing to replace the newer workspace path",
+                    link.display()
+                ),
+                Err(error) => Err(error).with_context(|| {
+                    format!(
+                        "installing Retread bld symlink {} without replacing a concurrently created path",
+                        link.display()
+                    )
+                }),
+            };
+        };
+
+        let quarantine = parent.join(format!(
+            ".{}.retread-quarantine.{}.{}",
+            link.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("link"),
+            std::process::id(),
+            unique_nonce()
+        ));
+        rename_noreplace(link, &quarantine).with_context(|| {
+            format!(
+                "quarantining {} for ownership revalidation before replacement",
+                link.display()
+            )
+        })?;
+
+        let moved_target = fs::symlink_metadata(&quarantine)
+            .ok()
+            .filter(|metadata| metadata.file_type().is_symlink())
+            .and_then(|_| fs::read_link(&quarantine).ok());
+        let still_owned = if moved_target.as_deref() == Some(expected) {
+            match workspace_link_target_is_owned(workspace_root, expected) {
+                Ok(owned) => owned,
+                Err(error) => {
+                    restore_quarantined_path(&quarantine, link)?;
+                    return Err(error).context(
+                        "revalidating Retread bld ownership before replacement; restored the workspace path",
+                    );
+                }
+            }
+        } else {
+            false
+        };
+        if !still_owned {
+            restore_quarantined_path(&quarantine, link)?;
+            bail!(
+                "retread fast-tmp: {} changed concurrently; restored it and refused replacement",
+                link.display()
+            );
         }
+
+        match rename_noreplace(&tmp, link) {
+            Ok(()) => fs::remove_file(&quarantine).with_context(|| {
+                format!(
+                    "removing replaced Retread-owned symlink {}",
+                    quarantine.display()
+                )
+            }),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                fs::remove_file(&quarantine).with_context(|| {
+                    format!(
+                        "removing displaced Retread-owned symlink {}",
+                        quarantine.display()
+                    )
+                })?;
+                bail!(
+                    "retread fast-tmp: {} changed concurrently; refusing to replace the newer workspace path",
+                    link.display()
+                )
+            }
+            Err(error) => {
+                restore_quarantined_path(&quarantine, link)?;
+                Err(error).with_context(|| {
+                    format!(
+                        "installing Retread bld symlink {} after ownership revalidation",
+                        link.display()
+                    )
+                })
+            }
+        }
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
     }
+    result
 }
 
 #[cfg(not(unix))]
-fn atomic_symlink_replace(_target: &Path, _link: &Path) -> Result<()> {
+fn atomic_symlink_replace(
+    _workspace_root: &Path,
+    _target: &Path,
+    _link: &Path,
+    _expected_current: Option<&Path>,
+) -> Result<()> {
     bail!("retread fast-tmp symlink setup is only supported on Unix")
 }
 
@@ -840,6 +1772,9 @@ fn warn_if_real_envs_dir(workspace_root: &Path) {
 }
 
 pub fn check_env_eviction(workspace_root: &Path, ns: &Namespace) {
+    if in_slurm_job() {
+        return;
+    }
     let envs = workspace_root.join(".pixi").join("envs");
     let Ok(meta) = fs::symlink_metadata(&envs) else {
         return;
@@ -869,530 +1804,6 @@ pub fn check_env_eviction(workspace_root: &Path, ns: &Namespace) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Env materialization fast path (parallel NFS copy) + persist-back.
-//
-// PREFIX IDENTITY INVARIANT: a snapshot under `envs-persist` was produced from
-// an env whose baked-in prefix (shebangs, activation scripts, conda-meta,
-// text-relocated paths) is the workspace's `<workspace>/.pixi/envs/<env>` NFS
-// path identity. Copying those bytes into the job-local namespace
-// (`ns.envs_dir()/<env>`) is only correct because the engage path points
-// `<workspace>/.pixi/envs` (a symlink) at `ns.envs_dir()` — i.e. the env is
-// always *reached through* the identical `<workspace>/.pixi/envs/<env>` path
-// on every node. Never hand out the raw job-tmp path as the env prefix, and
-// never materialize a snapshot somewhere that is not behind that symlink.
-// ---------------------------------------------------------------------------
-
-/// Stats from one parallel tree copy.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct CopyStats {
-    pub files: u64,
-    pub bytes: u64,
-    pub dirs: u64,
-    pub symlinks: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EntryKind {
-    File,
-    Symlink,
-}
-
-/// Resolved persist dir for this workspace (config or `.pixi/envs-persist`).
-pub fn persist_dir(cfg: &FastTmpConfig, workspace_root: &Path) -> PathBuf {
-    match &cfg.persist_dir {
-        Some(dir) if dir.is_absolute() => dir.clone(),
-        Some(dir) => workspace_root.join(dir),
-        None => workspace_root.join(DEFAULT_PERSIST_DIR),
-    }
-}
-
-/// Worker count: config wins, else min(60, 4*allocated_cpus).
-///
-/// "Allocated" is allocation-aware: on shared nodes the process is often
-/// confined to a slice of the machine, and sizing off the full core count
-/// oversubscribes the copy pool. Precedence:
-/// 1. `$SLURM_CPUS_ON_NODE` (cpus SLURM granted on this node)
-/// 2. cgroup v2 cpu quota (`/sys/fs/cgroup/cpu.max`, quota/period rounded up)
-/// 3. `available_parallelism()` (the historical formula)
-pub fn effective_copy_workers(cfg: &FastTmpConfig) -> usize {
-    if let Some(n) = cfg.copy_workers {
-        return n.max(1);
-    }
-    let ncpu = allocated_cpus().unwrap_or_else(|| {
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
-    });
-    MAX_COPY_WORKERS.min(4 * ncpu).max(1)
-}
-
-/// CPUs actually allocated to this process, when a scheduler or cgroup
-/// says so. `None` = no allocation signal; caller falls back to ncpu.
-fn allocated_cpus() -> Option<usize> {
-    if let Ok(v) = std::env::var("SLURM_CPUS_ON_NODE")
-        && let Ok(n) = v.trim().parse::<usize>()
-        && n > 0
-    {
-        return Some(n);
-    }
-    cgroup_v2_cpu_quota(Path::new("/sys/fs/cgroup/cpu.max"))
-}
-
-/// Parse a cgroup v2 `cpu.max` file ("<quota> <period>" or "max <period>")
-/// into a whole-cpu count (quota/period, rounded up). "max" = unconstrained.
-fn cgroup_v2_cpu_quota(path: &Path) -> Option<usize> {
-    let raw = fs::read_to_string(path).ok()?;
-    let mut it = raw.split_whitespace();
-    let quota = it.next()?;
-    if quota == "max" {
-        return None;
-    }
-    let quota: u64 = quota.parse().ok()?;
-    let period: u64 = it.next()?.parse().ok()?;
-    if quota == 0 || period == 0 {
-        return None;
-    }
-    Some(quota.div_ceil(period).max(1) as usize)
-}
-
-/// sha256 hex over the workspace lock(s) a snapshot is keyed by. Currently
-/// this is `pixi.lock`; if the retread lock format grows sibling lock files
-/// they must be hashed here too (sorted, concatenated) so snapshots invalidate.
-pub fn current_lock_hash(workspace_root: &Path) -> Option<String> {
-    let lock = workspace_root.join("pixi.lock");
-    let bytes = fs::read(&lock).ok()?;
-    let mut hasher = Sha256::new();
-    hasher.update(&bytes);
-    Some(
-        hasher
-            .finalize()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect(),
-    )
-}
-
-fn snapshot_hash(snapshot: &Path) -> Option<String> {
-    fs::read_to_string(snapshot.join(ENV_HASH_FILE))
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-}
-
-/// Test hook: fail the copy of any entry whose relative path contains the
-/// value of RETREAD_FAST_TMP_COPY_FAIL_SUBSTR. Used to exercise the
-/// partial-failure fallback without real I/O errors.
-fn maybe_inject_copy_failure(rel: &Path) -> Result<()> {
-    if let Ok(needle) = std::env::var("RETREAD_FAST_TMP_COPY_FAIL_SUBSTR")
-        && !needle.is_empty()
-        && rel.to_string_lossy().contains(&needle)
-    {
-        bail!(
-            "retread fast-tmp: injected copy failure for {} (test hook)",
-            rel.display()
-        );
-    }
-    Ok(())
-}
-
-/// Copy `src` tree to `dst` with `workers` threads. Pre-creates the directory
-/// tree first (so workers never race on mkdir), then fans file/symlink copies
-/// out over a shared work queue. Permissions are preserved: `fs::copy` carries
-/// file modes, symlinks are recreated as symlinks (targets untouched), and
-/// directory modes are applied deepest-first after the file pass so read-only
-/// dirs cannot block their own population. On any worker error the copy stops
-/// and the error is returned; the caller owns cleanup of the partial `dst`.
-pub fn parallel_copy_tree(src: &Path, dst: &Path, workers: usize) -> Result<CopyStats> {
-    let mut dirs: Vec<(PathBuf, u32)> = Vec::new();
-    let mut entries: Vec<(PathBuf, EntryKind)> = Vec::new();
-    walk_tree(src, Path::new(""), &mut dirs, &mut entries)?;
-
-    fs::create_dir_all(dst).with_context(|| format!("creating {}", dst.display()))?;
-    for (rel, _mode) in &dirs {
-        let dir = dst.join(rel);
-        fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    }
-
-    let next = AtomicUsize::new(0);
-    let bytes = AtomicU64::new(0);
-    let failed: Mutex<Option<anyhow::Error>> = Mutex::new(None);
-    let workers = workers.max(1).min(entries.len().max(1));
-    std::thread::scope(|scope| {
-        for _ in 0..workers {
-            scope.spawn(|| {
-                loop {
-                    let i = next.fetch_add(1, Ordering::Relaxed);
-                    if i >= entries.len() || failed.lock().unwrap().is_some() {
-                        break;
-                    }
-                    let (rel, kind) = &entries[i];
-                    match copy_entry(src, dst, rel, *kind) {
-                        Ok(copied) => {
-                            bytes.fetch_add(copied, Ordering::Relaxed);
-                        }
-                        Err(e) => {
-                            let mut slot = failed.lock().unwrap();
-                            if slot.is_none() {
-                                *slot = Some(e);
-                            }
-                            break;
-                        }
-                    }
-                }
-            });
-        }
-    });
-    if let Some(e) = failed.into_inner().unwrap() {
-        return Err(e);
-    }
-
-    // Directory modes last, deepest-first (walk order is parent-before-child).
-    for (rel, mode) in dirs.iter().rev() {
-        set_mode(&dst.join(rel), *mode);
-    }
-
-    let (files, symlinks) = entries
-        .iter()
-        .fold((0_u64, 0_u64), |(f, s), (_, k)| match k {
-            EntryKind::File => (f + 1, s),
-            EntryKind::Symlink => (f, s + 1),
-        });
-    Ok(CopyStats {
-        files,
-        bytes: bytes.into_inner(),
-        dirs: dirs.len() as u64,
-        symlinks,
-    })
-}
-
-fn walk_tree(
-    root: &Path,
-    rel: &Path,
-    dirs: &mut Vec<(PathBuf, u32)>,
-    entries: &mut Vec<(PathBuf, EntryKind)>,
-) -> Result<()> {
-    let abs = root.join(rel);
-    for entry in fs::read_dir(&abs).with_context(|| format!("reading {}", abs.display()))? {
-        let entry = entry.with_context(|| format!("reading entry in {}", abs.display()))?;
-        let child_rel = rel.join(entry.file_name());
-        let ft = entry
-            .file_type()
-            .with_context(|| format!("file type of {}", entry.path().display()))?;
-        if ft.is_symlink() {
-            entries.push((child_rel, EntryKind::Symlink));
-        } else if ft.is_dir() {
-            let mode = entry.metadata().map(unix_mode).unwrap_or(0o755);
-            dirs.push((child_rel.clone(), mode));
-            walk_tree(root, &child_rel, dirs, entries)?;
-        } else {
-            entries.push((child_rel, EntryKind::File));
-        }
-    }
-    Ok(())
-}
-
-fn copy_entry(src: &Path, dst: &Path, rel: &Path, kind: EntryKind) -> Result<u64> {
-    maybe_inject_copy_failure(rel)?;
-    let from = src.join(rel);
-    let to = dst.join(rel);
-    match kind {
-        EntryKind::Symlink => {
-            let target = fs::read_link(&from)
-                .with_context(|| format!("reading symlink {}", from.display()))?;
-            if fs::symlink_metadata(&to).is_ok() {
-                fs::remove_file(&to).with_context(|| format!("removing stale {}", to.display()))?;
-            }
-            make_symlink(&target, &to)?;
-            Ok(0)
-        }
-        EntryKind::File => fs::copy(&from, &to)
-            .with_context(|| format!("copying {} -> {}", from.display(), to.display())),
-    }
-}
-
-#[cfg(unix)]
-fn make_symlink(target: &Path, link: &Path) -> Result<()> {
-    std::os::unix::fs::symlink(target, link).with_context(|| {
-        format!(
-            "creating symlink {} -> {}",
-            link.display(),
-            target.display()
-        )
-    })
-}
-
-#[cfg(not(unix))]
-fn make_symlink(_target: &Path, link: &Path) -> Result<()> {
-    bail!(
-        "retread fast-tmp: symlink materialization is only supported on Unix ({})",
-        link.display()
-    )
-}
-
-#[cfg(unix)]
-fn unix_mode(meta: fs::Metadata) -> u32 {
-    use std::os::unix::fs::MetadataExt;
-    meta.mode() & 0o7777
-}
-
-#[cfg(not(unix))]
-fn unix_mode(_meta: fs::Metadata) -> u32 {
-    0o755
-}
-
-#[cfg(unix)]
-fn set_mode(path: &Path, mode: u32) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode));
-}
-
-#[cfg(not(unix))]
-fn set_mode(_path: &Path, _mode: u32) {}
-
-/// Try to materialize all persisted env snapshots into the job-local
-/// namespace. Returns `true` only when every snapshot present in the persist
-/// dir carried a hash matching the current lock and was copied (or already
-/// present) — in that case the frozen `pixi install` can be skipped entirely.
-/// Any hash miss/absence, or any copy failure (partial dest is deleted),
-/// returns `false` so the caller falls back to the existing install path.
-pub fn materialize_persisted_envs(
-    workspace_root: &Path,
-    cfg: &FastTmpConfig,
-    ns: &Namespace,
-) -> bool {
-    let Some(lock_hash) = current_lock_hash(workspace_root) else {
-        return false;
-    };
-    let pdir = persist_dir(cfg, workspace_root);
-    let Ok(read) = fs::read_dir(&pdir) else {
-        return false;
-    };
-    let workers = effective_copy_workers(cfg);
-    let mut materialized_any = false;
-    for entry in read.flatten() {
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        // Skip in-flight tmp/old swap dirs and stray dotfiles.
-        if name_str.starts_with('.') {
-            continue;
-        }
-        let snapshot = entry.path();
-        if !snapshot.is_dir() {
-            continue;
-        }
-        match snapshot_hash(&snapshot) {
-            Some(hash) if hash == lock_hash => {}
-            other => {
-                warn_msg(&format!(
-                    "retread fast-tmp: snapshot {} {}; falling back to frozen install",
-                    snapshot.display(),
-                    if other.is_none() {
-                        "has no .retread-env-hash"
-                    } else {
-                        "lock hash does not match current lock"
-                    },
-                ));
-                return false;
-            }
-        }
-        let dest = ns.envs_dir().join(&name);
-        if fs::read_dir(&dest)
-            .ok()
-            .and_then(|mut it| it.next())
-            .is_some()
-        {
-            // Already materialized in this job namespace.
-            materialized_any = true;
-            continue;
-        }
-        let started = Instant::now();
-        match parallel_copy_tree(&snapshot, &dest, workers) {
-            Ok(stats) => {
-                // The hash file is snapshot metadata, not env content.
-                let _ = fs::remove_file(dest.join(ENV_HASH_FILE));
-                log_copy_timing("materialized", &name_str, &stats, started.elapsed());
-                materialized_any = true;
-            }
-            Err(e) => {
-                warn_msg(&format!(
-                    "retread fast-tmp: parallel materialization of {} failed ({e:#}); removing partial dest and falling back to frozen install",
-                    snapshot.display()
-                ));
-                let _ = fs::remove_dir_all(&dest);
-                return false;
-            }
-        }
-    }
-    materialized_any
-}
-
-/// `retread fast --persist <env>`: parallel-copy the job-local env back to the
-/// NFS persist dir and stamp it with the current lock hash. Atomic: copies to
-/// `persist-dir/.tmp-<pid>-<nonce>` then rename-swaps into place; a previous
-/// snapshot is renamed aside first and removed after the swap.
-pub fn persist_env(
-    workspace_root: &Path,
-    cfg: &FastTmpConfig,
-    ns: &Namespace,
-    env_name: &str,
-) -> Result<()> {
-    if env_name.is_empty()
-        || env_name.starts_with('.')
-        || env_name.contains('/')
-        || env_name.contains("..")
-    {
-        bail!("retread fast --persist: invalid env name {env_name:?}");
-    }
-    let src = ns.envs_dir().join(env_name);
-    if !src.is_dir() {
-        bail!(
-            "retread fast --persist: job-local env not found at {}",
-            src.display()
-        );
-    }
-    let lock_hash = current_lock_hash(workspace_root).ok_or_else(|| {
-        anyhow!(
-            "retread fast --persist: no readable pixi.lock in {}; refusing to persist an unkeyed snapshot",
-            workspace_root.display()
-        )
-    })?;
-    let pdir = persist_dir(cfg, workspace_root);
-    fs::create_dir_all(&pdir)
-        .with_context(|| format!("creating persist dir {}", pdir.display()))?;
-    let tmp = pdir.join(format!(".tmp-{}-{}", std::process::id(), unique_nonce()));
-    let workers = effective_copy_workers(cfg);
-    let started = Instant::now();
-    let stats = match parallel_copy_tree(&src, &tmp, workers) {
-        Ok(stats) => stats,
-        Err(e) => {
-            let _ = fs::remove_dir_all(&tmp);
-            return Err(e).with_context(|| {
-                format!(
-                    "retread fast --persist: parallel copy {} -> {} failed; partial tmp removed",
-                    src.display(),
-                    tmp.display()
-                )
-            });
-        }
-    };
-    fs::write(tmp.join(ENV_HASH_FILE), format!("{lock_hash}\n"))
-        .with_context(|| format!("writing {}", tmp.join(ENV_HASH_FILE).display()))?;
-
-    let dest = pdir.join(env_name);
-    let old = pdir.join(format!(".old-{}-{}", std::process::id(), unique_nonce()));
-    let had_old = match fs::rename(&dest, &old) {
-        Ok(()) => true,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-        Err(e) => {
-            let _ = fs::remove_dir_all(&tmp);
-            return Err(e)
-                .with_context(|| format!("moving previous snapshot {} aside", dest.display()));
-        }
-    };
-    if let Err(e) = fs::rename(&tmp, &dest) {
-        // Best effort: restore the old snapshot, drop the tmp copy.
-        if had_old {
-            let _ = fs::rename(&old, &dest);
-        }
-        let _ = fs::remove_dir_all(&tmp);
-        return Err(e)
-            .with_context(|| format!("swapping snapshot {} -> {}", tmp.display(), dest.display()));
-    }
-    if had_old {
-        let _ = fs::remove_dir_all(&old);
-    }
-    log_copy_timing("persisted", env_name, &stats, started.elapsed());
-    Ok(())
-}
-
-/// `retread fast --persist` with the env omitted (or the literal `all`):
-/// persist every env directory present under the job-local envs root.
-/// Non-directories and dotted entries are skipped; each env goes through
-/// `persist_env`, so every snapshot keeps its own per-env hash stamp.
-pub fn persist_all_envs(workspace_root: &Path, cfg: &FastTmpConfig, ns: &Namespace) -> Result<()> {
-    let envs_dir = ns.envs_dir();
-    let entries = fs::read_dir(&envs_dir)
-        .with_context(|| format!("reading job-local envs dir {}", envs_dir.display()))?;
-    let mut names: Vec<String> = Vec::new();
-    for entry in entries {
-        let entry = entry.with_context(|| format!("reading entry in {}", envs_dir.display()))?;
-        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            continue;
-        }
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-        if name.starts_with('.') {
-            continue;
-        }
-        names.push(name);
-    }
-    if names.is_empty() {
-        bail!(
-            "retread fast --persist: no job-local envs found under {}",
-            envs_dir.display()
-        );
-    }
-    names.sort();
-    for name in &names {
-        persist_env(workspace_root, cfg, ns, name)?;
-    }
-    Ok(())
-}
-
-fn log_copy_timing(verb: &str, env_name: &str, stats: &CopyStats, elapsed: Duration) {
-    let secs = elapsed.as_secs_f64();
-    let total = stats.files + stats.symlinks;
-    let rate = if secs > 0.0 { total as f64 / secs } else { 0.0 };
-    let msg = format!(
-        "retread fast-tmp: {verb} env {env_name}: {total} files ({} symlinks, {} dirs), {} bytes, {secs:.2} s, {rate:.0} files/s",
-        stats.symlinks, stats.dirs, stats.bytes
-    );
-    eprintln!("{msg}");
-    tracing::info!("{msg}");
-}
-
-pub fn run_frozen_install_if_slurm(
-    workspace_root: &Path,
-    cfg: &FastTmpConfig,
-    ns: &Namespace,
-    env: &[(String, String)],
-) -> Result<()> {
-    if !in_slurm_job() {
-        return Ok(());
-    }
-    // Fast path: byte-for-byte parallel copy of persisted snapshots keyed by
-    // the current lock hash. When it fully succeeds the frozen install (and
-    // its lock check) is redundant — the snapshot was built from this lock.
-    if materialize_persisted_envs(workspace_root, cfg, ns) {
-        return Ok(());
-    }
-    let lock_status = Command::new("pixi")
-        .args(["lock", "--check"])
-        .current_dir(workspace_root)
-        .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-        .stdin(Stdio::null())
-        .status()
-        .context("running `pixi lock --check` before SLURM frozen install")?;
-    if !lock_status.success() {
-        bail!(
-            "pixi.lock is not up to date; run `retread solve` / `pixi install` once on a login node (or one designated job) before fanning out."
-        );
-    }
-    let install_status = Command::new("pixi")
-        .args(["install", "--frozen"])
-        .current_dir(workspace_root)
-        .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-        .stdin(Stdio::null())
-        .status()
-        .context("running `pixi install --frozen` inside SLURM job")?;
-    if !install_status.success() {
-        bail!("`pixi install --frozen` failed with status {install_status}");
-    }
-    Ok(())
-}
-
 pub fn print_mapping(engaged: &EngagedFastTmp) {
     eprintln!("retread fast-tmp namespace: {}", engaged.ns.root.display());
     for (key, value) in &engaged.env {
@@ -1412,6 +1823,33 @@ pub fn shell_exports(engaged: &EngagedFastTmp) -> String {
     out
 }
 
+/// Shell commands for disengaging a previously sourced fast-tmp environment,
+/// including same-job `RETREAD_FAST_TMP=off`. Only keys recorded as managed
+/// are changed, and every overwritten user value is restored.
+pub fn shell_stale_cleanup() -> String {
+    if !inherited_fasttmp_cleanup_needed() {
+        return String::new();
+    }
+    let mut out = String::new();
+    for (key, value) in cleanup_env_actions() {
+        match value {
+            Some(value) => {
+                out.push_str("export ");
+                out.push_str(&key);
+                out.push('=');
+                out.push_str(&shell_quote(&value));
+                out.push('\n');
+            }
+            None => {
+                out.push_str("unset ");
+                out.push_str(&key);
+                out.push('\n');
+            }
+        }
+    }
+    out
+}
+
 fn shell_quote(s: &str) -> String {
     let mut out = String::from("'");
     for ch in s.chars() {
@@ -1426,9 +1864,16 @@ fn shell_quote(s: &str) -> String {
 }
 
 pub fn remove_stale_fast_env_from_command(cmd: &mut Command) {
-    if inherited_fasttmp_stale() {
-        for key in FAST_ENV_KEYS {
-            cmd.env_remove(key);
+    if inherited_fasttmp_cleanup_needed() {
+        for (key, value) in cleanup_env_actions() {
+            match value {
+                Some(value) => {
+                    cmd.env(key, value);
+                }
+                None => {
+                    cmd.env_remove(key);
+                }
+            }
         }
     }
 }
@@ -2029,9 +2474,7 @@ mod tests {
             "RETREAD_FAST_TMP_FORCE_FS",
             "RETREAD_FAST_TMP_PROBE_THRESHOLD_MS",
             "RETREAD_FAST_TMP_CORRUPT_COPYBACK",
-            "RETREAD_FAST_TMP_PERSIST_DIR",
-            "RETREAD_FAST_TMP_COPY_WORKERS",
-            "RETREAD_FAST_TMP_COPY_FAIL_SUBSTR",
+            "PIXI_NO_CONFIG",
             "SLURM_JOB_ID",
             "SLURM_MEM_PER_NODE",
             "SLURM_MEM_PER_CPU",
@@ -2053,6 +2496,35 @@ mod tests {
     fn write_workspace(dir: &Path) {
         fs::create_dir_all(dir).unwrap();
         fs::write(dir.join("pixi.toml"), "[workspace]\nchannels = []\n").unwrap();
+    }
+
+    fn pair_map(pairs: &[(String, String)]) -> HashMap<String, String> {
+        pairs.iter().cloned().collect()
+    }
+
+    #[cfg(unix)]
+    fn install_fake_pixi(root: &Path, version_command: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let bin = root.join("fake-bin");
+        fs::create_dir_all(&bin).unwrap();
+        let pixi = bin.join("pixi");
+        fs::write(
+            &pixi,
+            format!(
+                "#!/bin/sh\n\
+                 if test \"$1\" = --version; then\n\
+                   {version_command}\n\
+                 elif test \"$1\" = config; then\n\
+                   printf '%s\\n' '{{}}'\n\
+                 else\n\
+                   exit 90\n\
+                 fi\n"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&pixi, fs::Permissions::from_mode(0o755)).unwrap();
+        bin
     }
 
     #[test]
@@ -2101,6 +2573,558 @@ blob-caches = "tmp"
         assert_eq!(cfg.budget_bytes, Some(456 * 1024 * 1024));
 
         fs::remove_dir_all(ws).ok();
+    }
+
+    #[test]
+    fn relative_tmp_root_is_resolved_from_invocation_cwd() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let guard = EnvGuard::new(&fasttmp_env_keys());
+        let ws = tmp_dir("relative-root");
+        write_workspace(&ws);
+        guard.set("RETREAD_FAST_TMP_ROOT", "relative-fast-root");
+        let cfg = FastTmpConfig::load(&ws);
+        assert_eq!(
+            cfg.tmp_root,
+            std::env::current_dir().unwrap().join("relative-fast-root")
+        );
+        assert!(cfg.tmp_root.is_absolute());
+        fs::remove_dir_all(ws).ok();
+    }
+
+    #[test]
+    fn pixi_no_config_uses_boolean_semantics() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let guard = EnvGuard::new(&fasttmp_env_keys());
+        let root = tmp_dir("no-config-bool");
+        let base = root.join("base-config.toml");
+        fs::write(&base, "tls-no-verify = false\n").unwrap();
+        guard.set("PIXI_CONFIG_FILE", base.to_str().unwrap());
+        let ns = Namespace {
+            root: root.join("namespace"),
+        };
+        fs::create_dir_all(&ns.root).unwrap();
+
+        for value in ["0", "false", "no", "off", ""] {
+            guard.set("PIXI_NO_CONFIG", value);
+            prepare_pixi_config_overlay(&ns).unwrap();
+        }
+        for value in ["1", "true", "yes", "on", "Y", "t"] {
+            guard.set("PIXI_NO_CONFIG", value);
+            assert!(
+                prepare_pixi_config_overlay(&ns)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("PIXI_NO_CONFIG")
+            );
+        }
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn pixi_overlay_preserves_effective_security_and_network_config() {
+        let effective = br#"{
+            "authentication-override-file": "/secure/pixi-auth.json",
+            "tls-no-verify": false,
+            "tls-root-certs": "system",
+            "run-post-link-scripts": "insecure",
+            "mirrors": {
+                "https://conda.example.invalid": ["https://mirror.example.invalid"]
+            },
+            "pypi-config": {
+                "index-url": "https://pypi.example.invalid/simple"
+            },
+            "proxy-config": {
+                "https": "http://proxy.example.invalid:8080"
+            }
+        }"#;
+        let rendered = render_pixi_config_overlay(effective).unwrap();
+        let config: toml::Table = toml::from_str(&rendered).unwrap();
+
+        assert_eq!(
+            config
+                .get("detached-environments")
+                .and_then(toml::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            config
+                .get("authentication-override-file")
+                .and_then(toml::Value::as_str),
+            Some("/secure/pixi-auth.json")
+        );
+        assert_eq!(
+            config
+                .get("run-post-link-scripts")
+                .and_then(toml::Value::as_str),
+            Some("insecure")
+        );
+        assert_eq!(
+            config.get("tls-root-certs").and_then(toml::Value::as_str),
+            Some("system")
+        );
+        assert_eq!(
+            config
+                .get("pypi-config")
+                .and_then(toml::Value::as_table)
+                .and_then(|table| table.get("index-url"))
+                .and_then(toml::Value::as_str),
+            Some("https://pypi.example.invalid/simple")
+        );
+        assert!(config.contains_key("mirrors"));
+        assert!(config.contains_key("proxy-config"));
+
+        let from_override = render_pixi_config_overlay_from_toml(
+            "authentication-override-file = \"/private/auth.json\"\n\
+             run-post-link-scripts = \"insecure\"\n",
+        )
+        .unwrap();
+        let override_config: toml::Table = toml::from_str(&from_override).unwrap();
+        assert_eq!(
+            override_config
+                .get("authentication-override-file")
+                .and_then(toml::Value::as_str),
+            Some("/private/auth.json")
+        );
+        assert_eq!(
+            override_config
+                .get("detached-environments")
+                .and_then(toml::Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn pixi_version_validation_requires_0_70_or_newer() {
+        for supported in ["pixi 0.70.0", "pixi 0.70.2\n", "pixi 0.99.1", "pixi 1.0.0"] {
+            validate_pixi_version_text(supported).unwrap();
+        }
+        for unsupported in ["pixi 0.69.9", "pixi 0.1.0", "pixi version unknown", ""] {
+            assert!(
+                validate_pixi_version_text(unsupported).is_err(),
+                "{unsupported:?}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn engage_emits_supported_and_legacy_pixi_detached_interfaces() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let mut env_keys = fasttmp_env_keys();
+        env_keys.extend(["PATH", "RETREAD_TEST_EXPECTED_CONFIG_CWD"]);
+        let guard = EnvGuard::new(&env_keys);
+        let root = tmp_dir("pixi-detached");
+        let ws = root.join("workspace");
+        write_workspace(&ws);
+        guard.set("RETREAD_FAST_TMP_FORCE_FS", "nfs");
+        guard.set("RETREAD_FAST_TMP_ROOT", root.join("tmp").to_str().unwrap());
+        guard.set("RETREAD_FAST_TMP_BUDGET_BYTES", "200G");
+
+        let cfg = FastTmpConfig::load(&ws);
+        let expected_ns = namespace(&cfg, &ws);
+        let fake_bin = root.join("fake-bin");
+        fs::create_dir_all(&fake_bin).unwrap();
+        let fake_pixi = fake_bin.join("pixi");
+        fs::write(
+            &fake_pixi,
+            r#"#!/bin/sh
+if test "$1" = --version; then
+  printf '%s\n' 'pixi 0.70.2'
+elif test "$1" = config; then
+  test "$#" = 3 || exit 41
+  test "$2" = list || exit 42
+  test "$3" = --json || exit 43
+  test "$PWD" = "$RETREAD_TEST_EXPECTED_CONFIG_CWD" || exit 44
+  test -z "$PIXI_CONFIG_FILE" || exit 45
+  printf '%s\n' '{"tls-no-verify":false,"run-post-link-scripts":"insecure"}'
+else
+  exit 60
+fi
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&fake_pixi, fs::Permissions::from_mode(0o755)).unwrap();
+        guard.set("PATH", fake_bin.to_str().unwrap());
+        guard.set(
+            "RETREAD_TEST_EXPECTED_CONFIG_CWD",
+            expected_ns.root.to_str().unwrap(),
+        );
+
+        let engaged = engage(&ws, &cfg).unwrap().unwrap();
+        let env = engaged.env.iter().cloned().collect::<HashMap<_, _>>();
+        assert_eq!(
+            env.get("PIXI_CONFIG_FILE").map(String::as_str),
+            engaged.ns.pixi_config_file().to_str()
+        );
+        assert_eq!(
+            env.get("PIXI_CACHE_DETACHED_ENVIRONMENTS_DIR")
+                .map(String::as_str),
+            engaged.ns.envs_dir().to_str()
+        );
+        assert_eq!(
+            env.get("PIXI_DETACHED_ENVIRONMENTS").map(String::as_str),
+            engaged.ns.envs_dir().to_str()
+        );
+        assert_eq!(
+            env.get(RETREAD_BASE_PIXI_CONFIG).map(String::as_str),
+            Some("")
+        );
+        let overlay: toml::Table =
+            toml::from_str(&fs::read_to_string(engaged.ns.pixi_config_file()).unwrap()).unwrap();
+        assert_eq!(
+            overlay
+                .get("detached-environments")
+                .and_then(toml::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            overlay
+                .get("run-post-link-scripts")
+                .and_then(toml::Value::as_str),
+            Some("insecure")
+        );
+        assert_eq!(
+            fs::metadata(engaged.ns.pixi_config_file())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn stale_shell_cleanup_restores_user_pixi_config() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let guard = EnvGuard::new(&fasttmp_env_keys());
+        let root = tmp_dir("stale-shell-cleanup");
+        let ws = root.join("workspace");
+        write_workspace(&ws);
+        guard.set("SLURM_JOB_ID", "old-job");
+        guard.set("PIXI_CONFIG_FILE", "/secure/user-pixi-config.toml");
+        let ns = Namespace {
+            root: root.join("namespace").join("job-old-job"),
+        };
+        for (key, value) in desired_env_pairs(&FastTmpConfig::default(), &ws, &ns).unwrap() {
+            guard.set(&key, &value);
+        }
+
+        // The sourced ownership metadata still describes the old job exactly;
+        // only the scheduler's current job identity changed.
+        guard.set("SLURM_JOB_ID", "new-job");
+
+        let cleanup = shell_stale_cleanup();
+        assert!(cleanup.contains("unset PIXI_CACHE_DETACHED_ENVIRONMENTS_DIR\n"));
+        assert!(cleanup.contains("unset RETREAD_FAST_TMP_PIXI_CONFIG_FILE\n"));
+        assert!(cleanup.contains("unset RETREAD_FAST_TMP_NS_JOB\n"));
+        assert!(cleanup.contains("export PIXI_CONFIG_FILE='/secure/user-pixi-config.toml'\n"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn managed_env_root_transition_replaces_owned_values_and_restores_base() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let guard = EnvGuard::new(&fasttmp_env_keys());
+        let root = tmp_dir("managed-root-transition");
+        let ws = root.join("workspace");
+        write_workspace(&ws);
+        let cfg = FastTmpConfig {
+            blob_caches: BlobCacheMode::Tmp,
+            ..FastTmpConfig::default()
+        };
+        let ns_a = Namespace {
+            root: root.join("root-a").join("job-42"),
+        };
+        let ns_b = Namespace {
+            root: root.join("root-b").join("job-42"),
+        };
+
+        let first = desired_env_pairs(&cfg, &ws, &ns_a).unwrap();
+        for (key, value) in &first {
+            guard.set(key, value);
+        }
+        let second = desired_env_pairs(&cfg, &ws, &ns_b).unwrap();
+        let second_map = pair_map(&second);
+        for (key, expected) in [
+            ("PIXI_CACHE_DIR", ns_b.rattler_cache_dir()),
+            ("RATTLER_CACHE_DIR", ns_b.rattler_cache_dir()),
+            ("UV_CACHE_DIR", ns_b.uv_cache_dir()),
+            ("RETREAD_CACHE_DIR", ns_b.retread_cache_dir()),
+            ("PIXI_CACHE_DETACHED_ENVIRONMENTS_DIR", ns_b.envs_dir()),
+            ("PIXI_DETACHED_ENVIRONMENTS", ns_b.envs_dir()),
+        ] {
+            assert_eq!(
+                second_map.get(key).map(String::as_str),
+                expected.to_str(),
+                "{key} must transition to root B"
+            );
+        }
+
+        for (key, value) in &second {
+            guard.set(key, value);
+        }
+        let actions = cleanup_env_actions().into_iter().collect::<HashMap<_, _>>();
+        for key in [
+            "PIXI_CACHE_DIR",
+            "RATTLER_CACHE_DIR",
+            "UV_CACHE_DIR",
+            "RETREAD_CACHE_DIR",
+            "PIXI_CACHE_DETACHED_ENVIRONMENTS_DIR",
+            "PIXI_DETACHED_ENVIRONMENTS",
+        ] {
+            assert_eq!(actions.get(key), Some(&None), "{key} base must stay unset");
+        }
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn forced_pixi_values_restore_originals_and_unowned_cache_is_preserved() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let guard = EnvGuard::new(&fasttmp_env_keys());
+        let root = tmp_dir("managed-base-restore");
+        let ws = root.join("workspace");
+        write_workspace(&ws);
+        guard.set("PIXI_CONFIG_FILE", "/secure/user-pixi.toml");
+        guard.set(
+            "PIXI_CACHE_DETACHED_ENVIRONMENTS_DIR",
+            "/shared/user-detached",
+        );
+        guard.set("PIXI_DETACHED_ENVIRONMENTS", "/shared/legacy-detached");
+        guard.set("UV_CACHE_DIR", "/shared/user-uv");
+        let ns = Namespace {
+            root: root.join("namespace").join("job-1"),
+        };
+
+        let pairs = desired_env_pairs(&FastTmpConfig::default(), &ws, &ns).unwrap();
+        assert!(
+            !pairs.iter().any(|(key, _)| key == "UV_CACHE_DIR"),
+            "an unowned user cache must not be overridden"
+        );
+        for (key, value) in &pairs {
+            guard.set(key, value);
+        }
+        let actions = cleanup_env_actions().into_iter().collect::<HashMap<_, _>>();
+        assert_eq!(
+            actions.get("PIXI_CONFIG_FILE"),
+            Some(&Some("/secure/user-pixi.toml".to_string()))
+        );
+        assert_eq!(
+            actions.get("PIXI_CACHE_DETACHED_ENVIRONMENTS_DIR"),
+            Some(&Some("/shared/user-detached".to_string()))
+        );
+        assert_eq!(
+            actions.get("PIXI_DETACHED_ENVIRONMENTS"),
+            Some(&Some("/shared/legacy-detached".to_string()))
+        );
+        assert!(!actions.contains_key("UV_CACHE_DIR"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn legacy_same_job_values_are_cleaned_and_not_saved_as_base() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let guard = EnvGuard::new(&fasttmp_env_keys());
+        let root = tmp_dir("legacy-cleanup");
+        let legacy_ns = root
+            .join(user_namespace_component())
+            .join("012345abcdef")
+            .join("nojob");
+        guard.set("RETREAD_FAST_TMP_NS_JOB", "nojob");
+        guard.set(
+            "UV_CACHE_DIR",
+            legacy_ns.join("caches/uv").to_str().unwrap(),
+        );
+        guard.set(
+            "RETREAD_CACHE_DIR",
+            legacy_ns.join("caches/retread").to_str().unwrap(),
+        );
+        guard.set(
+            "PIXI_CACHE_DETACHED_ENVIRONMENTS_DIR",
+            legacy_ns.join("envs").to_str().unwrap(),
+        );
+        guard.set("PIXI_CACHE_DIR", "/shared/user-pixi-cache");
+        guard.set("RATTLER_CACHE_DIR", "/shared/user-rattler-cache");
+        guard.set("UV_LOCK_TIMEOUT", "1800");
+
+        assert!(inherited_fasttmp_cleanup_needed());
+        let actions = cleanup_env_actions().into_iter().collect::<HashMap<_, _>>();
+        assert_eq!(actions.get("UV_CACHE_DIR"), Some(&None));
+        assert_eq!(actions.get("RETREAD_CACHE_DIR"), Some(&None));
+        assert_eq!(
+            actions.get("PIXI_CACHE_DETACHED_ENVIRONMENTS_DIR"),
+            Some(&None)
+        );
+        assert!(!actions.contains_key("PIXI_CACHE_DIR"));
+        assert!(!actions.contains_key("RATTLER_CACHE_DIR"));
+        assert_eq!(actions.get("UV_LOCK_TIMEOUT"), Some(&None));
+
+        let ws = root.join("workspace");
+        write_workspace(&ws);
+        let ns_b = Namespace {
+            root: root.join("new-root").join("nojob"),
+        };
+        let pairs = desired_env_pairs(&FastTmpConfig::default(), &ws, &ns_b).unwrap();
+        assert_eq!(
+            pair_map(&pairs).get("UV_CACHE_DIR").map(String::as_str),
+            ns_b.uv_cache_dir().to_str()
+        );
+        let base_json = pair_map(&pairs).remove(RETREAD_BASE_ENV_JSON).unwrap();
+        let base: HashMap<String, Option<String>> = serde_json::from_str(&base_json).unwrap();
+        assert_eq!(base.get("UV_CACHE_DIR"), Some(&None));
+        assert_eq!(base.get("RETREAD_CACHE_DIR"), Some(&None));
+        assert_eq!(base.get("UV_LOCK_TIMEOUT"), Some(&None));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn reengagement_preserves_changed_user_values_and_reowns_forced_pixi_values() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let guard = EnvGuard::new(&fasttmp_env_keys());
+        let root = tmp_dir("managed-user-change");
+        let ws = root.join("workspace");
+        write_workspace(&ws);
+        let ns_a = Namespace {
+            root: root.join("root-a").join("nojob"),
+        };
+        let ns_b = Namespace {
+            root: root.join("root-b").join("nojob"),
+        };
+        for (key, value) in desired_env_pairs(&FastTmpConfig::default(), &ws, &ns_a).unwrap() {
+            guard.set(&key, &value);
+        }
+        guard.set("UV_CACHE_DIR", "/user/changed-after-source");
+        guard.set(
+            "PIXI_CACHE_DETACHED_ENVIRONMENTS_DIR",
+            "/user/changed-detached-after-source",
+        );
+
+        let second = desired_env_pairs(&FastTmpConfig::default(), &ws, &ns_b).unwrap();
+        let second_map = pair_map(&second);
+        assert!(!second_map.contains_key("UV_CACHE_DIR"));
+        assert_eq!(
+            second_map
+                .get("PIXI_CACHE_DETACHED_ENVIRONMENTS_DIR")
+                .map(String::as_str),
+            ns_b.envs_dir().to_str()
+        );
+        let base: HashMap<String, Option<String>> =
+            serde_json::from_str(second_map.get(RETREAD_BASE_ENV_JSON).unwrap()).unwrap();
+        assert!(!base.contains_key("UV_CACHE_DIR"));
+        assert_eq!(
+            base.get("PIXI_CACHE_DETACHED_ENVIRONMENTS_DIR"),
+            Some(&Some("/user/changed-detached-after-source".to_string()))
+        );
+
+        for (key, value) in second {
+            guard.set(&key, &value);
+        }
+        let actions = cleanup_env_actions().into_iter().collect::<HashMap<_, _>>();
+        assert!(!actions.contains_key("UV_CACHE_DIR"));
+        assert_eq!(
+            actions.get("PIXI_CACHE_DETACHED_ENVIRONMENTS_DIR"),
+            Some(&Some("/user/changed-detached-after-source".to_string()))
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn cleanup_fails_closed_for_missing_or_malformed_ownership_metadata() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let guard = EnvGuard::new(&fasttmp_env_keys());
+        let root = tmp_dir("managed-metadata-fail-closed");
+        let ws = root.join("workspace");
+        write_workspace(&ws);
+        let ns = Namespace {
+            root: root.join("namespace").join("nojob"),
+        };
+        let pairs = desired_env_pairs(&FastTmpConfig::default(), &ws, &ns).unwrap();
+        for (key, value) in &pairs {
+            guard.set(key, value);
+        }
+
+        guard.remove(RETREAD_EXPECTED_ENV_JSON);
+        assert!(cleanup_env_actions().is_empty());
+        for (key, value) in &pairs {
+            guard.set(key, value);
+        }
+        guard.set(RETREAD_BASE_ENV_JSON, "not-json");
+        assert!(cleanup_env_actions().is_empty());
+        for (key, value) in &pairs {
+            guard.set(key, value);
+        }
+        guard.set(RETREAD_EXPECTED_ENV_JSON, "not-json");
+        assert!(cleanup_env_actions().is_empty());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn cleanup_quotes_base_values_and_rejects_injected_managed_names() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let guard = EnvGuard::new(&fasttmp_env_keys());
+        let root = tmp_dir("managed-shell-quoting");
+        let ws = root.join("workspace");
+        write_workspace(&ws);
+        guard.set("PIXI_CONFIG_FILE", "/safe/user's config.toml");
+        let ns = Namespace {
+            root: root.join("namespace").join("nojob"),
+        };
+        let pairs = desired_env_pairs(&FastTmpConfig::default(), &ws, &ns).unwrap();
+        for (key, value) in &pairs {
+            guard.set(key, value);
+        }
+        let cleanup = shell_stale_cleanup();
+        assert!(cleanup.contains("export PIXI_CONFIG_FILE='/safe/user'\\''s config.toml'\n"));
+
+        guard.set(
+            RETREAD_MANAGED_KEYS,
+            "UV_CACHE_DIR,EVIL_KEY\nexport RETREAD_PWNED=1",
+        );
+        let cleanup = shell_stale_cleanup();
+        assert!(cleanup.is_empty());
+        assert!(!cleanup.contains("EVIL_KEY"));
+        assert!(!cleanup.contains("RETREAD_PWNED"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn backend_cleanup_override_suppresses_inherited_legacy_cache() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let guard = EnvGuard::new(&fasttmp_env_keys());
+        let legacy = std::env::temp_dir()
+            .join(user_namespace_component())
+            .join("012345abcdef")
+            .join("job-old")
+            .join("caches/retread");
+        guard.set("RETREAD_FAST_TMP_NS_JOB", "old");
+        guard.set("RETREAD_CACHE_DIR", legacy.to_str().unwrap());
+
+        let backend = BACKEND_ENV.get_or_init(|| Mutex::new(BackendEnv::default()));
+        let previous = backend.lock().unwrap().clone();
+        *backend.lock().unwrap() = BackendEnv {
+            pairs: Vec::new(),
+            remove_fast_vars: true,
+        };
+        assert_eq!(
+            backend_env_override("RETREAD_CACHE_DIR"),
+            BackendEnvOverride::Remove
+        );
+        *backend.lock().unwrap() = previous;
+    }
+
+    #[test]
+    fn relative_base_pixi_config_is_made_absolute_before_overlay_cwd_changes() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let guard = EnvGuard::new(&fasttmp_env_keys());
+        guard.set("PIXI_CONFIG_FILE", "relative/config.toml");
+        assert_eq!(
+            PathBuf::from(base_pixi_config_file().unwrap()),
+            std::env::current_dir()
+                .unwrap()
+                .join("relative/config.toml")
+        );
     }
 
     #[test]
@@ -2155,7 +3179,7 @@ blob-caches = "tmp"
         fs::remove_dir_all(root).ok();
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn engage_is_idempotent_and_respects_existing_env() {
         let _lock = ENV_MUTEX.lock().unwrap();
@@ -2200,6 +3224,473 @@ blob-caches = "tmp"
         fs::remove_dir_all(root).ok();
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn root_transition_replaces_only_proven_retread_links() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _guard = EnvGuard::new(&fasttmp_env_keys());
+        let root = tmp_dir("bld-root-transition");
+        let ws = root.join("workspace");
+        write_workspace(&ws);
+        fs::create_dir_all(ws.join(".pixi")).unwrap();
+
+        let old_ns = Namespace {
+            root: root.join("old-root").join("job-1234"),
+        };
+        let new_ns = Namespace {
+            root: root.join("new-root").join("job-1234"),
+        };
+        fs::create_dir_all(&old_ns.root).unwrap();
+        fs::write(
+            old_ns.root.join("workspace-path"),
+            fs::canonicalize(&ws).unwrap().to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+        let old_target = old_ns.bld_dir();
+        let new_target = new_ns.bld_dir();
+        fs::create_dir_all(&old_target).unwrap();
+        fs::create_dir_all(&new_target).unwrap();
+        let link = ws.join(".pixi").join("bld");
+        std::os::unix::fs::symlink(&old_target, &link).unwrap();
+
+        setup_bld_symlink(&ws, &new_ns).unwrap();
+        assert_eq!(fs::read_link(&link).unwrap(), new_target);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn disengage_removes_owned_links_but_preserves_unowned_links() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _guard = EnvGuard::new(&fasttmp_env_keys());
+        let root = tmp_dir("link-cleanup");
+        let ws = root.join("workspace");
+        write_workspace(&ws);
+        let pixi = ws.join(".pixi");
+        fs::create_dir_all(&pixi).unwrap();
+        let owned_ns = root.join("owned").join("job-old");
+        fs::create_dir_all(owned_ns.join("envs")).unwrap();
+        fs::create_dir_all(owned_ns.join("bld")).unwrap();
+        fs::write(
+            owned_ns.join("workspace-path"),
+            fs::canonicalize(&ws).unwrap().to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+        let envs_target = owned_ns.join("envs");
+        std::os::unix::fs::symlink(&envs_target, pixi.join("envs")).unwrap();
+        std::os::unix::fs::symlink(owned_ns.join("bld"), pixi.join("bld")).unwrap();
+
+        let cfg = FastTmpConfig {
+            mode: FastTmpMode::Off,
+            ..FastTmpConfig::default()
+        };
+        assert!(engage(&ws, &cfg).unwrap().is_none());
+        assert_eq!(fs::read_link(pixi.join("envs")).unwrap(), envs_target);
+        assert!(fs::symlink_metadata(pixi.join("bld")).is_err());
+
+        let user_bld = root.join("user-bld");
+        std::os::unix::fs::symlink(&user_bld, pixi.join("bld")).unwrap();
+        assert!(engage(&ws, &cfg).unwrap().is_none());
+        assert_eq!(fs::read_link(pixi.join("envs")).unwrap(), envs_target);
+        assert_eq!(fs::read_link(pixi.join("bld")).unwrap(), user_bld);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unowned_symlinks_are_rejected_and_dangling_legacy_links_are_owned() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _guard = EnvGuard::new(&fasttmp_env_keys());
+        let root = tmp_dir("link-ownership");
+        let ws = root.join("workspace");
+        write_workspace(&ws);
+        fs::create_dir_all(ws.join(".pixi")).unwrap();
+        let link = ws.join(".pixi/bld");
+        let user_target = root.join("unrelated-user-bld");
+        std::os::unix::fs::symlink(&user_target, &link).unwrap();
+        let ns = Namespace {
+            root: root.join("new-namespace").join("nojob"),
+        };
+        fs::create_dir_all(ns.bld_dir()).unwrap();
+        let error = setup_bld_symlink(&ws, &ns).unwrap_err().to_string();
+        assert!(error.contains("unowned symlink"));
+        assert_eq!(fs::read_link(&link).unwrap(), user_target);
+
+        fs::remove_file(&link).unwrap();
+        let canonical = fs::canonicalize(&ws).unwrap();
+        let dangling = root
+            .join(user_namespace_component())
+            .join(workspace_hash(&canonical))
+            .join("job-evicted")
+            .join("bld");
+        std::os::unix::fs::symlink(&dangling, &link).unwrap();
+        assert!(workspace_link_target_is_owned(&ws, &dangling).unwrap());
+        cleanup_owned_workspace_links(&ws).unwrap();
+        assert!(fs::symlink_metadata(&link).is_err());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cleanup_restores_a_concurrently_swapped_unowned_bld_link() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _guard = EnvGuard::new(&fasttmp_env_keys());
+        let root = tmp_dir("bld-cleanup-race");
+        let ws = root.join("workspace");
+        write_workspace(&ws);
+        let pixi = ws.join(".pixi");
+        fs::create_dir_all(&pixi).unwrap();
+        let owned_ns = root.join("owned").join("job-old");
+        fs::create_dir_all(owned_ns.join("bld")).unwrap();
+        fs::write(
+            owned_ns.join("workspace-path"),
+            fs::canonicalize(&ws).unwrap().to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+        let link = pixi.join("bld");
+        std::os::unix::fs::symlink(owned_ns.join("bld"), &link).unwrap();
+        let user_target = root.join("user-bld");
+
+        let error = remove_owned_workspace_symlink_with_hook(&ws, &link, || {
+            fs::remove_file(&link).unwrap();
+            std::os::unix::fs::symlink(&user_target, &link).unwrap();
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("changed concurrently"));
+        assert_eq!(fs::read_link(&link).unwrap(), user_target);
+        assert!(
+            fs::read_dir(&pixi)
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| !entry.file_name().to_string_lossy().contains("quarantine"))
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cleanup_restores_a_concurrently_swapped_real_bld_directory() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _guard = EnvGuard::new(&fasttmp_env_keys());
+        let root = tmp_dir("bld-cleanup-directory-race");
+        let ws = root.join("workspace");
+        write_workspace(&ws);
+        let pixi = ws.join(".pixi");
+        fs::create_dir_all(&pixi).unwrap();
+        let owned_ns = root.join("owned").join("job-old");
+        fs::create_dir_all(owned_ns.join("bld")).unwrap();
+        fs::write(
+            owned_ns.join("workspace-path"),
+            fs::canonicalize(&ws).unwrap().to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+        let link = pixi.join("bld");
+        std::os::unix::fs::symlink(owned_ns.join("bld"), &link).unwrap();
+
+        let error = remove_owned_workspace_symlink_with_hook(&ws, &link, || {
+            fs::remove_file(&link).unwrap();
+            fs::create_dir(&link).unwrap();
+            fs::write(link.join("keep"), b"user directory").unwrap();
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("changed concurrently"));
+        assert_eq!(fs::read(link.join("keep")).unwrap(), b"user directory");
+        assert!(
+            fs::read_dir(&pixi)
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| !entry.file_name().to_string_lossy().contains("quarantine"))
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn setup_never_overwrites_concurrently_created_symlink_or_directory() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _guard = EnvGuard::new(&fasttmp_env_keys());
+        let root = tmp_dir("bld-setup-races");
+        let ws = root.join("workspace");
+        write_workspace(&ws);
+        let pixi = ws.join(".pixi");
+        fs::create_dir_all(&pixi).unwrap();
+        let link = pixi.join("bld");
+        let new_ns = Namespace {
+            root: root.join("new").join("job-new"),
+        };
+        fs::create_dir_all(new_ns.bld_dir()).unwrap();
+
+        let user_target = root.join("user-bld");
+        let error = setup_bld_symlink_with_hook(&ws, &new_ns, || {
+            std::os::unix::fs::symlink(&user_target, &link).unwrap();
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("changed concurrently"));
+        assert_eq!(fs::read_link(&link).unwrap(), user_target);
+
+        fs::remove_file(&link).unwrap();
+        let old_ns = root.join("old").join("job-old");
+        fs::create_dir_all(old_ns.join("bld")).unwrap();
+        fs::write(
+            old_ns.join("workspace-path"),
+            fs::canonicalize(&ws).unwrap().to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(old_ns.join("bld"), &link).unwrap();
+        let error = setup_bld_symlink_with_hook(&ws, &new_ns, || {
+            fs::remove_file(&link).unwrap();
+            fs::create_dir(&link).unwrap();
+            fs::write(link.join("keep"), b"user directory").unwrap();
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("changed concurrently"));
+        assert_eq!(fs::read(link.join("keep")).unwrap(), b"user directory");
+        assert!(
+            fs::read_dir(&pixi)
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    !name.contains("retread-quarantine") && !name.contains("retread-tmp")
+                })
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn quarantine_restore_never_overwrites_a_newer_workspace_path() {
+        let root = tmp_dir("bld-restore-no-replace");
+        let pixi = root.join(".pixi");
+        fs::create_dir_all(&pixi).unwrap();
+        let quarantine = pixi.join(".bld.retread-quarantine-test");
+        fs::create_dir(&quarantine).unwrap();
+        fs::write(quarantine.join("keep"), b"displaced directory").unwrap();
+        let link = pixi.join("bld");
+        let newer_target = root.join("newer-user-bld");
+        std::os::unix::fs::symlink(&newer_target, &link).unwrap();
+
+        let error = restore_quarantined_path(&quarantine, &link)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("without replacing"));
+        assert_eq!(fs::read_link(&link).unwrap(), newer_target);
+        assert_eq!(
+            fs::read(quarantine.join("keep")).unwrap(),
+            b"displaced directory"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn no_replace_rename_rejects_distinct_parent_directories() {
+        let root = tmp_dir("rename-parent-identity");
+        let first = root.join("first");
+        let second = root.join("second");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        let source = first.join("source");
+        let destination = second.join("destination");
+        fs::write(&source, b"keep").unwrap();
+
+        let error = rename_noreplace(&source, &destination).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(fs::read(&source).unwrap(), b"keep");
+        assert!(!destination.exists());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn invalid_managed_metadata_aborts_before_namespace_or_link_mutation() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let guard = EnvGuard::new(&fasttmp_env_keys());
+        let root = tmp_dir("invalid-metadata-engage");
+        let ws = root.join("workspace");
+        write_workspace(&ws);
+        let pixi = ws.join(".pixi");
+        fs::create_dir_all(&pixi).unwrap();
+        let old_ns = root.join("old").join("job-old");
+        fs::create_dir_all(old_ns.join("bld")).unwrap();
+        fs::write(
+            old_ns.join("workspace-path"),
+            fs::canonicalize(&ws).unwrap().to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+        let old_bld = old_ns.join("bld");
+        let envs_raw = PathBuf::from("../user-envs-relative");
+        std::os::unix::fs::symlink(&old_bld, pixi.join("bld")).unwrap();
+        std::os::unix::fs::symlink(&envs_raw, pixi.join("envs")).unwrap();
+
+        let tmp_root = root.join("new-tmp");
+        guard.set("RETREAD_FAST_TMP_FORCE_FS", "nfs");
+        guard.set("RETREAD_FAST_TMP_ROOT", tmp_root.to_str().unwrap());
+        guard.set("RETREAD_FAST_TMP_BUDGET_BYTES", "200G");
+        guard.set(RETREAD_BASE_ENV_JSON, "not-json");
+        let error = engage(&ws, &FastTmpConfig::load(&ws))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("ownership metadata"));
+        assert!(!tmp_root.exists());
+        assert_eq!(fs::read_link(pixi.join("bld")).unwrap(), old_bld);
+        assert_eq!(fs::read_link(pixi.join("envs")).unwrap(), envs_raw);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_pixi_version_validation_preserves_existing_links_byte_for_byte() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let mut keys = fasttmp_env_keys();
+        keys.push("PATH");
+        let guard = EnvGuard::new(&keys);
+        let root = tmp_dir("version-failure-atomicity");
+        let ws = root.join("workspace");
+        write_workspace(&ws);
+        let pixi = ws.join(".pixi");
+        fs::create_dir_all(&pixi).unwrap();
+        let old_ns = root.join("old").join("job-old");
+        fs::create_dir_all(old_ns.join("envs")).unwrap();
+        fs::create_dir_all(old_ns.join("bld")).unwrap();
+        fs::write(
+            old_ns.join("workspace-path"),
+            fs::canonicalize(&ws).unwrap().to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+        let old_envs = old_ns.join("envs");
+        let old_bld = old_ns.join("bld");
+        std::os::unix::fs::symlink(&old_envs, pixi.join("envs")).unwrap();
+        std::os::unix::fs::symlink(&old_bld, pixi.join("bld")).unwrap();
+
+        let fake_bin = install_fake_pixi(&root, "printf '%s\\n' 'pixi 0.69.9'");
+        guard.set("PATH", fake_bin.to_str().unwrap());
+        guard.set("RETREAD_FAST_TMP_FORCE_FS", "nfs");
+        guard.set(
+            "RETREAD_FAST_TMP_ROOT",
+            root.join("new-tmp").to_str().unwrap(),
+        );
+        guard.set("RETREAD_FAST_TMP_BUDGET_BYTES", "200G");
+        let cfg = FastTmpConfig::load(&ws);
+        let error = engage(&ws, &cfg).unwrap_err().to_string();
+        assert!(error.contains("requires Pixi >=0.70"));
+        assert_eq!(fs::read_link(pixi.join("envs")).unwrap(), old_envs);
+        assert_eq!(fs::read_link(pixi.join("bld")).unwrap(), old_bld);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn real_envs_path_is_preserved_during_engagement() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let mut keys = fasttmp_env_keys();
+        keys.push("PATH");
+        let guard = EnvGuard::new(&keys);
+        let root = tmp_dir("real-envs");
+        let ws = root.join("workspace");
+        write_workspace(&ws);
+        fs::create_dir_all(ws.join(".pixi/envs")).unwrap();
+        fs::write(ws.join(".pixi/envs/keep"), b"user environment").unwrap();
+        guard.set("RETREAD_FAST_TMP_FORCE_FS", "nfs");
+        guard.set("RETREAD_FAST_TMP_ROOT", root.join("tmp").to_str().unwrap());
+        guard.set("RETREAD_FAST_TMP_BUDGET_BYTES", "200G");
+        let fake_bin = install_fake_pixi(&root, "printf '%s\\n' 'pixi 0.70.2'");
+        guard.set("PATH", fake_bin.to_str().unwrap());
+        assert!(engage(&ws, &FastTmpConfig::load(&ws)).unwrap().is_some());
+        assert_eq!(
+            fs::read(ws.join(".pixi/envs/keep")).unwrap(),
+            b"user environment"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn slurm_engagement_and_disengagement_preserve_workspace_links_byte_for_byte() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let mut keys = fasttmp_env_keys();
+        keys.push("PATH");
+        let guard = EnvGuard::new(&keys);
+        let root = tmp_dir("slurm-workspace-links");
+        let ws = root.join("workspace");
+        write_workspace(&ws);
+        let pixi = ws.join(".pixi");
+        fs::create_dir_all(&pixi).unwrap();
+        let envs_raw = PathBuf::from("../user-envs-relative");
+        let bld_raw = PathBuf::from("../user-bld-relative");
+        std::os::unix::fs::symlink(&envs_raw, pixi.join("envs")).unwrap();
+        std::os::unix::fs::symlink(&bld_raw, pixi.join("bld")).unwrap();
+
+        let fake_bin = install_fake_pixi(&root, "printf '%s\\n' 'pixi 0.70.2'");
+        guard.set("PATH", fake_bin.to_str().unwrap());
+        guard.set("SLURM_JOB_ID", "481516");
+        guard.set("RETREAD_FAST_TMP_FORCE_FS", "nfs");
+        guard.set("RETREAD_FAST_TMP_ROOT", root.join("tmp").to_str().unwrap());
+        guard.set("RETREAD_FAST_TMP_BUDGET_BYTES", "200G");
+        let cfg = FastTmpConfig::load(&ws);
+        assert!(engage(&ws, &cfg).unwrap().is_some());
+        assert_eq!(fs::read_link(pixi.join("envs")).unwrap(), envs_raw);
+        assert_eq!(fs::read_link(pixi.join("bld")).unwrap(), bld_raw);
+
+        let off = FastTmpConfig {
+            mode: FastTmpMode::Off,
+            ..cfg
+        };
+        assert!(engage(&ws, &off).unwrap().is_none());
+        assert_eq!(fs::read_link(pixi.join("envs")).unwrap(), envs_raw);
+        assert_eq!(fs::read_link(pixi.join("bld")).unwrap(), bld_raw);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn workspace_local_detached_config_must_not_override_fasttmp_root() {
+        let root = tmp_dir("local-detached-config");
+        let ws = root.join("workspace");
+        write_workspace(&ws);
+        fs::create_dir_all(ws.join(".pixi")).unwrap();
+        let ns = Namespace {
+            root: root.join("job-root"),
+        };
+        fs::create_dir_all(ns.envs_dir()).unwrap();
+        let local = ws.join(".pixi").join("config.toml");
+
+        fs::write(&local, "detached-environments = false\n").unwrap();
+        let error = validate_workspace_local_detached_config(&ws, &ns)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("incompatible detached-environments"));
+
+        fs::write(&local, "detached-environments = true\n").unwrap();
+        validate_workspace_local_detached_config(&ws, &ns).unwrap();
+
+        let mut compatible = toml::Table::new();
+        compatible.insert(
+            "detached-environments".to_string(),
+            toml::Value::String(ns.envs_dir().to_string_lossy().into_owned()),
+        );
+        fs::write(&local, toml::to_string(&compatible).unwrap()).unwrap();
+        validate_workspace_local_detached_config(&ws, &ns).unwrap();
+
+        fs::write(&local, "detached-environments = \"../../job-root/envs\"\n").unwrap();
+        validate_workspace_local_detached_config(&ws, &ns).unwrap();
+
+        compatible.insert(
+            "detached-environments".to_string(),
+            toml::Value::String(root.join("other").to_string_lossy().into_owned()),
+        );
+        fs::write(&local, toml::to_string(&compatible).unwrap()).unwrap();
+        let error = validate_workspace_local_detached_config(&ws, &ns)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("overrides retread fast-tmp"));
+        fs::remove_dir_all(root).ok();
+    }
+
     #[test]
     fn budget_override_rejects_default_estimate() {
         let _lock = ENV_MUTEX.lock().unwrap();
@@ -2233,362 +3724,5 @@ blob-caches = "tmp"
         assert_eq!(fs::read(&final_path).unwrap(), b"conda bytes");
         assert_eq!(final_path, out.join("linux-64").join("pkg-1.0-0.conda"));
         fs::remove_dir_all(root).ok();
-    }
-
-    #[cfg(unix)]
-    fn write_fixture_env(env_dir: &Path) {
-        use std::os::unix::fs::PermissionsExt;
-        fs::create_dir_all(env_dir.join("bin")).unwrap();
-        fs::create_dir_all(env_dir.join("lib").join("python3.11").join("pkg")).unwrap();
-        fs::create_dir_all(env_dir.join("empty")).unwrap();
-        fs::write(env_dir.join("bin").join("tool"), b"#!/bin/sh\necho hi\n").unwrap();
-        fs::set_permissions(
-            env_dir.join("bin").join("tool"),
-            fs::Permissions::from_mode(0o755),
-        )
-        .unwrap();
-        fs::write(
-            env_dir
-                .join("lib")
-                .join("python3.11")
-                .join("pkg")
-                .join("mod.py"),
-            b"x = 1\n",
-        )
-        .unwrap();
-        fs::set_permissions(
-            env_dir
-                .join("lib")
-                .join("python3.11")
-                .join("pkg")
-                .join("mod.py"),
-            fs::Permissions::from_mode(0o644),
-        )
-        .unwrap();
-        // Relative symlink (like lib/libfoo.so -> libfoo.so.1) and a dangling
-        // absolute one (conda envs contain both; both must copy as symlinks).
-        std::os::unix::fs::symlink("tool", env_dir.join("bin").join("tool-alias")).unwrap();
-        std::os::unix::fs::symlink(
-            "/definitely/not/a/real/target",
-            env_dir.join("lib").join("dangling"),
-        )
-        .unwrap();
-        fs::set_permissions(env_dir.join("empty"), fs::Permissions::from_mode(0o700)).unwrap();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn parallel_copy_preserves_tree_perms_and_symlinks() {
-        use std::os::unix::fs::PermissionsExt;
-        let _lock = ENV_MUTEX.lock().unwrap();
-        let _guard = EnvGuard::new(&fasttmp_env_keys());
-        let root = tmp_dir("pcopy");
-        let src = root.join("src");
-        write_fixture_env(&src);
-        let dst = root.join("dst");
-
-        let stats = parallel_copy_tree(&src, &dst, 8).unwrap();
-        assert_eq!(stats.files, 2);
-        assert_eq!(stats.symlinks, 2);
-        assert_eq!(stats.dirs, 5);
-        assert_eq!(
-            stats.bytes,
-            fs::metadata(src.join("bin").join("tool")).unwrap().len()
-                + fs::metadata(
-                    src.join("lib")
-                        .join("python3.11")
-                        .join("pkg")
-                        .join("mod.py")
-                )
-                .unwrap()
-                .len()
-        );
-
-        assert_eq!(
-            fs::read(dst.join("bin").join("tool")).unwrap(),
-            b"#!/bin/sh\necho hi\n"
-        );
-        assert_eq!(
-            fs::metadata(dst.join("bin").join("tool"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o7777,
-            0o755
-        );
-        assert_eq!(
-            fs::metadata(dst.join("empty"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o7777,
-            0o700
-        );
-        let alias = dst.join("bin").join("tool-alias");
-        assert!(
-            fs::symlink_metadata(&alias)
-                .unwrap()
-                .file_type()
-                .is_symlink()
-        );
-        assert_eq!(fs::read_link(&alias).unwrap(), PathBuf::from("tool"));
-        let dangling = dst.join("lib").join("dangling");
-        assert!(
-            fs::symlink_metadata(&dangling)
-                .unwrap()
-                .file_type()
-                .is_symlink()
-        );
-        assert_eq!(
-            fs::read_link(&dangling).unwrap(),
-            PathBuf::from("/definitely/not/a/real/target")
-        );
-        fs::remove_dir_all(root).ok();
-    }
-
-    #[cfg(unix)]
-    struct PersistFixture {
-        root: PathBuf,
-        ws: PathBuf,
-        ns: Namespace,
-        cfg: FastTmpConfig,
-    }
-
-    #[cfg(unix)]
-    fn persist_fixture(label: &str) -> PersistFixture {
-        let root = tmp_dir(label);
-        let ws = root.join("workspace");
-        write_workspace(&ws);
-        fs::write(ws.join("pixi.lock"), b"version: 6\npackages: []\n").unwrap();
-        let ns = Namespace {
-            root: root.join("nsroot"),
-        };
-        fs::create_dir_all(ns.envs_dir()).unwrap();
-        let cfg = FastTmpConfig {
-            persist_dir: Some(root.join("persist")),
-            copy_workers: Some(4),
-            ..FastTmpConfig::default()
-        };
-        PersistFixture { root, ws, ns, cfg }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn materialize_gates_on_lock_hash() {
-        let _lock = ENV_MUTEX.lock().unwrap();
-        let _guard = EnvGuard::new(&fasttmp_env_keys());
-        let fx = persist_fixture("hashgate");
-        let snap = persist_dir(&fx.cfg, &fx.ws).join("default");
-        write_fixture_env(&snap);
-        let hash = current_lock_hash(&fx.ws).unwrap();
-
-        // No hash file -> miss -> no materialization.
-        assert!(!materialize_persisted_envs(&fx.ws, &fx.cfg, &fx.ns));
-        assert!(!fx.ns.envs_dir().join("default").exists());
-
-        // Wrong hash -> miss.
-        fs::write(snap.join(ENV_HASH_FILE), "deadbeef\n").unwrap();
-        assert!(!materialize_persisted_envs(&fx.ws, &fx.cfg, &fx.ns));
-        assert!(!fx.ns.envs_dir().join("default").exists());
-
-        // Matching hash -> materialized, hash metadata file not copied along.
-        fs::write(snap.join(ENV_HASH_FILE), format!("{hash}\n")).unwrap();
-        assert!(materialize_persisted_envs(&fx.ws, &fx.cfg, &fx.ns));
-        let dest = fx.ns.envs_dir().join("default");
-        assert_eq!(
-            fs::read(dest.join("bin").join("tool")).unwrap(),
-            b"#!/bin/sh\necho hi\n"
-        );
-        assert!(!dest.join(ENV_HASH_FILE).exists());
-        assert!(dest.join("bin").join("tool-alias").is_symlink());
-
-        // Idempotent: second call sees a warm dest and still reports success.
-        assert!(materialize_persisted_envs(&fx.ws, &fx.cfg, &fx.ns));
-        fs::remove_dir_all(fx.root).ok();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn materialize_partial_failure_cleans_dest_and_falls_back() {
-        let _lock = ENV_MUTEX.lock().unwrap();
-        let guard = EnvGuard::new(&fasttmp_env_keys());
-        let fx = persist_fixture("partial");
-        let snap = persist_dir(&fx.cfg, &fx.ws).join("default");
-        write_fixture_env(&snap);
-        let hash = current_lock_hash(&fx.ws).unwrap();
-        fs::write(snap.join(ENV_HASH_FILE), format!("{hash}\n")).unwrap();
-
-        guard.set("RETREAD_FAST_TMP_COPY_FAIL_SUBSTR", "mod.py");
-        assert!(!materialize_persisted_envs(&fx.ws, &fx.cfg, &fx.ns));
-        assert!(
-            !fx.ns.envs_dir().join("default").exists(),
-            "partial dest must be deleted so the frozen install starts clean"
-        );
-
-        guard.remove("RETREAD_FAST_TMP_COPY_FAIL_SUBSTR");
-        assert!(materialize_persisted_envs(&fx.ws, &fx.cfg, &fx.ns));
-        fs::remove_dir_all(fx.root).ok();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn persist_env_swaps_atomically_and_stamps_hash() {
-        let _lock = ENV_MUTEX.lock().unwrap();
-        let guard = EnvGuard::new(&fasttmp_env_keys());
-        let fx = persist_fixture("persist");
-        let local = fx.ns.envs_dir().join("default");
-        write_fixture_env(&local);
-
-        persist_env(&fx.ws, &fx.cfg, &fx.ns, "default").unwrap();
-        let pdir = persist_dir(&fx.cfg, &fx.ws);
-        let snap = pdir.join("default");
-        let hash = current_lock_hash(&fx.ws).unwrap();
-        assert_eq!(
-            fs::read_to_string(snap.join(ENV_HASH_FILE)).unwrap().trim(),
-            hash
-        );
-        assert_eq!(
-            fs::read(snap.join("bin").join("tool")).unwrap(),
-            b"#!/bin/sh\necho hi\n"
-        );
-        assert!(snap.join("bin").join("tool-alias").is_symlink());
-
-        // Re-persist replaces the old snapshot and leaves no tmp/old debris.
-        fs::write(local.join("bin").join("extra"), b"new").unwrap();
-        persist_env(&fx.ws, &fx.cfg, &fx.ns, "default").unwrap();
-        assert_eq!(fs::read(snap.join("bin").join("extra")).unwrap(), b"new");
-        let leftovers: Vec<String> = fs::read_dir(&pdir)
-            .unwrap()
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().to_string())
-            .filter(|n| n.starts_with(".tmp-") || n.starts_with(".old-"))
-            .collect();
-        assert!(
-            leftovers.is_empty(),
-            "swap debris left behind: {leftovers:?}"
-        );
-
-        // Failed persist removes the tmp dir and keeps the old snapshot.
-        guard.set("RETREAD_FAST_TMP_COPY_FAIL_SUBSTR", "mod.py");
-        assert!(persist_env(&fx.ws, &fx.cfg, &fx.ns, "default").is_err());
-        assert!(snap.join("bin").join("extra").exists());
-        let tmp_left = fs::read_dir(&pdir)
-            .unwrap()
-            .flatten()
-            .any(|e| e.file_name().to_string_lossy().starts_with(".tmp-"));
-        assert!(!tmp_left, "failed persist must remove its tmp dir");
-
-        assert!(persist_env(&fx.ws, &fx.cfg, &fx.ns, "../evil").is_err());
-        fs::remove_dir_all(fx.root).ok();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn persist_all_envs_persists_every_env_dir() {
-        let _lock = ENV_MUTEX.lock().unwrap();
-        let _guard = EnvGuard::new(&fasttmp_env_keys());
-        let fx = persist_fixture("persistall");
-
-        // Nothing job-local yet -> error, not a silent no-op.
-        assert!(persist_all_envs(&fx.ws, &fx.cfg, &fx.ns).is_err());
-
-        write_fixture_env(&fx.ns.envs_dir().join("default"));
-        write_fixture_env(&fx.ns.envs_dir().join("gpu"));
-        // Skipped: non-directory and dotted entries in the envs root.
-        fs::write(fx.ns.envs_dir().join("stray-file"), b"not an env").unwrap();
-        fs::create_dir_all(fx.ns.envs_dir().join(".hidden")).unwrap();
-
-        persist_all_envs(&fx.ws, &fx.cfg, &fx.ns).unwrap();
-
-        let pdir = persist_dir(&fx.cfg, &fx.ws);
-        let hash = current_lock_hash(&fx.ws).unwrap();
-        for env in ["default", "gpu"] {
-            let snap = pdir.join(env);
-            assert_eq!(
-                fs::read_to_string(snap.join(ENV_HASH_FILE)).unwrap().trim(),
-                hash,
-                "per-env hash stamp missing for {env}"
-            );
-            assert_eq!(
-                fs::read(snap.join("bin").join("tool")).unwrap(),
-                b"#!/bin/sh\necho hi\n"
-            );
-        }
-        assert!(!pdir.join("stray-file").exists());
-        assert!(!pdir.join(".hidden").exists());
-        fs::remove_dir_all(fx.root).ok();
-    }
-
-    #[test]
-    fn copy_workers_config_and_default() {
-        let _lock = ENV_MUTEX.lock().unwrap();
-        let guard = EnvGuard::new(&fasttmp_env_keys());
-        let ws = tmp_dir("workers");
-        fs::write(
-            ws.join("pixi.toml"),
-            r#"
-[workspace]
-channels = []
-
-[tool.retread.fast-tmp]
-persist-dir = "/nfs/persist"
-copy-workers = 12
-"#,
-        )
-        .unwrap();
-        let cfg = FastTmpConfig::load(&ws);
-        assert_eq!(cfg.persist_dir, Some(PathBuf::from("/nfs/persist")));
-        assert_eq!(cfg.copy_workers, Some(12));
-        assert_eq!(effective_copy_workers(&cfg), 12);
-        assert_eq!(persist_dir(&cfg, &ws), PathBuf::from("/nfs/persist"));
-
-        guard.set("RETREAD_FAST_TMP_COPY_WORKERS", "3");
-        guard.set("RETREAD_FAST_TMP_PERSIST_DIR", "rel/persist");
-        let cfg = FastTmpConfig::load(&ws);
-        assert_eq!(cfg.copy_workers, Some(3));
-        assert_eq!(persist_dir(&cfg, &ws), ws.join("rel/persist"));
-
-        let default_cfg = FastTmpConfig::default();
-        let n = effective_copy_workers(&default_cfg);
-        assert!((1..=MAX_COPY_WORKERS).contains(&n));
-        assert_eq!(
-            persist_dir(&default_cfg, &ws),
-            ws.join(".pixi/envs-persist")
-        );
-
-        // Allocation-aware default: SLURM_CPUS_ON_NODE beats ncpu...
-        guard.remove("RETREAD_FAST_TMP_COPY_WORKERS");
-        guard.set("SLURM_CPUS_ON_NODE", "3");
-        assert_eq!(effective_copy_workers(&default_cfg), 12);
-        // ...but never beats an explicit copy-workers override, and junk
-        // values fall back to the ncpu formula.
-        let pinned = FastTmpConfig {
-            copy_workers: Some(2),
-            ..FastTmpConfig::default()
-        };
-        assert_eq!(effective_copy_workers(&pinned), 2);
-        guard.set("SLURM_CPUS_ON_NODE", "banana");
-        let n = effective_copy_workers(&default_cfg);
-        assert!((1..=MAX_COPY_WORKERS).contains(&n));
-        guard.remove("SLURM_CPUS_ON_NODE");
-        fs::remove_dir_all(ws).ok();
-    }
-
-    #[test]
-    fn cgroup_v2_cpu_quota_parses_quota_and_max() {
-        let dir = tmp_dir("cgroup");
-        let f = dir.join("cpu.max");
-        // 2.5 cpus rounds up to 3.
-        fs::write(&f, "250000 100000\n").unwrap();
-        assert_eq!(cgroup_v2_cpu_quota(&f), Some(3));
-        fs::write(&f, "100000 100000\n").unwrap();
-        assert_eq!(cgroup_v2_cpu_quota(&f), Some(1));
-        // Unconstrained and malformed both mean "no signal".
-        fs::write(&f, "max 100000\n").unwrap();
-        assert_eq!(cgroup_v2_cpu_quota(&f), None);
-        fs::write(&f, "garbage\n").unwrap();
-        assert_eq!(cgroup_v2_cpu_quota(&f), None);
-        assert_eq!(cgroup_v2_cpu_quota(&dir.join("absent")), None);
-        fs::remove_dir_all(dir).ok();
     }
 }

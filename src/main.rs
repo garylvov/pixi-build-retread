@@ -172,6 +172,11 @@ fn run_fast(args: &[String]) -> anyhow::Result<()> {
     if let Some(path) = parsed.preflight_locks {
         return fasttmp::preflight_locks(&path);
     }
+    if parsed.persist.is_some() {
+        anyhow::bail!(
+            "retread fast --persist is disabled: Pixi environments embed their job-local detached prefix and cannot be safely restored into another job root; use the shared package cache plus `pixi install --frozen`"
+        );
+    }
 
     let workspace = match parsed.workspace {
         Some(dir) => fasttmp::find_workspace_root(&dir)?,
@@ -184,6 +189,10 @@ fn run_fast(args: &[String]) -> anyhow::Result<()> {
         if let Some(engaged) = engaged.as_ref() {
             print!("{}", fasttmp::shell_exports(engaged));
         } else {
+            // `--print-env` is commonly sourced. If it inherited a retread
+            // overlay from an older SLURM job, emit cleanup commands so Pixi
+            // is not left pointing at a dead job-local config/cache path.
+            print!("{}", fasttmp::shell_stale_cleanup());
             eprintln!(
                 "retread fast-tmp: disengaged for {} (mode off or filesystem not slow)",
                 workspace.display()
@@ -191,21 +200,9 @@ fn run_fast(args: &[String]) -> anyhow::Result<()> {
         }
         return Ok(());
     }
-    if let Some(env_name) = parsed.persist.as_deref() {
-        let Some(engaged) = engaged.as_ref() else {
-            anyhow::bail!(
-                "retread fast --persist: fast-tmp is disengaged for {} (mode off or filesystem not slow); nothing job-local to persist",
-                workspace.display()
-            );
-        };
-        if env_name == "all" {
-            return fasttmp::persist_all_envs(&workspace, &cfg, &engaged.ns);
-        }
-        return fasttmp::persist_env(&workspace, &cfg, &engaged.ns, env_name);
-    }
     if parsed.cmd.is_empty() {
         anyhow::bail!(
-            "retread fast: expected command after `--` (or use --print-env / --persist / --preflight-locks)"
+            "retread fast: expected command after `--` (or use --print-env / --preflight-locks)"
         );
     }
 
@@ -213,7 +210,6 @@ fn run_fast(args: &[String]) -> anyhow::Result<()> {
         Some(engaged) => {
             fasttmp::check_env_eviction(&workspace, &engaged.ns);
             fasttmp::print_mapping(engaged);
-            fasttmp::run_frozen_install_if_slurm(&workspace, &cfg, &engaged.ns, &engaged.env)?;
             exec_fast_command(&parsed.cmd, Some(&engaged.env), false)
         }
         None => {
@@ -221,7 +217,11 @@ fn run_fast(args: &[String]) -> anyhow::Result<()> {
                 "retread fast-tmp: disengaged for {} (mode off or filesystem not slow)",
                 workspace.display()
             );
-            exec_fast_command(&parsed.cmd, None, fasttmp::inherited_fasttmp_stale())
+            exec_fast_command(
+                &parsed.cmd,
+                None,
+                fasttmp::inherited_fasttmp_cleanup_needed(),
+            )
         }
     }
 }
@@ -251,8 +251,8 @@ fn parse_fast_args(args: &[String]) -> anyhow::Result<FastCli> {
             }
             "--print-env" => out.print_env = true,
             "--persist" => {
-                // Env name is optional: `--persist` with no env (or the
-                // literal `all`) persists every job-local env.
+                // Retain parsing solely to produce a targeted compatibility
+                // error; snapshots are unsafe until Pixi envs are relocatable.
                 match args.get(i + 1) {
                     Some(value) if !value.starts_with('-') => {
                         i += 1;

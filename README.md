@@ -72,16 +72,17 @@ conda-forge, which lags the pinned version and will disagree on `fmt`/
 | verify | `retread verify --lock <lock.json> [--full]` |
 | solve | `retread solve --manifest pixi.toml -e <env>` |
 | fast (env) | `eval "$(pixi-build-retread fast --print-env)"` |
-| fast (persist) | `pixi-build-retread fast --persist <env>` |
 
 ## Fast path
 
 For shared-filesystem machines (SLURM clusters, EC2+EFS) where the project and caches
 sit on slow shared storage: `eval "$(pixi-build-retread fast --print-env)"` reroutes
-caches and env storage to fast machine-local disk. `pixi install` then materializes the
-env by parallel copy from the `envs-persist` snapshot (~1.5 min for 40 GB, lock hash
-match) or a no-resolve frozen rebuild (~3 min); `fast --persist <env>` writes/updates
-the snapshot after env changes. On a local machine with fast disk it auto-disengages.
+caches and env storage to fast machine-local disk (Pixi 0.70 or newer is required).
+`pixi install` then materializes the environment with a no-resolve frozen rebuild
+backed by the shared package cache. Raw
+environment snapshots are intentionally unsupported because Pixi embeds the detached
+prefix in scripts and metadata, making snapshots unsafe to move between job roots. On
+a local machine with fast disk, fast-tmp auto-disengages.
 
 ## Config
 

@@ -1786,6 +1786,7 @@ dependencies = [
  "rattler_virtual_packages",
  "regex",
  "reqwest",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
  "serde_yaml",

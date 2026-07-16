@@ -237,12 +237,20 @@ fn file_url(path: &Path) -> anyhow::Result<String> {
 /// `inputs_hash` and a cache hit is byte-identical to a fresh rewrite, so
 /// relocating it does not warrant an `EMIT_EPOCH` bump.
 pub fn retread_cache_root() -> std::path::PathBuf {
-    if let Some(dir) = crate::fasttmp::backend_env_value("RETREAD_CACHE_DIR") {
-        return std::path::PathBuf::from(dir);
+    match crate::fasttmp::backend_env_override("RETREAD_CACHE_DIR") {
+        crate::fasttmp::BackendEnvOverride::Set(dir) => {
+            return std::path::PathBuf::from(dir);
+        }
+        crate::fasttmp::BackendEnvOverride::Remove => return default_retread_cache_root(),
+        crate::fasttmp::BackendEnvOverride::Unchanged => {}
     }
     if let Ok(dir) = std::env::var("RETREAD_CACHE_DIR") {
         return std::path::PathBuf::from(dir);
     }
+    default_retread_cache_root()
+}
+
+fn default_retread_cache_root() -> std::path::PathBuf {
     let base = std::env::var("XDG_CACHE_HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| {
