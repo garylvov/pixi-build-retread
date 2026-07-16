@@ -5425,6 +5425,10 @@ struct DiscoveredEmission {
     /// time and the env list documents provenance in debug output.
     #[allow(dead_code)]
     channels: Vec<ChannelUrl>,
+    /// Legacy constraints derived from a provisional workspace solve. They are
+    /// useful only as discovery evidence: they are not user-authored
+    /// `retread-overrides` and must never replace wheel metadata constraints.
+    #[allow(dead_code)]
     transitive_overrides: BTreeMap<String, String>,
     #[allow(dead_code)]
     envs: Vec<String>,
@@ -5770,10 +5774,14 @@ pub(crate) fn bundle_group_for(
         .unwrap_or_else(|| entry_name.to_string())
 }
 
-/// Apply a `DiscoveredEmission` to a materialized bundle + base
-/// config. Renames the bundle to the discovered output name and
-/// injects the env-union transitive constraints into the config's
-/// overrides. The cascade then treats them as authoritative.
+/// Apply a `DiscoveredEmission` to a materialized bundle + base config.
+///
+/// The emission selects only the output identity. Workspace constraints in
+/// `transitive_overrides` come from a provisional discovery solve, not explicit
+/// override authority. Precise workspace facts already enter the typed route
+/// and constraint pipeline during materialization; promoting the older
+/// snapshot into `RetreadConfig::overrides` here would replace upstream wheel
+/// requirements after routing has completed.
 fn apply_emission(
     base_bundle: &Bundle,
     base_config: &RetreadConfig,
@@ -5789,16 +5797,7 @@ fn apply_emission(
         .probe_decisions
         .retain(|decision| decision.stage == "auto_route_joint_solve");
 
-    let mut config = base_config.clone();
-    for (dep, spec) in &emission.transitive_overrides {
-        // User's manual [retread-overrides] wins over workspace
-        // transitive; preserve their entry if present.
-        config
-            .overrides
-            .entry(dep.clone())
-            .or_insert_with(|| spec.clone());
-    }
-    (bundle, config)
+    (bundle, base_config.clone())
 }
 
 /// Fetch one PyPI-form BFS item from its complete ordered index chain.

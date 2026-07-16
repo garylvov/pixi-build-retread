@@ -372,6 +372,78 @@ fn join_transitive_result_parses_as_version_spec() {
     );
 }
 
+#[test]
+fn emission_workspace_snapshot_cannot_override_wheel_metadata() {
+    // Regression: discovery independently solved the consuming workspace and
+    // happened to select aiohttp 3.14, whose transitive constraint is
+    // aiohappyeyeballs>=2.5. Applying that provisional selection as a
+    // `retread-overrides` entry replaced BOTH authoritative requirements from
+    // the routed Isaac Sim closure (==2.4.4 and >=2.3.0), after route planning
+    // had already selected the compatible conda package 2.4.4.
+    let mut bundle = solo_bundle("isaacsim-kernel-pack", vec!["aiohappyeyeballs==2.4.4"]);
+    bundle.extras.push(rw(
+        "aiohttp",
+        meta("aiohttp", "3.11.11", vec!["aiohappyeyeballs>=2.3.0"], true),
+    ));
+    bundle.auto_routed.push(bundle_auto_route(
+        "aiohappyeyeballs",
+        "2.4.4",
+        Provenance::PriorSelection,
+    ));
+
+    let mut base_config = cfg();
+    base_config
+        .overrides
+        .insert("manual-intent".to_string(), "==1.2.3".to_string());
+    let emission = DiscoveredEmission {
+        output_name: "isaaclab-2-3x-pack".to_string(),
+        channels: Vec::new(),
+        transitive_overrides: BTreeMap::from([
+            (
+                "aiohappyeyeballs".to_string(),
+                ">=2.5.0".to_string(),
+            ),
+            ("unrelated-derived".to_string(), ">=9".to_string()),
+        ]),
+        envs: vec!["uwlab-gpu".to_string()],
+    };
+
+    let (bundle, effective) = apply_emission(&bundle, &base_config, &emission);
+    assert_eq!(bundle.conda_name, "isaaclab-2-3x-pack");
+    assert_eq!(
+        effective.overrides,
+        base_config.overrides,
+        "explicit overrides must retain their authority, and no provisional \
+         workspace selection may be promoted"
+    );
+
+    let output = produce_output(
+        &bundle,
+        &effective,
+        Platform::Linux64,
+        "3.11",
+        &[],
+        None,
+        None,
+    )
+    .expect("the real Isaac Sim requirements intersect at aiohappyeyeballs 2.4.4");
+    let deps: Vec<(String, String)> = output
+        .run_dependencies
+        .depends
+        .iter()
+        .map(|dep| (dep.name.clone(), format_packagespec(&dep.spec)))
+        .collect();
+    let aiohappy = deps
+        .iter()
+        .find(|(name, _)| name == "aiohappyeyeballs")
+        .map(|(_, spec)| spec.as_str());
+    assert_eq!(
+        aiohappy,
+        Some(">=2.4.4,<3"),
+        "the relaxed but 2.4-compatible wheel intersection must survive emission: {deps:?}"
+    );
+}
+
 // -------------------------------------------------------------
 // v0.37.0: pythons_for bare-major rejection (D2).
 // -------------------------------------------------------------
