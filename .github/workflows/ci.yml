@@ -1,4 +1,4 @@
-name: linux-x86_64
+name: linux-native
 
 # Build + fast test suite, a non-blocking fmt/clippy lint job, the musl
 # static-link guard, and the EMIT_EPOCH guard. Heavy live/e2e tests
@@ -19,20 +19,33 @@ concurrency:
 
 jobs:
   build-test:
-    name: build + test
-    runs-on: ubuntu-24.04
+    name: build + test (${{ matrix.target_platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target_platform: linux-64
+            runner: ubuntu-24.04
+            runner_arch: x86_64
+          - target_platform: linux-aarch64
+            runner: ubuntu-24.04-arm
+            runner_arch: aarch64
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Assert native runner architecture
+        run: test "$(uname -m)" = "${{ matrix.runner_arch }}"
 
       # edition 2024 needs Rust >= 1.85; pinned exact version below (kept in
       # sync with rust-toolchain.toml) so CI and local fmt/clippy never drift.
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.97.0
+        uses: dtolnay/rust-toolchain@1a3a6d54512beeaffd394f8d516ca16f2c506a20 # 1.97.0
 
       # Cache the cargo registry, git deps (pixi/uv/pubgrub), and the build
       # so build+test don't recompile ~200 crates from scratch every run.
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       - name: Build
         run: cargo build --locked --all-targets
@@ -72,12 +85,12 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.97.0
+        uses: dtolnay/rust-toolchain@1a3a6d54512beeaffd394f8d516ca16f2c506a20 # 1.97.0
         with:
           components: rustfmt, clippy
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
@@ -86,37 +99,64 @@ jobs:
         if: always()
         run: cargo clippy --all-targets -- -D warnings
 
-  # The release artifact is a statically linked musl binary (v1.2.0+), so
-  # it runs on any x86_64 Linux regardless of glibc version. This job
+  # The release artifacts are statically linked musl binaries (v1.2.0+), so
+  # they run on supported Linux systems regardless of glibc version. This job
   # mirrors the recipe's build flags and fails if dynamic linking or
   # glibc symbol references ever sneak back in.
   musl-static:
-    name: static musl build
-    runs-on: ubuntu-24.04
+    name: static musl build (${{ matrix.target_platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target_platform: linux-64
+            runner: ubuntu-24.04
+            runner_arch: x86_64
+            rust_target: x86_64-unknown-linux-musl
+            elf_machine: 'Advanced Micro Devices X86-64|X86-64'
+          - target_platform: linux-aarch64
+            runner: ubuntu-24.04-arm
+            runner_arch: aarch64
+            rust_target: aarch64-unknown-linux-musl
+            elf_machine: AArch64
+    runs-on: ${{ matrix.runner }}
+    env:
+      RUST_TARGET: ${{ matrix.rust_target }}
+      ELF_MACHINE: ${{ matrix.elf_machine }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
+      - name: Assert native runner architecture
+        run: test "$(uname -m)" = "${{ matrix.runner_arch }}"
+
       - name: Install Rust toolchain (musl target)
-        uses: dtolnay/rust-toolchain@1.97.0
+        uses: dtolnay/rust-toolchain@1a3a6d54512beeaffd394f8d516ca16f2c506a20 # 1.97.0
         with:
-          targets: x86_64-unknown-linux-musl
+          targets: ${{ matrix.rust_target }}
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       # _FORTIFY_SOURCE emits glibc-only __memcpy_chk-style symbols in the
       # C objects (ring, zstd-sys) that musl lacks; disable it, same as
       # recipe/recipe.yaml.
       - name: Build statically linked binary
-        env:
-          CC_x86_64_unknown_linux_musl: gcc
-          CFLAGS_x86_64_unknown_linux_musl: -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0
-        run: cargo build --release --locked --target x86_64-unknown-linux-musl
-
-      - name: Assert fully static (no dynamic linker, no glibc refs)
+        shell: bash
         run: |
-          BIN=target/x86_64-unknown-linux-musl/release/pixi-build-retread
-          ldd "$BIN" 2>&1 | grep -Eq 'statically linked|not a dynamic executable'
+          set -euo pipefail
+          target_env="${RUST_TARGET//-/_}"
+          export "CC_${target_env}=gcc"
+          export "CFLAGS_${target_env}=-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0"
+          cargo build --release --locked --target "$RUST_TARGET"
+
+      - name: Assert target architecture and fully static linkage
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="target/$RUST_TARGET/release/pixi-build-retread"
+          readelf -h "$BIN" | grep -Eq "Machine:.*($ELF_MACHINE)"
+          ldd_output="$(ldd "$BIN" 2>&1 || true)"
+          grep -Eq 'statically linked|not a dynamic executable' <<<"$ldd_output"
           if readelf -d "$BIN" | grep -qi needed; then
             echo "ERROR: binary has dynamic dependencies" >&2; exit 1
           fi

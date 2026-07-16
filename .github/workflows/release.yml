@@ -1,74 +1,194 @@
 name: release
 
-# On a version tag (v*): build the retread conda package from recipe/ with
-# rattler-build and publish it to prefix.dev.
-#
-# Publishing requires the repository secret PREFIX_API_KEY (a prefix.dev API
-# key; rattler-build reads it from the PREFIX_API_KEY env var). If the secret
-# is not set, the build still runs and the package is uploaded as a workflow
-# artifact, but the publish step is skipped with a notice instead of failing.
+# Tag pushes build both native Linux architectures, retain each package as a
+# workflow artifact, and publish only after the entire matrix succeeds. Manual
+# dispatches are build-only by design, even when a tag is selected as the ref.
 
 on:
   push:
     tags: ['v*']
-  # Manual runs (builds whatever ref is selected, default branch by default).
   workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  # A build-only manual dispatch must never displace the pending tag-push run
+  # that is authorized to publish the same ref.
+  group: release-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RATTLER_BUILD_VERSION: '0.69.0'
+
 jobs:
-  build-publish:
-    name: rattler-build + publish to prefix.dev
+  validate-release:
+    name: validate release versions
     runs-on: ubuntu-24.04
-    env:
-      # https://prefix.dev/channels/garylvov/packages/pixi-build-retread
-      PREFIX_CHANNEL: garylvov
-      HAS_PREFIX_API_KEY: ${{ secrets.PREFIX_API_KEY != '' }}
-      RATTLER_BUILD_VERSION: '0.69.0'
-      RATTLER_BUILD_SHA256: 55ace96f0515f43273fec18307fbcb8c03ed8d6d90039494c65a39f7f0591d4a
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
-      # Pin both the release and its published digest. The statically linked
-      # musl binary runs on any x86_64 Linux runner.
-      - name: Install verified rattler-build
+      - name: Check Cargo, recipe, and tag versions
+        shell: bash
         run: |
           set -euo pipefail
-          asset=rattler-build-x86_64-unknown-linux-musl
-          url="https://github.com/prefix-dev/rattler-build/releases/download/v${RATTLER_BUILD_VERSION}/${asset}"
+          args=()
+          if [[ "$GITHUB_EVENT_NAME" == push ]]; then
+            args+=(--tag "$GITHUB_REF_NAME")
+          fi
+          python3 .github/scripts/check_release_version.py "${args[@]}"
+
+  build:
+    name: build (${{ matrix.target_platform }})
+    needs: validate-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target_platform: linux-64
+            runner: ubuntu-24.04
+            runner_arch: x86_64
+            rattler_asset: rattler-build-x86_64-unknown-linux-musl
+            rattler_sha256: 55ace96f0515f43273fec18307fbcb8c03ed8d6d90039494c65a39f7f0591d4a
+          - target_platform: linux-aarch64
+            runner: ubuntu-24.04-arm
+            runner_arch: aarch64
+            rattler_asset: rattler-build-aarch64-unknown-linux-musl
+            rattler_sha256: a90d0dbb3bf139b9ee0dca6e147929829514e6b71383c873a02e8a60221d3eda
+    runs-on: ${{ matrix.runner }}
+    env:
+      TARGET_PLATFORM: ${{ matrix.target_platform }}
+      RUNNER_ARCH: ${{ matrix.runner_arch }}
+      RATTLER_BUILD_ASSET: ${{ matrix.rattler_asset }}
+      RATTLER_BUILD_SHA256: ${{ matrix.rattler_sha256 }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Assert native runner architecture
+        shell: bash
+        run: test "$(uname -m)" = "$RUNNER_ARCH"
+
+      # A tag can point at any commit and can race the branch CI run. Keep the
+      # native correctness gate in this workflow so publishing is tied to the
+      # exact source SHA that produced both packages.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1a3a6d54512beeaffd394f8d516ca16f2c506a20 # 1.97.0
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Build native targets
+        run: cargo build --locked --all-targets
+
+      - name: Test native targets (fast suite)
+        run: >
+          cargo test --locked --all-targets --
+          --skip materialize_index_wheel_fetches_locked_url_and_verifies_hash
+          --skip initialize_preflight_repairs_dangling_pixi_bld_symlink_target
+          --skip incremental_add
+
+      - name: Test incremental_add (serial)
+        run: cargo test --locked --lib incremental_add -- --test-threads=1
+
+      # Pin both the release and its digest. The digests are published with
+      # v0.69.0 at https://github.com/prefix-dev/rattler-build/releases/tag/v0.69.0.
+      - name: Install verified rattler-build
+        shell: bash
+        run: |
+          set -euo pipefail
+          url="https://github.com/prefix-dev/rattler-build/releases/download/v${RATTLER_BUILD_VERSION}/${RATTLER_BUILD_ASSET}"
           curl --fail --location --silent --show-error --output rattler-build "$url"
           printf '%s  %s\n' "$RATTLER_BUILD_SHA256" rattler-build | sha256sum --check --strict
           sudo install -m 0755 rattler-build /usr/local/bin/rattler-build
           test "$(rattler-build --version)" = "rattler-build ${RATTLER_BUILD_VERSION}"
 
-      # recipe/recipe.yaml bootstraps its own rust toolchain via rustup inside
-      # the build sandbox (see comments there); recipe/variants.yaml sits next
-      # to it and is picked up automatically.
       - name: Build conda package
-        run: rattler-build build --recipe recipe/recipe.yaml --output-dir output
+        shell: bash
+        run: |
+          set -euo pipefail
+          rattler-build build \
+            --recipe recipe/recipe.yaml \
+            --target-platform "$TARGET_PLATFORM" \
+            --output-dir output
 
-      # Keep the package around even when publishing is skipped or fails.
-      - name: Upload package as workflow artifact
+      - name: Stage exactly one platform package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t packages < <(find "output/$TARGET_PLATFORM" -maxdepth 1 -type f -name '*.conda' -print)
+          if (( ${#packages[@]} != 1 )); then
+            printf 'expected exactly one %s package, found %d\n' "$TARGET_PLATFORM" "${#packages[@]}" >&2
+            exit 1
+          fi
+          mkdir -p "artifact/$TARGET_PLATFORM"
+          cp -- "${packages[0]}" "artifact/$TARGET_PLATFORM/"
+
+      - name: Upload package artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: conda-package
-          path: output/**/*.conda
+          name: conda-package-${{ matrix.target_platform }}
+          path: artifact
           if-no-files-found: error
 
-      - name: Publish to prefix.dev
+  publish:
+    name: publish complete architecture set
+    needs: [validate-release, build]
+    # A workflow_dispatch run is always build-only and can never publish.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    env:
+      PREFIX_CHANNEL: garylvov
+      HAS_PREFIX_API_KEY: ${{ secrets.PREFIX_API_KEY != '' }}
+      RATTLER_BUILD_ASSET: rattler-build-x86_64-unknown-linux-musl
+      RATTLER_BUILD_SHA256: 55ace96f0515f43273fec18307fbcb8c03ed8d6d90039494c65a39f7f0591d4a
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Download all platform packages
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: conda-package-*
+          path: packages
+          merge-multiple: true
+
+      - name: Verify complete architecture set
+        shell: bash
+        run: |
+          set -euo pipefail
+          for platform in linux-64 linux-aarch64; do
+            mapfile -t found < <(find "packages/$platform" -maxdepth 1 -type f -name '*.conda' -print)
+            if (( ${#found[@]} != 1 )); then
+              printf 'expected exactly one %s package, found %d\n' "$platform" "${#found[@]}" >&2
+              exit 1
+            fi
+          done
+
+      - name: Install verified rattler-build
+        if: env.HAS_PREFIX_API_KEY == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          url="https://github.com/prefix-dev/rattler-build/releases/download/v${RATTLER_BUILD_VERSION}/${RATTLER_BUILD_ASSET}"
+          curl --fail --location --silent --show-error --output rattler-build "$url"
+          printf '%s  %s\n' "$RATTLER_BUILD_SHA256" rattler-build | sha256sum --check --strict
+          sudo install -m 0755 rattler-build /usr/local/bin/rattler-build
+          test "$(rattler-build --version)" = "rattler-build ${RATTLER_BUILD_VERSION}"
+
+      - name: Publish both packages to prefix.dev
         if: env.HAS_PREFIX_API_KEY == 'true'
         env:
           PREFIX_API_KEY: ${{ secrets.PREFIX_API_KEY }}
+        shell: bash
         run: |
           set -euo pipefail
-          shopt -s globstar nullglob
-          packages=(output/**/*.conda)
-          test "${#packages[@]}" -eq 1
+          mapfile -t packages < <(find packages -mindepth 2 -maxdepth 2 -type f -name '*.conda' -print | sort)
+          test "${#packages[@]}" -eq 2
+          # Prefix uploads a multi-file argument list sequentially rather than
+          # transactionally. Make retries idempotent so a transient failure on
+          # the second architecture can resume past an already-published first.
           rattler-build upload prefix --skip-existing --channel "$PREFIX_CHANNEL" "${packages[@]}"
 
       - name: Publish skipped (no PREFIX_API_KEY secret)
         if: env.HAS_PREFIX_API_KEY != 'true'
         run: |
-          echo "::warning::PREFIX_API_KEY secret is not set; skipping publish to prefix.dev." \
-               "The built package is available as the 'conda-package' workflow artifact."
+          echo "::warning::PREFIX_API_KEY is not set; both packages remain available as workflow artifacts."

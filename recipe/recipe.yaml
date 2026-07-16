@@ -13,12 +13,17 @@ source:
 
 build:
   number: 0
+  # retread is currently released for the two native Linux platforms below.
+  # Keep unsupported targets from silently receiving a package containing a
+  # binary for the build machine.
+  skip:
+    - not (target_platform == "linux-64" or target_platform == "linux-aarch64")
   script:
     # v1.2.0+: statically linked against musl so the binary runs on any
-    # x86_64 Linux regardless of glibc version. The conda-forge rust
-    # toolchain only ships the glibc std (rust-std-x86_64-unknown-linux-gnu)
-    # and links against the BUILD HOST's glibc, which produced binaries
-    # requiring GLIBC_2.39 that failed on Ubuntu 22.04 (glibc 2.35).
+    # supported Linux system regardless of glibc version. The conda-forge
+    # rust toolchain only ships the glibc std and links against the BUILD
+    # HOST's glibc, which produced binaries requiring GLIBC_2.39 that failed
+    # on Ubuntu 22.04 (glibc 2.35).
     # conda-forge has no rust-std for *-musl, so we bootstrap the musl
     # target via rustup at build time. Networking inside the sandbox is
     # already a given: git deps (pixi_build_types, uv-pep508,
@@ -28,24 +33,30 @@ build:
     # toolchain lands); the cargo build then fails with E0463 "can't find
     # crate for `std`" for *-musl. Keep rustup/cargo state under $SRC_DIR
     # via RUSTUP_HOME/CARGO_HOME, but let HOME be the real one.
+    - if: target_platform == "linux-64"
+      then: export RETREAD_RUST_TARGET=x86_64-unknown-linux-musl
+    - if: target_platform == "linux-aarch64"
+      then: export RETREAD_RUST_TARGET=aarch64-unknown-linux-musl
+    - test -n "$RETREAD_RUST_TARGET"
     - 'export HOME=$(getent passwd "$(id -u)" | cut -d: -f6)'
     - export RUSTUP_HOME=$SRC_DIR/.rustup CARGO_HOME=$SRC_DIR/.cargo
     - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o rustup-init.sh
-    - sh rustup-init.sh -y --profile minimal --default-toolchain stable
-      --target x86_64-unknown-linux-musl --no-modify-path
+    - sh rustup-init.sh -y --profile minimal --default-toolchain 1.97.0
+      --target "$RETREAD_RUST_TARGET" --no-modify-path
     - export PATH=$CARGO_HOME/bin:$PATH
     # Belt and braces: idempotent explicit target add, then a loud check so
     # a missing musl std fails here instead of deep inside the cargo build.
-    - rustup target add x86_64-unknown-linux-musl
-    - rustup target list --installed | grep -q '^x86_64-unknown-linux-musl$'
+    - rustup target add "$RETREAD_RUST_TARGET"
+    - rustup target list --installed | grep -qx "$RETREAD_RUST_TARGET"
     # ring + zstd-sys compile C; point the cc crate at the conda gcc.
     # The objects only reference unversioned libc symbols, so linking
     # them against musl's static libc.a (rust's self-contained mode,
     # the default for *-musl) is sound -- EXCEPT _FORTIFY_SOURCE, which
     # gcc/conda CFLAGS enable by default and which emits glibc-only
     # __memcpy_chk-style symbols musl lacks. Disable it for these objects.
-    - export CC_x86_64_unknown_linux_musl=$CC
-    - export CFLAGS_x86_64_unknown_linux_musl="-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0"
+    - export RETREAD_RUST_TARGET_ENV=$(printf '%s' "$RETREAD_RUST_TARGET" | tr '-' '_')
+    - export "CC_${RETREAD_RUST_TARGET_ENV}=$CC"
+    - export "CFLAGS_${RETREAD_RUST_TARGET_ENV}=-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0"
     # The conda gcc drives the link and resolves `-ldl` (emitted by the
     # libloading crate) to the conda sysroot's glibc 2.17 libdl.a, whose
     # __dlclose-style internals don't exist under musl. Modern glibc ships
@@ -59,9 +70,17 @@ build:
     # `cargo install` rather than `cargo build` + cp, to avoid a second
     # hardcoded triple in a `cp` path.
     - cargo install --locked --no-track --bin pixi-build-retread --path .
-      --target x86_64-unknown-linux-musl --root $PREFIX
+      --target "$RETREAD_RUST_TARGET" --root $PREFIX
     # Fail the build loudly if dynamic linking ever sneaks back in.
-    - ldd $PREFIX/bin/pixi-build-retread 2>&1 | grep -Eq 'statically linked|not a dynamic executable'
+    - RETREAD_LDD_OUTPUT=$(ldd $PREFIX/bin/pixi-build-retread 2>&1 || true)
+    - printf '%s\n' "$RETREAD_LDD_OUTPUT" | grep -Eq 'statically linked|not a dynamic executable'
+    - if readelf -d $PREFIX/bin/pixi-build-retread | grep -qi needed; then
+        echo 'ERROR binary has dynamic dependencies' >&2; exit 1; fi
+    # A native ARM build must never package an x86 executable (or vice versa).
+    - if: target_platform == "linux-64"
+      then: readelf -h $PREFIX/bin/pixi-build-retread | grep -Eq 'Machine:.*(Advanced Micro Devices X86-64|X86-64)'
+    - if: target_platform == "linux-aarch64"
+      then: readelf -h $PREFIX/bin/pixi-build-retread | grep -Eq 'Machine:.*AArch64'
 
 requirements:
   build:
