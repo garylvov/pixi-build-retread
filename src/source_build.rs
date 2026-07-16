@@ -86,6 +86,18 @@ struct CanonicalGitSourceMarker {
     ref_state: String,
 }
 
+#[derive(Debug, Clone)]
+struct CanonicalGitTagRef {
+    name: Vec<u8>,
+    object_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct CanonicalGitTagState {
+    identity: String,
+    refs: Vec<CanonicalGitTagRef>,
+}
+
 #[cfg(unix)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -3605,7 +3617,7 @@ pub(crate) async fn ensure_git_checkout(
     })
 }
 
-async fn canonical_git_ref_state(repo: &Path) -> Result<String> {
+async fn canonical_git_tag_state(repo: &Path) -> Result<CanonicalGitTagState> {
     let refs = run_output_bytes(
         Command::new("git")
             .args([
@@ -3619,7 +3631,73 @@ async fn canonical_git_ref_state(repo: &Path) -> Result<String> {
         "git canonical tag-state query",
     )
     .await?;
-    Ok(hash_fields(b"retread-git-tag-state-v1\0", &[&refs]))
+    let mut parsed = Vec::new();
+    for record in refs
+        .split(|byte| *byte == b'\n')
+        .filter(|record| !record.is_empty())
+    {
+        let mut fields = record.split(|byte| *byte == 0);
+        let name = fields
+            .next()
+            .ok_or_else(|| anyhow!("canonical Git tag record has no ref name"))?;
+        let object_id = fields
+            .next()
+            .ok_or_else(|| anyhow!("canonical Git tag record has no object ID"))?;
+        let peeled_id = fields
+            .next()
+            .ok_or_else(|| anyhow!("canonical Git tag record has no peeled object field"))?;
+        if fields.next().is_some() || !name.starts_with(b"refs/tags/") {
+            bail!("git returned a malformed canonical tag record");
+        }
+        let parse_object_id = |value: &[u8], label: &str| -> Result<String> {
+            let value = std::str::from_utf8(value)
+                .with_context(|| format!("canonical Git {label} is not ASCII"))?;
+            if !matches!(value.len(), 40 | 64)
+                || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                bail!("canonical Git {label} is not an exact object ID: {value}");
+            }
+            Ok(value.to_ascii_lowercase())
+        };
+        let object_id = parse_object_id(object_id, "tag object ID")?;
+        if !peeled_id.is_empty() {
+            parse_object_id(peeled_id, "peeled tag object ID")?;
+        }
+        parsed.push(CanonicalGitTagRef {
+            name: name.to_vec(),
+            object_id,
+        });
+    }
+    Ok(CanonicalGitTagState {
+        identity: hash_fields(b"retread-git-tag-state-v1\0", &[&refs]),
+        refs: parsed,
+    })
+}
+
+async fn canonical_git_ref_state(repo: &Path) -> Result<String> {
+    Ok(canonical_git_tag_state(repo).await?.identity)
+}
+
+async fn recreate_canonical_git_tags(repo: &Path, tags: &[CanonicalGitTagRef]) -> Result<()> {
+    if tags.is_empty() {
+        return Ok(());
+    }
+    let mut commands = Vec::new();
+    for tag in tags {
+        commands.extend_from_slice(b"create ");
+        commands.extend_from_slice(&tag.name);
+        commands.push(0);
+        commands.extend_from_slice(tag.object_id.as_bytes());
+        commands.push(0);
+    }
+    run_silent_with_input(
+        Command::new("git")
+            .args(["update-ref", "--stdin", "-z"])
+            .current_dir(repo),
+        "git recreate canonical tags",
+        &commands,
+    )
+    .await
 }
 
 async fn git_checkout_has_promisor_remote(repo: &Path) -> Result<bool> {
@@ -3978,6 +4056,18 @@ async fn ensure_canonical_git_snapshot(
         "preparing shared canonical Git source",
     );
     let promisor_checkout = git_checkout_has_promisor_remote(shared_checkout).await?;
+    let shared_tags = if promisor_checkout {
+        let tags = canonical_git_tag_state(shared_checkout).await?;
+        if tags.identity != ref_state {
+            bail!(
+                "shared Git checkout tag/ref state changed before canonicalization: expected {ref_state}, found {}",
+                tags.identity,
+            );
+        }
+        Some(tags)
+    } else {
+        None
+    };
     let mut clone = Command::new("git");
     clone.arg("clone");
     if promisor_checkout {
@@ -3985,7 +4075,7 @@ async fn ensure_canonical_git_snapshot(
         // lazy fetches needed to fill missing objects. Re-clone its already
         // bound upstream while retaining blob filtering instead of mutating
         // the published shared checkout.
-        clone.arg("--filter=blob:none");
+        clone.args(["--filter=blob:none", "--no-tags"]);
     }
     clone.args(["--no-local", "--no-checkout", "--"]);
     if promisor_checkout {
@@ -3995,14 +4085,28 @@ async fn ensure_canonical_git_snapshot(
     }
     clone.arg(&repo);
     run_silent(&mut clone, "git clone canonical source").await?;
-    let mut fetch = Command::new("git");
-    fetch
-        .args(["fetch", "--force", "--tags", "origin"])
-        .current_dir(&repo);
-    if promisor_checkout {
-        fetch.arg(resolved_sha);
+    if let Some(shared_tags) = &shared_tags {
+        let mut required_objects = vec![resolved_sha.to_string()];
+        required_objects.extend(shared_tags.refs.iter().map(|tag| tag.object_id.clone()));
+        required_objects.sort();
+        required_objects.dedup();
+        let mut fetch = Command::new("git");
+        fetch
+            .args(["fetch", "--force", "--no-tags", "origin"])
+            .args(&required_objects)
+            .current_dir(&repo);
+        run_silent(&mut fetch, "git fetch canonical objects").await?;
+        delete_canonical_git_refs(&repo, "refs/tags").await?;
+        recreate_canonical_git_tags(&repo, &shared_tags.refs).await?;
+    } else {
+        run_silent(
+            Command::new("git")
+                .args(["fetch", "--force", "--tags", "origin"])
+                .current_dir(&repo),
+            "git fetch canonical tags",
+        )
+        .await?;
     }
-    run_silent(&mut fetch, "git fetch canonical tags").await?;
     run_silent(
         Command::new("git")
             .args(["checkout", "--detach", "--force", resolved_sha])
@@ -4030,6 +4134,12 @@ async fn ensure_canonical_git_snapshot(
     if actual_ref_state != ref_state {
         bail!(
             "canonical Git clone tag/ref state differs from the state bound to its cache identity: expected {ref_state}, found {actual_ref_state}"
+        );
+    }
+    let final_shared_ref_state = canonical_git_ref_state(shared_checkout).await?;
+    if final_shared_ref_state != ref_state {
+        bail!(
+            "shared Git checkout tag/ref state changed during canonicalization: expected {ref_state}, found {final_shared_ref_state}"
         );
     }
     ensure_no_canonical_gitlinks(&repo, resolved_sha).await?;
@@ -5637,6 +5747,17 @@ version = "0.1.0"
         let fixture = git_checkout_fixture("canonical-source");
         let origin = fixture.base.join("repo");
         run_fixture_git(&["tag", "release-one", &fixture.rev2], &origin);
+        run_fixture_git(
+            &[
+                "tag",
+                "--annotate",
+                "--message",
+                "historical release",
+                "history-note",
+                &fixture.rev1,
+            ],
+            &origin,
+        );
         let checkout = ensure_git_checkout(&fixture.url, &fixture.rev2, &fixture.cache)
             .await
             .expect("publish warm checkout");
@@ -5676,12 +5797,17 @@ version = "0.1.0"
             .is_empty()
         );
 
-        // Mutating only the visible tag set must select a different wheel and
-        // canonical-source identity even though URL/SHA/subdirectory are fixed.
-        run_fixture_git(&["tag", "release-two", &fixture.rev2], &origin);
+        // The published checkout's exact tag snapshot remains authoritative
+        // when the live upstream later adds and retargets tags.
+        run_fixture_git(&["tag", "--force", "release-one", &fixture.rev1], &origin);
+        run_fixture_git(&["tag", "upstream-only", &fixture.rev1], &origin);
         run_fixture_git(&["tag", "release-two", &fixture.rev2], warm);
         let second_ref_state = canonical_git_ref_state(warm).await.unwrap();
         assert_ne!(first_ref_state, second_ref_state);
+        assert_ne!(
+            canonical_git_ref_state(&origin).await.unwrap(),
+            second_ref_state,
+        );
         let family = git_wheel_family_identity(&fixture.url, &fixture.rev2, ".");
         assert_ne!(
             git_wheel_source_identity(&family, &first_ref_state),
@@ -5695,6 +5821,31 @@ version = "0.1.0"
         assert_eq!(
             canonical_git_ref_state(&second.root).await.unwrap(),
             second_ref_state
+        );
+        assert_eq!(
+            run_fixture_git(&["rev-parse", "refs/tags/release-one"], &second.root),
+            fixture.rev2,
+        );
+        assert_eq!(
+            run_fixture_git(&["tag", "--list"], &second.root),
+            "history-note\nrelease-one\nrelease-two",
+        );
+        assert_eq!(
+            run_fixture_git(&["cat-file", "-t", "refs/tags/history-note"], &second.root),
+            "tag",
+        );
+        assert_eq!(
+            run_fixture_git(&["rev-parse", "refs/tags/history-note^{}"], &second.root),
+            fixture.rev1,
+        );
+        assert_eq!(
+            run_fixture_git(&["tag", "--list"], warm),
+            "history-note\nrelease-one\nrelease-two",
+            "canonicalization must not import or rewrite shared tags",
+        );
+        assert_eq!(
+            run_fixture_git(&["rev-parse", "refs/tags/release-one"], &origin),
+            fixture.rev1,
         );
 
         // Canonicalization never repairs or cleans the published warm tree.
@@ -5718,6 +5869,10 @@ version = "0.1.0"
         let upstream = fixture.base.join("repo");
         run_fixture_git(&["config", "uploadpack.allowFilter", "true"], &upstream);
         run_fixture_git(&["tag", "promisor-release", &fixture.rev2], &upstream);
+        std::fs::write(upstream.join("future.txt"), "future-only blob\n").unwrap();
+        run_fixture_git(&["add", "future.txt"], &upstream);
+        run_fixture_git(&["commit", "-m", "future revision"], &upstream);
+        let future_blob = run_fixture_git(&["rev-parse", "HEAD:future.txt"], &upstream);
 
         let shared = fixture.base.join("shared-promisor");
         run_fixture_git(
@@ -5734,15 +5889,21 @@ version = "0.1.0"
         run_fixture_git(&["config", "remote.origin.promisor", "true"], &shared);
         let ref_state = canonical_git_ref_state(&shared).await.unwrap();
 
-        // Make the published checkout incapable of serving its bound commit.
-        // Its promisor URL is deliberately unusable so a local upload-pack
-        // cannot repair the missing objects as a side effect of cloning it.
+        // Checkout fetched the blobs for rev2, but not the future revision's
+        // blob. Poison its promisor URL so local upload-pack cannot repair the
+        // deliberately incomplete object store as a side effect of cloning.
         let missing_upstream = format!("file://{}", fixture.base.join("missing").display());
         run_fixture_git(&["config", "remote.origin.url", &missing_upstream], &shared);
-        let object_store = shared.join(".git/objects");
-        std::fs::remove_dir_all(&object_store).unwrap();
-        std::fs::create_dir_all(object_store.join("info")).unwrap();
-        std::fs::create_dir_all(object_store.join("pack")).unwrap();
+        let missing_blob = std::process::Command::new("git")
+            .args(["cat-file", "-e", &future_blob])
+            .current_dir(&shared)
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .output()
+            .expect("probe filtered future blob");
+        assert!(
+            !missing_blob.status.success(),
+            "fixture must retain a missing blob after exact checkout"
+        );
 
         let unusable_clone = fixture.base.join("unusable-local-clone");
         let output = std::process::Command::new("git")
@@ -5757,6 +5918,16 @@ version = "0.1.0"
             "fixture must fail if canonicalization clones the shared object store"
         );
         assert!(git_checkout_has_promisor_remote(&shared).await.unwrap());
+        let pack_dir = shared.join(".git/objects/pack");
+        let pack_files = || {
+            let mut files = std::fs::read_dir(&pack_dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>();
+            files.sort();
+            files
+        };
+        let shared_packs_before = pack_files();
 
         let canonical =
             ensure_canonical_git_snapshot(&shared, &fixture.url, &fixture.rev2, &ref_state)
@@ -5783,11 +5954,9 @@ version = "0.1.0"
             missing_upstream,
             "canonicalization must not rewrite the published checkout"
         );
-        assert!(
-            std::fs::read_dir(object_store.join("pack"))
-                .unwrap()
-                .next()
-                .is_none(),
+        assert_eq!(
+            pack_files(),
+            shared_packs_before,
             "canonicalization must not lazy-fetch into the published checkout"
         );
 
