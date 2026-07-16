@@ -486,7 +486,12 @@ pub const SCHEMA: u32 = 12;
 /// rewrite caches cannot replay across target contracts.
 /// Epoch 17: final joint-route restoration reuses a compatible wheel already
 /// present in the bundle instead of staging a duplicate distribution.
-pub const EMIT_EPOCH: u32 = 17;
+///
+/// Epoch 18: conda/outputs run dependencies are canonically ordered on both
+/// cold and replay paths, and replay omits Pixi's build-time-injected
+/// `python_abi`. This preserves the cold source-package identity instead of
+/// advertising a duplicate ABI dependency from the committed build lock.
+pub const EMIT_EPOCH: u32 = 18;
 
 fn parse_stored_glibc(value: Option<&str>) -> Option<Option<(u32, u32)>> {
     match value {

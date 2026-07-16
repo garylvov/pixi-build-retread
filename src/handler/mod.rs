@@ -7768,7 +7768,8 @@ async fn materialize_and_rewrite(
 /// [`CondaOutput`] by:
 /// 1. Appending sibling cross-links (skipping self).
 /// 2. Appending `uv` when `courier` is true.
-/// 3. Building the subdir/noarch/build/variant metadata.
+/// 3. Canonically ordering run dependencies.
+/// 4. Building the subdir/noarch/build/variant metadata.
 ///
 /// This is the single source of truth for output assembly — both the hot path
 /// (`produce_output` from live bundle data) and the replay path
@@ -7827,6 +7828,20 @@ fn assemble_conda_output(
     // (pixi forwards it as a solved run-dep), so only add if not present.
     if courier && seen_dep_names.insert("uv".to_string()) {
         run_dep_specs.push(spec_from_str("uv")?);
+    }
+
+    // Conda dependency order is semantically irrelevant, but pixi includes
+    // the ordered output metadata in its source-package identity. The courier
+    // lock canonicalizes conda_run_deps, so leaving the cold path in discovery
+    // order made a replay advertise the same set in a different order and
+    // changed pixi.lock. Canonicalize the shared cold/replay output here.
+    if courier {
+        run_dep_specs.sort_by(|a, b| {
+            a.name.cmp(&b.name).then_with(|| {
+                audit_report::format_packagespec(&a.spec)
+                    .cmp(&audit_report::format_packagespec(&b.spec))
+            })
+        });
     }
 
     // Courier is never noarch: it ships the native `retread` installer binary
@@ -11075,10 +11090,17 @@ fn replay_loaded_lock(
         format!("python {python_version}.*")
     };
 
-    // Reconstruct run-dependencies from the lock's conda_run_deps.
+    // Reconstruct run-dependencies from the lock's conda_run_deps. Pixi adds
+    // python_abi after conda/outputs and forwards it to conda/build_v1, so the
+    // committed build lock contains it even though the cold advertised output
+    // did not. Re-advertising it would make pixi inject a second python_abi and
+    // change the source-package identity on replay.
     let mut run_dep_specs: Vec<NamedSpec<PackageSpec>> = vec![spec_from_str(&python_dep)?];
     let mut seen_dep_names: HashSet<String> = HashSet::from(["python".to_string()]);
     for dep in &lock.conda_run_deps {
+        if dep.name == "python_abi" {
+            continue;
+        }
         let spec_str = if dep.spec.is_empty() {
             dep.name.clone()
         } else {
@@ -11163,7 +11185,7 @@ static TEST_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 // -----------------------------------------------------------------
 #[cfg(test)]
 mod replay_tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashSet};
 
     use rattler_conda_types::Platform;
 
@@ -11466,6 +11488,95 @@ mod replay_tests {
         assert!(
             dep_names.contains(&"numpy"),
             "run_deps must include numpy from lock: {dep_names:?}"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn replay_matches_cold_dependency_identity() {
+        let _env_guard = super::TEST_ENV_MUTEX.lock().unwrap();
+        let dir = unique_tmp_dir();
+        let mut lock = make_test_lock("mypack", "1.2.3", "3.11", "abc123", true);
+        // Build-v1 receives Pixi's injected python_abi and the lock
+        // canonicalizes all dependencies. Neither fact may change the
+        // conda/outputs identity when the lock is replayed.
+        lock.conda_run_deps = vec![
+            CondaDep {
+                name: "zlib".into(),
+                spec: ">=1.3".into(),
+            },
+            CondaDep {
+                name: "python_abi".into(),
+                spec: "3.11.* *_cp311".into(),
+            },
+            CondaDep {
+                name: "numpy".into(),
+                spec: ">=1.21".into(),
+            },
+        ];
+        let lock_path = dir.join(RetreadLock::file_name("mypack"));
+        std::fs::write(&lock_path, lock.to_pretty_json().unwrap()).unwrap();
+
+        let output = replay_from_lock(&lock_path, "abc123", true, Platform::Linux64, 0, false, &[])
+            .unwrap()
+            .unwrap();
+        let cold = super::assemble_conda_output(
+            "mypack",
+            "1.2.3",
+            "3.11",
+            true,
+            false,
+            vec![
+                super::spec_from_str("python 3.11.*").unwrap(),
+                super::spec_from_str("zlib >=1.3").unwrap(),
+                super::spec_from_str("numpy >=1.21").unwrap(),
+            ],
+            HashSet::from([
+                "python".to_string(),
+                "zlib".to_string(),
+                "numpy".to_string(),
+            ]),
+            Platform::Linux64,
+            0,
+            Some("abc123"),
+            false,
+            &[],
+        )
+        .unwrap();
+        let replay_deps: Vec<(String, String)> = output
+            .run_dependencies
+            .depends
+            .iter()
+            .map(|dep| {
+                (
+                    dep.name.clone(),
+                    super::audit_report::format_packagespec(&dep.spec),
+                )
+            })
+            .collect();
+        let cold_deps: Vec<(String, String)> = cold
+            .run_dependencies
+            .depends
+            .iter()
+            .map(|dep| {
+                (
+                    dep.name.clone(),
+                    super::audit_report::format_packagespec(&dep.spec),
+                )
+            })
+            .collect();
+        assert_eq!(replay_deps, cold_deps);
+        assert_eq!(output.metadata.build, cold.metadata.build);
+        let dep_names: Vec<&str> = output
+            .run_dependencies
+            .depends
+            .iter()
+            .map(|dep| dep.name.as_str())
+            .collect();
+        assert_eq!(dep_names, vec!["numpy", "python", "uv", "zlib"]);
+        assert!(
+            !dep_names.contains(&"python_abi"),
+            "Pixi injects python_abi after metadata; replay must not advertise it"
         );
         std::fs::remove_dir_all(dir).ok();
     }
