@@ -3622,6 +3622,48 @@ async fn canonical_git_ref_state(repo: &Path) -> Result<String> {
     Ok(hash_fields(b"retread-git-tag-state-v1\0", &[&refs]))
 }
 
+async fn git_checkout_has_promisor_remote(repo: &Path) -> Result<bool> {
+    let output = run_readonly_git_status(
+        Command::new("git")
+            .args([
+                "config",
+                "--local",
+                "--type=bool",
+                "--get-regexp",
+                r"^remote\..*\.promisor$",
+            ])
+            .current_dir(repo),
+        "git inspect promisor remotes",
+    )
+    .await?;
+    match output.status.code() {
+        Some(0) => {
+            for line in output
+                .stdout
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+            {
+                if line.ends_with(b" true") {
+                    return Ok(true);
+                }
+                if !line.ends_with(b" false") {
+                    bail!(
+                        "git returned malformed canonical promisor state: {}",
+                        String::from_utf8_lossy(line),
+                    );
+                }
+            }
+            Ok(false)
+        }
+        Some(1) => Ok(false),
+        _ => bail!(
+            "git inspect promisor remotes failed (status {}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim(),
+        ),
+    }
+}
+
 async fn delete_canonical_git_refs(repo: &Path, namespace: &str) -> Result<()> {
     let refs = run_output_bytes(
         Command::new("git")
@@ -3935,21 +3977,32 @@ async fn ensure_canonical_git_snapshot(
         refs = %ref_state,
         "preparing shared canonical Git source",
     );
-    run_silent(
-        Command::new("git")
-            .args(["clone", "--no-local", "--no-checkout", "--"])
-            .arg(shared_checkout)
-            .arg(&repo),
-        "git clone canonical source",
-    )
-    .await?;
-    run_silent(
-        Command::new("git")
-            .args(["fetch", "--force", "--tags", "origin"])
-            .current_dir(&repo),
-        "git fetch canonical tags",
-    )
-    .await?;
+    let promisor_checkout = git_checkout_has_promisor_remote(shared_checkout).await?;
+    let mut clone = Command::new("git");
+    clone.arg("clone");
+    if promisor_checkout {
+        // Serving a partial clone through a local upload-pack forbids the
+        // lazy fetches needed to fill missing objects. Re-clone its already
+        // bound upstream while retaining blob filtering instead of mutating
+        // the published shared checkout.
+        clone.arg("--filter=blob:none");
+    }
+    clone.args(["--no-local", "--no-checkout", "--"]);
+    if promisor_checkout {
+        clone.arg(upstream_url);
+    } else {
+        clone.arg(shared_checkout);
+    }
+    clone.arg(&repo);
+    run_silent(&mut clone, "git clone canonical source").await?;
+    let mut fetch = Command::new("git");
+    fetch
+        .args(["fetch", "--force", "--tags", "origin"])
+        .current_dir(&repo);
+    if promisor_checkout {
+        fetch.arg(resolved_sha);
+    }
+    run_silent(&mut fetch, "git fetch canonical tags").await?;
     run_silent(
         Command::new("git")
             .args(["checkout", "--detach", "--force", resolved_sha])
@@ -5625,6 +5678,7 @@ version = "0.1.0"
 
         // Mutating only the visible tag set must select a different wheel and
         // canonical-source identity even though URL/SHA/subdirectory are fixed.
+        run_fixture_git(&["tag", "release-two", &fixture.rev2], &origin);
         run_fixture_git(&["tag", "release-two", &fixture.rev2], warm);
         let second_ref_state = canonical_git_ref_state(warm).await.unwrap();
         assert_ne!(first_ref_state, second_ref_state);
@@ -5656,6 +5710,137 @@ version = "0.1.0"
             make_staging_tree_removable(&cache_dir);
             let _ = std::fs::remove_dir_all(cache_dir);
         }
+    }
+
+    #[tokio::test]
+    async fn canonical_git_source_reclones_promisor_from_bound_upstream() {
+        let fixture = git_checkout_fixture("canonical-promisor");
+        let upstream = fixture.base.join("repo");
+        run_fixture_git(&["config", "uploadpack.allowFilter", "true"], &upstream);
+        run_fixture_git(&["tag", "promisor-release", &fixture.rev2], &upstream);
+
+        let shared = fixture.base.join("shared-promisor");
+        run_fixture_git(
+            &[
+                "clone",
+                "--filter=blob:none",
+                "--no-checkout",
+                &fixture.url,
+                shared.to_str().unwrap(),
+            ],
+            &fixture.base,
+        );
+        run_fixture_git(&["checkout", "--force", &fixture.rev2], &shared);
+        run_fixture_git(&["config", "remote.origin.promisor", "true"], &shared);
+        let ref_state = canonical_git_ref_state(&shared).await.unwrap();
+
+        // Make the published checkout incapable of serving its bound commit.
+        // Its promisor URL is deliberately unusable so a local upload-pack
+        // cannot repair the missing objects as a side effect of cloning it.
+        let missing_upstream = format!("file://{}", fixture.base.join("missing").display());
+        run_fixture_git(&["config", "remote.origin.url", &missing_upstream], &shared);
+        let object_store = shared.join(".git/objects");
+        std::fs::remove_dir_all(&object_store).unwrap();
+        std::fs::create_dir_all(object_store.join("info")).unwrap();
+        std::fs::create_dir_all(object_store.join("pack")).unwrap();
+
+        let unusable_clone = fixture.base.join("unusable-local-clone");
+        let output = std::process::Command::new("git")
+            .args(["clone", "--no-local", "--no-checkout", "--"])
+            .arg(&shared)
+            .arg(&unusable_clone)
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .output()
+            .expect("probe unusable shared checkout");
+        assert!(
+            !output.status.success(),
+            "fixture must fail if canonicalization clones the shared object store"
+        );
+        assert!(git_checkout_has_promisor_remote(&shared).await.unwrap());
+
+        let canonical =
+            ensure_canonical_git_snapshot(&shared, &fixture.url, &fixture.rev2, &ref_state)
+                .await
+                .expect("canonicalize promisor checkout from its bound upstream");
+        assert_eq!(
+            run_fixture_git(&["rev-parse", "HEAD"], &canonical.root),
+            fixture.rev2
+        );
+        assert_eq!(
+            run_fixture_git(&["describe", "--tags", "--exact-match"], &canonical.root,),
+            "promisor-release"
+        );
+        assert_eq!(
+            run_fixture_git(&["remote", "get-url", "origin"], &canonical.root),
+            fixture.url
+        );
+        assert_eq!(
+            canonical_git_ref_state(&canonical.root).await.unwrap(),
+            ref_state
+        );
+        assert_eq!(
+            run_fixture_git(&["config", "remote.origin.url"], &shared),
+            missing_upstream,
+            "canonicalization must not rewrite the published checkout"
+        );
+        assert!(
+            std::fs::read_dir(object_store.join("pack"))
+                .unwrap()
+                .next()
+                .is_none(),
+            "canonicalization must not lazy-fetch into the published checkout"
+        );
+
+        let cache_dir = canonical.root.parent().unwrap().to_path_buf();
+        make_staging_tree_removable(&cache_dir);
+        let _ = std::fs::remove_dir_all(cache_dir);
+    }
+
+    #[tokio::test]
+    async fn canonical_git_source_keeps_full_checkout_offline() {
+        let fixture = git_checkout_fixture("canonical-full-offline");
+        let upstream = fixture.base.join("repo");
+        run_fixture_git(&["tag", "offline-release", &fixture.rev2], &upstream);
+        let shared = fixture.base.join("shared-full");
+        run_fixture_git(
+            &[
+                "clone",
+                "--no-checkout",
+                &fixture.url,
+                shared.to_str().unwrap(),
+            ],
+            &fixture.base,
+        );
+        run_fixture_git(&["checkout", "--force", &fixture.rev2], &shared);
+        assert!(!git_checkout_has_promisor_remote(&shared).await.unwrap());
+        let ref_state = canonical_git_ref_state(&shared).await.unwrap();
+
+        let parked_upstream = fixture.base.join("parked-upstream");
+        std::fs::rename(&upstream, &parked_upstream).unwrap();
+        let canonical =
+            ensure_canonical_git_snapshot(&shared, &fixture.url, &fixture.rev2, &ref_state)
+                .await
+                .expect("canonicalize full checkout without its upstream");
+        assert_eq!(
+            run_fixture_git(&["rev-parse", "HEAD"], &canonical.root),
+            fixture.rev2
+        );
+        assert_eq!(
+            run_fixture_git(&["describe", "--tags", "--exact-match"], &canonical.root,),
+            "offline-release"
+        );
+        assert_eq!(
+            run_fixture_git(&["remote", "get-url", "origin"], &canonical.root),
+            fixture.url
+        );
+        assert_eq!(
+            canonical_git_ref_state(&canonical.root).await.unwrap(),
+            ref_state
+        );
+
+        let cache_dir = canonical.root.parent().unwrap().to_path_buf();
+        make_staging_tree_removable(&cache_dir);
+        let _ = std::fs::remove_dir_all(cache_dir);
     }
 
     #[tokio::test]
