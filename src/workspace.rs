@@ -715,10 +715,59 @@ fn dependency_overlay_for_target(
     target_subdir: &str,
 ) -> BTreeMap<String, String> {
     let mut out = base.clone();
-    if let Some(target) = targets.get(target_subdir) {
+    for target in matching_target_dependencies(targets, target_subdir) {
+        // A target table overwrites the ordinary dependency regardless of
+        // representation. A target-local path source therefore removes an
+        // inherited version matchspec before exact-target versions are
+        // overlaid below.
+        for name in target.path_dependencies.keys() {
+            out.remove(name);
+        }
         out.extend(target.dependencies.clone());
     }
     out
+}
+
+fn path_dependency_overlay_for_target(
+    base: &BTreeMap<String, String>,
+    targets: &BTreeMap<String, TargetDependencyDef>,
+    target_subdir: &str,
+) -> BTreeMap<String, String> {
+    let mut out = base.clone();
+    for target in matching_target_dependencies(targets, target_subdir) {
+        // The inverse cross-kind overwrite: a target-local registry
+        // matchspec replaces an inherited path source with the same name.
+        for name in target.dependencies.keys() {
+            out.remove(name);
+        }
+        out.extend(target.path_dependencies.clone());
+    }
+    out
+}
+
+/// Pixi target selectors are cumulative: `unix` matches Linux and macOS,
+/// `linux`/`osx`/`win` match their OS families, and an exact subdir is most
+/// specific. Return overlays in that order so the exact table wins.
+fn matching_target_dependencies<'a>(
+    targets: &'a BTreeMap<String, TargetDependencyDef>,
+    target_subdir: &str,
+) -> Vec<&'a TargetDependencyDef> {
+    let mut selectors = Vec::with_capacity(3);
+    if target_subdir.starts_with("linux-") || target_subdir.starts_with("osx-") {
+        selectors.push("unix");
+    }
+    if target_subdir.starts_with("linux-") {
+        selectors.push("linux");
+    } else if target_subdir.starts_with("osx-") {
+        selectors.push("osx");
+    } else if target_subdir.starts_with("win-") {
+        selectors.push("win");
+    }
+    selectors.push(target_subdir);
+    selectors
+        .into_iter()
+        .filter_map(|selector| targets.get(selector))
+        .collect()
 }
 
 /// One output retread should emit, discovered from the workspace's
@@ -775,41 +824,29 @@ impl WorkspaceManifest {
         // (top-level [dependencies]). Record matches as
         // (output_name, feature_name).
         let mut matches: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-        for (dep_name, raw_path) in &self.path_dependencies {
-            if path_matches(workspace_dir, raw_path, &source_canon) {
+        for (dep_name, raw_path) in path_dependency_overlay_for_target(
+            &self.path_dependencies,
+            &self.target_dependencies,
+            target_subdir,
+        ) {
+            if path_matches(workspace_dir, &raw_path, &source_canon) {
                 matches
-                    .entry(dep_name.clone())
+                    .entry(dep_name)
                     .or_default()
                     .insert(DEFAULT_FEATURE.to_string());
             }
         }
-        if let Some(target) = self.target_dependencies.get(target_subdir) {
-            for (dep_name, raw_path) in &target.path_dependencies {
-                if path_matches(workspace_dir, raw_path, &source_canon) {
-                    matches
-                        .entry(dep_name.clone())
-                        .or_default()
-                        .insert(DEFAULT_FEATURE.to_string());
-                }
-            }
-        }
         for (feat_name, feat) in &self.features {
-            for (dep_name, raw_path) in &feat.path_dependencies {
-                if path_matches(workspace_dir, raw_path, &source_canon) {
+            for (dep_name, raw_path) in path_dependency_overlay_for_target(
+                &feat.path_dependencies,
+                &feat.target_dependencies,
+                target_subdir,
+            ) {
+                if path_matches(workspace_dir, &raw_path, &source_canon) {
                     matches
-                        .entry(dep_name.clone())
+                        .entry(dep_name)
                         .or_default()
                         .insert(feat_name.clone());
-                }
-            }
-            if let Some(target) = feat.target_dependencies.get(target_subdir) {
-                for (dep_name, raw_path) in &target.path_dependencies {
-                    if path_matches(workspace_dir, raw_path, &source_canon) {
-                        matches
-                            .entry(dep_name.clone())
-                            .or_default()
-                            .insert(feat_name.clone());
-                    }
                 }
             }
         }
@@ -944,11 +981,12 @@ impl WorkspaceManifest {
         // Default first (top-level [dependencies]). If env opts out
         // via no-default-feature, skip.
         if !env.no_default_feature
-            && (self.dependencies.contains_key(dep_name)
-                || self
-                    .target_dependencies
-                    .get(target_subdir)
-                    .is_some_and(|target| target.dependencies.contains_key(dep_name)))
+            && dependency_overlay_for_target(
+                &self.dependencies,
+                &self.target_dependencies,
+                target_subdir,
+            )
+            .contains_key(dep_name)
         {
             return Some("default".to_string());
         }
@@ -956,11 +994,12 @@ impl WorkspaceManifest {
             let Some(feat) = self.features.get(feat_name) else {
                 continue;
             };
-            if feat.dependencies.contains_key(dep_name)
-                || feat
-                    .target_dependencies
-                    .get(target_subdir)
-                    .is_some_and(|target| target.dependencies.contains_key(dep_name))
+            if dependency_overlay_for_target(
+                &feat.dependencies,
+                &feat.target_dependencies,
+                target_subdir,
+            )
+            .contains_key(dep_name)
             {
                 return Some(feat_name.clone());
             }
@@ -1999,6 +2038,140 @@ arm-feature-only = "*"
             ws.find_declaring_feature_for_target("sim", "arm-only", "linux-64"),
             None
         );
+    }
+
+    #[test]
+    fn target_dependency_selectors_apply_generic_before_exact() {
+        let ws = ws_toml(
+            r#"
+[dependencies]
+base = "1"
+arch-pkg = "base"
+
+[target.unix.dependencies]
+unix-only = "*"
+arch-pkg = "unix"
+
+[target.linux.dependencies]
+linux-only = "*"
+arch-pkg = "linux"
+
+[target.linux-aarch64.dependencies]
+arm-only = "*"
+arch-pkg = "arm"
+
+[environments]
+sim = { features = ["sim"] }
+
+[feature.sim.target.unix.dependencies]
+feature-unix = "*"
+feature-arch = "unix"
+
+[feature.sim.target.linux.dependencies]
+feature-linux = "*"
+feature-arch = "linux"
+
+[feature.sim.target.linux-aarch64.dependencies]
+feature-arm = "*"
+feature-arch = "arm"
+"#,
+        );
+
+        let x86 = ws.effective_dependencies_for_target("sim", "linux-64");
+        assert_eq!(x86.get("arch-pkg").map(String::as_str), Some("linux"));
+        assert_eq!(x86.get("feature-arch").map(String::as_str), Some("linux"));
+        assert!(x86.contains_key("unix-only"));
+        assert!(x86.contains_key("linux-only"));
+        assert!(x86.contains_key("feature-unix"));
+        assert!(x86.contains_key("feature-linux"));
+        assert!(!x86.contains_key("arm-only"));
+        assert!(!x86.contains_key("feature-arm"));
+
+        let arm = ws.effective_dependencies_for_target("sim", "linux-aarch64");
+        assert_eq!(arm.get("arch-pkg").map(String::as_str), Some("arm"));
+        assert_eq!(arm.get("feature-arch").map(String::as_str), Some("arm"));
+        for expected in [
+            "unix-only",
+            "linux-only",
+            "arm-only",
+            "feature-unix",
+            "feature-linux",
+            "feature-arm",
+        ] {
+            assert!(arm.contains_key(expected), "missing {expected}");
+        }
+
+        let mac = ws.effective_dependencies_for_target("sim", "osx-arm64");
+        assert_eq!(mac.get("arch-pkg").map(String::as_str), Some("unix"));
+        assert_eq!(mac.get("feature-arch").map(String::as_str), Some("unix"));
+        assert!(mac.contains_key("unix-only"));
+        assert!(!mac.contains_key("linux-only"));
+    }
+
+    #[test]
+    fn target_dependencies_overwrite_across_version_and_path_kinds() {
+        let tmp = std::env::temp_dir().join(format!(
+            "retread-ws-target-kind-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let base_source = tmp.join("base-source");
+        let arm_source = tmp.join("arm-source");
+        std::fs::create_dir_all(&base_source).unwrap();
+        std::fs::create_dir_all(&arm_source).unwrap();
+        let ws = ws_toml(
+            r#"
+[dependencies]
+swap-to-path = "1"
+swap-to-version = { path = "./base-source" }
+
+[target.linux-aarch64.dependencies]
+swap-to-path = { path = "./arm-source" }
+swap-to-version = "2"
+
+[environments]
+default = []
+"#,
+        );
+
+        let x86 = ws.effective_dependencies_for_target("default", "linux-64");
+        assert_eq!(x86.get("swap-to-path").map(String::as_str), Some("1"));
+        assert!(!x86.contains_key("swap-to-version"));
+        let arm = ws.effective_dependencies_for_target("default", "linux-aarch64");
+        assert!(!arm.contains_key("swap-to-path"));
+        assert_eq!(arm.get("swap-to-version").map(String::as_str), Some("2"));
+
+        assert!(
+            ws.discover_outputs_for_source_for_target(&tmp, &arm_source, "linux-64")
+                .is_empty()
+        );
+        let arm_outputs =
+            ws.discover_outputs_for_source_for_target(&tmp, &arm_source, "linux-aarch64");
+        assert_eq!(arm_outputs.len(), 1);
+        assert_eq!(arm_outputs[0].name, "swap-to-path");
+
+        let x86_outputs = ws.discover_outputs_for_source_for_target(&tmp, &base_source, "linux-64");
+        assert_eq!(x86_outputs.len(), 1);
+        assert_eq!(x86_outputs[0].name, "swap-to-version");
+        assert!(
+            ws.discover_outputs_for_source_for_target(&tmp, &base_source, "linux-aarch64")
+                .is_empty()
+        );
+
+        assert_eq!(
+            ws.find_declaring_feature_for_target("default", "swap-to-path", "linux-aarch64"),
+            None
+        );
+        assert_eq!(
+            ws.find_declaring_feature_for_target("default", "swap-to-version", "linux-aarch64")
+                .as_deref(),
+            Some("default")
+        );
+
+        std::fs::remove_dir_all(tmp).ok();
     }
 
     #[test]

@@ -465,6 +465,20 @@ pub(crate) fn resolve_declared_glibc_for_target(
             source: "workspace",
         });
     }
+    lock_declared_glibc_for_target(lock, target_subdir)
+}
+
+fn lock_declared_glibc_for_target(
+    lock: &RetreadLock,
+    target_subdir: &str,
+) -> Option<DeclaredGlibc> {
+    // Existing locks do not identify the platform whose declaration they
+    // recorded. Preserve the native fallback, but never let an unqualified
+    // lock raise a foreign target's compatibility ceiling. Target-qualified
+    // lock schemas can relax this guard once the recorded subdir is verified.
+    if target_subdir != current_pixi_platform() {
+        return None;
+    }
     lock.declared_glibc
         .as_deref()
         .and_then(parse_glibc_version)
@@ -1540,6 +1554,23 @@ mod tests {
             None,
             "glibc ceilings never apply to non-Linux targets"
         );
+    }
+
+    #[test]
+    fn unqualified_lock_glibc_never_applies_to_foreign_target() {
+        let mut lock = lock_with_shadow("x.so");
+        lock.declared_glibc = Some("2.39".to_string());
+        let native = current_pixi_platform();
+        let foreign = if native == "linux-aarch64" {
+            "linux-64"
+        } else {
+            "linux-aarch64"
+        };
+
+        assert!(lock_declared_glibc_for_target(&lock, foreign).is_none());
+        let native_declared = lock_declared_glibc_for_target(&lock, native).unwrap();
+        assert_eq!(native_declared.version, (2, 39));
+        assert_eq!(native_declared.source, "lock");
     }
 
     #[test]
