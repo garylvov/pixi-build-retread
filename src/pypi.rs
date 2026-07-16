@@ -7,9 +7,51 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use regex::Regex;
+use std::error::Error;
+use std::fmt;
 use std::str::FromStr;
 use std::sync::OnceLock;
 use uv_pep508::uv_pep440::{self, Version, VersionSpecifiers};
+
+/// A valid PyPI Simple index did not contain a usable artifact for one
+/// dependency request.
+///
+/// Callers use this typed marker to distinguish an index-local miss (where it
+/// is safe to try the next configured index) from transport, authentication,
+/// parsing, and artifact-processing failures (which must remain fatal).  The
+/// marker deliberately survives [`anyhow::Context`] wrapping; use
+/// [`is_pypi_index_miss`] rather than matching error text.
+#[derive(Debug)]
+pub(crate) struct PypiIndexMiss {
+    message: String,
+}
+
+impl PypiIndexMiss {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for PypiIndexMiss {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl Error for PypiIndexMiss {}
+
+/// Construct an [`anyhow::Error`] carrying the typed index-miss marker.
+pub(crate) fn pypi_index_miss(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(PypiIndexMiss::new(message))
+}
+
+/// Whether `error`, including any error in its context chain, is a typed
+/// PyPI index miss.
+pub(crate) fn is_pypi_index_miss(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<PypiIndexMiss>())
+}
 
 #[derive(Debug, Clone)]
 pub struct ResolvedWheel {
@@ -120,7 +162,7 @@ async fn resolve_inner(
     let mut candidates = fetch_and_parse_simple_index(&index_url, parse_index_links).await?;
     candidates.retain(|c| c.filename.ends_with(".whl"));
     if candidates.is_empty() {
-        bail!("no wheels listed at {index_url}");
+        return Err(pypi_index_miss(format!("no wheels listed at {index_url}")));
     }
 
     // PEP 427 says wheel filenames use the project distribution name with
@@ -147,10 +189,10 @@ async fn resolve_inner(
         .filter(|(v, _)| specifiers.contains(v))
         .collect();
     if versioned.is_empty() {
-        bail!(
+        return Err(pypi_index_miss(format!(
             "no wheels match {name} {specifiers} at {index_url}; \
              checked PEP 440 normalized version against case-insensitive filename prefix `{name_prefix_lower}`"
-        );
+        )));
     }
 
     // Descending version order. For each version (highest first), see if any
@@ -200,12 +242,11 @@ async fn resolve_inner(
             return Ok(picked);
         }
     }
-    bail!(
+    Err(pypi_index_miss(format!(
         "no wheel for {name} {specifiers} at {index_url} matches target \
          python={} subdir={}",
-        target.python_version,
-        target.conda_subdir,
-    )
+        target.python_version, target.conda_subdir,
+    )))
 }
 
 /// v0.18.0+: PyPI Simple resolution scoped to source distributions
@@ -237,7 +278,7 @@ pub async fn resolve_sdist(
         f.ends_with(".tar.gz") || f.ends_with(".zip") || f.ends_with(".tar.bz2")
     });
     if candidates.is_empty() {
-        bail!("no sdists listed at {index_url}");
+        return Err(pypi_index_miss(format!("no sdists listed at {index_url}")));
     }
 
     let name_norm_dash = name.replace('_', "-").to_ascii_lowercase();
@@ -263,7 +304,9 @@ pub async fn resolve_sdist(
         .filter(|(v, _)| specifiers.contains(v))
         .collect();
     if versioned.is_empty() {
-        bail!("no sdist for {name} {specifiers} at {index_url}");
+        return Err(pypi_index_miss(format!(
+            "no sdist for {name} {specifiers} at {index_url}"
+        )));
     }
     versioned.sort_by(|a, b| b.0.cmp(&a.0));
     let (version, wheel) = versioned.into_iter().next().unwrap();
@@ -359,6 +402,7 @@ fn parse_index_links(html: &str, base: &url::Url) -> Result<Vec<ResolvedWheel>> 
     let re = RE.get_or_init(|| Regex::new(r#"<a\s+[^>]*href="([^"]+)"[^>]*>"#).unwrap());
 
     let mut out = Vec::new();
+    let mut saw_valid_file_link = false;
     for cap in re.captures_iter(html) {
         let full_tag = &cap[0];
         let href = &cap[1];
@@ -385,6 +429,11 @@ fn parse_index_links(html: &str, base: &url::Url) -> Result<Vec<ResolvedWheel>> 
                 .into_owned(),
             _ => continue,
         };
+        // A project page containing only sdists is a valid Simple listing,
+        // not malformed HTML. Record a structurally usable file link before
+        // narrowing to wheels so `resolve_inner` can report a typed semantic
+        // miss and let the caller enter the sdist fallback.
+        saw_valid_file_link = true;
         if !filename.ends_with(".whl") {
             continue;
         }
@@ -400,7 +449,7 @@ fn parse_index_links(html: &str, base: &url::Url) -> Result<Vec<ResolvedWheel>> 
             has_metadata_sidecar,
         });
     }
-    if out.is_empty() {
+    if out.is_empty() && !saw_valid_file_link {
         bail!("no `<a href=...>` wheel links found at index");
     }
     Ok(out)
@@ -423,8 +472,16 @@ async fn fetch_simple_index(index_url: &url::Url) -> Result<(bool, String)> {
         .get(index_url.clone())
         .header(reqwest::header::ACCEPT, SIMPLE_ACCEPT)
         .send()
-        .await?
-        .error_for_status()?;
+        .await?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err(pypi_index_miss(format!(
+            "package is absent from PyPI Simple index: {index_url} returned HTTP 404"
+        )));
+    }
+    // Authentication failures, rate limits, server failures, and every other
+    // non-success status are operational errors, not evidence that the
+    // package is absent from this index.
+    let resp = resp.error_for_status()?;
     let is_json = is_json_simple_response(
         resp.headers()
             .get(reqwest::header::CONTENT_TYPE)
@@ -483,6 +540,12 @@ fn parse_index_json(body: &str, base: &url::Url) -> Result<Vec<ResolvedWheel>> {
         .get("files")
         .and_then(|f| f.as_array())
         .ok_or_else(|| anyhow!("PEP 691 simple-index JSON: missing `files` array"))?;
+    // An empty `files` array is a structurally valid PEP 691 project page.
+    // Artifact selection classifies it as a semantic index miss after
+    // applying the wheel/sdist filter.
+    if files.is_empty() {
+        return Ok(Vec::new());
+    }
     let mut out = Vec::new();
     for f in files {
         let Some(filename) = f.get("filename").and_then(|v| v.as_str()) else {
@@ -515,7 +578,7 @@ fn parse_index_json(body: &str, base: &url::Url) -> Result<Vec<ResolvedWheel>> {
         });
     }
     if out.is_empty() {
-        bail!("no files listed in PEP 691 simple-index JSON");
+        bail!("no valid files listed in PEP 691 simple-index JSON");
     }
     Ok(out)
 }
@@ -769,6 +832,18 @@ mod tests {
     }
 
     #[test]
+    fn index_miss_marker_survives_anyhow_context() {
+        let error = pypi_index_miss("package absent").context("while resolving dependency");
+        assert!(is_pypi_index_miss(&error));
+
+        let untyped = anyhow!("HTTP 404: package absent").context("same words, no marker");
+        assert!(
+            !is_pypi_index_miss(&untyped),
+            "classification must use the typed cause, not error text"
+        );
+    }
+
+    #[test]
     fn parses_pep658_metadata_sidecar_attribute() {
         // pypi.org serves both the PEP 658 attribute and its PEP 714
         // rename on the same tag; pypi.nvidia.com serves neither
@@ -787,6 +862,59 @@ mod tests {
         assert!(
             links[0].sha256.is_some(),
             "wheel hash still parsed from fragment"
+        );
+    }
+
+    #[test]
+    fn sdist_only_html_is_a_valid_empty_wheel_listing() {
+        let base: url::Url = "https://example.com/simple/source-only/".parse().unwrap();
+        let html = r#"
+            <!DOCTYPE html><html><body>
+            <a href="source_only-1.0.tar.gz#sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa">sdist</a>
+            </body></html>
+        "#;
+
+        let wheels = parse_index_links(html, &base).unwrap();
+        assert!(
+            wheels.is_empty(),
+            "a valid sdist-only page must reach wheel selection as an empty listing"
+        );
+        assert_eq!(parse_index_links_any(html, &base).unwrap().len(), 1);
+
+        assert!(
+            parse_index_links(
+                "<!DOCTYPE html><html><body>not a simple listing</body></html>",
+                &base
+            )
+            .is_err(),
+            "HTML without any structurally valid file link remains malformed"
+        );
+    }
+
+    #[test]
+    fn sdist_only_and_empty_json_are_valid_simple_listings() {
+        let base: url::Url = "https://example.com/simple/source-only/".parse().unwrap();
+        let json = r#"{
+            "meta": {"api-version": "1.1"},
+            "files": [{
+                "filename": "source_only-1.0.tar.gz",
+                "url": "source_only-1.0.tar.gz",
+                "hashes": {}
+            }]
+        }"#;
+        let mut wheel_candidates = parse_index_json(json, &base).unwrap();
+        wheel_candidates.retain(|candidate| candidate.filename.ends_with(".whl"));
+        assert!(wheel_candidates.is_empty());
+
+        assert!(
+            parse_index_json(r#"{"meta":{"api-version":"1.1"},"files":[]}"#, &base)
+                .unwrap()
+                .is_empty(),
+            "an explicitly empty files array is structurally valid"
+        );
+        assert!(
+            parse_index_json(r#"{"files":[{"filename":17,"url":false}]}"#, &base).is_err(),
+            "malformed file records remain fatal"
         );
     }
 
@@ -1399,6 +1527,44 @@ platforms = [{ platform = "linux-64", glibc = "2.35" }]
         });
 
         port
+    }
+
+    /// Serve one Simple project-page response with the requested HTTP status.
+    async fn spawn_status_server(status: &'static str) -> url::Url {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request).await;
+            let body = b"fixture response";
+            let response = format!(
+                "HTTP/1.0 {status}\r\nContent-Length: {}\r\nContent-Type: text/plain\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.write_all(body).await.unwrap();
+        });
+
+        format!("http://127.0.0.1:{port}/simple/example/")
+            .parse()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn simple_project_404_is_a_miss_but_server_failure_is_fatal() {
+        let not_found = spawn_status_server("404 Not Found").await;
+        let not_found_error = fetch_simple_index(&not_found).await.unwrap_err();
+        assert!(is_pypi_index_miss(&not_found_error));
+
+        let server_error = spawn_status_server("500 Internal Server Error").await;
+        let server_error = fetch_simple_index(&server_error).await.unwrap_err();
+        assert!(
+            !is_pypi_index_miss(&server_error),
+            "only a project-page 404 is an index-local miss"
+        );
     }
 
     // ── favor-lock: resolve_preferring tests ─────────────────────────────────
