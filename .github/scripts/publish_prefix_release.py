@@ -21,6 +21,7 @@ from typing import Any
 
 
 REQUIRED_SUBDIRS = ("linux-64", "linux-aarch64")
+DEFAULT_POLL_ATTEMPTS = 60
 
 
 class PublishError(RuntimeError):
@@ -187,7 +188,7 @@ class ReleasePublisher:
         *,
         upload: Callable[[str, Package], subprocess.CompletedProcess[str]],
         sleep: Callable[[float], None] = time.sleep,
-        poll_attempts: int = 12,
+        poll_attempts: int = DEFAULT_POLL_ATTEMPTS,
         poll_interval: float = 5.0,
     ) -> None:
         if set(packages) != set(REQUIRED_SUBDIRS):
@@ -351,7 +352,9 @@ def main() -> int:
         "--server-url",
         default=os.environ.get("PREFIX_SERVER_URL", "https://prefix.dev"),
     )
-    parser.add_argument("--poll-attempts", type=int, default=12)
+    parser.add_argument(
+        "--poll-attempts", type=int, default=DEFAULT_POLL_ATTEMPTS
+    )
     parser.add_argument("--poll-interval", type=float, default=5.0)
     args = parser.parse_args()
 
