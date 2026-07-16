@@ -1580,7 +1580,7 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::*;
-    use crate::lock::{CondaDep, LockWheel, Origin};
+    use crate::lock::{CondaDep, GitWheelSource, LockWheel, Origin};
 
     #[test]
     fn cuda_shadow_wheel_matches_nvidia_lib_shims_only() {
@@ -1877,6 +1877,20 @@ mod tests {
         lock.resolution_glibc = Some("2.35".into());
         validate_install_lock_for_platform(path, &lock, "linux-aarch64").unwrap();
         assert!(validate_install_lock_for_platform(path, &lock, "linux-64").is_err());
+    }
+
+    #[test]
+    fn validate_install_lock_accepts_sha256_git_commit_object_id() {
+        let mut lock = make_lock(vec![], vec![], BTreeMap::new());
+        lock.wheels[0].git_source = Some(GitWheelSource {
+            url: "https://example.com/mypackage.git".into(),
+            rev: "cd".repeat(32),
+            subdirectory: None,
+            extras: vec![],
+        });
+
+        validate_install_lock_for_platform(Path::new("/lock.json"), &lock, "linux-64")
+            .expect("installer ingress must accept an exact 64-hex Git commit object ID");
     }
 
     #[test]

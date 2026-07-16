@@ -35,9 +35,10 @@ fn is_legacy_default_target_subdir(target_subdir: &str) -> bool {
 /// Git provenance for a source-built wheel (schema 8+).
 ///
 /// Stored in `LockWheel.git_source` for every wheel whose bytes were
-/// produced by `build_wheel_from_git`. Carries the RESOLVED 40-char commit
-/// SHA (never a branch name or "HEAD") so replay can re-clone the identical
-/// commit without reading the live `[retread-wheels]` manifest entry.
+/// produced by `build_wheel_from_git`. Carries the resolved exact commit
+/// object ID (40 or 64 hexadecimal characters; never a branch name or
+/// "HEAD") so replay can re-clone the identical commit without reading the
+/// live `[retread-wheels]` manifest entry.
 ///
 /// ## POISONING note
 ///
@@ -62,9 +63,9 @@ fn is_legacy_default_target_subdir(target_subdir: &str) -> bool {
 pub struct GitWheelSource {
     /// Canonical git URL (without the `git+` prefix — the bare clone URL).
     pub url: String,
-    /// RESOLVED 40-character commit SHA (never a branch/tag/HEAD ref).
-    /// This is `git rev-parse HEAD` after checkout, not the original
-    /// `rev` string from the config entry.
+    /// Resolved exact 40- or 64-hex commit object ID (never a
+    /// branch/tag/HEAD ref). This is `git rev-parse HEAD` after checkout, not
+    /// the original `rev` string from the config entry.
     pub rev: String,
     /// Subdirectory within the repo where the Python package lives,
     /// relative to the repo root. `None` means the root (equiv. to ".").
@@ -77,6 +78,10 @@ pub struct GitWheelSource {
     /// build the synth entry with these extras for BFS parity.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extras: Vec<String>,
+}
+
+fn is_exact_git_commit_object_id(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 /// Provenance for a wheel built locally from a PyPI sdist because the
@@ -234,9 +239,10 @@ pub struct LockWheel {
     /// Git provenance for source-built wheels (schema 8+). Present when this
     /// wheel was built from a git source (either a named `[retread-git-sources]`
     /// entry or an inline `git=` entry in `[retread-wheels]`). Carries the
-    /// resolved 40-char commit SHA and the clone URL so replay can re-source-
-    /// build the wheel without reading the live manifest. `None` for index
-    /// wheels and non-git source-built wheels (path/from/url forms).
+    /// resolved exact 40- or 64-hex commit object ID and the clone URL so
+    /// replay can re-source-build the wheel without reading the live manifest.
+    /// `None` for index wheels and non-git source-built wheels
+    /// (path/from/url forms).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_source: Option<GitWheelSource>,
     /// Sdist provenance for wheels built from a PyPI sdist (schema 9+).
@@ -855,11 +861,9 @@ impl RetreadLock {
                                 wheel.version,
                             );
                         }
-                        if git.rev.len() != 40
-                            || !git.rev.bytes().all(|byte| byte.is_ascii_hexdigit())
-                        {
+                        if !is_exact_git_commit_object_id(&git.rev) {
                             anyhow::bail!(
-                                "built wheel {}=={} git revision is not a resolved 40-hex commit",
+                                "built wheel {}=={} git revision is not an exact 40- or 64-hex commit object ID",
                                 wheel.name,
                                 wheel.version,
                             );
@@ -1079,6 +1083,23 @@ impl RetreadLock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_git_commit_object_ids_accept_sha1_and_sha256_only() {
+        for accepted in ["a".repeat(40), "A1".repeat(20), "b".repeat(64)] {
+            assert!(is_exact_git_commit_object_id(&accepted), "{accepted}");
+        }
+        for rejected in [
+            "a".repeat(39),
+            "a".repeat(41),
+            "a".repeat(63),
+            "a".repeat(65),
+            "g".repeat(40),
+            "z".repeat(64),
+        ] {
+            assert!(!is_exact_git_commit_object_id(&rejected), "{rejected}");
+        }
+    }
 
     fn target(
         python: &str,

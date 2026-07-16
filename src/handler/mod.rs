@@ -11161,7 +11161,7 @@ mod replay_tests {
         validate_authoritative_replay_lock,
     };
     use crate::config::RetreadConfig;
-    use crate::lock::{CondaDep, LockWheel, Origin, RetreadLock, SCHEMA};
+    use crate::lock::{CondaDep, GitWheelSource, LockWheel, Origin, RetreadLock, SCHEMA};
     use crate::pypi::ResolutionTarget;
 
     fn unique_tmp_dir() -> std::path::PathBuf {
@@ -11267,6 +11267,34 @@ mod replay_tests {
                 "matching inputs hashes must never bypass target identity"
             );
         }
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn replay_accepts_sha256_git_commit_object_id() {
+        let _env_guard = super::TEST_ENV_MUTEX.lock().unwrap();
+        let dir = unique_tmp_dir();
+        let target = replay_target("3.11", "linux-64");
+        let mut lock = make_test_lock("pack", "1.0.0", "3.11", "same-hash", true);
+        lock.wheels[0].origin = Origin::Built;
+        lock.wheels[0].url = None;
+        lock.wheels[0].must_ship = true;
+        lock.wheels[0].git_source = Some(GitWheelSource {
+            url: "https://example.com/pack.git".into(),
+            rev: "ab".repeat(32),
+            subdirectory: None,
+            extras: vec![],
+        });
+        let path = dir.join(RetreadLock::file_name_for_target("pack", &target));
+        std::fs::write(&path, lock.to_pretty_json().unwrap()).unwrap();
+
+        let replayed = load_replayable_lock_for_target(&path, "same-hash", true, &target, "pack")
+            .unwrap()
+            .expect("a SHA-256-format Git commit object ID must be replayable");
+        assert_eq!(
+            replayed.wheels[0].git_source.as_ref().unwrap().rev.len(),
+            64,
+        );
         std::fs::remove_dir_all(dir).ok();
     }
 

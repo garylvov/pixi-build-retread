@@ -3887,11 +3887,11 @@ async fn build_wheel_from_git_inner(
 
     confined_git_source_dir(clone_dir, &subdirectory)?;
 
-    // Resolve the ACTUAL commit SHA after checkout. This converts branch
-    // names, tags, and "HEAD" to a stable 40-char SHA that the lock can
-    // store. Keying on the resolved SHA (rather than the original `rev`
-    // string) ensures a lukewarm replay clones the exact same commit even
-    // when the original rev was a moving ref like a branch name.
+    // Resolve the actual commit object ID after checkout. This converts
+    // branch names, tags, and "HEAD" to a full 40- or 64-hex identity that
+    // the lock can store. Keying on the resolved identity (rather than the
+    // original `rev` string) ensures a lukewarm replay clones the exact same
+    // commit even when the original rev was a moving ref like a branch name.
     let resolved_sha = run_output(
         Command::new("git")
             .args(["rev-parse", "HEAD"])
