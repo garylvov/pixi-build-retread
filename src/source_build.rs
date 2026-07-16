@@ -3857,6 +3857,153 @@ fn sanitize_canonical_git_metadata(repo: &Path) -> Result<()> {
     Ok(())
 }
 
+fn require_real_canonical_git_directory(path: &Path, label: &str) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("stating {label} {}", path.display()))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        bail!("{label} is not a real directory: {}", path.display());
+    }
+    Ok(())
+}
+
+fn reset_canonical_git_lfs_tmp(repo: &Path) -> Result<()> {
+    let git_dir = repo.join(".git");
+    require_real_canonical_git_directory(&git_dir, "canonical Git metadata")?;
+    let lfs = git_dir.join("lfs");
+    match std::fs::symlink_metadata(&lfs) {
+        Ok(_) => require_real_canonical_git_directory(&lfs, "canonical Git LFS storage")?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir(&lfs)
+                .with_context(|| format!("creating canonical Git LFS storage {}", lfs.display()))?;
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("stating canonical Git LFS storage {}", lfs.display()));
+        }
+    }
+    let tmp = lfs.join("tmp");
+    match std::fs::symlink_metadata(&tmp) {
+        Ok(_) => require_real_canonical_git_directory(&tmp, "canonical Git LFS scratch")?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("stating canonical Git LFS scratch {}", tmp.display()));
+        }
+    }
+    match std::fs::remove_dir_all(&tmp) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("clearing canonical Git LFS scratch {}", tmp.display()));
+        }
+    }
+    std::fs::create_dir_all(&tmp)
+        .with_context(|| format!("creating canonical Git LFS scratch {}", tmp.display()))
+}
+
+fn clear_canonical_git_lfs_tmp(repo: &Path) -> Result<()> {
+    let git_dir = repo.join(".git");
+    let lfs = git_dir.join("lfs");
+    let tmp = lfs.join("tmp");
+    require_real_canonical_git_directory(&git_dir, "canonical Git metadata")?;
+    require_real_canonical_git_directory(&lfs, "canonical Git LFS storage")?;
+    require_real_canonical_git_directory(&tmp, "canonical Git LFS scratch")?;
+    for entry in std::fs::read_dir(&tmp)
+        .with_context(|| format!("reading canonical Git LFS scratch {}", tmp.display()))?
+    {
+        let entry = entry
+            .with_context(|| format!("enumerating canonical Git LFS scratch {}", tmp.display()))?;
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path).with_context(|| {
+            format!("stating canonical Git LFS scratch entry {}", path.display())
+        })?;
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        }
+        .with_context(|| {
+            format!(
+                "clearing canonical Git LFS scratch entry {}",
+                path.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn make_canonical_git_lfs_tmp_writable(repo: &Path) -> Result<()> {
+    let tmp = repo.join(".git/lfs/tmp");
+    require_real_canonical_git_directory(&repo.join(".git"), "canonical Git metadata")?;
+    require_real_canonical_git_directory(&repo.join(".git/lfs"), "canonical Git LFS storage")?;
+    require_real_canonical_git_directory(&tmp, "canonical Git LFS scratch")?;
+    let metadata = std::fs::symlink_metadata(&tmp)
+        .with_context(|| format!("stating canonical Git LFS scratch {}", tmp.display()))?;
+    let mut permissions = metadata.permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode((permissions.mode() & !0o022) | 0o700);
+    }
+    #[cfg(not(unix))]
+    permissions.set_readonly(false);
+    std::fs::set_permissions(&tmp, permissions).with_context(|| {
+        format!(
+            "making canonical Git LFS filter scratch writable {}",
+            tmp.display(),
+        )
+    })
+}
+
+async fn validate_canonical_git_worktree(cache_dir: &Path, repo: &Path) -> Result<Vec<u8>> {
+    // Validation can run concurrently after multiple packs share a canonical
+    // source. Serialize the one writable Git LFS directory, and keep the lock
+    // inside a blocking owner: cancelling the async request then detaches the
+    // join handle, but the status process still finishes and clears scratch
+    // before releasing the lock.
+    let validation_namespace = cache_dir.join("canonical-git-status");
+    let lock = acquire_artifact_cache_lock(&validation_namespace).await?;
+    let repo = repo.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let _lock = lock;
+        clear_canonical_git_lfs_tmp(&repo)?;
+        // `lfs.storage` is configurable at repository, user, and system
+        // scope. Pin it so a clean filter cannot redirect temporary writes
+        // outside the sealed canonical repository or to another read-only
+        // directory within `.git`.
+        let output = std::process::Command::new("git")
+            .args([
+                "-c",
+                "lfs.storage=lfs",
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+            ])
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .current_dir(&repo)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .context("spawning git validate canonical worktree")?;
+        let cleanup = clear_canonical_git_lfs_tmp(&repo);
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            cleanup.context("cleaning Git LFS scratch after failed canonical validation")?;
+            bail!(
+                "git validate canonical worktree failed (status {}): {}",
+                output.status,
+                stderr.trim(),
+            );
+        }
+        cleanup.context("cleaning Git LFS scratch after canonical validation")?;
+        Ok(output.stdout)
+    })
+    .await
+    .context("canonical Git worktree validation task panicked")?
+}
+
 fn normalize_source_tree_times(path: &Path) -> Result<()> {
     let metadata = std::fs::symlink_metadata(path)
         .with_context(|| format!("stating canonical source path {}", path.display()))?;
@@ -3995,14 +4142,7 @@ async fn validate_canonical_git_snapshot(
     }
     ensure_no_canonical_gitlinks(&repo, resolved_sha).await?;
     if require_clean {
-        let status = run_output_bytes(
-            Command::new("git")
-                .args(["status", "--porcelain=v1", "--untracked-files=all"])
-                .env("GIT_OPTIONAL_LOCKS", "0")
-                .current_dir(&repo),
-            "git validate canonical worktree",
-        )
-        .await?;
+        let status = validate_canonical_git_worktree(cache_dir, &repo).await?;
         if !status.is_empty() {
             bail!(
                 "canonical Git source was mutated while a build used it: {}",
@@ -4112,7 +4252,14 @@ async fn ensure_canonical_git_snapshot(
     }
     run_silent(
         Command::new("git")
-            .args(["checkout", "--detach", "--force", resolved_sha])
+            .args([
+                "-c",
+                "lfs.storage=lfs",
+                "checkout",
+                "--detach",
+                "--force",
+                resolved_sha,
+            ])
             .current_dir(&repo),
         "git checkout canonical commit",
     )
@@ -4148,7 +4295,13 @@ async fn ensure_canonical_git_snapshot(
     ensure_no_canonical_gitlinks(&repo, resolved_sha).await?;
     let status = run_output_bytes(
         Command::new("git")
-            .args(["status", "--porcelain=v1", "--untracked-files=all"])
+            .args([
+                "-c",
+                "lfs.storage=lfs",
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+            ])
             .env("GIT_OPTIONAL_LOCKS", "0")
             .current_dir(&repo),
         "git verify canonical source",
@@ -4163,8 +4316,14 @@ async fn ensure_canonical_git_snapshot(
     let repo_for_normalize = repo.clone();
     tokio::task::spawn_blocking(move || {
         sanitize_canonical_git_metadata(&repo_for_normalize)?;
+        // `git status` runs clean filters. Git LFS writes a transient file to
+        // `.git/lfs/tmp` even for an unchanged worktree, so retain one empty,
+        // non-source scratch directory as the sole writable exception inside
+        // the otherwise immutable canonical snapshot.
+        reset_canonical_git_lfs_tmp(&repo_for_normalize)?;
         normalize_source_tree_times(&repo_for_normalize)?;
-        make_source_tree_read_only(&repo_for_normalize)
+        make_source_tree_read_only(&repo_for_normalize)?;
+        make_canonical_git_lfs_tmp_writable(&repo_for_normalize)
     })
     .await
     .context("canonical Git source normalization task panicked")??;
@@ -4220,7 +4379,14 @@ async fn prepare_private_git_build_tree(
     .await?;
     run_silent(
         Command::new("git")
-            .args(["checkout", "--detach", "--force", &canonical.resolved_sha])
+            .args([
+                "-c",
+                "lfs.storage=lfs",
+                "checkout",
+                "--detach",
+                "--force",
+                &canonical.resolved_sha,
+            ])
             .current_dir(&private_repo),
         "git checkout private build source",
     )
@@ -5771,6 +5937,111 @@ version = "0.1.0"
             run_fixture_git(&["for-each-ref", "refs/remotes"], &repo).is_empty(),
             "canonicalization must remove both symbolic and direct remote refs",
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn readonly_canonical_git_status_allows_lfs_filter_scratch() {
+        let fixture = git_checkout_fixture("canonical-lfs-status");
+        let repo = fixture.base.join("repo");
+        let filter = fixture.base.join("lfs-clean-filter.sh");
+        let marker = fixture.base.join("lfs-clean-ran");
+        let escaped_lfs = fixture.base.join("escaped-lfs");
+        std::fs::write(
+            &filter,
+            format!(
+                "#!/bin/sh\nset -eu\nstorage=$(git config --get lfs.storage)\nprintf '%s\\n' \"$storage\" > '{}'\nif [ \"$storage\" != lfs ]; then mkdir -p '{}'; : > '{}/escaped'; fi\ntmp=.git/lfs/tmp/retread-filter-$$\n: > \"$tmp\"\ncat\n",
+                marker.display(),
+                escaped_lfs.display(),
+                escaped_lfs.display(),
+            ),
+        )
+        .expect("write clean-filter fixture");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&filter, std::fs::Permissions::from_mode(0o755))
+                .expect("make clean-filter fixture executable");
+        }
+        let clean_command = format!("{} %f", filter.display());
+        run_fixture_git(
+            &["config", "filter.retread-lfs.clean", &clean_command],
+            &repo,
+        );
+        run_fixture_git(&["config", "filter.retread-lfs.smudge", "cat"], &repo);
+        run_fixture_git(&["config", "filter.retread-lfs.required", "true"], &repo);
+        run_fixture_git(&["config", "lfs.storage", "lfs"], &repo);
+        std::fs::write(repo.join(".gitattributes"), "*.lfs filter=retread-lfs\n")
+            .expect("write filter attributes");
+        std::fs::write(repo.join("fixture.lfs"), "tracked lfs-style bytes\n")
+            .expect("write filtered fixture");
+        reset_canonical_git_lfs_tmp(&repo).expect("prepare filter scratch before git add");
+        run_fixture_git(&["add", ".gitattributes", "fixture.lfs"], &repo);
+        run_fixture_git(&["commit", "-m", "add filtered fixture"], &repo);
+        std::fs::remove_file(&marker).expect("clear pre-seal filter marker");
+        run_fixture_git(
+            &["config", "lfs.storage", escaped_lfs.to_str().unwrap()],
+            &repo,
+        );
+
+        reset_canonical_git_lfs_tmp(&repo).expect("reset canonical filter scratch");
+        normalize_source_tree_times(&repo).expect("normalize canonical fixture times");
+        make_source_tree_read_only(&repo).expect("seal canonical fixture");
+        make_canonical_git_lfs_tmp_writable(&repo).expect("open only filter scratch");
+
+        let status = validate_canonical_git_worktree(&fixture.base, &repo)
+            .await
+            .expect("status must run its clean filter against read-only source bytes");
+        assert!(status.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(&marker).expect("read post-seal filter marker"),
+            "lfs\n",
+            "canonical validation must override repository/user LFS storage",
+        );
+        assert!(
+            !escaped_lfs.exists(),
+            "canonical validation must not write to configured external LFS storage",
+        );
+        assert!(
+            std::fs::read_dir(repo.join(".git/lfs/tmp"))
+                .expect("read filter scratch")
+                .next()
+                .is_none(),
+            "clean-filter scratch must remain empty after validation",
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for sealed_directory in [repo.clone(), repo.join(".git"), repo.join(".git/lfs")] {
+                assert_eq!(
+                    std::fs::metadata(&sealed_directory)
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o222,
+                    0,
+                    "{} must remain read-only",
+                    sealed_directory.display(),
+                );
+            }
+            assert_eq!(
+                std::fs::metadata(repo.join("fixture.lfs"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o222,
+                0,
+            );
+            assert_ne!(
+                std::fs::metadata(repo.join(".git/lfs/tmp"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o200,
+                0,
+            );
+        }
+        make_staging_tree_removable(&repo);
     }
 
     #[tokio::test]
