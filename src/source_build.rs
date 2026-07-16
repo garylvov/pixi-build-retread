@@ -3756,10 +3756,12 @@ async fn delete_canonical_git_refs(repo: &Path, namespace: &str) -> Result<()> {
         "git canonical ref query",
     )
     .await?;
-    // Delete symbolic refs themselves rather than dereferencing them. Without
-    // `no-deref`, deleting `origin/HEAD` and its target in one transaction is
-    // rejected as two updates to the same ref.
-    let mut commands = b"option no-deref\n".to_vec();
+    // Delete symbolic refs themselves rather than dereferencing them. Git's
+    // stdin `option no-deref` applies only to the next command, so repeat it
+    // for every ref. Otherwise an ordinary ref sorted before `origin/HEAD`
+    // consumes the option and deleting that symref plus its target is rejected
+    // as two updates to the target ref.
+    let mut commands = Vec::new();
     let mut ref_count = 0_usize;
     for reference in refs
         .split(|byte| *byte == b'\n')
@@ -3767,6 +3769,7 @@ async fn delete_canonical_git_refs(repo: &Path, namespace: &str) -> Result<()> {
     {
         let reference =
             std::str::from_utf8(reference).context("canonical Git ref name is not UTF-8")?;
+        commands.extend_from_slice(b"option no-deref\n");
         commands.extend_from_slice(b"delete ");
         commands.extend_from_slice(reference.as_bytes());
         commands.push(b'\n');
@@ -5743,6 +5746,34 @@ version = "0.1.0"
     }
 
     #[tokio::test]
+    async fn canonical_ref_deletion_handles_symref_after_ordinary_ref() {
+        let fixture = git_checkout_fixture("canonical-ref-symref-order");
+        let repo = fixture.base.join("repo");
+        run_fixture_git(
+            &["update-ref", "refs/remotes/origin/3.5-hotfix", "HEAD"],
+            &repo,
+        );
+        run_fixture_git(&["update-ref", "refs/remotes/origin/main", "HEAD"], &repo);
+        run_fixture_git(
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+            &repo,
+        );
+
+        delete_canonical_git_refs(&repo, "refs/remotes")
+            .await
+            .expect("delete remote refs without dereferencing origin/HEAD");
+
+        assert!(
+            run_fixture_git(&["for-each-ref", "refs/remotes"], &repo).is_empty(),
+            "canonicalization must remove both symbolic and direct remote refs",
+        );
+    }
+
+    #[tokio::test]
     async fn canonical_git_source_ignores_warm_dirt_and_binds_tag_state() {
         let fixture = git_checkout_fixture("canonical-source");
         let origin = fixture.base.join("repo");
@@ -5758,6 +5789,9 @@ version = "0.1.0"
             ],
             &origin,
         );
+        // A remote-tracking ref sorting before origin/HEAD exercises the
+        // per-command no-deref behavior in canonical ref deletion.
+        run_fixture_git(&["branch", "3.5-hotfix", &fixture.rev1], &origin);
         let checkout = ensure_git_checkout(&fixture.url, &fixture.rev2, &fixture.cache)
             .await
             .expect("publish warm checkout");
