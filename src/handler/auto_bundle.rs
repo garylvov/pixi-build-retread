@@ -13,7 +13,6 @@ use std::str::FromStr;
 use anyhow::{Context, Result, anyhow};
 use rattler_conda_types::ChannelUrl;
 use uv_pep508::MarkerEnvironment;
-#[cfg(test)]
 use uv_pep508::uv_pep440::Version;
 use uv_pep508::uv_pep440::VersionSpecifiers;
 
@@ -1416,6 +1415,41 @@ where
     // therefore fails without leaving the bundle partially un-routed.
     let mut restored_wheels = Vec::with_capacity(finalized_restore_requests.len());
     for request in finalized_restore_requests {
+        let request_key = PypiKey::from_pypi(&request.pypi_name);
+        let already_bundled = bundle
+            .all_wheels()
+            .find(|wheel| {
+                PypiKey::from_pypi(&wheel.metadata.name) == request_key
+                    || PypiKey::from_pypi(&wheel.pypi_name) == request_key
+            })
+            .map(|wheel| {
+                (
+                    wheel.pypi_name.clone(),
+                    wheel.metadata.name.clone(),
+                    wheel.metadata.version.clone(),
+                )
+            });
+        if let Some((bundle_name, metadata_name, version_text)) = already_bundled {
+            let version = Version::from_str(&version_text).with_context(|| {
+                format!(
+                    "parsing bundled wheel version `{version_text}` while restoring `{}`",
+                    request.pypi_name
+                )
+            })?;
+            if !request.specifiers.contains(&version) {
+                return Err(anyhow!(
+                    "joint route validation kept `{}` on PyPI at `{}`, but the bundle already contains `{bundle_name}` (metadata `{metadata_name}`) at incompatible version `{version_text}`",
+                    request.pypi_name,
+                    request.specifiers,
+                ));
+            }
+            tracing::info!(
+                pypi = %request.pypi_name,
+                version = %version_text,
+                "joint route validation reused compatible wheel already present in bundle",
+            );
+            continue;
+        }
         let requirement = request.specifiers.to_string();
         let failure_context = format!(
             "joint route validation kept `{}` on PyPI, but no configured index could fetch `{}`",
@@ -1843,11 +1877,14 @@ pub(crate) async fn fetch_and_parse(
 /// ever served the METADATA read. Preference order:
 ///   1. wheel already in the disk cache -> read it (no network, and
 ///      warm re-runs stay as fast as before);
-///   2. index advertised a PEP 658/714 sidecar AND a sha256 fragment
+///   2. wheel already in the attested machine-global store -> read it in
+///      place (no copy, re-hash, range request, or download);
+///   3. index advertised a PEP 658/714 sidecar AND a sha256 fragment
 ///      -> fetch the KB-sized `.metadata` sidecar instead of the
 ///      potentially-GB wheel (the fragment hash stands in for the
 ///      computed one the recipe pins);
-///   3. full download via fetch_and_parse (unchanged behavior).
+///   4. seek the zip metadata through HTTP ranges when supported;
+///   5. full download via fetch_and_parse.
 ///
 /// pypi.org serves sidecars; pypi.nvidia.com and static GitHub-Pages
 /// indexes do not (measured 2026-06-10), so NVIDIA-index-only wheels
@@ -1856,10 +1893,46 @@ pub(crate) async fn metadata_preferring_sidecar(
     resolved: &pypi::ResolvedWheel,
     download_dir: &Path,
 ) -> Result<WheelMetadata> {
+    metadata_preferring_sidecar_with_store(
+        resolved,
+        download_dir,
+        &crate::courier::retread_wheel_store_root(),
+    )
+    .await
+}
+
+async fn metadata_preferring_sidecar_with_store(
+    resolved: &pypi::ResolvedWheel,
+    download_dir: &Path,
+    store_root: &Path,
+) -> Result<WheelMetadata> {
     if let Ok(filename) = crate::wheel::wheel_filename_from_url(&resolved.url)
         && download_dir.join(&filename).exists()
     {
         return fetch_and_parse(&resolved.url, resolved.sha256.as_deref(), download_dir).await;
+    }
+    // Warm retries must consult the machine-global content-addressed store
+    // before touching the network. NVIDIA serves no metadata sidecars and its
+    // giant Isaac wheels are marked no-store; without this lookup, a failed
+    // solve repeatedly downloaded payload bytes that Retread already had.
+    if let Some(sha256) = resolved.sha256.as_deref() {
+        match crate::wheel::cached_wheel_store_path(&resolved.url, sha256, store_root).await {
+            Ok(Some(path)) => {
+                tracing::info!(
+                    wheel = %resolved.filename,
+                    "wheel metadata cache: hit (persistent store, no download)",
+                );
+                return tokio::task::spawn_blocking(move || crate::wheel::read_metadata(&path))
+                    .await
+                    .context("metadata reader panicked")?;
+            }
+            Ok(None) => {}
+            Err(error) => tracing::debug!(
+                wheel = %resolved.filename,
+                error = %format!("{error:#}"),
+                "persistent wheel metadata lookup failed; continuing through network fallbacks",
+            ),
+        }
     }
     if resolved.has_metadata_sidecar
         && let Some(sha) = resolved.sha256.as_deref()
@@ -1971,6 +2044,59 @@ mod tests {
     use rattler_conda_types::{PackageRecord, RepoDataRecord, VersionWithSource};
     use std::sync::{Arc, Mutex};
     use url::Url;
+
+    fn metadata_test_wheel() -> Vec<u8> {
+        use std::io::Write as _;
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut archive = zip::ZipWriter::new(&mut cursor);
+            let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+            archive
+                .start_file("cached_pkg-1.2.3.dist-info/METADATA", options)
+                .unwrap();
+            archive
+                .write_all(
+                    b"Metadata-Version: 2.1\nName: cached-pkg\nVersion: 1.2.3\nRequires-Dist: child>=4\n\n",
+                )
+                .unwrap();
+            archive.finish().unwrap();
+        }
+        cursor.into_inner()
+    }
+
+    #[tokio::test]
+    async fn metadata_reader_reuses_attested_persistent_wheel_without_network() {
+        let tmp = std::env::temp_dir().join(format!(
+            "retread-metadata-store-test-{}",
+            std::process::id()
+        ));
+        let store = tmp.join("store");
+        let downloads = tmp.join("downloads");
+        std::fs::create_dir_all(&downloads).unwrap();
+        let filename = "cached_pkg-1.2.3-py3-none-any.whl";
+        let source = tmp.join(filename);
+        std::fs::write(&source, metadata_test_wheel()).unwrap();
+        let sha256 = crate::wheel::store_wheel_in_cache(&source, &store)
+            .await
+            .unwrap();
+        let resolved = pypi::ResolvedWheel {
+            // The test must fail if this path touches the network.
+            url: Url::parse(&format!("http://127.0.0.1:1/{filename}")).unwrap(),
+            sha256: Some(sha256),
+            filename: filename.to_string(),
+            has_metadata_sidecar: false,
+        };
+
+        let metadata = metadata_preferring_sidecar_with_store(&resolved, &downloads, &store)
+            .await
+            .unwrap();
+
+        assert_eq!(metadata.name, "cached-pkg");
+        assert_eq!(metadata.version, "1.2.3");
+        assert_eq!(metadata.requires_dist, ["child>=4"]);
+        assert!(std::fs::read_dir(&downloads).unwrap().next().is_none());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 
     fn test_config() -> RetreadConfig {
         serde_json::from_value(serde_json::json!({
@@ -3929,6 +4055,57 @@ pillow = ">=10,<13"
                 .extras
                 .iter()
                 .any(|wheel| wheel.pypi_name == "pillow" && wheel.metadata.version == "11.0.0")
+        );
+    }
+
+    #[tokio::test]
+    async fn joint_unroute_reuses_compatible_wheel_already_in_bundle() {
+        let fetch_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fetch = {
+            let fetch_calls = Arc::clone(&fetch_calls);
+            move |_request: PypiFetchRequest, _indexes: Vec<String>, _failure_context: String| {
+                fetch_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async {
+                    Err(anyhow!(
+                        "compatible bundled wheel must prevent a duplicate fetch"
+                    ))
+                }
+            }
+        };
+        let mut bundle = test_bundle(&["pillow>=11,<11.1"]);
+        bundle
+            .extras
+            .push(test_wheel("pillow", "pillow", "11.0.0", &[]));
+        bundle.auto_routed.push(pillow_auto_route("12.3.0"));
+        let target = crate::pypi::WheelTarget::for_subdir("3.10", "linux-64");
+
+        auto_bundle_transitives_with(
+            &mut bundle,
+            &[crate::workspace::DEFAULT_PYPI_INDEX.to_string()],
+            &target,
+            &test_config(),
+            None,
+            None,
+            None,
+            &validated_probe,
+            &reject_every_mutable_route,
+            &fetch,
+            &["conda-forge/linux-64".to_string()],
+            &UvReresolveContext::default(),
+        )
+        .await
+        .unwrap();
+
+        assert!(bundle.auto_routed.is_empty());
+        assert_eq!(fetch_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            bundle
+                .all_wheels()
+                .filter(|wheel| PypiKey::from_pypi(&wheel.metadata.name)
+                    == PypiKey::from_pypi("pillow"))
+                .count(),
+            1,
+            "joint restoration must retain exactly one copy of the distribution",
         );
     }
 

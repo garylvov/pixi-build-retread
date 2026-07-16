@@ -8513,7 +8513,19 @@ fn produce_output(
         version_override,
     )?;
     if let Some(conflict) = conflicts.into_iter().next() {
-        return Err(anyhow::Error::new(conflict.conflict));
+        let conda_name = conflict.conda_name.as_spec().to_string();
+        tracing::error!(
+            bundle = %bundle.conda_name,
+            conda_dep = %conda_name,
+            error = %conflict.conflict,
+            "bundle emission rejected by structural constraint conflict",
+        );
+        return Err(anyhow::Error::new(conflict.conflict)).with_context(|| {
+            format!(
+                "emitting conda dependency `{conda_name}` for bundle `{}`",
+                bundle.conda_name
+            )
+        });
     }
     Ok(output)
 }

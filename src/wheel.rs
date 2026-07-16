@@ -486,6 +486,30 @@ async fn inspect_store_entry(store_path: &Path, sha256: &str) -> Result<StoreEnt
     Ok(StoreEntryState::Valid(fingerprint))
 }
 
+/// Return an attested wheel already present in the persistent store without
+/// copying or re-hashing its potentially multi-gigabyte payload.
+///
+/// This is the metadata-reader fast path: callers need a seekable local zip,
+/// not a consumer-owned copy. A corrupt entry is evicted and reported as a
+/// cache miss so the caller can continue through its normal sidecar/range/
+/// download fallback chain.
+pub(crate) async fn cached_wheel_store_path(
+    url: &url::Url,
+    expected_sha256: &str,
+    store_root: &Path,
+) -> Result<Option<PathBuf>> {
+    let sha256 = normalize_sha256(expected_sha256, "wheel hash")?;
+    let store_path = pinned_wheel_store_path(url, &sha256, store_root)?;
+    match inspect_store_entry(&store_path, &sha256).await? {
+        StoreEntryState::Valid(_) => Ok(Some(store_path)),
+        StoreEntryState::Corrupt => {
+            evict_store_entry(&store_path).await;
+            Ok(None)
+        }
+        StoreEntryState::Missing => Ok(None),
+    }
+}
+
 async fn evict_store_entry(store_path: &Path) {
     let _ = fs::remove_file(store_path).await;
     let _ = fs::remove_file(store_integrity_marker_path(store_path)).await;

@@ -484,7 +484,9 @@ pub const SCHEMA: u32 = 12;
 /// Epoch 16: resolution identity includes normalized Python minor, target
 /// subdir, explicit glibc declaration, and effective wheel ceiling. Locks and
 /// rewrite caches cannot replay across target contracts.
-pub const EMIT_EPOCH: u32 = 16;
+/// Epoch 17: final joint-route restoration reuses a compatible wheel already
+/// present in the bundle instead of staging a duplicate distribution.
+pub const EMIT_EPOCH: u32 = 17;
 
 fn parse_stored_glibc(value: Option<&str>) -> Option<Option<(u32, u32)>> {
     match value {
