@@ -32,7 +32,7 @@ const BUILT_WHEEL_CACHE_SCHEMA: &str = "retread-built-wheel-v3";
 const BUILT_WHEEL_CACHE_ROOT: &str = "built-wheels";
 const CHECKOUT_CACHE_VERSION: &str = "v3";
 const LOCAL_SOURCE_SNAPSHOT_VERSION: &str = "v5";
-const CANONICAL_GIT_SOURCE_SCHEMA: &str = "retread-canonical-git-source-v1";
+const CANONICAL_GIT_SOURCE_SCHEMA: &str = "retread-canonical-git-source-v2";
 static BUILD_TMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Optional caller knowledge used to bind a source-built artifact to the
@@ -4167,7 +4167,7 @@ async fn ensure_canonical_git_snapshot(
     let repository_identity = canonical_git_repository_identity(upstream_url, resolved_sha);
     let cache_dir = crate::courier::retread_cache_root()
         .join("canonical-git-sources")
-        .join("v1")
+        .join("v2")
         .join(&repository_identity)
         .join(ref_state);
     let _lock = acquire_artifact_cache_lock(&cache_dir).await?;
