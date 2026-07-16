@@ -25,9 +25,9 @@ build:
     # HOST's glibc, which produced binaries requiring GLIBC_2.39 that failed
     # on Ubuntu 22.04 (glibc 2.35).
     # conda-forge has no rust-std for *-musl, so we bootstrap the musl
-    # target via rustup at build time. Networking inside the sandbox is
-    # already a given: git deps (pixi_build_types, uv-pep508,
-    # uv-normalize) are fetched at build time too.
+    # target via an archived, SHA-verified rustup-init at build time.
+    # Networking inside the sandbox is already a given: git deps
+    # (pixi_build_types, uv-pep508, uv-normalize) are fetched at build time.
     # HOME must match the euid home or rustup-init errors out mid-run and
     # silently skips installing the extra --target (only the default gnu
     # toolchain lands); the cargo build then fails with E0463 "can't find
@@ -37,12 +37,28 @@ build:
       then: export RETREAD_RUST_TARGET=x86_64-unknown-linux-musl
     - if: target_platform == "linux-aarch64"
       then: export RETREAD_RUST_TARGET=aarch64-unknown-linux-musl
+    - if: build_platform == "linux-64"
+      then: export RETREAD_RUSTUP_HOST=x86_64-unknown-linux-gnu
+    - if: build_platform == "linux-64"
+      then: export RETREAD_RUSTUP_SHA256=4acc9acc76d5079515b46346a485974457b5a79893cfb01112423c89aeb5aa10
+    - if: build_platform == "linux-aarch64"
+      then: export RETREAD_RUSTUP_HOST=aarch64-unknown-linux-gnu
+    - if: build_platform == "linux-aarch64"
+      then: export RETREAD_RUSTUP_SHA256=9732d6c5e2a098d3521fca8145d826ae0aaa067ef2385ead08e6feac88fa5792
     - test -n "$RETREAD_RUST_TARGET"
+    - test -n "$RETREAD_RUSTUP_HOST"
+    - test -n "$RETREAD_RUSTUP_SHA256"
     - 'export HOME=$(getent passwd "$(id -u)" | cut -d: -f6)'
     - export RUSTUP_HOME=$SRC_DIR/.rustup CARGO_HOME=$SRC_DIR/.cargo
-    - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o rustup-init.sh
-    - sh rustup-init.sh -y --profile minimal --default-toolchain 1.97.0
-      --target "$RETREAD_RUST_TARGET" --no-modify-path
+    - export RETREAD_RUSTUP_VERSION=1.29.0
+    - export RETREAD_RUSTUP_URL=https://static.rust-lang.org/rustup/archive/$RETREAD_RUSTUP_VERSION/$RETREAD_RUSTUP_HOST/rustup-init
+    - curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error
+      --output rustup-init "$RETREAD_RUSTUP_URL"
+    - printf '%s  %s\n' "$RETREAD_RUSTUP_SHA256" rustup-init | sha256sum --check --strict
+    - chmod +x rustup-init
+    - ./rustup-init -y --profile minimal --default-toolchain 1.97.0
+      --default-host "$RETREAD_RUSTUP_HOST" --target "$RETREAD_RUST_TARGET"
+      --no-modify-path
     - export PATH=$CARGO_HOME/bin:$PATH
     # Belt and braces: idempotent explicit target add, then a loud check so
     # a missing musl std fails here instead of deep inside the cargo build.

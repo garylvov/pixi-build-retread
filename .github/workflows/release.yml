@@ -38,6 +38,9 @@ jobs:
           fi
           python3 .github/scripts/check_release_version.py "${args[@]}"
 
+      - name: Test release publisher state machine
+        run: python3 .github/scripts/test_publish_prefix_release.py
+
   build:
     name: build (${{ matrix.target_platform }})
     needs: validate-release
@@ -138,10 +141,20 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       PREFIX_CHANNEL: garylvov
-      HAS_PREFIX_API_KEY: ${{ secrets.PREFIX_API_KEY != '' }}
       RATTLER_BUILD_ASSET: rattler-build-x86_64-unknown-linux-musl
       RATTLER_BUILD_SHA256: 55ace96f0515f43273fec18307fbcb8c03ed8d6d90039494c65a39f7f0591d4a
     steps:
+      - name: Require release credential
+        env:
+          PREFIX_API_KEY: ${{ secrets.PREFIX_API_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "$PREFIX_API_KEY" ]]; then
+            echo "::error::PREFIX_API_KEY is required for tag releases; use workflow_dispatch for a build-only run."
+            exit 1
+          fi
+
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Download all platform packages
@@ -164,7 +177,6 @@ jobs:
           done
 
       - name: Install verified rattler-build
-        if: env.HAS_PREFIX_API_KEY == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -174,21 +186,14 @@ jobs:
           sudo install -m 0755 rattler-build /usr/local/bin/rattler-build
           test "$(rattler-build --version)" = "rattler-build ${RATTLER_BUILD_VERSION}"
 
-      - name: Publish both packages to prefix.dev
-        if: env.HAS_PREFIX_API_KEY == 'true'
+      # Prefix exposes uploads and repodata per package/subdir, not as one
+      # atomic multi-subdir transaction. The helper preflights both records,
+      # uploads only missing files without force/skip-existing, waits for
+      # indexing, and reports any partial state with exact retry guidance.
+      - name: Publish and verify both packages
         env:
           PREFIX_API_KEY: ${{ secrets.PREFIX_API_KEY }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          mapfile -t packages < <(find packages -mindepth 2 -maxdepth 2 -type f -name '*.conda' -print | sort)
-          test "${#packages[@]}" -eq 2
-          # Prefix uploads a multi-file argument list sequentially rather than
-          # transactionally. Make retries idempotent so a transient failure on
-          # the second architecture can resume past an already-published first.
-          rattler-build upload prefix --skip-existing --channel "$PREFIX_CHANNEL" "${packages[@]}"
-
-      - name: Publish skipped (no PREFIX_API_KEY secret)
-        if: env.HAS_PREFIX_API_KEY != 'true'
-        run: |
-          echo "::warning::PREFIX_API_KEY is not set; both packages remain available as workflow artifacts."
+        run: >-
+          python3 .github/scripts/publish_prefix_release.py
+          --channel "$PREFIX_CHANNEL"
+          --packages-root packages
