@@ -6051,10 +6051,27 @@ async fn resolve_bundle(
     {
         let mut tmp_queue: VecDeque<Pending> = VecDeque::new();
         let seen_set: HashSet<String> = state.constraints.keys().cloned().collect();
+        // The primary's transitives inherit the complete workspace chain. In a
+        // real group build `bundle_indexes` already folds in every entry index
+        // (see group_fallback_indexes), so this append is a dedup no-op there.
+        // It only adds the primary's own index as a terminal fallback when the
+        // caller passed a bare workspace list, keeping the seed hermetic (no
+        // implicit public-PyPI injection).
+        let primary_seed_indexes: Vec<String> = {
+            let mut v = bundle_indexes.to_vec();
+            if let Some(idx) = entry.index.as_ref()
+                && !v
+                    .iter()
+                    .any(|e| e.trim_end_matches('/') == idx.trim_end_matches('/'))
+            {
+                v.push(idx.clone());
+            }
+            v
+        };
         seed_worklist(
             &primary_original_rd,
             &entry.extras,
-            &bundle_indexes,
+            &primary_seed_indexes,
             &prefix,
             &seen_set,
             &mut tmp_queue,
