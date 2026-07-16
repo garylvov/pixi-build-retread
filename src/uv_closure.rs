@@ -3267,6 +3267,9 @@ async fn run_uv_closure_command(
         .current_dir(project_dir)
         .env("UV_CACHE_DIR", uv_cache_dir)
         .env("UV_NO_CONFIG", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
     #[cfg(unix)]
     command.process_group(0);
@@ -4906,6 +4909,77 @@ isaaclab = { path = "wheels/isaaclab/isaaclab-2.0.0-py3-none-any.whl" }
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn successful_uv_command_closes_stdin_and_captures_output() {
+        let tmp = std::env::temp_dir().join(format!(
+            "retread-uv-success-stdio-{}-{}",
+            std::process::id(),
+            CLOSURE_META_TMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let project = tmp.join("project");
+        let cache = tmp.join("cache");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+        let args = vec![
+            "-c".to_string(),
+            "if IFS= read -r _; then exit 97; fi; printf success-out; printf success-err >&2"
+                .to_string(),
+        ];
+
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            run_uv_closure_command(Path::new("/bin/sh"), &args, &project, &cache),
+        )
+        .await
+        .expect("uv command hung waiting for inherited stdin")
+        .unwrap();
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"success-out");
+        assert_eq!(output.stderr, b"success-err");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_uv_command_returns_status_and_captured_stderr() {
+        let tmp = std::env::temp_dir().join(format!(
+            "retread-uv-failure-stdio-{}-{}",
+            std::process::id(),
+            CLOSURE_META_TMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let project = tmp.join("project");
+        let cache = tmp.join("cache");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+        let args = vec![
+            "-c".to_string(),
+            "printf failure-out; printf 'has no wheels with a matching platform tag (e.g., manylinux_2_34_x86_64)' >&2; exit 42"
+                .to_string(),
+        ];
+
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            run_uv_closure_command(Path::new("/bin/sh"), &args, &project, &cache),
+        )
+        .await
+        .expect("failed uv command did not return")
+        .unwrap();
+
+        assert!(!output.status.success());
+        assert_eq!(output.status.code(), Some(42));
+        assert_eq!(output.stdout, b"failure-out");
+        assert_eq!(
+            output.stderr,
+            b"has no wheels with a matching platform tag (e.g., manylinux_2_34_x86_64)"
+        );
+        assert!(crate::installer::is_platform_tag_conflict(
+            String::from_utf8_lossy(&output.stderr).as_ref()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn cancelling_uv_command_kills_the_complete_process_group() {
         let tmp = std::env::temp_dir().join(format!(
             "retread-uv-cancel-group-{}-{}",
@@ -4942,7 +5016,11 @@ isaaclab = { path = "wheels/isaaclab/isaaclab-2.0.0-py3-none-any.whl" }
         }
         assert!(started.exists(), "test uv process never started");
         task.abort();
-        let _ = task.await;
+        let join_error = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("cancelled uv command did not return")
+            .unwrap_err();
+        assert!(join_error.is_cancelled());
         tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
         assert!(
             !finished.exists(),

@@ -6,8 +6,13 @@
 //! pipeline as any PyPI-resolved wheel.
 
 use std::collections::HashMap;
+use std::ffi::OsString;
+#[cfg(unix)]
+use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io::{Read, Seek, Write};
+#[cfg(unix)]
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::str::FromStr;
@@ -1242,18 +1247,6 @@ fn normalize_snapshot_times(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn source_snapshot_mode(metadata: &std::fs::Metadata) -> u32 {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        metadata.mode() & 0o7777
-    }
-    #[cfg(not(unix))]
-    {
-        u32::from(metadata.permissions().readonly())
-    }
-}
-
 fn relative_source_path<'a>(root: &Path, path: &'a Path) -> Result<&'a str> {
     path.strip_prefix(root)
         .expect("source snapshot walk stays below its root")
@@ -1268,12 +1261,13 @@ fn hash_snapshot_record(hasher: &mut Sha256, kind: u8, relative: &str, mode: u32
     hasher.update(mode.to_be_bytes());
 }
 
+#[cfg(target_os = "linux")]
 fn validate_snapshot_symlink(
     root: &Path,
     excluded_roots: &[PathBuf],
     link: &Path,
     target: &Path,
-) -> Result<()> {
+) -> Result<Vec<OsString>> {
     if target.is_absolute() {
         bail!(
             "source-build symlink {} escapes the source tree via absolute target {}",
@@ -1324,18 +1318,7 @@ fn validate_snapshot_symlink(
             target.display(),
         );
     }
-    // Existing link chains receive a second, filesystem-resolved containment
-    // check. Dangling in-tree links remain representable and deterministic.
-    if let Ok(resolved) = std::fs::canonicalize(link)
-        && !resolved.starts_with(root)
-    {
-        bail!(
-            "source-build symlink {} resolves outside the source tree to {}",
-            link.display(),
-            resolved.display(),
-        );
-    }
-    Ok(())
+    Ok(normalized)
 }
 
 #[cfg(unix)]
@@ -1421,7 +1404,346 @@ fn is_managed_snapshot_output(name: &std::ffi::OsStr) -> bool {
         })
 }
 
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SnapshotStat {
+    device: u64,
+    inode: u64,
+    mode: u32,
+    size: i128,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
+#[cfg(unix)]
+impl SnapshotStat {
+    fn from_rustix(stat: &rustix::fs::Stat) -> Self {
+        Self {
+            device: stat.st_dev as u64,
+            inode: stat.st_ino as u64,
+            mode: stat.st_mode as u32,
+            size: stat.st_size as i128,
+            modified_seconds: stat.st_mtime as i64,
+            modified_nanoseconds: stat.st_mtime_nsec as i64,
+            changed_seconds: stat.st_ctime as i64,
+            changed_nanoseconds: stat.st_ctime_nsec as i64,
+        }
+    }
+
+    fn file_type(self) -> rustix::fs::FileType {
+        rustix::fs::FileType::from_raw_mode(self.mode as _)
+    }
+
+    fn snapshot_mode(self) -> u32 {
+        self.mode & 0o7777
+    }
+
+    fn file_size(self, path: &Path) -> Result<u64> {
+        u64::try_from(self.size).with_context(|| {
+            format!(
+                "source file {} reported an invalid negative size",
+                path.display()
+            )
+        })
+    }
+
+    fn permissions(self) -> std::fs::Permissions {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::Permissions::from_mode(self.snapshot_mode())
+    }
+}
+
+#[cfg(unix)]
+fn snapshot_stat_at<Fd: std::os::fd::AsFd>(directory: Fd, name: &CStr) -> Result<SnapshotStat> {
+    rustix::fs::statat(directory, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+        .map(|stat| SnapshotStat::from_rustix(&stat))
+        .map_err(Into::into)
+}
+
+#[cfg(unix)]
+fn snapshot_fd_stat<Fd: std::os::fd::AsFd>(fd: Fd) -> Result<SnapshotStat> {
+    rustix::fs::fstat(fd)
+        .map(|stat| SnapshotStat::from_rustix(&stat))
+        .map_err(Into::into)
+}
+
+#[cfg(unix)]
+fn open_snapshot_at<Fd: std::os::fd::AsFd>(
+    directory: Fd,
+    name: &CStr,
+    expected: SnapshotStat,
+    expected_type: rustix::fs::FileType,
+    display: &Path,
+) -> Result<File> {
+    let mut flags =
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW;
+    if expected_type == rustix::fs::FileType::Directory {
+        flags |= rustix::fs::OFlags::DIRECTORY;
+    }
+    let fd = rustix::fs::openat(directory, name, flags, rustix::fs::Mode::empty()).with_context(
+        || {
+            format!(
+                "opening source entry relative to parent FD {}",
+                display.display()
+            )
+        },
+    )?;
+    let opened = snapshot_fd_stat(&fd)
+        .with_context(|| format!("stating opened source entry {}", display.display()))?;
+    if opened != expected || opened.file_type() != expected_type {
+        bail!(
+            "source entry {} changed inode, type, or metadata before traversal",
+            display.display(),
+        );
+    }
+    Ok(File::from(fd))
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+enum PinnedSymlinkPhase<'a> {
+    AfterOpen,
+    AfterRead(&'a CStr),
+}
+
+#[cfg(target_os = "linux")]
+fn read_snapshot_symlink_at<Fd: std::os::fd::AsFd>(
+    directory: Fd,
+    name: &CStr,
+    expected: SnapshotStat,
+    display: &Path,
+) -> Result<CString> {
+    let mut hook = |_: &Path, _: PinnedSymlinkPhase<'_>| Ok(());
+    read_snapshot_symlink_at_with_hook(directory, name, expected, display, &mut hook)
+}
+
+/// Pin a symlink inode before reading its target. Linux supports reading an
+/// `O_PATH|O_NOFOLLOW` symlink descriptor through an empty `readlinkat` path;
+/// failure of that facility is terminal rather than falling back to a second
+/// parent/name lookup.
+#[cfg(target_os = "linux")]
+fn read_snapshot_symlink_at_with_hook<Fd: std::os::fd::AsFd>(
+    directory: Fd,
+    name: &CStr,
+    expected: SnapshotStat,
+    display: &Path,
+    hook: &mut dyn FnMut(&Path, PinnedSymlinkPhase<'_>) -> Result<()>,
+) -> Result<CString> {
+    if expected.file_type() != rustix::fs::FileType::Symlink {
+        bail!(
+            "source entry {} changed type before symlink pinning",
+            display.display()
+        );
+    }
+    let symlink_fd = rustix::fs::openat(
+        &directory,
+        name,
+        rustix::fs::OFlags::PATH | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .with_context(|| format!("pinning source symlink inode {}", display.display()))?;
+    if snapshot_fd_stat(&symlink_fd)? != expected {
+        bail!(
+            "source symlink {} changed before its target was pinned",
+            display.display(),
+        );
+    }
+    hook(display, PinnedSymlinkPhase::AfterOpen)?;
+    let target = rustix::fs::readlinkat(&symlink_fd, c"", Vec::new()).with_context(|| {
+        format!(
+            "reading pinned source symlink target through its descriptor {}",
+            display.display()
+        )
+    })?;
+    hook(display, PinnedSymlinkPhase::AfterRead(&target))?;
+    let final_fd = snapshot_fd_stat(&symlink_fd)
+        .with_context(|| format!("restating pinned source symlink {}", display.display()))?;
+    let final_parent = snapshot_stat_at(directory, name).with_context(|| {
+        format!(
+            "restating pinned source symlink parent binding {}",
+            display.display()
+        )
+    })?;
+    if final_fd != expected || final_parent != expected {
+        bail!(
+            "source symlink {} changed while its target was read",
+            display.display(),
+        );
+    }
+    Ok(target)
+}
+
+#[cfg(unix)]
+fn apply_descriptor_link_target(
+    base: &[OsString],
+    target: &Path,
+    remainder: impl IntoIterator<Item = OsString>,
+) -> Option<Vec<OsString>> {
+    if target.is_absolute() {
+        return None;
+    }
+    let mut result = base.to_vec();
+    for component in target.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(value) => result.push(value.to_owned()),
+            std::path::Component::ParentDir => {
+                result.pop()?;
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => return None,
+        }
+    }
+    result.extend(remainder);
+    Some(result)
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DescriptorResolution {
+    Existing(rustix::fs::FileType),
+    Missing,
+    Escapes,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SnapshotVisitPhase {
+    BeforeEnumeration,
+    BeforeFinalValidation,
+}
+
+/// Resolve an already lexically in-tree path without reopening any source
+/// pathname. Every component is looked up relative to a verified directory
+/// descriptor, and every encountered symlink is expanded from that same FD.
+#[cfg(target_os = "linux")]
+fn resolve_snapshot_components(
+    root_fd: &File,
+    root: &Path,
+    excluded_roots: &[PathBuf],
+    initial: Vec<OsString>,
+) -> Result<DescriptorResolution> {
+    let mut symlink_hook = |_: &Path, _: PinnedSymlinkPhase<'_>| Ok(());
+    resolve_snapshot_components_with_hook(root_fd, root, excluded_roots, initial, &mut symlink_hook)
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_snapshot_components_with_hook(
+    root_fd: &File,
+    root: &Path,
+    excluded_roots: &[PathBuf],
+    initial: Vec<OsString>,
+    symlink_hook: &mut dyn FnMut(&Path, PinnedSymlinkPhase<'_>) -> Result<()>,
+) -> Result<DescriptorResolution> {
+    let mut components = initial;
+    let mut followed_links = 0_u8;
+    loop {
+        if components.is_empty() {
+            return Ok(DescriptorResolution::Existing(
+                rustix::fs::FileType::Directory,
+            ));
+        }
+        let logical = components
+            .iter()
+            .fold(root.to_path_buf(), |mut path, component| {
+                path.push(component);
+                path
+            });
+        if excluded_roots
+            .iter()
+            .any(|excluded| logical.starts_with(excluded))
+        {
+            return Ok(DescriptorResolution::Escapes);
+        }
+        let root_copy = rustix::io::dup(root_fd).context("duplicating source root descriptor")?;
+        let mut directory = File::from(root_copy);
+        let mut resolved = Vec::<OsString>::new();
+        let mut index = 0_usize;
+        while index < components.len() {
+            let component = &components[index];
+            let component_display = resolved.iter().fold(root.to_path_buf(), |mut path, item| {
+                path.push(item);
+                path
+            });
+            let component_display = component_display.join(component);
+            let component_bytes = component.as_bytes();
+            if component_bytes.is_empty()
+                || component_bytes == b"."
+                || component_bytes == b".."
+                || component_bytes.contains(&b'/')
+                || component_bytes.contains(&0)
+            {
+                bail!("invalid source path component during descriptor-relative resolution");
+            }
+            let component_c = CString::new(component_bytes)
+                .context("source path component unexpectedly contained NUL")?;
+            let stat = match snapshot_stat_at(&directory, &component_c) {
+                Ok(stat) => stat,
+                Err(error)
+                    if error
+                        .downcast_ref::<rustix::io::Errno>()
+                        .is_some_and(|errno| {
+                            *errno == rustix::io::Errno::NOENT
+                                || *errno == rustix::io::Errno::NOTDIR
+                        }) =>
+                {
+                    return Ok(DescriptorResolution::Missing);
+                }
+                Err(error) => return Err(error),
+            };
+            match stat.file_type() {
+                rustix::fs::FileType::Symlink => {
+                    followed_links = followed_links.saturating_add(1);
+                    if followed_links > 40 {
+                        return Ok(DescriptorResolution::Missing);
+                    }
+                    let target = read_snapshot_symlink_at_with_hook(
+                        &directory,
+                        &component_c,
+                        stat,
+                        &component_display,
+                        symlink_hook,
+                    )?;
+                    let target = PathBuf::from(OsString::from_vec(target.as_bytes().to_vec()));
+                    let Some(expanded) = apply_descriptor_link_target(
+                        &resolved,
+                        &target,
+                        components[index + 1..].iter().cloned(),
+                    ) else {
+                        return Ok(DescriptorResolution::Escapes);
+                    };
+                    components = expanded;
+                    break;
+                }
+                rustix::fs::FileType::Directory => {
+                    if index + 1 == components.len() {
+                        return Ok(DescriptorResolution::Existing(
+                            rustix::fs::FileType::Directory,
+                        ));
+                    }
+                    directory = open_snapshot_at(
+                        &directory,
+                        &component_c,
+                        stat,
+                        rustix::fs::FileType::Directory,
+                        &logical,
+                    )?;
+                    resolved.push(component.clone());
+                    index += 1;
+                }
+                file_type if index + 1 == components.len() => {
+                    return Ok(DescriptorResolution::Existing(file_type));
+                }
+                _ => return Ok(DescriptorResolution::Missing),
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn should_copy_snapshot_gitdir_pointer(
+    root_fd: &File,
     root: &Path,
     excluded_roots: &[PathBuf],
     pointer: &Path,
@@ -1437,160 +1759,112 @@ fn should_copy_snapshot_gitdir_pointer(
         return Ok(true);
     };
     let target = Path::new(target);
-    if target.is_absolute() {
+    let parent = pointer
+        .parent()
+        .expect("a .git pointer always has a parent")
+        .strip_prefix(root)
+        .expect("a .git pointer stays below the source root")
+        .components()
+        .map(|component| component.as_os_str().to_owned())
+        .collect::<Vec<_>>();
+    let Some(components) = apply_descriptor_link_target(&parent, target, std::iter::empty()) else {
         tracing::warn!(
             pointer = %pointer.display(),
             gitdir = %target.display(),
             "omitting out-of-context .git indirection from immutable source snapshot",
         );
         return Ok(false);
-    }
-    let resolved = match std::fs::canonicalize(
-        pointer
-            .parent()
-            .expect("a .git pointer always has a parent")
-            .join(target),
-    ) {
-        Ok(resolved) => resolved,
-        Err(error) => {
-            tracing::warn!(
-                pointer = %pointer.display(),
-                gitdir = %target.display(),
-                error = %error,
-                "omitting unresolved .git indirection from immutable source snapshot",
-            );
-            return Ok(false);
-        }
     };
-    if !resolved.starts_with(root)
-        || excluded_roots
-            .iter()
-            .any(|excluded| resolved.starts_with(excluded))
-        || !resolved.is_dir()
+    if resolve_snapshot_components(root_fd, root, excluded_roots, components)?
+        != DescriptorResolution::Existing(rustix::fs::FileType::Directory)
     {
         tracing::warn!(
             pointer = %pointer.display(),
-            gitdir = %resolved.display(),
-            "omitting out-of-context .git indirection from immutable source snapshot",
+            gitdir = %target.display(),
+            "omitting unresolved or out-of-context .git indirection from immutable source snapshot",
         );
         return Ok(false);
     }
     Ok(true)
 }
 
-fn snapshot_file_metadata_matches(
-    expected: &std::fs::Metadata,
-    actual: &std::fs::Metadata,
-) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        expected.dev() == actual.dev()
-            && expected.ino() == actual.ino()
-            && expected.mode() == actual.mode()
-            && expected.len() == actual.len()
-            && expected.mtime() == actual.mtime()
-            && expected.mtime_nsec() == actual.mtime_nsec()
-            && expected.ctime() == actual.ctime()
-            && expected.ctime_nsec() == actual.ctime_nsec()
-    }
-    #[cfg(not(unix))]
-    {
-        expected.file_type() == actual.file_type()
-            && expected.len() == actual.len()
-            && expected.modified().ok() == actual.modified().ok()
-    }
-}
-
-/// Open the exact regular-file inode observed by the directory walk. On Unix,
-/// `O_NOFOLLOW` rejects a last-component symlink substitution; the metadata
-/// comparison rejects a regular-file rename swap before any source byte is
-/// copied or hashed.
-fn open_snapshot_source_file(path: &Path, expected: &std::fs::Metadata) -> Result<File> {
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(nix::libc::O_NOFOLLOW);
-    }
-    let file = options.open(path).with_context(|| {
-        format!(
-            "opening source file without following links {}",
-            path.display()
-        )
-    })?;
-    let opened = file
-        .metadata()
-        .with_context(|| format!("stating opened source file {}", path.display()))?;
-    if !opened.file_type().is_file() || !snapshot_file_metadata_matches(expected, &opened) {
-        bail!(
-            "source file {} changed inode, type, or metadata before its build snapshot was prepared",
-            path.display(),
-        );
-    }
-    Ok(file)
-}
-
-fn open_snapshot_source_directory(path: &Path, expected: &std::fs::Metadata) -> Result<File> {
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_DIRECTORY);
-    }
-    let directory = options.open(path).with_context(|| {
-        format!(
-            "opening source directory without following links {}",
-            path.display(),
-        )
-    })?;
-    let opened = directory
-        .metadata()
-        .with_context(|| format!("stating opened source directory {}", path.display()))?;
-    if !opened.file_type().is_dir() || !snapshot_file_metadata_matches(expected, &opened) {
-        bail!(
-            "source directory {} changed inode, type, or metadata before traversal",
-            path.display(),
-        );
-    }
-    Ok(directory)
-}
-
+#[cfg(target_os = "linux")]
 fn prepare_source_snapshot(
     source: &Path,
     out_dir: &Path,
     additional_excluded_roots: &[PathBuf],
 ) -> Result<PreparedSourceSnapshot> {
+    let mut visit_hook = |_: &Path, _: SnapshotVisitPhase| Ok(());
+    prepare_source_snapshot_with_hook(source, out_dir, additional_excluded_roots, &mut visit_hook)
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_source_snapshot_with_hook(
+    source: &Path,
+    out_dir: &Path,
+    additional_excluded_roots: &[PathBuf],
+    visit_hook: &mut dyn FnMut(&Path, SnapshotVisitPhase) -> Result<()>,
+) -> Result<PreparedSourceSnapshot> {
     fn visit(
         root: &Path,
+        root_fd: &File,
         excluded_roots: &[PathBuf],
         snapshot: &Path,
         path: &Path,
-        expected_directory: &std::fs::Metadata,
+        directory: &File,
+        expected_directory: SnapshotStat,
+        parent_binding: Option<(&File, &CStr)>,
         hasher: &mut Sha256,
+        visit_hook: &mut dyn FnMut(&Path, SnapshotVisitPhase) -> Result<()>,
     ) -> Result<()> {
-        let directory = open_snapshot_source_directory(path, expected_directory)?;
-        let mut entries = std::fs::read_dir(path)
-            .with_context(|| format!("reading source tree {}", path.display()))?
-            .collect::<std::io::Result<Vec<_>>>()?;
-        entries.sort_by_key(std::fs::DirEntry::file_name);
-        for entry in entries {
-            if path == root && is_managed_snapshot_output(&entry.file_name()) {
+        visit_hook(path, SnapshotVisitPhase::BeforeEnumeration)?;
+        let mut reader = rustix::fs::Dir::read_from(directory)
+            .with_context(|| format!("reading source tree from directory FD {}", path.display()))?;
+        let mut entries = Vec::<CString>::new();
+        for entry in &mut reader {
+            let entry = entry.with_context(|| {
+                format!(
+                    "enumerating source tree from directory FD {}",
+                    path.display()
+                )
+            })?;
+            let bytes = entry.file_name().to_bytes();
+            if bytes == b"." || bytes == b".." {
                 continue;
             }
-            let entry_path = entry.path();
+            if bytes.is_empty() || bytes.contains(&b'/') || bytes.contains(&0) {
+                bail!(
+                    "source directory {} returned an invalid child name",
+                    path.display(),
+                );
+            }
+            entries.push(entry.file_name().to_owned());
+        }
+        entries.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+        for entry_name_c in entries {
+            let entry_name = OsString::from_vec(entry_name_c.as_bytes().to_vec());
+            if path == root && is_managed_snapshot_output(&entry_name) {
+                continue;
+            }
+            let entry_path = path.join(&entry_name);
             if excluded_roots
                 .iter()
                 .any(|excluded| entry_path.starts_with(excluded))
             {
                 continue;
             }
-            let metadata = std::fs::symlink_metadata(&entry_path)?;
-            if metadata.file_type().is_dir() {
+            let metadata = snapshot_stat_at(directory, &entry_name_c)
+                .with_context(|| format!("stating source entry {}", entry_path.display()))?;
+            if metadata.file_type() == rustix::fs::FileType::Directory {
+                let child = open_snapshot_at(
+                    directory,
+                    &entry_name_c,
+                    metadata,
+                    rustix::fs::FileType::Directory,
+                    &entry_path,
+                )?;
                 let relative = relative_source_path(root, &entry_path)?;
-                hash_snapshot_record(hasher, b'd', relative, source_snapshot_mode(&metadata));
+                hash_snapshot_record(hasher, b'd', relative, metadata.snapshot_mode());
                 let destination = snapshot.join(relative);
                 std::fs::create_dir(&destination).with_context(|| {
                     format!(
@@ -1600,19 +1874,35 @@ fn prepare_source_snapshot(
                 })?;
                 visit(
                     root,
+                    root_fd,
                     excluded_roots,
                     snapshot,
                     &entry_path,
-                    &metadata,
+                    &child,
+                    metadata,
+                    Some((directory, &entry_name_c)),
                     hasher,
+                    visit_hook,
                 )?;
                 std::fs::set_permissions(&destination, metadata.permissions()).with_context(
                     || format!("preserving source directory mode {}", destination.display()),
                 )?;
                 normalize_snapshot_times(&destination)?;
-            } else if metadata.file_type().is_symlink() {
-                let target = std::fs::read_link(&entry_path)?;
-                validate_snapshot_symlink(root, excluded_roots, &entry_path, &target)?;
+            } else if metadata.file_type() == rustix::fs::FileType::Symlink {
+                let target =
+                    read_snapshot_symlink_at(directory, &entry_name_c, metadata, &entry_path)?;
+                let target = PathBuf::from(OsString::from_vec(target.as_bytes().to_vec()));
+                let normalized =
+                    validate_snapshot_symlink(root, excluded_roots, &entry_path, &target)?;
+                if resolve_snapshot_components(root_fd, root, excluded_roots, normalized)?
+                    == DescriptorResolution::Escapes
+                {
+                    bail!(
+                        "source-build symlink {} resolves outside the source tree via target {}",
+                        entry_path.display(),
+                        target.display(),
+                    );
+                }
                 let relative = relative_source_path(root, &entry_path)?;
                 let target_text = target.to_str().ok_or_else(|| {
                     anyhow!(
@@ -1621,7 +1911,7 @@ fn prepare_source_snapshot(
                         target.display(),
                     )
                 })?;
-                hash_snapshot_record(hasher, b'l', relative, source_snapshot_mode(&metadata));
+                hash_snapshot_record(hasher, b'l', relative, metadata.snapshot_mode());
                 hasher.update((target_text.len() as u64).to_be_bytes());
                 hasher.update(target_text.as_bytes());
                 let destination = snapshot.join(relative);
@@ -1632,10 +1922,25 @@ fn prepare_source_snapshot(
                         target.display(),
                     )
                 })?;
-            } else if metadata.file_type().is_file() {
+                let final_link = snapshot_stat_at(directory, &entry_name_c).with_context(|| {
+                    format!("restating source symlink {}", entry_path.display())
+                })?;
+                if final_link != metadata {
+                    bail!(
+                        "source symlink {} changed while its build snapshot was prepared",
+                        entry_path.display(),
+                    );
+                }
+            } else if metadata.file_type() == rustix::fs::FileType::RegularFile {
                 let relative = relative_source_path(root, &entry_path)?;
-                let mut input = open_snapshot_source_file(&entry_path, &metadata)?;
-                let omit_git_pointer = if entry.file_name() == ".git" {
+                let mut input = open_snapshot_at(
+                    directory,
+                    &entry_name_c,
+                    metadata,
+                    rustix::fs::FileType::RegularFile,
+                    &entry_path,
+                )?;
+                let omit_git_pointer = if entry_name.as_bytes() == b".git" {
                     let mut text = String::new();
                     input.read_to_string(&mut text).with_context(|| {
                         format!("reading Git indirection file {}", entry_path.display())
@@ -1643,11 +1948,33 @@ fn prepare_source_snapshot(
                     input.rewind().with_context(|| {
                         format!("rewinding Git indirection file {}", entry_path.display())
                     })?;
-                    !should_copy_snapshot_gitdir_pointer(root, excluded_roots, &entry_path, &text)?
+                    !should_copy_snapshot_gitdir_pointer(
+                        root_fd,
+                        root,
+                        excluded_roots,
+                        &entry_path,
+                        &text,
+                    )?
                 } else {
                     false
                 };
                 if omit_git_pointer {
+                    let final_metadata = snapshot_fd_stat(&input).with_context(|| {
+                        format!("restating omitted Git indirection {}", entry_path.display())
+                    })?;
+                    let final_parent_metadata = snapshot_stat_at(directory, &entry_name_c)
+                        .with_context(|| {
+                            format!(
+                                "restating omitted Git indirection binding {}",
+                                entry_path.display()
+                            )
+                        })?;
+                    if final_metadata != metadata || final_parent_metadata != metadata {
+                        bail!(
+                            "source file {} changed while its build snapshot was prepared",
+                            entry_path.display(),
+                        );
+                    }
                     // Bind the deliberate omission itself into the tree hash.
                     // Static-version projects continue to build; SCM-dependent
                     // projects fail closed instead of following mutable host
@@ -1656,8 +1983,9 @@ fn prepare_source_snapshot(
                     hasher.update(b"retread-external-gitdir-omitted-v1\0");
                     continue;
                 }
-                hash_snapshot_record(hasher, b'f', relative, source_snapshot_mode(&metadata));
-                hasher.update(metadata.len().to_be_bytes());
+                let expected_size = metadata.file_size(&entry_path)?;
+                hash_snapshot_record(hasher, b'f', relative, metadata.snapshot_mode());
+                hasher.update(expected_size.to_be_bytes());
                 let destination = snapshot.join(relative);
                 let mut output = File::create(&destination).with_context(|| {
                     format!("creating source snapshot file {}", destination.display())
@@ -1677,16 +2005,20 @@ fn prepare_source_snapshot(
                     })?;
                     copied += read as u64;
                 }
-                if copied != metadata.len() {
+                if copied != expected_size {
                     bail!(
                         "source file {} changed size while its build snapshot was prepared",
                         entry_path.display(),
                     );
                 }
-                let final_metadata = input.metadata().with_context(|| {
+                let final_metadata = snapshot_fd_stat(&input).with_context(|| {
                     format!("restating copied source file {}", entry_path.display())
                 })?;
-                if !snapshot_file_metadata_matches(&metadata, &final_metadata) {
+                let final_parent_metadata = snapshot_stat_at(directory, &entry_name_c)
+                    .with_context(|| {
+                        format!("restating source file binding {}", entry_path.display())
+                    })?;
+                if final_metadata != metadata || final_parent_metadata != metadata {
                     bail!(
                         "source file {} changed while its build snapshot was prepared",
                         entry_path.display(),
@@ -1704,13 +2036,17 @@ fn prepare_source_snapshot(
                 );
             }
         }
-        let final_opened = directory
-            .metadata()
+        visit_hook(path, SnapshotVisitPhase::BeforeFinalValidation)?;
+        let final_opened = snapshot_fd_stat(directory)
             .with_context(|| format!("restating traversed source directory {}", path.display()))?;
-        let final_path = std::fs::symlink_metadata(path)
-            .with_context(|| format!("restating source directory path {}", path.display()))?;
-        if !snapshot_file_metadata_matches(expected_directory, &final_opened)
-            || !snapshot_file_metadata_matches(expected_directory, &final_path)
+        let final_parent = match parent_binding {
+            Some((parent, name)) => Some(snapshot_stat_at(parent, name).with_context(|| {
+                format!("restating source directory binding {}", path.display())
+            })?),
+            None => None,
+        };
+        if final_opened != expected_directory
+            || final_parent.is_some_and(|metadata| metadata != expected_directory)
         {
             bail!(
                 "source directory {} changed while its build snapshot was prepared",
@@ -1747,18 +2083,61 @@ fn prepare_source_snapshot(
     excluded_roots.sort();
     excluded_roots.dedup();
     let directory = unique_staging_dir(&snapshot_parent.join("source"))?;
-    let root_metadata = std::fs::symlink_metadata(&source)?;
+    let root_metadata = rustix::fs::statat(
+        rustix::fs::CWD,
+        &source,
+        rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+    )
+    .map(|stat| SnapshotStat::from_rustix(&stat))
+    .with_context(|| format!("stating source root {}", source.display()))?;
+    if root_metadata.file_type() != rustix::fs::FileType::Directory {
+        bail!("source-build path is not a directory: {}", source.display());
+    }
+    let root_fd = rustix::fs::openat(
+        rustix::fs::CWD,
+        &source,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::DIRECTORY,
+        rustix::fs::Mode::empty(),
+    )
+    .map(File::from)
+    .with_context(|| format!("opening source root directory {}", source.display()))?;
+    if snapshot_fd_stat(&root_fd)? != root_metadata {
+        bail!(
+            "source root {} changed before descriptor-relative traversal",
+            source.display(),
+        );
+    }
     let mut hasher = Sha256::new();
     hasher.update(b"retread-local-source-snapshot-v5\0");
-    hash_snapshot_record(&mut hasher, b'r', "", source_snapshot_mode(&root_metadata));
+    hash_snapshot_record(&mut hasher, b'r', "", root_metadata.snapshot_mode());
     visit(
         &source,
+        &root_fd,
         &excluded_roots,
         directory.0.as_path(),
         &source,
-        &root_metadata,
+        &root_fd,
+        root_metadata,
+        None,
         &mut hasher,
+        visit_hook,
     )?;
+    let final_root = rustix::fs::statat(
+        rustix::fs::CWD,
+        &source,
+        rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+    )
+    .map(|stat| SnapshotStat::from_rustix(&stat))
+    .with_context(|| format!("restating source root binding {}", source.display()))?;
+    if snapshot_fd_stat(&root_fd)? != root_metadata || final_root != root_metadata {
+        bail!(
+            "source root {} changed while its build snapshot was prepared",
+            source.display(),
+        );
+    }
     std::fs::set_permissions(&directory.0, root_metadata.permissions()).with_context(|| {
         format!(
             "preserving source root mode on snapshot {}",
@@ -1773,6 +2152,18 @@ fn prepare_source_snapshot(
         }),
         identity: format!("{:x}", hasher.finalize()),
     })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn prepare_source_snapshot(
+    source: &Path,
+    out_dir: &Path,
+    additional_excluded_roots: &[PathBuf],
+) -> Result<PreparedSourceSnapshot> {
+    let _ = (source, out_dir, additional_excluded_roots);
+    bail!(
+        "secure source snapshots require descriptor-relative no-follow traversal, which is unsupported on this platform"
+    )
 }
 
 fn has_external_gitdir_pointer(source_root: &Path) -> Result<bool> {
@@ -6348,6 +6739,211 @@ version = "0.1.0"
         assert!(!pristine.root().join("pkg/generated.egg-info").exists());
         drop(disposable);
         drop(pristine);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_snapshot_rejects_transient_directory_rename_swap() {
+        let base = unique_test_dir("snapshot-rename-swap");
+        let source = base.join("source");
+        let package = source.join("package");
+        let parked = base.join("parked-original");
+        let replacement = base.join("replacement");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::create_dir_all(&replacement).unwrap();
+        std::fs::write(package.join("module.py"), b"ORIGINAL = True\n").unwrap();
+        std::fs::write(replacement.join("module.py"), b"REPLACEMENT = True\n").unwrap();
+
+        let mut phase = 0_u8;
+        let result = prepare_source_snapshot_with_hook(
+            &source,
+            &base.join("out"),
+            &[],
+            &mut |path, visit_phase| {
+                if path != package {
+                    return Ok(());
+                }
+                match (phase, visit_phase) {
+                    (0, SnapshotVisitPhase::BeforeEnumeration) => {
+                        std::fs::rename(&package, &parked)?;
+                        std::fs::rename(&replacement, &package)?;
+                        phase = 1;
+                    }
+                    (1, SnapshotVisitPhase::BeforeFinalValidation) => {
+                        std::fs::rename(&package, &replacement)?;
+                        std::fs::rename(&parked, &package)?;
+                        phase = 2;
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+        );
+
+        assert_eq!(phase, 2, "test must execute and restore the A→B→A swap");
+        let error = result
+            .err()
+            .expect("a transient source-directory rename swap must be rejected");
+        assert!(
+            format!("{error:#}").contains("changed while its build snapshot was prepared"),
+            "unexpected rename-swap error: {error:#}",
+        );
+        assert_eq!(
+            std::fs::read(package.join("module.py")).unwrap(),
+            b"ORIGINAL = True\n"
+        );
+        assert_eq!(
+            std::fs::read(replacement.join("module.py")).unwrap(),
+            b"REPLACEMENT = True\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pinned_symlink_read_ignores_transient_direct_escape_swap() {
+        use std::os::unix::fs::symlink;
+
+        let base = unique_test_dir("snapshot-direct-symlink-swap");
+        let source = base.join("source");
+        let link = source.join("link");
+        let parked = base.join("parked-link");
+        let replacement = base.join("replacement-link");
+        std::fs::create_dir_all(source.join("safe")).unwrap();
+        std::fs::create_dir_all(base.join("outside")).unwrap();
+        symlink("safe", &link).unwrap();
+        symlink("../outside", &replacement).unwrap();
+        let root_fd = rustix::fs::openat(
+            rustix::fs::CWD,
+            &source,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::DIRECTORY,
+            rustix::fs::Mode::empty(),
+        )
+        .map(File::from)
+        .unwrap();
+        let name = CString::new("link").unwrap();
+        let expected = snapshot_stat_at(&root_fd, &name).unwrap();
+        let mut phase = 0_u8;
+        let mut observed_target = None;
+        let result = read_snapshot_symlink_at_with_hook(
+            &root_fd,
+            &name,
+            expected,
+            &link,
+            &mut |path, symlink_phase| {
+                assert_eq!(path, link);
+                match (phase, symlink_phase) {
+                    (0, PinnedSymlinkPhase::AfterOpen) => {
+                        std::fs::rename(&link, &parked)?;
+                        std::fs::rename(&replacement, &link)?;
+                        phase = 1;
+                    }
+                    (1, PinnedSymlinkPhase::AfterRead(target)) => {
+                        observed_target = Some(target.to_bytes().to_vec());
+                        std::fs::rename(&link, &replacement)?;
+                        std::fs::rename(&parked, &link)?;
+                        phase = 2;
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+        );
+
+        assert_eq!(phase, 2, "test must execute and restore the A→B→A swap");
+        assert_eq!(observed_target.as_deref(), Some(b"safe".as_slice()));
+        match result {
+            Ok(target) => assert_eq!(target.as_bytes(), b"safe"),
+            Err(error) => assert!(
+                format!("{error:#}").contains("changed while its target was read"),
+                "unexpected direct symlink-swap error: {error:#}",
+            ),
+        }
+        assert_eq!(std::fs::read_link(&link).unwrap(), Path::new("safe"));
+        assert_eq!(
+            std::fs::read_link(&replacement).unwrap(),
+            Path::new("../outside")
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descriptor_resolver_ignores_transient_intermediate_escape_swap() {
+        use std::os::unix::fs::symlink;
+
+        let base = unique_test_dir("snapshot-chain-symlink-swap");
+        let source = base.join("source");
+        let middle = source.join("middle");
+        let parked = base.join("parked-middle");
+        let replacement = base.join("replacement-middle");
+        std::fs::create_dir_all(source.join("safe")).unwrap();
+        std::fs::create_dir_all(base.join("outside")).unwrap();
+        symlink("middle", source.join("chain")).unwrap();
+        symlink("safe", &middle).unwrap();
+        symlink("../outside", &replacement).unwrap();
+        let root_fd = rustix::fs::openat(
+            rustix::fs::CWD,
+            &source,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::DIRECTORY,
+            rustix::fs::Mode::empty(),
+        )
+        .map(File::from)
+        .unwrap();
+        let mut phase = 0_u8;
+        let mut observed_target = None;
+        let result = resolve_snapshot_components_with_hook(
+            &root_fd,
+            &source,
+            &[],
+            vec![OsString::from("chain")],
+            &mut |path, symlink_phase| {
+                if path != middle {
+                    return Ok(());
+                }
+                match (phase, symlink_phase) {
+                    (0, PinnedSymlinkPhase::AfterOpen) => {
+                        std::fs::rename(&middle, &parked)?;
+                        std::fs::rename(&replacement, &middle)?;
+                        phase = 1;
+                    }
+                    (1, PinnedSymlinkPhase::AfterRead(target)) => {
+                        observed_target = Some(target.to_bytes().to_vec());
+                        std::fs::rename(&middle, &replacement)?;
+                        std::fs::rename(&parked, &middle)?;
+                        phase = 2;
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+        );
+
+        assert_eq!(phase, 2, "test must execute and restore the A→B→A swap");
+        assert_eq!(observed_target.as_deref(), Some(b"safe".as_slice()));
+        match result {
+            Ok(resolution) => assert_eq!(
+                resolution,
+                DescriptorResolution::Existing(rustix::fs::FileType::Directory)
+            ),
+            Err(error) => assert!(
+                format!("{error:#}").contains("changed while its target was read"),
+                "unexpected intermediate symlink-swap error: {error:#}",
+            ),
+        }
+        assert_eq!(std::fs::read_link(&middle).unwrap(), Path::new("safe"));
+        assert_eq!(
+            std::fs::read_link(&replacement).unwrap(),
+            Path::new("../outside")
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
