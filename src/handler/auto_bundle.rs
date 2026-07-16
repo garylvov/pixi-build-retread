@@ -307,6 +307,7 @@ enum JointRouteOutcome {
     RetryKeepPypi { keep_pypi: BTreeSet<PypiKey> },
 }
 
+#[cfg(test)]
 async fn fetch_from_index_chain<X, XF>(
     indexes: &[String],
     request: PypiFetchRequest,
@@ -439,42 +440,41 @@ pub(crate) async fn auto_bundle_transitives(
     let fetch_target = target.clone();
     let download_dir = download_dir.to_path_buf();
     let relax = config.relax;
-    // Production resolution owns the complete chain here. The generic
-    // auto-bundle harness still invokes its callback through the per-index
-    // seam used by tests, so this callback intentionally ignores that one
-    // index and performs the shared global artifact phases exactly once.
-    let fetch_indexes = indexes.to_vec();
-    let fetch_pypi = move |request: PypiFetchRequest, _index: String| {
-        let target = fetch_target.clone();
-        let download_dir = download_dir.clone();
-        let indexes = fetch_indexes.clone();
-        async move {
-            let (resolved_url, metadata, sdist_prov) = super::bfs_fetch_pypi_from_chain(
-                &request.pypi_name,
-                &request.specifiers,
-                &indexes,
-                &target,
-                &download_dir,
-                relax,
-                request.preferred_version.as_deref(),
-            )
-            .await?;
-            let (upstream_url, sdist_source, metadata_provenance) =
-                super::bfs_fetch_provenance(&resolved_url, sdist_prov);
-            Ok(ResolvedWheel {
-                pypi_name: request.bundle_name,
-                url: resolved_url,
-                upstream_url,
-                git_source: None,
-                sdist_source,
-                metadata_provenance,
-                metadata,
-                extras_requested: vec![],
-                auto_data: None,
-                auto_data_dedup_skipped_root: None,
-            })
-        }
-    };
+    // Production resolution owns the complete chain here. The generic harness
+    // passes the whole ordered chain and caller-specific exhaustion context to
+    // this callback once, avoiding the old chain-inside-chain retry shape.
+    let fetch_pypi =
+        move |request: PypiFetchRequest, indexes: Vec<String>, failure_context: String| {
+            let target = fetch_target.clone();
+            let download_dir = download_dir.clone();
+            async move {
+                let (resolved_url, metadata, sdist_prov) = super::bfs_fetch_pypi_from_chain(
+                    &request.pypi_name,
+                    &request.specifiers,
+                    &indexes,
+                    &target,
+                    &download_dir,
+                    relax,
+                    request.preferred_version.as_deref(),
+                    failure_context,
+                )
+                .await?;
+                let (upstream_url, sdist_source, metadata_provenance) =
+                    super::bfs_fetch_provenance(&resolved_url, sdist_prov);
+                Ok(ResolvedWheel {
+                    pypi_name: request.bundle_name,
+                    url: resolved_url,
+                    upstream_url,
+                    git_source: None,
+                    sdist_source,
+                    metadata_provenance,
+                    metadata,
+                    extras_requested: vec![],
+                    auto_data: None,
+                    auto_data_dedup_skipped_root: None,
+                })
+            }
+        };
     let channels_consulted = conda_co_solve.channels_consulted();
     auto_bundle_transitives_with(
         bundle,
@@ -513,7 +513,7 @@ where
     PF: Future<Output = Vec<crate::probe::ProbeResult>>,
     C: Fn(Vec<crate::uv_closure::CondaRouteSpec>) -> CF,
     CF: Future<Output = crate::uv_closure::CoInstallVerdict>,
-    X: Fn(PypiFetchRequest, String) -> XF,
+    X: Fn(PypiFetchRequest, Vec<String>, String) -> XF,
     XF: Future<Output = Result<ResolvedWheel>>,
 {
     // Build the skip set: anything already in the bundle, plus the user's
@@ -985,12 +985,7 @@ where
                         let failure_context = format!(
                             "auto-bundle: no PyPI index could resolve `{name}{specifiers}` after conda routing was refused"
                         );
-                        fetch_from_index_chain(
-                            indexes_ref,
-                            request,
-                            fetch_pypi,
-                            failure_context,
-                        )
+                        fetch_pypi(request, indexes_ref.to_vec(), failure_context)
                         .await
                         .map(|wheel| (name, version, wheel))
                     },
@@ -1159,7 +1154,7 @@ async fn jointly_unroute_unsolvable<C, CF, X, XF>(
 where
     C: Fn(Vec<crate::uv_closure::CondaRouteSpec>) -> CF,
     CF: Future<Output = crate::uv_closure::CoInstallVerdict>,
-    X: Fn(PypiFetchRequest, String) -> XF,
+    X: Fn(PypiFetchRequest, Vec<String>, String) -> XF,
     XF: Future<Output = Result<ResolvedWheel>>,
 {
     if bundle.auto_routed.is_empty() && metadata_routes.is_empty() {
@@ -1426,8 +1421,7 @@ where
             "joint route validation kept `{}` on PyPI, but no configured index could fetch `{}`",
             request.pypi_name, requirement
         );
-        restored_wheels
-            .push(fetch_from_index_chain(indexes, request, fetch_pypi, failure_context).await?);
+        restored_wheels.push(fetch_pypi(request, indexes.to_vec(), failure_context).await?);
     }
 
     let mut trial = bundle.clone();
@@ -2355,7 +2349,7 @@ mod tests {
         let fetch_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let fetch = {
             let fetch_calls = Arc::clone(&fetch_calls);
-            move |_request: PypiFetchRequest, _index: String| {
+            move |_request: PypiFetchRequest, _indexes: Vec<String>, _failure_context: String| {
                 fetch_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 async { Err(anyhow!("uv re-resolve must return before shadow fetch")) }
             }
@@ -2428,7 +2422,7 @@ mod tests {
         let fetch_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let fetch = {
             let fetch_calls = Arc::clone(&fetch_calls);
-            move |_request: PypiFetchRequest, _index: String| {
+            move |_request: PypiFetchRequest, _indexes: Vec<String>, _failure_context: String| {
                 fetch_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 async { Err(anyhow!("uv re-resolve must bypass shadow fetch")) }
             }
@@ -2712,7 +2706,7 @@ mod tests {
         let fetch_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let fetch = {
             let fetch_calls = Arc::clone(&fetch_calls);
-            move |_request: PypiFetchRequest, _index: String| {
+            move |_request: PypiFetchRequest, _indexes: Vec<String>, _failure_context: String| {
                 fetch_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 async { Err(anyhow!("workspace-owned packaging must never fetch PyPI")) }
             }
@@ -2809,7 +2803,7 @@ mod tests {
         let fetch_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let fetch = {
             let fetch_calls = Arc::clone(&fetch_calls);
-            move |_request: PypiFetchRequest, _index: String| {
+            move |_request: PypiFetchRequest, _indexes: Vec<String>, _failure_context: String| {
                 fetch_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 async { Err(anyhow!("workspace-owned numpy must never fetch PyPI")) }
             }
@@ -3039,7 +3033,7 @@ mod tests {
         let fetch_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let fetch = {
             let fetch_calls = Arc::clone(&fetch_calls);
-            move |_request: PypiFetchRequest, _index: String| {
+            move |_request: PypiFetchRequest, _indexes: Vec<String>, _failure_context: String| {
                 fetch_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 async { Err(anyhow!("workspace-owned psutil must not restore from PyPI")) }
             }
@@ -3089,7 +3083,7 @@ mod tests {
         let fetch_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let fetch = {
             let fetch_calls = Arc::clone(&fetch_calls);
-            move |_request: PypiFetchRequest, _index: String| {
+            move |_request: PypiFetchRequest, _indexes: Vec<String>, _failure_context: String| {
                 fetch_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 async { Err(anyhow!("semantic conflict must fail before fetch")) }
             }
@@ -3169,7 +3163,7 @@ mod tests {
         let fetch_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let fetch = {
             let fetch_calls = Arc::clone(&fetch_calls);
-            move |_request: PypiFetchRequest, _index: String| {
+            move |_request: PypiFetchRequest, _indexes: Vec<String>, _failure_context: String| {
                 fetch_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 async { Err(anyhow!("accepted conda route must not fetch PyPI")) }
             }
@@ -3235,7 +3229,7 @@ mod tests {
         let fetch_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let fetch = {
             let fetch_calls = Arc::clone(&fetch_calls);
-            move |_request: PypiFetchRequest, _index: String| {
+            move |_request: PypiFetchRequest, _indexes: Vec<String>, _failure_context: String| {
                 fetch_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 async { Ok(test_wheel(NAME, NAME, "4.0.1", &[])) }
             }
@@ -3321,7 +3315,7 @@ mod tests {
         let fetch_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let fetch = {
             let fetch_calls = Arc::clone(&fetch_calls);
-            move |_request: PypiFetchRequest, _index: String| {
+            move |_request: PypiFetchRequest, _indexes: Vec<String>, _failure_context: String| {
                 fetch_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 async { Err(anyhow!("a softened conda route must not fetch PyPI")) }
             }
@@ -3461,7 +3455,7 @@ mod tests {
         let requests = Arc::new(Mutex::new(Vec::<PypiFetchRequest>::new()));
         let fetch = {
             let requests = Arc::clone(&requests);
-            move |request: PypiFetchRequest, _index: String| {
+            move |request: PypiFetchRequest, _indexes: Vec<String>, _failure_context: String| {
                 let requests = Arc::clone(&requests);
                 async move {
                     requests.lock().unwrap().push(request.clone());
@@ -3678,7 +3672,7 @@ pillow = ">=10,<13"
         let requests = Arc::new(Mutex::new(Vec::<PypiFetchRequest>::new()));
         let fetch = {
             let requests = Arc::clone(&requests);
-            move |request: PypiFetchRequest, _index: String| {
+            move |request: PypiFetchRequest, _indexes: Vec<String>, _failure_context: String| {
                 let requests = Arc::clone(&requests);
                 async move {
                     requests.lock().unwrap().push(request.clone());
@@ -3734,7 +3728,7 @@ pillow = ">=10,<13"
         let fetch_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let fetch = {
             let fetch_calls = Arc::clone(&fetch_calls);
-            move |_request: PypiFetchRequest, _index: String| {
+            move |_request: PypiFetchRequest, _indexes: Vec<String>, _failure_context: String| {
                 fetch_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 async {
                     Err(anyhow!(
@@ -3879,7 +3873,7 @@ pillow = ">=10,<13"
         let requests = Arc::new(Mutex::new(Vec::<PypiFetchRequest>::new()));
         let fetch = {
             let requests = Arc::clone(&requests);
-            move |request: PypiFetchRequest, _index: String| {
+            move |request: PypiFetchRequest, _indexes: Vec<String>, _failure_context: String| {
                 let requests = Arc::clone(&requests);
                 async move {
                     requests.lock().unwrap().push(request.clone());
@@ -4022,7 +4016,7 @@ pillow = ">=10,<13"
         let fetch_calls = Arc::new(Mutex::new(Vec::<String>::new()));
         let fetch = {
             let fetch_calls = Arc::clone(&fetch_calls);
-            move |request: PypiFetchRequest, index: String| {
+            move |request: PypiFetchRequest, indexes: Vec<String>, failure_context: String| {
                 let fetch_calls = Arc::clone(&fetch_calls);
                 async move {
                     assert_eq!(request.pypi_name, "pyglet");
@@ -4030,20 +4024,26 @@ pillow = ">=10,<13"
                         request.specifiers,
                         VersionSpecifiers::from_str("<2").unwrap()
                     );
-                    fetch_calls.lock().unwrap().push(index.clone());
-                    if index.trim_end_matches('/')
-                        != crate::workspace::DEFAULT_PYPI_INDEX.trim_end_matches('/')
-                    {
-                        return Err(crate::pypi::pypi_index_miss(format!(
-                            "package absent from {index}"
-                        )));
-                    }
-                    Ok(test_wheel(
-                        &request.bundle_name,
-                        &request.pypi_name,
-                        "1.5.27",
-                        &[],
-                    ))
+                    let fetch_one = move |request: PypiFetchRequest, index: String| {
+                        let fetch_calls = Arc::clone(&fetch_calls);
+                        async move {
+                            fetch_calls.lock().unwrap().push(index.clone());
+                            if index.trim_end_matches('/')
+                                != crate::workspace::DEFAULT_PYPI_INDEX.trim_end_matches('/')
+                            {
+                                return Err(crate::pypi::pypi_index_miss(format!(
+                                    "package absent from {index}"
+                                )));
+                            }
+                            Ok(test_wheel(
+                                &request.bundle_name,
+                                &request.pypi_name,
+                                "1.5.27",
+                                &[],
+                            ))
+                        }
+                    };
+                    fetch_from_index_chain(&indexes, request, &fetch_one, failure_context).await
                 }
             }
         };
@@ -4138,7 +4138,7 @@ pillow = ">=10,<13"
         let calls = Arc::new(Mutex::new(Vec::<String>::new()));
         let fetch = {
             let calls = Arc::clone(&calls);
-            move |request: PypiFetchRequest, index: String| {
+            move |request: PypiFetchRequest, indexes: Vec<String>, failure_context: String| {
                 let calls = Arc::clone(&calls);
                 async move {
                     assert_eq!(request.pypi_name, "flatdict");
@@ -4146,20 +4146,26 @@ pillow = ">=10,<13"
                         request.specifiers,
                         VersionSpecifiers::from_str(">=4.0.1,<4.1").unwrap()
                     );
-                    calls.lock().unwrap().push(index.clone());
-                    if index.trim_end_matches('/')
-                        != crate::workspace::DEFAULT_PYPI_INDEX.trim_end_matches('/')
-                    {
-                        return Err(crate::pypi::pypi_index_miss(format!(
-                            "flatdict absent from {index}"
-                        )));
-                    }
-                    Ok(test_wheel(
-                        &request.bundle_name,
-                        &request.pypi_name,
-                        "4.0.1",
-                        &[],
-                    ))
+                    let fetch_one = move |request: PypiFetchRequest, index: String| {
+                        let calls = Arc::clone(&calls);
+                        async move {
+                            calls.lock().unwrap().push(index.clone());
+                            if index.trim_end_matches('/')
+                                != crate::workspace::DEFAULT_PYPI_INDEX.trim_end_matches('/')
+                            {
+                                return Err(crate::pypi::pypi_index_miss(format!(
+                                    "flatdict absent from {index}"
+                                )));
+                            }
+                            Ok(test_wheel(
+                                &request.bundle_name,
+                                &request.pypi_name,
+                                "4.0.1",
+                                &[],
+                            ))
+                        }
+                    };
+                    fetch_from_index_chain(&indexes, request, &fetch_one, failure_context).await
                 }
             }
         };
@@ -4209,6 +4215,82 @@ pillow = ">=10,<13"
                 crate::workspace::DEFAULT_PYPI_INDEX.to_string(),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn chain_fetch_runs_once_and_preserves_failure_context() {
+        let indexes = vec!["private".to_string(), "public".to_string()];
+        let calls = Arc::new(Mutex::new(Vec::<(Vec<String>, String)>::new()));
+        let fetch = {
+            let calls = Arc::clone(&calls);
+            move |request: PypiFetchRequest, indexes: Vec<String>, failure_context: String| {
+                let calls = Arc::clone(&calls);
+                async move {
+                    assert_eq!(request.pypi_name, "flatdict");
+                    calls
+                        .lock()
+                        .unwrap()
+                        .push((indexes.clone(), failure_context.clone()));
+                    super::super::fetch_artifact_from_pypi_index_chain(
+                        &indexes,
+                        true,
+                        request.preferred_version,
+                        |_index, _phase, _prefer_version| async {
+                            Err::<ResolvedWheel, _>(crate::pypi::pypi_index_miss("absent"))
+                        },
+                        failure_context,
+                    )
+                    .await
+                }
+            }
+        };
+        let probe = |pairs: Vec<(String, String)>| async move {
+            pairs
+                .into_iter()
+                .map(|(package, spec)| crate::probe::ProbeResult {
+                    package,
+                    spec,
+                    channels_consulted: vec!["conda-forge/linux-64".to_string()],
+                    satisfiable: Some(false),
+                    matching_candidates: 0,
+                })
+                .collect()
+        };
+        let solve = |_| async { crate::uv_closure::CoInstallVerdict::Sat };
+        let target = crate::pypi::WheelTarget::for_subdir("3.11", "linux-64");
+        let mut bundle = test_bundle(&["flatdict>=4.0.1,<4.1"]);
+
+        let error = auto_bundle_transitives_with(
+            &mut bundle,
+            &indexes,
+            &target,
+            &test_config(),
+            None,
+            None,
+            None,
+            &probe,
+            &solve,
+            &fetch,
+            &["conda-forge/linux-64".to_string()],
+            &UvReresolveContext::default(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(crate::pypi::is_pypi_index_miss(&error));
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "the chain-aware callback must run once");
+        assert_eq!(calls[0].0, indexes);
+        assert!(
+            calls[0]
+                .1
+                .starts_with("auto-bundle: no PyPI index could resolve `flatdict")
+        );
+        assert!(calls[0].1.ends_with("after conda routing was refused"));
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains(&calls[0].1));
+        assert!(rendered.contains("exact wheel private: absent"));
+        assert!(rendered.contains("sdist public: absent"));
     }
 
     /// v2.10.0: seed_worklist must NOT enqueue a dep whose canonical name is

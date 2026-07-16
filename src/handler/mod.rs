@@ -5901,15 +5901,17 @@ impl PypiArtifactPhase {
 /// Artifact preference is global across the chain: exact-spec wheels on every
 /// index, then relaxed-spec wheels when policy allows, then sdists. A transport,
 /// authentication, parse, or build error remains fatal at the index where it
-/// occurred. Index priority is preserved within each artifact phase.
+/// occurred. Index priority is preserved within each artifact phase. The
+/// optional version preference is forwarded unchanged through every phase.
 async fn fetch_artifact_from_pypi_index_chain<T, X, XF>(
     indexes: &[String],
     try_relaxed_wheels: bool,
+    prefer_version: Option<String>,
     mut fetch: X,
     exhaustion_context: String,
 ) -> Result<T>
 where
-    X: FnMut(String, PypiArtifactPhase) -> XF,
+    X: FnMut(String, PypiArtifactPhase, Option<String>) -> XF,
     XF: std::future::Future<Output = Result<T>>,
 {
     let mut misses = Vec::new();
@@ -5923,7 +5925,7 @@ where
             continue;
         }
         for index in indexes {
-            match fetch(index.clone(), phase).await {
+            match fetch(index.clone(), phase, prefer_version.clone()).await {
                 Ok(value) => return Ok(value),
                 Err(error) if pypi::is_pypi_index_miss(&error) => {
                     tracing::debug!(
@@ -5947,14 +5949,18 @@ where
     }
 
     if misses.is_empty() {
-        bail!("{exhaustion_context}: no PyPI index configured");
+        return Err(pypi::pypi_index_miss(format!(
+            "{exhaustion_context}: no PyPI index configured"
+        )));
     }
     let diagnostics = misses
         .into_iter()
         .map(|(kind, index, error)| format!("  - {kind} {index}: {error}"))
         .collect::<Vec<_>>()
         .join("\n");
-    bail!("{exhaustion_context}; every configured index missed:\n{diagnostics}")
+    Err(pypi::pypi_index_miss(format!(
+        "{exhaustion_context}; every configured index missed:\n{diagnostics}"
+    )))
 }
 
 #[cfg(test)]
@@ -5971,9 +5977,10 @@ mod wheel_then_sdist_chain_tests {
         let result = fetch_artifact_from_pypi_index_chain(
             &indexes,
             true,
+            None,
             {
                 let calls = calls.clone();
-                move |index, phase| {
+                move |index, phase, _prefer_version| {
                     let calls = calls.clone();
                     async move {
                         calls
@@ -6016,9 +6023,10 @@ mod wheel_then_sdist_chain_tests {
         let result = fetch_artifact_from_pypi_index_chain(
             &indexes,
             true,
+            None,
             {
                 let calls = calls.clone();
-                move |index, phase| {
+                move |index, phase, _prefer_version| {
                     let calls = calls.clone();
                     async move {
                         calls
@@ -6058,9 +6066,10 @@ mod wheel_then_sdist_chain_tests {
         let error = fetch_artifact_from_pypi_index_chain(
             &indexes,
             true,
+            None,
             {
                 let calls = calls.clone();
-                move |index, phase| {
+                move |index, phase, _prefer_version| {
                     let calls = calls.clone();
                     async move {
                         calls
@@ -6078,6 +6087,84 @@ mod wheel_then_sdist_chain_tests {
 
         assert!(format!("{error:#}").contains("exact wheel index chain aborted on `broken`"));
         assert_eq!(*calls.lock().unwrap(), vec!["exact wheel:broken"]);
+    }
+
+    #[tokio::test]
+    async fn preferred_version_reaches_relaxed_wheel_and_sdist_phases() {
+        let indexes = vec!["only".to_string()];
+        let calls = Arc::new(Mutex::new(Vec::new()));
+
+        let result = fetch_artifact_from_pypi_index_chain(
+            &indexes,
+            true,
+            Some("2.0".to_string()),
+            {
+                let calls = calls.clone();
+                move |index, phase, prefer_version| {
+                    let calls = calls.clone();
+                    async move {
+                        calls.lock().unwrap().push((
+                            phase.label().to_string(),
+                            index,
+                            prefer_version,
+                        ));
+                        if phase == PypiArtifactPhase::Sdist {
+                            Ok("preferred-sdist".to_string())
+                        } else {
+                            Err(crate::pypi::pypi_index_miss("artifact miss"))
+                        }
+                    }
+                }
+            },
+            "fixture exhaustion".to_string(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, "preferred-sdist");
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                (
+                    "exact wheel".to_string(),
+                    "only".to_string(),
+                    Some("2.0".to_string()),
+                ),
+                (
+                    "relaxed wheel".to_string(),
+                    "only".to_string(),
+                    Some("2.0".to_string()),
+                ),
+                (
+                    "sdist".to_string(),
+                    "only".to_string(),
+                    Some("2.0".to_string()),
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn all_index_miss_keeps_type_context_and_phase_diagnostics() {
+        let indexes = vec!["first".to_string(), "second".to_string()];
+        let error = fetch_artifact_from_pypi_index_chain(
+            &indexes,
+            true,
+            None,
+            |_index, _phase, _prefer_version| async {
+                Err::<String, _>(crate::pypi::pypi_index_miss("artifact miss"))
+            },
+            "auto-bundle fixture context".to_string(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(crate::pypi::is_pypi_index_miss(&error));
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("auto-bundle fixture context"));
+        assert!(rendered.contains("exact wheel first: artifact miss"));
+        assert!(rendered.contains("relaxed wheel second: artifact miss"));
+        assert!(rendered.contains("sdist second: artifact miss"));
     }
 }
 
@@ -6591,6 +6678,9 @@ async fn resolve_bundle(
                             download_dir,
                             relax,
                             prefer_version.as_deref(),
+                            format!(
+                                "BFS could not resolve `{pypi_name}` from any configured PyPI index"
+                            ),
                         )
                         .await
                         .map(Some)
@@ -6895,19 +6985,20 @@ async fn bfs_fetch_pypi_from_chain(
     download_dir: &Path,
     relax: RelaxPolicy,
     prefer_version: Option<&str>,
+    exhaustion_context: String,
 ) -> Result<BfsFetched> {
     let relaxed = relaxed_retry_specs(pypi_name, specifiers, relax);
     let try_relaxed = relaxed.is_some();
     fetch_artifact_from_pypi_index_chain(
         indexes,
         try_relaxed,
-        |index, phase| {
+        prefer_version.map(str::to_string),
+        |index, phase, prefer_version| {
             let pypi_name = pypi_name.to_string();
             let exact = specifiers.clone();
             let relaxed = relaxed.clone();
             let target = target.clone();
             let download_dir = download_dir.to_path_buf();
-            let prefer_version = prefer_version.map(str::to_string);
             async move {
                 match phase {
                     PypiArtifactPhase::ExactWheel => {
@@ -6931,7 +7022,7 @@ async fn bfs_fetch_pypi_from_chain(
                             &index,
                             &target,
                             &download_dir,
-                            None,
+                            prefer_version.as_deref(),
                         )
                         .await?;
                         tracing::warn!(
@@ -6954,13 +7045,14 @@ async fn bfs_fetch_pypi_from_chain(
                             &index,
                             &target,
                             &download_dir,
+                            prefer_version.as_deref(),
                         )
                         .await
                     }
                 }
             }
         },
-        format!("BFS could not resolve `{pypi_name}` from any configured PyPI index"),
+        exhaustion_context,
     )
     .await
 }
@@ -6991,16 +7083,22 @@ async fn bfs_fetch_pypi_wheel(
 /// Resolve and build a source distribution from one index. This runs only
 /// after binary-wheel resolution missed on every configured index, so source
 /// builds cannot shadow later vendor wheels. The sdist uses the original spec,
-/// preserving exact upstream pins and lock provenance.
+/// preserving exact upstream pins and lock provenance. A compatible favored
+/// lock version wins over the latest matching source distribution.
 async fn bfs_fetch_pypi_sdist(
     pypi_name: &str,
     specifiers: &VersionSpecifiers,
     index: &str,
     target: &ResolutionTarget,
     download_dir: &Path,
+    prefer_version: Option<&str>,
 ) -> Result<BfsFetched> {
-    let (sdist_version, sdist) = pypi::resolve_sdist(index, pypi_name, specifiers)
-        .await
+    let resolved = if let Some(preferred) = prefer_version {
+        pypi::resolve_sdist_preferring(index, pypi_name, specifiers, preferred).await
+    } else {
+        pypi::resolve_sdist(index, pypi_name, specifiers).await
+    };
+    let (sdist_version, sdist) = resolved
         .with_context(|| format!("BFS sdist fallback for {pypi_name} {specifiers} on {index}"))?;
     // Capture the sdist URL before the build so replay keeps the immutable
     // source even though the materialized wheel is a local file URL.

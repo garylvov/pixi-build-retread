@@ -524,6 +524,27 @@ pub async fn resolve_sdist(
     name: &str,
     specifiers: &VersionSpecifiers,
 ) -> Result<(uv_pep440::Version, ResolvedWheel)> {
+    resolve_sdist_inner(index, name, specifiers, None).await
+}
+
+/// Like [`resolve_sdist`] but prefers `prefer_version` when that version is
+/// present on the index and satisfies `specifiers`. Falls back to the highest
+/// matching sdist when the preference is absent or incompatible.
+pub async fn resolve_sdist_preferring(
+    index: &str,
+    name: &str,
+    specifiers: &VersionSpecifiers,
+    prefer_version: &str,
+) -> Result<(uv_pep440::Version, ResolvedWheel)> {
+    resolve_sdist_inner(index, name, specifiers, Some(prefer_version)).await
+}
+
+async fn resolve_sdist_inner(
+    index: &str,
+    name: &str,
+    specifiers: &VersionSpecifiers,
+    prefer_version: Option<&str>,
+) -> Result<(uv_pep440::Version, ResolvedWheel)> {
     let index_url = build_index_url(index, name)?;
     tracing::info!(url = %index_url, "sdist fallback: fetching simple index");
     // Single content-type-aware fetch+parse; `parse_index_links_any` is the
@@ -567,6 +588,15 @@ pub async fn resolve_sdist(
         )));
     }
     versioned.sort_by(|a, b| b.0.cmp(&a.0));
+    if let Some(preferred) = prefer_version
+        && let Ok(preferred) = Version::from_str(preferred)
+        && specifiers.contains(&preferred)
+        && let Some(position) = versioned
+            .iter()
+            .position(|(version, _)| *version == preferred)
+    {
+        return Ok(versioned.remove(position));
+    }
     let (version, wheel) = versioned.into_iter().next().unwrap();
     Ok((version, wheel))
 }
@@ -2192,5 +2222,42 @@ platforms = [{ platform = "linux-64", glibc = "2.35" }]
             picked.filename, "mylib-3.0-py3-none-any.whl",
             "plain resolve must pick the highest version (3.0)"
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_sdist_preferring_returns_preferred_not_latest() {
+        let entries = vec![
+            ("mylib-1.0.tar.gz".to_string(), b"v10".to_vec()),
+            ("mylib-2.0.tar.gz".to_string(), b"v20".to_vec()),
+            ("mylib-3.0.tar.gz".to_string(), b"v30".to_vec()),
+        ];
+        let port = spawn_fixture_server(entries, 2).await;
+        let index = format!("http://127.0.0.1:{port}/simple/");
+        let specs: VersionSpecifiers = ">=1.0".parse().unwrap();
+
+        let (version, picked) = resolve_sdist_preferring(&index, "mylib", &specs, "2.0")
+            .await
+            .expect("preferred sdist resolution must succeed");
+
+        assert_eq!(version, Version::from_str("2.0").unwrap());
+        assert_eq!(picked.filename, "mylib-2.0.tar.gz");
+    }
+
+    #[tokio::test]
+    async fn resolve_sdist_preferring_falls_back_to_latest() {
+        let entries = vec![
+            ("mylib-1.0.tar.gz".to_string(), b"v10".to_vec()),
+            ("mylib-3.0.tar.gz".to_string(), b"v30".to_vec()),
+        ];
+        let port = spawn_fixture_server(entries, 2).await;
+        let index = format!("http://127.0.0.1:{port}/simple/");
+        let specs: VersionSpecifiers = ">=1.0".parse().unwrap();
+
+        let (version, picked) = resolve_sdist_preferring(&index, "mylib", &specs, "2.0")
+            .await
+            .expect("missing preferred sdist must fall back");
+
+        assert_eq!(version, Version::from_str("3.0").unwrap());
+        assert_eq!(picked.filename, "mylib-3.0.tar.gz");
     }
 }
