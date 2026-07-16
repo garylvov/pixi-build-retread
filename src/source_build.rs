@@ -1227,24 +1227,86 @@ async fn run_output(cmd: &mut Command, label: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+#[cfg(unix)]
+struct UvProcessGroupGuard {
+    pgid: nix::unistd::Pid,
+    armed: bool,
+}
+
+#[cfg(unix)]
+impl UvProcessGroupGuard {
+    fn new(pgid: u32) -> Result<Self> {
+        let pgid = i32::try_from(pgid).context("uv process id exceeds Unix pid_t range")?;
+        Ok(Self {
+            pgid: nix::unistd::Pid::from_raw(pgid),
+            armed: true,
+        })
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for UvProcessGroupGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        match nix::sys::signal::killpg(self.pgid, nix::sys::signal::Signal::SIGKILL) {
+            Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+            Err(error) => tracing::warn!(
+                pgid = self.pgid.as_raw(),
+                error = %error,
+                "failed to kill cancelled uv build process group",
+            ),
+        }
+    }
+}
+
 /// Invoke `uv` with the given args, capturing stdout + stderr so neither
 /// leaks to retread's stdout (which is the JSON-RPC channel to pixi).
 /// Sets `UV_PYTHON_DOWNLOADS=automatic` so missing pythons are fetched
 /// on demand without user intervention.
 async fn run_capturing_uv(args: &[&str]) -> Result<()> {
+    // The callers above have already exhausted their wheel-cache paths. Hold
+    // the process-wide permit only for the real build subprocess so nested
+    // handler concurrency cannot multiply expensive `uv build` work.
+    let _build_permit = crate::concurrency::acquire_build_permit().await;
     let mut cmd = Command::new("uv");
     for arg in args {
         cmd.arg(arg);
     }
     crate::fasttmp::apply_backend_env(&mut cmd);
-    let output = cmd
+    #[cfg(unix)]
+    cmd.process_group(0);
+    let child = cmd
         .env("UV_PYTHON_DOWNLOADS", "automatic")
+        // If pixi cancels a backend request, dropping this future must also
+        // terminate the direct uv child. The Unix process-group guard below
+        // additionally terminates Python/compiler descendants.
+        .kill_on_drop(true)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
-        .await
+        .spawn()
         .context("spawning uv (is it on PATH? expected via retread's runtime dep)")?;
+    // Keep this guard declared after `_build_permit`: Rust drops locals in
+    // reverse declaration order, so cancellation kills the complete process
+    // group before releasing capacity to a replacement build.
+    #[cfg(unix)]
+    let mut process_group = UvProcessGroupGuard::new(
+        child
+            .id()
+            .context("spawned uv process has no operating-system pid")?,
+    )?;
+    let output = child
+        .wait_with_output()
+        .await
+        .context("waiting for uv build subprocess")?;
+    #[cfg(unix)]
+    process_group.disarm();
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     if !output.status.success() {
@@ -1405,6 +1467,8 @@ mod tests {
     use super::*;
 
     const CHECKOUT_SUBPROCESS_HELPER: &str = "source_build::tests::git_checkout_subprocess_helper";
+    const UV_BUILD_LIMIT_SUBPROCESS_HELPER: &str =
+        "source_build::tests::uv_build_limit_subprocess_helper";
 
     struct CheckoutTestChild {
         child: Option<std::process::Child>,
@@ -1413,16 +1477,25 @@ mod tests {
 
     impl CheckoutTestChild {
         fn spawn(label: &str, mode: &str, environment: &[(&str, String)]) -> Self {
+            Self::spawn_exact(
+                label,
+                CHECKOUT_SUBPROCESS_HELPER,
+                mode,
+                environment,
+            )
+        }
+
+        fn spawn_exact(
+            label: &str,
+            test_name: &str,
+            mode: &str,
+            environment: &[(&str, String)],
+        ) -> Self {
             let mut command = std::process::Command::new(
                 std::env::current_exe().expect("locate current Rust test executable"),
             );
             command
-                .args([
-                    "--exact",
-                    CHECKOUT_SUBPROCESS_HELPER,
-                    "--nocapture",
-                    "--test-threads=1",
-                ])
+                .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
                 .env("RETREAD_TEST_CHILD_MODE", mode)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
@@ -1517,6 +1590,188 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(10));
             }
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn recorded_uv_processes(
+        state_dir: &Path,
+        prefix: &str,
+    ) -> std::collections::BTreeMap<String, u32> {
+        let mut recorded = std::collections::BTreeMap::new();
+        for entry in std::fs::read_dir(state_dir).expect("read fake-uv state directory") {
+            let entry = entry.expect("read fake-uv state entry");
+            let name = entry.file_name();
+            let Some(id) = name.to_str().and_then(|name| name.strip_prefix(prefix)) else {
+                continue;
+            };
+            let Ok(pid) = std::fs::read_to_string(entry.path()) else {
+                continue;
+            };
+            let Ok(pid) = pid.trim().parse() else {
+                continue;
+            };
+            recorded.insert(id.to_string(), pid);
+        }
+        recorded
+    }
+
+    #[cfg(target_os = "linux")]
+    fn started_uv_processes(state_dir: &Path) -> std::collections::BTreeMap<String, u32> {
+        recorded_uv_processes(state_dir, "started-")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn uv_grandchildren(state_dir: &Path) -> std::collections::BTreeMap<String, u32> {
+        recorded_uv_processes(state_dir, "grandchild-")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn process_is_running(pid: u32) -> bool {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        // A killed child may briefly remain as a zombie until Tokio reaps it;
+        // that is terminated for this regression's purposes.
+        stat.rsplit_once(") ")
+            .and_then(|(_, rest)| rest.chars().next())
+            .is_some_and(|state| state != 'Z')
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn wait_for_test_condition(label: &str, mut condition: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !condition() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {label}"));
+    }
+
+    /// Subprocess-isolated because the production semaphore and parsed
+    /// environment setting are intentionally initialized once per process.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn uv_build_limit_subprocess_helper() {
+        if std::env::var("RETREAD_TEST_CHILD_MODE").as_deref() != Ok("uv-build-limit") {
+            return;
+        }
+        let state_dir = PathBuf::from(
+            std::env::var_os("RETREAD_TEST_UV_STATE").expect("missing fake-uv state directory"),
+        );
+        let ids = ["one", "two", "three"];
+        let mut tasks = Vec::new();
+        for id in ids {
+            tasks.push(Some(tokio::spawn(async move {
+                run_capturing_uv(&["build", id]).await
+            })));
+        }
+
+        wait_for_test_condition("two capped uv children", || {
+            started_uv_processes(&state_dir).len() >= 2
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let first_wave = started_uv_processes(&state_dir);
+        assert_eq!(
+            first_wave.len(),
+            2,
+            "cap=2 allowed a third uv build to start: {first_wave:?}",
+        );
+
+        let cancelled_id = first_wave.keys().next().expect("one started uv id").clone();
+        let cancelled_pid = first_wave[&cancelled_id];
+        let cancelled_grandchild_pid = uv_grandchildren(&state_dir)
+            .get(&cancelled_id)
+            .copied()
+            .expect("started fake uv recorded its grandchild pid");
+        let cancelled_index = ids
+            .iter()
+            .position(|id| *id == cancelled_id)
+            .expect("started uv id belongs to a task");
+        let cancelled = tasks[cancelled_index]
+            .take()
+            .expect("cancelled task still present");
+        cancelled.abort();
+        assert!(
+            cancelled.await.expect_err("aborted build task completed").is_cancelled(),
+            "build task did not report cancellation",
+        );
+        wait_for_test_condition("cancelled uv child termination", || {
+            !process_is_running(cancelled_pid)
+        })
+        .await;
+        wait_for_test_condition("cancelled uv grandchild termination", || {
+            !process_is_running(cancelled_grandchild_pid)
+        })
+        .await;
+        wait_for_test_condition("third uv child after permit release", || {
+            started_uv_processes(&state_dir).len() == 3
+        })
+        .await;
+
+        for task in tasks.into_iter().flatten() {
+            task.abort();
+            assert!(task.await.expect_err("aborted build task completed").is_cancelled());
+        }
+        for pid in started_uv_processes(&state_dir).into_values() {
+            wait_for_test_condition("fake uv cleanup", || !process_is_running(pid)).await;
+        }
+        for pid in uv_grandchildren(&state_dir).into_values() {
+            wait_for_test_condition("fake uv grandchild cleanup", || !process_is_running(pid))
+                .await;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn uv_builds_are_capped_and_killed_on_cancellation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "retread-uv-build-limit-{}-{unique}",
+            std::process::id()
+        ));
+        let bin_dir = base.join("bin");
+        let state_dir = base.join("state");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let fake_uv = bin_dir.join("uv");
+        std::fs::write(
+            &fake_uv,
+            b"#!/bin/sh\nsleep 30 &\ngrandchild=$!\ngrandchild_tmp=\"${RETREAD_TEST_UV_STATE}/.grandchild-$2-$$\"\nprintf '%s\\n' \"$grandchild\" > \"$grandchild_tmp\"\nmv \"$grandchild_tmp\" \"${RETREAD_TEST_UV_STATE}/grandchild-$2\"\nstarted_tmp=\"${RETREAD_TEST_UV_STATE}/.started-$2-$$\"\nprintf '%s\\n' \"$$\" > \"$started_tmp\"\nmv \"$started_tmp\" \"${RETREAD_TEST_UV_STATE}/started-$2\"\nwait \"$grandchild\"\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fake_uv).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_uv, permissions).unwrap();
+        let path = format!(
+            "{}:{}",
+            bin_dir.display(),
+            std::env::var_os("PATH")
+                .unwrap_or_default()
+                .to_string_lossy()
+        );
+
+        CheckoutTestChild::spawn_exact(
+            "uv build concurrency/cancellation probe",
+            UV_BUILD_LIMIT_SUBPROCESS_HELPER,
+            "uv-build-limit",
+            &[
+                ("RETREAD_MAX_CONCURRENT_BUILDS", "2".to_string()),
+                (
+                    "RETREAD_TEST_UV_STATE",
+                    state_dir.display().to_string(),
+                ),
+                ("PATH", path),
+            ],
+        )
+        .finish(Duration::from_secs(15));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     impl Drop for CheckoutTestChild {

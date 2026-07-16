@@ -2626,7 +2626,6 @@ async fn resolve_all(
         // already concurrency-safe: git clone/checkout is serialized by the
         // per-(url,rev) lock in source_build.rs, and wheel downloads land
         // via unique-temp + atomic rename (wheel.rs).
-        const ENTRY_BUILD_CONCURRENCY: usize = 6;
         let mut entry_futures = Vec::with_capacity(group_entries.len());
         for (idx, ((entry_name, entry), auto_data)) in
             group_entries.iter().zip(auto_data_per_entry).enumerate()
@@ -2684,7 +2683,7 @@ async fn resolve_all(
         let mut sub_bundles: Vec<Bundle> = {
             use futures::stream::{self, StreamExt, TryStreamExt};
             stream::iter(entry_futures)
-                .buffered(ENTRY_BUILD_CONCURRENCY)
+                .buffered(crate::concurrency::max_concurrent_builds())
                 .try_collect()
                 .await?
         };
@@ -3708,36 +3707,46 @@ async fn solve_workspace_conda_facts(
         _ => rattler_solve::ChannelPriority::Strict,
     };
     let bundle_key = PypiKey::from_pypi(bundle_name);
-    let solves = futures::future::join_all(inputs.iter().map(|input| {
-        let env = &input.env;
-        let deps = &input.conda_deps;
-        let mut specs = deps
-            .iter()
-            .filter_map(|(name, spec)| {
-                let name = CondaName::new(name.as_str());
-                if name.key() == bundle_key {
-                    return None;
-                }
-                Some(name.match_spec(spec))
-            })
-            .collect::<Vec<_>>();
-        specs.push(CondaName::new("python").match_spec(&format!("{}.*", target.python_version)));
-        let sysreqs = manifest.effective_system_requirements(env);
-        async move {
-            let result = crate::conda_solve::solve_selected_records(
-                conda_channels,
-                &specs,
-                &target.python_version,
-                &target.conda_subdir,
-                channel_priority,
-                &sysreqs,
-                rattler_solve::SolveStrategy::Highest,
-            )
-            .await;
-            (env.clone(), result)
-        }
-    }))
-    .await;
+    let solve_futures = inputs
+        .iter()
+        .map(|input| {
+            let env = &input.env;
+            let deps = &input.conda_deps;
+            let mut specs = deps
+                .iter()
+                .filter_map(|(name, spec)| {
+                    let name = CondaName::new(name.as_str());
+                    if name.key() == bundle_key {
+                        return None;
+                    }
+                    Some(name.match_spec(spec))
+                })
+                .collect::<Vec<_>>();
+            specs
+                .push(CondaName::new("python").match_spec(&format!("{}.*", target.python_version)));
+            let sysreqs = manifest.effective_system_requirements(env);
+            async move {
+                let result = crate::conda_solve::solve_selected_records(
+                    conda_channels,
+                    &specs,
+                    &target.python_version,
+                    &target.conda_subdir,
+                    channel_priority,
+                    &sysreqs,
+                    rattler_solve::SolveStrategy::Highest,
+                )
+                .await;
+                (env.clone(), result)
+            }
+        })
+        .collect::<Vec<_>>();
+    let solves = {
+        use futures::stream::{self, StreamExt};
+        stream::iter(solve_futures)
+            .buffered(crate::concurrency::max_concurrent_builds())
+            .collect::<Vec<_>>()
+            .await
+    };
 
     let mut env_records = BTreeMap::new();
     for (env, result) in solves {
@@ -5620,19 +5629,29 @@ async fn discover_emissions(
         // v1.4.0: the per-env extractions are independent at this
         // stage (no seed_overrides flow between them -- that's the
         // MAIN env loop's contract, not this one), so run them
-        // concurrently. join_all preserves input order, keeping the
+        // concurrently. buffered preserves input order, keeping the
         // accumulated clause order (and thus the joined spec strings)
         // deterministic.
-        let env_results = futures::future::join_all(d.envs.iter().map(|env| {
-            crate::workspace::extract_transitive_constraints(
-                manifest,
-                env,
-                target_python,
-                &channels,
-                bundle_names,
-            )
-        }))
-        .await;
+        let env_futures = d
+            .envs
+            .iter()
+            .map(|env| {
+                crate::workspace::extract_transitive_constraints(
+                    manifest,
+                    env,
+                    target_python,
+                    &channels,
+                    bundle_names,
+                )
+            })
+            .collect::<Vec<_>>();
+        let env_results = {
+            use futures::stream::{self, StreamExt};
+            stream::iter(env_futures)
+                .buffered(crate::concurrency::max_concurrent_builds())
+                .collect::<Vec<_>>()
+                .await
+        };
         let mut accumulated: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for trans in env_results {
             for (dep, specs) in trans {
