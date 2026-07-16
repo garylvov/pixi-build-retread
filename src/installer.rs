@@ -1669,6 +1669,16 @@ mod tests {
         }
     }
 
+    fn make_native_lock(
+        conda_run_deps: Vec<CondaDep>,
+        index_urls: Vec<String>,
+        prerelease: BTreeMap<String, String>,
+    ) -> RetreadLock {
+        let mut lock = make_lock(conda_run_deps, index_urls, prerelease);
+        lock.target_subdir = crate::glibc::current_pixi_platform().into();
+        lock
+    }
+
     #[test]
     fn write_marker_atomic_replaces_and_leaves_no_temp() {
         let dir =
@@ -2043,7 +2053,7 @@ mod tests {
     #[test]
     fn read_validated_lock_canonicalizes_python_patch_for_runtime_paths() {
         let root = tempdir("python-patch-lock");
-        let mut lock = make_lock(vec![], vec![], BTreeMap::new());
+        let mut lock = make_native_lock(vec![], vec![], BTreeMap::new());
         lock.python = "3.11.0".into();
         let target = lock.resolution_target().unwrap();
         let lock_path = root.join(RetreadLock::file_name_for_target(&lock.bundle, &target));
@@ -2857,7 +2867,7 @@ mod tests {
         let share = prefix.join("share").join("retread");
         std::fs::create_dir_all(&share).unwrap();
 
-        let lock = make_lock(
+        let lock = make_native_lock(
             vec![],
             vec!["https://pypi.org/simple/".into()],
             BTreeMap::new(),
@@ -2919,7 +2929,7 @@ mod tests {
         let share = prefix.join("share").join("retread");
         std::fs::create_dir_all(&share).unwrap();
 
-        let mut lock = make_lock(
+        let mut lock = make_native_lock(
             vec![],
             vec!["https://pypi.org/simple/".into()],
             BTreeMap::new(),
@@ -2985,13 +2995,14 @@ mod tests {
         let share = prefix.join("share").join("retread");
         std::fs::create_dir_all(&share).unwrap();
 
-        let lock = make_lock(
+        let lock = make_native_lock(
             vec![],
             vec!["https://pypi.org/simple/".into()],
             BTreeMap::new(),
         );
         let raw = serde_json::to_vec(&lock).unwrap();
-        let lock_path = share.join("retread-test-bundle.lock.json");
+        let target = lock.resolution_target().unwrap();
+        let lock_path = share.join(RetreadLock::file_name_for_target(&lock.bundle, &target));
         std::fs::write(&lock_path, &raw).unwrap();
         std::fs::write(share.join(lock.marker_name()), "not-the-lock-hash").unwrap();
 
@@ -3024,13 +3035,14 @@ mod tests {
         let share = prefix.join("share").join("retread");
         std::fs::create_dir_all(&share).unwrap();
 
-        let lock = make_lock(
+        let lock = make_native_lock(
             vec![],
             vec!["https://pypi.org/simple/".into()],
             BTreeMap::new(),
         );
         let raw = serde_json::to_vec(&lock).unwrap();
-        let lock_path = share.join("retread-test-bundle.lock.json");
+        let target = lock.resolution_target().unwrap();
+        let lock_path = share.join(RetreadLock::file_name_for_target(&lock.bundle, &target));
         std::fs::write(&lock_path, &raw).unwrap();
         std::fs::write(share.join(lock.marker_name()), lock_digest(&raw)).unwrap();
 
@@ -3067,13 +3079,14 @@ mod tests {
         let share = prefix.join("share").join("retread");
         std::fs::create_dir_all(&share).unwrap();
 
-        let lock = make_lock(
+        let lock = make_native_lock(
             vec![],
             vec!["https://pypi.org/simple/".into()],
             BTreeMap::new(),
         );
         let raw = serde_json::to_vec(&lock).unwrap();
-        let lock_path = share.join("retread-test-bundle.lock.json");
+        let target = lock.resolution_target().unwrap();
+        let lock_path = share.join(RetreadLock::file_name_for_target(&lock.bundle, &target));
         std::fs::write(&lock_path, &raw).unwrap();
         std::fs::write(
             share.join(lock.marker_name()),
