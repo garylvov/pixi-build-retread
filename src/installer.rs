@@ -9,9 +9,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
-use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::str::FromStr as _;
 
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
@@ -39,6 +39,25 @@ pub(crate) fn normalize_dist_name(name: &str) -> String {
         out.pop();
     }
     out
+}
+
+fn pep440_versions_equal(left: &str, right: &str) -> bool {
+    match (
+        uv_pep508::uv_pep440::Version::from_str(left),
+        uv_pep508::uv_pep440::Version::from_str(right),
+    ) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
+}
+
+fn installed_version_path<'a>(
+    versions: &'a BTreeMap<String, PathBuf>,
+    expected: &str,
+) -> Option<&'a PathBuf> {
+    versions
+        .iter()
+        .find_map(|(version, path)| pep440_versions_equal(version, expected).then_some(path))
 }
 
 /// True if uv's output shows a wheel rejected purely for an unsatisfied
@@ -157,7 +176,10 @@ fn lock_digest(raw: &[u8]) -> String {
     format!("{:x}", Sha256::digest(raw))
 }
 
+#[cfg(test)]
 fn sha256_file(path: &Path) -> Result<String> {
+    use std::io::Read as _;
+
     let mut file =
         std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let mut hasher = Sha256::new();
@@ -174,21 +196,35 @@ fn sha256_file(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn verify_sha256(path: &Path, expected: &str) -> Result<()> {
-    let actual = sha256_file(path)?;
-    if actual.eq_ignore_ascii_case(expected) {
-        Ok(())
-    } else {
-        bail!(
-            "SHA-256 mismatch for {}: expected {}, got {}",
-            path.display(),
-            expected,
-            actual
-        );
-    }
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-fn validate_install_lock(lock_path: &Path, lock: &RetreadLock) -> Result<()> {
+fn is_safe_bundle_component(value: &str) -> bool {
+    !value.trim().is_empty()
+        && !matches!(value, "." | "..")
+        && !value.contains('/')
+        && !value.contains('\\')
+        && Path::new(value)
+            .file_name()
+            .and_then(|component| component.to_str())
+            == Some(value)
+        && Path::new(value).components().count() == 1
+}
+
+fn validate_install_lock_for_platform(
+    lock_path: &Path,
+    lock: &RetreadLock,
+    platform: &str,
+) -> Result<()> {
+    if !is_safe_bundle_component(&lock.bundle) {
+        bail!(
+            "retread install: lock {} records invalid bundle path component {:?}; \
+             rebuild the courier pack",
+            lock_path.display(),
+            lock.bundle,
+        );
+    }
     if lock.schema != crate::lock::SCHEMA {
         bail!(
             "retread install: lock {} has schema {}, but this retread requires schema {} \
@@ -199,7 +235,40 @@ fn validate_install_lock(lock_path: &Path, lock: &RetreadLock) -> Result<()> {
             crate::lock::SCHEMA
         );
     }
+    lock.validate_replay_provenance().with_context(|| {
+        format!(
+            "retread install: lock {} has invalid replay provenance; rebuild the courier pack",
+            lock_path.display()
+        )
+    })?;
+    // Courier packages embed the native retread executable and a wheel set
+    // selected for one exact conda subdir. They are never cross-installable.
+    if !lock.is_for_target(platform) {
+        bail!(
+            "retread install: lock {} targets {}, but this host is {}. \
+             Rebuild the courier pack for the host platform before installing it.",
+            lock_path.display(),
+            lock.target_subdir,
+            platform,
+        );
+    }
+    let target = lock.resolution_target().with_context(|| {
+        format!(
+            "retread install: lock {} has malformed target metadata; rebuild the courier pack",
+            lock_path.display()
+        )
+    })?;
+    lock.validate_replay_contract_for_target(&target, &lock.bundle)
+        .with_context(|| {
+            format!(
+                "retread install: lock {} has invalid complete replay provenance; rebuild the courier pack",
+                lock_path.display()
+            )
+        })?;
+    let mut seen_distributions: BTreeMap<String, String> = BTreeMap::new();
+    let mut seen_filenames: BTreeMap<String, String> = BTreeMap::new();
     for wheel in &lock.wheels {
+        let mut source_provenance: Option<(String, String)> = None;
         if wheel.name.trim().is_empty()
             || wheel.version.trim().is_empty()
             || wheel.filename.trim().is_empty()
@@ -207,6 +276,45 @@ fn validate_install_lock(lock_path: &Path, lock: &RetreadLock) -> Result<()> {
             bail!(
                 "retread install: lock {} contains an incomplete wheel entry; rebuild the courier pack",
                 lock_path.display()
+            );
+        }
+        let canonical_name = normalize_dist_name(&wheel.name);
+        if let Some(prior) = seen_distributions.insert(canonical_name, wheel.name.clone()) {
+            bail!(
+                "retread install: lock {} contains duplicate distributions `{prior}` and `{}`; \
+                 rebuild the courier pack",
+                lock_path.display(),
+                wheel.name,
+            );
+        }
+        let standard_filename = crate::courier::validate_wheel_filename_for_target(
+            &wheel.name,
+            &wheel.version,
+            &wheel.filename,
+            target.wheel_target(),
+            "retread install locked wheel filename",
+        )
+        .with_context(|| {
+            format!(
+                "retread install: lock {} records the wrong wheel identity for {}=={}",
+                lock_path.display(),
+                wheel.name,
+                wheel.version,
+            )
+        })?;
+        debug_assert_eq!(
+            standard_filename,
+            crate::emit_pypi::standard_wheel_filename(&wheel.filename)
+        );
+        if let Some(prior) = seen_filenames.insert(
+            standard_filename.to_ascii_lowercase(),
+            wheel.filename.clone(),
+        ) {
+            bail!(
+                "retread install: lock {} contains duplicate wheel filenames `{prior}` and `{}`; \
+                 rebuild the courier pack",
+                lock_path.display(),
+                wheel.filename,
             );
         }
         if wheel.origin == Origin::Index && (wheel.url.is_none() || wheel.sha256.is_none()) {
@@ -218,8 +326,108 @@ fn validate_install_lock(lock_path: &Path, lock: &RetreadLock) -> Result<()> {
                 wheel.version
             );
         }
+        if let Some(sha256) = wheel.sha256.as_deref()
+            && !is_sha256(sha256)
+        {
+            bail!(
+                "retread install: lock {} records an invalid sha256 for {}=={}; \
+                 rebuild the courier pack",
+                lock_path.display(),
+                wheel.name,
+                wheel.version,
+            );
+        }
+        for (provenance, url_text) in [
+            ("locked URL", wheel.url.as_deref()),
+            ("upstream URL", wheel.upstream_url.as_deref()),
+        ] {
+            let Some(url_text) = url_text else { continue };
+            let url = url::Url::parse(url_text).with_context(|| {
+                format!(
+                    "retread install: invalid {provenance} for {}=={}: {url_text}",
+                    wheel.name, wheel.version
+                )
+            })?;
+            let filename = crate::wheel::wheel_filename_from_url(&url).with_context(|| {
+                format!(
+                    "retread install: invalid wheel filename in {provenance} for {}=={}",
+                    wheel.name, wheel.version
+                )
+            })?;
+            let standard = crate::courier::validate_wheel_filename_for_target(
+                &wheel.name,
+                &wheel.version,
+                &filename,
+                target.wheel_target(),
+                &format!("retread install {provenance} filename"),
+            )
+            .with_context(|| {
+                format!(
+                    "retread install: {provenance} records the wrong wheel identity for {}=={}",
+                    wheel.name, wheel.version,
+                )
+            })?;
+            debug_assert_eq!(
+                standard,
+                crate::emit_pypi::standard_wheel_filename(&filename)
+            );
+            if wheel.origin == Origin::Index && filename != wheel.filename {
+                bail!(
+                    "retread install: locked URL filename for {}=={} is {}, but the lock \
+                     records {}; rebuild the courier pack",
+                    wheel.name,
+                    wheel.version,
+                    filename,
+                    wheel.filename,
+                );
+            }
+            if wheel.origin == Origin::Built
+                && !crate::courier::wheel_filename_provenance_matches(&wheel.filename, &filename)
+            {
+                bail!(
+                    "retread install: {provenance} filename for {}=={} is {}, but the lock \
+                     records different wheel provenance {}; rebuild the courier pack",
+                    wheel.name,
+                    wheel.version,
+                    filename,
+                    wheel.filename,
+                );
+            }
+            if wheel.origin == Origin::Built && !crate::courier::has_owned_shadow_build(&standard) {
+                if let Some((prior_provenance, prior_filename)) = &source_provenance
+                    && prior_filename != &standard
+                {
+                    bail!(
+                        "retread install: source provenance mismatch for {}=={}: \
+                         {prior_provenance} records {}, but {provenance} records {}; \
+                         rebuild the courier pack",
+                        wheel.name,
+                        wheel.version,
+                        prior_filename,
+                        filename,
+                    );
+                }
+                source_provenance = Some((provenance.to_owned(), standard));
+            }
+        }
     }
     Ok(())
+}
+
+fn validate_install_lock(lock_path: &Path, lock: &RetreadLock) -> Result<()> {
+    validate_install_lock_for_platform(lock_path, lock, crate::glibc::current_pixi_platform())
+}
+
+fn lock_basename_matches_target(
+    lock_path: &Path,
+    bundle: &str,
+    target: &crate::pypi::ResolutionTarget,
+) -> bool {
+    let Some(lock_basename) = lock_path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    lock_basename == RetreadLock::file_name_for_target(bundle, target)
+        || (target.conda_subdir() == "linux-64" && lock_basename == RetreadLock::file_name(bundle))
 }
 
 fn read_validated_lock(lock_path: &Path) -> Result<(Vec<u8>, RetreadLock)> {
@@ -229,13 +437,26 @@ fn read_validated_lock(lock_path: &Path) -> Result<(Vec<u8>, RetreadLock)> {
             lock_path.display()
         )
     })?;
-    let lock: RetreadLock = serde_json::from_slice(&raw).with_context(|| {
+    let mut lock: RetreadLock = serde_json::from_slice(&raw).with_context(|| {
         format!(
             "parsing lock {}. Rebuild the courier pack so install replay has a valid lock.",
             lock_path.display()
         )
     })?;
     validate_install_lock(lock_path, &lock)?;
+    let target = lock.resolution_target()?;
+    if !lock_basename_matches_target(lock_path, &lock.bundle, &target) {
+        bail!(
+            "retread install: lock {} does not match its recorded bundle `{}` and target; rebuild the courier pack",
+            lock_path.display(),
+            lock.bundle,
+        );
+    }
+    // Runtime paths are minor-scoped (`lib/python3.11/site-packages`). Locks
+    // may compatibly spell the same target as 3.11.0, so canonicalize only the
+    // in-memory representation after validating and retaining the raw bytes
+    // for the idempotency digest.
+    lock.python = crate::lock::normalized_target_python(&lock.python)?;
     Ok((raw, lock))
 }
 
@@ -280,6 +501,26 @@ fn built_wheel_store_candidates(lock: &RetreadLock, primary: &Path) -> Vec<PathB
     out
 }
 
+fn validate_materialized_wheel(
+    wheel: &crate::lock::LockWheel,
+    path: &Path,
+    provenance: &str,
+) -> Result<()> {
+    crate::courier::validate_wheel_file_identity(
+        &wheel.name,
+        &wheel.version,
+        path,
+        wheel.sha256.as_deref(),
+        provenance,
+    )
+    .with_context(|| {
+        format!(
+            "retread install: {provenance} for {}=={} failed provenance validation",
+            wheel.name, wheel.version,
+        )
+    })
+}
+
 async fn materialize_index_wheel(
     lock: &RetreadLock,
     wheel: &crate::lock::LockWheel,
@@ -315,13 +556,13 @@ async fn materialize_index_wheel(
                 url
             )
         })?;
-        verify_sha256(&path, expected_sha)?;
+        validate_materialized_wheel(wheel, &path, "locked file-URL wheel")?;
         return Ok(path);
     }
 
     let store_path = store_root.join(expected_sha).join(&wheel.filename);
     if store_path.is_file() {
-        match verify_sha256(&store_path, expected_sha) {
+        match validate_materialized_wheel(wheel, &store_path, "cached index wheel") {
             Ok(()) => return Ok(store_path),
             Err(err) => {
                 tracing::warn!(
@@ -342,7 +583,11 @@ async fn materialize_index_wheel(
                 wheel.name, wheel.version, url
             )
         })?;
-    verify_sha256(&fetched, expected_sha)?;
+    if let Err(err) = validate_materialized_wheel(wheel, &fetched, "downloaded index wheel") {
+        let _ = std::fs::remove_file(&fetched);
+        let _ = std::fs::remove_file(&store_path);
+        return Err(err);
+    }
     tracing::info!(
         bundle = %lock.bundle,
         wheel = %wheel.filename,
@@ -372,7 +617,10 @@ async fn materialize_locked_wheels(
         // leave it to conda and keep it out of the uv replay entirely (not
         // even materialized), so uv never uninstalls the conda payload. See
         // `conda_owned_distributions` for why that uninstall is destructive.
-        if conda_owned.contains(&(normalize_dist_name(&wheel.name), wheel.version.clone())) {
+        let normalized_name = normalize_dist_name(&wheel.name);
+        if conda_owned.iter().any(|(name, version)| {
+            name == &normalized_name && pep440_versions_equal(version, &wheel.version)
+        }) {
             eprintln!(
                 "retread install: {}=={} is conda-provided in the prefix; \
                  skipping wheel replay to avoid clobbering the conda payload",
@@ -419,14 +667,7 @@ async fn materialize_locked_wheels(
         }
         let shipped = shipped_wheels_dir.join(&wheel.filename);
         if shipped.is_file() {
-            if let Some(expected) = wheel.sha256.as_deref() {
-                verify_sha256(&shipped, expected).with_context(|| {
-                    format!(
-                        "retread install: shipped wheel {}=={} failed hash verification",
-                        wheel.name, wheel.version
-                    )
-                })?;
-            }
+            validate_materialized_wheel(wheel, &shipped, "shipped wheel")?;
             files.push(shipped);
             continue;
         }
@@ -450,7 +691,11 @@ async fn materialize_locked_wheels(
                         if !store_path.is_file() {
                             continue;
                         }
-                        match verify_sha256(&store_path, expected) {
+                        match validate_materialized_wheel(
+                            wheel,
+                            &store_path,
+                            "built wheel-store entry",
+                        ) {
                             Ok(()) => {
                                 if i > 0 {
                                     tracing::warn!(
@@ -760,7 +1005,8 @@ pub(crate) fn missing_locked_wheels_from_installed(
             let name = normalize_dist_name(&wheel.name);
             let present = installed
                 .get(&name)
-                .is_some_and(|versions| versions.contains_key(&wheel.version));
+                .and_then(|versions| installed_version_path(versions, &wheel.version))
+                .is_some();
             (!present).then(|| format!("{}=={}", wheel.name, wheel.version))
         })
         .collect();
@@ -882,7 +1128,7 @@ fn verify_payload_installed(lock: &RetreadLock, prefix: &Path) -> Result<()> {
         }
         let dist_root = installed
             .get(&name)
-            .and_then(|versions| versions.get(&wheel.version))
+            .and_then(|versions| installed_version_path(versions, &wheel.version))
             .expect("missing list already checked");
         verify_record_payload(&site_packages, dist_root).with_context(|| {
             format!(
@@ -924,7 +1170,7 @@ fn installed_payload_libraries(
         }
         let dist_root = installed
             .get(&name)
-            .and_then(|versions| versions.get(&wheel.version))
+            .and_then(|versions| installed_version_path(versions, &wheel.version))
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "retread audit: {}=={} is not installed in {}",
@@ -1366,10 +1612,10 @@ mod tests {
         }
         // NOT lib-shim wheels: must never be dropped.
         for name in [
-            "nvidia-ml-py",         // pynvml bindings, pure python
+            "nvidia-ml-py",          // pynvml bindings, pure python
             "nvidia-cudnn-frontend", // C++ header lib, no -cuNN tag
             "torch",
-            "nccl",       // the conda name, never appears as a wheel here
+            "nccl", // the conda name, never appears as a wheel here
             "cupy-cuda12x",
             "nvidia",
         ] {
@@ -1387,7 +1633,7 @@ mod tests {
             origin: Origin::Built,
             filename: format!("{}-{version}-py3-none-any.whl", name.replace('-', "_")),
             url: None,
-            sha256: None,
+            sha256: Some(hex_sha256(&test_wheel_bytes(name, version))),
             requires_dist: vec![],
             must_ship: true,
             upstream_url: None,
@@ -1407,6 +1653,7 @@ mod tests {
             bundle: "test-bundle".into(),
             version: "1.0.0".into(),
             python: "3.11".into(),
+            target_subdir: "linux-64".into(),
             inputs_hash: "abc".into(),
             root_requirements: vec!["mypackage==1.0.0".into()],
             wheels: vec![lock_wheel("mypackage", "1.0.0")],
@@ -1415,6 +1662,7 @@ mod tests {
             prerelease,
             shadow_libs: BTreeMap::new(),
             declared_glibc: None,
+            resolution_glibc: None,
             conda_capable: vec![],
             entry_specs: vec![],
             wheel_store: None,
@@ -1471,6 +1719,32 @@ mod tests {
 
     fn hex_sha256(bytes: &[u8]) -> String {
         format!("{:x}", Sha256::digest(bytes))
+    }
+
+    fn test_wheel_bytes(name: &str, version: &str) -> Vec<u8> {
+        use std::io::{Cursor, Write as _};
+
+        let dist = name.replace(['-', '.'], "_");
+        let dist_info = format!("{dist}-{version}.dist-info");
+        let mut cursor = Cursor::new(Vec::new());
+        let mut zip = zip::ZipWriter::new(&mut cursor);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        zip.start_file(format!("{dist_info}/METADATA"), options)
+            .unwrap();
+        write!(
+            zip,
+            "Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n\n"
+        )
+        .unwrap();
+        zip.start_file(format!("{dist_info}/WHEEL"), options)
+            .unwrap();
+        zip.write_all(b"Wheel-Version: 1.0\nTag: py3-none-any\n")
+            .unwrap();
+        zip.start_file(format!("{dist_info}/RECORD"), options)
+            .unwrap();
+        zip.finish().unwrap();
+        cursor.into_inner()
     }
 
     fn index_lock_wheel(name: &str, version: &str, url: &str, sha256: &str) -> LockWheel {
@@ -1558,7 +1832,8 @@ mod tests {
             BTreeMap::new(),
         );
         lock.schema = crate::lock::SCHEMA - 1;
-        let err = validate_install_lock(Path::new("/lock.json"), &lock).unwrap_err();
+        let err = validate_install_lock_for_platform(Path::new("/lock.json"), &lock, "linux-64")
+            .unwrap_err();
         assert!(format!("{err:#}").contains("requires schema"));
 
         let mut lock = make_lock(
@@ -1579,8 +1854,225 @@ mod tests {
             git_source: None,
             sdist_source: None,
         }];
-        let err = validate_install_lock(Path::new("/lock.json"), &lock).unwrap_err();
-        assert!(format!("{err:#}").contains("require both url and sha256"));
+        let err = validate_install_lock_for_platform(Path::new("/lock.json"), &lock, "linux-64")
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("has no final sha256"));
+    }
+
+    #[test]
+    fn validate_install_lock_requires_native_target() {
+        let path = Path::new("/lock.json");
+        let mut lock = make_lock(vec![], vec![], BTreeMap::new());
+
+        validate_install_lock_for_platform(path, &lock, "linux-64").unwrap();
+        let err = format!(
+            "{:#}",
+            validate_install_lock_for_platform(path, &lock, "linux-aarch64").unwrap_err()
+        );
+        assert!(err.contains("targets linux-64"));
+        assert!(err.contains("host is linux-aarch64"));
+
+        lock.target_subdir = "linux-aarch64".into();
+        lock.declared_glibc = Some("2.35".into());
+        lock.resolution_glibc = Some("2.35".into());
+        validate_install_lock_for_platform(path, &lock, "linux-aarch64").unwrap();
+        assert!(validate_install_lock_for_platform(path, &lock, "linux-64").is_err());
+    }
+
+    #[test]
+    fn validate_install_lock_rescores_every_arm_provenance() {
+        let path = Path::new("/arm-lock.json");
+        let mut lock = make_lock(vec![], vec![], BTreeMap::new());
+        lock.target_subdir = "linux-aarch64".into();
+        lock.declared_glibc = Some("2.35".into());
+        lock.resolution_glibc = Some("2.35".into());
+
+        lock.wheels[0].filename = "mypackage-1.0.0-cp311-cp311-manylinux_2_35_aarch64.whl".into();
+        validate_install_lock_for_platform(path, &lock, "linux-aarch64").unwrap();
+
+        lock.wheels[0].filename = "mypackage-1.0.0-cp311-cp311-manylinux_2_35_x86_64.whl".into();
+        let err = format!(
+            "{:#}",
+            validate_install_lock_for_platform(path, &lock, "linux-aarch64").unwrap_err()
+        );
+        assert!(err.contains("incompatible"));
+
+        lock.wheels[0].filename = "mypackage-1.0.0-not-a-wheel.whl".into();
+        assert!(validate_install_lock_for_platform(path, &lock, "linux-aarch64").is_err());
+
+        let filename = "remote-1.0.0-cp311-cp311-manylinux_2_35_x86_64.whl";
+        lock.wheels = vec![index_lock_wheel(
+            "remote",
+            "1.0.0",
+            &format!("https://example.com/{filename}"),
+            &"0".repeat(64),
+        )];
+        let err = format!(
+            "{:#}",
+            validate_install_lock_for_platform(path, &lock, "linux-aarch64").unwrap_err()
+        );
+        assert!(err.contains("incompatible"));
+    }
+
+    #[test]
+    fn validate_install_lock_rejects_malformed_target_and_hash_metadata() {
+        let path = Path::new("/lock.json");
+        let mut lock = make_lock(vec![], vec![], BTreeMap::new());
+        lock.resolution_glibc = Some("2.35 trailing".into());
+        let err = validate_install_lock_for_platform(path, &lock, "linux-64")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("malformed target metadata"));
+
+        lock.resolution_glibc = None;
+        lock.wheels[0].sha256 = Some("abc".into());
+        let err = format!(
+            "{:#}",
+            validate_install_lock_for_platform(path, &lock, "linux-64").unwrap_err()
+        );
+        assert!(err.contains("invalid final sha256"));
+
+        lock.wheels[0].sha256 = Some("0".repeat(64));
+        lock.bundle = "../escape".into();
+        let err = validate_install_lock_for_platform(path, &lock, "linux-64")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid bundle path component"));
+    }
+
+    #[test]
+    fn validate_install_lock_binds_filename_and_url_identity() {
+        let path = Path::new("/lock.json");
+        let mut lock = make_lock(vec![], vec![], BTreeMap::new());
+        lock.wheels[0].filename = "evil-1.0.0-py3-none-any.whl".into();
+        let err = format!(
+            "{:#}",
+            validate_install_lock_for_platform(path, &lock, "linux-64").unwrap_err()
+        );
+        assert!(err.contains("records distribution `evil`"));
+
+        lock.wheels[0].filename = "mypackage-9.9-py3-none-any.whl".into();
+        let err = format!(
+            "{:#}",
+            validate_install_lock_for_platform(path, &lock, "linux-64").unwrap_err()
+        );
+        assert!(err.contains("records version `9.9`"));
+
+        lock.wheels = vec![index_lock_wheel(
+            "remote",
+            "1.0.0",
+            "https://example.com/evil-9.9-py3-none-any.whl",
+            &"0".repeat(64),
+        )];
+        lock.wheels[0].filename = "remote-1.0.0-py3-none-any.whl".into();
+        let err = format!(
+            "{:#}",
+            validate_install_lock_for_platform(path, &lock, "linux-64").unwrap_err()
+        );
+        assert!(
+            err.contains("artifact URL") && err.contains("distribution `evil`"),
+            "unexpected identity error: {err}",
+        );
+
+        lock.wheels = vec![LockWheel {
+            name: "demo".into(),
+            version: "1.0".into(),
+            origin: Origin::Built,
+            filename: "demo-1.0-999retread-cp311-cp311-manylinux_2_17_x86_64.whl".into(),
+            url: None,
+            sha256: Some("12".repeat(32)),
+            requires_dist: vec![],
+            must_ship: false,
+            upstream_url: Some(
+                "https://example.com/demo-1.0-1-cp311-cp311-manylinux_2_28_x86_64.whl".into(),
+            ),
+            git_source: None,
+            sdist_source: None,
+        }];
+        let err = validate_install_lock_for_platform(path, &lock, "linux-64").unwrap_err();
+        assert!(format!("{err:#}").contains("different wheel provenance"));
+
+        lock.wheels[0].filename =
+            "demo-1.0-999retread-cp311-cp311-manylinux_2_17_x86_64.whl".into();
+        lock.wheels[0].url =
+            Some("https://example.com/demo-1.0-1-cp311-cp311-manylinux_2_17_x86_64.whl".into());
+        lock.wheels[0].upstream_url =
+            Some("https://example.com/demo-1.0-2-cp311-cp311-manylinux_2_17_x86_64.whl".into());
+        let err = validate_install_lock_for_platform(path, &lock, "linux-64").unwrap_err();
+        assert!(format!("{err:#}").contains("unexpectedly records an index URL"));
+
+        lock.wheels[0].url = None;
+        lock.wheels[0].upstream_url = Some(
+            "https://example.com/demo-1.0-1%2F..%2F..%2Fevil-cp311-cp311-manylinux_2_17_x86_64.whl"
+                .into(),
+        );
+        let err = validate_install_lock_for_platform(path, &lock, "linux-64").unwrap_err();
+        assert!(format!("{err:#}").contains("single wheel basename"));
+
+        lock.wheels[0] = lock_wheel("my-package", "1.0");
+        lock.wheels[0].filename = "My_Package-1.0.0-py3-none-any.whl".into();
+        validate_install_lock_for_platform(path, &lock, "linux-64").unwrap();
+
+        let first = index_lock_wheel(
+            "remote",
+            "1.0.0",
+            "https://example.com/remote-1.0.0-py3-none-any.whl",
+            &"a".repeat(64),
+        );
+        let mut second = first.clone();
+        second.sha256 = Some("b".repeat(64));
+        lock.wheels = vec![first, second];
+        let err = validate_install_lock_for_platform(path, &lock, "linux-64").unwrap_err();
+        assert!(format!("{err:#}").contains("duplicate distributions"));
+    }
+
+    #[test]
+    fn read_validated_lock_canonicalizes_python_patch_for_runtime_paths() {
+        let root = tempdir("python-patch-lock");
+        let mut lock = make_lock(vec![], vec![], BTreeMap::new());
+        lock.python = "3.11.0".into();
+        let target = lock.resolution_target().unwrap();
+        let lock_path = root.join(RetreadLock::file_name_for_target(&lock.bundle, &target));
+        std::fs::write(&lock_path, lock.to_pretty_json().unwrap()).unwrap();
+
+        let (_, decoded) = read_validated_lock(&lock_path).unwrap();
+        assert_eq!(decoded.python, "3.11");
+        assert_eq!(
+            site_packages_dir(Path::new("/prefix"), &decoded.python),
+            PathBuf::from("/prefix/lib/python3.11/site-packages")
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_lock_basename_is_linux_64_only() {
+        let mut lock = make_lock(vec![], vec![], BTreeMap::new());
+        let legacy = Path::new("retread-demo.lock.json");
+        let linux = lock.resolution_target().unwrap();
+        assert!(lock_basename_matches_target(legacy, "demo", &linux));
+
+        lock.target_subdir = "linux-aarch64".into();
+        let arm = lock.resolution_target().unwrap();
+        assert!(!lock_basename_matches_target(legacy, "demo", &arm));
+        let qualified = RetreadLock::file_name_for_target("demo", &arm);
+        assert!(lock_basename_matches_target(
+            Path::new(&qualified),
+            "demo",
+            &arm,
+        ));
+    }
+
+    #[test]
+    fn legacy_missing_target_remains_linux_64_only() {
+        let path = Path::new("/legacy-lock.json");
+        let lock = make_lock(vec![], vec![], BTreeMap::new());
+        let mut json = serde_json::to_value(lock).unwrap();
+        json.as_object_mut().unwrap().remove("target_subdir");
+        let legacy: RetreadLock = serde_json::from_value(json).unwrap();
+
+        assert_eq!(legacy.target_subdir, "linux-64");
+        validate_install_lock_for_platform(path, &legacy, "linux-64").unwrap();
+        assert!(validate_install_lock_for_platform(path, &legacy, "linux-aarch64").is_err());
     }
 
     #[test]
@@ -1602,12 +2094,12 @@ mod tests {
         let root = tempdir("index-cache");
         let store_root = root.join("store");
         let fetch_dir = root.join("fetch");
-        let bytes = b"cached wheel bytes";
-        let sha = hex_sha256(bytes);
+        let bytes = test_wheel_bytes("remote", "1.0.0");
+        let sha = hex_sha256(&bytes);
         let filename = "remote-1.0.0-py3-none-any.whl";
         let cached = store_root.join(&sha).join(filename);
         std::fs::create_dir_all(cached.parent().unwrap()).unwrap();
-        std::fs::write(&cached, bytes).unwrap();
+        std::fs::write(&cached, &bytes).unwrap();
 
         let lock = make_lock(vec![], vec![], BTreeMap::new());
         let wheel = index_lock_wheel(
@@ -1632,12 +2124,12 @@ mod tests {
         let root = tempdir("offline-shipped");
         let prefix = root.join("prefix");
         let wheels_dir = root.join("wheels");
-        let bytes = b"already shipped wheel bytes";
-        let sha = hex_sha256(bytes);
+        let bytes = test_wheel_bytes("remote", "1.0.0");
+        let sha = hex_sha256(&bytes);
         let filename = "remote-1.0.0-py3-none-any.whl";
         let shipped = wheels_dir.join(filename);
         std::fs::create_dir_all(&wheels_dir).unwrap();
-        std::fs::write(&shipped, bytes).unwrap();
+        std::fs::write(&shipped, &bytes).unwrap();
 
         let mut lock = make_lock(vec![], vec![], BTreeMap::new());
         lock.wheels = vec![index_lock_wheel(
@@ -1680,12 +2172,12 @@ mod tests {
         let prefix = root.join("prefix");
         let wheels_dir = root.join("wheels"); // shipped dir: intentionally empty
         let store_root = root.join("store");
-        let bytes = b"loose built wheel bytes";
-        let sha = hex_sha256(bytes);
+        let bytes = test_wheel_bytes("builtpkg", "1.0.0");
+        let sha = hex_sha256(&bytes);
         let filename = "builtpkg-1.0.0-py3-none-any.whl";
         let stored = store_root.join(&sha).join(filename);
         std::fs::create_dir_all(stored.parent().unwrap()).unwrap();
-        std::fs::write(&stored, bytes).unwrap();
+        std::fs::write(&stored, &bytes).unwrap();
 
         let mut lock = make_lock(vec![], vec![], BTreeMap::new());
         lock.wheels = vec![LockWheel {
@@ -1714,6 +2206,67 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(files, vec![stored]);
+    }
+
+    #[tokio::test]
+    async fn materialization_rejects_shipped_and_store_metadata_mismatch() {
+        let root = tempdir("materialized-identity-mismatch");
+        let prefix = root.join("prefix");
+        let wheels_dir = root.join("wheels");
+        std::fs::create_dir_all(&wheels_dir).unwrap();
+
+        let shipped = wheels_dir.join("mypackage-1.0.0-py3-none-any.whl");
+        std::fs::write(&shipped, test_wheel_bytes("evil", "9.9")).unwrap();
+        let lock = make_lock(vec![], vec![], BTreeMap::new());
+        let err = materialize_locked_wheels(
+            &lock,
+            &prefix,
+            &wheels_dir,
+            &root.join("store"),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("records distribution `evil`"));
+
+        std::fs::remove_file(&shipped).unwrap();
+        let bytes = test_wheel_bytes("evil", "9.9");
+        let sha = hex_sha256(&bytes);
+        let filename = "builtpkg-1.0.0-py3-none-any.whl";
+        let stored = root.join("store").join(&sha).join(filename);
+        std::fs::create_dir_all(stored.parent().unwrap()).unwrap();
+        std::fs::write(&stored, bytes).unwrap();
+        let mut lock = make_lock(vec![], vec![], BTreeMap::new());
+        lock.wheels = vec![LockWheel {
+            name: "builtpkg".into(),
+            version: "1.0.0".into(),
+            origin: Origin::Built,
+            filename: filename.into(),
+            url: None,
+            sha256: Some(sha),
+            requires_dist: vec![],
+            must_ship: true,
+            upstream_url: None,
+            git_source: None,
+            sdist_source: None,
+        }];
+        assert!(
+            materialize_locked_wheels(
+                &lock,
+                &prefix,
+                &wheels_dir,
+                &root.join("store"),
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                false,
+            )
+            .await
+            .is_err()
+        );
+        assert!(!stored.exists(), "invalid store entry must be evicted");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// A dist-info whose INSTALLER marker reads `conda` is reported as
@@ -1761,15 +2314,20 @@ mod tests {
         std::fs::create_dir_all(&wheels_dir).unwrap();
 
         // Ship both wheels so materialization is a pure offline file lookup.
-        let torch_bytes = b"conda-owned torch wheel bytes";
-        let td_bytes = b"tensordict wheel bytes";
-        std::fs::write(wheels_dir.join("torch-2.7.0-py3-none-any.whl"), torch_bytes).unwrap();
+        let torch_bytes = test_wheel_bytes("torch", "2.7.0");
+        let td_bytes = test_wheel_bytes("tensordict", "0.9.0");
+        std::fs::write(
+            wheels_dir.join("torch-2.7.0-py3-none-any.whl"),
+            &torch_bytes,
+        )
+        .unwrap();
         let td_shipped = wheels_dir.join("tensordict-0.9.0-py3-none-any.whl");
-        std::fs::write(&td_shipped, td_bytes).unwrap();
+        std::fs::write(&td_shipped, &td_bytes).unwrap();
 
         let mut lock = make_lock(vec![], vec![], BTreeMap::new());
         lock.wheels = vec![
-            lock_wheel("torch", "2.7.0"),
+            // PEP 440-equivalent spelling must still preserve conda ownership.
+            lock_wheel("torch", "2.7.0.0"),
             lock_wheel("tensordict", "0.9.0"),
         ];
 
@@ -1862,11 +2420,11 @@ mod tests {
         // Ship both wheels so materialization is a pure offline file lookup.
         std::fs::write(
             wheels_dir.join("protomotions-2.0.0-py3-none-any.whl"),
-            b"bundled protomotions wheel bytes",
+            test_wheel_bytes("protomotions", "2.0.0"),
         )
         .unwrap();
         let td_shipped = wheels_dir.join("tensordict-0.9.0-py3-none-any.whl");
-        std::fs::write(&td_shipped, b"tensordict wheel bytes").unwrap();
+        std::fs::write(&td_shipped, test_wheel_bytes("tensordict", "0.9.0")).unwrap();
 
         let mut lock = make_lock(vec![], vec![], BTreeMap::new());
         // Lock pins protomotions==2.0.0; the user's editable is a DIFFERENT
@@ -1915,6 +2473,31 @@ mod tests {
         assert_eq!(lock.wheels[0].version, "1.0.0");
         verify_payload_installed(&lock, &prefix)
             .expect("editable overlay at any version satisfies verify");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn verify_payload_installed_accepts_pep440_equivalent_version() {
+        let root = tempdir("verify-equivalent-version");
+        let prefix = root.join("prefix");
+        let sp = site_packages_dir(&prefix, "3.11");
+        std::fs::create_dir_all(&sp).unwrap();
+        let dist_info = write_dist_info(&sp, "mypackage", "1.0", None);
+        std::fs::write(sp.join("mypackage.py"), "value = 1\n").unwrap();
+        std::fs::write(
+            dist_info.join("RECORD"),
+            "mypackage.py,,\nmypackage-1.0.dist-info/RECORD,,\n",
+        )
+        .unwrap();
+
+        let lock = make_lock(vec![], vec![], BTreeMap::new());
+        assert_eq!(lock.wheels[0].version, "1.0.0");
+        assert!(
+            missing_locked_wheels_from_installed(&lock, &installed_distributions(&sp).unwrap(),)
+                .is_empty()
+        );
+        verify_payload_installed(&lock, &prefix)
+            .expect("PEP 440-equivalent installed version satisfies verify");
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2048,12 +2631,12 @@ mod tests {
         let wheels_dir = root.join("wheels"); // shipped dir: intentionally empty
         let primary_store = root.join("primary-store"); // intentionally empty
         let recorded_store = root.join("recorded-store");
-        let bytes = b"loose built wheel bytes (recorded store)";
-        let sha = hex_sha256(bytes);
+        let bytes = test_wheel_bytes("builtpkg", "1.0.0");
+        let sha = hex_sha256(&bytes);
         let filename = "builtpkg-1.0.0-py3-none-any.whl";
         let recorded_path = recorded_store.join(&sha).join(filename);
         std::fs::create_dir_all(recorded_path.parent().unwrap()).unwrap();
-        std::fs::write(&recorded_path, bytes).unwrap();
+        std::fs::write(&recorded_path, &bytes).unwrap();
 
         let mut lock = make_lock(vec![], vec![], BTreeMap::new());
         lock.wheel_store = Some(recorded_store.display().to_string());
@@ -2102,7 +2685,7 @@ mod tests {
         let store_root = root.join("store");
         let fetch_dir = root.join("fetch");
         let filename = "remote-1.0.0-py3-none-any.whl";
-        let bytes = b"downloaded locked wheel bytes".to_vec();
+        let bytes = test_wheel_bytes("remote", "1.0.0");
         let sha = hex_sha256(&bytes);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2139,6 +2722,51 @@ mod tests {
             store_root.join(&sha).join(filename).exists(),
             "fetch must populate the sha-addressed wheel store"
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn materialize_index_wheel_rejects_downloaded_metadata_mismatch() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let root = tempdir("index-fetch-identity-mismatch");
+        let store_root = root.join("store");
+        let fetch_dir = root.join("fetch");
+        let filename = "remote-1.0.0-py3-none-any.whl";
+        let bytes = test_wheel_bytes("evil", "9.9");
+        let sha = hex_sha256(&bytes);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let serve = tokio::spawn({
+            let bytes = bytes.clone();
+            async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.0 200 OK\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\n\r\n",
+                    bytes.len()
+                );
+                stream.write_all(resp.as_bytes()).await.unwrap();
+                stream.write_all(&bytes).await.unwrap();
+            }
+        });
+
+        let lock = make_lock(vec![], vec![], BTreeMap::new());
+        let wheel = index_lock_wheel(
+            "remote",
+            "1.0.0",
+            &format!("http://127.0.0.1:{port}/{filename}"),
+            &sha,
+        );
+        let err = materialize_index_wheel(&lock, &wheel, &fetch_dir, &store_root)
+            .await
+            .unwrap_err();
+        serve.await.unwrap();
+        assert!(format!("{err:#}").contains("records distribution `evil`"));
+        assert!(!fetch_dir.join(filename).exists());
+        assert!(!store_root.join(&sha).join(filename).exists());
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2221,7 +2849,8 @@ mod tests {
             BTreeMap::new(),
         );
         let raw = serde_json::to_vec(&lock).unwrap();
-        let lock_path = share.join(lock.marker_name().replace(".installed", ".lock.json"));
+        let target = lock.resolution_target().unwrap();
+        let lock_path = share.join(RetreadLock::file_name_for_target(&lock.bundle, &target));
         std::fs::write(&lock_path, &raw).unwrap();
         std::fs::write(
             share.join(lock.marker_name()),
@@ -2283,7 +2912,8 @@ mod tests {
         );
         lock.python = "3.12".into();
         let raw = serde_json::to_vec(&lock).unwrap();
-        let lock_path = share.join(lock.marker_name().replace(".installed", ".lock.json"));
+        let target = lock.resolution_target().unwrap();
+        let lock_path = share.join(RetreadLock::file_name_for_target(&lock.bundle, &target));
         std::fs::write(&lock_path, &raw).unwrap();
         std::fs::write(
             share.join(lock.marker_name()),

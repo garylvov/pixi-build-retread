@@ -103,6 +103,13 @@ impl WheelTarget {
     pub fn for_subdir(python_version: &str, conda_subdir: &str) -> Self {
         ResolutionTarget::for_subdir(python_version, conda_subdir).wheel_target
     }
+
+    /// Full SHA-256 namespace for built artifacts. Two scorer targets may
+    /// share an artifact cache only when their effective compatibility
+    /// contracts are identical.
+    pub(crate) fn artifact_cache_identity(&self) -> String {
+        target_identity(b"retread-wheel-artifact-target-v2\0", self, None)
+    }
 }
 
 /// Immutable compatibility contract for one wheel-resolution operation.
@@ -182,11 +189,7 @@ impl ResolutionTarget {
     /// Full SHA-256 namespace for artifact compatibility. Two declarations
     /// that produce the same effective target can safely share artifacts.
     pub(crate) fn artifact_cache_identity(&self) -> String {
-        target_identity(
-            b"retread-wheel-artifact-target-v2\0",
-            &self.wheel_target,
-            None,
-        )
+        self.wheel_target.artifact_cache_identity()
     }
 
     /// Full SHA-256 identity for resolution and replay decisions. This also

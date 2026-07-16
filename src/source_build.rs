@@ -143,12 +143,17 @@ pub async fn build_wheel_from_sdist_url(
     sdist_url: &url::Url,
     out_dir: &Path,
     python_version: &str,
+    expected_sha256: Option<&str>,
 ) -> Result<PathBuf> {
-    tokio::fs::create_dir_all(out_dir)
-        .await
-        .with_context(|| format!("creating sdist-build out dir {}", out_dir.display()))?;
+    let expected_sha256 = expected_sha256
+        .map(normalize_sha256)
+        .transpose()
+        .context("validating expected sdist sha256")?;
 
-    // Cache: if a wheel was already built here, reuse it.
+    // Cache identity is supplied by the caller and must include the source
+    // digest and immutable target. Validate the digest syntax before looking
+    // at that cache so malformed replay provenance never reaches filesystem
+    // or network work.
     if let Some(cached) = newest_wheel_in(out_dir).await? {
         tracing::info!(
             sdist = %sdist_url,
@@ -180,6 +185,18 @@ pub async fn build_wheel_from_sdist_url(
         .bytes()
         .await
         .with_context(|| format!("reading sdist body from {sdist_url}"))?;
+
+    // An sdist executes arbitrary build-backend code. Verify the downloaded
+    // bytes before writing them into the build cache and, critically, before
+    // invoking `uv build`.
+    if let Some(expected) = expected_sha256.as_deref() {
+        verify_sha256(&bytes, expected)
+            .with_context(|| format!("sdist content verification failed for {sdist_url}"))?;
+    }
+
+    tokio::fs::create_dir_all(out_dir)
+        .await
+        .with_context(|| format!("creating sdist-build out dir {}", out_dir.display()))?;
     tokio::fs::write(&sdist_path, &bytes)
         .await
         .with_context(|| format!("writing sdist to {}", sdist_path.display()))?;
@@ -225,6 +242,23 @@ pub async fn build_wheel_from_sdist_url(
     }
 
     Ok(wheel_path)
+}
+
+fn normalize_sha256(value: &str) -> Result<String> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("expected sdist sha256 must be exactly 64 hexadecimal characters");
+    }
+    Ok(value.to_ascii_lowercase())
+}
+
+fn verify_sha256(bytes: &[u8], expected: &str) -> Result<()> {
+    use sha2::{Digest, Sha256};
+
+    let actual = format!("{:x}", Sha256::digest(bytes));
+    if actual != expected {
+        bail!("sdist sha256 mismatch: expected {expected}, got {actual}");
+    }
+    Ok(())
 }
 
 /// Shared cross-pack cache directory for a built git wheel, keyed by
@@ -2042,6 +2076,47 @@ mod tests {
         assert!(
             is_nondeterministic_version("mypkg-1.0+gabcdef0-py3-none-any.whl"),
             "+g<sha> local version must trigger determinism guard"
+        );
+    }
+
+    #[tokio::test]
+    async fn sdist_hash_mismatch_fails_before_cache_write_or_build() {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request).unwrap();
+            let body = b"untrusted-sdist-bytes";
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len(),
+            )
+            .unwrap();
+            stream.write_all(body).unwrap();
+        });
+        let url = url::Url::parse(&format!("http://{address}/demo-1.0.tar.gz")).unwrap();
+        let out_dir = std::env::temp_dir().join(format!(
+            "retread-sdist-hash-mismatch-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+
+        let err = build_wheel_from_sdist_url(&url, &out_dir, "3.11", Some(&"00".repeat(32)))
+            .await
+            .unwrap_err();
+        server.join().unwrap();
+
+        assert!(format!("{err:#}").contains("sdist sha256 mismatch"));
+        assert!(
+            !out_dir.exists(),
+            "unverified sdist bytes must not publish a cache directory"
         );
     }
 

@@ -24,6 +24,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::relax::canonical_conda_name;
 
+fn default_target_subdir() -> String {
+    "linux-64".to_owned()
+}
+
+fn is_legacy_default_target_subdir(target_subdir: &str) -> bool {
+    target_subdir == "linux-64"
+}
+
 /// Git provenance for a source-built wheel (schema 8+).
 ///
 /// Stored in `LockWheel.git_source` for every wheel whose bytes were
@@ -105,6 +113,74 @@ pub struct SdistWheelSource {
     pub sdist_url: String,
 }
 
+impl SdistWheelSource {
+    /// Validate replay-trusted sdist provenance and return its exact artifact
+    /// URL plus the full SHA-256 carried by the URL fragment.
+    ///
+    /// Schema 12 predates this strict ingress rule, so locks written by an
+    /// older schema-12 producer can deserialize but cannot replay when the
+    /// fragment is absent, truncated, or malformed. This check must run
+    /// before any replay cache, network, or output mutation.
+    pub(crate) fn validated_url_and_sha256(
+        &self,
+        wheel_name: &str,
+        wheel_version: &str,
+    ) -> Result<(url::Url, String)> {
+        use std::str::FromStr as _;
+
+        let source_name = uv_normalize::PackageName::from_str(&self.name)
+            .context("invalid sdist source project name")?;
+        let locked_name = uv_normalize::PackageName::from_str(wheel_name)
+            .context("invalid locked wheel project name")?;
+        if source_name != locked_name {
+            anyhow::bail!(
+                "sdist source project `{}` does not match locked wheel `{wheel_name}`",
+                self.name,
+            );
+        }
+
+        let source_version = uv_pep508::uv_pep440::Version::from_str(&self.version)
+            .context("invalid sdist source version")?;
+        let locked_version = uv_pep508::uv_pep440::Version::from_str(wheel_version)
+            .context("invalid locked wheel version")?;
+        if source_version != locked_version {
+            anyhow::bail!(
+                "sdist source version `{}` does not match locked wheel version `{wheel_version}`",
+                self.version,
+            );
+        }
+
+        let index = url::Url::parse(&self.index).context("invalid sdist source index URL")?;
+        if !matches!(index.scheme(), "http" | "https") {
+            anyhow::bail!(
+                "sdist source index must use http(s), not `{}`",
+                index.scheme()
+            );
+        }
+
+        let artifact = url::Url::parse(&self.sdist_url).context("invalid sdist artifact URL")?;
+        if !matches!(artifact.scheme(), "http" | "https") {
+            anyhow::bail!(
+                "sdist artifact URL must use http(s), not `{}`",
+                artifact.scheme()
+            );
+        }
+        let digest = artifact
+            .fragment()
+            .and_then(|fragment| fragment.strip_prefix("sha256="))
+            .filter(|digest| {
+                digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+            .map(str::to_ascii_lowercase)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "sdist artifact URL must carry an exact `#sha256=<64 hex>` fragment"
+                )
+            })?;
+        Ok((artifact, digest))
+    }
+}
+
 /// How a wheel reaches the consumer at install time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -117,7 +193,7 @@ pub enum Origin {
 }
 
 /// One wheel in the bundle's install set.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LockWheel {
     pub name: String,
     pub version: String,
@@ -176,14 +252,14 @@ pub struct LockWheel {
 /// A conda run-dep retread routed to the conda side (a shared transitive
 /// the consumer's conda solve provides). Carried so the courier conda
 /// package can declare them as its own run-deps.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CondaDep {
     pub name: String,
     pub spec: String,
 }
 
 /// The committed install lock for one bundle.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetreadLock {
     pub schema: u32,
     pub retread_version: String,
@@ -191,6 +267,16 @@ pub struct RetreadLock {
     pub version: String,
     /// Target python (e.g. "3.11"); the wheel set is python-specific.
     pub python: String,
+    /// Conda target subdir whose wheels and routes this lock resolved for.
+    ///
+    /// Locks written before target-aware resolution were implicitly linux-64,
+    /// so a missing field deserializes to that legacy target. The default is
+    /// omitted on write to preserve the established linux-64 wire format.
+    #[serde(
+        default = "default_target_subdir",
+        skip_serializing_if = "is_legacy_default_target_subdir"
+    )]
+    pub target_subdir: String,
     /// sha256 over the canonicalized resolution inputs (entry specs +
     /// ordered index chain + relax policy + python + retread version).
     /// Reproducibility gate (req #5) AND the cold-solve replay key (req #4):
@@ -225,6 +311,12 @@ pub struct RetreadLock {
     /// unavailable during post-link.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub declared_glibc: Option<String>,
+    /// Effective glibc ceiling used to select the locked wheel set.
+    ///
+    /// This is replay/cache identity only. Install-time ABI authority remains
+    /// the live declaration, with `declared_glibc` as its existing fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_glibc: Option<String>,
     /// PyPI package names (conda-normalized) that have a conda counterpart
     /// and are therefore routed to the conda side rather than bundled in the
     /// wheel set. Recorded for the build_v1 replay path so it can reconstruct
@@ -269,6 +361,10 @@ pub struct RetreadLock {
 /// `url` and `sha256`; unchanged wheels without a direct URL are shipped as
 /// `Origin::Built`. The installer rejects older schemas rather than falling
 /// back to resolver-backed uv installs.
+///
+/// Target identity was added compatibly within schema 12. Legacy locks default
+/// to linux-64, and missing resolution metadata fails cold-replay matching
+/// closed while remaining installable on linux-64.
 ///
 /// Schema 11: GLIBC runtime contract fields.
 ///
@@ -378,12 +474,422 @@ pub const SCHEMA: u32 = 12;
 /// Epoch 15: parselmouth candidate families are sorted and deduplicated before
 /// route and repair selection. Existing locks must cold-resolve once so their
 /// chosen provider cannot depend on hash-map iteration order.
-pub const EMIT_EPOCH: u32 = 15;
+///
+/// Epoch 16: resolution identity includes normalized Python minor, target
+/// subdir, explicit glibc declaration, and effective wheel ceiling. Locks and
+/// rewrite caches cannot replay across target contracts.
+pub const EMIT_EPOCH: u32 = 16;
+
+fn parse_stored_glibc(value: Option<&str>) -> Option<Option<(u32, u32)>> {
+    match value {
+        None => Some(None),
+        Some(value) => {
+            let (major, minor) = value.split_once('.')?;
+            if major.is_empty()
+                || minor.is_empty()
+                || minor.contains('.')
+                || !major.bytes().all(|byte| byte.is_ascii_digit())
+                || !minor.bytes().all(|byte| byte.is_ascii_digit())
+            {
+                return None;
+            }
+            Some(Some((major.parse().ok()?, minor.parse().ok()?)))
+        }
+    }
+}
+
+/// Parse the exact Python grammar permitted at lock ingress.
+///
+/// Locks record a minor compatibility target. A numeric patch is accepted for
+/// compatibility with producers that spell the same target as `3.11.0`, then
+/// intentionally discarded. Bare majors, wildcards, suffixes, whitespace,
+/// and additional components are malformed rather than aliases.
+fn parse_stored_python_minor(value: &str) -> Option<(u32, u32)> {
+    let mut parts = value.split('.');
+    let major = parts.next()?;
+    let minor = parts.next()?;
+    let patch = parts.next();
+    if parts.next().is_some()
+        || major.is_empty()
+        || minor.is_empty()
+        || !major.bytes().all(|byte| byte.is_ascii_digit())
+        || !minor.bytes().all(|byte| byte.is_ascii_digit())
+        || patch.is_some_and(|patch| {
+            patch.is_empty() || !patch.bytes().all(|byte| byte.is_ascii_digit())
+        })
+    {
+        return None;
+    }
+    Some((major.parse().ok()?, minor.parse().ok()?))
+}
+
+pub(crate) fn normalized_target_python(value: &str) -> Result<String> {
+    parse_stored_python_minor(value)
+        .map(|(major, minor)| format!("{major}.{minor}"))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "invalid target Python `{value}`; expected major.minor or major.minor.patch"
+            )
+        })
+}
+
+fn stored_python_matches(stored: &str, expected: &str) -> bool {
+    matches!(
+        (
+            parse_stored_python_minor(stored),
+            parse_stored_python_minor(expected)
+        ),
+        (Some(stored), Some(expected)) if stored == expected
+    )
+}
 
 impl RetreadLock {
     /// File name for a bundle's lock next to the pack manifest.
     pub fn file_name(bundle: &str) -> String {
         format!("retread-{bundle}.lock.json")
+    }
+
+    /// Target-qualified lock filename. The full resolution identity prevents
+    /// two Python/platform/glibc contracts for one bundle from overwriting or
+    /// replaying each other's committed lock.
+    pub(crate) fn file_name_for_target(
+        bundle: &str,
+        target: &crate::pypi::ResolutionTarget,
+    ) -> String {
+        format!(
+            "retread-{bundle}.target-{}.lock.json",
+            target.resolution_identity()
+        )
+    }
+
+    /// Ordered read candidates for an exact target. The target-qualified path
+    /// is always first. Only a native linux-64 request may inspect the legacy
+    /// bundle-only path; foreign targets never probe it and every write uses
+    /// the qualified path.
+    pub(crate) fn read_file_names_for_target(
+        bundle: &str,
+        target: &crate::pypi::ResolutionTarget,
+        native_subdir: &str,
+    ) -> Vec<String> {
+        let mut names = vec![Self::file_name_for_target(bundle, target)];
+        if target.conda_subdir() == "linux-64" && native_subdir == "linux-64" {
+            names.push(Self::file_name(bundle));
+        }
+        names
+    }
+
+    /// Whether this lock was resolved for `target_subdir`.
+    pub fn is_for_target(&self, target_subdir: &str) -> bool {
+        self.target_subdir == target_subdir
+    }
+
+    /// Reconstruct the immutable target recorded in this lock. Malformed
+    /// compatibility metadata is a hard error at lock ingress.
+    pub(crate) fn resolution_target(&self) -> Result<crate::pypi::ResolutionTarget> {
+        let (python_major, python_minor) = parse_stored_python_minor(&self.python)
+            .ok_or_else(|| anyhow::anyhow!("invalid python in retread lock"))?;
+        let declared_glibc = parse_stored_glibc(self.declared_glibc.as_deref())
+            .ok_or_else(|| anyhow::anyhow!("invalid declared_glibc in retread lock"))?;
+        let effective_glibc = parse_stored_glibc(self.resolution_glibc.as_deref())
+            .ok_or_else(|| anyhow::anyhow!("invalid resolution_glibc in retread lock"))?;
+        Ok(crate::pypi::ResolutionTarget::from_wheel_target(
+            crate::pypi::WheelTarget {
+                python_version: format!("{python_major}.{python_minor}"),
+                conda_subdir: self.target_subdir.clone(),
+                max_glibc: effective_glibc,
+            },
+            declared_glibc,
+        ))
+    }
+
+    /// Whether this lock matches the complete immutable resolution target.
+    ///
+    /// Missing or malformed target metadata never aliases a fully specified
+    /// target. This makes legacy locks cold-resolve once without preventing
+    /// their native linux-64 install replay.
+    pub(crate) fn is_for_resolution_target(&self, target: &crate::pypi::ResolutionTarget) -> bool {
+        stored_python_matches(&self.python, target.python_version())
+            && self
+                .resolution_target()
+                .is_ok_and(|locked| locked.resolution_identity() == target.resolution_identity())
+    }
+
+    /// Validate every replay-trusted content/provenance field before replay
+    /// performs cache, network, or output mutation.
+    pub(crate) fn validate_replay_provenance(&self) -> Result<()> {
+        for wheel in &self.wheels {
+            let sha256 = wheel.sha256.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "locked wheel {}=={} has no final sha256",
+                    wheel.name,
+                    wheel.version,
+                )
+            })?;
+            if sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                anyhow::bail!(
+                    "locked wheel {}=={} has an invalid final sha256",
+                    wheel.name,
+                    wheel.version,
+                );
+            }
+
+            if let Some(source) = &wheel.sdist_source {
+                if wheel.origin != Origin::Built || wheel.must_ship {
+                    anyhow::bail!(
+                        "locked wheel {}=={} records sdist provenance for an incompatible origin",
+                        wheel.name,
+                        wheel.version,
+                    );
+                }
+                source
+                    .validated_url_and_sha256(&wheel.name, &wheel.version)
+                    .with_context(|| {
+                        format!(
+                            "invalid sdist provenance for locked wheel {}=={}",
+                            wheel.name, wheel.version,
+                        )
+                    })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate the complete, target-bound replay contract without touching
+    /// the network, caches, or output filesystem. Replay callers run this for
+    /// every entry before materializing the first wheel so malformed later
+    /// provenance cannot leave partial work behind.
+    pub(crate) fn validate_replay_contract_for_target(
+        &self,
+        target: &crate::pypi::ResolutionTarget,
+        expected_bundle: &str,
+    ) -> Result<()> {
+        use std::path::Component;
+
+        self.validate_replay_provenance()?;
+        if !self.is_for_resolution_target(target) {
+            anyhow::bail!("retread lock does not match the requested resolution target");
+        }
+        if self.bundle != expected_bundle {
+            anyhow::bail!(
+                "retread lock records bundle `{}`, but replay requested `{expected_bundle}`",
+                self.bundle,
+            );
+        }
+        let safe_component = |value: &str| {
+            !value.trim().is_empty()
+                && value == value.trim()
+                && !matches!(value, "." | "..")
+                && !value.contains('/')
+                && !value.contains('\\')
+                && std::path::Path::new(value).components().count() == 1
+        };
+        if !safe_component(&self.bundle) {
+            anyhow::bail!("retread lock records an invalid bundle path component");
+        }
+        self.bundle
+            .parse::<uv_normalize::PackageName>()
+            .context("retread lock records an invalid bundle package name")?;
+        self.version
+            .parse::<uv_pep508::uv_pep440::Version>()
+            .context("retread lock records an invalid bundle version")?;
+        if self.wheels.is_empty() {
+            anyhow::bail!("retread lock contains no wheel payload");
+        }
+        if let Some(recorded) = self.wheel_store.as_deref() {
+            let (path, portable) = if let Some(rest) = recorded.strip_prefix("~/") {
+                (std::path::Path::new(rest), true)
+            } else {
+                let path = std::path::Path::new(recorded);
+                if !path.is_absolute() {
+                    anyhow::bail!("retread lock records a non-portable relative wheel-store path");
+                }
+                (path, false)
+            };
+            if path.as_os_str().is_empty()
+                || (portable && path.is_absolute())
+                || path.components().any(|component| {
+                    matches!(component, Component::ParentDir | Component::Prefix(_))
+                        || (portable && matches!(component, Component::RootDir))
+                })
+            {
+                anyhow::bail!("retread lock records an unsafe wheel-store path");
+            }
+        }
+
+        let mut seen_distributions = std::collections::BTreeMap::<String, String>::new();
+        let mut seen_filenames = std::collections::BTreeMap::<String, String>::new();
+        for wheel in &self.wheels {
+            if wheel.name.trim().is_empty()
+                || wheel.version.trim().is_empty()
+                || wheel.filename.trim().is_empty()
+            {
+                anyhow::bail!("retread lock contains an incomplete wheel entry");
+            }
+            let canonical = canonical_conda_name(&wheel.name);
+            if let Some(prior) = seen_distributions.insert(canonical, wheel.name.clone()) {
+                anyhow::bail!(
+                    "retread lock contains duplicate distributions `{prior}` and `{}`",
+                    wheel.name,
+                );
+            }
+            let recorded = crate::courier::validate_wheel_filename_for_target(
+                &wheel.name,
+                &wheel.version,
+                &wheel.filename,
+                target.wheel_target(),
+                "locked replay wheel filename",
+            )?;
+            if let Some(prior) =
+                seen_filenames.insert(recorded.to_ascii_lowercase(), wheel.filename.clone())
+            {
+                anyhow::bail!(
+                    "retread lock contains duplicate wheel filenames `{prior}` and `{}`",
+                    wheel.filename,
+                );
+            }
+
+            let validate_artifact_url = |label: &str, text: &str| -> Result<String> {
+                let url = url::Url::parse(text).with_context(|| {
+                    format!("invalid {label} for {}=={}", wheel.name, wheel.version)
+                })?;
+                if !matches!(url.scheme(), "http" | "https" | "file") {
+                    anyhow::bail!(
+                        "{label} for {}=={} uses unsupported scheme `{}`",
+                        wheel.name,
+                        wheel.version,
+                        url.scheme(),
+                    );
+                }
+                let filename = crate::wheel::wheel_filename_from_url(&url)
+                    .with_context(|| format!("invalid wheel filename in {label}"))?;
+                crate::courier::validate_wheel_filename_for_target(
+                    &wheel.name,
+                    &wheel.version,
+                    &filename,
+                    target.wheel_target(),
+                    &format!("locked replay {label} filename"),
+                )?;
+                Ok(filename)
+            };
+
+            match wheel.origin {
+                Origin::Index => {
+                    if wheel.must_ship
+                        || wheel.upstream_url.is_some()
+                        || wheel.git_source.is_some()
+                        || wheel.sdist_source.is_some()
+                    {
+                        anyhow::bail!(
+                            "index wheel {}=={} records incompatible replay provenance",
+                            wheel.name,
+                            wheel.version,
+                        );
+                    }
+                    let url = wheel.url.as_deref().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "index wheel {}=={} has no locked artifact URL",
+                            wheel.name,
+                            wheel.version,
+                        )
+                    })?;
+                    let filename = validate_artifact_url("artifact URL", url)?;
+                    if filename != wheel.filename {
+                        anyhow::bail!(
+                            "artifact URL for {}=={} names `{filename}`, but the lock records `{}`",
+                            wheel.name,
+                            wheel.version,
+                            wheel.filename,
+                        );
+                    }
+                }
+                Origin::Built => {
+                    if wheel.url.is_some() {
+                        anyhow::bail!(
+                            "built wheel {}=={} unexpectedly records an index URL",
+                            wheel.name,
+                            wheel.version,
+                        );
+                    }
+                    if let Some(upstream) = wheel.upstream_url.as_deref() {
+                        if wheel.must_ship
+                            || wheel.git_source.is_some()
+                            || wheel.sdist_source.is_some()
+                        {
+                            anyhow::bail!(
+                                "built wheel {}=={} records conflicting upstream provenance",
+                                wheel.name,
+                                wheel.version,
+                            );
+                        }
+                        let filename = validate_artifact_url("upstream URL", upstream)?;
+                        if !crate::courier::wheel_filename_provenance_matches(
+                            &wheel.filename,
+                            &filename,
+                        ) {
+                            anyhow::bail!(
+                                "upstream URL for {}=={} names different wheel provenance",
+                                wheel.name,
+                                wheel.version,
+                            );
+                        }
+                    }
+                    if let Some(git) = &wheel.git_source {
+                        if !wheel.must_ship
+                            || wheel.upstream_url.is_some()
+                            || wheel.sdist_source.is_some()
+                        {
+                            anyhow::bail!(
+                                "built wheel {}=={} records incompatible git provenance",
+                                wheel.name,
+                                wheel.version,
+                            );
+                        }
+                        if git.url.trim().is_empty()
+                            || git.url != git.url.trim()
+                            || git.url.starts_with('-')
+                            || git.url.chars().any(char::is_control)
+                        {
+                            anyhow::bail!(
+                                "built wheel {}=={} records an invalid git URL",
+                                wheel.name,
+                                wheel.version,
+                            );
+                        }
+                        if git.rev.len() != 40
+                            || !git.rev.bytes().all(|byte| byte.is_ascii_hexdigit())
+                        {
+                            anyhow::bail!(
+                                "built wheel {}=={} git revision is not a resolved 40-hex commit",
+                                wheel.name,
+                                wheel.version,
+                            );
+                        }
+                        if let Some(subdirectory) = git.subdirectory.as_deref() {
+                            let path = std::path::Path::new(subdirectory);
+                            if subdirectory.trim().is_empty()
+                                || subdirectory.contains('\\')
+                                || path.is_absolute()
+                                || path.components().any(|component| {
+                                    matches!(
+                                        component,
+                                        Component::ParentDir
+                                            | Component::RootDir
+                                            | Component::Prefix(_)
+                                    )
+                                })
+                            {
+                                anyhow::bail!(
+                                    "built wheel {}=={} records an unsafe git subdirectory",
+                                    wheel.name,
+                                    wheel.version,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Canonical inputs hash. EVERY producer (the courier staging that
@@ -416,11 +922,42 @@ impl RetreadLock {
         pin_version: Option<&str>,
         config_fingerprint: &str,
     ) -> String {
+        let target = crate::pypi::ResolutionTarget::from_wheel_target(
+            crate::pypi::WheelTarget {
+                python_version: python.to_owned(),
+                conda_subdir: "linux-64".to_owned(),
+                max_glibc: None,
+            },
+            None,
+        );
+        Self::compute_inputs_hash_for_target(
+            entry_specs,
+            index_urls,
+            relax,
+            &target,
+            emit_epoch,
+            pin_version,
+            config_fingerprint,
+        )
+    }
+
+    /// Exact-target form of [`Self::compute_inputs_hash`]. Build and replay
+    /// paths use this method so the foundation's normalized, full-SHA target
+    /// identity participates in every lock gate.
+    pub(crate) fn compute_inputs_hash_for_target(
+        entry_specs: &[String],
+        index_urls: &[String],
+        relax: &str,
+        target: &crate::pypi::ResolutionTarget,
+        emit_epoch: u32,
+        pin_version: Option<&str>,
+        config_fingerprint: &str,
+    ) -> String {
         use sha2::{Digest, Sha256};
         let mut sorted = entry_specs.to_vec();
         sorted.sort();
         let mut h = Sha256::new();
-        h.update(b"retread-inputs-v5\n");
+        h.update(b"retread-inputs-v6\n");
         for s in &sorted {
             h.update(s.as_bytes());
             h.update(b"\n");
@@ -433,7 +970,8 @@ impl RetreadLock {
         h.update(b"--meta--\n");
         h.update(relax.as_bytes());
         h.update(b"\n");
-        h.update(python.as_bytes());
+        h.update(b"--target--\n");
+        h.update(target.resolution_identity().as_bytes());
         h.update(b"\n");
         h.update(b"--epoch--\n");
         h.update(emit_epoch.to_le_bytes());
@@ -450,7 +988,13 @@ impl RetreadLock {
     pub fn load(path: &Path) -> Result<Self> {
         let bytes =
             std::fs::read(path).with_context(|| format!("reading lock {}", path.display()))?;
-        serde_json::from_slice(&bytes).with_context(|| format!("parsing lock {}", path.display()))
+        let lock: Self = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parsing lock {}", path.display()))?;
+        if lock.schema == SCHEMA {
+            lock.validate_replay_provenance()
+                .with_context(|| format!("validating lock {}", path.display()))?;
+        }
+        Ok(lock)
     }
 
     /// Serialize to pretty JSON for committing.
@@ -536,6 +1080,22 @@ impl RetreadLock {
 mod tests {
     use super::*;
 
+    fn target(
+        python: &str,
+        subdir: &str,
+        declared_glibc: Option<(u32, u32)>,
+        effective_glibc: Option<(u32, u32)>,
+    ) -> crate::pypi::ResolutionTarget {
+        crate::pypi::ResolutionTarget::from_wheel_target(
+            crate::pypi::WheelTarget {
+                python_version: python.into(),
+                conda_subdir: subdir.into(),
+                max_glibc: effective_glibc,
+            },
+            declared_glibc,
+        )
+    }
+
     #[test]
     fn lock_roundtrips() {
         let lock = RetreadLock {
@@ -544,6 +1104,7 @@ mod tests {
             bundle: "isaac-pack".into(),
             version: "5.1.0".into(),
             python: "3.11".into(),
+            target_subdir: "linux-64".into(),
             inputs_hash: "deadbeef".into(),
             root_requirements: vec!["isaac-pack-pypi==5.1.0".into()],
             wheels: vec![
@@ -601,6 +1162,7 @@ mod tests {
             prerelease: BTreeMap::from([("gmpy2".into(), "==2.1.0a4".into())]),
             shadow_libs: BTreeMap::new(),
             declared_glibc: None,
+            resolution_glibc: None,
             conda_capable: vec!["numpy".into(), "torch".into()],
             entry_specs: vec!["isaaclab==0.51.1".into()],
             wheel_store: None,
@@ -714,6 +1276,129 @@ mod tests {
         assert!(lock.wheels[0].upstream_url.is_none());
         assert!(!lock.wheels[0].must_ship);
         assert_eq!(lock.wheels[0].requires_dist, vec!["torch>=2.0"]);
+    }
+
+    #[test]
+    fn legacy_lock_target_defaults_to_linux_64() {
+        let legacy_json = r#"{
+            "schema": 12,
+            "retread_version": "4.8.8",
+            "bundle": "legacy-pack",
+            "version": "1.0.0",
+            "python": "3.11",
+            "wheels": [],
+            "conda_run_deps": [],
+            "index_urls": []
+        }"#;
+        let lock: RetreadLock = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(lock.target_subdir, "linux-64");
+        assert!(lock.resolution_glibc.is_none());
+        assert!(lock.is_for_target("linux-64"));
+        assert!(!lock.is_for_target("linux-aarch64"));
+        assert!(lock.is_for_resolution_target(&target("3.11.0", "linux-64", None, None)));
+        assert!(!lock.is_for_resolution_target(&target("3.11", "linux-64", None, Some((2, 35)))));
+    }
+
+    #[test]
+    fn lock_python_is_strict_and_normalizes_numeric_patch() {
+        let expected_minor = target("3.11", "linux-64", None, None);
+        let expected_patch = target("3.11.0", "linux-64", None, None);
+
+        for spelling in ["3.11", "3.11.0"] {
+            let mut lock = make_test_lock_unordered();
+            lock.python = spelling.into();
+            let reconstructed = lock.resolution_target().unwrap();
+            assert_eq!(reconstructed.python_version(), "3.11");
+            assert!(lock.is_for_resolution_target(&expected_minor));
+            assert!(lock.is_for_resolution_target(&expected_patch));
+        }
+
+        for malformed in [
+            "3",
+            "3.",
+            ".11",
+            "3.11.",
+            "3.11.*",
+            "3.11rc1",
+            "3.11.0rc1",
+            "3.11.0.1",
+            " 3.11",
+            "3.11 ",
+        ] {
+            let mut lock = make_test_lock_unordered();
+            lock.python = malformed.into();
+            assert!(
+                lock.resolution_target().is_err(),
+                "malformed lock Python {malformed:?} was accepted"
+            );
+            assert!(!lock.is_for_resolution_target(&expected_minor));
+
+            let valid_lock = make_test_lock_unordered();
+            assert!(
+                !valid_lock.is_for_resolution_target(&target(malformed, "linux-64", None, None))
+            );
+        }
+    }
+
+    #[test]
+    fn target_metadata_roundtrips_without_changing_linux_64_wire_default() {
+        let linux = make_test_lock_unordered();
+        let linux_json = linux.to_pretty_json().unwrap();
+        assert!(!linux_json.contains("\"target_subdir\""));
+        assert!(!linux_json.contains("\"resolution_glibc\""));
+
+        let mut arm = linux;
+        arm.target_subdir = "linux-aarch64".into();
+        arm.declared_glibc = Some("2.35".into());
+        arm.resolution_glibc = Some("2.35".into());
+        let arm_json = arm.to_pretty_json().unwrap();
+        let decoded: RetreadLock = serde_json::from_str(&arm_json).unwrap();
+        assert_eq!(decoded.target_subdir, "linux-aarch64");
+        assert_eq!(decoded.resolution_glibc.as_deref(), Some("2.35"));
+        assert!(decoded.is_for_resolution_target(&target(
+            "3.11",
+            "linux-aarch64",
+            Some((2, 35)),
+            Some((2, 35))
+        )));
+        assert!(!decoded.is_for_resolution_target(&target(
+            "3.11",
+            "linux-64",
+            Some((2, 35)),
+            Some((2, 35))
+        )));
+
+        arm.resolution_glibc = Some("2.35 trailing".into());
+        assert!(!arm.is_for_resolution_target(&target(
+            "3.11",
+            "linux-aarch64",
+            Some((2, 35)),
+            Some((2, 35))
+        )));
+    }
+
+    #[test]
+    fn inputs_hash_uses_full_normalized_target_identity() {
+        let hash = |target: &crate::pypi::ResolutionTarget| {
+            RetreadLock::compute_inputs_hash_for_target(
+                &["demo==1".into()],
+                &["https://pypi.org/simple/".into()],
+                "patch-then-minor",
+                target,
+                EMIT_EPOCH,
+                None,
+                "cfg",
+            )
+        };
+        let arm_35 = target("3.11", "linux-aarch64", Some((2, 35)), Some((2, 35)));
+        let arm_35_patch = target("3.11.0", "linux-aarch64", Some((2, 35)), Some((2, 35)));
+        let arm_39 = target("3.11", "linux-aarch64", Some((2, 39)), Some((2, 39)));
+        let x86_35 = target("3.11", "linux-64", Some((2, 35)), Some((2, 35)));
+
+        assert_eq!(hash(&arm_35), hash(&arm_35_patch));
+        assert_ne!(hash(&arm_35), hash(&arm_39));
+        assert_ne!(hash(&arm_35), hash(&x86_35));
+        assert_eq!(hash(&arm_35).len(), 64);
     }
 
     #[test]
@@ -939,8 +1624,10 @@ mod tests {
             index: "https://pypi.org/simple/".into(),
             name: "gym".into(),
             version: "0.26.2".into(),
-            sdist_url: "https://files.pythonhosted.org/packages/gym-0.26.2.tar.gz#sha256=abc"
-                .into(),
+            sdist_url: format!(
+                "https://files.pythonhosted.org/packages/gym-0.26.2.tar.gz#sha256={}",
+                "ab".repeat(32)
+            ),
         };
         let json = serde_json::to_string(&src).unwrap();
         let back: SdistWheelSource = serde_json::from_str(&json).unwrap();
@@ -953,6 +1640,144 @@ mod tests {
             back.sdist_url.starts_with("https://"),
             "sdist_url must be an https URL, not file://"
         );
+        let (_, digest) = back.validated_url_and_sha256("Gym", "0.26.2.0").unwrap();
+        assert_eq!(digest, "ab".repeat(32));
+    }
+
+    #[test]
+    fn target_qualified_lock_names_cover_the_full_resolution_identity() {
+        let x86 = target("3.11", "linux-64", None, Some((2, 35)));
+        let x86_patch = target("3.11.0", "linux-64", None, Some((2, 35)));
+        let python_minor = target("3.12", "linux-64", None, Some((2, 35)));
+        let arm = target("3.11", "linux-aarch64", None, Some((2, 35)));
+        let declared = target("3.11", "linux-64", Some((2, 35)), Some((2, 35)));
+        let effective = target("3.11", "linux-64", None, Some((2, 39)));
+
+        let name = |target: &crate::pypi::ResolutionTarget| {
+            RetreadLock::file_name_for_target("demo", target)
+        };
+        let x86_name = name(&x86);
+        assert!(x86_name.contains(&x86.resolution_identity()));
+        assert_eq!(
+            x86_name,
+            name(&x86_patch),
+            "Python patch-equivalent targets must share one lock namespace",
+        );
+
+        let distinct: std::collections::BTreeSet<_> = [
+            name(&x86),
+            name(&python_minor),
+            name(&arm),
+            name(&declared),
+            name(&effective),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            distinct.len(),
+            5,
+            "Python minor, subdir, declared glibc, and effective glibc must each change the lock namespace",
+        );
+
+        assert_eq!(
+            RetreadLock::read_file_names_for_target("demo", &x86, "linux-64"),
+            vec![x86_name.clone(), RetreadLock::file_name("demo")],
+        );
+        assert_eq!(
+            RetreadLock::read_file_names_for_target("demo", &x86_patch, "linux-64"),
+            vec![x86_name, RetreadLock::file_name("demo")],
+            "patch-equivalent targets must read the same candidates",
+        );
+        assert_eq!(
+            RetreadLock::read_file_names_for_target("demo", &arm, "linux-64"),
+            vec![name(&arm)],
+            "foreign targets must never probe the bundle-only legacy lock",
+        );
+        assert_eq!(
+            RetreadLock::read_file_names_for_target("demo", &x86, "linux-aarch64"),
+            vec![name(&x86)],
+            "linux-64 is foreign on a native aarch64 host and must not probe the legacy lock",
+        );
+    }
+
+    #[test]
+    fn current_lock_replay_provenance_requires_final_and_sdist_hashes() {
+        let mut lock = RetreadLock {
+            schema: SCHEMA,
+            retread_version: "test".into(),
+            bundle: "gympack".into(),
+            version: "1.0".into(),
+            python: "3.11".into(),
+            target_subdir: "linux-64".into(),
+            inputs_hash: "hash".into(),
+            root_requirements: vec![],
+            wheels: vec![LockWheel {
+                name: "gym".into(),
+                version: "0.26.2".into(),
+                origin: Origin::Built,
+                filename: "gym-0.26.2-999retread-py3-none-any.whl".into(),
+                url: None,
+                sha256: Some("11".repeat(32)),
+                requires_dist: vec![],
+                must_ship: false,
+                upstream_url: None,
+                git_source: None,
+                sdist_source: Some(SdistWheelSource {
+                    index: "https://pypi.org/simple/".into(),
+                    name: "gym".into(),
+                    version: "0.26.2".into(),
+                    sdist_url: "https://example.com/gym-0.26.2.tar.gz".into(),
+                }),
+            }],
+            conda_run_deps: vec![],
+            index_urls: vec![],
+            prerelease: BTreeMap::new(),
+            shadow_libs: BTreeMap::new(),
+            declared_glibc: None,
+            resolution_glibc: None,
+            conda_capable: vec![],
+            entry_specs: vec![],
+            wheel_store: None,
+        };
+
+        let err = lock.validate_replay_provenance().unwrap_err();
+        assert!(format!("{err:#}").contains("#sha256=<64 hex>"));
+        lock.wheels[0].sdist_source.as_mut().unwrap().sdist_url = format!(
+            "https://example.com/gym-0.26.2.tar.gz#sha256={}",
+            "22".repeat(32)
+        );
+        lock.validate_replay_provenance().unwrap();
+        lock.wheels[0].sha256 = None;
+        let err = lock.validate_replay_provenance().unwrap_err();
+        assert!(err.to_string().contains("no final sha256"));
+
+        lock.wheels[0].sha256 = Some("11".repeat(32));
+        lock.wheels[0].sdist_source = None;
+        lock.wheels[0].must_ship = true;
+        lock.wheels[0].git_source = Some(GitWheelSource {
+            url: "https://github.com/acme/gym.git".into(),
+            rev: "33".repeat(20),
+            subdirectory: Some("../escape".into()),
+            extras: vec![],
+        });
+        let target = target("3.11", "linux-64", None, None);
+        let err = lock
+            .validate_replay_contract_for_target(&target, "gympack")
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("unsafe git subdirectory"));
+
+        lock.wheels[0].git_source.as_mut().unwrap().subdirectory = Some("packages/gym".into());
+        lock.validate_replay_contract_for_target(&target, "gympack")
+            .unwrap();
+
+        lock.wheel_store = Some("~//tmp/evil".into());
+        let err = lock
+            .validate_replay_contract_for_target(&target, "gympack")
+            .unwrap_err();
+        assert!(err.to_string().contains("unsafe wheel-store path"));
+        lock.wheel_store = Some("~/retread/wheels".into());
+        lock.validate_replay_contract_for_target(&target, "gympack")
+            .unwrap();
     }
 
     /// A schema-8 lock (no sdist_source field) must deserialize cleanly
@@ -1035,6 +1860,7 @@ mod tests {
             bundle: "test-pack".into(),
             version: "1.0.0".into(),
             python: "3.11".into(),
+            target_subdir: "linux-64".into(),
             inputs_hash: "abc123".into(),
             root_requirements: vec!["torch-req".into(), "numpy-req".into()],
             wheels: vec![
@@ -1084,6 +1910,7 @@ mod tests {
             prerelease: BTreeMap::new(),
             shadow_libs: BTreeMap::new(),
             declared_glibc: None,
+            resolution_glibc: None,
             conda_capable: vec!["zlib".into(), "blas".into()],
             entry_specs: vec!["torch==2.0.0".into(), "numpy==1.26.0".into()],
             wheel_store: None,

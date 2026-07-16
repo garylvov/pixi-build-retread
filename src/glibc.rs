@@ -1731,6 +1731,8 @@ mod tests {
             bundle: "test-bundle".to_string(),
             version: "1.0.0".to_string(),
             python: "3.11".to_string(),
+            target_subdir: "linux-64".to_string(),
+            resolution_glibc: None,
             inputs_hash: "abc".to_string(),
             root_requirements: vec!["test-bundle-pypi==1.0.0".to_string()],
             wheels: Vec::new(),

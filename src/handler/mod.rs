@@ -41,8 +41,10 @@ use uv_pep508::uv_pep440::VersionSpecifiers;
 use crate::config::{RelaxPolicy, RetreadConfig, WheelEntry};
 use crate::constraint::{Authority, Conflict, Constraint, Provenance, finalize};
 use crate::index_chain::{IndexPurpose, index_chain};
-use crate::pypi::{self, WheelTarget};
-use crate::recipe::{BundleSource, build_bundle_recipe, build_courier_recipe_with_mode, to_yaml};
+use crate::pypi::{self, ResolutionTarget, WheelTarget};
+use crate::recipe::{
+    BundleSource, build_bundle_recipe, build_courier_recipe_with_mode_and_lock_filename, to_yaml,
+};
 use crate::relax::{
     CondaConstraintOrigin, CondaDep, CondaName, CondaTarget, NameMap, PypiKey,
     canonical_conda_name, emit_python_version, marker_env_for,
@@ -102,14 +104,21 @@ fn conda_outputs_cache_key(
                 .map(|d| d.subsec_nanos().to_string() + &d.as_secs().to_string())
         })
         .unwrap_or_else(|| "0".to_string());
+    // Python variants are already present in `variant_configuration`; use a
+    // fixed numeric minor here to namespace the remaining immutable target
+    // contract (subdir plus declared/effective glibc). This prevents a shared
+    // disk memo from crossing host/deployment compatibility boundaries.
+    let target_contract =
+        ResolutionTarget::for_subdir("0.0", params.host_platform.as_str()).resolution_identity();
     format!(
-        "{}|{}|{}|{:?}|{}|{}|{}",
+        "{}|{}|{}|{:?}|{}|{}|{}|{}",
         params.host_platform,
         params.build_platform,
         chans.join(","),
         params.variant_configuration,
         mtime_str,
         auto_overrides_fp,
+        target_contract,
         backend_build_identity(),
     )
 }
@@ -386,7 +395,7 @@ fn courier_build_string(
 fn courier_inputs_hash(
     config: &crate::config::RetreadConfig,
     bundle_name: &str,
-    python_version: &str,
+    target: &ResolutionTarget,
     channels: &[String],
     workspace_manifest: Option<&crate::workspace::WorkspaceManifest>,
     workspace_dir: &std::path::Path,
@@ -407,15 +416,54 @@ fn courier_inputs_hash(
         .map(|m| m.solve_fingerprint(workspace_dir, source_dir))
         .unwrap_or_default();
     let config_fp = crate::courier::config_fingerprint(config, channels, &workspace_fp);
-    crate::lock::RetreadLock::compute_inputs_hash(
+    crate::lock::RetreadLock::compute_inputs_hash_for_target(
         &entry_specs,
         &index_urls,
         &format!("{:?}", config.relax),
-        python_version,
+        target,
         crate::lock::EMIT_EPOCH,
         config.pin_version.then_some(env!("CARGO_PKG_VERSION")),
         &config_fp,
     )
+}
+
+/// Select the committed lock visible to this exact resolution target.
+///
+/// The target-qualified path is authoritative. A bundle-only schema-12 lock
+/// is a read-only compatibility candidate solely for native linux-64; foreign
+/// targets never probe that namespace. Callers always write the qualified
+/// path returned by [`exact_lock_path_for_target`].
+fn lock_path_for_target(
+    source_dir: &Path,
+    bundle_name: &str,
+    target: &ResolutionTarget,
+) -> PathBuf {
+    let candidates = crate::lock::RetreadLock::read_file_names_for_target(
+        bundle_name,
+        target,
+        crate::glibc::current_pixi_platform(),
+    );
+    let exact = source_dir.join(
+        candidates
+            .first()
+            .expect("target lock candidates always contain the exact path"),
+    );
+    candidates
+        .into_iter()
+        .map(|name| source_dir.join(name))
+        .find(|path| path.is_file())
+        .unwrap_or(exact)
+}
+
+fn exact_lock_path_for_target(
+    source_dir: &Path,
+    bundle_name: &str,
+    target: &ResolutionTarget,
+) -> PathBuf {
+    source_dir.join(crate::lock::RetreadLock::file_name_for_target(
+        bundle_name,
+        target,
+    ))
 }
 
 const DEFAULT_PYTHON: &str = "3.11";
@@ -1358,7 +1406,8 @@ impl Handler {
         // mirror-solver; outputs ship unvalidated and `retread solve`
         // owns conflict handling.
         for python_version in &pythons {
-            let target = wheel_target_for(params.host_platform, python_version);
+            let target = resolution_target_for(params.host_platform, python_version);
+            let python_version = target.python_version();
             // Phase 1: materialize wheels + auto-bundle. Env-agnostic;
             // results reused across all per-env emissions.
             let t_materialize = std::time::Instant::now();
@@ -1424,7 +1473,7 @@ impl Handler {
                 materialized,
                 base_config,
                 declared_config: config.clone(),
-                python_version: python_version.clone(),
+                python_version: python_version.to_owned(),
                 work_directory: params.work_directory.clone(),
                 workspace_manifest_mtime: prepared_workspace_mtime,
                 auto_overrides_fingerprint: prepared_auto_overrides_fp.clone(),
@@ -1483,15 +1532,15 @@ impl Handler {
                         env_bundles
                             .iter()
                             .filter_map(|b| {
-                                let lock_path = source_dir
-                                    .join(crate::lock::RetreadLock::file_name(&b.conda_name));
-                                detect_incremental_add(
+                                let lock_path =
+                                    lock_path_for_target(&source_dir, &b.conda_name, &target);
+                                detect_incremental_add_for_target(
                                     &lock_path,
                                     &config,
                                     &b.conda_name,
                                     &ws_indexes_for_incr,
                                     &relax_str_for_incr,
-                                    python_version,
+                                    &target,
                                     &config_fp_for_incr,
                                 )
                                 .map(|incr| (b.conda_name.clone(), incr.lock.version.clone()))
@@ -1545,7 +1594,7 @@ impl Handler {
                         Some(courier_inputs_hash(
                             &config,
                             &base_bundle.conda_name,
-                            python_version,
+                            &target,
                             &courier_channels,
                             workspace_manifest.as_ref(),
                             workspace_dir.as_deref().unwrap_or(source_dir.as_path()),
@@ -1555,14 +1604,16 @@ impl Handler {
                         None
                     };
                     if let Some(ref current_hash) = courier_build_hash {
-                        let lock_path = source_dir
-                            .join(crate::lock::RetreadLock::file_name(&bundle.conda_name));
+                        let lock_path =
+                            lock_path_for_target(&source_dir, &bundle.conda_name, &target);
                         let relax_is_default =
                             config.relax == crate::config::RelaxPolicy::default();
-                        match replay_from_lock(
+                        match replay_from_lock_for_target(
                             &lock_path,
                             current_hash,
                             relax_is_default,
+                            &target,
+                            &bundle.conda_name,
                             params.host_platform,
                             config.build_number,
                             config.bundle_mode == crate::config::BundleMode::Loose,
@@ -1629,9 +1680,7 @@ impl Handler {
                             "probe trace write failed (non-fatal)",
                         );
                     }
-                    if version_override_for_bundle.is_none()
-                        && plan.local_wheel_stamps.is_some()
-                    {
+                    if version_override_for_bundle.is_none() && plan.local_wheel_stamps.is_some() {
                         prepared_builds.push(PreparedBuild {
                             locator_id: prepared_builds.len(),
                             plan: Arc::clone(&plan),
@@ -1669,12 +1718,7 @@ impl Handler {
         write_conda_outputs_disk_cache(&disk_cache_path, &result).await;
         if let Some(transaction) = prepared_transaction {
             if !self
-                .publish_prepared_builds(
-                    generation,
-                    transaction,
-                    cache_key,
-                    prepared_builds,
-                )
+                .publish_prepared_builds(generation, transaction, cache_key, prepared_builds)
                 .await
             {
                 tracing::debug!(
@@ -1728,8 +1772,11 @@ impl Handler {
             .as_ref()
             .and_then(|s| s.as_versions().into_iter().next());
         let raw = params.output.variant.get("python").map(|v| v.to_string());
-        let exact_variant_python = raw.as_deref().filter(|value| value.contains('.'));
-        let python_version = match raw.as_deref() {
+        let exact_variant_python = raw
+            .as_deref()
+            .filter(|value| value.contains('.'))
+            .and_then(|value| crate::lock::normalized_target_python(value).ok());
+        let requested_python = match raw.as_deref() {
             Some(v) if v.contains('.') => v.to_string(),
             Some(other) => {
                 let fallback = config_python
@@ -1757,7 +1804,8 @@ impl Handler {
             }
             None => config_python.unwrap_or_else(|| DEFAULT_PYTHON.to_string()),
         };
-        let target = wheel_target_for(params.output.subdir, &python_version);
+        let target = resolution_target_for(params.output.subdir, &requested_python);
+        let python_version = target.python_version().to_owned();
 
         // WS-B build_v1 replay gate: when courier mode is active, check the
         // committed lock BEFORE running the expensive resolve_all / probe
@@ -1819,16 +1867,21 @@ impl Handler {
             let current_hash = courier_inputs_hash(
                 &config,
                 &bundle_name_for_hash,
-                &python_version,
+                &target,
                 &courier_channels,
                 ws_manifest_for_replay.as_ref(),
                 workspace_dir.as_deref().unwrap_or(&source_dir),
                 &source_dir,
             );
-            let lock_path =
-                source_dir.join(crate::lock::RetreadLock::file_name(&bundle_name_for_hash));
+            let lock_path = lock_path_for_target(&source_dir, &bundle_name_for_hash, &target);
             let relax_is_default = config.relax == crate::config::RelaxPolicy::default();
-            match load_replayable_lock(&lock_path, &current_hash, relax_is_default) {
+            match load_replayable_lock_for_target(
+                &lock_path,
+                &current_hash,
+                relax_is_default,
+                &target,
+                &bundle_name_for_hash,
+            ) {
                 Ok(Some(lock)) => {
                     tracing::info!(
                         bundle = %bundle_name_for_hash,
@@ -1860,12 +1913,13 @@ impl Handler {
                             }
                         })
                         .collect();
-                    match materialize_from_lock(
+                    match materialize_from_lock_for_target(
                         lock,
+                        &bundle_name_for_hash,
                         &config,
                         &params.work_directory,
                         &build_output_dir,
-                        params.output.subdir,
+                        &target,
                         &source_dir,
                         &cache_dir,
                         params.output.build.as_deref(),
@@ -1923,13 +1977,13 @@ impl Handler {
                     .map(|m| m.resolution_pypi_index_urls())
                     .unwrap_or_else(|| vec![crate::index_chain::PUBLIC_PYPI.to_string()]);
                 let relax_str = format!("{:?}", config.relax);
-                if let Some(incr) = detect_incremental_add(
+                if let Some(incr) = detect_incremental_add_for_target(
                     &lock_path,
                     &config,
                     &bundle_name_for_hash,
                     &ws_indexes,
                     &relax_str,
-                    &python_version,
+                    &target,
                     &config_fp,
                 ) {
                     match resolve_incremental_add(
@@ -1943,7 +1997,6 @@ impl Handler {
                         workspace_dir.as_deref(),
                         &params.work_directory,
                         &build_output_dir,
-                        params.output.subdir,
                         params.output.build.as_deref(),
                         &config_fp,
                     )
@@ -2002,7 +2055,7 @@ impl Handler {
                 generation,
                 &params.work_directory,
                 workspace_dir.as_deref(),
-                exact_variant_python,
+                exact_variant_python.as_deref(),
                 &params.output,
             )
             .await
@@ -2026,7 +2079,7 @@ impl Handler {
                 &prepared.plan.declared_config,
                 &params.work_directory,
                 &build_output_dir,
-                params.output.subdir,
+                &target,
                 &prepared.plan.python_version,
                 &source_dir,
                 workspace_dir.as_deref(),
@@ -2035,18 +2088,11 @@ impl Handler {
             )
             .await
             .map_err(|e| RpcError::internal(format!("build {}: {e:#}", bundle.conda_name)))?;
-            let result = finalize_fasttmp_build_output(
-                result,
-                stage_output_dir.as_deref(),
-                &output_dir,
-            )
-            .await?;
-            self.consume_prepared_build(
-                generation,
-                transaction,
-                prepared.locator_id,
-            )
-            .await;
+            let result =
+                finalize_fasttmp_build_output(result, stage_output_dir.as_deref(), &output_dir)
+                    .await?;
+            self.consume_prepared_build(generation, transaction, prepared.locator_id)
+                .await;
             return Ok(result);
         }
 
@@ -2108,7 +2154,7 @@ impl Handler {
             &config,
             &params.work_directory,
             &build_output_dir,
-            params.output.subdir,
+            &target,
             &python_version,
             &source_dir,
             workspace_dir.as_deref(),
@@ -2197,9 +2243,7 @@ impl Handler {
                 state
                     .prepared_builds
                     .iter()
-                    .filter(|prepared| {
-                        prepared.matches(work_dir, exact_python_version, output)
-                    })
+                    .filter(|prepared| prepared.matches(work_dir, exact_python_version, output))
                     .cloned()
                     .collect(),
             )
@@ -2214,8 +2258,7 @@ impl Handler {
         }
         let prepared = candidates.pop().expect("one candidate");
         if prepared.plan.workspace_manifest_mtime != workspace_manifest_mtime(workspace_dir)
-            || prepared.plan.auto_overrides_fingerprint
-                != auto_overrides_fingerprint(workspace_dir)
+            || prepared.plan.auto_overrides_fingerprint != auto_overrides_fingerprint(workspace_dir)
         {
             tracing::debug!(
                 output = %output.name.as_normalized(),
@@ -2403,11 +2446,21 @@ fn pythons_for(
     vec![DEFAULT_PYTHON.to_string()]
 }
 
+#[cfg(test)]
 fn wheel_target_for(subdir: Platform, python_version: &str) -> WheelTarget {
     // The python_version comes from variant configuration (or the chosen
     // output's variant in conda/build_v1). It drives wheel selection on
     // the PyPI index (cp tag matching) and the marker env in relax.rs.
     WheelTarget::for_subdir(python_version, &subdir.to_string())
+}
+
+fn resolution_target_for(subdir: Platform, python_version: &str) -> ResolutionTarget {
+    // Resolve the declaration/effective ceiling once at the operation
+    // boundary. Hashing, lock lookup, replay gates, and courier staging all
+    // consume this same immutable value.
+    let normalized_python = crate::lock::normalized_target_python(python_version)
+        .unwrap_or_else(|_| python_version.to_owned());
+    ResolutionTarget::for_subdir(&normalized_python, &subdir.to_string())
 }
 
 /// Resolve every user-supplied entry into a list of bundles. Each bundle
@@ -2421,7 +2474,7 @@ fn wheel_target_for(subdir: Platform, python_version: &str) -> WheelTarget {
 /// pull in the same sub-package.
 async fn resolve_all(
     config: &RetreadConfig,
-    target: &WheelTarget,
+    target: &ResolutionTarget,
     download_dir: &Path,
     source_dir: &Path,
     cache_dir: &Path,
@@ -2550,8 +2603,8 @@ async fn resolve_all(
         // unset (the default), so this is a no-op on the cold / default path
         // and produces byte-identical output to today.
         let bundle_conda_name = canonical_conda_name(&group_name);
-        let lock_path = source_dir.join(crate::lock::RetreadLock::file_name(&bundle_conda_name));
-        let favored = load_favored_versions(&lock_path);
+        let lock_path = lock_path_for_target(source_dir, &bundle_conda_name, target);
+        let favored = load_favored_versions_for_target(&lock_path, target);
 
         // uv-backed closure computation (the only resolver). This group's
         // closure is computed by a uv subprocess (ephemeral project + `uv
@@ -2850,17 +2903,16 @@ fn compose_sdist_source_url(url: &url::Url, sha256: Option<&str>) -> String {
 /// in the shared wheel store ([`crate::wheel::store_wheel_in_cache`]) so
 /// `retread install` replay never re-resolves (no-resolve edict).
 ///
-/// Build-output cache key: `sha256(sdist identity, python_version,
-/// conda_subdir)` — a toolchain change (different target python/subdir)
-/// or a changed sdist gets its own out-dir; an identical repeat request
-/// hits `source_build`'s own out-dir cache and skips the `uv build`
-/// subprocess entirely.
+/// Build-output cache key: the full `sha256(sdist identity,
+/// artifact-target identity)`. A changed sdist or compatibility contract gets
+/// its own out-dir; an identical repeat request hits `source_build`'s cache
+/// and skips the `uv build` subprocess entirely.
 async fn build_sdist_wheel(
     name: String,
     requirement: Option<String>,
     index_urls: Vec<String>,
     python_version: String,
-    conda_subdir: String,
+    target_cache_identity: String,
     cache_dir: PathBuf,
 ) -> Result<crate::uv_closure::BuiltSdistWheel> {
     // Constrain sdist selection to the EXACT version the structured
@@ -2899,98 +2951,66 @@ async fn build_sdist_wheel(
         format!("sdist auto-build: no index in the chain has an sdist for `{name}`"),
     )
     .await?;
-        tracing::info!(
-            pkg = %name,
-            version = %version,
-            "building sdist {name}=={version} (no wheel, no conda candidate)",
-        );
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(b"retread-sdist-autobuild-v1\n");
-        hasher.update(
-            sdist
-                .sha256
-                .as_deref()
-                .unwrap_or_else(|| sdist.url.as_str())
-                .as_bytes(),
-        );
-        hasher.update(b"\0");
-        hasher.update(python_version.as_bytes());
-        hasher.update(b"\0");
-        hasher.update(conda_subdir.as_bytes());
-        let digest = hasher.finalize();
-        let key12: String = digest.iter().take(6).map(|b| format!("{b:02x}")).collect();
-        let out_dir = cache_dir
-            .join("sdist-auto-builds")
-            .join(canonical_conda_name(&name))
-            .join(key12);
-        let built =
-            crate::source_build::build_wheel_from_sdist_url(&sdist.url, &out_dir, &python_version)
-                .await
-                .with_context(|| {
-                    format!("sdist auto-build: building `{name}` from {}", sdist.url)
-                })?;
+    tracing::info!(
+        pkg = %name,
+        version = %version,
+        "building sdist {name}=={version} (no wheel, no conda candidate)",
+    );
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"retread-sdist-autobuild-v2\0");
+    hasher.update(
+        sdist
+            .sha256
+            .as_deref()
+            .unwrap_or_else(|| sdist.url.as_str())
+            .as_bytes(),
+    );
+    hasher.update(b"\0");
+    hasher.update(target_cache_identity.as_bytes());
+    let cache_key = format!("{:x}", hasher.finalize());
+    let out_dir = cache_dir
+        .join("sdist-auto-builds")
+        .join(canonical_conda_name(&name))
+        .join(cache_key);
+    let built = crate::source_build::build_wheel_from_sdist_url(
+        &sdist.url,
+        &out_dir,
+        &python_version,
+        sdist.sha256.as_deref(),
+    )
+    .await
+    .with_context(|| format!("sdist auto-build: building `{name}` from {}", sdist.url))?;
 
-        // Hash-verify the sdist tarball `build_wheel_from_sdist_url`
-        // downloaded against the index's advertised sha256, when it
-        // published one. Best-effort: an index that omits the fragment
-        // (rare) skips the check rather than failing a build it has no
-        // way to verify.
-        if let Some(expected) = &sdist.sha256 {
-            let sdist_filename = sdist
-                .url
-                .path_segments()
-                .and_then(|mut s| s.next_back())
-                .unwrap_or_default();
-            let sdist_path = out_dir.join(sdist_filename);
-            if sdist_path.is_file() {
-                let bytes = tokio::fs::read(&sdist_path).await.with_context(|| {
-                    format!(
-                        "sdist auto-build: reading {} for hash verify",
-                        sdist_path.display()
-                    )
-                })?;
-                let mut h = Sha256::new();
-                h.update(&bytes);
-                let actual = format!("{:x}", h.finalize());
-                if !actual.eq_ignore_ascii_case(expected) {
-                    bail!(
-                        "sdist auto-build: hash mismatch for `{name}` sdist \
-                         {sdist_filename} (index advertised {expected}, got {actual})"
-                    );
-                }
-            }
-        }
-
-        let store_root = crate::courier::retread_wheel_store_root();
-        let sha256 = crate::wheel::store_wheel_in_cache(&built, &store_root)
-            .await
-            .with_context(|| format!("sdist auto-build: storing built wheel for `{name}`"))?;
-        let filename = built
-            .file_name()
-            .and_then(|s| s.to_str())
-            .ok_or_else(|| {
-                anyhow!(
-                    "sdist auto-build: built wheel path has no utf-8 filename: {}",
-                    built.display()
-                )
-            })?
-            .to_string();
-        let store_path = store_root.join(&sha256).join(&filename);
-        let sdist_url = compose_sdist_source_url(&sdist.url, sdist.sha256.as_deref());
-        Ok(crate::uv_closure::BuiltSdistWheel {
-            pypi_name: name.clone(),
+    let store_root = crate::courier::retread_wheel_store_root();
+    let sha256 = crate::wheel::store_wheel_in_cache(&built, &store_root)
+        .await
+        .with_context(|| format!("sdist auto-build: storing built wheel for `{name}`"))?;
+    let filename = built
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| {
+            anyhow!(
+                "sdist auto-build: built wheel path has no utf-8 filename: {}",
+                built.display()
+            )
+        })?
+        .to_string();
+    let store_path = store_root.join(&sha256).join(&filename);
+    let sdist_url = compose_sdist_source_url(&sdist.url, sdist.sha256.as_deref());
+    Ok(crate::uv_closure::BuiltSdistWheel {
+        pypi_name: name.clone(),
+        version: version.to_string(),
+        filename,
+        wheel_path: store_path,
+        sha256,
+        sdist_source: crate::lock::SdistWheelSource {
+            index,
+            name: name.clone(),
             version: version.to_string(),
-            filename,
-            wheel_path: store_path,
-            sha256,
-            sdist_source: crate::lock::SdistWheelSource {
-                index,
-                name: name.clone(),
-                version: version.to_string(),
-                sdist_url,
-            },
-        })
+            sdist_url,
+        },
+    })
 }
 
 /// Dedupe root requirement strings by PEP 503-normalized package name,
@@ -4487,7 +4507,7 @@ async fn uv_group_closure(
     let sdist_build = (effective.sdist_build == crate::config::SdistBuildPolicy::Auto).then(|| {
         let index_urls = transitive_index_urls.clone();
         let python_version = target.python_version.clone();
-        let conda_subdir = target.conda_subdir.clone();
+        let target_cache_identity = target.artifact_cache_identity();
         let cache_dir = cache_dir.to_path_buf();
         move |name: String, requirement: Option<String>| {
             let fut = build_sdist_wheel(
@@ -4495,7 +4515,7 @@ async fn uv_group_closure(
                 requirement,
                 index_urls.clone(),
                 python_version.clone(),
-                conda_subdir.clone(),
+                target_cache_identity.clone(),
                 cache_dir.clone(),
             );
             Box::pin(fut)
@@ -4753,8 +4773,16 @@ mod sdist_source_url_tests {
         );
         assert_eq!(out, format!("https://ex.org/p/foo-1.0.tar.gz#sha256={H}"));
 
-        // No advertised hash: URL passes through verbatim.
+        // PEP 691 may expose the digest in a discrete JSON field while the
+        // artifact URL itself has no fragment. Persist the hash-bound form so
+        // strict replay retains the exact raw artifact identity.
         let no_hash = url::Url::parse("https://ex.org/p/foo-1.0.tar.gz").unwrap();
+        assert_eq!(
+            compose_sdist_source_url(&no_hash, Some(H)),
+            format!("https://ex.org/p/foo-1.0.tar.gz#sha256={H}")
+        );
+
+        // No advertised hash: URL passes through verbatim.
         assert_eq!(
             compose_sdist_source_url(&no_hash, None),
             "https://ex.org/p/foo-1.0.tar.gz"
@@ -6991,17 +7019,36 @@ async fn bfs_fetch_pypi_sdist(
         .with_context(|| format!("BFS sdist fallback for {pypi_name} {specifiers} on {index}"))?;
     // Capture the sdist URL before the build so replay keeps the immutable
     // source even though the materialized wheel is a local file URL.
-    let captured_sdist_url = sdist.url.clone();
-    // Unified sdist build cache dir keyed on (name, version) so BFS,
-    // discovery, and replay all share the same output directory and never
-    // rebuild the same (name, version) twice.
+    let captured_sdist_url = url::Url::parse(&compose_sdist_source_url(
+        &sdist.url,
+        sdist.sha256.as_deref(),
+    ))
+    .context("constructing hash-bound BFS sdist provenance URL")?;
+    // Bind the cache to the exact source artifact and effective target. A
+    // same-version republish or a different Python/platform contract must
+    // never reuse executable build output.
+    use sha2::{Digest, Sha256};
+    let mut cache_hasher = Sha256::new();
+    cache_hasher.update(b"retread-sdist-build-v2\0");
+    cache_hasher.update(
+        sdist
+            .sha256
+            .as_deref()
+            .unwrap_or_else(|| sdist.url.as_str())
+            .as_bytes(),
+    );
+    cache_hasher.update(b"\0");
+    cache_hasher.update(target.artifact_cache_identity().as_bytes());
+    let cache_key = format!("{:x}", cache_hasher.finalize());
     let sdist_out = download_dir
         .join("sdist-builds")
-        .join(format!("{pypi_name}-{sdist_version}"));
+        .join(format!("{pypi_name}-{sdist_version}"))
+        .join(cache_key);
     let built = crate::source_build::build_wheel_from_sdist_url(
         &sdist.url,
         &sdist_out,
         &target.python_version,
+        sdist.sha256.as_deref(),
     )
     .await
     .with_context(|| {
@@ -8398,15 +8445,48 @@ fn localize_wheel_source(url: &url::Url, wheels_root: &Path) -> url::Url {
 /// `git_group_stash`, `built_roots`, `emit_wheels`), and the main
 /// per-`LockWheel` classification loop.  The caller retains responsibility for
 /// deriving `conda_capable` and `index_urls` from the lock after this returns.
+fn replay_sdist_cache_key(raw_sha256: &str, target: &ResolutionTarget) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"retread-replay-sdist-build-v2\0");
+    hasher.update(raw_sha256.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(target.resolution_identity().as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
 async fn emit_wheels_from_lock(
     lock: &crate::lock::RetreadLock,
     config: &RetreadConfig,
-    target: &WheelTarget,
+    target: &ResolutionTarget,
     download_dir: &Path,
     source_dir: &Path,
     cache_dir: &Path,
 ) -> Result<Option<Vec<crate::emit_pypi::EmitWheel>>> {
     use crate::lock::Origin;
+
+    // Provenance gaps are a legitimate signal to cold-resolve, but detect all
+    // of them before the first checkout, download, or build. Otherwise a later
+    // gap can leave earlier replay entries partially materialized.
+    for wheel in &lock.wheels {
+        let missing_manifest_source = wheel.origin == Origin::Built
+            && wheel.must_ship
+            && wheel.git_source.is_none()
+            && !config.retread_wheels.contains_key(&wheel.name);
+        let missing_shadow_source = wheel.origin == Origin::Built
+            && !wheel.must_ship
+            && wheel.sdist_source.is_none()
+            && wheel.upstream_url.is_none();
+        if missing_manifest_source || missing_shadow_source {
+            tracing::warn!(
+                wheel = %wheel.name,
+                "courier replay provenance gap detected before materialization; \
+                 falling through to full resolve",
+            );
+            return Ok(None);
+        }
+    }
 
     // Per-wheel re-materialization: classify each LockWheel and build the
     // EmitWheel with correct local_path / remote_url for courier::stage.
@@ -8542,6 +8622,7 @@ async fn emit_wheels_from_lock(
                     local_path,
                     wheel_filename: lw.filename.clone(),
                     sha256: lw.sha256.clone(),
+                    locked_final_sha256: None,
                     remote_url,
                     upstream_url: None,
                     git_source: None,   // Origin::Index: no git source
@@ -8663,7 +8744,8 @@ async fn emit_wheels_from_lock(
                                         requires_dist: member_lw.requires_dist.clone(),
                                         local_path,
                                         wheel_filename: member_lw.filename.clone(),
-                                        sha256: member_lw.sha256.clone(),
+                                        sha256: Some(resolved.metadata.sha256.clone()),
+                                        locked_final_sha256: member_lw.sha256.clone(),
                                         remote_url: None,
                                         upstream_url: None,
                                         git_source: resolved.git_source.clone(),
@@ -8751,7 +8833,8 @@ async fn emit_wheels_from_lock(
                             requires_dist: lw.requires_dist.clone(),
                             local_path,
                             wheel_filename: lw.filename.clone(),
-                            sha256: lw.sha256.clone(),
+                            sha256: Some(resolved.metadata.sha256.clone()),
+                            locked_final_sha256: lw.sha256.clone(),
                             remote_url: None,
                             upstream_url: None,
                             git_source: resolved.git_source.clone(),
@@ -8815,7 +8898,8 @@ async fn emit_wheels_from_lock(
                         requires_dist: lw.requires_dist.clone(),
                         local_path,
                         wheel_filename: lw.filename.clone(),
-                        sha256: lw.sha256.clone(),
+                        sha256: Some(resolved.metadata.sha256.clone()),
+                        locked_final_sha256: lw.sha256.clone(),
                         remote_url: None,
                         upstream_url: None,
                         // git_source from the re-materialized resolved wheel (schema 8+).
@@ -8862,18 +8946,19 @@ async fn emit_wheels_from_lock(
             // resolve, not an independent input.
             Origin::Built if !lw.must_ship && lw.sdist_source.is_some() => {
                 let s = lw.sdist_source.as_ref().unwrap();
-                // Unified sdist build cache dir: same key as BFS and discovery
-                // so whichever path runs first populates it and the others hit
-                // the cache without rebuilding.
+                let (stored_url, locked_raw_sha256) = s
+                    .validated_url_and_sha256(&lw.name, &lw.version)
+                    .with_context(|| {
+                        format!(
+                            "courier replay Class-2b: validating locked sdist for `{}`",
+                            lw.name,
+                        )
+                    })?;
+                let cache_key = replay_sdist_cache_key(&locked_raw_sha256, target);
                 let sdist_out = download_dir
                     .join("sdist-builds")
-                    .join(format!("{}-{}", s.name, s.version));
-                let stored_url = url::Url::parse(&s.sdist_url).with_context(|| {
-                    format!(
-                        "courier replay Class-2b: invalid sdist_url `{}` for wheel `{}`",
-                        s.sdist_url, lw.name,
-                    )
-                })?;
+                    .join(format!("{}-{}", s.name, s.version))
+                    .join(cache_key);
                 tracing::info!(
                     wheel = %lw.name,
                     sdist_url = %stored_url,
@@ -8882,7 +8967,8 @@ async fn emit_wheels_from_lock(
                 let built = match crate::source_build::build_wheel_from_sdist_url(
                     &stored_url,
                     &sdist_out,
-                    &lock.python,
+                    target.python_version(),
+                    Some(&locked_raw_sha256),
                 )
                 .await
                 {
@@ -8914,10 +9000,25 @@ async fn emit_wheels_from_lock(
                                 s.name, s.version,
                             )
                         })?;
+                        let fallback_sha256 = sdist.sha256.as_deref().ok_or_else(|| {
+                            anyhow!(
+                                "courier replay Class-2b: re-resolved sdist for `{}` has no \
+                                 sha256; refusing to build unverified fallback content",
+                                s.name,
+                            )
+                        })?;
+                        if !fallback_sha256.eq_ignore_ascii_case(&locked_raw_sha256) {
+                            bail!(
+                                "courier replay Class-2b: re-resolved sdist sha256 for `{}` \
+                                 differs from the locked raw artifact",
+                                s.name,
+                            );
+                        }
                         crate::source_build::build_wheel_from_sdist_url(
                             &sdist.url,
                             &sdist_out,
-                            &lock.python,
+                            target.python_version(),
+                            Some(&locked_raw_sha256),
                         )
                         .await
                         .with_context(|| {
@@ -8934,7 +9035,8 @@ async fn emit_wheels_from_lock(
                     requires_dist: lw.requires_dist.clone(),
                     local_path: Some(built),
                     wheel_filename: lw.filename.clone(),
-                    sha256: lw.sha256.clone(),
+                    sha256: None,
+                    locked_final_sha256: lw.sha256.clone(),
                     remote_url: None,
                     upstream_url: None,
                     git_source: None,
@@ -9043,7 +9145,8 @@ async fn emit_wheels_from_lock(
                     requires_dist: lw.requires_dist.clone(),
                     local_path: Some(fetched),
                     wheel_filename: lw.filename.clone(),
-                    sha256: lw.sha256.clone(),
+                    sha256: None,
+                    locked_final_sha256: lw.sha256.clone(),
                     remote_url: None, // local-path EmitWheel: cold has remote_url=None
                     // upstream_url carries the index URL so courier's Rewritten/Raw
                     // arms write upstream_url=github + url=None, matching cold.
@@ -9082,6 +9185,7 @@ async fn emit_wheels_from_lock(
 /// for sourcing `run_deps` from `lock.conda_run_deps` before calling this
 /// function on a replay hit.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 async fn materialize_from_lock(
     lock: crate::lock::RetreadLock,
     config: &RetreadConfig,
@@ -9094,14 +9198,56 @@ async fn materialize_from_lock(
     run_deps: Vec<String>,
     config_fp: &str,
 ) -> Result<Option<CondaBuildV1Result>> {
+    let target = lock
+        .resolution_target()
+        .context("reconstructing target from test/legacy materialize lock")?;
+    if target.conda_subdir() != target_subdir.to_string() {
+        return Ok(None);
+    }
+    let expected_bundle = lock.bundle.clone();
+    materialize_from_lock_for_target(
+        lock,
+        &expected_bundle,
+        config,
+        work_dir,
+        output_dir,
+        &target,
+        source_dir,
+        cache_dir,
+        expected_build,
+        run_deps,
+        config_fp,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn materialize_from_lock_for_target(
+    lock: crate::lock::RetreadLock,
+    expected_bundle: &str,
+    config: &RetreadConfig,
+    work_dir: &Path,
+    output_dir: &Path,
+    target: &ResolutionTarget,
+    source_dir: &Path,
+    cache_dir: &Path,
+    expected_build: Option<&str>,
+    run_deps: Vec<String>,
+    config_fp: &str,
+) -> Result<Option<CondaBuildV1Result>> {
+    if !lock.is_for_resolution_target(target) {
+        return Ok(None);
+    }
+    // Validate every entry before the first cache, network, staging, or output
+    // mutation so malformed later provenance cannot leave partial work behind.
+    lock.validate_replay_contract_for_target(target, expected_bundle)
+        .context("validating complete courier replay lock provenance")?;
     let bundle_name = lock.bundle.clone();
     let version = lock.version.clone();
-    let python_version = crate::relax::emit_python_version("", &lock.python);
     let download_dir = source_dir.join("wheels");
-    let target = wheel_target_for(target_subdir, &python_version);
 
     let emit_wheels =
-        match emit_wheels_from_lock(&lock, config, &target, &download_dir, source_dir, cache_dir)
+        match emit_wheels_from_lock(&lock, config, target, &download_dir, source_dir, cache_dir)
             .await?
         {
             Some(w) => w,
@@ -9125,7 +9271,8 @@ async fn materialize_from_lock(
         config,
         &bundle_name,
         &version,
-        &python_version,
+        target,
+        Some(&lock),
         emit_wheels,
         conda_capable,
         run_deps,
@@ -9133,7 +9280,6 @@ async fn materialize_from_lock(
         config_fp,
         work_dir,
         output_dir,
-        target_subdir,
         source_dir,
         expected_build,
     )
@@ -9157,7 +9303,8 @@ async fn materialize_and_pack(
     config: &RetreadConfig,
     bundle_name: &str,
     version: &str,
-    python_version: &str,
+    target: &ResolutionTarget,
+    authoritative_lock: Option<&crate::lock::RetreadLock>,
     emit_wheels: Vec<crate::emit_pypi::EmitWheel>,
     conda_capable: std::collections::HashSet<String>,
     run_deps: Vec<String>,
@@ -9165,16 +9312,25 @@ async fn materialize_and_pack(
     config_fp: &str,
     work_dir: &Path,
     output_dir: &Path,
-    target_subdir: Platform,
     source_dir: &Path,
     expected_build: Option<&str>,
 ) -> Result<CondaBuildV1Result> {
     let staging = work_dir.join(format!("courier-{bundle_name}"));
-    let staged = crate::courier::stage(
+    // `~/...` is an intentionally portable store identity: expand it against
+    // this host and stage there so the serialized identity remains exact.
+    // Absolute producer-host paths are not replay authority; those use the
+    // current configured store and are normalized only as location metadata
+    // by the authoritative-lock comparison below.
+    let replay_store_root = authoritative_lock
+        .and_then(|lock| lock.wheel_store.as_deref())
+        .filter(|recorded| recorded.starts_with("~/"))
+        .map(crate::courier::expand_wheel_store_path);
+    let staged = crate::courier::stage_for_target_with_store_root(
         config,
         bundle_name,
+        bundle_name,
         version,
-        python_version,
+        target,
         &emit_wheels,
         &conda_capable,
         &run_deps,
@@ -9182,26 +9338,33 @@ async fn materialize_and_pack(
         config_fp,
         source_dir,
         &staging,
+        replay_store_root.as_deref(),
     )
     .await
     .context("courier staging")?;
 
+    if let Some(authoritative_lock) = authoritative_lock {
+        validate_authoritative_replay_lock(authoritative_lock, &staged.lock)?;
+    }
+
     // Defer the committed install lock write until after a successful
     // rattler-build (B-2). The staged copy inside `staging` is already in
     // the recipe's source list; this is the authoritative pack-dir copy.
-    let lock_path = source_dir.join(crate::lock::RetreadLock::file_name(bundle_name));
+    let lock_path = exact_lock_path_for_target(source_dir, bundle_name, target);
     let courier_lock_to_commit = (lock_path, staged.lock.to_pretty_json()?);
 
-    let recipe = build_courier_recipe_with_mode(
+    let lock_filename = crate::lock::RetreadLock::file_name_for_target(bundle_name, target);
+    let recipe = build_courier_recipe_with_mode_and_lock_filename(
         bundle_name,
         version,
-        python_version,
+        target.python_version(),
         &staged.run_deps,
         &staged.source_urls,
         // Thread the content-addressed build string into the recipe so
         // the on-disk artifact name matches what conda/outputs advertised.
         expected_build,
         config.courier_mode,
+        &lock_filename,
     );
     let yaml = to_yaml(&recipe)?;
 
@@ -9228,7 +9391,13 @@ async fn materialize_and_pack(
 
     tokio::fs::create_dir_all(output_dir).await?;
 
-    let target_platform = target_subdir.to_string();
+    let target_platform = target.conda_subdir().to_owned();
+    let target_subdir = Platform::from_str(target.conda_subdir()).with_context(|| {
+        format!(
+            "parsing courier resolution target subdir `{}`",
+            target.conda_subdir()
+        )
+    })?;
     let compression_threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
@@ -9291,7 +9460,7 @@ async fn materialize_and_pack(
         find_conda_artifact(&subdir_dir, &recipe.package.name, &recipe.package.version).await?;
 
     let build = expected_build.map(|s| s.to_string()).unwrap_or_else(|| {
-        let py_short = python_version.replace('.', "");
+        let py_short = target.python_version().replace('.', "");
         format!("py{py_short}_{}", config.build_number)
     });
     Ok(CondaBuildV1Result {
@@ -9302,6 +9471,44 @@ async fn materialize_and_pack(
         build,
         subdir: target_subdir,
     })
+}
+
+fn validate_authoritative_replay_lock(
+    authoritative: &crate::lock::RetreadLock,
+    staged: &crate::lock::RetreadLock,
+) -> Result<()> {
+    let mut expected = authoritative.clone();
+    let mut actual = staged.clone();
+    // The producer version is observational unless `retread-pin-version`
+    // participates in `inputs_hash`. Preserve emit-neutral cross-version
+    // replay while comparing every semantic target, artifact, digest, and
+    // provenance field exactly.
+    expected.retread_version = actual.retread_version.clone();
+    expected.python = crate::lock::normalized_target_python(&expected.python)
+        .context("normalizing authoritative replay lock Python")?;
+    actual.python = crate::lock::normalized_target_python(&actual.python)
+        .context("normalizing staged replay lock Python")?;
+    // An absolute loose-store path names the producer host, not emitted wheel
+    // bytes. Replay uses the current configured store and keeps digest +
+    // filename identity exact. Portable `~/...` identities remain literal and
+    // were staged at their current-host expansion above.
+    if expected
+        .wheel_store
+        .as_deref()
+        .is_some_and(|recorded| std::path::Path::new(recorded).is_absolute())
+        && actual.wheel_store.is_some()
+    {
+        expected.wheel_store = actual.wheel_store.clone();
+    }
+    expected.canonicalize();
+    actual.canonicalize();
+    if actual != expected {
+        anyhow::bail!(
+            "courier replay drifted from the authoritative lock after staging; refusing \
+             to build or replace the committed lock"
+        );
+    }
+    Ok(())
 }
 
 /// Localized incremental-add resolver (STEP 5).
@@ -9323,7 +9530,7 @@ async fn materialize_and_pack(
 async fn resolve_incremental_add(
     incr: IncrementalAdd,
     config: &RetreadConfig,
-    target: &WheelTarget,
+    target: &ResolutionTarget,
     download_dir: &Path,
     source_dir: &Path,
     cache_dir: &Path,
@@ -9331,7 +9538,6 @@ async fn resolve_incremental_add(
     workspace_dir: Option<&Path>,
     work_dir: &Path,
     output_dir: &Path,
-    target_subdir: Platform,
     expected_build: Option<&str>,
     config_fp: &str,
 ) -> Result<Option<CondaBuildV1Result>> {
@@ -9345,7 +9551,8 @@ async fn resolve_incremental_add(
         .collect();
 
     // ── Step A: re-materialize locked wheels (emit_wheels_from_lock) ──────
-    let python_version = crate::relax::emit_python_version("", &lock.python);
+    let python_version = crate::lock::normalized_target_python(&lock.python)
+        .context("normalizing replay lock Python target")?;
     let locked_emit =
         match emit_wheels_from_lock(&lock, config, target, download_dir, source_dir, cache_dir)
             .await?
@@ -9457,6 +9664,7 @@ async fn resolve_incremental_add(
                 version: w.metadata.version.clone(),
                 requires_dist: w.metadata.requires_dist.clone(),
                 sha256: Some(w.metadata.sha256.clone()),
+                locked_final_sha256: None,
                 local_path: (url.scheme() == "file")
                     .then(|| url.to_file_path().ok())
                     .flatten(),
@@ -9557,7 +9765,8 @@ async fn resolve_incremental_add(
         config,
         &bundle_name,
         &version,
-        &python_version,
+        target,
+        None,
         merged,
         conda_capable,
         run_deps,
@@ -9565,7 +9774,6 @@ async fn resolve_incremental_add(
         config_fp,
         work_dir,
         output_dir,
-        target_subdir,
         source_dir,
         expected_build,
     )
@@ -9573,12 +9781,12 @@ async fn resolve_incremental_add(
 
     // ── Optional validity oracle ───────────────────────────────────────────
     if std::env::var("RETREAD_VERIFY_LOCALADD").as_deref() == Ok("1") {
-        let lock_path = source_dir.join(crate::lock::RetreadLock::file_name(&bundle_name));
+        let lock_path = exact_lock_path_for_target(source_dir, &bundle_name, target);
         verify_localadd_hook(
             &lock_path,
             &added_specs,
             &bundle_name,
-            &target_subdir.to_string(),
+            target.conda_subdir(),
             &python_version,
         );
     }
@@ -9775,13 +9983,19 @@ async fn build_one(
     declared_config: &RetreadConfig,
     work_dir: &Path,
     output_dir: &Path,
-    target_subdir: Platform,
+    target: &ResolutionTarget,
     workspace_python_version: &str,
     source_dir: &Path,
     workspace_dir: Option<&Path>,
     expected_build: Option<&str>,
     run_override: Option<&[String]>,
 ) -> Result<CondaBuildV1Result> {
+    let target_subdir = Platform::from_str(target.conda_subdir()).with_context(|| {
+        format!(
+            "parsing build resolution target subdir `{}`",
+            target.conda_subdir()
+        )
+    })?;
     // Lay out one BundleSource per wheel (primary first), in BFS order.
     //
     // v1.4.5: point each source at retread's local wheel cache when
@@ -9821,8 +10035,6 @@ async fn build_one(
     // WS-C: courier mode — delegate to materialize_and_pack which handles
     // the full courier staging + rattler-build + deferred lock flush pipeline.
     if config.courier {
-        let python_version =
-            emit_python_version(&bundle.primary.metadata.filename, workspace_python_version);
         let version = bundle.primary.metadata.version.clone();
         let emit_wheels: Vec<crate::emit_pypi::EmitWheel> = bundle
             .all_wheels()
@@ -9832,6 +10044,7 @@ async fn build_one(
                 version: w.metadata.version.clone(),
                 requires_dist: w.metadata.requires_dist.clone(),
                 sha256: Some(w.metadata.sha256.clone()),
+                locked_final_sha256: None,
                 local_path: (url.scheme() == "file")
                     .then(|| url.to_file_path().ok())
                     .flatten(),
@@ -9885,11 +10098,7 @@ async fn build_one(
             .filter(|entry| entry.url.is_none())
             .filter_map(|entry| entry.index.clone())
             .collect();
-        let index_urls = index_chain(
-            entry_indexes,
-            &workspace_indexes,
-            IndexPurpose::RootResolve,
-        );
+        let index_urls = index_chain(entry_indexes, &workspace_indexes, IndexPurpose::RootResolve);
         // B-1 (lock-poisoning): in courier mode the committed lock's
         // `conda_run_deps` MUST be the run-deps pixi actually solved and
         // locked (forwarded as `run_override`). The legacy fallback re-derived
@@ -9923,7 +10132,8 @@ async fn build_one(
             config,
             &bundle.conda_name,
             &version,
-            &python_version,
+            target,
+            None,
             emit_wheels,
             conda_capable,
             run_deps,
@@ -9931,7 +10141,6 @@ async fn build_one(
             &config_fp,
             work_dir,
             output_dir,
-            target_subdir,
             source_dir,
             expected_build,
         )
@@ -10174,6 +10383,7 @@ struct IncrementalAdd {
 ///    to combine with a frozen closure).
 ///
 /// Returns `None` on any gate failure (always safe: cold resolve follows).
+#[cfg(test)]
 fn detect_incremental_add(
     lock_path: &Path,
     config: &RetreadConfig,
@@ -10181,6 +10391,34 @@ fn detect_incremental_add(
     ws_indexes: &[String],
     relax_str: &str,
     python_version: &str,
+    config_fp: &str,
+) -> Option<IncrementalAdd> {
+    let target = ResolutionTarget::from_wheel_target(
+        WheelTarget {
+            python_version: python_version.to_owned(),
+            conda_subdir: "linux-64".to_owned(),
+            max_glibc: None,
+        },
+        None,
+    );
+    detect_incremental_add_for_target(
+        lock_path,
+        config,
+        bundle_name,
+        ws_indexes,
+        relax_str,
+        &target,
+        config_fp,
+    )
+}
+
+fn detect_incremental_add_for_target(
+    lock_path: &Path,
+    config: &RetreadConfig,
+    bundle_name: &str,
+    ws_indexes: &[String],
+    relax_str: &str,
+    target: &ResolutionTarget,
     config_fp: &str,
 ) -> Option<IncrementalAdd> {
     // Gate 1: feature flag.
@@ -10204,6 +10442,14 @@ fn detect_incremental_add(
             lock_schema = lock.schema,
             expected = crate::lock::SCHEMA,
             "incremental-add: schema mismatch; skipping"
+        );
+        return None;
+    }
+    if let Err(error) = lock.validate_replay_contract_for_target(target, bundle_name) {
+        tracing::debug!(
+            target = %target.resolution_identity(),
+            error = %format!("{error:#}"),
+            "incremental-add: complete replay contract validation failed; skipping"
         );
         return None;
     }
@@ -10255,11 +10501,7 @@ fn detect_incremental_add(
             .filter(|entry| entry.url.is_none())
             .filter_map(|entry| entry.index.clone())
             .collect();
-        let locked_chain = index_chain(
-            locked_entry_indexes,
-            ws_indexes,
-            IndexPurpose::RootResolve,
-        );
+        let locked_chain = index_chain(locked_entry_indexes, ws_indexes, IndexPurpose::RootResolve);
         if locked_chain != lock.index_urls {
             tracing::debug!(
                 ?locked_chain,
@@ -10275,13 +10517,13 @@ fn detect_incremental_add(
     // STEP A proved lock.index_urls == current locked chain, so it is safe to
     // use lock.index_urls as the index term, reproducing the canonical chain
     // order exactly, including the public terminal fallback.
-    let recomputed_hash = crate::lock::RetreadLock::compute_inputs_hash(
+    let recomputed_hash = crate::lock::RetreadLock::compute_inputs_hash_for_target(
         &lock.entry_specs,
         &lock.index_urls,
         relax_str,
-        python_version,
+        target,
         crate::lock::EMIT_EPOCH,
-        None, // pin_version matches the lock that was stored (non-circular)
+        config.pin_version.then_some(env!("CARGO_PKG_VERSION")),
         config_fp,
     );
     if recomputed_hash != lock.inputs_hash {
@@ -10339,13 +10581,31 @@ fn detect_incremental_add(
 /// Unlike [`load_replayable_lock`], this function loads the lock even when the
 /// `inputs_hash` does not match -- favor-lock REQUIRES a deliberate hash
 /// mismatch (it is designed for the re-resolve-after-manifest-change case).
+#[cfg(test)]
 fn load_favored_versions(lock_path: &Path) -> std::collections::BTreeMap<String, String> {
+    load_favored_versions_inner(lock_path, None)
+}
+
+fn load_favored_versions_for_target(
+    lock_path: &Path,
+    target: &ResolutionTarget,
+) -> std::collections::BTreeMap<String, String> {
+    load_favored_versions_inner(lock_path, Some(target))
+}
+
+fn load_favored_versions_inner(
+    lock_path: &Path,
+    target: Option<&ResolutionTarget>,
+) -> std::collections::BTreeMap<String, String> {
     if std::env::var_os("RETREAD_NO_FAVOR_LOCK").is_some() {
         return std::collections::BTreeMap::new();
     }
     let Ok(lock) = crate::lock::RetreadLock::load(lock_path) else {
         return std::collections::BTreeMap::new();
     };
+    if target.is_some_and(|target| !lock.is_for_resolution_target(target)) {
+        return std::collections::BTreeMap::new();
+    }
     let mut m = std::collections::BTreeMap::new();
     for w in &lock.wheels {
         // Skip wheels with empty version strings; those are malformed.
@@ -10405,10 +10665,37 @@ fn merge_uv_pins_into_prefs(
 ///
 /// `RETREAD_NO_REPLAY=1` unconditionally returns `None` (test knob;
 /// lets tests force cold-path exercising without touching the hash).
+#[cfg(test)]
 fn load_replayable_lock(
     lock_path: &Path,
     current_inputs_hash: &str,
     relax_is_default: bool,
+) -> anyhow::Result<Option<crate::lock::RetreadLock>> {
+    load_replayable_lock_inner(lock_path, current_inputs_hash, relax_is_default, None, None)
+}
+
+fn load_replayable_lock_for_target(
+    lock_path: &Path,
+    current_inputs_hash: &str,
+    relax_is_default: bool,
+    target: &ResolutionTarget,
+    expected_bundle: &str,
+) -> anyhow::Result<Option<crate::lock::RetreadLock>> {
+    load_replayable_lock_inner(
+        lock_path,
+        current_inputs_hash,
+        relax_is_default,
+        Some(target),
+        Some(expected_bundle),
+    )
+}
+
+fn load_replayable_lock_inner(
+    lock_path: &Path,
+    current_inputs_hash: &str,
+    relax_is_default: bool,
+    target: Option<&ResolutionTarget>,
+    expected_bundle: Option<&str>,
 ) -> anyhow::Result<Option<crate::lock::RetreadLock>> {
     // Test knob: RETREAD_NO_REPLAY=1 disables replay entirely.
     if std::env::var("RETREAD_NO_REPLAY").is_ok() {
@@ -10427,6 +10714,13 @@ fn load_replayable_lock(
     // explicit, cheap backstop.
     if lock.schema != crate::lock::SCHEMA {
         return Ok(None);
+    }
+    if target.is_some_and(|target| !lock.is_for_resolution_target(target)) {
+        return Ok(None);
+    }
+    if let (Some(target), Some(expected_bundle)) = (target, expected_bundle) {
+        lock.validate_replay_contract_for_target(target, expected_bundle)
+            .context("validating complete courier replay contract")?;
     }
     // Hash mismatch → inputs changed; must re-resolve.
     if lock.inputs_hash != current_inputs_hash {
@@ -10467,6 +10761,7 @@ fn load_replayable_lock(
 ///   cascade; this is not an error).
 /// - `Err(...)` — lock file exists but is malformed / unreadable. The
 ///   caller treats this as a replay miss and falls through (non-fatal).
+#[cfg(test)]
 fn replay_from_lock(
     lock_path: &Path,
     current_inputs_hash: &str,
@@ -10479,9 +10774,28 @@ fn replay_from_lock(
     let Some(lock) = load_replayable_lock(lock_path, current_inputs_hash, relax_is_default)? else {
         return Ok(None);
     };
+    replay_loaded_lock(
+        lock,
+        current_inputs_hash,
+        host_platform,
+        build_number,
+        loose,
+        siblings,
+    )
+    .map(Some)
+}
 
+fn replay_loaded_lock(
+    lock: crate::lock::RetreadLock,
+    current_inputs_hash: &str,
+    host_platform: Platform,
+    build_number: u64,
+    loose: bool,
+    siblings: &[(String, String)],
+) -> anyhow::Result<CondaOutput> {
     // ----- reconstruct CondaOutput from lock fields via the shared helper -----
-    let python_version = crate::relax::emit_python_version("", &lock.python);
+    let python_version = crate::lock::normalized_target_python(&lock.python)
+        .context("normalizing replay lock Python target")?;
 
     let python_dep = if python_version.contains('*') {
         format!("python {python_version}")
@@ -10522,7 +10836,40 @@ fn replay_from_lock(
         loose,
         siblings,
     )?;
-    Ok(Some(output))
+    Ok(output)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn replay_from_lock_for_target(
+    lock_path: &Path,
+    current_inputs_hash: &str,
+    relax_is_default: bool,
+    target: &ResolutionTarget,
+    expected_bundle: &str,
+    host_platform: Platform,
+    build_number: u64,
+    loose: bool,
+    siblings: &[(String, String)],
+) -> anyhow::Result<Option<CondaOutput>> {
+    let Some(lock) = load_replayable_lock_for_target(
+        lock_path,
+        current_inputs_hash,
+        relax_is_default,
+        target,
+        expected_bundle,
+    )?
+    else {
+        return Ok(None);
+    };
+    replay_loaded_lock(
+        lock,
+        current_inputs_hash,
+        host_platform,
+        build_number,
+        loose,
+        siblings,
+    )
+    .map(Some)
 }
 
 // -----------------------------------------------------------------
@@ -10548,7 +10895,11 @@ mod replay_tests {
 
     use rattler_conda_types::Platform;
 
-    use super::{AutoDataConfig, load_replayable_lock, replay_from_lock};
+    use super::{
+        AutoDataConfig, load_replayable_lock, load_replayable_lock_for_target,
+        materialize_from_lock_for_target, replay_from_lock, replay_sdist_cache_key,
+        validate_authoritative_replay_lock,
+    };
     use crate::config::RetreadConfig;
     use crate::lock::{CondaDep, LockWheel, Origin, RetreadLock, SCHEMA};
 
@@ -10580,12 +10931,15 @@ mod replay_tests {
         } else {
             format!("{bundle}-{version}-cp311-cp311-manylinux_2_17_x86_64.whl")
         };
+        let url = format!("https://example.com/{filename}");
         RetreadLock {
             schema: SCHEMA,
             retread_version: "0.0.1".into(),
             bundle: bundle.into(),
             version: version.into(),
             python: python.into(),
+            target_subdir: "linux-64".into(),
+            resolution_glibc: None,
             inputs_hash: inputs_hash.into(),
             root_requirements: Vec::new(),
             wheels: vec![LockWheel {
@@ -10593,8 +10947,8 @@ mod replay_tests {
                 version: version.into(),
                 origin: Origin::Index,
                 filename,
-                url: Some(format!("https://example.com/{bundle}-{version}.whl")),
-                sha256: None,
+                url: Some(url),
+                sha256: Some("11".repeat(32)),
                 requires_dist: vec![],
                 must_ship: false,
                 upstream_url: None,
@@ -10613,6 +10967,166 @@ mod replay_tests {
             entry_specs: vec![],
             wheel_store: None,
         }
+    }
+
+    fn replay_target(python: &str, subdir: &str) -> crate::pypi::ResolutionTarget {
+        crate::pypi::ResolutionTarget::from_wheel_target(
+            crate::pypi::WheelTarget {
+                python_version: python.into(),
+                conda_subdir: subdir.into(),
+                max_glibc: None,
+            },
+            None,
+        )
+    }
+
+    #[test]
+    fn replay_gate_requires_the_full_resolution_target() {
+        let _env_guard = super::TEST_ENV_MUTEX.lock().unwrap();
+        let dir = unique_tmp_dir();
+        let lock = make_test_lock("pack", "1.0.0", "3.11", "same-hash", true);
+        let path = dir.join(RetreadLock::file_name("pack"));
+        std::fs::write(&path, lock.to_pretty_json().unwrap()).unwrap();
+
+        let native = replay_target("3.11.0", "linux-64");
+        assert!(
+            load_replayable_lock_for_target(&path, "same-hash", true, &native, "pack")
+                .unwrap()
+                .is_some(),
+            "numeric Python patch spelling must match the same resolution target"
+        );
+        for foreign in [
+            replay_target("3.12", "linux-64"),
+            replay_target("3.11", "linux-aarch64"),
+        ] {
+            assert!(
+                load_replayable_lock_for_target(&path, "same-hash", true, &foreign, "pack")
+                    .unwrap()
+                    .is_none(),
+                "matching inputs hashes must never bypass target identity"
+            );
+        }
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn replay_sdist_cache_is_bound_to_raw_digest_and_target() {
+        let native = replay_target("3.11", "linux-64");
+        let patch_alias = replay_target("3.11.0", "linux-64");
+        let foreign = replay_target("3.11", "linux-aarch64");
+        let a = replay_sdist_cache_key(&"11".repeat(32), &native);
+
+        assert_eq!(a, replay_sdist_cache_key(&"11".repeat(32), &patch_alias));
+        assert_ne!(a, replay_sdist_cache_key(&"22".repeat(32), &native));
+        assert_ne!(a, replay_sdist_cache_key(&"11".repeat(32), &foreign));
+    }
+
+    #[test]
+    fn post_courier_replay_must_equal_the_authoritative_lock() {
+        let mut expected = make_test_lock("pack", "1.0.0", "3.11.0", "same-hash", true);
+        expected.wheel_store = Some("/producer-host/retread-wheels".into());
+        let mut permuted = expected.clone();
+        permuted.retread_version = "emit-neutral-upgrade".into();
+        permuted.python = "3.11".into();
+        permuted.wheel_store = Some("/current-host/retread-wheels".into());
+        permuted.root_requirements.reverse();
+        validate_authoritative_replay_lock(&expected, &permuted).unwrap();
+
+        let mut drifted = permuted.clone();
+        drifted.wheels[0].sha256 = Some("ff".repeat(32));
+        let err = validate_authoritative_replay_lock(&expected, &drifted).unwrap_err();
+        assert!(format!("{err:#}").contains("authoritative lock"));
+
+        let mut portable_expected = expected.clone();
+        portable_expected.wheel_store = Some("~/stores/a".into());
+        let mut portable_drifted = portable_expected.clone();
+        portable_drifted.wheel_store = Some("~/stores/b".into());
+        assert!(
+            validate_authoritative_replay_lock(&portable_expected, &portable_drifted).is_err(),
+            "portable store identities remain part of the exact lock contract"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_sdist_provenance_fails_before_replay_mutation() {
+        let dir = unique_tmp_dir();
+        let source_dir = dir.join("source");
+        let work_dir = dir.join("work");
+        let output_dir = dir.join("output");
+        let cache_dir = dir.join("cache");
+        let mut lock = make_test_lock("pack", "1.0.0", "3.11", "same-hash", true);
+        lock.wheels[0].origin = Origin::Built;
+        lock.wheels[0].url = None;
+        lock.wheels[0].sdist_source = Some(crate::lock::SdistWheelSource {
+            index: "https://pypi.org/simple/".into(),
+            name: "pack".into(),
+            version: "1.0.0".into(),
+            sdist_url: "https://example.com/pack-1.0.0.tar.gz#sha256=short".into(),
+        });
+        let config: RetreadConfig =
+            serde_json::from_value(serde_json::json!({"retread-wheels": {}})).unwrap();
+        let target = replay_target("3.11", "linux-64");
+
+        let err = materialize_from_lock_for_target(
+            lock,
+            "pack",
+            &config,
+            &work_dir,
+            &output_dir,
+            &target,
+            &source_dir,
+            &cache_dir,
+            None,
+            vec!["python 3.11.*".into()],
+            "fp",
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("#sha256=<64 hex>"));
+        assert!(!work_dir.exists());
+        assert!(!output_dir.exists());
+        assert!(!source_dir.join("wheels").exists());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn malformed_later_wheel_fails_before_replay_mutation() {
+        let dir = unique_tmp_dir();
+        let source_dir = dir.join("source");
+        let work_dir = dir.join("work");
+        let output_dir = dir.join("output");
+        let cache_dir = dir.join("cache");
+        let mut lock = make_test_lock("pack", "1.0.0", "3.11", "same-hash", true);
+        let mut malformed = lock.wheels[0].clone();
+        malformed.name = "later".into();
+        malformed.filename = "later-1.0.0-py3-none-any.whl".into();
+        malformed.url = Some("not-an-artifact-url".into());
+        lock.wheels.push(malformed);
+        let config: RetreadConfig =
+            serde_json::from_value(serde_json::json!({"retread-wheels": {}})).unwrap();
+        let target = replay_target("3.11", "linux-64");
+
+        let err = materialize_from_lock_for_target(
+            lock,
+            "pack",
+            &config,
+            &work_dir,
+            &output_dir,
+            &target,
+            &source_dir,
+            &cache_dir,
+            None,
+            vec!["python 3.11.*".into()],
+            "fp",
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("invalid artifact URL"));
+        assert!(!work_dir.exists());
+        assert!(!output_dir.exists());
+        assert!(!source_dir.join("wheels").exists());
+        assert!(!cache_dir.exists());
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
@@ -10837,7 +11351,7 @@ mod replay_tests {
         let dir = unique_tmp_dir();
         // Use a 64-hex-char inputs_hash (typical sha256 hex output length).
         let hash = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
-        let lock = make_test_lock("mypack", "1.2.3", "3.11", hash, true);
+        let lock = make_test_lock("mypack", "1.2.3", "3.11.0", hash, true);
         let json = lock.to_pretty_json().unwrap();
         let lock_path = dir.join(RetreadLock::file_name("mypack"));
         std::fs::write(&lock_path, &json).unwrap();
@@ -10847,7 +11361,7 @@ mod replay_tests {
         // Build string must be content-addressed: py311_h<first10>_0
         assert_eq!(
             out.metadata.build, "py311_habcdef0123_0",
-            "replay must emit content-addressed build string: got {}",
+            "patch-equivalent replay must emit the normalized content-addressed build string: got {}",
             out.metadata.build
         );
         std::fs::remove_dir_all(dir).ok();
@@ -10880,6 +11394,8 @@ mod replay_tests {
             bundle: "mypack".into(),
             version: "1.0.0".into(),
             python: "3.11".into(),
+            target_subdir: "linux-64".into(),
+            resolution_glibc: None,
             inputs_hash: "hash123".into(),
             root_requirements: vec![],
             wheels: vec![LockWheel {
@@ -10888,7 +11404,7 @@ mod replay_tests {
                 origin: Origin::Built,
                 filename: "orphan_git_wheel-1.0.0-py3-none-any.injected.whl".into(),
                 url: None,
-                sha256: None,
+                sha256: Some("12".repeat(32)),
                 requires_dist: vec![],
                 must_ship: true,
                 upstream_url: None, // class 3: no upstream, not in config
@@ -10950,6 +11466,8 @@ mod replay_tests {
             bundle: "mypack".into(),
             version: "1.0.0".into(),
             python: "3.11".into(),
+            target_subdir: "linux-64".into(),
+            resolution_glibc: None,
             inputs_hash: "hash456".into(),
             root_requirements: vec![],
             wheels: vec![LockWheel {
@@ -10958,7 +11476,7 @@ mod replay_tests {
                 origin: Origin::Built,
                 filename: "skrl-2.1.0-999retread-py3-none-any.whl".into(),
                 url: None,
-                sha256: None,
+                sha256: Some("13".repeat(32)),
                 requires_dist: vec!["torch>=2.0,<3".into()],
                 must_ship: false,
                 upstream_url: None, // schema-5 style: no upstream_url
@@ -11043,9 +11561,10 @@ mod replay_tests {
             version: "0.26.2".into(),
             // Intentionally unreachable URL — we want the arm to ATTEMPT a build
             // (entering Class-2b) and fail, NOT silently return Ok(None) (Class-2).
-            sdist_url:
-                "https://files.pythonhosted.org/packages/gym-0.26.2.tar.gz#sha256=deadbeef0000"
-                    .into(),
+            sdist_url: format!(
+                "https://files.pythonhosted.org/packages/gym-0.26.2.tar.gz#sha256={}",
+                "de".repeat(32)
+            ),
         };
 
         let lock = RetreadLock {
@@ -11054,6 +11573,8 @@ mod replay_tests {
             bundle: "gympack".into(),
             version: "1.0.0".into(),
             python: "3.11".into(),
+            target_subdir: "linux-64".into(),
+            resolution_glibc: None,
             inputs_hash: "hash999".into(),
             root_requirements: vec![],
             wheels: vec![LockWheel {
@@ -11062,7 +11583,7 @@ mod replay_tests {
                 origin: Origin::Built,
                 filename: "gym-0.26.2-999retread-py3-none-any.whl".into(),
                 url: None,
-                sha256: None,
+                sha256: Some("14".repeat(32)),
                 requires_dist: vec!["numpy>=1.21".into()],
                 // upstream_url=None: identical to a schema-5 class-2 lock.
                 // Without the Class-2b guard, this would have returned Ok(None).
@@ -11137,9 +11658,10 @@ mod replay_tests {
             index: "https://pypi.org/simple/".into(),
             name: "gym".into(),
             version: "0.26.2".into(),
-            sdist_url:
-                "https://files.pythonhosted.org/packages/gym-0.26.2.tar.gz#sha256=abc123def456"
-                    .into(),
+            sdist_url: format!(
+                "https://files.pythonhosted.org/packages/gym-0.26.2.tar.gz#sha256={}",
+                "ab".repeat(32)
+            ),
         };
 
         // Replicate the LockWheel that Class-2b operates on.
@@ -11149,7 +11671,7 @@ mod replay_tests {
             origin: Origin::Built,
             filename: "gym-0.26.2-999retread-py3-none-any.whl".into(),
             url: None,
-            sha256: None,
+            sha256: Some("15".repeat(32)),
             requires_dist: vec!["numpy>=1.21".into(), "cloudpickle>=1.2.0".into()],
             must_ship: false,
             upstream_url: None, // suppressed at write-time for sdist wheels
@@ -11165,7 +11687,8 @@ mod replay_tests {
             requires_dist: lw.requires_dist.clone(),
             local_path: Some(built_path.clone()),
             wheel_filename: lw.filename.clone(),
-            sha256: lw.sha256.clone(),
+            sha256: None,
+            locked_final_sha256: lw.sha256.clone(),
             remote_url: None,
             upstream_url: None,
             git_source: None,
@@ -11255,6 +11778,8 @@ mod replay_tests {
             bundle: "gympack".into(),
             version: "1.0.0".into(),
             python: "3.11".into(),
+            target_subdir: "linux-64".into(),
+            resolution_glibc: None,
             inputs_hash: "live-hash".into(),
             root_requirements: vec![],
             wheels: vec![LockWheel {
@@ -11263,7 +11788,7 @@ mod replay_tests {
                 origin: Origin::Built,
                 filename: "gym-0.26.2-999retread-py3-none-any.whl".into(),
                 url: None,
-                sha256: None,
+                sha256: Some("16".repeat(32)),
                 requires_dist: vec!["numpy>=1.21.0".into(), "cloudpickle>=1.2.0".into()],
                 must_ship: false,
                 upstream_url: None, // suppressed at write-time
@@ -11383,7 +11908,7 @@ mod replay_tests {
             filename: "pytorch3d-0.7.8+5043d15pt2.7.0cu128-999retread-cp311-cp311-linux_x86_64.whl"
                 .into(),
             url: None,
-            sha256: None,
+            sha256: Some("1a".repeat(32)),
             requires_dist: vec!["torch>=2.7.0".into(), "torchvision>=0.22.0".into()],
             must_ship: false,
             upstream_url: Some(upstream_url.to_string()),
@@ -11403,7 +11928,8 @@ mod replay_tests {
             requires_dist: lw.requires_dist.clone(),
             local_path: Some(fetched_path.clone()),
             wheel_filename: lw.filename.clone(),
-            sha256: lw.sha256.clone(),
+            sha256: None,
+            locked_final_sha256: lw.sha256.clone(),
             remote_url: None,
             upstream_url: Some(remote_url),
             git_source: None,
@@ -11489,7 +12015,10 @@ mod replay_tests {
         // detects change -> ShadowSrc::Rewritten or ShadowSrc::Raw -> Origin::Built.
         let dep_name = "dep-a";
         let dep_version = "1.0.0";
-        let dep_whl_name = format!("{dep_name}-{dep_version}-py3-none-any.whl");
+        let dep_whl_name = format!(
+            "{}-{dep_version}-py3-none-any.whl",
+            dep_name.replace('-', "_")
+        );
         let url_req = format!("{dep_name} @ https://example.com/{dep_whl_name}");
 
         // Write the dep wheel file.
@@ -11562,6 +12091,7 @@ mod replay_tests {
             requires_dist: vec![],
             wheel_filename: dep_whl_name.clone(),
             sha256: None,
+            locked_final_sha256: None,
             local_path: Some(dep_whl_path.clone()),
             remote_url: None,
             upstream_url: None,
@@ -11577,6 +12107,7 @@ mod replay_tests {
             requires_dist: vec![url_req.clone()],
             wheel_filename: p3d_whl_name.clone(),
             sha256: None,
+            locked_final_sha256: None,
             local_path: Some(p3d_local.clone()),
             remote_url: None,
             upstream_url: Some(upstream_url.clone()),
@@ -11626,6 +12157,8 @@ mod replay_tests {
             bundle: bundle.into(),
             version: wheel_version.into(),
             python: "3.11".into(),
+            target_subdir: "linux-64".into(),
+            resolution_glibc: None,
             inputs_hash: "test-hash".into(),
             root_requirements: vec![],
             wheels: cold_staged.lock.wheels.clone(),
@@ -11652,6 +12185,7 @@ mod replay_tests {
             requires_dist: vec![],
             wheel_filename: dep_whl_name.clone(),
             sha256: None,
+            locked_final_sha256: None,
             local_path: Some(dep_whl_path),
             remote_url: None,
             upstream_url: None,
@@ -11666,7 +12200,8 @@ mod replay_tests {
             version: wheel_version.to_string(),
             requires_dist: cold_lw.requires_dist.clone(),
             wheel_filename: cold_lw.filename.clone(), // already-999retread
-            sha256: cold_lw.sha256.clone(),
+            sha256: None,
+            locked_final_sha256: cold_lw.sha256.clone(),
             local_path: Some(fetched_replay),
             remote_url: None,
             upstream_url: Some(upstream_url),
@@ -11779,6 +12314,8 @@ mod replay_tests {
             bundle: "reqpack".into(),
             version: "1.0.0".into(),
             python: "3.11".into(),
+            target_subdir: "linux-64".into(),
+            resolution_glibc: None,
             inputs_hash: "live-c2".into(),
             root_requirements: vec![],
             wheels: vec![LockWheel {
@@ -11787,7 +12324,7 @@ mod replay_tests {
                 origin: Origin::Built,
                 filename: "requests-2.31.0-999retread-py3-none-any.whl".into(),
                 url: None,
-                sha256: None,
+                sha256: Some("17".repeat(32)),
                 requires_dist: vec!["urllib3>=1.21.1".into()],
                 must_ship: false,
                 upstream_url: Some(upstream_url.into()),
@@ -11926,7 +12463,7 @@ mod replay_tests {
             origin: Origin::Built,
             filename: "torchvision-0.18.0-cp311-cp311-linux_x86_64.999retread.whl".into(),
             url: None,
-            sha256: None,
+            sha256: Some("18".repeat(32)),
             requires_dist: vec![], // EMPTY — poison scenario
             must_ship: false,      // relax-changed index wheel
             upstream_url: None,
@@ -12048,7 +12585,7 @@ mod replay_tests {
             origin: Origin::Built,
             filename: "torchvision-0.18.0-cp311-cp311-linux_x86_64.999retread.whl".into(),
             url: None,
-            sha256: None,
+            sha256: Some("19".repeat(32)),
             requires_dist: vec!["torch>=2.0,<3".into()],
             must_ship: false,
             upstream_url: Some("https://files.pythonhosted.org/torchvision-0.18.0.whl".into()),
@@ -12569,6 +13106,8 @@ version = "1.0.0"
             bundle: "interleaved-pack".into(),
             version: "1.0.0".into(),
             python: "3.11".into(),
+            target_subdir: "linux-64".into(),
+            resolution_glibc: None,
             inputs_hash: "hash-c-test".into(),
             root_requirements: vec![],
             wheels: vec![
@@ -12578,8 +13117,11 @@ version = "1.0.0"
                     version: "1.26.0".into(),
                     origin: Origin::Index,
                     filename: "numpy-1.26.0-cp311-cp311-linux_x86_64.whl".into(),
-                    url: Some("https://files.pythonhosted.org/numpy-1.26.0.whl".into()),
-                    sha256: None,
+                    url: Some(
+                        "https://files.pythonhosted.org/numpy-1.26.0-cp311-cp311-linux_x86_64.whl"
+                            .into(),
+                    ),
+                    sha256: Some("1b".repeat(32)),
                     requires_dist: vec![],
                     must_ship: false,
                     upstream_url: None,
@@ -12594,7 +13136,7 @@ version = "1.0.0"
                     origin: Origin::Built,
                     filename: "bfs_transitive_orphan-0.1.0-py3-none-any.injected.whl".into(),
                     url: None,
-                    sha256: None,
+                    sha256: Some("1c".repeat(32)),
                     requires_dist: vec![],
                     must_ship: true,
                     upstream_url: None,
@@ -13258,6 +13800,7 @@ mod emit_wheel_upstream_url_tests {
                     version: w.metadata.version.clone(),
                     requires_dist: w.metadata.requires_dist.clone(),
                     sha256: Some(w.metadata.sha256.clone()),
+                    locked_final_sha256: None,
                     local_path: (url.scheme() == "file")
                         .then(|| url.to_file_path().ok())
                         .flatten(),
@@ -13370,6 +13913,7 @@ mod emit_wheel_upstream_url_tests {
                     version: w.metadata.version.clone(),
                     requires_dist: w.metadata.requires_dist.clone(),
                     sha256: Some(w.metadata.sha256.clone()),
+                    locked_final_sha256: None,
                     local_path: (url.scheme() == "file")
                         .then(|| url.to_file_path().ok())
                         .flatten(),
@@ -13437,6 +13981,8 @@ mod load_favored_versions_tests {
             bundle: bundle.into(),
             version: "1.0.0".into(),
             python: "3.11".into(),
+            target_subdir: "linux-64".into(),
+            resolution_glibc: None,
             inputs_hash: "testhash".into(),
             root_requirements: vec![],
             wheels,
@@ -13465,7 +14011,7 @@ mod load_favored_versions_tests {
             origin: Origin::Index,
             filename: format!("{name}-{version}-py3-none-any.whl"),
             url: Some(format!("https://example.com/{name}-{version}.whl")),
-            sha256: None,
+            sha256: Some("10".repeat(32)),
             requires_dist: vec![],
             must_ship: false,
             upstream_url: None,
@@ -14046,8 +14592,6 @@ mod resolve_bundle_bfs_tests {
         .await
         .expect("resolve_bundle must succeed");
 
-        std::fs::remove_dir_all(&dir).ok();
-
         let got: BTreeMap<&str, &ResolvedWheel> = bundle
             .extras
             .iter()
@@ -14099,10 +14643,17 @@ mod resolve_bundle_bfs_tests {
                 version: w.metadata.version.clone(),
                 requires_dist: w.metadata.requires_dist.clone(),
                 sha256: Some(w.metadata.sha256.clone()),
-                // Index wheels were never localized to file:// in this path.
-                local_path: None,
-                wheel_filename: w.metadata.filename.clone(),
-                remote_url: w.upstream_url.clone(),
+                locked_final_sha256: None,
+                local_path: (w.url.scheme() == "file")
+                    .then(|| w.url.to_file_path().ok())
+                    .flatten(),
+                wheel_filename: w
+                    .url
+                    .path_segments()
+                    .and_then(|mut segments| segments.next_back())
+                    .unwrap_or_default()
+                    .to_owned(),
+                remote_url: (w.url.scheme() != "file").then(|| w.url.clone()),
                 upstream_url: w.upstream_url.clone(),
                 git_source: None,
                 sdist_source: None,
@@ -14138,8 +14689,6 @@ mod resolve_bundle_bfs_tests {
             .map(|w| (w.name.as_str(), w))
             .collect();
 
-        std::fs::remove_dir_all(&stage_dir).ok();
-
         for name in extscache {
             let lw = locked.get(name).unwrap_or_else(|| {
                 panic!(
@@ -14168,6 +14717,8 @@ mod resolve_bundle_bfs_tests {
                 "{name}: lock url must be the direct artifact url; got {url}"
             );
         }
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&stage_dir).ok();
     }
 
     /// auto-extscache: an index that advertises NO digest is handled
@@ -15007,7 +15558,23 @@ mod incremental_add_tests {
 
     use super::detect_incremental_add;
     use crate::config::RetreadConfig;
-    use crate::lock::{RetreadLock, SCHEMA};
+    use crate::lock::{LockWheel, Origin, RetreadLock, SCHEMA};
+
+    fn valid_payload_wheel() -> LockWheel {
+        LockWheel {
+            name: "locked-payload".into(),
+            version: "1.0".into(),
+            origin: Origin::Index,
+            filename: "locked_payload-1.0-py3-none-any.whl".into(),
+            url: Some("https://example.com/locked_payload-1.0-py3-none-any.whl".into()),
+            sha256: Some("11".repeat(32)),
+            requires_dist: vec![],
+            must_ship: false,
+            upstream_url: None,
+            git_source: None,
+            sdist_source: None,
+        }
+    }
 
     fn make_lock_at(path: &std::path::Path, entry_specs: Vec<String>, inputs_hash: &str) {
         let lock = RetreadLock {
@@ -15016,9 +15583,11 @@ mod incremental_add_tests {
             bundle: "test-bundle".into(),
             version: "1.0".into(),
             python: "3.11".into(),
+            target_subdir: "linux-64".into(),
+            resolution_glibc: None,
             inputs_hash: inputs_hash.into(),
             root_requirements: vec![],
-            wheels: vec![],
+            wheels: vec![valid_payload_wheel()],
             conda_run_deps: vec![],
             index_urls: vec!["https://pypi.org/simple".into()],
             prerelease: BTreeMap::new(),
@@ -15110,9 +15679,11 @@ mod incremental_add_tests {
             bundle: "test-bundle".into(),
             version: "1.0".into(),
             python: "3.11".into(),
+            target_subdir: "linux-64".into(),
+            resolution_glibc: None,
             inputs_hash: "dummy".into(),
             root_requirements: vec![],
-            wheels: vec![],
+            wheels: vec![valid_payload_wheel()],
             conda_run_deps: vec![],
             index_urls: vec![],
             prerelease: BTreeMap::new(),
@@ -15190,9 +15761,11 @@ mod incremental_add_tests {
             bundle: "test-bundle".into(),
             version: "1.0".into(),
             python: "3.11".into(),
+            target_subdir: "linux-64".into(),
+            resolution_glibc: None,
             inputs_hash: inputs_hash.into(),
             root_requirements: vec![],
-            wheels: vec![],
+            wheels: vec![valid_payload_wheel()],
             conda_run_deps: vec![],
             index_urls,
             prerelease: BTreeMap::new(),
@@ -15735,6 +16308,8 @@ mod incremental_add_tests {
             bundle: "test-bundle".into(),
             version: "1.0".into(),
             python: "3.11".into(),
+            target_subdir: "linux-64".into(),
+            resolution_glibc: None,
             inputs_hash: "dummy".into(),
             root_requirements: vec![],
             wheels: lock_wheels,

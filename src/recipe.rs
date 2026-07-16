@@ -311,8 +311,34 @@ pub fn build_courier_recipe_with_mode(
     expected_build: Option<&str>,
     courier_mode: crate::config::CourierMode,
 ) -> Recipe {
-    let python_pin = format!("python {python_version}.*");
     let lock_filename = crate::lock::RetreadLock::file_name(conda_name);
+    build_courier_recipe_with_mode_and_lock_filename(
+        conda_name,
+        version,
+        python_version,
+        run_deps,
+        source_urls,
+        expected_build,
+        courier_mode,
+        &lock_filename,
+    )
+}
+
+/// Exact-target courier recipe form. The caller supplies the staged lock
+/// basename so the package scripts consume the same target-qualified lock
+/// that appears in `source_urls`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_courier_recipe_with_mode_and_lock_filename(
+    conda_name: &str,
+    version: &str,
+    python_version: &str,
+    run_deps: &[String],
+    source_urls: &[String],
+    expected_build: Option<&str>,
+    courier_mode: crate::config::CourierMode,
+    lock_filename: &str,
+) -> Recipe {
+    let python_pin = format!("python {python_version}.*");
 
     let mut run: Vec<String> = run_deps.to_vec();
     if !run
@@ -637,6 +663,23 @@ mod courier_tests {
             r.build.script.contains("\nDEACTIVATE\n"),
             "deactivate.d heredoc terminator must be at column 0"
         );
+    }
+
+    #[test]
+    fn exact_target_recipe_uses_supplied_lock_basename_everywhere() {
+        let exact = "retread-isaac-pack.target-deadbeef.lock.json";
+        let recipe = build_courier_recipe_with_mode_and_lock_filename(
+            "isaac-pack",
+            "5.1.0",
+            "3.11",
+            &[],
+            &[format!("file:///x/{exact}")],
+            None,
+            crate::config::CourierMode::PostLink,
+            exact,
+        );
+        assert!(recipe.build.script.contains(exact));
+        assert!(!recipe.build.script.contains("retread-isaac-pack.lock.json"));
     }
 
     // End-to-end: render the REAL courier build script, run it with bash to

@@ -78,6 +78,12 @@ pub struct EmitWheel {
     /// this into the courier lock so install-time replay can fetch the locked
     /// artifact URL directly without consulting index metadata.
     pub sha256: Option<String>,
+    /// Final post-courier SHA-256 asserted by a replayed lock. This is kept
+    /// separate from `sha256`: a rebuilt source/sdist wheel can have different
+    /// pre-stage bytes before courier deterministically rewrites metadata.
+    /// Cold resolution leaves this `None`; lock replay must populate it for
+    /// every `Origin::Built` wheel.
+    pub locked_final_sha256: Option<String>,
     /// Upstream URL when the wheel was never materialized locally
     /// (PEP 658 sidecar metadata). Blueprint mode fetches these on
     /// demand when their Requires-Dist needs rewriting.
@@ -596,6 +602,7 @@ mod tests {
                 })
                 .unwrap_or_else(|| format!("{name}-{version}-py3-none-any.whl")),
             sha256: None,
+            locked_final_sha256: None,
             local_path: local.map(PathBuf::from),
             remote_url: None,
             upstream_url: None,
@@ -652,6 +659,7 @@ mod tests {
             requires_dist: requires.iter().map(|s| (*s).to_string()).collect(),
             wheel_filename: format!("{name}-{version}-py3-none-any.whl"),
             sha256: None,
+            locked_final_sha256: None,
             local_path: None,
             remote_url: None,
             upstream_url: None,
