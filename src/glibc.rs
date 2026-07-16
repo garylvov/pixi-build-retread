@@ -12,6 +12,7 @@ use std::process::Command;
 use std::sync::OnceLock;
 
 use anyhow::{Context, Result, bail};
+use rattler_conda_types::Platform;
 use serde::{Deserialize, Serialize};
 
 use crate::lock::RetreadLock;
@@ -159,32 +160,37 @@ pub(crate) fn host_glibc() -> Option<(u32, u32)> {
 /// `platforms = [{ platform = ..., glibc = "X.Y" }]` form, via
 /// `WorkspaceManifest::declared_glibc`).
 pub(crate) fn declared_glibc_no_lock() -> Option<(u32, u32)> {
+    declared_glibc_no_lock_for_target(current_pixi_platform())
+}
+
+/// Exact-target form of [`declared_glibc_no_lock`]. Resolution paths use this
+/// when selecting artifacts for a platform other than the running host.
+pub(crate) fn declared_glibc_no_lock_for_target(target_subdir: &str) -> Option<(u32, u32)> {
     if let Ok(value) = std::env::var("RETREAD_DECLARED_GLIBC")
         && let Some(version) = parse_glibc_version(&value)
     {
         return Some(version);
     }
-    resolve_workspace_declared_glibc()
+    resolve_workspace_declared_glibc_for_target(target_subdir)
 }
 
 /// The manylinux ceiling for wheel-tag selection on a linux target:
 /// `manylinux_X_Y` wheels are acceptable when `(X, Y)` is at or below
-/// this. The ceiling is the MAX of the workspace-declared glibc (the
-/// user promised the runtime env provides it; retread's install-time
-/// GLIBC symbol audit enforces the promise) and the detected host glibc
-/// (the pre-declaration behavior). `None` = no ceiling information at
-/// all (non-linux subdir, or neither declaration nor host detection
-/// available) -- callers then accept every manylinux tag, preserving
-/// the historical behavior on exotic hosts.
+/// this. A declaration for the requested target is authoritative on aarch64
+/// and on foreign targets. Native linux-64 deliberately retains retread's
+/// established `max(declared, host)` behavior. Host detection otherwise only
+/// falls back for an undeclared native target and must never leak into a
+/// foreign target. `None` means no target-specific ceiling is known.
 pub(crate) fn manylinux_ceiling(conda_subdir: &str) -> Option<(u32, u32)> {
-    if !conda_subdir.starts_with("linux") {
-        return None;
-    }
-    combine_glibc_ceiling(declared_glibc_no_lock(), host_glibc())
+    target_glibc_ceiling(
+        conda_subdir,
+        current_pixi_platform(),
+        declared_glibc_no_lock_for_target(conda_subdir),
+        host_glibc(),
+    )
 }
 
-/// Pure combiner for [`manylinux_ceiling`]: max of declared and host,
-/// `None` only when both are unknown (undeclared -> host floor).
+/// Backward-compatible native linux-64 combiner.
 pub(crate) fn combine_glibc_ceiling(
     declared: Option<(u32, u32)>,
     host: Option<(u32, u32)>,
@@ -195,6 +201,27 @@ pub(crate) fn combine_glibc_ceiling(
         (None, Some(h)) => Some(h),
         (None, None) => None,
     }
+}
+
+/// Pure target resolver for [`manylinux_ceiling`].
+///
+/// A rich-platform declaration describes the deployment target, not the
+/// machine running retread. Native linux-64 retains the established maximum
+/// of declaration and host for compatibility. Other targets use the exact
+/// declaration, falling back to host glibc only when the target is native.
+pub(crate) fn target_glibc_ceiling(
+    target_subdir: &str,
+    native_subdir: &str,
+    declared: Option<(u32, u32)>,
+    host: Option<(u32, u32)>,
+) -> Option<(u32, u32)> {
+    if !target_subdir.starts_with("linux-") {
+        return None;
+    }
+    if target_subdir == "linux-64" && target_subdir == native_subdir {
+        return combine_glibc_ceiling(declared, host);
+    }
+    declared.or_else(|| (target_subdir == native_subdir).then_some(host).flatten())
 }
 
 fn detect_host_glibc() -> Option<(u32, u32)> {
@@ -352,6 +379,14 @@ pub(crate) fn undeclared_glibc_error(
     host: Option<(u32, u32)>,
     floor: Option<(u32, u32)>,
 ) -> String {
+    undeclared_glibc_error_for_target(host, floor, current_pixi_platform())
+}
+
+pub(crate) fn undeclared_glibc_error_for_target(
+    host: Option<(u32, u32)>,
+    floor: Option<(u32, u32)>,
+    target_subdir: &str,
+) -> String {
     let host = host
         .map(format_glibc)
         .unwrap_or_else(|| "unknown".to_string());
@@ -368,7 +403,7 @@ pub(crate) fn undeclared_glibc_error(
          then re-run. This declaration is load-bearing: retread verifies at install time\n\
          (GLIBC symbol audit) that every wheel library needing more than glibc {host} is\n\
          shadowed by a conda-provided library, and fails the install if not.",
-        current_pixi_platform(),
+        target_subdir,
     )
 }
 
@@ -405,13 +440,17 @@ pub(crate) fn emit_glibc_relax_warning(
 }
 
 pub(crate) fn current_pixi_platform() -> &'static str {
-    match std::env::consts::ARCH {
-        "aarch64" => "linux-aarch64",
-        _ => "linux-64",
-    }
+    Platform::current().as_str()
 }
 
 pub(crate) fn resolve_declared_glibc(lock: &RetreadLock) -> Option<DeclaredGlibc> {
+    resolve_declared_glibc_for_target(lock, current_pixi_platform())
+}
+
+pub(crate) fn resolve_declared_glibc_for_target(
+    lock: &RetreadLock,
+    target_subdir: &str,
+) -> Option<DeclaredGlibc> {
     if let Ok(value) = std::env::var("RETREAD_DECLARED_GLIBC")
         && let Some(version) = parse_glibc_version(&value)
     {
@@ -420,7 +459,7 @@ pub(crate) fn resolve_declared_glibc(lock: &RetreadLock) -> Option<DeclaredGlibc
             source: "env",
         });
     }
-    if let Some(version) = resolve_workspace_declared_glibc() {
+    if let Some(version) = resolve_workspace_declared_glibc_for_target(target_subdir) {
         return Some(DeclaredGlibc {
             version,
             source: "workspace",
@@ -436,6 +475,12 @@ pub(crate) fn resolve_declared_glibc(lock: &RetreadLock) -> Option<DeclaredGlibc
 }
 
 pub(crate) fn resolve_workspace_declared_glibc() -> Option<(u32, u32)> {
+    resolve_workspace_declared_glibc_for_target(current_pixi_platform())
+}
+
+pub(crate) fn resolve_workspace_declared_glibc_for_target(
+    target_subdir: &str,
+) -> Option<(u32, u32)> {
     let mut candidates = Vec::new();
     if let Ok(path) = std::env::var("PIXI_PROJECT_MANIFEST") {
         candidates.push(PathBuf::from(path));
@@ -452,7 +497,7 @@ pub(crate) fn resolve_workspace_declared_glibc() -> Option<(u32, u32)> {
         if !seen.insert(path.clone()) {
             continue;
         }
-        if let Some(v) = declared_glibc_from_manifest_path(&path) {
+        if let Some(v) = declared_glibc_from_manifest_path(&path, target_subdir) {
             return Some(v);
         }
     }
@@ -468,12 +513,12 @@ fn append_manifest_walk(out: &mut Vec<PathBuf>, start: &Path) {
     }
 }
 
-fn declared_glibc_from_manifest_path(path: &Path) -> Option<(u32, u32)> {
+fn declared_glibc_from_manifest_path(path: &Path, target_subdir: &str) -> Option<(u32, u32)> {
     let text = std::fs::read_to_string(path).ok()?;
     let parsed: toml::Value = toml::from_str(&text).ok()?;
     let root = pixi_manifest_root(&parsed)?;
     let ws = crate::workspace::WorkspaceManifest::from_toml(root);
-    ws.declared_glibc(None)
+    ws.declared_glibc_for_target(target_subdir, None)
 }
 
 fn pixi_manifest_root(parsed: &toml::Value) -> Option<&toml::Value> {
@@ -1456,6 +1501,45 @@ mod tests {
             RelaxDecision::HostUnknown
         );
         assert_eq!(relax_decision(None, None), RelaxDecision::HostUnknown);
+    }
+
+    #[test]
+    fn target_glibc_ceiling_never_leaks_host_into_foreign_resolution() {
+        assert_eq!(
+            target_glibc_ceiling("linux-aarch64", "linux-64", Some((2, 35)), Some((2, 39))),
+            Some((2, 35)),
+            "the exact Orin deployment declaration is authoritative"
+        );
+        assert_eq!(
+            target_glibc_ceiling("linux-64", "linux-aarch64", Some((2, 35)), Some((2, 39))),
+            Some((2, 35)),
+            "the exact x86 deployment declaration is authoritative"
+        );
+        assert_eq!(
+            target_glibc_ceiling("linux-aarch64", "linux-64", None, Some((2, 39))),
+            None,
+            "an x86 host says nothing about an undeclared aarch64 target"
+        );
+        assert_eq!(
+            target_glibc_ceiling("linux-64", "linux-aarch64", None, Some((2, 39))),
+            None,
+            "an ARM host says nothing about an undeclared x86 target"
+        );
+        assert_eq!(
+            target_glibc_ceiling("linux-aarch64", "linux-aarch64", None, Some((2, 35))),
+            Some((2, 35)),
+            "host glibc remains a safe fallback for an undeclared native target"
+        );
+        assert_eq!(
+            target_glibc_ceiling("linux-64", "linux-64", Some((2, 35)), Some((2, 39))),
+            Some((2, 39)),
+            "native x86 retains max(declared, host) compatibility"
+        );
+        assert_eq!(
+            target_glibc_ceiling("osx-arm64", "osx-arm64", Some((2, 39)), Some((2, 39))),
+            None,
+            "glibc ceilings never apply to non-Linux targets"
+        );
     }
 
     #[test]

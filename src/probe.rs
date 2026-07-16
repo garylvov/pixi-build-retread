@@ -38,6 +38,10 @@ use std::str::FromStr;
 use rattler_conda_types::{ChannelUrl, ParseStrictness, Version, VersionSpec};
 use serde::{Deserialize, Serialize};
 
+fn target_channel_pairs(channels: &[ChannelUrl], target_subdir: &str) -> Vec<(String, String)> {
+    crate::repodata::channel_subdir_pairs(channels, target_subdir)
+}
+
 /// A single probe's outcome, recorded in the audit so users can see
 /// which deps were validated against which channel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,15 +76,32 @@ impl ProbeResult {
 /// `<channel>/noarch/repodata.json.zst` per channel in parallel,
 /// caches the parsed index, and answers in memory.
 ///
-/// `target_python = None` skips the python filter (legacy behavior).
-/// `target_subdir = None` defaults to `"linux-64"` (only subdir
-/// retread targets today). Pass explicitly if/when retread learns
-/// other platforms.
+/// `target_python = None` skips the python filter (legacy behavior). This
+/// compatibility wrapper probes the native Pixi platform; target-aware
+/// resolution paths should call [`probe_for_target`].
 pub async fn probe(
     channels: &[ChannelUrl],
     package: &str,
     spec: &str,
     target_python: Option<&str>,
+) -> ProbeResult {
+    probe_for_target(
+        channels,
+        package,
+        spec,
+        target_python,
+        crate::glibc::current_pixi_platform(),
+    )
+    .await
+}
+
+/// Probe the exact target subdir plus `noarch` for one candidate spec.
+pub async fn probe_for_target(
+    channels: &[ChannelUrl],
+    package: &str,
+    spec: &str,
+    target_python: Option<&str>,
+    target_subdir: &str,
 ) -> ProbeResult {
     let parsed_spec = match VersionSpec::from_str(spec, ParseStrictness::Lenient) {
         Ok(s) => s,
@@ -112,12 +133,10 @@ pub async fn probe(
             }
         });
 
-    // Build the full (channel, subdir) work list. linux-64 is the
-    // only retread target today; noarch lives alongside it on every
-    // channel. Both subdirs are fanned out via the shared helper so
-    // this list is always consistent with sparse_pairs.
-    let target_subdir = "linux-64";
-    let work = crate::repodata::channel_subdir_pairs(channels, target_subdir);
+    // Build the full (channel, subdir) work list. noarch lives alongside the
+    // requested target on every channel. Both subdirs are fanned out via the
+    // shared helper so this list is always consistent with sparse_pairs.
+    let work = target_channel_pairs(channels, target_subdir);
 
     // Parallel fetch all (channel, subdir) repodatas. Each
     // get_repodata is in-memory-cached after first call, so repeated
@@ -286,6 +305,23 @@ pub async fn fetch_latest_build_depends(
     spec: &str,
     target_python: Option<&str>,
 ) -> Vec<String> {
+    fetch_latest_build_depends_for_target(
+        channels,
+        package,
+        spec,
+        target_python,
+        crate::glibc::current_pixi_platform(),
+    )
+    .await
+}
+
+pub async fn fetch_latest_build_depends_for_target(
+    channels: &[ChannelUrl],
+    package: &str,
+    spec: &str,
+    target_python: Option<&str>,
+    target_subdir: &str,
+) -> Vec<String> {
     let parsed_spec = match VersionSpec::from_str(spec, ParseStrictness::Lenient) {
         Ok(s) => s,
         Err(_) => return Vec::new(),
@@ -293,10 +329,9 @@ pub async fn fetch_latest_build_depends(
     let target_py_version: Option<Version> =
         target_python.and_then(|tp| Version::from_str(tp).ok());
 
-    let target_subdir = "linux-64";
     // Reuse the shared fan-out helper so the work list here is
     // always identical to what probe() and sparse_pairs use.
-    let work = crate::repodata::channel_subdir_pairs(channels, target_subdir);
+    let work = target_channel_pairs(channels, target_subdir);
 
     use futures::stream::{FuturesUnordered, StreamExt};
     let mut futs: FuturesUnordered<_> =
@@ -369,12 +404,28 @@ pub async fn find_route(
     spec: &str,
     target_python: Option<&str>,
 ) -> Option<RouteHit> {
+    find_route_for_target(
+        channels,
+        package,
+        spec,
+        target_python,
+        crate::glibc::current_pixi_platform(),
+    )
+    .await
+}
+
+pub async fn find_route_for_target(
+    channels: &[ChannelUrl],
+    package: &str,
+    spec: &str,
+    target_python: Option<&str>,
+    target_subdir: &str,
+) -> Option<RouteHit> {
     let parsed_spec = VersionSpec::from_str(spec, ParseStrictness::Lenient).ok()?;
     let target_py_version: Option<Version> =
         target_python.and_then(|tp| Version::from_str(tp).ok());
 
-    let target_subdir = "linux-64";
-    let work = crate::repodata::channel_subdir_pairs(channels, target_subdir);
+    let work = target_channel_pairs(channels, target_subdir);
 
     // Sequential in channel-priority order is fine here: repodata is
     // in-memory-cached after the first probe of a build, so these are
@@ -427,13 +478,32 @@ pub async fn probe_many(
     specs: Vec<(String, String)>,
     target_python: Option<&str>,
 ) -> Vec<ProbeResult> {
+    probe_many_for_target(
+        channels,
+        specs,
+        target_python,
+        crate::glibc::current_pixi_platform(),
+    )
+    .await
+}
+
+pub async fn probe_many_for_target(
+    channels: &[ChannelUrl],
+    specs: Vec<(String, String)>,
+    target_python: Option<&str>,
+    target_subdir: &str,
+) -> Vec<ProbeResult> {
     use futures::stream::{self, StreamExt};
     let tp_owned: Option<String> = target_python.map(|s| s.to_string());
+    let target_subdir = target_subdir.to_string();
     stream::iter(specs)
         .map(|(name, spec)| {
             let chans = channels.to_vec();
             let tp = tp_owned.clone();
-            async move { probe(&chans, &name, &spec, tp.as_deref()).await }
+            let target_subdir = target_subdir.clone();
+            async move {
+                probe_for_target(&chans, &name, &spec, tp.as_deref(), &target_subdir).await
+            }
         })
         .buffer_unordered(16)
         .collect::<Vec<_>>()
@@ -474,6 +544,17 @@ mod tests {
         // fail closed unless `is_satisfied()` is backed by a real candidate;
         // other callers can preserve the outage-vs-unsat distinction.
         assert!(!indecisive.is_definitively_unsatisfied());
+    }
+
+    #[test]
+    fn aarch64_probe_fanout_never_consults_linux_64() {
+        let channels = vec![ChannelUrl::from(
+            url::Url::parse("https://prefix.dev/conda-forge").expect("valid channel URL"),
+        )];
+        let work = target_channel_pairs(&channels, "linux-aarch64");
+        let subdirs: Vec<&str> = work.iter().map(|(_, subdir)| subdir.as_str()).collect();
+        assert_eq!(subdirs, vec!["linux-aarch64", "noarch"]);
+        assert!(!subdirs.contains(&"linux-64"));
     }
 
     #[test]

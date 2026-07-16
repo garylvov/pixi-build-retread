@@ -43,6 +43,9 @@ pub struct WorkspaceManifest {
     /// autodiscovery to find which workspace declarations reference
     /// THIS source package.
     pub path_dependencies: BTreeMap<String, String>,
+    /// Top-level `[target.<platform>.dependencies]`, keyed by Pixi platform.
+    /// Target-specific entries overlay the ordinary top-level dependencies.
+    pub target_dependencies: BTreeMap<String, TargetDependencyDef>,
     /// Top-level `[pypi-dependencies]`, keyed by canonical PEP 503
     /// package name. Version requirements are preserved verbatim;
     /// direct URL/path/git declarations are represented by `"*"`
@@ -111,6 +114,8 @@ pub struct FeatureDef {
     /// autodiscovery walks these to find features that reference the
     /// source package retread is building for.
     pub path_dependencies: BTreeMap<String, String>,
+    /// `[feature.X.target.<platform>.dependencies]`, keyed by Pixi platform.
+    pub target_dependencies: BTreeMap<String, TargetDependencyDef>,
     /// `[feature.X.pypi-dependencies]`, with the same canonical-name
     /// and direct-source semantics as
     /// [`WorkspaceManifest::pypi_dependencies`].
@@ -122,6 +127,13 @@ pub struct FeatureDef {
     /// `[feature.X.pypi-options]`, with primary and extra indexes kept
     /// distinct for the same reason as the top-level options.
     pub pypi_options: PypiOptions,
+}
+
+/// Version and path dependencies declared under one target selector.
+#[derive(Debug, Default, Clone)]
+pub struct TargetDependencyDef {
+    pub dependencies: BTreeMap<String, String>,
+    pub path_dependencies: BTreeMap<String, String>,
 }
 
 impl WorkspaceManifest {
@@ -206,6 +218,7 @@ impl WorkspaceManifest {
                 }
             }
         }
+        out.target_dependencies = parse_target_dependencies(parsed);
 
         out.pypi_dependencies = parse_pypi_dependencies(parsed);
 
@@ -258,6 +271,7 @@ impl WorkspaceManifest {
                             }
                         }
                     }
+                    def.target_dependencies = parse_target_dependencies(fvalue);
                     def.pypi_dependencies = parse_pypi_dependencies(fvalue);
                     // v0.37.0+ (D1): per-feature system-requirements.
                     if let Some(sysreqs) = fmap
@@ -287,22 +301,37 @@ impl WorkspaceManifest {
     /// (matches pixi's precedence: feature deps override workspace
     /// defaults).
     pub fn effective_dependencies(&self, env_name: &str) -> BTreeMap<String, String> {
+        self.effective_dependencies_for_target(env_name, crate::glibc::current_pixi_platform())
+    }
+
+    /// Exact-target form of [`Self::effective_dependencies`]. Target-specific
+    /// dependency tables overlay their ordinary default/feature table at each
+    /// precedence layer.
+    pub fn effective_dependencies_for_target(
+        &self,
+        env_name: &str,
+        target_subdir: &str,
+    ) -> BTreeMap<String, String> {
         let Some(env) = self.environments.get(env_name) else {
             return BTreeMap::new();
         };
         let mut out = BTreeMap::new();
         if !env.no_default_feature {
-            for (k, v) in &self.dependencies {
-                out.insert(k.clone(), v.clone());
-            }
+            out.extend(dependency_overlay_for_target(
+                &self.dependencies,
+                &self.target_dependencies,
+                target_subdir,
+            ));
         }
         for feat_name in &env.features {
             let Some(feat) = self.features.get(feat_name) else {
                 continue;
             };
-            for (k, v) in &feat.dependencies {
-                out.insert(k.clone(), v.clone());
-            }
+            out.extend(dependency_overlay_for_target(
+                &feat.dependencies,
+                &feat.target_dependencies,
+                target_subdir,
+            ));
         }
         out
     }
@@ -395,7 +424,24 @@ impl WorkspaceManifest {
     /// replayer (`conda_outputs`) call this with the same
     /// `(workspace_dir, source_dir)` pair, so the fingerprints always agree.
     pub fn solve_fingerprint(&self, workspace_dir: &Path, source_dir: &Path) -> String {
-        let outputs = self.discover_outputs_for_source(workspace_dir, source_dir);
+        self.solve_fingerprint_for_target(
+            workspace_dir,
+            source_dir,
+            crate::glibc::current_pixi_platform(),
+        )
+    }
+
+    /// Exact-target form of [`Self::solve_fingerprint`]. This keeps rich
+    /// platform system requirements from the build host out of a foreign
+    /// target's resolution inputs.
+    pub fn solve_fingerprint_for_target(
+        &self,
+        workspace_dir: &Path,
+        source_dir: &Path,
+        target_subdir: &str,
+    ) -> String {
+        let outputs =
+            self.discover_outputs_for_source_for_target(workspace_dir, source_dir, target_subdir);
         if outputs.is_empty() {
             return String::new();
         }
@@ -417,13 +463,13 @@ impl WorkspaceManifest {
             for c in self.effective_channels(env) {
                 parts.push(format!("scoped-env:{env}:channel:{c}"));
             }
-            for (k, v) in self.effective_dependencies(env) {
+            for (k, v) in self.effective_dependencies_for_target(env, target_subdir) {
                 parts.push(format!("scoped-env:{env}:dep:{k}={v}"));
             }
             for (k, v) in self.effective_pypi_dependencies(env) {
                 parts.push(format!("scoped-env:{env}:pypi-dep:{k}={v}"));
             }
-            for (k, v) in self.effective_system_requirements(env) {
+            for (k, v) in self.effective_system_requirements_for_target(env, target_subdir) {
                 parts.push(format!("scoped-env:{env}:sysreq:{k}={v}"));
             }
             for u in self.effective_pypi_index_urls(env) {
@@ -434,6 +480,39 @@ impl WorkspaceManifest {
     }
 
     pub fn effective_system_requirements(&self, env_name: &str) -> BTreeMap<String, String> {
+        self.effective_system_requirements_for_target(
+            env_name,
+            crate::glibc::current_pixi_platform(),
+        )
+    }
+
+    /// Return an environment's system requirements for the requested Pixi
+    /// platform. Legacy feature-scoped requirements apply to every target;
+    /// rich `[workspace].platforms` values are overlaid only from the exact
+    /// target entry.
+    pub fn effective_system_requirements_for_target(
+        &self,
+        env_name: &str,
+        target_subdir: &str,
+    ) -> BTreeMap<String, String> {
+        if !self.environments.contains_key(env_name) {
+            return BTreeMap::new();
+        }
+        let mut out = self.effective_legacy_system_requirements(env_name);
+        // pixi 0.71+ rich `[workspace].platforms` declarations replace the
+        // deprecated `[system-requirements]` table. They are workspace-wide
+        // (per platform, not per env/feature) and, matching
+        // `declared_glibc`'s precedence, win over any legacy declaration.
+        if let Some(glibc) = self.platform_glibc.get(target_subdir) {
+            out.insert("libc".to_string(), glibc.clone());
+        }
+        if let Some(cuda) = self.platform_cuda.get(target_subdir) {
+            out.insert("cuda".to_string(), cuda.clone());
+        }
+        out
+    }
+
+    fn effective_legacy_system_requirements(&self, env_name: &str) -> BTreeMap<String, String> {
         let Some(env) = self.environments.get(env_name) else {
             return BTreeMap::new();
         };
@@ -451,17 +530,6 @@ impl WorkspaceManifest {
                 out.insert(k.clone(), v.clone());
             }
         }
-        // pixi 0.71+ rich `[workspace].platforms` declarations replace the
-        // deprecated `[system-requirements]` table. They are workspace-wide
-        // (per platform, not per env/feature) and, matching
-        // `declared_glibc`'s precedence, win over any legacy declaration.
-        let platform = crate::glibc::current_pixi_platform();
-        if let Some(glibc) = self.platform_glibc.get(platform) {
-            out.insert("libc".to_string(), glibc.clone());
-        }
-        if let Some(cuda) = self.platform_cuda.get(platform) {
-            out.insert("cuda".to_string(), cuda.clone());
-        }
         out
     }
 
@@ -470,9 +538,18 @@ impl WorkspaceManifest {
     /// `[system-requirements]`; when `env_name` is unknown, union the legacy
     /// top-level and feature declarations and take the max.
     pub fn declared_glibc(&self, env_name: Option<&str>) -> Option<(u32, u32)> {
+        self.declared_glibc_for_target(crate::glibc::current_pixi_platform(), env_name)
+    }
+
+    /// Exact-target form of [`Self::declared_glibc`].
+    pub fn declared_glibc_for_target(
+        &self,
+        target_subdir: &str,
+        env_name: Option<&str>,
+    ) -> Option<(u32, u32)> {
         if let Some(v) = self
             .platform_glibc
-            .get(crate::glibc::current_pixi_platform())
+            .get(target_subdir)
             .and_then(|s| crate::glibc::parse_glibc_version(s))
         {
             return Some(v);
@@ -480,7 +557,7 @@ impl WorkspaceManifest {
 
         if let Some(env_name) = env_name {
             return self
-                .effective_system_requirements(env_name)
+                .effective_legacy_system_requirements(env_name)
                 .get("libc")
                 .and_then(|s| crate::glibc::parse_glibc_version(s));
         }
@@ -601,6 +678,49 @@ fn classify_dep_value(value: &toml::Value) -> DepKind {
     }
 }
 
+fn parse_target_dependencies(root: &toml::Value) -> BTreeMap<String, TargetDependencyDef> {
+    let mut out = BTreeMap::new();
+    let Some(targets) = root.get("target").and_then(toml::Value::as_table) else {
+        return out;
+    };
+    for (target_subdir, target_value) in targets {
+        let Some(dependencies) = target_value
+            .get("dependencies")
+            .and_then(toml::Value::as_table)
+        else {
+            continue;
+        };
+        let mut target = TargetDependencyDef::default();
+        for (name, value) in dependencies {
+            match classify_dep_value(value) {
+                DepKind::Version(spec) => {
+                    target.dependencies.insert(name.clone(), spec);
+                }
+                DepKind::Path(path) => {
+                    target.path_dependencies.insert(name.clone(), path);
+                }
+                DepKind::Other => {}
+            }
+        }
+        if !target.dependencies.is_empty() || !target.path_dependencies.is_empty() {
+            out.insert(target_subdir.clone(), target);
+        }
+    }
+    out
+}
+
+fn dependency_overlay_for_target(
+    base: &BTreeMap<String, String>,
+    targets: &BTreeMap<String, TargetDependencyDef>,
+    target_subdir: &str,
+) -> BTreeMap<String, String> {
+    let mut out = base.clone();
+    if let Some(target) = targets.get(target_subdir) {
+        out.extend(target.dependencies.clone());
+    }
+    out
+}
+
 /// One output retread should emit, discovered from the workspace's
 /// path-deps referencing this source package.
 #[derive(Debug, Clone)]
@@ -631,6 +751,22 @@ impl WorkspaceManifest {
         workspace_dir: &Path,
         source_dir: &Path,
     ) -> Vec<DiscoveredOutput> {
+        self.discover_outputs_for_source_for_target(
+            workspace_dir,
+            source_dir,
+            crate::glibc::current_pixi_platform(),
+        )
+    }
+
+    /// Exact-target form of [`Self::discover_outputs_for_source`]. Path
+    /// dependencies from the matching target table participate alongside the
+    /// ordinary dependency tables; declarations for other targets do not.
+    pub fn discover_outputs_for_source_for_target(
+        &self,
+        workspace_dir: &Path,
+        source_dir: &Path,
+        target_subdir: &str,
+    ) -> Vec<DiscoveredOutput> {
         // Resolve source_dir for comparison. Failing canonicalize is
         // tolerable -- fall back to the raw path.
         let source_canon = canonical_or_self(source_dir);
@@ -647,6 +783,16 @@ impl WorkspaceManifest {
                     .insert(DEFAULT_FEATURE.to_string());
             }
         }
+        if let Some(target) = self.target_dependencies.get(target_subdir) {
+            for (dep_name, raw_path) in &target.path_dependencies {
+                if path_matches(workspace_dir, raw_path, &source_canon) {
+                    matches
+                        .entry(dep_name.clone())
+                        .or_default()
+                        .insert(DEFAULT_FEATURE.to_string());
+                }
+            }
+        }
         for (feat_name, feat) in &self.features {
             for (dep_name, raw_path) in &feat.path_dependencies {
                 if path_matches(workspace_dir, raw_path, &source_canon) {
@@ -654,6 +800,16 @@ impl WorkspaceManifest {
                         .entry(dep_name.clone())
                         .or_default()
                         .insert(feat_name.clone());
+                }
+            }
+            if let Some(target) = feat.target_dependencies.get(target_subdir) {
+                for (dep_name, raw_path) in &target.path_dependencies {
+                    if path_matches(workspace_dir, raw_path, &source_canon) {
+                        matches
+                            .entry(dep_name.clone())
+                            .or_default()
+                            .insert(feat_name.clone());
+                    }
                 }
             }
         }
@@ -696,8 +852,21 @@ impl WorkspaceManifest {
         workspace_dir: &Path,
         source_dir: &Path,
     ) -> Option<Vec<String>> {
+        self.precise_consuming_envs_for_target(
+            workspace_dir,
+            source_dir,
+            crate::glibc::current_pixi_platform(),
+        )
+    }
+
+    pub fn precise_consuming_envs_for_target(
+        &self,
+        workspace_dir: &Path,
+        source_dir: &Path,
+        target_subdir: &str,
+    ) -> Option<Vec<String>> {
         let envs: BTreeSet<String> = self
-            .discover_outputs_for_source(workspace_dir, source_dir)
+            .discover_outputs_for_source_for_target(workspace_dir, source_dir, target_subdir)
             .into_iter()
             .flat_map(|output| output.envs)
             .collect();
@@ -715,9 +884,20 @@ impl WorkspaceManifest {
         &self,
         env_names: &[String],
     ) -> BTreeMap<String, Vec<String>> {
+        self.union_effective_dependencies_for_target(
+            env_names,
+            crate::glibc::current_pixi_platform(),
+        )
+    }
+
+    pub fn union_effective_dependencies_for_target(
+        &self,
+        env_names: &[String],
+        target_subdir: &str,
+    ) -> BTreeMap<String, Vec<String>> {
         let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for env in env_names {
-            for (k, v) in self.effective_dependencies(env) {
+            for (k, v) in self.effective_dependencies_for_target(env, target_subdir) {
                 let entry = out.entry(k).or_default();
                 if !entry.contains(&v) {
                     entry.push(v);
@@ -747,17 +927,41 @@ impl WorkspaceManifest {
     /// - `Some("<feature>")` -- declared in `[feature.<feature>.dependencies]`
     /// - `None` -- env doesn't exist, or no active feature declares it
     pub fn find_declaring_feature(&self, env_name: &str, dep_name: &str) -> Option<String> {
+        self.find_declaring_feature_for_target(
+            env_name,
+            dep_name,
+            crate::glibc::current_pixi_platform(),
+        )
+    }
+
+    pub fn find_declaring_feature_for_target(
+        &self,
+        env_name: &str,
+        dep_name: &str,
+        target_subdir: &str,
+    ) -> Option<String> {
         let env = self.environments.get(env_name)?;
         // Default first (top-level [dependencies]). If env opts out
         // via no-default-feature, skip.
-        if !env.no_default_feature && self.dependencies.contains_key(dep_name) {
+        if !env.no_default_feature
+            && (self.dependencies.contains_key(dep_name)
+                || self
+                    .target_dependencies
+                    .get(target_subdir)
+                    .is_some_and(|target| target.dependencies.contains_key(dep_name)))
+        {
             return Some("default".to_string());
         }
         for feat_name in &env.features {
             let Some(feat) = self.features.get(feat_name) else {
                 continue;
             };
-            if feat.dependencies.contains_key(dep_name) {
+            if feat.dependencies.contains_key(dep_name)
+                || feat
+                    .target_dependencies
+                    .get(target_subdir)
+                    .is_some_and(|target| target.dependencies.contains_key(dep_name))
+            {
                 return Some(feat_name.clone());
             }
         }
@@ -788,7 +992,21 @@ impl WorkspaceManifest {
     /// it (both sites then agree on empty; solve_fingerprint still folds the
     /// declared channels, so signal is not lost).
     pub fn courier_channel_set(&self, workspace_dir: &Path, source_dir: &Path) -> Vec<String> {
-        let outputs = self.discover_outputs_for_source(workspace_dir, source_dir);
+        self.courier_channel_set_for_target(
+            workspace_dir,
+            source_dir,
+            crate::glibc::current_pixi_platform(),
+        )
+    }
+
+    pub fn courier_channel_set_for_target(
+        &self,
+        workspace_dir: &Path,
+        source_dir: &Path,
+        target_subdir: &str,
+    ) -> Vec<String> {
+        let outputs =
+            self.discover_outputs_for_source_for_target(workspace_dir, source_dir, target_subdir);
         if outputs.is_empty() {
             return Vec::new();
         }
@@ -842,7 +1060,21 @@ impl WorkspaceManifest {
         workspace_dir: &Path,
         source_dir: &Path,
     ) -> BTreeMap<String, Vec<String>> {
-        let outputs = self.discover_outputs_for_source(workspace_dir, source_dir);
+        self.consuming_env_dependencies_for_target(
+            workspace_dir,
+            source_dir,
+            crate::glibc::current_pixi_platform(),
+        )
+    }
+
+    pub fn consuming_env_dependencies_for_target(
+        &self,
+        workspace_dir: &Path,
+        source_dir: &Path,
+        target_subdir: &str,
+    ) -> BTreeMap<String, Vec<String>> {
+        let outputs =
+            self.discover_outputs_for_source_for_target(workspace_dir, source_dir, target_subdir);
         if !outputs.is_empty() {
             let mut envs: BTreeSet<String> = BTreeSet::new();
             let mut features: BTreeSet<String> = BTreeSet::new();
@@ -852,23 +1084,31 @@ impl WorkspaceManifest {
             }
             if !envs.is_empty() {
                 let env_vec: Vec<String> = envs.into_iter().collect();
-                return self.union_effective_dependencies(&env_vec);
+                return self.union_effective_dependencies_for_target(&env_vec, target_subdir);
             }
             // Tier 3: declaring features exist but no active env
             // reaches them -- union their raw dependency tables.
             let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
             for feat_name in &features {
                 let deps = if feat_name == DEFAULT_FEATURE {
-                    &self.dependencies
+                    dependency_overlay_for_target(
+                        &self.dependencies,
+                        &self.target_dependencies,
+                        target_subdir,
+                    )
                 } else if let Some(f) = self.features.get(feat_name) {
-                    &f.dependencies
+                    dependency_overlay_for_target(
+                        &f.dependencies,
+                        &f.target_dependencies,
+                        target_subdir,
+                    )
                 } else {
                     continue;
                 };
                 for (k, v) in deps {
-                    let entry = out.entry(k.clone()).or_default();
-                    if !entry.contains(v) {
-                        entry.push(v.clone());
+                    let entry = out.entry(k).or_default();
+                    if !entry.contains(&v) {
+                        entry.push(v);
                     }
                 }
             }
@@ -879,14 +1119,22 @@ impl WorkspaceManifest {
         // Tier 4: nothing maps to this pack at all -- conservative
         // superset over every feature (plus the top-level default).
         let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for (k, v) in &self.dependencies {
-            out.entry(k.clone()).or_default().push(v.clone());
+        for (k, v) in dependency_overlay_for_target(
+            &self.dependencies,
+            &self.target_dependencies,
+            target_subdir,
+        ) {
+            out.entry(k).or_default().push(v);
         }
         for feat in self.features.values() {
-            for (k, v) in &feat.dependencies {
-                let entry = out.entry(k.clone()).or_default();
-                if !entry.contains(v) {
-                    entry.push(v.clone());
+            for (k, v) in dependency_overlay_for_target(
+                &feat.dependencies,
+                &feat.target_dependencies,
+                target_subdir,
+            ) {
+                let entry = out.entry(k).or_default();
+                if !entry.contains(&v) {
+                    entry.push(v);
                 }
             }
         }
@@ -916,8 +1164,23 @@ impl WorkspaceManifest {
         workspace_dir: &Path,
         source_dir: &Path,
     ) -> BTreeMap<String, String> {
+        self.consuming_env_system_requirements_for_target(
+            workspace_dir,
+            source_dir,
+            crate::glibc::current_pixi_platform(),
+        )
+    }
+
+    /// Exact-target form of [`Self::consuming_env_system_requirements`].
+    pub fn consuming_env_system_requirements_for_target(
+        &self,
+        workspace_dir: &Path,
+        source_dir: &Path,
+        target_subdir: &str,
+    ) -> BTreeMap<String, String> {
         let mut out: BTreeMap<String, String> = BTreeMap::new();
-        let outputs = self.discover_outputs_for_source(workspace_dir, source_dir);
+        let outputs =
+            self.discover_outputs_for_source_for_target(workspace_dir, source_dir, target_subdir);
         let mut envs: BTreeSet<String> = BTreeSet::new();
         let mut features: BTreeSet<String> = BTreeSet::new();
         for output in &outputs {
@@ -926,7 +1189,7 @@ impl WorkspaceManifest {
         }
         if !envs.is_empty() {
             for env in &envs {
-                for (k, v) in self.effective_system_requirements(env) {
+                for (k, v) in self.effective_system_requirements_for_target(env, target_subdir) {
                     out.insert(k, v);
                 }
             }
@@ -943,7 +1206,7 @@ impl WorkspaceManifest {
         }
         if out.is_empty() {
             // Conservative superset: default env + every feature.
-            out = self.effective_system_requirements("default");
+            out = self.effective_system_requirements_for_target("default", target_subdir);
             for feat in self.features.values() {
                 for (k, v) in &feat.system_requirements {
                     out.entry(k.clone()).or_insert_with(|| v.clone());
@@ -952,11 +1215,10 @@ impl WorkspaceManifest {
         }
         // Workspace-wide platform declarations win (parity with
         // effective_system_requirements).
-        let platform = crate::glibc::current_pixi_platform();
-        if let Some(glibc) = self.platform_glibc.get(platform) {
+        if let Some(glibc) = self.platform_glibc.get(target_subdir) {
             out.insert("libc".to_string(), glibc.clone());
         }
-        if let Some(cuda) = self.platform_cuda.get(platform) {
+        if let Some(cuda) = self.platform_cuda.get(target_subdir) {
             out.insert("cuda".to_string(), cuda.clone());
         }
         out
@@ -1054,20 +1316,42 @@ pub async fn extract_transitive_constraints(
     conda_channels: &[rattler_conda_types::ChannelUrl],
     bundle_names: &HashSet<PypiKey>,
 ) -> BTreeMap<PypiKey, Vec<String>> {
-    let deps = manifest.effective_dependencies(env_name);
+    extract_transitive_constraints_for_target(
+        manifest,
+        env_name,
+        target_python,
+        crate::glibc::current_pixi_platform(),
+        conda_channels,
+        bundle_names,
+    )
+    .await
+}
+
+/// Target-aware workspace transitive solve. The target subdir controls both
+/// the conda repodata selected by the solver and the rich platform system
+/// requirements injected as virtual packages.
+pub async fn extract_transitive_constraints_for_target(
+    manifest: &WorkspaceManifest,
+    env_name: &str,
+    target_python: &str,
+    target_subdir: &str,
+    conda_channels: &[rattler_conda_types::ChannelUrl],
+    bundle_names: &HashSet<PypiKey>,
+) -> BTreeMap<PypiKey, Vec<String>> {
+    let deps = manifest.effective_dependencies_for_target(env_name, target_subdir);
     let channel_priority = match manifest.channel_priority.as_deref() {
         Some("disabled") => rattler_solve::ChannelPriority::Disabled,
         _ => rattler_solve::ChannelPriority::Strict,
     };
-    let system_requirements = manifest.effective_system_requirements(env_name);
+    let system_requirements =
+        manifest.effective_system_requirements_for_target(env_name, target_subdir);
     let solve_specs = transitive_solve_specs(&deps, bundle_names);
 
     let solved_records = match crate::conda_solve::solve_selected_records(
         conda_channels,
         &solve_specs,
         target_python,
-        // TODO(target-subdir): derive this from the requested workspace platform.
-        "linux-64",
+        target_subdir,
         channel_priority,
         &system_requirements,
         rattler_solve::SolveStrategy::LowestVersionDirect,
@@ -1655,6 +1939,103 @@ python = "==3.12"
         assert!(!eff.contains_key("torch"));
     }
 
+    #[test]
+    fn target_dependencies_overlay_top_level_and_feature_tables() {
+        let ws = ws_toml(
+            r#"
+[dependencies]
+shared = "1"
+arch-pkg = "0"
+
+[target.linux-64.dependencies]
+arch-pkg = "64"
+x86-only = "*"
+
+[target.linux-aarch64.dependencies]
+arch-pkg = "arm"
+arm-only = "*"
+
+[environments]
+sim = { features = ["sim"] }
+
+[feature.sim.dependencies]
+feature-shared = "1"
+
+[feature.sim.target.linux-64.dependencies]
+feature-arch = "64"
+
+[feature.sim.target.linux-aarch64.dependencies]
+feature-arch = "arm"
+arm-feature-only = "*"
+"#,
+        );
+
+        let x86 = ws.effective_dependencies_for_target("sim", "linux-64");
+        assert_eq!(x86.get("shared").map(String::as_str), Some("1"));
+        assert_eq!(x86.get("arch-pkg").map(String::as_str), Some("64"));
+        assert_eq!(x86.get("feature-arch").map(String::as_str), Some("64"));
+        assert!(x86.contains_key("x86-only"));
+        assert!(!x86.contains_key("arm-only"));
+        assert!(!x86.contains_key("arm-feature-only"));
+
+        let arm = ws.effective_dependencies_for_target("sim", "linux-aarch64");
+        assert_eq!(arm.get("shared").map(String::as_str), Some("1"));
+        assert_eq!(arm.get("arch-pkg").map(String::as_str), Some("arm"));
+        assert_eq!(arm.get("feature-arch").map(String::as_str), Some("arm"));
+        assert!(arm.contains_key("arm-only"));
+        assert!(arm.contains_key("arm-feature-only"));
+        assert!(!arm.contains_key("x86-only"));
+        assert_eq!(
+            ws.find_declaring_feature_for_target("sim", "arm-only", "linux-aarch64")
+                .as_deref(),
+            Some("default")
+        );
+        assert_eq!(
+            ws.find_declaring_feature_for_target("sim", "arm-feature-only", "linux-aarch64")
+                .as_deref(),
+            Some("sim")
+        );
+        assert_eq!(
+            ws.find_declaring_feature_for_target("sim", "arm-only", "linux-64"),
+            None
+        );
+    }
+
+    #[test]
+    fn target_path_dependencies_are_discovered_only_for_requested_target() {
+        let tmp = std::env::temp_dir().join(format!(
+            "retread-ws-target-path-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let source = tmp.join("jetson-pack");
+        std::fs::create_dir_all(&source).unwrap();
+        let ws = ws_toml(
+            r#"
+[environments]
+jetson = { features = ["jetson"] }
+
+[feature.jetson.target.linux-aarch64.dependencies]
+jetson-pack = { path = "./jetson-pack" }
+"#,
+        );
+
+        assert!(
+            ws.discover_outputs_for_source_for_target(&tmp, &source, "linux-64")
+                .is_empty()
+        );
+        let arm = ws.discover_outputs_for_source_for_target(&tmp, &source, "linux-aarch64");
+        assert_eq!(arm.len(), 1);
+        assert_eq!(arm[0].name, "jetson-pack");
+        assert_eq!(arm[0].declaring_features, vec!["jetson"]);
+        assert_eq!(arm[0].envs, vec!["jetson"]);
+
+        std::fs::remove_dir_all(tmp).ok();
+    }
+
     // v0.37.0 D1: system-requirements parsing + effective rollup.
     // (Restored after an accidental revert; mirrors the gigastrap layout
     // where [feature.gpu] declares cuda=12 and [feature.isaaclab] libc.)
@@ -1748,6 +2129,44 @@ default = []
         // Legacy declaration stands; the rich entry targets another platform.
         assert_eq!(sr.get("libc").map(String::as_str), Some("2.34"));
         assert!(!sr.contains_key("cuda"));
+    }
+
+    #[test]
+    fn target_system_requirements_select_exact_rich_platform() {
+        let ws = ws_toml(
+            r#"
+[workspace]
+platforms = [
+  { platform = "linux-64", glibc = "2.35", cuda = "12" },
+  { platform = "linux-aarch64", glibc = "2.39", cuda = "13" },
+]
+
+[system-requirements]
+libc = "2.17"
+cuda = "11"
+
+[environments]
+default = []
+"#,
+        );
+        let x86 = ws.effective_system_requirements_for_target("default", "linux-64");
+        let arm = ws.effective_system_requirements_for_target("default", "linux-aarch64");
+        assert_eq!(x86.get("libc").map(String::as_str), Some("2.35"));
+        assert_eq!(x86.get("cuda").map(String::as_str), Some("12"));
+        assert_eq!(arm.get("libc").map(String::as_str), Some("2.39"));
+        assert_eq!(arm.get("cuda").map(String::as_str), Some("13"));
+        assert!(
+            ws.effective_system_requirements_for_target("missing", "linux-aarch64")
+                .is_empty()
+        );
+        assert_eq!(
+            ws.declared_glibc_for_target("linux-64", None),
+            Some((2, 35))
+        );
+        assert_eq!(
+            ws.declared_glibc_for_target("linux-aarch64", None),
+            Some((2, 39))
+        );
     }
 
     #[test]
@@ -2503,6 +2922,46 @@ index-url = "https://pypi.nvidia.com"
         // nvidia appears in both top-level and feature -- only first occurrence kept.
         assert_eq!(urls.len(), 1);
         assert_eq!(urls[0], "https://pypi.nvidia.com");
+    }
+
+    #[test]
+    fn solve_fingerprint_uses_requested_platform_requirements() {
+        let tmp = std::env::temp_dir().join(format!(
+            "retread-ws-target-fp-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let src = tmp.join("my-pack");
+        std::fs::create_dir_all(&src).unwrap();
+        let ws = ws_toml(
+            r#"
+[workspace]
+channels = ["conda-forge"]
+platforms = [
+  { platform = "linux-64", glibc = "2.35", cuda = "12" },
+  { platform = "linux-aarch64", glibc = "2.39", cuda = "13" },
+]
+
+[environments]
+sim = { features = ["sim"] }
+
+[feature.sim.dependencies]
+my-pack = { path = "./my-pack" }
+"#,
+        );
+
+        let x86 = ws.solve_fingerprint_for_target(&tmp, &src, "linux-64");
+        let arm = ws.solve_fingerprint_for_target(&tmp, &src, "linux-aarch64");
+        assert!(x86.contains("sysreq:libc=2.35"));
+        assert!(x86.contains("sysreq:cuda=12"));
+        assert!(arm.contains("sysreq:libc=2.39"));
+        assert!(arm.contains("sysreq:cuda=13"));
+        assert_ne!(x86, arm);
+
+        std::fs::remove_dir_all(tmp).ok();
     }
 
     #[test]

@@ -7,6 +7,7 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use regex::Regex;
+use sha2::{Digest, Sha256};
 use std::error::Error;
 use std::fmt;
 use std::str::FromStr;
@@ -85,12 +86,14 @@ pub struct WheelTarget {
     /// Manylinux / glibc ceiling for linux targets: a `manylinux_X_Y`
     /// wheel is compatible only when `(X, Y) <= max_glibc`. Resolved
     /// from the workspace-declared glibc (`[system-requirements]
-    /// libc = "X.Y"` pre-0.71, or the 0.71+ rich `platforms` form) OR
-    /// the detected host glibc, whichever is higher -- so a pack whose
-    /// consuming workspace declares `libc = "2.35"` accepts
-    /// `manylinux_2_35` wheels (e.g. isaacsim) even on a glibc-2.34
-    /// build host. `None` = no ceiling (non-linux target, or nothing
-    /// known): every manylinux tag is accepted.
+    /// libc = "X.Y"` pre-0.71, or the exact requested entry in the 0.71+
+    /// rich `platforms` form). Native linux-64 retains the established
+    /// `max(declared, host)` behavior; other targets use the exact declaration
+    /// and only fall back to host glibc when native. Host capabilities cannot
+    /// leak into a foreign resolution. For source compatibility, `None`
+    /// retains the historical unbounded linux-64 scorer behavior; an
+    /// undeclared linux-aarch64 target fails closed for Linux-specific wheels.
+    /// Universal `none-any` wheels remain usable on either target.
     pub max_glibc: Option<(u32, u32)>,
 }
 
@@ -98,12 +101,147 @@ impl WheelTarget {
     /// Standard constructor: fills [`Self::max_glibc`] from the
     /// declared-glibc plumbing in `crate::glibc` for linux subdirs.
     pub fn for_subdir(python_version: &str, conda_subdir: &str) -> Self {
-        WheelTarget {
-            python_version: python_version.to_string(),
-            conda_subdir: conda_subdir.to_string(),
-            max_glibc: crate::glibc::manylinux_ceiling(conda_subdir),
+        ResolutionTarget::for_subdir(python_version, conda_subdir).wheel_target
+    }
+}
+
+/// Immutable compatibility contract for one wheel-resolution operation.
+///
+/// [`WheelTarget`] remains source-compatible for scoring callers. Resolution,
+/// replay, and cache paths use this richer type so an explicit deployment
+/// declaration cannot be confused with a host-derived effective ceiling.
+#[derive(Debug, Clone)]
+pub(crate) struct ResolutionTarget {
+    wheel_target: WheelTarget,
+    declared_glibc: Option<(u32, u32)>,
+}
+
+impl ResolutionTarget {
+    /// Resolve the explicit declaration and effective ceiling exactly once
+    /// for this `(python_version, conda_subdir)` pair.
+    pub(crate) fn for_subdir(python_version: &str, conda_subdir: &str) -> Self {
+        let declared_glibc = crate::glibc::declared_glibc_no_lock_for_target(conda_subdir);
+        Self::from_parts(python_version, conda_subdir, declared_glibc)
+    }
+
+    /// Construct a target from an explicit deployment declaration.
+    pub(crate) fn from_parts(
+        python_version: &str,
+        conda_subdir: &str,
+        declared_glibc: Option<(u32, u32)>,
+    ) -> Self {
+        let max_glibc = crate::glibc::target_glibc_ceiling(
+            conda_subdir,
+            crate::glibc::current_pixi_platform(),
+            declared_glibc,
+            crate::glibc::host_glibc(),
+        );
+        Self {
+            wheel_target: WheelTarget {
+                python_version: python_version.to_string(),
+                conda_subdir: conda_subdir.to_string(),
+                max_glibc,
+            },
+            declared_glibc,
         }
     }
+
+    /// Wrap a scorer target without re-reading mutable workspace or host
+    /// state. This is useful for deterministic tests and callers that already
+    /// resolved their deployment contract.
+    pub(crate) fn from_wheel_target(
+        wheel_target: WheelTarget,
+        declared_glibc: Option<(u32, u32)>,
+    ) -> Self {
+        Self {
+            wheel_target,
+            declared_glibc,
+        }
+    }
+
+    pub(crate) fn wheel_target(&self) -> &WheelTarget {
+        &self.wheel_target
+    }
+
+    pub(crate) fn python_version(&self) -> &str {
+        &self.wheel_target.python_version
+    }
+
+    pub(crate) fn conda_subdir(&self) -> &str {
+        &self.wheel_target.conda_subdir
+    }
+
+    pub(crate) fn declared_glibc(&self) -> Option<(u32, u32)> {
+        self.declared_glibc
+    }
+
+    pub(crate) fn effective_glibc(&self) -> Option<(u32, u32)> {
+        self.wheel_target.max_glibc
+    }
+
+    /// Full SHA-256 namespace for artifact compatibility. Two declarations
+    /// that produce the same effective target can safely share artifacts.
+    pub(crate) fn artifact_cache_identity(&self) -> String {
+        target_identity(
+            b"retread-wheel-artifact-target-v2\0",
+            &self.wheel_target,
+            None,
+        )
+    }
+
+    /// Full SHA-256 identity for resolution and replay decisions. This also
+    /// includes the explicit declaration, distinguishing a deployment promise
+    /// from an equal host-derived compatibility ceiling.
+    pub(crate) fn resolution_identity(&self) -> String {
+        target_identity(
+            b"retread-wheel-resolution-target-v2\0",
+            &self.wheel_target,
+            Some(self.declared_glibc),
+        )
+    }
+}
+
+impl std::ops::Deref for ResolutionTarget {
+    type Target = WheelTarget;
+
+    fn deref(&self) -> &Self::Target {
+        self.wheel_target()
+    }
+}
+
+fn target_identity(
+    domain: &[u8],
+    target: &WheelTarget,
+    declared_glibc: Option<Option<(u32, u32)>>,
+) -> String {
+    fn field(hasher: &mut Sha256, value: &[u8]) {
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value);
+    }
+
+    fn glibc(hasher: &mut Sha256, value: Option<(u32, u32)>) {
+        match value {
+            Some((major, minor)) => {
+                hasher.update([1]);
+                hasher.update(major.to_be_bytes());
+                hasher.update(minor.to_be_bytes());
+            }
+            None => hasher.update([0]),
+        }
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    let normalized_python = parse_python_version(&target.python_version)
+        .map(|(major, minor)| format!("{major}.{minor}"))
+        .unwrap_or_else(|| target.python_version.clone());
+    field(&mut hasher, normalized_python.as_bytes());
+    field(&mut hasher, target.conda_subdir.as_bytes());
+    glibc(&mut hasher, target.max_glibc);
+    if let Some(declared_glibc) = declared_glibc {
+        glibc(&mut hasher, declared_glibc);
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 /// Fetch the simple index for `name` and pick the best wheel for the
@@ -679,14 +817,33 @@ struct WheelTags<'a> {
 fn parse_wheel_tags(filename: &str) -> Option<WheelTags<'_>> {
     let stem = filename.strip_suffix(".whl")?;
     // {distribution}-{version}(-{build})?-{python}-{abi}-{platform}
-    let rev: Vec<&str> = stem.rsplitn(4, '-').collect();
-    if rev.len() < 3 {
+    let fields: Vec<&str> = stem.split('-').collect();
+    if !matches!(fields.len(), 5 | 6) || fields.iter().any(|field| field.is_empty()) {
+        return None;
+    }
+    let distribution = fields[0];
+    if distribution.contains("__")
+        || !distribution
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.'))
+        || Version::from_str(fields[1]).is_err()
+    {
+        return None;
+    }
+    let tag_start = fields.len() - 3;
+    if fields.len() == 6 && !fields[2].as_bytes()[0].is_ascii_digit() {
+        return None;
+    }
+    if fields[tag_start..].iter().any(|tag| {
+        !tag.bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.'))
+    }) {
         return None;
     }
     Some(WheelTags {
-        platform: rev[0],
-        abi: rev[1],
-        python: rev[2],
+        python: fields[tag_start],
+        abi: fields[tag_start + 1],
+        platform: fields[tag_start + 2],
     })
 }
 
@@ -744,13 +901,17 @@ fn parse_python_version(s: &str) -> Option<(u32, u32)> {
 fn score_platform_tag(tag: &str, conda_subdir: &str, max_glibc: Option<(u32, u32)>) -> Option<i64> {
     // PEP 425 compressed tag sets: a single wheel can list multiple platform
     // tags joined by `.`. Score each and return the best match.
+    if tag.is_empty() || tag.split('.').any(str::is_empty) {
+        return None;
+    }
     tag.split('.')
         .filter_map(|t| score_one_platform_tag(t, conda_subdir, max_glibc))
         .max()
 }
 
 /// `true` when a manylinux glibc requirement `need` fits under the
-/// target's ceiling (`None` ceiling = accept everything).
+/// target's ceiling. `None` retains legacy linux-64 behavior; aarch64 rejects
+/// the unknown ceiling before calling this helper.
 fn glibc_fits(need: (u32, u32), max_glibc: Option<(u32, u32)>) -> bool {
     max_glibc.is_none_or(|ceiling| need <= ceiling)
 }
@@ -777,13 +938,22 @@ fn score_one_platform_tag(
     };
 
     if conda_subdir.starts_with("linux") {
+        // Existing linux-64 callers use `None` to mean unbounded. Preserve
+        // that public scorer contract. For aarch64, an unknown target ceiling
+        // is not evidence that a platform-specific wheel is deployable.
+        if conda_subdir == "linux-aarch64" && max_glibc.is_none() {
+            return None;
+        }
         if let Some(rest) = tag.strip_prefix("manylinux_") {
-            // Format: X_Y_<arch>
+            // PEP 600 format is exactly X_Y_<arch>.
             let suffix = format!("_{arch}");
             let ver = rest.strip_suffix(&suffix)?;
             let mut parts = ver.split('_');
             let major: u32 = parts.next()?.parse().ok()?;
             let minor: u32 = parts.next()?.parse().ok()?;
+            if parts.next().is_some() {
+                return None;
+            }
             // Reject tags above the declared/host glibc ceiling.
             if !glibc_fits((major, minor), max_glibc) {
                 return None;
@@ -793,13 +963,13 @@ fn score_one_platform_tag(
         }
         // Legacy aliases (PEP 600 equivalences): manylinux1 == 2.5,
         // manylinux2010 == 2.12, manylinux2014 == 2.17.
-        if tag.starts_with("manylinux1_") && tag.ends_with(arch) {
+        if arch == "x86_64" && tag == "manylinux1_x86_64" {
             return glibc_fits((2, 5), max_glibc).then_some(150);
         }
-        if tag.starts_with("manylinux2010_") && tag.ends_with(arch) {
+        if arch == "x86_64" && tag == "manylinux2010_x86_64" {
             return glibc_fits((2, 12), max_glibc).then_some(160);
         }
-        if tag.starts_with("manylinux2014_") && tag.ends_with(arch) {
+        if tag == format!("manylinux2014_{arch}") {
             return glibc_fits((2, 17), max_glibc).then_some(170);
         }
         if tag == format!("linux_{arch}") {
@@ -819,7 +989,7 @@ mod tests {
         WheelTarget {
             python_version: "3.11".into(),
             conda_subdir: "linux-64".into(),
-            max_glibc: None,
+            max_glibc: Some((99, 99)),
         }
     }
 
@@ -927,12 +1097,95 @@ mod tests {
         }
     }
 
+    fn exact_resolution_target(
+        python_version: &str,
+        conda_subdir: &str,
+        declared_glibc: Option<(u32, u32)>,
+        effective_glibc: Option<(u32, u32)>,
+    ) -> ResolutionTarget {
+        ResolutionTarget::from_wheel_target(
+            WheelTarget {
+                python_version: python_version.into(),
+                conda_subdir: conda_subdir.into(),
+                max_glibc: effective_glibc,
+            },
+            declared_glibc,
+        )
+    }
+
+    #[test]
+    fn target_identities_cover_artifact_and_resolution_contracts() {
+        let declared =
+            exact_resolution_target("3.11", "linux-aarch64", Some((2, 35)), Some((2, 35)));
+        let host_only = exact_resolution_target("3.11", "linux-aarch64", None, Some((2, 35)));
+
+        for identity in [
+            declared.artifact_cache_identity(),
+            declared.resolution_identity(),
+        ] {
+            assert_eq!(identity.len(), 64);
+            assert!(identity.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        }
+        assert_eq!(
+            declared.artifact_cache_identity(),
+            host_only.artifact_cache_identity(),
+            "equal effective targets can share immutable artifacts"
+        );
+        assert_ne!(
+            declared.resolution_identity(),
+            host_only.resolution_identity(),
+            "an explicit deployment promise changes resolution/replay identity"
+        );
+        let equivalent_python =
+            exact_resolution_target("3.11.0", "linux-aarch64", Some((2, 35)), Some((2, 35)));
+        assert_eq!(
+            declared.artifact_cache_identity(),
+            equivalent_python.artifact_cache_identity(),
+            "equivalent Python minor spellings share artifact identity"
+        );
+        assert_eq!(
+            declared.resolution_identity(),
+            equivalent_python.resolution_identity(),
+            "equivalent Python minor spellings share resolution identity"
+        );
+
+        for changed in [
+            exact_resolution_target("3.12", "linux-aarch64", Some((2, 35)), Some((2, 35))),
+            exact_resolution_target("3.11", "linux-64", Some((2, 35)), Some((2, 35))),
+            exact_resolution_target("3.11", "linux-aarch64", Some((2, 39)), Some((2, 39))),
+        ] {
+            assert_ne!(
+                declared.artifact_cache_identity(),
+                changed.artifact_cache_identity()
+            );
+            assert_ne!(
+                declared.resolution_identity(),
+                changed.resolution_identity()
+            );
+        }
+    }
+
+    #[test]
+    fn resolution_target_accessors_preserve_declared_and_effective_glibc() {
+        let target = exact_resolution_target("3.11", "linux-aarch64", Some((2, 35)), Some((2, 35)));
+        assert_eq!(target.python_version(), "3.11");
+        assert_eq!(target.conda_subdir(), "linux-aarch64");
+        assert_eq!(target.declared_glibc(), Some((2, 35)));
+        assert_eq!(target.effective_glibc(), Some((2, 35)));
+        assert_eq!(target.wheel_target().conda_subdir, "linux-aarch64");
+    }
+
     #[test]
     fn manylinux_2_35_accepted_when_declared_glibc_covers_it() {
-        // isaacsim's only linux wheel. Host glibc 2.34, workspace declares
-        // libc = "2.35" -> ceiling max(2.34, 2.35) = 2.35 -> accepted.
+        // isaacsim's only linux wheel. The exact target declaration admits it
+        // even when the native build host is older.
         let wheel = "isaacsim-6.0.0.0-cp312-none-manylinux_2_35_x86_64.whl";
-        let ceiling = crate::glibc::combine_glibc_ceiling(Some((2, 35)), Some((2, 34)));
+        let ceiling = crate::glibc::target_glibc_ceiling(
+            "linux-64",
+            "linux-64",
+            Some((2, 35)),
+            Some((2, 34)),
+        );
         assert_eq!(ceiling, Some((2, 35)));
         assert!(score_wheel(wheel, &t_glibc(ceiling)) >= 0);
     }
@@ -942,18 +1195,33 @@ mod tests {
         // Undeclared -> host floor: ceiling is the detected host glibc
         // alone, and a manylinux_2_35 wheel must be rejected on 2.34.
         let wheel = "isaacsim-6.0.0.0-cp312-none-manylinux_2_35_x86_64.whl";
-        let ceiling = crate::glibc::combine_glibc_ceiling(None, Some((2, 34)));
+        let ceiling =
+            crate::glibc::target_glibc_ceiling("linux-64", "linux-64", None, Some((2, 34)));
         assert_eq!(ceiling, Some((2, 34)));
         assert_eq!(score_wheel(wheel, &t_glibc(ceiling)), -1);
     }
 
     #[test]
-    fn manylinux_ceiling_none_accepts_everything() {
-        // No declaration and no detectable host glibc -> historical
-        // behavior: accept every manylinux tag.
-        assert_eq!(crate::glibc::combine_glibc_ceiling(None, None), None);
+    fn unknown_linux_ceiling_preserves_x86_and_fails_closed_on_aarch64() {
         let wheel = "isaacsim-6.0.0.0-cp312-none-manylinux_2_35_x86_64.whl";
         assert!(score_wheel(wheel, &t_glibc(None)) >= 0);
+        assert!(score_wheel("native-1.0.0-cp312-cp312-linux_x86_64.whl", &t_glibc(None)) >= 0);
+        assert!(score_wheel("portable-1.0.0-py3-none-any.whl", &t_glibc(None)) >= 0);
+
+        let arm = WheelTarget {
+            python_version: "3.12".into(),
+            conda_subdir: "linux-aarch64".into(),
+            max_glibc: None,
+        };
+        assert_eq!(
+            score_wheel("native-1.0.0-cp312-cp312-manylinux_2_17_aarch64.whl", &arm),
+            -1
+        );
+        assert_eq!(
+            score_wheel("native-1.0.0-cp312-cp312-linux_aarch64.whl", &arm),
+            -1
+        );
+        assert!(score_wheel("portable-1.0.0-py3-none-any.whl", &arm) >= 0);
     }
 
     #[test]
@@ -977,7 +1245,7 @@ mod tests {
     #[test]
     fn rich_platform_declaration_raises_ceiling_for_manylinux_2_35() {
         // 0.71+ rich platforms form parses into a declared glibc that,
-        // combined with a lower host glibc, admits the isaacsim wheel.
+        // remains authoritative over a different host glibc.
         let toml: toml::Value = toml::from_str(
             r#"
 [workspace]
@@ -991,7 +1259,8 @@ platforms = [{ platform = "linux-64", glibc = "2.35" }]
             .get("linux-64")
             .and_then(|s| crate::glibc::parse_glibc_version(s));
         assert_eq!(declared, Some((2, 35)));
-        let ceiling = crate::glibc::combine_glibc_ceiling(declared, Some((2, 34)));
+        let ceiling =
+            crate::glibc::target_glibc_ceiling("linux-64", "linux-64", declared, Some((2, 34)));
         let wheel = "isaacsim-6.0.0.0-cp312-none-manylinux_2_35_x86_64.whl";
         assert!(score_wheel(wheel, &t_glibc(ceiling)) >= 0);
     }
@@ -1304,6 +1573,76 @@ platforms = [{ platform = "linux-64", glibc = "2.35" }]
         assert_eq!(
             picked.filename,
             "isaacsim-5.1.0.0-cp311-none-manylinux_2_35_x86_64.whl"
+        );
+    }
+
+    #[test]
+    fn picks_linux_aarch64_wheel_and_respects_target_glibc() {
+        let orin = WheelTarget {
+            python_version: "3.11".into(),
+            conda_subdir: "linux-aarch64".into(),
+            max_glibc: Some((2, 35)),
+        };
+        let candidates = vec![
+            mk("torch-2.9.0-cp311-cp311-manylinux_2_35_x86_64.whl"),
+            mk("torch-2.9.0-cp311-cp311-manylinux_2_35_aarch64.whl"),
+            mk("torch-2.9.0-cp311-cp311-manylinux_2_39_aarch64.whl"),
+        ];
+        let picked = pick_best(candidates, &orin).unwrap();
+        assert_eq!(
+            picked.filename,
+            "torch-2.9.0-cp311-cp311-manylinux_2_35_aarch64.whl"
+        );
+        assert_eq!(
+            score_wheel("torch-2.9.0-cp311-cp311-manylinux_2_39_aarch64.whl", &orin),
+            -1
+        );
+    }
+
+    #[test]
+    fn legacy_manylinux_aliases_have_exact_architecture_contracts() {
+        let aarch64 = WheelTarget {
+            python_version: "3.11".into(),
+            conda_subdir: "linux-aarch64".into(),
+            max_glibc: Some((2, 39)),
+        };
+        for x86_only in [
+            "foo-1.0-cp311-cp311-manylinux1_aarch64.whl",
+            "foo-1.0-cp311-cp311-manylinux2010_aarch64.whl",
+        ] {
+            assert_eq!(score_wheel(x86_only, &aarch64), -1, "{x86_only}");
+        }
+        assert!(score_wheel("foo-1.0-cp311-cp311-manylinux2014_aarch64.whl", &aarch64) >= 0);
+    }
+
+    #[test]
+    fn wheel_tags_reject_malformed_residual_and_platform_shapes() {
+        let target = t();
+        for malformed in [
+            "cp311-cp311-manylinux_2_17_x86_64.whl",
+            "foo-cp311-cp311-manylinux_2_17_x86_64.whl",
+            "foo--cp311-cp311-manylinux_2_17_x86_64.whl",
+            "foo__bar-1.0-cp311-cp311-manylinux_2_17_x86_64.whl",
+            "foo-1.0-extra-extra-cp311-cp311-manylinux_2_17_x86_64.whl",
+            "foo-1.0-build!-cp311-cp311-manylinux_2_17_x86_64.whl",
+            "foo-1.0-cp311-cp311-manylinux_2_17_extra_x86_64.whl",
+            "foo-1.0-cp311-cp311-manylinux_2_17_x86_64_extra.whl",
+            "foo-1.0-cp311-cp311-manylinux2014_extra_x86_64.whl",
+        ] {
+            assert_eq!(score_wheel(malformed, &target), -1, "{malformed}");
+        }
+        assert!(
+            score_wheel(
+                "foo-1.0-1abc.def_2-cp311-cp311-manylinux_2_17_x86_64.whl",
+                &target
+            ) >= 0
+        );
+        assert!(
+            score_wheel(
+                "foo-1.0+vendor-cp311-cp311-manylinux_2_17_x86_64.whl",
+                &target
+            ) >= 0,
+            "a PEP 440 local version remains one valid version field"
         );
     }
 
