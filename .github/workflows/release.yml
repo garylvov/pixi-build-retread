@@ -61,7 +61,6 @@ jobs:
     runs-on: ${{ matrix.runner }}
     env:
       TARGET_PLATFORM: ${{ matrix.target_platform }}
-      RUNNER_ARCH: ${{ matrix.runner_arch }}
       RATTLER_BUILD_ASSET: ${{ matrix.rattler_asset }}
       RATTLER_BUILD_SHA256: ${{ matrix.rattler_sha256 }}
     steps:
@@ -69,7 +68,7 @@ jobs:
 
       - name: Assert native runner architecture
         shell: bash
-        run: test "$(uname -m)" = "$RUNNER_ARCH"
+        run: test "$(uname -m)" = "${{ matrix.runner_arch }}"
 
       # A tag can point at any commit and can race the branch CI run. Keep the
       # native correctness gate in this workflow so publishing is tied to the
