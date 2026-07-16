@@ -218,7 +218,9 @@ async fn pick_conda_target_single_parselmouth_candidate() {
     .await;
     assert!(Arc::ptr_eq(&fallback, &cached));
     assert!(
-        cached["torch"].iter().any(|candidate| candidate == "pytorch-gpu"),
+        cached["torch"]
+            .iter()
+            .any(|candidate| candidate == "pytorch-gpu"),
         "the process-stable fallback must retain curated mappings"
     );
 }
@@ -399,10 +401,7 @@ fn emission_workspace_snapshot_cannot_override_wheel_metadata() {
         output_name: "isaaclab-2-3x-pack".to_string(),
         channels: Vec::new(),
         transitive_overrides: BTreeMap::from([
-            (
-                "aiohappyeyeballs".to_string(),
-                ">=2.5.0".to_string(),
-            ),
+            ("aiohappyeyeballs".to_string(), ">=2.5.0".to_string()),
             ("unrelated-derived".to_string(), ">=9".to_string()),
         ]),
         envs: vec!["uwlab-gpu".to_string()],
@@ -411,8 +410,7 @@ fn emission_workspace_snapshot_cannot_override_wheel_metadata() {
     let (bundle, effective) = apply_emission(&bundle, &base_config, &emission);
     assert_eq!(bundle.conda_name, "isaaclab-2-3x-pack");
     assert_eq!(
-        effective.overrides,
-        base_config.overrides,
+        effective.overrides, base_config.overrides,
         "explicit overrides must retain their authority, and no provisional \
          workspace selection may be promoted"
     );
@@ -2450,15 +2448,12 @@ async fn d_rewrites_metadata_on_the_wheel_the_recipe_will_source() {
         path: Some(fixture.to_string_lossy().to_string()),
         ..Default::default()
     };
-    let target = WheelTarget {
-        python_version: "3.11".into(),
-        conda_subdir: "linux-64".into(),
-        max_glibc: None,
-    };
+    let target = crate::pypi::ResolutionTarget::for_subdir("3.11", "linux-64");
 
     let (resolved, original_rd) = materialize_and_rewrite(
         &entry,
         "retread-sample",
+        None,
         &target,
         &tmp,
         &fixture,
@@ -3396,7 +3391,7 @@ async fn conda_outputs_cache_and_prepared_handoff_round_trip() {
         materialized: vec![base_bundle],
         base_config: declared_config.clone(),
         declared_config: declared_config.clone(),
-        python_version: "3.11".to_string(),
+        target: crate::pypi::ResolutionTarget::for_subdir("3.11", "linux-64"),
         work_directory: work_dir.clone(),
         workspace_manifest_mtime: None,
         auto_overrides_fingerprint: "none".to_string(),
@@ -3441,8 +3436,7 @@ async fn conda_outputs_cache_and_prepared_handoff_round_trip() {
         Provenance::IndexWheelMetadata
     ));
     assert_eq!(
-        hit.prepared.advertised.build,
-        advertised_output.metadata.build,
+        hit.prepared.advertised.build, advertised_output.metadata.build,
         "a dynamic build request must retain the advertised content-addressed build"
     );
     handler
@@ -3457,13 +3451,7 @@ async fn conda_outputs_cache_and_prepared_handoff_round_trip() {
     );
     assert!(
         handler
-            .lookup_prepared_build(
-                7,
-                Path::new("/other-work"),
-                None,
-                Some("3.11"),
-                &request,
-            )
+            .lookup_prepared_build(7, Path::new("/other-work"), None, Some("3.11"), &request,)
             .await
             .is_none(),
         "work directories must not share prepared plans"
@@ -3486,7 +3474,7 @@ async fn conda_outputs_cache_and_prepared_handoff_round_trip() {
         materialized: vec![py312_bundle],
         base_config: declared_config.clone(),
         declared_config: declared_config.clone(),
-        python_version: "3.12".to_string(),
+        target: crate::pypi::ResolutionTarget::for_subdir("3.12", "linux-64"),
         work_directory: work_dir.clone(),
         workspace_manifest_mtime: None,
         auto_overrides_fingerprint: "none".to_string(),
@@ -3582,7 +3570,7 @@ async fn conda_outputs_cache_and_prepared_handoff_round_trip() {
         materialized: vec![local_bundle],
         base_config: declared_config.clone(),
         declared_config,
-        python_version: "3.11".to_string(),
+        target: crate::pypi::ResolutionTarget::for_subdir("3.11", "linux-64"),
         work_directory: work_dir.clone(),
         workspace_manifest_mtime: None,
         auto_overrides_fingerprint: "none".to_string(),

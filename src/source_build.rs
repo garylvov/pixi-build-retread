@@ -7,15 +7,2032 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::Write;
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
+
+use crate::pypi::{ResolutionTarget, normalized_python_minor};
+
+const BUILT_WHEEL_CACHE_SCHEMA: &str = "retread-built-wheel-v3";
+const BUILT_WHEEL_CACHE_ROOT: &str = "built-wheels";
+const CHECKOUT_CACHE_VERSION: &str = "v3";
+const LOCAL_SOURCE_SNAPSHOT_VERSION: &str = "v5";
+const CANONICAL_GIT_SOURCE_SCHEMA: &str = "retread-canonical-git-source-v1";
+static BUILD_TMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Optional caller knowledge used to bind a source-built artifact to the
+/// package identity that requested it.  Even without this hint, every wheel is
+/// checked for agreement between its PEP 427 filename and root METADATA.
+#[derive(Debug, Clone)]
+pub(crate) struct ExpectedWheel {
+    pub(crate) name: String,
+    pub(crate) version: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SdistWheelBuild {
+    pub(crate) wheel_path: PathBuf,
+    pub(crate) sdist_sha256: String,
+}
+
+impl ExpectedWheel {
+    pub(crate) fn named(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            version: None,
+        }
+    }
+
+    pub(crate) fn exact(name: impl Into<String>, version: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            version: Some(version.into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BuiltWheelMarker {
+    schema: String,
+    artifact_target: String,
+    source_identity: String,
+    filename: String,
+    sha256: String,
+    name: String,
+    version: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalGitSourceMarker {
+    schema: String,
+    repository_identity: String,
+    resolved_sha: String,
+    ref_state: String,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WheelFileFingerprint {
+    device: u64,
+    inode: u64,
+    size: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictWheelAttestation {
+    schema: String,
+    artifact_target: String,
+    source_identity: String,
+    filename: String,
+    sha256: String,
+    name: String,
+    version: String,
+    fingerprint: WheelFileFingerprint,
+}
+
+#[derive(Debug, Clone)]
+struct CanonicalGitSnapshot {
+    root: PathBuf,
+    repository_identity: String,
+    resolved_sha: String,
+    ref_state: String,
+}
+
+#[derive(Debug)]
+struct ValidatedWheel {
+    path: PathBuf,
+    marker: BuiltWheelMarker,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct ExpectedWheelMismatch(String);
+
+fn is_expected_wheel_mismatch(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<ExpectedWheelMismatch>())
+}
+
+/// A pinned ingress artifact whose bytes disagree with the caller's
+/// authoritative digest. Callers may use this narrow classification to heal
+/// a corrupt download/store entry without treating a correct-hash semantic
+/// mismatch (name, version, tags, or archive structure) as disposable.
+#[derive(Debug, thiserror::Error)]
+#[error("pinned wheel hash mismatch: expected {expected}, found {actual}")]
+pub(crate) struct AuthoritativeWheelHashMismatch {
+    expected: String,
+    actual: String,
+}
+
+pub(crate) fn is_authoritative_wheel_hash_mismatch(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<AuthoritativeWheelHashMismatch>())
+}
+
+struct ArtifactCacheLock(File);
+
+impl Drop for ArtifactCacheLock {
+    fn drop(&mut self) {
+        if let Err(error) = fs4::fs_std::FileExt::unlock(&self.0) {
+            tracing::warn!(error = %error, "failed to unlock built-wheel cache entry");
+        }
+    }
+}
+
+struct StagingDir(PathBuf);
+
+struct TemporaryFile {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl TemporaryFile {
+    fn armed(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TemporaryFile {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn make_staging_tree_removable(path: &Path) {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+    if metadata.file_type().is_symlink() {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.is_dir() {
+            let _ = std::fs::set_permissions(
+                path,
+                std::fs::Permissions::from_mode(metadata.permissions().mode() | 0o700),
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let mut permissions = metadata.permissions();
+        permissions.set_readonly(false);
+        let _ = std::fs::set_permissions(path, permissions);
+    }
+    if metadata.is_dir()
+        && let Ok(entries) = std::fs::read_dir(path)
+    {
+        for entry in entries.flatten() {
+            make_staging_tree_removable(&entry.path());
+        }
+    }
+}
+
+impl Drop for StagingDir {
+    fn drop(&mut self) {
+        make_staging_tree_removable(&self.0);
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn hash_fields(domain: &[u8], fields: &[&[u8]]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    for field in fields {
+        hasher.update((field.len() as u64).to_be_bytes());
+        hasher.update(field);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn same_filesystem_inode(left: &Path, right: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let (Ok(left), Ok(right)) = (left.metadata(), right.metadata()) else {
+            return false;
+        };
+        left.dev() == right.dev() && left.ino() == right.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (left, right);
+        false
+    }
+}
+
+fn validate_sha256(value: &str, label: &str) -> Result<String> {
+    let normalized = value.to_ascii_lowercase();
+    if normalized.len() != 64 || !normalized.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("{label} must be exactly 64 hexadecimal SHA-256 characters");
+    }
+    Ok(normalized)
+}
+
+fn built_wheel_cache_dir(kind: &str, source_identity: &str, target: &ResolutionTarget) -> PathBuf {
+    crate::courier::retread_cache_root()
+        .join(BUILT_WHEEL_CACHE_ROOT)
+        .join(kind)
+        .join("v3")
+        .join(target.artifact_cache_identity())
+        .join(source_identity)
+}
+
+fn materialized_wheel_output_dir(
+    out_dir: &Path,
+    source_identity: &str,
+    target: &ResolutionTarget,
+) -> PathBuf {
+    out_dir
+        .join(".retread-source-wheels")
+        .join("v3")
+        .join(target.artifact_cache_identity())
+        .join(source_identity)
+}
+
+fn native_build_allowed(target: &ResolutionTarget) -> bool {
+    target.is_native_build_target()
+}
+
+fn source_build_refusal_error(target: &ResolutionTarget) -> anyhow::Error {
+    if target.conda_subdir() == crate::glibc::current_pixi_platform()
+        && target.conda_subdir() == "linux-aarch64"
+        && let (Some(declared), Some(host)) = (target.declared_glibc(), crate::glibc::host_glibc())
+        && host > declared
+    {
+        return anyhow!(
+            "refusing to source-build for native target `linux-aarch64` with declared glibc {} on newer host glibc {}; use a compatible sysroot/container or a validated artifact-cache hit",
+            crate::glibc::format_glibc(declared),
+            crate::glibc::format_glibc(host),
+        );
+    }
+    anyhow!(
+        "refusing to build a wheel natively for foreign target `{}` on host `{}` after an exact validated artifact-cache miss",
+        target.conda_subdir(),
+        crate::glibc::current_pixi_platform(),
+    )
+}
+
+async fn acquire_artifact_cache_lock(cache_dir: &Path) -> Result<ArtifactCacheLock> {
+    let parent = cache_dir.parent().ok_or_else(|| {
+        anyhow!(
+            "built-wheel cache path has no parent: {}",
+            cache_dir.display()
+        )
+    })?;
+    tokio::fs::create_dir_all(parent)
+        .await
+        .with_context(|| format!("creating built-wheel cache parent {}", parent.display()))?;
+    let file_name = cache_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("built-wheel cache path has no UTF-8 filename"))?;
+    let lock_path = parent.join(format!(".{file_name}.lock"));
+    tokio::task::spawn_blocking(move || {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .with_context(|| format!("opening built-wheel lock {}", lock_path.display()))?;
+        fs4::fs_std::FileExt::lock_exclusive(&file)
+            .with_context(|| format!("locking built-wheel cache {}", lock_path.display()))?;
+        Ok(ArtifactCacheLock(file))
+    })
+    .await
+    .context("built-wheel cache lock task panicked")?
+}
+
+fn remove_owned_cache_entry(path: &Path) -> Result<()> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    }
+    .with_context(|| format!("removing invalid owned cache entry {}", path.display()))
+}
+
+fn validate_wheel_file(
+    path: &Path,
+    target: &ResolutionTarget,
+    expected: Option<&ExpectedWheel>,
+) -> Result<BuiltWheelMarker> {
+    validate_wheel_file_with(path, target, expected, true)
+}
+
+fn validate_wheel_file_with(
+    path: &Path,
+    target: &ResolutionTarget,
+    expected: Option<&ExpectedWheel>,
+    strict_archive: bool,
+) -> Result<BuiltWheelMarker> {
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("wheel path has no UTF-8 filename: {}", path.display()))?;
+    let standard_filename = crate::emit_pypi::standard_wheel_filename(filename);
+    if crate::pypi::score_wheel(&standard_filename, target.wheel_target()) < 0 {
+        bail!(
+            "source-built wheel `{filename}` is incompatible with python {} on {}",
+            target.python_version(),
+            target.conda_subdir(),
+        );
+    }
+    let (filename_name, filename_version) =
+        crate::pypi::wheel_filename_identity(&standard_filename).ok_or_else(|| {
+            anyhow!("source build produced invalid PEP 427 filename `{filename}`")
+        })?;
+    let metadata = if strict_archive {
+        crate::wheel::read_metadata_strict(path)
+    } else {
+        let file_type = std::fs::symlink_metadata(path)
+            .with_context(|| format!("stating cached wheel {}", path.display()))?
+            .file_type();
+        if !file_type.is_file() || file_type.is_symlink() {
+            bail!("cached wheel is not a regular file: {}", path.display());
+        }
+        crate::wheel::read_metadata(path)
+    }
+    .with_context(|| format!("validating source-built wheel {}", path.display()))?;
+    let metadata_name = crate::relax::canonical_conda_name(&metadata.name);
+    let filename_name = crate::relax::canonical_conda_name(&filename_name);
+    if metadata_name != filename_name {
+        bail!(
+            "source-built wheel identity mismatch: filename names `{filename_name}` but METADATA names `{metadata_name}`"
+        );
+    }
+    let metadata_version = uv_pep508::uv_pep440::Version::from_str(&metadata.version)
+        .with_context(|| format!("invalid METADATA version `{}`", metadata.version))?;
+    if metadata_version != filename_version {
+        bail!(
+            "source-built wheel identity mismatch: filename version `{filename_version}` but METADATA version `{metadata_version}`"
+        );
+    }
+    validate_expected_wheel(&metadata_name, &metadata_version.to_string(), expected)?;
+    Ok(BuiltWheelMarker {
+        schema: BUILT_WHEEL_CACHE_SCHEMA.to_string(),
+        artifact_target: target.artifact_cache_identity(),
+        source_identity: String::new(),
+        filename: filename.to_string(),
+        sha256: validate_sha256(&metadata.sha256, "built wheel hash")?,
+        name: metadata_name,
+        version: metadata_version.to_string(),
+    })
+}
+
+fn validate_expected_wheel(
+    actual_name: &str,
+    actual_version: &str,
+    expected: Option<&ExpectedWheel>,
+) -> Result<()> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let expected_name = crate::relax::canonical_conda_name(&expected.name);
+    if expected_name != actual_name {
+        return Err(anyhow::Error::new(ExpectedWheelMismatch(format!(
+            "source-built wheel identity mismatch: requested `{expected_name}` but artifact is `{actual_name}`"
+        ))));
+    }
+    if let Some(expected_version) = &expected.version {
+        let expected_version =
+            uv_pep508::uv_pep440::Version::from_str(expected_version).map_err(|error| {
+                anyhow::Error::new(ExpectedWheelMismatch(format!(
+                    "invalid expected wheel version `{expected_version}`: {error}"
+                )))
+            })?;
+        let actual_version = uv_pep508::uv_pep440::Version::from_str(actual_version)
+            .with_context(|| format!("invalid cached wheel version `{actual_version}`"))?;
+        if expected_version != actual_version {
+            return Err(anyhow::Error::new(ExpectedWheelMismatch(format!(
+                "source-built wheel version mismatch for `{expected_name}`: requested `{expected_version}` but artifact is `{actual_version}`"
+            ))));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_existing_wheel_for_target(
+    path: &Path,
+    target: &ResolutionTarget,
+    expected: Option<&ExpectedWheel>,
+) -> Result<String> {
+    validate_wheel_file(path, target, expected).map(|marker| marker.sha256)
+}
+
+pub(crate) async fn validate_wheel_for_target_async(
+    path: &Path,
+    target: &ResolutionTarget,
+    expected: Option<&ExpectedWheel>,
+) -> Result<String> {
+    let path = path.to_path_buf();
+    let target = target.clone();
+    let expected = expected.cloned();
+    tokio::task::spawn_blocking(move || {
+        validate_wheel_file(&path, &target, expected.as_ref()).map(|marker| marker.sha256)
+    })
+    .await
+    .context("strict wheel validation task panicked")?
+}
+
+#[cfg(unix)]
+fn wheel_file_fingerprint(path: &Path) -> Result<WheelFileFingerprint> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("stating wheel for strict attestation {}", path.display()))?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        bail!(
+            "wheel artifact must be a regular file for strict attestation: {}",
+            path.display(),
+        );
+    }
+    Ok(WheelFileFingerprint {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        size: metadata.size(),
+        modified_seconds: metadata.mtime(),
+        modified_nanoseconds: metadata.mtime_nsec(),
+        changed_seconds: metadata.ctime(),
+        changed_nanoseconds: metadata.ctime_nsec(),
+    })
+}
+
+fn raw_file_sha256(path: &Path) -> Result<String> {
+    let mut file = File::open(path).with_context(|| {
+        format!(
+            "opening wheel for authoritative hash check {}",
+            path.display()
+        )
+    })?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 1024 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("hashing wheel {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Strictly admit a pinned ingress wheel once, then reuse the attestation only
+/// while the exact Unix inode/stat tuple remains unchanged. This avoids
+/// repeatedly inflating multi-gigabyte direct wheels while retaining the
+/// authoritative SHA/name/version/target checks. Any replacement or in-place
+/// mutation changes inode/ctime and forces a fresh strict scan.
+pub(crate) async fn validate_pinned_wheel_for_target_async(
+    path: &Path,
+    target: &ResolutionTarget,
+    expected: &ExpectedWheel,
+    authoritative_sha256: &str,
+    source: &str,
+) -> Result<String> {
+    let authoritative_sha256 = validate_sha256(authoritative_sha256, "pinned wheel hash")?;
+    #[cfg(not(unix))]
+    {
+        let path_for_hash = path.to_path_buf();
+        let actual_hash = tokio::task::spawn_blocking(move || raw_file_sha256(&path_for_hash))
+            .await
+            .context("pinned wheel hash task panicked")??;
+        if actual_hash != authoritative_sha256 {
+            return Err(anyhow::Error::new(AuthoritativeWheelHashMismatch {
+                expected: authoritative_sha256,
+                actual: actual_hash,
+            }));
+        }
+        let actual = validate_wheel_for_target_async(path, target, Some(expected)).await?;
+        return Ok(actual);
+    }
+    #[cfg(unix)]
+    {
+        let filename = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow!("pinned wheel path has no UTF-8 filename"))?
+            .to_string();
+        let expected_name = crate::relax::canonical_conda_name(&expected.name);
+        let expected_version = expected.version.as_deref().unwrap_or("");
+        let artifact_target = target.artifact_cache_identity();
+        let source_identity =
+            hash_fields(b"retread-pinned-wheel-source-v1\0", &[source.as_bytes()]);
+        let attestation_identity = hash_fields(
+            b"retread-strict-wheel-attestation-v1\0",
+            &[
+                authoritative_sha256.as_bytes(),
+                filename.as_bytes(),
+                artifact_target.as_bytes(),
+                source_identity.as_bytes(),
+                expected_name.as_bytes(),
+                expected_version.as_bytes(),
+            ],
+        );
+        let attestation_dir = crate::courier::retread_cache_root()
+            .join("strict-wheel-attestations")
+            .join("v1")
+            .join(attestation_identity);
+        let _lock = acquire_artifact_cache_lock(&attestation_dir).await?;
+        if attestation_dir.try_exists()? {
+            let file_type = std::fs::symlink_metadata(&attestation_dir)
+                .with_context(|| {
+                    format!(
+                        "stating strict wheel attestation {}",
+                        attestation_dir.display()
+                    )
+                })?
+                .file_type();
+            if !file_type.is_dir() || file_type.is_symlink() {
+                bail!(
+                    "strict wheel attestation path is not a real directory: {}",
+                    attestation_dir.display(),
+                );
+            }
+        }
+        let path_for_fingerprint = path.to_path_buf();
+        let fingerprint =
+            tokio::task::spawn_blocking(move || wheel_file_fingerprint(&path_for_fingerprint))
+                .await
+                .context("wheel attestation fingerprint task panicked")??;
+        let marker_path = attestation_dir.join("attestation.json");
+        if marker_path.try_exists()? {
+            let file_type = std::fs::symlink_metadata(&marker_path)
+                .with_context(|| format!("stating strict wheel marker {}", marker_path.display()))?
+                .file_type();
+            if !file_type.is_file() || file_type.is_symlink() {
+                bail!(
+                    "strict wheel marker is not a regular file: {}",
+                    marker_path.display(),
+                );
+            }
+        }
+        if let Ok(marker_bytes) = std::fs::read(&marker_path)
+            && let Ok(marker) = serde_json::from_slice::<StrictWheelAttestation>(&marker_bytes)
+            && marker.schema == "retread-strict-wheel-attestation-v1"
+            && marker.artifact_target == artifact_target
+            && marker.source_identity == source_identity
+            && marker.filename == filename
+            && marker.sha256 == authoritative_sha256
+            && marker.name == expected_name
+            && expected
+                .version
+                .as_ref()
+                .is_none_or(|version| marker.version == *version)
+            && marker.fingerprint == fingerprint
+        {
+            return Ok(authoritative_sha256);
+        }
+
+        // Hash raw bytes before opening the ZIP. A truncated/malformed file
+        // with the wrong authoritative digest is healable ingress corruption;
+        // only a correct-hash artifact proceeds to terminal archive/semantic
+        // validation below.
+        let path_for_hash = path.to_path_buf();
+        let actual_hash = tokio::task::spawn_blocking(move || raw_file_sha256(&path_for_hash))
+            .await
+            .context("pinned wheel hash task panicked")??;
+        let path_for_post_hash_fingerprint = path.to_path_buf();
+        let post_hash_fingerprint = tokio::task::spawn_blocking(move || {
+            wheel_file_fingerprint(&path_for_post_hash_fingerprint)
+        })
+        .await
+        .context("post-hash wheel fingerprint task panicked")??;
+        if post_hash_fingerprint != fingerprint {
+            bail!(
+                "pinned wheel changed while its authoritative hash was checked: {}",
+                path.display(),
+            );
+        }
+        if actual_hash != authoritative_sha256 {
+            return Err(anyhow::Error::new(AuthoritativeWheelHashMismatch {
+                expected: authoritative_sha256,
+                actual: actual_hash,
+            }));
+        }
+
+        let path_for_validation = path.to_path_buf();
+        let target_for_validation = target.clone();
+        let expected_for_validation = expected.clone();
+        let marker = tokio::task::spawn_blocking(move || {
+            validate_wheel_file(
+                &path_for_validation,
+                &target_for_validation,
+                Some(&expected_for_validation),
+            )
+        })
+        .await
+        .context("strict pinned-wheel validation task panicked")??;
+        debug_assert_eq!(marker.sha256, authoritative_sha256);
+        let path_for_fingerprint = path.to_path_buf();
+        let final_fingerprint =
+            tokio::task::spawn_blocking(move || wheel_file_fingerprint(&path_for_fingerprint))
+                .await
+                .context("post-validation wheel fingerprint task panicked")??;
+        if final_fingerprint != fingerprint {
+            bail!(
+                "pinned wheel changed while it was strictly validated: {}",
+                path.display(),
+            );
+        }
+        std::fs::create_dir_all(&attestation_dir).with_context(|| {
+            format!(
+                "creating strict wheel attestation {}",
+                attestation_dir.display()
+            )
+        })?;
+        let attestation = StrictWheelAttestation {
+            schema: "retread-strict-wheel-attestation-v1".to_string(),
+            artifact_target,
+            source_identity,
+            filename,
+            sha256: marker.sha256.clone(),
+            name: marker.name,
+            version: marker.version,
+            fingerprint: final_fingerprint,
+        };
+        let temporary = attestation_dir.join(format!(
+            ".attestation.{}.{}.tmp",
+            std::process::id(),
+            BUILD_TMP_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+        ));
+        let temporary_guard = TemporaryFile::armed(temporary.clone());
+        std::fs::write(
+            &temporary,
+            serde_json::to_vec_pretty(&attestation)
+                .context("serializing strict wheel attestation")?,
+        )
+        .with_context(|| format!("writing strict wheel attestation {}", temporary.display()))?;
+        std::fs::rename(&temporary, &marker_path).with_context(|| {
+            format!(
+                "publishing strict wheel attestation {}",
+                marker_path.display()
+            )
+        })?;
+        temporary_guard.disarm();
+        Ok(marker.sha256)
+    }
+}
+
+fn validate_cache_entry(
+    cache_dir: &Path,
+    source_identity: &str,
+    target: &ResolutionTarget,
+    expected: Option<&ExpectedWheel>,
+) -> Result<Option<ValidatedWheel>> {
+    if !cache_dir.try_exists()? {
+        return Ok(None);
+    }
+    let cache_type = std::fs::symlink_metadata(cache_dir)
+        .with_context(|| format!("stating built-wheel cache {}", cache_dir.display()))?
+        .file_type();
+    if !cache_type.is_dir() || cache_type.is_symlink() {
+        bail!("built-wheel cache entry is not an owned regular directory");
+    }
+    let marker_path = cache_dir.join("artifact.json");
+    let marker_type = std::fs::symlink_metadata(&marker_path)
+        .with_context(|| format!("stating built-wheel marker {}", marker_path.display()))?
+        .file_type();
+    if !marker_type.is_file() || marker_type.is_symlink() {
+        bail!("built-wheel cache marker is not a regular file");
+    }
+    let marker: BuiltWheelMarker = serde_json::from_slice(
+        &std::fs::read(&marker_path)
+            .with_context(|| format!("reading built-wheel marker {}", marker_path.display()))?,
+    )
+    .with_context(|| format!("parsing built-wheel marker {}", marker_path.display()))?;
+    if marker.schema != BUILT_WHEEL_CACHE_SCHEMA
+        || marker.source_identity != source_identity
+        || marker.artifact_target != target.artifact_cache_identity()
+        || Path::new(&marker.filename)
+            .file_name()
+            .and_then(|v| v.to_str())
+            != Some(marker.filename.as_str())
+    {
+        bail!("built-wheel cache marker does not match its v3 namespace");
+    }
+    let path = cache_dir.join(&marker.filename);
+    // Integrity and the caller's semantic expectation are distinct. A cache
+    // entry can be perfectly valid for its source identity yet be the wrong
+    // package/version for a replay request. Never delete such an entry: doing
+    // so would turn a deterministic contract failure into a rebuild race.
+    let actual = validate_wheel_file_with(&path, target, None, false)?;
+    if actual.sha256 != marker.sha256
+        || actual.name != marker.name
+        || actual.version != marker.version
+    {
+        bail!("built-wheel cache marker does not match artifact bytes");
+    }
+    validate_expected_wheel(&marker.name, &marker.version, expected)?;
+    Ok(Some(ValidatedWheel { path, marker }))
+}
+
+fn unique_output_temporary(out_dir: &Path) -> Result<(PathBuf, File)> {
+    for _ in 0..100 {
+        let sequence = BUILD_TMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        // Keep this basename bounded: the canonical wheel destination may
+        // already be close to NAME_MAX.
+        let path = out_dir.join(format!(
+            ".retread-wheel-{}-{sequence}.tmp",
+            std::process::id(),
+        ));
+        match std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+        {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("creating wheel output temp {}", path.display()));
+            }
+        }
+    }
+    bail!("could not allocate a unique wheel output temporary file")
+}
+
+async fn materialize_validated_wheel(wheel: &ValidatedWheel, out_dir: &Path) -> Result<PathBuf> {
+    // Open the validated cache inode before the first await, while the caller
+    // still owns the artifact-cache lock. If this future is later cancelled,
+    // an already-spawned blocking publisher owns the fd and therefore cannot
+    // observe a concurrently deleted/replaced cache pathname.
+    let source_file = File::open(&wheel.path)
+        .with_context(|| format!("opening validated wheel {}", wheel.path.display()))?;
+    tokio::fs::create_dir_all(out_dir)
+        .await
+        .with_context(|| format!("creating wheel output dir {}", out_dir.display()))?;
+    let destination = out_dir.join(&wheel.marker.filename);
+    // Different source identities can legitimately produce the same wheel
+    // basename and therefore hold different artifact-cache locks. Serialize
+    // publication by the full caller destination in a managed lock namespace.
+    let absolute_destination = std::fs::canonicalize(out_dir)
+        .with_context(|| format!("canonicalizing wheel output dir {}", out_dir.display()))?
+        .join(&wheel.marker.filename);
+    let output_identity = hash_fields(
+        b"retread-built-wheel-output-v1\0",
+        &[absolute_destination.to_string_lossy().as_bytes()],
+    );
+    let output_lock_namespace = crate::courier::retread_cache_root()
+        .join("built-wheel-output-locks")
+        .join("v1")
+        .join(output_identity);
+    let output_lock = acquire_artifact_cache_lock(&output_lock_namespace).await?;
+    if destination.is_file() && !same_filesystem_inode(&destination, &wheel.path) {
+        let actual = tokio::task::spawn_blocking({
+            let destination = destination.clone();
+            move || crate::wheel::read_metadata(&destination)
+        })
+        .await
+        .context("existing output wheel validation task panicked")?;
+        if let Ok(metadata) = actual
+            && metadata.sha256.eq_ignore_ascii_case(&wheel.marker.sha256)
+        {
+            return Ok(destination);
+        }
+    }
+    // Always copy to a fresh inode. A hardlink would let caller-side rewrite
+    // or corruption mutate the persistent content-addressed cache, and its old
+    // mtime could make a derived wheel from another source identity look fresh.
+    let source = wheel.path.clone();
+    let out_dir = out_dir.to_path_buf();
+    let destination_for_publish = destination.clone();
+    tokio::task::spawn_blocking(move || {
+        // The detached blocking job owns both cleanup and the publication
+        // lock, so cancelling the async caller cannot strand a temp file or
+        // let a competing publisher race a still-running copy.
+        let (temporary, mut temporary_file) = unique_output_temporary(&out_dir)?;
+        let temporary_guard = TemporaryFile::armed(temporary.clone());
+        let mut source_file = source_file;
+        std::io::copy(&mut source_file, &mut temporary_file).with_context(|| {
+            format!(
+                "materializing validated wheel {} -> {}",
+                source.display(),
+                temporary.display(),
+            )
+        })?;
+        drop(temporary_file);
+        std::fs::rename(&temporary, &destination_for_publish).with_context(|| {
+            format!(
+                "atomically publishing wheel into caller output {} (the output directory was not removed or scanned)",
+                destination_for_publish.display(),
+            )
+        })?;
+        temporary_guard.disarm();
+        drop(output_lock);
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .context("wheel output publication task panicked")??;
+    Ok(destination)
+}
+
+fn unique_staging_dir(cache_dir: &Path) -> Result<StagingDir> {
+    let parent = cache_dir
+        .parent()
+        .ok_or_else(|| anyhow!("cache directory has no parent: {}", cache_dir.display()))?;
+    let cache_name = cache_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("cache directory has no UTF-8 filename"))?;
+    for _ in 0..100 {
+        let sequence = BUILD_TMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = parent.join(format!(
+            ".{cache_name}.{}.{}.tmp",
+            std::process::id(),
+            sequence,
+        ));
+        match std::fs::create_dir(&path) {
+            Ok(()) => return Ok(StagingDir(path)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("creating build staging dir {}", path.display()));
+            }
+        }
+    }
+    bail!("could not allocate a unique built-wheel staging directory")
+}
+
+async fn cached_build<F, Fut>(
+    kind: &str,
+    source_identity: &str,
+    target: &ResolutionTarget,
+    out_dir: &Path,
+    expected: Option<&ExpectedWheel>,
+    build: F,
+) -> Result<PathBuf>
+where
+    F: FnOnce(PathBuf) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let cache_dir = built_wheel_cache_dir(kind, source_identity, target);
+    let materialized_out = materialized_wheel_output_dir(out_dir, source_identity, target);
+    let _lock = acquire_artifact_cache_lock(&cache_dir).await?;
+    let cached = tokio::task::spawn_blocking({
+        let cache_dir = cache_dir.clone();
+        let source_identity = source_identity.to_string();
+        let target = target.clone();
+        let expected = expected.cloned();
+        move || validate_cache_entry(&cache_dir, &source_identity, &target, expected.as_ref())
+    })
+    .await
+    .context("built-wheel cache validation task panicked")?;
+    match cached {
+        Ok(Some(wheel)) => return materialize_validated_wheel(&wheel, &materialized_out).await,
+        Ok(None) => {}
+        Err(error) if is_expected_wheel_mismatch(&error) => return Err(error),
+        Err(error) => {
+            tracing::warn!(
+                cache = %cache_dir.display(),
+                error = %format!("{error:#}"),
+                "invalid owned built-wheel cache entry; rebuilding",
+            );
+            remove_owned_cache_entry(&cache_dir)?;
+        }
+    }
+    if !native_build_allowed(target) {
+        return Err(source_build_refusal_error(target));
+    }
+
+    let staging = unique_staging_dir(&cache_dir)?;
+    let build_dir = staging.0.join("build");
+    std::fs::create_dir(&build_dir)
+        .with_context(|| format!("creating empty build output {}", build_dir.display()))?;
+    build(build_dir.clone()).await?;
+    let built = find_built_wheel(&build_dir).await?;
+    let mut marker = tokio::task::spawn_blocking({
+        let built = built.clone();
+        let target = target.clone();
+        let expected = expected.cloned();
+        move || validate_wheel_file(&built, &target, expected.as_ref())
+    })
+    .await
+    .context("newly built wheel validation task panicked")??;
+    marker.source_identity = source_identity.to_string();
+    let cached_wheel = staging.0.join(&marker.filename);
+    tokio::fs::rename(&built, &cached_wheel)
+        .await
+        .with_context(|| format!("staging built wheel {}", cached_wheel.display()))?;
+    tokio::fs::remove_dir_all(&build_dir)
+        .await
+        .with_context(|| format!("cleaning private build dir {}", build_dir.display()))?;
+    std::fs::write(
+        staging.0.join("artifact.json"),
+        serde_json::to_vec_pretty(&marker).context("serializing built-wheel marker")?,
+    )
+    .context("writing built-wheel marker")?;
+    remove_owned_cache_entry(&cache_dir)?;
+    std::fs::rename(&staging.0, &cache_dir).with_context(|| {
+        format!(
+            "atomically publishing built-wheel cache {}",
+            cache_dir.display()
+        )
+    })?;
+    let published = ValidatedWheel {
+        path: cache_dir.join(&marker.filename),
+        marker,
+    };
+    materialize_validated_wheel(&published, &materialized_out).await
+}
+
+async fn lookup_cached_build(
+    kind: &str,
+    source_identity: &str,
+    target: &ResolutionTarget,
+    out_dir: &Path,
+    expected: Option<&ExpectedWheel>,
+) -> Result<Option<PathBuf>> {
+    let cache_dir = built_wheel_cache_dir(kind, source_identity, target);
+    let materialized_out = materialized_wheel_output_dir(out_dir, source_identity, target);
+    let _lock = acquire_artifact_cache_lock(&cache_dir).await?;
+    let cached = tokio::task::spawn_blocking({
+        let cache_dir = cache_dir.clone();
+        let source_identity = source_identity.to_string();
+        let target = target.clone();
+        let expected = expected.cloned();
+        move || validate_cache_entry(&cache_dir, &source_identity, &target, expected.as_ref())
+    })
+    .await
+    .context("built-wheel cache validation task panicked")?;
+    match cached {
+        Ok(Some(wheel)) => Ok(Some(
+            materialize_validated_wheel(&wheel, &materialized_out).await?,
+        )),
+        Ok(None) => Ok(None),
+        Err(error) if is_expected_wheel_mismatch(&error) => Err(error),
+        Err(error) => {
+            tracing::warn!(
+                cache = %cache_dir.display(),
+                error = %format!("{error:#}"),
+                "invalid owned built-wheel cache entry; treating as an exact miss",
+            );
+            remove_owned_cache_entry(&cache_dir)?;
+            Ok(None)
+        }
+    }
+}
+
+/// Validate an exact built-wheel cache leaf without publishing it into a
+/// caller output directory. This is only an authorization probe: callers must
+/// perform a second exact lookup after resolving all mutable source state.
+async fn probe_cached_build(
+    kind: &str,
+    source_identity: &str,
+    target: &ResolutionTarget,
+    expected: Option<&ExpectedWheel>,
+) -> Result<bool> {
+    let cache_dir = built_wheel_cache_dir(kind, source_identity, target);
+    let _lock = acquire_artifact_cache_lock(&cache_dir).await?;
+    let cached = tokio::task::spawn_blocking({
+        let cache_dir = cache_dir.clone();
+        let source_identity = source_identity.to_string();
+        let target = target.clone();
+        let expected = expected.cloned();
+        move || validate_cache_entry(&cache_dir, &source_identity, &target, expected.as_ref())
+    })
+    .await
+    .context("built-wheel cache probe task panicked")?;
+    match cached {
+        Ok(Some(_)) => Ok(true),
+        Ok(None) => Ok(false),
+        Err(error) if is_expected_wheel_mismatch(&error) => Ok(false),
+        Err(error) => {
+            tracing::warn!(
+                cache = %cache_dir.display(),
+                error = %format!("{error:#}"),
+                "invalid owned built-wheel cache entry; treating as an exact miss",
+            );
+            remove_owned_cache_entry(&cache_dir)?;
+            Ok(false)
+        }
+    }
+}
+
+/// Probe every historical ref-state leaf under an exact
+/// URL/SHA/subdirectory family without materializing any artifact. A later
+/// exact checkout determines which single state is current; old tag-state
+/// leaves may coexist indefinitely without making replay ambiguous.
+async fn probe_cached_git_family_states(
+    family_identity: &str,
+    target: &ResolutionTarget,
+    expected: Option<&ExpectedWheel>,
+) -> Result<Vec<String>> {
+    let family_dir = built_wheel_cache_dir("git", family_identity, target);
+    let metadata = match std::fs::symlink_metadata(&family_dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        bail!(
+            "git built-wheel cache family is not a real directory: {}",
+            family_dir.display(),
+        );
+    }
+    let mut ref_states = std::fs::read_dir(&family_dir)
+        .with_context(|| format!("reading git cache family {}", family_dir.display()))?
+        .collect::<std::io::Result<Vec<_>>>()?;
+    ref_states.sort_by_key(std::fs::DirEntry::file_name);
+    let mut hits = Vec::new();
+    for entry in ref_states {
+        let Some(ref_state) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if ref_state.len() != 64
+            || !ref_state.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || ref_state != ref_state.to_ascii_lowercase()
+            || !entry
+                .file_type()
+                .with_context(|| format!("stating git cache leaf {}", entry.path().display()))?
+                .is_dir()
+        {
+            continue;
+        }
+        let source_identity = git_wheel_source_identity(family_identity, &ref_state);
+        if probe_cached_build("git", &source_identity, target, expected).await? {
+            hits.push(ref_state);
+        }
+    }
+    Ok(hits)
+}
+
+struct PreparedSourceSnapshot {
+    workspace: Arc<PreparedSourceWorkspace>,
+    identity: String,
+}
+
+struct PreparedSourceWorkspace {
+    directory: StagingDir,
+    // When present, serializes use of the deterministic source-workspace path
+    // for the complete uv build/injection lease.
+    _workspace_lock: Option<ArtifactCacheLock>,
+}
+
+struct TemporaryWritableDirectory {
+    path: PathBuf,
+    original: std::fs::Permissions,
+    restored: bool,
+}
+
+impl TemporaryWritableDirectory {
+    fn new(path: &Path) -> Result<Self> {
+        let original = std::fs::symlink_metadata(path)
+            .with_context(|| format!("stating snapshot root {}", path.display()))?
+            .permissions();
+        let mut writable = original.clone();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            writable.set_mode(writable.mode() | 0o700);
+        }
+        #[cfg(not(unix))]
+        writable.set_readonly(false);
+        std::fs::set_permissions(path, writable).with_context(|| {
+            format!(
+                "temporarily making snapshot root writable {}",
+                path.display()
+            )
+        })?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            original,
+            restored: false,
+        })
+    }
+
+    fn restore(mut self) -> Result<()> {
+        std::fs::set_permissions(&self.path, self.original.clone()).with_context(|| {
+            format!(
+                "restoring snapshot root permissions {}",
+                self.path.display()
+            )
+        })?;
+        self.restored = true;
+        Ok(())
+    }
+}
+
+impl Drop for TemporaryWritableDirectory {
+    fn drop(&mut self) {
+        if !self.restored
+            && let Err(error) = std::fs::set_permissions(&self.path, self.original.clone())
+        {
+            tracing::warn!(
+                path = %self.path.display(),
+                error = %error,
+                "failed to restore snapshot root permissions after metadata attachment",
+            );
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ExternalPathGitState {
+    resolved_sha: String,
+    ref_state: String,
+}
+
+/// A path-built wheel plus the immutable source snapshot it was built from.
+/// The handler retains this value through source-file injection so both phases
+/// observe exactly the bytes bound to the cache identity.
+pub(crate) struct PathWheelBuild {
+    wheel_path: PathBuf,
+    _source_snapshot: PreparedSourceSnapshot,
+    project_root: PathBuf,
+}
+
+impl PathWheelBuild {
+    pub(crate) fn wheel_path(&self) -> &Path {
+        &self.wheel_path
+    }
+
+    pub(crate) fn source_root(&self) -> &Path {
+        &self.project_root
+    }
+}
+
+impl PreparedSourceSnapshot {
+    fn root(&self) -> &Path {
+        &self.workspace.directory.0
+    }
+}
+
+async fn stabilize_source_snapshot_workspace(
+    mut snapshot: PreparedSourceSnapshot,
+    kind: &str,
+    source_identity: &str,
+) -> Result<PreparedSourceSnapshot> {
+    let workspace = crate::courier::retread_cache_root()
+        .join("source-workspaces")
+        .join("v1")
+        .join(kind)
+        .join(source_identity);
+    let lock = acquire_artifact_cache_lock(&workspace).await?;
+    remove_owned_cache_entry(&workspace)?;
+    let source_workspace = Arc::get_mut(&mut snapshot.workspace)
+        .expect("a source snapshot cannot be shared before workspace publication");
+    std::fs::rename(&source_workspace.directory.0, &workspace).with_context(|| {
+        format!(
+            "publishing deterministic source workspace {}",
+            workspace.display(),
+        )
+    })?;
+    source_workspace.directory.0 = workspace;
+    source_workspace._workspace_lock = Some(lock);
+    Ok(snapshot)
+}
+
+fn normalize_snapshot_times(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        // Use 2000-01-01 UTC: ordinary ZIP cannot represent pre-1980 dates,
+        // and exactly 1980-01-01 UTC becomes 1979 in negative-offset zones.
+        let zip_safe_epoch = std::time::UNIX_EPOCH + Duration::from_secs(946_684_800);
+        let times = std::fs::FileTimes::new()
+            .set_accessed(zip_safe_epoch)
+            .set_modified(zip_safe_epoch);
+        File::open(path)
+            .with_context(|| {
+                format!(
+                    "opening snapshot path for timestamp normalization {}",
+                    path.display()
+                )
+            })?
+            .set_times(times)
+            .with_context(|| format!("normalizing snapshot timestamp {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+fn source_snapshot_mode(metadata: &std::fs::Metadata) -> u32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        metadata.mode() & 0o7777
+    }
+    #[cfg(not(unix))]
+    {
+        u32::from(metadata.permissions().readonly())
+    }
+}
+
+fn relative_source_path<'a>(root: &Path, path: &'a Path) -> Result<&'a str> {
+    path.strip_prefix(root)
+        .expect("source snapshot walk stays below its root")
+        .to_str()
+        .ok_or_else(|| anyhow!("source-build paths must be UTF-8: {}", path.display()))
+}
+
+fn hash_snapshot_record(hasher: &mut Sha256, kind: u8, relative: &str, mode: u32) {
+    hasher.update([kind]);
+    hasher.update((relative.len() as u64).to_be_bytes());
+    hasher.update(relative.as_bytes());
+    hasher.update(mode.to_be_bytes());
+}
+
+fn validate_snapshot_symlink(
+    root: &Path,
+    excluded_roots: &[PathBuf],
+    link: &Path,
+    target: &Path,
+) -> Result<()> {
+    if target.is_absolute() {
+        bail!(
+            "source-build symlink {} escapes the source tree via absolute target {}",
+            link.display(),
+            target.display(),
+        );
+    }
+    let parent = link
+        .parent()
+        .expect("source-build symlink below canonical source root");
+    let mut normalized = parent
+        .strip_prefix(root)
+        .expect("source-build symlink stays below root")
+        .components()
+        .map(|component| component.as_os_str().to_owned())
+        .collect::<Vec<_>>();
+    for component in target.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(value) => normalized.push(value.to_owned()),
+            std::path::Component::ParentDir => {
+                if normalized.pop().is_none() {
+                    bail!(
+                        "source-build symlink {} escapes the source tree via target {}",
+                        link.display(),
+                        target.display(),
+                    );
+                }
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                bail!(
+                    "source-build symlink {} has unsupported target {}",
+                    link.display(),
+                    target.display(),
+                );
+            }
+        }
+    }
+    let mut lexical_target = root.to_path_buf();
+    lexical_target.extend(&normalized);
+    if excluded_roots
+        .iter()
+        .any(|excluded| lexical_target.starts_with(excluded))
+    {
+        bail!(
+            "source-build symlink {} targets the managed output subtree {}",
+            link.display(),
+            target.display(),
+        );
+    }
+    // Existing link chains receive a second, filesystem-resolved containment
+    // check. Dangling in-tree links remain representable and deterministic.
+    if let Ok(resolved) = std::fs::canonicalize(link)
+        && !resolved.starts_with(root)
+    {
+        bail!(
+            "source-build symlink {} resolves outside the source tree to {}",
+            link.display(),
+            resolved.display(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn create_snapshot_symlink(target: &Path, destination: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, destination)
+}
+
+#[cfg(windows)]
+fn create_snapshot_symlink(target: &Path, destination: &Path) -> std::io::Result<()> {
+    if target.is_dir() {
+        std::os::windows::fs::symlink_dir(target, destination)
+    } else {
+        std::os::windows::fs::symlink_file(target, destination)
+    }
+}
+
+fn canonicalize_future_path(path: &Path) -> Result<PathBuf> {
+    let absolute = std::path::absolute(path)
+        .with_context(|| format!("making path absolute: {}", path.display()))?;
+    let mut ancestor = absolute.as_path();
+    let mut missing = Vec::new();
+    while !ancestor.exists() {
+        let name = ancestor.file_name().ok_or_else(|| {
+            anyhow!(
+                "could not find an existing ancestor for path {}",
+                absolute.display(),
+            )
+        })?;
+        missing.push(name.to_owned());
+        ancestor = ancestor
+            .parent()
+            .expect("a path with a file name has a parent");
+    }
+    let mut canonical = std::fs::canonicalize(ancestor)
+        .with_context(|| format!("canonicalizing path ancestor {}", ancestor.display()))?;
+    for component in missing.into_iter().rev() {
+        canonical.push(component);
+    }
+    Ok(canonical)
+}
+
+fn is_managed_snapshot_output(name: &std::ffi::OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    let name = name.strip_prefix('.').unwrap_or(name);
+    let strip_exact_suffix = |suffix: &str| {
+        name.strip_suffix(suffix).or_else(|| {
+            let temporary = name.strip_suffix(".tmp")?;
+            if let Some(stem) = temporary.strip_suffix(suffix) {
+                return Some(stem);
+            }
+            let (with_pid, sequence) = temporary.rsplit_once('.')?;
+            let (stem, pid) = with_pid.rsplit_once('.')?;
+            (pid.bytes().all(|byte| byte.is_ascii_digit())
+                && !pid.is_empty()
+                && sequence.bytes().all(|byte| byte.is_ascii_digit())
+                && !sequence.is_empty())
+            .then(|| stem.strip_suffix(suffix))
+            .flatten()
+        })
+    };
+    if let Some(stem) = strip_exact_suffix(".log") {
+        return stem
+            .strip_prefix("retread-progress-")
+            .is_some_and(|bundle| !bundle.is_empty());
+    }
+    let Some(stem) = strip_exact_suffix(".json") else {
+        return false;
+    };
+    stem == "retread-audit"
+        || stem
+            .strip_prefix("retread-audit-")
+            .is_some_and(|bundle| !bundle.is_empty())
+        || stem
+            .strip_prefix("retread-probe-trace-")
+            .is_some_and(|bundle| !bundle.is_empty())
+        || stem.strip_prefix("retread-").is_some_and(|bundle| {
+            bundle
+                .strip_suffix(".lock")
+                .or_else(|| bundle.strip_suffix(".retread-lock"))
+                .is_some_and(|bundle| !bundle.is_empty())
+        })
+}
+
+fn should_copy_snapshot_gitdir_pointer(
+    root: &Path,
+    excluded_roots: &[PathBuf],
+    pointer: &Path,
+    text: &str,
+) -> Result<bool> {
+    let Some(target) = text
+        .lines()
+        .next()
+        .map(str::trim)
+        .and_then(|line| line.strip_prefix("gitdir:"))
+        .map(str::trim)
+    else {
+        return Ok(true);
+    };
+    let target = Path::new(target);
+    if target.is_absolute() {
+        tracing::warn!(
+            pointer = %pointer.display(),
+            gitdir = %target.display(),
+            "omitting out-of-context .git indirection from immutable source snapshot",
+        );
+        return Ok(false);
+    }
+    let resolved = match std::fs::canonicalize(
+        pointer
+            .parent()
+            .expect("a .git pointer always has a parent")
+            .join(target),
+    ) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            tracing::warn!(
+                pointer = %pointer.display(),
+                gitdir = %target.display(),
+                error = %error,
+                "omitting unresolved .git indirection from immutable source snapshot",
+            );
+            return Ok(false);
+        }
+    };
+    if !resolved.starts_with(root)
+        || excluded_roots
+            .iter()
+            .any(|excluded| resolved.starts_with(excluded))
+        || !resolved.is_dir()
+    {
+        tracing::warn!(
+            pointer = %pointer.display(),
+            gitdir = %resolved.display(),
+            "omitting out-of-context .git indirection from immutable source snapshot",
+        );
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn snapshot_file_metadata_matches(
+    expected: &std::fs::Metadata,
+    actual: &std::fs::Metadata,
+) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        expected.dev() == actual.dev()
+            && expected.ino() == actual.ino()
+            && expected.mode() == actual.mode()
+            && expected.len() == actual.len()
+            && expected.mtime() == actual.mtime()
+            && expected.mtime_nsec() == actual.mtime_nsec()
+            && expected.ctime() == actual.ctime()
+            && expected.ctime_nsec() == actual.ctime_nsec()
+    }
+    #[cfg(not(unix))]
+    {
+        expected.file_type() == actual.file_type()
+            && expected.len() == actual.len()
+            && expected.modified().ok() == actual.modified().ok()
+    }
+}
+
+/// Open the exact regular-file inode observed by the directory walk. On Unix,
+/// `O_NOFOLLOW` rejects a last-component symlink substitution; the metadata
+/// comparison rejects a regular-file rename swap before any source byte is
+/// copied or hashed.
+fn open_snapshot_source_file(path: &Path, expected: &std::fs::Metadata) -> Result<File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(nix::libc::O_NOFOLLOW);
+    }
+    let file = options.open(path).with_context(|| {
+        format!(
+            "opening source file without following links {}",
+            path.display()
+        )
+    })?;
+    let opened = file
+        .metadata()
+        .with_context(|| format!("stating opened source file {}", path.display()))?;
+    if !opened.file_type().is_file() || !snapshot_file_metadata_matches(expected, &opened) {
+        bail!(
+            "source file {} changed inode, type, or metadata before its build snapshot was prepared",
+            path.display(),
+        );
+    }
+    Ok(file)
+}
+
+fn open_snapshot_source_directory(path: &Path, expected: &std::fs::Metadata) -> Result<File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_DIRECTORY);
+    }
+    let directory = options.open(path).with_context(|| {
+        format!(
+            "opening source directory without following links {}",
+            path.display(),
+        )
+    })?;
+    let opened = directory
+        .metadata()
+        .with_context(|| format!("stating opened source directory {}", path.display()))?;
+    if !opened.file_type().is_dir() || !snapshot_file_metadata_matches(expected, &opened) {
+        bail!(
+            "source directory {} changed inode, type, or metadata before traversal",
+            path.display(),
+        );
+    }
+    Ok(directory)
+}
+
+fn prepare_source_snapshot(
+    source: &Path,
+    out_dir: &Path,
+    additional_excluded_roots: &[PathBuf],
+) -> Result<PreparedSourceSnapshot> {
+    fn visit(
+        root: &Path,
+        excluded_roots: &[PathBuf],
+        snapshot: &Path,
+        path: &Path,
+        expected_directory: &std::fs::Metadata,
+        hasher: &mut Sha256,
+    ) -> Result<()> {
+        let directory = open_snapshot_source_directory(path, expected_directory)?;
+        let mut entries = std::fs::read_dir(path)
+            .with_context(|| format!("reading source tree {}", path.display()))?
+            .collect::<std::io::Result<Vec<_>>>()?;
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            if path == root && is_managed_snapshot_output(&entry.file_name()) {
+                continue;
+            }
+            let entry_path = entry.path();
+            if excluded_roots
+                .iter()
+                .any(|excluded| entry_path.starts_with(excluded))
+            {
+                continue;
+            }
+            let metadata = std::fs::symlink_metadata(&entry_path)?;
+            if metadata.file_type().is_dir() {
+                let relative = relative_source_path(root, &entry_path)?;
+                hash_snapshot_record(hasher, b'd', relative, source_snapshot_mode(&metadata));
+                let destination = snapshot.join(relative);
+                std::fs::create_dir(&destination).with_context(|| {
+                    format!(
+                        "creating source snapshot directory {}",
+                        destination.display()
+                    )
+                })?;
+                visit(
+                    root,
+                    excluded_roots,
+                    snapshot,
+                    &entry_path,
+                    &metadata,
+                    hasher,
+                )?;
+                std::fs::set_permissions(&destination, metadata.permissions()).with_context(
+                    || format!("preserving source directory mode {}", destination.display()),
+                )?;
+                normalize_snapshot_times(&destination)?;
+            } else if metadata.file_type().is_symlink() {
+                let target = std::fs::read_link(&entry_path)?;
+                validate_snapshot_symlink(root, excluded_roots, &entry_path, &target)?;
+                let relative = relative_source_path(root, &entry_path)?;
+                let target_text = target.to_str().ok_or_else(|| {
+                    anyhow!(
+                        "source-build symlink targets must be UTF-8: {} -> {}",
+                        entry_path.display(),
+                        target.display(),
+                    )
+                })?;
+                hash_snapshot_record(hasher, b'l', relative, source_snapshot_mode(&metadata));
+                hasher.update((target_text.len() as u64).to_be_bytes());
+                hasher.update(target_text.as_bytes());
+                let destination = snapshot.join(relative);
+                create_snapshot_symlink(&target, &destination).with_context(|| {
+                    format!(
+                        "copying source symlink {} -> {}",
+                        destination.display(),
+                        target.display(),
+                    )
+                })?;
+            } else if metadata.file_type().is_file() {
+                let relative = relative_source_path(root, &entry_path)?;
+                let mut input = open_snapshot_source_file(&entry_path, &metadata)?;
+                let omit_git_pointer = if entry.file_name() == ".git" {
+                    let mut text = String::new();
+                    input.read_to_string(&mut text).with_context(|| {
+                        format!("reading Git indirection file {}", entry_path.display())
+                    })?;
+                    input.rewind().with_context(|| {
+                        format!("rewinding Git indirection file {}", entry_path.display())
+                    })?;
+                    !should_copy_snapshot_gitdir_pointer(root, excluded_roots, &entry_path, &text)?
+                } else {
+                    false
+                };
+                if omit_git_pointer {
+                    // Bind the deliberate omission itself into the tree hash.
+                    // Static-version projects continue to build; SCM-dependent
+                    // projects fail closed instead of following mutable host
+                    // metadata outside the captured context.
+                    hash_snapshot_record(hasher, b'o', relative, 0);
+                    hasher.update(b"retread-external-gitdir-omitted-v1\0");
+                    continue;
+                }
+                hash_snapshot_record(hasher, b'f', relative, source_snapshot_mode(&metadata));
+                hasher.update(metadata.len().to_be_bytes());
+                let destination = snapshot.join(relative);
+                let mut output = File::create(&destination).with_context(|| {
+                    format!("creating source snapshot file {}", destination.display())
+                })?;
+                let mut copied = 0_u64;
+                let mut buffer = [0_u8; 64 * 1024];
+                loop {
+                    let read = input
+                        .read(&mut buffer)
+                        .with_context(|| format!("reading source file {}", entry_path.display()))?;
+                    if read == 0 {
+                        break;
+                    }
+                    hasher.update(&buffer[..read]);
+                    output.write_all(&buffer[..read]).with_context(|| {
+                        format!("writing source snapshot {}", destination.display())
+                    })?;
+                    copied += read as u64;
+                }
+                if copied != metadata.len() {
+                    bail!(
+                        "source file {} changed size while its build snapshot was prepared",
+                        entry_path.display(),
+                    );
+                }
+                let final_metadata = input.metadata().with_context(|| {
+                    format!("restating copied source file {}", entry_path.display())
+                })?;
+                if !snapshot_file_metadata_matches(&metadata, &final_metadata) {
+                    bail!(
+                        "source file {} changed while its build snapshot was prepared",
+                        entry_path.display(),
+                    );
+                }
+                output.flush()?;
+                std::fs::set_permissions(&destination, metadata.permissions()).with_context(
+                    || format!("preserving source file mode {}", destination.display()),
+                )?;
+                normalize_snapshot_times(&destination)?;
+            } else {
+                bail!(
+                    "source-build tree contains unsupported special file {}",
+                    entry_path.display(),
+                );
+            }
+        }
+        let final_opened = directory
+            .metadata()
+            .with_context(|| format!("restating traversed source directory {}", path.display()))?;
+        let final_path = std::fs::symlink_metadata(path)
+            .with_context(|| format!("restating source directory path {}", path.display()))?;
+        if !snapshot_file_metadata_matches(expected_directory, &final_opened)
+            || !snapshot_file_metadata_matches(expected_directory, &final_path)
+        {
+            bail!(
+                "source directory {} changed while its build snapshot was prepared",
+                path.display(),
+            );
+        }
+        Ok(())
+    }
+
+    let source = std::fs::canonicalize(source)
+        .with_context(|| format!("canonicalizing source tree {}", source.display()))?;
+    if !source.is_dir() {
+        bail!("source-build path is not a directory: {}", source.display());
+    }
+    let snapshot_parent = crate::courier::retread_cache_root()
+        .join("source-snapshots")
+        .join(LOCAL_SOURCE_SNAPSHOT_VERSION);
+    std::fs::create_dir_all(&snapshot_parent).with_context(|| {
+        format!(
+            "creating local-source snapshot parent {}",
+            snapshot_parent.display(),
+        )
+    })?;
+    let output = canonicalize_future_path(out_dir)?;
+    let cache_root = canonicalize_future_path(&crate::courier::retread_cache_root())?;
+    let mut candidates = vec![output, cache_root];
+    for excluded in additional_excluded_roots {
+        candidates.push(canonicalize_future_path(excluded)?);
+    }
+    let mut excluded_roots = candidates
+        .into_iter()
+        .filter(|path| path.starts_with(&source))
+        .collect::<Vec<_>>();
+    excluded_roots.sort();
+    excluded_roots.dedup();
+    let directory = unique_staging_dir(&snapshot_parent.join("source"))?;
+    let root_metadata = std::fs::symlink_metadata(&source)?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"retread-local-source-snapshot-v5\0");
+    hash_snapshot_record(&mut hasher, b'r', "", source_snapshot_mode(&root_metadata));
+    visit(
+        &source,
+        &excluded_roots,
+        directory.0.as_path(),
+        &source,
+        &root_metadata,
+        &mut hasher,
+    )?;
+    std::fs::set_permissions(&directory.0, root_metadata.permissions()).with_context(|| {
+        format!(
+            "preserving source root mode on snapshot {}",
+            directory.0.display(),
+        )
+    })?;
+    normalize_snapshot_times(&directory.0)?;
+    Ok(PreparedSourceSnapshot {
+        workspace: Arc::new(PreparedSourceWorkspace {
+            directory,
+            _workspace_lock: None,
+        }),
+        identity: format!("{:x}", hasher.finalize()),
+    })
+}
+
+fn has_external_gitdir_pointer(source_root: &Path) -> Result<bool> {
+    let pointer = source_root.join(".git");
+    let metadata = match std::fs::symlink_metadata(&pointer) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Ok(false);
+    }
+    let text = std::fs::read_to_string(&pointer)
+        .with_context(|| format!("reading Git indirection file {}", pointer.display()))?;
+    let Some(target) = text
+        .lines()
+        .next()
+        .map(str::trim)
+        .and_then(|line| line.strip_prefix("gitdir:"))
+        .map(str::trim)
+    else {
+        return Ok(false);
+    };
+    let target = Path::new(target);
+    let resolved = if target.is_absolute() {
+        std::fs::canonicalize(target)
+    } else {
+        std::fs::canonicalize(source_root.join(target))
+    }
+    .with_context(|| {
+        format!(
+            "resolving external Git metadata for path source {}",
+            source_root.display()
+        )
+    })?;
+    Ok(!resolved.starts_with(source_root))
+}
+
+async fn path_git_top_level(source_root: &Path) -> Result<Option<PathBuf>> {
+    let has_git_marker = source_root
+        .ancestors()
+        .any(|ancestor| std::fs::symlink_metadata(ancestor.join(".git")).is_ok());
+    if !has_git_marker {
+        return Ok(None);
+    }
+    let top_level = run_output(
+        Command::new("git")
+            .args(["rev-parse", "--show-toplevel"])
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .current_dir(source_root),
+        "git locate path-source root",
+    )
+    .await?;
+    Ok(Some(std::fs::canonicalize(top_level.trim()).with_context(
+        || {
+            format!(
+                "canonicalizing Git top-level `{}` for path source {}",
+                top_level.trim(),
+                source_root.display(),
+            )
+        },
+    )?))
+}
+
+async fn run_readonly_git_status(cmd: &mut Command, label: &str) -> Result<std::process::Output> {
+    cmd.env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .with_context(|| format!("spawning {label}"))
+}
+
+async fn external_path_git_state(source_root: &Path) -> Result<Option<ExternalPathGitState>> {
+    let external_pointer = has_external_gitdir_pointer(source_root)?;
+    let Some(top_level) = path_git_top_level(source_root).await? else {
+        return Ok(None);
+    };
+    if top_level != source_root {
+        bail!(
+            "path source {} has Git top-level {} outside its immutable snapshot context; retread cannot preserve sibling/ancestor SCM metadata",
+            source_root.display(),
+            top_level.display(),
+        );
+    }
+    if !external_pointer {
+        return Ok(None);
+    }
+    let symbolic = run_readonly_git_status(
+        Command::new("git")
+            .args(["symbolic-ref", "-q", "HEAD"])
+            .current_dir(source_root),
+        "git inspect external path-source HEAD",
+    )
+    .await?;
+    match symbolic.status.code() {
+        Some(0) => bail!(
+            "external path-source Git HEAD is attached to `{}`; use an exact detached worktree so branch movement is not hidden from the snapshot identity",
+            String::from_utf8_lossy(&symbolic.stdout).trim(),
+        ),
+        Some(1) => {}
+        _ => bail!(
+            "git inspect external path-source HEAD failed (status {}): {}",
+            symbolic.status,
+            String::from_utf8_lossy(&symbolic.stderr).trim(),
+        ),
+    }
+    let staged = run_readonly_git_status(
+        Command::new("git")
+            .args(["diff", "--cached", "--quiet", "--exit-code", "HEAD", "--"])
+            .current_dir(source_root),
+        "git inspect external path-source index",
+    )
+    .await?;
+    match staged.status.code() {
+        Some(0) => {}
+        Some(1) => bail!(
+            "external path-source Git index contains staged changes that cannot be represented by a detached metadata snapshot"
+        ),
+        _ => bail!(
+            "git inspect external path-source index failed (status {}): {}",
+            staged.status,
+            String::from_utf8_lossy(&staged.stderr).trim(),
+        ),
+    }
+    let shallow = run_output(
+        Command::new("git")
+            .args(["rev-parse", "--is-shallow-repository"])
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .current_dir(source_root),
+        "git inspect external path-source shallow state",
+    )
+    .await?;
+    if shallow.trim() != "false" {
+        bail!(
+            "external path-source Git repository is shallow; its incomplete history cannot provide a stable SCM view"
+        );
+    }
+    let resolved_sha = run_output(
+        Command::new("git")
+            .args(["rev-parse", "--verify", "HEAD^{commit}"])
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .current_dir(source_root),
+        "git resolve external path-source HEAD",
+    )
+    .await?
+    .trim()
+    .to_ascii_lowercase();
+    if !matches!(resolved_sha.len(), 40 | 64)
+        || !resolved_sha.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        bail!("external path-source Git HEAD is not an exact commit: {resolved_sha}");
+    }
+    let ref_state = canonical_git_ref_state(source_root).await?;
+    ensure_no_canonical_gitlinks(source_root, &resolved_sha).await?;
+    Ok(Some(ExternalPathGitState {
+        resolved_sha,
+        ref_state,
+    }))
+}
+
+async fn attach_external_path_git_metadata(
+    source_root: &Path,
+    snapshot: &PreparedSourceSnapshot,
+    state: &ExternalPathGitState,
+) -> Result<()> {
+    if snapshot.root().join(".git").exists() {
+        bail!(
+            "external path-source snapshot unexpectedly retained a live .git indirection: {}",
+            snapshot.root().display(),
+        );
+    }
+    let staging_parent = crate::courier::retread_cache_root()
+        .join("path-git-metadata")
+        .join("v1");
+    std::fs::create_dir_all(&staging_parent).with_context(|| {
+        format!(
+            "creating path-source Git metadata staging parent {}",
+            staging_parent.display()
+        )
+    })?;
+    let staging = unique_staging_dir(&staging_parent.join("metadata"))?;
+    let repo = staging.0.join("repo");
+    run_silent(
+        Command::new("git")
+            .args(["clone", "--no-local", "--no-checkout", "--"])
+            .arg(source_root)
+            .arg(&repo),
+        "git clone path-source metadata",
+    )
+    .await?;
+    run_silent(
+        Command::new("git")
+            .args(["fetch", "--force", "--tags", "origin"])
+            .current_dir(&repo),
+        "git fetch path-source tags",
+    )
+    .await?;
+    run_silent(
+        Command::new("git")
+            .args(["fetch", "--force", "origin", &state.resolved_sha])
+            .current_dir(&repo),
+        "git fetch path-source commit",
+    )
+    .await?;
+    run_silent(
+        Command::new("git")
+            .args(["checkout", "--detach", "--force", &state.resolved_sha])
+            .current_dir(&repo),
+        "git checkout path-source metadata",
+    )
+    .await?;
+    delete_canonical_git_refs(&repo, "refs/heads").await?;
+    delete_canonical_git_refs(&repo, "refs/remotes").await?;
+    run_silent(
+        Command::new("git")
+            .args(["remote", "remove", "origin"])
+            .current_dir(&repo),
+        "git remove live path-source origin",
+    )
+    .await?;
+    let actual_ref_state = canonical_git_ref_state(&repo).await?;
+    if actual_ref_state != state.ref_state {
+        bail!(
+            "path-source Git tag/ref state changed during snapshot: expected {}, found {}",
+            state.ref_state,
+            actual_ref_state,
+        );
+    }
+    ensure_no_canonical_gitlinks(&repo, &state.resolved_sha).await?;
+    let git_dir = repo.join(".git");
+    sanitize_canonical_git_metadata(&repo)?;
+    let snapshot_git_dir = snapshot.root().join(".git");
+    let writable_root = TemporaryWritableDirectory::new(snapshot.root())?;
+    std::fs::rename(&git_dir, &snapshot_git_dir).with_context(|| {
+        format!(
+            "attaching self-contained Git metadata {}",
+            snapshot_git_dir.display()
+        )
+    })?;
+    normalize_source_tree_times(&snapshot_git_dir)?;
+    // Attaching a child changes the parent directory mtime. Restore the same
+    // deterministic epoch used by the original source snapshot before
+    // restoring its exact permissions.
+    normalize_snapshot_times(snapshot.root())?;
+    let snapshot_head = run_output(
+        Command::new("git")
+            .args(["rev-parse", "--verify", "HEAD^{commit}"])
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .current_dir(snapshot.root()),
+        "git validate attached path-source metadata",
+    )
+    .await?;
+    if snapshot_head.trim().to_ascii_lowercase() != state.resolved_sha {
+        bail!("attached path-source Git metadata resolved the wrong HEAD");
+    }
+    writable_root.restore()?;
+    Ok(())
+}
 
 /// Build a wheel from a local source tree using `uv pip wheel --no-deps`.
 ///
@@ -37,27 +2054,99 @@ pub async fn build_wheel_from_path(
     out_dir: &Path,
     python_version: &str,
 ) -> Result<PathBuf> {
-    tokio::fs::create_dir_all(out_dir)
-        .await
-        .with_context(|| format!("creating wheel output dir {}", out_dir.display()))?;
+    let target = ResolutionTarget::for_subdir(
+        &normalized_python_minor(python_version)?.version(),
+        crate::glibc::current_pixi_platform(),
+    );
+    Ok(
+        build_wheel_from_path_for_target(source, out_dir, &target, None, None, None)
+            .await?
+            .wheel_path,
+    )
+}
 
-    // Cache reuse: if out_dir already holds a built wheel, return it
-    // instead of re-running uv (build + isolated env setup takes 30-60s
-    // per package for IsaacLab-sized sources). To force a rebuild after
-    // editing the source, delete the per-entry folder under
-    // `<pack>/wheels/<entry_name>/`.
-    if let Some(cached) = newest_wheel_in(out_dir).await? {
-        tracing::info!(
-            source = %source.display(),
-            wheel = %cached.display(),
-            "reusing cached wheel (delete the folder to force rebuild)",
-        );
-        return Ok(cached);
+pub(crate) async fn build_wheel_from_path_for_target(
+    source: &Path,
+    out_dir: &Path,
+    target: &ResolutionTarget,
+    expected: Option<&ExpectedWheel>,
+    managed_output_root: Option<&Path>,
+    context_root: Option<&Path>,
+) -> Result<PathWheelBuild> {
+    let python = normalized_python_minor(target.python_version())?;
+    let canonical_source = std::fs::canonicalize(source)
+        .with_context(|| format!("canonicalizing source project {}", source.display()))?;
+    let candidate_context = match context_root {
+        Some(context) => std::fs::canonicalize(context)
+            .with_context(|| format!("canonicalizing source context {}", context.display()))?,
+        None => canonical_source.clone(),
+    };
+    // Relative entries may intentionally reach a sibling Git submodule via
+    // `../..`. Select the nearest containing standalone Git root when one
+    // contains both the project and declared source context; that keeps a
+    // submodule's relative `.git/modules/...` pointer self-contained. Outside
+    // a shared repository, retain the declared parent only when it contains
+    // the project, otherwise snapshot the external project itself.
+    let canonical_context = select_path_source_context(&canonical_source, &candidate_context);
+    let project_relative = canonical_source
+        .strip_prefix(&canonical_context)
+        .with_context(|| {
+            format!(
+                "source project {} is outside declared context {}",
+                canonical_source.display(),
+                canonical_context.display(),
+            )
+        })?
+        .to_path_buf();
+    let external_git_state = external_path_git_state(&canonical_context).await?;
+    let context_for_git_metadata = canonical_context.clone();
+    let prepared = tokio::task::spawn_blocking({
+        let source = canonical_context;
+        let out_dir = out_dir.to_path_buf();
+        let excluded = managed_output_root
+            .map(Path::to_path_buf)
+            .into_iter()
+            .collect::<Vec<_>>();
+        move || prepare_source_snapshot(&source, &out_dir, &excluded)
+    })
+    .await
+    .context("source-tree snapshot task panicked")??;
+    if let Some(state) = &external_git_state {
+        // Replace the deliberately omitted live `.git` pointer with a private,
+        // self-contained detached metadata store. SCM-aware backends therefore
+        // observe exact HEAD/tags without following mutable superproject state.
+        attach_external_path_git_metadata(&context_for_git_metadata, &prepared, state).await?;
     }
-
+    let project_relative_text = project_relative
+        .to_str()
+        .ok_or_else(|| anyhow!("source project path relative to its context is not UTF-8"))?;
+    let source_identity = hash_fields(
+        b"retread-path-wheel-source-v6\0",
+        &[
+            prepared.identity.as_bytes(),
+            project_relative_text.as_bytes(),
+            external_git_state
+                .as_ref()
+                .map(|state| state.resolved_sha.as_bytes())
+                .unwrap_or_default(),
+            external_git_state
+                .as_ref()
+                .map(|state| state.ref_state.as_bytes())
+                .unwrap_or_default(),
+        ],
+    );
+    let prepared = stabilize_source_snapshot_workspace(prepared, "path", &source_identity).await?;
+    let pristine_source = prepared.root().join(&project_relative);
+    if !pristine_source.is_dir() {
+        bail!(
+            "source snapshot lost project subdirectory `{}`",
+            project_relative.display(),
+        );
+    }
     tracing::info!(
         source = %source.display(),
-        python = %python_version,
+        python = %python.version(),
+        target = %target.conda_subdir(),
         "building wheel via uv build --wheel (this can take a minute; uv downloads python if missing)",
     );
     // `uv build --wheel`: build the project at `source` into a wheel.
@@ -68,67 +2157,59 @@ pub async fn build_wheel_from_path(
     // the requested version isn't installed locally. uv build only
     // builds the project's own wheel -- it doesn't fetch runtime deps
     // -- so no equivalent of pip's `--no-deps` is needed.
-    let py_arg = format!("--python={python_version}");
-    let out_arg = format!("--out-dir={}", out_dir.display());
-    run_capturing_uv(&[
-        "build",
-        "--wheel",
-        &py_arg,
-        &out_arg,
-        &source.display().to_string(),
-    ])
+    let pristine_workspace = Arc::clone(&prepared.workspace);
+    let project_relative_for_build = project_relative.clone();
+    let wheel_path = cached_build(
+        "path",
+        &source_identity,
+        target,
+        out_dir,
+        expected,
+        move |private_out| async move {
+            // A PEP 517 backend may create egg-info/build/generated files in
+            // its source directory. Give it a disposable copy and retain the
+            // pristine hashed workspace for phase-1.5 injection, so cache miss
+            // and cache hit derive the same final wheel.
+            let disposable = tokio::task::spawn_blocking({
+                let pristine_workspace = Arc::clone(&pristine_workspace);
+                let out_dir = private_out.clone();
+                move || prepare_source_snapshot(&pristine_workspace.directory.0, &out_dir, &[])
+            })
+            .await
+            .context("disposable path-source copy task panicked")??;
+            let build_source = disposable.root().join(&project_relative_for_build);
+            if !build_source.is_dir() {
+                bail!(
+                    "disposable source build lost project subdirectory `{}`",
+                    project_relative_for_build.display(),
+                );
+            }
+            let py_arg = format!("--python={}", python.identity());
+            let out_arg = format!("--out-dir={}", private_out.display());
+            run_capturing_uv(&[
+                "build",
+                "--wheel",
+                &py_arg,
+                &out_arg,
+                &build_source.display().to_string(),
+            ])
+            .await
+        },
+    )
     .await?;
-    find_built_wheel(out_dir).await
+    Ok(PathWheelBuild {
+        wheel_path,
+        project_root: prepared.root().join(project_relative),
+        _source_snapshot: prepared,
+    })
 }
 
-/// Return the wheel in `dir` with the latest mtime, or `None` if `dir`
-/// is missing or contains no .whl. Used by the cache-reuse path so
-/// repeated solves don't re-run `pip wheel`.
-async fn newest_wheel_in(dir: &Path) -> Result<Option<PathBuf>> {
-    if !dir.exists() {
-        return Ok(None);
+fn select_path_source_context(source: &Path, declared_context: &Path) -> PathBuf {
+    if source.starts_with(declared_context) {
+        declared_context.to_path_buf()
+    } else {
+        source.to_path_buf()
     }
-    let mut read = tokio::fs::read_dir(dir)
-        .await
-        .with_context(|| format!("opening wheel-cache dir {}", dir.display()))?;
-    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
-    while let Some(entry) = read
-        .next_entry()
-        .await
-        .with_context(|| format!("reading wheel-cache dir {}", dir.display()))?
-    {
-        let path = entry.path();
-        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        if !name.ends_with(".whl") {
-            continue;
-        }
-        // Skip our own post-processed wheels so we always reuse the
-        // raw pip-wheel output and re-run inject+D on it. Match on
-        // SUBSTRING (not just .ends_with) so multi-suffix names like
-        // `foo.injected.autodata.whl` are filtered too -- otherwise
-        // the cache lookup picks the post-processed wheel as the new
-        // "raw" input, the next pipeline run suffixes it AGAIN, and
-        // the filename grows by ~18 chars per solve until pip wheel /
-        // git clone hits ENAMETOOLONG. Burned a multi-version-bump
-        // debug session on exactly this. Add every new suffix here
-        // when introducing a new pipeline phase.
-        const RETREAD_SUFFIXES: &[&str] = &[".injected.", ".autodata.", ".relaxed."];
-        if RETREAD_SUFFIXES.iter().any(|s| name.contains(s)) {
-            continue;
-        }
-        let mtime = entry
-            .metadata()
-            .await
-            .with_context(|| format!("stat'ing wheel {}", path.display()))?
-            .modified()
-            .with_context(|| format!("reading mtime of {}", path.display()))?;
-        if best.as_ref().is_none_or(|(t, _)| mtime > *t) {
-            best = Some((mtime, path));
-        }
-    }
-    Ok(best.map(|(_, p)| p))
 }
 
 /// v0.18.0+: download a PyPI sdist (`.tar.gz` / `.zip`) and run
@@ -145,78 +2226,152 @@ pub async fn build_wheel_from_sdist_url(
     python_version: &str,
     expected_sha256: Option<&str>,
 ) -> Result<PathBuf> {
-    let expected_sha256 = expected_sha256
-        .map(normalize_sha256)
-        .transpose()
-        .context("validating expected sdist sha256")?;
+    let target =
+        ResolutionTarget::try_for_subdir(python_version, crate::glibc::current_pixi_platform())?;
+    Ok(
+        build_wheel_from_sdist_url_for_target(sdist_url, out_dir, &target, expected_sha256, None)
+            .await?
+            .wheel_path,
+    )
+}
 
-    // Cache identity is supplied by the caller and must include the source
-    // digest and immutable target. Validate the digest syntax before looking
-    // at that cache so malformed replay provenance never reaches filesystem
-    // or network work.
-    if let Some(cached) = newest_wheel_in(out_dir).await? {
-        tracing::info!(
-            sdist = %sdist_url,
-            wheel = %cached.display(),
-            "reusing cached wheel from previous sdist build",
-        );
-        return Ok(cached);
-    }
-
-    // Pull the sdist filename out of the URL.
-    let filename = sdist_url
+fn sdist_filename(url: &url::Url) -> Result<String> {
+    let encoded = url
         .path_segments()
-        .and_then(|mut s| s.next_back())
-        .filter(|f| !f.is_empty())
-        .ok_or_else(|| anyhow!("sdist URL {sdist_url} has no filename component"))?
-        .to_string();
-    let sdist_path = out_dir.join(&filename);
+        .and_then(|mut segments| segments.next_back())
+        .filter(|filename| !filename.is_empty())
+        .ok_or_else(|| anyhow!("sdist URL {url} has no filename component"))?;
+    let decoded = percent_encoding::percent_decode_str(encoded)
+        .decode_utf8()
+        .context("sdist filename is not UTF-8")?
+        .into_owned();
+    if Path::new(&decoded)
+        .file_name()
+        .and_then(|name| name.to_str())
+        != Some(decoded.as_str())
+    {
+        bail!("sdist URL {url} has an unsafe filename component");
+    }
+    Ok(decoded)
+}
 
-    tracing::info!(
-        url = %sdist_url,
-        dst = %sdist_path.display(),
-        "downloading sdist for last-resort wheel build",
-    );
-    let bytes = reqwest::get(sdist_url.clone())
+fn sdist_source_identity(content_sha256: &str, filename: &str) -> String {
+    hash_fields(
+        b"retread-sdist-source-v4\0",
+        &[content_sha256.as_bytes(), filename.as_bytes()],
+    )
+}
+
+pub(crate) fn sdist_advertised_sha256(
+    url: &url::Url,
+    advertised: Option<&str>,
+) -> Result<Option<String>> {
+    let explicit = advertised
+        .map(|value| validate_sha256(value, "advertised sdist hash"))
+        .transpose()?;
+    let mut fragment_hash = None;
+    if let Some(fragment) = url.fragment() {
+        for (key, value) in url::form_urlencoded::parse(fragment.as_bytes()) {
+            if key.eq_ignore_ascii_case("sha256") {
+                let value = validate_sha256(&value, "sdist URL fragment hash")?;
+                if fragment_hash.replace(value.clone()).is_some() {
+                    bail!("sdist URL contains more than one sha256 fragment");
+                }
+            }
+        }
+    }
+    if let (Some(explicit), Some(fragment)) = (&explicit, &fragment_hash)
+        && explicit != fragment
+    {
+        bail!(
+            "sdist hash disagreement: index supplied `{explicit}` but URL fragment supplied `{fragment}`"
+        );
+    }
+    Ok(explicit.or(fragment_hash))
+}
+
+async fn download_sdist(url: &url::Url, expected_sha256: Option<&str>) -> Result<Vec<u8>> {
+    tracing::info!(url = %url, "downloading sdist for source build");
+    let bytes = reqwest::get(url.clone())
         .await
-        .with_context(|| format!("downloading sdist {sdist_url}"))?
+        .with_context(|| format!("downloading sdist {url}"))?
         .error_for_status()
-        .with_context(|| format!("sdist HTTP error for {sdist_url}"))?
+        .with_context(|| format!("sdist HTTP error for {url}"))?
         .bytes()
         .await
-        .with_context(|| format!("reading sdist body from {sdist_url}"))?;
-
-    // An sdist executes arbitrary build-backend code. Verify the downloaded
-    // bytes before writing them into the build cache and, critically, before
-    // invoking `uv build`.
-    if let Some(expected) = expected_sha256.as_deref() {
-        verify_sha256(&bytes, expected)
-            .with_context(|| format!("sdist content verification failed for {sdist_url}"))?;
+        .with_context(|| format!("reading sdist body from {url}"))?
+        .to_vec();
+    let actual = format!("{:x}", Sha256::digest(&bytes));
+    if let Some(expected) = expected_sha256
+        && actual != expected
+    {
+        bail!("sdist sha256 mismatch for {url}: expected {expected}, got {actual}");
     }
+    Ok(bytes)
+}
 
-    tokio::fs::create_dir_all(out_dir)
-        .await
-        .with_context(|| format!("creating sdist-build out dir {}", out_dir.display()))?;
-    tokio::fs::write(&sdist_path, &bytes)
-        .await
-        .with_context(|| format!("writing sdist to {}", sdist_path.display()))?;
-
-    tracing::info!(
-        sdist = %sdist_path.display(),
-        python = %python_version,
-        "uv build --wheel on sdist (downloads python if needed)",
-    );
-    let py_arg = format!("--python={python_version}");
-    let out_arg = format!("--out-dir={}", out_dir.display());
-    run_capturing_uv(&[
-        "build",
-        "--wheel",
-        &py_arg,
-        &out_arg,
-        &sdist_path.display().to_string(),
-    ])
+pub(crate) async fn build_wheel_from_sdist_url_for_target(
+    sdist_url: &url::Url,
+    out_dir: &Path,
+    target: &ResolutionTarget,
+    advertised_sha256: Option<&str>,
+    expected: Option<&ExpectedWheel>,
+) -> Result<SdistWheelBuild> {
+    let python = normalized_python_minor(target.python_version())?;
+    let filename = sdist_filename(sdist_url)?;
+    let advertised_sha256 = sdist_advertised_sha256(sdist_url, advertised_sha256)?;
+    // A hash-bearing source has an exact cache identity before any network
+    // access.  An unhashed source must be fetched to discover its content key;
+    // foreign targets are rejected before that fetch because they cannot be
+    // built natively on this host.
+    let prefetched = if advertised_sha256.is_none() {
+        if !native_build_allowed(target) {
+            return Err(source_build_refusal_error(target));
+        }
+        Some(download_sdist(sdist_url, None).await?)
+    } else {
+        None
+    };
+    let content_sha = match (&advertised_sha256, &prefetched) {
+        (Some(hash), _) => hash.clone(),
+        (None, Some(bytes)) => format!("{:x}", Sha256::digest(bytes)),
+        (None, None) => unreachable!("unhashed sdist was prefetched"),
+    };
+    // The archive basename is part of the build input: backends/uv use its
+    // extension to select unpacking behavior. Identical bytes presented as a
+    // `.zip` and `.tar.gz` must not share a warm artifact entry.
+    let source_identity = sdist_source_identity(&content_sha, &filename);
+    let url = sdist_url.clone();
+    let filename_for_build = filename.clone();
+    let expected_content_sha = content_sha.clone();
+    let wheel_path = cached_build(
+        "sdist",
+        &source_identity,
+        target,
+        out_dir,
+        expected,
+        move |private_out| async move {
+            let bytes = match prefetched {
+                Some(bytes) => bytes,
+                None => download_sdist(&url, Some(&expected_content_sha)).await?,
+            };
+            let sdist_path = private_out.join(&filename_for_build);
+            tokio::fs::write(&sdist_path, &bytes)
+                .await
+                .with_context(|| format!("writing private sdist {}", sdist_path.display()))?;
+            let py_arg = format!("--python={}", python.identity());
+            let out_arg = format!("--out-dir={}", private_out.display());
+            run_capturing_uv(&[
+                "build",
+                "--wheel",
+                &py_arg,
+                &out_arg,
+                &sdist_path.display().to_string(),
+            ])
+            .await
+        },
+    )
     .await?;
-    let wheel_path = find_built_wheel(out_dir).await?;
 
     // DETERMINISM GUARD (Amendment 3): detect non-reproducible setuptools_scm
     // versions, mirroring the identical guard in build_wheel_from_git.
@@ -241,31 +2396,20 @@ pub async fn build_wheel_from_sdist_url(
         );
     }
 
-    Ok(wheel_path)
+    Ok(SdistWheelBuild {
+        wheel_path,
+        sdist_sha256: content_sha,
+    })
 }
 
-fn normalize_sha256(value: &str) -> Result<String> {
-    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        bail!("expected sdist sha256 must be exactly 64 hexadecimal characters");
-    }
-    Ok(value.to_ascii_lowercase())
-}
-
-fn verify_sha256(bytes: &[u8], expected: &str) -> Result<()> {
-    use sha2::{Digest, Sha256};
-
-    let actual = format!("{:x}", Sha256::digest(bytes));
-    if actual != expected {
-        bail!("sdist sha256 mismatch: expected {expected}, got {actual}");
-    }
-    Ok(())
-}
-
-/// Shared cross-pack cache directory for a built git wheel, keyed by
+/// Shared cross-pack cache family for built git wheels, keyed by
 /// (repo url, resolved commit sha, subdirectory, python version).
 ///
-/// Layout: `<retread cache root>/built-wheels/git/<slug>/<key12>/<raw>.whl`
-/// (same slug/short-hash hierarchy rationale as [`git_checkout_root`]).
+/// Layout: `<retread cache root>/built-wheels/git/v3/<artifact-target-sha256>/
+/// <family-sha256>/<ref-state-sha256>/{artifact.json,<raw>.whl}`. The leaf
+/// additionally binds the canonical tag/ref state visible to SCM-aware build
+/// backends. All identity components use the complete 64 hexadecimal
+/// characters; earlier cache layouts are never consulted.
 /// Every pack that pins the same (url, rev, subdir) reuses ONE build --
 /// previously each pack rebuilt identical wheels into its own
 /// `pypi-packs/<pack>/wheels/<entry>/` dir (isaac-pack and
@@ -277,93 +2421,78 @@ pub fn git_wheel_cache_dir(
     subdirectory: &str,
     python_version: &str,
 ) -> PathBuf {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(b"retread-git-wheel-v1\n");
-    hasher.update(url.as_bytes());
-    hasher.update(b"\0");
-    hasher.update(sha.as_bytes());
-    hasher.update(b"\0");
-    hasher.update(subdirectory.as_bytes());
-    hasher.update(b"\0");
-    hasher.update(python_version.as_bytes());
-    let digest = hasher.finalize();
-    let key12: String = digest.iter().take(6).map(|b| format!("{b:02x}")).collect();
-    let mut slug = git_slug(url);
-    slug.truncate(24);
-    crate::courier::retread_cache_root()
-        .join("built-wheels")
-        .join("git")
-        .join(slug)
-        .join(key12)
+    let normalized = normalized_python_minor(python_version)
+        .expect("git_wheel_cache_dir requires numeric MAJOR.MINOR[.PATCH]")
+        .version();
+    let target = ResolutionTarget::for_subdir(&normalized, crate::glibc::current_pixi_platform());
+    let family_identity = git_wheel_family_identity(url, sha, subdirectory);
+    built_wheel_cache_dir("git", &family_identity, &target)
 }
 
-/// Look up the shared git-wheel cache; on a hit, materialize the raw wheel
-/// into `out_dir` (hardlink, copy on EXDEV) so the downstream
-/// inject/autodata/relax pipeline finds it exactly where a fresh build
-/// would have put it. Returns the out_dir wheel path, or `None` on miss.
-async fn git_wheel_cache_lookup(cache_wheel_dir: &Path, out_dir: &Path) -> Result<Option<PathBuf>> {
-    let Some(cached) = newest_wheel_in(cache_wheel_dir).await? else {
-        return Ok(None);
-    };
-    tokio::fs::create_dir_all(out_dir)
-        .await
-        .with_context(|| format!("creating wheel output dir {}", out_dir.display()))?;
-    let dst = out_dir.join(cached.file_name().expect("wheel path has a filename"));
-    if !dst.exists() {
-        crate::wheel::hardlink_or_copy_async(&cached, &dst)
-            .await
-            .with_context(|| {
-                format!(
-                    "materializing shared-cache git wheel {} -> {}",
-                    cached.display(),
-                    dst.display()
-                )
-            })?;
-    }
-    tracing::info!(
-        cache = %cached.display(),
-        wheel = %dst.display(),
-        "reusing shared-cache git wheel (cross-pack; delete the cache dir to force rebuild)",
-    );
-    Ok(Some(dst))
+fn git_wheel_family_identity(url: &str, sha: &str, subdirectory: &str) -> String {
+    hash_fields(
+        b"retread-git-wheel-family-v4\0",
+        &[url.as_bytes(), sha.as_bytes(), subdirectory.as_bytes()],
+    )
 }
 
-/// Best-effort population of the shared git-wheel cache after a successful
-/// build. Failure only warns: the pack-local out_dir copy is authoritative,
-/// the shared cache is purely a cross-pack build-speed optimization.
-async fn git_wheel_cache_store(wheel: &Path, cache_wheel_dir: &Path) {
-    let store = async {
-        tokio::fs::create_dir_all(cache_wheel_dir).await?;
-        let filename = wheel
-            .file_name()
-            .ok_or_else(|| anyhow!("wheel path has no filename: {}", wheel.display()))?;
-        let dst = cache_wheel_dir.join(filename);
-        if dst.exists() {
-            return Ok::<_, anyhow::Error>(());
-        }
-        let tmp = cache_wheel_dir.join(format!(
-            "{}.{}.tmp",
-            filename.to_string_lossy(),
-            std::process::id()
-        ));
-        crate::wheel::hardlink_or_copy_async(wheel, &tmp).await?;
-        if let Err(e) = tokio::fs::rename(&tmp, &dst).await {
-            let _ = tokio::fs::remove_file(&tmp).await;
-            if !dst.exists() {
-                return Err(e.into());
+fn git_wheel_source_identity(family_identity: &str, ref_state: &str) -> String {
+    format!("{family_identity}/{ref_state}")
+}
+
+fn canonical_git_repository_identity(url: &str, sha: &str) -> String {
+    hash_fields(
+        b"retread-canonical-git-repository-v1\0",
+        &[url.as_bytes(), sha.as_bytes()],
+    )
+}
+
+fn normalize_git_subdirectory(subdirectory: &str) -> Result<PathBuf> {
+    use std::path::Component;
+
+    let mut normalized = PathBuf::new();
+    for component in Path::new(subdirectory).components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(component) => normalized.push(component),
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                bail!(
+                    "git wheel subdirectory `{subdirectory}` must be a relative path without `..`"
+                );
             }
         }
-        Ok(())
-    };
-    if let Err(e) = store.await {
-        tracing::warn!(
-            wheel = %wheel.display(),
-            cache = %cache_wheel_dir.display(),
-            error = %format!("{e:#}"),
-            "could not populate shared git-wheel cache (non-fatal)",
+    }
+    if normalized.as_os_str().is_empty() {
+        normalized.push(".");
+    }
+    Ok(normalized)
+}
+
+fn confined_git_source_dir(clone_dir: &Path, subdirectory: &Path) -> Result<PathBuf> {
+    let clone_root = std::fs::canonicalize(clone_dir)
+        .with_context(|| format!("canonicalizing git checkout {}", clone_dir.display()))?;
+    let candidate = clone_root.join(subdirectory);
+    let resolved = std::fs::canonicalize(&candidate).with_context(|| {
+        format!(
+            "git wheel subdirectory `{}` not found in clone at {}",
+            subdirectory.display(),
+            clone_root.display(),
+        )
+    })?;
+    if !resolved.starts_with(&clone_root) {
+        bail!(
+            "git wheel subdirectory `{}` resolves outside checkout {}",
+            subdirectory.display(),
+            clone_root.display(),
         );
     }
+    if !resolved.is_dir() {
+        bail!(
+            "git wheel subdirectory `{}` is not a directory",
+            subdirectory.display(),
+        );
+    }
+    Ok(resolved)
 }
 
 /// Compute a git wheel entry's source directory without accessing it.
@@ -385,13 +2514,13 @@ pub fn git_source_root(url: &str, rev: &str, subdirectory: &str, cache_dir: &Pat
 /// the returned path. Checkout consumers must retain the [`GitCheckout`] lease
 /// returned by the internal checkout/build boundary.
 ///
-/// Layout (v0.13.3+): cache_dir / retread-git-clones / <slug> /
-/// <sha12> / ... -- a HIERARCHY rather than a single flat dirname.
+/// Layout: cache_dir / retread-git-clones / v3 / <slug> /
+/// <full-sha256> / ... -- a HIERARCHY rather than a single flat dirname.
 /// This is what pip/uv do (the wheel itself stays a normal PEP 427
 /// filename; disambiguation rides in parent directories). Each path
 /// component is independently bounded:
 ///   - `<slug>`: repo-name slug, truncated to 24 chars
-///   - `<sha12>`: 12 hex chars of sha256(url + "\0" + rev)
+///   - `<full-sha256>`: all 64 hex chars of sha256(url + "\0" + rev)
 ///
 /// Previously the (slug + raw 40-char git SHA) was flattened into one
 /// 60+ char component; combined with the rattler cache prefix and
@@ -408,12 +2537,16 @@ pub fn git_checkout_root(url: &str, rev: &str, cache_dir: &Path) -> PathBuf {
     hasher.update(b"\0");
     hasher.update(rev.as_bytes());
     let digest = hasher.finalize();
-    let sha12: String = digest.iter().take(6).map(|b| format!("{b:02x}")).collect();
+    let full_sha: String = digest.iter().map(|b| format!("{b:02x}")).collect();
     let mut slug = git_slug(url);
     // The slug strips `https___github.com_`; cap whatever's left so
     // big-org/long-name repos don't blow the slug component.
     slug.truncate(24);
-    cache_dir.join("retread-git-clones").join(slug).join(sha12)
+    cache_dir
+        .join("retread-git-clones")
+        .join(CHECKOUT_CACHE_VERSION)
+        .join(slug)
+        .join(full_sha)
 }
 
 const CHECKOUT_READY_MARKER: &str = ".retread-checkout-ready-v1";
@@ -1081,33 +3214,544 @@ pub(crate) async fn ensure_git_checkout(
     })
 }
 
-/// Result of a git wheel build. Keeping this value alive keeps the checkout's
-/// process-local reader lease alive; internal callers pass that same lease
-/// through all subsequent source-tree injection reads.
+async fn canonical_git_ref_state(repo: &Path) -> Result<String> {
+    let refs = run_output_bytes(
+        Command::new("git")
+            .args([
+                "for-each-ref",
+                "--sort=refname",
+                "--format=%(refname)%00%(objectname)%00%(*objectname)",
+                "refs/tags",
+            ])
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .current_dir(repo),
+        "git canonical tag-state query",
+    )
+    .await?;
+    Ok(hash_fields(b"retread-git-tag-state-v1\0", &[&refs]))
+}
+
+async fn delete_canonical_git_refs(repo: &Path, namespace: &str) -> Result<()> {
+    let refs = run_output_bytes(
+        Command::new("git")
+            .args([
+                "for-each-ref",
+                "--sort=refname",
+                "--format=%(refname)",
+                namespace,
+            ])
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .current_dir(repo),
+        "git canonical ref query",
+    )
+    .await?;
+    // Delete symbolic refs themselves rather than dereferencing them. Without
+    // `no-deref`, deleting `origin/HEAD` and its target in one transaction is
+    // rejected as two updates to the same ref.
+    let mut commands = b"option no-deref\n".to_vec();
+    let mut ref_count = 0_usize;
+    for reference in refs
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        let reference =
+            std::str::from_utf8(reference).context("canonical Git ref name is not UTF-8")?;
+        commands.extend_from_slice(b"delete ");
+        commands.extend_from_slice(reference.as_bytes());
+        commands.push(b'\n');
+        ref_count += 1;
+    }
+    if ref_count != 0 {
+        run_silent_with_input(
+            Command::new("git")
+                .args(["update-ref", "--stdin"])
+                .current_dir(repo),
+            "git batch-delete non-canonical refs",
+            &commands,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn ensure_no_canonical_gitlinks(repo: &Path, resolved_sha: &str) -> Result<()> {
+    let tree = run_output_bytes(
+        Command::new("git")
+            .args(["ls-tree", "-r", "-z", "--full-tree", resolved_sha])
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .current_dir(repo),
+        "git gitlink query",
+    )
+    .await?;
+    let mut gitlinks = Vec::new();
+    for record in tree
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+    {
+        if record.starts_with(b"160000 ") {
+            let path = record
+                .iter()
+                .position(|byte| *byte == b'\t')
+                .map(|tab| String::from_utf8_lossy(&record[tab + 1..]).into_owned())
+                .unwrap_or_else(|| "<malformed gitlink>".to_string());
+            gitlinks.push(path);
+        }
+    }
+    if !gitlinks.is_empty() {
+        gitlinks.sort();
+        bail!(
+            "git source at commit {resolved_sha} contains unsupported submodule gitlinks; retread will not silently build an uninitialized tree: {}",
+            gitlinks.join(", "),
+        );
+    }
+    Ok(())
+}
+
+fn sanitize_canonical_git_metadata(repo: &Path) -> Result<()> {
+    let git_dir = repo.join(".git");
+    for directory in ["logs"] {
+        let path = git_dir.join(directory);
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("removing volatile Git metadata {}", path.display()));
+            }
+        }
+    }
+    for file in [
+        "FETCH_HEAD",
+        "ORIG_HEAD",
+        "MERGE_HEAD",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+        "BISECT_LOG",
+        "index.lock",
+        "packed-refs.lock",
+    ] {
+        let path = git_dir.join(file);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("removing volatile Git metadata {}", path.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn normalize_source_tree_times(path: &Path) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("stating canonical source path {}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Ok(());
+    }
+    if metadata.is_dir() {
+        let mut entries = std::fs::read_dir(path)
+            .with_context(|| format!("reading canonical source path {}", path.display()))?
+            .collect::<std::io::Result<Vec<_>>>()?;
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            normalize_source_tree_times(&entry.path())?;
+        }
+    }
+    normalize_snapshot_times(path)
+}
+
+fn make_source_tree_read_only(path: &Path) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("stating canonical source path {}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Ok(());
+    }
+    if metadata.is_dir() {
+        let mut entries = std::fs::read_dir(path)
+            .with_context(|| format!("reading canonical source path {}", path.display()))?
+            .collect::<std::io::Result<Vec<_>>>()?;
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            make_source_tree_read_only(&entry.path())?;
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = metadata.permissions().mode() & !0o222;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).with_context(
+            || format!("making canonical source path read-only {}", path.display()),
+        )?;
+    }
+    #[cfg(not(unix))]
+    {
+        let mut permissions = metadata.permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(path, permissions).with_context(|| {
+            format!("making canonical source path read-only {}", path.display())
+        })?;
+    }
+    Ok(())
+}
+
+async fn validate_canonical_git_snapshot(
+    cache_dir: &Path,
+    repository_identity: &str,
+    resolved_sha: &str,
+    ref_state: &str,
+    require_clean: bool,
+) -> Result<CanonicalGitSnapshot> {
+    let cache_metadata = std::fs::symlink_metadata(cache_dir)
+        .with_context(|| format!("stating canonical Git source cache {}", cache_dir.display()))?;
+    if !cache_metadata.file_type().is_dir() || cache_metadata.file_type().is_symlink() {
+        bail!(
+            "canonical Git source cache is not a real directory: {}",
+            cache_dir.display(),
+        );
+    }
+    let marker_path = cache_dir.join("source.json");
+    let marker_metadata = std::fs::symlink_metadata(&marker_path)
+        .with_context(|| format!("stating canonical Git marker {}", marker_path.display()))?;
+    if !marker_metadata.file_type().is_file() || marker_metadata.file_type().is_symlink() {
+        bail!(
+            "canonical Git source marker is not a regular file: {}",
+            marker_path.display(),
+        );
+    }
+    let marker: CanonicalGitSourceMarker = serde_json::from_slice(
+        &std::fs::read(&marker_path)
+            .with_context(|| format!("reading canonical Git marker {}", marker_path.display()))?,
+    )
+    .with_context(|| format!("parsing canonical Git marker {}", marker_path.display()))?;
+    if marker.schema != CANONICAL_GIT_SOURCE_SCHEMA
+        || marker.repository_identity != repository_identity
+        || marker.resolved_sha != resolved_sha
+        || marker.ref_state != ref_state
+    {
+        bail!(
+            "canonical Git source marker does not match its full repository/commit/ref identity: {}",
+            marker_path.display(),
+        );
+    }
+    let repo = cache_dir.join("repo");
+    let repo_metadata = std::fs::symlink_metadata(&repo)
+        .with_context(|| format!("stating canonical Git repository {}", repo.display()))?;
+    if !repo_metadata.file_type().is_dir() || repo_metadata.file_type().is_symlink() {
+        bail!(
+            "canonical Git repository is not a real directory: {}",
+            repo.display(),
+        );
+    }
+    let head = run_output(
+        Command::new("git")
+            .args(["rev-parse", "--verify", "HEAD^{commit}"])
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .current_dir(&repo),
+        "git validate canonical HEAD",
+    )
+    .await?;
+    if head.trim().to_ascii_lowercase() != resolved_sha {
+        bail!(
+            "canonical Git repository HEAD `{}` does not match `{resolved_sha}`",
+            head.trim(),
+        );
+    }
+    let actual_ref_state = canonical_git_ref_state(&repo).await?;
+    if actual_ref_state != ref_state {
+        bail!(
+            "canonical Git repository tag/ref state changed: expected {ref_state}, found {actual_ref_state}"
+        );
+    }
+    let noncanonical_refs = run_output_bytes(
+        Command::new("git")
+            .args([
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/heads",
+                "refs/remotes",
+            ])
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .current_dir(&repo),
+        "git validate canonical refs",
+    )
+    .await?;
+    if !noncanonical_refs.is_empty() {
+        bail!("canonical Git repository regained branch or remote-tracking refs");
+    }
+    ensure_no_canonical_gitlinks(&repo, resolved_sha).await?;
+    if require_clean {
+        let status = run_output_bytes(
+            Command::new("git")
+                .args(["status", "--porcelain=v1", "--untracked-files=all"])
+                .env("GIT_OPTIONAL_LOCKS", "0")
+                .current_dir(&repo),
+            "git validate canonical worktree",
+        )
+        .await?;
+        if !status.is_empty() {
+            bail!(
+                "canonical Git source was mutated while a build used it: {}",
+                String::from_utf8_lossy(&status).trim(),
+            );
+        }
+    }
+    Ok(CanonicalGitSnapshot {
+        root: repo,
+        repository_identity: repository_identity.to_string(),
+        resolved_sha: resolved_sha.to_string(),
+        ref_state: ref_state.to_string(),
+    })
+}
+
+async fn ensure_canonical_git_snapshot(
+    shared_checkout: &Path,
+    upstream_url: &str,
+    resolved_sha: &str,
+    ref_state: &str,
+) -> Result<CanonicalGitSnapshot> {
+    let repository_identity = canonical_git_repository_identity(upstream_url, resolved_sha);
+    let cache_dir = crate::courier::retread_cache_root()
+        .join("canonical-git-sources")
+        .join("v1")
+        .join(&repository_identity)
+        .join(ref_state);
+    let _lock = acquire_artifact_cache_lock(&cache_dir).await?;
+    if cache_dir.try_exists().with_context(|| {
+        format!(
+            "checking canonical Git source cache {}",
+            cache_dir.display()
+        )
+    })? {
+        // Published canonical trees are never self-healed or replaced while a
+        // reader could be using them. Corruption is therefore a fail-closed
+        // error rather than a delete/rebuild race.
+        return validate_canonical_git_snapshot(
+            &cache_dir,
+            &repository_identity,
+            resolved_sha,
+            ref_state,
+            true,
+        )
+        .await;
+    }
+
+    let staging = unique_staging_dir(&cache_dir)?;
+    let repo = staging.0.join("repo");
+    tracing::debug!(
+        source = %shared_checkout.display(),
+        commit = %resolved_sha,
+        refs = %ref_state,
+        "preparing shared canonical Git source",
+    );
+    run_silent(
+        Command::new("git")
+            .args(["clone", "--no-local", "--no-checkout", "--"])
+            .arg(shared_checkout)
+            .arg(&repo),
+        "git clone canonical source",
+    )
+    .await?;
+    run_silent(
+        Command::new("git")
+            .args(["fetch", "--force", "--tags", "origin"])
+            .current_dir(&repo),
+        "git fetch canonical tags",
+    )
+    .await?;
+    run_silent(
+        Command::new("git")
+            .args(["checkout", "--detach", "--force", resolved_sha])
+            .current_dir(&repo),
+        "git checkout canonical commit",
+    )
+    .await?;
+    run_silent(
+        Command::new("git")
+            .args(["clean", "-ffdx"])
+            .current_dir(&repo),
+        "git clean canonical source",
+    )
+    .await?;
+    delete_canonical_git_refs(&repo, "refs/heads").await?;
+    delete_canonical_git_refs(&repo, "refs/remotes").await?;
+    run_silent(
+        Command::new("git")
+            .args(["remote", "set-url", "origin", upstream_url])
+            .current_dir(&repo),
+        "git normalize canonical origin",
+    )
+    .await?;
+    let actual_ref_state = canonical_git_ref_state(&repo).await?;
+    if actual_ref_state != ref_state {
+        bail!(
+            "canonical Git clone tag/ref state differs from the state bound to its cache identity: expected {ref_state}, found {actual_ref_state}"
+        );
+    }
+    ensure_no_canonical_gitlinks(&repo, resolved_sha).await?;
+    let status = run_output_bytes(
+        Command::new("git")
+            .args(["status", "--porcelain=v1", "--untracked-files=all"])
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .current_dir(&repo),
+        "git verify canonical source",
+    )
+    .await?;
+    if !status.is_empty() {
+        bail!(
+            "canonical Git source is not clean after exact checkout: {}",
+            String::from_utf8_lossy(&status).trim(),
+        );
+    }
+    let repo_for_normalize = repo.clone();
+    tokio::task::spawn_blocking(move || {
+        sanitize_canonical_git_metadata(&repo_for_normalize)?;
+        normalize_source_tree_times(&repo_for_normalize)?;
+        make_source_tree_read_only(&repo_for_normalize)
+    })
+    .await
+    .context("canonical Git source normalization task panicked")??;
+    let marker = CanonicalGitSourceMarker {
+        schema: CANONICAL_GIT_SOURCE_SCHEMA.to_string(),
+        repository_identity: repository_identity.clone(),
+        resolved_sha: resolved_sha.to_string(),
+        ref_state: ref_state.to_string(),
+    };
+    std::fs::write(
+        staging.0.join("source.json"),
+        serde_json::to_vec_pretty(&marker).context("serializing canonical Git marker")?,
+    )
+    .with_context(|| {
+        format!(
+            "writing canonical Git marker {}",
+            staging.0.join("source.json").display()
+        )
+    })?;
+    std::fs::rename(&staging.0, &cache_dir)
+        .with_context(|| format!("publishing canonical Git source {}", cache_dir.display()))?;
+    validate_canonical_git_snapshot(
+        &cache_dir,
+        &repository_identity,
+        resolved_sha,
+        ref_state,
+        true,
+    )
+    .await
+}
+
+/// Derive a disposable, writable SCM checkout from an immutable canonical Git
+/// snapshot. Build backends are allowed to create egg-info, SCM caches, and
+/// other temporary files here; the canonical tree remains the pristine source
+/// used later for wheel injection.
+async fn prepare_private_git_build_tree(
+    canonical: &CanonicalGitSnapshot,
+    upstream_url: &str,
+    subdirectory: &Path,
+    private_out: &Path,
+) -> Result<PathBuf> {
+    let private_repo = private_out
+        .parent()
+        .ok_or_else(|| anyhow!("private wheel output has no staging parent"))?
+        .join("git-build-source");
+    run_silent(
+        Command::new("git")
+            .args(["clone", "--shared", "--no-checkout", "--"])
+            .arg(&canonical.root)
+            .arg(&private_repo),
+        "git clone private build source",
+    )
+    .await?;
+    run_silent(
+        Command::new("git")
+            .args(["checkout", "--detach", "--force", &canonical.resolved_sha])
+            .current_dir(&private_repo),
+        "git checkout private build source",
+    )
+    .await?;
+    run_silent(
+        Command::new("git")
+            .args(["clean", "-ffdx"])
+            .current_dir(&private_repo),
+        "git clean private build source",
+    )
+    .await?;
+    run_silent(
+        Command::new("git")
+            .args(["remote", "set-url", "origin"])
+            .arg(upstream_url)
+            .current_dir(&private_repo),
+        "git normalize private build origin",
+    )
+    .await?;
+    let head = run_output(
+        Command::new("git")
+            .args(["rev-parse", "--verify", "HEAD^{commit}"])
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .current_dir(&private_repo),
+        "git verify private build HEAD",
+    )
+    .await?;
+    if head.trim().to_ascii_lowercase() != canonical.resolved_sha {
+        bail!(
+            "private Git build checkout resolved `{}` instead of canonical commit `{}`",
+            head.trim(),
+            canonical.resolved_sha,
+        );
+    }
+    let ref_state = canonical_git_ref_state(&private_repo).await?;
+    if ref_state != canonical.ref_state {
+        bail!(
+            "private Git build checkout tag/ref state differs from its canonical snapshot: expected {}, found {ref_state}",
+            canonical.ref_state,
+        );
+    }
+    confined_git_source_dir(&private_repo, subdirectory)
+}
+
+/// Result of a git wheel build. Keeping this value alive retains both the
+/// checkout's process-local reader lease (used only for its planned identity)
+/// and the canonical clean source tree consumed by build and injection.
 #[derive(Debug)]
 pub(crate) struct GitWheelBuild {
     wheel_path: PathBuf,
     resolved_sha: String,
     checkout: GitCheckout,
+    canonical: CanonicalGitSnapshot,
+    project_root: PathBuf,
 }
 
 impl GitWheelBuild {
-    pub(crate) fn into_parts(self) -> (PathBuf, String, GitCheckout) {
-        (self.wheel_path, self.resolved_sha, self.checkout)
+    pub(crate) fn wheel_path(&self) -> &Path {
+        &self.wheel_path
+    }
+
+    pub(crate) fn resolved_sha(&self) -> &str {
+        &self.resolved_sha
+    }
+
+    pub(crate) fn checkout_root(&self) -> &Path {
+        self.checkout.root()
+    }
+
+    pub(crate) fn canonical_root(&self) -> &Path {
+        &self.canonical.root
+    }
+
+    pub(crate) fn source_root(&self) -> &Path {
+        &self.project_root
     }
 }
 
-/// Internal leased build boundary. The handler retains this result across its
-/// subsequent source-tree injection phases.
-pub(crate) async fn build_wheel_from_git_leased(
+pub(crate) async fn build_wheel_from_git_leased_for_target(
     url: &str,
     rev: &str,
     subdirectory: &str,
     cache_dir: &Path,
     out_dir: &Path,
-    python_version: &str,
+    target: &ResolutionTarget,
+    expected: Option<&ExpectedWheel>,
 ) -> Result<GitWheelBuild> {
-    build_wheel_from_git_inner(url, rev, subdirectory, cache_dir, out_dir, python_version).await
+    build_wheel_from_git_inner(url, rev, subdirectory, cache_dir, out_dir, target, expected).await
 }
 
 /// Build a wheel from a clone-once git checkout and return its path plus the
@@ -1124,11 +3768,17 @@ pub async fn build_wheel_from_git(
     out_dir: &Path,
     python_version: &str,
 ) -> Result<(PathBuf, String)> {
+    let target = ResolutionTarget::for_subdir(
+        &normalized_python_minor(python_version)?.version(),
+        crate::glibc::current_pixi_platform(),
+    );
     let build =
-        build_wheel_from_git_inner(url, rev, subdirectory, cache_dir, out_dir, python_version)
+        build_wheel_from_git_inner(url, rev, subdirectory, cache_dir, out_dir, &target, None)
             .await?;
-    let (wheel_path, resolved_sha, _checkout) = build.into_parts();
-    Ok((wheel_path, resolved_sha))
+    Ok((
+        build.wheel_path().to_path_buf(),
+        build.resolved_sha().to_string(),
+    ))
 }
 
 async fn build_wheel_from_git_inner(
@@ -1137,8 +3787,95 @@ async fn build_wheel_from_git_inner(
     subdirectory: &str,
     cache_dir: &Path,
     out_dir: &Path,
-    python_version: &str,
+    target: &ResolutionTarget,
+    expected: Option<&ExpectedWheel>,
 ) -> Result<GitWheelBuild> {
+    let python = normalized_python_minor(target.python_version())?;
+    let subdirectory = normalize_git_subdirectory(subdirectory)?;
+    let subdirectory_identity = subdirectory
+        .to_str()
+        .ok_or_else(|| anyhow!("git wheel subdirectory is not UTF-8"))?
+        .to_string();
+    let exact_rev =
+        matches!(rev.len(), 40 | 64) && rev.bytes().all(|byte| byte.is_ascii_hexdigit());
+
+    // A foreign build may consume a previously validated compatible artifact,
+    // but it must not clone/download merely to discover a moving ref or build
+    // natively. Exact commit pins can probe the v3 artifact cache first.
+    if !native_build_allowed(target) {
+        if !exact_rev {
+            return Err(source_build_refusal_error(target)).with_context(|| {
+                format!("git source `{url}` uses moving/non-exact revision `{rev}`")
+            });
+        }
+        let resolved_sha = rev.to_ascii_lowercase();
+        let family_identity = git_wheel_family_identity(url, &resolved_sha, &subdirectory_identity);
+        let candidate_ref_states =
+            probe_cached_git_family_states(&family_identity, target, expected).await?;
+        if candidate_ref_states.is_empty() {
+            return Err(source_build_refusal_error(target));
+        }
+        // The validated artifact hit authorizes source-tree materialization for
+        // downstream auto-data injection; it does not authorize a native build.
+        // Historical tag-state leaves are deliberately not materialized yet:
+        // the exact checkout below selects the one state visible now.
+        let checkout = ensure_git_checkout(url, rev, cache_dir).await?;
+        confined_git_source_dir(checkout.root(), &subdirectory)?;
+        let checkout_sha = run_output(
+            Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(checkout.root()),
+            "git rev-parse HEAD",
+        )
+        .await?;
+        if checkout_sha.trim().to_ascii_lowercase() != resolved_sha {
+            bail!(
+                "foreign git artifact cache hit was bound to commit `{resolved_sha}` but checkout resolved `{}`",
+                checkout_sha.trim(),
+            );
+        }
+        let checkout_ref_state = canonical_git_ref_state(checkout.root()).await?;
+        let matching_states = candidate_ref_states
+            .iter()
+            .filter(|state| state.as_str() == checkout_ref_state)
+            .count();
+        if matching_states == 0 {
+            bail!(
+                "foreign git artifact cache family has no validated artifact for the checkout's current tag/ref state `{checkout_ref_state}`"
+            );
+        }
+        if matching_states > 1 {
+            bail!(
+                "foreign git artifact cache family has {matching_states} validated leaves for current tag/ref state `{checkout_ref_state}`"
+            );
+        }
+        let source_identity = git_wheel_source_identity(&family_identity, &checkout_ref_state);
+        let wheel_path = lookup_cached_build(
+            "git",
+            &source_identity,
+            target,
+            out_dir,
+            expected,
+        )
+        .await?
+        .ok_or_else(|| {
+            anyhow!(
+                "validated foreign git artifact disappeared before exact ref-state materialization"
+            )
+        })?;
+        let canonical =
+            ensure_canonical_git_snapshot(checkout.root(), url, &resolved_sha, &checkout_ref_state)
+                .await?;
+        let project_root = confined_git_source_dir(&canonical.root, &subdirectory)?;
+        return Ok(GitWheelBuild {
+            wheel_path,
+            resolved_sha,
+            checkout,
+            canonical,
+            project_root,
+        });
+    }
+
     // NOTE on the shared cross-pack wheel cache: the lookup deliberately
     // happens AFTER clone+checkout (below), not here. Callers derive
     // `source_root` from the checkout for the auto-data inject phase, so the
@@ -1148,13 +3885,7 @@ async fn build_wheel_from_git_inner(
     let checkout = ensure_git_checkout(url, rev, cache_dir).await?;
     let clone_dir = checkout.root();
 
-    let source_dir = clone_dir.join(subdirectory);
-    if !source_dir.exists() {
-        bail!(
-            "subdirectory `{subdirectory}` not found in clone at {}",
-            clone_dir.display()
-        );
-    }
+    confined_git_source_dir(clone_dir, &subdirectory)?;
 
     // Resolve the ACTUAL commit SHA after checkout. This converts branch
     // names, tags, and "HEAD" to a stable 40-char SHA that the lock can
@@ -1173,14 +3904,18 @@ async fn build_wheel_from_git_inner(
     // Cross-pack shared-cache lookup, now that a moving rev (branch/tag)
     // has been resolved to an exact sha. A hit skips the `uv build` (the
     // expensive part; the clone above was needed anyway to resolve the sha).
-    let shared = git_wheel_cache_dir(url, &resolved_sha, subdirectory, python_version);
-    if let Some(wheel) = git_wheel_cache_lookup(&shared, out_dir).await? {
-        return Ok(GitWheelBuild {
-            wheel_path: wheel,
-            resolved_sha,
-            checkout,
-        });
+    if !matches!(resolved_sha.len(), 40 | 64)
+        || !resolved_sha.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        bail!("git rev-parse returned a non-commit identity `{resolved_sha}`");
     }
+    let resolved_sha = resolved_sha.to_ascii_lowercase();
+    let ref_state = canonical_git_ref_state(clone_dir).await?;
+    let family_identity = git_wheel_family_identity(url, &resolved_sha, &subdirectory_identity);
+    let source_identity = git_wheel_source_identity(&family_identity, &ref_state);
+    let canonical =
+        ensure_canonical_git_snapshot(clone_dir, url, &resolved_sha, &ref_state).await?;
+    let project_root = confined_git_source_dir(&canonical.root, &subdirectory)?;
 
     // DETERMINISM GUARD: detect non-reproducible setuptools_scm versions.
     // A wheel whose version contains .devN, .dYYYYMMDD, or +g<sha> segments
@@ -1189,7 +3924,49 @@ async fn build_wheel_from_git_inner(
     // across calendar days even when the commit SHA is unchanged, producing
     // a lock that is not byte-identical on replay. The `git fetch --tags`
     // above is cheap insurance; this warn fires when it was not enough.
-    let wheel_path = build_wheel_from_path(&source_dir, out_dir, python_version).await?;
+    let canonical_for_build = canonical.clone();
+    let subdirectory_for_build = subdirectory.clone();
+    let upstream_url_for_build = url.to_string();
+    let wheel_path = cached_build(
+        "git",
+        &source_identity,
+        target,
+        out_dir,
+        expected,
+        move |private_out| async move {
+            let private_project_root = prepare_private_git_build_tree(
+                &canonical_for_build,
+                &upstream_url_for_build,
+                &subdirectory_for_build,
+                &private_out,
+            )
+            .await?;
+            let py_arg = format!("--python={}", python.identity());
+            let out_arg = format!("--out-dir={}", private_out.display());
+            run_capturing_uv(&[
+                "build",
+                "--wheel",
+                &py_arg,
+                &out_arg,
+                &private_project_root.display().to_string(),
+            ])
+            .await?;
+            let cache_dir = canonical_for_build
+                .root
+                .parent()
+                .expect("canonical Git repo has a cache parent");
+            validate_canonical_git_snapshot(
+                cache_dir,
+                &canonical_for_build.repository_identity,
+                &canonical_for_build.resolved_sha,
+                &canonical_for_build.ref_state,
+                true,
+            )
+            .await?;
+            Ok(())
+        },
+    )
+    .await?;
     if wheel_path
         .file_name()
         .and_then(|n| n.to_str())
@@ -1209,13 +3986,12 @@ async fn build_wheel_from_git_inner(
         );
     }
 
-    // Populate the shared cross-pack cache (best-effort).
-    git_wheel_cache_store(&wheel_path, &shared).await;
-
     Ok(GitWheelBuild {
         wheel_path,
         resolved_sha,
         checkout,
+        canonical,
+        project_root,
     })
 }
 
@@ -1243,6 +4019,14 @@ pub fn is_nondeterministic_version(filename: &str) -> bool {
 /// Run a command silently and return its trimmed stdout as a `String`.
 /// Fails if the command exits non-zero.
 async fn run_output(cmd: &mut Command, label: &str) -> Result<String> {
+    let output = run_output_bytes(cmd, label).await?;
+    Ok(String::from_utf8_lossy(&output).into_owned())
+}
+
+/// Byte-preserving counterpart to [`run_output`]. Git ref names are byte
+/// strings on Unix, so cache identities must not collapse distinct names via
+/// lossy UTF-8 replacement.
+async fn run_output_bytes(cmd: &mut Command, label: &str) -> Result<Vec<u8>> {
     let output = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1258,22 +4042,24 @@ async fn run_output(cmd: &mut Command, label: &str) -> Result<String> {
             stderr.trim()
         );
     }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    Ok(output.stdout)
 }
 
 #[cfg(unix)]
-struct UvProcessGroupGuard {
+struct UnixProcessGroupGuard {
     pgid: nix::unistd::Pid,
     armed: bool,
+    label: String,
 }
 
 #[cfg(unix)]
-impl UvProcessGroupGuard {
-    fn new(pgid: u32) -> Result<Self> {
-        let pgid = i32::try_from(pgid).context("uv process id exceeds Unix pid_t range")?;
+impl UnixProcessGroupGuard {
+    fn new(pgid: u32, label: impl Into<String>) -> Result<Self> {
+        let pgid = i32::try_from(pgid).context("child process id exceeds Unix pid_t range")?;
         Ok(Self {
             pgid: nix::unistd::Pid::from_raw(pgid),
             armed: true,
+            label: label.into(),
         })
     }
 
@@ -1283,7 +4069,7 @@ impl UvProcessGroupGuard {
 }
 
 #[cfg(unix)]
-impl Drop for UvProcessGroupGuard {
+impl Drop for UnixProcessGroupGuard {
     fn drop(&mut self) {
         if !self.armed {
             return;
@@ -1293,7 +4079,8 @@ impl Drop for UvProcessGroupGuard {
             Err(error) => tracing::warn!(
                 pgid = self.pgid.as_raw(),
                 error = %error,
-                "failed to kill cancelled uv build process group",
+                label = %self.label,
+                "failed to kill cancelled child process group",
             ),
         }
     }
@@ -1317,6 +4104,10 @@ async fn run_capturing_uv(args: &[&str]) -> Result<()> {
     cmd.process_group(0);
     let child = cmd
         .env("UV_PYTHON_DOWNLOADS", "automatic")
+        // Canonical Git sources intentionally share one read-only metadata
+        // store across subdirectory builds. SCM probes may read it, but Git
+        // must not refresh its index or take optional locks there.
+        .env("GIT_OPTIONAL_LOCKS", "0")
         // If pixi cancels a backend request, dropping this future must also
         // terminate the direct uv child. The Unix process-group guard below
         // additionally terminates Python/compiler descendants.
@@ -1330,10 +4121,11 @@ async fn run_capturing_uv(args: &[&str]) -> Result<()> {
     // reverse declaration order, so cancellation kills the complete process
     // group before releasing capacity to a replacement build.
     #[cfg(unix)]
-    let mut process_group = UvProcessGroupGuard::new(
+    let mut process_group = UnixProcessGroupGuard::new(
         child
             .id()
             .context("spawned uv process has no operating-system pid")?,
+        "uv build",
     )?;
     let output = child
         .wait_with_output()
@@ -1372,17 +4164,7 @@ async fn run_capturing_uv(args: &[&str]) -> Result<()> {
 /// "status N" we used to emit was useless for diagnosing upstream
 /// issues like ENAMETOOLONG on git checkout.
 async fn run_silent(cmd: &mut Command, label: &str) -> Result<()> {
-    let output = cmd
-        // Clone/checkout/clean/fetch run while the one-time EX transaction is
-        // armed. If that task is aborted during runtime shutdown, do not let a
-        // detached git child continue mutating after the RAII guard unlocks.
-        .kill_on_drop(true)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .with_context(|| format!("spawning {label} (is the tool on PATH?)"))?;
+    let output = run_mutating_command(cmd, label).await?;
     if !output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1411,18 +4193,99 @@ async fn run_silent(cmd: &mut Command, label: &str) -> Result<()> {
     Ok(())
 }
 
-/// Like [`run_silent`] but returns `Ok(false)` instead of failing when
-/// the child exits non-zero. Used by paths that have a fallback (e.g.,
-/// `git checkout` -> `git fetch` -> `git checkout`).
-async fn try_run_silent(cmd: &mut Command) -> Result<bool> {
-    let output = cmd
+/// Run one mutating command with bounded caller-provided standard input. This
+/// retains the same cancellation/process-group contract as [`run_silent`],
+/// while allowing Git's transactional `update-ref --stdin` protocol instead
+/// of spawning one process per ref.
+async fn run_silent_with_input(cmd: &mut Command, label: &str, input: &[u8]) -> Result<()> {
+    #[cfg(unix)]
+    cmd.process_group(0);
+    let mut child = cmd
+        .kill_on_drop(true)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("spawning {label} (is the tool on PATH?)"))?;
+    #[cfg(unix)]
+    let mut process_group = UnixProcessGroupGuard::new(
+        child
+            .id()
+            .context("spawned mutating child has no operating-system pid")?,
+        label,
+    )?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("{label} did not expose piped stdin"))?;
+    stdin
+        .write_all(input)
+        .await
+        .with_context(|| format!("writing {label} stdin"))?;
+    drop(stdin);
+    let output = child
+        .wait_with_output()
+        .await
+        .with_context(|| format!("waiting for {label}"))?;
+    #[cfg(unix)]
+    process_group.disarm();
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "{label} failed (status {}): {}{}",
+            output.status,
+            stderr.trim(),
+            if stdout.is_empty() {
+                String::new()
+            } else {
+                format!(" | (stdout) {}", stdout.trim())
+            },
+        );
+    }
+    Ok(())
+}
+
+/// Run a checkout-mutating child in its own Unix process group. The group
+/// guard is declared inside the caller that still owns the checkout's EX
+/// transaction, so cancellation kills ordinary git helpers/transports before
+/// that outer transaction can drop and unlock. Windows retains Tokio's
+/// direct-child `kill_on_drop` behavior; process-tree parity there requires a
+/// Job Object and is intentionally not claimed here.
+async fn run_mutating_command(cmd: &mut Command, label: &str) -> Result<std::process::Output> {
+    #[cfg(unix)]
+    cmd.process_group(0);
+    let child = cmd
+        // Clone/checkout/clean/fetch run while the one-time EX transaction is
+        // armed. If that task is aborted during runtime shutdown, do not let a
+        // detached direct child continue mutating after the RAII guard unlocks.
         .kill_on_drop(true)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
+        .spawn()
+        .with_context(|| format!("spawning {label} (is the tool on PATH?)"))?;
+    #[cfg(unix)]
+    let mut process_group = UnixProcessGroupGuard::new(
+        child
+            .id()
+            .context("spawned mutating child has no operating-system pid")?,
+        label,
+    )?;
+    let output = child
+        .wait_with_output()
         .await
-        .context("spawning subprocess")?;
+        .with_context(|| format!("waiting for {label}"))?;
+    #[cfg(unix)]
+    process_group.disarm();
+    Ok(output)
+}
+
+/// Like [`run_silent`] but returns `Ok(false)` instead of failing when
+/// the child exits non-zero. Used by paths that have a fallback (e.g.,
+/// `git checkout` -> `git fetch` -> `git checkout`).
+async fn try_run_silent(cmd: &mut Command) -> Result<bool> {
+    let output = run_mutating_command(cmd, "git subprocess").await?;
     Ok(output.status.success())
 }
 
@@ -1473,7 +4336,7 @@ async fn find_built_wheel(dir: &Path) -> Result<PathBuf> {
     let mut read = tokio::fs::read_dir(dir)
         .await
         .with_context(|| format!("opening wheel-build dir {}", dir.display()))?;
-    let mut latest: Option<PathBuf> = None;
+    let mut wheels = Vec::new();
     while let Some(entry) = read
         .next_entry()
         .await
@@ -1484,10 +4347,26 @@ async fn find_built_wheel(dir: &Path) -> Result<PathBuf> {
             continue;
         };
         if name.ends_with(".whl") {
-            latest = Some(path);
+            wheels.push(path);
         }
     }
-    latest.ok_or_else(|| anyhow!("no .whl produced in {}", dir.display()))
+    match wheels.as_slice() {
+        [wheel] => Ok(wheel.clone()),
+        [] => bail!("source build produced no wheel in {}", dir.display()),
+        _ => {
+            wheels.sort();
+            bail!(
+                "source build produced {} wheels in {}; expected exactly one: {}",
+                wheels.len(),
+                dir.display(),
+                wheels
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            )
+        }
+    }
 }
 
 /// Sanitize a git URL into a filesystem-safe slug for cache key.
@@ -1504,6 +4383,14 @@ mod tests {
     const UV_BUILD_LIMIT_SUBPROCESS_HELPER: &str =
         "source_build::tests::uv_build_limit_subprocess_helper";
 
+    fn unique_test_dir(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "retread-{label}-{}-{}",
+            std::process::id(),
+            BUILD_TMP_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+        ))
+    }
+
     struct CheckoutTestChild {
         child: Option<std::process::Child>,
         label: String,
@@ -1511,12 +4398,7 @@ mod tests {
 
     impl CheckoutTestChild {
         fn spawn(label: &str, mode: &str, environment: &[(&str, String)]) -> Self {
-            Self::spawn_exact(
-                label,
-                CHECKOUT_SUBPROCESS_HELPER,
-                mode,
-                environment,
-            )
+            Self::spawn_exact(label, CHECKOUT_SUBPROCESS_HELPER, mode, environment)
         }
 
         fn spawn_exact(
@@ -1728,7 +4610,10 @@ mod tests {
             .expect("cancelled task still present");
         cancelled.abort();
         assert!(
-            cancelled.await.expect_err("aborted build task completed").is_cancelled(),
+            cancelled
+                .await
+                .expect_err("aborted build task completed")
+                .is_cancelled(),
             "build task did not report cancellation",
         );
         wait_for_test_condition("cancelled uv child termination", || {
@@ -1746,7 +4631,11 @@ mod tests {
 
         for task in tasks.into_iter().flatten() {
             task.abort();
-            assert!(task.await.expect_err("aborted build task completed").is_cancelled());
+            assert!(
+                task.await
+                    .expect_err("aborted build task completed")
+                    .is_cancelled()
+            );
         }
         for pid in started_uv_processes(&state_dir).into_values() {
             wait_for_test_condition("fake uv cleanup", || !process_is_running(pid)).await;
@@ -1797,10 +4686,7 @@ mod tests {
             "uv-build-limit",
             &[
                 ("RETREAD_MAX_CONCURRENT_BUILDS", "2".to_string()),
-                (
-                    "RETREAD_TEST_UV_STATE",
-                    state_dir.display().to_string(),
-                ),
+                ("RETREAD_TEST_UV_STATE", state_dir.display().to_string()),
                 ("PATH", path),
             ],
         )
@@ -1844,8 +4730,7 @@ mod tests {
 
     /// v0.13.3+ regression: every on-disk path component in the
     /// checkout-root path is independently bounded. Layout is
-    /// cache/retread-git-clones/<slug<=24>/<sha12>, so the longest
-    /// component should be the 24-char slug cap. Previously the
+    /// cache/retread-git-clones/v3/<slug<=24>/<full-sha256>. Previously the
     /// (slug + 40-char raw SHA) flattened into one 60+ char
     /// component; combined with the rattler cache prefix and deep
     /// IsaacLab internals, pathnames tripped ENAMETOOLONG on git
@@ -1862,14 +4747,14 @@ mod tests {
             .components()
             .filter_map(|c| c.as_os_str().to_str().map(String::from))
             .collect();
-        // Last component is the 12-hex sha; second-to-last is the
-        // slug (<=24 chars). Neither anywhere near NAME_MAX / 255.
+        // Last component is the full 64-hex identity; second-to-last is the
+        // slug (<=24 chars). Neither is near NAME_MAX / 255.
         let last = comps.last().expect("at least one component");
         let parent = &comps[comps.len() - 2];
         assert_eq!(
             last.len(),
-            12,
-            "sha12 must be exactly 12 chars; got: {last}"
+            64,
+            "full SHA-256 identity must be exactly 64 chars; got: {last}"
         );
         assert!(parent.len() <= 24, "slug must be <=24 chars; got {parent}");
     }
@@ -2245,6 +5130,7 @@ version = "0.1.0"
             .env("GIT_AUTHOR_EMAIL", "retread-test@example.com")
             .env("GIT_COMMITTER_NAME", "retread-test")
             .env("GIT_COMMITTER_EMAIL", "retread-test@example.com")
+            .env("GIT_OPTIONAL_LOCKS", "0")
             .output()
             .expect("spawn fixture git");
         assert!(
@@ -2300,6 +5186,184 @@ version = "0.1.0"
             "legacy fixture must begin unpublished"
         );
         clone_dir
+    }
+
+    #[tokio::test]
+    async fn canonical_git_source_ignores_warm_dirt_and_binds_tag_state() {
+        let fixture = git_checkout_fixture("canonical-source");
+        let origin = fixture.base.join("repo");
+        run_fixture_git(&["tag", "release-one", &fixture.rev2], &origin);
+        let checkout = ensure_git_checkout(&fixture.url, &fixture.rev2, &fixture.cache)
+            .await
+            .expect("publish warm checkout");
+        let warm = checkout.root();
+        std::fs::write(warm.join("base.txt"), "dirty-warm-bytes\n").unwrap();
+        std::fs::write(warm.join("warm-sentinel.txt"), "must not enter source\n").unwrap();
+        std::fs::write(warm.join(".git/index.lock"), "external warm lock\n").unwrap();
+
+        let first_ref_state = canonical_git_ref_state(warm).await.unwrap();
+        let first =
+            ensure_canonical_git_snapshot(warm, &fixture.url, &fixture.rev2, &first_ref_state)
+                .await
+                .expect("prepare first canonical source");
+        assert_eq!(
+            std::fs::read_to_string(first.root.join("base.txt")).unwrap(),
+            "base\n"
+        );
+        assert!(!first.root.join("warm-sentinel.txt").exists());
+        assert!(!first.root.join(".git/index.lock").exists());
+        assert_eq!(
+            run_fixture_git(&["rev-parse", "HEAD"], &first.root),
+            fixture.rev2
+        );
+        assert_eq!(
+            run_fixture_git(&["describe", "--tags", "--exact-match"], &first.root),
+            "release-one"
+        );
+        assert_eq!(
+            run_fixture_git(&["remote", "get-url", "origin"], &first.root),
+            fixture.url
+        );
+        assert!(
+            run_fixture_git(
+                &["status", "--porcelain=v1", "--untracked-files=all"],
+                &first.root,
+            )
+            .is_empty()
+        );
+
+        // Mutating only the visible tag set must select a different wheel and
+        // canonical-source identity even though URL/SHA/subdirectory are fixed.
+        run_fixture_git(&["tag", "release-two", &fixture.rev2], warm);
+        let second_ref_state = canonical_git_ref_state(warm).await.unwrap();
+        assert_ne!(first_ref_state, second_ref_state);
+        let family = git_wheel_family_identity(&fixture.url, &fixture.rev2, ".");
+        assert_ne!(
+            git_wheel_source_identity(&family, &first_ref_state),
+            git_wheel_source_identity(&family, &second_ref_state),
+        );
+        let second =
+            ensure_canonical_git_snapshot(warm, &fixture.url, &fixture.rev2, &second_ref_state)
+                .await
+                .expect("prepare second canonical source");
+        assert_ne!(first.root.parent(), second.root.parent());
+        assert_eq!(
+            canonical_git_ref_state(&second.root).await.unwrap(),
+            second_ref_state
+        );
+
+        // Canonicalization never repairs or cleans the published warm tree.
+        assert_eq!(
+            std::fs::read_to_string(warm.join("base.txt")).unwrap(),
+            "dirty-warm-bytes\n"
+        );
+        assert!(warm.join("warm-sentinel.txt").exists());
+        assert!(warm.join(".git/index.lock").exists());
+
+        for snapshot in [first, second] {
+            let cache_dir = snapshot.root.parent().unwrap().to_path_buf();
+            make_staging_tree_removable(&cache_dir);
+            let _ = std::fs::remove_dir_all(cache_dir);
+        }
+    }
+
+    #[tokio::test]
+    async fn private_git_build_tree_is_writable_and_removed_on_cancellation() {
+        let fixture = git_checkout_fixture("private-git-build");
+        let checkout = ensure_git_checkout(&fixture.url, &fixture.rev2, &fixture.cache)
+            .await
+            .expect("publish fixture checkout");
+        let ref_state = canonical_git_ref_state(checkout.root()).await.unwrap();
+        let canonical =
+            ensure_canonical_git_snapshot(checkout.root(), &fixture.url, &fixture.rev2, &ref_state)
+                .await
+                .expect("prepare canonical fixture");
+        let staging_parent = fixture.base.join("private-build-staging");
+        std::fs::create_dir_all(&staging_parent).unwrap();
+        let cache_leaf = staging_parent.join("cache-leaf");
+        let canonical_for_task = canonical.clone();
+        let url_for_task = fixture.url.clone();
+        let (published, receive_published) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let staging = unique_staging_dir(&cache_leaf).unwrap();
+            let private_out = staging.0.join("build");
+            std::fs::create_dir(&private_out).unwrap();
+            let private_project = prepare_private_git_build_tree(
+                &canonical_for_task,
+                &url_for_task,
+                Path::new("."),
+                &private_out,
+            )
+            .await
+            .unwrap();
+            let backend_scratch = private_project.join("retread_fixture.egg-info");
+            std::fs::create_dir(&backend_scratch).expect("private Git build tree must be writable");
+            published
+                .send((staging.0.clone(), backend_scratch))
+                .expect("test receiver remains alive");
+            std::future::pending::<()>().await;
+            drop(staging);
+        });
+        let (staging_path, backend_scratch) = receive_published
+            .await
+            .expect("private build task reached cancellation point");
+        assert!(backend_scratch.is_dir());
+        assert!(!canonical.root.join("retread_fixture.egg-info").exists());
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(
+            !staging_path.exists(),
+            "cancelling a build must remove its writable private tree",
+        );
+        validate_canonical_git_snapshot(
+            canonical.root.parent().unwrap(),
+            &canonical.repository_identity,
+            &canonical.resolved_sha,
+            &canonical.ref_state,
+            true,
+        )
+        .await
+        .expect("private build must not mutate canonical injection source");
+        let canonical_cache = canonical.root.parent().unwrap().to_path_buf();
+        make_staging_tree_removable(&canonical_cache);
+        let _ = std::fs::remove_dir_all(canonical_cache);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_mutating_git_runner_kills_descendant_process_group() {
+        let base = unique_test_dir("git-runner-cancel");
+        std::fs::create_dir_all(&base).unwrap();
+        let started = base.join("started");
+        let finished = base.join("finished");
+        let started_for_task = started.clone();
+        let finished_for_task = finished.clone();
+        let task = tokio::spawn(async move {
+            run_silent(
+                Command::new("/bin/sh").args([
+                    "-c",
+                    "touch \"$1\"; (sleep 1; touch \"$2\") & wait",
+                    "retread-git-cancel-test",
+                    &started_for_task.display().to_string(),
+                    &finished_for_task.display().to_string(),
+                ]),
+                "git cancellation test",
+            )
+            .await
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !started.exists() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(started.exists(), "mutating test command never started");
+        task.abort();
+        let _ = task.await;
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(
+            !finished.exists(),
+            "a mutating descendant survived cancellation"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// Entry point used only by parent tests that need a killable process
@@ -2711,54 +5775,753 @@ version = "0.1.0"
         for other in [&b, &c, &d, &e] {
             assert_ne!(&a, other);
         }
+        assert!(
+            a.components()
+                .any(|component| component.as_os_str() == "v3")
+        );
+        assert_eq!(
+            a.file_name().and_then(|name| name.to_str()).unwrap().len(),
+            64,
+            "git source identity must use the complete SHA-256 namespace",
+        );
+    }
+
+    fn write_test_wheel_with_payload(
+        path: &Path,
+        metadata_name: &str,
+        metadata_version: &str,
+        payload: &[u8],
+    ) {
+        let file = File::create(path).unwrap();
+        let mut archive = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        archive
+            .start_file(
+                format!(
+                    "{}-{}.dist-info/METADATA",
+                    metadata_name.replace('-', "_"),
+                    metadata_version
+                ),
+                options,
+            )
+            .unwrap();
+        archive
+            .write_all(
+                format!(
+                    "Metadata-Version: 2.4\nName: {metadata_name}\nVersion: {metadata_version}\n\n"
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        if !payload.is_empty() {
+            archive.start_file("payload.bin", options).unwrap();
+            archive.write_all(payload).unwrap();
+        }
+        archive.finish().unwrap();
+    }
+
+    fn write_test_wheel(path: &Path, metadata_name: &str, metadata_version: &str) {
+        write_test_wheel_with_payload(path, metadata_name, metadata_version, &[]);
     }
 
     #[tokio::test]
-    async fn git_wheel_cache_store_then_lookup_round_trips() {
+    async fn v3_cache_marker_round_trip_preserves_user_outdir_sentinel() {
         let base =
             std::env::temp_dir().join(format!("retread-gitwheel-cache-{}", std::process::id()));
-        let cache_dir = base.join("shared");
+        let _ = std::fs::remove_dir_all(&base);
+        let cache_dir = base.join("managed-cache");
         let out_dir = base.join("out");
-        let built_dir = base.join("built");
-        std::fs::create_dir_all(&built_dir).unwrap();
-
-        // Empty cache: miss.
-        let miss = git_wheel_cache_lookup(&cache_dir, &out_dir).await.unwrap();
-        assert!(miss.is_none(), "empty cache must miss");
-
-        // Store a freshly-"built" wheel, then look it up into out_dir.
-        let wheel = built_dir.join("pkg-1.0.0-py3-none-any.whl");
-        std::fs::write(&wheel, b"wheel bytes").unwrap();
-        git_wheel_cache_store(&wheel, &cache_dir).await;
-        assert!(
-            cache_dir.join("pkg-1.0.0-py3-none-any.whl").is_file(),
-            "store must persist the raw wheel into the shared cache dir"
-        );
-
-        let hit = git_wheel_cache_lookup(&cache_dir, &out_dir)
-            .await
-            .unwrap()
-            .expect("populated cache must hit");
-        assert_eq!(hit, out_dir.join("pkg-1.0.0-py3-none-any.whl"));
-        assert_eq!(std::fs::read(&hit).unwrap(), b"wheel bytes");
-
-        // Post-processed variants must never be served from the cache
-        // (they are pack/config-specific and regenerate downstream).
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::create_dir_all(&out_dir).unwrap();
+        std::fs::write(out_dir.join("user-sentinel"), b"keep").unwrap();
+        let wheel = cache_dir.join("pkg-1.0.0-py3-none-any.whl");
+        write_test_wheel(&wheel, "pkg", "1.0.0");
+        let target = ResolutionTarget::from_parts("3.11", "linux-64", None);
+        let source_identity = "a".repeat(64);
+        let mut marker =
+            validate_wheel_file(&wheel, &target, Some(&ExpectedWheel::exact("pkg", "1.0.0")))
+                .unwrap();
+        marker.source_identity = source_identity.clone();
         std::fs::write(
-            cache_dir.join("pkg-1.0.0-py3-none-any.injected.whl"),
-            b"processed",
+            cache_dir.join("artifact.json"),
+            serde_json::to_vec_pretty(&marker).unwrap(),
         )
         .unwrap();
-        let hit2 = git_wheel_cache_lookup(&cache_dir, &out_dir)
+        let validated = validate_cache_entry(
+            &cache_dir,
+            &source_identity,
+            &target,
+            Some(&ExpectedWheel::exact("pkg", "1.0.0")),
+        )
+        .unwrap()
+        .unwrap();
+        let hit = materialize_validated_wheel(&validated, &out_dir)
             .await
-            .unwrap()
-            .expect("raw wheel still present");
-        assert!(
-            !hit2.to_string_lossy().contains(".injected."),
-            "cache lookup must skip retread-processed variants: {}",
-            hit2.display()
+            .unwrap();
+        assert!(hit.is_file());
+        assert_eq!(
+            std::fs::read(out_dir.join("user-sentinel")).unwrap(),
+            b"keep"
         );
 
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn build_output_requires_exactly_one_wheel() {
+        let base = std::env::temp_dir().join(format!(
+            "retread-multiwheel-{}-{}",
+            std::process::id(),
+            BUILD_TMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        write_test_wheel(&base.join("one-1.0-py3-none-any.whl"), "one", "1.0");
+        write_test_wheel(&base.join("two-1.0-py3-none-any.whl"), "two", "1.0");
+        let error = find_built_wheel(&base).await.unwrap_err();
+        assert!(format!("{error:#}").contains("expected exactly one"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn wheel_validation_rejects_filename_metadata_identity_mismatch() {
+        let base = std::env::temp_dir().join(format!(
+            "retread-wrong-metadata-{}-{}",
+            std::process::id(),
+            BUILD_TMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let wheel = base.join("good-1.0-py3-none-any.whl");
+        write_test_wheel(&wheel, "evil", "9.0");
+        let target = ResolutionTarget::from_parts("3.11", "linux-64", None);
+        let error =
+            validate_wheel_file(&wheel, &target, Some(&ExpectedWheel::named("good"))).unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("identity mismatch") || rendered.contains("does not match"),
+            "unexpected strict identity error: {rendered}",
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pinned_wheel_attestation_rechecks_changed_inode_bytes() {
+        let base = unique_test_dir("pinned-attestation");
+        std::fs::create_dir_all(&base).unwrap();
+        let wheel = base.join("pkg-1.0.0-py3-none-any.whl");
+        let unique_payload = format!(
+            "first-{}-{}",
+            std::process::id(),
+            BUILD_TMP_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+        );
+        write_test_wheel_with_payload(&wheel, "pkg", "1.0.0", unique_payload.as_bytes());
+        let target =
+            ResolutionTarget::from_parts("3.11", crate::glibc::current_pixi_platform(), None);
+        let expected = ExpectedWheel::exact("pkg", "1.0.0");
+        let authoritative = crate::wheel::read_metadata(&wheel).unwrap().sha256;
+        assert_eq!(
+            validate_pinned_wheel_for_target_async(
+                &wheel,
+                &target,
+                &expected,
+                &authoritative,
+                "https://example.invalid/pkg-1.0.0.whl",
+            )
+            .await
+            .unwrap(),
+            authoritative,
+        );
+        // The unchanged inode/stat tuple takes the persisted fast path.
+        assert_eq!(
+            validate_pinned_wheel_for_target_async(
+                &wheel,
+                &target,
+                &expected,
+                &authoritative,
+                "https://example.invalid/pkg-1.0.0.whl",
+            )
+            .await
+            .unwrap(),
+            authoritative,
+        );
+
+        write_test_wheel_with_payload(&wheel, "pkg", "1.0.0", b"coherent-wrong-bytes");
+        let error = validate_pinned_wheel_for_target_async(
+            &wheel,
+            &target,
+            &expected,
+            &authoritative,
+            "https://example.invalid/pkg-1.0.0.whl",
+        )
+        .await
+        .unwrap_err();
+        assert!(is_authoritative_wheel_hash_mismatch(&error));
+        assert!(
+            wheel.is_file(),
+            "semantic hash mismatch must preserve ingress bytes"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn v3_artifact_namespaces_separate_architectures_and_use_full_hashes() {
+        let x86 = ResolutionTarget::from_parts("3.11", "linux-64", Some((2, 35)));
+        let arm = ResolutionTarget::from_parts("3.11", "linux-aarch64", Some((2, 35)));
+        let source = "f".repeat(64);
+        let x86_path = built_wheel_cache_dir("git", &source, &x86);
+        let arm_path = built_wheel_cache_dir("git", &source, &arm);
+        assert_ne!(x86_path, arm_path);
+        assert!(x86_path.components().any(|part| part.as_os_str() == "v3"));
+        assert_eq!(x86_path.file_name().unwrap().to_string_lossy().len(), 64);
+        assert_eq!(
+            x86_path
+                .parent()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .len(),
+            64,
+            "artifact target identity must be full SHA-256",
+        );
+    }
+
+    #[test]
+    fn partial_cache_is_invalid_without_touching_caller_output() {
+        let base = std::env::temp_dir().join(format!(
+            "retread-partial-cache-{}-{}",
+            std::process::id(),
+            BUILD_TMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cache = base.join("cache");
+        let output = base.join("output");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::create_dir_all(&output).unwrap();
+        std::fs::write(output.join("sentinel"), b"owned by caller").unwrap();
+        let target = ResolutionTarget::from_parts("3.11", "linux-64", None);
+        assert!(validate_cache_entry(&cache, &"a".repeat(64), &target, None).is_err());
+        assert_eq!(
+            std::fs::read(output.join("sentinel")).unwrap(),
+            b"owned by caller"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn sdist_pep691_and_fragment_hashes_must_agree() {
+        let fragment = "a".repeat(64);
+        let advertised = "b".repeat(64);
+        let url = url::Url::parse(&format!(
+            "https://example.invalid/pkg-1.0.tar.gz#sha256={fragment}"
+        ))
+        .unwrap();
+        let error = sdist_advertised_sha256(&url, Some(&advertised)).unwrap_err();
+        assert!(format!("{error:#}").contains("hash disagreement"));
+    }
+
+    #[tokio::test]
+    async fn foreign_exact_miss_refuses_before_build_callback() {
+        let foreign_subdir = match crate::glibc::current_pixi_platform() {
+            "linux-aarch64" => "linux-64",
+            _ => "linux-aarch64",
+        };
+        let target = ResolutionTarget::from_parts("3.11", foreign_subdir, Some((2, 35)));
+        let source_identity = hash_fields(
+            b"foreign-miss-test\0",
+            &[format!(
+                "{}-{}",
+                std::process::id(),
+                BUILD_TMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            )
+            .as_bytes()],
+        );
+        let cache = built_wheel_cache_dir("git", &source_identity, &target);
+        let _ = remove_owned_cache_entry(&cache);
+        let callback_ran = Arc::new(AtomicBool::new(false));
+        let callback_flag = Arc::clone(&callback_ran);
+        let output = std::env::temp_dir().join(format!(
+            "retread-foreign-miss-output-{}",
+            std::process::id()
+        ));
+        let error = cached_build(
+            "git",
+            &source_identity,
+            &target,
+            &output,
+            None,
+            move |_private_out| async move {
+                callback_flag.store(true, Ordering::Relaxed);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("foreign target"));
+        assert!(!callback_ran.load(Ordering::Relaxed));
+        let _ = remove_owned_cache_entry(&cache);
+        let _ = std::fs::remove_dir_all(&output);
+    }
+
+    #[tokio::test]
+    async fn valid_cache_semantic_mismatch_is_preserved_without_rebuild() {
+        let target =
+            ResolutionTarget::from_parts("3.11", crate::glibc::current_pixi_platform(), None);
+        let source_identity = hash_fields(
+            b"semantic-mismatch-test\0",
+            &[unique_test_dir("semantic-key").to_string_lossy().as_bytes()],
+        );
+        let cache = built_wheel_cache_dir("path", &source_identity, &target);
+        remove_owned_cache_entry(&cache).unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+        let wheel = cache.join("pkg-1.0.0-py3-none-any.whl");
+        write_test_wheel(&wheel, "pkg", "1.0.0");
+        let mut marker = validate_wheel_file(&wheel, &target, None).unwrap();
+        marker.source_identity = source_identity.clone();
+        std::fs::write(
+            cache.join("artifact.json"),
+            serde_json::to_vec_pretty(&marker).unwrap(),
+        )
+        .unwrap();
+
+        let callback_ran = Arc::new(AtomicBool::new(false));
+        let callback_flag = Arc::clone(&callback_ran);
+        let output = unique_test_dir("semantic-output");
+        let error = cached_build(
+            "path",
+            &source_identity,
+            &target,
+            &output,
+            Some(&ExpectedWheel::exact("pkg", "2.0.0")),
+            move |_private_out| async move {
+                callback_flag.store(true, Ordering::Relaxed);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(is_expected_wheel_mismatch(&error));
+        assert!(!callback_ran.load(Ordering::Relaxed));
+        assert!(cache.join("artifact.json").is_file());
+        assert!(wheel.is_file());
+
+        remove_owned_cache_entry(&cache).unwrap();
+        let _ = std::fs::remove_dir_all(&output);
+    }
+
+    #[tokio::test]
+    async fn foreign_target_can_use_exact_validated_cache_hit() {
+        let foreign_subdir = match crate::glibc::current_pixi_platform() {
+            "linux-aarch64" => "linux-64",
+            _ => "linux-aarch64",
+        };
+        let target = ResolutionTarget::from_parts("3.11", foreign_subdir, Some((2, 35)));
+        let source_identity = hash_fields(
+            b"foreign-hit-test\0",
+            &[unique_test_dir("foreign-hit-key")
+                .to_string_lossy()
+                .as_bytes()],
+        );
+        let cache = built_wheel_cache_dir("git", &source_identity, &target);
+        remove_owned_cache_entry(&cache).unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+        let wheel = cache.join("pkg-1.0.0-py3-none-any.whl");
+        write_test_wheel(&wheel, "pkg", "1.0.0");
+        let mut marker = validate_wheel_file(&wheel, &target, None).unwrap();
+        marker.source_identity = source_identity.clone();
+        std::fs::write(
+            cache.join("artifact.json"),
+            serde_json::to_vec_pretty(&marker).unwrap(),
+        )
+        .unwrap();
+
+        let callback_ran = Arc::new(AtomicBool::new(false));
+        let callback_flag = Arc::clone(&callback_ran);
+        let output = unique_test_dir("foreign-hit-output");
+        let hit = cached_build(
+            "git",
+            &source_identity,
+            &target,
+            &output,
+            Some(&ExpectedWheel::exact("pkg", "1.0.0")),
+            move |_private_out| async move {
+                callback_flag.store(true, Ordering::Relaxed);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        assert!(hit.is_file());
+        assert!(!callback_ran.load(Ordering::Relaxed));
+
+        remove_owned_cache_entry(&cache).unwrap();
+        let _ = std::fs::remove_dir_all(&output);
+    }
+
+    #[tokio::test]
+    async fn output_publication_replaces_a_b_a_without_cache_aliasing() {
+        let base = unique_test_dir("output-aba");
+        let cache_a = base.join("cache-a");
+        let cache_b = base.join("cache-b");
+        let output = base.join("output");
+        std::fs::create_dir_all(&cache_a).unwrap();
+        std::fs::create_dir_all(&cache_b).unwrap();
+        let filename = "pkg-1.0.0-py3-none-any.whl";
+        let path_a = cache_a.join(filename);
+        let path_b = cache_b.join(filename);
+        write_test_wheel_with_payload(&path_a, "pkg", "1.0.0", b"artifact-a");
+        write_test_wheel_with_payload(&path_b, "pkg", "1.0.0", b"artifact-b");
+        let target = ResolutionTarget::from_parts("3.11", "linux-64", None);
+        let mut marker_a = validate_wheel_file(&path_a, &target, None).unwrap();
+        marker_a.source_identity = "a".repeat(64);
+        let mut marker_b = validate_wheel_file(&path_b, &target, None).unwrap();
+        marker_b.source_identity = "b".repeat(64);
+        assert_ne!(marker_a.sha256, marker_b.sha256);
+        let validated_a = ValidatedWheel {
+            path: path_a.clone(),
+            marker: marker_a.clone(),
+        };
+        let validated_b = ValidatedWheel {
+            path: path_b.clone(),
+            marker: marker_b.clone(),
+        };
+
+        let published = materialize_validated_wheel(&validated_a, &output)
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::wheel::read_metadata(&published).unwrap().sha256,
+            marker_a.sha256
+        );
+        materialize_validated_wheel(&validated_b, &output)
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::wheel::read_metadata(&published).unwrap().sha256,
+            marker_b.sha256
+        );
+        materialize_validated_wheel(&validated_a, &output)
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::wheel::read_metadata(&published).unwrap().sha256,
+            marker_a.sha256
+        );
+        assert!(!same_filesystem_inode(&published, &path_a));
+        assert!(!same_filesystem_inode(&published, &path_b));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn source_snapshot_captures_context_and_excludes_only_managed_roots() {
+        let base = unique_test_dir("snapshot-context");
+        let context = base.join("workspace");
+        let project = context.join("packages/pkg");
+        let managed = context.join("generated-wheels");
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        std::fs::create_dir_all(context.join(".git")).unwrap();
+        std::fs::create_dir_all(&managed).unwrap();
+        std::fs::write(project.join("pyproject.toml"), b"[build-system]\n").unwrap();
+        std::fs::write(project.join("src/lib.py"), b"VALUE = 1\n").unwrap();
+        std::fs::write(context.join(".git/HEAD"), b"ref: refs/heads/main\n").unwrap();
+        std::fs::write(
+            context.join("workspace.toml"),
+            b"members = ['packages/pkg']\n",
+        )
+        .unwrap();
+        for managed_file in [
+            "retread-pack.lock.json",
+            "retread-audit-pack.json",
+            "retread-probe-trace-pack.json",
+            "retread-progress-pack.log",
+            ".retread-pack.lock.json.tmp",
+        ] {
+            std::fs::write(context.join(managed_file), b"managed generation one").unwrap();
+        }
+        std::fs::write(context.join("retread-real.py"), b"REAL = True\n").unwrap();
+        std::fs::write(managed.join("old.whl"), b"old output").unwrap();
+
+        let first =
+            prepare_source_snapshot(&context, &managed, std::slice::from_ref(&managed)).unwrap();
+        assert!(first.root().join("packages/pkg/pyproject.toml").is_file());
+        assert!(first.root().join(".git/HEAD").is_file());
+        assert!(first.root().join("workspace.toml").is_file());
+        assert!(first.root().join("retread-real.py").is_file());
+        assert!(!first.root().join("retread-pack.lock.json").exists());
+        assert!(!first.root().join("retread-progress-pack.log").exists());
+        assert!(!first.root().join("generated-wheels").exists());
+        std::fs::write(managed.join("new.whl"), b"new output").unwrap();
+        std::fs::write(
+            context.join("retread-progress-pack.log"),
+            b"managed generation two",
+        )
+        .unwrap();
+        let second =
+            prepare_source_snapshot(&context, &managed, std::slice::from_ref(&managed)).unwrap();
+        assert_eq!(first.identity, second.identity);
+        std::fs::write(
+            context.join("workspace.toml"),
+            b"members = ['packages/pkg', 'other']\n",
+        )
+        .unwrap();
+        let third =
+            prepare_source_snapshot(&context, &managed, std::slice::from_ref(&managed)).unwrap();
+        assert_ne!(first.identity, third.identity);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn source_snapshot_workspace_path_is_stable_and_lease_scoped() {
+        let base = unique_test_dir("stable-snapshot");
+        let source = base.join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("input.txt"), b"stable bytes").unwrap();
+        let snapshot = prepare_source_snapshot(&source, &base.join("out"), &[]).unwrap();
+        let source_identity = hash_fields(
+            b"stable-workspace-test\0",
+            &[unique_test_dir("stable-workspace-key")
+                .to_string_lossy()
+                .as_bytes()],
+        );
+        let stable = stabilize_source_snapshot_workspace(snapshot, "test", &source_identity)
+            .await
+            .unwrap();
+        let expected = crate::courier::retread_cache_root()
+            .join("source-workspaces/v1/test")
+            .join(&source_identity);
+        assert_eq!(stable.root(), expected);
+        assert_eq!(
+            std::fs::read(stable.root().join("input.txt")).unwrap(),
+            b"stable bytes"
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::metadata(stable.root().join("input.txt"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            std::time::UNIX_EPOCH + Duration::from_secs(946_684_800),
+        );
+        drop(stable);
+        assert!(
+            !expected.exists(),
+            "workspace must be removed before its lease unlocks"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn disposable_build_mutation_cannot_change_retained_injection_source() {
+        let base = unique_test_dir("disposable-build-source");
+        let source = base.join("source");
+        std::fs::create_dir_all(source.join("pkg")).unwrap();
+        std::fs::write(source.join("pkg/module.py"), b"committed = True\n").unwrap();
+        let snapshot = prepare_source_snapshot(&source, &base.join("out"), &[]).unwrap();
+        let identity = hash_fields(
+            b"disposable-build-source-test\0",
+            &[base.to_string_lossy().as_bytes()],
+        );
+        let pristine = stabilize_source_snapshot_workspace(snapshot, "test", &identity)
+            .await
+            .unwrap();
+        let retained_workspace = Arc::clone(&pristine.workspace);
+        let disposable = tokio::task::spawn_blocking({
+            let out = base.join("private-output");
+            move || prepare_source_snapshot(&retained_workspace.directory.0, &out, &[])
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        std::fs::write(disposable.root().join("pkg/module.py"), b"mutated = True\n").unwrap();
+        std::fs::write(
+            disposable.root().join("pkg/generated.egg-info"),
+            b"generated\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(pristine.root().join("pkg/module.py")).unwrap(),
+            b"committed = True\n"
+        );
+        assert!(!pristine.root().join("pkg/generated.egg-info").exists());
+        drop(disposable);
+        drop(pristine);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_snapshot_identity_binds_modes_and_symlink_targets() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let base = unique_test_dir("snapshot-mode-link");
+        let source = base.join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        let script = source.join("tool.sh");
+        std::fs::write(&script, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o644)).unwrap();
+        symlink("tool.sh", source.join("tool-link")).unwrap();
+        let first = prepare_source_snapshot(&source, &base.join("out"), &[]).unwrap();
+
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let second = prepare_source_snapshot(&source, &base.join("out"), &[]).unwrap();
+        assert_ne!(first.identity, second.identity);
+        std::fs::remove_file(source.join("tool-link")).unwrap();
+        symlink("missing-tool.sh", source.join("tool-link")).unwrap();
+        let third = prepare_source_snapshot(&source, &base.join("out"), &[]).unwrap();
+        assert_ne!(second.identity, third.identity);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn source_snapshot_omits_external_gitdir_indirection() {
+        let base = unique_test_dir("snapshot-gitdir");
+        let source = base.join("source");
+        let external_gitdir = base.join("external-gitdir");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&external_gitdir).unwrap();
+        std::fs::write(
+            source.join(".git"),
+            format!("gitdir: {}\n", external_gitdir.display()),
+        )
+        .unwrap();
+        let external = prepare_source_snapshot(&source, &base.join("out"), &[]).unwrap();
+        assert!(!external.root().join(".git").exists());
+
+        std::fs::write(source.join(".git"), "gitdir: .git-data\n").unwrap();
+        std::fs::create_dir_all(source.join(".git-data")).unwrap();
+        std::fs::write(source.join(".git-data/HEAD"), b"ref: refs/heads/main\n").unwrap();
+        let snapshot = prepare_source_snapshot(&source, &base.join("out"), &[]).unwrap();
+        assert!(snapshot.root().join(".git").is_file());
+        assert!(snapshot.root().join(".git-data/HEAD").is_file());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn external_gitdir_path_source_gets_self_contained_scm_metadata() {
+        let fixture = git_checkout_fixture("path-external-gitdir");
+        let origin = fixture.base.join("repo");
+        run_fixture_git(&["tag", "path-release", &fixture.rev2], &origin);
+        let worktree = fixture.base.join("external-worktree");
+        run_fixture_git(
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                worktree.to_str().unwrap(),
+                &fixture.rev2,
+            ],
+            &origin,
+        );
+        assert!(worktree.join(".git").is_file());
+        std::fs::write(worktree.join("base.txt"), b"dirty path bytes\n").unwrap();
+
+        let state = external_path_git_state(&worktree)
+            .await
+            .unwrap()
+            .expect("worktree uses external Git metadata");
+        let snapshot = prepare_source_snapshot(&worktree, &fixture.base.join("out"), &[]).unwrap();
+        assert!(!snapshot.root().join(".git").exists());
+        attach_external_path_git_metadata(&worktree, &snapshot, &state)
+            .await
+            .unwrap();
+
+        assert!(snapshot.root().join(".git").is_dir());
+        assert_eq!(
+            run_fixture_git(&["rev-parse", "HEAD"], snapshot.root()),
+            fixture.rev2
+        );
+        assert_eq!(
+            run_fixture_git(&["describe", "--tags", "--exact-match"], snapshot.root()),
+            "path-release"
+        );
+        let status = run_fixture_git(
+            &["status", "--porcelain=v1", "--untracked-files=all"],
+            snapshot.root(),
+        );
+        assert!(
+            status.contains("base.txt"),
+            "dirty state must remain visible: {status}"
+        );
+        assert_eq!(
+            std::fs::read(snapshot.root().join("base.txt")).unwrap(),
+            b"dirty path bytes\n"
+        );
+    }
+
+    #[test]
+    fn external_relative_project_falls_back_to_its_own_context() {
+        let base = unique_test_dir("external-relative-context");
+        let declared_context = base.join("packs/one");
+        let external_project = base.join("third_party/project");
+        let submodule_gitdir = base.join(".git/modules/third_party/project");
+        std::fs::create_dir_all(&declared_context).unwrap();
+        std::fs::create_dir_all(&external_project).unwrap();
+        std::fs::create_dir_all(&submodule_gitdir).unwrap();
+        std::fs::write(external_project.join("pyproject.toml"), b"[build-system]\n").unwrap();
+        std::fs::write(
+            external_project.join(".git"),
+            "gitdir: ../../.git/modules/third_party/project\n",
+        )
+        .unwrap();
+        std::fs::write(submodule_gitdir.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+
+        let canonical_source = std::fs::canonicalize(&external_project).unwrap();
+        let candidate_context = std::fs::canonicalize(&declared_context).unwrap();
+        let selected = select_path_source_context(&canonical_source, &candidate_context);
+        assert_eq!(selected, canonical_source);
+        let snapshot = prepare_source_snapshot(&selected, &base.join("out"), &[]).unwrap();
+        assert!(snapshot.root().join("pyproject.toml").is_file());
+        assert!(!snapshot.root().join(".git").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_subdirectory_is_lexically_and_physically_confined() {
+        use std::os::unix::fs::symlink;
+
+        assert!(normalize_git_subdirectory("pkg/sub").is_ok());
+        assert!(normalize_git_subdirectory("./pkg").is_ok());
+        assert!(normalize_git_subdirectory("../outside").is_err());
+        assert!(normalize_git_subdirectory("/outside").is_err());
+
+        let base = unique_test_dir("git-confinement");
+        let checkout = base.join("checkout");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(checkout.join("pkg")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, checkout.join("escape")).unwrap();
+        assert!(confined_git_source_dir(&checkout, Path::new("pkg")).is_ok());
+        let error = confined_git_source_dir(&checkout, Path::new("escape")).unwrap_err();
+        assert!(format!("{error:#}").contains("outside checkout"));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn sdist_identity_binds_url_derived_archive_filename() {
+        let sha = "a".repeat(64);
+        assert_ne!(
+            sdist_source_identity(&sha, "pkg-1.0.tar.gz"),
+            sdist_source_identity(&sha, "pkg-1.0.zip"),
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_python_target_fails_before_output_mutation() {
+        let base = unique_test_dir("invalid-python");
+        let source = base.join("source");
+        let output = base.join("output");
+        std::fs::create_dir_all(&source).unwrap();
+        let error = build_wheel_from_path(&source, &output, "3")
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("MAJOR.MINOR"));
+        assert!(!output.exists());
         let _ = std::fs::remove_dir_all(&base);
     }
 }

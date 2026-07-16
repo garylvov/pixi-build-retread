@@ -7,12 +7,53 @@
 use std::fmt::Write as _;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use anyhow::{Context, Result, anyhow, bail};
 use futures::StreamExt as _;
 use sha2::{Digest, Sha256};
 use tokio::fs;
-use tokio::io::AsyncWriteExt as _;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+static ATOMIC_FILE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn unique_atomic_sibling(dst: &Path, suffix: &str) -> PathBuf {
+    use std::sync::atomic::Ordering;
+
+    let parent = dst.parent().unwrap_or_else(|| Path::new("."));
+    let filename = dst
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("wheel.whl");
+    parent.join(format!(
+        ".{filename}.{}.{}.{suffix}",
+        std::process::id(),
+        ATOMIC_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+    ))
+}
+
+struct TemporaryPath {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl TemporaryPath {
+    fn armed(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TemporaryPath {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct WheelMetadata {
@@ -54,14 +95,7 @@ pub(crate) fn create_atomic_tmp(dst: &Path) -> Result<(PathBuf, std::fs::File)> 
 /// `wheel_rewrite.rs`) whose write step needs the path to NOT already
 /// exist (`std::fs::hard_link` errors if the destination is present).
 pub(crate) fn atomic_tmp_path(dst: &Path) -> PathBuf {
-    let parent = dst.parent().unwrap_or_else(|| Path::new("."));
-    parent.join(format!(
-        "{}.{}.tmp",
-        dst.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("wheel.whl"),
-        std::process::id()
-    ))
+    unique_atomic_sibling(dst, "tmp")
 }
 
 /// Promote a temp file created by [`create_atomic_tmp`] to its final
@@ -107,7 +141,443 @@ pub fn wheel_filename_from_url(url: &url::Url) -> Result<String> {
     if !decoded.ends_with(".whl") {
         bail!("URL does not point to a .whl file: {url}");
     }
+    let decoded_str: &str = &decoded;
+    if decoded_str.contains(['/', '\\'])
+        || decoded_str == "."
+        || decoded_str == ".."
+        || !matches!(
+            Path::new(decoded_str)
+                .components()
+                .collect::<Vec<_>>()
+                .as_slice(),
+            [std::path::Component::Normal(_)]
+        )
+    {
+        bail!(
+            "URL wheel filename must decode to a single wheel basename (exactly one ordinary path component): {url}"
+        );
+    }
     Ok(decoded.into_owned())
+}
+
+pub(crate) fn normalize_sha256(value: &str, label: &str) -> Result<String> {
+    let normalized = value.to_ascii_lowercase();
+    if normalized.len() != 64 || !normalized.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("{label} must be exactly 64 hexadecimal SHA-256 characters");
+    }
+    Ok(normalized)
+}
+
+fn wheel_url_identity(url: &url::Url) -> String {
+    format!("{:x}", Sha256::digest(url.as_str().as_bytes()))
+}
+
+/// Immutable per-digest destination for a pinned fetched wheel. The digest
+/// namespace prevents equal basenames with different authoritative bytes from
+/// replacing each other while downstream validation or rewriting is active.
+pub(crate) fn pinned_wheel_destination(
+    url: &url::Url,
+    expected_sha256: &str,
+    dest_dir: &Path,
+) -> Result<PathBuf> {
+    let sha256 = normalize_sha256(expected_sha256, "wheel hash")?;
+    Ok(dest_dir
+        .join(".retread-wheel-fetch")
+        .join("v1")
+        .join("sha256")
+        .join(sha256)
+        .join(wheel_filename_from_url(url)?))
+}
+
+fn unpinned_wheel_destination(url: &url::Url, dest_dir: &Path) -> Result<PathBuf> {
+    Ok(dest_dir
+        .join(".retread-wheel-fetch")
+        .join("v1")
+        .join("url")
+        .join(wheel_url_identity(url))
+        .join(wheel_filename_from_url(url)?))
+}
+
+/// Stable content-addressed store location for an authoritative wheel hash.
+/// Both the digest and decoded filename are validated before a path is
+/// returned, so callers can use this helper before touching the filesystem.
+pub(crate) fn pinned_wheel_store_path(
+    url: &url::Url,
+    expected_sha256: &str,
+    store_root: &Path,
+) -> Result<PathBuf> {
+    let sha256 = normalize_sha256(expected_sha256, "wheel hash")?;
+    Ok(store_root.join(sha256).join(wheel_filename_from_url(url)?))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct CachedFileFingerprint {
+    size: u64,
+    modified_nanos: u128,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    changed_seconds: i64,
+    #[cfg(unix)]
+    changed_nanoseconds: i64,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct StoreIntegrityMarker {
+    schema: String,
+    sha256: String,
+    fingerprint: CachedFileFingerprint,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct UrlIntegrityMarker {
+    schema: String,
+    url_identity: String,
+    sha256: String,
+    fingerprint: CachedFileFingerprint,
+}
+
+fn url_integrity_marker_path(path: &Path) -> PathBuf {
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("wheel.whl");
+    path.with_file_name(format!(".{filename}.retread-url-integrity-v1.json"))
+}
+
+async fn inspect_unpinned_destination(path: &Path, url: &url::Url) -> Result<bool> {
+    let metadata = match fs::symlink_metadata(path).await {
+        Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {
+            metadata
+        }
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).with_context(|| format!("stating {}", path.display())),
+    };
+    let marker_path = url_integrity_marker_path(path);
+    let marker_metadata = match fs::symlink_metadata(&marker_path).await {
+        Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {
+            metadata
+        }
+        _ => return Ok(false),
+    };
+    let _ = marker_metadata;
+    let marker: UrlIntegrityMarker = match fs::read(&marker_path)
+        .await
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+    {
+        Some(marker) => marker,
+        None => return Ok(false),
+    };
+    Ok(marker.schema == "retread-wheel-url-integrity-v1"
+        && marker.url_identity == wheel_url_identity(url)
+        && marker.sha256.len() == 64
+        && marker.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && marker.fingerprint == fingerprint_metadata(&metadata)?)
+}
+
+async fn write_url_integrity_marker(path: &Path, url: &url::Url, sha256: &str) -> Result<()> {
+    let marker_path = url_integrity_marker_path(path);
+    let temporary = unique_atomic_sibling(&marker_path, "tmp");
+    let guard = TemporaryPath::armed(temporary.clone());
+    let metadata = fs::symlink_metadata(path)
+        .await
+        .with_context(|| format!("stating fetched wheel {}", path.display()))?;
+    let marker = UrlIntegrityMarker {
+        schema: "retread-wheel-url-integrity-v1".to_string(),
+        url_identity: wheel_url_identity(url),
+        sha256: sha256.to_string(),
+        fingerprint: fingerprint_metadata(&metadata)?,
+    };
+    let bytes = serde_json::to_vec_pretty(&marker).context("serializing URL wheel marker")?;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .await?;
+    file.write_all(&bytes).await?;
+    file.sync_all().await?;
+    drop(file);
+    fs::rename(&temporary, &marker_path).await?;
+    guard.disarm();
+    Ok(())
+}
+
+fn fingerprint_metadata(metadata: &std::fs::Metadata) -> Result<CachedFileFingerprint> {
+    let modified_nanos = metadata
+        .modified()
+        .context("reading cached wheel modification time")?
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("cached wheel modification time predates the Unix epoch")?
+        .as_nanos();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        Ok(CachedFileFingerprint {
+            size: metadata.len(),
+            modified_nanos,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(CachedFileFingerprint {
+            size: metadata.len(),
+            modified_nanos,
+        })
+    }
+}
+
+fn store_integrity_marker_path(store_path: &Path) -> PathBuf {
+    let filename = store_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("wheel.whl");
+    store_path.with_file_name(format!(".{filename}.retread-integrity-v1.json"))
+}
+
+async fn stable_file_sha256(path: &Path) -> Result<Option<(String, CachedFileFingerprint)>> {
+    let path_metadata = match fs::symlink_metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("stating {}", path.display())),
+    };
+    if !path_metadata.file_type().is_file() || path_metadata.file_type().is_symlink() {
+        return Ok(None);
+    }
+    let initial = fingerprint_metadata(&path_metadata)?;
+    let mut file = fs::File::open(path)
+        .await
+        .with_context(|| format!("opening {}", path.display()))?;
+    if fingerprint_metadata(&file.metadata().await?)? != initial {
+        return Ok(None);
+    }
+
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .await
+            .with_context(|| format!("reading {}", path.display()))?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    let final_opened = fingerprint_metadata(&file.metadata().await?)?;
+    let final_path = match fs::symlink_metadata(path).await {
+        Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {
+            fingerprint_metadata(&metadata)?
+        }
+        _ => return Ok(None),
+    };
+    if initial != final_opened || initial != final_path {
+        return Ok(None);
+    }
+    Ok(Some((format!("{:x}", hasher.finalize()), initial)))
+}
+
+async fn set_store_file_readonly(path: &Path) -> Result<CachedFileFingerprint> {
+    let mut permissions = fs::symlink_metadata(path)
+        .await
+        .with_context(|| format!("stating cached wheel {}", path.display()))?
+        .permissions();
+    permissions.set_readonly(true);
+    fs::set_permissions(path, permissions)
+        .await
+        .with_context(|| format!("making cached wheel read-only: {}", path.display()))?;
+    let metadata = fs::symlink_metadata(path)
+        .await
+        .with_context(|| format!("stating cached wheel {}", path.display()))?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        bail!("cached wheel is not a regular file: {}", path.display());
+    }
+    fingerprint_metadata(&metadata)
+}
+
+async fn write_store_integrity_marker(
+    store_path: &Path,
+    sha256: &str,
+    fingerprint: &CachedFileFingerprint,
+) -> Result<()> {
+    let marker_path = store_integrity_marker_path(store_path);
+    let temporary = unique_atomic_sibling(&marker_path, "tmp");
+    let guard = TemporaryPath::armed(temporary.clone());
+    let bytes = serde_json::to_vec_pretty(&StoreIntegrityMarker {
+        schema: "retread-wheel-store-integrity-v1".to_string(),
+        sha256: sha256.to_string(),
+        fingerprint: fingerprint.clone(),
+    })
+    .context("serializing cached wheel integrity marker")?;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .await
+        .with_context(|| format!("creating {}", temporary.display()))?;
+    file.write_all(&bytes).await?;
+    file.sync_all().await?;
+    drop(file);
+    fs::rename(&temporary, &marker_path)
+        .await
+        .with_context(|| {
+            format!(
+                "publishing cached wheel marker {} -> {}",
+                temporary.display(),
+                marker_path.display(),
+            )
+        })?;
+    guard.disarm();
+    Ok(())
+}
+
+enum StoreEntryState {
+    Missing,
+    Valid(CachedFileFingerprint),
+    Corrupt,
+}
+
+/// Check a persistent-store entry without trusting path existence alone. A
+/// marker can skip a multi-gigabyte rehash only while the exact read-only
+/// inode/stat tuple admitted under the authoritative digest is unchanged.
+async fn inspect_store_entry(store_path: &Path, sha256: &str) -> Result<StoreEntryState> {
+    let metadata = match fs::symlink_metadata(store_path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(StoreEntryState::Missing);
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("stating {}", store_path.display()));
+        }
+    };
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Ok(StoreEntryState::Corrupt);
+    }
+    let fingerprint = fingerprint_metadata(&metadata)?;
+    let marker_path = store_integrity_marker_path(store_path);
+    if let Ok(marker_metadata) = fs::symlink_metadata(&marker_path).await
+        && marker_metadata.file_type().is_file()
+        && !marker_metadata.file_type().is_symlink()
+        && let Ok(bytes) = fs::read(&marker_path).await
+        && let Ok(marker) = serde_json::from_slice::<StoreIntegrityMarker>(&bytes)
+        && marker.schema == "retread-wheel-store-integrity-v1"
+        && marker.sha256 == sha256
+        && marker.fingerprint == fingerprint
+        && metadata.permissions().readonly()
+    {
+        return Ok(StoreEntryState::Valid(fingerprint));
+    }
+
+    let Some((actual, _)) = stable_file_sha256(store_path).await? else {
+        return Ok(StoreEntryState::Corrupt);
+    };
+    if actual != sha256 {
+        return Ok(StoreEntryState::Corrupt);
+    }
+    let fingerprint = set_store_file_readonly(store_path).await?;
+    write_store_integrity_marker(store_path, sha256, &fingerprint).await?;
+    Ok(StoreEntryState::Valid(fingerprint))
+}
+
+async fn evict_store_entry(store_path: &Path) {
+    let _ = fs::remove_file(store_path).await;
+    let _ = fs::remove_file(store_integrity_marker_path(store_path)).await;
+}
+
+/// Copy to a fresh inode and publish with a same-directory atomic rename.
+/// When `attested_source` is supplied, the copy is accepted only if the exact
+/// source inode/stat tuple remains stable throughout; otherwise `false` asks
+/// the caller to revalidate the source. Without an attestation, bytes are
+/// hashed while copying and must match `expected_sha256`.
+async fn atomic_owned_copy(
+    src: &Path,
+    dst: &Path,
+    expected_sha256: &str,
+    attested_source: Option<&CachedFileFingerprint>,
+) -> Result<bool> {
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+    let source_path_metadata = match fs::symlink_metadata(src).await {
+        Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {
+            metadata
+        }
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).with_context(|| format!("stating {}", src.display())),
+    };
+    let source_initial = fingerprint_metadata(&source_path_metadata)?;
+    if attested_source.is_some_and(|fingerprint| *fingerprint != source_initial) {
+        return Ok(false);
+    }
+    let mut source = fs::File::open(src)
+        .await
+        .with_context(|| format!("opening {}", src.display()))?;
+    if fingerprint_metadata(&source.metadata().await?)? != source_initial {
+        return Ok(false);
+    }
+
+    let temporary = unique_atomic_sibling(dst, "copy");
+    let guard = TemporaryPath::armed(temporary.clone());
+    let mut destination = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .await
+        .with_context(|| format!("creating {}", temporary.display()))?;
+    let mut hasher = attested_source.is_none().then(Sha256::new);
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let count = source
+            .read(&mut buffer)
+            .await
+            .with_context(|| format!("reading {}", src.display()))?;
+        if count == 0 {
+            break;
+        }
+        if let Some(hasher) = &mut hasher {
+            hasher.update(&buffer[..count]);
+        }
+        destination
+            .write_all(&buffer[..count])
+            .await
+            .with_context(|| format!("writing {}", temporary.display()))?;
+    }
+    destination.flush().await?;
+    destination.sync_all().await?;
+    drop(destination);
+
+    let final_opened = fingerprint_metadata(&source.metadata().await?)?;
+    let final_path = match fs::symlink_metadata(src).await {
+        Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {
+            fingerprint_metadata(&metadata)?
+        }
+        _ => return Ok(false),
+    };
+    if source_initial != final_opened || source_initial != final_path {
+        return Ok(false);
+    }
+    if let Some(hasher) = hasher
+        && format!("{:x}", hasher.finalize()) != expected_sha256
+    {
+        return Ok(false);
+    }
+    fs::rename(&temporary, dst).await.with_context(|| {
+        format!(
+            "publishing owned wheel copy {} -> {}",
+            temporary.display(),
+            dst.display(),
+        )
+    })?;
+    guard.disarm();
+    Ok(true)
 }
 
 /// Download a wheel into `dest_dir`. Verifies SHA-256 if `expected_sha256` is
@@ -118,13 +588,26 @@ pub async fn fetch_wheel(
     expected_sha256: Option<&str>,
     dest_dir: &Path,
 ) -> Result<PathBuf> {
-    fs::create_dir_all(dest_dir).await?;
-
-    let filename = wheel_filename_from_url(url)?;
-    let dest = dest_dir.join(&filename);
+    let expected_sha256 = expected_sha256
+        .map(|sha256| normalize_sha256(sha256, "wheel hash"))
+        .transpose()?;
+    let dest = match expected_sha256.as_deref() {
+        Some(sha256) => pinned_wheel_destination(url, sha256, dest_dir)?,
+        None => unpinned_wheel_destination(url, dest_dir)?,
+    };
+    let filename = dest
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("wheel destination retains validated UTF-8 filename")
+        .to_string();
+    fs::create_dir_all(
+        dest.parent()
+            .expect("wheel destination always has a namespace parent"),
+    )
+    .await?;
 
     if dest.exists() {
-        if let Some(expected) = expected_sha256 {
+        if let Some(expected) = expected_sha256.as_deref() {
             let actual = sha256_file(&dest).await?;
             if actual.eq_ignore_ascii_case(expected) {
                 tracing::debug!(path = %dest.display(), "wheel already cached");
@@ -135,8 +618,15 @@ pub async fn fetch_wheel(
                 "cached wheel hash mismatch, re-downloading"
             );
             fs::remove_file(&dest).await.ok();
-        } else {
+        } else if inspect_unpinned_destination(&dest, url).await? {
             return Ok(dest);
+        } else {
+            tracing::warn!(
+                path = %dest.display(),
+                "URL-keyed wheel cache attestation is missing or stale; re-downloading"
+            );
+            fs::remove_file(&dest).await.ok();
+            fs::remove_file(url_integrity_marker_path(&dest)).await.ok();
         }
     }
 
@@ -175,16 +665,12 @@ pub async fn fetch_wheel(
     // `<filename>.part` would interleave both streams into one file; a unique
     // temp + the atomic rename below make the race last-writer-wins with
     // identical bytes instead.
-    let part = {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static PART_SEQ: AtomicU64 = AtomicU64::new(0);
-        dest_dir.join(format!(
-            "{filename}.{}.{}.part",
-            std::process::id(),
-            PART_SEQ.fetch_add(1, Ordering::Relaxed)
-        ))
-    };
-    let mut file = fs::File::create(&part)
+    let part = unique_atomic_sibling(&dest, "part");
+    let part_guard = TemporaryPath::armed(part.clone());
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&part)
         .await
         .with_context(|| format!("creating {}", part.display()))?;
     let mut hasher = Sha256::new();
@@ -215,17 +701,19 @@ pub async fn fetch_wheel(
     file.flush()
         .await
         .with_context(|| format!("flushing {}", part.display()))?;
+    file.sync_all()
+        .await
+        .with_context(|| format!("syncing {}", part.display()))?;
     drop(file);
     tracing::info!(%filename, mb = downloaded / 1_048_576, "wheel download complete");
 
-    if let Some(expected) = expected_sha256 {
-        let digest = hasher.finalize();
-        let mut actual = String::with_capacity(64);
-        for b in digest {
-            write!(&mut actual, "{b:02x}").expect("write to String");
-        }
+    let digest = hasher.finalize();
+    let mut actual = String::with_capacity(64);
+    for b in digest {
+        write!(&mut actual, "{b:02x}").expect("write to String");
+    }
+    if let Some(expected) = expected_sha256.as_deref() {
         if !actual.eq_ignore_ascii_case(expected) {
-            fs::remove_file(&part).await.ok();
             bail!("SHA-256 mismatch for {url}: expected {expected}, got {actual}");
         }
     }
@@ -233,6 +721,16 @@ pub async fn fetch_wheel(
     fs::rename(&part, &dest)
         .await
         .with_context(|| format!("renaming {} -> {}", part.display(), dest.display()))?;
+    part_guard.disarm();
+    if expected_sha256.is_none()
+        && let Err(error) = write_url_integrity_marker(&dest, url, &actual).await
+    {
+        tracing::warn!(
+            path = %dest.display(),
+            error = %error,
+            "could not publish URL wheel cache attestation; next fetch will re-download"
+        );
+    }
     Ok(dest)
 }
 
@@ -267,8 +765,9 @@ pub(crate) async fn hardlink_or_copy_async(src: &Path, dst: &Path) -> Result<()>
 /// Store layout: `<store_root>/<sha256>/<filename>.whl` (the shared
 /// content-addressed wheel store; see `courier::retread_wheel_store_root`).
 ///
-/// On cache HIT (sha256 known and file present): hard-links the cached file
-/// into `dest_dir/<filename>`, no network.
+/// On cache HIT (sha256 known and an attested store inode is present): copies
+/// the cached bytes to a fresh consumer-owned inode and atomically publishes
+/// it below the digest-qualified destination namespace, no network.
 /// On cache MISS: downloads normally (with streaming + sha256 verification),
 /// then populates the cache for future calls.
 ///
@@ -281,19 +780,29 @@ pub async fn fetch_wheel_cached(
     dest_dir: &Path,
     store_root: &Path,
 ) -> Result<PathBuf> {
+    // Normalize before consulting the environment or touching either cache.
+    // Besides rejecting invalid keys, this makes every later log prefix slice
+    // and path component safe by construction.
+    let expected_sha256 = expected_sha256
+        .map(|sha256| normalize_sha256(sha256, "wheel hash"))
+        .transpose()?;
+
     // Bypass when disabled or when we have no sha256 to address by.
     let bypass = std::env::var("RETREAD_NO_SHADOW_CACHE").is_ok();
-    let Some(sha256) = expected_sha256.filter(|_| !bypass) else {
-        return fetch_wheel(url, expected_sha256, dest_dir).await;
+    let Some(sha256) = expected_sha256.as_deref().filter(|_| !bypass) else {
+        return fetch_wheel(url, expected_sha256.as_deref(), dest_dir).await;
     };
 
     let filename = wheel_filename_from_url(url)?;
-    let dest = dest_dir.join(&filename);
+    let dest = pinned_wheel_destination(url, sha256, dest_dir)?;
 
-    // Early return: already in dest_dir.
+    // Early return: already in the digest-qualified consumer namespace. This
+    // generic entry point verifies bytes; callers with a target/source-bound
+    // strict attestation can inspect this stable path before calling us.
     if dest.exists() {
-        let actual = sha256_file(&dest).await?;
-        if actual.eq_ignore_ascii_case(sha256) {
+        if let Some((actual, _)) = stable_file_sha256(&dest).await?
+            && actual == sha256
+        {
             tracing::debug!(
                 wheel = %filename,
                 "wheel cache: already in dest_dir (no fetch needed)",
@@ -308,24 +817,45 @@ pub async fn fetch_wheel_cached(
     }
 
     // Check the persistent store.
-    let store_path = store_root.join(sha256).join(&filename);
-    if store_path.exists() {
-        // Cache hit: hard-link (copy on EXDEV) into dest_dir.
-        if let Err(e) = hardlink_or_copy_async(&store_path, &dest).await {
-            tracing::warn!(
-                wheel = %filename,
-                err = %e,
-                "wheel cache: hit but hardlink failed, falling back to download",
-            );
-        } else {
-            tracing::info!(
-                wheel = %filename,
-                sha256 = %&sha256[..8],
-                "wheel cache: hit (persistent store, no download)",
-            );
-            return Ok(dest);
+    let store_path = pinned_wheel_store_path(url, sha256, store_root)?;
+    let mut store_was_missing = false;
+    for _ in 0..2 {
+        match inspect_store_entry(&store_path, sha256).await {
+            Ok(StoreEntryState::Valid(fingerprint)) => {
+                if atomic_owned_copy(&store_path, &dest, sha256, Some(&fingerprint)).await? {
+                    tracing::info!(
+                        wheel = %filename,
+                        sha256 = %&sha256[..8],
+                        "wheel cache: hit (persistent store, no download)",
+                    );
+                    return Ok(dest);
+                }
+                // The inode changed between inspection and opening/copying.
+                // Re-inspect once; a stable corrupt replacement is evicted.
+            }
+            Ok(StoreEntryState::Corrupt) => {
+                tracing::warn!(
+                    wheel = %filename,
+                    "wheel cache: authoritative store entry is corrupt; evicting",
+                );
+                evict_store_entry(&store_path).await;
+                break;
+            }
+            Ok(StoreEntryState::Missing) => {
+                store_was_missing = true;
+                break;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    wheel = %filename,
+                    err = %error,
+                    "wheel cache: could not validate store entry; falling back to download",
+                );
+                break;
+            }
         }
-    } else {
+    }
+    if store_was_missing {
         tracing::debug!(
             wheel = %filename,
             sha256 = %&sha256[..8],
@@ -346,38 +876,40 @@ pub async fn fetch_wheel_cached(
         );
         return Ok(downloaded);
     }
-    // Process+sequence-unique tmp so concurrent installs sharing this
-    // machine-global store never promote each other's torn temp file onto the
-    // canonical (existence-checked, unverified) hit path.
-    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let store_tmp = store_dir.join(format!(
-        "{filename}.{}.{}.tmp",
-        std::process::id(),
-        TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
     let store_final = store_dir.join(&filename);
-    // Copy to a unique .tmp then atomically rename so concurrent writers are safe.
-    if let Err(e) = hardlink_or_copy_async(&downloaded, &store_tmp).await {
-        tracing::warn!(
+    match atomic_owned_copy(&downloaded, &store_final, sha256, None).await {
+        Ok(true) => match set_store_file_readonly(&store_final).await {
+            Ok(fingerprint) => {
+                if let Err(error) =
+                    write_store_integrity_marker(&store_final, sha256, &fingerprint).await
+                {
+                    tracing::warn!(
+                        wheel = %filename,
+                        err = %error,
+                        "wheel cache: populated store but could not write integrity marker",
+                    );
+                }
+                tracing::debug!(
+                    wheel = %filename,
+                    sha256 = %&sha256[..8],
+                    "wheel cache: populated persistent store",
+                );
+            }
+            Err(error) => tracing::warn!(
+                wheel = %filename,
+                err = %error,
+                "wheel cache: populated store but could not make it immutable",
+            ),
+        },
+        Ok(false) => tracing::warn!(
             wheel = %filename,
-            err = %e,
-            "wheel cache: could not populate store (link/copy to tmp), skipping",
-        );
-        return Ok(downloaded);
-    }
-    if let Err(e) = fs::rename(&store_tmp, &store_final).await {
-        tracing::warn!(
+            "wheel cache: downloaded bytes changed during store population; skipping cache",
+        ),
+        Err(error) => tracing::warn!(
             wheel = %filename,
-            err = %e,
-            "wheel cache: could not rename to final store path, skipping",
-        );
-        let _ = fs::remove_file(&store_tmp).await;
-    } else {
-        tracing::debug!(
-            wheel = %filename,
-            sha256 = %&sha256[..8],
-            "wheel cache: populated persistent store",
-        );
+            err = %error,
+            "wheel cache: could not populate persistent store",
+        ),
     }
 
     Ok(downloaded)
@@ -395,10 +927,10 @@ pub async fn fetch_wheel_cached(
 /// records the sha and the install replay depends on the store holding the
 /// bytes.
 ///
-/// Concurrency-safe: writes go to a process+sequence-unique `.tmp` and are
+/// Concurrency-safe: writes go to a process+sequence-unique sibling and are
 /// promoted with an atomic rename, same protocol as `fetch_wheel_cached`.
-/// An existing store entry is trusted as-is (content-addressed: same sha =>
-/// same bytes) and the write is skipped.
+/// Existing entries must carry a matching immutable-inode attestation or are
+/// rehashed; corrupt entries are evicted instead of being trusted by path.
 pub(crate) async fn store_wheel_in_cache(src: &Path, store_root: &Path) -> Result<String> {
     let filename = src
         .file_name()
@@ -414,45 +946,39 @@ pub(crate) async fn store_wheel_in_cache(src: &Path, store_root: &Path) -> Resul
 
     let store_dir = store_root.join(&sha256);
     let store_final = store_dir.join(&filename);
-    if store_final.is_file() {
-        tracing::debug!(
-            wheel = %filename,
-            sha256 = %&sha256[..8],
-            "wheel store: already populated",
-        );
-        return Ok(sha256);
+    match inspect_store_entry(&store_final, &sha256).await? {
+        StoreEntryState::Valid(_) => {
+            tracing::debug!(
+                wheel = %filename,
+                sha256 = %&sha256[..8],
+                "wheel store: already populated",
+            );
+            return Ok(sha256);
+        }
+        StoreEntryState::Corrupt => evict_store_entry(&store_final).await,
+        StoreEntryState::Missing => {}
     }
     fs::create_dir_all(&store_dir)
         .await
         .with_context(|| format!("wheel store: creating {}", store_dir.display()))?;
 
-    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let store_tmp = store_dir.join(format!(
-        "{filename}.{}.{}.tmp",
-        std::process::id(),
-        TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
-    hardlink_or_copy_async(src, &store_tmp)
+    if !atomic_owned_copy(src, &store_final, &sha256, None)
         .await
         .with_context(|| {
             format!(
-                "wheel store: staging {} -> {}",
+                "wheel store: staging owned copy {} -> {}",
                 src.display(),
-                store_tmp.display()
+                store_final.display(),
             )
-        })?;
-    if let Err(e) = fs::rename(&store_tmp, &store_final).await {
-        let _ = fs::remove_file(&store_tmp).await;
-        // A concurrent writer may have promoted the same content first;
-        // that is a success for our purposes (content-addressed store).
-        if !store_final.is_file() {
-            return Err(anyhow::Error::new(e).context(format!(
-                "wheel store: promoting {} -> {}",
-                store_tmp.display(),
-                store_final.display()
-            )));
-        }
+        })?
+    {
+        bail!(
+            "wheel store: source changed or failed its computed digest while staging {}",
+            src.display(),
+        );
     }
+    let fingerprint = set_store_file_readonly(&store_final).await?;
+    write_store_integrity_marker(&store_final, &sha256, &fingerprint).await?;
     tracing::info!(
         wheel = %filename,
         sha256 = %&sha256[..8],
@@ -495,6 +1021,9 @@ pub async fn prefetch_url_wheel_as_source(
     dest_dir: &Path,
     store_root: &Path,
 ) -> Result<PathBuf> {
+    let expected_sha256 = expected_sha256
+        .map(|sha256| normalize_sha256(sha256, "wheel hash"))
+        .transpose()?;
     let filename = wheel_filename_from_url(url)?;
 
     // Fast path: sha known AND already in the content-addressed store. This is
@@ -502,16 +1031,20 @@ pub async fn prefetch_url_wheel_as_source(
     // extscache wheels are up to ~5.9 GiB). Emit the store path with NO fetch,
     // NO copy, and crucially NO hashing: reading a multi-GB wheel into memory
     // just to re-confirm its sha would spike RSS and can OOM the build backend.
-    if let Some(sha) = expected_sha256 {
-        let sha = sha.to_ascii_lowercase();
-        let store_path = store_root.join(&sha).join(&filename);
-        if store_path.is_file() {
-            return Ok(store_path);
+    if let Some(sha) = expected_sha256.as_deref() {
+        let store_path = pinned_wheel_store_path(url, sha, store_root)?;
+        match inspect_store_entry(&store_path, sha).await? {
+            StoreEntryState::Valid(_) => return Ok(store_path),
+            StoreEntryState::Corrupt => evict_store_entry(&store_path).await,
+            StoreEntryState::Missing => {}
         }
         // Cold store: fetch (verifies the sha, streaming/incremental -- never
         // buffers the whole wheel) and populate the store, then re-check.
         let fetched = fetch_wheel_cached(url, Some(&sha), dest_dir, store_root).await?;
-        if store_path.is_file() {
+        if matches!(
+            inspect_store_entry(&store_path, sha).await?,
+            StoreEntryState::Valid(_)
+        ) {
             return Ok(store_path);
         }
         // Store populate was best-effort and failed: the freshly fetched local
@@ -526,7 +1059,10 @@ pub async fn prefetch_url_wheel_as_source(
     let fetched = fetch_wheel_cached(url, None, dest_dir, store_root).await?;
     let sha256 = store_wheel_in_cache(&fetched, store_root).await?;
     let store_path = store_root.join(&sha256).join(&filename);
-    if store_path.is_file() {
+    if matches!(
+        inspect_store_entry(&store_path, &sha256).await?,
+        StoreEntryState::Valid(_)
+    ) {
         Ok(store_path)
     } else {
         Ok(fetched)
@@ -604,14 +1140,91 @@ pub async fn fetch_metadata_sidecar(
 /// Read the METADATA file inside a wheel zip and parse out the fields we care
 /// about.
 pub fn read_metadata(wheel_path: &Path) -> Result<WheelMetadata> {
+    use sha2::{Digest, Sha256};
+    let mut file = std::fs::File::open(wheel_path)
+        .with_context(|| format!("opening {} for SHA-256", wheel_path.display()))?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher)
+        .with_context(|| format!("hashing {}", wheel_path.display()))?;
+    read_metadata_with_sha(wheel_path, format!("{:x}", hasher.finalize()))
+}
+
+/// Strict local-artifact boundary for source-built/path-source wheels.
+/// Besides hashing and parsing METADATA, this rejects symlinks/special files,
+/// requires exactly one root dist-info matching the wheel filename identity,
+/// and streams every ZIP member to EOF so CRC failures cannot enter a cache.
+pub(crate) fn read_metadata_strict(wheel_path: &Path) -> Result<WheelMetadata> {
+    let file_type = std::fs::symlink_metadata(wheel_path)
+        .with_context(|| format!("stating wheel {}", wheel_path.display()))?
+        .file_type();
+    if !file_type.is_file() || file_type.is_symlink() {
+        bail!(
+            "wheel artifact must be a regular file, not a symlink or special file: {}",
+            wheel_path.display(),
+        );
+    }
+    let filename = wheel_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("wheel path has no UTF-8 filename"))?;
+    let standard_filename = crate::emit_pypi::standard_wheel_filename(filename);
+    let (expected_name, expected_version) =
+        crate::pypi::wheel_filename_identity(&standard_filename)
+            .ok_or_else(|| anyhow!("invalid PEP 427 wheel filename `{filename}`"))?;
+
+    let file = std::fs::File::open(wheel_path)
+        .with_context(|| format!("opening strict wheel ZIP {}", wheel_path.display()))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .with_context(|| format!("reading strict wheel ZIP {}", wheel_path.display()))?;
+    let mut root_metadata = Vec::new();
+    for index in 0..archive.len() {
+        let mut entry = archive
+            .by_index(index)
+            .with_context(|| format!("opening ZIP member {index} in {}", wheel_path.display()))?;
+        let name = entry.name().to_string();
+        if name.ends_with(".dist-info/METADATA") && name.matches('/').count() == 1 {
+            root_metadata.push(name);
+        }
+        std::io::copy(&mut entry, &mut std::io::sink()).with_context(|| {
+            format!(
+                "validating ZIP member `{}` in {}",
+                entry.name(),
+                wheel_path.display(),
+            )
+        })?;
+    }
+    if root_metadata.len() != 1 {
+        bail!(
+            "wheel `{filename}` must contain exactly one root .dist-info/METADATA, found {}",
+            root_metadata.len(),
+        );
+    }
+    let dist_info = root_metadata[0]
+        .strip_suffix(".dist-info/METADATA")
+        .expect("root metadata suffix was checked");
+    let (dist_name, dist_version) = dist_info.rsplit_once('-').ok_or_else(|| {
+        anyhow!("root dist-info directory `{dist_info}` has no name/version separator")
+    })?;
+    let dist_version = uv_pep508::uv_pep440::Version::from_str(dist_version)
+        .with_context(|| format!("invalid root dist-info version `{dist_version}`"))?;
+    if crate::relax::canonical_conda_name(dist_name)
+        != crate::relax::canonical_conda_name(&expected_name)
+        || dist_version != expected_version
+    {
+        bail!(
+            "wheel `{filename}` root dist-info `{dist_info}` does not match its filename identity"
+        );
+    }
+    read_metadata(wheel_path)
+}
+
+fn read_metadata_with_sha(wheel_path: &Path, sha256: String) -> Result<WheelMetadata> {
     let filename = wheel_path
         .file_name()
         .and_then(|s| s.to_str())
         .ok_or_else(|| anyhow!("wheel path has no filename: {}", wheel_path.display()))?
         .to_string();
     let is_pure_python = is_pure_python_wheel_filename(&filename);
-
-    let sha256 = hex_sha256(&std::fs::read(wheel_path)?);
 
     let file = std::fs::File::open(wheel_path)
         .with_context(|| format!("opening {}", wheel_path.display()))?;
@@ -925,10 +1538,25 @@ pub async fn fetch_metadata_ranged(
 }
 
 async fn sha256_file(path: &Path) -> Result<String> {
-    let bytes = fs::read(path).await?;
-    Ok(hex_sha256(&bytes))
+    let mut file = fs::File::open(path)
+        .await
+        .with_context(|| format!("opening {} for SHA-256", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .await
+            .with_context(|| format!("reading {} for SHA-256", path.display()))?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
+#[cfg(test)]
 fn hex_sha256(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -952,8 +1580,8 @@ mod tests {
         let mut cursor = std::io::Cursor::new(Vec::new());
         {
             let mut zw = zip::ZipWriter::new(&mut cursor);
-            let opts: zip::write::FileOptions<'_, ()> =
-                zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+            let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
             // A vendored nested .dist-info (deeper path) must be ignored --
             // only the single-slash root entry is ours.
             zw.start_file("vendored/other-9.9.dist-info/METADATA", opts)
@@ -988,10 +1616,7 @@ mod tests {
                     loop {
                         // Read one request (headers terminate at \r\n\r\n).
                         let hdr_end = loop {
-                            if let Some(p) = buf
-                                .windows(4)
-                                .position(|w| w == b"\r\n\r\n")
-                            {
+                            if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
                                 break p + 4;
                             }
                             let n = match stream.read(&mut tmp).await {
@@ -1005,7 +1630,8 @@ mod tests {
                         let is_head = req.starts_with("HEAD");
                         let range = req.lines().find_map(|l| {
                             let l = l.to_ascii_lowercase();
-                            l.strip_prefix("range: bytes=").map(|s| s.trim().to_string())
+                            l.strip_prefix("range: bytes=")
+                                .map(|s| s.trim().to_string())
                         });
                         let total = bytes.len();
                         let resp: Vec<u8> = if is_head {
@@ -1031,10 +1657,9 @@ mod tests {
                             h.extend_from_slice(slice);
                             h
                         } else {
-                            let mut h = format!(
-                                "HTTP/1.1 200 OK\r\nContent-Length: {total}\r\n\r\n"
-                            )
-                            .into_bytes();
+                            let mut h =
+                                format!("HTTP/1.1 200 OK\r\nContent-Length: {total}\r\n\r\n")
+                                    .into_bytes();
                             h.extend_from_slice(&bytes);
                             h
                         };
@@ -1098,7 +1723,10 @@ mod tests {
             }
             cursor.into_inner()
         };
-        assert!(zip_bytes.len() > 1024, "padding must exceed the server slice");
+        assert!(
+            zip_bytes.len() > 1024,
+            "padding must exceed the server slice"
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let server = tokio::spawn(async move {
@@ -1165,7 +1793,10 @@ mod tests {
 
     #[test]
     fn parse_content_range_shapes() {
-        assert_eq!(parse_content_range("bytes 100-199/500"), Some((100, 199, 500)));
+        assert_eq!(
+            parse_content_range("bytes 100-199/500"),
+            Some((100, 199, 500))
+        );
         assert_eq!(parse_content_range(" bytes 0-0/1"), Some((0, 0, 1)));
         assert_eq!(parse_content_range("bytes */500"), None);
         assert_eq!(parse_content_range("items 0-1/2"), None);
@@ -1194,10 +1825,8 @@ mod tests {
                             Ok(_) => {}
                         }
                         // No Accept-Ranges, always 200 with the whole body.
-                        let resp = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
-                            bytes.len()
-                        );
+                        let resp =
+                            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", bytes.len());
                         if stream.write_all(resp.as_bytes()).await.is_err() {
                             return;
                         }
@@ -1363,6 +1992,80 @@ mod tests {
     }
 
     #[test]
+    fn wheel_filename_rejects_percent_decoded_traversal_and_separators() {
+        for raw in [
+            "https://example.com/%2e%2e%2ffoo-1.0-py3-none-any.whl",
+            "https://example.com/%2e%2e%5cfoo-1.0-py3-none-any.whl",
+            "https://example.com/a%2fb-1.0-py3-none-any.whl",
+            "https://example.com/a%5Cb-1.0-py3-none-any.whl",
+        ] {
+            let url: url::Url = raw.parse().unwrap();
+            assert!(
+                wheel_filename_from_url(&url).is_err(),
+                "decoded separator/traversal must be rejected: {raw}",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_expected_sha_is_rejected_before_filesystem_mutation() {
+        let tmp = std::env::temp_dir().join(format!(
+            "retread-wheel-invalid-sha-{}-{}",
+            std::process::id(),
+            line!(),
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let dest = tmp.join("dest");
+        let store = tmp.join("store");
+        let url: url::Url = "http://127.0.0.1:1/foo-1.0-py3-none-any.whl"
+            .parse()
+            .unwrap();
+
+        assert!(fetch_wheel(&url, Some("abc"), &dest).await.is_err());
+        assert!(
+            fetch_wheel_cached(&url, Some("not-hex"), &dest, &store)
+                .await
+                .is_err()
+        );
+        assert!(
+            prefetch_url_wheel_as_source(&url, Some(&"g".repeat(64)), &dest, &store)
+                .await
+                .is_err()
+        );
+        assert!(
+            !tmp.exists(),
+            "invalid hashes must fail before creating destination or cache directories",
+        );
+    }
+
+    #[test]
+    fn wheel_destinations_isolate_equal_basenames_by_pin_and_url() {
+        let root = Path::new("/tmp/retread-wheel-destination-shape");
+        let first: url::Url = "https://a.example/x/foo-1.0-py3-none-any.whl"
+            .parse()
+            .unwrap();
+        let second: url::Url = "https://b.example/y/foo-1.0-py3-none-any.whl"
+            .parse()
+            .unwrap();
+        let pin_a = "a".repeat(64);
+        let pin_b = "b".repeat(64);
+
+        assert_ne!(
+            pinned_wheel_destination(&first, &pin_a, root).unwrap(),
+            pinned_wheel_destination(&first, &pin_b, root).unwrap(),
+        );
+        assert_ne!(
+            unpinned_wheel_destination(&first, root).unwrap(),
+            unpinned_wheel_destination(&second, root).unwrap(),
+        );
+        assert_eq!(
+            unpinned_wheel_destination(&first, root).unwrap(),
+            unpinned_wheel_destination(&first, root).unwrap(),
+            "the same full URL gets one stable attested destination",
+        );
+    }
+
+    #[test]
     fn parse_metadata_carries_is_pure_python_for_relaxed_wheel() {
         // Caller passes the helper's verdict; this test just locks that the
         // wired-through flag reaches the WheelMetadata struct unchanged.
@@ -1473,6 +2176,98 @@ mod tests {
             result_bytes, wheel_bytes,
             "persistent store hit must produce byte-identical output"
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_pinned_downloads_publish_one_complete_destination() {
+        let bytes = build_test_wheel_zip();
+        let sha = hex_sha256(&bytes);
+        let (port, server) = serve_ranged(bytes.clone()).await;
+        let url: url::Url = format!("http://127.0.0.1:{port}/foo-1.0-py3-none-any.whl")
+            .parse()
+            .unwrap();
+        let tmp = std::env::temp_dir().join(format!(
+            "retread-wheel-concurrent-fetch-{}-{}",
+            std::process::id(),
+            line!(),
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let (first, second) = tokio::join!(
+            fetch_wheel(&url, Some(&sha), &tmp),
+            fetch_wheel(&url, Some(&sha), &tmp),
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert_eq!(first, second);
+        assert_eq!(std::fs::read(&first).unwrap(), bytes);
+        let parent = first.parent().unwrap();
+        let leftovers = std::fs::read_dir(parent)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".part") || name.ends_with(".copy"))
+            .collect::<Vec<_>>();
+        assert!(
+            leftovers.is_empty(),
+            "atomic publication must not leave attempt files: {leftovers:?}",
+        );
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn corrupt_authoritative_store_entry_is_evicted_and_refetched() {
+        let bytes = build_test_wheel_zip();
+        let sha = hex_sha256(&bytes);
+        let (port, server) = serve_ranged(bytes.clone()).await;
+        let url: url::Url = format!("http://127.0.0.1:{port}/foo-1.0-py3-none-any.whl")
+            .parse()
+            .unwrap();
+        let tmp = std::env::temp_dir().join(format!(
+            "retread-wheel-corrupt-store-{}-{}",
+            std::process::id(),
+            line!(),
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let dest = tmp.join("dest");
+        let second_dest = tmp.join("second-dest");
+        let store = tmp.join("store");
+        let store_path = pinned_wheel_store_path(&url, &sha, &store).unwrap();
+        std::fs::create_dir_all(store_path.parent().unwrap()).unwrap();
+        std::fs::write(&store_path, b"poisoned shared-cache bytes").unwrap();
+
+        let fetched = fetch_wheel_cached(&url, Some(&sha), &dest, &store)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&fetched).unwrap(), bytes);
+        assert_eq!(std::fs::read(&store_path).unwrap(), bytes);
+        assert!(
+            std::fs::metadata(&store_path)
+                .unwrap()
+                .permissions()
+                .readonly(),
+            "the healed persistent-store inode must be immutable",
+        );
+
+        // A warm store hit still creates a consumer-owned inode. Mutating a
+        // downstream wheel can therefore never mutate the shared store.
+        let warm = fetch_wheel_cached(&url, Some(&sha), &second_dest, &store)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&warm).unwrap(), bytes);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            assert_ne!(
+                std::fs::metadata(&warm).unwrap().ino(),
+                std::fs::metadata(&store_path).unwrap().ino(),
+                "consumer wheels must never hard-link the shared-store inode",
+            );
+        }
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     // ── Run 9: atomic cache-write + corrupted-zip self-heal ──────────────────
@@ -1595,19 +2390,97 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 
-    // ---- prefetch_url_wheel_as_source (direct-URL -> path source) ----
+    #[test]
+    fn strict_metadata_rejects_duplicate_root_dist_info() {
+        use std::io::Write as _;
 
-    /// Stage a fake wheel in `dest_dir` so `fetch_wheel_cached`'s early-return
-    /// (dest exists) fires and no network is touched. Returns (url, sha).
-    fn stage_offline_wheel(dest_dir: &Path, filename: &str) -> (url::Url, String) {
-        std::fs::create_dir_all(dest_dir).unwrap();
-        let bytes = build_test_wheel_zip();
-        std::fs::write(dest_dir.join(filename), &bytes).unwrap();
-        let sha = hex_sha256(&bytes);
-        // Any host: the dest early-return means we never connect.
-        let url = url::Url::parse(&format!("https://pypi.nvidia.com/x/{filename}")).unwrap();
-        (url, sha)
+        let tmp = std::env::temp_dir().join(format!(
+            "retread-strict-duplicate-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("foo-1.0-py3-none-any.whl");
+        let file = std::fs::File::create(&path).unwrap();
+        let mut archive = zip::ZipWriter::new(file);
+        let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+        for root in ["foo-1.0", "other-1.0"] {
+            archive
+                .start_file(format!("{root}.dist-info/METADATA"), options)
+                .unwrap();
+            archive
+                .write_all(b"Metadata-Version: 2.1\nName: foo\nVersion: 1.0\n\n")
+                .unwrap();
+        }
+        archive.finish().unwrap();
+
+        let error = read_metadata_strict(&path).unwrap_err();
+        assert!(format!("{error:#}").contains("exactly one root"));
+        let _ = std::fs::remove_dir_all(&tmp);
     }
+
+    #[test]
+    fn strict_metadata_reads_every_member_and_rejects_crc_corruption() {
+        use std::io::Write as _;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "retread-strict-crc-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("foo-1.0-py3-none-any.whl");
+        let file = std::fs::File::create(&path).unwrap();
+        let mut archive = zip::ZipWriter::new(file);
+        let options: zip::write::FileOptions<'_, ()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        archive
+            .start_file("foo-1.0.dist-info/METADATA", options)
+            .unwrap();
+        archive
+            .write_all(b"Metadata-Version: 2.1\nName: foo\nVersion: 1.0\n\n")
+            .unwrap();
+        archive.start_file("payload.bin", options).unwrap();
+        const PAYLOAD: &[u8] = b"RETREAD-UNIQUE-PAYLOAD-CONTENT";
+        archive.write_all(PAYLOAD).unwrap();
+        archive.finish().unwrap();
+
+        let mut bytes = std::fs::read(&path).unwrap();
+        let offset = bytes
+            .windows(PAYLOAD.len())
+            .position(|window| window == PAYLOAD)
+            .expect("stored payload is present verbatim");
+        bytes[offset] ^= 0x01;
+        std::fs::write(&path, bytes).unwrap();
+        assert!(
+            read_metadata(&path).is_ok(),
+            "ordinary metadata lookup does not read the corrupt payload"
+        );
+        let error = read_metadata_strict(&path).unwrap_err();
+        assert!(format!("{error:#}").contains("payload.bin"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn strict_metadata_accepts_internal_retread_filename_suffixes() {
+        let tmp = std::env::temp_dir().join(format!(
+            "retread-strict-suffix-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("foo-1.0-py3-none-any.injected.relaxed.whl");
+        std::fs::write(&path, build_test_wheel_zip()).unwrap();
+        let metadata = read_metadata_strict(&path).unwrap();
+        assert_eq!(metadata.name, "foo");
+        assert_eq!(metadata.version, "1.0");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ---- prefetch_url_wheel_as_source (direct-URL -> path source) ----
 
     #[tokio::test]
     async fn prefetch_url_wheel_source_with_sha_returns_stable_store_path() {
@@ -1622,7 +2495,12 @@ mod tests {
         let bytes = build_test_wheel_zip();
         let sha = hex_sha256(&bytes);
         std::fs::create_dir_all(store.join(&sha)).unwrap();
-        std::fs::write(store.join(&sha).join(filename), &bytes).unwrap();
+        let store_path = store.join(&sha).join(filename);
+        std::fs::write(&store_path, &bytes).unwrap();
+        let fingerprint = set_store_file_readonly(&store_path).await.unwrap();
+        write_store_integrity_marker(&store_path, &sha, &fingerprint)
+            .await
+            .unwrap();
         let url = url::Url::parse(&format!("https://127.0.0.1:1/x/{filename}")).unwrap();
 
         let path = prefetch_url_wheel_as_source(&url, Some(&sha), &dest, &store)
@@ -1649,7 +2527,10 @@ mod tests {
         let dest = tmp.join("dl");
         let store = tmp.join("store");
         let filename = "bar-2.0-py3-none-any.whl";
-        let (url, sha) = stage_offline_wheel(&dest, filename);
+        let bytes = build_test_wheel_zip();
+        let sha = hex_sha256(&bytes);
+        let (port, server) = serve_ranged(bytes).await;
+        let url = url::Url::parse(&format!("http://127.0.0.1:{port}/x/{filename}")).unwrap();
 
         // No configured sha: the content-addressed store computes it at first
         // fetch (existing store_wheel_in_cache behavior, no new hashing).
@@ -1659,6 +2540,7 @@ mod tests {
         assert_eq!(path, store.join(&sha).join(filename));
         assert!(path.is_file());
 
+        server.abort();
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

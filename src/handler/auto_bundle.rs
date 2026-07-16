@@ -384,7 +384,7 @@ fn expand_name_map_groups(names: &mut HashSet<String>, name_map: &NameMap) {
 pub(crate) async fn auto_bundle_transitives(
     bundle: &mut Bundle,
     indexes: &[String],
-    target: &crate::pypi::WheelTarget,
+    target: &crate::pypi::ResolutionTarget,
     download_dir: &Path,
     config: &RetreadConfig,
     conda_channels: &[ChannelUrl],
@@ -479,7 +479,7 @@ pub(crate) async fn auto_bundle_transitives(
     auto_bundle_transitives_with(
         bundle,
         indexes,
-        &target,
+        target.wheel_target(),
         config,
         locked_closure,
         favor_lock_prefs,

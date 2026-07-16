@@ -41,7 +41,7 @@ use uv_pep508::uv_pep440::VersionSpecifiers;
 use crate::config::{RelaxPolicy, RetreadConfig, WheelEntry};
 use crate::constraint::{Authority, Conflict, Constraint, Provenance, finalize};
 use crate::index_chain::{IndexPurpose, index_chain};
-use crate::pypi::{self, ResolutionTarget, WheelTarget};
+use crate::pypi::{self, ResolutionTarget, WheelTarget, normalized_python_minor};
 use crate::recipe::{
     BundleSource, build_bundle_recipe, build_courier_recipe_with_mode_and_lock_filename, to_yaml,
 };
@@ -1406,7 +1406,12 @@ impl Handler {
         // mirror-solver; outputs ship unvalidated and `retread solve`
         // owns conflict handling.
         for python_version in &pythons {
-            let target = resolution_target_for(params.host_platform, python_version);
+            let target =
+                wheel_target_for(params.host_platform, python_version).map_err(|error| {
+                    RpcError::invalid_params(format!(
+                        "invalid Python target `{python_version}`: {error:#}"
+                    ))
+                })?;
             let python_version = target.python_version();
             // Phase 1: materialize wheels + auto-bundle. Env-agnostic;
             // results reused across all per-env emissions.
@@ -1473,7 +1478,7 @@ impl Handler {
                 materialized,
                 base_config,
                 declared_config: config.clone(),
-                python_version: python_version.to_owned(),
+                target: target.clone(),
                 work_directory: params.work_directory.clone(),
                 workspace_manifest_mtime: prepared_workspace_mtime,
                 auto_overrides_fingerprint: prepared_auto_overrides_fp.clone(),
@@ -1804,7 +1809,12 @@ impl Handler {
             }
             None => config_python.unwrap_or_else(|| DEFAULT_PYTHON.to_string()),
         };
-        let target = resolution_target_for(params.output.subdir, &requested_python);
+        let target =
+            wheel_target_for(params.output.subdir, &requested_python).map_err(|error| {
+                RpcError::invalid_params(format!(
+                    "invalid Python target `{requested_python}`: {error:#}"
+                ))
+            })?;
         let python_version = target.python_version().to_owned();
 
         // WS-B build_v1 replay gate: when courier mode is active, check the
@@ -2079,8 +2089,8 @@ impl Handler {
                 &prepared.plan.declared_config,
                 &params.work_directory,
                 &build_output_dir,
-                &target,
-                &prepared.plan.python_version,
+                params.output.subdir,
+                &prepared.plan.target,
                 &source_dir,
                 workspace_dir.as_deref(),
                 Some(expected_build),
@@ -2154,8 +2164,8 @@ impl Handler {
             &config,
             &params.work_directory,
             &build_output_dir,
+            params.output.subdir,
             &target,
-            &python_version,
             &source_dir,
             workspace_dir.as_deref(),
             params.output.build.as_deref(),
@@ -2446,21 +2456,11 @@ fn pythons_for(
     vec![DEFAULT_PYTHON.to_string()]
 }
 
-#[cfg(test)]
-fn wheel_target_for(subdir: Platform, python_version: &str) -> WheelTarget {
+fn wheel_target_for(subdir: Platform, python_version: &str) -> Result<ResolutionTarget> {
     // The python_version comes from variant configuration (or the chosen
     // output's variant in conda/build_v1). It drives wheel selection on
     // the PyPI index (cp tag matching) and the marker env in relax.rs.
-    WheelTarget::for_subdir(python_version, &subdir.to_string())
-}
-
-fn resolution_target_for(subdir: Platform, python_version: &str) -> ResolutionTarget {
-    // Resolve the declaration/effective ceiling once at the operation
-    // boundary. Hashing, lock lookup, replay gates, and courier staging all
-    // consume this same immutable value.
-    let normalized_python = crate::lock::normalized_target_python(python_version)
-        .unwrap_or_else(|_| python_version.to_owned());
-    ResolutionTarget::for_subdir(&normalized_python, &subdir.to_string())
+    ResolutionTarget::try_for_subdir(python_version, &subdir.to_string())
 }
 
 /// Resolve every user-supplied entry into a list of bundles. Each bundle
@@ -2911,8 +2911,7 @@ async fn build_sdist_wheel(
     name: String,
     requirement: Option<String>,
     index_urls: Vec<String>,
-    python_version: String,
-    target_cache_identity: String,
+    target: ResolutionTarget,
     cache_dir: PathBuf,
 ) -> Result<crate::uv_closure::BuiltSdistWheel> {
     // Constrain sdist selection to the EXACT version the structured
@@ -2956,48 +2955,37 @@ async fn build_sdist_wheel(
         version = %version,
         "building sdist {name}=={version} (no wheel, no conda candidate)",
     );
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(b"retread-sdist-autobuild-v2\0");
-    hasher.update(
-        sdist
-            .sha256
-            .as_deref()
-            .unwrap_or_else(|| sdist.url.as_str())
-            .as_bytes(),
-    );
-    hasher.update(b"\0");
-    hasher.update(target_cache_identity.as_bytes());
-    let cache_key = format!("{:x}", hasher.finalize());
     let out_dir = cache_dir
-        .join("sdist-auto-builds")
-        .join(canonical_conda_name(&name))
-        .join(cache_key);
-    let built = crate::source_build::build_wheel_from_sdist_url(
+        .join("sdist-auto-build-outputs")
+        .join(canonical_conda_name(&name));
+    let expected = crate::source_build::ExpectedWheel::exact(name.clone(), version.to_string());
+    let built = crate::source_build::build_wheel_from_sdist_url_for_target(
         &sdist.url,
         &out_dir,
-        &python_version,
+        &target,
         sdist.sha256.as_deref(),
+        Some(&expected),
     )
     .await
     .with_context(|| format!("sdist auto-build: building `{name}` from {}", sdist.url))?;
 
     let store_root = crate::courier::retread_wheel_store_root();
-    let sha256 = crate::wheel::store_wheel_in_cache(&built, &store_root)
+    let sha256 = crate::wheel::store_wheel_in_cache(&built.wheel_path, &store_root)
         .await
         .with_context(|| format!("sdist auto-build: storing built wheel for `{name}`"))?;
     let filename = built
+        .wheel_path
         .file_name()
         .and_then(|s| s.to_str())
         .ok_or_else(|| {
             anyhow!(
                 "sdist auto-build: built wheel path has no utf-8 filename: {}",
-                built.display()
+                built.wheel_path.display()
             )
         })?
         .to_string();
     let store_path = store_root.join(&sha256).join(&filename);
-    let sdist_url = compose_sdist_source_url(&sdist.url, sdist.sha256.as_deref());
+    let sdist_url = compose_sdist_source_url(&sdist.url, Some(&built.sdist_sha256));
     Ok(crate::uv_closure::BuiltSdistWheel {
         pypi_name: name.clone(),
         version: version.to_string(),
@@ -3803,7 +3791,7 @@ async fn uv_group_closure(
     group_entries: &[(String, WheelEntry)],
     effective: &RetreadConfig,
     fact_name_map: &NameMap,
-    target: &WheelTarget,
+    target: &ResolutionTarget,
     cache_dir: &Path,
     source_dir: &Path,
     workspace_dir: Option<&Path>,
@@ -3860,41 +3848,30 @@ async fn uv_group_closure(
             // (`fetch_wheel_cached`, cache hit), and the pylock records the
             // wheel as a local `archive` either way (pin-only, no index
             // wheel), so lock provenance is unchanged.
-            match crate::wheel::prefetch_url_wheel_as_source(
+            let store_path = crate::wheel::prefetch_url_wheel_as_source(
                 url,
                 entry.sha256.as_deref(),
                 &url_prefetch_dir,
                 &wheel_store_root,
             )
             .await
-            {
-                Ok(store_path) => {
-                    tracing::info!(
-                        entry = %name,
-                        bundle = %group_name,
-                        path = %store_path.display(),
-                        "uv closure: direct-URL wheel pre-fetched to store; \
-                         emitting a local path source (avoids the no-store \
-                         whole-wheel redownload uv would do to read METADATA)",
-                    );
-                    url_wheel_sources.insert(name.clone(), store_path);
-                    // First-party bare requirement; the path source binds by
-                    // name (uv reads name/version from the local wheel).
-                    roots.push(name.clone());
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        entry = %name,
-                        bundle = %group_name,
-                        url = %url,
-                        err = %e,
-                        "uv closure: direct-URL wheel pre-fetch failed; falling \
-                         back to the direct-URL requirement (uv will download \
-                         the whole wheel to read METADATA)",
-                    );
-                    roots.push(format!("{name} @ {url}"));
-                }
-            }
+            .with_context(|| {
+                format!(
+                    "uv closure: direct-URL wheel prefetch for `{name}` failed; integrity and target failures are not eligible for direct-URL fallback"
+                )
+            })?;
+            tracing::info!(
+                entry = %name,
+                bundle = %group_name,
+                path = %store_path.display(),
+                "uv closure: direct-URL wheel pre-fetched to store; \
+                 emitting a local path source (avoids the no-store \
+                 whole-wheel redownload uv would do to read METADATA)",
+            );
+            url_wheel_sources.insert(name.clone(), store_path);
+            // First-party bare requirement; the path source binds by
+            // name (uv reads name/version from the local wheel).
+            roots.push(name.clone());
         } else {
             tracing::info!(
                 entry = %name,
@@ -4276,12 +4253,8 @@ async fn uv_group_closure(
     // Persisted heal facts live OUTSIDE uv-projects so they survive a
     // "delete uv-projects state" cold reset -- that survival is what lets
     // the post-reset Pass A converge in one lock (issue #10 perf, item 3b).
-    let heal_facts_path = crate::uv_closure::heal_facts_path(
-        cache_dir,
-        group_name,
-        &target.python_version,
-        &target.conda_subdir,
-    );
+    let heal_facts_path =
+        crate::uv_closure::heal_facts_path_for_target(cache_dir, group_name, target);
 
     // M2: auto-route options. Roots (this bundle's own entries) and
     // retread-built wheel sources must never leave the closure; keep-pypi
@@ -4431,13 +4404,16 @@ async fn uv_group_closure(
     let raw_solve = {
         let project_dir = project_dir.clone();
         let uv_cache_dir = uv_cache_dir.clone();
+        let target = target.clone();
         let sdist_build_policy = effective.sdist_build;
         move |r: crate::uv_closure::UvClosureRequest| {
             let project_dir = project_dir.clone();
             let uv_cache_dir = uv_cache_dir.clone();
+            let target = target.clone();
             let fut = async move {
-                crate::uv_closure::compute_closure(
+                crate::uv_closure::compute_closure_for_target(
                     &r,
+                    &target,
                     &project_dir,
                     &uv_cache_dir,
                     None,
@@ -4506,16 +4482,14 @@ async fn uv_group_closure(
     };
     let sdist_build = (effective.sdist_build == crate::config::SdistBuildPolicy::Auto).then(|| {
         let index_urls = transitive_index_urls.clone();
-        let python_version = target.python_version.clone();
-        let target_cache_identity = target.artifact_cache_identity();
+        let target = target.clone();
         let cache_dir = cache_dir.to_path_buf();
         move |name: String, requirement: Option<String>| {
             let fut = build_sdist_wheel(
                 name,
                 requirement,
                 index_urls.clone(),
-                python_version.clone(),
-                target_cache_identity.clone(),
+                target.clone(),
                 cache_dir.clone(),
             );
             Box::pin(fut)
@@ -4532,9 +4506,15 @@ async fn uv_group_closure(
     // Facts are only replayable under the manifest/routing state they were
     // learned from (B1): stamp over the BASE request + routing options; a
     // mismatch discards the file (fresh heal), never a stale replay.
-    let facts_stamp =
-        crate::uv_closure::heal_facts_stamp(&req, &auto_route_opts, effective.sdist_build);
-    let persisted_facts = crate::uv_closure::load_heal_facts(&heal_facts_path, &facts_stamp);
+    let facts_stamp = crate::uv_closure::heal_facts_stamp_for_target(
+        &req,
+        &auto_route_opts,
+        effective.sdist_build,
+        target,
+    );
+    let persisted_facts =
+        crate::uv_closure::load_heal_facts_for_target(&heal_facts_path, &facts_stamp, target)
+            .await?;
     if !persisted_facts.is_empty() {
         tracing::info!(
             bundle = %group_name,
@@ -5479,7 +5459,7 @@ struct ResolvedTargetPlan {
     materialized: Vec<Bundle>,
     base_config: RetreadConfig,
     declared_config: RetreadConfig,
-    python_version: String,
+    target: ResolutionTarget,
     work_directory: PathBuf,
     workspace_manifest_mtime: Option<std::time::SystemTime>,
     auto_overrides_fingerprint: String,
@@ -5536,8 +5516,10 @@ impl PreparedBuild {
         output: &pixi_build_types::procedures::conda_build_v1::CondaBuildV1Output,
     ) -> bool {
         self.plan.work_directory == work_directory
-            && exact_python_version
-                .is_none_or(|python_version| self.plan.python_version == python_version)
+            && exact_python_version.is_none_or(|python_version| {
+                normalized_python_minor(python_version)
+                    .is_ok_and(|python| python.version() == self.plan.target.python_version())
+            })
             && self.advertised.name == output.name.as_normalized()
             && self.advertised.subdir == output.subdir
             && output
@@ -6115,7 +6097,7 @@ fn bfs_descendant_indexes(source: &PendingSource, bundle_indexes: &[String]) -> 
 async fn resolve_bundle(
     entry_name: &str,
     entry: &WheelEntry,
-    target: &WheelTarget,
+    target: &ResolutionTarget,
     download_dir: &Path,
     source_dir: &Path,
     cache_dir: &Path,
@@ -6190,6 +6172,7 @@ async fn resolve_bundle(
     let (primary, primary_original_rd) = materialize_and_rewrite(
         entry,
         entry_name,
+        None,
         target,
         download_dir,
         source_dir,
@@ -6678,6 +6661,7 @@ async fn resolve_bundle(
                     let (sub, sub_original_rd) = materialize_and_rewrite(
                         &synth,
                         &synth_name,
+                        None,
                         target,
                         download_dir,
                         source_dir,
@@ -6717,6 +6701,7 @@ async fn resolve_bundle(
                     let (sub, sub_original_rd) = materialize_and_rewrite(
                         &synth,
                         &synth_name,
+                        None,
                         target,
                         download_dir,
                         source_dir,
@@ -6906,7 +6891,7 @@ async fn bfs_fetch_pypi_from_chain(
     pypi_name: &str,
     specifiers: &VersionSpecifiers,
     indexes: &[String],
-    target: &WheelTarget,
+    target: &ResolutionTarget,
     download_dir: &Path,
     relax: RelaxPolicy,
     prefer_version: Option<&str>,
@@ -6987,7 +6972,7 @@ async fn bfs_fetch_pypi_wheel(
     pypi_name: &str,
     specifiers: &VersionSpecifiers,
     index: &str,
-    target: &WheelTarget,
+    target: &ResolutionTarget,
     download_dir: &Path,
     // favor-lock: when Some, prefer this version on the index before falling
     // back to highest-version selection. Propagated from favor_lock_prefs by the
@@ -7011,7 +6996,7 @@ async fn bfs_fetch_pypi_sdist(
     pypi_name: &str,
     specifiers: &VersionSpecifiers,
     index: &str,
-    target: &WheelTarget,
+    target: &ResolutionTarget,
     download_dir: &Path,
 ) -> Result<BfsFetched> {
     let (sdist_version, sdist) = pypi::resolve_sdist(index, pypi_name, specifiers)
@@ -7019,36 +7004,20 @@ async fn bfs_fetch_pypi_sdist(
         .with_context(|| format!("BFS sdist fallback for {pypi_name} {specifiers} on {index}"))?;
     // Capture the sdist URL before the build so replay keeps the immutable
     // source even though the materialized wheel is a local file URL.
-    let captured_sdist_url = url::Url::parse(&compose_sdist_source_url(
-        &sdist.url,
-        sdist.sha256.as_deref(),
-    ))
-    .context("constructing hash-bound BFS sdist provenance URL")?;
-    // Bind the cache to the exact source artifact and effective target. A
-    // same-version republish or a different Python/platform contract must
-    // never reuse executable build output.
-    use sha2::{Digest, Sha256};
-    let mut cache_hasher = Sha256::new();
-    cache_hasher.update(b"retread-sdist-build-v2\0");
-    cache_hasher.update(
-        sdist
-            .sha256
-            .as_deref()
-            .unwrap_or_else(|| sdist.url.as_str())
-            .as_bytes(),
-    );
-    cache_hasher.update(b"\0");
-    cache_hasher.update(target.artifact_cache_identity().as_bytes());
-    let cache_key = format!("{:x}", cache_hasher.finalize());
+    let mut captured_sdist_url = sdist.url.clone();
+    // Unified sdist build cache dir keyed on (name, version) so BFS,
+    // discovery, and replay all share the same output directory and never
+    // rebuild the same (name, version) twice.
     let sdist_out = download_dir
         .join("sdist-builds")
-        .join(format!("{pypi_name}-{sdist_version}"))
-        .join(cache_key);
-    let built = crate::source_build::build_wheel_from_sdist_url(
+        .join(format!("{pypi_name}-{sdist_version}"));
+    let expected = crate::source_build::ExpectedWheel::exact(pypi_name, sdist_version.to_string());
+    let built = crate::source_build::build_wheel_from_sdist_url_for_target(
         &sdist.url,
         &sdist_out,
-        &target.python_version,
+        target,
         sdist.sha256.as_deref(),
+        Some(&expected),
     )
     .await
     .with_context(|| {
@@ -7057,21 +7026,22 @@ async fn bfs_fetch_pypi_sdist(
             sdist.url, pypi_name,
         )
     })?;
-    let built_url = url::Url::from_file_path(&built).map_err(|_| {
+    captured_sdist_url.set_fragment(Some(&format!("sha256={}", built.sdist_sha256)));
+    let built_url = url::Url::from_file_path(&built.wheel_path).map_err(|_| {
         anyhow!(
             "built wheel path is not a valid file URL: {}",
-            built.display(),
+            built.wheel_path.display(),
         )
     })?;
     let metadata = tokio::task::spawn_blocking({
-        let p = built.clone();
+        let p = built.wheel_path.clone();
         move || crate::wheel::read_metadata(&p)
     })
     .await
     .context("metadata reader panicked")??;
     tracing::info!(
         dep = %pypi_name,
-        built = %built.display(),
+        built = %built.wheel_path.display(),
         "BFS sdist fallback: built wheel from sdist after all wheel indexes missed",
     );
     let prov = SdistProv {
@@ -7190,7 +7160,8 @@ pub(crate) struct EntryAuditInfo {
 async fn materialize_and_rewrite(
     entry: &crate::config::WheelEntry,
     entry_name: &str,
-    target: &WheelTarget,
+    expected_version: Option<&str>,
+    target: &ResolutionTarget,
     download_dir: &Path,
     source_dir: &Path,
     cache_dir: &Path,
@@ -7206,11 +7177,14 @@ async fn materialize_and_rewrite(
     // (path / git / from), also remember the source root so phase 1.5
     // can inject any files pip wheel failed to ship.
     let mut source_root: Option<PathBuf> = None;
-    // Git source-tree reads must retain the checkout's logical reader lease.
-    // The lease returned by phase 1 stays alive through both injection phases;
-    // dropping it after the wheel build would leave those later tree walks
-    // outside the clone cache's synchronization boundary.
-    let mut git_checkout: Option<crate::source_build::GitCheckout> = None;
+    // Path builds return an immutable source snapshot lease. Keep it alive
+    // through phase 1.5 so injection sees the exact tree that produced the
+    // content-addressed raw wheel, even if the live checkout changes.
+    let mut path_build: Option<crate::source_build::PathWheelBuild> = None;
+    // Git builds retain a shared canonical clean source snapshot through both
+    // injection phases. The mutable/warm checkout is kept only as a leased
+    // planning identity and is never used as artifact input.
+    let mut git_build: Option<crate::source_build::GitWheelBuild> = None;
     // Pristine upstream URL captured BEFORE localization to file://.
     // Set for index (PyPI version-spec) and direct-URL entry forms only.
     // Source-built forms (git / path / from) leave this None.
@@ -7230,13 +7204,18 @@ async fn materialize_and_rewrite(
         })?;
         let subdir = entry.subdirectory.as_deref().unwrap_or(".");
         let out = download_dir.join(entry_name);
-        let build = crate::source_build::build_wheel_from_git_leased(
+        let expected = expected_version.map_or_else(
+            || crate::source_build::ExpectedWheel::named(entry_name),
+            |version| crate::source_build::ExpectedWheel::exact(entry_name, version),
+        );
+        let build = crate::source_build::build_wheel_from_git_leased_for_target(
             &src.url,
             &src.rev,
             subdir,
             cache_dir,
             &out,
-            &target.python_version,
+            target,
+            Some(&expected),
         )
         .await
         .with_context(|| {
@@ -7249,9 +7228,9 @@ async fn materialize_and_rewrite(
                 out.display(),
             )
         })?;
-        let (wheel, resolved_sha, checkout) = build.into_parts();
-        source_root = Some(checkout.root().join(subdir));
-        git_checkout = Some(checkout);
+        let wheel = build.wheel_path().to_path_buf();
+        let resolved_sha = build.resolved_sha().to_string();
+        source_root = Some(build.source_root().to_path_buf());
         // Record git provenance with the RESOLVED SHA (not the config rev,
         // which may be a branch/tag) so replay is manifest-independent.
         // POISONING: the config rev IS in inputs_hash via courier_input_specs
@@ -7266,18 +7245,101 @@ async fn materialize_and_rewrite(
             subdirectory: entry.subdirectory.clone(),
             extras: entry.extras.clone(),
         });
+        git_build = Some(build);
         wheel
     } else if let Some(url) = &entry.url {
         // Capture the direct URL as the upstream before fetch/localization.
         upstream_url = Some((*url).clone());
-        crate::wheel::fetch_wheel_cached(
-            url,
-            entry.sha256.as_deref(),
-            download_dir,
-            &crate::courier::retread_wheel_store_root(),
-        )
-        .await
-        .with_context(|| format!("phase 1 URL fetch for entry `{entry_name}` (url=`{url}`)"))?
+        let expected = expected_version.map_or_else(
+            || crate::source_build::ExpectedWheel::named(entry_name),
+            |version| crate::source_build::ExpectedWheel::exact(entry_name, version),
+        );
+        let mut already_validated = false;
+        let fetched = if let Some(authoritative_sha256) = entry.sha256.as_deref() {
+            // The digest-qualified destination is stable. Admit it before the
+            // generic fetch path so an unchanged strict attestation avoids a
+            // second multi-gigabyte compressed-byte hash on warm locks.
+            let destination =
+                crate::wheel::pinned_wheel_destination(url, authoritative_sha256, download_dir)?;
+            if destination.try_exists()? {
+                match crate::source_build::validate_pinned_wheel_for_target_async(
+                    &destination,
+                    target,
+                    &expected,
+                    authoritative_sha256,
+                    url.as_str(),
+                )
+                .await
+                {
+                    Ok(_) => {
+                        already_validated = true;
+                        destination
+                    }
+                    Err(error)
+                        if crate::source_build::is_authoritative_wheel_hash_mismatch(&error) =>
+                    {
+                        tracing::warn!(
+                            wheel = %entry_name,
+                            error = %format!("{error:#}"),
+                            "pinned destination bytes are corrupt; healing from authoritative store or URL",
+                        );
+                        crate::wheel::fetch_wheel_cached(
+                            url,
+                            Some(authoritative_sha256),
+                            download_dir,
+                            &crate::courier::retread_wheel_store_root(),
+                        )
+                        .await?
+                    }
+                    Err(error) => return Err(error).with_context(|| {
+                        format!(
+                            "phase 1 URL artifact for `{entry_name}` has a correct authoritative identity but fails strict target/name/version validation"
+                        )
+                    }),
+                }
+            } else {
+                crate::wheel::fetch_wheel_cached(
+                    url,
+                    Some(authoritative_sha256),
+                    download_dir,
+                    &crate::courier::retread_wheel_store_root(),
+                )
+                .await?
+            }
+        } else {
+            crate::wheel::fetch_wheel_cached(
+                url,
+                None,
+                download_dir,
+                &crate::courier::retread_wheel_store_root(),
+            )
+            .await?
+        };
+        if !already_validated {
+            let validation = if let Some(authoritative_sha256) = entry.sha256.as_deref() {
+                crate::source_build::validate_pinned_wheel_for_target_async(
+                    &fetched,
+                    target,
+                    &expected,
+                    authoritative_sha256,
+                    url.as_str(),
+                )
+                .await
+            } else {
+                crate::source_build::validate_wheel_for_target_async(
+                    &fetched,
+                    target,
+                    Some(&expected),
+                )
+                .await
+            };
+            validation.with_context(|| {
+                format!(
+                    "phase 1 URL artifact for `{entry_name}` is incompatible with the immutable target or pinned hash"
+                )
+            })?;
+        }
+        fetched
     } else if let Some(path) = &entry.path {
         let abs = if Path::new(path).is_absolute() {
             PathBuf::from(path)
@@ -7285,16 +7347,29 @@ async fn materialize_and_rewrite(
             source_dir.join(path)
         };
         let out = download_dir.join(entry_name);
-        let wheel = crate::source_build::build_wheel_from_path(&abs, &out, &target.python_version)
-            .await
-            .with_context(|| {
-                format!(
-                    "phase 1 path build for entry `{entry_name}` (source={}, out_dir={})",
-                    abs.display(),
-                    out.display(),
-                )
-            })?;
-        source_root = Some(abs);
+        let expected = expected_version.map_or_else(
+            || crate::source_build::ExpectedWheel::named(entry_name),
+            |version| crate::source_build::ExpectedWheel::exact(entry_name, version),
+        );
+        let build = crate::source_build::build_wheel_from_path_for_target(
+            &abs,
+            &out,
+            target,
+            Some(&expected),
+            Some(download_dir),
+            (!Path::new(path).is_absolute()).then_some(source_dir),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "phase 1 path build for entry `{entry_name}` (source={}, out_dir={})",
+                abs.display(),
+                out.display(),
+            )
+        })?;
+        source_root = Some(build.source_root().to_path_buf());
+        let wheel = build.wheel_path().to_path_buf();
+        path_build = Some(build);
         wheel
     } else if let Some(git_url) = &entry.git {
         let rev = entry
@@ -7303,13 +7378,18 @@ async fn materialize_and_rewrite(
             .ok_or_else(|| anyhow!("git source `{entry_name}` missing rev"))?;
         let subdir = entry.subdirectory.as_deref().unwrap_or(".");
         let out = download_dir.join(entry_name);
-        let build = crate::source_build::build_wheel_from_git_leased(
+        let expected = expected_version.map_or_else(
+            || crate::source_build::ExpectedWheel::named(entry_name),
+            |version| crate::source_build::ExpectedWheel::exact(entry_name, version),
+        );
+        let build = crate::source_build::build_wheel_from_git_leased_for_target(
             git_url,
             rev,
             subdir,
             cache_dir,
             &out,
-            &target.python_version,
+            target,
+            Some(&expected),
         )
         .await
         .with_context(|| {
@@ -7319,9 +7399,9 @@ async fn materialize_and_rewrite(
                 out.display(),
             )
         })?;
-        let (wheel, resolved_sha, checkout) = build.into_parts();
-        source_root = Some(checkout.root().join(subdir));
-        git_checkout = Some(checkout);
+        let wheel = build.wheel_path().to_path_buf();
+        let resolved_sha = build.resolved_sha().to_string();
+        source_root = Some(build.source_root().to_path_buf());
         // Record git provenance with the RESOLVED SHA (not the config rev,
         // which may be a branch/tag) so replay is manifest-independent.
         // POISONING: the config rev IS in inputs_hash via courier_input_specs
@@ -7335,6 +7415,7 @@ async fn materialize_and_rewrite(
             subdirectory: entry.subdirectory.clone(),
             extras: entry.extras.clone(),
         });
+        git_build = Some(build);
         wheel
     } else {
         // PyPI version spec form.
@@ -7407,6 +7488,8 @@ async fn materialize_and_rewrite(
     } else {
         raw_path
     };
+    // No later phase reads a local path source tree.
+    drop(path_build);
 
     // Phase 1.6 (v0.12.0+): if the caller passed an `AutoDataConfig`,
     // walk the upstream checkout root (parent of this entry's
@@ -7422,17 +7505,17 @@ async fn materialize_and_rewrite(
     // backend-cache invalidation step).
     let mut auto_data_file_count: Option<usize> = None;
     let with_data_path = if let Some(cfg) = auto_data.as_ref() {
-        let checkout = git_checkout.as_ref().ok_or_else(|| {
+        let build = git_build.as_ref().ok_or_else(|| {
             anyhow!("phase 1.6 checkout-root auto-data requested for non-git entry `{entry_name}`")
         })?;
-        if cfg.checkout_root.as_path() != checkout.root() {
+        if cfg.checkout_root.as_path() != build.checkout_root() {
             bail!(
                 "phase 1.6 checkout-root mismatch for entry `{entry_name}`: planned={}, built={}",
                 cfg.checkout_root.display(),
-                checkout.root().display(),
+                build.checkout_root().display(),
             );
         }
-        let checkout_root = checkout.root();
+        let checkout_root = build.canonical_root();
         let out = injected_path.with_extension("autodata.whl");
         if is_fresh(&out, &injected_path)? {
             tracing::info!(
@@ -7475,7 +7558,7 @@ async fn materialize_and_rewrite(
     };
     // No later phase reads the checkout. Release the logical reader before
     // metadata rewriting so unrelated work does not retain it unnecessarily.
-    drop(git_checkout);
+    drop(git_build);
 
     // Phase 2: apply D (rewrite METADATA per the relax policy). For
     // policies that aren't 'none', the output is a new wheel file with
@@ -8431,6 +8514,60 @@ fn localize_wheel_source(url: &url::Url, wheels_root: &Path) -> url::Url {
     url.clone()
 }
 
+/// Validate the bytes re-produced for a source-built replay before copying
+/// lock fields into an EmitWheel. The lock hash is the later courier-rewritten
+/// artifact and cannot equal this pre-stage file, but the actual replay file
+/// must retain the exact source filename/tag contract that predicts the
+/// canonical staged filename.
+async fn validate_replayed_source_artifact(
+    resolved: &ResolvedWheel,
+    locked: &crate::lock::LockWheel,
+    target: &ResolutionTarget,
+) -> Result<(String, String)> {
+    let path = resolved.url.to_file_path().map_err(|_| {
+        anyhow!(
+            "courier replay source wheel for `{}` is not a local artifact: {}",
+            locked.name,
+            resolved.url,
+        )
+    })?;
+    let expected = crate::source_build::ExpectedWheel::exact(&locked.name, &locked.version);
+    let actual_sha = crate::source_build::validate_wheel_for_target_async(
+        &path,
+        target,
+        Some(&expected),
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "courier replay source artifact for `{}` failed strict target/identity validation",
+            locked.name,
+        )
+    })?;
+    if !actual_sha.eq_ignore_ascii_case(&resolved.metadata.sha256) {
+        bail!(
+            "courier replay source artifact for `{}` changed after materialization: metadata read {}, strict read {}",
+            locked.name,
+            resolved.metadata.sha256,
+            actual_sha,
+        );
+    }
+    let actual_filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("courier replay source artifact has no UTF-8 filename"))?
+        .to_string();
+    let predicted_locked_filename = crate::emit_pypi::standard_wheel_filename(&actual_filename);
+    if predicted_locked_filename != locked.filename {
+        bail!(
+            "courier replay source artifact filename drift for `{}`: rebuilt `{actual_filename}` predicts `{predicted_locked_filename}`, lock records `{}`",
+            locked.name,
+            locked.filename,
+        );
+    }
+    Ok((actual_filename, actual_sha))
+}
+
 /// Reconstruct the per-wheel [`crate::emit_pypi::EmitWheel`] list from a
 /// committed lock without re-running the full BFS resolve.
 ///
@@ -8615,6 +8752,61 @@ async fn emit_wheels_from_lock(
                             .and_then(|u| u.to_file_path().ok())
                     })
                 };
+                let expected = crate::source_build::ExpectedWheel::exact(&lw.name, &lw.version);
+                if let Some(path) = &local_path {
+                    let actual_sha = crate::source_build::validate_wheel_for_target_async(
+                        path,
+                        target,
+                        Some(&expected),
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "courier replay index artifact for `{}` is incompatible with the immutable target",
+                            lw.name,
+                        )
+                    })?;
+                    if let Some(locked_sha) = &lw.sha256
+                        && !actual_sha.eq_ignore_ascii_case(locked_sha)
+                    {
+                        bail!(
+                            "courier replay index artifact hash mismatch for `{}`: lock has {}, local file has {}",
+                            lw.name,
+                            locked_sha,
+                            actual_sha,
+                        );
+                    }
+                } else {
+                    if crate::pypi::score_wheel(&lw.filename, target.wheel_target()) < 0 {
+                        bail!(
+                            "courier replay index wheel `{}` is incompatible with python {} on {}",
+                            lw.filename,
+                            target.python_version(),
+                            target.conda_subdir(),
+                        );
+                    }
+                    let (filename_name, filename_version) =
+                        crate::pypi::wheel_filename_identity(&lw.filename).ok_or_else(|| {
+                            anyhow!(
+                                "courier replay index wheel has invalid filename `{}`",
+                                lw.filename,
+                            )
+                        })?;
+                    let locked_version = uv_pep508::uv_pep440::Version::from_str(&lw.version)
+                        .with_context(|| {
+                            format!("invalid locked wheel version `{}`", lw.version)
+                        })?;
+                    if canonical_conda_name(&filename_name) != canonical_conda_name(&lw.name)
+                        || filename_version != locked_version
+                    {
+                        bail!(
+                            "courier replay index wheel `{}` does not match locked identity {}=={}",
+                            lw.filename,
+                            lw.name,
+                            lw.version,
+                        );
+                    }
+                }
                 crate::emit_pypi::EmitWheel {
                     pypi_name: lw.name.clone(),
                     version: lw.version.clone(),
@@ -8716,6 +8908,7 @@ async fn emit_wheels_from_lock(
                                 let (resolved, _rd) = materialize_and_rewrite(
                                     &synth_entry,
                                     &member_lw.name,
+                                    Some(&member_lw.version),
                                     target,
                                     download_dir,
                                     source_dir,
@@ -8733,6 +8926,9 @@ async fn emit_wheels_from_lock(
                                         member_lw.name, member_gs.url, member_gs.rev,
                                     )
                                 })?;
+                                let (actual_filename, actual_sha) =
+                                    validate_replayed_source_artifact(&resolved, member_lw, target)
+                                        .await?;
                                 let local_path = (resolved.url.scheme() == "file")
                                     .then(|| resolved.url.to_file_path().ok())
                                     .flatten();
@@ -8743,8 +8939,8 @@ async fn emit_wheels_from_lock(
                                         version: member_lw.version.clone(),
                                         requires_dist: member_lw.requires_dist.clone(),
                                         local_path,
-                                        wheel_filename: member_lw.filename.clone(),
-                                        sha256: Some(resolved.metadata.sha256.clone()),
+                                        wheel_filename: actual_filename,
+                                        sha256: Some(actual_sha),
                                         locked_final_sha256: member_lw.sha256.clone(),
                                         remote_url: None,
                                         upstream_url: None,
@@ -8807,6 +9003,7 @@ async fn emit_wheels_from_lock(
                         let (resolved, _rd) = materialize_and_rewrite(
                             &synth_entry,
                             &lw.name,
+                            Some(&lw.version),
                             target,
                             download_dir,
                             source_dir,
@@ -8824,6 +9021,8 @@ async fn emit_wheels_from_lock(
                                 lw.name, gs.url, gs.rev,
                             )
                         })?;
+                        let (actual_filename, actual_sha) =
+                            validate_replayed_source_artifact(&resolved, lw, target).await?;
                         let local_path = (resolved.url.scheme() == "file")
                             .then(|| resolved.url.to_file_path().ok())
                             .flatten();
@@ -8832,8 +9031,8 @@ async fn emit_wheels_from_lock(
                             version: lw.version.clone(),
                             requires_dist: lw.requires_dist.clone(),
                             local_path,
-                            wheel_filename: lw.filename.clone(),
-                            sha256: Some(resolved.metadata.sha256.clone()),
+                            wheel_filename: actual_filename,
+                            sha256: Some(actual_sha),
                             locked_final_sha256: lw.sha256.clone(),
                             remote_url: None,
                             upstream_url: None,
@@ -8873,6 +9072,7 @@ async fn emit_wheels_from_lock(
                     let (resolved, _rd) = materialize_and_rewrite(
                         entry,
                         &lw.name,
+                        Some(&lw.version),
                         target,
                         download_dir,
                         source_dir,
@@ -8889,6 +9089,8 @@ async fn emit_wheels_from_lock(
                             lw.name
                         )
                     })?;
+                    let (actual_filename, actual_sha) =
+                        validate_replayed_source_artifact(&resolved, lw, target).await?;
                     let local_path = (resolved.url.scheme() == "file")
                         .then(|| resolved.url.to_file_path().ok())
                         .flatten();
@@ -8897,8 +9099,8 @@ async fn emit_wheels_from_lock(
                         version: lw.version.clone(),
                         requires_dist: lw.requires_dist.clone(),
                         local_path,
-                        wheel_filename: lw.filename.clone(),
-                        sha256: Some(resolved.metadata.sha256.clone()),
+                        wheel_filename: actual_filename,
+                        sha256: Some(actual_sha),
                         locked_final_sha256: lw.sha256.clone(),
                         remote_url: None,
                         upstream_url: None,
@@ -8939,7 +9141,8 @@ async fn emit_wheels_from_lock(
             //
             // This arm intercepts BEFORE the bare Origin::Built arm and re-builds
             // directly from the stored sdist_url, bypassing the re-resolve.
-            // Fallback: if the exact URL fails (yanked), re-resolve via version pin.
+            // Integrity or availability failures are terminal: a version-only
+            // re-resolve is not equivalent to replaying the locked source bytes.
             //
             // POISONING note: sdist_source is NOT in compute_inputs_hash (same
             // circularity as git_source.rev): the sdist URL is a consequence of the
@@ -8964,76 +9167,27 @@ async fn emit_wheels_from_lock(
                     sdist_url = %stored_url,
                     "courier replay: rebuilding sdist-built shadow from stored sdist_url (class 2b)",
                 );
-                let built = match crate::source_build::build_wheel_from_sdist_url(
+                let expected =
+                    crate::source_build::ExpectedWheel::exact(lw.name.clone(), lw.version.clone());
+                let built = crate::source_build::build_wheel_from_sdist_url_for_target(
                     &stored_url,
                     &sdist_out,
-                    target.python_version(),
+                    target,
                     Some(&locked_raw_sha256),
+                    Some(&expected),
                 )
                 .await
-                {
-                    Ok(p) => p,
-                    Err(e) => {
-                        // Stored URL may be yanked; fall back to re-resolve by exact version.
-                        tracing::warn!(
-                            wheel = %lw.name,
-                            sdist_url = %stored_url,
-                            error = %format!("{e:#}"),
-                            "courier replay Class-2b: stored sdist_url failed; re-resolving by version",
-                        );
-                        let specifiers = VersionSpecifiers::from_str(&format!("=={}", s.version))
-                            .with_context(|| {
-                            format!(
-                                "courier replay Class-2b: parsing version spec `=={}` for `{}`",
-                                s.version, lw.name,
-                            )
-                        })?;
-                        let (_sdist_version, sdist) = pypi::resolve_sdist(
-                            &s.index,
-                            &s.name,
-                            &specifiers,
-                        )
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "courier replay Class-2b: re-resolving sdist for `{}` at `=={}`",
-                                s.name, s.version,
-                            )
-                        })?;
-                        let fallback_sha256 = sdist.sha256.as_deref().ok_or_else(|| {
-                            anyhow!(
-                                "courier replay Class-2b: re-resolved sdist for `{}` has no \
-                                 sha256; refusing to build unverified fallback content",
-                                s.name,
-                            )
-                        })?;
-                        if !fallback_sha256.eq_ignore_ascii_case(&locked_raw_sha256) {
-                            bail!(
-                                "courier replay Class-2b: re-resolved sdist sha256 for `{}` \
-                                 differs from the locked raw artifact",
-                                s.name,
-                            );
-                        }
-                        crate::source_build::build_wheel_from_sdist_url(
-                            &sdist.url,
-                            &sdist_out,
-                            target.python_version(),
-                            Some(&locked_raw_sha256),
-                        )
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "courier replay Class-2b: building wheel from re-resolved sdist `{}`",
-                                sdist.url,
-                            )
-                        })?
-                    }
-                };
+                .with_context(|| {
+                    format!(
+                        "courier replay Class-2b: rebuilding `{}` from immutable stored sdist `{stored_url}`; integrity/target errors are not eligible for re-resolve fallback",
+                        lw.name,
+                    )
+                })?;
                 crate::emit_pypi::EmitWheel {
                     pypi_name: lw.name.clone(),
                     version: lw.version.clone(),
                     requires_dist: lw.requires_dist.clone(),
-                    local_path: Some(built),
+                    local_path: Some(built.wheel_path),
                     wheel_filename: lw.filename.clone(),
                     sha256: None,
                     locked_final_sha256: lw.sha256.clone(),
@@ -9102,6 +9256,19 @@ async fn emit_wheels_from_lock(
                                 lw.name, remote_url,
                             )
                         })?;
+                let expected = crate::source_build::ExpectedWheel::exact(&lw.name, &lw.version);
+                crate::source_build::validate_wheel_for_target_async(
+                    &fetched,
+                    target,
+                    Some(&expected),
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "courier replay Class-2 artifact for `{}` is incompatible with the immutable target",
+                        lw.name,
+                    )
+                })?;
 
                 // DETERMINISM GUARD (Phase 2.7): verify the re-fetched artifact's
                 // predicted shadow name matches the recorded lw.filename. If upstream
@@ -9191,19 +9358,13 @@ async fn materialize_from_lock(
     config: &RetreadConfig,
     work_dir: &Path,
     output_dir: &Path,
-    target_subdir: Platform,
+    target: &ResolutionTarget,
     source_dir: &Path,
     cache_dir: &Path,
     expected_build: Option<&str>,
     run_deps: Vec<String>,
     config_fp: &str,
 ) -> Result<Option<CondaBuildV1Result>> {
-    let target = lock
-        .resolution_target()
-        .context("reconstructing target from test/legacy materialize lock")?;
-    if target.conda_subdir() != target_subdir.to_string() {
-        return Ok(None);
-    }
     let expected_bundle = lock.bundle.clone();
     materialize_from_lock_for_target(
         lock,
@@ -9211,7 +9372,7 @@ async fn materialize_from_lock(
         config,
         work_dir,
         output_dir,
-        &target,
+        target,
         source_dir,
         cache_dir,
         expected_build,
@@ -9983,19 +10144,20 @@ async fn build_one(
     declared_config: &RetreadConfig,
     work_dir: &Path,
     output_dir: &Path,
+    target_subdir: Platform,
     target: &ResolutionTarget,
-    workspace_python_version: &str,
     source_dir: &Path,
     workspace_dir: Option<&Path>,
     expected_build: Option<&str>,
     run_override: Option<&[String]>,
 ) -> Result<CondaBuildV1Result> {
-    let target_subdir = Platform::from_str(target.conda_subdir()).with_context(|| {
-        format!(
-            "parsing build resolution target subdir `{}`",
-            target.conda_subdir()
-        )
-    })?;
+    if target.conda_subdir() != target_subdir.to_string() {
+        bail!(
+            "build target mismatch: immutable resolution target is `{}` but requested output subdir is `{target_subdir}`",
+            target.conda_subdir(),
+        );
+    }
+    let workspace_python_version = target.python_version();
     // Lay out one BundleSource per wheel (primary first), in BFS order.
     //
     // v1.4.5: point each source at retread's local wheel cache when
@@ -10902,6 +11064,7 @@ mod replay_tests {
     };
     use crate::config::RetreadConfig;
     use crate::lock::{CondaDep, LockWheel, Origin, RetreadLock, SCHEMA};
+    use crate::pypi::ResolutionTarget;
 
     fn unique_tmp_dir() -> std::path::PathBuf {
         let base = std::env::temp_dir();
@@ -11430,7 +11593,7 @@ mod replay_tests {
             &config,
             &work_dir,
             &output_dir,
-            rattler_conda_types::Platform::Linux64,
+            &replay_target("3.11", "linux-64"),
             &source_dir,
             &cache_dir,
             None,
@@ -11499,7 +11662,7 @@ mod replay_tests {
             &config,
             &work_dir,
             &output_dir,
-            rattler_conda_types::Platform::Linux64,
+            &replay_target("3.11", "linux-64"),
             &source_dir,
             &cache_dir,
             None,
@@ -11609,7 +11772,7 @@ mod replay_tests {
             &config,
             &work_dir,
             &output_dir,
-            rattler_conda_types::Platform::Linux64,
+            &replay_target("3.11", "linux-64"),
             &source_dir,
             &cache_dir,
             None,
@@ -11814,7 +11977,7 @@ mod replay_tests {
             &config,
             &work_dir,
             &output_dir,
-            rattler_conda_types::Platform::Linux64,
+            &ResolutionTarget::from_parts("3.11", "linux-64", None),
             &source_dir,
             &cache_dir,
             None,
@@ -12350,7 +12513,7 @@ mod replay_tests {
             &config,
             &work_dir,
             &output_dir,
-            rattler_conda_types::Platform::Linux64,
+            &ResolutionTarget::from_parts("3.11", "linux-64", None),
             &source_dir,
             &cache_dir,
             None,
@@ -12718,7 +12881,7 @@ version = "1.0.0"
             subdirectory: Some("packages/mypkg".to_string()),
             ..WheelEntry::default()
         };
-        let target = wheel_target_for(Platform::Linux64, "3.11");
+        let target = wheel_target_for(Platform::Linux64, "3.11").expect("valid target");
         let checkout_root = crate::source_build::git_checkout_root(&repo_url, &sha, &cache_dir);
 
         // ── PRODUCE: auto_data with correct skip_subdirs=["packages/mypkg"] ──
@@ -12727,6 +12890,7 @@ version = "1.0.0"
         let (produce_resolved, _) = materialize_and_rewrite(
             &entry,
             "retread-nested-mypkg",
+            None,
             &target,
             &produce_dd,
             &produce_src,
@@ -12754,6 +12918,7 @@ version = "1.0.0"
         let (buggy_resolved, _) = materialize_and_rewrite(
             &entry,
             "retread-nested-mypkg",
+            None,
             &target,
             &buggy_dd,
             &buggy_src,
@@ -12792,6 +12957,7 @@ version = "1.0.0"
         let (fixed_resolved, _) = materialize_and_rewrite(
             &entry,
             "retread-nested-mypkg",
+            None,
             &target,
             &fixed_dd,
             &fixed_src,
@@ -13161,7 +13327,7 @@ version = "1.0.0"
             &config,
             &work_dir,
             &output_dir,
-            rattler_conda_types::Platform::Linux64,
+            &ResolutionTarget::from_parts("3.11", "linux-64", None),
             &source_dir,
             &cache_dir,
             None,
@@ -13343,7 +13509,7 @@ version = "1.0.0"
             std::fs::create_dir_all(d).unwrap();
         }
 
-        let target = wheel_target_for(Platform::Linux64, "3.11");
+        let target = wheel_target_for(Platform::Linux64, "3.11").expect("valid target");
         let mono_checkout_root =
             crate::source_build::git_checkout_root(&mono_url, &mono_sha, &cache_dir);
         let gamma_checkout_root =
@@ -13364,6 +13530,7 @@ version = "1.0.0"
         let (produce_alpha_resolved, _) = materialize_and_rewrite(
             &alpha_entry,
             "retread-p25-pkg-alpha",
+            None,
             &target,
             &produce_alpha_dd,
             &produce_alpha_src,
@@ -13399,6 +13566,7 @@ version = "1.0.0"
         let (produce_beta_resolved, _) = materialize_and_rewrite(
             &beta_entry,
             "retread-p25-pkg-beta",
+            None,
             &target,
             &produce_beta_dd,
             &produce_beta_src,
@@ -13428,6 +13596,7 @@ version = "1.0.0"
         let (produce_gamma_resolved, _) = materialize_and_rewrite(
             &gamma_entry,
             "retread-p25-pkg-gamma",
+            None,
             &target,
             &produce_gamma_dd,
             &produce_gamma_src,
@@ -13476,6 +13645,7 @@ version = "1.0.0"
         let (replay_alpha_resolved, _) = materialize_and_rewrite(
             &synth_alpha,
             "retread-p25-pkg-alpha",
+            Some("1.0.0"),
             &target,
             &replay_alpha_dd,
             &replay_alpha_src,
@@ -13508,6 +13678,7 @@ version = "1.0.0"
         let (replay_beta_resolved, _) = materialize_and_rewrite(
             &synth_beta,
             "retread-p25-pkg-beta",
+            Some("1.0.0"),
             &target,
             &replay_beta_dd,
             &replay_beta_src,
@@ -13534,6 +13705,7 @@ version = "1.0.0"
         let (replay_gamma_resolved, _) = materialize_and_rewrite(
             &synth_gamma,
             "retread-p25-pkg-gamma",
+            Some("1.0.0"),
             &target,
             &replay_gamma_dd,
             &replay_gamma_src,
@@ -14171,11 +14343,10 @@ mod resolve_bundle_bfs_tests {
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    use super::{
-        PypiToCondaMap, ResolvedWheel, WheelTarget, merge_uv_pins_into_prefs, resolve_bundle,
-    };
+    use super::{PypiToCondaMap, ResolvedWheel, merge_uv_pins_into_prefs, resolve_bundle};
     use crate::config::{RelaxPolicy, WheelEntry};
     use crate::index_chain::{IndexPurpose, index_chain};
+    use crate::pypi::ResolutionTarget;
     use crate::relax::NameMap;
 
     fn unique_tmp_dir() -> std::path::PathBuf {
@@ -14407,11 +14578,7 @@ mod resolve_bundle_bfs_tests {
             index: Some(entry_index),
             ..Default::default()
         };
-        let target = WheelTarget {
-            python_version: "3.11".to_string(),
-            conda_subdir: "linux-64".to_string(),
-            max_glibc: None,
-        };
+        let target = ResolutionTarget::for_subdir("3.11", "linux-64");
         let pypi_to_conda: PypiToCondaMap = HashMap::new();
         let name_map = NameMap::new();
         let git_sources: BTreeMap<String, crate::config::NamedGitSource> = BTreeMap::new();
@@ -14560,11 +14727,7 @@ mod resolve_bundle_bfs_tests {
             extras: vec!["all".into(), "extscache".into()],
             ..Default::default()
         };
-        let target = WheelTarget {
-            python_version: "3.12".to_string(),
-            conda_subdir: "linux-64".to_string(),
-            max_glibc: None,
-        };
+        let target = ResolutionTarget::for_subdir("3.12", "linux-64");
         let pypi_to_conda: PypiToCondaMap = HashMap::new();
         let name_map = NameMap::new();
         let git_sources: BTreeMap<String, crate::config::NamedGitSource> = BTreeMap::new();
@@ -14768,11 +14931,7 @@ mod resolve_bundle_bfs_tests {
             extras: vec!["extscache".into()],
             ..Default::default()
         };
-        let target = WheelTarget {
-            python_version: "3.12".to_string(),
-            conda_subdir: "linux-64".to_string(),
-            max_glibc: None,
-        };
+        let target = ResolutionTarget::for_subdir("3.12", "linux-64");
         let bundle = resolve_bundle(
             "isaacsim",
             &entry,
@@ -14857,11 +15016,7 @@ mod resolve_bundle_bfs_tests {
             "fragment digest must be lifted into the discrete field"
         );
 
-        let target = WheelTarget {
-            python_version: "3.12".to_string(),
-            conda_subdir: "linux-64".to_string(),
-            max_glibc: None,
-        };
+        let target = ResolutionTarget::for_subdir("3.12", "linux-64");
         let bundle = resolve_bundle(
             name,
             &entry,
@@ -14931,11 +15086,7 @@ mod resolve_bundle_bfs_tests {
         };
         entry.normalize(name).unwrap();
 
-        let target = WheelTarget {
-            python_version: "3.12".to_string(),
-            conda_subdir: "linux-64".to_string(),
-            max_glibc: None,
-        };
+        let target = ResolutionTarget::for_subdir("3.12", "linux-64");
         let err = resolve_bundle(
             name,
             &entry,
@@ -15054,11 +15205,7 @@ mod resolve_bundle_bfs_tests {
             index: Some(index_url),
             ..Default::default()
         };
-        let target = WheelTarget {
-            python_version: "3.11".to_string(),
-            conda_subdir: "linux-64".to_string(),
-            max_glibc: None,
-        };
+        let target = ResolutionTarget::for_subdir("3.11", "linux-64");
         let pypi_to_conda: PypiToCondaMap = HashMap::new();
         let name_map = NameMap::new();
         let git_sources: std::collections::BTreeMap<String, crate::config::NamedGitSource> =
@@ -15190,11 +15337,7 @@ mod resolve_bundle_bfs_tests {
             index: Some(index_url),
             ..Default::default()
         };
-        let target = WheelTarget {
-            python_version: "3.11".to_string(),
-            conda_subdir: "linux-64".to_string(),
-            max_glibc: None,
-        };
+        let target = ResolutionTarget::for_subdir("3.11", "linux-64");
         let pypi_to_conda: PypiToCondaMap = HashMap::new();
         let name_map = NameMap::new();
         let git_sources: std::collections::BTreeMap<String, crate::config::NamedGitSource> =
@@ -15383,11 +15526,7 @@ mod resolve_bundle_bfs_tests {
             index: Some(index_url),
             ..Default::default()
         };
-        let target = WheelTarget {
-            python_version: "3.11".to_string(),
-            conda_subdir: "linux-64".to_string(),
-            max_glibc: None,
-        };
+        let target = ResolutionTarget::for_subdir("3.11", "linux-64");
         let pypi_to_conda: PypiToCondaMap = HashMap::new();
         let name_map = NameMap::new();
         let git_sources: BTreeMap<String, crate::config::NamedGitSource> = BTreeMap::new();
@@ -15497,11 +15636,7 @@ mod resolve_bundle_bfs_tests {
             index: Some(index_url),
             ..Default::default()
         };
-        let target = WheelTarget {
-            python_version: "3.11".to_string(),
-            conda_subdir: "linux-64".to_string(),
-            max_glibc: None,
-        };
+        let target = ResolutionTarget::for_subdir("3.11", "linux-64");
         let pypi_to_conda: PypiToCondaMap = HashMap::new();
         let name_map = NameMap::new();
         let git_sources: BTreeMap<String, crate::config::NamedGitSource> = BTreeMap::new();

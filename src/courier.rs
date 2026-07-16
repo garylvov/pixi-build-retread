@@ -1447,7 +1447,8 @@ pub async fn stage(
     source_dir: &Path,
     staging_dir: &Path,
 ) -> anyhow::Result<CourierStaged> {
-    let target = ResolutionTarget::for_subdir(python, Platform::current().as_str());
+    let target = ResolutionTarget::try_for_subdir(python, Platform::current().as_str())
+        .context("courier: malformed resolution target")?;
     stage_for_target(
         config,
         bundle_name,
@@ -3208,20 +3209,11 @@ mod tests {
     async fn stage_rejects_malformed_python_before_mutation() {
         let tmp = make_test_dir("malformed-python-target");
         let staging = tmp.join("staging");
-        let target = ResolutionTarget::from_wheel_target(
-            WheelTarget {
-                python_version: "3.11.0.1".into(),
-                conda_subdir: Platform::current().as_str().to_owned(),
-                max_glibc: None,
-            },
-            None,
-        );
-        let result = stage_for_target(
+        let result = stage(
             &minimal_config("demo"),
             "demo",
-            "demo",
             "1.0",
-            &target,
+            "3.11.0.1",
             &[],
             &HashSet::new(),
             &[],
@@ -3233,7 +3225,7 @@ mod tests {
         .await;
         let err = match result {
             Ok(_) => panic!("malformed target unexpectedly staged"),
-            Err(err) => err,
+            Err(error) => error,
         };
         assert!(format!("{err:#}").contains("malformed resolution target"));
         assert!(!staging.exists());

@@ -1333,9 +1333,9 @@ mod tests {
             );
             assert!(!lock.is_for_resolution_target(&expected_minor));
 
-            let valid_lock = make_test_lock_unordered();
             assert!(
-                !valid_lock.is_for_resolution_target(&target(malformed, "linux-64", None, None))
+                crate::pypi::ResolutionTarget::try_from_parts(malformed, "linux-64", None).is_err(),
+                "malformed requested target {malformed:?} was constructed",
             );
         }
     }

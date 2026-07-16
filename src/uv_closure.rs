@@ -36,7 +36,7 @@ use uv_pep508::Requirement;
 
 use crate::constraint::{Authority, Provenance, authority};
 use crate::lock::{LockWheel, Origin};
-use crate::pypi::WheelTarget;
+use crate::pypi::{ResolutionTarget, WheelTarget, normalized_python_minor};
 use crate::relax::{
     CondaMatchSpec, CondaName, CondaTarget, NameMap, PypiKey, canonical_conda_name,
 };
@@ -174,7 +174,8 @@ pub struct UvClosureRequest {
     /// Simple-index chain, in priority order. Public PyPI last.
     pub index_urls: Vec<String>,
     /// retread-built wheels satisfying in-project names:
-    /// entry name -> path (relative to the project dir or absolute),
+    /// entry name -> absolute path. Resolution rejects relative paths before
+    /// inspecting or mutating its project/cache namespace,
     /// emitted as `[tool.uv.sources]` path sources.
     pub built_wheel_sources: BTreeMap<String, PathBuf>,
     /// Self-heal repairs injected as EXPLICIT first-party `name==version`
@@ -2314,15 +2315,11 @@ pub fn cuda_family_constraints(cuda_major: u32) -> Vec<(&'static str, String)> {
 /// (or `"3.12.4"`) -> `("3.12", "3.13")`. `None` when the string does
 /// not start with a parseable `major.minor`.
 pub fn python_minor_bounds(python_version: &str) -> Option<(String, String)> {
-    let mut parts = python_version.split('.');
-    let major: u64 = parts.next()?.trim().parse().ok()?;
-    let minor_digits: String = parts
-        .next()?
-        .chars()
-        .take_while(|c| c.is_ascii_digit())
-        .collect();
-    let minor: u64 = minor_digits.parse().ok()?;
-    Some((format!("{major}.{minor}"), format!("{major}.{}", minor + 1)))
+    let python = normalized_python_minor(python_version).ok()?;
+    Some((
+        python.version(),
+        format!("{}.{}", python.major, python.minor.checked_add(1)?),
+    ))
 }
 
 /// `tool.uv.environments` marker restricting universal resolution to the
@@ -3198,6 +3195,7 @@ pub async fn detect_uv() -> Result<(PathBuf, String)> {
         .unwrap_or_else(|| PathBuf::from("uv"));
     let out = tokio::process::Command::new(&bin)
         .arg("--version")
+        .kill_on_drop(true)
         .output()
         .await
         .with_context(|| {
@@ -3219,6 +3217,77 @@ pub async fn detect_uv() -> Result<(PathBuf, String)> {
     Ok((bin, version))
 }
 
+#[cfg(unix)]
+struct ClosureUvProcessGroupGuard {
+    pgid: nix::unistd::Pid,
+    armed: bool,
+}
+
+#[cfg(unix)]
+impl ClosureUvProcessGroupGuard {
+    fn new(pgid: u32) -> Result<Self> {
+        let pgid = i32::try_from(pgid).context("uv process id exceeds Unix pid_t range")?;
+        Ok(Self {
+            pgid: nix::unistd::Pid::from_raw(pgid),
+            armed: true,
+        })
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ClosureUvProcessGroupGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        match nix::sys::signal::killpg(self.pgid, nix::sys::signal::Signal::SIGKILL) {
+            Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+            Err(error) => tracing::warn!(
+                pgid = self.pgid.as_raw(),
+                error = %error,
+                "failed to kill cancelled uv closure process group",
+            ),
+        }
+    }
+}
+
+async fn run_uv_closure_command(
+    uv_bin: &Path,
+    args: &[String],
+    project_dir: &Path,
+    uv_cache_dir: &Path,
+) -> Result<std::process::Output> {
+    let mut command = tokio::process::Command::new(uv_bin);
+    command
+        .args(args)
+        .current_dir(project_dir)
+        .env("UV_CACHE_DIR", uv_cache_dir)
+        .env("UV_NO_CONFIG", "1")
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
+    let child = command
+        .spawn()
+        .with_context(|| format!("spawning `{} {}`", uv_bin.display(), args.join(" ")))?;
+    #[cfg(unix)]
+    let mut process_group = ClosureUvProcessGroupGuard::new(
+        child
+            .id()
+            .context("spawned uv closure process has no operating-system pid")?,
+    )?;
+    let output = child
+        .wait_with_output()
+        .await
+        .with_context(|| format!("waiting for `{} {}`", uv_bin.display(), args.join(" ")))?;
+    #[cfg(unix)]
+    process_group.disarm();
+    Ok(output)
+}
+
 /// Warn (do NOT error) when the uv on PATH differs from a previously
 /// recorded version (spec §2.5's hard pin is deferred; milestone 1 warns).
 pub fn warn_on_uv_version_skew(current: &str, recorded: Option<&str>) {
@@ -3236,6 +3305,10 @@ pub fn warn_on_uv_version_skew(current: &str, recorded: Option<&str>) {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ClosureMeta {
+    #[serde(default)]
+    schema: String,
+    #[serde(default)]
+    resolution_target: String,
     uv_version: String,
     /// Fingerprint of every resolution input uv itself cannot see in the
     /// project files: the CLI flag vector (indexes, --no-build,
@@ -3259,11 +3332,13 @@ struct ClosureMeta {
 /// must invalidate, or the reused pylock would be missing a package that
 /// should now be emitted (the parse-time exclude filter can only REMOVE
 /// packages from a superset, never restore absent ones).
-fn closure_inputs_fingerprint(
+fn closure_inputs_fingerprint_with_built_sources(
     pyproject: &str,
     lock_args: &[String],
     export_args: &[String],
     uv_version: &str,
+    resolution_target: &str,
+    built_source_fingerprint: &str,
 ) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
@@ -3279,14 +3354,129 @@ fn closure_inputs_fingerprint(
     }
     h.update([0u8]);
     h.update(uv_version.as_bytes());
+    h.update([2u8]);
+    h.update(resolution_target.as_bytes());
+    h.update([3u8]);
+    h.update(built_source_fingerprint.as_bytes());
     format!("{:x}", h.finalize())
 }
 
+#[cfg(test)]
+fn closure_inputs_fingerprint(
+    pyproject: &str,
+    lock_args: &[String],
+    export_args: &[String],
+    uv_version: &str,
+    resolution_target: &str,
+) -> String {
+    closure_inputs_fingerprint_with_built_sources(
+        pyproject,
+        lock_args,
+        export_args,
+        uv_version,
+        resolution_target,
+        "",
+    )
+}
+
+const CLOSURE_CACHE_SCHEMA: &str = "retread-uv-closure-v3";
 const META_FILE: &str = "retread-closure.meta.json";
 // uv requires the export filename to match `pylock.*.toml`.
 const PYLOCK_FILE: &str = "pylock.retread.toml";
 const PROVENANCE_FILE: &str = "constraints.provenance.json";
 const CONFLICT_FILE: &str = "retread-conflict.json";
+static CLOSURE_META_TMP_SEQUENCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+struct ClosureProjectLock(std::fs::File);
+
+impl Drop for ClosureProjectLock {
+    fn drop(&mut self) {
+        if let Err(error) = fs4::fs_std::FileExt::unlock(&self.0) {
+            tracing::warn!(error = %error, "failed to unlock uv closure project");
+        }
+    }
+}
+
+fn resolution_project_dir(base: &Path, target: &ResolutionTarget) -> PathBuf {
+    base.join("v3").join(target.resolution_identity())
+}
+
+fn artifact_uv_cache_dir(base: &Path, target: &ResolutionTarget) -> PathBuf {
+    base.join("v3").join(target.artifact_cache_identity())
+}
+
+async fn acquire_closure_project_lock(project_dir: &Path) -> Result<ClosureProjectLock> {
+    let parent = project_dir
+        .parent()
+        .ok_or_else(|| anyhow!("uv project has no parent: {}", project_dir.display()))?;
+    tokio::fs::create_dir_all(parent)
+        .await
+        .with_context(|| format!("creating uv project namespace {}", parent.display()))?;
+    let name = project_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("uv project has no UTF-8 name"))?;
+    let lock_path = parent.join(format!(".{name}.lock"));
+    tokio::task::spawn_blocking(move || {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .with_context(|| format!("opening uv project lock {}", lock_path.display()))?;
+        fs4::fs_std::FileExt::lock_exclusive(&file)
+            .with_context(|| format!("locking uv project {}", lock_path.display()))?;
+        Ok(ClosureProjectLock(file))
+    })
+    .await
+    .context("uv project lock task panicked")?
+}
+
+fn invalidate_cached_closure(project_dir: &Path) -> Result<()> {
+    let mut first_error = None;
+    for filename in ["uv.lock", PYLOCK_FILE, META_FILE] {
+        let path = project_dir.join(filename);
+        if let Err(error) = std::fs::remove_file(&path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            let error = anyhow::Error::new(error).context(format!(
+                "removing invalid uv closure cache file {}",
+                path.display()
+            ));
+            tracing::warn!(path = %path.display(), error = %format!("{error:#}"), "could not remove invalid uv closure cache file");
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+fn write_closure_meta_atomic(path: &Path, meta: &ClosureMeta) -> Result<()> {
+    let json = serde_json::to_vec_pretty(meta).context("serializing uv closure metadata")?;
+    let sequence = CLOSURE_META_TMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temporary = path.with_file_name(format!(
+        ".{}.{}.{}.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(META_FILE),
+        std::process::id(),
+        sequence,
+    ));
+    std::fs::write(&temporary, json)
+        .with_context(|| format!("writing uv closure metadata {}", temporary.display()))?;
+    if let Err(error) = std::fs::rename(&temporary, path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error)
+            .with_context(|| format!("publishing uv closure metadata {}", path.display()));
+    }
+    Ok(())
+}
 
 /// The self-heal facts learned during a heal cycle -- workspace-fact
 /// overrides, routed sdist-only packages, sdist-built wheels, and transitive
@@ -3364,6 +3554,22 @@ pub fn heal_facts_stamp(
     opts: &AutoRouteOptions,
     sdist_build_policy: crate::config::SdistBuildPolicy,
 ) -> String {
+    let normalized_version = normalized_python_minor(&req.python_version)
+        .expect("heal_facts_stamp requires numeric MAJOR.MINOR[.PATCH]")
+        .version();
+    let target = ResolutionTarget::for_subdir(&normalized_version, &req.conda_subdir);
+    heal_facts_stamp_for_target(req, opts, sdist_build_policy, &target)
+}
+
+/// Target-explicit form used by the production resolution pipeline. The same
+/// immutable target that selects the uv project and wheel cache also owns the
+/// persisted-facts namespace and fingerprint.
+pub(crate) fn heal_facts_stamp_for_target(
+    req: &UvClosureRequest,
+    opts: &AutoRouteOptions,
+    sdist_build_policy: crate::config::SdistBuildPolicy,
+    target: &ResolutionTarget,
+) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     let mut field = |tag: &str, vals: &mut dyn Iterator<Item = &str>| {
@@ -3375,8 +3581,13 @@ pub fn heal_facts_stamp(
         }
     };
     field("schema", &mut std::iter::once(HEAL_FACTS_STAMP_SCHEMA));
-    field("python", &mut std::iter::once(req.python_version.as_str()));
-    field("subdir", &mut std::iter::once(req.conda_subdir.as_str()));
+    let normalized_python = target.python_identity();
+    let resolution_target = target.resolution_identity();
+    field("python", &mut std::iter::once(normalized_python.as_str()));
+    field(
+        "resolution-target",
+        &mut std::iter::once(resolution_target.as_str()),
+    );
     field("deps", &mut req.dependencies.iter().map(String::as_str));
     let dependency_provenance: Vec<String> = req
         .dependency_provenance
@@ -3469,12 +3680,23 @@ pub fn heal_facts_path(
     python_version: &str,
     subdir: &str,
 ) -> PathBuf {
-    cache_dir.join("retread-heal-facts").join(format!(
-        "{}-py{}-{}.json",
-        canonical_conda_name(bundle),
-        python_version,
-        subdir,
-    ))
+    let normalized = normalized_python_minor(python_version)
+        .expect("heal_facts_path requires numeric MAJOR.MINOR[.PATCH]")
+        .version();
+    let target = ResolutionTarget::for_subdir(&normalized, subdir);
+    heal_facts_path_for_target(cache_dir, bundle, &target)
+}
+
+pub(crate) fn heal_facts_path_for_target(
+    cache_dir: &Path,
+    bundle: &str,
+    target: &ResolutionTarget,
+) -> PathBuf {
+    cache_dir
+        .join("retread-heal-facts")
+        .join("v3")
+        .join(canonical_conda_name(bundle))
+        .join(format!("{}.json", target.resolution_identity()))
 }
 
 /// Load persisted heal facts from `path`, dropping any built-wheel entry
@@ -3519,6 +3741,54 @@ pub fn load_heal_facts(path: &Path, expected_stamp: &str) -> HealFacts {
         present
     });
     facts
+}
+
+pub(crate) async fn load_heal_facts_for_target(
+    path: &Path,
+    expected_stamp: &str,
+    target: &ResolutionTarget,
+) -> Result<HealFacts> {
+    let path = path.to_path_buf();
+    let expected_stamp = expected_stamp.to_string();
+    let target = target.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut facts = load_heal_facts(&path, &expected_stamp);
+        facts.built.retain(|wheel| {
+            let expected = crate::source_build::ExpectedWheel::exact(
+                wheel.pypi_name.clone(),
+                wheel.version.clone(),
+            );
+            match crate::source_build::validate_existing_wheel_for_target(
+                &wheel.wheel_path,
+                &target,
+                Some(&expected),
+            ) {
+                Ok(actual_sha256) if actual_sha256.eq_ignore_ascii_case(&wheel.sha256) => true,
+                Ok(actual_sha256) => {
+                    tracing::warn!(
+                        pkg = %wheel.pypi_name,
+                        path = %wheel.wheel_path.display(),
+                        expected = %wheel.sha256,
+                        actual = %actual_sha256,
+                        "heal facts: persisted built wheel hash changed; dropping without deleting store data",
+                    );
+                    false
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        pkg = %wheel.pypi_name,
+                        path = %wheel.wheel_path.display(),
+                        error = %format!("{error:#}"),
+                        "heal facts: persisted built wheel failed identity/target/integrity validation; dropping without deleting caller/store data",
+                    );
+                    false
+                }
+            }
+        });
+        facts
+    })
+    .await
+    .context("heal-facts wheel validation task panicked")
 }
 
 /// Persist heal facts atomically (temp + rename) to `path` (see
@@ -3594,7 +3864,13 @@ impl LockRelaxations {
     };
 
     /// Pass B relaxations appropriate for the pack's build policy.
-    fn pass_b_for(policy: crate::config::SdistBuildPolicy) -> Self {
+    fn pass_b_for(policy: crate::config::SdistBuildPolicy, native_target: bool) -> Self {
+        if !native_target {
+            // uv may inspect/build sdists during relaxed resolution. A foreign
+            // target must retain `--no-build`; only the prerelease policy may
+            // relax because source-build ownership remains target-native.
+            return Self::PASS_B_NEVER;
+        }
         match policy {
             crate::config::SdistBuildPolicy::Auto => Self::PASS_B_AUTO,
             crate::config::SdistBuildPolicy::Never => Self::PASS_B_NEVER,
@@ -3844,6 +4120,100 @@ fn workspace_owned_drops_from_lock(
     Ok(dropped)
 }
 
+fn validate_built_wheel_sources(
+    req: &mut UvClosureRequest,
+    target: &ResolutionTarget,
+) -> Result<String> {
+    use sha2::{Digest, Sha256};
+
+    let sources = std::mem::take(&mut req.built_wheel_sources);
+    let mut normalized_sources = BTreeMap::new();
+    let mut fingerprint = Sha256::new();
+    fingerprint.update(b"retread-built-wheel-sources-v1\0");
+    for (requested_name, path) in sources {
+        if !path.is_absolute() {
+            bail!(
+                "built-wheel source `{requested_name}` must be an absolute path, got {}",
+                path.display(),
+            );
+        }
+        let path = std::fs::canonicalize(&path).with_context(|| {
+            format!(
+                "canonicalizing built-wheel source `{requested_name}` at {}",
+                path.display(),
+            )
+        })?;
+        if !path.is_file() {
+            bail!(
+                "built-wheel source `{requested_name}` is missing or not a regular file: {}",
+                path.display()
+            );
+        }
+        let filename = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow!("built-wheel source path has no UTF-8 filename"))?;
+        if crate::pypi::score_wheel(filename, target.wheel_target()) < 0 {
+            bail!(
+                "built-wheel source `{requested_name}` has incompatible artifact `{filename}` for python {} on {}",
+                target.python_version(),
+                target.conda_subdir(),
+            );
+        }
+        let (filename_name, filename_version) = crate::pypi::wheel_filename_identity(filename)
+            .ok_or_else(|| {
+                anyhow!("built-wheel source has invalid PEP 427 filename `{filename}`")
+            })?;
+        let requested_name_canonical = canonical_conda_name(&requested_name);
+        if canonical_conda_name(&filename_name) != requested_name_canonical {
+            bail!(
+                "built-wheel source identity mismatch: request names `{requested_name_canonical}` but filename names `{filename_name}`"
+            );
+        }
+        let metadata = crate::wheel::read_metadata_strict(&path)
+            .with_context(|| format!("validating built-wheel source {}", path.display()))?;
+        if canonical_conda_name(&metadata.name) != requested_name_canonical {
+            bail!(
+                "built-wheel source identity mismatch: request names `{requested_name_canonical}` but METADATA names `{}`",
+                metadata.name,
+            );
+        }
+        let metadata_version = uv_pep508::uv_pep440::Version::from_str(&metadata.version)
+            .with_context(|| {
+                format!(
+                    "invalid built-wheel METADATA version `{}`",
+                    metadata.version
+                )
+            })?;
+        if metadata_version != filename_version {
+            bail!(
+                "built-wheel source version mismatch: filename has `{filename_version}` but METADATA has `{metadata_version}`"
+            );
+        }
+        if let Some(expected_version) = req.explicit_pins.get(&requested_name_canonical) {
+            let expected_version = uv_pep508::uv_pep440::Version::from_str(expected_version)
+                .with_context(|| format!("invalid built-wheel pin `{expected_version}`"))?;
+            if expected_version != metadata_version {
+                bail!(
+                    "built-wheel source `{requested_name_canonical}` is `{metadata_version}` but the explicit pin requires `{expected_version}`"
+                );
+            }
+        }
+        let path_text = path.to_string_lossy().into_owned();
+        for value in [
+            requested_name_canonical.as_bytes(),
+            path_text.as_bytes(),
+            metadata.sha256.as_bytes(),
+        ] {
+            fingerprint.update((value.len() as u64).to_be_bytes());
+            fingerprint.update(value);
+        }
+        normalized_sources.insert(requested_name, path);
+    }
+    req.built_wheel_sources = normalized_sources;
+    Ok(format!("{:x}", fingerprint.finalize()))
+}
+
 /// Compute the closure for `req` under `project_dir` (created if absent):
 /// write the synthesized project, run `uv lock` + `uv export`, parse the
 /// pylock. `recorded_uv_version` (when Some, e.g. from a committed lock)
@@ -3856,12 +4226,63 @@ pub async fn compute_closure(
     recorded_uv_version: Option<&str>,
     sdist_build_policy: crate::config::SdistBuildPolicy,
 ) -> Result<UvClosure> {
+    let python = normalized_python_minor(&req.python_version)?;
+    let target = ResolutionTarget::try_for_subdir(&python.version(), &req.conda_subdir)?;
+    compute_closure_for_target(
+        req,
+        &target,
+        project_dir,
+        uv_cache_dir,
+        recorded_uv_version,
+        sdist_build_policy,
+    )
+    .await
+}
+
+pub(crate) async fn compute_closure_for_target(
+    req: &UvClosureRequest,
+    target: &ResolutionTarget,
+    project_dir: &Path,
+    uv_cache_dir: &Path,
+    recorded_uv_version: Option<&str>,
+    sdist_build_policy: crate::config::SdistBuildPolicy,
+) -> Result<UvClosure> {
+    // Validate and normalize before inspecting any cache state or spawning uv.
+    // The caller-supplied immutable target is the single contract threaded
+    // through project namespaces, subprocess arguments, and pylock selection.
+    let python = normalized_python_minor(&req.python_version)?;
+    if target.python_version() != python.version() || target.conda_subdir() != req.conda_subdir {
+        bail!(
+            "uv request target mismatch: request is {} on {} but resolved target is {} on {}",
+            python.version(),
+            req.conda_subdir,
+            target.python_version(),
+            target.conda_subdir(),
+        );
+    }
+    let normalized_req = req.clone();
+    let target_for_validation = target.clone();
+    let (normalized_req, built_source_fingerprint) = tokio::task::spawn_blocking(move || {
+        let mut normalized_req = normalized_req;
+        let fingerprint =
+            validate_built_wheel_sources(&mut normalized_req, &target_for_validation)?;
+        Ok::<_, anyhow::Error>((normalized_req, fingerprint))
+    })
+    .await
+    .context("built-wheel source validation task panicked")??;
+    let req = &normalized_req;
+    let project_dir_storage = resolution_project_dir(project_dir, target);
+    let uv_cache_dir_storage = artifact_uv_cache_dir(uv_cache_dir, target);
+    let project_dir = project_dir_storage.as_path();
+    let uv_cache_dir = uv_cache_dir_storage.as_path();
+    let resolution_identity = target.resolution_identity();
+    let _project_lock = acquire_closure_project_lock(project_dir).await?;
     let (uv_bin, uv_version) = detect_uv().await?;
     tracing::info!(
         uv = %uv_bin.display(),
         version = %uv_version,
         bundle = %req.bundle,
-        python = %req.python_version,
+        python = %python.identity(),
         subdir = %req.conda_subdir,
         "uv closure: resolving via uv",
     );
@@ -3870,6 +4291,8 @@ pub async fn compute_closure(
     if recorded_uv_version.is_none()
         && let Ok(prev) = std::fs::read_to_string(&meta_path)
         && let Ok(meta) = serde_json::from_str::<ClosureMeta>(&prev)
+        && meta.schema == CLOSURE_CACHE_SCHEMA
+        && meta.resolution_target == resolution_identity
     {
         warn_on_uv_version_skew(&uv_version, Some(&meta.uv_version));
     }
@@ -3898,16 +4321,7 @@ pub async fn compute_closure(
         let uv_bin = uv_bin.clone();
         let project_dir = project_dir.to_path_buf();
         let uv_cache_dir = uv_cache_dir.to_path_buf();
-        async move {
-            tokio::process::Command::new(&uv_bin)
-                .args(&args)
-                .current_dir(&project_dir)
-                .env("UV_CACHE_DIR", &uv_cache_dir)
-                .env("UV_NO_CONFIG", "1")
-                .output()
-                .await
-                .with_context(|| format!("spawning `{} {}`", uv_bin.display(), args.join(" ")))
-        }
+        async move { run_uv_closure_command(&uv_bin, &args, &project_dir, &uv_cache_dir).await }
     };
 
     // -- uv lock (Pass A) --------------------------------------------------
@@ -3916,7 +4330,7 @@ pub async fn compute_closure(
     // name the offenders exactly -- see the `HealNeeded` module doc.
     let lock_args = build_lock_args(
         project_dir,
-        &req.python_version,
+        &python.identity(),
         &req.index_urls,
         workspace_provider_dir.as_deref(),
         req.offline,
@@ -3942,13 +4356,38 @@ pub async fn compute_closure(
     // for, so the fingerprint matches and this guard KEEPS the lock -> uv
     // fast-relocks instead of re-resolving.
     let export_args = build_export_args(project_dir, &no_emit_packages, req.offline);
-    let fingerprint =
-        closure_inputs_fingerprint(&pyproject_text, &lock_args, &export_args, &uv_version);
+    let fingerprint = closure_inputs_fingerprint_with_built_sources(
+        &pyproject_text,
+        &lock_args,
+        &export_args,
+        &uv_version,
+        &resolution_identity,
+        &built_source_fingerprint,
+    );
     let lock_file = project_dir.join("uv.lock");
     let pylock_file = project_dir.join(PYLOCK_FILE);
+    let trio_present = [
+        lock_file.as_path(),
+        pylock_file.as_path(),
+        meta_path.as_path(),
+    ]
+    .into_iter()
+    .map(Path::try_exists)
+    .collect::<std::io::Result<Vec<_>>>()?;
+    let trio_count = trio_present.iter().filter(|present| **present).count();
+    if (1..3).contains(&trio_count) {
+        tracing::warn!(
+            bundle = %req.bundle,
+            "uv closure: cached lock/pylock/meta transaction is incomplete; purging all three",
+        );
+        invalidate_cached_closure(project_dir)?;
+    }
     let recorded_fingerprint = std::fs::read_to_string(&meta_path)
         .ok()
         .and_then(|s| serde_json::from_str::<ClosureMeta>(&s).ok())
+        .filter(|meta| {
+            meta.schema == CLOSURE_CACHE_SCHEMA && meta.resolution_target == resolution_identity
+        })
         .map(|m| m.inputs_fingerprint);
     let fingerprint_matches = recorded_fingerprint.as_deref() == Some(fingerprint.as_str());
 
@@ -3969,8 +4408,7 @@ pub async fn compute_closure(
                     .iter()
                     .map(|n| canonical_conda_name(n))
                     .collect();
-                let target = WheelTarget::for_subdir(&req.python_version, &req.conda_subdir);
-                match parse_pylock_closure(&pylock, &target, &exclude, &uv_version) {
+                match parse_pylock_closure(&pylock, target.wheel_target(), &exclude, &uv_version) {
                     Ok(mut closure) => match tokio::fs::read_to_string(&lock_file).await {
                         Ok(uv_lock) => match workspace_owned_drops_from_lock(req, &uv_lock) {
                             Ok(owned_drops) => {
@@ -3992,7 +4430,7 @@ pub async fn compute_closure(
                                     "uv closure: cached uv.lock unusable for workspace providers; \
                                      re-resolving",
                                 );
-                                let _ = std::fs::remove_file(&lock_file);
+                                invalidate_cached_closure(project_dir)?;
                             }
                         },
                         Err(error) => {
@@ -4001,7 +4439,7 @@ pub async fn compute_closure(
                                 error = %error,
                                 "uv closure: cached uv.lock unreadable; re-resolving",
                             );
-                            let _ = std::fs::remove_file(&lock_file);
+                            invalidate_cached_closure(project_dir)?;
                         }
                     },
                     Err(e) => {
@@ -4010,6 +4448,7 @@ pub async fn compute_closure(
                             error = %format!("{e:#}"),
                             "uv closure: cached pylock unusable; re-resolving",
                         );
+                        invalidate_cached_closure(project_dir)?;
                     }
                 }
             }
@@ -4019,6 +4458,7 @@ pub async fn compute_closure(
                     error = %e,
                     "uv closure: cached pylock unreadable; re-resolving",
                 );
+                invalidate_cached_closure(project_dir)?;
             }
         }
     }
@@ -4029,7 +4469,7 @@ pub async fn compute_closure(
             "uv closure: resolution inputs changed since the cached uv.lock \
              was written; discarding it for a fresh resolve",
         );
-        let _ = std::fs::remove_file(&lock_file);
+        invalidate_cached_closure(project_dir)?;
     }
 
     let lock_out = run(lock_args).await?;
@@ -4075,59 +4515,69 @@ pub async fn compute_closure(
         // simply fails Pass B if it can't fetch sdist metadata, which then
         // surfaces Pass A's error below -- exactly the pre-two-pass
         // behavior.
-        let pass_b_args = build_lock_args(
-            project_dir,
-            &req.python_version,
-            &req.index_urls,
-            workspace_provider_dir.as_deref(),
-            req.offline,
-            LockRelaxations::pass_b_for(sdist_build_policy),
-        );
-        let pass_b_out = run(pass_b_args).await?;
-        if !pass_b_out.status.success() {
-            // Pass B can uncover an exact-pin contradiction that Pass A's
-            // no-build/prerelease error masked. Classify that conflict before
-            // falling back to Pass A's error; every non-workspace or non-exact
-            // conflict keeps the historical behavior.
-            let pass_b_stderr = String::from_utf8_lossy(&pass_b_out.stderr).into_owned();
-            let pass_b_attributions =
-                attribute_conflict(&pass_b_stderr, &resolved_constraints.provenance);
-            let pass_b_error = format_lock_failure(req, &pass_b_stderr, &pass_b_attributions);
-            if let Some(needed) =
-                workspace_fact_override_needed(req, &pass_b_attributions, &pass_b_error)
-            {
-                return Err(anyhow::Error::new(needed));
+        let pass_b_result: Result<HealNeeded> = async {
+            let pass_b_args = build_lock_args(
+                project_dir,
+                &python.identity(),
+                &req.index_urls,
+                workspace_provider_dir.as_deref(),
+                req.offline,
+                LockRelaxations::pass_b_for(sdist_build_policy, target.is_native_build_target()),
+            );
+            let pass_b_out = run(pass_b_args).await?;
+            if !pass_b_out.status.success() {
+                // Pass B can uncover an exact-pin contradiction that Pass A's
+                // no-build/prerelease error masked. Classify that conflict before
+                // falling back to Pass A's error; every non-workspace or non-exact
+                // conflict keeps the historical behavior.
+                let pass_b_stderr = String::from_utf8_lossy(&pass_b_out.stderr).into_owned();
+                let pass_b_attributions =
+                    attribute_conflict(&pass_b_stderr, &resolved_constraints.provenance);
+                let pass_b_error = format_lock_failure(req, &pass_b_stderr, &pass_b_attributions);
+                if let Some(needed) =
+                    workspace_fact_override_needed(req, &pass_b_attributions, &pass_b_error)
+                {
+                    return Err(anyhow::Error::new(needed));
+                }
+                bail!("{original_error}");
             }
-            bail!("{original_error}");
-        }
 
-        // Pass B resolved. Export its lock and read the offenders
-        // STRUCTURALLY from the pylock document (no stderr prose parsing).
-        let pass_b_export = run(build_export_args(
-            project_dir,
-            &no_emit_packages,
-            req.offline,
-        ))
-        .await?;
-        if !pass_b_export.status.success() {
-            // Can't inspect the Pass B lock -> fall back to Pass A's error.
-            bail!("{original_error}");
+            // Pass B resolved. Export its lock and read the offenders
+            // STRUCTURALLY from the pylock document (no stderr prose parsing).
+            let pass_b_export = run(build_export_args(
+                project_dir,
+                &no_emit_packages,
+                req.offline,
+            ))
+            .await?;
+            if !pass_b_export.status.success() {
+                // Can't inspect the Pass B lock -> fall back to Pass A's error.
+                bail!("{original_error}");
+            }
+            let pass_b_pylock = tokio::fs::read_to_string(project_dir.join(PYLOCK_FILE))
+                .await
+                .context("reading Pass-B pylock for offender detection")?;
+            let offenders = classify_pylock_offenders(&pass_b_pylock)?;
+            if offenders.sdist_only.is_empty() && offenders.prerelease.is_empty() {
+                // Pass B succeeded but named no healable offender (whatever the
+                // relaxation flipped, it isn't a class we repair) -> surface
+                // Pass A's error rather than loop.
+                bail!("{original_error}");
+            }
+            Ok(HealNeeded {
+                sdist_only: offenders.sdist_only,
+                prerelease: offenders.prerelease,
+                original_error,
+            })
         }
-        let pass_b_pylock = tokio::fs::read_to_string(project_dir.join(PYLOCK_FILE))
-            .await
-            .context("reading Pass-B pylock for offender detection")?;
-        let offenders = classify_pylock_offenders(&pass_b_pylock)?;
-        if offenders.sdist_only.is_empty() && offenders.prerelease.is_empty() {
-            // Pass B succeeded but named no healable offender (whatever the
-            // relaxation flipped, it isn't a class we repair) -> surface
-            // Pass A's error rather than loop.
-            bail!("{original_error}");
-        }
-        return Err(anyhow::Error::new(HealNeeded {
-            sdist_only: offenders.sdist_only,
-            prerelease: offenders.prerelease,
-            original_error,
-        }));
+        .await;
+        // Pass B is diagnostic only. Never leave its relaxed uv.lock/pylock
+        // paired with a Pass-A metadata record, regardless of how Pass B exits.
+        invalidate_cached_closure(project_dir)?;
+        return match pass_b_result {
+            Ok(needed) => Err(anyhow::Error::new(needed)),
+            Err(error) => Err(error),
+        };
     }
 
     // -- uv export ---------------------------------------------------------
@@ -4149,8 +4599,7 @@ pub async fn compute_closure(
         .iter()
         .map(|n| canonical_conda_name(n))
         .collect();
-    let target = WheelTarget::for_subdir(&req.python_version, &req.conda_subdir);
-    let mut closure = parse_pylock_closure(&pylock, &target, &exclude, &uv_version)?;
+    let mut closure = parse_pylock_closure(&pylock, target.wheel_target(), &exclude, &uv_version)?;
     let uv_lock = tokio::fs::read_to_string(&lock_file)
         .await
         .context("reading uv.lock for workspace-owned providers")?;
@@ -4159,14 +4608,15 @@ pub async fn compute_closure(
         .extend(workspace_owned_drops_from_lock(req, &uv_lock)?);
     attach_effective_input_requirements(&mut closure, req)?;
 
-    let _ = std::fs::write(
+    write_closure_meta_atomic(
         &meta_path,
-        serde_json::to_string_pretty(&ClosureMeta {
+        &ClosureMeta {
+            schema: CLOSURE_CACHE_SCHEMA.to_string(),
+            resolution_target: resolution_identity,
             uv_version: uv_version.clone(),
             inputs_fingerprint: fingerprint,
-        })
-        .unwrap_or_default(),
-    );
+        },
+    )?;
 
     tracing::info!(
         bundle = %req.bundle,
@@ -4191,6 +4641,40 @@ mod tests {
             conda_subdir: subdir.to_string(),
             max_glibc: None,
         }
+    }
+
+    fn write_built_source_test_wheel(path: &Path, name: &str, version: &str) {
+        write_built_source_test_wheel_with_payload(path, name, version, &[]);
+    }
+
+    fn write_built_source_test_wheel_with_payload(
+        path: &Path,
+        name: &str,
+        version: &str,
+        payload: &[u8],
+    ) {
+        use std::io::Write as _;
+
+        let file = std::fs::File::create(path).unwrap();
+        let mut archive = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        archive
+            .start_file(
+                format!("{}-{version}.dist-info/METADATA", name.replace('-', "_")),
+                options,
+            )
+            .unwrap();
+        archive
+            .write_all(
+                format!("Metadata-Version: 2.4\nName: {name}\nVersion: {version}\n\n").as_bytes(),
+            )
+            .unwrap();
+        if !payload.is_empty() {
+            archive.start_file("payload.bin", options).unwrap();
+            archive.write_all(payload).unwrap();
+        }
+        archive.finish().unwrap();
     }
 
     fn mapped_name_map(entries: &[(&str, &str)]) -> NameMap {
@@ -4343,6 +4827,131 @@ isaaclab = { path = "wheels/isaaclab/isaaclab-2.0.0-py3-none-any.whl" }
     }
 
     #[test]
+    fn built_wheel_ingress_rejects_wrong_name_and_metadata() {
+        let tmp = std::env::temp_dir().join(format!(
+            "retread-uv-built-ingress-{}-{}",
+            std::process::id(),
+            CLOSURE_META_TMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let wheel = tmp.join("evil-9.0-py3-none-any.whl");
+        write_built_source_test_wheel(&wheel, "evil", "9.0");
+        let mut req = sample_request();
+        req.built_wheel_sources.clear();
+        req.built_wheel_sources.insert("good".to_string(), wheel);
+        let target = ResolutionTarget::from_parts("3.12", "linux-64", None);
+        let error = validate_built_wheel_sources(&mut req, &target).unwrap_err();
+        assert!(format!("{error:#}").contains("identity mismatch"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn built_wheel_source_fingerprint_binds_exact_bytes() {
+        let tmp = std::env::temp_dir().join(format!(
+            "retread-uv-built-fingerprint-{}-{}",
+            std::process::id(),
+            CLOSURE_META_TMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let wheel = tmp.join("good-1.0-py3-none-any.whl");
+        let target = ResolutionTarget::from_parts("3.12", "linux-64", None);
+
+        write_built_source_test_wheel_with_payload(&wheel, "good", "1.0", b"first");
+        let mut first = sample_request();
+        first.built_wheel_sources.clear();
+        first
+            .built_wheel_sources
+            .insert("good".to_string(), wheel.clone());
+        let first_fingerprint = validate_built_wheel_sources(&mut first, &target).unwrap();
+
+        write_built_source_test_wheel_with_payload(&wheel, "good", "1.0", b"second");
+        let mut second = sample_request();
+        second.built_wheel_sources.clear();
+        second
+            .built_wheel_sources
+            .insert("good".to_string(), wheel.clone());
+        let second_fingerprint = validate_built_wheel_sources(&mut second, &target).unwrap();
+        assert_ne!(first_fingerprint, second_fingerprint);
+        assert_eq!(
+            second.built_wheel_sources["good"],
+            std::fs::canonicalize(&wheel).unwrap(),
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn invalid_python_target_fails_before_project_or_cache_mutation() {
+        let tmp = std::env::temp_dir().join(format!(
+            "retread-uv-invalid-target-{}-{}",
+            std::process::id(),
+            CLOSURE_META_TMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let project = tmp.join("project");
+        let cache = tmp.join("cache");
+        let mut req = sample_request();
+        req.python_version = "3".to_string();
+        let error = compute_closure(
+            &req,
+            &project,
+            &cache,
+            None,
+            crate::config::SdistBuildPolicy::Never,
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("MAJOR.MINOR"));
+        assert!(!project.exists());
+        assert!(!cache.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_uv_command_kills_the_complete_process_group() {
+        let tmp = std::env::temp_dir().join(format!(
+            "retread-uv-cancel-group-{}-{}",
+            std::process::id(),
+            CLOSURE_META_TMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let project = tmp.join("project");
+        let cache = tmp.join("cache");
+        let started = tmp.join("started");
+        let finished = tmp.join("finished");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+        let args = vec![
+            "-c".to_string(),
+            "touch \"$1\"; sleep 1; touch \"$2\"".to_string(),
+            "retread-cancel-test".to_string(),
+            started.display().to_string(),
+            finished.display().to_string(),
+        ];
+        let project_for_task = project.clone();
+        let cache_for_task = cache.clone();
+        let task = tokio::spawn(async move {
+            run_uv_closure_command(
+                Path::new("/bin/sh"),
+                &args,
+                &project_for_task,
+                &cache_for_task,
+            )
+            .await
+        });
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !started.exists() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(started.exists(), "test uv process never started");
+        task.abort();
+        let _ = task.await;
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        assert!(
+            !finished.exists(),
+            "a descendant survived cancellation and mutated project state"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn synthesize_pyproject_noarch_keeps_python_environments() {
         // Unknown subdir: the platform clause is dropped but the python
         // clause still restricts universal resolution.
@@ -4393,6 +5002,13 @@ isaaclab = { path = "wheels/isaaclab/isaaclab-2.0.0-py3-none-any.whl" }
         assert_eq!(python_minor_bounds("3"), None);
         assert_eq!(python_minor_bounds("weird"), None);
         assert_eq!(python_minor_bounds(""), None);
+        for malformed in ["3.11.", "3.11rc1", "3.11.0.1", " 3.11", "3.11.*"] {
+            assert_eq!(
+                python_minor_bounds(malformed),
+                None,
+                "malformed Python target `{malformed}` must fail closed"
+            );
+        }
     }
 
     #[test]
@@ -7688,7 +8304,14 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
         // Regression: the CLI args vector must carry the prerelease policy
         // (UV_NO_CONFIG=1 strips it from the synthesized pyproject table).
         let dir = Path::new("/tmp/proj");
-        let a = build_lock_args(dir, "3.12", &[], None, false, LockRelaxations::PASS_A);
+        let a = build_lock_args(
+            dir,
+            "cpython@3.12",
+            &[],
+            None,
+            false,
+            LockRelaxations::PASS_A,
+        );
         let idx = a
             .iter()
             .position(|t| t == "--prerelease")
@@ -7697,6 +8320,26 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
             a.get(idx + 1).map(String::as_str),
             Some("if-necessary-or-explicit")
         );
+        let python_idx = a.iter().position(|token| token == "--python").unwrap();
+        assert_eq!(
+            a.get(python_idx + 1).map(String::as_str),
+            Some("cpython@3.12")
+        );
+    }
+
+    #[test]
+    fn foreign_pass_b_retains_no_build() {
+        let foreign = LockRelaxations::pass_b_for(crate::config::SdistBuildPolicy::Auto, false);
+        assert_eq!(foreign, LockRelaxations::PASS_B_NEVER);
+        let args = build_lock_args(
+            Path::new("/tmp/project"),
+            "cpython@3.11",
+            &[],
+            None,
+            false,
+            foreign,
+        );
+        assert!(args.iter().any(|token| token == "--no-build"));
     }
 
     // ---- heal ladder driven by the structured verdict --------------------
@@ -8374,22 +9017,76 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
         // healed uv.lock is discarded and re-resolved every run.
         let args = vec!["lock".to_string(), "--no-build".to_string()];
         let export = vec!["export".to_string()];
-        let a = closure_inputs_fingerprint("[project]\nname='x'\n", &args, &export, "0.11.0");
-        let b = closure_inputs_fingerprint("[project]\nname='x'\n", &args, &export, "0.11.0");
+        let a = closure_inputs_fingerprint(
+            "[project]\nname='x'\n",
+            &args,
+            &export,
+            "0.11.0",
+            "target-a",
+        );
+        let b = closure_inputs_fingerprint(
+            "[project]\nname='x'\n",
+            &args,
+            &export,
+            "0.11.0",
+            "target-a",
+        );
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn v3_uv_namespaces_use_resolution_and_artifact_identities() {
+        let base = Path::new("/tmp/uv-project");
+        let cache = Path::new("/tmp/uv-cache");
+        let x86 = ResolutionTarget::from_parts("3.11", "linux-64", Some((2, 35)));
+        let arm = ResolutionTarget::from_parts("3.11", "linux-aarch64", Some((2, 35)));
+        let x86_project = resolution_project_dir(base, &x86);
+        let arm_project = resolution_project_dir(base, &arm);
+        assert_ne!(x86_project, arm_project);
+        assert!(
+            x86_project
+                .components()
+                .any(|part| part.as_os_str() == "v3")
+        );
+        assert_eq!(x86_project.file_name().unwrap().to_string_lossy().len(), 64);
+        let x86_cache = artifact_uv_cache_dir(cache, &x86);
+        let arm_cache = artifact_uv_cache_dir(cache, &arm);
+        assert_ne!(x86_cache, arm_cache);
+        assert_eq!(x86_cache.file_name().unwrap().to_string_lossy().len(), 64);
+    }
+
+    #[test]
+    fn invalid_cached_closure_removes_lock_pylock_and_meta_together() {
+        let tmp = std::env::temp_dir().join(format!(
+            "retread-invalid-closure-{}-{}",
+            std::process::id(),
+            CLOSURE_META_TMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        for filename in ["uv.lock", PYLOCK_FILE, META_FILE] {
+            std::fs::write(tmp.join(filename), b"partial/corrupt").unwrap();
+        }
+        std::fs::write(tmp.join("user-sentinel"), b"keep").unwrap();
+        invalidate_cached_closure(&tmp).unwrap();
+        for filename in ["uv.lock", PYLOCK_FILE, META_FILE] {
+            assert!(!tmp.join(filename).exists());
+        }
+        assert_eq!(std::fs::read(tmp.join("user-sentinel")).unwrap(), b"keep");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn fingerprint_changes_when_manifest_changes() {
         let args = vec!["lock".to_string()];
         let export = vec!["export".to_string()];
-        let base = closure_inputs_fingerprint("deps=['a==1']", &args, &export, "0.11.0");
+        let base =
+            closure_inputs_fingerprint("deps=['a==1']", &args, &export, "0.11.0", "target-a");
         // A changed synthesized pyproject (e.g. a new explicit pin) must
         // invalidate: otherwise a pinned lock would be reused for a
         // different (pinless) request.
         assert_ne!(
             base,
-            closure_inputs_fingerprint("deps=['a==2']", &args, &export, "0.11.0")
+            closure_inputs_fingerprint("deps=['a==2']", &args, &export, "0.11.0", "target-a")
         );
         // A changed flag vector (index set, prerelease policy) invalidates.
         assert_ne!(
@@ -8398,7 +9095,8 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
                 "deps=['a==1']",
                 &["lock".into(), "--x".into()],
                 &export,
-                "0.11.0"
+                "0.11.0",
+                "target-a",
             )
         );
         // A changed EXPORT vector (--no-emit-package set) invalidates: the
@@ -8410,13 +9108,18 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
                 "deps=['a==1']",
                 &args,
                 &["export".into(), "--no-emit-package".into(), "x".into()],
-                "0.11.0"
+                "0.11.0",
+                "target-a",
             )
         );
         // A uv upgrade invalidates.
         assert_ne!(
             base,
-            closure_inputs_fingerprint("deps=['a==1']", &args, &export, "0.12.0")
+            closure_inputs_fingerprint("deps=['a==1']", &args, &export, "0.12.0", "target-a")
+        );
+        assert_ne!(
+            base,
+            closure_inputs_fingerprint("deps=['a==1']", &args, &export, "0.11.0", "target-b")
         );
     }
 

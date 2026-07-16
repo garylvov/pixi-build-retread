@@ -14,6 +14,57 @@ use std::str::FromStr;
 use std::sync::OnceLock;
 use uv_pep508::uv_pep440::{self, Version, VersionSpecifiers};
 
+/// A strictly parsed CPython minor used in every build/resolution cache key.
+///
+/// Accepted spellings are `MAJOR.MINOR` and `MAJOR.MINOR.PATCH`, with every
+/// component made only of ASCII digits.  The patch component is deliberately
+/// discarded: `3.11` and `3.11.0` select the same ABI and therefore share the
+/// same `cpython@3.11` identity.  Bare majors, pre-release suffixes, empty
+/// components, and extra components are rejected rather than silently folded
+/// into a different target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NormalizedPythonMinor {
+    pub(crate) major: u32,
+    pub(crate) minor: u32,
+}
+
+impl NormalizedPythonMinor {
+    pub(crate) fn version(self) -> String {
+        format!("{}.{}", self.major, self.minor)
+    }
+
+    pub(crate) fn identity(self) -> String {
+        format!("cpython@{}.{}", self.major, self.minor)
+    }
+}
+
+pub(crate) fn normalized_python_minor(value: &str) -> Result<NormalizedPythonMinor> {
+    let components: Vec<&str> = value.split('.').collect();
+    if !matches!(components.len(), 2 | 3)
+        || components
+            .iter()
+            .any(|component| component.is_empty() || !component.bytes().all(|b| b.is_ascii_digit()))
+    {
+        bail!(
+            "invalid Python version `{value}`: expected numeric MAJOR.MINOR or MAJOR.MINOR.PATCH"
+        );
+    }
+    // Parsing the optional patch is intentional even though it does not enter
+    // the minor identity: an overflowing/non-numeric patch must not be accepted.
+    let major = components[0]
+        .parse::<u32>()
+        .with_context(|| format!("invalid Python major in `{value}`"))?;
+    let minor = components[1]
+        .parse::<u32>()
+        .with_context(|| format!("invalid Python minor in `{value}`"))?;
+    if components.len() == 3 {
+        components[2]
+            .parse::<u32>()
+            .with_context(|| format!("invalid Python patch in `{value}`"))?;
+    }
+    Ok(NormalizedPythonMinor { major, minor })
+}
+
 /// A valid PyPI Simple index did not contain a usable artifact for one
 /// dependency request.
 ///
@@ -101,7 +152,9 @@ impl WheelTarget {
     /// Standard constructor: fills [`Self::max_glibc`] from the
     /// declared-glibc plumbing in `crate::glibc` for linux subdirs.
     pub fn for_subdir(python_version: &str, conda_subdir: &str) -> Self {
-        ResolutionTarget::for_subdir(python_version, conda_subdir).wheel_target
+        ResolutionTarget::try_for_subdir(python_version, conda_subdir)
+            .expect("WheelTarget::for_subdir requires numeric MAJOR.MINOR[.PATCH]")
+            .wheel_target
     }
 
     /// Full SHA-256 namespace for built artifacts. Two scorer targets may
@@ -124,42 +177,64 @@ pub(crate) struct ResolutionTarget {
 }
 
 impl ResolutionTarget {
+    /// Fallible production constructor. Python is validated before any host
+    /// or workspace target state is inspected, so malformed declarations can
+    /// never acquire a cache identity.
+    pub(crate) fn try_for_subdir(python_version: &str, conda_subdir: &str) -> Result<Self> {
+        let python_version = normalized_python_minor(python_version)?.version();
+        let declared_glibc = crate::glibc::declared_glibc_no_lock_for_target(conda_subdir);
+        Self::try_from_parts(&python_version, conda_subdir, declared_glibc)
+    }
+
     /// Resolve the explicit declaration and effective ceiling exactly once
     /// for this `(python_version, conda_subdir)` pair.
     pub(crate) fn for_subdir(python_version: &str, conda_subdir: &str) -> Self {
-        let declared_glibc = crate::glibc::declared_glibc_no_lock_for_target(conda_subdir);
-        Self::from_parts(python_version, conda_subdir, declared_glibc)
+        Self::try_for_subdir(python_version, conda_subdir)
+            .expect("ResolutionTarget::for_subdir requires numeric MAJOR.MINOR[.PATCH]")
     }
 
     /// Construct a target from an explicit deployment declaration.
-    pub(crate) fn from_parts(
+    pub(crate) fn try_from_parts(
         python_version: &str,
         conda_subdir: &str,
         declared_glibc: Option<(u32, u32)>,
-    ) -> Self {
+    ) -> Result<Self> {
+        let python_version = normalized_python_minor(python_version)?.version();
         let max_glibc = crate::glibc::target_glibc_ceiling(
             conda_subdir,
             crate::glibc::current_pixi_platform(),
             declared_glibc,
             crate::glibc::host_glibc(),
         );
-        Self {
+        Ok(Self {
             wheel_target: WheelTarget {
-                python_version: python_version.to_string(),
+                python_version,
                 conda_subdir: conda_subdir.to_string(),
                 max_glibc,
             },
             declared_glibc,
-        }
+        })
+    }
+
+    pub(crate) fn from_parts(
+        python_version: &str,
+        conda_subdir: &str,
+        declared_glibc: Option<(u32, u32)>,
+    ) -> Self {
+        Self::try_from_parts(python_version, conda_subdir, declared_glibc)
+            .expect("ResolutionTarget::from_parts requires numeric MAJOR.MINOR[.PATCH]")
     }
 
     /// Wrap a scorer target without re-reading mutable workspace or host
     /// state. This is useful for deterministic tests and callers that already
     /// resolved their deployment contract.
     pub(crate) fn from_wheel_target(
-        wheel_target: WheelTarget,
+        mut wheel_target: WheelTarget,
         declared_glibc: Option<(u32, u32)>,
     ) -> Self {
+        wheel_target.python_version = normalized_python_minor(&wheel_target.python_version)
+            .expect("ResolutionTarget::from_wheel_target requires numeric MAJOR.MINOR[.PATCH]")
+            .version();
         Self {
             wheel_target,
             declared_glibc,
@@ -174,6 +249,10 @@ impl ResolutionTarget {
         &self.wheel_target.python_version
     }
 
+    pub(crate) fn python_identity(&self) -> String {
+        format!("cpython@{}", self.python_version())
+    }
+
     pub(crate) fn conda_subdir(&self) -> &str {
         &self.wheel_target.conda_subdir
     }
@@ -184,6 +263,23 @@ impl ResolutionTarget {
 
     pub(crate) fn effective_glibc(&self) -> Option<(u32, u32)> {
         self.wheel_target.max_glibc
+    }
+
+    /// Whether this process may execute a source build for the target. A
+    /// noarch artifact is intentionally buildable on every host; platform
+    /// artifacts require an exact host-subdir match. Native aarch64 also
+    /// refuses a build when the host glibc is newer than an explicit
+    /// deployment ceiling: a generic `linux_aarch64` wheel can contain ELF
+    /// symbols from the host and must not be cached as compatible with the
+    /// older target. Native linux-64 retains its established effective-ceiling
+    /// behavior for compatibility.
+    pub(crate) fn is_native_build_target(&self) -> bool {
+        native_source_build_compatible(
+            self.conda_subdir(),
+            crate::glibc::current_pixi_platform(),
+            self.declared_glibc,
+            crate::glibc::host_glibc(),
+        )
     }
 
     /// Full SHA-256 namespace for artifact compatibility. Two declarations
@@ -202,6 +298,27 @@ impl ResolutionTarget {
             Some(self.declared_glibc),
         )
     }
+}
+
+fn native_source_build_compatible(
+    target_subdir: &str,
+    host_subdir: &str,
+    declared_glibc: Option<(u32, u32)>,
+    host_glibc: Option<(u32, u32)>,
+) -> bool {
+    if target_subdir == "noarch" {
+        return true;
+    }
+    if target_subdir != host_subdir {
+        return false;
+    }
+    if target_subdir == "linux-aarch64" {
+        let Some(host) = host_glibc else {
+            return false;
+        };
+        return declared_glibc.is_none_or(|declared| host <= declared);
+    }
+    true
 }
 
 impl std::ops::Deref for ResolutionTarget {
@@ -235,9 +352,9 @@ fn target_identity(
 
     let mut hasher = Sha256::new();
     hasher.update(domain);
-    let normalized_python = parse_python_version(&target.python_version)
-        .map(|(major, minor)| format!("{major}.{minor}"))
-        .unwrap_or_else(|| target.python_version.clone());
+    let normalized_python = normalized_python_minor(&target.python_version)
+        .expect("ResolutionTarget always stores a normalized Python minor")
+        .identity();
     field(&mut hasher, normalized_python.as_bytes());
     field(&mut hasher, target.conda_subdir.as_bytes());
     glibc(&mut hasher, target.max_glibc);
@@ -467,6 +584,19 @@ fn extract_version_from_wheel_filename(
     let rest = filename_lower.strip_prefix(name_prefix_lower)?;
     let version_str = rest.split('-').next()?;
     Version::from_str(version_str).ok()
+}
+
+/// Return the distribution spelling and normalized PEP 440 version carried by
+/// a structurally valid PEP 427 filename.  Artifact-ingress paths pair this
+/// with the wheel's root METADATA so a compatible tag alone can never smuggle
+/// bytes for a different package/version into a source-build cache entry.
+pub(crate) fn wheel_filename_identity(filename: &str) -> Option<(String, Version)> {
+    parse_wheel_tags(filename)?;
+    let stem = filename.strip_suffix(".whl")?;
+    let mut fields = stem.split('-');
+    let distribution = fields.next()?.to_string();
+    let version = Version::from_str(fields.next()?).ok()?;
+    Some((distribution, version))
 }
 
 /// Parser variant that DOES NOT filter by `.whl` suffix. Used by
@@ -778,9 +908,9 @@ pub(crate) fn score_wheel(filename: &str, target: &WheelTarget) -> i64 {
 /// was 3.11.
 fn score_python_tag_with_abi(python_tag: &str, abi_tag: &str, target: &str) -> Option<u32> {
     if abi_tag == "abi3" {
-        let (target_major, target_minor) = parse_python_version(target)?;
+        let target = normalized_python_minor(target).ok()?;
         for sub in python_tag.split('.') {
-            if let Some(score) = score_abi3_python(sub, target_major, target_minor) {
+            if let Some(score) = score_abi3_python(sub, target.major, target.minor) {
                 return Some(score);
             }
         }
@@ -852,9 +982,9 @@ fn parse_wheel_tags(filename: &str) -> Option<WheelTags<'_>> {
 
 fn score_python_tag(tag: &str, target: &str) -> Option<u32> {
     // Compatible if any dotted sub-tag matches.
-    let (target_major, target_minor) = parse_python_version(target)?;
+    let target = normalized_python_minor(target).ok()?;
     for sub in tag.split('.') {
-        if let Some(score) = score_one_python(sub, target_major, target_minor) {
+        if let Some(score) = score_one_python(sub, target.major, target.minor) {
             return Some(score);
         }
     }
@@ -892,13 +1022,6 @@ fn split_python_digits(digits: &str) -> Option<(u32, u32)> {
         let minor: u32 = digits[1..].parse().ok()?;
         Some((major, minor))
     }
-}
-
-fn parse_python_version(s: &str) -> Option<(u32, u32)> {
-    let mut parts = s.split('.');
-    let major: u32 = parts.next()?.parse().ok()?;
-    let minor: u32 = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
-    Some((major, minor))
 }
 
 fn score_platform_tag(tag: &str, conda_subdir: &str, max_glibc: Option<(u32, u32)>) -> Option<i64> {
@@ -1169,6 +1292,23 @@ mod tests {
     }
 
     #[test]
+    fn normalized_python_minor_is_strict_and_patch_insensitive() {
+        let minor = normalized_python_minor("3.11").unwrap();
+        assert_eq!(minor.version(), "3.11");
+        assert_eq!(minor.identity(), "cpython@3.11");
+        assert_eq!(normalized_python_minor("3.11.0").unwrap(), minor);
+        assert_eq!(normalized_python_minor("3.11.9").unwrap(), minor);
+        for invalid in [
+            "3", "3.", ".11", "3.11.", "3.11.0.1", "3.11rc1", " 3.11", "3. 11", "3.11.*",
+        ] {
+            assert!(
+                normalized_python_minor(invalid).is_err(),
+                "malformed Python target `{invalid}` must fail closed"
+            );
+        }
+    }
+
+    #[test]
     fn resolution_target_accessors_preserve_declared_and_effective_glibc() {
         let target = exact_resolution_target("3.11", "linux-aarch64", Some((2, 35)), Some((2, 35)));
         assert_eq!(target.python_version(), "3.11");
@@ -1176,6 +1316,36 @@ mod tests {
         assert_eq!(target.declared_glibc(), Some((2, 35)));
         assert_eq!(target.effective_glibc(), Some((2, 35)));
         assert_eq!(target.wheel_target().conda_subdir, "linux-aarch64");
+    }
+
+    #[test]
+    fn native_arm_source_build_refuses_newer_host_glibc() {
+        assert!(!native_source_build_compatible(
+            "linux-aarch64",
+            "linux-aarch64",
+            Some((2, 35)),
+            Some((2, 39)),
+        ));
+        assert!(native_source_build_compatible(
+            "linux-aarch64",
+            "linux-aarch64",
+            Some((2, 39)),
+            Some((2, 35)),
+        ));
+        assert!(
+            !native_source_build_compatible("linux-aarch64", "linux-aarch64", Some((2, 35)), None,),
+            "unknown native ARM glibc must fail closed",
+        );
+        assert!(
+            native_source_build_compatible("linux-64", "linux-64", Some((2, 35)), Some((2, 39))),
+            "linux-64 retains its established effective-ceiling behavior"
+        );
+        assert!(native_source_build_compatible(
+            "noarch",
+            "linux-aarch64",
+            Some((2, 35)),
+            Some((2, 39)),
+        ));
     }
 
     #[test]
