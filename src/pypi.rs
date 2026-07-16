@@ -162,9 +162,7 @@ async fn resolve_inner(
     let mut candidates = fetch_and_parse_simple_index(&index_url, parse_index_links).await?;
     candidates.retain(|c| c.filename.ends_with(".whl"));
     if candidates.is_empty() {
-        return Err(pypi_index_miss(format!(
-            "no wheels listed at {index_url}"
-        )));
+        return Err(pypi_index_miss(format!("no wheels listed at {index_url}")));
     }
 
     // PEP 427 says wheel filenames use the project distribution name with
@@ -247,8 +245,7 @@ async fn resolve_inner(
     Err(pypi_index_miss(format!(
         "no wheel for {name} {specifiers} at {index_url} matches target \
          python={} subdir={}",
-        target.python_version,
-        target.conda_subdir,
+        target.python_version, target.conda_subdir,
     )))
 }
 
@@ -281,9 +278,7 @@ pub async fn resolve_sdist(
         f.ends_with(".tar.gz") || f.ends_with(".zip") || f.ends_with(".tar.bz2")
     });
     if candidates.is_empty() {
-        return Err(pypi_index_miss(format!(
-            "no sdists listed at {index_url}"
-        )));
+        return Err(pypi_index_miss(format!("no sdists listed at {index_url}")));
     }
 
     let name_norm_dash = name.replace('_', "-").to_ascii_lowercase();
@@ -887,8 +882,11 @@ mod tests {
         assert_eq!(parse_index_links_any(html, &base).unwrap().len(), 1);
 
         assert!(
-            parse_index_links("<!DOCTYPE html><html><body>not a simple listing</body></html>", &base)
-                .is_err(),
+            parse_index_links(
+                "<!DOCTYPE html><html><body>not a simple listing</body></html>",
+                &base
+            )
+            .is_err(),
             "HTML without any structurally valid file link remains malformed"
         );
     }
@@ -1535,9 +1533,7 @@ platforms = [{ platform = "linux-64", glibc = "2.35" }]
     async fn spawn_status_server(status: &'static str) -> url::Url {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();

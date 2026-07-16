@@ -1973,8 +1973,11 @@ fn index_chain_entry_before_workspace() {
     // Public PyPI should land last, entry index first.
     let result = index_chain(
         ["https://pypi.nvidia.com".to_string()],
-        &["https://download.pytorch.org/whl/cu128".to_string()],
-        IndexPurpose::Resolve,
+        &[
+            "https://download.pytorch.org/whl/cu128".to_string(),
+            PUBLIC_PYPI.to_string(),
+        ],
+        IndexPurpose::RootResolve,
     );
     assert_eq!(
         result,
@@ -1993,7 +1996,7 @@ fn index_chain_dedups_trailing_slash() {
     let result = index_chain(
         ["https://pypi.nvidia.com".to_string()],
         &["https://pypi.org/simple".to_string()],
-        IndexPurpose::Resolve,
+        IndexPurpose::RootResolve,
     );
     assert_eq!(
         result,
@@ -2007,7 +2010,7 @@ fn index_chain_dedups_trailing_slash() {
 
 #[test]
 fn index_chain_empty_inputs_append_public() {
-    let result = index_chain(std::iter::empty::<String>(), &[], IndexPurpose::Resolve);
+    let result = index_chain(std::iter::empty::<String>(), &[], IndexPurpose::RootResolve);
     assert_eq!(result, vec![PUBLIC_PYPI.to_string()]);
 }
 
@@ -2021,7 +2024,7 @@ fn index_chain_deduplicates_repeated_entry_indexes() {
             "https://pypi.nvidia.com/".to_string(),
         ],
         &[],
-        IndexPurpose::Resolve,
+        IndexPurpose::RootResolve,
     );
     assert_eq!(
         result,
@@ -2033,7 +2036,7 @@ fn index_chain_deduplicates_repeated_entry_indexes() {
 }
 
 #[test]
-fn index_chain_override_keeps_pypi_terminal() {
+fn index_chain_explicit_override_replaces_public() {
     let workspace = vec![
         "https://packages.example/simple".to_string(),
         "https://extra.example/simple".to_string(),
@@ -2042,24 +2045,29 @@ fn index_chain_override_keeps_pypi_terminal() {
         index_chain(
             std::iter::empty::<String>(),
             &workspace,
-            IndexPurpose::Resolve,
+            IndexPurpose::RootResolve,
         ),
         vec![
             "https://packages.example/simple".to_string(),
             "https://extra.example/simple".to_string(),
-            PUBLIC_PYPI.to_string(),
         ],
-        "an explicit workspace index-url changes preference but cannot remove public PyPI",
+        "an explicit workspace index-url replaces public PyPI; index_chain must not re-append it",
     );
 }
 
 #[tokio::test]
 async fn resolve_bundle_bfs_falls_back_to_default() {
-    let workspace = vec!["https://workspace.example/simple".to_string()];
+    // The workspace arg is the COMPLETE chain (resolution_pypi_index_urls
+    // already appends pixi's implicit public default), so public PyPI is the
+    // terminal fallback the mock serves.
+    let workspace = vec![
+        "https://workspace.example/simple".to_string(),
+        PUBLIC_PYPI.to_string(),
+    ];
     let indexes = index_chain(
         ["https://entry.example/simple".to_string()],
         &workspace,
-        IndexPurpose::Resolve,
+        IndexPurpose::RootResolve,
     );
     let requires_dist = vec!["root-child>=1".to_string()];
     let mut work = std::collections::VecDeque::new();
@@ -2098,7 +2106,9 @@ async fn resolve_bundle_bfs_falls_back_to_default() {
                 if index.trim_end_matches('/') == PUBLIC_PYPI.trim_end_matches('/') {
                     Ok(index)
                 } else {
-                    Err(anyhow::anyhow!("root-child is absent from {index}"))
+                    Err(crate::pypi::pypi_index_miss(format!(
+                        "root-child is absent from {index}"
+                    )))
                 }
             }
         }
@@ -2116,7 +2126,7 @@ fn resolve_bundle_bfs_descendants_inherit_full_chain() {
     let indexes = index_chain(
         ["https://entry.example/simple".to_string()],
         &["https://workspace.example/simple".to_string()],
-        IndexPurpose::Resolve,
+        IndexPurpose::RootResolve,
     );
     let parent = PendingSource::Pypi {
         specifiers: VersionSpecifiers::empty(),

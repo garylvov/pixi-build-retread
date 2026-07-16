@@ -394,15 +394,15 @@ fn courier_inputs_hash(
 ) -> String {
     let entry_specs = crate::courier::courier_input_specs(config, bundle_name);
     let ws_indexes: Vec<String> = workspace_manifest
-        .map(|m| m.all_pypi_index_urls())
-        .unwrap_or_default();
+        .map(|m| m.resolution_pypi_index_urls())
+        .unwrap_or_else(|| vec![crate::index_chain::PUBLIC_PYPI.to_string()]);
     let entry_indexes: Vec<String> = config
         .retread_wheels
         .values()
         .filter(|entry| entry.url.is_none())
         .filter_map(|entry| entry.index.clone())
         .collect();
-    let index_urls = index_chain(entry_indexes, &ws_indexes, IndexPurpose::Resolve);
+    let index_urls = index_chain(entry_indexes, &ws_indexes, IndexPurpose::RootResolve);
     let workspace_fp = workspace_manifest
         .map(|m| m.solve_fingerprint(workspace_dir, source_dir))
         .unwrap_or_default();
@@ -1477,8 +1477,8 @@ impl Handler {
                         );
                         let ws_indexes_for_incr: Vec<String> = workspace_manifest
                             .as_ref()
-                            .map(|m| m.all_pypi_index_urls())
-                            .unwrap_or_default();
+                            .map(|m| m.resolution_pypi_index_urls())
+                            .unwrap_or_else(|| vec![crate::index_chain::PUBLIC_PYPI.to_string()]);
                         let relax_str_for_incr = format!("{:?}", config.relax);
                         env_bundles
                             .iter()
@@ -1920,8 +1920,8 @@ impl Handler {
             {
                 let ws_indexes: Vec<String> = ws_manifest_for_replay
                     .as_ref()
-                    .map(|m| m.all_pypi_index_urls())
-                    .unwrap_or_default();
+                    .map(|m| m.resolution_pypi_index_urls())
+                    .unwrap_or_else(|| vec![crate::index_chain::PUBLIC_PYPI.to_string()]);
                 let relax_str = format!("{:?}", config.relax);
                 if let Some(incr) = detect_incremental_add(
                     &lock_path,
@@ -2430,12 +2430,13 @@ async fn resolve_all(
 ) -> Result<(Vec<Bundle>, RetreadConfig)> {
     let mut bundles = Vec::with_capacity(config.retread_wheels.len());
 
-    // Raw workspace [pypi-options] participate in every resolution path.
-    // `index_chain` adds the public terminal fallback at each consumer.
+    // One complete workspace chain participates in every resolution path.
+    // It retains the declared extras priority and either the explicit main
+    // index or pixi's implicit public default.
     let workspace_pypi_indexes = workspace_dir
         .and_then(crate::workspace::WorkspaceManifest::load)
-        .map(|manifest| manifest.all_pypi_index_urls())
-        .unwrap_or_default();
+        .map(|manifest| manifest.resolution_pypi_index_urls())
+        .unwrap_or_else(|| vec![crate::index_chain::PUBLIC_PYPI.to_string()]);
 
     // Load parselmouth once and reuse across bundles. We also merge it
     // into the effective name-map: when parselmouth says PyPI name X
@@ -2485,6 +2486,14 @@ async fn resolve_all(
     let mut uv_retry_keep_by_group: BTreeMap<String, BTreeSet<PypiKey>> = BTreeMap::new();
 
     while let Some((group_name, group_entries)) = groups.pop_first() {
+        let group_fallback_indexes = index_chain(
+            group_entries
+                .iter()
+                .filter(|(_, entry)| !entry.is_url())
+                .filter_map(|(_, entry)| entry.index.clone()),
+            &workspace_pypi_indexes,
+            IndexPurpose::TransitiveFallback,
+        );
         let uv_retry_keep = uv_retry_keep_by_group
             .get(&group_name)
             .cloned()
@@ -2636,7 +2645,7 @@ async fn resolve_all(
             let group_name = &group_name;
             let group_entries = &group_entries;
             let pypi_to_conda = &pypi_to_conda;
-            let workspace_pypi_indexes = &workspace_pypi_indexes;
+            let group_fallback_indexes = &group_fallback_indexes;
             entry_futures.push(async move {
                     resolve_bundle(
                         entry_name,
@@ -2651,7 +2660,7 @@ async fn resolve_all(
                         pypi_to_conda,
                         &effective.name_map,
                         conda_channels,
-                        workspace_pypi_indexes,
+                        group_fallback_indexes,
                         None, // locked-closure seam: incremental-add ONLY (uv pins flow via prefs below)
                         Some(favored).filter(|m| !m.is_empty()), // favor-lock + uv-closure prefs (empty map → None)
                         &sibling_names,
@@ -2758,18 +2767,9 @@ async fn resolve_all(
                     .collect()
             });
         if effective.auto_bundle || uv_closure.is_some() {
-            let auto_indexes = index_chain(
-                group_entries
-                    .iter()
-                    .map(|(_, entry)| entry)
-                    .filter(|entry| entry.url.is_none())
-                    .filter_map(|entry| entry.index.clone()),
-                &workspace_pypi_indexes,
-                IndexPurpose::Resolve,
-            );
             let outcome = auto_bundle_transitives(
                 &mut bundle,
-                &auto_indexes,
+                &group_fallback_indexes,
                 target,
                 download_dir,
                 &effective,
@@ -2890,15 +2890,16 @@ async fn build_sdist_wheel(
         }),
         None => match_any(),
     };
-    let mut last_err: Option<anyhow::Error> = None;
-    for index in &index_urls {
-        let (version, sdist) = match crate::pypi::resolve_sdist(index, &name, &specifiers).await {
-            Ok(hit) => hit,
-            Err(e) => {
-                last_err = Some(e);
-                continue;
-            }
-        };
+    let (index, version, sdist) = fetch_from_pypi_index_chain(
+        &index_urls,
+        |index| async {
+            crate::pypi::resolve_sdist(&index, &name, &specifiers)
+                .await
+                .map(|(version, sdist)| (index, version, sdist))
+        },
+        format!("sdist auto-build: no index in the chain has an sdist for `{name}`"),
+    )
+    .await?;
         tracing::info!(
             pkg = %name,
             version = %version,
@@ -2978,25 +2979,19 @@ async fn build_sdist_wheel(
             .to_string();
         let store_path = store_root.join(&sha256).join(&filename);
         let sdist_url = compose_sdist_source_url(&sdist.url, sdist.sha256.as_deref());
-        return Ok(crate::uv_closure::BuiltSdistWheel {
+        Ok(crate::uv_closure::BuiltSdistWheel {
             pypi_name: name.clone(),
             version: version.to_string(),
             filename,
             wheel_path: store_path,
             sha256,
             sdist_source: crate::lock::SdistWheelSource {
-                index: index.clone(),
+                index,
                 name: name.clone(),
                 version: version.to_string(),
                 sdist_url,
             },
-        });
-    }
-    Err(last_err
-        .unwrap_or_else(|| anyhow!("sdist auto-build: no index chain configured for `{name}`"))
-        .context(format!(
-            "sdist auto-build: no index in the chain has an sdist for `{name}`"
-        )))
+        })
 }
 
 /// Dedupe root requirement strings by PEP 503-normalized package name,
@@ -4189,8 +4184,8 @@ async fn uv_group_closure(
         );
     }
 
-    // Index chain: explicit entry indexes in group order, then workspace
-    // [pypi-options] indexes, then public PyPI. Deduped, order-preserving.
+    // Root chain: explicit entry indexes in group order, then the complete
+    // workspace chain. Transitive fallback uses the opposite priority below.
     //
     // Only explicitly-declared entry indexes join the priority chain --
     // entries without an `index =` fall through to the PUBLIC_PYPI tail.
@@ -4201,13 +4196,20 @@ async fn uv_group_closure(
     // pypi.org while the real manylinux wheels live only on
     // pypi.nvidia.com, so pypi.org-first made uv lock the useless stub
     // (-> "has no usable wheels" under no-build).
+    let entry_indexes = group_entries
+        .iter()
+        .filter(|(_, entry)| !entry.is_url())
+        .filter_map(|(_, entry)| entry.index.clone())
+        .collect::<Vec<_>>();
     let index_urls = index_chain(
-        group_entries
-            .iter()
-            .filter(|(_, entry)| entry.url.is_none())
-            .filter_map(|(_, entry)| entry.index.clone()),
+        entry_indexes.clone(),
         workspace_pypi_indexes,
-        IndexPurpose::Resolve,
+        IndexPurpose::RootResolve,
+    );
+    let transitive_index_urls = index_chain(
+        entry_indexes,
+        workspace_pypi_indexes,
+        IndexPurpose::TransitiveFallback,
     );
 
     // retread-drop-deps also excluded from the parsed closure.
@@ -4474,7 +4476,7 @@ async fn uv_group_closure(
         }
     };
     let sdist_build = (effective.sdist_build == crate::config::SdistBuildPolicy::Auto).then(|| {
-        let index_urls = index_urls.clone();
+        let index_urls = transitive_index_urls.clone();
         let python_version = target.python_version.clone();
         let conda_subdir = target.conda_subdir.clone();
         let cache_dir = cache_dir.to_path_buf();
@@ -5805,6 +5807,48 @@ fn apply_emission(
 /// this wrapper advances only after that complete attempt fails. Keeping the
 /// `Pending` as the input makes phase 2 consume the chain that `seed_worklist`
 /// attached to the dependency.
+pub(super) async fn fetch_from_pypi_index_chain<T, X, XF>(
+    indexes: &[String],
+    mut fetch: X,
+    exhaustion_context: String,
+) -> Result<T>
+where
+    X: FnMut(String) -> XF,
+    XF: std::future::Future<Output = Result<T>>,
+{
+    let mut misses = Vec::new();
+    for index in indexes {
+        match fetch(index.clone()).await {
+            Ok(value) => return Ok(value),
+            Err(error) if pypi::is_pypi_index_miss(&error) => {
+                tracing::debug!(
+                    index = %index,
+                    error = %format!("{error:#}"),
+                    "package is absent from this PyPI index; continuing fallback chain"
+                );
+                misses.push((index.clone(), format!("{error:#}")));
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "PyPI index chain aborted on `{index}` because the failure was not a package miss"
+                    )
+                });
+            }
+        }
+    }
+
+    if misses.is_empty() {
+        bail!("{exhaustion_context}: no PyPI index configured");
+    }
+    let diagnostics = misses
+        .into_iter()
+        .map(|(index, error)| format!("  - {index}: {error}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    bail!("{exhaustion_context}; every configured index missed:\n{diagnostics}")
+}
+
 async fn fetch_pending_pypi_with<T, X, XF>(pending: &Pending, fetch_pypi: &X) -> Result<Option<T>>
 where
     X: Fn(String, VersionSpecifiers, String) -> XF,
@@ -5818,28 +5862,16 @@ where
         return Ok(None);
     };
 
-    let mut last_error = None;
-    for index in indexes {
-        match fetch_pypi(pending.pypi_name.clone(), specifiers.clone(), index.clone()).await {
-            Ok(fetched) => return Ok(Some(fetched)),
-            Err(error) => {
-                tracing::debug!(
-                    dep = %pending.pypi_name,
-                    index = %index,
-                    error = %format!("{error:#}"),
-                    "BFS PyPI fetch failed on this index"
-                );
-                last_error = Some(error);
-            }
-        }
-    }
-
-    Err(last_error
-        .unwrap_or_else(|| anyhow!("no PyPI index configured for `{}`", pending.pypi_name))
-        .context(format!(
+    let fetched = fetch_from_pypi_index_chain(
+        indexes,
+        |index| fetch_pypi(pending.pypi_name.clone(), specifiers.clone(), index),
+        format!(
             "BFS could not resolve `{}` from any configured PyPI index",
             pending.pypi_name
-        )))
+        ),
+    )
+    .await?;
+    Ok(Some(fetched))
 }
 
 /// Select the full chain inherited by ordinary PyPI descendants.
@@ -5886,9 +5918,9 @@ async fn resolve_bundle(
     // this map; the BFS now matches it.
     name_map: &NameMap,
     conda_channels: &[ChannelUrl],
-    // Raw workspace PyPI indexes. The BFS combines these with the entry's
-    // explicit index and the public terminal fallback exactly once below.
-    workspace_indexes: &[String],
+    // Complete workspace-first group fallback chain. URL-form roots do not
+    // contribute an index, but their ordinary metadata descendants inherit it.
+    bundle_indexes: &[String],
     // incremental-add path: locked closure from the committed lock
     // (name → version_str for every wheel EXCEPT the new dep being added).
     // When Some, seeds ResolveState with ==V pinned constraints so ripples
@@ -5908,11 +5940,6 @@ async fn resolve_bundle(
     sibling_names: &std::collections::HashSet<String>,
 ) -> Result<Bundle> {
     let conda_name = canonical_conda_name(entry_name);
-    let bundle_indexes = index_chain(
-        entry.index.clone().filter(|_| !entry.is_url()).into_iter(),
-        workspace_indexes,
-        IndexPurpose::Resolve,
-    );
     let mut state = ResolveState::default();
     let mut work: BTreeMap<String, Pending> = BTreeMap::new();
     // v0.14.1+: collect every probe + routing decision so the audit
@@ -6656,7 +6683,7 @@ async fn bfs_fetch_pypi(
         pypi::resolve(index, pypi_name, specifiers, target).await
     } {
         Ok(resolved) => Ok(resolved),
-        Err(exact_err) => {
+        Err(exact_err) if pypi::is_pypi_index_miss(&exact_err) => {
             if let Some(relaxed) = relaxed_retry_specs(pypi_name, specifiers, relax) {
                 match pypi::resolve(index, pypi_name, &relaxed, target).await {
                     Ok(resolved) => {
@@ -6673,12 +6700,18 @@ async fn bfs_fetch_pypi(
                         ));
                         Ok(resolved)
                     }
-                    Err(_) => Err(exact_err),
+                    Err(relaxed_err) if pypi::is_pypi_index_miss(&relaxed_err) => Err(exact_err),
+                    Err(relaxed_err) => Err(relaxed_err).with_context(|| {
+                        format!(
+                            "relaxed PyPI resolve for {pypi_name} {relaxed} on {index} failed fatally"
+                        )
+                    }),
                 }
             } else {
                 Err(exact_err)
             }
         }
+        Err(fatal) => Err(fatal),
     };
     let (resolved_url, metadata, sdist_prov) = match wheel_result {
         Ok(resolved) => {
@@ -6686,7 +6719,7 @@ async fn bfs_fetch_pypi(
             // Wheel path: no sdist provenance.
             (resolved.url, metadata, None)
         }
-        Err(wheel_err) => {
+        Err(wheel_err) if pypi::is_pypi_index_miss(&wheel_err) => {
             tracing::info!(
                 dep = %pypi_name,
                 spec = %specifiers,
@@ -6752,6 +6785,7 @@ async fn bfs_fetch_pypi(
             // will SUPPRESS this as upstream_url when sdist_prov.is_some().
             (built_url, metadata, Some(prov))
         }
+        Err(fatal) => return Err(fatal),
     };
     Ok((resolved_url, metadata, sdist_prov))
 }
@@ -9083,8 +9117,8 @@ async fn resolve_incremental_add(
     // ── Setup: replicate the parselmouth + name_map setup from resolve_all ─
     let workspace_pypi_indexes: Vec<String> = workspace_dir
         .and_then(crate::workspace::WorkspaceManifest::load)
-        .map(|m| m.all_pypi_index_urls())
-        .unwrap_or_default();
+        .map(|m| m.resolution_pypi_index_urls())
+        .unwrap_or_else(|| vec![crate::index_chain::PUBLIC_PYPI.to_string()]);
     let pypi_to_conda = if config.auto_bundle {
         load_pypi_to_conda_map().await
     } else {
@@ -9591,8 +9625,8 @@ async fn build_one(
         let ws_manifest = workspace_dir.and_then(crate::workspace::WorkspaceManifest::load);
         let workspace_indexes: Vec<String> = ws_manifest
             .as_ref()
-            .map(|m| m.all_pypi_index_urls())
-            .unwrap_or_default();
+            .map(|m| m.resolution_pypi_index_urls())
+            .unwrap_or_else(|| vec![crate::index_chain::PUBLIC_PYPI.to_string()]);
         // grizzly H1: fold the workspace solve environment into the hash.
         // Pack-scoped: only envs that reference source_dir are hashed.
         let workspace_fp = ws_manifest
@@ -9605,7 +9639,11 @@ async fn build_one(
             .filter(|entry| entry.url.is_none())
             .filter_map(|entry| entry.index.clone())
             .collect();
-        let index_urls = index_chain(entry_indexes, &workspace_indexes, IndexPurpose::Resolve);
+        let index_urls = index_chain(
+            entry_indexes,
+            &workspace_indexes,
+            IndexPurpose::RootResolve,
+        );
         // B-1 (lock-poisoning): in courier mode the committed lock's
         // `conda_run_deps` MUST be the run-deps pixi actually solved and
         // locked (forwarded as `run_override`). The legacy fallback re-derived
@@ -9971,7 +10009,11 @@ fn detect_incremental_add(
             .filter(|entry| entry.url.is_none())
             .filter_map(|entry| entry.index.clone())
             .collect();
-        let locked_chain = index_chain(locked_entry_indexes, ws_indexes, IndexPurpose::Resolve);
+        let locked_chain = index_chain(
+            locked_entry_indexes,
+            ws_indexes,
+            IndexPurpose::RootResolve,
+        );
         if locked_chain != lock.index_urls {
             tracing::debug!(
                 ?locked_chain,
@@ -13563,13 +13605,9 @@ mod resolve_bundle_bfs_tests {
             index_chain(
                 [entry_index.clone()],
                 &workspace_indexes,
-                IndexPurpose::Resolve,
+                IndexPurpose::RootResolve,
             ),
-            vec![
-                entry_index.clone(),
-                workspace_index.clone(),
-                PUBLIC_PYPI.to_string(),
-            ],
+            vec![entry_index.clone(), workspace_index.clone()],
         );
 
         let entry = WheelEntry {

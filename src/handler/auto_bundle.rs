@@ -317,24 +317,12 @@ where
     X: Fn(PypiFetchRequest, String) -> XF,
     XF: Future<Output = Result<ResolvedWheel>>,
 {
-    let mut last_error = None;
-    for index in indexes {
-        match fetch_pypi(request.clone(), index.clone()).await {
-            Ok(wheel) => return Ok(wheel),
-            Err(error) => {
-                tracing::debug!(
-                    dep = %request.pypi_name,
-                    index = %index,
-                    error = %format!("{error:#}"),
-                    "auto-bundle PyPI fetch failed on this index"
-                );
-                last_error = Some(error);
-            }
-        }
-    }
-    Err(last_error
-        .unwrap_or_else(|| anyhow!("no PyPI index configured for `{}`", request.pypi_name))
-        .context(failure_context))
+    super::fetch_from_pypi_index_chain(
+        indexes,
+        |index| fetch_pypi(request.clone(), index),
+        failure_context,
+    )
+    .await
 }
 
 fn record_metadata_route(
@@ -4040,7 +4028,9 @@ pillow = ">=10,<13"
                     if index.trim_end_matches('/')
                         != crate::workspace::DEFAULT_PYPI_INDEX.trim_end_matches('/')
                     {
-                        return Err(anyhow!("package absent from {index}"));
+                        return Err(crate::pypi::pypi_index_miss(format!(
+                            "package absent from {index}"
+                        )));
                     }
                     Ok(test_wheel(
                         &request.bundle_name,
@@ -4130,7 +4120,7 @@ pillow = ">=10,<13"
                 .filter(|entry| !entry.is_url())
                 .filter_map(|entry| entry.index.clone()),
             &[],
-            crate::index_chain::IndexPurpose::Resolve,
+            crate::index_chain::IndexPurpose::RootResolve,
         );
         assert_eq!(
             explicit_private_chain,
@@ -4154,7 +4144,9 @@ pillow = ">=10,<13"
                     if index.trim_end_matches('/')
                         != crate::workspace::DEFAULT_PYPI_INDEX.trim_end_matches('/')
                     {
-                        return Err(anyhow!("flatdict absent from {index}"));
+                        return Err(crate::pypi::pypi_index_miss(format!(
+                            "flatdict absent from {index}"
+                        )));
                     }
                     Ok(test_wheel(
                         &request.bundle_name,
