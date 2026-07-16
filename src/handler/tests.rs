@@ -2113,10 +2113,13 @@ async fn resolve_bundle_bfs_falls_back_to_default() {
             }
         }
     };
-    let selected = fetch_pending_pypi_with(&pending, &fetch)
-        .await
-        .unwrap()
-        .expect("a PyPI pending source must be fetched");
+    let selected = fetch_from_pypi_index_chain(
+        pending_indexes,
+        |index| fetch(pending.pypi_name.clone(), specifiers.clone(), index),
+        "root-child fixture exhausted its index chain".to_string(),
+    )
+    .await
+    .unwrap();
     assert_eq!(selected, PUBLIC_PYPI);
     assert_eq!(*calls.lock().unwrap(), indexes);
 }

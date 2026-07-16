@@ -439,14 +439,20 @@ pub(crate) async fn auto_bundle_transitives(
     let fetch_target = target.clone();
     let download_dir = download_dir.to_path_buf();
     let relax = config.relax;
-    let fetch_pypi = move |request: PypiFetchRequest, index: String| {
+    // Production resolution owns the complete chain here. The generic
+    // auto-bundle harness still invokes its callback through the per-index
+    // seam used by tests, so this callback intentionally ignores that one
+    // index and performs the shared global artifact phases exactly once.
+    let fetch_indexes = indexes.to_vec();
+    let fetch_pypi = move |request: PypiFetchRequest, _index: String| {
         let target = fetch_target.clone();
         let download_dir = download_dir.clone();
+        let indexes = fetch_indexes.clone();
         async move {
-            let (resolved_url, metadata, sdist_prov) = super::bfs_fetch_pypi(
+            let (resolved_url, metadata, sdist_prov) = super::bfs_fetch_pypi_from_chain(
                 &request.pypi_name,
                 &request.specifiers,
-                &index,
+                &indexes,
                 &target,
                 &download_dir,
                 relax,

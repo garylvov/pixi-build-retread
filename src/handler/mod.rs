@@ -5849,29 +5849,208 @@ where
     bail!("{exhaustion_context}; every configured index missed:\n{diagnostics}")
 }
 
-async fn fetch_pending_pypi_with<T, X, XF>(pending: &Pending, fetch_pypi: &X) -> Result<Option<T>>
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PypiArtifactPhase {
+    ExactWheel,
+    RelaxedWheel,
+    Sdist,
+}
+
+impl PypiArtifactPhase {
+    fn label(self) -> &'static str {
+        match self {
+            Self::ExactWheel => "exact wheel",
+            Self::RelaxedWheel => "relaxed wheel",
+            Self::Sdist => "sdist",
+        }
+    }
+}
+
+/// Resolve artifacts across a complete PyPI index chain without letting an
+/// sdist or relaxed candidate on an earlier index shadow an exact wheel on a
+/// later one.
+///
+/// Artifact preference is global across the chain: exact-spec wheels on every
+/// index, then relaxed-spec wheels when policy allows, then sdists. A transport,
+/// authentication, parse, or build error remains fatal at the index where it
+/// occurred. Index priority is preserved within each artifact phase.
+async fn fetch_artifact_from_pypi_index_chain<T, X, XF>(
+    indexes: &[String],
+    try_relaxed_wheels: bool,
+    mut fetch: X,
+    exhaustion_context: String,
+) -> Result<T>
 where
-    X: Fn(String, VersionSpecifiers, String) -> XF,
+    X: FnMut(String, PypiArtifactPhase) -> XF,
     XF: std::future::Future<Output = Result<T>>,
 {
-    let PendingSource::Pypi {
-        specifiers,
-        indexes,
-    } = &pending.source
-    else {
-        return Ok(None);
-    };
+    let mut misses = Vec::new();
+    let phases = [
+        PypiArtifactPhase::ExactWheel,
+        PypiArtifactPhase::RelaxedWheel,
+        PypiArtifactPhase::Sdist,
+    ];
+    for phase in phases {
+        if phase == PypiArtifactPhase::RelaxedWheel && !try_relaxed_wheels {
+            continue;
+        }
+        for index in indexes {
+            match fetch(index.clone(), phase).await {
+                Ok(value) => return Ok(value),
+                Err(error) if pypi::is_pypi_index_miss(&error) => {
+                    tracing::debug!(
+                        index = %index,
+                        artifact_phase = phase.label(),
+                        error = %format!("{error:#}"),
+                        "no usable artifact on this PyPI index; continuing phase"
+                    );
+                    misses.push((phase.label(), index.clone(), format!("{error:#}")));
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "PyPI {} index chain aborted on `{index}` because the failure was not a package miss",
+                            phase.label(),
+                        )
+                    });
+                }
+            }
+        }
+    }
 
-    let fetched = fetch_from_pypi_index_chain(
-        indexes,
-        |index| fetch_pypi(pending.pypi_name.clone(), specifiers.clone(), index),
-        format!(
-            "BFS could not resolve `{}` from any configured PyPI index",
-            pending.pypi_name
-        ),
-    )
-    .await?;
-    Ok(Some(fetched))
+    if misses.is_empty() {
+        bail!("{exhaustion_context}: no PyPI index configured");
+    }
+    let diagnostics = misses
+        .into_iter()
+        .map(|(kind, index, error)| format!("  - {kind} {index}: {error}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    bail!("{exhaustion_context}; every configured index missed:\n{diagnostics}")
+}
+
+#[cfg(test)]
+mod wheel_then_sdist_chain_tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::{PypiArtifactPhase, fetch_artifact_from_pypi_index_chain};
+
+    #[tokio::test]
+    async fn later_vendor_wheel_beats_earlier_public_sdist() {
+        let indexes = vec!["public".to_string(), "vendor".to_string()];
+        let calls = Arc::new(Mutex::new(Vec::new()));
+
+        let result = fetch_artifact_from_pypi_index_chain(
+            &indexes,
+            true,
+            {
+                let calls = calls.clone();
+                move |index, phase| {
+                    let calls = calls.clone();
+                    async move {
+                        calls
+                            .lock()
+                            .unwrap()
+                            .push(format!("{}:{index}", phase.label()));
+                        match phase {
+                            PypiArtifactPhase::ExactWheel if index == "vendor" => {
+                                Ok("vendor-wheel".to_string())
+                            }
+                            PypiArtifactPhase::RelaxedWheel if index == "public" => {
+                                Ok("public-relaxed-wheel".to_string())
+                            }
+                            PypiArtifactPhase::Sdist if index == "public" => {
+                                Ok("public-sdist".to_string())
+                            }
+                            _ => Err(crate::pypi::pypi_index_miss("artifact miss")),
+                        }
+                    }
+                }
+            },
+            "fixture exhaustion".to_string(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, "vendor-wheel");
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec!["exact wheel:public", "exact wheel:vendor"],
+            "relaxation and sdist lookup must not start while a later index has an exact wheel"
+        );
+    }
+
+    #[tokio::test]
+    async fn sdist_search_starts_only_after_every_wheel_index_misses() {
+        let indexes = vec!["first".to_string(), "second".to_string()];
+        let calls = Arc::new(Mutex::new(Vec::new()));
+
+        let result = fetch_artifact_from_pypi_index_chain(
+            &indexes,
+            true,
+            {
+                let calls = calls.clone();
+                move |index, phase| {
+                    let calls = calls.clone();
+                    async move {
+                        calls
+                            .lock()
+                            .unwrap()
+                            .push(format!("{}:{index}", phase.label()));
+                        if phase == PypiArtifactPhase::Sdist && index == "first" {
+                            return Ok("first-sdist".to_string());
+                        }
+                        Err(crate::pypi::pypi_index_miss("artifact miss"))
+                    }
+                }
+            },
+            "fixture exhaustion".to_string(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, "first-sdist");
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                "exact wheel:first",
+                "exact wheel:second",
+                "relaxed wheel:first",
+                "relaxed wheel:second",
+                "sdist:first",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn fatal_wheel_error_still_aborts_the_chain() {
+        let indexes = vec!["broken".to_string(), "later".to_string()];
+        let calls = Arc::new(Mutex::new(Vec::new()));
+
+        let error = fetch_artifact_from_pypi_index_chain(
+            &indexes,
+            true,
+            {
+                let calls = calls.clone();
+                move |index, phase| {
+                    let calls = calls.clone();
+                    async move {
+                        calls
+                            .lock()
+                            .unwrap()
+                            .push(format!("{}:{index}", phase.label()));
+                        Err::<String, _>(anyhow::anyhow!("transport failure"))
+                    }
+                }
+            },
+            "fixture exhaustion".to_string(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("exact wheel index chain aborted on `broken`"));
+        assert_eq!(*calls.lock().unwrap(), vec!["exact wheel:broken"]);
+    }
 }
 
 /// Select the full chain inherited by ordinary PyPI descendants.
@@ -6334,10 +6513,10 @@ async fn resolve_bundle(
         // Phase 2: fetch this level's PyPI-form wheels concurrently
         // (8-way bounded, order-preserving `buffered`). Git/URL forms
         // pass through untouched and materialize serially in phase 3.
-        // Each index keeps the old single-index order: wheel resolve -> fetch,
-        // then sdist fallback on wheel-resolve failure. A complete per-index
-        // failure advances to the next index; exhausting the chain fails the
-        // bundle with the final error.
+        // Search the COMPLETE index chain for a compatible wheel before
+        // trying any sdist. Otherwise a public wheel-stub sdist can shadow
+        // the real binary on a later vendor index (isaacsim-app on NVIDIA).
+        // Fatal index or build errors still abort immediately.
         // favor-lock: build a snapshot of the preferred versions for this fetch
         // sweep.  We only look versions up (no mutation), so a cheap reference
         // to the caller's BTreeMap is enough -- but async closures capture by
@@ -6361,27 +6540,34 @@ async fn resolve_bundle(
             let favor_lock_snap_ref = &favor_lock_snap;
             stream::iter(to_materialize)
                 .map(|pending| async move {
-                    // A preferred lock version remains only a per-index hint;
-                    // the complete pending chain still decides fallback order.
                     let dep_canon = crate::relax::canonical_conda_name(&pending.pypi_name);
                     let prefer_version = favor_lock_snap_ref.get(&dep_canon).cloned();
-                    let result =
-                        fetch_pending_pypi_with(&pending, &|pypi_name, specifiers, index| {
-                            let prefer_version = prefer_version.clone();
-                            async move {
-                                bfs_fetch_pypi(
-                                    &pypi_name,
-                                    &specifiers,
-                                    &index,
-                                    target,
-                                    download_dir,
-                                    relax,
-                                    prefer_version.as_deref(),
-                                )
-                                .await
-                            }
-                        })
-                        .await;
+                    let request = match &pending.source {
+                        PendingSource::Pypi {
+                            specifiers,
+                            indexes,
+                        } => Some((
+                            pending.pypi_name.clone(),
+                            specifiers.clone(),
+                            indexes.clone(),
+                        )),
+                        PendingSource::Git { .. } | PendingSource::Url { .. } => None,
+                    };
+                    let result = if let Some((pypi_name, specifiers, indexes)) = request {
+                        bfs_fetch_pypi_from_chain(
+                            &pypi_name,
+                            &specifiers,
+                            &indexes,
+                            target,
+                            download_dir,
+                            relax,
+                            prefer_version.as_deref(),
+                        )
+                        .await
+                        .map(Some)
+                    } else {
+                        Ok(None)
+                    };
                     (pending, result)
                 })
                 .buffered(8)
@@ -6602,12 +6788,6 @@ async fn resolve_bundle(
     Ok(bfs_bundle)
 }
 
-/// One PyPI-form BFS item's materialization: wheel resolve -> fetch,
-/// with sdist fallback on wheel-resolve failure (PyPI publishers like
-/// OpenAI gym stopped shipping wheels; uv builds the sdist into a
-/// wheel). The sdist fallback uses the SAME spec, so a narrow version
-/// pin still gets honored. Extracted verbatim from the old serial BFS
-/// arm so phase 2 of the level loop can run items concurrently.
 /// v1.5.9: produce the relaxed retry specifiers for a sub-wheel whose
 /// EXACT upstream pin is missing from the index. Returns None when the
 /// policy doesn't relax or relaxation changes nothing (bare deps,
@@ -6635,7 +6815,7 @@ fn relaxed_retry_specs(
 }
 
 /// Sdist provenance captured by the BFS sdist fallback path.
-/// Threaded out of `bfs_fetch_pypi` so the caller can populate
+/// Threaded out of `bfs_fetch_pypi_sdist` so the caller can populate
 /// `ResolvedWheel.sdist_source` without losing the `sdist.url` that
 /// was previously discarded at mod.rs (THE DISCARD POINT in §1.1).
 pub(super) struct SdistProv {
@@ -6674,137 +6854,168 @@ fn bfs_fetch_provenance(
     (upstream_url, sdist_source, metadata_provenance)
 }
 
-async fn bfs_fetch_pypi(
+/// Resolve one PyPI BFS request using global artifact phases across the full
+/// configured index chain: exact wheels, relaxed wheels, then sdists.
+async fn bfs_fetch_pypi_from_chain(
+    pypi_name: &str,
+    specifiers: &VersionSpecifiers,
+    indexes: &[String],
+    target: &WheelTarget,
+    download_dir: &Path,
+    relax: RelaxPolicy,
+    prefer_version: Option<&str>,
+) -> Result<BfsFetched> {
+    let relaxed = relaxed_retry_specs(pypi_name, specifiers, relax);
+    let try_relaxed = relaxed.is_some();
+    fetch_artifact_from_pypi_index_chain(
+        indexes,
+        try_relaxed,
+        |index, phase| {
+            let pypi_name = pypi_name.to_string();
+            let exact = specifiers.clone();
+            let relaxed = relaxed.clone();
+            let target = target.clone();
+            let download_dir = download_dir.to_path_buf();
+            let prefer_version = prefer_version.map(str::to_string);
+            async move {
+                match phase {
+                    PypiArtifactPhase::ExactWheel => {
+                        bfs_fetch_pypi_wheel(
+                            &pypi_name,
+                            &exact,
+                            &index,
+                            &target,
+                            &download_dir,
+                            prefer_version.as_deref(),
+                        )
+                        .await
+                    }
+                    PypiArtifactPhase::RelaxedWheel => {
+                        let relaxed = relaxed.as_ref().expect(
+                            "relaxed artifact phase runs only when relaxed specs are available",
+                        );
+                        let fetched = bfs_fetch_pypi_wheel(
+                            &pypi_name,
+                            relaxed,
+                            &index,
+                            &target,
+                            &download_dir,
+                            None,
+                        )
+                        .await?;
+                        tracing::warn!(
+                            dep = %pypi_name,
+                            exact = %exact,
+                            relaxed = %relaxed,
+                            resolved = %fetched.0,
+                            "PATCH-DRIFT FALLBACK: exact upstream pin was absent from every index; resolved a relaxed wheel. If this dep is part of a pinned wheel family (isaacsim-*), check for runtime contract drift.",
+                        );
+                        crate::status::tty(&format!(
+                            "warning: {pypi_name}{exact} absent from every index; using relaxed match {} (possible family version drift)",
+                            fetched.0,
+                        ));
+                        Ok(fetched)
+                    }
+                    PypiArtifactPhase::Sdist => {
+                        bfs_fetch_pypi_sdist(
+                            &pypi_name,
+                            &exact,
+                            &index,
+                            &target,
+                            &download_dir,
+                        )
+                        .await
+                    }
+                }
+            }
+        },
+        format!("BFS could not resolve `{pypi_name}` from any configured PyPI index"),
+    )
+    .await
+}
+
+/// Resolve and materialize a binary wheel from one index. A semantic miss is
+/// returned unchanged so the chain-level caller can try every remaining wheel
+/// index before considering source distributions.
+async fn bfs_fetch_pypi_wheel(
     pypi_name: &str,
     specifiers: &VersionSpecifiers,
     index: &str,
     target: &WheelTarget,
     download_dir: &Path,
-    relax: RelaxPolicy,
     // favor-lock: when Some, prefer this version on the index before falling
     // back to highest-version selection. Propagated from favor_lock_prefs by the
     // BFS phase-2 fetch loop when RETREAD_FAVOR_LOCK=1. None on the cold path.
     prefer_version: Option<&str>,
 ) -> Result<BfsFetched> {
-    // v1.5.9 exact-first: `specifiers` are the ORIGINAL (pre-D)
-    // upstream pins, so exact family pins (isaacsim-kernel==6.0.0.0)
-    // resolve the exact version and the installed family stays
-    // patch-consistent. Only when the exact version has VANISHED from
-    // the index do we retry with the relaxed range -- loudly, because
-    // that is precisely the patch-drift condition that broke Kit
-    // extension resolution (6.0.0.0 experience files requiring
-    // extensions the 6.0.0.1 sensor wheel renamed).
-    let wheel_result = match if let Some(pv) = prefer_version {
+    let resolved = if let Some(pv) = prefer_version {
         pypi::resolve_preferring(index, pypi_name, specifiers, target, pv).await
     } else {
         pypi::resolve(index, pypi_name, specifiers, target).await
-    } {
-        Ok(resolved) => Ok(resolved),
-        Err(exact_err) if pypi::is_pypi_index_miss(&exact_err) => {
-            if let Some(relaxed) = relaxed_retry_specs(pypi_name, specifiers, relax) {
-                match pypi::resolve(index, pypi_name, &relaxed, target).await {
-                    Ok(resolved) => {
-                        tracing::warn!(
-                            dep = %pypi_name,
-                            exact = %specifiers,
-                            relaxed = %relaxed,
-                            resolved = %resolved.filename,
-                            "PATCH-DRIFT FALLBACK: exact upstream pin not on the index; resolved a relaxed match. If this dep is part of a pinned wheel family (isaacsim-*), check for runtime contract drift.",
-                        );
-                        crate::status::tty(&format!(
-                            "warning: {pypi_name}{specifiers} not on index; using relaxed match {} (possible family version drift)",
-                            resolved.filename,
-                        ));
-                        Ok(resolved)
-                    }
-                    Err(relaxed_err) if pypi::is_pypi_index_miss(&relaxed_err) => Err(exact_err),
-                    Err(relaxed_err) => Err(relaxed_err).with_context(|| {
-                        format!(
-                            "relaxed PyPI resolve for {pypi_name} {relaxed} on {index} failed fatally"
-                        )
-                    }),
-                }
-            } else {
-                Err(exact_err)
-            }
-        }
-        Err(fatal) => Err(fatal),
+    }?;
+    let metadata = metadata_preferring_sidecar(&resolved, download_dir).await?;
+    Ok((resolved.url, metadata, None))
+}
+
+/// Resolve and build a source distribution from one index. This runs only
+/// after binary-wheel resolution missed on every configured index, so source
+/// builds cannot shadow later vendor wheels. The sdist uses the original spec,
+/// preserving exact upstream pins and lock provenance.
+async fn bfs_fetch_pypi_sdist(
+    pypi_name: &str,
+    specifiers: &VersionSpecifiers,
+    index: &str,
+    target: &WheelTarget,
+    download_dir: &Path,
+) -> Result<BfsFetched> {
+    let (sdist_version, sdist) = pypi::resolve_sdist(index, pypi_name, specifiers)
+        .await
+        .with_context(|| format!("BFS sdist fallback for {pypi_name} {specifiers} on {index}"))?;
+    // Capture the sdist URL before the build so replay keeps the immutable
+    // source even though the materialized wheel is a local file URL.
+    let captured_sdist_url = sdist.url.clone();
+    // Unified sdist build cache dir keyed on (name, version) so BFS,
+    // discovery, and replay all share the same output directory and never
+    // rebuild the same (name, version) twice.
+    let sdist_out = download_dir
+        .join("sdist-builds")
+        .join(format!("{pypi_name}-{sdist_version}"));
+    let built = crate::source_build::build_wheel_from_sdist_url(
+        &sdist.url,
+        &sdist_out,
+        &target.python_version,
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "uv-building wheel from sdist {} for {}",
+            sdist.url, pypi_name,
+        )
+    })?;
+    let built_url = url::Url::from_file_path(&built).map_err(|_| {
+        anyhow!(
+            "built wheel path is not a valid file URL: {}",
+            built.display(),
+        )
+    })?;
+    let metadata = tokio::task::spawn_blocking({
+        let p = built.clone();
+        move || crate::wheel::read_metadata(&p)
+    })
+    .await
+    .context("metadata reader panicked")??;
+    tracing::info!(
+        dep = %pypi_name,
+        built = %built.display(),
+        "BFS sdist fallback: built wheel from sdist after all wheel indexes missed",
+    );
+    let prov = SdistProv {
+        index: index.to_string(),
+        name: pypi_name.to_string(),
+        version: metadata.version.clone(),
+        sdist_url: captured_sdist_url,
     };
-    let (resolved_url, metadata, sdist_prov) = match wheel_result {
-        Ok(resolved) => {
-            let metadata = metadata_preferring_sidecar(&resolved, download_dir).await?;
-            // Wheel path: no sdist provenance.
-            (resolved.url, metadata, None)
-        }
-        Err(wheel_err) if pypi::is_pypi_index_miss(&wheel_err) => {
-            tracing::info!(
-                dep = %pypi_name,
-                spec = %specifiers,
-                index = %index,
-                error = %format!("{wheel_err:#}"),
-                "BFS PyPI wheel resolve failed; attempting sdist fallback",
-            );
-            let (sdist_version, sdist) = pypi::resolve_sdist(index, pypi_name, specifiers)
-                .await
-                .with_context(|| {
-                    format!(
-                        "BFS sdist fallback for {} {} on {} (after wheel-resolve failure: {})",
-                        pypi_name, specifiers, index, wheel_err,
-                    )
-                })?;
-            // Capture the sdist URL BEFORE consuming `sdist` (THE FIX:
-            // previously this was discarded and never threaded out).
-            let captured_sdist_url = sdist.url.clone();
-            // Unified sdist build cache dir keyed on (name, version) so BFS,
-            // discovery, and replay all share the same output directory and
-            // never rebuild the same (name, version) twice.
-            let sdist_out = download_dir
-                .join("sdist-builds")
-                .join(format!("{pypi_name}-{sdist_version}"));
-            let built = crate::source_build::build_wheel_from_sdist_url(
-                &sdist.url,
-                &sdist_out,
-                &target.python_version,
-            )
-            .await
-            .with_context(|| {
-                format!(
-                    "uv-building wheel from sdist {} for {}",
-                    sdist.url, pypi_name,
-                )
-            })?;
-            let built_url = url::Url::from_file_path(&built).map_err(|_| {
-                anyhow!(
-                    "built wheel path is not a valid file URL: {}",
-                    built.display(),
-                )
-            })?;
-            let metadata = tokio::task::spawn_blocking({
-                let p = built.clone();
-                move || crate::wheel::read_metadata(&p)
-            })
-            .await
-            .context("metadata reader panicked")??;
-            tracing::info!(
-                dep = %pypi_name,
-                built = %built.display(),
-                "BFS sdist fallback: built wheel from sdist",
-            );
-            // Build the sdist provenance descriptor. `version` comes from the
-            // built wheel's parsed metadata (authoritative resolved version).
-            let prov = SdistProv {
-                index: index.to_string(),
-                name: pypi_name.to_string(),
-                version: metadata.version.clone(),
-                sdist_url: captured_sdist_url,
-            };
-            // Return built_url (file://) for the URL slot; the caller
-            // will SUPPRESS this as upstream_url when sdist_prov.is_some().
-            (built_url, metadata, Some(prov))
-        }
-        Err(fatal) => return Err(fatal),
-    };
-    Ok((resolved_url, metadata, sdist_prov))
+    Ok((built_url, metadata, Some(prov)))
 }
 
 /// True if `output` exists on disk and is newer than `input`. Used to
@@ -13400,7 +13611,7 @@ mod resolve_bundle_bfs_tests {
         PypiToCondaMap, ResolvedWheel, WheelTarget, merge_uv_pins_into_prefs, resolve_bundle,
     };
     use crate::config::{RelaxPolicy, WheelEntry};
-    use crate::index_chain::{IndexPurpose, PUBLIC_PYPI, index_chain};
+    use crate::index_chain::{IndexPurpose, index_chain};
     use crate::relax::NameMap;
 
     fn unique_tmp_dir() -> std::path::PathBuf {
