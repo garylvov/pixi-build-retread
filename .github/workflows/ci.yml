@@ -9,6 +9,9 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 # Cancel superseded runs on the same ref.
 concurrency:
   group: ci-${{ github.ref }}
@@ -17,9 +20,9 @@ concurrency:
 jobs:
   build-test:
     name: build + test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       # edition 2024 needs Rust >= 1.85; pinned exact version below (kept in
       # sync with rust-toolchain.toml) so CI and local fmt/clippy never drift.
@@ -63,10 +66,10 @@ jobs:
   # backlog is cleaned up.
   lint:
     name: fmt + clippy (advisory)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.97.0
@@ -89,9 +92,9 @@ jobs:
   # glibc symbol references ever sneak back in.
   musl-static:
     name: static musl build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Install Rust toolchain (musl target)
         uses: dtolnay/rust-toolchain@1.97.0
@@ -126,9 +129,9 @@ jobs:
   # message when the change provably leaves emitted output unchanged.
   emit-epoch-guard:
     name: EMIT_EPOCH guard
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
 
