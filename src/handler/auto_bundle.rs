@@ -3868,11 +3868,13 @@ pillow = ">=10,<13"
         .unwrap();
         let manifest = crate::workspace::WorkspaceManifest::load(&tmp).unwrap();
         let target = crate::pypi::WheelTarget::for_subdir("3.10", "linux-64");
+        let resolution_target =
+            crate::pypi::ResolutionTarget::from_wheel_target(target.clone(), None);
         let context = super::super::CondaCoSolveContext::new(
             Some(&manifest),
             Some(&tmp),
             &tmp.join("hover-pack"),
-            &target,
+            &resolution_target,
             &[],
             "hover-pack",
         );

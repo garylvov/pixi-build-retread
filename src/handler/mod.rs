@@ -502,7 +502,94 @@ fn workspace_solve_fingerprint(
             .into_iter()
             .map(|line| format!("co-activated-sibling:{line}")),
     );
+    for (name, specs) in sibling_conda_run_dependencies(manifest, workspace_dir, source_dir, target)
+    {
+        for spec in specs {
+            parts.push(format!("co-activated-sibling-conda:{name}={spec}"));
+        }
+    }
     parts.join("\n")
+}
+
+/// Load every exact-target Retread lock activated beside this pack.
+///
+/// Keeping discovery and replay-contract validation in one place is
+/// load-bearing: UV constraints and conda co-solve inputs must describe the
+/// same sibling set.
+fn coactivated_sibling_locks(
+    manifest: &crate::workspace::WorkspaceManifest,
+    workspace_dir: &Path,
+    source_dir: &Path,
+    target: &ResolutionTarget,
+) -> Vec<(String, crate::lock::RetreadLock)> {
+    let Some(envs) = manifest.precise_consuming_envs_for_target(
+        workspace_dir,
+        source_dir,
+        target.conda_subdir(),
+    ) else {
+        return Vec::new();
+    };
+    let source_canon = std::fs::canonicalize(source_dir).unwrap_or_else(|_| source_dir.into());
+    let mut siblings = BTreeMap::new();
+    for env in envs {
+        for (bundle, raw_path) in
+            manifest.effective_path_dependencies_for_target(&env, target.conda_subdir())
+        {
+            let raw_path = PathBuf::from(raw_path);
+            let pack_dir = if raw_path.is_absolute() {
+                raw_path
+            } else {
+                workspace_dir.join(raw_path)
+            };
+            let pack_canon = std::fs::canonicalize(&pack_dir).unwrap_or(pack_dir);
+            if pack_canon != source_canon {
+                siblings.insert(bundle, pack_canon);
+            }
+        }
+    }
+
+    siblings
+        .into_iter()
+        .filter_map(|(bundle, pack_dir)| {
+            // Preserve the declared bundle spelling for its lock filename and
+            // replay contract. Conda names may legally contain dots.
+            let lock_path = pack_dir.join(crate::lock::RetreadLock::file_name_for_target(
+                &bundle, target,
+            ));
+            let lock = crate::lock::RetreadLock::load(&lock_path).ok()?;
+            lock.validate_replay_contract_for_target(target, &bundle)
+                .ok()?;
+            Some((bundle, lock))
+        })
+        .collect()
+}
+
+/// Exact emitted conda contracts of co-activated sibling packs.
+///
+/// These are not UV constraints: they describe whether a proposed conda
+/// route can coexist with packages Pixi will install beside this bundle. A
+/// route that conflicts here must remain a PyPI wheel instead of poisoning
+/// the eventual workspace solve.
+fn sibling_conda_run_dependencies(
+    manifest: &crate::workspace::WorkspaceManifest,
+    workspace_dir: &Path,
+    source_dir: &Path,
+    target: &ResolutionTarget,
+) -> BTreeMap<String, Vec<String>> {
+    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (_, lock) in coactivated_sibling_locks(manifest, workspace_dir, source_dir, target) {
+        for dep in lock.conda_run_deps {
+            let name = canonical_conda_name(&dep.name);
+            let specs = out.entry(name).or_default();
+            if !specs.contains(&dep.spec) {
+                specs.push(dep.spec);
+            }
+        }
+    }
+    for specs in out.values_mut() {
+        specs.sort();
+    }
+    out
 }
 
 /// Read the exact-target committed locks of Retread path packages activated
@@ -520,51 +607,8 @@ fn sibling_lock_constraints(
     target: &ResolutionTarget,
 ) -> crate::uv_closure::ConstraintSet {
     let mut out = crate::uv_closure::ConstraintSet::default();
-    let Some(envs) = manifest.precise_consuming_envs_for_target(
-        workspace_dir,
-        source_dir,
-        target.conda_subdir(),
-    ) else {
-        return out;
-    };
-    let source_canon = std::fs::canonicalize(source_dir).unwrap_or_else(|_| source_dir.into());
-    let mut siblings = BTreeMap::new();
-    for env in envs {
-        for (bundle, raw_path) in
-            manifest.effective_path_dependencies_for_target(&env, target.conda_subdir())
-        {
-            let raw_path = PathBuf::from(raw_path);
-            let pack_dir = if raw_path.is_absolute() {
-                raw_path
-            } else {
-                workspace_dir.join(raw_path)
-            };
-            let pack_canon = std::fs::canonicalize(&pack_dir).unwrap_or(pack_dir);
-            if pack_canon == source_canon {
-                continue;
-            }
-            // Preserve the declared bundle spelling for its lock filename and
-            // replay contract. Conda names may legally contain dots, and the
-            // lock namespace is exact (`isaaclab-2.3x-pack` must not become
-            // `isaaclab-2-3x-pack`). Dependency names are canonicalized below.
-            siblings.insert(bundle, pack_canon);
-        }
-    }
-
     let mut seen = BTreeSet::new();
-    for (bundle, pack_dir) in siblings {
-        let lock_path = pack_dir.join(crate::lock::RetreadLock::file_name_for_target(
-            &bundle, target,
-        ));
-        let Ok(lock) = crate::lock::RetreadLock::load(&lock_path) else {
-            continue;
-        };
-        if lock
-            .validate_replay_contract_for_target(target, &bundle)
-            .is_err()
-        {
-            continue;
-        }
+    for (bundle, lock) in coactivated_sibling_locks(manifest, workspace_dir, source_dir, target) {
         // Compose only the sibling's declared entry wheels. Transitive wheel
         // metadata can be internally contradictory after Retread routes or
         // relaxes those dependencies (for example cmeel-boost's numpy>=2 and
@@ -644,8 +688,11 @@ fn locked_entry_name(spec: &str) -> Option<String> {
 mod sibling_lock_constraint_tests {
     use std::collections::BTreeMap;
 
-    use super::{sibling_lock_constraints, workspace_solve_fingerprint};
-    use crate::lock::{LockWheel, Origin, RetreadLock, SCHEMA};
+    use super::{
+        CondaCoSolveContext, sibling_conda_run_dependencies, sibling_lock_constraints,
+        workspace_solve_fingerprint,
+    };
+    use crate::lock::{CondaDep, LockWheel, Origin, RetreadLock, SCHEMA};
     use crate::pypi::{ResolutionTarget, WheelTarget};
 
     fn temp_workspace() -> std::path::PathBuf {
@@ -738,7 +785,10 @@ composed = { features = ["composed"], no-default-feature = true }
                     sdist_source: None,
                 },
             ],
-            conda_run_deps: Vec::new(),
+            conda_run_deps: vec![CondaDep {
+                name: "numba".to_string(),
+                spec: ">=0.59.1,<0.60".to_string(),
+            }],
             index_urls: vec!["https://pypi.org/simple/".to_string()],
             prerelease: BTreeMap::new(),
             shadow_libs: BTreeMap::new(),
@@ -799,6 +849,30 @@ composed = { features = ["composed"], no-default-feature = true }
         let fingerprint =
             workspace_solve_fingerprint(&manifest, &dir, &dir.join("current"), &target);
         assert!(fingerprint.contains("co-activated-sibling:transformers>=4.57.6, <4.58"));
+        assert!(
+            fingerprint.contains("co-activated-sibling-conda:numba=>=0.59.1,<0.60"),
+            "fingerprint was {fingerprint}",
+        );
+        assert_eq!(
+            sibling_conda_run_dependencies(&manifest, &dir, &dir.join("current"), &target)
+                .get("numba"),
+            Some(&vec![">=0.59.1,<0.60".to_string()]),
+        );
+        let context = CondaCoSolveContext::new(
+            Some(&manifest),
+            Some(&dir),
+            &dir.join("current"),
+            &target,
+            &[],
+            "current-pack",
+        );
+        assert_eq!(
+            context
+                .workspace_deps
+                .get(&crate::relax::CondaName::new("numba")),
+            Some(&vec![">=0.59.1,<0.60".to_string()]),
+            "the conda route oracle must compose the sibling's emitted contract",
+        );
 
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -3638,7 +3712,7 @@ impl CondaCoSolveContext {
         manifest: Option<&crate::workspace::WorkspaceManifest>,
         workspace_dir: Option<&Path>,
         source_dir: &Path,
-        target: &WheelTarget,
+        target: &ResolutionTarget,
         conda_channels: &[ChannelUrl],
         bundle: &str,
     ) -> Self {
@@ -3649,15 +3723,20 @@ impl CondaCoSolveContext {
                     _ => rattler_solve::ChannelPriority::Strict,
                 },
                 match workspace_dir {
-                    Some(workspace_dir) => {
-                        manifest.consuming_env_system_requirements(workspace_dir, source_dir)
-                    }
-                    None => manifest.effective_system_requirements("default"),
+                    Some(workspace_dir) => manifest.consuming_env_system_requirements_for_target(
+                        workspace_dir,
+                        source_dir,
+                        target.conda_subdir(),
+                    ),
+                    None => manifest
+                        .effective_system_requirements_for_target("default", target.conda_subdir()),
                 },
                 match workspace_dir {
-                    Some(workspace_dir) => {
-                        manifest.consuming_env_dependencies(workspace_dir, source_dir)
-                    }
+                    Some(workspace_dir) => manifest.consuming_env_dependencies_for_target(
+                        workspace_dir,
+                        source_dir,
+                        target.conda_subdir(),
+                    ),
                     None => Default::default(),
                 },
             ),
@@ -3667,17 +3746,30 @@ impl CondaCoSolveContext {
                 Default::default(),
             ),
         };
+        let mut workspace_deps: BTreeMap<CondaName, Vec<String>> = raw_workspace_deps
+            .into_iter()
+            .map(|(name, specs)| (CondaName::new(name), specs))
+            .collect();
+        if let (Some(manifest), Some(workspace_dir)) = (manifest, workspace_dir) {
+            for (name, specs) in
+                sibling_conda_run_dependencies(manifest, workspace_dir, source_dir, target)
+            {
+                let destination = workspace_deps.entry(CondaName::new(name)).or_default();
+                for spec in specs {
+                    if !destination.contains(&spec) {
+                        destination.push(spec);
+                    }
+                }
+            }
+        }
         Self {
             channels: conda_channels.to_vec(),
-            python: target.python_version.clone(),
-            subdir: target.conda_subdir.clone(),
+            python: target.python_version().to_string(),
+            subdir: target.conda_subdir().to_string(),
             bundle: PypiKey::from_pypi(bundle),
             channel_priority,
             system_requirements,
-            workspace_deps: raw_workspace_deps
-                .into_iter()
-                .map(|(name, specs)| (CondaName::new(name), specs))
-                .collect(),
+            workspace_deps,
         }
     }
 
