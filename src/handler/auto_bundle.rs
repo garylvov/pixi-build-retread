@@ -1092,14 +1092,14 @@ fn route_group_is_fully_mutable(
 }
 
 /// Does this canonical conda dependency have metadata supplied by a
-/// source-built wheel? Those requirements belong to the source package's
-/// natural run-dependency emission: the source wheel already ships in the
-/// bundle and is not a uv root that can be restored through Rule 2.
+/// source-built wheel?
 ///
-/// Route ownership is grouped by canonical conda identity because emission
-/// deduplicates at that boundary. One source-built PyPI alias therefore fixes
-/// the whole group; partially restoring another alias would still remove the
-/// shared conda dependency.
+/// Source-built routes still participate in Rule 2: the dependency wheel can
+/// be bundled even though the declaring root wheel already ships in the pack.
+/// We retain the provenance distinction so an independently-unsatisfiable
+/// fixed baseline does not spuriously move every source-root dependency to
+/// PyPI. A source route is restored only after a satisfiable baseline proves
+/// that route (or a route group containing it) is the conflict.
 fn metadata_route_group_has_source_built_origin(
     metadata_routes: &ProvisionalMetadataRoutes,
     observed_requirements: &ObservedRequirements,
@@ -1133,11 +1133,10 @@ fn metadata_route_group_has_source_built_origin(
 }
 
 /// Finalize every provisional conda route against the exact dependency set
-/// this bundle would emit. Uv routes and index-backed metadata routes are
-/// mutable until this check succeeds; source-built metadata routes remain
-/// owned by natural conda run-dependency emission. Rejected mutable routes are
-/// restored through the same ordered PyPI fallback chain before the bundle is
-/// changed.
+/// this bundle would emit. Uv routes and metadata-probe routes, including
+/// requirements declared by source-built roots, are mutable until this check
+/// succeeds. Rejected routes are restored through the same ordered PyPI
+/// fallback chain before the bundle is changed.
 async fn jointly_unroute_unsolvable<C, CF, X, XF>(
     bundle: &mut Bundle,
     metadata_routes: &mut ProvisionalMetadataRoutes,
@@ -1197,6 +1196,7 @@ where
         .chain(metadata_routes.keys().cloned())
         .collect();
     let mut mutable_conda_names = BTreeSet::new();
+    let mut source_metadata_conda_names = BTreeSet::new();
     for conda_name in route_conda_names {
         if fixed_by_config.contains(&conda_name) {
             continue;
@@ -1218,7 +1218,7 @@ where
             observed_requirements,
             &conda_name,
         )? {
-            continue;
+            source_metadata_conda_names.insert(conda_name.clone());
         }
         if route_group_is_fully_mutable(bundle, metadata_routes, &conda_name, config, target)? {
             mutable_conda_names.insert(conda_name);
@@ -1258,12 +1258,20 @@ where
         co_solve,
     )
     .await;
-    // Rule 2 is fail-closed: an unsatisfiable/indeterminate baseline cannot
-    // authorize any mutable conda route. Typed assembly conflicts are always
-    // pre-rejected, then pass through the same restore gate below.
-    let mut rejected = selection
-        .map(|selection| selection.rejected)
-        .unwrap_or(mutable_candidates);
+    // Rule 2 is fail-closed for ordinary mutable routes: an unsatisfiable or
+    // indeterminate baseline cannot authorize them. Source-root metadata
+    // routes retain their existing conda placement until a satisfiable
+    // baseline positively identifies a conflicting route; otherwise an
+    // unrelated broken baseline would vendor every source-root dependency.
+    // Typed assembly conflicts are always pre-rejected, then pass through the
+    // same restore gate below.
+    let mut rejected = match selection {
+        Some(selection) => selection.rejected,
+        None => mutable_candidates
+            .into_iter()
+            .filter(|route| !source_metadata_conda_names.contains(route.conda_name.key().as_str()))
+            .collect(),
+    };
     rejected.extend(pre_rejected);
     let mut seen_rejected = BTreeSet::new();
     rejected.retain(|route| seen_rejected.insert(route.conda_name.key().into_string()));
@@ -3431,7 +3439,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn source_built_serveable_transitive_emits_conda_run_dependency() {
+    async fn source_built_route_survives_unsatisfiable_fixed_baseline() {
         const NAME: &str = "serveable-transitive";
         const RANGE: &str = ">=4.0.1,<4.1";
 
@@ -3496,8 +3504,8 @@ mod tests {
         assert_eq!(probed, vec![(NAME.to_string(), RANGE.to_string())]);
         assert_eq!(
             solve_calls.load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "source-built metadata routes must not enter Rule-2 candidate selection"
+            2,
+            "Rule 2 must test the complete route set and the fixed baseline"
         );
         assert_eq!(
             fetch_calls.load(std::sync::atomic::Ordering::SeqCst),
@@ -3537,6 +3545,70 @@ mod tests {
             .map(|dependency| super::super::audit_report::format_packagespec(&dependency.spec))
             .expect("recipe output must contain the serveable transitive");
         assert_eq!(output_spec, RANGE);
+    }
+
+    #[tokio::test]
+    async fn source_built_unsolvable_transitive_restores_pypi_wheel() {
+        const NAME: &str = "source-conflicting-transitive";
+        const RANGE: &str = ">=3,<4";
+
+        let co_solve = |routes: Vec<crate::uv_closure::CondaRouteSpec>| async move {
+            if routes
+                .iter()
+                .any(|route| route.conda_name.key().as_str() == NAME)
+            {
+                crate::uv_closure::CoInstallVerdict::Unsat(vec![format!(
+                    "{NAME} conflicts with a co-activated sibling constraint"
+                )])
+            } else {
+                crate::uv_closure::CoInstallVerdict::Sat
+            }
+        };
+        let fetch_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fetch = {
+            let fetch_calls = Arc::clone(&fetch_calls);
+            move |request: PypiFetchRequest, _indexes: Vec<String>, _failure_context: String| {
+                assert_eq!(request.pypi_name, NAME);
+                assert_eq!(
+                    request.specifiers,
+                    VersionSpecifiers::from_str(RANGE).unwrap()
+                );
+                fetch_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { Ok(test_wheel(NAME, NAME, "3.2.1", &[])) }
+            }
+        };
+        let target = crate::pypi::WheelTarget::for_subdir("3.11", "linux-64");
+        let config = test_config();
+        let mut bundle = test_bundle(&[&format!("{NAME}{RANGE}")]);
+        bundle.primary.metadata.name = "source-built-pack".to_string();
+        bundle.primary.metadata_provenance = Provenance::SourceBuiltRelaxed;
+
+        auto_bundle_transitives_with(
+            &mut bundle,
+            &[crate::workspace::DEFAULT_PYPI_INDEX.to_string()],
+            &target,
+            &config,
+            None,
+            None,
+            None,
+            &validated_probe,
+            &co_solve,
+            &fetch,
+            &["conda-forge/linux-64".to_string()],
+            &UvReresolveContext::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(fetch_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(bundle.extras.iter().any(|wheel| wheel.pypi_name == NAME));
+        let emitted = super::super::emitted_bundle_route_specs(&bundle, &config, &target).unwrap();
+        assert!(
+            emitted
+                .iter()
+                .all(|route| route.conda_name.key().as_str() != NAME),
+            "the rejected source-root dependency must be provided by its bundled wheel: {emitted:?}"
+        );
     }
 
     #[tokio::test]

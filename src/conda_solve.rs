@@ -536,6 +536,80 @@ mod tests {
         assert_eq!(pytorch.package_record.version.as_str(), "2.7.0");
     }
 
+    #[test]
+    fn selected_package_run_constraint_conflicts_with_installed_package() {
+        let mut pandas = repo_record("pandas", "3.0.3", &["python >=3.11,<3.12.0a0"]);
+        pandas.package_record.constrains = vec!["numba >=0.60.0".to_string()];
+        let all_records = vec![
+            repo_record("python", "3.11.5", &[]),
+            repo_record("numba", "0.59.1", &["python >=3.11,<3.12.0a0"]),
+            repo_record("numba", "0.60.0", &["python >=3.11,<3.12.0a0"]),
+            pandas,
+        ];
+        let specs = parse_match_specs(&[
+            "python 3.11.*".to_string(),
+            "pandas ==3.0.3".to_string(),
+            "numba >=0.59.1,<0.60".to_string(),
+        ]);
+        let reasons = solve_selected_records_from_records(
+            specs,
+            &all_records,
+            "3.11",
+            ChannelPriority::Strict,
+            &BTreeMap::new(),
+            SolveStrategy::Highest,
+            Vec::new(),
+        )
+        .expect_err("pandas' run constraint must reject numba 0.59");
+        assert!(
+            reasons.iter().any(|reason| unsat_mentions(reason, "numba")),
+            "unsat reasons should name numba: {reasons:?}",
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires conda-forge repodata"]
+    async fn sparse_conda_forge_pandas_keeps_numba_run_constraint() {
+        let channels = vec![ChannelUrl::from(
+            url::Url::parse("https://prefix.dev/conda-forge").unwrap(),
+        )];
+        let specs = parse_match_specs(&[
+            "python 3.11.*".to_string(),
+            "pandas >=3.0.3,<4".to_string(),
+            "numba >=0.59.1,<0.60".to_string(),
+        ]);
+        let (records, consulted) =
+            load_selected_records_sparse(&channels, "linux-64", &specs).await;
+        assert!(
+            !consulted.is_empty(),
+            "conda-forge repodata was not available"
+        );
+        let pandas = records
+            .iter()
+            .filter(|record| record.package_record.name.as_normalized() == "pandas")
+            .find(|record| record.package_record.version.as_str() == "3.0.3")
+            .expect("pandas 3.0.3 must be present in sparse records");
+        assert!(
+            pandas.package_record.constrains.iter().any(|constraint| {
+                constraint.starts_with("numba ") && constraint.contains(">=0.60")
+            }),
+            "pandas constraints were {:?}",
+            pandas.package_record.constrains,
+        );
+        let reasons = solve_on_blocking_pool(
+            specs,
+            records,
+            "3.11".to_string(),
+            ChannelPriority::Strict,
+            BTreeMap::new(),
+            SolveStrategy::Highest,
+            Vec::new(),
+        )
+        .await
+        .expect_err("the real pandas/numba closure must be unsatisfiable");
+        assert!(reasons.iter().any(|reason| unsat_mentions(reason, "numba")));
+    }
+
     /// The cuda-bindings incident, reproduced at the record level: an
     /// auto-routed exact pin (`cuda-bindings ==13.3.1`) whose conda
     /// variant requires `cuda-version >=13,<14` is fed into the SAME
