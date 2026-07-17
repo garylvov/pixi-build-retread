@@ -290,7 +290,12 @@ pub fn inject_checkout_root_data(
             CompressionMethod::Stored => CompressionMethod::Stored,
             _ => CompressionMethod::Deflated,
         };
-        let options = SimpleFileOptions::default().compression_method(compression);
+        // Source-built wheels inherit the build clock in their ZIP entry
+        // timestamps. Normalize every copied entry so identical source bytes
+        // produce an identical auto-data wheel across worktrees and replay.
+        let options = SimpleFileOptions::default()
+            .compression_method(compression)
+            .last_modified_time(zip::DateTime::default());
         writer.start_file(&name, options)?;
         if name == record_name {
             writer.write_all(new_record.as_bytes())?;
@@ -299,7 +304,9 @@ pub fn inject_checkout_root_data(
         }
     }
     for data in &data_entries {
-        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+        let options = SimpleFileOptions::default()
+            .compression_method(CompressionMethod::Deflated)
+            .last_modified_time(zip::DateTime::default());
         writer.start_file(&data.zip_path, options)?;
         writer.write_all(&data.bytes)?;
     }
@@ -426,11 +433,21 @@ mod tests {
     /// produces: one python module + a dist-info with METADATA, WHEEL,
     /// and RECORD. Mirrors the fixture style in wheel_inject tests.
     fn build_stub_wheel(dist_name: &str, dist_version: &str) -> Vec<u8> {
+        build_stub_wheel_at(dist_name, dist_version, zip::DateTime::default())
+    }
+
+    fn build_stub_wheel_at(
+        dist_name: &str,
+        dist_version: &str,
+        timestamp: zip::DateTime,
+    ) -> Vec<u8> {
         let dist_info = format!("{dist_name}-{dist_version}.dist-info");
         let mut buf: Vec<u8> = Vec::new();
         {
             let mut w = ZipWriter::new(Cursor::new(&mut buf));
-            let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+            let opts = SimpleFileOptions::default()
+                .compression_method(CompressionMethod::Deflated)
+                .last_modified_time(timestamp);
             w.start_file(format!("{dist_name}/__init__.py"), opts)
                 .unwrap();
             w.write_all(b"").unwrap();
@@ -454,6 +471,43 @@ mod tests {
             w.finish().unwrap();
         }
         buf
+    }
+
+    #[test]
+    fn auto_data_injection_normalizes_source_wheel_timestamps() -> Result<()> {
+        let parent = tempdir_in_target("retread-data-inject-timestamp")?;
+        let checkout = parent.join("repo");
+        let wheels = parent.join("wheels");
+        fs::create_dir_all(&checkout)?;
+        fs::create_dir_all(&wheels)?;
+        write_file(&checkout, "apps/example.kit", b"app-bytes\n");
+
+        let early = wheels.join("early.whl");
+        let late = wheels.join("late.whl");
+        fs::write(
+            &early,
+            build_stub_wheel_at(
+                "foo",
+                "1.0",
+                zip::DateTime::from_date_and_time(2025, 1, 2, 3, 4, 6)?,
+            ),
+        )?;
+        fs::write(
+            &late,
+            build_stub_wheel_at(
+                "foo",
+                "1.0",
+                zip::DateTime::from_date_and_time(2026, 7, 8, 9, 10, 12)?,
+            ),
+        )?;
+        let early_out = wheels.join("early.autodata.whl");
+        let late_out = wheels.join("late.autodata.whl");
+        inject_checkout_root_data(&early, &early_out, &checkout, &[])?;
+        inject_checkout_root_data(&late, &late_out, &checkout, &[])?;
+        assert_eq!(fs::read(early_out)?, fs::read(late_out)?);
+
+        let _ = fs::remove_dir_all(&parent);
+        Ok(())
     }
 
     fn write_file(root: &Path, rel: &str, body: &[u8]) {

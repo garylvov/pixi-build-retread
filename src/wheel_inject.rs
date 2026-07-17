@@ -203,7 +203,12 @@ pub fn inject_source_extras(src: &Path, dst: &Path, source_root: &Path) -> Resul
             CompressionMethod::Stored => CompressionMethod::Stored,
             _ => CompressionMethod::Deflated,
         };
-        let options = SimpleFileOptions::default().compression_method(compression);
+        // Source-built wheels inherit the build clock in their ZIP entry
+        // timestamps. Normalize every copied entry so identical source bytes
+        // produce an identical injected wheel across worktrees and replay.
+        let options = SimpleFileOptions::default()
+            .compression_method(compression)
+            .last_modified_time(zip::DateTime::default());
         writer.start_file(&name, options)?;
         if name == record_name {
             writer.write_all(new_record.as_bytes())?;
@@ -212,7 +217,9 @@ pub fn inject_source_extras(src: &Path, dst: &Path, source_root: &Path) -> Resul
         }
     }
     for extra in &extras {
-        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+        let options = SimpleFileOptions::default()
+            .compression_method(CompressionMethod::Deflated)
+            .last_modified_time(zip::DateTime::default());
         writer.start_file(&extra.zip_path, options)?;
         writer.write_all(&extra.bytes)?;
     }
@@ -465,6 +472,51 @@ mod tests {
         assert_eq!(to_zip_path(&p), "config/extension.toml");
         let p = Path::new("isaaclab").join("envs").join("manager.py");
         assert_eq!(to_zip_path(&p), "isaaclab/envs/manager.py");
+    }
+
+    #[test]
+    fn injection_normalizes_source_wheel_timestamps() -> Result<()> {
+        fn build(timestamp: zip::DateTime) -> Result<Vec<u8>> {
+            let mut buf = Vec::new();
+            let mut wheel = ZipWriter::new(Cursor::new(&mut buf));
+            let options = SimpleFileOptions::default()
+                .compression_method(CompressionMethod::Deflated)
+                .last_modified_time(timestamp);
+            wheel.start_file("foo/__init__.py", options)?;
+            wheel.write_all(b"x = 1\n")?;
+            wheel.start_file("foo-0.1.0.dist-info/RECORD", options)?;
+            wheel.write_all(b"foo/__init__.py,sha256=dummy,6\nfoo-0.1.0.dist-info/RECORD,,\n")?;
+            wheel.finish()?;
+            Ok(buf)
+        }
+
+        let base =
+            std::env::temp_dir().join(format!("retread-inject-timestamp-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let source_root = base.join("source");
+        let wheels = base.join("wheels");
+        fs::create_dir_all(source_root.join("foo"))?;
+        fs::create_dir_all(&wheels)?;
+        fs::write(source_root.join("foo/extra.py"), b"y = 2\n")?;
+
+        let early = wheels.join("early.whl");
+        let late = wheels.join("late.whl");
+        fs::write(
+            &early,
+            build(zip::DateTime::from_date_and_time(2025, 1, 2, 3, 4, 6)?)?,
+        )?;
+        fs::write(
+            &late,
+            build(zip::DateTime::from_date_and_time(2026, 7, 8, 9, 10, 12)?)?,
+        )?;
+        let early_out = wheels.join("early.injected.whl");
+        let late_out = wheels.join("late.injected.whl");
+        inject_source_extras(&early, &early_out, &source_root)?;
+        inject_source_extras(&late, &late_out, &source_root)?;
+        assert_eq!(fs::read(early_out)?, fs::read(late_out)?);
+
+        let _ = fs::remove_dir_all(&base);
+        Ok(())
     }
 
     /// End-to-end: build a minimal wheel in memory, inject from a tmp
