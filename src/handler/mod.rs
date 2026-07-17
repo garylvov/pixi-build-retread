@@ -9522,7 +9522,12 @@ async fn emit_wheels_from_lock(
                 // policy before courier performs its override/provider rewrite.
                 // Replay must feed courier the same phase-D bytes, not the raw
                 // upstream wheel, or the authoritative final SHA can drift.
-                let replay_local = relax_replayed_class2_wheel(fetched, config.relax).await?;
+                let replay_local = prepare_replayed_class2_wheel(
+                    fetched,
+                    config.relax,
+                    config.retread_wheels.contains_key(&lw.name),
+                )
+                .await?;
 
                 crate::emit_pypi::EmitWheel {
                     pypi_name: lw.name.clone(),
@@ -9555,8 +9560,15 @@ async fn emit_wheels_from_lock(
 /// raw upstream wheel on replay skips phase D and can therefore produce bytes
 /// that differ from the authoritative lock whenever the general relax policy
 /// widened an exact pin before courier staging.
-async fn relax_replayed_class2_wheel(fetched: PathBuf, relax: RelaxPolicy) -> Result<PathBuf> {
-    if relax == RelaxPolicy::None {
+async fn prepare_replayed_class2_wheel(
+    fetched: PathBuf,
+    relax: RelaxPolicy,
+    declared_root: bool,
+) -> Result<PathBuf> {
+    // Cold phase D runs in materialize_and_rewrite for declared roots. A
+    // remote-only BFS transitive is first downloaded inside courier itself,
+    // so courier receives its raw bytes instead. Preserve that distinction.
+    if !declared_root || relax == RelaxPolicy::None {
         return Ok(fetched);
     }
 
@@ -11312,10 +11324,10 @@ mod replay_tests {
 
     use super::{
         AutoDataConfig, load_replayable_lock, load_replayable_lock_for_target,
-        materialize_from_lock_for_target, relax_replayed_class2_wheel, replay_from_lock,
+        materialize_from_lock_for_target, prepare_replayed_class2_wheel, replay_from_lock,
         replay_sdist_cache_key, validate_authoritative_replay_lock,
     };
-    use crate::config::RetreadConfig;
+    use crate::config::{RelaxPolicy, RetreadConfig};
     use crate::lock::{CondaDep, GitWheelSource, LockWheel, Origin, RetreadLock, SCHEMA};
     use crate::pypi::ResolutionTarget;
     use crate::wheel_rewrite::rewrite_wheel;
@@ -12726,7 +12738,7 @@ mod replay_tests {
         std::fs::create_dir_all(&replay_download).unwrap();
         let fetched_replay = replay_download.join(&p3d_whl_name);
         std::fs::write(&fetched_replay, &raw_wheel_bytes).unwrap();
-        let replay_local = relax_replayed_class2_wheel(fetched_replay, config.relax)
+        let replay_local = prepare_replayed_class2_wheel(fetched_replay, config.relax, true)
             .await
             .unwrap();
 
@@ -12831,6 +12843,26 @@ mod replay_tests {
             cold_lw.sdist_source, replay_lw.sdist_source,
             "PARITY FAIL: sdist_source mismatch"
         );
+    }
+
+    #[tokio::test]
+    async fn class2_replay_transitive_keeps_raw_pre_courier_bytes() {
+        let dir = unique_tmp_dir();
+        let raw = dir.join("sidecar_dep-1.2.3-py3-none-any.whl");
+        let bytes = make_wheel_bytes_for_replay("sidecar-dep", "1.2.3", &["nested-dep==4.5.6"]);
+        std::fs::write(&raw, &bytes).unwrap();
+
+        let prepared = prepare_replayed_class2_wheel(raw.clone(), RelaxPolicy::Minor, false)
+            .await
+            .unwrap();
+
+        assert_eq!(prepared, raw);
+        assert_eq!(std::fs::read(&prepared).unwrap(), bytes);
+        assert!(
+            !prepared.with_extension("relaxed.whl").exists(),
+            "a cold remote-only transitive enters courier as raw bytes"
+        );
+        std::fs::remove_dir_all(dir).ok();
     }
 
     /// (3) CLASS-2 live round-trip: materialize_from_lock re-fetches a real upstream
