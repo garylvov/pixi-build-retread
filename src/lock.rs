@@ -495,7 +495,7 @@ pub const SCHEMA: u32 = 12;
 /// Epoch 19: the zip writer upgrade from 2.4 to 6.0 can change rewritten wheel
 /// bytes for identical metadata edits. Existing locks and shadow caches must
 /// cold-derive once so their recorded content hashes match the new writer.
-pub const EMIT_EPOCH: u32 = 19;
+pub const EMIT_EPOCH: u32 = 20;
 
 fn parse_stored_glibc(value: Option<&str>) -> Option<Option<(u32, u32)>> {
     match value {
