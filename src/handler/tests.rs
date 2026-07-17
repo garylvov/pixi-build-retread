@@ -3862,6 +3862,27 @@ fn dedupe_roots_last_wins_preserves_order_when_no_collisions() {
     assert_eq!(dedupe_roots_last_wins(roots.clone()), roots);
 }
 
+#[test]
+fn deps_from_roots_are_not_first_party_for_workspace_ownership() {
+    let dependencies = vec![
+        "gr00t".to_string(),
+        "torch".to_string(),
+        "torchvision>=0.22,<0.23".to_string(),
+        "!!! preserve unparseable input !!!".to_string(),
+    ];
+    let deps_from_root_names =
+        std::collections::BTreeSet::from(["torch".to_string(), "torchvision".to_string()]);
+
+    assert_eq!(
+        workspace_ownership_planning_dependencies(&dependencies, &deps_from_root_names),
+        vec![
+            "gr00t".to_string(),
+            "!!! preserve unparseable input !!!".to_string(),
+        ],
+        "configured artifacts remain protected, while imported upstream roots may be supplied by every precise consumer's explicit PyPI dependency",
+    );
+}
+
 /// End-to-end root-assembly test: a `retread-deps-from` local source's
 /// PEP 508 lines make it into the root set `uv_group_closure` extends,
 /// combined + deduped against a `[retread-wheels]` root — without driving

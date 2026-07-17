@@ -3866,6 +3866,26 @@ fn dependency_name_intersection(maps: &[BTreeMap<String, String>]) -> BTreeSet<S
     common
 }
 
+/// Build the request view used only for workspace-provider ownership planning.
+///
+/// A configured `[retread-wheels]` root is a first-party artifact and must
+/// never be hollowed out by a same-name dependency in the consuming workspace.
+/// A `retread-deps-from` root is different: it mirrors an upstream dependency
+/// manifest, so an explicit PyPI dependency in every precise consumer is the
+/// provider for that requirement. Hide only those imported roots from the
+/// planner's `request_has_direct_root` guard; the real uv request keeps them
+/// and receives the planner's graph-wide workspace-provider override.
+fn workspace_ownership_planning_dependencies(
+    dependencies: &[String],
+    deps_from_root_names: &BTreeSet<String>,
+) -> Vec<String> {
+    dependencies
+        .iter()
+        .filter(|raw| root_req_name(raw).is_none_or(|name| !deps_from_root_names.contains(&name)))
+        .cloned()
+        .collect()
+}
+
 fn facts_from_solved_records(
     env_records: BTreeMap<String, Vec<rattler_conda_types::RepoDataRecord>>,
     env_conda_deps: BTreeMap<String, BTreeMap<String, String>>,
@@ -4468,13 +4488,8 @@ async fn uv_group_closure(
             .iter()
             .map(|(name, _)| canonical_conda_name(name))
             .collect();
-        let first_party: BTreeSet<String> =
-            roots.iter().filter_map(|req| root_req_name(req)).collect();
         workspace_facts.owned_pypi.retain(|name| {
-            !manual.contains(name)
-                && !keep.contains(name)
-                && !protected_entries.contains(name)
-                && !first_party.contains(name)
+            !manual.contains(name) && !keep.contains(name) && !protected_entries.contains(name)
         });
         tracing::debug!(
             bundle = %group_name,
@@ -4813,12 +4828,8 @@ async fn uv_group_closure(
             .map(|name| canonical_conda_name(name))
             .chain(uv_retry_keep_names.iter().cloned())
             .collect();
-        let first_party: BTreeSet<String> = first_party_names.iter().cloned().collect();
         workspace_facts.owned_pypi.retain(|name| {
-            !manual.contains(name)
-                && !keep.contains(name)
-                && !protected.contains(name)
-                && !first_party.contains(name)
+            !manual.contains(name) && !keep.contains(name) && !protected.contains(name)
         });
     } else {
         workspace_facts.owned_pypi.clear();
@@ -4844,8 +4855,11 @@ async fn uv_group_closure(
     // three unconditional pre-P4 drop implementations and preserves their
     // default-off behavior. RETREAD_UV_RERESOLVE gates only the rejected-route
     // handoff that bypasses the legacy reconstruct/fetch path.
+    let mut ownership_req = req.clone();
+    ownership_req.dependencies =
+        workspace_ownership_planning_dependencies(&req.dependencies, &deps_from_root_names);
     req.workspace_owned = crate::uv_closure::plan_workspace_owned_prelock(
-        &req,
+        &ownership_req,
         &direct_workspace_pypi,
         conda_candidates,
         &workspace_ownership.excluded_pypi_names,
