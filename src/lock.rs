@@ -506,7 +506,11 @@ pub const SCHEMA: u32 = 12;
 /// Epoch 22: source builds run with PYTHONHASHSEED=0 so PEP 517 projects that
 /// derive metadata from Python sets emit stable header ordering. The built-
 /// wheel artifact namespace advances to v5 with this epoch.
-pub const EMIT_EPOCH: u32 = 22;
+///
+/// Epoch 23: isolated sdist builds constrain setuptools below 81, retaining
+/// pkg_resources compatibility for legacy setup.py projects. The built-wheel
+/// artifact namespace advances to v6 with this epoch.
+pub const EMIT_EPOCH: u32 = 23;
 
 fn parse_stored_glibc(value: Option<&str>) -> Option<Option<(u32, u32)>> {
     match value {

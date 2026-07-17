@@ -28,12 +28,13 @@ use tokio::process::Command;
 
 use crate::pypi::{ResolutionTarget, normalized_python_minor};
 
-const BUILT_WHEEL_CACHE_SCHEMA: &str = "retread-built-wheel-v5";
+const BUILT_WHEEL_CACHE_SCHEMA: &str = "retread-built-wheel-v6";
 const BUILT_WHEEL_CACHE_ROOT: &str = "built-wheels";
-const BUILT_WHEEL_CACHE_VERSION: &str = "v5";
+const BUILT_WHEEL_CACHE_VERSION: &str = "v6";
 const CHECKOUT_CACHE_VERSION: &str = "v3";
 const LOCAL_SOURCE_SNAPSHOT_VERSION: &str = "v5";
 const CANONICAL_GIT_SOURCE_SCHEMA: &str = "retread-canonical-git-source-v2";
+const SDIST_BUILD_CONSTRAINTS: &str = "setuptools<81\n";
 static BUILD_TMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Optional caller knowledge used to bind a source-built artifact to the
@@ -2811,13 +2812,28 @@ pub(crate) async fn build_wheel_from_sdist_url_for_target(
             tokio::fs::write(&sdist_path, &bytes)
                 .await
                 .with_context(|| format!("writing private sdist {}", sdist_path.display()))?;
+            // Legacy sdists such as flatdict 4.0.1 import pkg_resources from
+            // setup.py without declaring a build dependency. Setuptools 81
+            // removed that compatibility module, so constrain only isolated
+            // sdist build environments to the final compatible major line.
+            let build_constraints = private_out.join("retread-build-constraints.txt");
+            tokio::fs::write(&build_constraints, SDIST_BUILD_CONSTRAINTS)
+                .await
+                .with_context(|| {
+                    format!(
+                        "writing sdist build constraints {}",
+                        build_constraints.display()
+                    )
+                })?;
             let py_arg = format!("--python={}", python.identity());
             let out_arg = format!("--out-dir={}", private_out.display());
+            let constraints_arg = format!("--build-constraints={}", build_constraints.display());
             run_capturing_uv(&[
                 "build",
                 "--wheel",
                 &py_arg,
                 &out_arg,
+                &constraints_arg,
                 &sdist_path.display().to_string(),
             ])
             .await
@@ -2857,7 +2873,7 @@ pub(crate) async fn build_wheel_from_sdist_url_for_target(
 /// Shared cross-pack cache family for built git wheels, keyed by
 /// (repo url, resolved commit sha, subdirectory, python version).
 ///
-/// Layout: `<retread cache root>/built-wheels/git/v5/<artifact-target-sha256>/
+/// Layout: `<retread cache root>/built-wheels/git/v6/<artifact-target-sha256>/
 /// <family-sha256>/<ref-state-sha256>/{artifact.json,<raw>.whl}`. The leaf
 /// additionally binds the canonical tag/ref state visible to SCM-aware build
 /// backends. All identity components use the complete 64 hexadecimal
@@ -6884,7 +6900,7 @@ version = "0.1.0"
         }
         assert!(
             a.components()
-                .any(|component| component.as_os_str() == "v5")
+                .any(|component| component.as_os_str() == "v6")
         );
         assert_eq!(
             a.file_name().and_then(|name| name.to_str()).unwrap().len(),
@@ -6980,7 +6996,7 @@ version = "0.1.0"
     }
 
     #[tokio::test]
-    async fn v5_cache_marker_round_trip_preserves_user_outdir_sentinel() {
+    async fn v6_cache_marker_round_trip_preserves_user_outdir_sentinel() {
         let base =
             std::env::temp_dir().join(format!("retread-gitwheel-cache-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
@@ -7119,14 +7135,14 @@ version = "0.1.0"
     }
 
     #[test]
-    fn v5_artifact_namespaces_separate_architectures_and_use_full_hashes() {
+    fn v6_artifact_namespaces_separate_architectures_and_use_full_hashes() {
         let x86 = ResolutionTarget::from_parts("3.11", "linux-64", Some((2, 35)));
         let arm = ResolutionTarget::from_parts("3.11", "linux-aarch64", Some((2, 35)));
         let source = "f".repeat(64);
         let x86_path = built_wheel_cache_dir("git", &source, &x86);
         let arm_path = built_wheel_cache_dir("git", &source, &arm);
         assert_ne!(x86_path, arm_path);
-        assert!(x86_path.components().any(|part| part.as_os_str() == "v5"));
+        assert!(x86_path.components().any(|part| part.as_os_str() == "v6"));
         assert_eq!(x86_path.file_name().unwrap().to_string_lossy().len(), 64);
         assert_eq!(
             x86_path
@@ -7154,6 +7170,11 @@ version = "0.1.0"
             })
             .expect("source build did not set PYTHONHASHSEED");
         assert_eq!(value, "0");
+    }
+
+    #[test]
+    fn sdist_builds_pin_the_last_pkg_resources_setuptools_line() {
+        assert_eq!(SDIST_BUILD_CONSTRAINTS, "setuptools<81\n");
     }
 
     #[test]
