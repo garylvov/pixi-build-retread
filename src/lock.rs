@@ -491,7 +491,11 @@ pub const SCHEMA: u32 = 12;
 /// cold and replay paths, and replay omits Pixi's build-time-injected
 /// `python_abi`. This preserves the cold source-package identity instead of
 /// advertising a duplicate ABI dependency from the committed build lock.
-pub const EMIT_EPOCH: u32 = 18;
+///
+/// Epoch 19: the zip writer upgrade from 2.4 to 6.0 can change rewritten wheel
+/// bytes for identical metadata edits. Existing locks and shadow caches must
+/// cold-derive once so their recorded content hashes match the new writer.
+pub const EMIT_EPOCH: u32 = 19;
 
 fn parse_stored_glibc(value: Option<&str>) -> Option<Option<(u32, u32)>> {
     match value {
