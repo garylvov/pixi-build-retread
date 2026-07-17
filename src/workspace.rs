@@ -336,6 +336,42 @@ impl WorkspaceManifest {
         out
     }
 
+    /// Compute the path packages activated by one concrete environment.
+    ///
+    /// This is the path-source counterpart of
+    /// [`Self::effective_dependencies_for_target`]. Keeping the same overlay
+    /// order is load-bearing for sibling-pack composition: a target-local
+    /// registry dependency replaces an inherited path source, while a
+    /// target-local path source replaces an inherited registry dependency.
+    pub fn effective_path_dependencies_for_target(
+        &self,
+        env_name: &str,
+        target_subdir: &str,
+    ) -> BTreeMap<String, String> {
+        let Some(env) = self.environments.get(env_name) else {
+            return BTreeMap::new();
+        };
+        let mut out = BTreeMap::new();
+        if !env.no_default_feature {
+            out.extend(path_dependency_overlay_for_target(
+                &self.path_dependencies,
+                &self.target_dependencies,
+                target_subdir,
+            ));
+        }
+        for feat_name in &env.features {
+            let Some(feat) = self.features.get(feat_name) else {
+                continue;
+            };
+            out.extend(path_dependency_overlay_for_target(
+                &feat.path_dependencies,
+                &feat.target_dependencies,
+                target_subdir,
+            ));
+        }
+        out
+    }
+
     /// Compute the effective PyPI declarations for an environment.
     /// Top-level `[pypi-dependencies]` is inherited unless the env sets
     /// `no-default-feature`; active feature declarations then override

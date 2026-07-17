@@ -461,7 +461,7 @@ fn courier_inputs_hash(
         .collect();
     let index_urls = index_chain(entry_indexes, &ws_indexes, IndexPurpose::RootResolve);
     let workspace_fp = workspace_manifest
-        .map(|m| m.solve_fingerprint(workspace_dir, source_dir))
+        .map(|m| workspace_solve_fingerprint(m, workspace_dir, source_dir, target))
         .unwrap_or_default();
     let config_fp = crate::courier::config_fingerprint(config, channels, &workspace_fp);
     crate::lock::RetreadLock::compute_inputs_hash_for_target(
@@ -473,6 +473,278 @@ fn courier_inputs_hash(
         config.pin_version.then_some(env!("CARGO_PKG_VERSION")),
         &config_fp,
     )
+}
+
+/// Resolution-affecting workspace fingerprint, including the actual metadata
+/// constraints exported by co-activated Retread path packages.
+///
+/// A plain manifest fingerprint sees only the sibling package path, not the
+/// sibling's emitted dependency contract. Folding the normalized constraints
+/// into the producer and replay hashes ensures a changed sibling requirement
+/// invalidates this pack's committed solve instead of replaying a stale,
+/// independently-selected closure.
+fn workspace_solve_fingerprint(
+    manifest: &crate::workspace::WorkspaceManifest,
+    workspace_dir: &Path,
+    source_dir: &Path,
+    target: &ResolutionTarget,
+) -> String {
+    let mut parts = Vec::new();
+    let base =
+        manifest.solve_fingerprint_for_target(workspace_dir, source_dir, target.conda_subdir());
+    if !base.is_empty() {
+        parts.push(base);
+    }
+    let sibling = sibling_lock_constraints(manifest, workspace_dir, source_dir, target);
+    parts.extend(
+        sibling
+            .constraints
+            .into_iter()
+            .map(|line| format!("co-activated-sibling:{line}")),
+    );
+    parts.join("\n")
+}
+
+/// Read the exact-target committed locks of Retread path packages activated
+/// beside `source_dir` and turn their real wheel metadata requirements into
+/// non-installing uv constraints for this pack.
+///
+/// This is intentionally based on `requires_dist`, not a sibling's selected
+/// `conda_run_deps`. The latter is a narrow output of an independent solve
+/// (the source of the transformers 4.57-vs-5.x false conflict); the former is
+/// the actual compatibility contract. Bare requirements impose no constraint.
+fn sibling_lock_constraints(
+    manifest: &crate::workspace::WorkspaceManifest,
+    workspace_dir: &Path,
+    source_dir: &Path,
+    target: &ResolutionTarget,
+) -> crate::uv_closure::ConstraintSet {
+    let mut out = crate::uv_closure::ConstraintSet::default();
+    let Some(envs) = manifest.precise_consuming_envs_for_target(
+        workspace_dir,
+        source_dir,
+        target.conda_subdir(),
+    ) else {
+        return out;
+    };
+    let source_canon = std::fs::canonicalize(source_dir).unwrap_or_else(|_| source_dir.into());
+    let mut siblings = BTreeMap::new();
+    for env in envs {
+        for (bundle, raw_path) in
+            manifest.effective_path_dependencies_for_target(&env, target.conda_subdir())
+        {
+            let raw_path = PathBuf::from(raw_path);
+            let pack_dir = if raw_path.is_absolute() {
+                raw_path
+            } else {
+                workspace_dir.join(raw_path)
+            };
+            let pack_canon = std::fs::canonicalize(&pack_dir).unwrap_or(pack_dir);
+            if pack_canon == source_canon {
+                continue;
+            }
+            siblings.insert(canonical_conda_name(&bundle), pack_canon);
+        }
+    }
+
+    let mut seen = BTreeSet::new();
+    for (bundle, pack_dir) in siblings {
+        let lock_path = pack_dir.join(crate::lock::RetreadLock::file_name_for_target(
+            &bundle, target,
+        ));
+        let Ok(lock) = crate::lock::RetreadLock::load(&lock_path) else {
+            continue;
+        };
+        if lock
+            .validate_replay_contract_for_target(target, &bundle)
+            .is_err()
+        {
+            continue;
+        }
+        for raw in lock.wheels.iter().flat_map(|wheel| &wheel.requires_dist) {
+            let Ok(requirement): Result<uv_pep508::Requirement, _> =
+                uv_pep508::Requirement::from_str(raw)
+            else {
+                continue;
+            };
+            let Some(uv_pep508::VersionOrUrl::VersionSpecifier(specifiers)) =
+                requirement.version_or_url.as_ref()
+            else {
+                continue;
+            };
+            let specifiers = specifiers.to_string();
+            if specifiers.is_empty() {
+                continue;
+            }
+            // A constraint must not activate dependency extras merely because
+            // the sibling did. Preserve the version and marker only.
+            let marker = requirement.marker.try_to_string().unwrap_or_default();
+            let marker = if marker.is_empty() {
+                String::new()
+            } else {
+                format!(" ; {marker}")
+            };
+            let name = canonical_conda_name(requirement.name.as_ref());
+            let line = format!("{name}{specifiers}{marker}");
+            if !seen.insert(line.clone()) {
+                continue;
+            }
+            out.constraints.push(line.clone());
+            let conda_name = name.clone();
+            let conda_version = specifiers.clone();
+            out.provenance
+                .entry(name)
+                .or_insert_with(|| crate::uv_closure::ConstraintProvenance {
+                    constraint: line,
+                    conda_name,
+                    conda_version,
+                    source: format!("co-activated-retread-lock:{bundle}"),
+                    env: "precise-consuming-envs".to_string(),
+                    provenance: Provenance::UvConstraint,
+                });
+        }
+    }
+    out.constraints.sort();
+    out
+}
+
+#[cfg(test)]
+mod sibling_lock_constraint_tests {
+    use std::collections::BTreeMap;
+
+    use super::{sibling_lock_constraints, workspace_solve_fingerprint};
+    use crate::lock::{LockWheel, Origin, RetreadLock, SCHEMA};
+    use crate::pypi::{ResolutionTarget, WheelTarget};
+
+    fn temp_workspace() -> std::path::PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "retread-sibling-constraints-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(dir.join("current")).unwrap();
+        std::fs::create_dir_all(dir.join("sibling")).unwrap();
+        std::fs::write(
+            dir.join("pixi.toml"),
+            r#"[workspace]
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[feature.composed.dependencies]
+current-pack = { path = "./current" }
+sibling-pack = { path = "./sibling" }
+
+[environments]
+composed = { features = ["composed"], no-default-feature = true }
+"#,
+        )
+        .unwrap();
+        dir
+    }
+
+    fn target() -> ResolutionTarget {
+        ResolutionTarget::from_wheel_target(
+            WheelTarget {
+                python_version: "3.11".to_string(),
+                conda_subdir: "linux-64".to_string(),
+                max_glibc: None,
+            },
+            None,
+        )
+    }
+
+    #[test]
+    fn coactivated_sibling_metadata_constrains_uv_and_fingerprints_replay() {
+        let dir = temp_workspace();
+        let target = target();
+        let lock = RetreadLock {
+            schema: SCHEMA,
+            retread_version: env!("CARGO_PKG_VERSION").to_string(),
+            bundle: "sibling-pack".to_string(),
+            version: "1.0.0".to_string(),
+            python: "3.11".to_string(),
+            target_subdir: "linux-64".to_string(),
+            inputs_hash: "test-inputs".to_string(),
+            root_requirements: vec!["sibling-root==1.0.0".to_string()],
+            wheels: vec![LockWheel {
+                name: "sibling-root".to_string(),
+                version: "1.0.0".to_string(),
+                origin: Origin::Index,
+                filename: "sibling_root-1.0.0-py3-none-any.whl".to_string(),
+                url: Some(
+                    "https://example.invalid/sibling_root-1.0.0-py3-none-any.whl".to_string(),
+                ),
+                sha256: Some("11".repeat(32)),
+                requires_dist: vec![
+                    "transformers>=4.57.6,<4.58".to_string(),
+                    "bare-dependency".to_string(),
+                    "tokenizers[testing]>=0.22,<0.23 ; python_version >= '3.10'".to_string(),
+                ],
+                must_ship: false,
+                upstream_url: None,
+                git_source: None,
+                sdist_source: None,
+            }],
+            conda_run_deps: Vec::new(),
+            index_urls: vec!["https://pypi.org/simple/".to_string()],
+            prerelease: BTreeMap::new(),
+            shadow_libs: BTreeMap::new(),
+            declared_glibc: None,
+            resolution_glibc: None,
+            conda_capable: Vec::new(),
+            entry_specs: vec!["sibling-root==1.0.0".to_string()],
+            wheel_store: None,
+        };
+        let lock_path = dir
+            .join("sibling")
+            .join(RetreadLock::file_name_for_target("sibling-pack", &target));
+        std::fs::write(&lock_path, lock.to_pretty_json().unwrap()).unwrap();
+
+        let manifest = crate::workspace::WorkspaceManifest::load(&dir).unwrap();
+        assert_eq!(
+            manifest.precise_consuming_envs_for_target(
+                &dir,
+                &dir.join("current"),
+                target.conda_subdir(),
+            ),
+            Some(vec!["composed".to_string()])
+        );
+        assert!(lock_path.is_file());
+        let loaded = RetreadLock::load(&lock_path).unwrap();
+        loaded
+            .validate_replay_contract_for_target(&target, "sibling-pack")
+            .unwrap();
+        let constraints = sibling_lock_constraints(&manifest, &dir, &dir.join("current"), &target);
+        assert!(
+            constraints
+                .constraints
+                .iter()
+                .any(|line| line == "transformers>=4.57.6, <4.58"),
+            "constraints were {:?}",
+            constraints.constraints
+        );
+        assert!(
+            constraints
+                .constraints
+                .iter()
+                .any(|line| line.starts_with("tokenizers>=0.22, <0.23 ; ")),
+            "dependency extras must not be activated by a sibling constraint"
+        );
+        assert!(
+            constraints
+                .constraints
+                .iter()
+                .all(|line| !line.starts_with("bare-dependency"))
+        );
+        let fingerprint =
+            workspace_solve_fingerprint(&manifest, &dir, &dir.join("current"), &target);
+        assert!(fingerprint.contains("co-activated-sibling:transformers>=4.57.6, <4.58"));
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }
 
 /// Select the committed lock visible to this exact resolution target.
@@ -1605,9 +1877,11 @@ impl Handler {
                         let workspace_fp_for_incr = workspace_manifest
                             .as_ref()
                             .map(|m| {
-                                m.solve_fingerprint(
+                                workspace_solve_fingerprint(
+                                    m,
                                     workspace_dir.as_deref().unwrap_or(source_dir.as_path()),
                                     &source_dir,
+                                    &target,
                                 )
                             })
                             .unwrap_or_default();
@@ -1949,9 +2223,11 @@ impl Handler {
             let workspace_fp = ws_manifest_for_replay
                 .as_ref()
                 .map(|m| {
-                    m.solve_fingerprint(
+                    workspace_solve_fingerprint(
+                        m,
                         workspace_dir.as_deref().unwrap_or(&source_dir),
                         &source_dir,
+                        &target,
                     )
                 })
                 .unwrap_or_default();
@@ -4156,6 +4432,24 @@ async fn uv_group_closure(
             _ => Default::default(),
         },
     };
+    if let (Some(manifest), Some(ws_dir)) = (manifest_opt.as_ref(), workspace_dir) {
+        let sibling_constraints = sibling_lock_constraints(manifest, ws_dir, source_dir, target);
+        if !sibling_constraints.constraints.is_empty() {
+            tracing::info!(
+                bundle = %group_name,
+                constraints = sibling_constraints.constraints.len(),
+                "uv closure: applying co-activated sibling pack requirements",
+            );
+        }
+        for line in sibling_constraints.constraints {
+            if !constraints.constraints.contains(&line) {
+                constraints.constraints.push(line);
+            }
+        }
+        for (name, provenance) in sibling_constraints.provenance {
+            constraints.provenance.entry(name).or_insert(provenance);
+        }
+    }
     // Proactive cuda-major capping (belt to the auto-route co-install
     // check's suspenders): derive this pack's actual consuming env(s)'
     // `cuda-version` anchor via `consuming_env_dependencies` (env-scoped,
@@ -10510,7 +10804,14 @@ async fn build_one(
         // Pack-scoped: only envs that reference source_dir are hashed.
         let workspace_fp = ws_manifest
             .as_ref()
-            .map(|m| m.solve_fingerprint(workspace_dir.unwrap_or(source_dir), source_dir))
+            .map(|m| {
+                workspace_solve_fingerprint(
+                    m,
+                    workspace_dir.unwrap_or(source_dir),
+                    source_dir,
+                    target,
+                )
+            })
             .unwrap_or_default();
         let entry_indexes: Vec<String> = config
             .retread_wheels
