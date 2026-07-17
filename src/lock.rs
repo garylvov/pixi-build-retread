@@ -495,7 +495,14 @@ pub const SCHEMA: u32 = 12;
 /// Epoch 19: the zip writer upgrade from 2.4 to 6.0 can change rewritten wheel
 /// bytes for identical metadata edits. Existing locks and shadow caches must
 /// cold-derive once so their recorded content hashes match the new writer.
-pub const EMIT_EPOCH: u32 = 20;
+///
+/// Epoch 20: injection and auto-data rewrites normalize every source-wheel ZIP
+/// timestamp so identical payloads cannot acquire worktree-specific hashes.
+///
+/// Epoch 21: every raw source-built wheel is timestamp-normalized before it is
+/// hashed or cached, including wheels that need no injection or metadata
+/// rewrite. The built-wheel artifact namespace advances to v4 with this epoch.
+pub const EMIT_EPOCH: u32 = 21;
 
 fn parse_stored_glibc(value: Option<&str>) -> Option<Option<(u32, u32)>> {
     match value {

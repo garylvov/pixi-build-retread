@@ -28,8 +28,9 @@ use tokio::process::Command;
 
 use crate::pypi::{ResolutionTarget, normalized_python_minor};
 
-const BUILT_WHEEL_CACHE_SCHEMA: &str = "retread-built-wheel-v3";
+const BUILT_WHEEL_CACHE_SCHEMA: &str = "retread-built-wheel-v4";
 const BUILT_WHEEL_CACHE_ROOT: &str = "built-wheels";
+const BUILT_WHEEL_CACHE_VERSION: &str = "v4";
 const CHECKOUT_CACHE_VERSION: &str = "v3";
 const LOCAL_SOURCE_SNAPSHOT_VERSION: &str = "v5";
 const CANONICAL_GIT_SOURCE_SCHEMA: &str = "retread-canonical-git-source-v2";
@@ -278,7 +279,7 @@ fn built_wheel_cache_dir(kind: &str, source_identity: &str, target: &ResolutionT
     crate::courier::retread_cache_root()
         .join(BUILT_WHEEL_CACHE_ROOT)
         .join(kind)
-        .join("v3")
+        .join(BUILT_WHEEL_CACHE_VERSION)
         .join(target.artifact_cache_identity())
         .join(source_identity)
 }
@@ -290,9 +291,54 @@ fn materialized_wheel_output_dir(
 ) -> PathBuf {
     out_dir
         .join(".retread-source-wheels")
-        .join("v3")
+        .join(BUILT_WHEEL_CACHE_VERSION)
         .join(target.artifact_cache_identity())
         .join(source_identity)
+}
+
+/// Rewrite a freshly source-built wheel with a fixed ZIP timestamp on every
+/// entry before hashing or publishing it into the persistent artifact cache.
+/// PEP 517 backends commonly stamp wheel entries with the build clock even
+/// when every payload byte is otherwise deterministic. RECORD hashes cover
+/// extracted file bytes, not ZIP metadata, so timestamp normalization leaves
+/// the wheel's signed inventory valid while making replay byte-identical.
+fn normalize_source_built_wheel(path: &Path) -> Result<()> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("reading source-built wheel {}", path.display()))?;
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
+        .with_context(|| format!("opening source-built wheel {}", path.display()))?;
+    let (temporary, destination) = crate::wheel::create_atomic_tmp(path)?;
+    let temporary_guard = TemporaryFile::armed(temporary.clone());
+    let mut writer = zip::ZipWriter::new(destination);
+
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index)?;
+        let name = entry.name().to_string();
+        let compression = match entry.compression() {
+            zip::CompressionMethod::Stored => zip::CompressionMethod::Stored,
+            _ => zip::CompressionMethod::Deflated,
+        };
+        let mut options = zip::write::SimpleFileOptions::default()
+            .compression_method(compression)
+            .last_modified_time(zip::DateTime::default())
+            .large_file(entry.size() > u32::MAX as u64);
+        if let Some(mode) = entry.unix_mode() {
+            options = options.unix_permissions(mode);
+        }
+        if entry.is_dir() {
+            writer.add_directory(&name, options)?;
+        } else {
+            writer.start_file(&name, options)?;
+            std::io::copy(&mut entry, &mut writer)?;
+        }
+    }
+
+    let mut destination = writer.finish()?;
+    destination.flush()?;
+    drop(destination);
+    crate::wheel::commit_atomic_write(&temporary, path)?;
+    temporary_guard.disarm();
+    Ok(())
 }
 
 fn native_build_allowed(target: &ResolutionTarget) -> bool {
@@ -957,7 +1003,10 @@ where
         let built = built.clone();
         let target = target.clone();
         let expected = expected.cloned();
-        move || validate_wheel_file(&built, &target, expected.as_ref())
+        move || {
+            normalize_source_built_wheel(&built)?;
+            validate_wheel_file(&built, &target, expected.as_ref())
+        }
     })
     .await
     .context("newly built wheel validation task panicked")??;
@@ -2808,7 +2857,7 @@ pub(crate) async fn build_wheel_from_sdist_url_for_target(
 /// Shared cross-pack cache family for built git wheels, keyed by
 /// (repo url, resolved commit sha, subdirectory, python version).
 ///
-/// Layout: `<retread cache root>/built-wheels/git/v3/<artifact-target-sha256>/
+/// Layout: `<retread cache root>/built-wheels/git/v4/<artifact-target-sha256>/
 /// <family-sha256>/<ref-state-sha256>/{artifact.json,<raw>.whl}`. The leaf
 /// additionally binds the canonical tag/ref state visible to SCM-aware build
 /// backends. All identity components use the complete 64 hexadecimal
@@ -6827,7 +6876,7 @@ version = "0.1.0"
         }
         assert!(
             a.components()
-                .any(|component| component.as_os_str() == "v3")
+                .any(|component| component.as_os_str() == "v4")
         );
         assert_eq!(
             a.file_name().and_then(|name| name.to_str()).unwrap().len(),
@@ -6875,8 +6924,55 @@ version = "0.1.0"
         write_test_wheel_with_payload(path, metadata_name, metadata_version, &[]);
     }
 
+    #[test]
+    fn source_wheel_normalization_makes_build_clock_irrelevant() {
+        fn write_at(path: &Path, timestamp: zip::DateTime) {
+            let file = File::create(path).unwrap();
+            let mut archive = zip::ZipWriter::new(file);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated)
+                .last_modified_time(timestamp)
+                .unix_permissions(0o644);
+            archive.start_file("pkg/__init__.py", options).unwrap();
+            archive.write_all(b"VALUE = 1\n").unwrap();
+            archive
+                .start_file("pkg-1.0.0.dist-info/METADATA", options)
+                .unwrap();
+            archive
+                .write_all(b"Metadata-Version: 2.4\nName: pkg\nVersion: 1.0.0\n\n")
+                .unwrap();
+            archive.finish().unwrap();
+        }
+
+        let base = unique_test_dir("source-wheel-timestamps");
+        std::fs::create_dir_all(&base).unwrap();
+        let early = base.join("early.whl");
+        let late = base.join("late.whl");
+        write_at(
+            &early,
+            zip::DateTime::from_date_and_time(2025, 1, 2, 3, 4, 6).unwrap(),
+        );
+        write_at(
+            &late,
+            zip::DateTime::from_date_and_time(2026, 7, 8, 9, 10, 12).unwrap(),
+        );
+        assert_ne!(
+            std::fs::read(&early).unwrap(),
+            std::fs::read(&late).unwrap()
+        );
+
+        normalize_source_built_wheel(&early).unwrap();
+        normalize_source_built_wheel(&late).unwrap();
+        assert_eq!(
+            std::fs::read(&early).unwrap(),
+            std::fs::read(&late).unwrap()
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[tokio::test]
-    async fn v3_cache_marker_round_trip_preserves_user_outdir_sentinel() {
+    async fn v4_cache_marker_round_trip_preserves_user_outdir_sentinel() {
         let base =
             std::env::temp_dir().join(format!("retread-gitwheel-cache-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
@@ -7015,14 +7111,14 @@ version = "0.1.0"
     }
 
     #[test]
-    fn v3_artifact_namespaces_separate_architectures_and_use_full_hashes() {
+    fn v4_artifact_namespaces_separate_architectures_and_use_full_hashes() {
         let x86 = ResolutionTarget::from_parts("3.11", "linux-64", Some((2, 35)));
         let arm = ResolutionTarget::from_parts("3.11", "linux-aarch64", Some((2, 35)));
         let source = "f".repeat(64);
         let x86_path = built_wheel_cache_dir("git", &source, &x86);
         let arm_path = built_wheel_cache_dir("git", &source, &arm);
         assert_ne!(x86_path, arm_path);
-        assert!(x86_path.components().any(|part| part.as_os_str() == "v3"));
+        assert!(x86_path.components().any(|part| part.as_os_str() == "v4"));
         assert_eq!(x86_path.file_name().unwrap().to_string_lossy().len(), 64);
         assert_eq!(
             x86_path
