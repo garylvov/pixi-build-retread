@@ -543,7 +543,11 @@ fn sibling_lock_constraints(
             if pack_canon == source_canon {
                 continue;
             }
-            siblings.insert(canonical_conda_name(&bundle), pack_canon);
+            // Preserve the declared bundle spelling for its lock filename and
+            // replay contract. Conda names may legally contain dots, and the
+            // lock namespace is exact (`isaaclab-2.3x-pack` must not become
+            // `isaaclab-2-3x-pack`). Dependency names are canonicalized below.
+            siblings.insert(bundle, pack_canon);
         }
     }
 
@@ -635,7 +639,7 @@ platforms = ["linux-64"]
 
 [feature.composed.dependencies]
 current-pack = { path = "./current" }
-sibling-pack = { path = "./sibling" }
+"sibling.pack" = { path = "./sibling" }
 
 [environments]
 composed = { features = ["composed"], no-default-feature = true }
@@ -663,7 +667,7 @@ composed = { features = ["composed"], no-default-feature = true }
         let lock = RetreadLock {
             schema: SCHEMA,
             retread_version: env!("CARGO_PKG_VERSION").to_string(),
-            bundle: "sibling-pack".to_string(),
+            bundle: "sibling.pack".to_string(),
             version: "1.0.0".to_string(),
             python: "3.11".to_string(),
             target_subdir: "linux-64".to_string(),
@@ -700,7 +704,7 @@ composed = { features = ["composed"], no-default-feature = true }
         };
         let lock_path = dir
             .join("sibling")
-            .join(RetreadLock::file_name_for_target("sibling-pack", &target));
+            .join(RetreadLock::file_name_for_target("sibling.pack", &target));
         std::fs::write(&lock_path, lock.to_pretty_json().unwrap()).unwrap();
 
         let manifest = crate::workspace::WorkspaceManifest::load(&dir).unwrap();
@@ -715,7 +719,7 @@ composed = { features = ["composed"], no-default-feature = true }
         assert!(lock_path.is_file());
         let loaded = RetreadLock::load(&lock_path).unwrap();
         loaded
-            .validate_replay_contract_for_target(&target, "sibling-pack")
+            .validate_replay_contract_for_target(&target, "sibling.pack")
             .unwrap();
         let constraints = sibling_lock_constraints(&manifest, &dir, &dir.join("current"), &target);
         assert!(
