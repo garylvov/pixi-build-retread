@@ -1,6 +1,6 @@
 [package]
 name = "pixi-build-retread"
-version = "4.10.16"
+version = "4.10.17"
 edition = "2024"
 description = "Retread PyPI wheels as conda packages, with dep versions loosened and shared deps preferred from conda"
 license = "BSD-3-Clause"
