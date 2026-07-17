@@ -3624,6 +3624,22 @@ pub(crate) fn heal_facts_stamp_for_target(
     sdist_build_policy: crate::config::SdistBuildPolicy,
     target: &ResolutionTarget,
 ) -> String {
+    heal_facts_stamp_for_target_and_backend_version(
+        req,
+        opts,
+        sdist_build_policy,
+        target,
+        env!("CARGO_PKG_VERSION"),
+    )
+}
+
+fn heal_facts_stamp_for_target_and_backend_version(
+    req: &UvClosureRequest,
+    opts: &AutoRouteOptions,
+    sdist_build_policy: crate::config::SdistBuildPolicy,
+    target: &ResolutionTarget,
+    backend_version: &str,
+) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     let mut field = |tag: &str, vals: &mut dyn Iterator<Item = &str>| {
@@ -3635,6 +3651,11 @@ pub(crate) fn heal_facts_stamp_for_target(
         }
     };
     field("schema", &mut std::iter::once(HEAL_FACTS_STAMP_SCHEMA));
+    // Route/co-solve semantics are backend behavior, not manifest input.
+    // Scoping replay to the exact Retread version prevents an upgrade from
+    // re-injecting decisions made before a new validator existed, while
+    // preserving the single-lock warm path for repeated runs of one version.
+    field("backend-version", &mut std::iter::once(backend_version));
     let normalized_python = target.python_identity();
     let resolution_target = target.resolution_identity();
     field("python", &mut std::iter::once(normalized_python.as_str()));
@@ -9558,6 +9579,25 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
             auto, never,
             "sdist-build policy change must move the heal-facts stamp",
         );
+    }
+
+    #[test]
+    fn heal_facts_stamp_is_scoped_to_backend_version() {
+        let req = sample_request();
+        let opts = AutoRouteOptions::default();
+        let target = ResolutionTarget::for_subdir("3.12", "linux-64");
+        let stamp = |version| {
+            heal_facts_stamp_for_target_and_backend_version(
+                &req,
+                &opts,
+                crate::config::SdistBuildPolicy::Auto,
+                &target,
+                version,
+            )
+        };
+
+        assert_eq!(stamp("4.10.26"), stamp("4.10.26"));
+        assert_ne!(stamp("4.10.25"), stamp("4.10.26"));
     }
 
     /// B1 (b) wedge self-recovery: a SEEDED built-wheel fact at a stale
