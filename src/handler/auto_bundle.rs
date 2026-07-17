@@ -435,6 +435,11 @@ pub(crate) async fn auto_bundle_transitives(
         let context = solve_context.clone();
         async move { context.solve(routes).await }
     };
+    let provider_context = conda_co_solve.clone();
+    let validate_standalone_provider_route = move |route: crate::uv_closure::CondaRouteSpec| {
+        let context = provider_context.clone();
+        async move { context.validate_standalone_provider_route(route).await }
+    };
     let target = target.clone();
     let fetch_target = target.clone();
     let download_dir = download_dir.to_path_buf();
@@ -475,7 +480,7 @@ pub(crate) async fn auto_bundle_transitives(
             }
         };
     let channels_consulted = conda_co_solve.channels_consulted();
-    auto_bundle_transitives_with(
+    auto_bundle_transitives_with_route_precheck(
         bundle,
         indexes,
         target.wheel_target(),
@@ -485,6 +490,7 @@ pub(crate) async fn auto_bundle_transitives(
         uv_closure_wheels,
         &probe_many,
         &co_solve,
+        &validate_standalone_provider_route,
         &fetch_pypi,
         &channels_consulted,
         uv_reresolve,
@@ -512,6 +518,53 @@ where
     PF: Future<Output = Vec<crate::probe::ProbeResult>>,
     C: Fn(Vec<crate::uv_closure::CondaRouteSpec>) -> CF,
     CF: Future<Output = crate::uv_closure::CoInstallVerdict>,
+    X: Fn(PypiFetchRequest, Vec<String>, String) -> XF,
+    XF: Future<Output = Result<ResolvedWheel>>,
+{
+    let allow_source_route = |_route: crate::uv_closure::CondaRouteSpec| async {
+        crate::uv_closure::CoInstallVerdict::Sat
+    };
+    auto_bundle_transitives_with_route_precheck(
+        bundle,
+        indexes,
+        target,
+        config,
+        locked_closure,
+        favor_lock_prefs,
+        uv_closure_wheels,
+        probe_many,
+        co_solve,
+        &allow_source_route,
+        fetch_pypi,
+        channels_consulted,
+        uv_reresolve,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn auto_bundle_transitives_with_route_precheck<P, PF, C, CF, V, VF, X, XF>(
+    bundle: &mut Bundle,
+    indexes: &[String],
+    target: &crate::pypi::WheelTarget,
+    config: &RetreadConfig,
+    locked_closure: Option<&BTreeMap<String, String>>,
+    favor_lock_prefs: Option<&BTreeMap<String, String>>,
+    uv_closure_wheels: Option<&BTreeMap<String, String>>,
+    probe_many: &P,
+    co_solve: &C,
+    validate_standalone_provider_route: &V,
+    fetch_pypi: &X,
+    channels_consulted: &[String],
+    uv_reresolve: &UvReresolveContext,
+) -> Result<AutoBundleOutcome>
+where
+    P: Fn(Vec<(String, String)>) -> PF,
+    PF: Future<Output = Vec<crate::probe::ProbeResult>>,
+    C: Fn(Vec<crate::uv_closure::CondaRouteSpec>) -> CF,
+    CF: Future<Output = crate::uv_closure::CoInstallVerdict>,
+    V: Fn(crate::uv_closure::CondaRouteSpec) -> VF,
+    VF: Future<Output = crate::uv_closure::CoInstallVerdict>,
     X: Fn(PypiFetchRequest, Vec<String>, String) -> XF,
     XF: Future<Output = Result<ResolvedWheel>>,
 {
@@ -565,6 +618,7 @@ where
     // wheel happened to be scanned first.
     let mut observed_requirements = ObservedRequirements::new();
     let mut provisional_metadata_routes: ProvisionalMetadataRoutes = BTreeMap::new();
+    let mut standalone_provider_safe: BTreeSet<(String, String)> = BTreeSet::new();
     let marker_env = marker_env_for(&target.conda_subdir, &target.python_version)?;
     // v4.6: seed the first round with every exported closure wheel not
     // already in the bundle/skip set (see the `uv_closure_wheels` doc
@@ -632,7 +686,7 @@ where
         // candidates (first iteration; empty afterwards).
         candidates.append(&mut closure_seed);
         if candidates.is_empty() && loose_candidates.is_empty() {
-            match jointly_unroute_unsolvable(
+            match jointly_unroute_unsolvable_with_route_precheck(
                 bundle,
                 &mut provisional_metadata_routes,
                 &observed_requirements,
@@ -640,6 +694,8 @@ where
                 target,
                 config,
                 co_solve,
+                validate_standalone_provider_route,
+                &mut standalone_provider_safe,
                 fetch_pypi,
                 channels_consulted,
                 uv_reresolve,
@@ -1009,7 +1065,7 @@ where
         // routes. Otherwise a later wheel can tighten a requirement after its
         // conda route has already been rejected and restored from PyPI.
         if !added_any {
-            match jointly_unroute_unsolvable(
+            match jointly_unroute_unsolvable_with_route_precheck(
                 bundle,
                 &mut provisional_metadata_routes,
                 &observed_requirements,
@@ -1017,6 +1073,8 @@ where
                 target,
                 config,
                 co_solve,
+                validate_standalone_provider_route,
+                &mut standalone_provider_safe,
                 fetch_pypi,
                 channels_consulted,
                 uv_reresolve,
@@ -1155,6 +1213,49 @@ where
     X: Fn(PypiFetchRequest, Vec<String>, String) -> XF,
     XF: Future<Output = Result<ResolvedWheel>>,
 {
+    let allow_source_route = |_route: crate::uv_closure::CondaRouteSpec| async {
+        crate::uv_closure::CoInstallVerdict::Sat
+    };
+    let mut standalone_provider_safe = BTreeSet::new();
+    jointly_unroute_unsolvable_with_route_precheck(
+        bundle,
+        metadata_routes,
+        observed_requirements,
+        indexes,
+        target,
+        config,
+        co_solve,
+        &allow_source_route,
+        &mut standalone_provider_safe,
+        fetch_pypi,
+        channels_consulted,
+        uv_reresolve,
+    )
+    .await
+}
+
+async fn jointly_unroute_unsolvable_with_route_precheck<C, CF, V, VF, X, XF>(
+    bundle: &mut Bundle,
+    metadata_routes: &mut ProvisionalMetadataRoutes,
+    observed_requirements: &ObservedRequirements,
+    indexes: &[String],
+    target: &crate::pypi::WheelTarget,
+    config: &RetreadConfig,
+    co_solve: &C,
+    validate_standalone_provider_route: &V,
+    standalone_provider_safe: &mut BTreeSet<(String, String)>,
+    fetch_pypi: &X,
+    channels_consulted: &[String],
+    uv_reresolve: &UvReresolveContext,
+) -> Result<JointRouteOutcome>
+where
+    C: Fn(Vec<crate::uv_closure::CondaRouteSpec>) -> CF,
+    CF: Future<Output = crate::uv_closure::CoInstallVerdict>,
+    V: Fn(crate::uv_closure::CondaRouteSpec) -> VF,
+    VF: Future<Output = crate::uv_closure::CoInstallVerdict>,
+    X: Fn(PypiFetchRequest, Vec<String>, String) -> XF,
+    XF: Future<Output = Result<ResolvedWheel>>,
+{
     if bundle.auto_routed.is_empty() && metadata_routes.is_empty() {
         return Ok(JointRouteOutcome::Unchanged);
     }
@@ -1234,11 +1335,11 @@ where
         .iter()
         .map(|conflict| conflict.conda_name.key().into_string())
         .collect();
-    let pre_rejected: Vec<_> = conflicted_keys
+    let mut pre_rejected: Vec<_> = conflicted_keys
         .iter()
         .filter_map(|name| emitted_by_conda.get(name).cloned())
         .collect();
-    let mutable_candidates: Vec<_> = mutable_conda_names
+    let mut mutable_candidates: Vec<_> = mutable_conda_names
         .iter()
         .filter(|name| !conflicted_keys.contains(*name))
         .filter_map(|name| emitted_by_conda.get(name).cloned())
@@ -1247,17 +1348,79 @@ where
         return Ok(JointRouteOutcome::Unchanged);
     }
 
+    // A globally unsatisfiable fixed baseline cannot identify ordinary route
+    // conflicts, so source-built metadata routes normally remain on conda.
+    // Direct workspace PyPI provider shadows are route-local: solve each
+    // mutable source route by itself and reject only a positively conflicting
+    // route. These small trials run concurrently and avoid both the unsafe
+    // fail-open (`tensordict -> pytorch` against PyPI torch) and an exhaustive
+    // whole-workspace core reduction.
+    let provider_trials = {
+        use futures::stream::{self, StreamExt};
+        stream::iter(
+            mutable_candidates
+                .iter()
+                .filter(|route| {
+                    source_metadata_conda_names.contains(route.conda_name.key().as_str())
+                        && !standalone_provider_safe
+                            .contains(&(route.conda_name.key().into_string(), route.spec.clone()))
+                })
+                .cloned(),
+        )
+        .map(|route| async move {
+            let verdict = validate_standalone_provider_route(route.clone()).await;
+            (route, verdict)
+        })
+        .buffered(crate::concurrency::max_concurrent_builds().min(8))
+        .collect::<Vec<_>>()
+        .await
+    };
+    let mut provider_rejected_keys = BTreeSet::new();
+    for (route, verdict) in provider_trials {
+        match verdict {
+            crate::uv_closure::CoInstallVerdict::Unsat(reasons) => {
+                tracing::info!(
+                    route = %route.conda_name,
+                    reasons = ?reasons,
+                    "joint route solve: standalone source route rejected before fixed-baseline validation",
+                );
+                provider_rejected_keys.insert(route.conda_name.key().into_string());
+                pre_rejected.push(route);
+            }
+            crate::uv_closure::CoInstallVerdict::Sat => {
+                standalone_provider_safe
+                    .insert((route.conda_name.key().into_string(), route.spec.clone()));
+            }
+            crate::uv_closure::CoInstallVerdict::Skipped(reason) => {
+                tracing::debug!(
+                    route = %route.conda_name,
+                    reason = %reason,
+                    "joint route solve: standalone source-route validation unavailable; preserving baseline fail-open",
+                );
+            }
+        }
+    }
+    mutable_candidates
+        .retain(|route| !provider_rejected_keys.contains(route.conda_name.key().as_str()));
+
     let mutable_keys: HashSet<String> = mutable_conda_names.iter().cloned().collect();
     let fixed: Vec<_> = emitted
         .into_iter()
         .filter(|route| !mutable_keys.contains(route.conda_name.key().as_str()))
         .collect();
-    let selection = crate::uv_closure::select_jointly_solvable_routes(
-        fixed,
-        mutable_candidates.clone(),
-        co_solve,
-    )
-    .await;
+    let selection = if mutable_candidates.is_empty() {
+        Some(crate::uv_closure::JointRouteSelection {
+            accepted: Vec::new(),
+            rejected: Vec::new(),
+        })
+    } else {
+        crate::uv_closure::select_jointly_solvable_routes(
+            fixed,
+            mutable_candidates.clone(),
+            co_solve,
+        )
+        .await
+    };
     // Rule 2 is fail-closed for ordinary mutable routes: an unsatisfiable or
     // indeterminate baseline cannot authorize them. Source-root metadata
     // routes retain their existing conda placement until a satisfiable
@@ -3545,6 +3708,82 @@ mod tests {
             .map(|dependency| super::super::audit_report::format_packagespec(&dependency.spec))
             .expect("recipe output must contain the serveable transitive");
         assert_eq!(output_spec, RANGE);
+    }
+
+    #[tokio::test]
+    async fn source_provider_shadow_restores_when_fixed_baseline_is_unsatisfiable() {
+        const NAME: &str = "tensordict";
+        const RANGE: &str = ">=0.8,<0.9";
+
+        let co_solve_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let co_solve = {
+            let calls = Arc::clone(&co_solve_calls);
+            move |_routes: Vec<crate::uv_closure::CondaRouteSpec>| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async {
+                    crate::uv_closure::CoInstallVerdict::Unsat(vec![
+                        "unrelated fixed baseline is unsatisfiable".to_string(),
+                    ])
+                }
+            }
+        };
+        let provider_checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider_check = {
+            let calls = Arc::clone(&provider_checks);
+            move |route: crate::uv_closure::CondaRouteSpec| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    assert_eq!(route.conda_name.key().as_str(), NAME);
+                    crate::uv_closure::CoInstallVerdict::Unsat(vec![
+                        "standalone tensordict route selects workspace-owned pytorch".to_string(),
+                    ])
+                }
+            }
+        };
+        let fetch_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fetch = {
+            let calls = Arc::clone(&fetch_calls);
+            move |request: PypiFetchRequest, _indexes: Vec<String>, _failure_context: String| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                assert_eq!(request.pypi_name, NAME);
+                async { Ok(test_wheel(NAME, NAME, "0.8.3", &[])) }
+            }
+        };
+        let target = crate::pypi::WheelTarget::for_subdir("3.11", "linux-64");
+        let config = test_config();
+        let mut bundle = test_bundle(&[&format!("{NAME}{RANGE}")]);
+        bundle.primary.metadata.name = "gr00t".to_string();
+        bundle.primary.metadata_provenance = Provenance::SourceBuiltRelaxed;
+
+        auto_bundle_transitives_with_route_precheck(
+            &mut bundle,
+            &[crate::workspace::DEFAULT_PYPI_INDEX.to_string()],
+            &target,
+            &config,
+            None,
+            None,
+            None,
+            &validated_probe,
+            &co_solve,
+            &provider_check,
+            &fetch,
+            &["conda-forge/linux-64".to_string()],
+            &UvReresolveContext::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(provider_checks.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(co_solve_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(fetch_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(bundle.extras.iter().any(|wheel| wheel.pypi_name == NAME));
+        assert!(
+            super::super::emitted_bundle_route_specs(&bundle, &config, &target)
+                .unwrap()
+                .iter()
+                .all(|route| route.conda_name.key().as_str() != NAME),
+            "positive provider-shadow evidence must override only the source-route baseline fail-open",
+        );
     }
 
     #[tokio::test]

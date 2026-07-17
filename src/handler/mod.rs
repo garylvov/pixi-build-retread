@@ -3865,6 +3865,69 @@ impl CondaCoSolveContext {
         }
     }
 
+    /// Check one mutable route without the globally fixed workspace baseline.
+    ///
+    /// Source-built metadata routes normally fail open when that baseline is
+    /// independently unsatisfiable. Provider ownership is different: a
+    /// standalone route whose selected closure contains a conda provider for
+    /// a direct workspace PyPI dependency is positive, route-local evidence
+    /// and can be rejected without blaming the unrelated baseline.
+    pub(crate) async fn validate_standalone_provider_route(
+        &self,
+        route: crate::uv_closure::CondaRouteSpec,
+    ) -> crate::uv_closure::CoInstallVerdict {
+        if self.workspace_pypi_providers.is_empty() {
+            return crate::uv_closure::CoInstallVerdict::Sat;
+        }
+        let specs = vec![
+            route.match_spec(),
+            CondaName::new("python").match_spec(&format!("{}.*", self.python)),
+        ];
+        match crate::conda_solve::solve_selected_records(
+            &self.channels,
+            &specs,
+            &self.python,
+            &self.subdir,
+            self.channel_priority,
+            &self.system_requirements,
+            rattler_solve::SolveStrategy::Highest,
+        )
+        .await
+        {
+            Ok(records) => {
+                let conflicts = selected_workspace_pypi_provider_conflicts(
+                    records
+                        .iter()
+                        .map(|record| record.package_record.name.as_normalized()),
+                    &self.workspace_pypi_providers,
+                );
+                if conflicts.is_empty() {
+                    crate::uv_closure::CoInstallVerdict::Sat
+                } else {
+                    crate::uv_closure::CoInstallVerdict::Unsat(
+                        conflicts
+                            .into_iter()
+                            .map(|(conda, pypi)| {
+                                format!(
+                                    "standalone conda route `{}` selects provider `{conda}` owned by workspace PyPI dependency `{pypi}`",
+                                    route.conda_name,
+                                )
+                            })
+                            .collect(),
+                    )
+                }
+            }
+            Err(reasons)
+                if reasons
+                    .iter()
+                    .any(|reason| reason.contains("no repodata available from disk cache")) =>
+            {
+                crate::uv_closure::CoInstallVerdict::Skipped(reasons.join("; "))
+            }
+            Err(reasons) => crate::uv_closure::CoInstallVerdict::Unsat(reasons),
+        }
+    }
+
     pub(crate) fn channels_consulted(&self) -> Vec<String> {
         self.channels.iter().map(ToString::to_string).collect()
     }
