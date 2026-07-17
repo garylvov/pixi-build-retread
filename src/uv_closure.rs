@@ -1057,7 +1057,10 @@ where
             .collect::<Vec<_>>()
     };
 
-    if matches!(co_solve(combined(&candidates)).await, CoInstallVerdict::Sat) {
+    // Retain the first complete-set verdict so an unsatisfiable request is not
+    // immediately solved a second time after the fixed-baseline check.
+    let mut next_verdict = Some(co_solve(combined(&candidates)).await);
+    if matches!(next_verdict.as_ref(), Some(CoInstallVerdict::Sat)) {
         return Some(JointRouteSelection {
             accepted: candidates,
             rejected: Vec::new(),
@@ -1071,7 +1074,11 @@ where
     let mut rejected = Vec::new();
     let mut remaining = candidates;
     loop {
-        match co_solve(combined(&remaining)).await {
+        let verdict = match next_verdict.take() {
+            Some(verdict) => verdict,
+            None => co_solve(combined(&remaining)).await,
+        };
+        match verdict {
             CoInstallVerdict::Sat => {
                 return Some(JointRouteSelection {
                     accepted: remaining,
@@ -1085,7 +1092,51 @@ where
                     rejected,
                 });
             }
-            CoInstallVerdict::Unsat(_) => {}
+            CoInstallVerdict::Unsat(reasons) => {
+                // Resolvo normally names a directly conflicting root in its
+                // explanation. Prove a small number of those hints against
+                // the already-satisfiable fixed baseline before falling back
+                // to exhaustive core reduction. A singleton that is UNSAT is
+                // itself a deletion-minimal core, so rejecting it cannot
+                // change which routes are ultimately eligible. The cap keeps
+                // a broad/noisy explanation from adding more work than the
+                // fallback it is meant to avoid.
+                const SINGLETON_HINT_LIMIT: usize = 8;
+                let hinted: Vec<CondaRouteSpec> = remaining
+                    .iter()
+                    .filter(|candidate| {
+                        reasons.iter().any(|reason| {
+                            unsat_reason_names_package(reason, candidate.conda_name.as_spec())
+                        })
+                    })
+                    .take(SINGLETON_HINT_LIMIT + 1)
+                    .cloned()
+                    .collect();
+                if !hinted.is_empty() && hinted.len() <= SINGLETON_HINT_LIMIT {
+                    let mut singleton_cores = Vec::new();
+                    for candidate in hinted {
+                        if matches!(
+                            co_solve(combined(std::slice::from_ref(&candidate))).await,
+                            CoInstallVerdict::Unsat(_)
+                        ) {
+                            singleton_cores.push(candidate);
+                        }
+                    }
+                    if !singleton_cores.is_empty() {
+                        tracing::info!(
+                            routes = ?singleton_cores
+                                .iter()
+                                .map(|route| route.conda_name.as_spec())
+                                .collect::<Vec<_>>(),
+                            "joint route solve: rejected unsat-reason singleton cores",
+                        );
+                        let singleton_set: BTreeSet<_> = singleton_cores.iter().cloned().collect();
+                        rejected.extend(singleton_cores);
+                        remaining.retain(|route| !singleton_set.contains(route));
+                        continue;
+                    }
+                }
+            }
         }
 
         // Reduce the failing set to a deletion-minimal unsatisfiable core:
@@ -7602,6 +7653,49 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
 
         assert_eq!(selection.accepted, vec![unrelated]);
         assert_eq!(selection.rejected, vec![left, right]);
+    }
+
+    #[tokio::test]
+    async fn rule2_joint_solve_uses_unsat_hint_for_singleton_core() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = AtomicUsize::new(0);
+        let broken = emitted_route("zz-broken", "zz-broken", "==1");
+        let mut candidates = (0..96)
+            .map(|index| {
+                let name = format!("candidate-{index:03}");
+                emitted_route(&name, &name, "==1")
+            })
+            .collect::<Vec<_>>();
+        candidates.push(broken.clone());
+        let expected_accepted = candidates.len() - 1;
+        let co_solve = |routes: Vec<CondaRouteSpec>| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            let has_broken = routes
+                .iter()
+                .any(|route| route.conda_name.as_spec() == "zz-broken");
+            async move {
+                if has_broken {
+                    CoInstallVerdict::Unsat(vec![
+                        "zz-broken ==1 conflicts with the fixed runtime".to_string(),
+                    ])
+                } else {
+                    CoInstallVerdict::Sat
+                }
+            }
+        };
+
+        let selection = select_jointly_solvable_routes(Vec::new(), candidates, &co_solve)
+            .await
+            .expect("the fixed conda baseline is satisfiable");
+
+        assert_eq!(selection.accepted.len(), expected_accepted);
+        assert_eq!(selection.rejected, vec![broken]);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            4,
+            "one full solve, one baseline proof, one singleton proof, and one final solve"
+        );
     }
 
     #[tokio::test]
