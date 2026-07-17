@@ -51,6 +51,7 @@ use crate::relax::{
 };
 use crate::rpc::{RpcError, ok, parse_params};
 use crate::wheel::WheelMetadata;
+use crate::wheel_rewrite::rewrite_wheel;
 
 /// Process-global memo of `conda/outputs` results, keyed by the params
 /// that determine the outputs (host/build platform, sorted channels,
@@ -9517,11 +9518,17 @@ async fn emit_wheels_from_lock(
                     return Ok(None);
                 }
 
+                // Cold materialization applies the configured general relax
+                // policy before courier performs its override/provider rewrite.
+                // Replay must feed courier the same phase-D bytes, not the raw
+                // upstream wheel, or the authoritative final SHA can drift.
+                let replay_local = relax_replayed_class2_wheel(fetched, config.relax).await?;
+
                 crate::emit_pypi::EmitWheel {
                     pypi_name: lw.name.clone(),
                     version: lw.version.clone(),
                     requires_dist: lw.requires_dist.clone(),
-                    local_path: Some(fetched),
+                    local_path: Some(replay_local),
                     wheel_filename: lw.filename.clone(),
                     sha256: None,
                     locked_final_sha256: lw.sha256.clone(),
@@ -9538,6 +9545,34 @@ async fn emit_wheels_from_lock(
     }
 
     Ok(Some(emit_wheels))
+}
+
+/// Apply the same phase-D relax rewrite to a re-fetched Class-2 index wheel
+/// that [`materialize_and_rewrite`] applies on the cold path.
+///
+/// Courier staging performs a second, distinct metadata rewrite for resolved
+/// overrides, conda providers, and orphan URL dependencies.  Feeding it the
+/// raw upstream wheel on replay skips phase D and can therefore produce bytes
+/// that differ from the authoritative lock whenever the general relax policy
+/// widened an exact pin before courier staging.
+async fn relax_replayed_class2_wheel(fetched: PathBuf, relax: RelaxPolicy) -> Result<PathBuf> {
+    if relax == RelaxPolicy::None {
+        return Ok(fetched);
+    }
+
+    let rewritten = fetched.with_extension("relaxed.whl");
+    let src = fetched.clone();
+    let dst = rewritten.clone();
+    tokio::task::spawn_blocking(move || rewrite_wheel(&src, &dst, relax))
+        .await
+        .context("Class-2 replay relax rewrite panicked")?
+        .with_context(|| {
+            format!(
+                "Class-2 replay phase-D rewrite for {} (policy={relax:?})",
+                fetched.display(),
+            )
+        })?;
+    Ok(rewritten)
 }
 
 /// Replay a committed courier lock: re-materialize all wheels and run
@@ -11277,12 +11312,13 @@ mod replay_tests {
 
     use super::{
         AutoDataConfig, load_replayable_lock, load_replayable_lock_for_target,
-        materialize_from_lock_for_target, replay_from_lock, replay_sdist_cache_key,
-        validate_authoritative_replay_lock,
+        materialize_from_lock_for_target, relax_replayed_class2_wheel, replay_from_lock,
+        replay_sdist_cache_key, validate_authoritative_replay_lock,
     };
     use crate::config::RetreadConfig;
     use crate::lock::{CondaDep, GitWheelSource, LockWheel, Origin, RetreadLock, SCHEMA};
     use crate::pypi::ResolutionTarget;
+    use crate::wheel_rewrite::rewrite_wheel;
 
     fn unique_tmp_dir() -> std::path::PathBuf {
         let base = std::env::temp_dir();
@@ -12514,17 +12550,19 @@ mod replay_tests {
         // detects change -> ShadowSrc::Rewritten or ShadowSrc::Raw -> Origin::Built.
         let dep_name = "dep-a";
         let dep_version = "1.0.0";
+        let strict_req = "strict-dep==1.2.3";
         let dep_whl_name = format!(
             "{}-{dep_version}-py3-none-any.whl",
             dep_name.replace('-', "_")
         );
+        let dep_requires = vec!["leaf>=1".to_string()];
         let url_req = format!("{dep_name} @ https://example.com/{dep_whl_name}");
 
         // Write the dep wheel file.
         let dep_whl_path = source_dir.join("wheels").join(&dep_whl_name);
         std::fs::write(
             &dep_whl_path,
-            make_wheel_bytes_for_replay(dep_name, dep_version, &[]),
+            make_wheel_bytes_for_replay(dep_name, dep_version, &["leaf>=1"]),
         )
         .unwrap();
 
@@ -12535,7 +12573,7 @@ mod replay_tests {
             wheel_version
         );
         let raw_wheel_bytes =
-            make_wheel_bytes_for_replay(wheel_name, wheel_version, &[url_req.as_str()]);
+            make_wheel_bytes_for_replay(wheel_name, wheel_version, &[url_req.as_str(), strict_req]);
 
         // ── Localhost HTTP server ────────────────────────────────────────────────
         let wheel_bytes_srv = Arc::new(raw_wheel_bytes.clone());
@@ -12567,7 +12605,8 @@ mod replay_tests {
         let config: crate::config::RetreadConfig = serde_json::from_value(serde_json::json!({
             "retread-wheels": {
                 bundle: { "version": &format!("=={wheel_version}") }
-            }
+            },
+            "retread-relax": "minor"
         }))
         .unwrap();
 
@@ -12578,16 +12617,25 @@ mod replay_tests {
 
         let index_urls = [format!("http://127.0.0.1:{port}/simple/")];
 
-        // ── Write the upstream wheel bytes to disk (simulating materialize_and_rewrite
-        //    fetch). The cold EmitWheel has local_path=Some(fetched+relaxed whl).
-        //    For this test we write the raw bytes as the "already fetched" local file.
+        // ── Write the upstream wheel bytes to disk and apply cold phase D, exactly
+        //    as materialize_and_rewrite does before courier staging.
         let p3d_local = source_dir.join("wheels").join(&p3d_whl_name);
         std::fs::write(&p3d_local, &raw_wheel_bytes).unwrap();
+        let p3d_cold_relaxed = p3d_local.with_extension("relaxed.whl");
+        rewrite_wheel(&p3d_local, &p3d_cold_relaxed, config.relax).unwrap();
+        let cold_metadata = crate::wheel::read_metadata(&p3d_cold_relaxed).unwrap();
+        assert!(
+            cold_metadata
+                .requires_dist
+                .iter()
+                .any(|req| req.starts_with("strict-dep>=1.2")),
+            "test must exercise a general relax rewrite before courier staging"
+        );
 
         let dep_emit = crate::emit_pypi::EmitWheel {
             pypi_name: dep_name.to_string(),
             version: dep_version.to_string(),
-            requires_dist: vec![],
+            requires_dist: dep_requires.clone(),
             wheel_filename: dep_whl_name.clone(),
             sha256: None,
             locked_final_sha256: None,
@@ -12603,11 +12651,11 @@ mod replay_tests {
         let cold_emit = crate::emit_pypi::EmitWheel {
             pypi_name: wheel_name.to_string(),
             version: wheel_version.to_string(),
-            requires_dist: vec![url_req.clone()],
+            requires_dist: cold_metadata.requires_dist,
             wheel_filename: p3d_whl_name.clone(),
             sha256: None,
             locked_final_sha256: None,
-            local_path: Some(p3d_local.clone()),
+            local_path: Some(p3d_cold_relaxed),
             remote_url: None,
             upstream_url: Some(upstream_url.clone()),
             git_source: None,
@@ -12674,14 +12722,18 @@ mod replay_tests {
         // Build the replay EmitWheel exactly as the new Class-2 arm would:
         // download from upstream_url -> local_path=Some, remote_url=None,
         // upstream_url=Some(github).
-        let fetched_replay = source_dir.join("wheels").join(&p3d_whl_name);
-        // The wheel bytes are already in source_dir/wheels/ from cold;
-        // fetch_wheel_cached would land there too (dest_dir.join(filename_from_url)).
+        let replay_download = source_dir.join("replay-download");
+        std::fs::create_dir_all(&replay_download).unwrap();
+        let fetched_replay = replay_download.join(&p3d_whl_name);
+        std::fs::write(&fetched_replay, &raw_wheel_bytes).unwrap();
+        let replay_local = relax_replayed_class2_wheel(fetched_replay, config.relax)
+            .await
+            .unwrap();
 
         let dep_replay = crate::emit_pypi::EmitWheel {
             pypi_name: dep_name.to_string(),
             version: dep_version.to_string(),
-            requires_dist: vec![],
+            requires_dist: dep_requires,
             wheel_filename: dep_whl_name.clone(),
             sha256: None,
             locked_final_sha256: None,
@@ -12701,7 +12753,7 @@ mod replay_tests {
             wheel_filename: cold_lw.filename.clone(), // already-999retread
             sha256: None,
             locked_final_sha256: cold_lw.sha256.clone(),
-            local_path: Some(fetched_replay),
+            local_path: Some(replay_local),
             remote_url: None,
             upstream_url: Some(upstream_url),
             git_source: None,
