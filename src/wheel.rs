@@ -1496,7 +1496,11 @@ impl HttpRangeReader {
                 )
             })?;
             let (cr_start, cr_end, cr_total) = parsed;
-            if cr_start != start || cr_end < cr_start || cr_end >= cr_total || cr_total != self.len
+            if cr_start != start
+                || cr_end < cr_start
+                || cr_end > last
+                || cr_end >= cr_total
+                || cr_total != self.len
             {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -1507,8 +1511,35 @@ impl HttpRangeReader {
                     ),
                 ));
             }
-            let bytes = resp.bytes().map_err(std::io::Error::other)?;
-            self.window = Some((start, bytes.to_vec()));
+            let expected_body_len = cr_end - cr_start + 1;
+            if let Some(content_length) = resp.content_length()
+                && content_length != expected_body_len
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "Content-Length `{content_length}` does not match Content-Range body length `{expected_body_len}`"
+                    ),
+                ));
+            }
+            // Never let a misbehaving CDN turn a 256-KiB metadata range into
+            // a multi-gigabyte receive. Even if Content-Length is absent or
+            // false, read at most the declared span plus one sentinel byte.
+            let mut bytes = Vec::with_capacity(expected_body_len as usize);
+            let mut bounded = resp.take(expected_body_len + 1);
+            bounded
+                .read_to_end(&mut bytes)
+                .map_err(std::io::Error::other)?;
+            if bytes.len() as u64 != expected_body_len {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "range body length `{}` does not match Content-Range `{expected_body_len}`",
+                        bytes.len()
+                    ),
+                ));
+            }
+            self.window = Some((start, bytes));
         }
         let (ws, wb) = self.window.as_ref().expect("window populated above");
         let off = (start - ws) as usize;
@@ -1956,6 +1987,99 @@ mod tests {
         assert!(
             err.is_err(),
             "wrong-offset 206 must be rejected, got {err:?}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ranged_metadata_rejects_overserved_206_from_requested_offset() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        // Some CDNs preserve the requested start in Content-Range but ignore
+        // its end, returning the rest of a multi-gigabyte object. The old
+        // reader accepted that header and consumed the entire response.
+        let zip_bytes = {
+            use std::io::Write as _;
+            let mut cursor = std::io::Cursor::new(Vec::new());
+            {
+                let mut zw = zip::ZipWriter::new(&mut cursor);
+                let stored: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored);
+                // Put METADATA near the beginning and padding after it. The
+                // zip reader first inspects the central directory at EOF,
+                // then seeks back to a range whose requested end is far short
+                // of EOF, forcing the over-serve check.
+                zw.start_file("foo-1.0.dist-info/METADATA", stored).unwrap();
+                zw.write_all(b"Metadata-Version: 2.1\nName: foo\nVersion: 1.0\n\n")
+                    .unwrap();
+                zw.start_file("padding.bin", stored).unwrap();
+                let padding: Vec<u8> = (0..1_048_576u32).map(|i| (i % 251) as u8).collect();
+                zw.write_all(&padding).unwrap();
+                zw.finish().unwrap();
+            }
+            cursor.into_inner()
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let bytes = zip_bytes.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut chunk = [0_u8; 1024];
+                    loop {
+                        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                            break;
+                        }
+                        match stream.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(count) => request.extend_from_slice(&chunk[..count]),
+                        }
+                    }
+                    let request = String::from_utf8_lossy(&request);
+                    let total = bytes.len();
+                    if request.starts_with("HEAD ") {
+                        let header = format!(
+                            "HTTP/1.1 200 OK\r\nAccept-Ranges: bytes\r\nContent-Length: {total}\r\nConnection: close\r\n\r\n"
+                        );
+                        let _ = stream.write_all(header.as_bytes()).await;
+                        return;
+                    }
+                    let start = request
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("range: bytes=")
+                                .and_then(|span| span.split_once('-'))
+                                .and_then(|(start, _)| start.parse::<usize>().ok())
+                        })
+                        .unwrap();
+                    let body = &bytes[start..];
+                    let header = format!(
+                        "HTTP/1.1 206 Partial Content\r\nAccept-Ranges: bytes\r\nContent-Range: bytes {start}-{}/{total}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        total - 1,
+                        body.len(),
+                    );
+                    if stream.write_all(header.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    let _ = stream.write_all(body).await;
+                });
+            }
+        });
+
+        let url: url::Url = format!("http://127.0.0.1:{port}/foo-1.0-py3-none-any.whl")
+            .parse()
+            .unwrap();
+        let error = fetch_metadata_ranged(&url, &"f".repeat(64))
+            .await
+            .expect_err("an over-wide 206 response must be rejected");
+        assert!(
+            format!("{error:#}").contains("does not match requested"),
+            "unexpected over-serve error: {error:#}",
         );
         server.abort();
     }

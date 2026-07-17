@@ -1870,6 +1870,18 @@ pub(crate) async fn fetch_and_parse(
         .context("metadata reader panicked")?
 }
 
+async fn fetch_and_parse_cached(
+    url: &url::Url,
+    sha256_hint: Option<&str>,
+    download_dir: &Path,
+    store_root: &Path,
+) -> Result<WheelMetadata> {
+    let path = crate::wheel::fetch_wheel_cached(url, sha256_hint, download_dir, store_root).await?;
+    tokio::task::spawn_blocking(move || crate::wheel::read_metadata(&path))
+        .await
+        .context("metadata reader panicked")?
+}
+
 /// v1.4.3: metadata-only acquisition for wheels whose BYTES aren't
 /// needed in this phase. BFS extras, auto-bundled, and cascade-bundled
 /// wheels enter the recipe by their UPSTREAM url -- rattler-build
@@ -1884,7 +1896,7 @@ pub(crate) async fn fetch_and_parse(
 ///      potentially-GB wheel (the fragment hash stands in for the
 ///      computed one the recipe pins);
 ///   4. seek the zip metadata through HTTP ranges when supported;
-///   5. full download via fetch_and_parse.
+///   5. full download through the shared content-addressed wheel store.
 ///
 /// pypi.org serves sidecars; pypi.nvidia.com and static GitHub-Pages
 /// indexes do not (measured 2026-06-10), so NVIDIA-index-only wheels
@@ -1967,7 +1979,13 @@ async fn metadata_preferring_sidecar_with_store(
             }
         }
     }
-    fetch_and_parse(&resolved.url, resolved.sha256.as_deref(), download_dir).await
+    fetch_and_parse_cached(
+        &resolved.url,
+        resolved.sha256.as_deref(),
+        download_dir,
+        store_root,
+    )
+    .await
 }
 
 /// One extras-derived dependency. v0.12.0+: source can be PyPI Simple
@@ -2042,6 +2060,7 @@ pub(crate) fn pep508_extra_dep(raw: &str, extra: &str) -> Result<Option<ExtraDep
 mod tests {
     use super::*;
     use rattler_conda_types::{PackageRecord, RepoDataRecord, VersionWithSource};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use url::Url;
 
@@ -2096,6 +2115,90 @@ mod tests {
         assert_eq!(metadata.requires_dist, ["child>=4"]);
         assert!(std::fs::read_dir(&downloads).unwrap().next().is_none());
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn full_metadata_fallback_coalesces_into_shared_store() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        // fetch_wheel_cached consults RETREAD_NO_SHADOW_CACHE. Other async
+        // tests deliberately toggle that process-global variable, so hold the
+        // shared guard while asserting the cache-enabled path.
+        let _env_guard = crate::TEST_ASYNC_ENV_MUTEX.lock().await;
+        let bytes = metadata_test_wheel();
+        let sha256 = crate::wheel_rewrite::sha256_hex(&bytes);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let gets = Arc::new(AtomicUsize::new(0));
+        let server_gets = gets.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let bytes = bytes.clone();
+                let gets = server_gets.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut chunk = [0_u8; 1024];
+                    loop {
+                        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                            break;
+                        }
+                        match stream.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(count) => request.extend_from_slice(&chunk[..count]),
+                        }
+                    }
+                    if request.starts_with(b"GET ") {
+                        gets.fetch_add(1, Ordering::SeqCst);
+                    }
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        bytes.len(),
+                    );
+                    if stream.write_all(header.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    let _ = stream.write_all(&bytes).await;
+                });
+            }
+        });
+
+        let tmp = std::env::temp_dir().join(format!(
+            "retread-metadata-coalesced-fallback-{}-{}",
+            std::process::id(),
+            line!(),
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let first_downloads = tmp.join("first");
+        let second_downloads = tmp.join("second");
+        let store = tmp.join("store");
+        let url = Url::parse(&format!(
+            "http://127.0.0.1:{port}/cached_pkg-1.2.3-py3-none-any.whl"
+        ))
+        .unwrap();
+
+        let (first, second) = tokio::join!(
+            fetch_and_parse_cached(&url, Some(&sha256), &first_downloads, &store),
+            fetch_and_parse_cached(&url, Some(&sha256), &second_downloads, &store),
+        );
+        assert_eq!(first.unwrap().name, "cached-pkg");
+        assert_eq!(second.unwrap().name, "cached-pkg");
+        assert_eq!(
+            gets.load(Ordering::SeqCst),
+            1,
+            "concurrent metadata fallbacks must share one full-wheel GET",
+        );
+        assert!(
+            crate::wheel::cached_wheel_store_path(&url, &sha256, &store)
+                .await
+                .unwrap()
+                .is_some(),
+            "metadata fallback must durably populate the shared wheel store",
+        );
+        server.abort();
+        let _ = std::fs::remove_dir_all(tmp);
     }
 
     fn test_config() -> RetreadConfig {
