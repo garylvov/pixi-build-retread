@@ -1353,6 +1353,55 @@ fn produce_output_softens_deps_from_floor_pin_to_floor_spec() {
     );
 }
 
+#[test]
+fn produce_output_preserves_deps_from_bare_and_range_specs() {
+    let mut pandas = bundle_auto_route("pandas", "3.0.3", Provenance::DepsFromRelaxed);
+    pandas
+        .route
+        .input_requirements
+        .push(crate::uv_closure::AutoRouteInputRequirement {
+            specifiers: String::new(),
+            source: "retread-deps-from root `pandas`".to_string(),
+            provenance: Provenance::DepsFromRelaxed,
+            role: crate::uv_closure::AutoRouteInputRole::Requirement,
+        });
+    let mut scipy = bundle_auto_route("scipy", "1.17.0", Provenance::DepsFromRelaxed);
+    scipy
+        .route
+        .input_requirements
+        .push(crate::uv_closure::AutoRouteInputRequirement {
+            specifiers: ">=1.15,<1.18".to_string(),
+            source: "retread-deps-from root `scipy>=1.15,<1.18`".to_string(),
+            provenance: Provenance::DepsFromRelaxed,
+            role: crate::uv_closure::AutoRouteInputRole::Requirement,
+        });
+    let bundle = Bundle {
+        conda_name: "upstream-requirements-pack".into(),
+        primary: rw(
+            "upstream-requirements-pack",
+            meta("upstream-requirements-pack", "1.0.0", vec![], false),
+        ),
+        extras: vec![],
+        probe_decisions: vec![],
+        solve_diagnostics: BTreeMap::new(),
+        auto_routed: vec![pandas, scipy],
+        auto_dropped: Default::default(),
+        uv_closure_names: Default::default(),
+        workspace_conda_versions: Default::default(),
+        workspace_conda_provider_facts: Default::default(),
+    };
+
+    let out = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
+    let deps: BTreeMap<String, String> = out
+        .run_dependencies
+        .depends
+        .iter()
+        .map(|dep| (dep.name.clone(), format_packagespec(&dep.spec)))
+        .collect();
+    assert_eq!(deps.get("pandas").map(String::as_str), Some(""));
+    assert_eq!(deps.get("scipy").map(String::as_str), Some(">=1.15,<1.18"));
+}
+
 // --- bounded_range_ceiling / auto-routed pin emission ----------------------
 
 #[test]

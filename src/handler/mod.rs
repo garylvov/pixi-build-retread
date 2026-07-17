@@ -1273,10 +1273,10 @@ struct Bundle {
     /// conda — not a shipped wheel — provides it at install time. Empty
     /// on the legacy path and when `auto-route = false`.
     ///
-    /// Each route carries the typed origin of its selected version. Exact
-    /// pins originating in `retread-deps-from` are advisory; ordinary uv
-    /// selections remain preferences until the common constraint finalizer
-    /// derives an emitted spec.
+    /// Each route carries the typed origin of its selected version.
+    /// Requirements originating in `retread-deps-from` remain advisory and
+    /// emit their effective upstream spec; ordinary uv selections remain
+    /// preferences until the common constraint finalizer derives a spec.
     auto_routed: Vec<BundleAutoRoute>,
     /// Canonical PyPI names the precise consuming workspace already owns.
     /// These are removed from the pack's wheel graph and are not re-emitted
@@ -3109,7 +3109,7 @@ async fn resolve_all(
         // the materialization path then runs unpinned.
         let (
             uv_closure,
-            deps_from_floor_names,
+            deps_from_root_names,
             workspace_facts,
             prelock_owned_drops,
             protected_workspace_fact_names,
@@ -3246,7 +3246,7 @@ async fn resolve_all(
                 .filter(|r| !closure.auto_dropped.contains(&r.pypi_name))
                 .map(|r| BundleAutoRoute {
                     route: r.clone(),
-                    provenance: if deps_from_floor_names.contains(&r.pypi_name) {
+                    provenance: if deps_from_root_names.contains(&r.pypi_name) {
                         Provenance::DepsFromRelaxed
                     } else {
                         Provenance::PriorSelection
@@ -4398,14 +4398,13 @@ async fn uv_group_closure(
     // uv-resolvable `[retread-wheels]` entries at all) is exactly why this
     // runs BEFORE the `roots.is_empty()` bail-out below -- deps-from alone
     // can supply every root this bundle needs.
-    // conda-as-truth (deps-from soften-pins fix): canonical PyPI names
-    // whose deps-from-sourced root carries an exact `==`/`===` pin.
+    // Conda-as-truth: canonical PyPI names supplied by retread-deps-from.
     // deps-from roots are appended strictly AFTER `[retread-wheels]`
     // roots and `dedupe_roots_last_wins` keeps the last occurrence per
     // name, so any name present here is guaranteed to be the winning
-    // root below -- these pins are safe to soften at conda run-dep
-    // emission time (see `BundleAutoRoute::provenance`).
-    let mut deps_from_floor_names: std::collections::BTreeSet<String> = Default::default();
+    // root below, so these requirements may safely retain deps-from
+    // provenance through conda run-dep emission.
+    let mut deps_from_root_names: std::collections::BTreeSet<String> = Default::default();
     let mut deps_from_advisory_floors = Vec::new();
     if !effective.deps_from.is_empty() {
         let deps_from = crate::deps_from::resolve_deps_from(
@@ -4415,7 +4414,11 @@ async fn uv_group_closure(
         )
         .await
         .with_context(|| format!("retread-deps-from: bundle `{group_name}`"))?;
-        deps_from_floor_names = deps_from_exact_pinned_names(&deps_from.pypi_roots);
+        deps_from_root_names = deps_from
+            .pypi_roots
+            .iter()
+            .filter_map(|root| root_req_name(root))
+            .collect();
         deps_from_advisory_floors = deps_from.advisory_conda_floors;
         roots.extend(deps_from.pypi_roots);
         // Dedupe by PEP 503-normalized package name, LAST occurrence wins.
@@ -4757,7 +4760,7 @@ async fn uv_group_closure(
         python_version: target.python_version.clone(),
         conda_subdir: target.conda_subdir.clone(),
         dependencies: roots,
-        dependency_provenance: deps_from_floor_names
+        dependency_provenance: deps_from_root_names
             .iter()
             .cloned()
             .map(|name| (name, Provenance::DepsFromRelaxed))
@@ -5195,7 +5198,7 @@ async fn uv_group_closure(
     );
     Ok((
         Some(closure),
-        deps_from_floor_names,
+        deps_from_root_names,
         workspace_facts,
         prelock_owned_drops,
         protected_root_names,
@@ -8674,19 +8677,17 @@ fn produce_output_with_conflicts(
     let mut emission_groups = Vec::new();
     let mut emission_group_indexes = BTreeMap::new();
 
-    // M2 (v4.3.0): auto-routed packages FIRST, exact-pinned. The uv
-    // closure was resolved against exactly these versions, and the probe
-    // already confirmed the (channel, python) build exists — the exact
-    // pin must win over any looser Requires-Dist spec a shipped wheel
-    // would emit for the same name below (seen_dep_names dedup).
+    // M2 (v4.3.0): auto-routed packages FIRST. The uv closure was resolved
+    // against concrete versions and the probe confirmed each corresponding
+    // (channel, python) build. Typed route inputs determine the emitted
+    // constraint before any shipped wheel's Requires-Dist for the same name.
     //
-    // conda-as-truth exception: a root whose ONLY reason for an exact
-    // pin is a `retread-deps-from` requirement-file line (`floor` ==
-    // true, see `deps_from_exact_pinned_names`) is softened to a `>=`
-    // floor instead. Upstream requirement-file pins are pip-world
-    // advisories; the composed workspace's conda solve is the source of
-    // truth, so this pack must not hard-conflict with a sibling pack's
-    // own conda pin for the same name (e.g. `setuptools ==83.0.0`).
+    // Conda-as-truth exception: a route rooted in `retread-deps-from`
+    // emits the upstream requirement itself rather than inventing a bound
+    // from uv's selected version. Exact pins have already been softened to
+    // `>=` by the typed input bridge; ranges remain ranges, and a bare root
+    // remains bare. This lets the composed conda solve select a compatible
+    // provider instead of freezing an incidental uv choice.
     //
     // Bounded-range emission (root-cause fix for the serial repair grind):
     // every OTHER auto-routed pin -- one this pack picked itself off the
@@ -8730,49 +8731,50 @@ fn produce_output_with_conflicts(
         let conda_key = conda_name.key();
 
         // Preserve the existing conda route contract. The selected version is
-        // not restored as a hard PyPI `==`: it becomes either a deps-from
-        // advisory floor or the bounded/exact compatibility envelope the
-        // emitted conda package has always declared.
+        // not restored as a hard PyPI `==`: ordinary routes receive the
+        // bounded/exact compatibility envelope the emitted conda package has
+        // always declared. Deps-from routes rely solely on their typed
+        // upstream inputs below.
         let manual_override = config.overrides.contains_key(conda_key.as_str())
             && !config.ledger_overrides.contains(conda_key.as_str());
-        let (route_spec, provenance) =
-            if matches!(auto_route.provenance, Provenance::DepsFromRelaxed) {
-                (format!(">={conda_version}"), Provenance::DepsFromRelaxed)
-            } else if crate::solve::is_abi_anchor(conda_key.as_str()) || manual_override {
-                (format!("=={conda_version}"), Provenance::UvConstraint)
-            } else {
-                match bounded_range_ceiling(conda_version) {
-                    Some(ceiling) => (
-                        format!(">={conda_version},<{ceiling}"),
-                        Provenance::UvConstraint,
+        if !matches!(auto_route.provenance, Provenance::DepsFromRelaxed) {
+            let (route_spec, provenance) =
+                if crate::solve::is_abi_anchor(conda_key.as_str()) || manual_override {
+                    (format!("=={conda_version}"), Provenance::UvConstraint)
+                } else {
+                    match bounded_range_ceiling(conda_version) {
+                        Some(ceiling) => (
+                            format!(">={conda_version},<{ceiling}"),
+                            Provenance::UvConstraint,
+                        ),
+                        None => (format!("=={conda_version}"), Provenance::UvConstraint),
+                    }
+                };
+            let specifiers = VersionSpecifiers::from_str(&route_spec).with_context(|| {
+                format!(
+                    "parsing generated conda route constraint `{} {route_spec}`",
+                    auto_route.route.pypi_name
+                )
+            })?;
+            add_emission_constraint(
+                &mut emission_groups,
+                &mut emission_group_indexes,
+                pypi_name.clone(),
+                conda_name.clone(),
+                Constraint {
+                    specifiers,
+                    provenance,
+                    source: format!(
+                        "auto-route `{}=={}` to conda `{}=={}`",
+                        auto_route.route.pypi_name,
+                        auto_route.route.pypi_version,
+                        auto_route.route.conda_name,
+                        auto_route.route.conda_version
                     ),
-                    None => (format!("=={conda_version}"), Provenance::UvConstraint),
-                }
-            };
-        let specifiers = VersionSpecifiers::from_str(&route_spec).with_context(|| {
-            format!(
-                "parsing generated conda route constraint `{} {route_spec}`",
-                auto_route.route.pypi_name
-            )
-        })?;
-        add_emission_constraint(
-            &mut emission_groups,
-            &mut emission_group_indexes,
-            pypi_name.clone(),
-            conda_name.clone(),
-            Constraint {
-                specifiers,
-                provenance,
-                source: format!(
-                    "auto-route `{}=={}` to conda `{}=={}`",
-                    auto_route.route.pypi_name,
-                    auto_route.route.pypi_version,
-                    auto_route.route.conda_name,
-                    auto_route.route.conda_version
-                ),
-            },
-            None,
-        );
+                },
+                None,
+            );
+        }
         let prior_specifiers =
             VersionSpecifiers::from_str(&format!("=={}", auto_route.route.pypi_version))
                 .with_context(|| {
