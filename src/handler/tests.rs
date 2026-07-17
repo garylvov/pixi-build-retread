@@ -194,6 +194,53 @@ fn conda_route_rejects_transitive_workspace_pypi_provider() {
 }
 
 #[test]
+fn provider_conflict_names_the_mutable_route_root() {
+    use rattler_conda_types::{PackageRecord, RepoDataRecord, VersionWithSource};
+    use std::str::FromStr;
+    use url::Url;
+
+    let record = |name: &str, depends: &[&str]| {
+        let mut package_record = PackageRecord::new(
+            name.parse().unwrap(),
+            VersionWithSource::from_str("1.0.0").unwrap(),
+            "h123_0".to_string(),
+        );
+        package_record.subdir = "linux-64".to_string();
+        package_record.depends = depends.iter().map(|dep| (*dep).to_string()).collect();
+        RepoDataRecord {
+            package_record,
+            file_name: format!("{name}-1.0.0-h123_0.conda"),
+            url: Url::parse(&format!(
+                "https://example.invalid/linux-64/{name}-1.0.0-h123_0.conda"
+            ))
+            .unwrap(),
+            channel: Some("https://example.invalid".into()),
+        }
+    };
+    let records = vec![
+        record("tensordict", &["torchopt >=0.7"]),
+        record("torchopt", &["pytorch >=2.0"]),
+        record("pytorch", &["python >=3.11"]),
+        record("unrelated", &["python >=3.11"]),
+    ];
+    let route = |name: &str| crate::uv_closure::CondaRouteSpec {
+        pypi_name: PypiKey::from_pypi(name),
+        conda_name: CondaName::new(name),
+        spec: String::new(),
+    };
+
+    assert_eq!(
+        routed_roots_reaching_provider(
+            &records,
+            &[route("tensordict"), route("unrelated")],
+            &CondaName::new("pytorch"),
+        ),
+        vec![CondaName::new("tensordict")],
+        "the reason hint must identify the route to reject, not only its transitive provider",
+    );
+}
+
+#[test]
 fn pick_conda_target_ambiguous_parselmouth_without_name_map_is_none() {
     // Documents the pre-fix behavior: ambiguous parselmouth + no
     // curated answer -> None (caller leaves it on the PyPI/bundle

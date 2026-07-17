@@ -3611,6 +3611,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn deps_from_source_route_group_is_fully_mutable() {
+        const NAME: &str = "tensordict";
+
+        let mut bundle = test_bundle(&[NAME]);
+        bundle.primary.metadata.name = "gr00t".to_string();
+        bundle.primary.metadata_provenance = Provenance::SourceBuiltRelaxed;
+        let mut route = pillow_auto_route("0.8.3");
+        route.route.pypi_name = NAME.to_string();
+        route.route.conda_name = NAME.to_string();
+        route.route.pypi_version = "0.8.3".to_string();
+        route.route.conda_version = "0.8.3".to_string();
+        route.provenance = Provenance::DepsFromRelaxed;
+        route.route.input_requirements = vec![crate::uv_closure::AutoRouteInputRequirement {
+            specifiers: String::new(),
+            source: "retread-deps-from root `tensordict`".to_string(),
+            provenance: Provenance::DepsFromRelaxed,
+            role: crate::uv_closure::AutoRouteInputRole::Requirement,
+        }];
+        bundle.auto_routed.push(route);
+
+        let mut metadata_routes = ProvisionalMetadataRoutes::new();
+        record_metadata_route(
+            &mut metadata_routes,
+            NAME.to_string(),
+            NAME.to_string(),
+            Some("0.8.3".to_string()),
+        );
+        let target = crate::pypi::WheelTarget::for_subdir("3.11", "linux-64");
+
+        assert!(
+            route_group_is_fully_mutable(&bundle, &metadata_routes, NAME, &test_config(), &target,)
+                .unwrap(),
+            "a deps-from route duplicated by source-wheel metadata must disappear when its PyPI wheel is restored",
+        );
+    }
+
     #[tokio::test]
     async fn workspace_fact_owns_source_built_advisory_dependency() {
         let fetch_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));

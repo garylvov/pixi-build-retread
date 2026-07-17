@@ -3836,16 +3836,22 @@ impl CondaCoSolveContext {
                 if conflicts.is_empty() {
                     crate::uv_closure::CoInstallVerdict::Sat
                 } else {
-                    crate::uv_closure::CoInstallVerdict::Unsat(
-                        conflicts
-                            .into_iter()
-                            .map(|(conda, pypi)| {
+                    let mut reasons = Vec::new();
+                    for (conda, pypi) in conflicts {
+                        let culprits = routed_roots_reaching_provider(&records, &routed, &conda);
+                        if culprits.is_empty() {
+                            reasons.push(format!(
+                                "conda route selects provider `{conda}` owned by workspace PyPI dependency `{pypi}`"
+                            ));
+                        } else {
+                            reasons.extend(culprits.into_iter().map(|route| {
                                 format!(
-                                    "conda route selects provider `{conda}` owned by workspace PyPI dependency `{pypi}`"
+                                    "conda route `{route}` selects provider `{conda}` owned by workspace PyPI dependency `{pypi}`"
                                 )
-                            })
-                            .collect(),
-                    )
+                            }));
+                        }
+                    }
+                    crate::uv_closure::CoInstallVerdict::Unsat(reasons)
                 }
             }
             Err(reasons)
@@ -3862,6 +3868,55 @@ impl CondaCoSolveContext {
     pub(crate) fn channels_consulted(&self) -> Vec<String> {
         self.channels.iter().map(ToString::to_string).collect()
     }
+}
+
+/// Attribute a protected provider selected by a complete conda solve back to
+/// the mutable route roots that reach it. The joint route selector consumes
+/// these package-name hints before its exhaustive core reducer, turning a
+/// `tensordict -> pytorch` shadow into one singleton proof instead of dozens
+/// of whole-environment solves.
+fn routed_roots_reaching_provider(
+    records: &[rattler_conda_types::RepoDataRecord],
+    routed: &[crate::uv_closure::CondaRouteSpec],
+    provider: &CondaName,
+) -> Vec<CondaName> {
+    let graph: BTreeMap<String, BTreeSet<String>> = records
+        .iter()
+        .map(|record| {
+            let name = canonical_conda_name(record.package_record.name.as_normalized());
+            let dependencies = record
+                .package_record
+                .depends
+                .iter()
+                .filter_map(|dependency| dependency.split_ascii_whitespace().next())
+                .map(canonical_conda_name)
+                .collect();
+            (name, dependencies)
+        })
+        .collect();
+    let provider = provider.key().into_string();
+    routed
+        .iter()
+        .filter_map(|route| {
+            let root = route.conda_name.key().into_string();
+            let mut stack = vec![root.clone()];
+            let mut seen = BTreeSet::new();
+            while let Some(current) = stack.pop() {
+                if !seen.insert(current.clone()) {
+                    continue;
+                }
+                if current == provider {
+                    return Some(route.conda_name.clone());
+                }
+                if let Some(dependencies) = graph.get(&current) {
+                    stack.extend(dependencies.iter().cloned());
+                }
+            }
+            None
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn selected_workspace_pypi_provider_conflicts<I, S>(
@@ -4613,7 +4668,11 @@ async fn uv_group_closure(
 
     // Construct the shared oracle before the roots-empty return so the legacy
     // materialization path and the uv path validate Rule 2 against identical
-    // consuming-workspace facts.
+    // consuming-workspace facts. Direct PyPI ownership still comes only from
+    // the precise consumer facts above, but provider identity is a
+    // non-destructive validation edge: use the effective Parselmouth-backed
+    // map so a workspace-owned `torch` also protects its conda `pytorch`
+    // provider without requiring every pack to repeat retread-name-map.
     let conda_co_solve = CondaCoSolveContext::new(
         manifest_opt.as_ref(),
         workspace_dir,
@@ -4622,7 +4681,7 @@ async fn uv_group_closure(
         conda_channels,
         group_name,
         &workspace_facts.owned_pypi,
-        fact_name_map,
+        &effective.name_map,
     );
 
     // Rule-3-capable policies receive only precise, solved, agreed facts.
@@ -5430,11 +5489,12 @@ mod facts_cleanup_tests {
 #[cfg(test)]
 mod workspace_conda_facts_tests {
     use super::{
-        SolvedPypiFact, WorkspaceCondaFacts, WorkspaceRouteOwnership, dependency_name_intersection,
-        facts_from_solved_records, precise_consumer_inputs, workspace_conda_provider_candidates,
-        workspace_fact_constraints,
+        CondaCoSolveContext, SolvedPypiFact, WorkspaceCondaFacts, WorkspaceRouteOwnership,
+        dependency_name_intersection, effective_name_map, facts_from_solved_records,
+        precise_consumer_inputs, workspace_conda_provider_candidates, workspace_fact_constraints,
     };
     use crate::constraint::Provenance;
+    use crate::pypi::{ResolutionTarget, WheelTarget};
     use crate::relax::{CondaName, CondaTarget, NameMap, PypiKey};
     use rattler_conda_types::{PackageRecord, RepoDataRecord, VersionWithSource};
     use std::collections::{BTreeMap, BTreeSet};
@@ -5470,6 +5530,88 @@ mod workspace_conda_facts_tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn parselmouth_map_protects_direct_pypi_torch_from_conda_routes() {
+        let tmp = std::env::temp_dir().join(format!(
+            "retread-viral-provider-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let pack_dir = tmp.join("viral-pack");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        std::fs::write(
+            tmp.join("pixi.toml"),
+            r#"[workspace]
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[feature.viral.dependencies]
+viral-pack = { path = "./viral-pack" }
+python = "==3.11"
+
+[feature.viral.pypi-dependencies]
+torch = { version = "==2.7.0", index = "https://download.pytorch.org/whl/cu128" }
+
+[environments]
+viral-gpu = { features = ["viral"], no-default-feature = true }
+"#,
+        )
+        .unwrap();
+
+        let manifest = crate::workspace::WorkspaceManifest::load(&tmp).unwrap();
+        let inputs = precise_consumer_inputs(&manifest, &tmp, &pack_dir).unwrap();
+        let owned_pypi = dependency_name_intersection(
+            &inputs
+                .iter()
+                .map(|input| input.pypi_deps.clone())
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(owned_pypi, BTreeSet::from(["torch".to_string()]));
+
+        // Model the central mapping even when the pack declares no
+        // retread-name-map of its own. The curated fallback resolves
+        // Parselmouth's multi-provider torch family to `pytorch`.
+        let parselmouth = std::collections::HashMap::from([(
+            "torch".to_string(),
+            vec![
+                "pytorch".to_string(),
+                "pytorch-cpu".to_string(),
+                "pytorch-gpu".to_string(),
+            ],
+        )]);
+        let effective_map = effective_name_map(&NameMap::new(), &parselmouth);
+        let target = ResolutionTarget::from_wheel_target(
+            WheelTarget {
+                python_version: "3.11".to_string(),
+                conda_subdir: "linux-64".to_string(),
+                max_glibc: None,
+            },
+            None,
+        );
+        let context = CondaCoSolveContext::new(
+            Some(&manifest),
+            Some(&tmp),
+            &pack_dir,
+            &target,
+            &[],
+            "viral-pack",
+            &owned_pypi,
+            &effective_map,
+        );
+        assert_eq!(
+            context
+                .workspace_pypi_providers
+                .get(&CondaName::new("pytorch")),
+            Some(&PypiKey::from_pypi("torch")),
+            "the shared provider map must protect workspace PyPI torch without a pack-local map",
+        );
+
+        std::fs::remove_dir_all(tmp).unwrap();
     }
 
     /// The holosoma regression, at the layer that actually broke.
