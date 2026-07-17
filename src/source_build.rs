@@ -28,9 +28,9 @@ use tokio::process::Command;
 
 use crate::pypi::{ResolutionTarget, normalized_python_minor};
 
-const BUILT_WHEEL_CACHE_SCHEMA: &str = "retread-built-wheel-v4";
+const BUILT_WHEEL_CACHE_SCHEMA: &str = "retread-built-wheel-v5";
 const BUILT_WHEEL_CACHE_ROOT: &str = "built-wheels";
-const BUILT_WHEEL_CACHE_VERSION: &str = "v4";
+const BUILT_WHEEL_CACHE_VERSION: &str = "v5";
 const CHECKOUT_CACHE_VERSION: &str = "v3";
 const LOCAL_SOURCE_SNAPSHOT_VERSION: &str = "v5";
 const CANONICAL_GIT_SOURCE_SCHEMA: &str = "retread-canonical-git-source-v2";
@@ -2857,7 +2857,7 @@ pub(crate) async fn build_wheel_from_sdist_url_for_target(
 /// Shared cross-pack cache family for built git wheels, keyed by
 /// (repo url, resolved commit sha, subdirectory, python version).
 ///
-/// Layout: `<retread cache root>/built-wheels/git/v4/<artifact-target-sha256>/
+/// Layout: `<retread cache root>/built-wheels/git/v5/<artifact-target-sha256>/
 /// <family-sha256>/<ref-state-sha256>/{artifact.json,<raw>.whl}`. The leaf
 /// additionally binds the canonical tag/ref state visible to SCM-aware build
 /// backends. All identity components use the complete 64 hexadecimal
@@ -4862,6 +4862,13 @@ impl Drop for UnixProcessGroupGuard {
 /// leaks to retread's stdout (which is the JSON-RPC channel to pixi).
 /// Sets `UV_PYTHON_DOWNLOADS=automatic` so missing pythons are fetched
 /// on demand without user intervention.
+fn configure_reproducible_source_build(command: &mut Command) {
+    // Some PEP 517 projects construct dependency metadata from Python sets.
+    // A randomized interpreter hash seed can therefore reorder semantically
+    // identical Requires-Dist lines and change wheel bytes.
+    command.env("PYTHONHASHSEED", "0");
+}
+
 async fn run_capturing_uv(args: &[&str]) -> Result<()> {
     // The callers above have already exhausted their wheel-cache paths. Hold
     // the process-wide permit only for the real build subprocess so nested
@@ -4872,6 +4879,7 @@ async fn run_capturing_uv(args: &[&str]) -> Result<()> {
         cmd.arg(arg);
     }
     crate::fasttmp::apply_backend_env(&mut cmd);
+    configure_reproducible_source_build(&mut cmd);
     #[cfg(unix)]
     cmd.process_group(0);
     let child = cmd
@@ -6876,7 +6884,7 @@ version = "0.1.0"
         }
         assert!(
             a.components()
-                .any(|component| component.as_os_str() == "v4")
+                .any(|component| component.as_os_str() == "v5")
         );
         assert_eq!(
             a.file_name().and_then(|name| name.to_str()).unwrap().len(),
@@ -6972,7 +6980,7 @@ version = "0.1.0"
     }
 
     #[tokio::test]
-    async fn v4_cache_marker_round_trip_preserves_user_outdir_sentinel() {
+    async fn v5_cache_marker_round_trip_preserves_user_outdir_sentinel() {
         let base =
             std::env::temp_dir().join(format!("retread-gitwheel-cache-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
@@ -7111,14 +7119,14 @@ version = "0.1.0"
     }
 
     #[test]
-    fn v4_artifact_namespaces_separate_architectures_and_use_full_hashes() {
+    fn v5_artifact_namespaces_separate_architectures_and_use_full_hashes() {
         let x86 = ResolutionTarget::from_parts("3.11", "linux-64", Some((2, 35)));
         let arm = ResolutionTarget::from_parts("3.11", "linux-aarch64", Some((2, 35)));
         let source = "f".repeat(64);
         let x86_path = built_wheel_cache_dir("git", &source, &x86);
         let arm_path = built_wheel_cache_dir("git", &source, &arm);
         assert_ne!(x86_path, arm_path);
-        assert!(x86_path.components().any(|part| part.as_os_str() == "v4"));
+        assert!(x86_path.components().any(|part| part.as_os_str() == "v5"));
         assert_eq!(x86_path.file_name().unwrap().to_string_lossy().len(), 64);
         assert_eq!(
             x86_path
@@ -7131,6 +7139,21 @@ version = "0.1.0"
             64,
             "artifact target identity must be full SHA-256",
         );
+    }
+
+    #[test]
+    fn source_build_fixes_python_hash_seed() {
+        let mut command = Command::new("uv");
+        command.env("PYTHONHASHSEED", "random");
+        configure_reproducible_source_build(&mut command);
+        let value = command
+            .as_std()
+            .get_envs()
+            .find_map(|(name, value)| {
+                (name == "PYTHONHASHSEED").then(|| value.expect("seed was removed"))
+            })
+            .expect("source build did not set PYTHONHASHSEED");
+        assert_eq!(value, "0");
     }
 
     #[test]

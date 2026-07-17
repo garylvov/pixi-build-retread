@@ -502,7 +502,11 @@ pub const SCHEMA: u32 = 12;
 /// Epoch 21: every raw source-built wheel is timestamp-normalized before it is
 /// hashed or cached, including wheels that need no injection or metadata
 /// rewrite. The built-wheel artifact namespace advances to v4 with this epoch.
-pub const EMIT_EPOCH: u32 = 21;
+///
+/// Epoch 22: source builds run with PYTHONHASHSEED=0 so PEP 517 projects that
+/// derive metadata from Python sets emit stable header ordering. The built-
+/// wheel artifact namespace advances to v5 with this epoch.
+pub const EMIT_EPOCH: u32 = 22;
 
 fn parse_stored_glibc(value: Option<&str>) -> Option<Option<(u32, u32)>> {
     match value {
