@@ -55,6 +55,49 @@ impl Drop for TemporaryPath {
     }
 }
 
+struct WheelStoreFillLock(std::fs::File);
+
+impl Drop for WheelStoreFillLock {
+    fn drop(&mut self) {
+        if let Err(error) = fs4::fs_std::FileExt::unlock(&self.0) {
+            tracing::warn!(error = %error, "failed to unlock wheel-store first fill");
+        }
+    }
+}
+
+/// Serialize the first population of one content-addressed store entry across
+/// backend processes. The lock is intentionally per wheel, not global: sibling
+/// packs can still fetch different wheels concurrently, while contenders for a
+/// multi-gigabyte NVIDIA wheel wait for the first downloader and then reuse its
+/// attested store entry.
+async fn acquire_wheel_store_fill_lock(store_path: &Path) -> Result<WheelStoreFillLock> {
+    let parent = store_path
+        .parent()
+        .ok_or_else(|| anyhow!("wheel store path has no parent: {}", store_path.display()))?;
+    fs::create_dir_all(parent)
+        .await
+        .with_context(|| format!("creating wheel store namespace {}", parent.display()))?;
+    let filename = store_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("wheel store path has no UTF-8 filename"))?;
+    let lock_path = parent.join(format!(".{filename}.retread-fill-v1.lock"));
+    tokio::task::spawn_blocking(move || {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .with_context(|| format!("opening wheel-store fill lock {}", lock_path.display()))?;
+        fs4::fs_std::FileExt::lock_exclusive(&file)
+            .with_context(|| format!("locking wheel-store fill {}", lock_path.display()))?;
+        Ok(WheelStoreFillLock(file))
+    })
+    .await
+    .context("wheel-store fill lock task panicked")?
+}
+
 #[derive(Debug, Clone)]
 pub struct WheelMetadata {
     pub name: String,
@@ -860,9 +903,8 @@ pub async fn fetch_wheel_cached(
             Ok(StoreEntryState::Corrupt) => {
                 tracing::warn!(
                     wheel = %filename,
-                    "wheel cache: authoritative store entry is corrupt; evicting",
+                    "wheel cache: authoritative store entry is corrupt; serializing repair",
                 );
-                evict_store_entry(&store_path).await;
                 break;
             }
             Ok(StoreEntryState::Missing) => {
@@ -885,6 +927,61 @@ pub async fn fetch_wheel_cached(
             sha256 = %&sha256[..8],
             "wheel cache: miss",
         );
+    }
+
+    // Coalesce a concurrent first fill across sibling packs/processes. Atomic
+    // publication alone prevents corruption, but without this lock every
+    // contender still transfers the same multi-gigabyte wheel. Recheck after
+    // acquiring the lock: the process that waited should consume the entry the
+    // first process just published instead of opening another network stream.
+    let fill_lock = match acquire_wheel_store_fill_lock(&store_path).await {
+        Ok(lock) => Some(lock),
+        Err(error) => {
+            tracing::warn!(
+                wheel = %filename,
+                err = %error,
+                "wheel cache: could not acquire first-fill lock; falling back to atomic publication",
+            );
+            None
+        }
+    };
+    if fill_lock.is_some() {
+        for _ in 0..2 {
+            match inspect_store_entry(&store_path, sha256).await {
+                Ok(StoreEntryState::Valid(fingerprint)) => {
+                    if atomic_owned_copy(&store_path, &dest, sha256, Some(&fingerprint)).await? {
+                        tracing::info!(
+                            wheel = %filename,
+                            sha256 = %&sha256[..8],
+                            "wheel cache: hit after waiting for concurrent first fill (no download)",
+                        );
+                        return Ok(dest);
+                    }
+                }
+                Ok(StoreEntryState::Corrupt) => {
+                    tracing::warn!(
+                        wheel = %filename,
+                        "wheel cache: authoritative store entry is corrupt; evicting under first-fill lock",
+                    );
+                    evict_store_entry(&store_path).await;
+                    break;
+                }
+                Ok(StoreEntryState::Missing) => break,
+                Err(error) => {
+                    tracing::warn!(
+                        wheel = %filename,
+                        err = %error,
+                        "wheel cache: could not revalidate store entry under first-fill lock",
+                    );
+                    break;
+                }
+            }
+        }
+    } else if matches!(
+        inspect_store_entry(&store_path, sha256).await,
+        Ok(StoreEntryState::Corrupt)
+    ) {
+        evict_store_entry(&store_path).await;
     }
 
     // Cache miss: download normally.
@@ -1595,6 +1692,8 @@ fn hex_sha256(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Build a minimal but real wheel zip (deflate-compressed METADATA at a
     /// root-level `.dist-info`) so the ranged reader exercises central-
@@ -1696,6 +1795,52 @@ mod tests {
             }
         });
         (port, handle)
+    }
+
+    async fn serve_counted_full(
+        bytes: Vec<u8>,
+    ) -> (u16, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let gets = Arc::new(AtomicUsize::new(0));
+        let server_gets = gets.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let bytes = bytes.clone();
+                let gets = server_gets.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut chunk = [0_u8; 1024];
+                    loop {
+                        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                            break;
+                        }
+                        match stream.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(count) => request.extend_from_slice(&chunk[..count]),
+                        }
+                    }
+                    if request.starts_with(b"GET ") {
+                        gets.fetch_add(1, Ordering::SeqCst);
+                    }
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        bytes.len(),
+                    );
+                    if stream.write_all(header.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    let _ = stream.write_all(&bytes).await;
+                    let _ = stream.flush().await;
+                });
+            }
+        });
+        (port, gets, handle)
     }
 
     #[tokio::test]
@@ -2234,6 +2379,42 @@ mod tests {
         assert!(
             leftovers.is_empty(),
             "atomic publication must not leave attempt files: {leftovers:?}",
+        );
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn concurrent_store_misses_coalesce_to_one_download() {
+        let bytes = build_test_wheel_zip();
+        let sha = hex_sha256(&bytes);
+        let (port, gets, server) = serve_counted_full(bytes.clone()).await;
+        let url: url::Url = format!("http://127.0.0.1:{port}/foo-1.0-py3-none-any.whl")
+            .parse()
+            .unwrap();
+        let tmp = std::env::temp_dir().join(format!(
+            "retread-wheel-coalesced-fetch-{}-{}",
+            std::process::id(),
+            line!(),
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let store = tmp.join("store");
+        let first_dest = tmp.join("first");
+        let second_dest = tmp.join("second");
+
+        let (first, second) = tokio::join!(
+            fetch_wheel_cached(&url, Some(&sha), &first_dest, &store),
+            fetch_wheel_cached(&url, Some(&sha), &second_dest, &store),
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert_eq!(std::fs::read(first).unwrap(), bytes);
+        assert_eq!(std::fs::read(second).unwrap(), bytes);
+        assert_eq!(
+            gets.load(Ordering::SeqCst),
+            1,
+            "concurrent cold store misses must share one network transfer",
         );
 
         server.abort();

@@ -20,6 +20,50 @@ fn unique_test_dir(label: &str) -> std::path::PathBuf {
 }
 
 #[cfg(unix)]
+#[tokio::test]
+async fn conda_outputs_disk_fill_lock_coalesces_same_key_only() {
+    let root = unique_test_dir("outputs-fill-lock");
+    let first_path = root.join("same.json");
+    let other_path = root.join("other.json");
+    let first = acquire_conda_outputs_disk_cache_fill_lock(&first_path)
+        .await
+        .unwrap();
+
+    // A different memo key must remain independently lockable.
+    let other = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        acquire_conda_outputs_disk_cache_fill_lock(&other_path),
+    )
+    .await
+    .expect("different output-memo keys must not serialize")
+    .unwrap();
+    drop(other);
+
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let mut waiter = tokio::spawn(async move {
+        started_tx.send(()).unwrap();
+        acquire_conda_outputs_disk_cache_fill_lock(&first_path)
+            .await
+            .unwrap()
+    });
+    started_rx.await.unwrap();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut waiter)
+            .await
+            .is_err(),
+        "a same-key contender must wait for the active first compute",
+    );
+
+    drop(first);
+    let second = tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+        .await
+        .expect("same-key contender did not acquire after publication")
+        .unwrap();
+    drop(second);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
 #[test]
 fn initialize_preflight_repairs_dangling_pixi_bld_symlink_target() {
     let root = unique_test_dir("pixi-bld-symlink");

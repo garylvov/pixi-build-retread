@@ -3900,6 +3900,7 @@ mod tests {
     /// rewrite changes it, the staged shadow bytes differ from the raw input).
     #[tokio::test]
     async fn raw_shadow_src_goes_through_rewrite() {
+        let _env_guard = crate::TEST_ASYNC_ENV_MUTEX.lock().await;
         let tmp = make_test_dir("step0-raw");
         let staging = tmp.join("staging");
 
@@ -4080,6 +4081,7 @@ mod tests {
     /// vec![] for index wheels (Step 2+3 bug). ALL THREE required for GREEN.
     #[tokio::test]
     async fn empty_wheels_byte_identical_parity() {
+        let _env_guard = crate::TEST_ASYNC_ENV_MUTEX.lock().await;
         use std::sync::Arc;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -4352,6 +4354,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "live: builds a git wheel via uv (needs uv + git on PATH); run with --include-ignored"]
     async fn git_source_wheel_replay_byte_identical_parity() {
+        let _env_guard = crate::TEST_ASYNC_ENV_MUTEX.lock().await;
         use crate::lock::{GitWheelSource, Origin};
         use crate::source_build::build_wheel_from_git;
 
@@ -4674,6 +4677,7 @@ version = "1.0.0"
     ///   (c) LockWheel.upstream_url is None (suppressed at write time for sdist)
     #[tokio::test]
     async fn sdist_source_carried_into_lock() {
+        let _env_guard = crate::TEST_ASYNC_ENV_MUTEX.lock().await;
         use crate::lock::{Origin, SdistWheelSource};
         use std::collections::HashSet;
 

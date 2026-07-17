@@ -2703,6 +2703,7 @@ mod tests {
 
     #[tokio::test]
     async fn materialize_index_wheel_fetches_locked_url_and_verifies_hash() {
+        let _env_guard = crate::TEST_ASYNC_ENV_MUTEX.lock().await;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let root = tempdir("index-fetch");

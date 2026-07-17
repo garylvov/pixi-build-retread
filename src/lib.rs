@@ -34,3 +34,9 @@ pub mod wheel_inject;
 pub mod wheel_inject_data;
 pub mod wheel_rewrite;
 pub mod workspace;
+
+// Process environment is global even when Rust's test harness runs modules in
+// parallel. Env-sensitive tests share this lock so one module cannot
+// transiently switch another module's production path.
+#[cfg(test)]
+pub(crate) static TEST_ASYNC_ENV_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());

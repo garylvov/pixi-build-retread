@@ -208,6 +208,53 @@ async fn read_conda_outputs_disk_cache(path: &std::path::Path) -> Option<CondaOu
     serde_json::from_slice(&bytes).ok()
 }
 
+struct CondaOutputsDiskCacheFillLock(std::fs::File);
+
+impl Drop for CondaOutputsDiskCacheFillLock {
+    fn drop(&mut self) {
+        if let Err(error) = fs4::fs_std::FileExt::unlock(&self.0) {
+            tracing::warn!(error = %error, "failed to unlock conda/outputs first compute");
+        }
+    }
+}
+
+/// Serialize the cold computation for one cross-process output-memo key.
+/// Pixi can launch one backend process per environment even when three
+/// environments consume the same source package with identical parameters.
+/// Atomic memo publication protects readers from partial JSON, but without a
+/// fill lock every process still repeats the full closure/routing computation.
+async fn acquire_conda_outputs_disk_cache_fill_lock(
+    cache_path: &std::path::Path,
+) -> Result<CondaOutputsDiskCacheFillLock> {
+    let parent = cache_path.parent().ok_or_else(|| {
+        anyhow!(
+            "conda/outputs cache path has no parent: {}",
+            cache_path.display()
+        )
+    })?;
+    tokio::fs::create_dir_all(parent).await.with_context(|| {
+        format!(
+            "creating conda/outputs cache namespace {}",
+            parent.display()
+        )
+    })?;
+    let lock_path = cache_path.with_extension("json.fill-v1.lock");
+    tokio::task::spawn_blocking(move || {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .with_context(|| format!("opening conda/outputs fill lock {}", lock_path.display()))?;
+        fs4::fs_std::FileExt::lock_exclusive(&file)
+            .with_context(|| format!("locking conda/outputs fill {}", lock_path.display()))?;
+        Ok(CondaOutputsDiskCacheFillLock(file))
+    })
+    .await
+    .context("conda/outputs fill lock task panicked")?
+}
+
 /// Persist a computed [`CondaOutputsResult`] to disk for reuse by a
 /// future retread process solving a different environment with the
 /// same params. Failures are logged at debug and otherwise ignored --
@@ -1349,6 +1396,45 @@ impl Handler {
             crate::status::tty(
                 "reusing a previously-computed solve for this source package \
                  (another environment already solved it with the same inputs).",
+            );
+            CONDA_OUTPUTS_CACHE
+                .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+                .lock()
+                .unwrap()
+                .insert(cache_key.clone(), cached.clone());
+            self.invalidate_prepared_builds().await;
+            return Ok(cached);
+        }
+        // Coalesce simultaneous cold requests for this exact source/target
+        // key. A waiter rechecks the memo after acquiring the lock and returns
+        // the first process's completed result instead of repeating minutes of
+        // closure resolution, route validation, and wheel materialization.
+        // Locking is best-effort so a cache permission/filesystem issue never
+        // turns an otherwise-valid cold compute into an RPC failure.
+        let disk_cache_fill_lock = match acquire_conda_outputs_disk_cache_fill_lock(
+            &disk_cache_path,
+        )
+        .await
+        {
+            Ok(lock) => Some(lock),
+            Err(error) => {
+                tracing::warn!(
+                    path = %disk_cache_path.display(),
+                    error = %error,
+                    "retread: could not acquire conda/outputs first-compute lock; computing independently",
+                );
+                None
+            }
+        };
+        if disk_cache_fill_lock.is_some()
+            && let Some(cached) = read_conda_outputs_disk_cache(&disk_cache_path).await
+        {
+            tracing::info!(
+                path = %disk_cache_path.display(),
+                "retread: conda/outputs disk-cache hit after waiting for a concurrent first compute",
+            );
+            crate::status::tty(
+                "reusing a source-package solve completed concurrently for another environment.",
             );
             CONDA_OUTPUTS_CACHE
                 .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
@@ -12408,6 +12494,7 @@ mod replay_tests {
     /// origin=Index, url=Some(upstream), upstream_url=None -> diverge.
     #[tokio::test]
     async fn class2_replay_cold_byte_identity() {
+        let _env_guard = crate::TEST_ASYNC_ENV_MUTEX.lock().await;
         use std::collections::HashSet;
         use std::sync::Arc;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
