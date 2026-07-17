@@ -865,6 +865,8 @@ composed = { features = ["composed"], no-default-feature = true }
             &target,
             &[],
             "current-pack",
+            &std::collections::BTreeSet::new(),
+            &crate::relax::NameMap::new(),
         );
         assert_eq!(
             context
@@ -3705,6 +3707,13 @@ pub(crate) struct CondaCoSolveContext {
     channel_priority: rattler_solve::ChannelPriority,
     system_requirements: BTreeMap<String, String>,
     workspace_deps: BTreeMap<CondaName, Vec<String>>,
+    /// Conda providers that would shadow a direct PyPI declaration shared by
+    /// every precise consumer. A mutable conda route is invalid when its
+    /// solved transitive closure introduces one of these providers: Pixi maps
+    /// the conda record back to the PyPI identity and pins the wheel solve to
+    /// the conda version (for example `tensordict -> pytorch 2.7.1` against an
+    /// explicit PyPI `torch==2.7.0`).
+    workspace_pypi_providers: BTreeMap<CondaName, PypiKey>,
 }
 
 impl CondaCoSolveContext {
@@ -3715,6 +3724,8 @@ impl CondaCoSolveContext {
         target: &ResolutionTarget,
         conda_channels: &[ChannelUrl],
         bundle: &str,
+        owned_pypi: &BTreeSet<String>,
+        fact_name_map: &NameMap,
     ) -> Self {
         let (channel_priority, system_requirements, raw_workspace_deps) = match manifest {
             Some(manifest) => (
@@ -3762,6 +3773,17 @@ impl CondaCoSolveContext {
                 }
             }
         }
+        let workspace_pypi_providers = owned_pypi
+            .iter()
+            .filter_map(|name| {
+                let pypi_name = PypiKey::from_pypi(name);
+                let conda_name = fact_name_map.get(&pypi_name)?.mapped_name()?.clone();
+                // An explicit conda declaration is already part of the
+                // immutable workspace baseline; only wheel-only providers can
+                // veto a newly introduced transitive conda provider.
+                (!workspace_deps.contains_key(&conda_name)).then_some((conda_name, pypi_name))
+            })
+            .collect();
         Self {
             channels: conda_channels.to_vec(),
             python: target.python_version().to_string(),
@@ -3770,6 +3792,7 @@ impl CondaCoSolveContext {
             channel_priority,
             system_requirements,
             workspace_deps,
+            workspace_pypi_providers,
         }
     }
 
@@ -3803,7 +3826,28 @@ impl CondaCoSolveContext {
         )
         .await
         {
-            Ok(_) => crate::uv_closure::CoInstallVerdict::Sat,
+            Ok(records) => {
+                let conflicts = selected_workspace_pypi_provider_conflicts(
+                    records
+                        .iter()
+                        .map(|record| record.package_record.name.as_normalized()),
+                    &self.workspace_pypi_providers,
+                );
+                if conflicts.is_empty() {
+                    crate::uv_closure::CoInstallVerdict::Sat
+                } else {
+                    crate::uv_closure::CoInstallVerdict::Unsat(
+                        conflicts
+                            .into_iter()
+                            .map(|(conda, pypi)| {
+                                format!(
+                                    "conda route selects provider `{conda}` owned by workspace PyPI dependency `{pypi}`"
+                                )
+                            })
+                            .collect(),
+                    )
+                }
+            }
             Err(reasons)
                 if reasons
                     .iter()
@@ -3818,6 +3862,25 @@ impl CondaCoSolveContext {
     pub(crate) fn channels_consulted(&self) -> Vec<String> {
         self.channels.iter().map(ToString::to_string).collect()
     }
+}
+
+fn selected_workspace_pypi_provider_conflicts<I, S>(
+    selected_names: I,
+    protected: &BTreeMap<CondaName, PypiKey>,
+) -> Vec<(CondaName, PypiKey)>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let selected: BTreeSet<String> = selected_names
+        .into_iter()
+        .map(|name| canonical_conda_name(name.as_ref()))
+        .collect();
+    protected
+        .iter()
+        .filter(|(conda, _)| selected.contains(conda.key().as_str()))
+        .map(|(conda, pypi)| (conda.clone(), pypi.clone()))
+        .collect()
 }
 
 /// Direct dependency inputs for one concrete environment that consumes the
@@ -4558,6 +4621,8 @@ async fn uv_group_closure(
         target,
         conda_channels,
         group_name,
+        &workspace_facts.owned_pypi,
+        fact_name_map,
     );
 
     // Rule-3-capable policies receive only precise, solved, agreed facts.

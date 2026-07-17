@@ -3949,6 +3949,8 @@ pillow = ">=10,<13"
             &resolution_target,
             &[],
             "hover-pack",
+            &BTreeSet::new(),
+            &NameMap::new(),
         );
         assert_eq!(
             context.workspace_deps.get(&CondaName::new("pillow")),

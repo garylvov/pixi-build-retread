@@ -178,6 +178,22 @@ fn pick_conda_target_name_map_wins_over_ambiguous_parselmouth() {
 }
 
 #[test]
+fn conda_route_rejects_transitive_workspace_pypi_provider() {
+    let protected = BTreeMap::from([(CondaName::new("pytorch"), PypiKey::from_pypi("torch"))]);
+
+    assert_eq!(
+        selected_workspace_pypi_provider_conflicts(["python", "tensordict", "pytorch"], &protected,),
+        vec![(CondaName::new("pytorch"), PypiKey::from_pypi("torch"),)],
+        "a routed package may not pull a conda provider owned by the workspace's PyPI solve",
+    );
+    assert!(
+        selected_workspace_pypi_provider_conflicts(["python", "tensordict"], &protected,)
+            .is_empty(),
+        "the route remains valid when its solved closure does not shadow the PyPI provider",
+    );
+}
+
+#[test]
 fn pick_conda_target_ambiguous_parselmouth_without_name_map_is_none() {
     // Documents the pre-fix behavior: ambiguous parselmouth + no
     // curated answer -> None (caller leaves it on the PyPI/bundle
