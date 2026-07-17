@@ -1670,17 +1670,16 @@ pub async fn fetch_metadata_ranged(
             .with_context(|| format!("opening remote zip via Range for {filename}"))?;
         // Root-level `<name>-<version>.dist-info/METADATA` only (wheels may
         // vendor nested .dist-info trees; ours is the single-slash one).
-        let mut idx = None;
-        for i in 0..archive.len() {
-            let entry = archive.by_index(i)?;
-            let name = entry.name();
-            if name.ends_with(".dist-info/METADATA") && name.matches('/').count() == 1 {
-                idx = Some(i);
-                break;
-            }
-        }
-        let idx = idx.ok_or_else(|| anyhow!("no root-level .dist-info/METADATA in {filename}"))?;
-        let mut entry = archive.by_index(idx)?;
+        // `file_names()` walks the central-directory index already held in
+        // memory. Do not call `by_index()` merely to inspect each name:
+        // opening an entry seeks to its local header, which turns archives
+        // with thousands of members into thousands of RANGE_WINDOW GETs.
+        let metadata_name = archive
+            .file_names()
+            .find(|name| name.ends_with(".dist-info/METADATA") && name.matches('/').count() == 1)
+            .map(str::to_owned)
+            .ok_or_else(|| anyhow!("no root-level .dist-info/METADATA in {filename}"))?;
+        let mut entry = archive.by_name(&metadata_name)?;
         let mut buf = String::new();
         entry.read_to_string(&mut buf)?;
         parse_metadata(&buf, filename, is_pure_python, sha)
@@ -1754,16 +1753,21 @@ mod tests {
 
     /// A tiny HTTP/1.1 server honoring HEAD + `Range` GETs, for the ranged
     /// metadata test. Handles keep-alive (multiple requests per connection).
-    async fn serve_ranged(bytes: Vec<u8>) -> (u16, tokio::task::JoinHandle<()>) {
+    async fn serve_ranged_counted(
+        bytes: Vec<u8>,
+    ) -> (u16, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
+        let gets = Arc::new(AtomicUsize::new(0));
+        let server_gets = gets.clone();
         let handle = tokio::spawn(async move {
             loop {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     return;
                 };
                 let bytes = bytes.clone();
+                let gets = server_gets.clone();
                 tokio::spawn(async move {
                     let mut buf = Vec::new();
                     let mut tmp = [0u8; 1024];
@@ -1782,6 +1786,9 @@ mod tests {
                         let req = String::from_utf8_lossy(&buf[..hdr_end]).to_string();
                         buf.drain(..hdr_end);
                         let is_head = req.starts_with("HEAD");
+                        if req.starts_with("GET ") {
+                            gets.fetch_add(1, Ordering::SeqCst);
+                        }
                         let range = req.lines().find_map(|l| {
                             let l = l.to_ascii_lowercase();
                             l.strip_prefix("range: bytes=")
@@ -1825,6 +1832,11 @@ mod tests {
                 });
             }
         });
+        (port, gets, handle)
+    }
+
+    async fn serve_ranged(bytes: Vec<u8>) -> (u16, tokio::task::JoinHandle<()>) {
+        let (port, _gets, handle) = serve_ranged_counted(bytes).await;
         (port, handle)
     }
 
@@ -1890,6 +1902,47 @@ mod tests {
         // sha256 comes from the caller (index fragment), not recomputed.
         assert_eq!(md.sha256, sha);
         assert!(md.is_pure_python, "py3-none-any is pure python");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ranged_metadata_does_not_open_every_archive_member() {
+        use std::io::Write as _;
+
+        let zip_bytes = {
+            let mut cursor = std::io::Cursor::new(Vec::new());
+            {
+                let mut zw = zip::ZipWriter::new(&mut cursor);
+                let stored: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored);
+                // Keep adjacent local headers farther apart than one range
+                // window. The old name scan opened all twelve entries and
+                // therefore issued at least twelve otherwise-useless GETs.
+                let padding = vec![0x5a; RANGE_WINDOW as usize];
+                for index in 0..12 {
+                    zw.start_file(format!("payload-{index:02}.bin"), stored)
+                        .unwrap();
+                    zw.write_all(&padding).unwrap();
+                }
+                zw.start_file("foo-1.0.dist-info/METADATA", stored).unwrap();
+                zw.write_all(b"Metadata-Version: 2.1\nName: foo\nVersion: 1.0\n\n")
+                    .unwrap();
+                zw.finish().unwrap();
+            }
+            cursor.into_inner()
+        };
+        let (port, gets, server) = serve_ranged_counted(zip_bytes).await;
+        let url: url::Url = format!("http://127.0.0.1:{port}/foo-1.0-py3-none-any.whl")
+            .parse()
+            .unwrap();
+
+        let metadata = fetch_metadata_ranged(&url, &"b".repeat(64)).await.unwrap();
+        assert_eq!(metadata.name, "foo");
+        assert!(
+            gets.load(Ordering::SeqCst) <= 4,
+            "central-directory name lookup should not open every member; observed {} range GETs",
+            gets.load(Ordering::SeqCst),
+        );
         server.abort();
     }
 
