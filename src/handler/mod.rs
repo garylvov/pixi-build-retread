@@ -565,7 +565,22 @@ fn sibling_lock_constraints(
         {
             continue;
         }
-        for raw in lock.wheels.iter().flat_map(|wheel| &wheel.requires_dist) {
+        // Compose only the sibling's declared entry wheels. Transitive wheel
+        // metadata can be internally contradictory after Retread routes or
+        // relaxes those dependencies (for example cmeel-boost's numpy>=2 and
+        // dex-retargeting's numpy<2 in one valid IsaacLab pack). The entry
+        // wheels are the sibling package's public compatibility contract.
+        let entry_names: BTreeSet<String> = lock
+            .entry_specs
+            .iter()
+            .filter_map(|spec| locked_entry_name(spec))
+            .collect();
+        for raw in lock
+            .wheels
+            .iter()
+            .filter(|wheel| entry_names.contains(&canonical_conda_name(&wheel.name)))
+            .flat_map(|wheel| &wheel.requires_dist)
+        {
             let Ok(requirement): Result<uv_pep508::Requirement, _> =
                 uv_pep508::Requirement::from_str(raw)
             else {
@@ -610,6 +625,19 @@ fn sibling_lock_constraints(
     }
     out.constraints.sort();
     out
+}
+
+/// Extract the normalized package key from Retread's persisted entry-spec
+/// forms (`name[extra]==1`, `name@git:rev`, `name@url:...`, or bare `name`).
+fn locked_entry_name(spec: &str) -> Option<String> {
+    let end = spec
+        .char_indices()
+        .find_map(|(index, ch)| {
+            matches!(ch, '[' | '=' | '@' | '<' | '>' | '!' | '~' | ' ').then_some(index)
+        })
+        .unwrap_or(spec.len());
+    let name = spec[..end].trim();
+    (!name.is_empty()).then(|| canonical_conda_name(name))
 }
 
 #[cfg(test)]
@@ -673,25 +701,43 @@ composed = { features = ["composed"], no-default-feature = true }
             target_subdir: "linux-64".to_string(),
             inputs_hash: "test-inputs".to_string(),
             root_requirements: vec!["sibling-root==1.0.0".to_string()],
-            wheels: vec![LockWheel {
-                name: "sibling-root".to_string(),
-                version: "1.0.0".to_string(),
-                origin: Origin::Index,
-                filename: "sibling_root-1.0.0-py3-none-any.whl".to_string(),
-                url: Some(
-                    "https://example.invalid/sibling_root-1.0.0-py3-none-any.whl".to_string(),
-                ),
-                sha256: Some("11".repeat(32)),
-                requires_dist: vec![
-                    "transformers>=4.57.6,<4.58".to_string(),
-                    "bare-dependency".to_string(),
-                    "tokenizers[testing]>=0.22,<0.23 ; python_version >= '3.10'".to_string(),
-                ],
-                must_ship: false,
-                upstream_url: None,
-                git_source: None,
-                sdist_source: None,
-            }],
+            wheels: vec![
+                LockWheel {
+                    name: "sibling-root".to_string(),
+                    version: "1.0.0".to_string(),
+                    origin: Origin::Index,
+                    filename: "sibling_root-1.0.0-py3-none-any.whl".to_string(),
+                    url: Some(
+                        "https://example.invalid/sibling_root-1.0.0-py3-none-any.whl".to_string(),
+                    ),
+                    sha256: Some("11".repeat(32)),
+                    requires_dist: vec![
+                        "transformers>=4.57.6,<4.58".to_string(),
+                        "bare-dependency".to_string(),
+                        "tokenizers[testing]>=0.22,<0.23 ; python_version >= '3.10'".to_string(),
+                    ],
+                    must_ship: false,
+                    upstream_url: None,
+                    git_source: None,
+                    sdist_source: None,
+                },
+                LockWheel {
+                    name: "transitive-root".to_string(),
+                    version: "2.0.0".to_string(),
+                    origin: Origin::Index,
+                    filename: "transitive_root-2.0.0-py3-none-any.whl".to_string(),
+                    url: Some(
+                        "https://example.invalid/transitive_root-2.0.0-py3-none-any.whl"
+                            .to_string(),
+                    ),
+                    sha256: Some("22".repeat(32)),
+                    requires_dist: vec!["numpy>=2".to_string()],
+                    must_ship: false,
+                    upstream_url: None,
+                    git_source: None,
+                    sdist_source: None,
+                },
+            ],
             conda_run_deps: Vec::new(),
             index_urls: vec!["https://pypi.org/simple/".to_string()],
             prerelease: BTreeMap::new(),
@@ -699,7 +745,7 @@ composed = { features = ["composed"], no-default-feature = true }
             declared_glibc: None,
             resolution_glibc: None,
             conda_capable: Vec::new(),
-            entry_specs: vec!["sibling-root==1.0.0".to_string()],
+            entry_specs: vec!["sibling-root@git:deadbeef".to_string()],
             wheel_store: None,
         };
         let lock_path = dir
@@ -742,6 +788,13 @@ composed = { features = ["composed"], no-default-feature = true }
                 .constraints
                 .iter()
                 .all(|line| !line.starts_with("bare-dependency"))
+        );
+        assert!(
+            constraints
+                .constraints
+                .iter()
+                .all(|line| !line.starts_with("numpy")),
+            "transitive sibling requirements must not become constraints",
         );
         let fingerprint =
             workspace_solve_fingerprint(&manifest, &dir, &dir.join("current"), &target);
