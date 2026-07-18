@@ -1357,23 +1357,26 @@ where
     // whole-workspace core reduction.
     let provider_trials = {
         use futures::stream::{self, StreamExt};
-        stream::iter(
-            mutable_candidates
-                .iter()
-                .filter(|route| {
-                    source_metadata_conda_names.contains(route.conda_name.key().as_str())
-                        && !standalone_provider_safe
-                            .contains(&(route.conda_name.key().into_string(), route.spec.clone()))
-                })
-                .cloned(),
-        )
-        .map(|route| async move {
-            let verdict = validate_standalone_provider_route(route.clone()).await;
-            (route, verdict)
-        })
-        .buffered(crate::concurrency::max_concurrent_builds().min(8))
-        .collect::<Vec<_>>()
-        .await
+        // Own the selected routes before entering the buffered async stream.
+        // Keeping the slice iterator in the stream made Handler::dispatch's
+        // opaque future fail the RPC server's higher-ranked Send requirement.
+        let routes_to_validate: Vec<_> = mutable_candidates
+            .iter()
+            .filter(|route| {
+                source_metadata_conda_names.contains(route.conda_name.key().as_str())
+                    && !standalone_provider_safe
+                        .contains(&(route.conda_name.key().into_string(), route.spec.clone()))
+            })
+            .cloned()
+            .collect();
+        stream::iter(routes_to_validate)
+            .map(|route| async move {
+                let verdict = validate_standalone_provider_route(route.clone()).await;
+                (route, verdict)
+            })
+            .buffered(crate::concurrency::max_concurrent_builds().min(8))
+            .collect::<Vec<_>>()
+            .await
     };
     let mut provider_rejected_keys = BTreeSet::new();
     for (route, verdict) in provider_trials {
