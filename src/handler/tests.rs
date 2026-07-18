@@ -330,6 +330,38 @@ async fn pick_conda_target_single_parselmouth_candidate() {
             .any(|candidate| candidate == "pytorch-gpu"),
         "the process-stable fallback must retain curated mappings"
     );
+    assert_eq!(
+        cached["ray"],
+        ["ray-core"],
+        "Ray routing must survive a total Parselmouth fetch failure"
+    );
+    let effective = effective_name_map(&NameMap::new(), &cached);
+    assert_eq!(
+        effective
+            .get(&PypiKey::from_pypi("ray"))
+            .and_then(CondaTarget::mapped_name)
+            .map(CondaName::as_spec),
+        Some("ray-core"),
+    );
+}
+
+#[test]
+fn parselmouth_retry_statuses_are_transient_only() {
+    assert!(retryable_parselmouth_status(
+        reqwest::StatusCode::REQUEST_TIMEOUT
+    ));
+    assert!(retryable_parselmouth_status(
+        reqwest::StatusCode::TOO_MANY_REQUESTS
+    ));
+    assert!(retryable_parselmouth_status(
+        reqwest::StatusCode::SERVICE_UNAVAILABLE
+    ));
+    assert!(!retryable_parselmouth_status(
+        reqwest::StatusCode::UNAUTHORIZED
+    ));
+    assert!(!retryable_parselmouth_status(
+        reqwest::StatusCode::NOT_FOUND
+    ));
 }
 
 #[test]

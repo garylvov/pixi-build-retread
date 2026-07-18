@@ -953,6 +953,14 @@ const FALLBACK_PYPI_TO_CONDA: &[(&str, &str)] = &[
     // Already covered by parselmouth (`pytorch: [torch]`) but here as a
     // safety net in case the fetch fails entirely.
     ("torch", "pytorch"),
+    // Parselmouth maps the PyPI `ray` distribution to conda-forge's
+    // `ray-core` package. Keep the same unambiguous edge in the curated
+    // fallback so a transient raw.githubusercontent.com failure cannot turn
+    // IsaacLab's ranged `ray>=2.45,<3` dependency into the newest PyPI wheel.
+    // That wheel can require packaging>=24.2 while Isaac Sim 5.1 pins
+    // packaging==23.0; routing the range to conda lets the workspace solver
+    // select the compatible ray-core build without a pack-local version pin.
+    ("ray", "ray-core"),
     // `pytorch-gpu` is a meta-package on conda-forge (no Requires-Dist /
     // pypi names of its own -- parselmouth's compressed_mapping.json ships
     // `"pytorch-gpu": null`), so the inverse map never gets a `torch ->
@@ -979,6 +987,8 @@ pub(crate) type PypiToCondaMap = std::collections::HashMap<String, Vec<String>>;
 
 const PARSELMOUTH_MAPPING_MAX_BYTES: usize = 16 * 1024 * 1024;
 const PARSELMOUTH_MAPPING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const PARSELMOUTH_MAPPING_ATTEMPTS: usize = 5;
+const PARSELMOUTH_RETRY_BASE_DELAY_MS: u64 = if cfg!(test) { 10 } else { 250 };
 
 /// One immutable mapping snapshot per backend process. Caching the complete
 /// first result, including the curated-only fallback after a fetch failure,
@@ -1004,13 +1014,27 @@ fn finalize_pypi_to_conda_map(mut inverse: PypiToCondaMap) -> PypiToCondaMap {
     inverse
 }
 
-async fn fetch_pypi_to_conda_map() -> Result<PypiToCondaMap> {
+fn retryable_parselmouth_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+}
+
+fn retryable_parselmouth_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<reqwest::Error>().is_some_and(|error| {
+            error.is_connect()
+                || error.is_timeout()
+                || error.is_request()
+                || error.is_body()
+                || error.status().is_some_and(retryable_parselmouth_status)
+        })
+    })
+}
+
+async fn fetch_pypi_to_conda_map_once(client: &reqwest::Client) -> Result<PypiToCondaMap> {
     use futures::StreamExt;
 
-    let client = reqwest::Client::builder()
-        .timeout(PARSELMOUTH_MAPPING_TIMEOUT)
-        .build()
-        .context("building parselmouth HTTP client")?;
     let response = client
         .get(PARSELMOUTH_MAPPING_URL)
         .send()
@@ -1070,6 +1094,35 @@ async fn fetch_pypi_to_conda_map() -> Result<PypiToCondaMap> {
         "loaded parselmouth PyPI<->conda mapping"
     );
     Ok(inverse)
+}
+
+async fn fetch_pypi_to_conda_map() -> Result<PypiToCondaMap> {
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .timeout(PARSELMOUTH_MAPPING_TIMEOUT)
+        .build()
+        .context("building parselmouth HTTP client")?;
+    for attempt in 1..=PARSELMOUTH_MAPPING_ATTEMPTS {
+        match fetch_pypi_to_conda_map_once(&client).await {
+            Ok(mapping) => return Ok(mapping),
+            Err(error)
+                if attempt < PARSELMOUTH_MAPPING_ATTEMPTS
+                    && retryable_parselmouth_error(&error) =>
+            {
+                let delay_ms = PARSELMOUTH_RETRY_BASE_DELAY_MS * (1_u64 << (attempt - 1));
+                tracing::warn!(
+                    attempt,
+                    max_attempts = PARSELMOUTH_MAPPING_ATTEMPTS,
+                    delay_ms,
+                    error = %format!("{error:#}"),
+                    "transient parselmouth mapping fetch failure; retrying",
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("parselmouth retry loop always returns on its final attempt")
 }
 
 async fn load_pypi_to_conda_map_with<F, Fut>(
