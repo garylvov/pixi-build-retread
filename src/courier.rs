@@ -29,6 +29,73 @@ use crate::emit_pypi::{
 use crate::lock::{CondaDep, LockWheel, Origin, RetreadLock, SCHEMA};
 use crate::pypi::{ResolutionTarget, WheelTarget};
 
+const SHADOW_DOWNLOAD_ATTEMPTS: usize = 5;
+const SHADOW_RETRY_BASE_DELAY_MS: u64 = if cfg!(test) { 10 } else { 250 };
+
+fn retryable_shadow_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+}
+
+fn retryable_shadow_transport(error: &reqwest::Error) -> bool {
+    error.is_connect() || error.is_timeout() || error.is_body()
+}
+
+async fn wait_before_shadow_retry(url: &url::Url, wheel: &str, attempt: usize, reason: &str) {
+    let delay_ms = SHADOW_RETRY_BASE_DELAY_MS * (1_u64 << (attempt - 1));
+    tracing::warn!(
+        %url,
+        wheel,
+        attempt,
+        max_attempts = SHADOW_DOWNLOAD_ATTEMPTS,
+        delay_ms,
+        reason,
+        "transient courier wheel download failure; retrying",
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+}
+
+/// Fetch a remote-only wheel needed for a courier shadow rewrite. These
+/// downloads happen at the very end of an expensive solve, so transient DNS,
+/// timeout, rate-limit, and server failures must not discard the whole run.
+async fn download_shadow_wheel(
+    client: &reqwest::Client,
+    url: &url::Url,
+    wheel: &str,
+) -> anyhow::Result<Vec<u8>> {
+    for attempt in 1..=SHADOW_DOWNLOAD_ATTEMPTS {
+        let response = match client.get(url.clone()).send().await {
+            Ok(response) => response,
+            Err(error)
+                if attempt < SHADOW_DOWNLOAD_ATTEMPTS && retryable_shadow_transport(&error) =>
+            {
+                wait_before_shadow_retry(url, wheel, attempt, &error.to_string()).await;
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let status = response.status();
+        if !status.is_success() {
+            if attempt < SHADOW_DOWNLOAD_ATTEMPTS && retryable_shadow_status(status) {
+                wait_before_shadow_retry(url, wheel, attempt, &format!("HTTP {status}")).await;
+                continue;
+            }
+            return Err(response.error_for_status().unwrap_err().into());
+        }
+        match response.bytes().await {
+            Ok(bytes) => return Ok(bytes.to_vec()),
+            Err(error)
+                if attempt < SHADOW_DOWNLOAD_ATTEMPTS && retryable_shadow_transport(&error) =>
+            {
+                wait_before_shadow_retry(url, wheel, attempt, &error.to_string()).await;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    unreachable!("shadow download retry loop always returns on its final attempt")
+}
+
 /// Everything `build_one` needs to build the courier recipe + write the lock.
 pub struct CourierStaged {
     /// `file://` URLs of the staged artifacts (shipped wheels + the lock
@@ -1597,6 +1664,11 @@ pub(crate) async fn stage_for_target_with_store_root(
     // Step 3: Classify and stage each wheel.
     let mut lock_wheels: Vec<LockWheel> = Vec::new();
     let mut source_urls: Vec<String> = Vec::new();
+    let shadow_download_client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .context("building courier shadow download client")?;
 
     crate::status::phase(
         source_dir,
@@ -1867,15 +1939,11 @@ pub(crate) async fn stage_for_target_with_store_root(
                         .await
                         .with_context(|| format!("creating {}", dl_dir.display()))?;
                     let dl = dl_dir.join(&std_name);
-                    let bytes = reqwest::get(url.clone())
+                    let bytes = download_shadow_wheel(&shadow_download_client, url, &w.pypi_name)
                         .await
-                        .and_then(|r| r.error_for_status())
                         .with_context(|| {
                             format!("downloading {} ({url}) for shadow rewrite", w.pypi_name)
-                        })?
-                        .bytes()
-                        .await
-                        .with_context(|| format!("reading bytes of {}", w.pypi_name))?;
+                        })?;
                     tokio::fs::write(&dl, &bytes)
                         .await
                         .with_context(|| format!("writing downloaded {}", dl.display()))?;
@@ -2442,6 +2510,34 @@ mod tests {
             git_source: None,
             sdist_source: None,
         }
+    }
+
+    #[tokio::test]
+    async fn shadow_download_retries_transient_http_failure() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for attempt in 1..=2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 1024];
+                let _ = stream.read(&mut request).await;
+                let response = if attempt == 1 {
+                    "HTTP/1.0 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n".to_string()
+                } else {
+                    "HTTP/1.0 200 OK\r\nContent-Length: 5\r\n\r\nwheel".to_string()
+                };
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let url: url::Url = format!("http://{address}/demo.whl").parse().unwrap();
+        let client = reqwest::Client::builder().build().unwrap();
+        let bytes = download_shadow_wheel(&client, &url, "demo").await.unwrap();
+
+        assert_eq!(bytes, b"wheel");
+        server.await.unwrap();
     }
 
     // Fat mode: the historical stage() contract these tests were written
