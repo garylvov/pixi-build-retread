@@ -12,6 +12,7 @@ use std::error::Error;
 use std::fmt;
 use std::str::FromStr;
 use std::sync::OnceLock;
+use std::time::Duration;
 use uv_pep508::uv_pep440::{self, Version, VersionSpecifiers};
 
 /// A strictly parsed CPython minor used in every build/resolution cache key.
@@ -761,6 +762,31 @@ fn parse_index_links(html: &str, base: &url::Url) -> Result<Vec<ResolvedWheel>> 
 /// fallback for indexes that only serve HTML. Matches what pip/uv send.
 const SIMPLE_ACCEPT: &str = "application/vnd.pypi.simple.v1+json, \
      application/vnd.pypi.simple.v1+html;q=0.2, text/html;q=0.1";
+const SIMPLE_FETCH_ATTEMPTS: usize = 5;
+const SIMPLE_RETRY_BASE_DELAY_MS: u64 = if cfg!(test) { 10 } else { 250 };
+
+fn retryable_simple_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+}
+
+fn retryable_simple_transport(error: &reqwest::Error) -> bool {
+    error.is_connect() || error.is_timeout() || error.is_body()
+}
+
+async fn wait_before_simple_retry(index_url: &url::Url, attempt: usize, reason: &str) {
+    let delay_ms = SIMPLE_RETRY_BASE_DELAY_MS * (1_u64 << (attempt - 1));
+    tracing::warn!(
+        url = %index_url,
+        attempt,
+        max_attempts = SIMPLE_FETCH_ATTEMPTS,
+        delay_ms,
+        reason,
+        "transient simple-index fetch failure; retrying",
+    );
+    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+}
 
 /// Fetch a simple-index page, returning `(is_json, body)`. `is_json` is
 /// derived from the RESPONSE content-type (not the request): a
@@ -769,27 +795,54 @@ const SIMPLE_ACCEPT: &str = "application/vnd.pypi.simple.v1+json, \
 /// now, which is why the bare HTML `<a href>` scraper found zero links and
 /// the resolve hard-failed before this dispatch existed.
 async fn fetch_simple_index(index_url: &url::Url) -> Result<(bool, String)> {
-    let resp = reqwest::Client::new()
-        .get(index_url.clone())
-        .header(reqwest::header::ACCEPT, SIMPLE_ACCEPT)
-        .send()
-        .await?;
-    if resp.status() == reqwest::StatusCode::NOT_FOUND {
-        return Err(pypi_index_miss(format!(
-            "package is absent from PyPI Simple index: {index_url} returned HTTP 404"
-        )));
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(60))
+        .build()?;
+    for attempt in 1..=SIMPLE_FETCH_ATTEMPTS {
+        let resp = match client
+            .get(index_url.clone())
+            .header(reqwest::header::ACCEPT, SIMPLE_ACCEPT)
+            .send()
+            .await
+        {
+            Ok(resp) => resp,
+            Err(error) if attempt < SIMPLE_FETCH_ATTEMPTS && retryable_simple_transport(&error) => {
+                wait_before_simple_retry(index_url, attempt, &error.to_string()).await;
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let status = resp.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err(pypi_index_miss(format!(
+                "package is absent from PyPI Simple index: {index_url} returned HTTP 404"
+            )));
+        }
+        // Authentication and other permanent client failures remain fatal.
+        // Rate limits, request timeouts, and server failures are operational
+        // and may be transient, but never count as an index-local miss.
+        if !status.is_success() {
+            if attempt < SIMPLE_FETCH_ATTEMPTS && retryable_simple_status(status) {
+                wait_before_simple_retry(index_url, attempt, &format!("HTTP {status}")).await;
+                continue;
+            }
+            return Err(resp.error_for_status().unwrap_err().into());
+        }
+        let is_json = is_json_simple_response(
+            resp.headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+        );
+        match resp.text().await {
+            Ok(body) => return Ok((is_json, body)),
+            Err(error) if attempt < SIMPLE_FETCH_ATTEMPTS && retryable_simple_transport(&error) => {
+                wait_before_simple_retry(index_url, attempt, &error.to_string()).await;
+            }
+            Err(error) => return Err(error.into()),
+        }
     }
-    // Authentication failures, rate limits, server failures, and every other
-    // non-success status are operational errors, not evidence that the
-    // package is absent from this index.
-    let resp = resp.error_for_status()?;
-    let is_json = is_json_simple_response(
-        resp.headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok()),
-    );
-    let body = resp.text().await?;
-    Ok((is_json, body))
+    unreachable!("simple-index retry loop always returns on its final attempt")
 }
 
 /// THE single fetch-and-parse entry point for a PyPI simple index. Every
@@ -2095,6 +2148,33 @@ platforms = [{ platform = "linux-64", glibc = "2.35" }]
             .unwrap()
     }
 
+    /// Serve a sequence of responses so transient-status retry behavior can
+    /// be tested without sleeping or depending on an external index.
+    async fn spawn_status_sequence_server(statuses: Vec<&'static str>) -> url::Url {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            for status in statuses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 4096];
+                let _ = stream.read(&mut request).await;
+                let body = b"fixture response";
+                let response = format!(
+                    "HTTP/1.0 {status}\r\nContent-Length: {}\r\nContent-Type: text/plain\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.write_all(body).await.unwrap();
+            }
+        });
+
+        format!("http://127.0.0.1:{port}/simple/example/")
+            .parse()
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn simple_project_404_is_a_miss_but_server_failure_is_fatal() {
         let not_found = spawn_status_server("404 Not Found").await;
@@ -2107,6 +2187,14 @@ platforms = [{ platform = "linux-64", glibc = "2.35" }]
             !is_pypi_index_miss(&server_error),
             "only a project-page 404 is an index-local miss"
         );
+    }
+
+    #[tokio::test]
+    async fn simple_project_retries_transient_server_failure() {
+        let index = spawn_status_sequence_server(vec!["503 Service Unavailable", "200 OK"]).await;
+        let (is_json, body) = fetch_simple_index(&index).await.unwrap();
+        assert!(!is_json);
+        assert_eq!(body, "fixture response");
     }
 
     // ── favor-lock: resolve_preferring tests ─────────────────────────────────
