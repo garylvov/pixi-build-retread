@@ -572,7 +572,12 @@ pub const SCHEMA: u32 = 13;
 /// Epoch 23: isolated sdist builds constrain setuptools below 81, retaining
 /// pkg_resources compatibility for legacy setup.py projects. The built-wheel
 /// artifact namespace advances to v6 with this epoch.
-pub const EMIT_EPOCH: u32 = 23;
+///
+/// Epoch 24: wheel metadata parsing ignores RFC 822 folded continuation lines
+/// before matching identity and dependency headers. Existing locks must cold-
+/// derive once so folded License text cannot masquerade as Name, Version, or
+/// Requires-Dist metadata.
+pub const EMIT_EPOCH: u32 = 24;
 
 fn parse_stored_glibc(value: Option<&str>) -> Option<Option<(u32, u32)>> {
     match value {
