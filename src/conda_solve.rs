@@ -33,6 +33,7 @@ use crate::relax::CondaMatchSpec;
 /// verdict and the diagnostic strings it emits are identical regardless
 /// of what is in `preferred` because `locked_packages` never hard-
 /// constrains a version.
+#[cfg(test)]
 fn solve_selected_records_from_records(
     parsed_specs: Vec<MatchSpec>,
     all_records: &[RepoDataRecord],
@@ -42,7 +43,34 @@ fn solve_selected_records_from_records(
     strategy: SolveStrategy,
     preferred: Vec<RepoDataRecord>,
 ) -> std::result::Result<Vec<RepoDataRecord>, Vec<String>> {
-    let virtual_packages = build_virtual_packages(target_python, system_requirements);
+    solve_selected_records_from_records_for_target(
+        parsed_specs,
+        all_records,
+        target_python,
+        channel_priority,
+        system_requirements,
+        None,
+        strategy,
+        preferred,
+    )
+}
+
+fn solve_selected_records_from_records_for_target(
+    parsed_specs: Vec<MatchSpec>,
+    all_records: &[RepoDataRecord],
+    target_python: &str,
+    channel_priority: ChannelPriority,
+    system_requirements: &BTreeMap<String, String>,
+    detected_virtual_packages: Option<&BTreeMap<String, String>>,
+    strategy: SolveStrategy,
+    preferred: Vec<RepoDataRecord>,
+) -> std::result::Result<Vec<RepoDataRecord>, Vec<String>> {
+    let virtual_packages = build_virtual_packages_for_target(
+        target_python,
+        system_requirements,
+        detected_virtual_packages,
+    )
+    .map_err(|error| vec![error])?;
     let task = SolverTask {
         available_packages: vec![all_records],
         // `locked_packages` = soft preference in rattler_solve: the solver
@@ -79,6 +107,7 @@ fn solve_selected_records_from_records(
 /// `preferred` is forwarded directly to
 /// `solve_selected_records_from_records` as the warm-start seed (soft
 /// preference via `locked_packages`). Pass `Vec::new()` for a cold solve.
+#[cfg(test)]
 async fn solve_on_blocking_pool(
     parsed_specs: Vec<MatchSpec>,
     records: Vec<RepoDataRecord>,
@@ -88,16 +117,40 @@ async fn solve_on_blocking_pool(
     strategy: SolveStrategy,
     preferred: Vec<RepoDataRecord>,
 ) -> std::result::Result<Vec<RepoDataRecord>, Vec<String>> {
+    solve_on_blocking_pool_for_target(
+        parsed_specs,
+        records,
+        target_python,
+        channel_priority,
+        system_requirements,
+        None,
+        strategy,
+        preferred,
+    )
+    .await
+}
+
+async fn solve_on_blocking_pool_for_target(
+    parsed_specs: Vec<MatchSpec>,
+    records: Vec<RepoDataRecord>,
+    target_python: String,
+    channel_priority: ChannelPriority,
+    system_requirements: BTreeMap<String, String>,
+    detected_virtual_packages: Option<BTreeMap<String, String>>,
+    strategy: SolveStrategy,
+    preferred: Vec<RepoDataRecord>,
+) -> std::result::Result<Vec<RepoDataRecord>, Vec<String>> {
     let t_solve = std::time::Instant::now();
     let specs_count = parsed_specs.len();
     let records_count = records.len();
     let result = tokio::task::spawn_blocking(move || {
-        solve_selected_records_from_records(
+        solve_selected_records_from_records_for_target(
             parsed_specs,
             &records,
             &target_python,
             channel_priority,
             &system_requirements,
+            detected_virtual_packages.as_ref(),
             strategy,
             preferred,
         )
@@ -161,32 +214,40 @@ pub(crate) fn solve_records_for_test(
 ///
 /// `target_subdir` is the linux-64/osx-64/etc. selector. retread today
 /// targets linux-64 only.
-/// v0.37.0+: build the rattler virtual-package set the solver
-/// should see. Order of operations:
-///   1. Host detection (`__archspec`, `__linux`, `__glibc`, `__cuda`,
-///      `__osx`, ...) — provides defaults for keys the workspace
-///      doesn't constrain explicitly.
-///   2. `__cpython` override from the variant-derived `target_python`
-///      so transitive `python_abi` constraints resolve consistently
-///      with what pixi will install.
-///   3. Workspace `[feature.X.system-requirements]` overrides — pixi
-///      treats these as authoritative; retread must too. Keys map:
-///      `cuda -> __cuda`, `libc -> __glibc` (linux; value is glibc
-///      version), `macos -> __osx`, `archspec -> __archspec`
-///      (build-string encoded), `linux -> __linux`. Unrecognized keys
-///      are trace-logged + skipped (forward-compat).
+/// v0.37.0+: build the legacy rattler virtual-package set the solver should
+/// see. Host detection supplies defaults and workspace system requirements
+/// override them. Exact rich targets use [`build_virtual_packages_for_target`]
+/// instead: a nonempty Pixi-detected map is a complete set, so absence (most
+/// importantly the absence of `__cuda`) must be preserved rather than filled
+/// from the build host.
 ///
-/// Without (3), retread's solve_check sees the BUILD HOST's virtual
-/// packages while pixi's actual solve sees the WORKSPACE-declared
-/// ones — the asymmetry produced "retread sat, pixi unsat" for the
-/// gsn gymnasium failure that motivated v0.37.0. Extracted into a
-/// pure function so the mapping logic is unit-testable without
-/// running a full solve.
+/// Without the workspace override on the legacy path, retread's solve check
+/// sees the build host's virtual packages while Pixi's actual solve sees the
+/// workspace declarations. That asymmetry produced "retread sat, pixi unsat"
+/// for the gsn gymnasium failure that motivated v0.37.0.
 pub fn build_virtual_packages(
     target_python: &str,
     system_requirements: &std::collections::BTreeMap<String, String>,
 ) -> Vec<GenericVirtualPackage> {
-    let mut virtual_packages: Vec<GenericVirtualPackage> =
+    build_virtual_packages_for_target(target_python, system_requirements, None)
+        .expect("legacy virtual-package mapping uses valid built-in package names")
+}
+
+/// Build virtual packages for either a legacy inferred target or an exact
+/// Pixi target contract. `Some` means the request is contract-qualified, even
+/// when its detected map is empty. A nonempty map is the authoritative
+/// complete set reported by Pixi. We deliberately do not run host detection
+/// on either contract-qualified path: merging a host baseline would turn an
+/// exact CPU contract into a CUDA contract, or retain host OS markers that do
+/// not belong to the requested target.
+pub(crate) fn build_virtual_packages_for_target(
+    target_python: &str,
+    system_requirements: &BTreeMap<String, String>,
+    detected_virtual_packages: Option<&BTreeMap<String, String>>,
+) -> Result<Vec<GenericVirtualPackage>, String> {
+    let host_baseline = if detected_virtual_packages.is_some() {
+        Vec::new()
+    } else {
         match rattler_virtual_packages::VirtualPackage::detect(
             &rattler_virtual_packages::VirtualPackageOverrides::default(),
         ) {
@@ -198,7 +259,52 @@ pub fn build_virtual_packages(
                 );
                 Vec::new()
             }
-        };
+        }
+    };
+    build_virtual_packages_from_baseline(
+        target_python,
+        system_requirements,
+        detected_virtual_packages,
+        host_baseline,
+    )
+}
+
+/// Pure assembly boundary used by the exact-target regression. The injected
+/// baseline is intentionally discarded when `detected_virtual_packages` is
+/// `Some`, making both exact and contract-qualified-empty absence semantics
+/// directly testable on any host.
+fn build_virtual_packages_from_baseline(
+    target_python: &str,
+    system_requirements: &BTreeMap<String, String>,
+    detected_virtual_packages: Option<&BTreeMap<String, String>>,
+    host_baseline: Vec<GenericVirtualPackage>,
+) -> Result<Vec<GenericVirtualPackage>, String> {
+    let contract_qualified = detected_virtual_packages.is_some();
+    let exact_detected = detected_virtual_packages.filter(|packages| !packages.is_empty());
+    let mut virtual_packages = if contract_qualified {
+        Vec::new()
+    } else {
+        host_baseline
+    };
+
+    if let Some(packages) = exact_detected {
+        for (req_key, req_value) in packages {
+            insert_virtual_package(&mut virtual_packages, req_key, req_value, true)?;
+        }
+        // Pixi 0.73 does not include a declared CUDA compute capability in
+        // its detected VP list. Supply only that known declaration gap; all
+        // other absences in the exact detected set remain authoritative.
+        if !packages.contains_key("cuda_arch")
+            && let Some(cuda_arch) = system_requirements.get("cuda_arch")
+        {
+            insert_virtual_package(&mut virtual_packages, "cuda_arch", cuda_arch, false)?;
+        }
+    } else {
+        for (req_key, req_value) in system_requirements {
+            insert_virtual_package(&mut virtual_packages, req_key, req_value, false)?;
+        }
+    }
+
     if let Ok(v) = Version::from_str(target_python)
         && let Ok(name) = PackageName::from_str("__cpython")
     {
@@ -209,51 +315,82 @@ pub fn build_virtual_packages(
             build_string: String::new(),
         });
     }
-    for (req_key, req_value) in system_requirements {
-        let (vp_name, is_build_string) = match req_key.as_str() {
-            "cuda" => ("__cuda", false),
-            "libc" | "glibc" => ("__glibc", false),
-            "macos" | "osx" => ("__osx", false),
-            // Archspec is unconditionally a build-string virtual
-            // package -- even values like "1" or "10" that LOOK
-            // like versions are arch identifiers; treat as such.
-            "archspec" => ("__archspec", true),
-            "linux" => ("__linux", false),
-            other => {
-                tracing::trace!(
-                    key = %other,
-                    "solve-check: ignoring unrecognized system-requirement key (not in pixi schema)",
-                );
-                continue;
+    Ok(virtual_packages)
+}
+
+fn insert_virtual_package(
+    virtual_packages: &mut Vec<GenericVirtualPackage>,
+    req_key: &str,
+    req_value: &str,
+    allow_arbitrary_detected_package: bool,
+) -> Result<(), String> {
+    let normalized_key = req_key.trim().trim_start_matches("__");
+    let (vp_name, is_archspec) = match normalized_key {
+        "cuda" => ("__cuda".to_string(), false),
+        "cuda_arch" => ("__cuda_arch".to_string(), false),
+        "libc" | "glibc" => ("__glibc".to_string(), false),
+        "macos" | "osx" => ("__osx".to_string(), false),
+        "windows" | "win" => ("__win".to_string(), false),
+        "archspec" => ("__archspec".to_string(), true),
+        "linux" => ("__linux".to_string(), false),
+        "unix" => ("__unix".to_string(), false),
+        other if allow_arbitrary_detected_package && !other.is_empty() => {
+            (format!("__{other}"), false)
+        }
+        other => {
+            tracing::trace!(
+                key = %other,
+                "solve-check: ignoring unrecognized system-requirement key (not in pixi schema)",
+            );
+            return Ok(());
+        }
+    };
+    let Ok(name) = PackageName::from_str(&vp_name) else {
+        if allow_arbitrary_detected_package {
+            return Err(format!(
+                "invalid exact target virtual-package name `{req_key}`"
+            ));
+        }
+        tracing::trace!(
+            key = %req_key,
+            "solve-check: ignoring invalid detected virtual-package name",
+        );
+        return Ok(());
+    };
+
+    // Pixi renders generic virtual packages as `name=version=build`. Preserve
+    // that representation for exact contracts. Legacy archspec declarations
+    // often contain only the architecture string and retain the historical
+    // synthetic version 1.0 encoding.
+    let (version, build_string) = if let Some((version, build_string)) = req_value.split_once('=')
+        && let Ok(version) = Version::from_str(version)
+    {
+        (version, build_string.to_string())
+    } else if normalized_key == "unix" && req_value.is_empty() {
+        (Version::major(0), "0".to_string())
+    } else if is_archspec {
+        let Ok(version) = Version::from_str("1.0") else {
+            return Ok(());
+        };
+        (version, req_value.to_string())
+    } else {
+        match Version::from_str(req_value) {
+            Ok(version) => (version, String::new()),
+            Err(_) => {
+                let Ok(version) = Version::from_str("1.0") else {
+                    return Ok(());
+                };
+                (version, req_value.to_string())
             }
-        };
-        let Ok(name) = PackageName::from_str(vp_name) else {
-            continue;
-        };
-        let (version, build_string) = if is_build_string {
-            let Ok(v1) = Version::from_str("1.0") else {
-                continue;
-            };
-            (v1, req_value.clone())
-        } else {
-            match Version::from_str(req_value) {
-                Ok(v) => (v, String::new()),
-                Err(_) => {
-                    let Ok(v1) = Version::from_str("1.0") else {
-                        continue;
-                    };
-                    (v1, req_value.clone())
-                }
-            }
-        };
-        virtual_packages.retain(|vp| vp.name.as_normalized() != vp_name);
-        virtual_packages.push(GenericVirtualPackage {
-            name,
-            version,
-            build_string,
-        });
-    }
-    virtual_packages
+        }
+    };
+    virtual_packages.retain(|package| package.name.as_normalized() != vp_name);
+    virtual_packages.push(GenericVirtualPackage {
+        name,
+        version,
+        build_string,
+    });
+    Ok(())
 }
 
 /// v1.5.0: load only the records REACHABLE from the spec set's
@@ -345,6 +482,33 @@ pub async fn solve_selected_records(
     system_requirements: &BTreeMap<String, String>,
     strategy: SolveStrategy,
 ) -> std::result::Result<Vec<RepoDataRecord>, Vec<String>> {
+    solve_selected_records_for_target(
+        channels,
+        specs,
+        target_python,
+        target_subdir,
+        channel_priority,
+        system_requirements,
+        None,
+        strategy,
+    )
+    .await
+}
+
+/// Target-contract-aware form of [`solve_selected_records`]. A nonempty
+/// detected map is Pixi's complete virtual-package set for the selected rich
+/// target. `Some(empty)` remains contract-qualified and suppresses host
+/// detection; only `None` selects legacy host inference.
+pub async fn solve_selected_records_for_target(
+    channels: &[ChannelUrl],
+    specs: &[CondaMatchSpec],
+    target_python: &str,
+    target_subdir: &str,
+    channel_priority: ChannelPriority,
+    system_requirements: &BTreeMap<String, String>,
+    detected_virtual_packages: Option<&BTreeMap<String, String>>,
+    strategy: SolveStrategy,
+) -> std::result::Result<Vec<RepoDataRecord>, Vec<String>> {
     // The only production entrance to conda's MatchSpec parser is the typed
     // raw-name boundary. Test helpers retain String input so solver fixtures
     // can express arbitrary malformed/diagnostic cases without weakening the
@@ -358,12 +522,13 @@ pub async fn solve_selected_records(
             "solve-check skipped: no repodata available from disk cache".into(),
         ]);
     }
-    solve_on_blocking_pool(
+    solve_on_blocking_pool_for_target(
         parsed_specs,
         records,
         target_python.to_string(),
         channel_priority,
         system_requirements.clone(),
+        detected_virtual_packages.cloned(),
         strategy,
         Vec::new(),
     )
@@ -401,6 +566,178 @@ mod tests {
         name: &str,
     ) -> Option<&'a GenericVirtualPackage> {
         vps.iter().find(|vp| vp.name.as_normalized() == name)
+    }
+
+    fn virtual_package(name: &str, version: &str, build_string: &str) -> GenericVirtualPackage {
+        GenericVirtualPackage {
+            name: PackageName::from_str(name).unwrap(),
+            version: Version::from_str(version).unwrap(),
+            build_string: build_string.to_string(),
+        }
+    }
+
+    #[test]
+    fn exact_detected_virtual_packages_discard_host_cuda_and_other_os_markers() {
+        let host_baseline = vec![
+            virtual_package("__cuda", "99", ""),
+            virtual_package("__osx", "15", "0"),
+            virtual_package("__win", "0", "0"),
+            virtual_package("__linux", "99", ""),
+            virtual_package("__cpython", "3.10", ""),
+        ];
+        let detected = BTreeMap::from([
+            ("archspec".to_string(), "1=x86_64".to_string()),
+            ("glibc".to_string(), "2.28".to_string()),
+            ("linux".to_string(), "4.18".to_string()),
+            ("unix".to_string(), "0=0".to_string()),
+        ]);
+
+        let vps = build_virtual_packages_from_baseline(
+            "3.11",
+            &BTreeMap::new(),
+            Some(&detected),
+            host_baseline,
+        )
+        .unwrap();
+
+        assert!(vp_lookup(&vps, "__cuda").is_none());
+        assert!(vp_lookup(&vps, "__osx").is_none());
+        assert!(vp_lookup(&vps, "__win").is_none());
+        assert_eq!(
+            vp_lookup(&vps, "__linux").unwrap().version.to_string(),
+            "4.18"
+        );
+        assert_eq!(
+            vp_lookup(&vps, "__glibc").unwrap().version.to_string(),
+            "2.28"
+        );
+        let archspec = vp_lookup(&vps, "__archspec").unwrap();
+        assert_eq!(archspec.version.to_string(), "1");
+        assert_eq!(archspec.build_string, "x86_64");
+        let unix = vp_lookup(&vps, "__unix").unwrap();
+        assert_eq!(unix.version.to_string(), "0");
+        assert_eq!(unix.build_string, "0");
+        assert!(
+            vp_lookup(&vps, "__cpython")
+                .unwrap()
+                .version
+                .to_string()
+                .starts_with("3.11")
+        );
+    }
+
+    #[test]
+    fn exact_detected_virtual_packages_retain_generic_entries() {
+        let detected = BTreeMap::from([("cuda_arch".to_string(), "8.6".to_string())]);
+        let vps = build_virtual_packages_from_baseline(
+            "3.11",
+            &BTreeMap::new(),
+            Some(&detected),
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            vp_lookup(&vps, "__cuda_arch").unwrap().version.to_string(),
+            "8.6"
+        );
+    }
+
+    #[test]
+    fn exact_detected_virtual_packages_fill_only_declared_cuda_arch_gap() {
+        let host_baseline = vec![
+            virtual_package("__cuda", "99", ""),
+            virtual_package("__linux", "99", ""),
+        ];
+        let detected = BTreeMap::from([
+            ("archspec".to_string(), "1=x86_64".to_string()),
+            ("glibc".to_string(), "2.35".to_string()),
+            ("linux".to_string(), "4.18".to_string()),
+            ("unix".to_string(), "0=0".to_string()),
+        ]);
+        let system_requirements = BTreeMap::from([
+            ("cuda".to_string(), "12".to_string()),
+            ("cuda_arch".to_string(), "8.6".to_string()),
+            ("linux".to_string(), "5.15".to_string()),
+        ]);
+
+        let vps = build_virtual_packages_from_baseline(
+            "3.11",
+            &system_requirements,
+            Some(&detected),
+            host_baseline,
+        )
+        .unwrap();
+
+        assert!(vp_lookup(&vps, "__cuda").is_none());
+        assert_eq!(
+            vp_lookup(&vps, "__cuda_arch").unwrap().version.to_string(),
+            "8.6"
+        );
+        assert_eq!(
+            vp_lookup(&vps, "__linux").unwrap().version.to_string(),
+            "4.18"
+        );
+    }
+
+    #[test]
+    fn contract_qualified_empty_detected_map_does_not_inherit_host_baseline() {
+        let host_baseline = vec![
+            virtual_package("__archspec", "1", "x86_64"),
+            virtual_package("__cuda", "99", ""),
+            virtual_package("__osx", "15", "0"),
+        ];
+        let system_requirements = BTreeMap::from([
+            ("archspec".to_string(), "aarch64".to_string()),
+            ("libc".to_string(), "2.35".to_string()),
+            ("linux".to_string(), "5.15".to_string()),
+        ]);
+        let detected = BTreeMap::new();
+
+        let legacy = build_virtual_packages_from_baseline(
+            "3.10",
+            &system_requirements,
+            None,
+            host_baseline.clone(),
+        )
+        .unwrap();
+        assert!(vp_lookup(&legacy, "__cuda").is_some());
+        assert!(vp_lookup(&legacy, "__osx").is_some());
+
+        let vps = build_virtual_packages_from_baseline(
+            "3.10",
+            &system_requirements,
+            Some(&detected),
+            host_baseline,
+        )
+        .unwrap();
+
+        assert!(vp_lookup(&vps, "__cuda").is_none());
+        assert!(vp_lookup(&vps, "__osx").is_none());
+        assert_eq!(
+            vp_lookup(&vps, "__archspec").unwrap().build_string,
+            "aarch64"
+        );
+        assert_eq!(
+            vp_lookup(&vps, "__glibc").unwrap().version.to_string(),
+            "2.35"
+        );
+        assert_eq!(
+            vp_lookup(&vps, "__linux").unwrap().version.to_string(),
+            "5.15"
+        );
+    }
+
+    #[test]
+    fn exact_detected_virtual_packages_reject_invalid_names() {
+        let detected = BTreeMap::from([("bad/name".to_string(), "1".to_string())]);
+        let error = build_virtual_packages_from_baseline(
+            "3.11",
+            &BTreeMap::new(),
+            Some(&detected),
+            Vec::new(),
+        )
+        .expect_err("an exact contract must not silently omit an invalid virtual package");
+        assert!(error.contains("bad/name"), "unexpected error: {error}");
     }
 
     #[test]

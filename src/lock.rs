@@ -23,6 +23,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::relax::canonical_conda_name;
+use crate::workspace::WorkspaceTargetContract;
 
 fn default_target_subdir() -> String {
     "linux-64".to_owned()
@@ -30,6 +31,10 @@ fn default_target_subdir() -> String {
 
 fn is_legacy_default_target_subdir(target_subdir: &str) -> bool {
     target_subdir == "linux-64"
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Exact checkout-root data-injection decision for a Git-built wheel.
@@ -338,6 +343,28 @@ pub struct RetreadLock {
         skip_serializing_if = "is_legacy_default_target_subdir"
     )]
     pub target_subdir: String,
+    /// Complete, name-independent Pixi workspace target contract used for
+    /// resolution. Older locks omit this field and therefore cannot replay as
+    /// a rich-profile target; they cold-resolve once instead of aliasing a
+    /// different profile on the same conda subdir.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_contract: Option<WorkspaceTargetContract>,
+    /// Exact target identity used in the qualified sidecar filename. This
+    /// includes canonical environment/profile scope when Pixi supplied an
+    /// exact workspace target envelope. The virtual-package contract remains
+    /// separately inspectable in `target_contract`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_identity: Option<String>,
+    /// Canonical environment/profile provenance needed to reconstruct an
+    /// exact scoped target during install and replay. The identity alone is
+    /// insufficient because its SHA-256 digest is intentionally irreversible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_scope: Option<crate::workspace::ResolvedWorkspaceTarget>,
+    /// Whether `target_scope` was selected by a validated exact workspace
+    /// target envelope. Direct inference may produce the same contract and
+    /// scope but cannot authorize that scope for co-activated sibling sources.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub exact_workspace_envelope: bool,
     /// sha256 over the canonicalized resolution inputs (entry specs +
     /// ordered index chain + relax policy + python + retread version).
     /// Reproducibility gate (req #5) AND the cold-solve replay key (req #4):
@@ -367,9 +394,11 @@ pub struct RetreadLock {
     /// schema 11 supports `conda-lib`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub shadow_libs: BTreeMap<String, String>,
-    /// Declared glibc floor recorded from the producer workspace. The installer
-    /// uses this only as a fallback when the live consumer workspace manifest is
-    /// unavailable during post-link.
+    /// Compatibility glibc floor recorded from the producer workspace. Exact
+    /// target-envelope builds store Pixi's detected value first; direct
+    /// inference falls back to the rich profile's explicit declaration. The
+    /// installer uses this only as a fallback when the live consumer workspace
+    /// manifest is unavailable during post-link.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub declared_glibc: Option<String>,
     /// Effective glibc ceiling used to select the locked wheel set.
@@ -416,6 +445,29 @@ pub struct RetreadLock {
     pub wheel_store: Option<String>,
 }
 
+/// Schema 14: complete Pixi workspace target contract.
+///
+/// `RetreadLock.target_contract` preserves the canonical rich-profile virtual
+/// package contract, while `target_scope` preserves canonical environment /
+/// profile provenance and `target_identity` binds it to the qualified sidecar
+/// filename. Missing contracts, scopes, or exact identities deserialize for
+/// compatibility but do not match a scoped contract-qualified resolution
+/// target, forcing one cold derive.
+///
+/// Schema 15: exact workspace-envelope provenance.
+///
+/// `exact_workspace_envelope` distinguishes an authoritative out-of-band
+/// environment/profile selection from direct inference with the same target
+/// contract and consumer scope. Resolution, artifact, sidecar, build, and
+/// replay identities include this bit, preventing different sibling-lock
+/// semantics from aliasing.
+///
+/// Schema 14: complete workspace target contract and consumer scope.
+///
+/// `target_contract`, `target_identity`, and `target_scope` bind rich Pixi
+/// platform compatibility and environment/profile dependency provenance to a
+/// target-qualified sidecar.
+///
 /// Schema 13: exact Git auto-data replay provenance.
 ///
 /// `GitWheelSource.auto_data` records whether phase 1.6 ran and, when it did,
@@ -458,7 +510,7 @@ pub struct RetreadLock {
 /// On the consumer-side install path, old schemas are hard errors: install
 /// replay must not fall back to resolver-backed uv. SCHEMA is NOT an epoch bump
 /// (output SEMANTICS for identical inputs are unchanged; [emit-epoch-ok]).
-pub const SCHEMA: u32 = 13;
+pub const SCHEMA: u32 = 15;
 
 /// Bump EMIT_EPOCH in the SAME commit as ANY change that can alter the bytes
 /// retread emits for identical manifest inputs (relax/version-selection
@@ -583,11 +635,23 @@ pub const SCHEMA: u32 = 13;
 /// must rebuild so recordless conda metadata cannot trigger endless activation
 /// repair replays.
 ///
-/// Epoch 26: routed BFS overrides, workspace-provider compatibility, and
-/// prepared output identity are validated across metadata, cold build, and
-/// replay. Existing locks must cold-derive under the complete provider and
-/// output-identity contract.
-pub const EMIT_EPOCH: u32 = 26;
+/// Epoch 26: routed BFS overrides and prepared output identity are validated
+/// consistently across metadata, cold build, and replay. Existing locks must
+/// cold-derive under the complete routed-dependency and output-identity
+/// contract.
+///
+/// Epoch 27: resolution, artifact, sidecar, and build identities include the
+/// complete name-independent Pixi workspace target contract plus canonical
+/// exact consumer scope. Same-subdir rich profiles such as Pixi-detected
+/// linux-64/glibc 2.28 and explicit glibc 2.35 cannot cross-replay, and two
+/// same-contract environments with different dependency overlays cannot
+/// overwrite one another's emitted courier artifacts.
+///
+/// Epoch 28: exact workspace-envelope provenance participates in every rich
+/// target identity and is persisted in courier locks. Exact and directly
+/// inferred targets with otherwise identical contracts and consumer scopes
+/// cannot share sibling constraints, artifacts, sidecars, builds, or replay.
+pub const EMIT_EPOCH: u32 = 28;
 
 fn parse_stored_glibc(value: Option<&str>) -> Option<Option<(u32, u32)>> {
     match value {
@@ -665,10 +729,11 @@ impl RetreadLock {
         bundle: &str,
         target: &crate::pypi::ResolutionTarget,
     ) -> String {
-        format!(
-            "retread-{bundle}.target-{}.lock.json",
-            target.resolution_identity()
-        )
+        Self::file_name_for_target_identity(bundle, &target.resolution_identity())
+    }
+
+    pub(crate) fn file_name_for_target_identity(bundle: &str, target_identity: &str) -> String {
+        format!("retread-{bundle}.target-{target_identity}.lock.json")
     }
 
     /// Ordered read candidates for an exact target. The target-qualified path
@@ -695,20 +760,39 @@ impl RetreadLock {
     /// Reconstruct the immutable target recorded in this lock. Malformed
     /// compatibility metadata is a hard error at lock ingress.
     pub(crate) fn resolution_target(&self) -> Result<crate::pypi::ResolutionTarget> {
+        if let Some(identity) = &self.target_identity
+            && (identity.len() != 64 || !identity.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        {
+            anyhow::bail!("invalid target_identity in retread lock");
+        }
         let (python_major, python_minor) = parse_stored_python_minor(&self.python)
             .ok_or_else(|| anyhow::anyhow!("invalid python in retread lock"))?;
         let declared_glibc = parse_stored_glibc(self.declared_glibc.as_deref())
             .ok_or_else(|| anyhow::anyhow!("invalid declared_glibc in retread lock"))?;
         let effective_glibc = parse_stored_glibc(self.resolution_glibc.as_deref())
             .ok_or_else(|| anyhow::anyhow!("invalid resolution_glibc in retread lock"))?;
-        Ok(crate::pypi::ResolutionTarget::from_wheel_target(
+        if self.exact_workspace_envelope
+            && (self.target_contract.is_none() || self.target_scope.is_none())
+        {
+            anyhow::bail!(
+                "exact workspace-envelope provenance requires both target_contract and target_scope"
+            );
+        }
+        let target = crate::pypi::ResolutionTarget::try_from_wheel_target_with_contract(
             crate::pypi::WheelTarget {
                 python_version: format!("{python_major}.{python_minor}"),
                 conda_subdir: self.target_subdir.clone(),
                 max_glibc: effective_glibc,
             },
             declared_glibc,
-        ))
+            self.target_contract.clone(),
+        )?;
+        match (self.target_scope.clone(), self.exact_workspace_envelope) {
+            (Some(scope), true) => target.with_exact_workspace_scope(scope),
+            (Some(scope), false) => target.with_workspace_scope(scope),
+            (None, false) => Ok(target),
+            (None, true) => unreachable!("validated exact envelope scope above"),
+        }
     }
 
     /// Whether this lock matches the complete immutable resolution target.
@@ -717,10 +801,18 @@ impl RetreadLock {
     /// target. This makes legacy locks cold-resolve once without preventing
     /// their native linux-64 install replay.
     pub(crate) fn is_for_resolution_target(&self, target: &crate::pypi::ResolutionTarget) -> bool {
-        stored_python_matches(&self.python, target.python_version())
-            && self
-                .resolution_target()
-                .is_ok_and(|locked| locked.resolution_identity() == target.resolution_identity())
+        let Ok(locked) = self.resolution_target() else {
+            return false;
+        };
+        let exact_identity_matches = match self.target_identity.as_deref() {
+            Some(stored) => {
+                stored == target.resolution_identity() && stored == locked.resolution_identity()
+            }
+            None => target.workspace_scope().is_none() && locked.workspace_scope().is_none(),
+        };
+        exact_identity_matches
+            && stored_python_matches(&self.python, target.python_version())
+            && locked.compatibility_identity() == target.compatibility_identity()
     }
 
     /// Validate every replay-trusted content/provenance field before replay
@@ -1250,6 +1342,26 @@ mod tests {
         )
     }
 
+    fn linux_64_contract(
+        declared_glibc: Option<&str>,
+        detected_glibc: &str,
+    ) -> WorkspaceTargetContract {
+        let mut declared_virtual_packages = BTreeMap::new();
+        if let Some(glibc) = declared_glibc {
+            declared_virtual_packages.insert("glibc".to_string(), glibc.to_string());
+        }
+        WorkspaceTargetContract {
+            subdir: "linux-64".to_string(),
+            declared_virtual_packages,
+            detected_virtual_packages: BTreeMap::from([
+                ("archspec".to_string(), "1=x86_64".to_string()),
+                ("glibc".to_string(), detected_glibc.to_string()),
+                ("linux".to_string(), "4.18".to_string()),
+                ("unix".to_string(), String::new()),
+            ]),
+        }
+    }
+
     #[test]
     fn lock_roundtrips() {
         let lock = RetreadLock {
@@ -1259,6 +1371,10 @@ mod tests {
             version: "5.1.0".into(),
             python: "3.11".into(),
             target_subdir: "linux-64".into(),
+            target_contract: None,
+            target_identity: None,
+            target_scope: None,
+            exact_workspace_envelope: false,
             inputs_hash: "deadbeef".into(),
             root_requirements: vec!["isaac-pack-pypi==5.1.0".into()],
             wheels: vec![
@@ -1529,6 +1645,46 @@ mod tests {
             Some((2, 35)),
             Some((2, 35))
         )));
+    }
+
+    #[test]
+    fn rich_target_contract_roundtrips_and_fails_closed_across_profiles() {
+        let p1 = crate::pypi::ResolutionTarget::try_for_contract(
+            "3.11",
+            linux_64_contract(None, "2.28"),
+        )
+        .unwrap();
+        let p3 = crate::pypi::ResolutionTarget::try_for_contract(
+            "3.11",
+            linux_64_contract(Some("2.35"), "2.35"),
+        )
+        .unwrap();
+
+        let mut lock = make_test_lock_unordered();
+        lock.target_contract = p1.target_contract().cloned();
+        lock.declared_glibc = p1.declared_glibc().map(crate::glibc::format_glibc);
+        lock.resolution_glibc = p1.effective_glibc().map(crate::glibc::format_glibc);
+        let json = lock.to_pretty_json().unwrap();
+        assert!(json.contains("\"target_contract\""));
+        let decoded: RetreadLock = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(decoded.target_contract, p1.target_contract().cloned());
+        assert!(decoded.is_for_resolution_target(&p1));
+        assert!(
+            !decoded.is_for_resolution_target(&p3),
+            "same-subdir p1 and p3 contracts must never share a lock"
+        );
+
+        let mut missing_contract = decoded.clone();
+        missing_contract.target_contract = None;
+        assert!(
+            !missing_contract.is_for_resolution_target(&p1),
+            "a legacy lock cannot alias a fully specified profile contract"
+        );
+
+        let mut mismatched_subdir = decoded;
+        mismatched_subdir.target_contract.as_mut().unwrap().subdir = "linux-aarch64".into();
+        assert!(mismatched_subdir.resolution_target().is_err());
     }
 
     #[test]
@@ -1868,6 +2024,127 @@ mod tests {
     }
 
     #[test]
+    fn target_qualified_lock_names_partition_exact_consumer_scope() {
+        let contract = linux_64_contract(Some("2.35"), "2.35");
+        let scoped = |environment: &str| {
+            crate::pypi::ResolutionTarget::try_for_contract("3.11", contract.clone())
+                .unwrap()
+                .with_workspace_scope(crate::workspace::ResolvedWorkspaceTarget {
+                    contract: contract.clone(),
+                    profiles: vec!["p3".to_string()],
+                    environments: vec![environment.to_string()],
+                })
+                .unwrap()
+        };
+        let old = scoped("old");
+        let new = scoped("new");
+
+        assert_ne!(
+            RetreadLock::file_name_for_target("demo", &old),
+            RetreadLock::file_name_for_target("demo", &new),
+            "same-contract environments may have different dependency overlays and locks"
+        );
+        assert_eq!(
+            old.compatibility_identity(),
+            new.compatibility_identity(),
+            "the embedded virtual-package target contract remains name-independent"
+        );
+    }
+
+    #[test]
+    fn persisted_scope_is_bound_to_its_exact_target_identity() {
+        let contract = linux_64_contract(Some("2.35"), "2.35");
+        let unscoped =
+            crate::pypi::ResolutionTarget::try_for_contract("3.11", contract.clone()).unwrap();
+        let scope = crate::workspace::ResolvedWorkspaceTarget {
+            contract: contract.clone(),
+            profiles: vec!["p3".to_string()],
+            environments: vec!["new".to_string()],
+        };
+        let scoped = unscoped
+            .clone()
+            .with_workspace_scope(scope.clone())
+            .unwrap();
+
+        let mut lock = make_test_lock_unordered();
+        lock.target_contract = Some(contract);
+        lock.target_scope = Some(scope);
+        lock.target_identity = Some(scoped.resolution_identity());
+        lock.declared_glibc = scoped.declared_glibc().map(crate::glibc::format_glibc);
+        lock.resolution_glibc = scoped.effective_glibc().map(crate::glibc::format_glibc);
+        assert!(lock.is_for_resolution_target(&scoped));
+
+        let mut changed_scope = lock.clone();
+        changed_scope.target_scope.as_mut().unwrap().environments = vec!["other".to_string()];
+        assert!(
+            !changed_scope.is_for_resolution_target(&scoped),
+            "a stale identity must not authorize changed persisted scope"
+        );
+
+        let mut missing_identity = lock.clone();
+        missing_identity.target_identity = None;
+        assert!(
+            !missing_identity.is_for_resolution_target(&scoped),
+            "scoped locks require their exact identity"
+        );
+        assert!(
+            !missing_identity.is_for_resolution_target(&unscoped),
+            "persisted scope must not disappear through an unscoped request"
+        );
+
+        let mut missing_scope = lock;
+        missing_scope.target_scope = None;
+        assert!(
+            !missing_scope.is_for_resolution_target(&scoped),
+            "a scoped identity must also bind reconstructable scope provenance"
+        );
+    }
+
+    #[test]
+    fn persisted_exact_envelope_provenance_roundtrips_and_partitions_replay() {
+        let contract = linux_64_contract(Some("2.35"), "2.35");
+        let scope = crate::workspace::ResolvedWorkspaceTarget {
+            contract: contract.clone(),
+            profiles: vec!["p3".to_string()],
+            environments: vec!["new".to_string()],
+        };
+        let inferred = crate::pypi::ResolutionTarget::try_for_contract("3.11", contract.clone())
+            .unwrap()
+            .with_workspace_scope(scope.clone())
+            .unwrap();
+        let exact = crate::pypi::ResolutionTarget::try_for_contract("3.11", contract.clone())
+            .unwrap()
+            .with_exact_workspace_scope(scope.clone())
+            .unwrap();
+        assert_ne!(inferred.resolution_identity(), exact.resolution_identity());
+
+        let mut lock = make_test_lock_unordered();
+        lock.target_contract = Some(contract);
+        lock.target_scope = Some(scope);
+        lock.exact_workspace_envelope = true;
+        lock.target_identity = Some(exact.resolution_identity());
+        lock.declared_glibc = exact.declared_glibc().map(crate::glibc::format_glibc);
+        lock.resolution_glibc = exact.effective_glibc().map(crate::glibc::format_glibc);
+
+        let reconstructed = lock.resolution_target().unwrap();
+        assert!(reconstructed.has_exact_workspace_envelope());
+        assert_eq!(
+            reconstructed.resolution_identity(),
+            exact.resolution_identity()
+        );
+        assert!(lock.is_for_resolution_target(&exact));
+        assert!(!lock.is_for_resolution_target(&inferred));
+
+        let mut missing_authority = lock.clone();
+        missing_authority.exact_workspace_envelope = false;
+        assert!(!missing_authority.is_for_resolution_target(&exact));
+
+        let mut missing_scope = lock;
+        missing_scope.target_scope = None;
+        assert!(missing_scope.resolution_target().is_err());
+    }
+
+    #[test]
     fn current_lock_replay_provenance_requires_final_and_sdist_hashes() {
         let mut lock = RetreadLock {
             schema: SCHEMA,
@@ -1876,6 +2153,10 @@ mod tests {
             version: "1.0".into(),
             python: "3.11".into(),
             target_subdir: "linux-64".into(),
+            target_contract: None,
+            target_identity: None,
+            target_scope: None,
+            exact_workspace_envelope: false,
             inputs_hash: "hash".into(),
             root_requirements: vec![],
             wheels: vec![LockWheel {
@@ -2047,6 +2328,10 @@ mod tests {
             version: "1.0.0".into(),
             python: "3.11".into(),
             target_subdir: "linux-64".into(),
+            target_contract: None,
+            target_identity: None,
+            target_scope: None,
+            exact_workspace_envelope: false,
             inputs_hash: "abc123".into(),
             root_requirements: vec!["torch-req".into(), "numpy-req".into()],
             wheels: vec![

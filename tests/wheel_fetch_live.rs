@@ -123,6 +123,7 @@ async fn fetch_isaacsim_kernel_end_to_end() {
         &config,
         "3.11",
         None,
+        None,
         true,
     )
     .unwrap();

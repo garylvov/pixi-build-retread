@@ -131,6 +131,7 @@ fn isaacsim_kernel_pins_widen_under_minor_relax() {
         &baseline_config(),
         "3.11",
         None,
+        None,
         true,
     )
     .unwrap();
@@ -191,6 +192,7 @@ fn isaacsim_core_compat_with_ros2_workspace_pins() {
         &baseline_config(),
         "3.11",
         None,
+        None,
         true,
     )
     .unwrap();
@@ -237,6 +239,7 @@ fn name_map_remaps_opencv_to_conda() {
         &cfg,
         "3.11",
         None,
+        None,
         true,
     )
     .unwrap();
@@ -272,6 +275,7 @@ fn aggressive_major_relax_drops_upper_bounds() {
         }],
         &cfg,
         "3.11",
+        None,
         None,
         true,
     )

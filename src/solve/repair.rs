@@ -1710,7 +1710,9 @@ fn deps_from_owns_exact_pin(project_dir: &Path, bundle: &str, package: &str) -> 
     let Ok(text) = std::fs::read_to_string(pack_dir.join("pixi.toml")) else {
         return false;
     };
-    let Ok(value) = text.parse::<toml::Value>() else {
+    // `toml::Value::from_str` parses one TOML value as of toml 1.1; this is
+    // a complete pixi.toml document and must use the document deserializer.
+    let Ok(value) = toml::from_str::<toml::Value>(&text) else {
         return false;
     };
     let Some(config_value) = value
