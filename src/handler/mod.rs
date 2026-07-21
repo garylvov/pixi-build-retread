@@ -5248,24 +5248,6 @@ struct PreciseConsumerInput {
     pypi_deps: BTreeMap<String, Vec<String>>,
 }
 
-#[cfg(test)]
-fn precise_consumer_inputs(
-    manifest: &crate::workspace::WorkspaceManifest,
-    workspace_dir: &Path,
-    source_dir: &Path,
-) -> Option<Vec<PreciseConsumerInput>> {
-    let envs = manifest.precise_consuming_envs(workspace_dir, source_dir)?;
-    Some(
-        envs.into_iter()
-            .map(|env| PreciseConsumerInput {
-                conda_deps: manifest.effective_dependencies(&env),
-                pypi_deps: manifest.effective_pypi_dependencies(&env),
-                env,
-            })
-            .collect(),
-    )
-}
-
 fn precise_consumer_inputs_for_target(
     manifest: &crate::workspace::WorkspaceManifest,
     workspace_dir: &Path,
@@ -6830,7 +6812,8 @@ mod workspace_conda_facts_tests {
     use super::{
         CondaCoSolveContext, SolvedPypiFact, WorkspaceCondaFacts, WorkspaceRouteOwnership,
         dependency_name_intersection, effective_name_map, facts_from_solved_records,
-        precise_consumer_inputs, workspace_conda_provider_candidates, workspace_fact_constraints,
+        precise_consumer_inputs_for_target, workspace_conda_provider_candidates,
+        workspace_fact_constraints,
     };
     use crate::constraint::Provenance;
     use crate::pypi::{ResolutionTarget, WheelTarget};
@@ -6903,7 +6886,9 @@ viral-gpu = { features = ["viral"], no-default-feature = true }
         .unwrap();
 
         let manifest = crate::workspace::WorkspaceManifest::load(&tmp).unwrap();
-        let inputs = precise_consumer_inputs(&manifest, &tmp, &pack_dir).unwrap();
+        let target = ResolutionTarget::for_subdir("3.11", "linux-64");
+        let inputs =
+            precise_consumer_inputs_for_target(&manifest, &tmp, &pack_dir, &target).unwrap();
         let owned_pypi = dependency_name_intersection(
             &inputs
                 .iter()
@@ -7006,7 +6991,9 @@ holosoma = { features = ["doit-task-runner", "holosoma"], no-default-feature = t
         )
         .unwrap();
         let manifest = crate::workspace::WorkspaceManifest::load(&tmp).unwrap();
-        let inputs = precise_consumer_inputs(&manifest, &tmp, &pack_dir).unwrap();
+        let target = ResolutionTarget::for_subdir("3.11", "linux-64");
+        let inputs =
+            precise_consumer_inputs_for_target(&manifest, &tmp, &pack_dir, &target).unwrap();
 
         assert_eq!(inputs.len(), 1);
         assert_eq!(inputs[0].env, "holosoma");
@@ -7164,7 +7151,9 @@ gpu = { features = ["gpu"], no-default-feature = true }
         )
         .unwrap();
         let manifest = crate::workspace::WorkspaceManifest::load(&tmp).unwrap();
-        let inputs = precise_consumer_inputs(&manifest, &tmp, &pack_dir).unwrap();
+        let target = ResolutionTarget::for_subdir("3.10", "linux-64");
+        let inputs =
+            precise_consumer_inputs_for_target(&manifest, &tmp, &pack_dir, &target).unwrap();
 
         assert_eq!(inputs.len(), 1);
         assert_eq!(inputs[0].env, "sage");
@@ -18236,7 +18225,8 @@ def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
             .overrides
             .insert("packaging".to_string(), "==23.0".to_string());
 
-        let target = ResolutionTarget::for_subdir("3.11", "linux-64");
+        let platform = Platform::current();
+        let target = ResolutionTarget::for_subdir("3.11", platform.as_str());
         let bundle = resolve_bundle(
             "retread-source-root",
             &entry,
@@ -18294,7 +18284,7 @@ def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
             "incremental add must escalate instead of dropping the newly routed ray-core run dep"
         );
 
-        let output = produce_output(&bundle, &config, Platform::Linux64, "3.11", &[], None, None)
+        let output = produce_output(&bundle, &config, platform, "3.11", &[], None, None)
             .expect("the mapped override must emit a valid exact conda dependency");
         let ray_core = output
             .run_dependencies
