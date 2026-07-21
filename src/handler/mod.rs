@@ -8110,6 +8110,75 @@ pub(crate) struct AutoDataConfig {
     pub skip_subdirs: Vec<PathBuf>,
 }
 
+fn persist_git_auto_data(
+    auto_data: Option<&AutoDataConfig>,
+) -> Result<crate::lock::GitWheelAutoData> {
+    let disposition = match auto_data {
+        None => Ok(crate::lock::GitWheelAutoData::Disabled),
+        Some(config) => config
+            .skip_subdirs
+            .iter()
+            .map(|path| {
+                path.to_str().map(str::to_owned).ok_or_else(|| {
+                    anyhow!(
+                        "Git auto-data skip subdirectory is not valid UTF-8: {}",
+                        path.display(),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(
+                |skip_subdirectories| crate::lock::GitWheelAutoData::CheckoutRoot {
+                    skip_subdirectories,
+                },
+            ),
+    }?;
+    disposition
+        .validate()
+        .context("validating producer-selected Git auto-data disposition")?;
+    Ok(disposition)
+}
+
+fn git_auto_data_cache_key(config: &AutoDataConfig) -> Result<String> {
+    use sha2::{Digest, Sha256};
+
+    let mut disposition = persist_git_auto_data(Some(config))?;
+    if let crate::lock::GitWheelAutoData::CheckoutRoot {
+        skip_subdirectories,
+    } = &mut disposition
+    {
+        skip_subdirectories.sort();
+        skip_subdirectories.dedup();
+    }
+    let contract = format!(
+        "retread-git-auto-data-cache-v1\nemit-epoch={}\n{}\n",
+        crate::lock::EMIT_EPOCH,
+        serde_json::to_string(&disposition)?,
+    );
+    Ok(format!("{:x}", Sha256::digest(contract.as_bytes())))
+}
+
+fn replay_git_auto_data(
+    source: &crate::lock::GitWheelSource,
+    checkout_root: PathBuf,
+) -> Result<Option<AutoDataConfig>> {
+    match source.auto_data.as_ref().ok_or_else(|| {
+        anyhow!(
+            "Git replay source {}@{} is missing its exact auto-data disposition",
+            source.url,
+            source.rev,
+        )
+    })? {
+        crate::lock::GitWheelAutoData::Disabled => Ok(None),
+        crate::lock::GitWheelAutoData::CheckoutRoot {
+            skip_subdirectories,
+        } => Ok(Some(AutoDataConfig {
+            checkout_root,
+            skip_subdirs: skip_subdirectories.iter().map(PathBuf::from).collect(),
+        })),
+    }
+}
+
 /// v0.12.0+: audit context passed alongside `AutoDataConfig` so the
 /// resulting `ResolvedWheel` carries enough info to populate the audit
 /// without a second pass. `extras_requested` comes from the entry;
@@ -8140,6 +8209,7 @@ async fn materialize_and_rewrite(
 ) -> Result<(ResolvedWheel, Vec<String>)> {
     use crate::wheel_rewrite::rewrite_wheel;
     let pypi_name = canonical_conda_name(entry_name);
+    let persisted_auto_data = persist_git_auto_data(auto_data.as_ref())?;
 
     // Phase 1: get the raw wheel onto disk. For source-built wheels
     // (path / git / from), also remember the source root so phase 1.5
@@ -8212,6 +8282,7 @@ async fn materialize_and_rewrite(
             rev: resolved_sha,
             subdirectory: entry.subdirectory.clone(),
             extras: entry.extras.clone(),
+            auto_data: Some(persisted_auto_data.clone()),
         });
         git_build = Some(build);
         wheel
@@ -8382,6 +8453,7 @@ async fn materialize_and_rewrite(
             rev: resolved_sha,
             subdirectory: entry.subdirectory.clone(),
             extras: entry.extras.clone(),
+            auto_data: Some(persisted_auto_data),
         });
         git_build = Some(build);
         wheel
@@ -8466,11 +8538,11 @@ async fn materialize_and_rewrite(
     // <rel>` entry -- those land at `$CONDA_PREFIX/lib/<rel>` after
     // pip installs the wheel. Solves the IsaacLab case where the
     // `.kit` experience files live at the repo root but the wheel only
-    // captures `source/<pkg>/`. Cache key: `*.autodata.whl`, refreshed
-    // when the injected wheel changes (auto-data inject doesn't see
-    // checkout-root file mtimes; clearing the auto-data cache when
-    // upstream files change is the user's job via the existing
-    // backend-cache invalidation step).
+    // captures `source/<pkg>/`. The output lives beneath a cache directory
+    // keyed by the canonical skip set and emit epoch, and is refreshed when
+    // the injected wheel changes. Auto-data inject doesn't see checkout-root
+    // file mtimes; clearing the build cache when upstream files change remains
+    // the caller's responsibility.
     let mut auto_data_file_count: Option<usize> = None;
     let with_data_path = if let Some(cfg) = auto_data.as_ref() {
         let build = git_build.as_ref().ok_or_else(|| {
@@ -8484,7 +8556,31 @@ async fn materialize_and_rewrite(
             );
         }
         let checkout_root = build.canonical_root();
-        let out = injected_path.with_extension("autodata.whl");
+        let cache_key = git_auto_data_cache_key(cfg)?;
+        let injected_filename = injected_path.file_name().ok_or_else(|| {
+            anyhow!(
+                "phase 1.6 input wheel has no filename: {}",
+                injected_path.display(),
+            )
+        })?;
+        // The disposition is part of the cache path, rather than an adjacent
+        // marker. Wheel bytes and their cache identity are therefore
+        // published by the same atomic wheel rename: concurrent or rolled-
+        // back group shapes cannot pair one disposition with another's bytes.
+        let out = injected_path
+            .parent()
+            .ok_or_else(|| {
+                anyhow!(
+                    "phase 1.6 input wheel has no parent: {}",
+                    injected_path.display(),
+                )
+            })?
+            .join(".retread-autodata")
+            .join(cache_key)
+            .join(injected_filename)
+            .with_extension("autodata.whl");
+        std::fs::create_dir_all(out.parent().expect("autodata wheel always has a parent"))
+            .with_context(|| format!("creating Git auto-data cache for `{entry_name}`"))?;
         if is_fresh(&out, &injected_path)? {
             tracing::info!(
                 entry = %entry_name,
@@ -9627,10 +9723,10 @@ async fn emit_wheels_from_lock(
     //
     // Pre-pass: group all Class-1 git wheels (must_ship=true, git_source present)
     // by checkout root (git_checkout_root(gs.url, gs.rev)), preserving lock order.
-    // Within each group, group[0] is the CARRIER (mirrors produce's BTreeMap-order
-    // first entry -> first in emit_wheels -> first in lock.wheels). The carrier
-    // gets AutoDataConfig{skip_subdirs = union of ALL members' subdirs}; non-carriers
-    // get None (ship only their own pip+inject wheel, no auto-data).
+    // Every member carries its producer-selected auto-data disposition in
+    // GitWheelSource. Grouping only coordinates shared-checkout materialization;
+    // it must not infer a carrier from lock order because BFS-discovered Git
+    // transitives deliberately have auto-data disabled.
     //
     // Grouping key uses the RESOLVED SHA (gs.rev) so equivalence matches produce's
     // partitioning. The lock's subdirectory field may be None (root/"." member).
@@ -9647,10 +9743,9 @@ async fn emit_wheels_from_lock(
 
     // Step 1: scan lock.wheels to build per-root group membership (preserving order).
     // git_group_members: checkout_root -> Vec<lock index>
-    // git_group_skip_subdirs: checkout_root -> Vec<subdir> (union of all members)
     let mut git_group_members: std::collections::HashMap<PathBuf, Vec<usize>> =
         std::collections::HashMap::new();
-    // Parallel vec for ordering: the FIRST lock index seen for each root (= carrier).
+    // Parallel vec preserving the order in which checkout roots first appear.
     let mut git_group_order: Vec<PathBuf> = Vec::new();
 
     for (idx, lw) in lock.wheels.iter().enumerate() {
@@ -9667,43 +9762,26 @@ async fn emit_wheels_from_lock(
         }
     }
 
-    // Step 2: for each group with >1 members (multi-entry), validate all members
-    // have git_source (invariant; they do by construction of the scan above).
-    // Compute AutoDataConfig per group member index (carrier=first, rest=None).
+    // Step 2: for each group with >1 members (multi-entry), restore each member's
+    // exact producer-recorded AutoDataConfig.
     // auto_data_for_lock_idx: lock index -> Option<AutoDataConfig>
-    // None means "non-carrier of a multi-entry group" -> build with auto_data=None.
-    // Missing key means "size-1 group" -> use single-entry logic below (unchanged).
+    // None means the producer explicitly disabled phase 1.6 for this member.
+    // Missing key means "size-1 group" -> restore its disposition in the loop.
     let mut auto_data_override: std::collections::HashMap<usize, Option<AutoDataConfig>> =
         std::collections::HashMap::new();
 
     for root in &git_group_order {
         let members = &git_group_members[root];
         if members.len() > 1 {
-            // Compute skip_subdirs = union of all members' subdirectory fields.
-            let skip_subdirs: Vec<PathBuf> = members
-                .iter()
-                .map(|&idx| {
-                    let gs = lock.wheels[idx]
-                        .git_source
-                        .as_ref()
-                        .expect("git_group_members only contains wheels with git_source; qed");
-                    PathBuf::from(gs.subdirectory.as_deref().unwrap_or("."))
-                })
-                .collect();
-            // Carrier = members[0] (lock-order index 0).
-            auto_data_override.insert(
-                members[0],
-                Some(AutoDataConfig {
-                    checkout_root: root.clone(),
-                    skip_subdirs,
-                }),
-            );
-            // Non-carriers get None.
-            for &idx in &members[1..] {
-                auto_data_override.insert(idx, None);
+            for &idx in members {
+                let gs = lock.wheels[idx]
+                    .git_source
+                    .as_ref()
+                    .expect("git_group_members only contains wheels with git_source; qed");
+                auto_data_override.insert(idx, replay_git_auto_data(gs, root.clone())?);
             }
         }
-        // Size-1 groups fall through to the single-entry path below (no override).
+        // Size-1 groups restore their disposition in the single-entry path below.
     }
 
     // Stash: checkout_root -> built EmitWheels for that group, keyed by lock index.
@@ -9845,11 +9923,10 @@ async fn emit_wheels_from_lock(
                     // The pre-pass above identified groups by checkout root. If this wheel
                     // is part of a multi-entry group, we use the group stash:
                     //   - First encounter of the root: build ALL group members via
-                    //     materialize_and_rewrite (carrier gets union skip_subdirs, non-
-                    //     carriers get None), stash results by lock index.
+                    //     materialize_and_rewrite with each member's persisted
+                    //     auto-data disposition, then stash results by lock index.
                     //   - Subsequent encounters: emit from stash (no rebuild).
-                    // Single-entry groups fall through to the pre-existing single-entry path
-                    // (skip_subdirs=[gs.subdirectory], unchanged behavior).
+                    // Single-entry groups restore their own persisted disposition below.
                     let checkout_root =
                         crate::source_build::git_checkout_root(&gs.url, &gs.rev, cache_dir);
                     let cur_lock_idx = emit_wheels.len();
@@ -9954,10 +10031,9 @@ async fn emit_wheels_from_lock(
                                  cur_lock_idx must equal emit_wheels.len() at group-build time",
                             )
                     } else {
-                        // Single-entry group: existing single-entry logic (unchanged).
-                        // skip_subdirs = [gs.subdirectory] mirrors produce-path derivation
-                        // (auto_data_per_entry, mod.rs ~2205-2218): one entry owns the
-                        // checkout root; skip_subdirs = its own subdirectory.
+                        // Single-entry group: restore the exact producer decision.
+                        // This is not inferable from group size: an explicit Git entry
+                        // enables checkout-root data, while a BFS Git transitive does not.
                         tracing::info!(
                             wheel = %lw.name,
                             url = %gs.url,
@@ -9981,19 +10057,7 @@ async fn emit_wheels_from_lock(
                             // bumps; keep defaults for anything not carried in GitWheelSource.
                             ..crate::config::WheelEntry::default()
                         };
-                        // Mirror the produce-path derivation (auto_data_per_entry,
-                        // ~mod.rs:2205-2218): for a single-entry git pack the
-                        // skip_subdirs set is exactly [subdirectory] (defaulting to
-                        // ".").  Previously this was vec![] — inert for root entries
-                        // (subdirectory="."), but a silent correctness landmine for
-                        // nested subdirectories (e.g. monorepo subpaths): produce
-                        // would skip the subtree while replay would NOT.
-                        let skip_subdirs =
-                            vec![PathBuf::from(gs.subdirectory.as_deref().unwrap_or("."))];
-                        let auto_data = Some(AutoDataConfig {
-                            checkout_root,
-                            skip_subdirs,
-                        });
+                        let auto_data = replay_git_auto_data(gs, checkout_root)?;
                         let (resolved, _rd) = materialize_and_rewrite(
                             &synth_entry,
                             &lw.name,
@@ -10744,6 +10808,36 @@ async fn resolve_incremental_add(
 ) -> Result<Option<CondaBuildV1Result>> {
     let IncrementalAdd { added_specs, lock } = incr;
 
+    // Match added specs before replaying any locked source wheels. Git
+    // additions require whole-group auto-data planning, so they are a known
+    // cold escalation and should not mutate replay caches first.
+    let added_set: std::collections::HashSet<&str> =
+        added_specs.iter().map(|s| s.as_str()).collect();
+    let mut matched_entries: Vec<(String, WheelEntry)> = Vec::new();
+    for (key, entry) in &config.retread_wheels {
+        let spec = crate::courier::spec_for_entry(key, entry, &config.git_sources);
+        if added_set.contains(spec.as_str()) {
+            matched_entries.push((key.clone(), entry.clone()));
+        }
+    }
+    if matched_entries.len() != added_specs.len() {
+        tracing::debug!(
+            matched = matched_entries.len(),
+            added = added_specs.len(),
+            "incremental-add: could not match all added_specs to config entries; escalating"
+        );
+        return Ok(None);
+    }
+    if matched_entries
+        .iter()
+        .any(|(_, entry)| entry.is_git() || entry.is_named_git())
+    {
+        tracing::debug!(
+            "incremental-add: Git entry requires whole-group auto-data planning; escalating"
+        );
+        return Ok(None);
+    }
+
     // ── Build locked_closure: name → version from lock.wheels ─────────────
     let locked_closure: std::collections::BTreeMap<String, String> = lock
         .wheels
@@ -10784,27 +10878,6 @@ async fn resolve_incremental_add(
     // ── Step B: resolve each added entry ──────────────────────────────────
     let mut new_emit: Vec<crate::emit_pypi::EmitWheel> = Vec::new();
     let mut new_conda_capable: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-    // Match added_specs back to config entries.
-    // courier_input_specs produces "<key>[extras]<ver>" — we find entries
-    // whose spec string appears in added_specs.
-    let added_set: std::collections::HashSet<&str> =
-        added_specs.iter().map(|s| s.as_str()).collect();
-    let mut matched_entries: Vec<(String, WheelEntry)> = Vec::new();
-    for (key, entry) in &effective.retread_wheels {
-        let spec = crate::courier::spec_for_entry(key, entry, &config.git_sources);
-        if added_set.contains(spec.as_str()) {
-            matched_entries.push((key.clone(), entry.clone()));
-        }
-    }
-    if matched_entries.len() != added_specs.len() {
-        tracing::debug!(
-            matched = matched_entries.len(),
-            added = added_specs.len(),
-            "incremental-add: could not match all added_specs to config entries; escalating"
-        );
-        return Ok(None);
-    }
 
     // auto_data_per_entry for group dedup (use None for simplicity — each
     // new entry is treated as a standalone single-entry group).
@@ -12112,11 +12185,12 @@ mod replay_tests {
     use rattler_conda_types::Platform;
 
     use super::{
-        AutoDataConfig, load_replayable_lock, load_replayable_lock_for_target,
-        materialize_from_lock_for_target, prepare_replayed_class2_wheel, replay_from_lock,
+        AutoDataConfig, git_auto_data_cache_key, load_replayable_lock,
+        load_replayable_lock_for_target, materialize_from_lock_for_target, persist_git_auto_data,
+        prepare_replayed_class2_wheel, replay_from_lock, replay_git_auto_data,
         replay_sdist_cache_key, validate_authoritative_replay_lock,
     };
-    use crate::config::{RelaxPolicy, RetreadConfig};
+    use crate::config::{RelaxPolicy, RetreadConfig, WheelEntry};
     use crate::lock::{CondaDep, GitWheelSource, LockWheel, Origin, RetreadLock, SCHEMA};
     use crate::pypi::ResolutionTarget;
     use crate::wheel_rewrite::rewrite_wheel;
@@ -12199,6 +12273,81 @@ mod replay_tests {
     }
 
     #[test]
+    fn git_auto_data_disposition_round_trips_exactly() {
+        use crate::lock::GitWheelAutoData;
+
+        let checkout_root = std::path::PathBuf::from("/cache/checkout");
+        let config = AutoDataConfig {
+            checkout_root: checkout_root.clone(),
+            skip_subdirs: vec![std::path::PathBuf::from("packages/member")],
+        };
+
+        assert_eq!(
+            persist_git_auto_data(None).unwrap(),
+            GitWheelAutoData::Disabled,
+        );
+        assert_eq!(
+            persist_git_auto_data(Some(&config)).unwrap(),
+            GitWheelAutoData::CheckoutRoot {
+                skip_subdirectories: vec!["packages/member".into()],
+            },
+        );
+        let unsafe_config = AutoDataConfig {
+            checkout_root: checkout_root.clone(),
+            skip_subdirs: vec![std::path::PathBuf::from(" packages/member")],
+        };
+        assert!(
+            persist_git_auto_data(Some(&unsafe_config)).is_err(),
+            "producer capture must reject paths that replay would reject",
+        );
+
+        let permuted = AutoDataConfig {
+            checkout_root: checkout_root.clone(),
+            skip_subdirs: vec!["b".into(), "a".into(), "a".into()],
+        };
+        let canonical = AutoDataConfig {
+            checkout_root: checkout_root.clone(),
+            skip_subdirs: vec!["a".into(), "b".into()],
+        };
+        assert_eq!(
+            git_auto_data_cache_key(&permuted).unwrap(),
+            git_auto_data_cache_key(&canonical).unwrap(),
+            "cache identity must be insensitive to skip-set order and duplicates",
+        );
+
+        let mut source = GitWheelSource {
+            url: "https://example.com/checkout.git".into(),
+            rev: "ab".repeat(20),
+            subdirectory: Some("packages/member".into()),
+            extras: vec![],
+            auto_data: Some(GitWheelAutoData::Disabled),
+        };
+        assert!(
+            replay_git_auto_data(&source, checkout_root.clone())
+                .unwrap()
+                .is_none(),
+        );
+
+        source.auto_data = Some(GitWheelAutoData::CheckoutRoot {
+            skip_subdirectories: vec!["packages/member".into()],
+        });
+        let replayed = replay_git_auto_data(&source, checkout_root.clone())
+            .unwrap()
+            .expect("checkout-root injection must be restored");
+        assert_eq!(replayed.checkout_root, checkout_root);
+        assert_eq!(
+            replayed.skip_subdirs,
+            vec![std::path::PathBuf::from("packages/member")],
+        );
+
+        source.auto_data = None;
+        assert!(
+            replay_git_auto_data(&source, std::path::PathBuf::from("/cache/checkout")).is_err(),
+            "legacy provenance must fail closed instead of inferring behavior",
+        );
+    }
+
+    #[test]
     fn replay_gate_requires_the_full_resolution_target() {
         let _env_guard = super::TEST_ENV_MUTEX.lock().unwrap();
         let dir = unique_tmp_dir();
@@ -12241,6 +12390,7 @@ mod replay_tests {
             rev: "ab".repeat(32),
             subdirectory: None,
             extras: vec![],
+            auto_data: Some(crate::lock::GitWheelAutoData::Disabled),
         });
         let path = dir.join(RetreadLock::file_name_for_target("pack", &target));
         std::fs::write(&path, lock.to_pretty_json().unwrap()).unwrap();
@@ -14199,21 +14349,331 @@ version = "1.0.0"
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// Regression for the `rl-games` replay failure seen in
+    /// `isaaclab-gpu-latest`: a BFS-discovered Git transitive is a singleton
+    /// checkout group, but phase 1.6 was disabled on the cold path. Replay
+    /// must consume that persisted decision instead of treating every
+    /// singleton as an explicit checkout-root carrier.
+    #[tokio::test]
+    #[ignore = "runs two local Git source builds through uv"]
+    async fn bfs_git_singleton_replay_preserves_disabled_auto_data() {
+        use crate::emit_pypi::EmitWheel;
+        use crate::lock::GitWheelAutoData;
+        use std::io::Read;
+
+        let _env_guard = crate::TEST_ASYNC_ENV_MUTEX.lock().await;
+        let base = unique_tmp_dir();
+        let repo = base.join("repo");
+        std::fs::create_dir_all(repo.join("retread_bfs_git_leaf")).unwrap();
+        std::fs::write(
+            repo.join("pyproject.toml"),
+            r#"[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "retread-bfs-git-leaf"
+version = "1.0.0"
+
+[tool.setuptools.packages.find]
+include = ["retread_bfs_git_leaf*"]
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("retread_bfs_git_leaf/__init__.py"),
+            b"VALUE = 1\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(repo.join("future_sibling")).unwrap();
+        std::fs::write(repo.join("future_sibling/module.py"), b"VALUE = 2\n").unwrap();
+        // Phase 1.5 denies README.md but injects normalizer.dat. The latter
+        // guarantees a deterministic wheel rewrite; the former is the file
+        // the old, erroneous phase 1.6 replay added under .data/data/lib/.
+        std::fs::write(repo.join("README.md"), b"checkout-root only\n").unwrap();
+        std::fs::write(repo.join("normalizer.dat"), b"phase-1.5\n").unwrap();
+
+        let run_git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .env("GIT_AUTHOR_NAME", "Retread Test")
+                .env("GIT_AUTHOR_EMAIL", "retread@example.invalid")
+                .env("GIT_COMMITTER_NAME", "Retread Test")
+                .env("GIT_COMMITTER_EMAIL", "retread@example.invalid")
+                .output()
+                .expect("run git");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr),
+            );
+            output.stdout
+        };
+        run_git(&["init", "-b", "main"]);
+        run_git(&["add", "."]);
+        run_git(&["commit", "-m", "fixture"]);
+        let rev = String::from_utf8(run_git(&["rev-parse", "HEAD"]))
+            .unwrap()
+            .trim()
+            .to_owned();
+        assert_eq!(rev.len(), 40);
+
+        let git_url = format!("file://{}", repo.display());
+        let entry = WheelEntry {
+            git: Some(git_url),
+            rev: Some(rev),
+            ..WheelEntry::default()
+        };
+        let target = super::wheel_target_for(Platform::Linux64, "3.11").unwrap();
+        let cache_dir = base.join("cache");
+        let cold_download = base.join("cold-download");
+        let cold_source = base.join("cold-source");
+        let replay_download = base.join("replay-download");
+        let replay_source = base.join("replay-source");
+        for dir in [
+            &cache_dir,
+            &cold_download,
+            &cold_source,
+            &replay_download,
+            &replay_source,
+        ] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+
+        let (cold, _) = super::materialize_and_rewrite(
+            &entry,
+            "retread-bfs-git-leaf",
+            None,
+            &target,
+            &cold_download,
+            &cold_source,
+            &cache_dir,
+            RelaxPolicy::None,
+            &BTreeMap::new(),
+            None,
+            super::EntryAuditInfo::default(),
+        )
+        .await
+        .expect("cold BFS Git materialization");
+        assert_eq!(
+            cold.git_source
+                .as_ref()
+                .and_then(|source| source.auto_data.clone()),
+            Some(GitWheelAutoData::Disabled),
+        );
+
+        let cold_path = cold.url.to_file_path().unwrap();
+        let cold_bytes = std::fs::read(&cold_path).unwrap();
+        let wheel_names = |path: &std::path::Path| {
+            let file = std::fs::File::open(path).unwrap();
+            let mut archive = zip::ZipArchive::new(file).unwrap();
+            let mut names = Vec::with_capacity(archive.len());
+            for index in 0..archive.len() {
+                let mut member = archive.by_index(index).unwrap();
+                let mut sink = Vec::new();
+                member.read_to_end(&mut sink).unwrap();
+                names.push(member.name().to_owned());
+            }
+            names
+        };
+        let cold_names = wheel_names(&cold_path);
+        assert!(cold_names.iter().any(|name| name == "normalizer.dat"));
+        assert!(
+            !cold_names
+                .iter()
+                .any(|name| name.ends_with(".data/data/lib/README.md"))
+        );
+
+        let cold_emit = EmitWheel {
+            pypi_name: cold.pypi_name.clone(),
+            version: cold.metadata.version.clone(),
+            requires_dist: cold.metadata.requires_dist.clone(),
+            local_path: Some(cold_path.clone()),
+            wheel_filename: cold_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            sha256: Some(cold.metadata.sha256.clone()),
+            locked_final_sha256: None,
+            remote_url: None,
+            upstream_url: None,
+            git_source: cold.git_source.clone(),
+            sdist_source: None,
+        };
+        let config: RetreadConfig = serde_json::from_value(serde_json::json!({
+            "retread-wheels": {},
+            "retread-bundle-mode": "fat",
+            "retread-relax": "none"
+        }))
+        .unwrap();
+        let indexes = vec!["https://pypi.org/simple/".to_owned()];
+
+        unsafe { std::env::set_var("RETREAD_NO_SHADOW_CACHE", "1") };
+        let cold_staged = crate::courier::stage_for_target(
+            &config,
+            "bfs-git-pack",
+            "bfs-git-pack",
+            "1.0.0",
+            &target,
+            &[cold_emit],
+            &HashSet::new(),
+            &[],
+            &indexes,
+            "fixture",
+            &cold_source,
+            &base.join("cold-staging"),
+        )
+        .await;
+        unsafe { std::env::remove_var("RETREAD_NO_SHADOW_CACHE") };
+        let cold_staged = cold_staged.expect("cold courier stage");
+        let cold_locked = cold_staged
+            .lock
+            .wheels
+            .iter()
+            .find(|wheel| wheel.name == "retread-bfs-git-leaf")
+            .unwrap();
+        assert_eq!(
+            cold_locked
+                .git_source
+                .as_ref()
+                .and_then(|source| source.auto_data.clone()),
+            Some(GitWheelAutoData::Disabled),
+        );
+
+        let replay_emit = super::emit_wheels_from_lock(
+            &cold_staged.lock,
+            &config,
+            &target,
+            &replay_download,
+            &replay_source,
+            &cache_dir,
+        )
+        .await
+        .expect("replay materialization")
+        .expect("complete Git provenance must replay");
+        let replay_leaf = replay_emit
+            .iter()
+            .find(|wheel| wheel.pypi_name == "retread-bfs-git-leaf")
+            .unwrap();
+        let replay_path = replay_leaf.local_path.as_ref().unwrap();
+        assert_eq!(
+            cold_bytes,
+            std::fs::read(replay_path).unwrap(),
+            "cold and replay pre-courier wheel bytes must match",
+        );
+        let replay_names = wheel_names(replay_path);
+        assert!(
+            !replay_names
+                .iter()
+                .any(|name| name.ends_with(".data/data/lib/README.md"))
+        );
+
+        unsafe { std::env::set_var("RETREAD_NO_SHADOW_CACHE", "1") };
+        let replay_staged = crate::courier::stage_for_target(
+            &config,
+            "bfs-git-pack",
+            "bfs-git-pack",
+            "1.0.0",
+            &target,
+            &replay_emit,
+            &HashSet::new(),
+            &[],
+            &indexes,
+            "fixture",
+            &replay_source,
+            &base.join("replay-staging"),
+        )
+        .await;
+        unsafe { std::env::remove_var("RETREAD_NO_SHADOW_CACHE") };
+        let replay_staged = replay_staged.expect("replay courier stage");
+        validate_authoritative_replay_lock(&cold_staged.lock, &replay_staged.lock)
+            .expect("replayed lock must equal the authoritative cold lock");
+
+        // A changed explicit-Git group can reuse the same raw/injected wheel
+        // with a different skip set. Its phase-1.6 cache path must change
+        // rather than merely trusting the old autodata wheel's mtime. First,
+        // future_sibling is not skipped and its Python file is present under
+        // .data/data/lib/.
+        let checkout_root = crate::source_build::git_checkout_root(
+            entry.git.as_deref().unwrap(),
+            entry.rev.as_deref().unwrap(),
+            &cache_dir,
+        );
+        let (first_group_shape, _) = super::materialize_and_rewrite(
+            &entry,
+            "retread-bfs-git-leaf",
+            Some("1.0.0"),
+            &target,
+            &cold_download,
+            &cold_source,
+            &cache_dir,
+            RelaxPolicy::None,
+            &BTreeMap::new(),
+            Some(AutoDataConfig {
+                checkout_root: checkout_root.clone(),
+                skip_subdirs: vec!["retread_bfs_git_leaf".into()],
+            }),
+            super::EntryAuditInfo::default(),
+        )
+        .await
+        .expect("first Git group shape");
+        let group_cache_path = first_group_shape.url.to_file_path().unwrap();
+        assert!(
+            wheel_names(&group_cache_path)
+                .iter()
+                .any(|name| name.ends_with(".data/data/lib/future_sibling/module.py")),
+        );
+
+        // Then future_sibling joins the skipped package set. This specifically
+        // proves disposition-keyed warm-cache isolation.
+        let (second_group_shape, _) = super::materialize_and_rewrite(
+            &entry,
+            "retread-bfs-git-leaf",
+            Some("1.0.0"),
+            &target,
+            &cold_download,
+            &cold_source,
+            &cache_dir,
+            RelaxPolicy::None,
+            &BTreeMap::new(),
+            Some(AutoDataConfig {
+                checkout_root,
+                skip_subdirs: vec!["retread_bfs_git_leaf".into(), "future_sibling".into()],
+            }),
+            super::EntryAuditInfo::default(),
+        )
+        .await
+        .expect("changed Git group shape");
+        let second_group_cache_path = second_group_shape.url.to_file_path().unwrap();
+        assert_ne!(group_cache_path, second_group_cache_path);
+        assert_eq!(
+            group_cache_path.file_name(),
+            second_group_cache_path.file_name()
+        );
+        assert!(
+            !wheel_names(&second_group_cache_path)
+                .iter()
+                .any(|name| name.ends_with(".data/data/lib/future_sibling/module.py")),
+            "changed skip set must invalidate the warm autodata wheel",
+        );
+
+        std::fs::remove_dir_all(base).ok();
+    }
+
     // -----------------------------------------------------------------------
     // PHASE 2.5 tests: multi-entry shared-git-checkout replay.
     // -----------------------------------------------------------------------
 
-    /// Test (b): group[0] in lock order is the carrier.
+    /// Replay restores each Git wheel's persisted auto-data disposition.
     ///
-    /// Verify that the pre-pass in materialize_from_lock assigns AutoDataConfig
-    /// (with the union skip_subdirs) to lock index 0 of a multi-entry group, and
-    /// None to all other members. This mirrors produce's BTreeMap-order-first
-    /// carrier rule (auto_data_per_entry, mod.rs ~2197-2221).
-    ///
-    /// This is a pure unit test — it exercises the grouping + AutoDataConfig
-    /// derivation logic directly via a synthetic lock, no git/uv required.
+    /// The carrier deliberately appears second in lock order. This proves that
+    /// grouping only coordinates a shared checkout and never elects a carrier.
+    /// The separate singleton models a BFS Git transitive whose phase-1.6 pass
+    /// was explicitly disabled.
     #[test]
-    fn multi_entry_git_group_lock_order_first_is_carrier() {
+    fn git_group_replay_uses_persisted_auto_data_dispositions() {
         use crate::lock::{GitWheelSource, LockWheel, Origin};
         use std::path::PathBuf;
 
@@ -14227,7 +14687,7 @@ version = "1.0.0"
 
         // Group: 3 members of the same git repo, different subdirs.
         // Lock order: isaaclab (index 0), isaaclab_assets (index 1),
-        // isaaclab_tasks (index 2).
+        // isaaclab_tasks (index 4). The producer-selected carrier is index 1.
         // rl_games: separate size-1 group (different rev).
         let rev2 = "b".repeat(40);
         let url2 = "https://github.com/example/rl_games.git".to_string();
@@ -14248,6 +14708,7 @@ version = "1.0.0"
                     rev: rev.clone(),
                     subdirectory: Some("source/isaaclab".into()),
                     extras: vec![],
+                    auto_data: Some(crate::lock::GitWheelAutoData::Disabled),
                 }),
                 sdist_source: None,
             },
@@ -14266,6 +14727,13 @@ version = "1.0.0"
                     rev: rev.clone(),
                     subdirectory: Some("source/isaaclab_assets".into()),
                     extras: vec![],
+                    auto_data: Some(crate::lock::GitWheelAutoData::CheckoutRoot {
+                        skip_subdirectories: vec![
+                            "source/isaaclab".into(),
+                            "source/isaaclab_assets".into(),
+                            "source/isaaclab_tasks".into(),
+                        ],
+                    }),
                 }),
                 sdist_source: None,
             },
@@ -14299,6 +14767,7 @@ version = "1.0.0"
                     rev: rev2.clone(),
                     subdirectory: None, // root subdir
                     extras: vec![],
+                    auto_data: Some(crate::lock::GitWheelAutoData::Disabled),
                 }),
                 sdist_source: None,
             },
@@ -14318,6 +14787,7 @@ version = "1.0.0"
                     rev: rev.clone(),
                     subdirectory: Some("source/isaaclab_tasks".into()),
                     extras: vec![],
+                    auto_data: Some(crate::lock::GitWheelAutoData::Disabled),
                 }),
                 sdist_source: None,
             },
@@ -14342,28 +14812,15 @@ version = "1.0.0"
             }
         }
 
-        // Compute auto_data_override (mirrors materialize_from_lock pre-pass).
+        // Compute auto_data_override exactly as emit_wheels_from_lock does.
         let mut auto_data_override: std::collections::HashMap<usize, Option<AutoDataConfig>> =
             std::collections::HashMap::new();
         for root in &git_group_order {
             let members = &git_group_members[root];
             if members.len() > 1 {
-                let skip_subdirs: Vec<PathBuf> = members
-                    .iter()
-                    .map(|&idx| {
-                        let gs = wheels[idx].git_source.as_ref().unwrap();
-                        PathBuf::from(gs.subdirectory.as_deref().unwrap_or("."))
-                    })
-                    .collect();
-                auto_data_override.insert(
-                    members[0],
-                    Some(AutoDataConfig {
-                        checkout_root: root.clone(),
-                        skip_subdirs,
-                    }),
-                );
-                for &idx in &members[1..] {
-                    auto_data_override.insert(idx, None);
+                for &idx in members {
+                    let gs = wheels[idx].git_source.as_ref().unwrap();
+                    auto_data_override.insert(idx, replay_git_auto_data(gs, root.clone()).unwrap());
                 }
             }
         }
@@ -14372,10 +14829,7 @@ version = "1.0.0"
         let isaac_root = crate::source_build::git_checkout_root(&url, &rev, &cache_dir);
         let isaac_members = &git_group_members[&isaac_root];
         assert_eq!(isaac_members.len(), 3, "isaaclab group must have 3 members");
-        assert_eq!(
-            isaac_members[0], 0,
-            "isaaclab (lock idx 0) must be group[0]"
-        );
+        assert_eq!(isaac_members[0], 0);
         assert_eq!(
             isaac_members[1], 1,
             "isaaclab-assets (lock idx 1) must be group[1]"
@@ -14385,12 +14839,19 @@ version = "1.0.0"
             "isaaclab-tasks (lock idx 4, non-contiguous) must be group[2]"
         );
 
-        // Carrier (index 0) has AutoDataConfig with all 3 subdirs.
+        // The first lock member is explicitly disabled. Lock order is not
+        // replay authority.
+        assert!(
+            auto_data_override.contains_key(&0) && auto_data_override[&0].is_none(),
+            "first lock member must remain disabled"
+        );
+
+        // The persisted carrier (index 1) has all three skipped subdirectories.
         let carrier_ad = auto_data_override
-            .get(&0)
-            .expect("lock idx 0 must be in auto_data_override")
+            .get(&1)
+            .expect("lock idx 1 must be in auto_data_override")
             .as_ref()
-            .expect("carrier (lock idx 0) must have Some(AutoDataConfig)");
+            .expect("persisted carrier must have Some(AutoDataConfig)");
         assert_eq!(
             carrier_ad.skip_subdirs.len(),
             3,
@@ -14415,11 +14876,7 @@ version = "1.0.0"
             "carrier skip_subdirs must include source/isaaclab_tasks"
         );
 
-        // Non-carriers (indices 1 and 4) have None.
-        assert!(
-            auto_data_override.contains_key(&1) && auto_data_override[&1].is_none(),
-            "lock idx 1 (non-carrier) must have None auto_data"
-        );
+        // The other non-carrier remains disabled despite being non-contiguous.
         assert!(
             auto_data_override.contains_key(&4) && auto_data_override[&4].is_none(),
             "lock idx 4 (non-carrier, non-contiguous) must have None auto_data"
@@ -14432,6 +14889,12 @@ version = "1.0.0"
         assert!(
             !auto_data_override.contains_key(&rl_members[0]),
             "size-1 group must not be in auto_data_override (single-entry path)"
+        );
+        assert!(
+            replay_git_auto_data(wheels[rl_members[0]].git_source.as_ref().unwrap(), rl_root,)
+                .unwrap()
+                .is_none(),
+            "BFS singleton must preserve its explicit Disabled disposition"
         );
 
         // Index wheel (lock idx 2, Origin::Index) must NOT appear in any group.
@@ -14565,9 +15028,9 @@ version = "1.0.0"
     //
     // Creates a local git repo with two subdirectory packages (pkg-alpha and
     // pkg-beta) plus a separate size-1 repo (pkg-gamma). Runs produce via
-    // materialize_and_rewrite for each, then simulates what materialize_from_lock
-    // does for the group (carrier with union skip_subdirs, non-carrier with None),
-    // and asserts byte-identical wheels.
+    // materialize_and_rewrite for each, then drives both the isolated byte
+    // production and the real lock replay planner. The canonical-second beta
+    // member is the persisted carrier; alpha is explicitly disabled.
     //
     // Also tests NON-CONTIGUOUS group order: the lock has pkg-alpha (idx 0),
     // an unrelated index wheel (idx 1), pkg-beta (idx 2), pkg-gamma (idx 3).
@@ -14660,7 +15123,7 @@ version = "1.0.0"
         std::fs::create_dir_all(&beta_src).unwrap();
         std::fs::write(beta_src.join("__init__.py"), b"# pkg-beta\n").unwrap();
 
-        // shared root file (must appear in BOTH carriers' auto-data)
+        // Shared root file carried by beta's checkout-root auto-data pass.
         std::fs::write(mono_repo.join("README.md"), b"monorepo root\n").unwrap();
 
         run_git(&["add", "."], &mono_repo);
@@ -14724,10 +15187,9 @@ version = "1.0.0"
         let gamma_checkout_root =
             crate::source_build::git_checkout_root(&gamma_url, &gamma_sha, &cache_dir);
 
-        // ── PRODUCE: alpha (carrier, skip_subdirs = union of all mono members) ──
-        //
-        // Produce carrier: skip_subdirs = [packages/pkg_alpha, packages/pkg_beta]
-        // (union of both group members' subdirs, mirrors auto_data_per_entry).
+        // ── PRODUCE: alpha (non-carrier) ────────────────────────────────────
+        // The carrier is intentionally beta, which sorts after alpha in the
+        // canonical lock. This makes lock order incapable of selecting it.
         let alpha_entry = WheelEntry {
             git: Some(mono_url.clone()),
             rev: Some(mono_sha.clone()),
@@ -14746,13 +15208,7 @@ version = "1.0.0"
             &cache_dir,
             RelaxPolicy::None,
             &std::collections::BTreeMap::new(),
-            Some(AutoDataConfig {
-                checkout_root: mono_checkout_root.clone(),
-                skip_subdirs: vec![
-                    std::path::PathBuf::from("packages/pkg_alpha"),
-                    std::path::PathBuf::from("packages/pkg_beta"),
-                ],
-            }),
+            None,
             EntryAuditInfo::default(),
         )
         .await
@@ -14763,7 +15219,7 @@ version = "1.0.0"
             .expect("produce alpha must be file URL");
         let produce_alpha_bytes = std::fs::read(&produce_alpha_path).unwrap();
 
-        // ── PRODUCE: beta (non-carrier, auto_data=None) ──────────────────────
+        // ── PRODUCE: beta (persisted carrier, union skip set) ────────────────
         let beta_entry = WheelEntry {
             git: Some(mono_url.clone()),
             rev: Some(mono_sha.clone()),
@@ -14782,7 +15238,13 @@ version = "1.0.0"
             &cache_dir,
             RelaxPolicy::None,
             &std::collections::BTreeMap::new(),
-            None, // non-carrier: no auto_data
+            Some(AutoDataConfig {
+                checkout_root: mono_checkout_root.clone(),
+                skip_subdirs: vec![
+                    std::path::PathBuf::from("packages/pkg_alpha"),
+                    std::path::PathBuf::from("packages/pkg_beta"),
+                ],
+            }),
             EntryAuditInfo::default(),
         )
         .await
@@ -14835,14 +15297,14 @@ version = "1.0.0"
         //   idx 3: gamma (size-1 group)
         //
         // Pre-pass would assign:
-        //   idx 0 -> Some(AutoDataConfig{skip=[alpha,beta]})  (carrier)
-        //   idx 2 -> None                                      (non-carrier)
+        //   idx 0 -> None                                      (non-carrier)
+        //   idx 2 -> Some(AutoDataConfig{skip=[alpha,beta]})  (carrier)
         //   idx 3 -> not in override (size-1 path)
         //
         // We reproduce this in the test by calling materialize_and_rewrite with
         // the same auto_data the pre-pass would produce.
 
-        // Replay alpha (carrier: auto_data with union skip_subdirs).
+        // Replay alpha (non-carrier: auto_data=None).
         let replay_alpha_dd = replay_alpha_src.join("wheels");
         std::fs::create_dir_all(&replay_alpha_dd).unwrap();
         let synth_alpha = WheelEntry {
@@ -14861,13 +15323,7 @@ version = "1.0.0"
             &cache_dir,
             RelaxPolicy::None,
             &std::collections::BTreeMap::new(),
-            Some(AutoDataConfig {
-                checkout_root: mono_checkout_root.clone(),
-                skip_subdirs: vec![
-                    std::path::PathBuf::from("packages/pkg_alpha"),
-                    std::path::PathBuf::from("packages/pkg_beta"),
-                ],
-            }),
+            None,
             EntryAuditInfo::default(),
         )
         .await
@@ -14875,7 +15331,7 @@ version = "1.0.0"
         let replay_alpha_bytes =
             std::fs::read(replay_alpha_resolved.url.to_file_path().unwrap()).unwrap();
 
-        // Replay beta (non-carrier: auto_data=None).
+        // Replay beta (persisted carrier with the union skip set).
         let replay_beta_dd = replay_beta_src.join("wheels");
         std::fs::create_dir_all(&replay_beta_dd).unwrap();
         let synth_beta = WheelEntry {
@@ -14894,7 +15350,13 @@ version = "1.0.0"
             &cache_dir,
             RelaxPolicy::None,
             &std::collections::BTreeMap::new(),
-            None, // non-carrier: auto_data=None
+            Some(AutoDataConfig {
+                checkout_root: mono_checkout_root.clone(),
+                skip_subdirs: vec![
+                    std::path::PathBuf::from("packages/pkg_alpha"),
+                    std::path::PathBuf::from("packages/pkg_beta"),
+                ],
+            }),
             EntryAuditInfo::default(),
         )
         .await
@@ -14935,12 +15397,12 @@ version = "1.0.0"
         // ── ASSERT: byte-identical ───────────────────────────────────────────
         assert_eq!(
             produce_alpha_bytes, replay_alpha_bytes,
-            "PHASE 2.5 PARITY: alpha carrier (union skip_subdirs) must be \
+            "PHASE 2.5 PARITY: alpha non-carrier (auto_data=None) must be \
              byte-identical between produce and replay"
         );
         assert_eq!(
             produce_beta_bytes, replay_beta_bytes,
-            "PHASE 2.5 PARITY: beta non-carrier (auto_data=None) must be \
+            "PHASE 2.5 PARITY: beta persisted carrier (union skip_subdirs) must be \
              byte-identical between produce and replay"
         );
         assert_eq!(
@@ -14948,6 +15410,128 @@ version = "1.0.0"
             "PHASE 2.5 PARITY: gamma size-1 group (single-entry path) must be \
              byte-identical between produce and replay"
         );
+
+        // Drive the real lock -> emit planner as well. The assertions above
+        // isolate byte production; this closes the integration seam so a
+        // future grouping/pre-pass drift cannot be hidden by a test that
+        // independently reconstructs the expected AutoDataConfig.
+        let cold_emit: Vec<crate::emit_pypi::EmitWheel> = [
+            &produce_alpha_resolved,
+            &produce_beta_resolved,
+            &produce_gamma_resolved,
+        ]
+        .into_iter()
+        .map(|resolved| {
+            let path = resolved.url.to_file_path().unwrap();
+            crate::emit_pypi::EmitWheel {
+                pypi_name: resolved.pypi_name.clone(),
+                version: resolved.metadata.version.clone(),
+                requires_dist: resolved.metadata.requires_dist.clone(),
+                local_path: Some(path.clone()),
+                wheel_filename: path.file_name().unwrap().to_string_lossy().into_owned(),
+                sha256: Some(resolved.metadata.sha256.clone()),
+                locked_final_sha256: None,
+                remote_url: None,
+                upstream_url: None,
+                git_source: resolved.git_source.clone(),
+                sdist_source: None,
+            }
+        })
+        .collect();
+        let config: RetreadConfig = serde_json::from_value(serde_json::json!({
+            "retread-wheels": {},
+            "retread-bundle-mode": "fat",
+            "retread-relax": "none"
+        }))
+        .unwrap();
+        let stage_source = base.join("stage-source");
+        let actual_replay_download = base.join("actual-replay-download");
+        let actual_replay_source = base.join("actual-replay-source");
+        for dir in [
+            &stage_source,
+            &actual_replay_download,
+            &actual_replay_source,
+        ] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let indexes = vec!["https://pypi.org/simple/".to_owned()];
+        let cold_staged = crate::courier::stage_for_target(
+            &config,
+            "phase25-pack",
+            "phase25-pack",
+            "1.0.0",
+            &target,
+            &cold_emit,
+            &HashSet::new(),
+            &[],
+            &indexes,
+            "fixture",
+            &stage_source,
+            &base.join("actual-cold-staging"),
+        )
+        .await
+        .expect("stage authoritative multi-Git lock");
+        let locked_alpha = cold_staged
+            .lock
+            .wheels
+            .iter()
+            .find(|wheel| wheel.name == "retread-p25-pkg-alpha")
+            .unwrap();
+        let locked_beta = cold_staged
+            .lock
+            .wheels
+            .iter()
+            .find(|wheel| wheel.name == "retread-p25-pkg-beta")
+            .unwrap();
+        assert!(matches!(
+            locked_alpha.git_source.as_ref().unwrap().auto_data.as_ref(),
+            Some(crate::lock::GitWheelAutoData::Disabled),
+        ));
+        assert!(matches!(
+            locked_beta.git_source.as_ref().unwrap().auto_data.as_ref(),
+            Some(crate::lock::GitWheelAutoData::CheckoutRoot { .. }),
+        ));
+        let actual_replay = super::emit_wheels_from_lock(
+            &cold_staged.lock,
+            &config,
+            &target,
+            &actual_replay_download,
+            &actual_replay_source,
+            &cache_dir,
+        )
+        .await
+        .expect("actual multi-Git lock replay")
+        .expect("all multi-Git provenance must be complete");
+        let replayed_bytes: BTreeMap<String, Vec<u8>> = actual_replay
+            .iter()
+            .map(|wheel| {
+                (
+                    wheel.pypi_name.clone(),
+                    std::fs::read(wheel.local_path.as_ref().unwrap()).unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(replayed_bytes["retread-p25-pkg-alpha"], produce_alpha_bytes,);
+        assert_eq!(replayed_bytes["retread-p25-pkg-beta"], produce_beta_bytes,);
+        assert_eq!(replayed_bytes["retread-p25-pkg-gamma"], produce_gamma_bytes,);
+        let replay_staged = crate::courier::stage_for_target(
+            &config,
+            "phase25-pack",
+            "phase25-pack",
+            "1.0.0",
+            &target,
+            &actual_replay,
+            &HashSet::new(),
+            &[],
+            &indexes,
+            "fixture",
+            &actual_replay_source,
+            &base.join("actual-replay-staging"),
+        )
+        .await
+        .expect("stage replayed multi-Git lock");
+        validate_authoritative_replay_lock(&cold_staged.lock, &replay_staged.lock)
+            .expect("actual multi-Git replay must preserve the authoritative lock");
 
         // ── ASSERT: non-contiguous lock ordering simulation ──────────────────
         // Confirm the group detection works for non-contiguous lock indices
@@ -14966,6 +15550,7 @@ version = "1.0.0"
                     rev: rev.clone(),
                     subdirectory: Some("packages/pkg_alpha".into()),
                     extras: vec![],
+                    auto_data: Some(crate::lock::GitWheelAutoData::Disabled),
                 }),
             ),
             (false, None), // Origin::Index — skipped
@@ -14976,6 +15561,12 @@ version = "1.0.0"
                     rev: rev.clone(),
                     subdirectory: Some("packages/pkg_beta".into()),
                     extras: vec![],
+                    auto_data: Some(crate::lock::GitWheelAutoData::CheckoutRoot {
+                        skip_subdirectories: vec![
+                            "packages/pkg_alpha".into(),
+                            "packages/pkg_beta".into(),
+                        ],
+                    }),
                 }),
             ),
             (
@@ -14985,6 +15576,9 @@ version = "1.0.0"
                     rev: gamma_sha.clone(),
                     subdirectory: None,
                     extras: vec![],
+                    auto_data: Some(crate::lock::GitWheelAutoData::CheckoutRoot {
+                        skip_subdirectories: vec![".".into()],
+                    }),
                 }),
             ),
         ];
@@ -15007,8 +15601,26 @@ version = "1.0.0"
         );
         assert_eq!(
             mono_members[0], 0usize,
-            "alpha (lock idx 0) must be carrier of non-contiguous group"
+            "alpha remains first in canonical order even though beta is the persisted carrier"
         );
+        assert!(matches!(
+            sim_wheels[mono_members[0]]
+                .1
+                .as_ref()
+                .unwrap()
+                .auto_data
+                .as_ref(),
+            Some(crate::lock::GitWheelAutoData::Disabled),
+        ));
+        assert!(matches!(
+            sim_wheels[mono_members[1]]
+                .1
+                .as_ref()
+                .unwrap()
+                .auto_data
+                .as_ref(),
+            Some(crate::lock::GitWheelAutoData::CheckoutRoot { .. }),
+        ));
 
         let _ = std::fs::remove_dir_all(&base);
     }

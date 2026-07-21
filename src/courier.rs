@@ -4559,6 +4559,7 @@ version = "1.0.0"
                 rev: resolved_sha.clone(),
                 subdirectory: None,
                 extras: vec![],
+                auto_data: Some(crate::lock::GitWheelAutoData::Disabled),
             }),
             sdist_source: None, // git source: no sdist provenance
         };
@@ -4705,6 +4706,7 @@ version = "1.0.0"
                 rev: replay_sha.clone(),
                 subdirectory: None,
                 extras: vec![],
+                auto_data: Some(crate::lock::GitWheelAutoData::Disabled),
             }),
             sdist_source: None, // git source replay: no sdist provenance
         };

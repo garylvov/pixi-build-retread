@@ -32,6 +32,60 @@ fn is_legacy_default_target_subdir(target_subdir: &str) -> bool {
     target_subdir == "linux-64"
 }
 
+/// Exact checkout-root data-injection decision for a Git-built wheel.
+///
+/// The checkout root itself is derived from [`GitWheelSource::url`] and
+/// [`GitWheelSource::rev`].  Persisting only the skipped package subdirectories
+/// keeps the lock portable while preserving the producer's exact distinction
+/// between checkout-root injection and an intentionally disabled pass.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "kebab-case")]
+pub enum GitWheelAutoData {
+    /// Phase 1.6 did not run for this Git wheel.
+    Disabled,
+    /// Phase 1.6 injected non-ignored checkout-root data into this wheel.
+    CheckoutRoot {
+        /// Package subdirectories whose Python build artifacts are already
+        /// carried by sibling wheels. Non-Python data beneath them remains
+        /// eligible for the checkout-root data pass.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        skip_subdirectories: Vec<String>,
+    },
+}
+
+impl GitWheelAutoData {
+    /// Validate the portable, replay-trusted portion of this disposition.
+    /// Producer capture calls the same contract as replay so a current lock
+    /// can never serialize a path that it would later reject.
+    pub(crate) fn validate(&self) -> Result<()> {
+        use std::path::Component;
+
+        let Self::CheckoutRoot {
+            skip_subdirectories,
+        } = self
+        else {
+            return Ok(());
+        };
+        for skip in skip_subdirectories {
+            let path = std::path::Path::new(skip);
+            if skip.trim().is_empty()
+                || skip != skip.trim()
+                || skip.contains('\\')
+                || path.is_absolute()
+                || path.components().any(|component| {
+                    matches!(
+                        component,
+                        Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                    )
+                })
+            {
+                anyhow::bail!("unsafe Git auto-data skip subdirectory `{skip}`");
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Git provenance for a source-built wheel (schema 8+).
 ///
 /// Stored in `LockWheel.git_source` for every wheel whose bytes were
@@ -49,16 +103,9 @@ fn is_legacy_default_target_subdir(target_subdir: &str) -> bool {
 /// (the inputs_hash covers the config rev, not the resolved SHA — adding
 /// the resolved SHA to the hash would be circular).
 ///
-/// ## Phase-2 limitation — single-entry per checkout root
-///
-/// This struct is safe for the Class-1 single-entry case (one
-/// `[retread-wheels]` entry per git checkout root). A future multi-entry
-/// shared-checkout bundle (e.g. two entries from the same repo at different
-/// subdirectories, which would produce a non-trivial `skip_subdirs` at
-/// produce time) is NOT covered: the replay synth uses `skip_subdirs=[]`
-/// and would produce a non-byte-identical wheel (it over-ships files the
-/// produce-time build excluded). This is guarded at replay time (see
-/// `materialize_from_lock`) and deferred to Phase 3.
+/// The producer also records the exact phase-1.6 auto-data disposition for
+/// each wheel. Replay therefore does not infer carrier/non-carrier behavior
+/// from canonical lock order or checkout group size.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitWheelSource {
     /// Canonical git URL (without the `git+` prefix — the bare clone URL).
@@ -78,6 +125,14 @@ pub struct GitWheelSource {
     /// build the synth entry with these extras for BFS parity.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extras: Vec<String>,
+    /// Exact phase-1.6 checkout-root data decision made by the producer.
+    ///
+    /// `Some(Disabled)` is load-bearing: Git wheels discovered transitively
+    /// through a PEP 508 URL do not receive the explicit entry's checkout-root
+    /// payload. `None` means legacy/unknown provenance and is rejected for a
+    /// schema-13 replay rather than guessed from checkout group size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_data: Option<GitWheelAutoData>,
 }
 
 fn is_exact_git_commit_object_id(value: &str) -> bool {
@@ -361,6 +416,13 @@ pub struct RetreadLock {
     pub wheel_store: Option<String>,
 }
 
+/// Schema 13: exact Git auto-data replay provenance.
+///
+/// `GitWheelSource.auto_data` records whether phase 1.6 ran and, when it did,
+/// its exact skipped subdirectories. Older locks cannot distinguish an
+/// explicit single-entry Git root from a BFS-discovered Git transitive, so
+/// producer replay rejects them and cold-derives once.
+///
 /// Schema 12: install-time pure replay metadata.
 ///
 /// New invariant: every `Origin::Index` wheel must carry a direct artifact
@@ -396,7 +458,7 @@ pub struct RetreadLock {
 /// On the consumer-side install path, old schemas are hard errors: install
 /// replay must not fall back to resolver-backed uv. SCHEMA is NOT an epoch bump
 /// (output SEMANTICS for identical inputs are unchanged; [emit-epoch-ok]).
-pub const SCHEMA: u32 = 12;
+pub const SCHEMA: u32 = 13;
 
 /// Bump EMIT_EPOCH in the SAME commit as ANY change that can alter the bytes
 /// retread emits for identical manifest inputs (relax/version-selection
@@ -682,6 +744,15 @@ impl RetreadLock {
                         )
                     })?;
             }
+            if let Some(source) = &wheel.git_source
+                && source.auto_data.is_none()
+            {
+                anyhow::bail!(
+                    "locked wheel {}=={} is missing its exact Git auto-data disposition",
+                    wheel.name,
+                    wheel.version,
+                );
+            }
         }
         Ok(())
     }
@@ -915,6 +986,19 @@ impl RetreadLock {
                                 );
                             }
                         }
+                        let auto_data = git.auto_data.as_ref().ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "built wheel {}=={} is missing its exact Git auto-data disposition",
+                                wheel.name,
+                                wheel.version,
+                            )
+                        })?;
+                        auto_data.validate().with_context(|| {
+                            format!(
+                                "built wheel {}=={} records invalid Git auto-data provenance",
+                                wheel.name, wheel.version,
+                            )
+                        })?;
                     }
                 }
             }
@@ -1060,6 +1144,7 @@ impl RetreadLock {
     /// Nested sorts (A-1):
     /// - `LockWheel.requires_dist[]`: lexicographic (order-insensitive per §A.5)
     /// - `GitWheelSource.extras[]`: lexicographic
+    /// - `GitWheelSource.auto_data.skip_subdirectories[]`: lexicographic
     pub fn canonicalize(&mut self) {
         // Top-level: wheels sorted by (canonical name, version, origin, filename).
         self.wheels.sort_by(|a, b| {
@@ -1101,6 +1186,13 @@ impl RetreadLock {
             wheel.requires_dist.sort();
             if let Some(gs) = &mut wheel.git_source {
                 gs.extras.sort();
+                if let Some(GitWheelAutoData::CheckoutRoot {
+                    skip_subdirectories,
+                }) = &mut gs.auto_data
+                {
+                    skip_subdirectories.sort();
+                    skip_subdirectories.dedup();
+                }
             }
         }
     }
@@ -1218,8 +1310,8 @@ mod tests {
         let back: RetreadLock = serde_json::from_str(&json).unwrap();
         assert_eq!(back.bundle, "isaac-pack");
         assert_eq!(
-            back.schema, 12,
-            "SCHEMA must be 12 after pure replay url+sha256 metadata was required"
+            back.schema, SCHEMA,
+            "lock round-trip must preserve the current schema"
         );
         assert_eq!(back.wheels.len(), 3);
         // Wheel 0: must_ship source-built, no upstream_url.
@@ -1625,8 +1717,8 @@ mod tests {
         );
     }
 
-    /// GitWheelSource serializes and deserializes correctly with and without
-    /// the optional fields (subdirectory and extras).
+    /// GitWheelSource serializes and deserializes exact auto-data disposition,
+    /// while an older lock with no field remains parseable as unknown.
     #[test]
     fn git_wheel_source_serde_roundtrip() {
         // Full — with subdirectory and extras.
@@ -1635,6 +1727,9 @@ mod tests {
             rev: "abcdef1234567890abcdef1234567890abcdef12".into(),
             subdirectory: Some("packages/core".into()),
             extras: vec!["sim".into(), "dev".into()],
+            auto_data: Some(GitWheelAutoData::CheckoutRoot {
+                skip_subdirectories: vec!["packages/core".into()],
+            }),
         };
         let json = serde_json::to_string(&full).unwrap();
         let back: GitWheelSource = serde_json::from_str(&json).unwrap();
@@ -1642,6 +1737,7 @@ mod tests {
         assert_eq!(back.rev, full.rev);
         assert_eq!(back.subdirectory.as_deref(), Some("packages/core"));
         assert_eq!(back.extras, vec!["sim", "dev"]);
+        assert_eq!(back.auto_data, full.auto_data);
 
         // Minimal — no subdirectory, no extras: those fields must be absent in JSON.
         let minimal = GitWheelSource {
@@ -1649,6 +1745,7 @@ mod tests {
             rev: "abcdef1234567890abcdef1234567890abcdef12".into(),
             subdirectory: None,
             extras: vec![],
+            auto_data: Some(GitWheelAutoData::Disabled),
         };
         let minimal_json = serde_json::to_string(&minimal).unwrap();
         assert!(
@@ -1662,6 +1759,14 @@ mod tests {
         let back_minimal: GitWheelSource = serde_json::from_str(&minimal_json).unwrap();
         assert!(back_minimal.subdirectory.is_none());
         assert!(back_minimal.extras.is_empty());
+        assert_eq!(back_minimal.auto_data, Some(GitWheelAutoData::Disabled));
+
+        let legacy: GitWheelSource = serde_json::from_str(&format!(
+            r#"{{"url":"https://github.com/acme/repo.git","rev":"{}"}}"#,
+            "ab".repeat(20),
+        ))
+        .unwrap();
+        assert!(legacy.auto_data.is_none());
     }
 
     /// `SdistWheelSource` serializes and deserializes correctly.
@@ -1806,6 +1911,7 @@ mod tests {
             rev: "33".repeat(20),
             subdirectory: Some("../escape".into()),
             extras: vec![],
+            auto_data: Some(GitWheelAutoData::Disabled),
         });
         let target = target("3.11", "linux-64", None, None);
         let err = lock
@@ -1814,6 +1920,24 @@ mod tests {
         assert!(format!("{err:#}").contains("unsafe git subdirectory"));
 
         lock.wheels[0].git_source.as_mut().unwrap().subdirectory = Some("packages/gym".into());
+        lock.validate_replay_contract_for_target(&target, "gympack")
+            .unwrap();
+
+        lock.wheels[0].git_source.as_mut().unwrap().auto_data = None;
+        let err = lock.validate_replay_provenance().unwrap_err();
+        assert!(err.to_string().contains("Git auto-data disposition"));
+        lock.wheels[0].git_source.as_mut().unwrap().auto_data =
+            Some(GitWheelAutoData::CheckoutRoot {
+                skip_subdirectories: vec!["../escape".into()],
+            });
+        let err = lock
+            .validate_replay_contract_for_target(&target, "gympack")
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("unsafe Git auto-data"));
+        lock.wheels[0].git_source.as_mut().unwrap().auto_data =
+            Some(GitWheelAutoData::CheckoutRoot {
+                skip_subdirectories: vec!["packages/gym".into()],
+            });
         lock.validate_replay_contract_for_target(&target, "gympack")
             .unwrap();
 
@@ -1939,6 +2063,7 @@ mod tests {
                         rev: "abc123".into(),
                         subdirectory: None,
                         extras: vec!["test".into(), "dev".into()],
+                        auto_data: Some(GitWheelAutoData::Disabled),
                     }),
                     sdist_source: None,
                 },
