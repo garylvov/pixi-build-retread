@@ -17032,10 +17032,11 @@ def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
     }
 
     /// Regression for the cold all-source-built seam: a source root's extra
-    /// selects a Git child, whose ordinary metadata contains ranged Ray. The
-    /// explicit mapped-provider override must remain native-conda authority
+    /// selects a Git child whose ordinary metadata contains ranged Ray and
+    /// `packaging<24`. The explicit overrides must remain native-conda authority
     /// even when no channel can be consulted; otherwise BFS fetches the index's
-    /// newest Ray wheel (2.56 here) before emission ever sees the override.
+    /// newest Ray wheel (2.56 here, requiring `packaging>=24.2`) before emission
+    /// ever sees the compatible Ray 2.49.1 / packaging 23.0 pair.
     #[tokio::test]
     async fn source_extra_git_child_manual_pypi_override_never_fetches_latest_pypi() {
         let dir = unique_tmp_dir();
@@ -17052,7 +17053,7 @@ def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
             &child_dir,
             "retread-git-child",
             "1.0.0",
-            &["ray>=2.40,<3".to_string()],
+            &["ray>=2.40,<3".to_string(), "packaging<24".to_string()],
             None,
         );
         let child_rev = git_commit_all(&child_dir);
@@ -17068,11 +17069,15 @@ def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
         );
 
         let ray_249 = make_wheel_bytes("ray", "2.49.1", &[]);
-        let ray_256 = make_wheel_bytes("ray", "2.56.0", &[]);
+        let ray_256 = make_wheel_bytes("ray", "2.56.0", &["packaging>=24.2"]);
+        let packaging_23 = make_wheel_bytes("packaging", "23.0", &[]);
+        let packaging_242 = make_wheel_bytes("packaging", "24.2", &[]);
         let port = spawn_index_server(
             vec![
                 ("ray".to_string(), "2.49.1".to_string(), ray_249),
                 ("ray".to_string(), "2.56.0".to_string(), ray_256),
+                ("packaging".to_string(), "23.0".to_string(), packaging_23),
+                ("packaging".to_string(), "24.2".to_string(), packaging_242),
             ],
             32,
             true,
@@ -17094,6 +17099,9 @@ def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
         config
             .overrides
             .insert("ray".to_string(), "==2.49.1".to_string());
+        config
+            .overrides
+            .insert("packaging".to_string(), "==23.0".to_string());
 
         let target = ResolutionTarget::for_subdir("3.11", "linux-64");
         let bundle = resolve_bundle(
@@ -17125,8 +17133,11 @@ def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
             "the Git child itself must still be materialized"
         );
         assert!(
-            bundle.extras.iter().all(|wheel| wheel.pypi_name != "ray"),
-            "Ray must remain a conda route; bundled wheels were {:?}",
+            bundle
+                .extras
+                .iter()
+                .all(|wheel| wheel.pypi_name != "ray" && wheel.pypi_name != "packaging"),
+            "Ray and packaging must remain conda routes; bundled wheels were {:?}",
             bundle
                 .extras
                 .iter()
@@ -17159,6 +17170,33 @@ def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
             .find(|dependency| dependency.name == "ray-core")
             .expect("the manual mapped-provider override must be emitted");
         assert_eq!(format_packagespec(&ray_core.spec), "==2.49.1");
+        let packaging = output
+            .run_dependencies
+            .depends
+            .iter()
+            .find(|dependency| dependency.name == "packaging")
+            .expect("the manual packaging override must be emitted");
+        assert_eq!(format_packagespec(&packaging.spec), "==23.0");
+        let routed_deps: Vec<(String, String)> = output
+            .run_dependencies
+            .depends
+            .iter()
+            .filter(|dependency| dependency.name != "python" && dependency.name != "uv")
+            .map(|dependency| {
+                (
+                    dependency.name.clone(),
+                    format_packagespec(&dependency.spec),
+                )
+            })
+            .collect();
+        assert_eq!(
+            routed_deps,
+            vec![
+                ("packaging".to_string(), "==23.0".to_string()),
+                ("ray-core".to_string(), "==2.49.1".to_string()),
+            ],
+            "apart from the mandatory Python/Courier runtime, the source/Git closure must emit only the two manual native-conda routes"
+        );
         assert!(
             output
                 .run_dependencies
