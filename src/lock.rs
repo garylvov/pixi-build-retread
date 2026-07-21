@@ -577,7 +577,12 @@ pub const SCHEMA: u32 = 13;
 /// before matching identity and dependency headers. Existing locks must cold-
 /// derive once so folded License text cannot masquerade as Name, Version, or
 /// Requires-Dist metadata.
-pub const EMIT_EPOCH: u32 = 24;
+///
+/// Epoch 25: exact-version conda-owned Python distributions are verified by
+/// conda ownership rather than wheel RECORD layout. Existing courier packages
+/// must rebuild so recordless conda metadata cannot trigger endless activation
+/// repair replays.
+pub const EMIT_EPOCH: u32 = 25;
 
 fn parse_stored_glibc(value: Option<&str>) -> Option<Option<(u32, u32)>> {
     match value {
