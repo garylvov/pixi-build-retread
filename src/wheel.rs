@@ -1392,12 +1392,16 @@ pub fn parse_metadata(
     let mut version = None;
     let mut requires_dist = Vec::new();
 
-    // RFC 822-style headers terminate at the first blank line.
-    // Continuation lines start with whitespace; we don't currently need them
-    // since Name/Version/Requires-Dist are single-line in every wheel I've seen.
+    // RFC 822-style headers terminate at the first blank line. Continuation
+    // lines start with whitespace and belong to the preceding header. Ignore
+    // them rather than treating identity-like text in a folded License value
+    // as another Name, Version, or Requires-Dist header.
     for line in raw.lines() {
         if line.is_empty() {
             break;
+        }
+        if line.starts_with(' ') || line.starts_with('\t') {
+            continue;
         }
         let Some((key, value)) = line.split_once(':') else {
             continue;
@@ -2259,6 +2263,83 @@ mod tests {
         assert_eq!(m.version, "1.2.3");
         assert_eq!(m.requires_dist, vec!["numpy==1.26.4", "torch>=2.7"]);
         assert!(m.is_pure_python);
+    }
+
+    #[test]
+    fn ignores_space_folded_license_identity_fragments() {
+        let cases = [
+            (
+                "scipy",
+                "1.15.3",
+                "numpy<2.5,>=1.23.5",
+                concat!(
+                    "Metadata-Version: 2.1\n",
+                    "Name: scipy\n",
+                    "Version: 1.15.3\n",
+                    "License: Copyright SciPy Developers\n",
+                    "         Name: OpenBLAS\n",
+                    "         Name: GCC runtime library\n",
+                    "         Name: libquadmath\n",
+                    "Requires-Dist: numpy<2.5,>=1.23.5\n",
+                    "\n",
+                ),
+            ),
+            (
+                "matplotlib",
+                "3.11.1",
+                "contourpy>=1.0.1",
+                concat!(
+                    "Metadata-Version: 2.1\n",
+                    "Name: matplotlib\n",
+                    "Version: 3.11.1\n",
+                    "License: License agreement for matplotlib\n",
+                    "         Name: AMS Fonts\n",
+                    "         Name: FreeType\n",
+                    "         Name: Yorick Colormaps\n",
+                    "Requires-Dist: contourpy>=1.0.1\n",
+                    "\n",
+                ),
+            ),
+        ];
+
+        for (name, version, requirement, raw) in cases {
+            let metadata = parse_metadata(
+                raw,
+                format!("{name}-{version}-py3-none-any.whl"),
+                true,
+                "abc".into(),
+            )
+            .unwrap();
+            assert_eq!(metadata.name, name);
+            assert_eq!(metadata.version, version);
+            assert_eq!(metadata.requires_dist, vec![requirement]);
+        }
+    }
+
+    #[test]
+    fn ignores_tab_folded_identity_like_continuations() {
+        let raw = concat!(
+            "Metadata-Version: 2.1\n",
+            "Name: example-pkg\n",
+            "Version: 1.2.3\n",
+            "License: example license\n",
+            "\tName: impostor\n",
+            "\tVersion: 9.9\n",
+            "\tRequires-Dist: injected-dependency\n",
+            "Requires-Dist: numpy==1.26.4\n",
+            "\n",
+        );
+        let metadata = parse_metadata(
+            raw,
+            "example_pkg-1.2.3-py3-none-any.whl".into(),
+            true,
+            "abc".into(),
+        )
+        .unwrap();
+
+        assert_eq!(metadata.name, "example-pkg");
+        assert_eq!(metadata.version, "1.2.3");
+        assert_eq!(metadata.requires_dist, vec!["numpy==1.26.4"]);
     }
 
     // Regression: a pure-Python wheel after D rewrite has filename
