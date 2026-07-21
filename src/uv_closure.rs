@@ -9100,7 +9100,7 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
         let req = UvClosureRequest {
             bundle: "sdist-smoke".into(),
             python_version: "3.12".into(),
-            conda_subdir: "linux-64".into(),
+            conda_subdir: crate::glibc::current_pixi_platform().into(),
             dependencies: vec!["astub".into()],
             dependency_provenance: BTreeMap::new(),
             constraints: ConstraintSet::default(),

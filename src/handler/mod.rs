@@ -52,6 +52,7 @@ use crate::relax::{
 use crate::rpc::{RpcError, ok, parse_params};
 use crate::wheel::WheelMetadata;
 use crate::wheel_rewrite::rewrite_wheel;
+use crate::workspace::{ResolvedWorkspaceTarget, WorkspaceTargetContract, WorkspaceTargetEnvelope};
 
 /// Process-global memo of `conda/outputs` results, keyed by the params
 /// that determine the outputs (host/build platform, sorted channels,
@@ -65,9 +66,33 @@ use crate::wheel_rewrite::rewrite_wheel;
 /// per `pixi` invocation, so this survives across the repeated calls and
 /// is dropped when the backend exits. Same pattern as
 /// `solve_check::RECORDS_CACHE`.
+#[derive(Clone)]
+struct CondaOutputsMemo {
+    result: CondaOutputsResult,
+    /// Incremental metadata is safe to build only from the exact retained
+    /// cold plan that produced it. Never serve such a memo after that typed
+    /// handoff has been consumed or invalidated.
+    requires_prepared_plan: bool,
+}
+
 static CONDA_OUTPUTS_CACHE: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<String, CondaOutputsResult>>,
+    std::sync::Mutex<std::collections::HashMap<String, CondaOutputsMemo>>,
 > = std::sync::OnceLock::new();
+
+fn remove_incremental_conda_outputs_memo(cache_key: &str) -> bool {
+    let Some(cache) = CONDA_OUTPUTS_CACHE.get() else {
+        return false;
+    };
+    let mut cache = cache.lock().unwrap();
+    if !cache
+        .get(cache_key)
+        .is_some_and(|memo| memo.requires_prepared_plan)
+    {
+        return false;
+    }
+    cache.remove(cache_key);
+    true
+}
 
 /// Build the cache key from the params that actually determine the
 /// outputs. `work_directory` is deliberately EXCLUDED: it's a scratch
@@ -85,10 +110,55 @@ static CONDA_OUTPUTS_CACHE: std::sync::OnceLock<
 /// definitions changed. Use "0" when the mtime is unavailable (offline /
 /// read-error) so the key is still a valid string and the cache can
 /// still hit on identical conditions.
+#[cfg(test)]
 fn conda_outputs_cache_key(
     params: &CondaOutputsParams,
     workspace_mtime: Option<std::time::SystemTime>,
     auto_overrides_fp: &str,
+) -> String {
+    let target = ResolutionTarget::for_subdir("0.0", params.host_platform.as_str());
+    conda_outputs_cache_key_for_target(
+        params,
+        workspace_mtime,
+        auto_overrides_fp,
+        &target,
+        None,
+        "",
+    )
+}
+
+fn workspace_consumer_scope_identity(scope: Option<&ResolvedWorkspaceTarget>) -> String {
+    use sha2::{Digest, Sha256};
+
+    fn hash_set(hasher: &mut Sha256, values: &[String]) {
+        let values: std::collections::BTreeSet<&str> = values.iter().map(String::as_str).collect();
+        hasher.update((values.len() as u64).to_le_bytes());
+        for value in values {
+            hasher.update((value.len() as u64).to_le_bytes());
+            hasher.update(value.as_bytes());
+        }
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"retread-workspace-consumer-scope-v1\0");
+    match scope {
+        None => hasher.update([0]),
+        Some(scope) => {
+            hasher.update([1]);
+            hash_set(&mut hasher, &scope.profiles);
+            hash_set(&mut hasher, &scope.environments);
+        }
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn conda_outputs_cache_key_for_target(
+    params: &CondaOutputsParams,
+    workspace_mtime: Option<std::time::SystemTime>,
+    auto_overrides_fp: &str,
+    target: &ResolutionTarget,
+    consumer_scope: Option<&ResolvedWorkspaceTarget>,
+    workspace_solve_fingerprint: &str,
 ) -> String {
     let mut chans: Vec<String> = params
         .channels
@@ -109,10 +179,10 @@ fn conda_outputs_cache_key(
     // fixed numeric minor here to namespace the remaining immutable target
     // contract (subdir plus declared/effective glibc). This prevents a shared
     // disk memo from crossing host/deployment compatibility boundaries.
-    let target_contract =
-        ResolutionTarget::for_subdir("0.0", params.host_platform.as_str()).resolution_identity();
+    let target_contract = target.resolution_identity();
+    let consumer_scope = workspace_consumer_scope_identity(consumer_scope);
     format!(
-        "{}|{}|{}|{:?}|{}|{}|{}|{}",
+        "{}|{}|{}|{:?}|{}|{}|{}|{}|{}|{}",
         params.host_platform,
         params.build_platform,
         chans.join(","),
@@ -120,6 +190,8 @@ fn conda_outputs_cache_key(
         mtime_str,
         auto_overrides_fp,
         target_contract,
+        consumer_scope,
+        workspace_solve_fingerprint,
         backend_build_identity(),
     )
 }
@@ -425,6 +497,67 @@ fn courier_build_string(
     }
 }
 
+fn courier_build_string_for_target(
+    target: &ResolutionTarget,
+    inputs_hash: &str,
+    build_number: u64,
+    loose: bool,
+) -> String {
+    courier_build_string(
+        &target.python_version().replace('.', ""),
+        inputs_hash,
+        build_number,
+        loose,
+    )
+}
+
+fn resolved_courier_build(
+    expected_build: Option<&str>,
+    target: &ResolutionTarget,
+    staged_inputs_hash: &str,
+    build_number: u64,
+    loose: bool,
+) -> String {
+    expected_build.map(str::to_owned).unwrap_or_else(|| {
+        courier_build_string_for_target(target, staged_inputs_hash, build_number, loose)
+    })
+}
+
+fn advertised_build_matches(advertised_build: Option<&str>, current_build: &str) -> bool {
+    advertised_build.is_none_or(|build| build == current_build)
+}
+
+fn non_courier_build_for_target(
+    config: &RetreadConfig,
+    target: &ResolutionTarget,
+) -> Option<String> {
+    (!config.courier && target.target_contract().is_some()).then(|| {
+        courier_build_string_for_target(
+            target,
+            &target.resolution_identity(),
+            config.build_number,
+            config.bundle_mode == crate::config::BundleMode::Loose,
+        )
+    })
+}
+
+fn validate_advertised_non_courier_target_build(
+    config: &RetreadConfig,
+    target: &ResolutionTarget,
+    advertised_build: Option<&str>,
+) -> Result<(), RpcError> {
+    let Some(required) = non_courier_build_for_target(config, target) else {
+        return Ok(());
+    };
+    if advertised_build_matches(advertised_build, &required) {
+        return Ok(());
+    }
+    Err(RpcError::invalid_params(format!(
+        "advertised non-courier build `{}` does not match immutable target identity `{required}`",
+        advertised_build.unwrap_or_default(),
+    )))
+}
+
 /// Compute the courier inputs hash that uniquely identifies a courier build's
 /// content-affecting inputs. This is the single authoritative implementation
 /// called by:
@@ -475,6 +608,189 @@ fn courier_inputs_hash(
     )
 }
 
+fn current_courier_build_for_input_bundle(
+    config: &RetreadConfig,
+    input_bundle_name: &str,
+    target: &ResolutionTarget,
+    workspace_manifest: Option<&crate::workspace::WorkspaceManifest>,
+    workspace_dir: Option<&Path>,
+    source_dir: &Path,
+) -> String {
+    let workspace_root = workspace_dir.unwrap_or(source_dir);
+    let channels = workspace_manifest
+        .map(|manifest| workspace_courier_channels(manifest, workspace_root, source_dir, target))
+        .unwrap_or_default();
+    let inputs_hash = courier_inputs_hash(
+        config,
+        input_bundle_name,
+        target,
+        &channels,
+        workspace_manifest,
+        workspace_root,
+        source_dir,
+    );
+    courier_build_string_for_target(
+        target,
+        &inputs_hash,
+        config.build_number,
+        config.bundle_mode == crate::config::BundleMode::Loose,
+    )
+}
+
+fn validate_advertised_courier_build(
+    config: &RetreadConfig,
+    input_bundle_name: &str,
+    target: &ResolutionTarget,
+    workspace_manifest: Option<&crate::workspace::WorkspaceManifest>,
+    workspace_dir: Option<&Path>,
+    source_dir: &Path,
+    advertised_build: Option<&str>,
+) -> Result<(), RpcError> {
+    let current_build = current_courier_build_for_input_bundle(
+        config,
+        input_bundle_name,
+        target,
+        workspace_manifest,
+        workspace_dir,
+        source_dir,
+    );
+    if advertised_build_matches(advertised_build, &current_build) {
+        return Ok(());
+    }
+    Err(RpcError::invalid_params(format!(
+        "courier inputs changed between conda/outputs and conda/build_v1: pixi requested build `{}`, but current inputs for source bundle `{input_bundle_name}` require `{current_build}`; rerun the lock/install so output metadata can be recomputed",
+        advertised_build.unwrap_or_default(),
+    )))
+}
+
+fn resolved_workspace_target_from_resolution(
+    manifest: &crate::workspace::WorkspaceManifest,
+    workspace_dir: &Path,
+    source_dir: &Path,
+    target: &ResolutionTarget,
+) -> Option<ResolvedWorkspaceTarget> {
+    if let Some(scope) = target.workspace_scope() {
+        return Some(scope.clone());
+    }
+    target.target_contract().and_then(|contract| {
+        manifest.resolve_source_for_contract(workspace_dir, source_dir, contract)
+    })
+}
+
+fn workspace_courier_channels(
+    manifest: &crate::workspace::WorkspaceManifest,
+    workspace_dir: &Path,
+    source_dir: &Path,
+    target: &ResolutionTarget,
+) -> Vec<String> {
+    match target.target_contract() {
+        Some(_) => {
+            resolved_workspace_target_from_resolution(manifest, workspace_dir, source_dir, target)
+                .map(|resolved| {
+                    manifest.courier_channel_set_for_resolved_target(
+                        workspace_dir,
+                        source_dir,
+                        &resolved,
+                    )
+                })
+                .unwrap_or_default()
+        }
+        None => manifest.courier_channel_set_for_target(
+            workspace_dir,
+            source_dir,
+            target.conda_subdir(),
+        ),
+    }
+}
+
+fn workspace_precise_consuming_envs(
+    manifest: &crate::workspace::WorkspaceManifest,
+    workspace_dir: &Path,
+    source_dir: &Path,
+    target: &ResolutionTarget,
+) -> Option<Vec<String>> {
+    match target.target_contract() {
+        Some(_) => {
+            resolved_workspace_target_from_resolution(manifest, workspace_dir, source_dir, target)
+                .and_then(|resolved| {
+                    manifest.precise_consuming_envs_for_resolved_target(
+                        workspace_dir,
+                        source_dir,
+                        &resolved,
+                    )
+                })
+        }
+        None => manifest.precise_consuming_envs_for_target(
+            workspace_dir,
+            source_dir,
+            target.conda_subdir(),
+        ),
+    }
+}
+
+fn workspace_consuming_dependencies(
+    manifest: &crate::workspace::WorkspaceManifest,
+    workspace_dir: &Path,
+    source_dir: &Path,
+    target: &ResolutionTarget,
+) -> BTreeMap<String, Vec<String>> {
+    match target.target_contract() {
+        Some(_) => {
+            resolved_workspace_target_from_resolution(manifest, workspace_dir, source_dir, target)
+                .map(|resolved| {
+                    manifest.consuming_env_dependencies_for_resolved_target(
+                        workspace_dir,
+                        source_dir,
+                        &resolved,
+                    )
+                })
+                .unwrap_or_default()
+        }
+        None => manifest.consuming_env_dependencies_for_target(
+            workspace_dir,
+            source_dir,
+            target.conda_subdir(),
+        ),
+    }
+}
+
+fn workspace_consuming_system_requirements(
+    manifest: &crate::workspace::WorkspaceManifest,
+    workspace_dir: &Path,
+    source_dir: &Path,
+    target: &ResolutionTarget,
+) -> BTreeMap<String, String> {
+    match target.target_contract() {
+        Some(_) => {
+            resolved_workspace_target_from_resolution(manifest, workspace_dir, source_dir, target)
+                .map(|resolved| {
+                    manifest.consuming_env_system_requirements_for_resolved_target(
+                        workspace_dir,
+                        source_dir,
+                        &resolved,
+                    )
+                })
+                .unwrap_or_default()
+        }
+        None => manifest.consuming_env_system_requirements_for_target(
+            workspace_dir,
+            source_dir,
+            target.conda_subdir(),
+        ),
+    }
+}
+
+fn workspace_effective_system_requirements(
+    manifest: &crate::workspace::WorkspaceManifest,
+    env: &str,
+    target: &ResolutionTarget,
+) -> BTreeMap<String, String> {
+    target.target_contract().map_or_else(
+        || manifest.effective_system_requirements_for_target(env, target.conda_subdir()),
+        |contract| manifest.effective_system_requirements_for_contract(env, contract),
+    )
+}
+
 /// Resolution-affecting workspace fingerprint, including the actual metadata
 /// constraints exported by co-activated Retread path packages.
 ///
@@ -490,8 +806,20 @@ fn workspace_solve_fingerprint(
     target: &ResolutionTarget,
 ) -> String {
     let mut parts = Vec::new();
-    let base =
-        manifest.solve_fingerprint_for_target(workspace_dir, source_dir, target.conda_subdir());
+    let base = match resolved_workspace_target_from_resolution(
+        manifest,
+        workspace_dir,
+        source_dir,
+        target,
+    ) {
+        Some(resolved) => {
+            manifest.solve_fingerprint_for_resolved_target(workspace_dir, source_dir, &resolved)
+        }
+        None if target.target_contract().is_none() => {
+            manifest.solve_fingerprint_for_target(workspace_dir, source_dir, target.conda_subdir())
+        }
+        None => String::new(),
+    };
     if !base.is_empty() {
         parts.push(base);
     }
@@ -511,6 +839,43 @@ fn workspace_solve_fingerprint(
     parts.join("\n")
 }
 
+/// Cache-key form of [`workspace_solve_fingerprint`]. Conda output metadata
+/// can fan out over multiple Python variants, while sibling lock filenames
+/// and replay contracts are Python-qualified. Fingerprint every actual
+/// `pythons_for` target; the metadata-only `0.0` cache target must never be
+/// used to look up sibling locks.
+fn workspace_solve_fingerprint_for_cache(
+    workspace_dir: Option<&Path>,
+    source_dir: &Path,
+    subdir: Platform,
+    config: &RetreadConfig,
+    variant_configuration: Option<&BTreeMap<String, Vec<VariantValue>>>,
+    resolved: Option<&ResolvedWorkspaceTarget>,
+    exact_envelope: bool,
+) -> Result<String> {
+    let Some(workspace_dir) = workspace_dir else {
+        return Ok(String::new());
+    };
+    let Some(manifest) = crate::workspace::WorkspaceManifest::load(workspace_dir) else {
+        return Ok(String::new());
+    };
+
+    let mut fingerprints = Vec::new();
+    for python in pythons_for(config, variant_configuration) {
+        let target =
+            wheel_target_for_resolved_workspace(subdir, &python, resolved, exact_envelope)?;
+        fingerprints.push(format!(
+            "python={}\ntarget={}\n{}",
+            target.python_version(),
+            target.resolution_identity(),
+            workspace_solve_fingerprint(&manifest, workspace_dir, source_dir, &target),
+        ));
+    }
+    fingerprints.sort();
+    fingerprints.dedup();
+    Ok(fingerprints.join("\n--target--\n"))
+}
+
 /// Load every exact-target Retread lock activated beside this pack.
 ///
 /// Keeping discovery and replay-contract validation in one place is
@@ -522,19 +887,25 @@ fn coactivated_sibling_locks(
     source_dir: &Path,
     target: &ResolutionTarget,
 ) -> Vec<(String, crate::lock::RetreadLock)> {
-    let Some(envs) = manifest.precise_consuming_envs_for_target(
-        workspace_dir,
-        source_dir,
-        target.conda_subdir(),
-    ) else {
+    let Some(envs) = workspace_precise_consuming_envs(manifest, workspace_dir, source_dir, target)
+    else {
         return Vec::new();
     };
+    let resolved = target.target_contract().and_then(|_| {
+        resolved_workspace_target_from_resolution(manifest, workspace_dir, source_dir, target)
+    });
     let source_canon = std::fs::canonicalize(source_dir).unwrap_or_else(|_| source_dir.into());
     let mut siblings = BTreeMap::new();
     for env in envs {
-        for (bundle, raw_path) in
-            manifest.effective_path_dependencies_for_target(&env, target.conda_subdir())
-        {
+        let paths = resolved.as_ref().map_or_else(
+            || manifest.effective_path_dependencies_for_target(&env, target.conda_subdir()),
+            |resolved| {
+                manifest
+                    .effective_path_dependencies_for_resolved_env(&env, resolved)
+                    .unwrap_or_default()
+            },
+        );
+        for (bundle, raw_path) in paths {
             let raw_path = PathBuf::from(raw_path);
             let pack_dir = if raw_path.is_absolute() {
                 raw_path
@@ -551,13 +922,46 @@ fn coactivated_sibling_locks(
     siblings
         .into_iter()
         .filter_map(|(bundle, pack_dir)| {
+            // Exact envelopes authorize one workspace-wide
+            // environment/profile scope, so the current target names the
+            // sibling sidecar too. Direct inference can carry an identical
+            // contract and singleton scope; use explicit envelope provenance,
+            // never detected-VP presence, to distinguish them.
+            let sibling_target = match target.target_contract() {
+                // Legacy, unqualified targets have no consumer scope to
+                // rehydrate. Keep their historical target lookup.
+                None => target.clone(),
+                // An exact envelope authorizes one workspace-wide
+                // environment/profile pair, which applies to every source
+                // co-activated by that pair.
+                Some(_) if target.has_exact_workspace_envelope() => target.clone(),
+                // Direct inference aggregates consumers independently for
+                // each source. Never fall back to the current source's scope
+                // when the sibling scope cannot be proven: that could make a
+                // stale lock under the current identity look authoritative.
+                Some(contract) => {
+                    let scope =
+                        manifest.resolve_source_for_contract(workspace_dir, &pack_dir, contract)?;
+                    ResolutionTarget::try_for_contract_on_subdir(
+                        target.python_version(),
+                        target.conda_subdir(),
+                        contract.clone(),
+                    )
+                    .and_then(|resolved| resolved.with_workspace_scope(scope))
+                    .ok()?
+                }
+            };
             // Preserve the declared bundle spelling for its lock filename and
             // replay contract. Conda names may legally contain dots.
             let lock_path = pack_dir.join(crate::lock::RetreadLock::file_name_for_target(
-                &bundle, target,
+                &bundle,
+                &sibling_target,
             ));
             let lock = crate::lock::RetreadLock::load(&lock_path).ok()?;
-            lock.validate_replay_contract_for_target(target, &bundle)
+            if lock.schema != crate::lock::SCHEMA {
+                return None;
+            }
+            lock.validate_replay_contract_for_target(&sibling_target, &bundle)
                 .ok()?;
             Some((bundle, lock))
         })
@@ -689,11 +1093,13 @@ mod sibling_lock_constraint_tests {
     use std::collections::BTreeMap;
 
     use super::{
-        CondaCoSolveContext, sibling_conda_run_dependencies, sibling_lock_constraints,
-        workspace_solve_fingerprint,
+        CondaCoSolveContext, RetreadConfig, VariantValue, conda_outputs_cache_key_for_target,
+        sibling_conda_run_dependencies, sibling_lock_constraints, workspace_solve_fingerprint,
+        workspace_solve_fingerprint_for_cache,
     };
     use crate::lock::{CondaDep, LockWheel, Origin, RetreadLock, SCHEMA};
     use crate::pypi::{ResolutionTarget, WheelTarget};
+    use crate::workspace::WorkspaceTargetContract;
 
     fn temp_workspace() -> std::path::PathBuf {
         let nonce = std::time::SystemTime::now()
@@ -736,16 +1142,66 @@ composed = { features = ["composed"], no-default-feature = true }
     }
 
     #[test]
+    fn conda_co_solve_preserves_legacy_and_qualified_empty_contract_semantics() {
+        let legacy = CondaCoSolveContext::new(
+            None,
+            None,
+            std::path::Path::new("."),
+            &target(),
+            &[],
+            "current-pack",
+            &std::collections::BTreeSet::new(),
+            &crate::relax::NameMap::new(),
+        );
+        assert!(
+            legacy.detected_virtual_packages.is_none(),
+            "an unqualified target must retain the solver's host VP baseline",
+        );
+
+        let qualified_target = ResolutionTarget::try_for_contract(
+            "3.11",
+            WorkspaceTargetContract {
+                subdir: "linux-64".to_string(),
+                declared_virtual_packages: BTreeMap::from([(
+                    "glibc".to_string(),
+                    "2.17".to_string(),
+                )]),
+                detected_virtual_packages: BTreeMap::new(),
+            },
+        )
+        .unwrap();
+        let qualified = CondaCoSolveContext::new(
+            None,
+            None,
+            std::path::Path::new("."),
+            &qualified_target,
+            &[],
+            "current-pack",
+            &std::collections::BTreeSet::new(),
+            &crate::relax::NameMap::new(),
+        );
+        assert_eq!(
+            qualified.detected_virtual_packages,
+            Some(BTreeMap::new()),
+            "a contract-qualified empty detected set must suppress host VP inheritance",
+        );
+    }
+
+    #[test]
     fn coactivated_sibling_metadata_constrains_uv_and_fingerprints_replay() {
         let dir = temp_workspace();
-        let target = target();
-        let lock = RetreadLock {
+        let target = ResolutionTarget::try_for_subdir("3.11", "linux-64").unwrap();
+        let mut lock = RetreadLock {
             schema: SCHEMA,
             retread_version: env!("CARGO_PKG_VERSION").to_string(),
             bundle: "sibling.pack".to_string(),
             version: "1.0.0".to_string(),
             python: "3.11".to_string(),
             target_subdir: "linux-64".to_string(),
+            target_contract: target.target_contract().cloned(),
+            target_identity: Some(target.resolution_identity()),
+            target_scope: None,
+            exact_workspace_envelope: false,
             inputs_hash: "test-inputs".to_string(),
             root_requirements: vec!["sibling-root==1.0.0".to_string()],
             wheels: vec![
@@ -792,8 +1248,8 @@ composed = { features = ["composed"], no-default-feature = true }
             index_urls: vec!["https://pypi.org/simple/".to_string()],
             prerelease: BTreeMap::new(),
             shadow_libs: BTreeMap::new(),
-            declared_glibc: None,
-            resolution_glibc: None,
+            declared_glibc: target.declared_glibc().map(crate::glibc::format_glibc),
+            resolution_glibc: target.effective_glibc().map(crate::glibc::format_glibc),
             conda_capable: Vec::new(),
             entry_specs: vec!["sibling-root@git:deadbeef".to_string()],
             wheel_store: None,
@@ -814,6 +1270,11 @@ composed = { features = ["composed"], no-default-feature = true }
         );
         assert!(lock_path.is_file());
         let loaded = RetreadLock::load(&lock_path).unwrap();
+        assert_eq!(
+            loaded.resolution_target().unwrap().resolution_identity(),
+            target.resolution_identity(),
+            "the sibling fixture must use the same production target identity as cache fingerprinting",
+        );
         loaded
             .validate_replay_contract_for_target(&target, "sibling.pack")
             .unwrap();
@@ -853,6 +1314,74 @@ composed = { features = ["composed"], no-default-feature = true }
             fingerprint.contains("co-activated-sibling-conda:numba=>=0.59.1,<0.60"),
             "fingerprint was {fingerprint}",
         );
+        let cache_params = pixi_build_types::procedures::conda_outputs::CondaOutputsParams {
+            host_platform: rattler_conda_types::Platform::Linux64,
+            build_platform: rattler_conda_types::Platform::Linux64,
+            channels: vec![],
+            variant_configuration: None,
+            variant_files: None,
+            work_directory: dir.join("work"),
+        };
+        let cache_key_before = conda_outputs_cache_key_for_target(
+            &cache_params,
+            None,
+            "none",
+            &target,
+            None,
+            &fingerprint,
+        );
+        let cache_config: RetreadConfig =
+            serde_json::from_value(serde_json::json!({"retread-wheels": {}})).unwrap();
+        let cache_variants = BTreeMap::from([(
+            "python".to_string(),
+            vec![
+                VariantValue::String("3.10".to_string()),
+                VariantValue::String("3.11".to_string()),
+            ],
+        )]);
+        let multi_python_before = workspace_solve_fingerprint_for_cache(
+            Some(&dir),
+            &dir.join("current"),
+            rattler_conda_types::Platform::Linux64,
+            &cache_config,
+            Some(&cache_variants),
+            None,
+            false,
+        )
+        .unwrap();
+        lock.wheels[0]
+            .requires_dist
+            .push("cache-buster>=2".to_string());
+        std::fs::write(&lock_path, lock.to_pretty_json().unwrap()).unwrap();
+        let changed_fingerprint =
+            workspace_solve_fingerprint(&manifest, &dir, &dir.join("current"), &target);
+        let cache_key_after = conda_outputs_cache_key_for_target(
+            &cache_params,
+            None,
+            "none",
+            &target,
+            None,
+            &changed_fingerprint,
+        );
+        let multi_python_after = workspace_solve_fingerprint_for_cache(
+            Some(&dir),
+            &dir.join("current"),
+            rattler_conda_types::Platform::Linux64,
+            &cache_config,
+            Some(&cache_variants),
+            None,
+            false,
+        )
+        .unwrap();
+        assert_ne!(fingerprint, changed_fingerprint);
+        assert_ne!(
+            cache_key_before, cache_key_after,
+            "sibling lock content must invalidate conda/outputs memory and disk cache keys",
+        );
+        assert_ne!(
+            multi_python_before, multi_python_after,
+            "cache fingerprinting must inspect actual Python-qualified sibling locks across a multi-Python output fanout",
+        );
         assert_eq!(
             sibling_conda_run_dependencies(&manifest, &dir, &dir.join("current"), &target)
                 .get("numba"),
@@ -874,6 +1403,177 @@ composed = { features = ["composed"], no-default-feature = true }
                 .get(&crate::relax::CondaName::new("numba")),
             Some(&vec![">=0.59.1,<0.60".to_string()]),
             "the conda route oracle must compose the sibling's emitted contract",
+        );
+
+        lock.schema = SCHEMA - 1;
+        std::fs::write(&lock_path, lock.to_pretty_json().unwrap()).unwrap();
+        assert!(
+            sibling_lock_constraints(&manifest, &dir, &dir.join("current"), &target)
+                .constraints
+                .is_empty(),
+            "stale-schema sibling locks must never feed current replay constraints",
+        );
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn exact_empty_vp_scope_applies_to_siblings_but_direct_inference_does_not() {
+        let dir = std::env::temp_dir().join(format!(
+            "retread-sibling-scope-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("current")).unwrap();
+        std::fs::create_dir_all(dir.join("sibling")).unwrap();
+        std::fs::write(
+            dir.join("pixi.toml"),
+            r#"[workspace]
+channels = ["conda-forge"]
+platforms = [
+  { name = "p1", platform = "linux-64", glibc = "2.28", linux = "4.18" },
+  { name = "p1-alias", platform = "linux-64", glibc = "2.28", linux = "4.18" },
+]
+
+[feature.current.dependencies]
+current-pack = { path = "./current" }
+
+[feature.sibling.dependencies]
+"sibling.pack" = { path = "./sibling" }
+
+[feature.sibling.target.p1.dependencies]
+profile-only = "1"
+
+[feature.sibling.target.p1-alias.dependencies]
+profile-only = "2"
+
+[feature.old]
+platforms = ["p1"]
+
+[feature.alias]
+platforms = ["p1-alias"]
+
+[environments]
+old = { features = ["current", "sibling", "old"], no-default-feature = true }
+alias = { features = ["sibling", "alias"], no-default-feature = true }
+"#,
+        )
+        .unwrap();
+
+        let manifest = crate::workspace::WorkspaceManifest::load(&dir).unwrap();
+        let resolved = manifest
+            .resolve_target_for_source(&dir, &dir.join("current"), "linux-64", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.environments, vec!["old"]);
+        assert!(
+            manifest
+                .resolve_source_for_contract(&dir, &dir.join("sibling"), &resolved.contract)
+                .is_none(),
+            "the sibling's divergent same-contract aliases must fail closed",
+        );
+        assert!(resolved.contract.detected_virtual_packages.is_empty());
+        let direct_target = ResolutionTarget::try_for_contract("3.11", resolved.contract.clone())
+            .unwrap()
+            .with_workspace_scope(resolved.clone())
+            .unwrap();
+        let exact_target = ResolutionTarget::try_for_contract("3.11", resolved.contract.clone())
+            .unwrap()
+            .with_exact_workspace_scope(resolved)
+            .unwrap();
+        assert!(!direct_target.has_exact_workspace_envelope());
+        assert!(exact_target.has_exact_workspace_envelope());
+        let lock = RetreadLock {
+            schema: SCHEMA,
+            retread_version: env!("CARGO_PKG_VERSION").to_string(),
+            bundle: "sibling.pack".to_string(),
+            version: "1.0.0".to_string(),
+            python: "3.11".to_string(),
+            target_subdir: "linux-64".to_string(),
+            target_contract: direct_target.target_contract().cloned(),
+            target_identity: Some(direct_target.resolution_identity()),
+            target_scope: direct_target.workspace_scope().cloned(),
+            exact_workspace_envelope: false,
+            inputs_hash: "stale-current-scope".to_string(),
+            root_requirements: vec!["sibling-root==1.0.0".to_string()],
+            wheels: vec![LockWheel {
+                name: "sibling-root".to_string(),
+                version: "1.0.0".to_string(),
+                origin: Origin::Index,
+                filename: "sibling_root-1.0.0-py3-none-any.whl".to_string(),
+                url: Some(
+                    "https://example.invalid/sibling_root-1.0.0-py3-none-any.whl".to_string(),
+                ),
+                sha256: Some("33".repeat(32)),
+                requires_dist: vec!["must-not-leak>=1".to_string()],
+                must_ship: false,
+                upstream_url: None,
+                git_source: None,
+                sdist_source: None,
+            }],
+            conda_run_deps: Vec::new(),
+            index_urls: vec!["https://pypi.org/simple/".to_string()],
+            prerelease: BTreeMap::new(),
+            shadow_libs: BTreeMap::new(),
+            declared_glibc: direct_target
+                .declared_glibc()
+                .map(crate::glibc::format_glibc),
+            resolution_glibc: direct_target
+                .effective_glibc()
+                .map(crate::glibc::format_glibc),
+            conda_capable: Vec::new(),
+            entry_specs: vec!["sibling-root==1.0.0".to_string()],
+            wheel_store: None,
+        };
+        let lock_path = dir.join("sibling").join(RetreadLock::file_name_for_target(
+            "sibling.pack",
+            &direct_target,
+        ));
+        std::fs::write(&lock_path, lock.to_pretty_json().unwrap()).unwrap();
+        RetreadLock::load(&lock_path)
+            .unwrap()
+            .validate_replay_contract_for_target(&direct_target, "sibling.pack")
+            .unwrap();
+
+        let constraints =
+            sibling_lock_constraints(&manifest, &dir, &dir.join("current"), &direct_target);
+        assert!(
+            constraints.constraints.is_empty(),
+            "a lock under the current source scope must not stand in for an unresolved sibling scope: {:?}",
+            constraints.constraints,
+        );
+        assert!(
+            sibling_conda_run_dependencies(&manifest, &dir, &dir.join("current"), &direct_target,)
+                .is_empty()
+        );
+
+        let mut exact_lock = lock;
+        exact_lock.target_identity = Some(exact_target.resolution_identity());
+        exact_lock.target_contract = exact_target.target_contract().cloned();
+        exact_lock.target_scope = exact_target.workspace_scope().cloned();
+        exact_lock.exact_workspace_envelope = true;
+        let exact_lock_path = dir.join("sibling").join(RetreadLock::file_name_for_target(
+            "sibling.pack",
+            &exact_target,
+        ));
+        std::fs::write(&exact_lock_path, exact_lock.to_pretty_json().unwrap()).unwrap();
+        RetreadLock::load(&exact_lock_path)
+            .unwrap()
+            .validate_replay_contract_for_target(&exact_target, "sibling.pack")
+            .unwrap();
+
+        let exact_constraints =
+            sibling_lock_constraints(&manifest, &dir, &dir.join("current"), &exact_target);
+        assert!(
+            exact_constraints
+                .constraints
+                .iter()
+                .any(|constraint| constraint == "must-not-leak>=1"),
+            "the exact envelope must authorize its empty-VP environment/profile scope for co-activated siblings: {:?}",
+            exact_constraints.constraints,
         );
 
         std::fs::remove_dir_all(dir).unwrap();
@@ -1197,6 +1897,10 @@ struct State {
     /// the cascade's last-resort step to mirror the workspace's
     /// `[dependencies]` pin (if any) instead of widening to `*`.
     workspace_dir: Option<PathBuf>,
+    /// Optional exact environment/profile target supplied by a workspace
+    /// orchestrator. Parsed once at initialize and validated against the
+    /// source consumer for every output/build request.
+    target_envelope: Option<WorkspaceTargetEnvelope>,
     /// Monotonic initialize generation. Prepared output plans are valid only
     /// for the exact configuration generation that advertised them.
     generation: u64,
@@ -1219,6 +1923,7 @@ struct Snapshot {
     source_dir: PathBuf,
     cache_dir: PathBuf,
     workspace_dir: Option<PathBuf>,
+    target_envelope: Option<WorkspaceTargetEnvelope>,
     fast_cfg: crate::fasttmp::FastTmpConfig,
     fast_tmp: Option<crate::fasttmp::EngagedFastTmp>,
 }
@@ -1739,6 +2444,9 @@ impl Handler {
             );
         }
 
+        let target_envelope = WorkspaceTargetEnvelope::from_process_env().map_err(|error| {
+            RpcError::invalid_params(format!("invalid workspace target envelope: {error:#}"))
+        })?;
         let workspace_dir = params.workspace_directory;
         ensure_pixi_bld_symlink_target(workspace_dir.as_deref())?;
 
@@ -1764,6 +2472,7 @@ impl Handler {
             .source_directory
             .or_else(|| params.manifest_path.parent().map(PathBuf::from));
         state.workspace_dir = workspace_dir;
+        state.target_envelope = target_envelope;
         state.generation = state
             .generation
             .checked_add(1)
@@ -1792,13 +2501,72 @@ impl Handler {
         //
         // Read workspace_dir from handler state BEFORE the lock guard so we
         // don't hold the state lock while doing blocking I/O.
-        let pre_key_workspace_dir = {
+        let (pre_key_workspace_dir, pre_key_source_dir, pre_key_target_envelope, pre_key_config) = {
             let state = self.state.read().await;
-            state.workspace_dir.clone()
+            let config = state
+                .config
+                .clone()
+                .ok_or_else(|| RpcError::internal("initialize was not called"))?;
+            (
+                state.workspace_dir.clone(),
+                state
+                    .source_dir
+                    .clone()
+                    .unwrap_or_else(|| params.work_directory.clone()),
+                state.target_envelope.clone(),
+                config,
+            )
         };
+        let resolved_workspace_target = resolve_workspace_target_for_source(
+            pre_key_workspace_dir.as_deref(),
+            &pre_key_source_dir,
+            params.host_platform.as_str(),
+            pre_key_target_envelope.as_ref(),
+        )
+        .map_err(|error| {
+            RpcError::invalid_params(format!(
+                "resolving workspace target `{}` for source `{}`: {error:#}",
+                params.host_platform,
+                pre_key_source_dir.display(),
+            ))
+        })?;
+        let cache_target = wheel_target_for_resolved_workspace(
+            params.host_platform,
+            "0.0",
+            resolved_workspace_target.as_ref(),
+            pre_key_target_envelope.is_some(),
+        )
+        .map_err(|error| {
+            RpcError::invalid_params(format!(
+                "invalid workspace target `{}`: {error:#}",
+                params.host_platform
+            ))
+        })?;
+        let cache_workspace_solve_fingerprint = workspace_solve_fingerprint_for_cache(
+            pre_key_workspace_dir.as_deref(),
+            &pre_key_source_dir,
+            params.host_platform,
+            &pre_key_config,
+            params.variant_configuration.as_ref(),
+            resolved_workspace_target.as_ref(),
+            pre_key_target_envelope.is_some(),
+        )
+        .map_err(|error| {
+            RpcError::invalid_params(format!(
+                "fingerprinting workspace solve inputs for target `{}`: {error:#}",
+                params.host_platform
+            ))
+        })?;
         let mtime = workspace_manifest_mtime(pre_key_workspace_dir.as_deref());
         let auto_overrides_fp = auto_overrides_fingerprint(pre_key_workspace_dir.as_deref());
-        let cache_key = conda_outputs_cache_key(&params, mtime, &auto_overrides_fp);
+        let cache_key = conda_outputs_cache_key_for_target(
+            &params,
+            mtime,
+            &auto_overrides_fp,
+            &cache_target,
+            resolved_workspace_target.as_ref(),
+            &cache_workspace_solve_fingerprint,
+        );
         let memory_cached = {
             let cache = CONDA_OUTPUTS_CACHE
                 .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
@@ -1807,15 +2575,30 @@ impl Handler {
             cache.get(&cache_key).cloned()
         };
         if let Some(cached) = memory_cached {
-            self.retain_prepared_for_memory_cache_hit(&cache_key, &params.work_directory)
+            let retained = self
+                .retain_prepared_for_memory_cache_hit(&cache_key, &params.work_directory)
                 .await;
-            tracing::info!(
-                "retread: conda/outputs cache hit -- returning memoized result (pixi re-requested for another env)",
+            if !cached.requires_prepared_plan || retained {
+                tracing::info!(
+                    "retread: conda/outputs cache hit -- returning memoized result (pixi re-requested for another env)",
+                );
+                crate::status::tty(
+                    "reusing already-computed outputs (pixi re-requested this package for another environment).",
+                );
+                return Ok(cached.result);
+            }
+            // The memo advertised an incremental lock version, but its exact
+            // materialized plan was consumed or invalidated. Recompute both
+            // metadata and the typed plan together rather than returning an
+            // identity that a later build cannot safely reproduce.
+            CONDA_OUTPUTS_CACHE
+                .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+                .lock()
+                .unwrap()
+                .remove(&cache_key);
+            tracing::debug!(
+                "retread: incremental conda/outputs memo lost its prepared plan; recomputing"
             );
-            crate::status::tty(
-                "reusing already-computed outputs (pixi re-requested this package for another environment).",
-            );
-            return Ok(cached);
         }
         // Fetched early (cheap: just clones handler state) so the DISK
         // cache below can be consulted before the expensive solve.
@@ -1826,6 +2609,7 @@ impl Handler {
             source_dir,
             cache_dir,
             workspace_dir,
+            target_envelope: _target_envelope,
             fast_cfg: _fast_cfg,
             fast_tmp: _fast_tmp,
         } = self.snapshot(&params.work_directory).await?;
@@ -1860,7 +2644,13 @@ impl Handler {
                 .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
                 .lock()
                 .unwrap()
-                .insert(cache_key.clone(), cached.clone());
+                .insert(
+                    cache_key.clone(),
+                    CondaOutputsMemo {
+                        result: cached.clone(),
+                        requires_prepared_plan: false,
+                    },
+                );
             self.invalidate_prepared_builds().await;
             return Ok(cached);
         }
@@ -1899,12 +2689,19 @@ impl Handler {
                 .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
                 .lock()
                 .unwrap()
-                .insert(cache_key.clone(), cached.clone());
+                .insert(
+                    cache_key.clone(),
+                    CondaOutputsMemo {
+                        result: cached.clone(),
+                        requires_prepared_plan: false,
+                    },
+                );
             self.invalidate_prepared_builds().await;
             return Ok(cached);
         }
         let prepared_transaction = self.begin_prepared_transaction(generation).await;
         let mut prepared_builds = Vec::new();
+        let mut incremental_output_advertised = false;
         // Re-read from the snapshot's workspace path. The cache-key probes
         // above happen before snapshotting handler state and are not a safe
         // lifecycle boundary for the typed plan itself.
@@ -1951,12 +2748,17 @@ impl Handler {
         // mirror-solver; outputs ship unvalidated and `retread solve`
         // owns conflict handling.
         for python_version in &pythons {
-            let target =
-                wheel_target_for(params.host_platform, python_version).map_err(|error| {
-                    RpcError::invalid_params(format!(
-                        "invalid Python target `{python_version}`: {error:#}"
-                    ))
-                })?;
+            let target = wheel_target_for_resolved_workspace(
+                params.host_platform,
+                python_version,
+                resolved_workspace_target.as_ref(),
+                pre_key_target_envelope.is_some(),
+            )
+            .map_err(|error| {
+                RpcError::invalid_params(format!(
+                    "invalid Python target `{python_version}`: {error:#}"
+                ))
+            })?;
             let python_version = target.python_version();
             // Phase 1: materialize wheels + auto-bundle. Env-agnostic;
             // results reused across all per-env emissions.
@@ -2003,10 +2805,16 @@ impl Handler {
                 workspace_dir.as_deref(),
                 &default_name,
                 &params.channels,
-                python_version,
+                &target,
                 &bundle_names,
             )
-            .await;
+            .await
+            .map_err(|error| {
+                RpcError::invalid_params(format!(
+                    "discovering workspace emissions for target {}: {error:#}",
+                    target.conda_subdir()
+                ))
+            })?;
             tracing::info!(
                 elapsed_ms = t_discover.elapsed().as_millis() as u64,
                 emissions = emissions.len(),
@@ -2050,13 +2858,15 @@ impl Handler {
                 // off, detect_incremental_add returns None at Gate 1 and the map
                 // is empty (byte-identical to today).
                 let incr_version_overrides: std::collections::HashMap<String, String> =
-                    if config.courier {
+                    if config.courier && plan.local_wheel_stamps.is_some() {
                         let courier_channels_for_fp = workspace_manifest
                             .as_ref()
                             .map(|m| {
-                                m.courier_channel_set(
+                                workspace_courier_channels(
+                                    m,
                                     workspace_dir.as_deref().unwrap_or(source_dir.as_path()),
                                     &source_dir,
+                                    &target,
                                 )
                             })
                             .unwrap_or_default();
@@ -2137,9 +2947,11 @@ impl Handler {
                         let courier_channels = workspace_manifest
                             .as_ref()
                             .map(|m| {
-                                m.courier_channel_set(
+                                workspace_courier_channels(
+                                    m,
                                     workspace_dir.as_deref().unwrap_or(source_dir.as_path()),
                                     &source_dir,
+                                    &target,
                                 )
                             })
                             .unwrap_or_default();
@@ -2208,13 +3020,24 @@ impl Handler {
                     let version_override_for_bundle = incr_version_overrides
                         .get(&bundle.conda_name)
                         .map(|s| s.as_str());
+                    incremental_output_advertised |= version_override_for_bundle.is_some();
+                    let non_courier_target_hash = (!config.courier)
+                        .then(|| {
+                            target
+                                .target_contract()
+                                .map(|_| target.resolution_identity())
+                        })
+                        .flatten();
+                    let output_build_hash = courier_build_hash
+                        .as_deref()
+                        .or(non_courier_target_hash.as_deref());
                     let output = produce_output(
                         &bundle,
                         &effective,
                         params.host_platform,
                         python_version,
                         &siblings,
-                        courier_build_hash.as_deref(),
+                        output_build_hash,
                         version_override_for_bundle,
                     )
                     .map_err(|e| {
@@ -2232,13 +3055,15 @@ impl Handler {
                             "probe trace write failed (non-fatal)",
                         );
                     }
-                    if version_override_for_bundle.is_none() && plan.local_wheel_stamps.is_some() {
+                    if plan.local_wheel_stamps.is_some() {
                         prepared_builds.push(PreparedBuild {
                             locator_id: prepared_builds.len(),
                             plan: Arc::clone(&plan),
                             bundle_index,
                             emission: emission.clone(),
                             advertised: PreparedOutputIdentity::from_metadata(&output.metadata),
+                            incremental_version_override: version_override_for_bundle
+                                .map(str::to_owned),
                         });
                     }
                     outputs.push(output);
@@ -2257,26 +3082,38 @@ impl Handler {
         );
         // Memoize so pixi's subsequent per-env re-requests (identical
         // params) skip the whole recompute.
-        CONDA_OUTPUTS_CACHE
-            .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
-            .lock()
-            .unwrap()
-            .insert(cache_key.clone(), result.clone());
-        // Cross-process: persist so a DIFFERENT retread process solving
-        // another environment that shares this exact (params, workspace
-        // mtime) key can skip the recompute too. Best-effort -- a write
-        // failure (read-only cache dir, disk full) just means the next
-        // process falls back to a cold compute, same as today.
-        write_conda_outputs_disk_cache(&disk_cache_path, &result).await;
+        let requires_prepared_plan = incremental_output_advertised;
         if let Some(transaction) = prepared_transaction {
             if !self
-                .publish_prepared_builds(generation, transaction, cache_key, prepared_builds)
+                .publish_prepared_builds(
+                    generation,
+                    transaction,
+                    cache_key.clone(),
+                    prepared_builds,
+                )
                 .await
             {
                 tracing::debug!(
                     "discarded prepared build plans from a superseded conda/outputs transaction"
                 );
             }
+        }
+        CONDA_OUTPUTS_CACHE
+            .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+            .lock()
+            .unwrap()
+            .insert(
+                cache_key.clone(),
+                CondaOutputsMemo {
+                    result: result.clone(),
+                    requires_prepared_plan,
+                },
+            );
+        // Cross-process memos cannot carry the exact typed/materialized plan.
+        // Persist ordinary outputs only; incremental-version outputs must be
+        // recomputed by each backend process so build_v1 has their plan.
+        if !requires_prepared_plan {
+            write_conda_outputs_disk_cache(&disk_cache_path, &result).await;
         }
         Ok(result)
     }
@@ -2304,6 +3141,7 @@ impl Handler {
             source_dir,
             cache_dir,
             workspace_dir,
+            target_envelope,
             fast_cfg,
             fast_tmp,
         } = self.snapshot(&params.work_directory).await?;
@@ -2356,14 +3194,48 @@ impl Handler {
             }
             None => config_python.unwrap_or_else(|| DEFAULT_PYTHON.to_string()),
         };
-        let target =
-            wheel_target_for(params.output.subdir, &requested_python).map_err(|error| {
-                RpcError::invalid_params(format!(
-                    "invalid Python target `{requested_python}`: {error:#}"
-                ))
-            })?;
-        let python_version = target.python_version().to_owned();
-
+        let artifact_subdir = params.output.subdir;
+        let resolution_subdir = resolution_subdir_for_build(
+            artifact_subdir,
+            params.host_prefix.as_ref().map(|prefix| prefix.platform),
+            target_envelope.as_ref(),
+            params.output.build.as_deref(),
+        )
+        .map_err(|error| {
+            RpcError::invalid_params(format!(
+                "resolving build platform for `{}`: {error:#}",
+                params.output.name.as_normalized(),
+            ))
+        })?;
+        let resolved_workspace_target = resolve_workspace_target_for_source(
+            workspace_dir.as_deref(),
+            &source_dir,
+            resolution_subdir.as_str(),
+            target_envelope.as_ref(),
+        )
+        .map_err(|error| {
+            RpcError::invalid_params(format!(
+                "resolving workspace target `{}` for source `{}`: {error:#}",
+                resolution_subdir,
+                source_dir.display(),
+            ))
+        })?;
+        let target = wheel_target_for_resolved_workspace(
+            resolution_subdir,
+            &requested_python,
+            resolved_workspace_target.as_ref(),
+            target_envelope.is_some(),
+        )
+        .map_err(|error| {
+            RpcError::invalid_params(format!(
+                "invalid Python target `{requested_python}`: {error:#}"
+            ))
+        })?;
+        validate_advertised_non_courier_target_build(
+            &config,
+            &target,
+            params.output.build.as_deref(),
+        )?;
         // WS-B build_v1 replay gate: when courier mode is active, check the
         // committed lock BEFORE running the expensive resolve_all / probe
         // cascade. If the lock matches (same schema + inputs_hash), re-
@@ -2390,6 +3262,13 @@ impl Handler {
         let build_output_dir = stage_output_dir
             .clone()
             .unwrap_or_else(|| output_dir.clone());
+        // The output version is the package identity pixi already solved from
+        // conda/outputs. A cold re-resolve must reproduce it exactly rather
+        // than relabel newly resolved wheel bytes. The sole override below is
+        // granted only after build_v1 independently proves that this request
+        // came from an incremental lock and its localized attempt escalates.
+        let advertised_output_version = params.output.version.as_ref().map(ToString::to_string);
+        let mut detected_incremental_fallback_version = None;
         if config.courier {
             // Need workspace_manifest to compute the config fingerprint
             // identically to how build_one does it (channel set + workspace
@@ -2400,9 +3279,11 @@ impl Handler {
             let courier_channels = ws_manifest_for_replay
                 .as_ref()
                 .map(|m| {
-                    m.courier_channel_set(
+                    workspace_courier_channels(
+                        m,
                         workspace_dir.as_deref().unwrap_or(&source_dir),
                         &source_dir,
+                        &target,
                     )
                 })
                 .unwrap_or_default();
@@ -2423,170 +3304,227 @@ impl Handler {
             // (params.output.name.as_normalized()), which equals bundle.conda_name
             // and is what courier::stage uses as the lock key.
             let bundle_name_for_hash = params.output.name.as_normalized().to_string();
+            let declared_input_bundle =
+                declared_input_bundle_for_output(&config, &bundle_name_for_hash);
             let current_hash = courier_inputs_hash(
                 &config,
-                &bundle_name_for_hash,
+                declared_input_bundle
+                    .as_deref()
+                    .unwrap_or(&bundle_name_for_hash),
                 &target,
                 &courier_channels,
                 ws_manifest_for_replay.as_ref(),
                 workspace_dir.as_deref().unwrap_or(&source_dir),
                 &source_dir,
             );
-            let lock_path = lock_path_for_target(&source_dir, &bundle_name_for_hash, &target);
-            let relax_is_default = config.relax == crate::config::RelaxPolicy::default();
-            match load_replayable_lock_for_target(
-                &lock_path,
-                &current_hash,
-                relax_is_default,
+            let current_build = courier_build_string_for_target(
                 &target,
-                &bundle_name_for_hash,
-            ) {
-                Ok(Some(lock)) => {
-                    tracing::info!(
-                        bundle = %bundle_name_for_hash,
-                        "WS-B build_v1 replay hit: re-materializing from lock \
-                         (resolve_all skipped)",
-                    );
-                    crate::status::tty(&format!(
-                        "building '{}': replay hit -- re-materializing from lock \
-                         (derivation skipped).",
-                        bundle_name_for_hash,
-                    ));
-                    // On the REPLAY path the authoritative run-deps are
-                    // lock.conda_run_deps (already validated and stored when
-                    // the lock was committed). Using params.run_dependencies
-                    // here would allow pixi's live conda solver to inject
-                    // non-deterministic extras (e.g. python_abi) that drift
-                    // the rewritten lock away from the committed one.
-                    // params.run_dependencies is intentionally ignored on
-                    // this path; the COLD path (full resolve_all) keeps
-                    // using run_override / params.run_dependencies unchanged.
-                    let run_deps: Vec<String> = lock
-                        .conda_run_deps
-                        .iter()
-                        .map(|dep| {
-                            if dep.spec.is_empty() {
-                                dep.name.clone()
-                            } else {
-                                format!("{} {}", dep.name, dep.spec)
-                            }
-                        })
-                        .collect();
-                    match materialize_from_lock_for_target(
-                        lock,
-                        &bundle_name_for_hash,
-                        &config,
-                        &params.work_directory,
-                        &build_output_dir,
-                        &target,
-                        &source_dir,
-                        &cache_dir,
-                        params.output.build.as_deref(),
-                        run_deps,
-                        &config_fp,
-                    )
-                    .await
-                    {
-                        Ok(Some(result)) => {
-                            return finalize_fasttmp_build_output(
-                                result,
-                                stage_output_dir.as_deref(),
-                                &output_dir,
-                            )
-                            .await;
-                        }
-                        Ok(None) => {
-                            // Provenance gap (class 3 / schema-5 class 2):
-                            // fall through to full resolve_all.
-                            tracing::debug!(
-                                bundle = %bundle_name_for_hash,
-                                "WS-B build_v1 replay: provenance gap -- \
-                                 falling through to full resolve",
-                            );
-                        }
-                        Err(e) => {
-                            return Err(RpcError::internal(format!(
-                                "build_v1 replay {bundle_name_for_hash}: {e:#}"
-                            )));
-                        }
-                    }
-                }
-                Ok(None) => {
-                    tracing::debug!(
-                        bundle = %bundle_name_for_hash,
-                        "WS-B build_v1 replay miss (hash mismatch / no lock) -- full resolve",
-                    );
-                }
-                Err(e) => {
-                    tracing::debug!(
-                        bundle = %bundle_name_for_hash,
-                        error = %format!("{e:#}"),
-                        "WS-B build_v1 replay error (non-fatal) -- full resolve",
-                    );
-                }
-            }
-
-            // WS-B incremental-add fast path (STEP 4): if RETREAD_INCREMENTAL=1
-            // and the current manifest diff is a pure dep addition, attempt a
-            // localized resolve that reuses the locked closure.  Falls through
-            // to cold resolve_all on any gate failure, ripple, or conflict.
-            {
-                let ws_indexes: Vec<String> = ws_manifest_for_replay
-                    .as_ref()
-                    .map(|m| m.resolution_pypi_index_urls())
-                    .unwrap_or_else(|| vec![crate::index_chain::PUBLIC_PYPI.to_string()]);
-                let relax_str = format!("{:?}", config.relax);
-                if let Some(incr) = detect_incremental_add_for_target(
+                &current_hash,
+                config.build_number,
+                config.bundle_mode == crate::config::BundleMode::Loose,
+            );
+            let fast_identity_matches = declared_input_bundle.is_some()
+                && advertised_build_matches(params.output.build.as_deref(), &current_build);
+            if fast_identity_matches {
+                let lock_path = lock_path_for_target(&source_dir, &bundle_name_for_hash, &target);
+                let relax_is_default = config.relax == crate::config::RelaxPolicy::default();
+                match load_replayable_lock_for_target(
                     &lock_path,
-                    &config,
-                    &bundle_name_for_hash,
-                    &ws_indexes,
-                    &relax_str,
+                    &current_hash,
+                    relax_is_default,
                     &target,
-                    &config_fp,
+                    &bundle_name_for_hash,
                 ) {
-                    match resolve_incremental_add(
-                        incr,
-                        &config,
-                        &target,
-                        &download_dir,
-                        &source_dir,
-                        &cache_dir,
-                        &params.channels,
-                        workspace_dir.as_deref(),
-                        &params.work_directory,
-                        &build_output_dir,
-                        params.output.build.as_deref(),
-                        &config_fp,
-                    )
-                    .await
+                    Ok(Some(lock))
+                        if advertised_version_matches(
+                            advertised_output_version.as_deref(),
+                            &lock.version,
+                        ) =>
                     {
-                        Ok(Some(result)) => {
-                            tracing::info!(
-                                bundle = %bundle_name_for_hash,
-                                "incremental-add: localized resolve succeeded"
-                            );
-                            return finalize_fasttmp_build_output(
-                                result,
-                                stage_output_dir.as_deref(),
-                                &output_dir,
-                            )
-                            .await;
+                        tracing::info!(
+                            bundle = %bundle_name_for_hash,
+                            "WS-B build_v1 replay hit: re-materializing from lock \
+                             (resolve_all skipped)",
+                        );
+                        crate::status::tty(&format!(
+                            "building '{}': replay hit -- re-materializing from lock \
+                         (derivation skipped).",
+                            bundle_name_for_hash,
+                        ));
+                        // On the REPLAY path the authoritative run-deps are
+                        // lock.conda_run_deps (already validated and stored when
+                        // the lock was committed). Using params.run_dependencies
+                        // here would allow pixi's live conda solver to inject
+                        // non-deterministic extras (e.g. python_abi) that drift
+                        // the rewritten lock away from the committed one.
+                        // params.run_dependencies is intentionally ignored on
+                        // this path; the COLD path (full resolve_all) keeps
+                        // using run_override / params.run_dependencies unchanged.
+                        let run_deps: Vec<String> = lock
+                            .conda_run_deps
+                            .iter()
+                            .map(|dep| {
+                                if dep.spec.is_empty() {
+                                    dep.name.clone()
+                                } else {
+                                    format!("{} {}", dep.name, dep.spec)
+                                }
+                            })
+                            .collect();
+                        match materialize_from_lock_for_target(
+                            lock,
+                            &bundle_name_for_hash,
+                            &config,
+                            &params.work_directory,
+                            &build_output_dir,
+                            &target,
+                            &source_dir,
+                            &cache_dir,
+                            params.output.build.as_deref(),
+                            run_deps,
+                            &config_fp,
+                        )
+                        .await
+                        {
+                            Ok(Some(result)) => {
+                                return finalize_fasttmp_build_output(
+                                    result,
+                                    stage_output_dir.as_deref(),
+                                    &output_dir,
+                                )
+                                .await;
+                            }
+                            Ok(None) => {
+                                // Provenance gap (class 3 / schema-5 class 2):
+                                // fall through to full resolve_all.
+                                tracing::debug!(
+                                    bundle = %bundle_name_for_hash,
+                                    "WS-B build_v1 replay: provenance gap -- \
+                                     falling through to full resolve",
+                                );
+                            }
+                            Err(e) => {
+                                return Err(RpcError::internal(format!(
+                                    "build_v1 replay {bundle_name_for_hash}: {e:#}"
+                                )));
+                            }
                         }
-                        Ok(None) => {
-                            tracing::debug!(
-                                bundle = %bundle_name_for_hash,
-                                "incremental-add: escalated to cold resolve"
-                            );
-                            // fall through to resolve_all
-                        }
-                        Err(e) => {
-                            return Err(RpcError::internal(format!(
-                                "incremental-add {bundle_name_for_hash}: {e:#}"
-                            )));
+                    }
+                    Ok(Some(lock)) => {
+                        tracing::debug!(
+                            bundle = %bundle_name_for_hash,
+                            advertised_version = %advertised_output_version.as_deref().unwrap_or_default(),
+                            lock_version = %lock.version,
+                            "WS-B build_v1 replay version differs from advertised output; falling through to cold resolve",
+                        );
+                    }
+                    Ok(None) => {
+                        tracing::debug!(
+                            bundle = %bundle_name_for_hash,
+                            "WS-B build_v1 replay miss (hash mismatch / no lock) -- full resolve",
+                        );
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            bundle = %bundle_name_for_hash,
+                            error = %format!("{e:#}"),
+                            "WS-B build_v1 replay error (non-fatal) -- full resolve",
+                        );
+                    }
+                }
+
+                // WS-B incremental-add fast path (STEP 4): if RETREAD_INCREMENTAL=1
+                // and the current manifest diff is a pure dep addition, attempt a
+                // localized resolve that reuses the locked closure.  Falls through
+                // to cold resolve_all on any gate failure, ripple, or conflict.
+                {
+                    let ws_indexes: Vec<String> = ws_manifest_for_replay
+                        .as_ref()
+                        .map(|m| m.resolution_pypi_index_urls())
+                        .unwrap_or_else(|| vec![crate::index_chain::PUBLIC_PYPI.to_string()]);
+                    let relax_str = format!("{:?}", config.relax);
+                    if let Some(incr) = detect_incremental_add_for_target(
+                        &lock_path,
+                        &config,
+                        declared_input_bundle
+                            .as_deref()
+                            .unwrap_or(&bundle_name_for_hash),
+                        &ws_indexes,
+                        &relax_str,
+                        &target,
+                        &config_fp,
+                    ) {
+                        match incremental_version_plan(
+                            advertised_output_version.as_deref(),
+                            &incr.lock.version,
+                        ) {
+                            IncrementalVersionPlan::Cold => {
+                                tracing::debug!(
+                                    bundle = %bundle_name_for_hash,
+                                    lock_version = %incr.lock.version,
+                                    advertised_version = %advertised_output_version.as_deref().unwrap_or_default(),
+                                    "incremental-add: advertised version differs from lock; skipping localized build and requiring an exact cold version match"
+                                );
+                            }
+                            IncrementalVersionPlan::Attempt { fallback_version } => {
+                                match resolve_incremental_add(
+                                    incr,
+                                    &config,
+                                    &target,
+                                    &download_dir,
+                                    &source_dir,
+                                    &cache_dir,
+                                    &params.channels,
+                                    workspace_dir.as_deref(),
+                                    &params.work_directory,
+                                    &build_output_dir,
+                                    params.output.build.as_deref(),
+                                    &config_fp,
+                                )
+                                .await
+                                {
+                                    Ok(Some(result)) => {
+                                        tracing::info!(
+                                            bundle = %bundle_name_for_hash,
+                                            "incremental-add: localized resolve succeeded"
+                                        );
+                                        return finalize_fasttmp_build_output(
+                                            result,
+                                            stage_output_dir.as_deref(),
+                                            &output_dir,
+                                        )
+                                        .await;
+                                    }
+                                    Ok(None) => {
+                                        detected_incremental_fallback_version =
+                                            Some(fallback_version);
+                                        tracing::debug!(
+                                            bundle = %bundle_name_for_hash,
+                                            version = %detected_incremental_fallback_version.as_deref().unwrap_or_default(),
+                                            "incremental-add: localized attempt escalated; requiring the exact prepared conda/outputs plan"
+                                        );
+                                        // Fall through to the typed prepared
+                                        // plan handoff. A fresh resolve_all is
+                                        // forbidden for this identity.
+                                    }
+                                    Err(e) => {
+                                        return Err(RpcError::internal(format!(
+                                            "incremental-add {bundle_name_for_hash}: {e:#}"
+                                        )));
+                                    }
+                                }
+                            }
                         }
                     }
                 }
+            } else {
+                tracing::debug!(
+                    output = %bundle_name_for_hash,
+                    input_bundle = ?declared_input_bundle,
+                    advertised_build = %params.output.build.as_deref().unwrap_or_default(),
+                    current_build = %current_build,
+                    "courier fast replay/incremental identity unavailable; deferring to recovered cold plan",
+                );
             }
         }
 
@@ -2610,11 +3548,12 @@ impl Handler {
             bundle,
             effective,
         }) = self
-            .lookup_prepared_build(
+            .lookup_prepared_build_for_target(
                 generation,
                 &params.work_directory,
                 workspace_dir.as_deref(),
                 exact_variant_python.as_deref(),
+                &target,
                 &params.output,
             )
             .await
@@ -2632,6 +3571,38 @@ impl Handler {
                 .build
                 .as_deref()
                 .unwrap_or(&prepared.advertised.build);
+            let input_bundle_name = prepared
+                .plan
+                .materialized
+                .get(prepared.bundle_index)
+                .map(|base| base.conda_name.as_str())
+                .ok_or_else(|| {
+                    RpcError::internal("prepared build lost its source bundle identity".to_string())
+                })?;
+            validate_prepared_incremental_version_handoff(
+                prepared.incremental_version_override.as_deref(),
+                detected_incremental_fallback_version.as_deref(),
+                &bundle.conda_name,
+            )?;
+            let prepared_workspace_manifest = workspace_dir
+                .as_deref()
+                .and_then(crate::workspace::WorkspaceManifest::load);
+            if prepared.plan.declared_config.courier {
+                validate_advertised_courier_build(
+                    &prepared.plan.declared_config,
+                    input_bundle_name,
+                    &prepared.plan.target,
+                    prepared_workspace_manifest.as_ref(),
+                    workspace_dir.as_deref(),
+                    &source_dir,
+                    Some(expected_build),
+                )?;
+                validate_advertised_courier_version(
+                    &bundle,
+                    advertised_output_version.as_deref(),
+                    prepared.incremental_version_override.as_deref(),
+                )?;
+            }
             let result = build_one(
                 &bundle,
                 &effective,
@@ -2642,7 +3613,9 @@ impl Handler {
                 &prepared.plan.target,
                 &source_dir,
                 workspace_dir.as_deref(),
+                input_bundle_name,
                 Some(expected_build),
+                prepared.incremental_version_override.as_deref(),
                 run_override.as_deref(),
             )
             .await
@@ -2654,6 +3627,11 @@ impl Handler {
                 .await;
             return Ok(result);
         }
+
+        reject_unprepared_incremental_fallback(
+            detected_incremental_fallback_version.as_deref(),
+            params.output.name.as_normalized(),
+        )?;
 
         // Re-resolve materialized bundles, then autodiscover emissions
         // and pick the one matching the requested output name.
@@ -2681,10 +3659,16 @@ impl Handler {
             workspace_dir.as_deref(),
             &default_name,
             &params.channels,
-            &python_version,
+            &target,
             &bundle_names,
         )
-        .await;
+        .await
+        .map_err(|error| {
+            RpcError::invalid_params(format!(
+                "discovering workspace emissions for target {}: {error:#}",
+                target.conda_subdir()
+            ))
+        })?;
 
         let requested = params.output.name.as_normalized().to_string();
         let picked_emission = emissions
@@ -2705,7 +3689,28 @@ impl Handler {
         let base_bundle = materialized.first().ok_or_else(|| {
             RpcError::invalid_params("no bundles produced; check [retread-wheels]".to_string())
         })?;
+        let input_bundle_name = base_bundle.conda_name.clone();
         let (bundle, effective) = apply_emission(base_bundle, &base_config, picked_emission);
+
+        if config.courier {
+            let cold_workspace_manifest = workspace_dir
+                .as_deref()
+                .and_then(crate::workspace::WorkspaceManifest::load);
+            validate_advertised_courier_build(
+                &config,
+                &input_bundle_name,
+                &target,
+                cold_workspace_manifest.as_ref(),
+                workspace_dir.as_deref(),
+                &source_dir,
+                params.output.build.as_deref(),
+            )?;
+            validate_advertised_courier_version(
+                &bundle,
+                advertised_output_version.as_deref(),
+                None,
+            )?;
+        }
 
         let result = build_one(
             &bundle,
@@ -2717,7 +3722,9 @@ impl Handler {
             &target,
             &source_dir,
             workspace_dir.as_deref(),
+            &input_bundle_name,
             params.output.build.as_deref(),
+            None,
             run_override.as_deref(),
         )
         .await
@@ -2755,7 +3762,7 @@ impl Handler {
         true
     }
 
-    async fn retain_prepared_for_memory_cache_hit(&self, cache_key: &str, work_dir: &Path) {
+    async fn retain_prepared_for_memory_cache_hit(&self, cache_key: &str, work_dir: &Path) -> bool {
         let mut state = self.state.write().await;
         let reusable = state.prepared_cache_key.as_deref() == Some(cache_key)
             && !state.prepared_builds.is_empty()
@@ -2764,7 +3771,7 @@ impl Handler {
                 .iter()
                 .all(|prepared| prepared.plan.work_directory == work_dir);
         if reusable {
-            return;
+            return true;
         }
         state.prepared_transaction = state
             .prepared_transaction
@@ -2772,6 +3779,7 @@ impl Handler {
             .expect("prepared transaction counter exhausted");
         state.prepared_cache_key = None;
         state.prepared_builds.clear();
+        false
     }
 
     async fn invalidate_prepared_builds(&self) {
@@ -2784,12 +3792,53 @@ impl Handler {
         state.prepared_builds.clear();
     }
 
+    #[cfg(test)]
     async fn lookup_prepared_build(
         &self,
         generation: u64,
         work_dir: &Path,
         workspace_dir: Option<&Path>,
         exact_python_version: Option<&str>,
+        output: &pixi_build_types::procedures::conda_build_v1::CondaBuildV1Output,
+    ) -> Option<PreparedBuildSelection> {
+        self.lookup_prepared_build_impl(
+            generation,
+            work_dir,
+            workspace_dir,
+            exact_python_version,
+            None,
+            output,
+        )
+        .await
+    }
+
+    async fn lookup_prepared_build_for_target(
+        &self,
+        generation: u64,
+        work_dir: &Path,
+        workspace_dir: Option<&Path>,
+        exact_python_version: Option<&str>,
+        target: &ResolutionTarget,
+        output: &pixi_build_types::procedures::conda_build_v1::CondaBuildV1Output,
+    ) -> Option<PreparedBuildSelection> {
+        self.lookup_prepared_build_impl(
+            generation,
+            work_dir,
+            workspace_dir,
+            exact_python_version,
+            Some(target),
+            output,
+        )
+        .await
+    }
+
+    async fn lookup_prepared_build_impl(
+        &self,
+        generation: u64,
+        work_dir: &Path,
+        workspace_dir: Option<&Path>,
+        exact_python_version: Option<&str>,
+        target: Option<&ResolutionTarget>,
         output: &pixi_build_types::procedures::conda_build_v1::CondaBuildV1Output,
     ) -> Option<PreparedBuildSelection> {
         let (transaction, mut candidates): (u64, Vec<PreparedBuild>) = {
@@ -2802,7 +3851,9 @@ impl Handler {
                 state
                     .prepared_builds
                     .iter()
-                    .filter(|prepared| prepared.matches(work_dir, exact_python_version, output))
+                    .filter(|prepared| {
+                        prepared.matches(work_dir, exact_python_version, target, output)
+                    })
                     .cloned()
                     .collect(),
             )
@@ -2851,16 +3902,28 @@ impl Handler {
         if state.generation != generation || state.prepared_transaction != transaction {
             return;
         }
+        let previous_len = state.prepared_builds.len();
+        let cache_key = state.prepared_cache_key.clone();
         state
             .prepared_builds
             .retain(|prepared| prepared.locator_id != locator_id);
+        let consumed = state.prepared_builds.len() != previous_len;
         if state.prepared_builds.is_empty() {
             state.prepared_cache_key = None;
+        }
+        drop(state);
+
+        // An incremental memo is a set of typed output→plan handoffs, not
+        // merely reusable metadata. Consuming any one locator makes that set
+        // incomplete even while sibling locators remain, so a repeated
+        // conda/outputs request must recompute the whole set.
+        if consumed && let Some(cache_key) = cache_key {
+            remove_incremental_conda_outputs_memo(&cache_key);
         }
     }
 
     async fn snapshot(&self, work_dir: &Path) -> Result<Snapshot, RpcError> {
-        let (generation, config, state_cache_dir, source_dir, workspace_dir) = {
+        let (generation, config, state_cache_dir, source_dir, workspace_dir, target_envelope) = {
             let state = self.state.read().await;
             let config = state
                 .config
@@ -2876,6 +3939,7 @@ impl Handler {
                 state.cache_dir.clone(),
                 source_dir,
                 state.workspace_dir.clone(),
+                state.target_envelope.clone(),
             )
         };
         // Materialized wheels (downloads, source-builds, and relaxed copies)
@@ -2906,6 +3970,7 @@ impl Handler {
             source_dir,
             cache_dir,
             workspace_dir,
+            target_envelope,
             fast_cfg,
             fast_tmp,
         })
@@ -3005,11 +4070,118 @@ fn pythons_for(
     vec![DEFAULT_PYTHON.to_string()]
 }
 
+#[cfg(test)]
 fn wheel_target_for(subdir: Platform, python_version: &str) -> Result<ResolutionTarget> {
+    wheel_target_for_contract(subdir, python_version, None)
+}
+
+fn wheel_target_for_contract(
+    subdir: Platform,
+    python_version: &str,
+    contract: Option<&WorkspaceTargetContract>,
+) -> Result<ResolutionTarget> {
     // The python_version comes from variant configuration (or the chosen
     // output's variant in conda/build_v1). It drives wheel selection on
     // the PyPI index (cp tag matching) and the marker env in relax.rs.
-    ResolutionTarget::try_for_subdir(python_version, &subdir.to_string())
+    match contract {
+        Some(contract) => ResolutionTarget::try_for_contract_on_subdir(
+            python_version,
+            subdir.as_str(),
+            contract.clone(),
+        ),
+        None => ResolutionTarget::try_for_subdir(python_version, &subdir.to_string()),
+    }
+}
+
+fn wheel_target_for_resolved_workspace(
+    subdir: Platform,
+    python_version: &str,
+    resolved: Option<&ResolvedWorkspaceTarget>,
+    exact_envelope: bool,
+) -> Result<ResolutionTarget> {
+    let target = wheel_target_for_contract(
+        subdir,
+        python_version,
+        resolved.map(|resolved| &resolved.contract),
+    )?;
+    match (resolved, exact_envelope) {
+        (Some(resolved), true) => target.with_exact_workspace_scope(resolved.clone()),
+        (Some(resolved), false) => target.with_workspace_scope(resolved.clone()),
+        (None, false) => Ok(target),
+        (None, true) => bail!("an exact workspace target envelope resolved no consumer scope"),
+    }
+}
+
+/// The output subdir describes the conda artifact, not necessarily the wheel
+/// resolution platform. Pure Python bundles advertise `noarch`, while Pixi's
+/// host prefix retains the concrete platform whose virtual-package contract
+/// selected the wheels. Keep those identities separate during build_v1.
+fn resolution_subdir_for_build(
+    artifact_subdir: Platform,
+    host_platform: Option<Platform>,
+    target_envelope: Option<&WorkspaceTargetEnvelope>,
+    advertised_build: Option<&str>,
+) -> Result<Platform> {
+    if artifact_subdir != Platform::NoArch {
+        return Ok(artifact_subdir);
+    }
+    if let Some(platform) = host_platform.filter(|platform| *platform != Platform::NoArch) {
+        return Ok(platform);
+    }
+    if let Some(envelope) = target_envelope {
+        let platform = Platform::from_str(&envelope.profile.subdir).with_context(|| {
+            format!(
+                "parsing exact workspace target profile subdir `{}`",
+                envelope.profile.subdir
+            )
+        })?;
+        if platform == Platform::NoArch {
+            bail!("an exact workspace target profile may not use `noarch`");
+        }
+        return Ok(platform);
+    }
+    if advertised_build.is_some_and(|build| {
+        build.split('_').any(|component| {
+            component.strip_prefix('h').is_some_and(|hash| {
+                hash.len() == 10 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+        })
+    }) {
+        bail!(
+            "noarch build carries a target-qualified build identity, but build_v1 supplied no concrete host platform or exact target envelope"
+        );
+    }
+    // Legacy noarch metadata had no target-qualified identity. Preserve that
+    // fallback only when there is no richer provenance to recover.
+    Ok(Platform::NoArch)
+}
+
+/// Resolve the target contract that this source's concrete workspace
+/// consumers select. A malformed or ambiguous workspace contract is a hard
+/// error; falling back to host/subdir-only identity is reserved for sources
+/// that have no discoverable workspace consumer.
+fn resolve_workspace_target_for_source(
+    workspace_dir: Option<&Path>,
+    source_dir: &Path,
+    requested_subdir: &str,
+    envelope: Option<&WorkspaceTargetEnvelope>,
+) -> Result<Option<ResolvedWorkspaceTarget>> {
+    let Some(workspace_dir) = workspace_dir else {
+        if envelope.is_some() {
+            bail!("an exact workspace target envelope requires a workspace directory");
+        }
+        return Ok(None);
+    };
+    let Some(manifest) = crate::workspace::WorkspaceManifest::load(workspace_dir) else {
+        if envelope.is_some() {
+            bail!(
+                "an exact workspace target envelope requires a readable `{}`",
+                workspace_dir.join("pixi.toml").display()
+            );
+        }
+        return Ok(None);
+    };
+    manifest.resolve_target_for_source(workspace_dir, source_dir, requested_subdir, envelope)
 }
 
 /// Resolve every user-supplied entry into a list of bundles. Each bundle
@@ -3259,7 +4431,7 @@ async fn resolve_all(
                         &effective.git_sources,
                         auto_data,
                         pypi_to_conda,
-                        &effective.name_map,
+                        BfsRoutePolicy::from_config(effective),
                         conda_channels,
                         group_fallback_indexes,
                         None, // locked-closure seam: incremental-add ONLY (uv pins flow via prefs below)
@@ -3759,6 +4931,10 @@ pub(crate) struct CondaCoSolveContext {
     bundle: PypiKey,
     channel_priority: rattler_solve::ChannelPriority,
     system_requirements: BTreeMap<String, String>,
+    /// `None` preserves legacy host virtual-package detection. `Some(empty)`
+    /// is distinct: a contract-qualified direct-inference target must not
+    /// inherit build-host virtual packages that are absent from its contract.
+    detected_virtual_packages: Option<BTreeMap<String, String>>,
     workspace_deps: BTreeMap<CondaName, Vec<String>>,
     /// Conda providers that would shadow a direct PyPI declaration shared by
     /// every precise consumer. A mutable conda route is invalid when its
@@ -3787,19 +4963,20 @@ impl CondaCoSolveContext {
                     _ => rattler_solve::ChannelPriority::Strict,
                 },
                 match workspace_dir {
-                    Some(workspace_dir) => manifest.consuming_env_system_requirements_for_target(
+                    Some(workspace_dir) => workspace_consuming_system_requirements(
+                        manifest,
                         workspace_dir,
                         source_dir,
-                        target.conda_subdir(),
+                        target,
                     ),
-                    None => manifest
-                        .effective_system_requirements_for_target("default", target.conda_subdir()),
+                    None => workspace_effective_system_requirements(manifest, "default", target),
                 },
                 match workspace_dir {
-                    Some(workspace_dir) => manifest.consuming_env_dependencies_for_target(
+                    Some(workspace_dir) => workspace_consuming_dependencies(
+                        manifest,
                         workspace_dir,
                         source_dir,
-                        target.conda_subdir(),
+                        target,
                     ),
                     None => Default::default(),
                 },
@@ -3837,6 +5014,9 @@ impl CondaCoSolveContext {
                 (!workspace_deps.contains_key(&conda_name)).then_some((conda_name, pypi_name))
             })
             .collect();
+        let detected_virtual_packages = target
+            .target_contract()
+            .map(|contract| contract.detected_virtual_packages.clone());
         Self {
             channels: conda_channels.to_vec(),
             python: target.python_version().to_string(),
@@ -3844,6 +5024,7 @@ impl CondaCoSolveContext {
             bundle: PypiKey::from_pypi(bundle),
             channel_priority,
             system_requirements,
+            detected_virtual_packages,
             workspace_deps,
             workspace_pypi_providers,
         }
@@ -3868,13 +5049,14 @@ impl CondaCoSolveContext {
             }
         }
         specs.push(CondaName::new("python").match_spec(&format!("{}.*", self.python)));
-        match crate::conda_solve::solve_selected_records(
+        match crate::conda_solve::solve_selected_records_for_target(
             &self.channels,
             &specs,
             &self.python,
             &self.subdir,
             self.channel_priority,
             &self.system_requirements,
+            self.detected_virtual_packages.as_ref(),
             rattler_solve::SolveStrategy::Highest,
         )
         .await
@@ -3936,13 +5118,14 @@ impl CondaCoSolveContext {
             route.match_spec(),
             CondaName::new("python").match_spec(&format!("{}.*", self.python)),
         ];
-        match crate::conda_solve::solve_selected_records(
+        match crate::conda_solve::solve_selected_records_for_target(
             &self.channels,
             &specs,
             &self.python,
             &self.subdir,
             self.channel_priority,
             &self.system_requirements,
+            self.detected_virtual_packages.as_ref(),
             rattler_solve::SolveStrategy::Highest,
         )
         .await
@@ -4062,30 +5245,47 @@ where
 struct PreciseConsumerInput {
     env: String,
     conda_deps: BTreeMap<String, String>,
-    pypi_deps: BTreeMap<String, String>,
+    pypi_deps: BTreeMap<String, Vec<String>>,
 }
 
-fn precise_consumer_inputs(
+fn precise_consumer_inputs_for_target(
     manifest: &crate::workspace::WorkspaceManifest,
     workspace_dir: &Path,
     source_dir: &Path,
+    target: &ResolutionTarget,
 ) -> Option<Vec<PreciseConsumerInput>> {
-    let envs = manifest.precise_consuming_envs(workspace_dir, source_dir)?;
-    Some(
-        envs.into_iter()
-            .map(|env| PreciseConsumerInput {
-                conda_deps: manifest.effective_dependencies(&env),
-                pypi_deps: manifest.effective_pypi_dependencies(&env),
-                env,
-            })
-            .collect(),
-    )
+    let envs = workspace_precise_consuming_envs(manifest, workspace_dir, source_dir, target)?;
+    let resolved = target.target_contract().and_then(|_| {
+        resolved_workspace_target_from_resolution(manifest, workspace_dir, source_dir, target)
+    });
+    let mut inputs = Vec::with_capacity(envs.len());
+    for env in envs {
+        let conda_deps = match &resolved {
+            Some(resolved) => manifest
+                .effective_dependencies_for_resolved_env(&env, resolved)
+                .ok()?,
+            None => manifest.effective_dependencies_for_target(&env, target.conda_subdir()),
+        };
+        inputs.push(PreciseConsumerInput {
+            conda_deps,
+            pypi_deps: match &resolved {
+                Some(resolved) => manifest
+                    .effective_pypi_dependencies_for_resolved_env(&env, resolved)
+                    .ok()?,
+                None => {
+                    manifest.effective_pypi_dependencies_for_target(&env, target.conda_subdir())
+                }
+            },
+            env,
+        });
+    }
+    Some(inputs)
 }
 
 /// Intersection of direct dependency names across every precise consumer.
 /// A name declared in only one of several consumers cannot be removed from a
 /// shared pack: another consumer would then receive neither ecosystem copy.
-fn dependency_name_intersection(maps: &[BTreeMap<String, String>]) -> BTreeSet<String> {
+fn dependency_name_intersection<T>(maps: &[BTreeMap<String, T>]) -> BTreeSet<String> {
     let Some(first) = maps.first() else {
         return BTreeSet::new();
     };
@@ -4447,12 +5647,14 @@ async fn solve_workspace_conda_facts(
     manifest: &crate::workspace::WorkspaceManifest,
     workspace_dir: &Path,
     source_dir: &Path,
-    target: &WheelTarget,
+    target: &ResolutionTarget,
     conda_channels: &[ChannelUrl],
     name_map: &NameMap,
     bundle_name: &str,
 ) -> WorkspaceCondaFacts {
-    let Some(inputs) = precise_consumer_inputs(manifest, workspace_dir, source_dir) else {
+    let Some(inputs) =
+        precise_consumer_inputs_for_target(manifest, workspace_dir, source_dir, target)
+    else {
         tracing::debug!(
             bundle = %bundle_name,
             "conda facts: pack-to-environment ownership is ambiguous; abstaining",
@@ -4465,7 +5667,7 @@ async fn solve_workspace_conda_facts(
         .map(|input| (input.env.clone(), input.conda_deps.clone()))
         .collect();
     let conda_deps: Vec<BTreeMap<String, String>> = env_conda_deps.values().cloned().collect();
-    let pypi_deps: Vec<BTreeMap<String, String>> =
+    let pypi_deps: Vec<BTreeMap<String, Vec<String>>> =
         inputs.iter().map(|input| input.pypi_deps.clone()).collect();
     let owned_pypi = dependency_name_intersection(&pypi_deps);
 
@@ -4498,15 +5700,18 @@ async fn solve_workspace_conda_facts(
                 .collect::<Vec<_>>();
             specs
                 .push(CondaName::new("python").match_spec(&format!("{}.*", target.python_version)));
-            let sysreqs = manifest.effective_system_requirements(env);
+            let sysreqs = workspace_effective_system_requirements(manifest, env, target);
             async move {
-                let result = crate::conda_solve::solve_selected_records(
+                let result = crate::conda_solve::solve_selected_records_for_target(
                     conda_channels,
                     &specs,
                     &target.python_version,
                     &target.conda_subdir,
                     channel_priority,
                     &sysreqs,
+                    target
+                        .target_contract()
+                        .map(|contract| &contract.detected_virtual_packages),
                     rattler_solve::SolveStrategy::Highest,
                 )
                 .await;
@@ -4814,9 +6019,9 @@ async fn uv_group_closure(
         }
         crate::config::RoutePolicy::Aggressive => match (manifest_opt.as_ref(), workspace_dir) {
             (Some(manifest), Some(ws_dir)) => {
-                let deps = unambiguous_consuming_deps(
-                    &manifest.consuming_env_dependencies(ws_dir, source_dir),
-                );
+                let deps = unambiguous_consuming_deps(&workspace_consuming_dependencies(
+                    manifest, ws_dir, source_dir, target,
+                ));
                 let global_map = load_pypi_to_conda_map().await;
                 crate::uv_closure::build_constraints(
                     &deps,
@@ -4827,7 +6032,8 @@ async fn uv_group_closure(
                 )
             }
             (Some(manifest), None) => {
-                let deps = manifest.effective_dependencies("default");
+                let deps =
+                    manifest.effective_dependencies_for_target("default", target.conda_subdir());
                 crate::uv_closure::build_constraints(
                     &deps,
                     &effective.name_map,
@@ -4867,7 +6073,7 @@ async fn uv_group_closure(
     // never independently picks a cuda-(X+1) release the conda side
     // can't co-install.
     if let (Some(manifest), Some(ws_dir)) = (manifest_opt.as_ref(), workspace_dir) {
-        let workspace_deps = manifest.consuming_env_dependencies(ws_dir, source_dir);
+        let workspace_deps = workspace_consuming_dependencies(manifest, ws_dir, source_dir, target);
         if let Some(specs) = workspace_deps.get("cuda-version")
             && let Some(major) = crate::uv_closure::cuda_major_from_specs(specs)
         {
@@ -5131,8 +6337,7 @@ async fn uv_group_closure(
     // >=12.9,<13` against a cuda-12.8 workspace).
     let mut abi_anchor_pins: std::collections::BTreeMap<String, String> =
         if let (Some(manifest), Some(ws_dir)) = (manifest_opt.as_ref(), workspace_dir) {
-            manifest
-                .consuming_env_dependencies(ws_dir, source_dir)
+            workspace_consuming_dependencies(manifest, ws_dir, source_dir, target)
                 .into_iter()
                 .filter(|(name, _)| crate::solve::is_abi_anchor(name))
                 .filter_map(|(name, specs)| specs.into_iter().next().map(|spec| (name, spec)))
@@ -5607,7 +6812,8 @@ mod workspace_conda_facts_tests {
     use super::{
         CondaCoSolveContext, SolvedPypiFact, WorkspaceCondaFacts, WorkspaceRouteOwnership,
         dependency_name_intersection, effective_name_map, facts_from_solved_records,
-        precise_consumer_inputs, workspace_conda_provider_candidates, workspace_fact_constraints,
+        precise_consumer_inputs_for_target, workspace_conda_provider_candidates,
+        workspace_fact_constraints,
     };
     use crate::constraint::Provenance;
     use crate::pypi::{ResolutionTarget, WheelTarget};
@@ -5680,7 +6886,9 @@ viral-gpu = { features = ["viral"], no-default-feature = true }
         .unwrap();
 
         let manifest = crate::workspace::WorkspaceManifest::load(&tmp).unwrap();
-        let inputs = precise_consumer_inputs(&manifest, &tmp, &pack_dir).unwrap();
+        let target = ResolutionTarget::for_subdir("3.11", "linux-64");
+        let inputs =
+            precise_consumer_inputs_for_target(&manifest, &tmp, &pack_dir, &target).unwrap();
         let owned_pypi = dependency_name_intersection(
             &inputs
                 .iter()
@@ -5783,7 +6991,9 @@ holosoma = { features = ["doit-task-runner", "holosoma"], no-default-feature = t
         )
         .unwrap();
         let manifest = crate::workspace::WorkspaceManifest::load(&tmp).unwrap();
-        let inputs = precise_consumer_inputs(&manifest, &tmp, &pack_dir).unwrap();
+        let target = ResolutionTarget::for_subdir("3.11", "linux-64");
+        let inputs =
+            precise_consumer_inputs_for_target(&manifest, &tmp, &pack_dir, &target).unwrap();
 
         assert_eq!(inputs.len(), 1);
         assert_eq!(inputs[0].env, "holosoma");
@@ -5941,7 +7151,9 @@ gpu = { features = ["gpu"], no-default-feature = true }
         )
         .unwrap();
         let manifest = crate::workspace::WorkspaceManifest::load(&tmp).unwrap();
-        let inputs = precise_consumer_inputs(&manifest, &tmp, &pack_dir).unwrap();
+        let target = ResolutionTarget::for_subdir("3.10", "linux-64");
+        let inputs =
+            precise_consumer_inputs_for_target(&manifest, &tmp, &pack_dir, &target).unwrap();
 
         assert_eq!(inputs.len(), 1);
         assert_eq!(inputs[0].env, "sage");
@@ -6369,6 +7581,12 @@ struct PreparedBuild {
     bundle_index: usize,
     emission: DiscoveredEmission,
     advertised: PreparedOutputIdentity,
+    /// Present only when conda/outputs intentionally advertised the version
+    /// of a matching incremental lock rather than the cold primary wheel.
+    /// This typed origin never crosses the process-local metadata/build
+    /// handoff; build_v1 must independently rediscover the same lock before
+    /// it may use the override.
+    incremental_version_override: Option<String>,
 }
 
 struct PreparedBuildSelection {
@@ -6383,9 +7601,13 @@ impl PreparedBuild {
         &self,
         work_directory: &Path,
         exact_python_version: Option<&str>,
+        target: Option<&ResolutionTarget>,
         output: &pixi_build_types::procedures::conda_build_v1::CondaBuildV1Output,
     ) -> bool {
         self.plan.work_directory == work_directory
+            && target.is_none_or(|target| {
+                self.plan.target.resolution_identity() == target.resolution_identity()
+            })
             && exact_python_version.is_none_or(|python_version| {
                 normalized_python_minor(python_version)
                     .is_ok_and(|python| python.version() == self.plan.target.python_version())
@@ -6407,8 +7629,10 @@ impl PreparedBuild {
         let (bundle, effective) =
             apply_emission(base_bundle, &self.plan.base_config, &self.emission);
         let applied_name = PackageName::new_unchecked(bundle.conda_name.clone());
+        let package_version =
+            courier_pack_version(&bundle, self.incremental_version_override.as_deref());
         (applied_name.as_normalized() == self.advertised.name
-            && bundle.primary.metadata.version == self.advertised.version)
+            && package_version == self.advertised.version)
             .then_some((bundle, effective))
     }
 }
@@ -6468,9 +7692,9 @@ async fn discover_emissions(
     workspace_dir: Option<&Path>,
     default_output_name: &str,
     default_channels: &[ChannelUrl],
-    target_python: &str,
+    target: &ResolutionTarget,
     bundle_names: &HashSet<PypiKey>,
-) -> Vec<DiscoveredEmission> {
+) -> Result<Vec<DiscoveredEmission>> {
     let manifest_opt = workspace_dir.and_then(crate::workspace::WorkspaceManifest::load);
     let default_emission = || DiscoveredEmission {
         output_name: default_output_name.to_string(),
@@ -6480,11 +7704,39 @@ async fn discover_emissions(
     };
 
     let (Some(manifest), Some(ws_dir)) = (manifest_opt.as_ref(), workspace_dir) else {
-        return vec![default_emission()];
+        if target.target_contract().is_some() {
+            bail!(
+                "workspace target contract cannot be used after the workspace manifest disappeared"
+            );
+        }
+        return Ok(vec![default_emission()]);
     };
-    let discovered = manifest.discover_outputs_for_source(ws_dir, source_dir);
+    let resolved = match target.target_contract() {
+        Some(_) => Some(
+            resolved_workspace_target_from_resolution(manifest, ws_dir, source_dir, target)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "workspace target contract no longer maps source `{}` to a concrete consumer",
+                        source_dir.display()
+                    )
+                })?,
+        ),
+        None => None,
+    };
+    let discovered = resolved.as_ref().map_or_else(
+        || {
+            manifest.discover_outputs_for_source_for_target(
+                ws_dir,
+                source_dir,
+                target.conda_subdir(),
+            )
+        },
+        |resolved| {
+            manifest.discover_outputs_for_source_for_resolved_target(ws_dir, source_dir, resolved)
+        },
+    );
     if discovered.is_empty() {
-        return vec![default_emission()];
+        return Ok(vec![default_emission()]);
     }
 
     let mut out = Vec::with_capacity(discovered.len());
@@ -6515,14 +7767,31 @@ async fn discover_emissions(
         let env_futures = d
             .envs
             .iter()
-            .map(|env| {
-                crate::workspace::extract_transitive_constraints(
-                    manifest,
-                    env,
-                    target_python,
-                    &channels,
-                    bundle_names,
-                )
+            .map(|env| async {
+                match resolved.as_ref() {
+                    Some(resolved) => {
+                        crate::workspace::extract_transitive_constraints_for_resolved_target(
+                            manifest,
+                            env,
+                            target.python_version(),
+                            resolved,
+                            &channels,
+                            bundle_names,
+                        )
+                        .await
+                    }
+                    None => {
+                        crate::workspace::extract_transitive_constraints_for_target(
+                            manifest,
+                            env,
+                            target.python_version(),
+                            target.conda_subdir(),
+                            &channels,
+                            bundle_names,
+                        )
+                        .await
+                    }
+                }
             })
             .collect::<Vec<_>>();
         let env_results = {
@@ -6554,7 +7823,10 @@ async fn discover_emissions(
         // `binutils_linux-64`. The solve check consumes these
         // strings directly, so passing them verbatim keeps the
         // solver looking up the right package.
-        let direct = manifest.union_effective_dependencies(&d.envs);
+        let direct = resolved.as_ref().map_or_else(
+            || manifest.union_effective_dependencies_for_target(&d.envs, target.conda_subdir()),
+            |resolved| manifest.union_effective_dependencies_for_resolved_target(&d.envs, resolved),
+        );
         for (dep, specs) in direct {
             let entry = accumulated.entry(dep).or_default();
             for s in specs {
@@ -6571,7 +7843,7 @@ async fn discover_emissions(
             envs: d.envs,
         });
     }
-    out
+    Ok(out)
 }
 
 /// Collapse `dep_name -> [spec1, spec2, ...]` into comma-AND match-
@@ -7050,6 +8322,182 @@ fn bfs_descendant_indexes(source: &PendingSource, bundle_indexes: &[String]) -> 
     }
 }
 
+/// The subset of pack configuration that can make a BFS dependency a native
+/// conda route.  Keeping this typed prevents the source-built fallback walk
+/// from seeing the effective name map while silently missing the manual
+/// override that emission will apply later.
+#[derive(Clone, Copy)]
+struct BfsRoutePolicy<'a> {
+    name_map: &'a NameMap,
+    overrides: Option<&'a BTreeMap<String, String>>,
+    ledger_overrides: Option<&'a BTreeSet<String>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BfsOverride<'a> {
+    spec: &'a str,
+    manual: bool,
+}
+
+impl<'a> BfsRoutePolicy<'a> {
+    fn from_config(config: &'a RetreadConfig) -> Self {
+        Self {
+            name_map: &config.name_map,
+            overrides: Some(&config.overrides),
+            ledger_overrides: Some(&config.ledger_overrides),
+        }
+    }
+
+    #[cfg(test)]
+    fn name_map_only(name_map: &'a NameMap) -> Self {
+        Self {
+            name_map,
+            overrides: None,
+            ledger_overrides: None,
+        }
+    }
+
+    fn override_for(&self, key: &str) -> Option<BfsOverride<'a>> {
+        let override_spec = self.overrides?.get(key)?;
+        // The ledger records the exact key it inserted into `overrides`.
+        // Classify that selected entry by exact key as well: canonical-family
+        // matching could mislabel a distinct hand-written alias.
+        let ledgered = self
+            .ledger_overrides
+            .is_some_and(|ledger| ledger.contains(key));
+        Some(BfsOverride {
+            spec: override_spec.as_str(),
+            manual: !ledgered,
+        })
+    }
+
+    /// Resolve the conda identity and any hand-written override with the same
+    /// precedence as emission: the PyPI-keyed override wins, then the mapped
+    /// conda-provider key. A PyPI-keyed override may establish an identity
+    /// route when no mapping exists; an explicit disabled mapping still keeps
+    /// the dependency on PyPI.
+    fn target_and_override(
+        &self,
+        pypi_key: &PypiKey,
+        pypi_to_conda: &PypiToCondaMap,
+    ) -> (Option<CondaName>, Option<BfsOverride<'a>>) {
+        // Select by the same precedence as emission BEFORE classifying manual
+        // authority. A higher-precedence PyPI-key ledger entry must block a
+        // lower-precedence mapped-provider manual entry.
+        let pypi_override = self.override_for(pypi_key.as_str());
+        let explicitly_disabled =
+            matches!(self.name_map.get(pypi_key), Some(CondaTarget::Disabled));
+        let target = pick_conda_target(pypi_key, self.name_map, pypi_to_conda).or_else(|| {
+            (pypi_override.is_some_and(|entry| entry.manual) && !explicitly_disabled)
+                .then(|| CondaName::new(pypi_key.as_str()))
+        });
+        let selected_override = target.as_ref().and_then(|conda_name| {
+            pypi_override.or_else(|| self.override_for(conda_name.as_spec()))
+        });
+        (target, selected_override)
+    }
+}
+
+fn incremental_bundle_requires_cold_resolve(bundle: &Bundle) -> bool {
+    bundle.probe_decisions.iter().any(|decision| {
+        decision.stage == "bfs" && decision.routing_decision.starts_with("short-circuit")
+    })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum IncrementalVersionPlan {
+    /// Metadata and the committed lock agree, so localized build may proceed.
+    /// A later escalation must retain this version during the cold build.
+    Attempt { fallback_version: String },
+    /// Metadata advertised a different (normally cold-resolved) version. A
+    /// localized build would return `lock.version`, so bypass it and preserve
+    /// the version pixi already solved.
+    Cold,
+}
+
+fn incremental_version_plan(
+    advertised_version: Option<&str>,
+    lock_version: &str,
+) -> IncrementalVersionPlan {
+    match advertised_version {
+        Some(version) if version != lock_version => IncrementalVersionPlan::Cold,
+        Some(version) => IncrementalVersionPlan::Attempt {
+            fallback_version: version.to_string(),
+        },
+        None => IncrementalVersionPlan::Attempt {
+            fallback_version: lock_version.to_string(),
+        },
+    }
+}
+
+fn advertised_version_matches(advertised_version: Option<&str>, candidate_version: &str) -> bool {
+    advertised_version.is_none_or(|version| version == candidate_version)
+}
+
+fn validate_advertised_courier_version(
+    bundle: &Bundle,
+    advertised_version: Option<&str>,
+    incremental_fallback_version: Option<&str>,
+) -> Result<(), RpcError> {
+    let package_version = courier_pack_version(bundle, incremental_fallback_version);
+    if advertised_version_matches(advertised_version, &package_version) {
+        return Ok(());
+    }
+    Err(RpcError::invalid_params(format!(
+        "courier resolution changed between conda/outputs and conda/build_v1: pixi requested version `{}`, but the current primary wheel for `{}` requires package version `{package_version}`; rerun the lock/install so output metadata can be recomputed",
+        advertised_version.unwrap_or_default(),
+        bundle.conda_name,
+    )))
+}
+
+fn validate_prepared_incremental_version_handoff(
+    prepared_override: Option<&str>,
+    detected_override: Option<&str>,
+    output_name: &str,
+) -> Result<(), RpcError> {
+    if prepared_override == detected_override {
+        return Ok(());
+    }
+    Err(RpcError::invalid_params(format!(
+        "courier incremental metadata/build handoff changed for `{output_name}`: conda/outputs recorded version override `{}`, but build_v1 independently detected `{}`; rerun the lock/install so metadata and its exact prepared plan are recomputed together",
+        prepared_override.unwrap_or("none"),
+        detected_override.unwrap_or("none"),
+    )))
+}
+
+fn reject_unprepared_incremental_fallback(
+    detected_override: Option<&str>,
+    output_name: &str,
+) -> Result<(), RpcError> {
+    let Some(version) = detected_override else {
+        return Ok(());
+    };
+    Err(RpcError::invalid_params(format!(
+        "courier incremental build for `{output_name}` escalated after metadata advertised lock version `{version}`, but the exact conda/outputs plan is unavailable or stale; rerun the lock/install so metadata and build share one materialized plan"
+    )))
+}
+
+/// Resolve an output name back to a declared retread bundle/group only when
+/// the identity is unambiguous from the source manifest itself. Workspace
+/// aliases created by `apply_emission` deliberately return `None`; build_v1
+/// must recover their base identity from the prepared or cold plan before it
+/// can validate a content-addressed build hash.
+fn declared_input_bundle_for_output(config: &RetreadConfig, output_name: &str) -> Option<String> {
+    let output = canonical_conda_name(output_name);
+    config
+        .retread_wheels
+        .iter()
+        .find_map(|(entry_name, entry)| {
+            let group = bundle_group_for(entry_name, entry, config.default_bundle.as_deref());
+            let group = canonical_conda_name(&group);
+            if group == output { Some(group) } else { None }
+        })
+}
+
+fn bfs_probe_target_subdir(target: &ResolutionTarget) -> &str {
+    target.conda_subdir()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn resolve_bundle(
     entry_name: &str,
@@ -7072,15 +8520,12 @@ async fn resolve_bundle(
     // circuit: user opted into a specific upstream source via PEP 508
     // `pkg @ <url>` and substituting conda would silently swap deps.
     pypi_to_conda: &PypiToCondaMap,
-    // v0.46.0: the merged effective name-map (user retread-name-map +
-    // FALLBACK_PYPI_TO_CONDA + unambiguous parselmouth). The BFS prefer-
-    // conda picker consults THIS first, so curated answers like
-    // torch->pytorch route to conda even when parselmouth's inverted map
-    // is ambiguous (multiple conda candidates, no identity match). Without
-    // it, `torch` fell through to PyPI and got bundled at latest (2.12.0),
-    // clobbering conda's pinned pytorch at install. Emission already used
-    // this map; the BFS now matches it.
-    name_map: &NameMap,
+    // Native-conda routing inputs: the merged effective name-map (user
+    // retread-name-map + FALLBACK_PYPI_TO_CONDA + unambiguous parselmouth)
+    // plus hand-written retread-overrides. The BFS must see both because
+    // emission applies both: otherwise an indecisive route probe can bundle a
+    // newest PyPI wheel before a later exact override is emitted.
+    route_policy: BfsRoutePolicy<'_>,
     conda_channels: &[ChannelUrl],
     // Complete workspace-first group fallback chain. URL-form roots do not
     // contribute an index, but their ordinary metadata descendants inherit it.
@@ -7411,8 +8856,8 @@ async fn resolve_bundle(
                 // which are often ambiguous for exactly the deps the FALLBACK
                 // table exists to disambiguate.
                 {
-                    let picked: Option<CondaName> =
-                        pick_conda_target(&dep_pypi_key, name_map, pypi_to_conda);
+                    let (picked, selected_override) =
+                        route_policy.target_and_override(&dep_pypi_key, pypi_to_conda);
                     match picked {
                         None => {
                             let amb = pypi_to_conda.get(dep_pypi_key.as_str());
@@ -7435,16 +8880,32 @@ async fn resolve_bundle(
                             // routed_to_conda stays false -> falls through to pypi::resolve below
                         }
                         Some(conda_target_name) => {
-                            let probe_spec = conda_probe_spec(specifiers);
-                            let probe_result = crate::probe::probe(
+                            // Emission replaces the wheel requirement with the
+                            // selected override, so probe that same spec. A
+                            // hand-written override is the native-conda
+                            // boundary and remains authoritative even when the
+                            // diagnostic probe is unavailable or indecisive.
+                            let probe_spec = match selected_override.map(|entry| entry.spec.trim())
+                            {
+                                Some("") => "*".to_string(),
+                                Some(spec) => spec.to_string(),
+                                None => conda_probe_spec(specifiers),
+                            };
+                            let probe_result = crate::probe::probe_for_target(
                                 conda_channels,
                                 conda_target_name.as_spec(),
                                 &probe_spec,
                                 Some(&target.python_version),
+                                bfs_probe_target_subdir(target),
                             )
                             .await;
-                            let route_to_conda = validated_conda_route(&probe_result);
-                            let routing_decision = if route_to_conda {
+                            let manual_override =
+                                selected_override.is_some_and(|entry| entry.manual);
+                            let route_to_conda =
+                                manual_override || validated_conda_route(&probe_result);
+                            let routing_decision = if manual_override {
+                                "short-circuit-explicit-override"
+                            } else if route_to_conda {
                                 "short-circuit"
                             } else {
                                 "fall-through-to-pypi"
@@ -7465,6 +8926,7 @@ async fn resolve_bundle(
                                 conda_name = %conda_target_name,
                                 spec = %probe_spec,
                                 decision = %routing_decision,
+                                manual_override,
                                 matches = probe_result.matching_candidates,
                                 channels = ?probe_result.channels_consulted,
                                 "BFS prefer-conda probe result",
@@ -8826,9 +10288,9 @@ fn assemble_conda_output(
     };
 
     let py_short = python_version.replace('.', "");
-    // Courier: use the content-addressed build string so pixi cache-hits are
-    // invalidated whenever the inputs change (wheel set, indexes, config...).
-    // Non-courier: keep the legacy `py{XY}_{build_number}` string unchanged.
+    // A hash-qualified target uses a content-addressed build string so Pixi
+    // cannot alias either courier inputs or two rich same-subdir platform
+    // contracts. Legacy non-courier targets retain `py{XY}_{build_number}`.
     let build = match build_hash {
         Some(hash) => courier_build_string(&py_short, hash, build_number, loose),
         None => format!("py{py_short}_{build_number}"),
@@ -8879,11 +10341,10 @@ fn assemble_conda_output(
 /// declaring any one output in the workspace pulls the whole pack via
 /// the conda solver.
 ///
-/// `courier_build_hash`: when `Some`, this is the courier inputs hash
-/// (from [`courier_inputs_hash`]) and the build string is set to the
-/// content-addressed form `py{XY}_h{hash_prefix}_{build_number}`.
-/// When `None` (non-courier path), the legacy `py{XY}_{build_number}`
-/// string is emitted unchanged.
+/// `courier_build_hash`: when `Some`, this is either the courier inputs hash
+/// (from [`courier_inputs_hash`]) or a non-courier rich target identity. The
+/// build string becomes `py{XY}_h{hash_prefix}_{build_number}`. Legacy
+/// non-courier calls with no rich target keep `py{XY}_{build_number}`.
 #[derive(Clone, Debug)]
 struct EmissionConstraintConflict {
     conda_name: CondaName,
@@ -10535,6 +11996,7 @@ async fn materialize_from_lock_for_target(
         None, // bundle=None: replay path, audit skipped
         config,
         &bundle_name,
+        &bundle_name,
         &version,
         target,
         Some(&lock),
@@ -10567,6 +12029,7 @@ async fn materialize_and_pack(
     bundle: Option<&Bundle>,
     config: &RetreadConfig,
     bundle_name: &str,
+    input_bundle_name: &str,
     version: &str,
     target: &ResolutionTarget,
     authoritative_lock: Option<&crate::lock::RetreadLock>,
@@ -10593,7 +12056,7 @@ async fn materialize_and_pack(
     let staged = crate::courier::stage_for_target_with_store_root(
         config,
         bundle_name,
-        bundle_name,
+        input_bundle_name,
         version,
         target,
         &emit_wheels,
@@ -10612,6 +12075,19 @@ async fn materialize_and_pack(
         validate_authoritative_replay_lock(authoritative_lock, &staged.lock)?;
     }
 
+    // Pixi permits a dynamic build request (`output.build = None`). The
+    // staged lock is the first point where the authoritative inputs hash is
+    // available on cold, replay, and incremental paths alike, so synthesize
+    // the same content-addressed rich build identity here instead of falling
+    // back to the legacy `pyXY_N` namespace.
+    let resolved_build = resolved_courier_build(
+        expected_build,
+        target,
+        &staged.lock.inputs_hash,
+        config.build_number,
+        config.bundle_mode == crate::config::BundleMode::Loose,
+    );
+
     // Defer the committed install lock write until after a successful
     // rattler-build (B-2). The staged copy inside `staging` is already in
     // the recipe's source list; this is the authoritative pack-dir copy.
@@ -10625,9 +12101,10 @@ async fn materialize_and_pack(
         target.python_version(),
         &staged.run_deps,
         &staged.source_urls,
+        config.build_number,
         // Thread the content-addressed build string into the recipe so
         // the on-disk artifact name matches what conda/outputs advertised.
-        expected_build,
+        Some(&resolved_build),
         config.courier_mode,
         &lock_filename,
     );
@@ -10720,14 +12197,15 @@ async fn materialize_and_pack(
         })?;
     tracing::info!(path = %lock_commit_path.display(), "courier: wrote install lock (post-build)");
 
+    let build = resolved_build;
     let subdir_dir = output_dir.join(&target_platform);
-    let output_file =
-        find_conda_artifact(&subdir_dir, &recipe.package.name, &recipe.package.version).await?;
-
-    let build = expected_build.map(|s| s.to_string()).unwrap_or_else(|| {
-        let py_short = target.python_version().replace('.', "");
-        format!("py{py_short}_{}", config.build_number)
-    });
+    let output_file = find_conda_artifact(
+        &subdir_dir,
+        &recipe.package.name,
+        &recipe.package.version,
+        &build,
+    )
+    .await?;
     Ok(CondaBuildV1Result {
         output_file,
         input_globs: Default::default(),
@@ -10905,7 +12383,7 @@ async fn resolve_incremental_add(
             &effective.git_sources,
             auto_data,
             &pypi_to_conda,
-            &effective.name_map,
+            BfsRoutePolicy::from_config(&effective),
             conda_channels,
             &workspace_pypi_indexes,
             Some(&locked_closure),
@@ -10928,6 +12406,19 @@ async fn resolve_incremental_add(
                 return Err(e);
             }
         };
+
+        // Incremental merge reuses the committed lock's conda run-deps and
+        // only appends wheel payloads. A dependency that this new bundle
+        // short-circuited to conda would therefore be absent from BOTH sets.
+        // Cold resolution owns complete run-dep emission, so escalate rather
+        // than publish a silently incomplete incremental lock.
+        if incremental_bundle_requires_cold_resolve(&bundle) {
+            tracing::debug!(
+                entry = %entry_name,
+                "incremental-add: new BFS conda route requires complete cold run-dep emission"
+            );
+            return Ok(None);
+        }
 
         // Convert Bundle → EmitWheel (same logic as build_one, lines 5461-5494).
         let wheels_root = source_dir.join("wheels");
@@ -11037,6 +12528,7 @@ async fn resolve_incremental_add(
     let result = materialize_and_pack(
         None, // bundle=None: incremental path, no full Bundle available
         config,
+        &bundle_name,
         &bundle_name,
         &version,
         target,
@@ -11250,6 +12742,30 @@ fn verify_localadd_hook(
     }
 }
 
+/// Select the courier package version independently from the primary wheel's
+/// version when a localized incremental add was advertised and then had to
+/// fall back to a full cold materialization. Wheel identities remain their
+/// own upstream versions; only the generated conda package keeps the version
+/// pixi already solved from conda/outputs.
+fn courier_pack_version(bundle: &Bundle, advertised_override: Option<&str>) -> String {
+    advertised_override
+        .unwrap_or(&bundle.primary.metadata.version)
+        .to_string()
+}
+
+fn validate_resolution_artifact_subdir(
+    target: &ResolutionTarget,
+    artifact_subdir: Platform,
+) -> Result<()> {
+    if artifact_subdir != Platform::NoArch && target.conda_subdir() != artifact_subdir.to_string() {
+        bail!(
+            "build target mismatch: immutable resolution target is `{}` but requested output subdir is `{artifact_subdir}`",
+            target.conda_subdir(),
+        );
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn build_one(
     bundle: &Bundle,
@@ -11261,16 +12777,38 @@ async fn build_one(
     target: &ResolutionTarget,
     source_dir: &Path,
     workspace_dir: Option<&Path>,
+    input_bundle_name: &str,
     expected_build: Option<&str>,
+    courier_version_override: Option<&str>,
     run_override: Option<&[String]>,
 ) -> Result<CondaBuildV1Result> {
-    if target.conda_subdir() != target_subdir.to_string() {
+    validate_resolution_artifact_subdir(target, target_subdir)?;
+    let workspace_python_version = target.python_version();
+    let py_short = workspace_python_version.replace('.', "");
+    let legacy_build = format!("py{py_short}_{}", config.build_number);
+    let rich_target_build = (!config.courier)
+        .then(|| {
+            target.target_contract().map(|_| {
+                courier_build_string_for_target(
+                    target,
+                    &target.resolution_identity(),
+                    config.build_number,
+                    config.bundle_mode == crate::config::BundleMode::Loose,
+                )
+            })
+        })
+        .flatten();
+    if let (Some(expected), Some(required)) = (expected_build, rich_target_build.as_deref())
+        && expected != required
+    {
         bail!(
-            "build target mismatch: immutable resolution target is `{}` but requested output subdir is `{target_subdir}`",
-            target.conda_subdir(),
+            "advertised non-courier build `{expected}` does not match immutable target identity `{required}`"
         );
     }
-    let workspace_python_version = target.python_version();
+    let build = expected_build
+        .map(str::to_owned)
+        .or(rich_target_build)
+        .unwrap_or(legacy_build);
     // Lay out one BundleSource per wheel (primary first), in BFS order.
     //
     // v1.4.5: point each source at retread's local wheel cache when
@@ -11297,6 +12835,14 @@ async fn build_one(
             metadata: &w.metadata,
         })
         .collect();
+    if target_subdir == Platform::NoArch
+        && (config.courier || sources.iter().any(|source| !source.metadata.is_pure_python))
+    {
+        bail!(
+            "requested noarch artifact for platform-specific bundle `{}`",
+            bundle.conda_name
+        );
+    }
     // Deprecation gate: warn once when the old emit-pypi / blueprint
     // keys are set. These were replaced by `retread-courier` (v2.0.0);
     // the fields are retained only for backward-compat parsing.
@@ -11310,7 +12856,7 @@ async fn build_one(
     // WS-C: courier mode — delegate to materialize_and_pack which handles
     // the full courier staging + rattler-build + deferred lock flush pipeline.
     if config.courier {
-        let version = bundle.primary.metadata.version.clone();
+        let version = courier_pack_version(bundle, courier_version_override);
         let emit_wheels: Vec<crate::emit_pypi::EmitWheel> = bundle
             .all_wheels()
             .zip(localized_urls.iter())
@@ -11405,7 +12951,14 @@ async fn build_one(
         // multi-env workspaces, causing replay to never fire).
         let courier_channels = ws_manifest
             .as_ref()
-            .map(|m| m.courier_channel_set(workspace_dir.unwrap_or(source_dir), source_dir))
+            .map(|m| {
+                workspace_courier_channels(
+                    m,
+                    workspace_dir.unwrap_or(source_dir),
+                    source_dir,
+                    target,
+                )
+            })
             .unwrap_or_default();
         let config_fp =
             crate::courier::config_fingerprint(declared_config, &courier_channels, &workspace_fp);
@@ -11413,6 +12966,7 @@ async fn build_one(
             Some(bundle),
             config,
             &bundle.conda_name,
+            input_bundle_name,
             &version,
             target,
             None,
@@ -11437,6 +12991,7 @@ async fn build_one(
         config,
         workspace_python_version,
         run_override,
+        Some(&build),
         // blueprint="only" payload-skip is deprecated (v2.0.0); the
         // non-courier conda path always carries its wheel payload.
         true,
@@ -11522,19 +13077,13 @@ async fn build_one(
     }
 
     let subdir_dir = output_dir.join(&target_platform);
-    let output_file =
-        find_conda_artifact(&subdir_dir, &recipe.package.name, &recipe.package.version).await?;
-
-    // Build string contract: pixi computes the expected build string
-    // from the variant it sent us in conda/outputs and rejects mismatches
-    // with "The build backend did not return the expected package: ...".
-    // Echo back exactly what pixi expects when it tells us. Only synthesize
-    // from workspace_python_version when there's no expectation (e.g.,
-    // direct test calls).
-    let build = expected_build.map(|s| s.to_string()).unwrap_or_else(|| {
-        let py_short = workspace_python_version.replace('.', "");
-        format!("py{py_short}_{}", config.build_number)
-    });
+    let output_file = find_conda_artifact(
+        &subdir_dir,
+        &recipe.package.name,
+        &recipe.package.version,
+        &build,
+    )
+    .await?;
     Ok(CondaBuildV1Result {
         output_file,
         input_globs: Default::default(),
@@ -11605,23 +13154,23 @@ fn spec_from_str(s: &str) -> Result<NamedSpec<PackageSpec>> {
     })
 }
 
-async fn find_conda_artifact(dir: &Path, name: &str, version: &str) -> Result<PathBuf> {
-    let mut read = tokio::fs::read_dir(dir)
+async fn find_conda_artifact(
+    dir: &Path,
+    name: &str,
+    version: &str,
+    build: &str,
+) -> Result<PathBuf> {
+    let expected_name = format!("{name}-{version}-{build}.conda");
+    let expected = dir.join(&expected_name);
+    if tokio::fs::try_exists(&expected)
         .await
-        .with_context(|| format!("reading rattler-build output dir {}", dir.display()))?;
-    let prefix = format!("{name}-{version}-");
-    while let Some(entry) = read.next_entry().await? {
-        let path = entry.path();
-        let Some(fname) = path.file_name().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        if fname.starts_with(&prefix) && fname.ends_with(".conda") {
-            return Ok(path);
-        }
+        .with_context(|| format!("checking rattler-build artifact {}", expected.display()))?
+    {
+        return Ok(expected);
     }
     bail!(
-        "no .conda artifact found in {} matching {prefix}*.conda",
-        dir.display()
+        "no exact .conda artifact found at {} (expected build `{build}`)",
+        expected.display()
     )
 }
 
@@ -12231,6 +13780,10 @@ mod replay_tests {
             version: version.into(),
             python: python.into(),
             target_subdir: "linux-64".into(),
+            target_contract: None,
+            target_identity: None,
+            target_scope: None,
+            exact_workspace_envelope: false,
             resolution_glibc: None,
             inputs_hash: inputs_hash.into(),
             root_requirements: Vec::new(),
@@ -12880,6 +14433,10 @@ mod replay_tests {
             version: "1.0.0".into(),
             python: "3.11".into(),
             target_subdir: "linux-64".into(),
+            target_contract: None,
+            target_identity: None,
+            target_scope: None,
+            exact_workspace_envelope: false,
             resolution_glibc: None,
             inputs_hash: "hash123".into(),
             root_requirements: vec![],
@@ -12952,6 +14509,10 @@ mod replay_tests {
             version: "1.0.0".into(),
             python: "3.11".into(),
             target_subdir: "linux-64".into(),
+            target_contract: None,
+            target_identity: None,
+            target_scope: None,
+            exact_workspace_envelope: false,
             resolution_glibc: None,
             inputs_hash: "hash456".into(),
             root_requirements: vec![],
@@ -13059,6 +14620,10 @@ mod replay_tests {
             version: "1.0.0".into(),
             python: "3.11".into(),
             target_subdir: "linux-64".into(),
+            target_contract: None,
+            target_identity: None,
+            target_scope: None,
+            exact_workspace_envelope: false,
             resolution_glibc: None,
             inputs_hash: "hash999".into(),
             root_requirements: vec![],
@@ -13264,6 +14829,10 @@ mod replay_tests {
             version: "1.0.0".into(),
             python: "3.11".into(),
             target_subdir: "linux-64".into(),
+            target_contract: None,
+            target_identity: None,
+            target_scope: None,
+            exact_workspace_envelope: false,
             resolution_glibc: None,
             inputs_hash: "live-hash".into(),
             root_requirements: vec![],
@@ -13656,6 +15225,10 @@ mod replay_tests {
             version: wheel_version.into(),
             python: "3.11".into(),
             target_subdir: "linux-64".into(),
+            target_contract: None,
+            target_identity: None,
+            target_scope: None,
+            exact_workspace_envelope: false,
             resolution_glibc: None,
             inputs_hash: "test-hash".into(),
             root_requirements: vec![],
@@ -13837,6 +15410,10 @@ mod replay_tests {
             version: "1.0.0".into(),
             python: "3.11".into(),
             target_subdir: "linux-64".into(),
+            target_contract: None,
+            target_identity: None,
+            target_scope: None,
+            exact_workspace_envelope: false,
             resolution_glibc: None,
             inputs_hash: "live-c2".into(),
             root_requirements: vec![],
@@ -14945,6 +16522,10 @@ include = ["retread_bfs_git_leaf*"]
             version: "1.0.0".into(),
             python: "3.11".into(),
             target_subdir: "linux-64".into(),
+            target_contract: None,
+            target_identity: None,
+            target_scope: None,
+            exact_workspace_envelope: false,
             resolution_glibc: None,
             inputs_hash: "hash-c-test".into(),
             root_requirements: vec![],
@@ -15631,7 +17212,13 @@ version = "1.0.0"
 // -----------------------------------------------------------------
 #[cfg(test)]
 mod courier_build_string_tests {
-    use super::courier_build_string;
+    use super::{
+        advertised_build_matches, assemble_conda_output,
+        build_courier_recipe_with_mode_and_lock_filename, courier_build_string,
+        courier_build_string_for_target,
+    };
+    use crate::pypi::ResolutionTarget;
+    use rattler_conda_types::Platform;
 
     #[test]
     fn build_string_includes_hash_prefix() {
@@ -15673,6 +17260,45 @@ mod courier_build_string_tests {
     }
 
     #[test]
+    fn nonzero_advertised_build_number_reaches_generated_courier_recipe() {
+        let build_number = 7;
+        let inputs_hash = "abcdef0123456789";
+        let output = assemble_conda_output(
+            "mypack",
+            "1.0.0",
+            "3.11",
+            true,
+            false,
+            Vec::new(),
+            std::collections::HashSet::new(),
+            Platform::Linux64,
+            build_number,
+            Some(inputs_hash),
+            false,
+            &[],
+        )
+        .unwrap();
+
+        let recipe = build_courier_recipe_with_mode_and_lock_filename(
+            "mypack",
+            "1.0.0",
+            "3.11",
+            &[],
+            &[],
+            build_number,
+            Some(&output.metadata.build),
+            crate::config::CourierMode::PostLink,
+            "retread-mypack.target-deadbeef.lock.json",
+        );
+
+        assert_eq!(recipe.build.number, output.metadata.build_number);
+        assert_eq!(
+            recipe.build.string.as_deref(),
+            Some(output.metadata.build.as_str())
+        );
+    }
+
+    #[test]
     fn hash_shorter_than_10_chars_does_not_panic() {
         // When the hash is shorter than 10 chars, min(len, 10) keeps all chars.
         let s = courier_build_string("311", "abc", 0, false);
@@ -15695,6 +17321,19 @@ mod courier_build_string_tests {
         let loose = courier_build_string("312", "1234567890abcdef", 2, true);
         assert_ne!(fat, loose);
         assert_eq!(loose, "py312_h1234567890_loose_2");
+    }
+
+    #[test]
+    fn requested_build_must_match_recomputed_current_hash() {
+        let target = ResolutionTarget::for_subdir("3.11", "linux-64");
+        let advertised = courier_build_string_for_target(&target, "aaaaaaaaaa111111", 0, false);
+        let current = courier_build_string_for_target(&target, "bbbbbbbbbb222222", 0, false);
+        assert!(advertised_build_matches(Some(&current), &current));
+        assert!(advertised_build_matches(None, &current));
+        assert!(
+            !advertised_build_matches(Some(&advertised), &current),
+            "build_v1 must fail closed rather than label current inputs with a stale content hash"
+        );
     }
 }
 
@@ -15975,6 +17614,10 @@ mod load_favored_versions_tests {
             version: "1.0.0".into(),
             python: "3.11".into(),
             target_subdir: "linux-64".into(),
+            target_contract: None,
+            target_identity: None,
+            target_scope: None,
+            exact_workspace_envelope: false,
             resolution_glibc: None,
             inputs_hash: "testhash".into(),
             root_requirements: vec![],
@@ -16160,15 +17803,22 @@ mod load_favored_versions_tests {
 mod resolve_bundle_bfs_tests {
     use std::collections::{BTreeMap, HashMap};
     use std::io::Write;
+    use std::process::Command;
     use std::sync::Arc;
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    use super::{PypiToCondaMap, ResolvedWheel, merge_uv_pins_into_prefs, resolve_bundle};
-    use crate::config::{RelaxPolicy, WheelEntry};
+    use super::{
+        BfsOverride, BfsRoutePolicy, PypiToCondaMap, ResolvedWheel, bfs_probe_target_subdir,
+        incremental_bundle_requires_cold_resolve, merge_uv_pins_into_prefs, produce_output,
+        resolve_bundle,
+    };
+    use crate::config::{RelaxPolicy, RetreadConfig, WheelEntry};
+    use crate::handler::audit_report::format_packagespec;
     use crate::index_chain::{IndexPurpose, index_chain};
     use crate::pypi::ResolutionTarget;
-    use crate::relax::NameMap;
+    use crate::relax::{CondaName, CondaTarget, NameMap, PypiKey};
+    use rattler_conda_types::Platform;
 
     fn unique_tmp_dir() -> std::path::PathBuf {
         let base = std::env::temp_dir();
@@ -16323,6 +17973,365 @@ mod resolve_bundle_bfs_tests {
         port
     }
 
+    /// A dependency-free in-tree PEP 517 backend keeps the source/Git BFS
+    /// fixture hermetic: uv invokes only stdlib Python and never downloads a
+    /// build backend from an index.
+    fn write_fixture_project(
+        dir: &std::path::Path,
+        name: &str,
+        version: &str,
+        requires_dist: &[String],
+        provides_extra: Option<&str>,
+    ) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join("pyproject.toml"),
+            "[build-system]\nrequires = []\nbuild-backend = \"fixture_backend\"\nbackend-path = [\".\"]\n",
+        )
+        .unwrap();
+
+        let normalized = name.replace('-', "_");
+        let dist_info = format!("{normalized}-{version}.dist-info");
+        let filename = format!("{normalized}-{version}-py3-none-any.whl");
+        let mut metadata = format!("Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n");
+        if let Some(extra) = provides_extra {
+            metadata.push_str(&format!("Provides-Extra: {extra}\n"));
+        }
+        for requirement in requires_dist {
+            metadata.push_str(&format!("Requires-Dist: {requirement}\n"));
+        }
+        let backend = format!(
+            r#"from pathlib import Path
+from zipfile import ZIP_DEFLATED, ZipFile
+
+FILENAME = {filename}
+DIST_INFO = {dist_info}
+METADATA = {metadata}
+WHEEL = "Wheel-Version: 1.0\nGenerator: retread-fixture\nRoot-Is-Purelib: true\nTag: py3-none-any\n"
+
+def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
+    output = Path(wheel_directory) / FILENAME
+    output.parent.mkdir(parents=True, exist_ok=True)
+    record = f"{{DIST_INFO}}/METADATA,,\n{{DIST_INFO}}/WHEEL,,\n{{DIST_INFO}}/RECORD,,\n"
+    with ZipFile(output, "w", ZIP_DEFLATED) as wheel:
+        wheel.writestr(f"{{DIST_INFO}}/METADATA", METADATA)
+        wheel.writestr(f"{{DIST_INFO}}/WHEEL", WHEEL)
+        wheel.writestr(f"{{DIST_INFO}}/RECORD", record)
+    return FILENAME
+"#,
+            filename = serde_json::to_string(&filename).unwrap(),
+            dist_info = serde_json::to_string(&dist_info).unwrap(),
+            metadata = serde_json::to_string(&metadata).unwrap(),
+        );
+        std::fs::write(dir.join("fixture_backend.py"), backend).unwrap();
+    }
+
+    fn git_commit_all(dir: &std::path::Path) -> String {
+        let run = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output
+        };
+        run(&["init", "-q"]);
+        run(&["add", "."]);
+        run(&[
+            "-c",
+            "user.name=Retread Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "-qm",
+            "fixture",
+        ]);
+        String::from_utf8(run(&["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_string()
+    }
+
+    #[test]
+    fn bfs_route_policy_manual_override_precedence() {
+        let ray = PypiKey::from_pypi("ray");
+        let mapping = || CondaTarget::Mapped(CondaName::new("ray-core"));
+        let empty_parselmouth = PypiToCondaMap::new();
+        let config = || {
+            serde_json::from_value::<RetreadConfig>(serde_json::json!({"retread-wheels": {}}))
+                .unwrap()
+        };
+
+        // The exact Imprint form: the override is keyed by the pending PyPI
+        // name while emission is mapped to the ray-core provider.
+        let mut by_pypi = config();
+        by_pypi.name_map.insert(ray.clone(), mapping());
+        by_pypi
+            .overrides
+            .insert("ray".to_string(), "==2.49.1".to_string());
+        let (target, override_spec) =
+            BfsRoutePolicy::from_config(&by_pypi).target_and_override(&ray, &empty_parselmouth);
+        assert_eq!(target.as_ref().map(CondaName::as_spec), Some("ray-core"));
+        assert_eq!(
+            override_spec,
+            Some(BfsOverride {
+                spec: "==2.49.1",
+                manual: true,
+            })
+        );
+
+        // The provider-key spelling accepted by translate/emission is equally
+        // authoritative at the BFS seam.
+        let mut by_conda_alias = config();
+        by_conda_alias.name_map.insert(ray.clone(), mapping());
+        by_conda_alias
+            .overrides
+            .insert("ray-core".to_string(), "==2.49.1".to_string());
+        let (target, override_spec) = BfsRoutePolicy::from_config(&by_conda_alias)
+            .target_and_override(&ray, &empty_parselmouth);
+        assert_eq!(target.as_ref().map(CondaName::as_spec), Some("ray-core"));
+        assert_eq!(
+            override_spec,
+            Some(BfsOverride {
+                spec: "==2.49.1",
+                manual: true,
+            })
+        );
+
+        // Explicit keep-on-PyPI intent still wins over a contradictory
+        // override, and repair-ledger overrides remain resolver steering rather
+        // than new manual native-conda authority.
+        let mut disabled = config();
+        disabled.name_map.insert(ray.clone(), CondaTarget::Disabled);
+        disabled
+            .overrides
+            .insert("ray".to_string(), "==2.49.1".to_string());
+        assert_eq!(
+            BfsRoutePolicy::from_config(&disabled).target_and_override(&ray, &empty_parselmouth),
+            (None, None)
+        );
+
+        let mut ledgered = by_pypi;
+        ledgered.ledger_overrides.insert("ray".to_string());
+        let (target, override_spec) =
+            BfsRoutePolicy::from_config(&ledgered).target_and_override(&ray, &empty_parselmouth);
+        assert_eq!(target.as_ref().map(CondaName::as_spec), Some("ray-core"));
+        assert_eq!(
+            override_spec,
+            Some(BfsOverride {
+                spec: "==2.49.1",
+                manual: false,
+            })
+        );
+
+        let mut mixed = by_conda_alias;
+        mixed
+            .overrides
+            .insert("ray".to_string(), "==2.48.0".to_string());
+        mixed.ledger_overrides.insert("ray".to_string());
+        let (target, override_spec) =
+            BfsRoutePolicy::from_config(&mixed).target_and_override(&ray, &empty_parselmouth);
+        assert_eq!(target.as_ref().map(CondaName::as_spec), Some("ray-core"));
+        assert_eq!(
+            override_spec,
+            Some(BfsOverride {
+                spec: "==2.48.0",
+                manual: false,
+            }),
+            "the higher-precedence PyPI ledger entry must shadow the manual mapped-provider entry"
+        );
+    }
+
+    #[test]
+    fn bfs_probe_uses_resolution_target_subdir() {
+        let target = ResolutionTarget::for_subdir("3.10", "linux-aarch64");
+        assert_eq!(bfs_probe_target_subdir(&target), "linux-aarch64");
+    }
+
+    /// Regression for the cold all-source-built seam: a source root's extra
+    /// selects a Git child whose ordinary metadata contains ranged Ray and
+    /// `packaging<24`. The explicit overrides must remain native-conda authority
+    /// even when no channel can be consulted; otherwise BFS fetches the index's
+    /// newest Ray wheel (2.56 here, requiring `packaging>=24.2`) before emission
+    /// ever sees the compatible Ray 2.49.1 / packaging 23.0 pair.
+    #[tokio::test]
+    async fn source_extra_git_child_manual_pypi_override_never_fetches_latest_pypi() {
+        let dir = unique_tmp_dir();
+        let download_dir = dir.join("download");
+        let source_dir = dir.join("source");
+        let cache_dir = dir.join("cache");
+        let root_dir = dir.join("root-project");
+        let child_dir = dir.join("git-child");
+        for path in [&download_dir, &source_dir, &cache_dir] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+
+        write_fixture_project(
+            &child_dir,
+            "retread-git-child",
+            "1.0.0",
+            &["ray>=2.40,<3".to_string(), "packaging<24".to_string()],
+            None,
+        );
+        let child_rev = git_commit_all(&child_dir);
+        let child_url = url::Url::from_directory_path(&child_dir).unwrap();
+        write_fixture_project(
+            &root_dir,
+            "retread-source-root",
+            "1.0.0",
+            &[format!(
+                "retread-git-child @ git+{child_url}@{child_rev} ; extra == \"routed\""
+            )],
+            Some("routed"),
+        );
+
+        let ray_249 = make_wheel_bytes("ray", "2.49.1", &[]);
+        let ray_256 = make_wheel_bytes("ray", "2.56.0", &["packaging>=24.2"]);
+        let packaging_23 = make_wheel_bytes("packaging", "23.0", &[]);
+        let packaging_242 = make_wheel_bytes("packaging", "24.2", &[]);
+        let port = spawn_index_server(
+            vec![
+                ("ray".to_string(), "2.49.1".to_string(), ray_249),
+                ("ray".to_string(), "2.56.0".to_string(), ray_256),
+                ("packaging".to_string(), "23.0".to_string(), packaging_23),
+                ("packaging".to_string(), "24.2".to_string(), packaging_242),
+            ],
+            32,
+            true,
+        )
+        .await;
+        let indexes = vec![format!("http://127.0.0.1:{port}/simple/")];
+
+        let entry = WheelEntry {
+            path: Some(root_dir.to_string_lossy().into_owned()),
+            extras: vec!["routed".to_string()],
+            ..Default::default()
+        };
+        let mut config: RetreadConfig =
+            serde_json::from_value(serde_json::json!({"retread-wheels": {}})).unwrap();
+        config.name_map.insert(
+            PypiKey::from_pypi("ray"),
+            CondaTarget::Mapped(CondaName::new("ray-core")),
+        );
+        config
+            .overrides
+            .insert("ray".to_string(), "==2.49.1".to_string());
+        config
+            .overrides
+            .insert("packaging".to_string(), "==23.0".to_string());
+
+        let platform = Platform::current();
+        let target = ResolutionTarget::for_subdir("3.11", platform.as_str());
+        let bundle = resolve_bundle(
+            "retread-source-root",
+            &entry,
+            &target,
+            &download_dir,
+            &source_dir,
+            &cache_dir,
+            RelaxPolicy::None,
+            &BTreeMap::new(),
+            None,
+            &PypiToCondaMap::new(),
+            BfsRoutePolicy::from_config(&config),
+            &[], // deliberate indecisive probe: no channel was consultable
+            &indexes,
+            None,
+            None,
+            &std::collections::HashSet::new(),
+        )
+        .await
+        .expect("the source/Git BFS must honor the manual mapped-provider override");
+
+        assert!(
+            bundle
+                .extras
+                .iter()
+                .any(|wheel| wheel.pypi_name == "retread-git-child"),
+            "the Git child itself must still be materialized"
+        );
+        assert!(
+            bundle
+                .extras
+                .iter()
+                .all(|wheel| wheel.pypi_name != "ray" && wheel.pypi_name != "packaging"),
+            "Ray and packaging must remain conda routes; bundled wheels were {:?}",
+            bundle
+                .extras
+                .iter()
+                .map(|wheel| (&wheel.pypi_name, &wheel.metadata.version))
+                .collect::<Vec<_>>()
+        );
+        let ray_probe = bundle
+            .probe_decisions
+            .iter()
+            .find(|decision| decision.pypi_name == "ray")
+            .expect("the indecisive explicit-override probe must remain auditable");
+        assert_eq!(ray_probe.conda_name, "ray-core");
+        assert_eq!(ray_probe.spec, "==2.49.1");
+        assert_eq!(ray_probe.satisfiable, None);
+        assert_eq!(
+            ray_probe.routing_decision,
+            "short-circuit-explicit-override"
+        );
+        assert!(
+            incremental_bundle_requires_cold_resolve(&bundle),
+            "incremental add must escalate instead of dropping the newly routed ray-core run dep"
+        );
+
+        let output = produce_output(&bundle, &config, platform, "3.11", &[], None, None)
+            .expect("the mapped override must emit a valid exact conda dependency");
+        let ray_core = output
+            .run_dependencies
+            .depends
+            .iter()
+            .find(|dependency| dependency.name == "ray-core")
+            .expect("the manual mapped-provider override must be emitted");
+        assert_eq!(format_packagespec(&ray_core.spec), "==2.49.1");
+        let packaging = output
+            .run_dependencies
+            .depends
+            .iter()
+            .find(|dependency| dependency.name == "packaging")
+            .expect("the manual packaging override must be emitted");
+        assert_eq!(format_packagespec(&packaging.spec), "==23.0");
+        let routed_deps: Vec<(String, String)> = output
+            .run_dependencies
+            .depends
+            .iter()
+            .filter(|dependency| dependency.name != "python" && dependency.name != "uv")
+            .map(|dependency| {
+                (
+                    dependency.name.clone(),
+                    format_packagespec(&dependency.spec),
+                )
+            })
+            .collect();
+        assert_eq!(
+            routed_deps,
+            vec![
+                ("packaging".to_string(), "==23.0".to_string()),
+                ("ray-core".to_string(), "==2.49.1".to_string()),
+            ],
+            "apart from the mandatory Python/Courier runtime, the source/Git closure must emit only the two manual native-conda routes"
+        );
+        assert!(
+            output
+                .run_dependencies
+                .depends
+                .iter()
+                .all(|dependency| dependency.name != "ray"),
+            "the PyPI identity must not leak into conda run dependencies"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// Task A (FIX 3 completion): resolve_bundle-loop-level integration test.
     ///
     /// Drives the FULL BFS loop inside resolve_bundle with two localhost fixture
@@ -16416,7 +18425,7 @@ mod resolve_bundle_bfs_tests {
             &git_sources,
             None, // auto_data
             &pypi_to_conda,
-            &name_map,
+            BfsRoutePolicy::name_map_only(&name_map),
             &conda_channels,
             &workspace_indexes,
             None,                              // cold path: no locked closure
@@ -16565,7 +18574,7 @@ mod resolve_bundle_bfs_tests {
             &git_sources,
             None,
             &pypi_to_conda,
-            &name_map,
+            BfsRoutePolicy::name_map_only(&name_map),
             &conda_channels,
             &[],
             None,
@@ -16764,7 +18773,7 @@ mod resolve_bundle_bfs_tests {
             &BTreeMap::new(),
             None,
             &PypiToCondaMap::new(),
-            &BTreeMap::new(),
+            BfsRoutePolicy::name_map_only(&BTreeMap::new()),
             &[],
             &[],
             None,
@@ -16849,7 +18858,7 @@ mod resolve_bundle_bfs_tests {
             &BTreeMap::new(),
             None,
             &PypiToCondaMap::new(),
-            &BTreeMap::new(),
+            BfsRoutePolicy::name_map_only(&BTreeMap::new()),
             &[],
             &[],
             None,
@@ -16919,7 +18928,7 @@ mod resolve_bundle_bfs_tests {
             &BTreeMap::new(),
             None,
             &PypiToCondaMap::new(),
-            &BTreeMap::new(),
+            BfsRoutePolicy::name_map_only(&BTreeMap::new()),
             &[],
             &[],
             None,
@@ -17044,7 +19053,7 @@ mod resolve_bundle_bfs_tests {
             &git_sources,
             None, // auto_data
             &pypi_to_conda,
-            &name_map,
+            BfsRoutePolicy::name_map_only(&name_map),
             &conda_channels,
             &[],                               // workspace_indexes
             None,                              // cold path: no locked closure
@@ -17185,7 +19194,7 @@ mod resolve_bundle_bfs_tests {
             &git_sources,
             None, // auto_data
             &pypi_to_conda,
-            &name_map,
+            BfsRoutePolicy::name_map_only(&name_map),
             &conda_channels,
             &[],          // workspace_indexes
             None,         // FIXED seam: uv pins must NOT ride locked_closure
@@ -17228,7 +19237,7 @@ mod resolve_bundle_bfs_tests {
             &git_sources,
             None,
             &pypi_to_conda,
-            &name_map,
+            BfsRoutePolicy::name_map_only(&name_map),
             &conda_channels,
             &[],
             Some(&uv_pins), // locked-closure seam: suppresses the walk
@@ -17372,7 +19381,7 @@ mod resolve_bundle_bfs_tests {
             &git_sources,
             None, // auto_data
             &pypi_to_conda,
-            &name_map,
+            BfsRoutePolicy::name_map_only(&name_map),
             &conda_channels,
             &[],                               // workspace_indexes
             None, // no incremental-add locked closure (deps must go through BFS)
@@ -17476,7 +19485,7 @@ mod resolve_bundle_bfs_tests {
             &git_sources,
             None, // auto_data
             &pypi_to_conda,
-            &name_map,
+            BfsRoutePolicy::name_map_only(&name_map),
             &conda_channels,
             &[],                               // workspace_indexes
             None,                              // no incremental-add locked closure
@@ -17540,6 +19549,10 @@ mod incremental_add_tests {
             version: "1.0".into(),
             python: "3.11".into(),
             target_subdir: "linux-64".into(),
+            target_contract: None,
+            target_identity: None,
+            target_scope: None,
+            exact_workspace_envelope: false,
             resolution_glibc: None,
             inputs_hash: inputs_hash.into(),
             root_requirements: vec![],
@@ -17636,6 +19649,10 @@ mod incremental_add_tests {
             version: "1.0".into(),
             python: "3.11".into(),
             target_subdir: "linux-64".into(),
+            target_contract: None,
+            target_identity: None,
+            target_scope: None,
+            exact_workspace_envelope: false,
             resolution_glibc: None,
             inputs_hash: "dummy".into(),
             root_requirements: vec![],
@@ -17718,6 +19735,10 @@ mod incremental_add_tests {
             version: "1.0".into(),
             python: "3.11".into(),
             target_subdir: "linux-64".into(),
+            target_contract: None,
+            target_identity: None,
+            target_scope: None,
+            exact_workspace_envelope: false,
             resolution_glibc: None,
             inputs_hash: inputs_hash.into(),
             root_requirements: vec![],
@@ -18265,6 +20286,10 @@ mod incremental_add_tests {
             version: "1.0".into(),
             python: "3.11".into(),
             target_subdir: "linux-64".into(),
+            target_contract: None,
+            target_identity: None,
+            target_scope: None,
+            exact_workspace_envelope: false,
             resolution_glibc: None,
             inputs_hash: "dummy".into(),
             root_requirements: vec![],

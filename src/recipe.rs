@@ -40,9 +40,9 @@ pub struct Source {
 pub struct Build {
     pub number: u64,
     /// Explicit build string. When set, rattler-build uses this verbatim
-    /// instead of synthesizing one from the variant + build number. Used by
-    /// the courier path to embed the content-addressed `inputs_hash` prefix
-    /// so pixi cache-hits are invalidated whenever content changes.
+    /// instead of synthesizing one from the variant + build number. Courier
+    /// builds embed the content-addressed inputs hash; rich non-courier builds
+    /// embed the complete resolution-target identity.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub string: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -119,6 +119,7 @@ pub fn build_bundle_recipe(
     config: &RetreadConfig,
     workspace_python_version: &str,
     run_override: Option<&[String]>,
+    build_string: Option<&str>,
     payload: bool,
 ) -> anyhow::Result<Recipe> {
     let primary = sources
@@ -218,9 +219,12 @@ pub fn build_bundle_recipe(
         source: recipe_sources,
         build: Build {
             number: config.build_number,
-            // Non-courier path: no content-addressed string; rattler-build
-            // synthesizes the standard `py{XY}_{build_number}` string.
-            string: None,
+            // conda/outputs owns the advertised build identity. Thread that
+            // exact, already-validated string into rattler-build so the
+            // artifact metadata and filename match the build_v1 response.
+            // `None` retains the legacy synthesized-string behavior for
+            // callers that do not advertise a dynamic build identity.
+            string: build_string.map(str::to_owned),
             noarch,
             // Vendor wheels (Omniverse, manylinux) ship pre-baked rpaths;
             // rattler-build's default relocation pass either overflows the
@@ -318,6 +322,7 @@ pub fn build_courier_recipe_with_mode(
         python_version,
         run_deps,
         source_urls,
+        0,
         expected_build,
         courier_mode,
         &lock_filename,
@@ -334,6 +339,7 @@ pub(crate) fn build_courier_recipe_with_mode_and_lock_filename(
     python_version: &str,
     run_deps: &[String],
     source_urls: &[String],
+    build_number: u64,
     expected_build: Option<&str>,
     courier_mode: crate::config::CourierMode,
     lock_filename: &str,
@@ -476,7 +482,7 @@ pub(crate) fn build_courier_recipe_with_mode_and_lock_filename(
         },
         source,
         build: Build {
-            number: 0,
+            number: build_number,
             // Content-addressed string: embed so the on-disk artifact name
             // matches what conda/outputs advertised to pixi (prevents stale
             // cache hits when content changes but metadata stays the same).
@@ -669,16 +675,19 @@ mod courier_tests {
     #[test]
     fn exact_target_recipe_uses_supplied_lock_basename_everywhere() {
         let exact = "retread-isaac-pack.target-deadbeef.lock.json";
+        let build_number = 7;
         let recipe = build_courier_recipe_with_mode_and_lock_filename(
             "isaac-pack",
             "5.1.0",
             "3.11",
             &[],
             &[format!("file:///x/{exact}")],
+            build_number,
             None,
             crate::config::CourierMode::PostLink,
             exact,
         );
+        assert_eq!(recipe.build.number, build_number);
         assert!(recipe.build.script.contains(exact));
         assert!(!recipe.build.script.contains("retread-isaac-pack.lock.json"));
     }
@@ -1242,6 +1251,7 @@ mod tests {
             &cfg(),
             "3.11",
             None,
+            None,
             true,
         )
         .unwrap();
@@ -1283,12 +1293,53 @@ mod tests {
         let url = "https://example.com/pure-0.1.0-py3-none-any.whl"
             .parse()
             .unwrap();
-        let r = build_bundle_recipe("pure", &one_source(&meta, &url), &cfg(), "3.11", None, true)
-            .unwrap();
+        let r = build_bundle_recipe(
+            "pure",
+            &one_source(&meta, &url),
+            &cfg(),
+            "3.11",
+            None,
+            None,
+            true,
+        )
+        .unwrap();
         assert_eq!(r.build.noarch.as_deref(), Some("python"));
+        assert!(r.build.string.is_none(), "legacy callers keep synthesis");
         // noarch bundles have nothing to relocate -- don't emit the field
         // (and don't risk poisoning future rattler-build default changes).
         assert!(r.build.dynamic_linking.is_none());
+    }
+
+    #[test]
+    fn advertised_build_string_is_written_into_recipe() {
+        let meta = WheelMetadata {
+            name: "pure".into(),
+            version: "0.1.0".into(),
+            requires_dist: vec![],
+            is_pure_python: true,
+            sha256: "abc".into(),
+            filename: "pure-0.1.0-py3-none-any.whl".into(),
+        };
+        let url = "https://example.com/pure-0.1.0-py3-none-any.whl"
+            .parse()
+            .unwrap();
+        let expected = "py311_h0123456789_0";
+        let recipe = build_bundle_recipe(
+            "pure",
+            &one_source(&meta, &url),
+            &cfg(),
+            "3.11",
+            None,
+            Some(expected),
+            true,
+        )
+        .unwrap();
+        assert_eq!(recipe.build.string.as_deref(), Some(expected));
+        let yaml = to_yaml(&recipe).unwrap();
+        assert!(
+            yaml.contains(&format!("string: {expected}")),
+            "yaml:\n{yaml}"
+        );
     }
 
     #[test]
@@ -1327,7 +1378,8 @@ mod tests {
                 metadata: &kernel,
             },
         ];
-        let r = build_bundle_recipe("isaacsim", &sources, &cfg(), "3.11", None, true).unwrap();
+        let r =
+            build_bundle_recipe("isaacsim", &sources, &cfg(), "3.11", None, None, true).unwrap();
         let yaml = to_yaml(&r).unwrap();
 
         assert_eq!(r.source.len(), 2, "two sources in the recipe");
@@ -1377,6 +1429,7 @@ mod tests {
             &cfg(),
             "3.11",
             Some(&over),
+            None,
             true,
         )
         .unwrap();

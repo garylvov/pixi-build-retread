@@ -421,13 +421,20 @@ fn validate_install_lock(lock_path: &Path, lock: &RetreadLock) -> Result<()> {
 fn lock_basename_matches_target(
     lock_path: &Path,
     bundle: &str,
+    stored_target_identity: Option<&str>,
     target: &crate::pypi::ResolutionTarget,
 ) -> bool {
     let Some(lock_basename) = lock_path.file_name().and_then(|name| name.to_str()) else {
         return false;
     };
-    lock_basename == RetreadLock::file_name_for_target(bundle, target)
-        || (target.conda_subdir() == "linux-64" && lock_basename == RetreadLock::file_name(bundle))
+    let qualified = stored_target_identity.map_or_else(
+        || RetreadLock::file_name_for_target(bundle, target),
+        |identity| RetreadLock::file_name_for_target_identity(bundle, identity),
+    );
+    lock_basename == qualified
+        || (stored_target_identity.is_none()
+            && target.conda_subdir() == "linux-64"
+            && lock_basename == RetreadLock::file_name(bundle))
 }
 
 fn read_validated_lock(lock_path: &Path) -> Result<(Vec<u8>, RetreadLock)> {
@@ -445,7 +452,12 @@ fn read_validated_lock(lock_path: &Path) -> Result<(Vec<u8>, RetreadLock)> {
     })?;
     validate_install_lock(lock_path, &lock)?;
     let target = lock.resolution_target()?;
-    if !lock_basename_matches_target(lock_path, &lock.bundle, &target) {
+    if !lock_basename_matches_target(
+        lock_path,
+        &lock.bundle,
+        lock.target_identity.as_deref(),
+        &target,
+    ) {
         bail!(
             "retread install: lock {} does not match its recorded bundle `{}` and target; rebuild the courier pack",
             lock_path.display(),
@@ -1681,6 +1693,10 @@ mod tests {
             version: "1.0.0".into(),
             python: "3.11".into(),
             target_subdir: "linux-64".into(),
+            target_contract: None,
+            target_identity: None,
+            target_scope: None,
+            exact_workspace_envelope: false,
             inputs_hash: "abc".into(),
             root_requirements: vec!["mypackage==1.0.0".into()],
             wheels: vec![lock_wheel("mypackage", "1.0.0")],
@@ -2097,20 +2113,96 @@ mod tests {
     }
 
     #[test]
+    fn read_validated_lock_reconstructs_exact_scoped_target() {
+        let root = tempdir("scoped-target-lock");
+        let subdir = crate::glibc::current_pixi_platform();
+        let declared_virtual_packages = subdir
+            .starts_with("linux-")
+            .then(|| BTreeMap::from([("glibc".to_string(), "2.28".to_string())]))
+            .unwrap_or_default();
+        let contract = crate::workspace::WorkspaceTargetContract {
+            subdir: subdir.to_string(),
+            declared_virtual_packages,
+            detected_virtual_packages: BTreeMap::new(),
+        };
+        let scope = crate::workspace::ResolvedWorkspaceTarget {
+            contract: contract.clone(),
+            profiles: vec!["native-profile".to_string()],
+            environments: vec!["native-env".to_string()],
+        };
+        let target = crate::pypi::ResolutionTarget::try_for_contract_on_subdir(
+            "3.11",
+            subdir,
+            contract.clone(),
+        )
+        .unwrap()
+        .with_exact_workspace_scope(scope.clone())
+        .unwrap();
+        let mut lock = make_native_lock(vec![], vec![], BTreeMap::new());
+        lock.target_contract = Some(contract);
+        lock.target_identity = Some(target.resolution_identity());
+        lock.target_scope = Some(scope);
+        lock.exact_workspace_envelope = true;
+        lock.declared_glibc = target.declared_glibc().map(crate::glibc::format_glibc);
+        lock.resolution_glibc = target.effective_glibc().map(crate::glibc::format_glibc);
+        let lock_path = root.join(RetreadLock::file_name_for_target(&lock.bundle, &target));
+        std::fs::write(&lock_path, lock.to_pretty_json().unwrap()).unwrap();
+
+        let (_, decoded) = read_validated_lock(&lock_path).unwrap();
+        let decoded_target = decoded.resolution_target().unwrap();
+        assert_eq!(
+            decoded_target.resolution_identity(),
+            target.resolution_identity()
+        );
+        assert_eq!(decoded.target_scope.as_ref(), target.workspace_scope());
+        assert!(decoded_target.has_exact_workspace_envelope());
+
+        lock.exact_workspace_envelope = false;
+        std::fs::write(&lock_path, lock.to_pretty_json().unwrap()).unwrap();
+        assert!(
+            read_validated_lock(&lock_path).is_err(),
+            "an exact identity must not replay when its persisted envelope provenance is removed",
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn legacy_lock_basename_is_linux_64_only() {
         let mut lock = make_lock(vec![], vec![], BTreeMap::new());
         let legacy = Path::new("retread-demo.lock.json");
         let linux = lock.resolution_target().unwrap();
-        assert!(lock_basename_matches_target(legacy, "demo", &linux));
+        assert!(lock_basename_matches_target(legacy, "demo", None, &linux));
 
         lock.target_subdir = "linux-aarch64".into();
         let arm = lock.resolution_target().unwrap();
-        assert!(!lock_basename_matches_target(legacy, "demo", &arm));
+        assert!(!lock_basename_matches_target(legacy, "demo", None, &arm));
         let qualified = RetreadLock::file_name_for_target("demo", &arm);
         assert!(lock_basename_matches_target(
             Path::new(&qualified),
             "demo",
+            None,
             &arm,
+        ));
+    }
+
+    #[test]
+    fn scoped_lock_basename_uses_persisted_exact_target_identity() {
+        let lock = make_native_lock(vec![], vec![], BTreeMap::new());
+        let target = lock.resolution_target().unwrap();
+        let scoped_identity = "ab".repeat(32);
+        let qualified = RetreadLock::file_name_for_target_identity("demo", &scoped_identity);
+
+        assert!(lock_basename_matches_target(
+            Path::new(&qualified),
+            "demo",
+            Some(&scoped_identity),
+            &target,
+        ));
+        assert!(!lock_basename_matches_target(
+            Path::new(&RetreadLock::file_name_for_target("demo", &target)),
+            "demo",
+            Some(&scoped_identity),
+            &target,
         ));
     }
 

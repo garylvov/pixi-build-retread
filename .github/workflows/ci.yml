@@ -42,6 +42,12 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1a3a6d54512beeaffd394f8d516ca16f2c506a20 # 1.97.0
 
+      - name: Install uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          version: '0.9.5'
+          enable-cache: false
+
       # Cache the cargo registry, git deps (pixi/uv/pubgrub), and the build
       # so build+test don't recompile ~200 crates from scratch every run.
       - name: Cache cargo
@@ -50,8 +56,8 @@ jobs:
       - name: Build
         run: cargo build --locked --all-targets
 
-      # Known-flaky / host-dependent tests are excluded from the parallel run
-      # rather than serializing the whole suite with --test-threads=1:
+      # Tests that mutate process-global environment and cache state must run
+      # serially. Known host-dependent tests remain excluded:
       #   - materialize_index_wheel_fetches_locked_url_and_verifies_hash:
       #     sha-addressed-cache env race (cache-dir env vars are
       #     process-global; parallel tests stomp each other's cache dir).
@@ -63,6 +69,7 @@ jobs:
       - name: Test (fast suite, flaky tests excluded)
         run: >
           cargo test --locked --all-targets --
+          --test-threads=1
           --skip materialize_index_wheel_fetches_locked_url_and_verifies_hash
           --skip initialize_preflight_repairs_dangling_pixi_bld_symlink_target
           --skip incremental_add
@@ -188,7 +195,7 @@ jobs:
           fi
           changed="$(git diff --name-only "$base" HEAD)"
           # Files whose change can alter retread's emitted bytes for identical inputs.
-          emit_re='^src/(relax|wheel|wheel_rewrite|wheel_inject|wheel_inject_data|emit_pypi|recipe|courier|installer|lock)\.rs$|^src/handler/(auto_bundle|cascade)\.rs$'
+          emit_re='^src/(relax|wheel|wheel_rewrite|wheel_inject|wheel_inject_data|emit_pypi|recipe|courier|installer|lock)\.rs$|^src/handler/(mod|auto_bundle|cascade)\.rs$'
           if ! echo "$changed" | grep -Eq "$emit_re"; then
             echo "no emit-affecting files changed; OK."; exit 0
           fi

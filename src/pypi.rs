@@ -15,6 +15,10 @@ use std::sync::OnceLock;
 use std::time::Duration;
 use uv_pep508::uv_pep440::{self, Version, VersionSpecifiers};
 
+use crate::workspace::{
+    ResolvedWorkspaceTarget, WorkspaceTargetContract, pixi_detects_declared_virtual_package,
+};
+
 /// A strictly parsed CPython minor used in every build/resolution cache key.
 ///
 /// Accepted spellings are `MAJOR.MINOR` and `MAJOR.MINOR.PATCH`, with every
@@ -139,13 +143,15 @@ pub struct WheelTarget {
     /// wheel is compatible only when `(X, Y) <= max_glibc`. Resolved
     /// from the workspace-declared glibc (`[system-requirements]
     /// libc = "X.Y"` pre-0.71, or the exact requested entry in the 0.71+
-    /// rich `platforms` form). Native linux-64 retains the established
-    /// `max(declared, host)` behavior; other targets use the exact declaration
-    /// and only fall back to host glibc when native. Host capabilities cannot
-    /// leak into a foreign resolution. For source compatibility, `None`
-    /// retains the historical unbounded linux-64 scorer behavior; an
-    /// undeclared linux-aarch64 target fails closed for Linux-specific wheels.
-    /// Universal `none-any` wheels remain usable on either target.
+    /// rich `platforms` form). An exact workspace contract uses its effective
+    /// glibc verbatim. Legacy native linux-64 resolution retains the
+    /// established `max(declared, host)` behavior; other legacy targets use
+    /// the exact declaration and only fall back to host glibc when native.
+    /// Host capabilities cannot leak into a foreign or exact resolution. For
+    /// source compatibility, `None` retains the historical unbounded
+    /// linux-64 scorer behavior; an undeclared linux-aarch64 target fails
+    /// closed for Linux-specific wheels. Universal `none-any` wheels remain
+    /// usable on either target.
     pub max_glibc: Option<(u32, u32)>,
 }
 
@@ -162,7 +168,14 @@ impl WheelTarget {
     /// share an artifact cache only when their effective compatibility
     /// contracts are identical.
     pub(crate) fn artifact_cache_identity(&self) -> String {
-        target_identity(b"retread-wheel-artifact-target-v2\0", self, None)
+        target_identity(
+            b"retread-wheel-artifact-target-v2\0",
+            self,
+            None,
+            None,
+            None,
+            false,
+        )
     }
 }
 
@@ -174,7 +187,21 @@ impl WheelTarget {
 #[derive(Debug, Clone)]
 pub(crate) struct ResolutionTarget {
     wheel_target: WheelTarget,
+    // Legacy-named compatibility floor. Exact workspace contracts populate it
+    // from Pixi-detected virtual packages first, then explicit declarations.
     declared_glibc: Option<(u32, u32)>,
+    target_contract: Option<WorkspaceTargetContract>,
+    // Exact consumer provenance scopes workspace dependency/channel discovery
+    // and therefore participates in resolution, artifact, build, and sidecar
+    // identity. Two environments may share a virtual-package contract while
+    // contributing different final dependency overlays.
+    workspace_scope: Option<ResolvedWorkspaceTarget>,
+    // True only when the scope came from a validated out-of-band workspace
+    // target envelope. Direct inference can produce the same contract and
+    // singleton scope, so neither shape nor detected-VP presence is valid
+    // provenance. This flag controls operations where an envelope authorizes
+    // the same environment/profile pair for co-activated sibling sources.
+    exact_workspace_envelope: bool,
 }
 
 impl ResolutionTarget {
@@ -200,12 +227,70 @@ impl ResolutionTarget {
         conda_subdir: &str,
         declared_glibc: Option<(u32, u32)>,
     ) -> Result<Self> {
+        Self::try_from_parts_and_contract(python_version, conda_subdir, declared_glibc, None)
+    }
+
+    /// Construct a target from a complete workspace platform contract.
+    ///
+    /// The contract owns the effective glibc floor (Pixi-detected first,
+    /// explicitly declared fallback). Keeping that value and the conda subdir
+    /// consistent with the scorer target prevents a malformed out-of-band
+    /// envelope or lock from acquiring a valid cache identity.
+    pub(crate) fn try_for_contract(
+        python_version: &str,
+        contract: WorkspaceTargetContract,
+    ) -> Result<Self> {
+        let conda_subdir = contract.subdir.clone();
+        Self::try_for_contract_on_subdir(python_version, &conda_subdir, contract)
+    }
+
+    /// Construct an exact workspace target while checking it against the
+    /// subdir supplied by the Pixi RPC call.
+    pub(crate) fn try_for_contract_on_subdir(
+        python_version: &str,
+        conda_subdir: &str,
+        contract: WorkspaceTargetContract,
+    ) -> Result<Self> {
+        let declared_glibc = validated_contract_effective_glibc(&contract)?;
+        Self::try_from_parts_and_contract(
+            python_version,
+            conda_subdir,
+            declared_glibc,
+            Some(contract),
+        )
+    }
+
+    /// Construct a target from separately supplied compatibility metadata and
+    /// a complete workspace contract, validating that they describe the same
+    /// deployment target.
+    pub(crate) fn try_from_parts_with_contract(
+        python_version: &str,
+        conda_subdir: &str,
+        declared_glibc: Option<(u32, u32)>,
+        contract: WorkspaceTargetContract,
+    ) -> Result<Self> {
+        Self::try_from_parts_and_contract(
+            python_version,
+            conda_subdir,
+            declared_glibc,
+            Some(contract),
+        )
+    }
+
+    fn try_from_parts_and_contract(
+        python_version: &str,
+        conda_subdir: &str,
+        declared_glibc: Option<(u32, u32)>,
+        target_contract: Option<WorkspaceTargetContract>,
+    ) -> Result<Self> {
         let python_version = normalized_python_minor(python_version)?.version();
-        let max_glibc = crate::glibc::target_glibc_ceiling(
+        validate_target_contract(target_contract.as_ref(), conda_subdir, declared_glibc)?;
+        let max_glibc = resolution_glibc_ceiling(
             conda_subdir,
             crate::glibc::current_pixi_platform(),
             declared_glibc,
             crate::glibc::host_glibc(),
+            target_contract.is_some(),
         );
         Ok(Self {
             wheel_target: WheelTarget {
@@ -214,6 +299,9 @@ impl ResolutionTarget {
                 max_glibc,
             },
             declared_glibc,
+            target_contract,
+            workspace_scope: None,
+            exact_workspace_envelope: false,
         })
     }
 
@@ -230,16 +318,46 @@ impl ResolutionTarget {
     /// state. This is useful for deterministic tests and callers that already
     /// resolved their deployment contract.
     pub(crate) fn from_wheel_target(
-        mut wheel_target: WheelTarget,
+        wheel_target: WheelTarget,
         declared_glibc: Option<(u32, u32)>,
     ) -> Self {
+        Self::try_from_wheel_target_with_contract(wheel_target, declared_glibc, None)
+            .expect("ResolutionTarget::from_wheel_target requires a valid target contract")
+    }
+
+    /// Wrap a scorer target and an optional complete workspace contract
+    /// without re-reading mutable workspace or host state.
+    pub(crate) fn try_from_wheel_target_with_contract(
+        mut wheel_target: WheelTarget,
+        declared_glibc: Option<(u32, u32)>,
+        target_contract: Option<WorkspaceTargetContract>,
+    ) -> Result<Self> {
         wheel_target.python_version = normalized_python_minor(&wheel_target.python_version)
-            .expect("ResolutionTarget::from_wheel_target requires numeric MAJOR.MINOR[.PATCH]")
+            .context("invalid Python in resolution target")?
             .version();
-        Self {
+        validate_target_contract(
+            target_contract.as_ref(),
+            &wheel_target.conda_subdir,
+            declared_glibc,
+        )?;
+        if target_contract.is_some() {
+            let exact_glibc =
+                exact_contract_glibc_ceiling(&wheel_target.conda_subdir, declared_glibc);
+            if wheel_target.max_glibc != exact_glibc {
+                bail!(
+                    "workspace target contract glibc {:?} does not match scorer ceiling {:?}",
+                    exact_glibc,
+                    wheel_target.max_glibc,
+                );
+            }
+        }
+        Ok(Self {
             wheel_target,
             declared_glibc,
-        }
+            target_contract,
+            workspace_scope: None,
+            exact_workspace_envelope: false,
+        })
     }
 
     pub(crate) fn wheel_target(&self) -> &WheelTarget {
@@ -266,13 +384,64 @@ impl ResolutionTarget {
         self.wheel_target.max_glibc
     }
 
+    pub(crate) fn target_contract(&self) -> Option<&WorkspaceTargetContract> {
+        self.target_contract.as_ref()
+    }
+
+    /// Attach the exact workspace consumer provenance that selected this
+    /// semantic contract. It prevents downstream workspace queries from
+    /// re-broadening an exact environment/profile envelope to unrelated
+    /// aliases and partitions every content-bearing target identity.
+    pub(crate) fn with_workspace_scope(
+        mut self,
+        mut workspace_scope: ResolvedWorkspaceTarget,
+    ) -> Result<Self> {
+        if self.target_contract.as_ref() != Some(&workspace_scope.contract) {
+            bail!("workspace target scope does not match resolution target contract");
+        }
+        if workspace_scope.profiles.is_empty() || workspace_scope.environments.is_empty() {
+            bail!("workspace target scope must name at least one profile and environment");
+        }
+        workspace_scope.profiles.sort();
+        workspace_scope.profiles.dedup();
+        workspace_scope.environments.sort();
+        workspace_scope.environments.dedup();
+        self.workspace_scope = Some(workspace_scope);
+        // Attaching an ordinary inferred scope must revoke any envelope
+        // authority carried by a cloned target. The exact setter below calls
+        // this method first, then explicitly restores the authority bit.
+        self.exact_workspace_envelope = false;
+        Ok(self)
+    }
+
+    pub(crate) fn workspace_scope(&self) -> Option<&ResolvedWorkspaceTarget> {
+        self.workspace_scope.as_ref()
+    }
+
+    /// Attach consumer scope with authoritative exact-envelope provenance.
+    /// This is intentionally separate from [`Self::with_workspace_scope`]: a
+    /// directly inferred target may have an identical singleton scope but may
+    /// not reuse that scope for another source package.
+    pub(crate) fn with_exact_workspace_scope(
+        self,
+        workspace_scope: ResolvedWorkspaceTarget,
+    ) -> Result<Self> {
+        let mut target = self.with_workspace_scope(workspace_scope)?;
+        target.exact_workspace_envelope = true;
+        Ok(target)
+    }
+
+    pub(crate) fn has_exact_workspace_envelope(&self) -> bool {
+        self.exact_workspace_envelope
+    }
+
     /// Whether this process may execute a source build for the target. A
     /// noarch artifact is intentionally buildable on every host; platform
-    /// artifacts require an exact host-subdir match. Native aarch64 also
-    /// refuses a build when the host glibc is newer than an explicit
-    /// deployment ceiling: a generic `linux_aarch64` wheel can contain ELF
+    /// artifacts require an exact host-subdir match. Exact Linux contracts and
+    /// native aarch64 also refuse a build when the host glibc is newer than an
+    /// explicit deployment ceiling: a generic Linux wheel can contain ELF
     /// symbols from the host and must not be cached as compatible with the
-    /// older target. Native linux-64 retains its established effective-ceiling
+    /// older target. Unqualified native linux-64 retains its established
     /// behavior for compatibility.
     pub(crate) fn is_native_build_target(&self) -> bool {
         native_source_build_compatible(
@@ -280,13 +449,22 @@ impl ResolutionTarget {
             crate::glibc::current_pixi_platform(),
             self.declared_glibc,
             crate::glibc::host_glibc(),
+            self.target_contract.is_some(),
         )
     }
 
-    /// Full SHA-256 namespace for artifact compatibility. Two declarations
-    /// that produce the same effective target can safely share artifacts.
+    /// Full SHA-256 namespace for artifact compatibility. Rich targets share
+    /// artifacts only when their complete canonical workspace contracts and
+    /// scorer targets are identical.
     pub(crate) fn artifact_cache_identity(&self) -> String {
-        self.wheel_target.artifact_cache_identity()
+        target_identity(
+            b"retread-wheel-artifact-target-v5\0",
+            &self.wheel_target,
+            None,
+            self.target_contract.as_ref(),
+            self.workspace_scope.as_ref(),
+            self.exact_workspace_envelope,
+        )
     }
 
     /// Full SHA-256 identity for resolution and replay decisions. This also
@@ -294,11 +472,121 @@ impl ResolutionTarget {
     /// from an equal host-derived compatibility ceiling.
     pub(crate) fn resolution_identity(&self) -> String {
         target_identity(
-            b"retread-wheel-resolution-target-v2\0",
+            b"retread-wheel-resolution-target-v5\0",
             &self.wheel_target,
             Some(self.declared_glibc),
+            self.target_contract.as_ref(),
+            self.workspace_scope.as_ref(),
+            self.exact_workspace_envelope,
         )
     }
+
+    /// Scope-independent compatibility identity used to validate the target
+    /// fields stored inside a lock. The qualified lock path and inputs hash
+    /// carry the exact consumer scope; the lock's compatibility fields retain
+    /// the complete virtual-package contract but intentionally do not repeat
+    /// environment/profile names.
+    pub(crate) fn compatibility_identity(&self) -> String {
+        target_identity(
+            b"retread-wheel-resolution-target-v5\0",
+            &self.wheel_target,
+            Some(self.declared_glibc),
+            self.target_contract.as_ref(),
+            None,
+            self.exact_workspace_envelope,
+        )
+    }
+}
+
+fn validated_contract_effective_glibc(
+    contract: &WorkspaceTargetContract,
+) -> Result<Option<(u32, u32)>> {
+    let parse = |kind: &str, value: Option<&String>| -> Result<Option<(u32, u32)>> {
+        let Some(value) = value else {
+            return Ok(None);
+        };
+        crate::glibc::parse_glibc_version(value)
+            .map(Some)
+            .ok_or_else(|| anyhow!("invalid {kind} glibc `{value}` in workspace target contract"))
+    };
+    let declared = parse("declared", contract.declared_virtual_packages.get("glibc"))?;
+    let detected = parse("detected", contract.detected_virtual_packages.get("glibc"))?;
+    Ok(detected.or(declared))
+}
+
+fn validate_target_contract(
+    contract: Option<&WorkspaceTargetContract>,
+    conda_subdir: &str,
+    declared_glibc: Option<(u32, u32)>,
+) -> Result<()> {
+    let Some(contract) = contract else {
+        return Ok(());
+    };
+    if contract.subdir != conda_subdir {
+        bail!(
+            "workspace target contract subdir `{}` does not match resolution subdir `{conda_subdir}`",
+            contract.subdir
+        );
+    }
+    if !contract.detected_virtual_packages.is_empty() {
+        for (name, declared) in &contract.declared_virtual_packages {
+            if !pixi_detects_declared_virtual_package(name) {
+                continue;
+            }
+            let preserved = contract
+                .detected_virtual_packages
+                .get(name)
+                .is_some_and(|detected| {
+                    detected == declared
+                        || (name == "archspec" && detected.ends_with(&format!("={declared}")))
+                });
+            if !preserved {
+                bail!(
+                    "workspace target contract detected virtual packages do not preserve declared `{name}={declared}`"
+                );
+            }
+        }
+    }
+    let contract_glibc = validated_contract_effective_glibc(contract)?;
+    if contract_glibc != declared_glibc {
+        bail!(
+            "workspace target contract glibc {:?} does not match resolution declaration {:?}",
+            contract_glibc,
+            declared_glibc
+        );
+    }
+    if conda_subdir.starts_with("linux-") && contract_glibc.is_none() {
+        bail!(
+            "workspace target contract for `{conda_subdir}` has no effective glibc; declare glibc explicitly or use an exact target envelope with Pixi-detected virtual packages"
+        );
+    }
+    Ok(())
+}
+
+/// Resolve the wheel compatibility ceiling without allowing build-host facts
+/// to widen an exact workspace contract. The legacy branch deliberately keeps
+/// [`crate::glibc::target_glibc_ceiling`] semantics for unqualified calls.
+fn resolution_glibc_ceiling(
+    target_subdir: &str,
+    native_subdir: &str,
+    declared_glibc: Option<(u32, u32)>,
+    host_glibc: Option<(u32, u32)>,
+    contract_qualified: bool,
+) -> Option<(u32, u32)> {
+    if contract_qualified {
+        return exact_contract_glibc_ceiling(target_subdir, declared_glibc);
+    }
+    crate::glibc::target_glibc_ceiling(target_subdir, native_subdir, declared_glibc, host_glibc)
+}
+
+fn exact_contract_glibc_ceiling(
+    target_subdir: &str,
+    effective_glibc: Option<(u32, u32)>,
+) -> Option<(u32, u32)> {
+    target_subdir
+        .starts_with("linux-")
+        .then_some(effective_glibc)
+        .flatten()
 }
 
 fn native_source_build_compatible(
@@ -306,12 +594,19 @@ fn native_source_build_compatible(
     host_subdir: &str,
     declared_glibc: Option<(u32, u32)>,
     host_glibc: Option<(u32, u32)>,
+    contract_qualified: bool,
 ) -> bool {
     if target_subdir == "noarch" {
         return true;
     }
     if target_subdir != host_subdir {
         return false;
+    }
+    if contract_qualified && target_subdir.starts_with("linux-") {
+        let (Some(host), Some(target)) = (host_glibc, declared_glibc) else {
+            return false;
+        };
+        return host <= target;
     }
     if target_subdir == "linux-aarch64" {
         let Some(host) = host_glibc else {
@@ -334,6 +629,9 @@ fn target_identity(
     domain: &[u8],
     target: &WheelTarget,
     declared_glibc: Option<Option<(u32, u32)>>,
+    target_contract: Option<&WorkspaceTargetContract>,
+    workspace_scope: Option<&ResolvedWorkspaceTarget>,
+    exact_workspace_envelope: bool,
 ) -> String {
     fn field(hasher: &mut Sha256, value: &[u8]) {
         hasher.update((value.len() as u64).to_be_bytes());
@@ -351,6 +649,43 @@ fn target_identity(
         }
     }
 
+    fn string_map(hasher: &mut Sha256, values: &std::collections::BTreeMap<String, String>) {
+        hasher.update((values.len() as u64).to_be_bytes());
+        for (key, value) in values {
+            field(hasher, key.as_bytes());
+            field(hasher, value.as_bytes());
+        }
+    }
+
+    fn workspace_contract(hasher: &mut Sha256, contract: Option<&WorkspaceTargetContract>) {
+        let Some(contract) = contract else {
+            hasher.update([0]);
+            return;
+        };
+        hasher.update([1]);
+        field(hasher, contract.subdir.as_bytes());
+        string_map(hasher, &contract.declared_virtual_packages);
+        string_map(hasher, &contract.detected_virtual_packages);
+    }
+
+    fn string_set(hasher: &mut Sha256, values: &[String]) {
+        let values: std::collections::BTreeSet<&str> = values.iter().map(String::as_str).collect();
+        hasher.update((values.len() as u64).to_be_bytes());
+        for value in values {
+            field(hasher, value.as_bytes());
+        }
+    }
+
+    fn consumer_scope(hasher: &mut Sha256, scope: Option<&ResolvedWorkspaceTarget>) {
+        let Some(scope) = scope else {
+            hasher.update([0]);
+            return;
+        };
+        hasher.update([1]);
+        string_set(hasher, &scope.profiles);
+        string_set(hasher, &scope.environments);
+    }
+
     let mut hasher = Sha256::new();
     hasher.update(domain);
     let normalized_python = normalized_python_minor(&target.python_version)
@@ -362,6 +697,9 @@ fn target_identity(
     if let Some(declared_glibc) = declared_glibc {
         glibc(&mut hasher, declared_glibc);
     }
+    workspace_contract(&mut hasher, target_contract);
+    consumer_scope(&mut hasher, workspace_scope);
+    hasher.update([u8::from(exact_workspace_envelope)]);
     format!("{:x}", hasher.finalize())
 }
 
@@ -1322,6 +1660,27 @@ mod tests {
         )
     }
 
+    fn linux_64_contract(glibc: Option<&str>) -> WorkspaceTargetContract {
+        let mut declared_virtual_packages = std::collections::BTreeMap::new();
+        if let Some(glibc) = glibc {
+            declared_virtual_packages.insert("glibc".to_string(), glibc.to_string());
+        }
+        let mut detected_virtual_packages = std::collections::BTreeMap::from([
+            ("archspec".to_string(), "1=x86_64".to_string()),
+            ("glibc".to_string(), "2.28".to_string()),
+            ("linux".to_string(), "4.18".to_string()),
+            ("unix".to_string(), String::new()),
+        ]);
+        if let Some(glibc) = glibc {
+            detected_virtual_packages.insert("glibc".to_string(), glibc.to_string());
+        }
+        WorkspaceTargetContract {
+            subdir: "linux-64".to_string(),
+            declared_virtual_packages,
+            detected_virtual_packages,
+        }
+    }
+
     #[test]
     fn target_identities_cover_artifact_and_resolution_contracts() {
         let declared =
@@ -1375,6 +1734,294 @@ mod tests {
     }
 
     #[test]
+    fn rich_workspace_contracts_partition_artifact_and_resolution_identity() {
+        let p1 = ResolutionTarget::try_for_contract("3.11", linux_64_contract(None)).unwrap();
+        let p1_alias =
+            ResolutionTarget::try_for_contract("3.11.0", linux_64_contract(None)).unwrap();
+        let p3 =
+            ResolutionTarget::try_for_contract("3.11", linux_64_contract(Some("2.35"))).unwrap();
+
+        assert_eq!(p1.target_contract(), p1_alias.target_contract());
+        assert_eq!(
+            p1.artifact_cache_identity(),
+            p1_alias.artifact_cache_identity(),
+            "profile aliases with the same canonical contract must share artifacts"
+        );
+        assert_eq!(p1.resolution_identity(), p1_alias.resolution_identity());
+        assert_ne!(p1.artifact_cache_identity(), p3.artifact_cache_identity());
+        assert_ne!(p1.resolution_identity(), p3.resolution_identity());
+    }
+
+    #[test]
+    fn exact_linux_contract_keeps_detected_glibc_for_target_and_scoring() {
+        let contract = linux_64_contract(None);
+        let target = ResolutionTarget::try_for_contract("3.12", contract.clone()).unwrap();
+        assert_eq!(target.declared_glibc(), Some((2, 28)));
+        assert_eq!(target.effective_glibc(), Some((2, 28)));
+
+        let newer = "demo-1.0.0-cp312-cp312-manylinux_2_35_x86_64.whl";
+        assert_eq!(score_wheel(newer, target.wheel_target()), -1);
+
+        let exact =
+            resolution_glibc_ceiling("linux-64", "linux-64", Some((2, 28)), Some((2, 39)), true);
+        let legacy =
+            resolution_glibc_ceiling("linux-64", "linux-64", Some((2, 28)), Some((2, 39)), false);
+        assert_eq!(exact, Some((2, 28)));
+        assert_eq!(legacy, Some((2, 39)));
+        assert_eq!(score_wheel(newer, &t_glibc(exact)), -1);
+        assert!(score_wheel(newer, &t_glibc(legacy)) >= 0);
+
+        let widened = ResolutionTarget::try_from_wheel_target_with_contract(
+            WheelTarget {
+                python_version: "3.11".to_string(),
+                conda_subdir: "linux-64".to_string(),
+                max_glibc: Some((2, 35)),
+            },
+            Some((2, 28)),
+            Some(contract),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            widened.contains("does not match scorer ceiling"),
+            "{widened}"
+        );
+    }
+
+    #[test]
+    fn qualified_linux_contract_without_glibc_fails_closed() {
+        for (case, subdir, declared_virtual_packages) in [
+            ("bare x86", "linux-64", std::collections::BTreeMap::new()),
+            (
+                "cuda-only x86",
+                "linux-64",
+                std::collections::BTreeMap::from([("cuda".to_string(), "12".to_string())]),
+            ),
+            (
+                "bare aarch64",
+                "linux-aarch64",
+                std::collections::BTreeMap::new(),
+            ),
+        ] {
+            let error = ResolutionTarget::try_for_contract(
+                "3.12",
+                WorkspaceTargetContract {
+                    subdir: subdir.to_string(),
+                    declared_virtual_packages,
+                    detected_virtual_packages: std::collections::BTreeMap::new(),
+                },
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("has no effective glibc"), "{case}: {error}");
+            assert!(error.contains("exact target envelope"), "{case}: {error}");
+        }
+    }
+
+    #[test]
+    fn exact_cuda_only_contract_uses_pixi_detected_default_glibc() {
+        let contract = WorkspaceTargetContract {
+            subdir: "linux-64".to_string(),
+            declared_virtual_packages: std::collections::BTreeMap::from([(
+                "cuda".to_string(),
+                "12".to_string(),
+            )]),
+            detected_virtual_packages: std::collections::BTreeMap::from([
+                ("archspec".to_string(), "1=x86_64".to_string()),
+                ("cuda".to_string(), "12".to_string()),
+                ("glibc".to_string(), "2.28".to_string()),
+                ("linux".to_string(), "4.18".to_string()),
+                ("unix".to_string(), String::new()),
+            ]),
+        };
+        let target = ResolutionTarget::try_for_contract("3.12", contract).unwrap();
+
+        assert_eq!(target.declared_glibc(), Some((2, 28)));
+        assert_eq!(target.effective_glibc(), Some((2, 28)));
+        assert!(
+            score_wheel(
+                "demo-1.0.0-cp312-cp312-manylinux_2_28_x86_64.whl",
+                target.wheel_target(),
+            ) >= 0
+        );
+        assert_eq!(
+            score_wheel(
+                "demo-1.0.0-cp312-cp312-manylinux_2_35_x86_64.whl",
+                target.wheel_target(),
+            ),
+            -1
+        );
+    }
+
+    #[test]
+    fn workspace_contract_constructor_accepts_declared_cuda_arch_omitted_by_pixi_detection() {
+        let contract = WorkspaceTargetContract {
+            subdir: "linux-64".to_string(),
+            declared_virtual_packages: std::collections::BTreeMap::from([
+                ("cuda".to_string(), "12".to_string()),
+                ("cuda_arch".to_string(), "8.6".to_string()),
+                ("glibc".to_string(), "2.35".to_string()),
+                ("linux".to_string(), "4.18".to_string()),
+            ]),
+            detected_virtual_packages: std::collections::BTreeMap::from([
+                ("archspec".to_string(), "1=x86_64".to_string()),
+                ("cuda".to_string(), "12".to_string()),
+                ("glibc".to_string(), "2.35".to_string()),
+                ("linux".to_string(), "4.18".to_string()),
+                ("unix".to_string(), String::new()),
+            ]),
+        };
+
+        let target =
+            ResolutionTarget::try_for_contract_on_subdir("3.11", "linux-64", contract.clone())
+                .unwrap();
+        assert_eq!(target.target_contract(), Some(&contract));
+    }
+
+    #[test]
+    fn exact_workspace_scope_partitions_content_identity_canonically() {
+        let unscoped =
+            ResolutionTarget::try_for_contract("3.11", linux_64_contract(Some("2.35"))).unwrap();
+        let scoped = unscoped
+            .clone()
+            .with_workspace_scope(ResolvedWorkspaceTarget {
+                contract: unscoped.target_contract().unwrap().clone(),
+                profiles: vec!["p3".to_string()],
+                environments: vec!["new".to_string()],
+            })
+            .unwrap();
+        let other_environment = unscoped
+            .clone()
+            .with_workspace_scope(ResolvedWorkspaceTarget {
+                contract: unscoped.target_contract().unwrap().clone(),
+                profiles: vec!["p3".to_string()],
+                environments: vec!["alias".to_string()],
+            })
+            .unwrap();
+        let same_scope_permuted = unscoped
+            .clone()
+            .with_workspace_scope(ResolvedWorkspaceTarget {
+                contract: unscoped.target_contract().unwrap().clone(),
+                profiles: vec!["p3".to_string(), "p3".to_string()],
+                environments: vec!["new".to_string(), "new".to_string()],
+            })
+            .unwrap();
+
+        assert_ne!(scoped.resolution_identity(), unscoped.resolution_identity());
+        assert_ne!(
+            scoped.artifact_cache_identity(),
+            unscoped.artifact_cache_identity()
+        );
+        assert_ne!(
+            scoped.resolution_identity(),
+            other_environment.resolution_identity(),
+            "same-contract environments may carry different final dependency overlays"
+        );
+        assert_ne!(
+            scoped.artifact_cache_identity(),
+            other_environment.artifact_cache_identity()
+        );
+        assert_eq!(
+            scoped.resolution_identity(),
+            same_scope_permuted.resolution_identity(),
+            "scope identity must ignore duplicate names and ordering"
+        );
+        assert_eq!(
+            scoped.compatibility_identity(),
+            other_environment.compatibility_identity(),
+            "the persisted virtual-package compatibility contract is name-independent"
+        );
+        assert_eq!(scoped.workspace_scope().unwrap().environments, vec!["new"]);
+
+        let mut wrong_contract = unscoped.target_contract().unwrap().clone();
+        wrong_contract
+            .declared_virtual_packages
+            .insert("glibc".to_string(), "2.28".to_string());
+        assert!(
+            unscoped
+                .with_workspace_scope(ResolvedWorkspaceTarget {
+                    contract: wrong_contract,
+                    profiles: vec!["p1".to_string()],
+                    environments: vec!["old".to_string()],
+                })
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn exact_envelope_provenance_does_not_depend_on_detected_vp_presence() {
+        let contract = WorkspaceTargetContract {
+            subdir: "wasi-wasm32".to_string(),
+            declared_virtual_packages: std::collections::BTreeMap::new(),
+            detected_virtual_packages: std::collections::BTreeMap::new(),
+        };
+        let scope = ResolvedWorkspaceTarget {
+            contract: contract.clone(),
+            profiles: vec!["wasi-wasm32".to_string()],
+            environments: vec!["wasm".to_string()],
+        };
+
+        let direct = ResolutionTarget::try_for_contract("3.11", contract.clone())
+            .unwrap()
+            .with_workspace_scope(scope.clone())
+            .unwrap();
+        let exact = ResolutionTarget::try_for_contract("3.11", contract)
+            .unwrap()
+            .with_exact_workspace_scope(scope)
+            .unwrap();
+        let legacy = ResolutionTarget::try_for_subdir("3.11", "wasi-wasm32").unwrap();
+
+        assert!(exact.target_contract().is_some());
+        assert!(
+            exact
+                .target_contract()
+                .unwrap()
+                .detected_virtual_packages
+                .is_empty()
+        );
+        assert!(exact.has_exact_workspace_envelope());
+        assert!(!direct.has_exact_workspace_envelope());
+        assert!(legacy.target_contract().is_none());
+        assert!(!legacy.has_exact_workspace_envelope());
+        assert_ne!(exact.resolution_identity(), direct.resolution_identity());
+        assert_ne!(
+            exact.artifact_cache_identity(),
+            direct.artifact_cache_identity()
+        );
+        assert_ne!(
+            exact.compatibility_identity(),
+            direct.compatibility_identity()
+        );
+    }
+
+    #[test]
+    fn workspace_contract_constructor_rejects_inconsistent_subdir_or_glibc() {
+        let contract = linux_64_contract(Some("2.35"));
+        assert!(
+            ResolutionTarget::try_for_contract_on_subdir(
+                "3.11",
+                "linux-aarch64",
+                contract.clone(),
+            )
+            .is_err()
+        );
+        assert!(
+            ResolutionTarget::try_from_parts_with_contract(
+                "3.11",
+                "linux-64",
+                Some((2, 34)),
+                contract.clone(),
+            )
+            .is_err()
+        );
+        let mut contradictory = contract;
+        contradictory
+            .detected_virtual_packages
+            .insert("glibc".to_string(), "2.28".to_string());
+        assert!(ResolutionTarget::try_for_contract("3.11", contradictory).is_err());
+    }
+
+    #[test]
     fn normalized_python_minor_is_strict_and_patch_insensitive() {
         let minor = normalized_python_minor("3.11").unwrap();
         assert_eq!(minor.version(), "3.11");
@@ -1408,19 +2055,33 @@ mod tests {
             "linux-aarch64",
             Some((2, 35)),
             Some((2, 39)),
+            false,
         ));
         assert!(native_source_build_compatible(
             "linux-aarch64",
             "linux-aarch64",
             Some((2, 39)),
             Some((2, 35)),
+            false,
         ));
         assert!(
-            !native_source_build_compatible("linux-aarch64", "linux-aarch64", Some((2, 35)), None,),
+            !native_source_build_compatible(
+                "linux-aarch64",
+                "linux-aarch64",
+                Some((2, 35)),
+                None,
+                false,
+            ),
             "unknown native ARM glibc must fail closed",
         );
         assert!(
-            native_source_build_compatible("linux-64", "linux-64", Some((2, 35)), Some((2, 39))),
+            native_source_build_compatible(
+                "linux-64",
+                "linux-64",
+                Some((2, 35)),
+                Some((2, 39)),
+                false,
+            ),
             "linux-64 retains its established effective-ceiling behavior"
         );
         assert!(native_source_build_compatible(
@@ -1428,6 +2089,39 @@ mod tests {
             "linux-aarch64",
             Some((2, 35)),
             Some((2, 39)),
+            false,
+        ));
+    }
+
+    #[test]
+    fn exact_native_x86_source_build_refuses_newer_or_unknown_host_glibc() {
+        assert!(!native_source_build_compatible(
+            "linux-64",
+            "linux-64",
+            Some((2, 28)),
+            Some((2, 39)),
+            true,
+        ));
+        assert!(native_source_build_compatible(
+            "linux-64",
+            "linux-64",
+            Some((2, 39)),
+            Some((2, 39)),
+            true,
+        ));
+        assert!(!native_source_build_compatible(
+            "linux-64",
+            "linux-64",
+            Some((2, 39)),
+            None,
+            true,
+        ));
+        assert!(!native_source_build_compatible(
+            "linux-64",
+            "linux-64",
+            None,
+            Some((2, 39)),
+            true,
         ));
     }
 

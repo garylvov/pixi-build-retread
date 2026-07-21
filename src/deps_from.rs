@@ -458,7 +458,10 @@ fn strip_inline_comment(line: &str) -> &str {
 /// Parse a PEP 621 `pyproject.toml`'s `[project] dependencies` array and
 /// suppress dependencies whose uv source is a local path.
 fn parse_pyproject(source: &FetchedDepSource) -> Result<ParsedDepsFrom> {
-    let value: toml::Value = source.content.parse()?;
+    // `toml::Value::from_str` parses a single TOML value as of toml 1.1.
+    // A pyproject is a complete TOML document, so use the document
+    // deserializer explicitly rather than `str::parse::<toml::Value>()`.
+    let value: toml::Value = toml::from_str(&source.content)?;
 
     if let Some(project) = value.get("project") {
         let deps = project

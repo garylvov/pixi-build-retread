@@ -3465,6 +3465,360 @@ fn cache_key_changes_when_manifest_mtime_changes() {
 }
 
 #[test]
+fn cache_key_partitions_same_subdir_rich_target_contracts() {
+    use pixi_build_types::procedures::conda_outputs::CondaOutputsParams;
+    use rattler_conda_types::Platform;
+
+    let params = CondaOutputsParams {
+        host_platform: Platform::Linux64,
+        build_platform: Platform::Linux64,
+        channels: vec![],
+        variant_configuration: None,
+        variant_files: None,
+        work_directory: std::path::PathBuf::new(),
+    };
+    let contract = |glibc: &str| WorkspaceTargetContract {
+        subdir: "linux-64".to_string(),
+        declared_virtual_packages: BTreeMap::from([
+            ("cuda".to_string(), "12".to_string()),
+            ("glibc".to_string(), glibc.to_string()),
+            ("linux".to_string(), "4.18".to_string()),
+        ]),
+        detected_virtual_packages: BTreeMap::new(),
+    };
+    let p1 = ResolutionTarget::try_for_contract("0.0", contract("2.28")).unwrap();
+    let p3 = ResolutionTarget::try_for_contract("0.0", contract("2.35")).unwrap();
+
+    let p1_key = conda_outputs_cache_key_for_target(&params, None, "none", &p1, None, "");
+    let p3_key = conda_outputs_cache_key_for_target(&params, None, "none", &p3, None, "");
+    assert_ne!(
+        p1_key, p3_key,
+        "p1 and p3 share linux-64 but must never share conda/outputs metadata"
+    );
+
+    let output_for = |target: &ResolutionTarget| {
+        assemble_conda_output(
+            "demo-pack",
+            "1.0.0",
+            "3.11",
+            false,
+            true,
+            Vec::new(),
+            std::collections::HashSet::new(),
+            Platform::Linux64,
+            0,
+            Some(&target.resolution_identity()),
+            false,
+            &[],
+        )
+        .unwrap()
+    };
+    assert_ne!(
+        output_for(&p1).metadata.build,
+        output_for(&p3).metadata.build,
+        "non-courier rich targets also need distinct conda build identities"
+    );
+}
+
+#[test]
+fn cache_key_partitions_exact_workspace_consumer_scope() {
+    use pixi_build_types::procedures::conda_outputs::CondaOutputsParams;
+    use rattler_conda_types::Platform;
+
+    let params = CondaOutputsParams {
+        host_platform: Platform::Linux64,
+        build_platform: Platform::Linux64,
+        channels: vec![],
+        variant_configuration: None,
+        variant_files: None,
+        work_directory: std::path::PathBuf::new(),
+    };
+    let contract = WorkspaceTargetContract {
+        subdir: "linux-64".to_string(),
+        declared_virtual_packages: BTreeMap::from([("glibc".to_string(), "2.28".to_string())]),
+        detected_virtual_packages: BTreeMap::new(),
+    };
+    let target = ResolutionTarget::try_for_contract("0.0", contract.clone()).unwrap();
+    let old = ResolvedWorkspaceTarget {
+        contract: contract.clone(),
+        profiles: vec!["p1".to_string()],
+        environments: vec!["old".to_string()],
+    };
+    let alias = ResolvedWorkspaceTarget {
+        contract: contract.clone(),
+        profiles: vec!["p1-alias".to_string()],
+        environments: vec!["alias".to_string()],
+    };
+    let aggregate = ResolvedWorkspaceTarget {
+        contract: contract.clone(),
+        profiles: vec!["p1-alias".to_string(), "p1".to_string()],
+        environments: vec!["alias".to_string(), "old".to_string()],
+    };
+    let permuted_with_duplicates = ResolvedWorkspaceTarget {
+        contract,
+        profiles: vec!["p1".to_string(), "p1-alias".to_string(), "p1".to_string()],
+        environments: vec!["old".to_string(), "alias".to_string(), "old".to_string()],
+    };
+    let key = |scope| conda_outputs_cache_key_for_target(&params, None, "none", &target, scope, "");
+
+    assert_ne!(key(Some(&old)), key(Some(&alias)));
+    assert_ne!(key(Some(&old)), key(Some(&aggregate)));
+    assert_eq!(
+        key(Some(&aggregate)),
+        key(Some(&permuted_with_duplicates)),
+        "logical consumer scope identity must ignore ordering and duplicates"
+    );
+    assert_eq!(key(None), key(None));
+
+    let old_target = target.clone().with_workspace_scope(old).unwrap();
+    let alias_target = target.clone().with_workspace_scope(alias).unwrap();
+    assert_ne!(
+        old_target.resolution_identity(),
+        alias_target.resolution_identity(),
+        "exact consumer scope must partition resolution, lock, and build identity"
+    );
+    let output_for = |target: &ResolutionTarget| {
+        assemble_conda_output(
+            "demo-pack",
+            "1.0.0",
+            "3.11",
+            false,
+            true,
+            Vec::new(),
+            std::collections::HashSet::new(),
+            Platform::Linux64,
+            0,
+            Some(&target.resolution_identity()),
+            false,
+            &[],
+        )
+        .unwrap()
+    };
+    assert_ne!(
+        output_for(&old_target).metadata.build,
+        output_for(&alias_target).metadata.build,
+        "same-contract environments may emit different dependency metadata"
+    );
+}
+
+#[test]
+fn dynamic_courier_cold_and_replay_use_staged_content_build_identity() {
+    let target = ResolutionTarget::for_subdir("3.11", "linux-64");
+    let staged_hash = "0123456789abcdef";
+    let expected = courier_build_string_for_target(&target, staged_hash, 4, false);
+
+    let cold = resolved_courier_build(None, &target, staged_hash, 4, false);
+    let replay = resolved_courier_build(None, &target, staged_hash, 4, false);
+    assert_eq!(cold, expected);
+    assert_eq!(replay, expected);
+    assert_ne!(
+        cold, "py311_4",
+        "dynamic builds must not use the legacy namespace"
+    );
+    assert_eq!(
+        resolved_courier_build(Some("advertised"), &target, staged_hash, 4, false),
+        "advertised",
+        "an explicit Pixi build identity remains authoritative"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn artifact_lookup_requires_exact_build_identity() {
+    let dir = unique_test_dir("exact-artifact-build");
+    std::fs::create_dir_all(&dir).unwrap();
+    let p1 = dir.join("demo-1.0.0-py311_h1111111111_0.conda");
+    let p3 = dir.join("demo-1.0.0-py311_h3333333333_0.conda");
+    std::fs::write(&p1, b"p1").unwrap();
+    std::fs::write(&p3, b"p3").unwrap();
+
+    let found = find_conda_artifact(&dir, "demo", "1.0.0", "py311_h3333333333_0")
+        .await
+        .unwrap();
+    assert_eq!(found, p3, "must not return the first same-version sibling");
+    let error = find_conda_artifact(&dir, "demo", "1.0.0", "py311_h2222222222_0")
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("py311_h2222222222_0"));
+
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn noarch_build_uses_host_prefix_as_resolution_platform() {
+    assert_eq!(
+        resolution_subdir_for_build(
+            Platform::NoArch,
+            Some(Platform::Linux64),
+            None,
+            Some("py311_h0123456789_0"),
+        )
+        .unwrap(),
+        Platform::Linux64,
+    );
+    assert!(
+        resolution_subdir_for_build(Platform::NoArch, None, None, Some("py311_h0123456789_0"),)
+            .is_err(),
+        "a rich noarch output must not fall back to a noarch resolution target"
+    );
+    assert_eq!(
+        resolution_subdir_for_build(Platform::NoArch, None, None, Some("py311_0")).unwrap(),
+        Platform::NoArch,
+        "legacy noarch identity retains the old fallback"
+    );
+    assert_eq!(
+        resolution_subdir_for_build(Platform::LinuxAarch64, Some(Platform::Linux64), None, None,)
+            .unwrap(),
+        Platform::LinuxAarch64,
+        "platform-specific artifact identity remains authoritative"
+    );
+
+    let linux = ResolutionTarget::for_subdir("3.11", "linux-64");
+    assert!(validate_resolution_artifact_subdir(&linux, Platform::NoArch).is_ok());
+    assert!(validate_resolution_artifact_subdir(&linux, Platform::LinuxAarch64).is_err());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn pure_noarch_prepared_handoff_retains_rich_target_contract() {
+    let contract = |glibc: &str| WorkspaceTargetContract {
+        subdir: "linux-64".to_string(),
+        declared_virtual_packages: BTreeMap::from([("glibc".to_string(), glibc.to_string())]),
+        detected_virtual_packages: BTreeMap::new(),
+    };
+    let p1 = ResolutionTarget::try_for_contract("3.11", contract("2.28")).unwrap();
+    let p3 = ResolutionTarget::try_for_contract("3.11", contract("2.35")).unwrap();
+    let mut base_bundle = solo_bundle("pure-target-pack", vec![]);
+    base_bundle.primary.metadata.is_pure_python = true;
+    base_bundle.primary.metadata.filename = "pure_target_pack-1.0.0-py3-none-any.whl".to_string();
+    let config = cfg();
+    let emission = DiscoveredEmission {
+        output_name: "pure-target-pack".to_string(),
+        channels: Vec::new(),
+        transitive_overrides: BTreeMap::new(),
+        envs: vec!["old".to_string()],
+    };
+    let advertised = produce_output(
+        &base_bundle,
+        &config,
+        Platform::Linux64,
+        "3.11",
+        &[],
+        Some(&p1.resolution_identity()),
+        None,
+    )
+    .unwrap();
+    assert_eq!(advertised.metadata.subdir, Platform::NoArch);
+    let work_dir = unique_test_dir("rich-noarch-prepared");
+    let plan = Arc::new(ResolvedTargetPlan {
+        local_wheel_stamps: capture_local_wheel_stamps(std::slice::from_ref(&base_bundle)),
+        materialized: vec![base_bundle],
+        base_config: config.clone(),
+        declared_config: config,
+        target: p1.clone(),
+        work_directory: work_dir.clone(),
+        workspace_manifest_mtime: None,
+        auto_overrides_fingerprint: "none".to_string(),
+    });
+    let prepared = PreparedBuild {
+        locator_id: 0,
+        plan,
+        bundle_index: 0,
+        emission,
+        advertised: PreparedOutputIdentity::from_metadata(&advertised.metadata),
+        incremental_version_override: None,
+    };
+    let request = pixi_build_types::procedures::conda_build_v1::CondaBuildV1Output {
+        name: advertised.metadata.name.clone(),
+        version: Some(advertised.metadata.version.clone()),
+        build: Some(advertised.metadata.build.clone()),
+        subdir: advertised.metadata.subdir,
+        variant: advertised.metadata.variant.clone(),
+    };
+    let handler = Handler::default();
+    {
+        let mut state = handler.state.write().await;
+        state.generation = 19;
+    }
+    let transaction = handler.begin_prepared_transaction(19).await.unwrap();
+    assert!(
+        handler
+            .publish_prepared_builds(19, transaction, "rich-noarch".to_string(), vec![prepared])
+            .await
+    );
+    assert!(
+        handler
+            .lookup_prepared_build_for_target(19, &work_dir, None, Some("3.11"), &p3, &request,)
+            .await
+            .is_none(),
+        "same-subdir p3 contract must not consume p1's noarch plan"
+    );
+    assert!(
+        handler
+            .lookup_prepared_build_for_target(19, &work_dir, None, Some("3.11"), &p1, &request,)
+            .await
+            .is_some(),
+        "noarch artifact identity must retain the p1 resolution contract"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn handler_source_resolution_does_not_inherit_sibling_profile_glibc() {
+    use rattler_conda_types::Platform;
+
+    let workspace = unique_test_dir("handler-rich-target");
+    let p1_source = workspace.join("p1-pack");
+    let p3_source = workspace.join("p3-pack");
+    std::fs::create_dir_all(&p1_source).unwrap();
+    std::fs::create_dir_all(&p3_source).unwrap();
+    std::fs::write(
+        workspace.join("pixi.toml"),
+        r#"
+[workspace]
+platforms = [
+  { name = "p1", platform = "linux-64", cuda = "12", glibc = "2.28", linux = "4.18" },
+  { name = "p3", platform = "linux-64", cuda = "12", glibc = "2.35", linux = "4.18" },
+]
+[feature.p1]
+platforms = ["p1"]
+[feature.p1.dependencies]
+p1-pack = { path = "./p1-pack" }
+[feature.p3]
+platforms = ["p3"]
+[feature.p3.dependencies]
+p3-pack = { path = "./p3-pack" }
+[environments]
+old = { features = ["p1"], no-default-feature = true }
+new = { features = ["p3"], no-default-feature = true }
+"#,
+    )
+    .unwrap();
+
+    let p1 = resolve_workspace_target_for_source(Some(&workspace), &p1_source, "linux-64", None)
+        .unwrap()
+        .unwrap();
+    let p3 = resolve_workspace_target_for_source(Some(&workspace), &p3_source, "linux-64", None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(p1.contract.effective_glibc(), Some((2, 28)));
+    assert_eq!(p3.contract.effective_glibc(), Some((2, 35)));
+
+    let p1_target =
+        wheel_target_for_contract(Platform::Linux64, "3.11", Some(&p1.contract)).unwrap();
+    let p3_target =
+        wheel_target_for_contract(Platform::Linux64, "3.11", Some(&p3.contract)).unwrap();
+    assert_eq!(p1_target.declared_glibc(), Some((2, 28)));
+    assert_eq!(p3_target.declared_glibc(), Some((2, 35)));
+    assert_ne!(
+        p1_target.resolution_identity(),
+        p3_target.resolution_identity()
+    );
+
+    std::fs::remove_dir_all(workspace).ok();
+}
+
+#[test]
 fn auto_overrides_fingerprint_tracks_ledger_content_not_mtime() {
     let dir = std::env::temp_dir().join(format!(
         "retread-auto-fp-test-{}",
@@ -3590,6 +3944,7 @@ async fn conda_outputs_cache_and_prepared_handoff_round_trip() {
         bundle_index: 0,
         emission,
         advertised: PreparedOutputIdentity::from_metadata(&advertised_output.metadata),
+        incremental_version_override: None,
     };
     let request = pixi_build_types::procedures::conda_build_v1::CondaBuildV1Output {
         name: advertised_output.metadata.name.clone(),
@@ -3673,6 +4028,7 @@ async fn conda_outputs_cache_and_prepared_handoff_round_trip() {
         bundle_index: 0,
         emission: prepared.emission.clone(),
         advertised: prepared.advertised.clone(),
+        incremental_version_override: None,
     };
     handler
         .publish_prepared_builds(
@@ -3770,6 +4126,7 @@ async fn conda_outputs_cache_and_prepared_handoff_round_trip() {
         bundle_index: 0,
         emission: hit.prepared.emission.clone(),
         advertised: hit.prepared.advertised.clone(),
+        incremental_version_override: None,
     };
     let transaction = handler.begin_prepared_transaction(8).await.unwrap();
     handler
@@ -3796,6 +4153,347 @@ async fn conda_outputs_cache_and_prepared_handoff_round_trip() {
     );
 
     let _ = std::fs::remove_dir_all(&cache_dir);
+}
+
+/// An incremental metadata response may intentionally retain the committed
+/// pack version even when the newly added source sorts first and has another
+/// wheel version. That identity is safe only while the exact cold plan from
+/// conda/outputs and the independently rediscovered build-time lock agree.
+#[tokio::test]
+async fn incremental_cold_fallback_requires_exact_prepared_plan() {
+    let work_dir = std::env::temp_dir().join(format!(
+        "retread-incremental-prepared-plan-{}",
+        std::process::id()
+    ));
+    let mut config = cfg();
+    config.courier = true;
+    let mut base_bundle = solo_bundle("incremental-pack", vec![]);
+    base_bundle.primary.metadata.version = "2.0.0".to_string();
+    let emission = DiscoveredEmission {
+        output_name: "incremental-pack".to_string(),
+        channels: Vec::new(),
+        transitive_overrides: BTreeMap::new(),
+        envs: Vec::new(),
+    };
+    let (advertised_bundle, effective) = apply_emission(&base_bundle, &config, &emission);
+    let output = produce_output(
+        &advertised_bundle,
+        &effective,
+        Platform::Linux64,
+        "3.11",
+        &[],
+        Some("incremental-prepared-hash"),
+        Some("1.0.0"),
+    )
+    .unwrap();
+    assert_eq!(output.metadata.version.to_string(), "1.0.0");
+    assert_eq!(advertised_bundle.primary.metadata.version, "2.0.0");
+
+    let plan = Arc::new(ResolvedTargetPlan {
+        local_wheel_stamps: capture_local_wheel_stamps(std::slice::from_ref(&base_bundle)),
+        materialized: vec![base_bundle],
+        base_config: config.clone(),
+        declared_config: config,
+        target: ResolutionTarget::for_subdir("3.11", "linux-64"),
+        work_directory: work_dir.clone(),
+        workspace_manifest_mtime: None,
+        auto_overrides_fingerprint: "none".to_string(),
+    });
+    let prepared = PreparedBuild {
+        locator_id: 0,
+        plan,
+        bundle_index: 0,
+        emission,
+        advertised: PreparedOutputIdentity::from_metadata(&output.metadata),
+        incremental_version_override: Some("1.0.0".to_string()),
+    };
+    let mut sibling = prepared.clone();
+    sibling.locator_id = 1;
+    sibling.emission.output_name = "incremental-pack-sibling".to_string();
+    sibling.advertised.name = "incremental-pack-sibling".to_string();
+    let request = pixi_build_types::procedures::conda_build_v1::CondaBuildV1Output {
+        name: output.metadata.name.clone(),
+        version: Some(output.metadata.version.clone()),
+        build: Some(output.metadata.build.clone()),
+        subdir: output.metadata.subdir,
+        variant: output.metadata.variant.clone(),
+    };
+    let handler = Handler::default();
+    {
+        let mut state = handler.state.write().await;
+        state.generation = 11;
+    }
+    let transaction = handler.begin_prepared_transaction(11).await.unwrap();
+    let cache_key = format!("incremental-multi-key-{}", std::process::id());
+    assert!(
+        handler
+            .publish_prepared_builds(11, transaction, cache_key.clone(), vec![prepared, sibling],)
+            .await
+    );
+    CONDA_OUTPUTS_CACHE
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap()
+        .insert(
+            cache_key.clone(),
+            CondaOutputsMemo {
+                result: pixi_build_types::procedures::conda_outputs::CondaOutputsResult {
+                    outputs: vec![output.clone()],
+                    input_globs: Default::default(),
+                },
+                requires_prepared_plan: true,
+            },
+        );
+
+    let hit = handler
+        .lookup_prepared_build(11, &work_dir, None, Some("3.11"), &request)
+        .await
+        .expect("incremental metadata must retain its exact cold plan");
+    assert_eq!(hit.bundle.primary.metadata.version, "2.0.0");
+    assert_eq!(
+        hit.prepared.incremental_version_override.as_deref(),
+        Some("1.0.0")
+    );
+    assert!(
+        validate_prepared_incremental_version_handoff(
+            hit.prepared.incremental_version_override.as_deref(),
+            Some("1.0.0"),
+            &hit.bundle.conda_name,
+        )
+        .is_ok()
+    );
+    assert!(
+        validate_advertised_courier_version(
+            &hit.bundle,
+            Some("1.0.0"),
+            hit.prepared.incremental_version_override.as_deref(),
+        )
+        .is_ok()
+    );
+    assert!(
+        handler
+            .retain_prepared_for_memory_cache_hit(&cache_key, &work_dir)
+            .await,
+        "an in-memory metadata memo may be reused only with its typed plan"
+    );
+
+    handler
+        .consume_prepared_build(11, transaction, hit.prepared.locator_id)
+        .await;
+    assert!(
+        handler
+            .lookup_prepared_build(11, &work_dir, None, Some("3.11"), &request)
+            .await
+            .is_none()
+    );
+    assert!(
+        !CONDA_OUTPUTS_CACHE
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .contains_key(&cache_key),
+        "consuming one output must evict the incremental memo even while sibling plans remain"
+    );
+    assert!(
+        handler
+            .retain_prepared_for_memory_cache_hit(&cache_key, &work_dir)
+            .await,
+        "the sibling plan remains, proving memo eviction does not rely on an empty plan set"
+    );
+    assert!(
+        reject_unprepared_incremental_fallback(Some("1.0.0"), "incremental-pack").is_err(),
+        "build_v1 must stop before fresh resolve_all when the typed plan is unavailable"
+    );
+    assert!(
+        validate_advertised_courier_version(&hit.bundle, Some("1.0.0"), None).is_err(),
+        "freshly resolved v2 bytes must never be relabeled as the stale v1 output"
+    );
+}
+
+/// Metadata-to-build regression for a late incremental escalation. Metadata
+/// has already advertised the committed lock version; if build-time channels
+/// or newer repodata make the new source entry's BFS choose conda, localized
+/// merge must escalate and the cold courier package must keep that same
+/// advertised version even when its new primary wheel sorts first.
+#[test]
+fn routed_incremental_cold_fallback_keeps_advertised_lock_version() {
+    let mut config = cfg();
+    config.courier = true;
+    config.name_map.insert(
+        PypiKey::from_pypi("ray"),
+        CondaTarget::Mapped(CondaName::new("ray-core")),
+    );
+    config
+        .overrides
+        .insert("ray".to_string(), "==2.49.1".to_string());
+
+    let mut cold_bundle = solo_bundle("a-new-source-root", vec!["ray>=2.40,<3"]);
+    cold_bundle.primary.metadata.version = "2.0.0".to_string();
+    cold_bundle
+        .probe_decisions
+        .push(crate::audit::ProbeDecision {
+            stage: "bfs".to_string(),
+            pypi_name: "ray".to_string(),
+            conda_name: "ray-core".to_string(),
+            spec: "==2.49.1".to_string(),
+            target_python: "3.11".to_string(),
+            channels_consulted: Vec::new(),
+            satisfiable: None,
+            matching_candidates: 0,
+            routing_decision: "short-circuit-explicit-override".to_string(),
+        });
+    assert!(
+        incremental_bundle_requires_cold_resolve(&cold_bundle),
+        "the new BFS route must exercise the late cold-escalation branch"
+    );
+
+    let metadata = produce_output(
+        &cold_bundle,
+        &config,
+        Platform::Linux64,
+        "3.11",
+        &[],
+        Some("routed-cold-hash"),
+        Some("1.0.0"),
+    )
+    .unwrap();
+    let advertised_version = metadata.metadata.version.to_string();
+    assert_eq!(advertised_version, "1.0.0");
+    assert_eq!(cold_bundle.primary.metadata.version, "2.0.0");
+
+    let fallback_version = match incremental_version_plan(Some(&advertised_version), "1.0.0") {
+        IncrementalVersionPlan::Attempt { fallback_version } => fallback_version,
+        other => panic!("matching metadata/lock versions must attempt localized build: {other:?}"),
+    };
+    assert_eq!(
+        courier_pack_version(&cold_bundle, Some(&fallback_version)),
+        advertised_version,
+        "late cold fallback must build the package identity metadata advertised"
+    );
+    assert!(
+        validate_advertised_courier_version(
+            &cold_bundle,
+            Some(&advertised_version),
+            Some(&fallback_version),
+        )
+        .is_ok(),
+        "a build-time-positive incremental fallback may retain the committed lock version"
+    );
+}
+
+/// A route retained from an unchanged grouped entry does not prove that the
+/// newly-added entry will route. Metadata must keep the ordinary incremental
+/// lock version so a successful localized build stays on the fast path. If a
+/// stale/cold metadata response instead advertised another version, build_v1
+/// must skip localized output rather than return the lock's version.
+#[test]
+fn unrelated_existing_route_keeps_incremental_fast_path_version_safe() {
+    let mut grouped_cold_bundle = solo_bundle("a-new", vec![]);
+    grouped_cold_bundle.primary.metadata.version = "2.0.0".to_string();
+    grouped_cold_bundle
+        .probe_decisions
+        .push(crate::audit::ProbeDecision {
+            stage: "bfs".to_string(),
+            pypi_name: "old-native-dep".to_string(),
+            conda_name: "old-native-dep".to_string(),
+            spec: ">=1".to_string(),
+            target_python: "3.11".to_string(),
+            channels_consulted: vec!["conda-forge".to_string()],
+            satisfiable: Some(true),
+            matching_candidates: 1,
+            routing_decision: "short-circuit".to_string(),
+        });
+    assert!(incremental_bundle_requires_cold_resolve(
+        &grouped_cold_bundle
+    ));
+
+    assert_eq!(
+        incremental_version_plan(Some("1.0.0"), "1.0.0"),
+        IncrementalVersionPlan::Attempt {
+            fallback_version: "1.0.0".to_string(),
+        },
+        "an unrelated retained route must not disable a valid localized add"
+    );
+    assert_eq!(
+        incremental_version_plan(Some("2.0.0"), "1.0.0"),
+        IncrementalVersionPlan::Cold,
+        "a build request for cold metadata must never return lock.version"
+    );
+    assert_eq!(courier_pack_version(&grouped_cold_bundle, None), "2.0.0");
+    assert!(
+        validate_advertised_courier_version(&grouped_cold_bundle, Some("2.0.0"), None).is_ok(),
+        "cold metadata may build only when the fresh primary version still matches"
+    );
+}
+
+/// conda/outputs may detect an incremental add and advertise `lock.version`,
+/// while build_v1 later fails that detection gate because the lock, config,
+/// environment, or cache changed between RPCs. Without a persisted marker,
+/// the cold build cannot prove that metadata's version came from that lock.
+/// It must reject a newly resolved primary version instead of relabeling its
+/// bytes under the stale advertised identity.
+#[test]
+fn disappeared_build_incremental_detection_rejects_primary_version_drift() {
+    let mut config = cfg();
+    config.courier = true;
+    config.retread_wheels.insert(
+        "a-new-primary".to_string(),
+        WheelEntry {
+            version: Some(">=1,<3".to_string()),
+            ..WheelEntry::default()
+        },
+    );
+    let mut cold_bundle = solo_bundle("a-new-primary", vec![]);
+    cold_bundle.primary.metadata.version = "2.0.0".to_string();
+
+    let metadata = produce_output(
+        &cold_bundle,
+        &config,
+        Platform::Linux64,
+        "3.11",
+        &[],
+        Some("detection-drift-hash"),
+        Some("1.0.0"),
+    )
+    .unwrap();
+    let advertised = metadata.metadata.version.to_string();
+    let target = ResolutionTarget::for_subdir("3.11", "linux-64");
+    let unchanged_manifest_build = current_courier_build_for_input_bundle(
+        &config,
+        "a-new-primary",
+        &target,
+        None,
+        None,
+        Path::new("/source"),
+    );
+    assert!(
+        validate_advertised_courier_build(
+            &config,
+            "a-new-primary",
+            &target,
+            None,
+            None,
+            Path::new("/source"),
+            Some(&unchanged_manifest_build),
+        )
+        .is_ok(),
+        "a ranged input can keep the same manifest hash while resolving a newer primary"
+    );
+    assert_eq!(
+        courier_pack_version(&cold_bundle, None),
+        "2.0.0",
+        "an ordinary cold build derives its identity from the bytes it just resolved"
+    );
+    assert!(
+        validate_advertised_courier_version(&cold_bundle, Some(&advertised), None).is_err(),
+        "a disappeared incremental detector must fail closed on primary version drift"
+    );
+    assert!(
+        !advertised_version_matches(Some("2.0.0"), "1.0.0"),
+        "replay must not return a lock version different from the requested output"
+    );
+    assert!(advertised_version_matches(None, "1.0.0"));
 }
 
 #[test]
