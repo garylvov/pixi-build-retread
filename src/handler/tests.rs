@@ -3590,6 +3590,7 @@ async fn conda_outputs_cache_and_prepared_handoff_round_trip() {
         bundle_index: 0,
         emission,
         advertised: PreparedOutputIdentity::from_metadata(&advertised_output.metadata),
+        incremental_version_override: None,
     };
     let request = pixi_build_types::procedures::conda_build_v1::CondaBuildV1Output {
         name: advertised_output.metadata.name.clone(),
@@ -3673,6 +3674,7 @@ async fn conda_outputs_cache_and_prepared_handoff_round_trip() {
         bundle_index: 0,
         emission: prepared.emission.clone(),
         advertised: prepared.advertised.clone(),
+        incremental_version_override: None,
     };
     handler
         .publish_prepared_builds(
@@ -3770,6 +3772,7 @@ async fn conda_outputs_cache_and_prepared_handoff_round_trip() {
         bundle_index: 0,
         emission: hit.prepared.emission.clone(),
         advertised: hit.prepared.advertised.clone(),
+        incremental_version_override: None,
     };
     let transaction = handler.begin_prepared_transaction(8).await.unwrap();
     handler
@@ -3796,6 +3799,347 @@ async fn conda_outputs_cache_and_prepared_handoff_round_trip() {
     );
 
     let _ = std::fs::remove_dir_all(&cache_dir);
+}
+
+/// An incremental metadata response may intentionally retain the committed
+/// pack version even when the newly added source sorts first and has another
+/// wheel version. That identity is safe only while the exact cold plan from
+/// conda/outputs and the independently rediscovered build-time lock agree.
+#[tokio::test]
+async fn incremental_cold_fallback_requires_exact_prepared_plan() {
+    let work_dir = std::env::temp_dir().join(format!(
+        "retread-incremental-prepared-plan-{}",
+        std::process::id()
+    ));
+    let mut config = cfg();
+    config.courier = true;
+    let mut base_bundle = solo_bundle("incremental-pack", vec![]);
+    base_bundle.primary.metadata.version = "2.0.0".to_string();
+    let emission = DiscoveredEmission {
+        output_name: "incremental-pack".to_string(),
+        channels: Vec::new(),
+        transitive_overrides: BTreeMap::new(),
+        envs: Vec::new(),
+    };
+    let (advertised_bundle, effective) = apply_emission(&base_bundle, &config, &emission);
+    let output = produce_output(
+        &advertised_bundle,
+        &effective,
+        Platform::Linux64,
+        "3.11",
+        &[],
+        Some("incremental-prepared-hash"),
+        Some("1.0.0"),
+    )
+    .unwrap();
+    assert_eq!(output.metadata.version.to_string(), "1.0.0");
+    assert_eq!(advertised_bundle.primary.metadata.version, "2.0.0");
+
+    let plan = Arc::new(ResolvedTargetPlan {
+        local_wheel_stamps: capture_local_wheel_stamps(std::slice::from_ref(&base_bundle)),
+        materialized: vec![base_bundle],
+        base_config: config.clone(),
+        declared_config: config,
+        target: ResolutionTarget::for_subdir("3.11", "linux-64"),
+        work_directory: work_dir.clone(),
+        workspace_manifest_mtime: None,
+        auto_overrides_fingerprint: "none".to_string(),
+    });
+    let prepared = PreparedBuild {
+        locator_id: 0,
+        plan,
+        bundle_index: 0,
+        emission,
+        advertised: PreparedOutputIdentity::from_metadata(&output.metadata),
+        incremental_version_override: Some("1.0.0".to_string()),
+    };
+    let mut sibling = prepared.clone();
+    sibling.locator_id = 1;
+    sibling.emission.output_name = "incremental-pack-sibling".to_string();
+    sibling.advertised.name = "incremental-pack-sibling".to_string();
+    let request = pixi_build_types::procedures::conda_build_v1::CondaBuildV1Output {
+        name: output.metadata.name.clone(),
+        version: Some(output.metadata.version.clone()),
+        build: Some(output.metadata.build.clone()),
+        subdir: output.metadata.subdir,
+        variant: output.metadata.variant.clone(),
+    };
+    let handler = Handler::default();
+    {
+        let mut state = handler.state.write().await;
+        state.generation = 11;
+    }
+    let transaction = handler.begin_prepared_transaction(11).await.unwrap();
+    let cache_key = format!("incremental-multi-key-{}", std::process::id());
+    assert!(
+        handler
+            .publish_prepared_builds(11, transaction, cache_key.clone(), vec![prepared, sibling],)
+            .await
+    );
+    CONDA_OUTPUTS_CACHE
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap()
+        .insert(
+            cache_key.clone(),
+            CondaOutputsMemo {
+                result: pixi_build_types::procedures::conda_outputs::CondaOutputsResult {
+                    outputs: vec![output.clone()],
+                    input_globs: Default::default(),
+                },
+                requires_prepared_plan: true,
+            },
+        );
+
+    let hit = handler
+        .lookup_prepared_build(11, &work_dir, None, Some("3.11"), &request)
+        .await
+        .expect("incremental metadata must retain its exact cold plan");
+    assert_eq!(hit.bundle.primary.metadata.version, "2.0.0");
+    assert_eq!(
+        hit.prepared.incremental_version_override.as_deref(),
+        Some("1.0.0")
+    );
+    assert!(
+        validate_prepared_incremental_version_handoff(
+            hit.prepared.incremental_version_override.as_deref(),
+            Some("1.0.0"),
+            &hit.bundle.conda_name,
+        )
+        .is_ok()
+    );
+    assert!(
+        validate_advertised_courier_version(
+            &hit.bundle,
+            Some("1.0.0"),
+            hit.prepared.incremental_version_override.as_deref(),
+        )
+        .is_ok()
+    );
+    assert!(
+        handler
+            .retain_prepared_for_memory_cache_hit(&cache_key, &work_dir)
+            .await,
+        "an in-memory metadata memo may be reused only with its typed plan"
+    );
+
+    handler
+        .consume_prepared_build(11, transaction, hit.prepared.locator_id)
+        .await;
+    assert!(
+        handler
+            .lookup_prepared_build(11, &work_dir, None, Some("3.11"), &request)
+            .await
+            .is_none()
+    );
+    assert!(
+        !CONDA_OUTPUTS_CACHE
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .contains_key(&cache_key),
+        "consuming one output must evict the incremental memo even while sibling plans remain"
+    );
+    assert!(
+        handler
+            .retain_prepared_for_memory_cache_hit(&cache_key, &work_dir)
+            .await,
+        "the sibling plan remains, proving memo eviction does not rely on an empty plan set"
+    );
+    assert!(
+        reject_unprepared_incremental_fallback(Some("1.0.0"), "incremental-pack").is_err(),
+        "build_v1 must stop before fresh resolve_all when the typed plan is unavailable"
+    );
+    assert!(
+        validate_advertised_courier_version(&hit.bundle, Some("1.0.0"), None).is_err(),
+        "freshly resolved v2 bytes must never be relabeled as the stale v1 output"
+    );
+}
+
+/// Metadata-to-build regression for a late incremental escalation. Metadata
+/// has already advertised the committed lock version; if build-time channels
+/// or newer repodata make the new source entry's BFS choose conda, localized
+/// merge must escalate and the cold courier package must keep that same
+/// advertised version even when its new primary wheel sorts first.
+#[test]
+fn routed_incremental_cold_fallback_keeps_advertised_lock_version() {
+    let mut config = cfg();
+    config.courier = true;
+    config.name_map.insert(
+        PypiKey::from_pypi("ray"),
+        CondaTarget::Mapped(CondaName::new("ray-core")),
+    );
+    config
+        .overrides
+        .insert("ray".to_string(), "==2.49.1".to_string());
+
+    let mut cold_bundle = solo_bundle("a-new-source-root", vec!["ray>=2.40,<3"]);
+    cold_bundle.primary.metadata.version = "2.0.0".to_string();
+    cold_bundle
+        .probe_decisions
+        .push(crate::audit::ProbeDecision {
+            stage: "bfs".to_string(),
+            pypi_name: "ray".to_string(),
+            conda_name: "ray-core".to_string(),
+            spec: "==2.49.1".to_string(),
+            target_python: "3.11".to_string(),
+            channels_consulted: Vec::new(),
+            satisfiable: None,
+            matching_candidates: 0,
+            routing_decision: "short-circuit-explicit-override".to_string(),
+        });
+    assert!(
+        incremental_bundle_requires_cold_resolve(&cold_bundle),
+        "the new BFS route must exercise the late cold-escalation branch"
+    );
+
+    let metadata = produce_output(
+        &cold_bundle,
+        &config,
+        Platform::Linux64,
+        "3.11",
+        &[],
+        Some("routed-cold-hash"),
+        Some("1.0.0"),
+    )
+    .unwrap();
+    let advertised_version = metadata.metadata.version.to_string();
+    assert_eq!(advertised_version, "1.0.0");
+    assert_eq!(cold_bundle.primary.metadata.version, "2.0.0");
+
+    let fallback_version = match incremental_version_plan(Some(&advertised_version), "1.0.0") {
+        IncrementalVersionPlan::Attempt { fallback_version } => fallback_version,
+        other => panic!("matching metadata/lock versions must attempt localized build: {other:?}"),
+    };
+    assert_eq!(
+        courier_pack_version(&cold_bundle, Some(&fallback_version)),
+        advertised_version,
+        "late cold fallback must build the package identity metadata advertised"
+    );
+    assert!(
+        validate_advertised_courier_version(
+            &cold_bundle,
+            Some(&advertised_version),
+            Some(&fallback_version),
+        )
+        .is_ok(),
+        "a build-time-positive incremental fallback may retain the committed lock version"
+    );
+}
+
+/// A route retained from an unchanged grouped entry does not prove that the
+/// newly-added entry will route. Metadata must keep the ordinary incremental
+/// lock version so a successful localized build stays on the fast path. If a
+/// stale/cold metadata response instead advertised another version, build_v1
+/// must skip localized output rather than return the lock's version.
+#[test]
+fn unrelated_existing_route_keeps_incremental_fast_path_version_safe() {
+    let mut grouped_cold_bundle = solo_bundle("a-new", vec![]);
+    grouped_cold_bundle.primary.metadata.version = "2.0.0".to_string();
+    grouped_cold_bundle
+        .probe_decisions
+        .push(crate::audit::ProbeDecision {
+            stage: "bfs".to_string(),
+            pypi_name: "old-native-dep".to_string(),
+            conda_name: "old-native-dep".to_string(),
+            spec: ">=1".to_string(),
+            target_python: "3.11".to_string(),
+            channels_consulted: vec!["conda-forge".to_string()],
+            satisfiable: Some(true),
+            matching_candidates: 1,
+            routing_decision: "short-circuit".to_string(),
+        });
+    assert!(incremental_bundle_requires_cold_resolve(
+        &grouped_cold_bundle
+    ));
+
+    assert_eq!(
+        incremental_version_plan(Some("1.0.0"), "1.0.0"),
+        IncrementalVersionPlan::Attempt {
+            fallback_version: "1.0.0".to_string(),
+        },
+        "an unrelated retained route must not disable a valid localized add"
+    );
+    assert_eq!(
+        incremental_version_plan(Some("2.0.0"), "1.0.0"),
+        IncrementalVersionPlan::Cold,
+        "a build request for cold metadata must never return lock.version"
+    );
+    assert_eq!(courier_pack_version(&grouped_cold_bundle, None), "2.0.0");
+    assert!(
+        validate_advertised_courier_version(&grouped_cold_bundle, Some("2.0.0"), None).is_ok(),
+        "cold metadata may build only when the fresh primary version still matches"
+    );
+}
+
+/// conda/outputs may detect an incremental add and advertise `lock.version`,
+/// while build_v1 later fails that detection gate because the lock, config,
+/// environment, or cache changed between RPCs. Without a persisted marker,
+/// the cold build cannot prove that metadata's version came from that lock.
+/// It must reject a newly resolved primary version instead of relabeling its
+/// bytes under the stale advertised identity.
+#[test]
+fn disappeared_build_incremental_detection_rejects_primary_version_drift() {
+    let mut config = cfg();
+    config.courier = true;
+    config.retread_wheels.insert(
+        "a-new-primary".to_string(),
+        WheelEntry {
+            version: Some(">=1,<3".to_string()),
+            ..WheelEntry::default()
+        },
+    );
+    let mut cold_bundle = solo_bundle("a-new-primary", vec![]);
+    cold_bundle.primary.metadata.version = "2.0.0".to_string();
+
+    let metadata = produce_output(
+        &cold_bundle,
+        &config,
+        Platform::Linux64,
+        "3.11",
+        &[],
+        Some("detection-drift-hash"),
+        Some("1.0.0"),
+    )
+    .unwrap();
+    let advertised = metadata.metadata.version.to_string();
+    let target = ResolutionTarget::for_subdir("3.11", "linux-64");
+    let unchanged_manifest_build = current_courier_build_for_input_bundle(
+        &config,
+        "a-new-primary",
+        &target,
+        None,
+        None,
+        Path::new("/source"),
+    );
+    assert!(
+        validate_advertised_courier_build(
+            &config,
+            "a-new-primary",
+            &target,
+            None,
+            None,
+            Path::new("/source"),
+            Some(&unchanged_manifest_build),
+        )
+        .is_ok(),
+        "a ranged input can keep the same manifest hash while resolving a newer primary"
+    );
+    assert_eq!(
+        courier_pack_version(&cold_bundle, None),
+        "2.0.0",
+        "an ordinary cold build derives its identity from the bytes it just resolved"
+    );
+    assert!(
+        validate_advertised_courier_version(&cold_bundle, Some(&advertised), None).is_err(),
+        "a disappeared incremental detector must fail closed on primary version drift"
+    );
+    assert!(
+        !advertised_version_matches(Some("2.0.0"), "1.0.0"),
+        "replay must not return a lock version different from the requested output"
+    );
+    assert!(advertised_version_matches(None, "1.0.0"));
 }
 
 #[test]

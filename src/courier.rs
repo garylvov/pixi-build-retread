@@ -190,10 +190,10 @@ pub fn courier_input_specs(config: &RetreadConfig, bundle_name: &str) -> Vec<Str
 /// identically or the inputs hash diverges and replay never fires / fires
 /// stale.
 ///
-/// Folds in: per-dep overrides, the PyPI->conda name-map, drop-deps,
-/// conda-deps, the route policy and include set, the auto-bundle toggle, the
-/// build-number, deps-from source identity, AND the conda channel list. Each
-/// of these changes the emitted
+/// Folds in: per-dep overrides and their ledger provenance, the PyPI->conda
+/// name-map, drop-deps, conda-deps, the route policy and include set, the
+/// auto-bundle toggle, the build-number, deps-from source identity, AND the
+/// conda channel list. Each of these changes the emitted
 /// conda specs or the conda/PyPI routing, so omitting any would let a
 /// manifest/workspace edit leave the hash unchanged and replay a stale,
 /// POISONED lock. (genesis's `retread-name-map` is the canonical config
@@ -222,6 +222,13 @@ pub fn config_fingerprint(
     let mut parts: Vec<String> = Vec::new();
     for (k, v) in &config.overrides {
         parts.push(format!("override:{k}={v}"));
+    }
+    // Provenance changes BFS authority even when the merged key/value stays
+    // byte-identical: hand-written overrides force the native-conda route,
+    // while repair-ledger overrides remain probe-gated resolver steering.
+    // BTreeSet iteration is already deterministic.
+    for key in &config.ledger_overrides {
+        parts.push(format!("ledger-override:{key}"));
     }
     for (k, v) in &config.name_map {
         parts.push(format!("name-map:{k}={v}"));
@@ -2566,6 +2573,72 @@ mod tests {
         cfg
     }
 
+    #[tokio::test]
+    async fn renamed_output_stages_hash_from_manifest_bundle_identity() {
+        let tmp = make_test_dir("renamed-output-input-identity");
+        let staging = tmp.join("staging");
+        let input_bundle = "prepared-pack";
+        let output_bundle = "prepared-pack-env";
+        let config = minimal_config(input_bundle);
+
+        let wheel_name = format!(
+            "{}-1.0.0-py3-none-any.injected.whl",
+            input_bundle.replace('-', "_")
+        );
+        let wheel_path = tmp.join(&wheel_name);
+        std::fs::write(&wheel_path, make_wheel_bytes(input_bundle, "1.0.0", &[])).unwrap();
+        let emit_wheels = vec![make_emit_wheel(
+            input_bundle,
+            "1.0.0",
+            &[],
+            Some(&wheel_path),
+            None,
+        )];
+        let target = ResolutionTarget::for_subdir("3.11", Platform::current().as_str());
+        let index_urls = vec!["https://pypi.org/simple/".to_string()];
+
+        let staged = stage_for_target(
+            &config,
+            output_bundle,
+            input_bundle,
+            "1.0.0",
+            &target,
+            &emit_wheels,
+            &HashSet::new(),
+            &[],
+            &index_urls,
+            "",
+            &tmp,
+            &staging,
+        )
+        .await
+        .unwrap();
+
+        let expected_specs = courier_input_specs(&config, input_bundle);
+        assert!(!expected_specs.is_empty());
+        assert!(
+            courier_input_specs(&config, output_bundle).is_empty(),
+            "the emitted alias is not a declared manifest group"
+        );
+        assert_eq!(staged.lock.bundle, output_bundle);
+        assert_eq!(staged.lock.entry_specs, expected_specs);
+        assert_eq!(
+            staged.lock.inputs_hash,
+            RetreadLock::compute_inputs_hash_for_target(
+                &expected_specs,
+                &index_urls,
+                &format!("{:?}", config.relax),
+                &target,
+                crate::lock::EMIT_EPOCH,
+                config.pin_version.then_some(env!("CARGO_PKG_VERSION")),
+                "",
+            ),
+            "renaming the emitted package must not erase or replace its manifest inputs"
+        );
+
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
     #[test]
     fn direct_url_input_identity_includes_sha256() {
         let config = |sha: &str| -> RetreadConfig {
@@ -2628,6 +2701,29 @@ mod tests {
         assert_ne!(
             config_fingerprint(&first, &channels, ""),
             config_fingerprint(&changed, &channels, ""),
+        );
+    }
+
+    #[test]
+    fn fingerprint_covers_override_ledger_provenance() {
+        let mut manual = minimal_config("b");
+        manual
+            .overrides
+            .insert("ray".to_string(), "==2.49.1".to_string());
+        let mut ledgered = manual.clone();
+        ledgered.ledger_overrides.insert("ray".to_string());
+        let channels = ["conda-forge".to_string()];
+
+        let manual_fp = config_fingerprint(&manual, &channels, "");
+        let ledgered_fp = config_fingerprint(&ledgered, &channels, "");
+        assert_ne!(
+            manual_fp, ledgered_fp,
+            "moving an identical override from manual config to the repair ledger changes BFS authority"
+        );
+        assert!(
+            ledgered_fp
+                .lines()
+                .any(|line| line == "ledger-override:ray")
         );
     }
 

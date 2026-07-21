@@ -65,9 +65,33 @@ use crate::wheel_rewrite::rewrite_wheel;
 /// per `pixi` invocation, so this survives across the repeated calls and
 /// is dropped when the backend exits. Same pattern as
 /// `solve_check::RECORDS_CACHE`.
+#[derive(Clone)]
+struct CondaOutputsMemo {
+    result: CondaOutputsResult,
+    /// Incremental metadata is safe to build only from the exact retained
+    /// cold plan that produced it. Never serve such a memo after that typed
+    /// handoff has been consumed or invalidated.
+    requires_prepared_plan: bool,
+}
+
 static CONDA_OUTPUTS_CACHE: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<String, CondaOutputsResult>>,
+    std::sync::Mutex<std::collections::HashMap<String, CondaOutputsMemo>>,
 > = std::sync::OnceLock::new();
+
+fn remove_incremental_conda_outputs_memo(cache_key: &str) -> bool {
+    let Some(cache) = CONDA_OUTPUTS_CACHE.get() else {
+        return false;
+    };
+    let mut cache = cache.lock().unwrap();
+    if !cache
+        .get(cache_key)
+        .is_some_and(|memo| memo.requires_prepared_plan)
+    {
+        return false;
+    }
+    cache.remove(cache_key);
+    true
+}
 
 /// Build the cache key from the params that actually determine the
 /// outputs. `work_directory` is deliberately EXCLUDED: it's a scratch
@@ -425,6 +449,24 @@ fn courier_build_string(
     }
 }
 
+fn courier_build_string_for_target(
+    target: &ResolutionTarget,
+    inputs_hash: &str,
+    build_number: u64,
+    loose: bool,
+) -> String {
+    courier_build_string(
+        &target.python_version().replace('.', ""),
+        inputs_hash,
+        build_number,
+        loose,
+    )
+}
+
+fn advertised_build_matches(advertised_build: Option<&str>, current_build: &str) -> bool {
+    advertised_build.is_none_or(|build| build == current_build)
+}
+
 /// Compute the courier inputs hash that uniquely identifies a courier build's
 /// content-affecting inputs. This is the single authoritative implementation
 /// called by:
@@ -473,6 +515,61 @@ fn courier_inputs_hash(
         config.pin_version.then_some(env!("CARGO_PKG_VERSION")),
         &config_fp,
     )
+}
+
+fn current_courier_build_for_input_bundle(
+    config: &RetreadConfig,
+    input_bundle_name: &str,
+    target: &ResolutionTarget,
+    workspace_manifest: Option<&crate::workspace::WorkspaceManifest>,
+    workspace_dir: Option<&Path>,
+    source_dir: &Path,
+) -> String {
+    let workspace_root = workspace_dir.unwrap_or(source_dir);
+    let channels = workspace_manifest
+        .map(|manifest| manifest.courier_channel_set(workspace_root, source_dir))
+        .unwrap_or_default();
+    let inputs_hash = courier_inputs_hash(
+        config,
+        input_bundle_name,
+        target,
+        &channels,
+        workspace_manifest,
+        workspace_root,
+        source_dir,
+    );
+    courier_build_string_for_target(
+        target,
+        &inputs_hash,
+        config.build_number,
+        config.bundle_mode == crate::config::BundleMode::Loose,
+    )
+}
+
+fn validate_advertised_courier_build(
+    config: &RetreadConfig,
+    input_bundle_name: &str,
+    target: &ResolutionTarget,
+    workspace_manifest: Option<&crate::workspace::WorkspaceManifest>,
+    workspace_dir: Option<&Path>,
+    source_dir: &Path,
+    advertised_build: Option<&str>,
+) -> Result<(), RpcError> {
+    let current_build = current_courier_build_for_input_bundle(
+        config,
+        input_bundle_name,
+        target,
+        workspace_manifest,
+        workspace_dir,
+        source_dir,
+    );
+    if advertised_build_matches(advertised_build, &current_build) {
+        return Ok(());
+    }
+    Err(RpcError::invalid_params(format!(
+        "courier inputs changed between conda/outputs and conda/build_v1: pixi requested build `{}`, but current inputs for source bundle `{input_bundle_name}` require `{current_build}`; rerun the lock/install so output metadata can be recomputed",
+        advertised_build.unwrap_or_default(),
+    )))
 }
 
 /// Resolution-affecting workspace fingerprint, including the actual metadata
@@ -1807,15 +1904,30 @@ impl Handler {
             cache.get(&cache_key).cloned()
         };
         if let Some(cached) = memory_cached {
-            self.retain_prepared_for_memory_cache_hit(&cache_key, &params.work_directory)
+            let retained = self
+                .retain_prepared_for_memory_cache_hit(&cache_key, &params.work_directory)
                 .await;
-            tracing::info!(
-                "retread: conda/outputs cache hit -- returning memoized result (pixi re-requested for another env)",
+            if !cached.requires_prepared_plan || retained {
+                tracing::info!(
+                    "retread: conda/outputs cache hit -- returning memoized result (pixi re-requested for another env)",
+                );
+                crate::status::tty(
+                    "reusing already-computed outputs (pixi re-requested this package for another environment).",
+                );
+                return Ok(cached.result);
+            }
+            // The memo advertised an incremental lock version, but its exact
+            // materialized plan was consumed or invalidated. Recompute both
+            // metadata and the typed plan together rather than returning an
+            // identity that a later build cannot safely reproduce.
+            CONDA_OUTPUTS_CACHE
+                .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+                .lock()
+                .unwrap()
+                .remove(&cache_key);
+            tracing::debug!(
+                "retread: incremental conda/outputs memo lost its prepared plan; recomputing"
             );
-            crate::status::tty(
-                "reusing already-computed outputs (pixi re-requested this package for another environment).",
-            );
-            return Ok(cached);
         }
         // Fetched early (cheap: just clones handler state) so the DISK
         // cache below can be consulted before the expensive solve.
@@ -1860,7 +1972,13 @@ impl Handler {
                 .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
                 .lock()
                 .unwrap()
-                .insert(cache_key.clone(), cached.clone());
+                .insert(
+                    cache_key.clone(),
+                    CondaOutputsMemo {
+                        result: cached.clone(),
+                        requires_prepared_plan: false,
+                    },
+                );
             self.invalidate_prepared_builds().await;
             return Ok(cached);
         }
@@ -1899,12 +2017,19 @@ impl Handler {
                 .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
                 .lock()
                 .unwrap()
-                .insert(cache_key.clone(), cached.clone());
+                .insert(
+                    cache_key.clone(),
+                    CondaOutputsMemo {
+                        result: cached.clone(),
+                        requires_prepared_plan: false,
+                    },
+                );
             self.invalidate_prepared_builds().await;
             return Ok(cached);
         }
         let prepared_transaction = self.begin_prepared_transaction(generation).await;
         let mut prepared_builds = Vec::new();
+        let mut incremental_output_advertised = false;
         // Re-read from the snapshot's workspace path. The cache-key probes
         // above happen before snapshotting handler state and are not a safe
         // lifecycle boundary for the typed plan itself.
@@ -2050,7 +2175,7 @@ impl Handler {
                 // off, detect_incremental_add returns None at Gate 1 and the map
                 // is empty (byte-identical to today).
                 let incr_version_overrides: std::collections::HashMap<String, String> =
-                    if config.courier {
+                    if config.courier && plan.local_wheel_stamps.is_some() {
                         let courier_channels_for_fp = workspace_manifest
                             .as_ref()
                             .map(|m| {
@@ -2208,6 +2333,7 @@ impl Handler {
                     let version_override_for_bundle = incr_version_overrides
                         .get(&bundle.conda_name)
                         .map(|s| s.as_str());
+                    incremental_output_advertised |= version_override_for_bundle.is_some();
                     let output = produce_output(
                         &bundle,
                         &effective,
@@ -2232,13 +2358,15 @@ impl Handler {
                             "probe trace write failed (non-fatal)",
                         );
                     }
-                    if version_override_for_bundle.is_none() && plan.local_wheel_stamps.is_some() {
+                    if plan.local_wheel_stamps.is_some() {
                         prepared_builds.push(PreparedBuild {
                             locator_id: prepared_builds.len(),
                             plan: Arc::clone(&plan),
                             bundle_index,
                             emission: emission.clone(),
                             advertised: PreparedOutputIdentity::from_metadata(&output.metadata),
+                            incremental_version_override: version_override_for_bundle
+                                .map(str::to_owned),
                         });
                     }
                     outputs.push(output);
@@ -2257,26 +2385,38 @@ impl Handler {
         );
         // Memoize so pixi's subsequent per-env re-requests (identical
         // params) skip the whole recompute.
-        CONDA_OUTPUTS_CACHE
-            .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
-            .lock()
-            .unwrap()
-            .insert(cache_key.clone(), result.clone());
-        // Cross-process: persist so a DIFFERENT retread process solving
-        // another environment that shares this exact (params, workspace
-        // mtime) key can skip the recompute too. Best-effort -- a write
-        // failure (read-only cache dir, disk full) just means the next
-        // process falls back to a cold compute, same as today.
-        write_conda_outputs_disk_cache(&disk_cache_path, &result).await;
+        let requires_prepared_plan = incremental_output_advertised;
         if let Some(transaction) = prepared_transaction {
             if !self
-                .publish_prepared_builds(generation, transaction, cache_key, prepared_builds)
+                .publish_prepared_builds(
+                    generation,
+                    transaction,
+                    cache_key.clone(),
+                    prepared_builds,
+                )
                 .await
             {
                 tracing::debug!(
                     "discarded prepared build plans from a superseded conda/outputs transaction"
                 );
             }
+        }
+        CONDA_OUTPUTS_CACHE
+            .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+            .lock()
+            .unwrap()
+            .insert(
+                cache_key.clone(),
+                CondaOutputsMemo {
+                    result: result.clone(),
+                    requires_prepared_plan,
+                },
+            );
+        // Cross-process memos cannot carry the exact typed/materialized plan.
+        // Persist ordinary outputs only; incremental-version outputs must be
+        // recomputed by each backend process so build_v1 has their plan.
+        if !requires_prepared_plan {
+            write_conda_outputs_disk_cache(&disk_cache_path, &result).await;
         }
         Ok(result)
     }
@@ -2390,6 +2530,13 @@ impl Handler {
         let build_output_dir = stage_output_dir
             .clone()
             .unwrap_or_else(|| output_dir.clone());
+        // The output version is the package identity pixi already solved from
+        // conda/outputs. A cold re-resolve must reproduce it exactly rather
+        // than relabel newly resolved wheel bytes. The sole override below is
+        // granted only after build_v1 independently proves that this request
+        // came from an incremental lock and its localized attempt escalates.
+        let advertised_output_version = params.output.version.as_ref().map(ToString::to_string);
+        let mut detected_incremental_fallback_version = None;
         if config.courier {
             // Need workspace_manifest to compute the config fingerprint
             // identically to how build_one does it (channel set + workspace
@@ -2423,170 +2570,227 @@ impl Handler {
             // (params.output.name.as_normalized()), which equals bundle.conda_name
             // and is what courier::stage uses as the lock key.
             let bundle_name_for_hash = params.output.name.as_normalized().to_string();
+            let declared_input_bundle =
+                declared_input_bundle_for_output(&config, &bundle_name_for_hash);
             let current_hash = courier_inputs_hash(
                 &config,
-                &bundle_name_for_hash,
+                declared_input_bundle
+                    .as_deref()
+                    .unwrap_or(&bundle_name_for_hash),
                 &target,
                 &courier_channels,
                 ws_manifest_for_replay.as_ref(),
                 workspace_dir.as_deref().unwrap_or(&source_dir),
                 &source_dir,
             );
-            let lock_path = lock_path_for_target(&source_dir, &bundle_name_for_hash, &target);
-            let relax_is_default = config.relax == crate::config::RelaxPolicy::default();
-            match load_replayable_lock_for_target(
-                &lock_path,
-                &current_hash,
-                relax_is_default,
+            let current_build = courier_build_string_for_target(
                 &target,
-                &bundle_name_for_hash,
-            ) {
-                Ok(Some(lock)) => {
-                    tracing::info!(
-                        bundle = %bundle_name_for_hash,
-                        "WS-B build_v1 replay hit: re-materializing from lock \
-                         (resolve_all skipped)",
-                    );
-                    crate::status::tty(&format!(
-                        "building '{}': replay hit -- re-materializing from lock \
-                         (derivation skipped).",
-                        bundle_name_for_hash,
-                    ));
-                    // On the REPLAY path the authoritative run-deps are
-                    // lock.conda_run_deps (already validated and stored when
-                    // the lock was committed). Using params.run_dependencies
-                    // here would allow pixi's live conda solver to inject
-                    // non-deterministic extras (e.g. python_abi) that drift
-                    // the rewritten lock away from the committed one.
-                    // params.run_dependencies is intentionally ignored on
-                    // this path; the COLD path (full resolve_all) keeps
-                    // using run_override / params.run_dependencies unchanged.
-                    let run_deps: Vec<String> = lock
-                        .conda_run_deps
-                        .iter()
-                        .map(|dep| {
-                            if dep.spec.is_empty() {
-                                dep.name.clone()
-                            } else {
-                                format!("{} {}", dep.name, dep.spec)
-                            }
-                        })
-                        .collect();
-                    match materialize_from_lock_for_target(
-                        lock,
-                        &bundle_name_for_hash,
-                        &config,
-                        &params.work_directory,
-                        &build_output_dir,
-                        &target,
-                        &source_dir,
-                        &cache_dir,
-                        params.output.build.as_deref(),
-                        run_deps,
-                        &config_fp,
-                    )
-                    .await
-                    {
-                        Ok(Some(result)) => {
-                            return finalize_fasttmp_build_output(
-                                result,
-                                stage_output_dir.as_deref(),
-                                &output_dir,
-                            )
-                            .await;
-                        }
-                        Ok(None) => {
-                            // Provenance gap (class 3 / schema-5 class 2):
-                            // fall through to full resolve_all.
-                            tracing::debug!(
-                                bundle = %bundle_name_for_hash,
-                                "WS-B build_v1 replay: provenance gap -- \
-                                 falling through to full resolve",
-                            );
-                        }
-                        Err(e) => {
-                            return Err(RpcError::internal(format!(
-                                "build_v1 replay {bundle_name_for_hash}: {e:#}"
-                            )));
-                        }
-                    }
-                }
-                Ok(None) => {
-                    tracing::debug!(
-                        bundle = %bundle_name_for_hash,
-                        "WS-B build_v1 replay miss (hash mismatch / no lock) -- full resolve",
-                    );
-                }
-                Err(e) => {
-                    tracing::debug!(
-                        bundle = %bundle_name_for_hash,
-                        error = %format!("{e:#}"),
-                        "WS-B build_v1 replay error (non-fatal) -- full resolve",
-                    );
-                }
-            }
-
-            // WS-B incremental-add fast path (STEP 4): if RETREAD_INCREMENTAL=1
-            // and the current manifest diff is a pure dep addition, attempt a
-            // localized resolve that reuses the locked closure.  Falls through
-            // to cold resolve_all on any gate failure, ripple, or conflict.
-            {
-                let ws_indexes: Vec<String> = ws_manifest_for_replay
-                    .as_ref()
-                    .map(|m| m.resolution_pypi_index_urls())
-                    .unwrap_or_else(|| vec![crate::index_chain::PUBLIC_PYPI.to_string()]);
-                let relax_str = format!("{:?}", config.relax);
-                if let Some(incr) = detect_incremental_add_for_target(
+                &current_hash,
+                config.build_number,
+                config.bundle_mode == crate::config::BundleMode::Loose,
+            );
+            let fast_identity_matches = declared_input_bundle.is_some()
+                && advertised_build_matches(params.output.build.as_deref(), &current_build);
+            if fast_identity_matches {
+                let lock_path = lock_path_for_target(&source_dir, &bundle_name_for_hash, &target);
+                let relax_is_default = config.relax == crate::config::RelaxPolicy::default();
+                match load_replayable_lock_for_target(
                     &lock_path,
-                    &config,
-                    &bundle_name_for_hash,
-                    &ws_indexes,
-                    &relax_str,
+                    &current_hash,
+                    relax_is_default,
                     &target,
-                    &config_fp,
+                    &bundle_name_for_hash,
                 ) {
-                    match resolve_incremental_add(
-                        incr,
-                        &config,
-                        &target,
-                        &download_dir,
-                        &source_dir,
-                        &cache_dir,
-                        &params.channels,
-                        workspace_dir.as_deref(),
-                        &params.work_directory,
-                        &build_output_dir,
-                        params.output.build.as_deref(),
-                        &config_fp,
-                    )
-                    .await
+                    Ok(Some(lock))
+                        if advertised_version_matches(
+                            advertised_output_version.as_deref(),
+                            &lock.version,
+                        ) =>
                     {
-                        Ok(Some(result)) => {
-                            tracing::info!(
-                                bundle = %bundle_name_for_hash,
-                                "incremental-add: localized resolve succeeded"
-                            );
-                            return finalize_fasttmp_build_output(
-                                result,
-                                stage_output_dir.as_deref(),
-                                &output_dir,
-                            )
-                            .await;
+                        tracing::info!(
+                            bundle = %bundle_name_for_hash,
+                            "WS-B build_v1 replay hit: re-materializing from lock \
+                             (resolve_all skipped)",
+                        );
+                        crate::status::tty(&format!(
+                            "building '{}': replay hit -- re-materializing from lock \
+                         (derivation skipped).",
+                            bundle_name_for_hash,
+                        ));
+                        // On the REPLAY path the authoritative run-deps are
+                        // lock.conda_run_deps (already validated and stored when
+                        // the lock was committed). Using params.run_dependencies
+                        // here would allow pixi's live conda solver to inject
+                        // non-deterministic extras (e.g. python_abi) that drift
+                        // the rewritten lock away from the committed one.
+                        // params.run_dependencies is intentionally ignored on
+                        // this path; the COLD path (full resolve_all) keeps
+                        // using run_override / params.run_dependencies unchanged.
+                        let run_deps: Vec<String> = lock
+                            .conda_run_deps
+                            .iter()
+                            .map(|dep| {
+                                if dep.spec.is_empty() {
+                                    dep.name.clone()
+                                } else {
+                                    format!("{} {}", dep.name, dep.spec)
+                                }
+                            })
+                            .collect();
+                        match materialize_from_lock_for_target(
+                            lock,
+                            &bundle_name_for_hash,
+                            &config,
+                            &params.work_directory,
+                            &build_output_dir,
+                            &target,
+                            &source_dir,
+                            &cache_dir,
+                            params.output.build.as_deref(),
+                            run_deps,
+                            &config_fp,
+                        )
+                        .await
+                        {
+                            Ok(Some(result)) => {
+                                return finalize_fasttmp_build_output(
+                                    result,
+                                    stage_output_dir.as_deref(),
+                                    &output_dir,
+                                )
+                                .await;
+                            }
+                            Ok(None) => {
+                                // Provenance gap (class 3 / schema-5 class 2):
+                                // fall through to full resolve_all.
+                                tracing::debug!(
+                                    bundle = %bundle_name_for_hash,
+                                    "WS-B build_v1 replay: provenance gap -- \
+                                     falling through to full resolve",
+                                );
+                            }
+                            Err(e) => {
+                                return Err(RpcError::internal(format!(
+                                    "build_v1 replay {bundle_name_for_hash}: {e:#}"
+                                )));
+                            }
                         }
-                        Ok(None) => {
-                            tracing::debug!(
-                                bundle = %bundle_name_for_hash,
-                                "incremental-add: escalated to cold resolve"
-                            );
-                            // fall through to resolve_all
-                        }
-                        Err(e) => {
-                            return Err(RpcError::internal(format!(
-                                "incremental-add {bundle_name_for_hash}: {e:#}"
-                            )));
+                    }
+                    Ok(Some(lock)) => {
+                        tracing::debug!(
+                            bundle = %bundle_name_for_hash,
+                            advertised_version = %advertised_output_version.as_deref().unwrap_or_default(),
+                            lock_version = %lock.version,
+                            "WS-B build_v1 replay version differs from advertised output; falling through to cold resolve",
+                        );
+                    }
+                    Ok(None) => {
+                        tracing::debug!(
+                            bundle = %bundle_name_for_hash,
+                            "WS-B build_v1 replay miss (hash mismatch / no lock) -- full resolve",
+                        );
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            bundle = %bundle_name_for_hash,
+                            error = %format!("{e:#}"),
+                            "WS-B build_v1 replay error (non-fatal) -- full resolve",
+                        );
+                    }
+                }
+
+                // WS-B incremental-add fast path (STEP 4): if RETREAD_INCREMENTAL=1
+                // and the current manifest diff is a pure dep addition, attempt a
+                // localized resolve that reuses the locked closure.  Falls through
+                // to cold resolve_all on any gate failure, ripple, or conflict.
+                {
+                    let ws_indexes: Vec<String> = ws_manifest_for_replay
+                        .as_ref()
+                        .map(|m| m.resolution_pypi_index_urls())
+                        .unwrap_or_else(|| vec![crate::index_chain::PUBLIC_PYPI.to_string()]);
+                    let relax_str = format!("{:?}", config.relax);
+                    if let Some(incr) = detect_incremental_add_for_target(
+                        &lock_path,
+                        &config,
+                        declared_input_bundle
+                            .as_deref()
+                            .unwrap_or(&bundle_name_for_hash),
+                        &ws_indexes,
+                        &relax_str,
+                        &target,
+                        &config_fp,
+                    ) {
+                        match incremental_version_plan(
+                            advertised_output_version.as_deref(),
+                            &incr.lock.version,
+                        ) {
+                            IncrementalVersionPlan::Cold => {
+                                tracing::debug!(
+                                    bundle = %bundle_name_for_hash,
+                                    lock_version = %incr.lock.version,
+                                    advertised_version = %advertised_output_version.as_deref().unwrap_or_default(),
+                                    "incremental-add: advertised version differs from lock; skipping localized build and requiring an exact cold version match"
+                                );
+                            }
+                            IncrementalVersionPlan::Attempt { fallback_version } => {
+                                match resolve_incremental_add(
+                                    incr,
+                                    &config,
+                                    &target,
+                                    &download_dir,
+                                    &source_dir,
+                                    &cache_dir,
+                                    &params.channels,
+                                    workspace_dir.as_deref(),
+                                    &params.work_directory,
+                                    &build_output_dir,
+                                    params.output.build.as_deref(),
+                                    &config_fp,
+                                )
+                                .await
+                                {
+                                    Ok(Some(result)) => {
+                                        tracing::info!(
+                                            bundle = %bundle_name_for_hash,
+                                            "incremental-add: localized resolve succeeded"
+                                        );
+                                        return finalize_fasttmp_build_output(
+                                            result,
+                                            stage_output_dir.as_deref(),
+                                            &output_dir,
+                                        )
+                                        .await;
+                                    }
+                                    Ok(None) => {
+                                        detected_incremental_fallback_version =
+                                            Some(fallback_version);
+                                        tracing::debug!(
+                                            bundle = %bundle_name_for_hash,
+                                            version = %detected_incremental_fallback_version.as_deref().unwrap_or_default(),
+                                            "incremental-add: localized attempt escalated; requiring the exact prepared conda/outputs plan"
+                                        );
+                                        // Fall through to the typed prepared
+                                        // plan handoff. A fresh resolve_all is
+                                        // forbidden for this identity.
+                                    }
+                                    Err(e) => {
+                                        return Err(RpcError::internal(format!(
+                                            "incremental-add {bundle_name_for_hash}: {e:#}"
+                                        )));
+                                    }
+                                }
+                            }
                         }
                     }
                 }
+            } else {
+                tracing::debug!(
+                    output = %bundle_name_for_hash,
+                    input_bundle = ?declared_input_bundle,
+                    advertised_build = %params.output.build.as_deref().unwrap_or_default(),
+                    current_build = %current_build,
+                    "courier fast replay/incremental identity unavailable; deferring to recovered cold plan",
+                );
             }
         }
 
@@ -2632,6 +2836,38 @@ impl Handler {
                 .build
                 .as_deref()
                 .unwrap_or(&prepared.advertised.build);
+            let input_bundle_name = prepared
+                .plan
+                .materialized
+                .get(prepared.bundle_index)
+                .map(|base| base.conda_name.as_str())
+                .ok_or_else(|| {
+                    RpcError::internal("prepared build lost its source bundle identity".to_string())
+                })?;
+            validate_prepared_incremental_version_handoff(
+                prepared.incremental_version_override.as_deref(),
+                detected_incremental_fallback_version.as_deref(),
+                &bundle.conda_name,
+            )?;
+            let prepared_workspace_manifest = workspace_dir
+                .as_deref()
+                .and_then(crate::workspace::WorkspaceManifest::load);
+            if prepared.plan.declared_config.courier {
+                validate_advertised_courier_build(
+                    &prepared.plan.declared_config,
+                    input_bundle_name,
+                    &prepared.plan.target,
+                    prepared_workspace_manifest.as_ref(),
+                    workspace_dir.as_deref(),
+                    &source_dir,
+                    Some(expected_build),
+                )?;
+                validate_advertised_courier_version(
+                    &bundle,
+                    advertised_output_version.as_deref(),
+                    prepared.incremental_version_override.as_deref(),
+                )?;
+            }
             let result = build_one(
                 &bundle,
                 &effective,
@@ -2642,7 +2878,9 @@ impl Handler {
                 &prepared.plan.target,
                 &source_dir,
                 workspace_dir.as_deref(),
+                input_bundle_name,
                 Some(expected_build),
+                prepared.incremental_version_override.as_deref(),
                 run_override.as_deref(),
             )
             .await
@@ -2654,6 +2892,11 @@ impl Handler {
                 .await;
             return Ok(result);
         }
+
+        reject_unprepared_incremental_fallback(
+            detected_incremental_fallback_version.as_deref(),
+            params.output.name.as_normalized(),
+        )?;
 
         // Re-resolve materialized bundles, then autodiscover emissions
         // and pick the one matching the requested output name.
@@ -2705,7 +2948,28 @@ impl Handler {
         let base_bundle = materialized.first().ok_or_else(|| {
             RpcError::invalid_params("no bundles produced; check [retread-wheels]".to_string())
         })?;
+        let input_bundle_name = base_bundle.conda_name.clone();
         let (bundle, effective) = apply_emission(base_bundle, &base_config, picked_emission);
+
+        if config.courier {
+            let cold_workspace_manifest = workspace_dir
+                .as_deref()
+                .and_then(crate::workspace::WorkspaceManifest::load);
+            validate_advertised_courier_build(
+                &config,
+                &input_bundle_name,
+                &target,
+                cold_workspace_manifest.as_ref(),
+                workspace_dir.as_deref(),
+                &source_dir,
+                params.output.build.as_deref(),
+            )?;
+            validate_advertised_courier_version(
+                &bundle,
+                advertised_output_version.as_deref(),
+                None,
+            )?;
+        }
 
         let result = build_one(
             &bundle,
@@ -2717,7 +2981,9 @@ impl Handler {
             &target,
             &source_dir,
             workspace_dir.as_deref(),
+            &input_bundle_name,
             params.output.build.as_deref(),
+            None,
             run_override.as_deref(),
         )
         .await
@@ -2755,7 +3021,7 @@ impl Handler {
         true
     }
 
-    async fn retain_prepared_for_memory_cache_hit(&self, cache_key: &str, work_dir: &Path) {
+    async fn retain_prepared_for_memory_cache_hit(&self, cache_key: &str, work_dir: &Path) -> bool {
         let mut state = self.state.write().await;
         let reusable = state.prepared_cache_key.as_deref() == Some(cache_key)
             && !state.prepared_builds.is_empty()
@@ -2764,7 +3030,7 @@ impl Handler {
                 .iter()
                 .all(|prepared| prepared.plan.work_directory == work_dir);
         if reusable {
-            return;
+            return true;
         }
         state.prepared_transaction = state
             .prepared_transaction
@@ -2772,6 +3038,7 @@ impl Handler {
             .expect("prepared transaction counter exhausted");
         state.prepared_cache_key = None;
         state.prepared_builds.clear();
+        false
     }
 
     async fn invalidate_prepared_builds(&self) {
@@ -2851,11 +3118,23 @@ impl Handler {
         if state.generation != generation || state.prepared_transaction != transaction {
             return;
         }
+        let previous_len = state.prepared_builds.len();
+        let cache_key = state.prepared_cache_key.clone();
         state
             .prepared_builds
             .retain(|prepared| prepared.locator_id != locator_id);
+        let consumed = state.prepared_builds.len() != previous_len;
         if state.prepared_builds.is_empty() {
             state.prepared_cache_key = None;
+        }
+        drop(state);
+
+        // An incremental memo is a set of typed output→plan handoffs, not
+        // merely reusable metadata. Consuming any one locator makes that set
+        // incomplete even while sibling locators remain, so a repeated
+        // conda/outputs request must recompute the whole set.
+        if consumed && let Some(cache_key) = cache_key {
+            remove_incremental_conda_outputs_memo(&cache_key);
         }
     }
 
@@ -3259,7 +3538,7 @@ async fn resolve_all(
                         &effective.git_sources,
                         auto_data,
                         pypi_to_conda,
-                        &effective.name_map,
+                        BfsRoutePolicy::from_config(effective),
                         conda_channels,
                         group_fallback_indexes,
                         None, // locked-closure seam: incremental-add ONLY (uv pins flow via prefs below)
@@ -6369,6 +6648,12 @@ struct PreparedBuild {
     bundle_index: usize,
     emission: DiscoveredEmission,
     advertised: PreparedOutputIdentity,
+    /// Present only when conda/outputs intentionally advertised the version
+    /// of a matching incremental lock rather than the cold primary wheel.
+    /// This typed origin never crosses the process-local metadata/build
+    /// handoff; build_v1 must independently rediscover the same lock before
+    /// it may use the override.
+    incremental_version_override: Option<String>,
 }
 
 struct PreparedBuildSelection {
@@ -6407,8 +6692,10 @@ impl PreparedBuild {
         let (bundle, effective) =
             apply_emission(base_bundle, &self.plan.base_config, &self.emission);
         let applied_name = PackageName::new_unchecked(bundle.conda_name.clone());
+        let package_version =
+            courier_pack_version(&bundle, self.incremental_version_override.as_deref());
         (applied_name.as_normalized() == self.advertised.name
-            && bundle.primary.metadata.version == self.advertised.version)
+            && package_version == self.advertised.version)
             .then_some((bundle, effective))
     }
 }
@@ -7050,6 +7337,182 @@ fn bfs_descendant_indexes(source: &PendingSource, bundle_indexes: &[String]) -> 
     }
 }
 
+/// The subset of pack configuration that can make a BFS dependency a native
+/// conda route.  Keeping this typed prevents the source-built fallback walk
+/// from seeing the effective name map while silently missing the manual
+/// override that emission will apply later.
+#[derive(Clone, Copy)]
+struct BfsRoutePolicy<'a> {
+    name_map: &'a NameMap,
+    overrides: Option<&'a BTreeMap<String, String>>,
+    ledger_overrides: Option<&'a BTreeSet<String>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BfsOverride<'a> {
+    spec: &'a str,
+    manual: bool,
+}
+
+impl<'a> BfsRoutePolicy<'a> {
+    fn from_config(config: &'a RetreadConfig) -> Self {
+        Self {
+            name_map: &config.name_map,
+            overrides: Some(&config.overrides),
+            ledger_overrides: Some(&config.ledger_overrides),
+        }
+    }
+
+    #[cfg(test)]
+    fn name_map_only(name_map: &'a NameMap) -> Self {
+        Self {
+            name_map,
+            overrides: None,
+            ledger_overrides: None,
+        }
+    }
+
+    fn override_for(&self, key: &str) -> Option<BfsOverride<'a>> {
+        let override_spec = self.overrides?.get(key)?;
+        // The ledger records the exact key it inserted into `overrides`.
+        // Classify that selected entry by exact key as well: canonical-family
+        // matching could mislabel a distinct hand-written alias.
+        let ledgered = self
+            .ledger_overrides
+            .is_some_and(|ledger| ledger.contains(key));
+        Some(BfsOverride {
+            spec: override_spec.as_str(),
+            manual: !ledgered,
+        })
+    }
+
+    /// Resolve the conda identity and any hand-written override with the same
+    /// precedence as emission: the PyPI-keyed override wins, then the mapped
+    /// conda-provider key. A PyPI-keyed override may establish an identity
+    /// route when no mapping exists; an explicit disabled mapping still keeps
+    /// the dependency on PyPI.
+    fn target_and_override(
+        &self,
+        pypi_key: &PypiKey,
+        pypi_to_conda: &PypiToCondaMap,
+    ) -> (Option<CondaName>, Option<BfsOverride<'a>>) {
+        // Select by the same precedence as emission BEFORE classifying manual
+        // authority. A higher-precedence PyPI-key ledger entry must block a
+        // lower-precedence mapped-provider manual entry.
+        let pypi_override = self.override_for(pypi_key.as_str());
+        let explicitly_disabled =
+            matches!(self.name_map.get(pypi_key), Some(CondaTarget::Disabled));
+        let target = pick_conda_target(pypi_key, self.name_map, pypi_to_conda).or_else(|| {
+            (pypi_override.is_some_and(|entry| entry.manual) && !explicitly_disabled)
+                .then(|| CondaName::new(pypi_key.as_str()))
+        });
+        let selected_override = target.as_ref().and_then(|conda_name| {
+            pypi_override.or_else(|| self.override_for(conda_name.as_spec()))
+        });
+        (target, selected_override)
+    }
+}
+
+fn incremental_bundle_requires_cold_resolve(bundle: &Bundle) -> bool {
+    bundle.probe_decisions.iter().any(|decision| {
+        decision.stage == "bfs" && decision.routing_decision.starts_with("short-circuit")
+    })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum IncrementalVersionPlan {
+    /// Metadata and the committed lock agree, so localized build may proceed.
+    /// A later escalation must retain this version during the cold build.
+    Attempt { fallback_version: String },
+    /// Metadata advertised a different (normally cold-resolved) version. A
+    /// localized build would return `lock.version`, so bypass it and preserve
+    /// the version pixi already solved.
+    Cold,
+}
+
+fn incremental_version_plan(
+    advertised_version: Option<&str>,
+    lock_version: &str,
+) -> IncrementalVersionPlan {
+    match advertised_version {
+        Some(version) if version != lock_version => IncrementalVersionPlan::Cold,
+        Some(version) => IncrementalVersionPlan::Attempt {
+            fallback_version: version.to_string(),
+        },
+        None => IncrementalVersionPlan::Attempt {
+            fallback_version: lock_version.to_string(),
+        },
+    }
+}
+
+fn advertised_version_matches(advertised_version: Option<&str>, candidate_version: &str) -> bool {
+    advertised_version.is_none_or(|version| version == candidate_version)
+}
+
+fn validate_advertised_courier_version(
+    bundle: &Bundle,
+    advertised_version: Option<&str>,
+    incremental_fallback_version: Option<&str>,
+) -> Result<(), RpcError> {
+    let package_version = courier_pack_version(bundle, incremental_fallback_version);
+    if advertised_version_matches(advertised_version, &package_version) {
+        return Ok(());
+    }
+    Err(RpcError::invalid_params(format!(
+        "courier resolution changed between conda/outputs and conda/build_v1: pixi requested version `{}`, but the current primary wheel for `{}` requires package version `{package_version}`; rerun the lock/install so output metadata can be recomputed",
+        advertised_version.unwrap_or_default(),
+        bundle.conda_name,
+    )))
+}
+
+fn validate_prepared_incremental_version_handoff(
+    prepared_override: Option<&str>,
+    detected_override: Option<&str>,
+    output_name: &str,
+) -> Result<(), RpcError> {
+    if prepared_override == detected_override {
+        return Ok(());
+    }
+    Err(RpcError::invalid_params(format!(
+        "courier incremental metadata/build handoff changed for `{output_name}`: conda/outputs recorded version override `{}`, but build_v1 independently detected `{}`; rerun the lock/install so metadata and its exact prepared plan are recomputed together",
+        prepared_override.unwrap_or("none"),
+        detected_override.unwrap_or("none"),
+    )))
+}
+
+fn reject_unprepared_incremental_fallback(
+    detected_override: Option<&str>,
+    output_name: &str,
+) -> Result<(), RpcError> {
+    let Some(version) = detected_override else {
+        return Ok(());
+    };
+    Err(RpcError::invalid_params(format!(
+        "courier incremental build for `{output_name}` escalated after metadata advertised lock version `{version}`, but the exact conda/outputs plan is unavailable or stale; rerun the lock/install so metadata and build share one materialized plan"
+    )))
+}
+
+/// Resolve an output name back to a declared retread bundle/group only when
+/// the identity is unambiguous from the source manifest itself. Workspace
+/// aliases created by `apply_emission` deliberately return `None`; build_v1
+/// must recover their base identity from the prepared or cold plan before it
+/// can validate a content-addressed build hash.
+fn declared_input_bundle_for_output(config: &RetreadConfig, output_name: &str) -> Option<String> {
+    let output = canonical_conda_name(output_name);
+    config
+        .retread_wheels
+        .iter()
+        .find_map(|(entry_name, entry)| {
+            let group = bundle_group_for(entry_name, entry, config.default_bundle.as_deref());
+            let group = canonical_conda_name(&group);
+            if group == output { Some(group) } else { None }
+        })
+}
+
+fn bfs_probe_target_subdir(target: &ResolutionTarget) -> &str {
+    target.conda_subdir()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn resolve_bundle(
     entry_name: &str,
@@ -7072,15 +7535,12 @@ async fn resolve_bundle(
     // circuit: user opted into a specific upstream source via PEP 508
     // `pkg @ <url>` and substituting conda would silently swap deps.
     pypi_to_conda: &PypiToCondaMap,
-    // v0.46.0: the merged effective name-map (user retread-name-map +
-    // FALLBACK_PYPI_TO_CONDA + unambiguous parselmouth). The BFS prefer-
-    // conda picker consults THIS first, so curated answers like
-    // torch->pytorch route to conda even when parselmouth's inverted map
-    // is ambiguous (multiple conda candidates, no identity match). Without
-    // it, `torch` fell through to PyPI and got bundled at latest (2.12.0),
-    // clobbering conda's pinned pytorch at install. Emission already used
-    // this map; the BFS now matches it.
-    name_map: &NameMap,
+    // Native-conda routing inputs: the merged effective name-map (user
+    // retread-name-map + FALLBACK_PYPI_TO_CONDA + unambiguous parselmouth)
+    // plus hand-written retread-overrides. The BFS must see both because
+    // emission applies both: otherwise an indecisive route probe can bundle a
+    // newest PyPI wheel before a later exact override is emitted.
+    route_policy: BfsRoutePolicy<'_>,
     conda_channels: &[ChannelUrl],
     // Complete workspace-first group fallback chain. URL-form roots do not
     // contribute an index, but their ordinary metadata descendants inherit it.
@@ -7411,8 +7871,8 @@ async fn resolve_bundle(
                 // which are often ambiguous for exactly the deps the FALLBACK
                 // table exists to disambiguate.
                 {
-                    let picked: Option<CondaName> =
-                        pick_conda_target(&dep_pypi_key, name_map, pypi_to_conda);
+                    let (picked, selected_override) =
+                        route_policy.target_and_override(&dep_pypi_key, pypi_to_conda);
                     match picked {
                         None => {
                             let amb = pypi_to_conda.get(dep_pypi_key.as_str());
@@ -7435,16 +7895,32 @@ async fn resolve_bundle(
                             // routed_to_conda stays false -> falls through to pypi::resolve below
                         }
                         Some(conda_target_name) => {
-                            let probe_spec = conda_probe_spec(specifiers);
-                            let probe_result = crate::probe::probe(
+                            // Emission replaces the wheel requirement with the
+                            // selected override, so probe that same spec. A
+                            // hand-written override is the native-conda
+                            // boundary and remains authoritative even when the
+                            // diagnostic probe is unavailable or indecisive.
+                            let probe_spec = match selected_override.map(|entry| entry.spec.trim())
+                            {
+                                Some("") => "*".to_string(),
+                                Some(spec) => spec.to_string(),
+                                None => conda_probe_spec(specifiers),
+                            };
+                            let probe_result = crate::probe::probe_for_target(
                                 conda_channels,
                                 conda_target_name.as_spec(),
                                 &probe_spec,
                                 Some(&target.python_version),
+                                bfs_probe_target_subdir(target),
                             )
                             .await;
-                            let route_to_conda = validated_conda_route(&probe_result);
-                            let routing_decision = if route_to_conda {
+                            let manual_override =
+                                selected_override.is_some_and(|entry| entry.manual);
+                            let route_to_conda =
+                                manual_override || validated_conda_route(&probe_result);
+                            let routing_decision = if manual_override {
+                                "short-circuit-explicit-override"
+                            } else if route_to_conda {
                                 "short-circuit"
                             } else {
                                 "fall-through-to-pypi"
@@ -7465,6 +7941,7 @@ async fn resolve_bundle(
                                 conda_name = %conda_target_name,
                                 spec = %probe_spec,
                                 decision = %routing_decision,
+                                manual_override,
                                 matches = probe_result.matching_candidates,
                                 channels = ?probe_result.channels_consulted,
                                 "BFS prefer-conda probe result",
@@ -10535,6 +11012,7 @@ async fn materialize_from_lock_for_target(
         None, // bundle=None: replay path, audit skipped
         config,
         &bundle_name,
+        &bundle_name,
         &version,
         target,
         Some(&lock),
@@ -10567,6 +11045,7 @@ async fn materialize_and_pack(
     bundle: Option<&Bundle>,
     config: &RetreadConfig,
     bundle_name: &str,
+    input_bundle_name: &str,
     version: &str,
     target: &ResolutionTarget,
     authoritative_lock: Option<&crate::lock::RetreadLock>,
@@ -10593,7 +11072,7 @@ async fn materialize_and_pack(
     let staged = crate::courier::stage_for_target_with_store_root(
         config,
         bundle_name,
-        bundle_name,
+        input_bundle_name,
         version,
         target,
         &emit_wheels,
@@ -10905,7 +11384,7 @@ async fn resolve_incremental_add(
             &effective.git_sources,
             auto_data,
             &pypi_to_conda,
-            &effective.name_map,
+            BfsRoutePolicy::from_config(&effective),
             conda_channels,
             &workspace_pypi_indexes,
             Some(&locked_closure),
@@ -10928,6 +11407,19 @@ async fn resolve_incremental_add(
                 return Err(e);
             }
         };
+
+        // Incremental merge reuses the committed lock's conda run-deps and
+        // only appends wheel payloads. A dependency that this new bundle
+        // short-circuited to conda would therefore be absent from BOTH sets.
+        // Cold resolution owns complete run-dep emission, so escalate rather
+        // than publish a silently incomplete incremental lock.
+        if incremental_bundle_requires_cold_resolve(&bundle) {
+            tracing::debug!(
+                entry = %entry_name,
+                "incremental-add: new BFS conda route requires complete cold run-dep emission"
+            );
+            return Ok(None);
+        }
 
         // Convert Bundle → EmitWheel (same logic as build_one, lines 5461-5494).
         let wheels_root = source_dir.join("wheels");
@@ -11037,6 +11529,7 @@ async fn resolve_incremental_add(
     let result = materialize_and_pack(
         None, // bundle=None: incremental path, no full Bundle available
         config,
+        &bundle_name,
         &bundle_name,
         &version,
         target,
@@ -11250,6 +11743,17 @@ fn verify_localadd_hook(
     }
 }
 
+/// Select the courier package version independently from the primary wheel's
+/// version when a localized incremental add was advertised and then had to
+/// fall back to a full cold materialization. Wheel identities remain their
+/// own upstream versions; only the generated conda package keeps the version
+/// pixi already solved from conda/outputs.
+fn courier_pack_version(bundle: &Bundle, advertised_override: Option<&str>) -> String {
+    advertised_override
+        .unwrap_or(&bundle.primary.metadata.version)
+        .to_string()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn build_one(
     bundle: &Bundle,
@@ -11261,7 +11765,9 @@ async fn build_one(
     target: &ResolutionTarget,
     source_dir: &Path,
     workspace_dir: Option<&Path>,
+    input_bundle_name: &str,
     expected_build: Option<&str>,
+    courier_version_override: Option<&str>,
     run_override: Option<&[String]>,
 ) -> Result<CondaBuildV1Result> {
     if target.conda_subdir() != target_subdir.to_string() {
@@ -11310,7 +11816,7 @@ async fn build_one(
     // WS-C: courier mode — delegate to materialize_and_pack which handles
     // the full courier staging + rattler-build + deferred lock flush pipeline.
     if config.courier {
-        let version = bundle.primary.metadata.version.clone();
+        let version = courier_pack_version(bundle, courier_version_override);
         let emit_wheels: Vec<crate::emit_pypi::EmitWheel> = bundle
             .all_wheels()
             .zip(localized_urls.iter())
@@ -11413,6 +11919,7 @@ async fn build_one(
             Some(bundle),
             config,
             &bundle.conda_name,
+            input_bundle_name,
             &version,
             target,
             None,
@@ -15631,7 +16138,8 @@ version = "1.0.0"
 // -----------------------------------------------------------------
 #[cfg(test)]
 mod courier_build_string_tests {
-    use super::courier_build_string;
+    use super::{advertised_build_matches, courier_build_string, courier_build_string_for_target};
+    use crate::pypi::ResolutionTarget;
 
     #[test]
     fn build_string_includes_hash_prefix() {
@@ -15695,6 +16203,19 @@ mod courier_build_string_tests {
         let loose = courier_build_string("312", "1234567890abcdef", 2, true);
         assert_ne!(fat, loose);
         assert_eq!(loose, "py312_h1234567890_loose_2");
+    }
+
+    #[test]
+    fn requested_build_must_match_recomputed_current_hash() {
+        let target = ResolutionTarget::for_subdir("3.11", "linux-64");
+        let advertised = courier_build_string_for_target(&target, "aaaaaaaaaa111111", 0, false);
+        let current = courier_build_string_for_target(&target, "bbbbbbbbbb222222", 0, false);
+        assert!(advertised_build_matches(Some(&current), &current));
+        assert!(advertised_build_matches(None, &current));
+        assert!(
+            !advertised_build_matches(Some(&advertised), &current),
+            "build_v1 must fail closed rather than label current inputs with a stale content hash"
+        );
     }
 }
 
@@ -16160,15 +16681,22 @@ mod load_favored_versions_tests {
 mod resolve_bundle_bfs_tests {
     use std::collections::{BTreeMap, HashMap};
     use std::io::Write;
+    use std::process::Command;
     use std::sync::Arc;
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    use super::{PypiToCondaMap, ResolvedWheel, merge_uv_pins_into_prefs, resolve_bundle};
-    use crate::config::{RelaxPolicy, WheelEntry};
+    use super::{
+        BfsOverride, BfsRoutePolicy, PypiToCondaMap, ResolvedWheel, bfs_probe_target_subdir,
+        incremental_bundle_requires_cold_resolve, merge_uv_pins_into_prefs, produce_output,
+        resolve_bundle,
+    };
+    use crate::config::{RelaxPolicy, RetreadConfig, WheelEntry};
+    use crate::handler::audit_report::format_packagespec;
     use crate::index_chain::{IndexPurpose, index_chain};
     use crate::pypi::ResolutionTarget;
-    use crate::relax::NameMap;
+    use crate::relax::{CondaName, CondaTarget, NameMap, PypiKey};
+    use rattler_conda_types::Platform;
 
     fn unique_tmp_dir() -> std::path::PathBuf {
         let base = std::env::temp_dir();
@@ -16323,6 +16851,326 @@ mod resolve_bundle_bfs_tests {
         port
     }
 
+    /// A dependency-free in-tree PEP 517 backend keeps the source/Git BFS
+    /// fixture hermetic: uv invokes only stdlib Python and never downloads a
+    /// build backend from an index.
+    fn write_fixture_project(
+        dir: &std::path::Path,
+        name: &str,
+        version: &str,
+        requires_dist: &[String],
+        provides_extra: Option<&str>,
+    ) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join("pyproject.toml"),
+            "[build-system]\nrequires = []\nbuild-backend = \"fixture_backend\"\nbackend-path = [\".\"]\n",
+        )
+        .unwrap();
+
+        let normalized = name.replace('-', "_");
+        let dist_info = format!("{normalized}-{version}.dist-info");
+        let filename = format!("{normalized}-{version}-py3-none-any.whl");
+        let mut metadata = format!("Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n");
+        if let Some(extra) = provides_extra {
+            metadata.push_str(&format!("Provides-Extra: {extra}\n"));
+        }
+        for requirement in requires_dist {
+            metadata.push_str(&format!("Requires-Dist: {requirement}\n"));
+        }
+        let backend = format!(
+            r#"from pathlib import Path
+from zipfile import ZIP_DEFLATED, ZipFile
+
+FILENAME = {filename}
+DIST_INFO = {dist_info}
+METADATA = {metadata}
+WHEEL = "Wheel-Version: 1.0\nGenerator: retread-fixture\nRoot-Is-Purelib: true\nTag: py3-none-any\n"
+
+def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
+    output = Path(wheel_directory) / FILENAME
+    output.parent.mkdir(parents=True, exist_ok=True)
+    record = f"{{DIST_INFO}}/METADATA,,\n{{DIST_INFO}}/WHEEL,,\n{{DIST_INFO}}/RECORD,,\n"
+    with ZipFile(output, "w", ZIP_DEFLATED) as wheel:
+        wheel.writestr(f"{{DIST_INFO}}/METADATA", METADATA)
+        wheel.writestr(f"{{DIST_INFO}}/WHEEL", WHEEL)
+        wheel.writestr(f"{{DIST_INFO}}/RECORD", record)
+    return FILENAME
+"#,
+            filename = serde_json::to_string(&filename).unwrap(),
+            dist_info = serde_json::to_string(&dist_info).unwrap(),
+            metadata = serde_json::to_string(&metadata).unwrap(),
+        );
+        std::fs::write(dir.join("fixture_backend.py"), backend).unwrap();
+    }
+
+    fn git_commit_all(dir: &std::path::Path) -> String {
+        let run = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output
+        };
+        run(&["init", "-q"]);
+        run(&["add", "."]);
+        run(&[
+            "-c",
+            "user.name=Retread Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "-qm",
+            "fixture",
+        ]);
+        String::from_utf8(run(&["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_string()
+    }
+
+    #[test]
+    fn bfs_route_policy_manual_override_precedence() {
+        let ray = PypiKey::from_pypi("ray");
+        let mapping = || CondaTarget::Mapped(CondaName::new("ray-core"));
+        let empty_parselmouth = PypiToCondaMap::new();
+        let config = || {
+            serde_json::from_value::<RetreadConfig>(serde_json::json!({"retread-wheels": {}}))
+                .unwrap()
+        };
+
+        // The exact Imprint form: the override is keyed by the pending PyPI
+        // name while emission is mapped to the ray-core provider.
+        let mut by_pypi = config();
+        by_pypi.name_map.insert(ray.clone(), mapping());
+        by_pypi
+            .overrides
+            .insert("ray".to_string(), "==2.49.1".to_string());
+        let (target, override_spec) =
+            BfsRoutePolicy::from_config(&by_pypi).target_and_override(&ray, &empty_parselmouth);
+        assert_eq!(target.as_ref().map(CondaName::as_spec), Some("ray-core"));
+        assert_eq!(
+            override_spec,
+            Some(BfsOverride {
+                spec: "==2.49.1",
+                manual: true,
+            })
+        );
+
+        // The provider-key spelling accepted by translate/emission is equally
+        // authoritative at the BFS seam.
+        let mut by_conda_alias = config();
+        by_conda_alias.name_map.insert(ray.clone(), mapping());
+        by_conda_alias
+            .overrides
+            .insert("ray-core".to_string(), "==2.49.1".to_string());
+        let (target, override_spec) = BfsRoutePolicy::from_config(&by_conda_alias)
+            .target_and_override(&ray, &empty_parselmouth);
+        assert_eq!(target.as_ref().map(CondaName::as_spec), Some("ray-core"));
+        assert_eq!(
+            override_spec,
+            Some(BfsOverride {
+                spec: "==2.49.1",
+                manual: true,
+            })
+        );
+
+        // Explicit keep-on-PyPI intent still wins over a contradictory
+        // override, and repair-ledger overrides remain resolver steering rather
+        // than new manual native-conda authority.
+        let mut disabled = config();
+        disabled.name_map.insert(ray.clone(), CondaTarget::Disabled);
+        disabled
+            .overrides
+            .insert("ray".to_string(), "==2.49.1".to_string());
+        assert_eq!(
+            BfsRoutePolicy::from_config(&disabled).target_and_override(&ray, &empty_parselmouth),
+            (None, None)
+        );
+
+        let mut ledgered = by_pypi;
+        ledgered.ledger_overrides.insert("ray".to_string());
+        let (target, override_spec) =
+            BfsRoutePolicy::from_config(&ledgered).target_and_override(&ray, &empty_parselmouth);
+        assert_eq!(target.as_ref().map(CondaName::as_spec), Some("ray-core"));
+        assert_eq!(
+            override_spec,
+            Some(BfsOverride {
+                spec: "==2.49.1",
+                manual: false,
+            })
+        );
+
+        let mut mixed = by_conda_alias;
+        mixed
+            .overrides
+            .insert("ray".to_string(), "==2.48.0".to_string());
+        mixed.ledger_overrides.insert("ray".to_string());
+        let (target, override_spec) =
+            BfsRoutePolicy::from_config(&mixed).target_and_override(&ray, &empty_parselmouth);
+        assert_eq!(target.as_ref().map(CondaName::as_spec), Some("ray-core"));
+        assert_eq!(
+            override_spec,
+            Some(BfsOverride {
+                spec: "==2.48.0",
+                manual: false,
+            }),
+            "the higher-precedence PyPI ledger entry must shadow the manual mapped-provider entry"
+        );
+    }
+
+    #[test]
+    fn bfs_probe_uses_resolution_target_subdir() {
+        let target = ResolutionTarget::for_subdir("3.10", "linux-aarch64");
+        assert_eq!(bfs_probe_target_subdir(&target), "linux-aarch64");
+    }
+
+    /// Regression for the cold all-source-built seam: a source root's extra
+    /// selects a Git child, whose ordinary metadata contains ranged Ray. The
+    /// explicit mapped-provider override must remain native-conda authority
+    /// even when no channel can be consulted; otherwise BFS fetches the index's
+    /// newest Ray wheel (2.56 here) before emission ever sees the override.
+    #[tokio::test]
+    async fn source_extra_git_child_manual_pypi_override_never_fetches_latest_pypi() {
+        let dir = unique_tmp_dir();
+        let download_dir = dir.join("download");
+        let source_dir = dir.join("source");
+        let cache_dir = dir.join("cache");
+        let root_dir = dir.join("root-project");
+        let child_dir = dir.join("git-child");
+        for path in [&download_dir, &source_dir, &cache_dir] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+
+        write_fixture_project(
+            &child_dir,
+            "retread-git-child",
+            "1.0.0",
+            &["ray>=2.40,<3".to_string()],
+            None,
+        );
+        let child_rev = git_commit_all(&child_dir);
+        let child_url = url::Url::from_directory_path(&child_dir).unwrap();
+        write_fixture_project(
+            &root_dir,
+            "retread-source-root",
+            "1.0.0",
+            &[format!(
+                "retread-git-child @ git+{child_url}@{child_rev} ; extra == \"routed\""
+            )],
+            Some("routed"),
+        );
+
+        let ray_249 = make_wheel_bytes("ray", "2.49.1", &[]);
+        let ray_256 = make_wheel_bytes("ray", "2.56.0", &[]);
+        let port = spawn_index_server(
+            vec![
+                ("ray".to_string(), "2.49.1".to_string(), ray_249),
+                ("ray".to_string(), "2.56.0".to_string(), ray_256),
+            ],
+            32,
+            true,
+        )
+        .await;
+        let indexes = vec![format!("http://127.0.0.1:{port}/simple/")];
+
+        let entry = WheelEntry {
+            path: Some(root_dir.to_string_lossy().into_owned()),
+            extras: vec!["routed".to_string()],
+            ..Default::default()
+        };
+        let mut config: RetreadConfig =
+            serde_json::from_value(serde_json::json!({"retread-wheels": {}})).unwrap();
+        config.name_map.insert(
+            PypiKey::from_pypi("ray"),
+            CondaTarget::Mapped(CondaName::new("ray-core")),
+        );
+        config
+            .overrides
+            .insert("ray".to_string(), "==2.49.1".to_string());
+
+        let target = ResolutionTarget::for_subdir("3.11", "linux-64");
+        let bundle = resolve_bundle(
+            "retread-source-root",
+            &entry,
+            &target,
+            &download_dir,
+            &source_dir,
+            &cache_dir,
+            RelaxPolicy::None,
+            &BTreeMap::new(),
+            None,
+            &PypiToCondaMap::new(),
+            BfsRoutePolicy::from_config(&config),
+            &[], // deliberate indecisive probe: no channel was consultable
+            &indexes,
+            None,
+            None,
+            &std::collections::HashSet::new(),
+        )
+        .await
+        .expect("the source/Git BFS must honor the manual mapped-provider override");
+
+        assert!(
+            bundle
+                .extras
+                .iter()
+                .any(|wheel| wheel.pypi_name == "retread-git-child"),
+            "the Git child itself must still be materialized"
+        );
+        assert!(
+            bundle.extras.iter().all(|wheel| wheel.pypi_name != "ray"),
+            "Ray must remain a conda route; bundled wheels were {:?}",
+            bundle
+                .extras
+                .iter()
+                .map(|wheel| (&wheel.pypi_name, &wheel.metadata.version))
+                .collect::<Vec<_>>()
+        );
+        let ray_probe = bundle
+            .probe_decisions
+            .iter()
+            .find(|decision| decision.pypi_name == "ray")
+            .expect("the indecisive explicit-override probe must remain auditable");
+        assert_eq!(ray_probe.conda_name, "ray-core");
+        assert_eq!(ray_probe.spec, "==2.49.1");
+        assert_eq!(ray_probe.satisfiable, None);
+        assert_eq!(
+            ray_probe.routing_decision,
+            "short-circuit-explicit-override"
+        );
+        assert!(
+            incremental_bundle_requires_cold_resolve(&bundle),
+            "incremental add must escalate instead of dropping the newly routed ray-core run dep"
+        );
+
+        let output = produce_output(&bundle, &config, Platform::Linux64, "3.11", &[], None, None)
+            .expect("the mapped override must emit a valid exact conda dependency");
+        let ray_core = output
+            .run_dependencies
+            .depends
+            .iter()
+            .find(|dependency| dependency.name == "ray-core")
+            .expect("the manual mapped-provider override must be emitted");
+        assert_eq!(format_packagespec(&ray_core.spec), "==2.49.1");
+        assert!(
+            output
+                .run_dependencies
+                .depends
+                .iter()
+                .all(|dependency| dependency.name != "ray"),
+            "the PyPI identity must not leak into conda run dependencies"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// Task A (FIX 3 completion): resolve_bundle-loop-level integration test.
     ///
     /// Drives the FULL BFS loop inside resolve_bundle with two localhost fixture
@@ -16416,7 +17264,7 @@ mod resolve_bundle_bfs_tests {
             &git_sources,
             None, // auto_data
             &pypi_to_conda,
-            &name_map,
+            BfsRoutePolicy::name_map_only(&name_map),
             &conda_channels,
             &workspace_indexes,
             None,                              // cold path: no locked closure
@@ -16565,7 +17413,7 @@ mod resolve_bundle_bfs_tests {
             &git_sources,
             None,
             &pypi_to_conda,
-            &name_map,
+            BfsRoutePolicy::name_map_only(&name_map),
             &conda_channels,
             &[],
             None,
@@ -16764,7 +17612,7 @@ mod resolve_bundle_bfs_tests {
             &BTreeMap::new(),
             None,
             &PypiToCondaMap::new(),
-            &BTreeMap::new(),
+            BfsRoutePolicy::name_map_only(&BTreeMap::new()),
             &[],
             &[],
             None,
@@ -16849,7 +17697,7 @@ mod resolve_bundle_bfs_tests {
             &BTreeMap::new(),
             None,
             &PypiToCondaMap::new(),
-            &BTreeMap::new(),
+            BfsRoutePolicy::name_map_only(&BTreeMap::new()),
             &[],
             &[],
             None,
@@ -16919,7 +17767,7 @@ mod resolve_bundle_bfs_tests {
             &BTreeMap::new(),
             None,
             &PypiToCondaMap::new(),
-            &BTreeMap::new(),
+            BfsRoutePolicy::name_map_only(&BTreeMap::new()),
             &[],
             &[],
             None,
@@ -17044,7 +17892,7 @@ mod resolve_bundle_bfs_tests {
             &git_sources,
             None, // auto_data
             &pypi_to_conda,
-            &name_map,
+            BfsRoutePolicy::name_map_only(&name_map),
             &conda_channels,
             &[],                               // workspace_indexes
             None,                              // cold path: no locked closure
@@ -17185,7 +18033,7 @@ mod resolve_bundle_bfs_tests {
             &git_sources,
             None, // auto_data
             &pypi_to_conda,
-            &name_map,
+            BfsRoutePolicy::name_map_only(&name_map),
             &conda_channels,
             &[],          // workspace_indexes
             None,         // FIXED seam: uv pins must NOT ride locked_closure
@@ -17228,7 +18076,7 @@ mod resolve_bundle_bfs_tests {
             &git_sources,
             None,
             &pypi_to_conda,
-            &name_map,
+            BfsRoutePolicy::name_map_only(&name_map),
             &conda_channels,
             &[],
             Some(&uv_pins), // locked-closure seam: suppresses the walk
@@ -17372,7 +18220,7 @@ mod resolve_bundle_bfs_tests {
             &git_sources,
             None, // auto_data
             &pypi_to_conda,
-            &name_map,
+            BfsRoutePolicy::name_map_only(&name_map),
             &conda_channels,
             &[],                               // workspace_indexes
             None, // no incremental-add locked closure (deps must go through BFS)
@@ -17476,7 +18324,7 @@ mod resolve_bundle_bfs_tests {
             &git_sources,
             None, // auto_data
             &pypi_to_conda,
-            &name_map,
+            BfsRoutePolicy::name_map_only(&name_map),
             &conda_channels,
             &[],                               // workspace_indexes
             None,                              // no incremental-add locked closure
