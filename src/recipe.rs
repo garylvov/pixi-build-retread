@@ -431,6 +431,7 @@ pub(crate) fn build_courier_recipe_with_mode_and_lock_filename(
          echo \"retread: '{conda_name}' is marked broken; skipping auto-repair during 300s backoff. Retry manually:\" >&2\n\
          echo \"  \\\"$CONDA_PREFIX/bin/retread\\\" install --lock \\\"$RETREAD_LOCK\\\" --prefix \\\"$CONDA_PREFIX\\\"\" >&2\n\
          export RETREAD_BROKEN_{var_pack}=1\n\
+         if [ \"${{RETREAD_GUARD_STRICT:-0}}\" = \"1\" ]; then return 1 2>/dev/null || true; fi\n\
          elif ! \"$CONDA_PREFIX/bin/retread\" verify --lock \"$RETREAD_LOCK\" --prefix \"$CONDA_PREFIX\" >/dev/null 2>&1; then\n\
          echo \"retread: '{conda_name}' PyPI wheels missing from this env; repairing...\" >&2\n\
          if \"$CONDA_PREFIX/bin/retread\" install --lock \"$RETREAD_LOCK\" --prefix \"$CONDA_PREFIX\" >\"$RETREAD_REPAIR_LOG\" 2>&1; then\n\
@@ -939,6 +940,21 @@ mod courier_tests {
         assert!(
             String::from_utf8_lossy(&second.stderr).contains("backoff"),
             "backoff should be announced"
+        );
+
+        let strict_backoff = source(true);
+        assert!(
+            String::from_utf8_lossy(&strict_backoff.stdout).contains("status:1 broken:1"),
+            "strict mode must return 1 even during the repair backoff: {}",
+            String::from_utf8_lossy(&strict_backoff.stdout)
+        );
+        assert_eq!(
+            std::fs::read_to_string(prefix.join("retread-stub.log"))
+                .unwrap_or_default()
+                .lines()
+                .count(),
+            1,
+            "strict backoff must not invoke installer again"
         );
 
         std::fs::remove_file(&broken).unwrap();

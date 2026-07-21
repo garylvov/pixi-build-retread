@@ -618,9 +618,7 @@ async fn materialize_locked_wheels(
         // even materialized), so uv never uninstalls the conda payload. See
         // `conda_owned_distributions` for why that uninstall is destructive.
         let normalized_name = normalize_dist_name(&wheel.name);
-        if conda_owned.iter().any(|(name, version)| {
-            name == &normalized_name && pep440_versions_equal(version, &wheel.version)
-        }) {
+        if conda_owned_at_version(conda_owned, &normalized_name, &wheel.version) {
             eprintln!(
                 "retread install: {}=={} is conda-provided in the prefix; \
                  skipping wheel replay to avoid clobbering the conda payload",
@@ -857,9 +855,10 @@ fn installed_distributions(
 /// ("Not a directory", ENOTDIR) after already deleting most of the tree,
 /// gutting `torch` (no `__init__.py`, no dist-info) into an empty namespace
 /// package. conda is authoritative for anything it already installed at the
-/// locked version, so those wheels are dropped from the replay; `verify`
-/// still passes because the conda dist-info + RECORD satisfy the payload
-/// check.
+/// locked version, so those wheels are dropped from the replay. Some conda
+/// packages intentionally expose only minimal Python metadata and no wheel
+/// `RECORD`; verification trusts exact-version conda ownership instead of
+/// applying wheel-layout checks to those distributions.
 fn conda_owned_distributions(site_packages: &Path) -> BTreeSet<(String, String)> {
     let mut out = BTreeSet::new();
     let Ok(installed) = installed_distributions(site_packages) else {
@@ -876,6 +875,16 @@ fn conda_owned_distributions(site_packages: &Path) -> BTreeSet<(String, String)>
         }
     }
     out
+}
+
+fn conda_owned_at_version(
+    conda_owned: &BTreeSet<(String, String)>,
+    normalized_name: &str,
+    version: &str,
+) -> bool {
+    conda_owned.iter().any(|(name, owned_version)| {
+        name == normalized_name && pep440_versions_equal(owned_version, version)
+    })
 }
 
 /// True if `name` is one of PyPI's `nvidia-<component>-cu<major>` CUDA-runtime
@@ -1095,6 +1104,7 @@ fn verify_record_payload(site_packages: &Path, dist_root: &Path) -> Result<()> {
 fn verify_payload_installed(lock: &RetreadLock, prefix: &Path) -> Result<()> {
     let site_packages = site_packages_dir(prefix, &lock.python);
     let installed = installed_distributions(&site_packages)?;
+    let conda_owned = conda_owned_distributions(&site_packages);
     // An editable overlay (`pip install -e`) satisfies a locked distribution
     // at ANY version: the user has replaced the bundled wheel's dist-info with
     // the checkout's own (PEP 660 editables ship a real dist-info + RECORD, so
@@ -1130,6 +1140,16 @@ fn verify_payload_installed(lock: &RetreadLock, prefix: &Path) -> Result<()> {
             .get(&name)
             .and_then(|versions| installed_version_path(versions, &wheel.version))
             .expect("missing list already checked");
+        // Conda-generated dist-info can legitimately omit RECORD (for example
+        // `pin` from the `pinocchio` package). Trust exact-version conda
+        // ownership only when wheel-layout verification is unavailable; keep
+        // the existing strict payload check for conda distributions that do
+        // publish RECORD.
+        if conda_owned_at_version(&conda_owned, &name, &wheel.version)
+            && !dist_root.join("RECORD").is_file()
+        {
+            continue;
+        }
         verify_record_payload(&site_packages, dist_root).with_context(|| {
             format!(
                 "retread verify: {}=={} payload check failed",
@@ -1162,6 +1182,7 @@ fn installed_payload_libraries(
     // to manage; the courier neither installed nor audits them. Skip so the
     // (name, version) lookup below does not error on the overlaid version.
     let editable_owned = editable_owned_distributions(&site_packages);
+    let conda_owned = conda_owned_distributions(&site_packages);
     let mut out: BTreeMap<String, crate::glibc::PayloadLib> = BTreeMap::new();
     for wheel in &lock.wheels {
         let name = normalize_dist_name(&wheel.name);
@@ -1180,6 +1201,12 @@ fn installed_payload_libraries(
                 )
             })?;
         let record = dist_root.join("RECORD");
+        // Recordless conda metadata has no wheel payload inventory to audit.
+        // Preserve the prior library audit for every conda distribution that
+        // does expose RECORD.
+        if conda_owned_at_version(&conda_owned, &name, &wheel.version) && !record.is_file() {
+            continue;
+        }
         let body = std::fs::read_to_string(&record)
             .with_context(|| format!("reading wheel RECORD {}", record.display()))?;
         for line in body.lines() {
@@ -1428,7 +1455,7 @@ pub async fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
     // uninstall a conda-managed distribution to swap in the bundle's PyPI
     // wheel (that clobbers the conda payload -- see
     // `conda_owned_distributions`). conda is authoritative at the locked
-    // version and its dist-info still satisfies `verify`.
+    // version even when it emits only minimal dist-info without wheel RECORD.
     let conda_owned = conda_owned_distributions(&site_packages_dir(prefix, &lock.python));
     // Editable overlays the user has installed on top of the bundle: the
     // courier must never replay the bundled wheel over a `pip install -e`
@@ -2324,6 +2351,83 @@ mod tests {
         assert!(!owned.contains(&("tensordict".into(), "0.9.0".into())));
         assert!(!owned.contains(&("orphan".into(), "1.0.0".into())));
         assert_eq!(owned.len(), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Conda may publish only enough dist-info for Python metadata lookup and
+    /// omit wheel-specific RECORD data entirely (for example `pin` from the
+    /// conda `pinocchio` package). Exact-version conda ownership must satisfy
+    /// payload verification and stay outside the wheel-library audit.
+    #[test]
+    fn conda_owned_distribution_without_record_satisfies_verify_and_audit() {
+        let root = tempdir("verify-recordless-conda-owned");
+        let prefix = root.join("prefix");
+        let sp = site_packages_dir(&prefix, "3.11");
+        std::fs::create_dir_all(&sp).unwrap();
+
+        // make_lock pins mypackage==1.0.0. The PEP 440-equivalent conda
+        // metadata deliberately has no RECORD file.
+        let dist_info = write_dist_info(&sp, "mypackage", "1.0", None);
+        std::fs::write(dist_info.join("INSTALLER"), "conda\n").unwrap();
+
+        let lock = make_lock(vec![], vec![], BTreeMap::new());
+        verify_payload_installed(&lock, &prefix)
+            .expect("exact-version conda ownership does not require wheel RECORD");
+        let (_, libraries) = installed_payload_libraries(&lock, &prefix)
+            .expect("recordless conda distribution is outside the wheel library audit");
+        assert!(libraries.is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recordless_non_conda_distribution_still_fails_verification() {
+        let root = tempdir("verify-recordless-non-conda");
+        let prefix = root.join("prefix");
+        let sp = site_packages_dir(&prefix, "3.11");
+        std::fs::create_dir_all(&sp).unwrap();
+        write_dist_info(&sp, "mypackage", "1.0.0", None);
+
+        let lock = make_lock(vec![], vec![], BTreeMap::new());
+        let err = verify_payload_installed(&lock, &prefix)
+            .expect_err("ordinary wheel installs must retain strict RECORD verification");
+        assert!(format!("{err:#}").contains("reading wheel RECORD"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recordless_conda_distribution_at_wrong_version_is_missing() {
+        let root = tempdir("verify-recordless-conda-wrong-version");
+        let prefix = root.join("prefix");
+        let sp = site_packages_dir(&prefix, "3.11");
+        std::fs::create_dir_all(&sp).unwrap();
+        let dist_info = write_dist_info(&sp, "mypackage", "2.0.0", None);
+        std::fs::write(dist_info.join("INSTALLER"), "conda\n").unwrap();
+
+        let lock = make_lock(vec![], vec![], BTreeMap::new());
+        let err = verify_payload_installed(&lock, &prefix)
+            .expect_err("conda ownership only satisfies the exact locked version");
+        assert!(format!("{err:#}").contains("mypackage==1.0.0"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn conda_owned_distribution_with_record_keeps_strict_payload_check() {
+        let root = tempdir("verify-conda-owned-record");
+        let prefix = root.join("prefix");
+        let sp = site_packages_dir(&prefix, "3.11");
+        std::fs::create_dir_all(&sp).unwrap();
+        let dist_info = write_dist_info(&sp, "mypackage", "1.0.0", None);
+        std::fs::write(dist_info.join("INSTALLER"), "conda\n").unwrap();
+        std::fs::write(
+            dist_info.join("RECORD"),
+            "mypackage.py,,\nmypackage-1.0.0.dist-info/RECORD,,\n",
+        )
+        .unwrap();
+
+        let lock = make_lock(vec![], vec![], BTreeMap::new());
+        let err = verify_payload_installed(&lock, &prefix)
+            .expect_err("a conda RECORD must still detect a missing payload file");
+        assert!(format!("{err:#}").contains("missing installed file"));
         let _ = std::fs::remove_dir_all(root);
     }
 
