@@ -188,7 +188,7 @@ jobs:
           fi
           changed="$(git diff --name-only "$base" HEAD)"
           # Files whose change can alter retread's emitted bytes for identical inputs.
-          emit_re='^src/(relax|wheel|wheel_rewrite|wheel_inject|wheel_inject_data|emit_pypi|recipe|courier|installer|lock)\.rs$|^src/handler/(auto_bundle|cascade)\.rs$'
+          emit_re='^src/(relax|wheel|wheel_rewrite|wheel_inject|wheel_inject_data|emit_pypi|recipe|courier|installer|lock)\.rs$|^src/handler/(mod|auto_bundle|cascade)\.rs$'
           if ! echo "$changed" | grep -Eq "$emit_re"; then
             echo "no emit-affecting files changed; OK."; exit 0
           fi

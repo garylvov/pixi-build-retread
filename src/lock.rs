@@ -582,7 +582,12 @@ pub const SCHEMA: u32 = 13;
 /// conda ownership rather than wheel RECORD layout. Existing courier packages
 /// must rebuild so recordless conda metadata cannot trigger endless activation
 /// repair replays.
-pub const EMIT_EPOCH: u32 = 25;
+///
+/// Epoch 26: routed BFS overrides, workspace-provider compatibility, and
+/// prepared output identity are validated across metadata, cold build, and
+/// replay. Existing locks must cold-derive under the complete provider and
+/// output-identity contract.
+pub const EMIT_EPOCH: u32 = 26;
 
 fn parse_stored_glibc(value: Option<&str>) -> Option<Option<(u32, u32)>> {
     match value {
