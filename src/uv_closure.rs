@@ -6540,7 +6540,7 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
         UvClosureRequest {
             bundle: "tiny-pack".into(),
             python_version: "3.12".into(),
-            conda_subdir: "linux-64".into(),
+            conda_subdir: crate::glibc::current_pixi_platform().into(),
             dependencies: vec!["mujoco==3.5.0".into()],
             dependency_provenance: BTreeMap::new(),
             constraints: ConstraintSet::default(),
