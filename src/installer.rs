@@ -1897,6 +1897,7 @@ mod tests {
             rev: "cd".repeat(32),
             subdirectory: None,
             extras: vec![],
+            auto_data: Some(crate::lock::GitWheelAutoData::Disabled),
         });
 
         validate_install_lock_for_platform(Path::new("/lock.json"), &lock, "linux-64")
