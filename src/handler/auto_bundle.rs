@@ -200,6 +200,88 @@ fn observe_requirement(
     }
 }
 
+const JOINT_ROUTE_CONFIGURATION_REMEDIATION: &str = "Review the named dependencies and \
+    PyPI indexes, then adjust `retread-overrides` or `retread-drop-deps` in the pack \
+    manifest if needed (see README).";
+
+/// User-visible identity retained at the joint-route boundary. A rich
+/// resolution target can name the consuming environment and target profile;
+/// legacy/test paths fall back to the bundle, concrete subdir, and Python.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct JointRouteDiagnosticContext {
+    bundle: String,
+    environments: Vec<String>,
+    profiles: Vec<String>,
+    platform: String,
+    python: String,
+}
+
+impl JointRouteDiagnosticContext {
+    fn new(
+        bundle: &Bundle,
+        target: &crate::pypi::WheelTarget,
+        workspace_scope: Option<&crate::workspace::ResolvedWorkspaceTarget>,
+    ) -> Self {
+        Self {
+            bundle: bundle.conda_name.clone(),
+            environments: workspace_scope
+                .map(|scope| scope.environments.clone())
+                .unwrap_or_default(),
+            profiles: workspace_scope
+                .map(|scope| scope.profiles.clone())
+                .unwrap_or_default(),
+            platform: target.conda_subdir.clone(),
+            python: target.python_version.clone(),
+        }
+    }
+
+    fn quoted(values: &[String]) -> String {
+        values
+            .iter()
+            .map(|value| format!("'{value}'"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    fn scope(&self) -> String {
+        let owner = match self.environments.as_slice() {
+            [] => format!("in bundle '{}'", self.bundle),
+            [environment] => format!(
+                "in environment '{environment}' for bundle '{}'",
+                self.bundle
+            ),
+            environments => format!(
+                "in environments {} for bundle '{}'",
+                Self::quoted(environments),
+                self.bundle
+            ),
+        };
+        let mut details = Vec::new();
+        match self.profiles.as_slice() {
+            [] => {}
+            [profile] => details.push(format!("target profile '{profile}'")),
+            profiles => details.push(format!("target profiles {}", Self::quoted(profiles))),
+        }
+        details.push(format!("platform {}", self.platform));
+        details.push(format!("python {}", self.python));
+        format!("{owner} ({})", details.join(", "))
+    }
+
+    fn routing_error(&self, problem: impl std::fmt::Display) -> anyhow::Error {
+        anyhow!(
+            "dependency routing failed {}: {problem}. {JOINT_ROUTE_CONFIGURATION_REMEDIATION}",
+            self.scope()
+        )
+    }
+
+    fn scope_error(&self, error: anyhow::Error) -> anyhow::Error {
+        match error.downcast::<crate::constraint::Conflict>() {
+            Ok(conflict) => anyhow::Error::new(conflict.with_scope(self.scope())),
+            Err(error) => error.context(format!("validating dependency routes {}", self.scope())),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct RestoreRequestBuilder {
     pypi_name: String,
@@ -241,7 +323,15 @@ impl RestoreRequestBuilder {
         preferences.keys().next().cloned()
     }
 
-    fn finish(mut self) -> Result<PypiFetchRequest> {
+    #[cfg(test)]
+    fn finish(self) -> Result<PypiFetchRequest> {
+        self.finish_with_context(None)
+    }
+
+    fn finish_with_context(
+        mut self,
+        diagnostic_context: Option<&JointRouteDiagnosticContext>,
+    ) -> Result<PypiFetchRequest> {
         let prior_constraints = self
             .route_preferences
             .iter()
@@ -265,15 +355,24 @@ impl RestoreRequestBuilder {
             self.add_constraint(constraint);
         }
         if self.constraints.is_empty() {
-            return Err(anyhow!(
-                "joint route validation rejected `{}`, but no active PyPI \
-                 requirement or prior selection was available",
+            let problem = format!(
+                "no active PyPI requirement or prior version is available for `{}`",
                 self.pypi_name
-            ));
+            );
+            return Err(match diagnostic_context {
+                Some(context) => context.routing_error(problem),
+                None => anyhow!("{problem}"),
+            });
         }
         let route_preference = Self::unique_preference(&self.route_preferences);
         let lock_preference = Self::unique_preference(&self.lock_preferences);
-        let specifiers = finalize(&PypiKey::from_pypi(&self.pypi_name), &self.constraints)?;
+        let specifiers = finalize(&PypiKey::from_pypi(&self.pypi_name), &self.constraints)
+            .map_err(|conflict| {
+                anyhow::Error::new(match diagnostic_context {
+                    Some(context) => conflict.with_scope(context.scope()),
+                    None => conflict,
+                })
+            })?;
 
         Ok(PypiFetchRequest {
             pypi_name: self.pypi_name,
@@ -484,6 +583,7 @@ pub(crate) async fn auto_bundle_transitives(
         bundle,
         indexes,
         target.wheel_target(),
+        target.workspace_scope(),
         config,
         locked_closure,
         favor_lock_prefs,
@@ -528,6 +628,7 @@ where
         bundle,
         indexes,
         target,
+        None,
         config,
         locked_closure,
         favor_lock_prefs,
@@ -547,6 +648,7 @@ async fn auto_bundle_transitives_with_route_precheck<P, PF, C, CF, V, VF, X, XF>
     bundle: &mut Bundle,
     indexes: &[String],
     target: &crate::pypi::WheelTarget,
+    workspace_scope: Option<&crate::workspace::ResolvedWorkspaceTarget>,
     config: &RetreadConfig,
     locked_closure: Option<&BTreeMap<String, String>>,
     favor_lock_prefs: Option<&BTreeMap<String, String>>,
@@ -568,6 +670,8 @@ where
     X: Fn(PypiFetchRequest, Vec<String>, String) -> XF,
     XF: Future<Output = Result<ResolvedWheel>>,
 {
+    let diagnostic_context = JointRouteDiagnosticContext::new(bundle, target, workspace_scope);
+
     // Build the skip set: anything already in the bundle, plus the user's
     // `retread-conda-deps` allowlist (deps that should stay as conda
     // run-deps), plus drop-deps, plus packages with explicit overrides
@@ -692,6 +796,7 @@ where
                 &observed_requirements,
                 indexes,
                 target,
+                &diagnostic_context,
                 config,
                 co_solve,
                 validate_standalone_provider_route,
@@ -1071,6 +1176,7 @@ where
                 &observed_requirements,
                 indexes,
                 target,
+                &diagnostic_context,
                 config,
                 co_solve,
                 validate_standalone_provider_route,
@@ -1171,14 +1277,16 @@ fn metadata_route_group_has_source_built_origin(
         let pypi_key = PypiKey::from_pypi(&origin.pypi_name);
         let requirements = observed_requirements.get(&pypi_key).ok_or_else(|| {
             anyhow!(
-                "provisional metadata route `{} -> {}` has no recorded Requires-Dist provenance",
+                "cannot verify whether PyPI dependency `{}` should use conda package `{}` because \
+                 its source requirement is unavailable",
                 origin.pypi_name,
                 origin.conda_name
             )
         })?;
         if requirements.is_empty() {
             return Err(anyhow!(
-                "provisional metadata route `{} -> {}` has an empty Requires-Dist provenance set",
+                "cannot verify whether PyPI dependency `{}` should use conda package `{}` because \
+                 it has no active source requirements",
                 origin.pypi_name,
                 origin.conda_name
             ));
@@ -1217,12 +1325,14 @@ where
         crate::uv_closure::CoInstallVerdict::Sat
     };
     let mut standalone_provider_safe = BTreeSet::new();
+    let diagnostic_context = JointRouteDiagnosticContext::new(bundle, target, None);
     jointly_unroute_unsolvable_with_route_precheck(
         bundle,
         metadata_routes,
         observed_requirements,
         indexes,
         target,
+        &diagnostic_context,
         config,
         co_solve,
         &allow_source_route,
@@ -1240,6 +1350,7 @@ async fn jointly_unroute_unsolvable_with_route_precheck<C, CF, V, VF, X, XF>(
     observed_requirements: &ObservedRequirements,
     indexes: &[String],
     target: &crate::pypi::WheelTarget,
+    diagnostic_context: &JointRouteDiagnosticContext,
     config: &RetreadConfig,
     co_solve: &C,
     validate_standalone_provider_route: &V,
@@ -1318,7 +1429,9 @@ where
             metadata_routes,
             observed_requirements,
             &conda_name,
-        )? {
+        )
+        .map_err(|error| diagnostic_context.routing_error(format!("{error:#}")))?
+        {
             source_metadata_conda_names.insert(conda_name.clone());
         }
         if route_group_is_fully_mutable(bundle, metadata_routes, &conda_name, config, target)? {
@@ -1328,7 +1441,12 @@ where
     for conflict in &assembly_conflicts {
         let conda_key = conflict.conda_name.key().into_string();
         if !mutable_conda_names.contains(&conda_key) {
-            return Err(anyhow::Error::new(conflict.conflict.clone()));
+            return Err(anyhow::Error::new(
+                conflict
+                    .conflict
+                    .clone()
+                    .with_scope(diagnostic_context.scope()),
+            ));
         }
     }
     let conflicted_keys: BTreeSet<String> = assembly_conflicts
@@ -1469,10 +1587,11 @@ where
             }
         }
         if rejected_pypi_origins.is_empty() {
-            return Err(anyhow!(
-                "joint route validation rejected {:?}, but no PyPI route provenance was available for uv re-resolve",
-                rejected_keys
-            ));
+            return Err(diagnostic_context.routing_error(format!(
+                "cannot move conda dependencies {} back to PyPI because their corresponding \
+                 PyPI package names are unavailable",
+                rejected_keys.iter().cloned().collect::<Vec<_>>().join(", ")
+            )));
         }
         let mut keep_pypi = uv_reresolve.keep_pypi.clone();
         keep_pypi.extend(rejected_pypi_origins);
@@ -1546,12 +1665,11 @@ where
                 let requirements = observed_requirements
                     .get(&PypiKey::from_pypi(&key))
                     .ok_or_else(|| {
-                        anyhow!(
-                            "joint route validation rejected metadata route `{} -> {}`, \
-                             but no active Requires-Dist provenance was recorded",
-                            origin.pypi_name,
-                            origin.conda_name
-                        )
+                        diagnostic_context.routing_error(format!(
+                            "cannot move PyPI dependency `{}` from conda package `{}` back to PyPI \
+                             because its source requirement is unavailable",
+                            origin.pypi_name, origin.conda_name
+                        ))
                     })?;
                 for requirement in requirements {
                     request.add_constraint(requirement.clone());
@@ -1571,10 +1689,11 @@ where
         }
     }
     if restore_requests.is_empty() {
-        return Err(anyhow!(
-            "joint route validation rejected {:?}, but no PyPI route provenance was available",
-            rejected_keys
-        ));
+        return Err(diagnostic_context.routing_error(format!(
+            "cannot move conda dependencies {} back to PyPI because their corresponding \
+             PyPI package names are unavailable",
+            rejected_keys.iter().cloned().collect::<Vec<_>>().join(", ")
+        )));
     }
     // Finalize every requirement (dedupe + semantic satisfiability) before
     // the first index request, so one genuine conflict cannot be obscured by
@@ -1582,7 +1701,7 @@ where
     // typed diagnostic and fail before any fetch.
     let mut finalized_restore_requests = Vec::new();
     for request in restore_requests.into_values() {
-        finalized_restore_requests.push(request.finish()?);
+        finalized_restore_requests.push(request.finish_with_context(Some(diagnostic_context))?);
     }
 
     // Fetch every wheel before changing routing. A missing index candidate
@@ -1611,11 +1730,12 @@ where
                 )
             })?;
             if !request.specifiers.contains(&version) {
-                return Err(anyhow!(
-                    "joint route validation kept `{}` on PyPI at `{}`, but the bundle already contains `{bundle_name}` (metadata `{metadata_name}`) at incompatible version `{version_text}`",
-                    request.pypi_name,
-                    request.specifiers,
-                ));
+                return Err(diagnostic_context.routing_error(format!(
+                    "PyPI dependency `{}` requires `{}`, but the bundle already contains \
+                     `{bundle_name}` (metadata `{metadata_name}`) at incompatible version \
+                     `{version_text}`",
+                    request.pypi_name, request.specifiers
+                )));
             }
             tracing::info!(
                 pypi = %request.pypi_name,
@@ -1625,10 +1745,12 @@ where
             continue;
         }
         let requirement = request.specifiers.to_string();
-        let failure_context = format!(
-            "joint route validation kept `{}` on PyPI, but no configured index could fetch `{}`",
-            request.pypi_name, requirement
-        );
+        let failure_context = diagnostic_context
+            .routing_error(format!(
+                "no configured PyPI index can provide `{}{requirement}`",
+                request.pypi_name
+            ))
+            .to_string();
         restored_wheels.push(fetch_pypi(request, indexes.to_vec(), failure_context).await?);
     }
 
@@ -1658,16 +1780,17 @@ where
         );
     }
 
-    let still_emitted: Vec<String> = super::emitted_bundle_route_specs(&trial, config, target)?
+    let still_emitted: Vec<String> = super::emitted_bundle_route_specs(&trial, config, target)
+        .map_err(|error| diagnostic_context.scope_error(error))?
         .into_iter()
         .map(|route| route.conda_name.key().into_string())
         .filter(|name| rejected_keys.contains(name))
         .collect();
     if !still_emitted.is_empty() {
-        return Err(anyhow!(
-            "joint route validation restored PyPI wheels, but rejected conda routes remain emitted: {}",
+        return Err(diagnostic_context.routing_error(format!(
+            "could not move conda dependencies {} back to PyPI",
             still_emitted.join(", ")
-        ));
+        )));
     }
 
     *bundle = trial;
@@ -2524,6 +2647,47 @@ mod tests {
     }
 
     #[test]
+    fn dependency_conflict_names_workspace_scope_and_remediation() {
+        let context = JointRouteDiagnosticContext {
+            bundle: "isaaclab-pack".to_string(),
+            environments: vec!["uwlab-gpu".to_string()],
+            profiles: vec!["linux-64-cuda-12".to_string()],
+            platform: "linux-64".to_string(),
+            python: "3.11".to_string(),
+        };
+        let constraints = vec![
+            Constraint {
+                specifiers: VersionSpecifiers::from_str("<2").unwrap(),
+                provenance: Provenance::IndexWheelMetadata,
+                source: "isaaclab==0.54.2, isaaclab_rl==0.4.7, \
+                         isaaclab_tasks==0.11.12"
+                    .to_string(),
+            },
+            Constraint {
+                specifiers: VersionSpecifiers::from_str(">=2.0").unwrap(),
+                provenance: Provenance::UvConstraint,
+                source: "cmeel-boost==1.90.0".to_string(),
+            },
+        ];
+
+        let message = finalize(&PypiKey::from_pypi("numpy"), &constraints)
+            .unwrap_err()
+            .with_scope(context.scope())
+            .to_string();
+
+        assert_eq!(
+            message,
+            "dependency conflict in environment 'uwlab-gpu' for bundle 'isaaclab-pack' \
+             (target profile 'linux-64-cuda-12', platform linux-64, python 3.11): \
+             `numpy` requirements are mutually unsatisfiable: `<2` required by \
+             isaaclab==0.54.2, isaaclab_rl==0.4.7, isaaclab_tasks==0.11.12; \
+             `>=2.0` required by cmeel-boost==1.90.0. Resolve by pinning one side, or \
+             use `retread-relax`, `retread-overrides`, or `retread-drop-deps` in the \
+             pack manifest (see README)."
+        );
+    }
+
+    #[test]
     fn source_built_metadata_alias_fixes_entire_conda_route_group() {
         let specifiers = VersionSpecifiers::from_str(">=4.0.1,<4.1").unwrap();
         let mut routes = ProvisionalMetadataRoutes::new();
@@ -2586,7 +2750,7 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(
-            missing.contains("no recorded Requires-Dist provenance"),
+            missing.contains("source requirement is unavailable"),
             "{missing}"
         );
 
@@ -2596,10 +2760,7 @@ mod tests {
             metadata_route_group_has_source_built_origin(&routes, &empty, "orphan-conda-dep")
                 .unwrap_err()
                 .to_string();
-        assert!(
-            empty.contains("empty Requires-Dist provenance set"),
-            "{empty}"
-        );
+        assert!(empty.contains("no active source requirements"), "{empty}");
 
         let mut mixed_routes = ProvisionalMetadataRoutes::new();
         record_metadata_route(
@@ -2631,7 +2792,7 @@ mod tests {
         .to_string();
         assert!(later_missing.contains("orphan-second"), "{later_missing}");
         assert!(
-            later_missing.contains("no recorded Requires-Dist provenance"),
+            later_missing.contains("source requirement is unavailable"),
             "{later_missing}"
         );
     }
@@ -3075,7 +3236,9 @@ mod tests {
         );
         let message = format!("{error:#}");
         assert!(
-            message.contains(&format!("cannot restore `{package}` to PyPI")),
+            message.contains(&format!(
+                "`{package}` requirements are mutually unsatisfiable"
+            )),
             "{message}"
         );
         assert!(
@@ -3358,7 +3521,7 @@ mod tests {
         );
         let message = format!("{error:#}");
         assert!(
-            message.contains("cannot restore `psutil` to PyPI"),
+            message.contains("`psutil` requirements are mutually unsatisfiable"),
             "{message}"
         );
         assert!(message.contains("mutually unsatisfiable"), "{message}");
@@ -3535,7 +3698,7 @@ mod tests {
         );
         let message = format!("{error:#}");
         assert!(
-            message.contains("cannot restore `numpy` to PyPI"),
+            message.contains("`numpy` requirements are mutually unsatisfiable"),
             "{message}"
         );
         assert!(message.contains("mutually unsatisfiable"), "{message}");
@@ -3762,6 +3925,7 @@ mod tests {
             &mut bundle,
             &[crate::workspace::DEFAULT_PYPI_INDEX.to_string()],
             &target,
+            None,
             &config,
             None,
             None,
@@ -4340,17 +4504,31 @@ pillow = ">=10,<13"
         );
         bundle.auto_routed.push(deps_from_route);
         let target = crate::pypi::WheelTarget::for_subdir("3.10", "linux-64");
+        let workspace_scope = crate::workspace::ResolvedWorkspaceTarget {
+            contract: crate::workspace::WorkspaceTargetContract {
+                subdir: "linux-64".to_string(),
+                declared_virtual_packages: BTreeMap::new(),
+                detected_virtual_packages: BTreeMap::new(),
+            },
+            profiles: vec!["linux-64-cuda-12".to_string()],
+            environments: vec!["uwlab-gpu".to_string()],
+        };
+        let allow_source_route = |_route: crate::uv_closure::CondaRouteSpec| async {
+            crate::uv_closure::CoInstallVerdict::Sat
+        };
 
-        let error = auto_bundle_transitives_with(
+        let error = auto_bundle_transitives_with_route_precheck(
             &mut bundle,
             &[crate::workspace::DEFAULT_PYPI_INDEX.to_string()],
             &target,
+            Some(&workspace_scope),
             &test_config(),
             None,
             None,
             None,
             &validated_probe,
             &reject_every_mutable_route,
+            &allow_source_route,
             &fetch,
             &["conda-forge/linux-64".to_string()],
             &UvReresolveContext::default(),
@@ -4359,8 +4537,29 @@ pillow = ">=10,<13"
         .unwrap_err();
 
         let message = format!("{error:#}");
+        assert!(
+            error
+                .downcast_ref::<crate::constraint::Conflict>()
+                .is_some(),
+            "the scoped diagnostic must retain its typed Conflict source: {message}"
+        );
         assert!(message.contains("pillow"), "{message}");
         assert!(message.contains("mutually unsatisfiable"), "{message}");
+        assert!(
+            message.contains(
+                "in environment 'uwlab-gpu' for bundle 'regression-pack' \
+                 (target profile 'linux-64-cuda-12', platform linux-64, python 3.10)"
+            ),
+            "{message}"
+        );
+        for remediation in [
+            "retread-relax",
+            "retread-overrides",
+            "retread-drop-deps",
+            "(see README)",
+        ] {
+            assert!(message.contains(remediation), "{message}");
+        }
         assert!(message.contains("regression-root==1.0.0"), "{message}");
         assert!(message.contains("pillow>=11,<11.1"), "{message}");
         assert!(message.contains("conflicting-root==2.0.0"), "{message}");

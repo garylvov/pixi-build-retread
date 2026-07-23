@@ -74,15 +74,28 @@ impl Constraint {
 /// A finalized requirement whose active constraints have an empty
 /// intersection.
 ///
-/// The display text preserves the existing joint-route diagnostic while the
-/// package identity and source list remain structurally available to callers.
+/// The package identity and complete source list remain structurally available
+/// to callers. Joint-route callers attach the concrete environment/target
+/// scope before surfacing the conflict.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 #[error(
-    "joint route validation cannot restore `{package}` to PyPI: active requirements are mutually unsatisfiable:\n{sources}"
+    "dependency conflict{scope}: `{package}` requirements are mutually unsatisfiable: {sources}. \
+     Resolve by pinning one side, or use `retread-relax`, `retread-overrides`, or \
+     `retread-drop-deps` in the pack manifest (see README)."
 )]
 pub struct Conflict {
     pub package: PypiKey,
     pub sources: String,
+    scope: String,
+}
+
+impl Conflict {
+    /// Add a user-facing solve scope such as an environment, target profile,
+    /// platform, Python version, and bundle identity.
+    pub(crate) fn with_scope(mut self, scope: impl Into<String>) -> Self {
+        self.scope = format!(" {}", scope.into());
+        self
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -301,13 +314,14 @@ pub fn finalize(
             } else {
                 constraint.specifiers.to_string()
             };
-            format!("  - `{rendered}` from {}", constraint.source)
+            format!("`{rendered}` required by {}", constraint.source)
         })
         .collect::<Vec<_>>()
-        .join("\n");
+        .join("; ");
     Err(Conflict {
         package: package.clone(),
         sources,
+        scope: String::new(),
     })
 }
 
