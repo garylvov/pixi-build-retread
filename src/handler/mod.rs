@@ -39,7 +39,9 @@ use tokio::sync::RwLock;
 use uv_pep508::uv_pep440::VersionSpecifiers;
 
 use crate::config::{RelaxPolicy, RetreadConfig, WheelEntry};
-use crate::constraint::{Authority, Conflict, Constraint, Provenance, finalize};
+use crate::constraint::{
+    Authority, Conflict, Constraint, Provenance, aggregate_conflicts, finalize,
+};
 use crate::index_chain::{IndexPurpose, index_chain};
 use crate::pypi::{self, ResolutionTarget, WheelTarget, normalized_python_minor};
 use crate::recipe::{
@@ -10953,20 +10955,41 @@ fn produce_output(
         courier_build_hash,
         version_override,
     )?;
-    if let Some(conflict) = conflicts.into_iter().next() {
-        let conda_name = conflict.conda_name.as_spec().to_string();
-        tracing::error!(
-            bundle = %bundle.conda_name,
-            conda_dep = %conda_name,
-            error = %conflict.conflict,
-            "bundle emission rejected by structural constraint conflict",
-        );
-        return Err(anyhow::Error::new(conflict.conflict)).with_context(|| {
+    if !conflicts.is_empty() {
+        let conda_names = conflicts
+            .iter()
+            .map(|conflict| conflict.conda_name.as_spec().to_string())
+            .collect::<Vec<_>>();
+        for conflict in &conflicts {
+            let conda_name = conflict.conda_name.as_spec().to_string();
+            tracing::error!(
+                bundle = %bundle.conda_name,
+                conda_dep = %conda_name,
+                error = %conflict.conflict,
+                "bundle emission rejected by structural constraint conflict",
+            );
+        }
+        let context = if conda_names.len() == 1 {
             format!(
-                "emitting conda dependency `{conda_name}` for bundle `{}`",
+                "emitting conda dependency `{}` for bundle `{}`",
+                conda_names[0], bundle.conda_name
+            )
+        } else {
+            format!(
+                "emitting conda dependencies {} for bundle `{}`",
+                conda_names
+                    .iter()
+                    .map(|name| format!("`{name}`"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
                 bundle.conda_name
             )
-        });
+        };
+        let conflicts = conflicts
+            .into_iter()
+            .map(|conflict| conflict.conflict)
+            .collect();
+        return Err(aggregate_conflicts(conflicts)).with_context(|| context);
     }
     Ok(output)
 }
@@ -11022,8 +11045,14 @@ fn emitted_bundle_route_specs(
     target: &WheelTarget,
 ) -> Result<Vec<crate::uv_closure::CondaRouteSpec>> {
     let assembly = emitted_bundle_route_assembly(bundle, config, target)?;
-    if let Some(conflict) = assembly.conflicts.into_iter().next() {
-        return Err(anyhow::Error::new(conflict.conflict));
+    if !assembly.conflicts.is_empty() {
+        return Err(aggregate_conflicts(
+            assembly
+                .conflicts
+                .into_iter()
+                .map(|conflict| conflict.conflict)
+                .collect(),
+        ));
     }
     Ok(assembly.routes)
 }

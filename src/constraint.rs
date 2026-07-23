@@ -5,6 +5,7 @@
 //! new source of constraints cannot acquire independent hard/soft semantics.
 
 use std::collections::BTreeMap;
+use std::fmt;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -95,6 +96,62 @@ impl Conflict {
     pub(crate) fn with_scope(mut self, scope: impl Into<String>) -> Self {
         self.scope = format!(" {}", scope.into());
         self
+    }
+}
+
+/// Every structural dependency conflict found while validating one solve
+/// request.
+///
+/// Individual entries retain the ordinary [`Conflict`] rendering so package,
+/// provenance, solve scope, and remediation stay actionable. The report only
+/// adds deterministic numbering and separation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConflictReport {
+    pub conflicts: Vec<Conflict>,
+}
+
+impl ConflictReport {
+    pub(crate) fn with_scope(mut self, scope: impl Into<String>) -> Self {
+        let scope = scope.into();
+        self.conflicts = self
+            .conflicts
+            .into_iter()
+            .map(|conflict| conflict.with_scope(scope.clone()))
+            .collect();
+        self
+    }
+}
+
+impl fmt::Display for ConflictReport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "{} dependency conflicts found:", self.conflicts.len())?;
+        for (index, conflict) in self.conflicts.iter().enumerate() {
+            if index > 0 {
+                write!(f, "\n\n")?;
+            }
+            write!(f, "{}. {conflict}", index + 1)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for ConflictReport {}
+
+/// Preserve the existing typed single-conflict error while representing two
+/// or more conflicts as one report.
+pub(crate) fn aggregate_conflicts(mut conflicts: Vec<Conflict>) -> anyhow::Error {
+    assert!(!conflicts.is_empty(), "cannot aggregate zero conflicts");
+    conflicts.sort_by(|left, right| {
+        (&left.package, &left.sources, &left.scope).cmp(&(
+            &right.package,
+            &right.sources,
+            &right.scope,
+        ))
+    });
+    if conflicts.len() == 1 {
+        anyhow::Error::new(conflicts.pop().expect("one conflict"))
+    } else {
+        anyhow::Error::new(ConflictReport { conflicts })
     }
 }
 

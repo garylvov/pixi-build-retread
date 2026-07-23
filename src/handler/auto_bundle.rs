@@ -17,7 +17,7 @@ use uv_pep508::uv_pep440::Version;
 use uv_pep508::uv_pep440::VersionSpecifiers;
 
 use crate::config::RetreadConfig;
-use crate::constraint::{Constraint, Provenance, finalize};
+use crate::constraint::{ConflictReport, Constraint, Provenance, aggregate_conflicts, finalize};
 use crate::pypi;
 use crate::relax::{
     CondaName, CondaTarget, NameMap, PypiKey, canonical_conda_name, default_marker_env,
@@ -277,7 +277,12 @@ impl JointRouteDiagnosticContext {
     fn scope_error(&self, error: anyhow::Error) -> anyhow::Error {
         match error.downcast::<crate::constraint::Conflict>() {
             Ok(conflict) => anyhow::Error::new(conflict.with_scope(self.scope())),
-            Err(error) => error.context(format!("validating dependency routes {}", self.scope())),
+            Err(error) => match error.downcast::<ConflictReport>() {
+                Ok(report) => anyhow::Error::new(report.with_scope(self.scope())),
+                Err(error) => {
+                    error.context(format!("validating dependency routes {}", self.scope()))
+                }
+            },
         }
     }
 }
@@ -1438,16 +1443,18 @@ where
             mutable_conda_names.insert(conda_name);
         }
     }
-    for conflict in &assembly_conflicts {
-        let conda_key = conflict.conda_name.key().into_string();
-        if !mutable_conda_names.contains(&conda_key) {
-            return Err(anyhow::Error::new(
-                conflict
-                    .conflict
-                    .clone()
-                    .with_scope(diagnostic_context.scope()),
-            ));
-        }
+    let fixed_conflicts: Vec<_> = assembly_conflicts
+        .iter()
+        .filter(|conflict| !mutable_conda_names.contains(conflict.conda_name.key().as_str()))
+        .map(|conflict| {
+            conflict
+                .conflict
+                .clone()
+                .with_scope(diagnostic_context.scope())
+        })
+        .collect();
+    if !fixed_conflicts.is_empty() {
+        return Err(aggregate_conflicts(fixed_conflicts));
     }
     let conflicted_keys: BTreeSet<String> = assembly_conflicts
         .iter()
@@ -1700,8 +1707,18 @@ where
     // a network error for another rejected route. Conflicts retain the P3
     // typed diagnostic and fail before any fetch.
     let mut finalized_restore_requests = Vec::new();
+    let mut restore_conflicts = Vec::new();
     for request in restore_requests.into_values() {
-        finalized_restore_requests.push(request.finish_with_context(Some(diagnostic_context))?);
+        match request.finish_with_context(Some(diagnostic_context)) {
+            Ok(request) => finalized_restore_requests.push(request),
+            Err(error) => match error.downcast::<crate::constraint::Conflict>() {
+                Ok(conflict) => restore_conflicts.push(conflict),
+                Err(error) => return Err(error),
+            },
+        }
+    }
+    if !restore_conflicts.is_empty() {
+        return Err(aggregate_conflicts(restore_conflicts));
     }
 
     // Fetch every wheel before changing routing. A missing index candidate
@@ -4572,6 +4589,113 @@ pillow = ">=10,<13"
             fetch_calls.load(std::sync::atomic::Ordering::SeqCst),
             0,
             "semantic conflicts must fail before any index request"
+        );
+    }
+
+    #[tokio::test]
+    async fn joint_unroute_aggregates_all_scoped_requirement_conflicts_before_fetch() {
+        let fetch_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fetch = {
+            let fetch_calls = Arc::clone(&fetch_calls);
+            move |_request: PypiFetchRequest, _indexes: Vec<String>, _failure_context: String| {
+                fetch_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { Err(anyhow!("conflicts must fail before any fetch")) }
+            }
+        };
+        let mut bundle = test_bundle(&["pillow>=11,<11.1", "typing-extensions<4"]);
+        bundle.extras.push(test_wheel(
+            "conflicting-root",
+            "conflicting-root",
+            "2.0.0",
+            &["pillow>=12,<13", "typing-extensions>=5,<6"],
+        ));
+
+        let mut pillow_route = pillow_auto_route("12.3.0");
+        pillow_route.provenance = Provenance::DepsFromRelaxed;
+        pillow_route
+            .route
+            .input_requirements
+            .push(crate::uv_closure::AutoRouteInputRequirement {
+                specifiers: "==12.3.0".to_string(),
+                source: "uv root requirement `pillow==12.3.0`".to_string(),
+                provenance: Provenance::UvRoot,
+                role: crate::uv_closure::AutoRouteInputRole::Requirement,
+            });
+        bundle.auto_routed.push(pillow_route);
+
+        let mut typing_route = pillow_auto_route("5.0.0");
+        typing_route.route.pypi_name = "typing-extensions".to_string();
+        typing_route.route.conda_name = "typing-extensions".to_string();
+        typing_route.provenance = Provenance::DepsFromRelaxed;
+        typing_route
+            .route
+            .input_requirements
+            .push(crate::uv_closure::AutoRouteInputRequirement {
+                specifiers: "==5.0.0".to_string(),
+                source: "uv root requirement `typing-extensions==5.0.0`".to_string(),
+                provenance: Provenance::UvRoot,
+                role: crate::uv_closure::AutoRouteInputRole::Requirement,
+            });
+        bundle.auto_routed.push(typing_route);
+
+        let target = crate::pypi::WheelTarget::for_subdir("3.10", "linux-64");
+        let workspace_scope = crate::workspace::ResolvedWorkspaceTarget {
+            contract: crate::workspace::WorkspaceTargetContract {
+                subdir: "linux-64".to_string(),
+                declared_virtual_packages: BTreeMap::new(),
+                detected_virtual_packages: BTreeMap::new(),
+            },
+            profiles: vec!["linux-64-cuda-12".to_string()],
+            environments: vec!["uwlab-gpu".to_string()],
+        };
+        let allow_source_route = |_route: crate::uv_closure::CondaRouteSpec| async {
+            crate::uv_closure::CoInstallVerdict::Sat
+        };
+
+        let error = auto_bundle_transitives_with_route_precheck(
+            &mut bundle,
+            &[crate::workspace::DEFAULT_PYPI_INDEX.to_string()],
+            &target,
+            Some(&workspace_scope),
+            &test_config(),
+            None,
+            None,
+            None,
+            &validated_probe,
+            &reject_every_mutable_route,
+            &allow_source_route,
+            &fetch,
+            &["conda-forge/linux-64".to_string()],
+            &UvReresolveContext::default(),
+        )
+        .await
+        .unwrap_err();
+
+        let message = format!("{error:#}");
+        let report = error
+            .downcast_ref::<crate::constraint::ConflictReport>()
+            .expect("multiple package conflicts must retain a typed aggregate");
+        assert_eq!(report.conflicts.len(), 2, "{message}");
+        assert!(
+            message.starts_with("2 dependency conflicts found:"),
+            "{message}"
+        );
+        for package in ["pillow", "typing-extensions"] {
+            assert!(
+                message.contains(&format!(
+                    "dependency conflict in environment 'uwlab-gpu' for bundle \
+                     'regression-pack' (target profile 'linux-64-cuda-12', platform \
+                     linux-64, python 3.10): `{package}` requirements are mutually \
+                     unsatisfiable"
+                )),
+                "{message}"
+            );
+        }
+        assert!(message.contains("\n\n2. dependency conflict"), "{message}");
+        assert_eq!(
+            fetch_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "all semantic conflicts must be collected before any index request"
         );
     }
 
