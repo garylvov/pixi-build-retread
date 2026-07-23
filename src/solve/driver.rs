@@ -1,8 +1,12 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use regex::Regex;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
@@ -10,7 +14,9 @@ use crate::status;
 use crate::workspace::WorkspaceManifest;
 
 use super::args::SolveArgs;
-use super::error::{EXIT_OK, EXIT_SMOKE_FAILED, SolveError};
+use super::error::{
+    EXIT_EXHAUSTED, EXIT_INTERRUPTED, EXIT_OK, EXIT_SMOKE_FAILED, EXIT_UNPARSEABLE, SolveError,
+};
 use super::manifest::{AppliedEdit, ManifestEditor, copy_atomic, restore_bytes_atomic};
 use super::parse::{ConflictParser, RegexConflictParser, tail};
 use super::repair::{
@@ -28,6 +34,12 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
         ));
         eprintln!("{err}");
         return Ok(err.exit_code());
+    }
+
+    if args.audit {
+        let report = run_workspace_audit(&manifest_path, "pixi").await?;
+        eprint!("{}", report.render());
+        return Ok(report.exit_code());
     }
 
     let mut editor = ManifestEditor::open(manifest_path.clone())?;
@@ -191,6 +203,469 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
     cleanup_snapshot(&project_dir)?;
     crate::pack_overrides::cleanup_all(&project_dir)?;
     Ok(any_failed_code)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct AuditConflict {
+    package: String,
+    requirements: Vec<String>,
+    remediation: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct AuditEnvironmentFailure {
+    conflicts: Vec<AuditConflict>,
+    fallback: Option<String>,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct AuditReport {
+    checked: usize,
+    environments: BTreeMap<String, AuditEnvironmentFailure>,
+    interrupted: bool,
+}
+
+impl AuditReport {
+    fn conflict_count(&self) -> usize {
+        self.environments
+            .values()
+            .map(|failure| failure.conflicts.len())
+            .sum()
+    }
+
+    fn conflicting_environment_count(&self) -> usize {
+        self.environments
+            .values()
+            .filter(|failure| !failure.conflicts.is_empty())
+            .count()
+    }
+
+    fn exit_code(&self) -> i32 {
+        if self.interrupted {
+            EXIT_INTERRUPTED
+        } else if self
+            .environments
+            .values()
+            .any(|failure| failure.fallback.is_some())
+        {
+            EXIT_UNPARSEABLE
+        } else if !self.environments.is_empty() {
+            EXIT_EXHAUSTED
+        } else {
+            EXIT_OK
+        }
+    }
+
+    fn render(&self) -> String {
+        if self.environments.is_empty() && !self.interrupted {
+            return format!(
+                "retread solve audit: all {} environments passed\n",
+                self.checked
+            );
+        }
+
+        let mut out = String::new();
+        let _ = writeln!(
+            out,
+            "retread solve audit: {} environments checked; {} dependency conflicts across {} environments",
+            self.checked,
+            self.conflict_count(),
+            self.conflicting_environment_count()
+        );
+        for (environment, failure) in &self.environments {
+            let _ = writeln!(out, "\nenvironment `{environment}`:");
+            for conflict in &failure.conflicts {
+                let _ = writeln!(out, "  package `{}`:", conflict.package);
+                let _ = writeln!(out, "    conflicting requirements:");
+                for requirement in &conflict.requirements {
+                    let _ = writeln!(out, "      - {requirement}");
+                }
+                let _ = writeln!(out, "    remediation: {}", conflict.remediation);
+            }
+            if let Some(fallback) = &failure.fallback {
+                let _ = writeln!(
+                    out,
+                    "  solve failed without a scoped dependency conflict:\n    {fallback}"
+                );
+            }
+        }
+        if self.interrupted {
+            let _ = writeln!(out, "\naudit interrupted");
+        }
+        out
+    }
+}
+
+/// A disposable sibling workspace containing one selected environment (and
+/// any peers that deliberately share its Pixi solve-group).
+///
+/// Pixi 0.73's environment selector controls installation, but lock refresh
+/// still visits every outdated environment. Filtering the manifest is
+/// therefore load-bearing: otherwise every iteration can abort on the same
+/// unrelated first environment.
+struct AuditShadow {
+    root: PathBuf,
+    manifest: PathBuf,
+}
+
+impl AuditShadow {
+    fn create(
+        project_dir: &Path,
+        manifest_path: &Path,
+        manifest_source: &str,
+        manifest: &toml::Value,
+        environment: &str,
+    ) -> Result<Self> {
+        let root = create_audit_shadow_dir(project_dir)?;
+        let shadow = Self {
+            manifest: root.join("pixi.toml"),
+            root,
+        };
+        populate_audit_shadow(&shadow, project_dir, manifest_path)?;
+        let filtered = filtered_audit_manifest(manifest_source, manifest, environment)?;
+        std::fs::write(&shadow.manifest, filtered).with_context(|| {
+            format!(
+                "retread solve audit: failed writing {}",
+                shadow.manifest.display()
+            )
+        })?;
+        Ok(shadow)
+    }
+}
+
+impl Drop for AuditShadow {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+fn create_audit_shadow_dir(project_dir: &Path) -> Result<PathBuf> {
+    static NEXT_SHADOW: AtomicU64 = AtomicU64::new(0);
+
+    let parent = project_dir.parent().ok_or_else(|| {
+        anyhow::anyhow!(
+            "retread solve audit: workspace {} has no parent directory",
+            project_dir.display()
+        )
+    })?;
+    let workspace_name = project_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("workspace");
+    for _ in 0..100 {
+        let serial = NEXT_SHADOW.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!(
+            ".{workspace_name}-retread-audit-{}-{serial}",
+            std::process::id()
+        ));
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "retread solve audit: failed creating sibling shadow workspace {}",
+                        candidate.display()
+                    )
+                });
+            }
+        }
+    }
+    anyhow::bail!("retread solve audit: could not allocate a unique shadow workspace")
+}
+
+fn populate_audit_shadow(
+    shadow: &AuditShadow,
+    project_dir: &Path,
+    manifest_path: &Path,
+) -> Result<()> {
+    let manifest_name = manifest_path.file_name();
+    for entry in std::fs::read_dir(project_dir).with_context(|| {
+        format!(
+            "retread solve audit: failed reading workspace {}",
+            project_dir.display()
+        )
+    })? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if Some(name.as_os_str()) == manifest_name
+            || name == "pixi.toml"
+            || name == "pixi.lock"
+            || name == ".pixi"
+            || name == ".retread"
+        {
+            continue;
+        }
+        symlink_audit_entry(
+            &entry.path(),
+            &shadow.root.join(&name),
+            entry.file_type()?.is_dir(),
+        )?;
+    }
+
+    let local_config = project_dir.join(".pixi").join("config.toml");
+    if local_config.is_file() {
+        let shadow_pixi = shadow.root.join(".pixi");
+        std::fs::create_dir(&shadow_pixi)?;
+        std::fs::copy(&local_config, shadow_pixi.join("config.toml")).with_context(|| {
+            format!(
+                "retread solve audit: failed copying local Pixi config {}",
+                local_config.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn symlink_audit_entry(source: &Path, destination: &Path, _is_dir: bool) -> Result<()> {
+    std::os::unix::fs::symlink(source, destination).with_context(|| {
+        format!(
+            "retread solve audit: failed linking {} into shadow workspace",
+            source.display()
+        )
+    })
+}
+
+#[cfg(windows)]
+fn symlink_audit_entry(source: &Path, destination: &Path, is_dir: bool) -> Result<()> {
+    let result = if is_dir {
+        std::os::windows::fs::symlink_dir(source, destination)
+    } else {
+        std::os::windows::fs::symlink_file(source, destination)
+    };
+    result.with_context(|| {
+        format!(
+            "retread solve audit: failed linking {} into shadow workspace",
+            source.display()
+        )
+    })
+}
+
+fn filtered_audit_manifest(
+    manifest_source: &str,
+    manifest: &toml::Value,
+    environment: &str,
+) -> Result<String> {
+    let source_root = manifest.as_table().ok_or_else(|| {
+        anyhow::anyhow!("retread solve audit: manifest root must be a TOML table")
+    })?;
+    let source_environments = match source_root.get("environments") {
+        Some(value) => Some(value.as_table().ok_or_else(|| {
+            anyhow::anyhow!("retread solve audit: `environments` must be a TOML table")
+        })?),
+        None => None,
+    };
+    let selected = source_environments.and_then(|envs| envs.get(environment));
+    if environment != "default" && selected.is_none() {
+        anyhow::bail!(
+            "retread solve audit: environment `{environment}` disappeared while filtering manifest"
+        );
+    }
+
+    let selected_group = selected.and_then(environment_solve_group);
+    let mut kept_environments = BTreeSet::new();
+    if let Some(group) = selected_group {
+        if let Some(source_environments) = source_environments {
+            for (name, definition) in source_environments {
+                if environment_solve_group(definition) == Some(group) {
+                    kept_environments.insert(name.clone());
+                }
+            }
+        }
+    } else if selected.is_some() {
+        kept_environments.insert(environment.to_string());
+    }
+
+    let preserve_declared_default =
+        environment == "default" || kept_environments.contains("default");
+    if environment != "default" {
+        kept_environments.insert("default".to_string());
+    }
+
+    // Preserve declaration order, comments, and formatting outside the
+    // environment table. In particular, target-selector order can affect
+    // Pixi's last-match-wins semantics and must not be reordered by a
+    // `toml::Value` round trip.
+    let mut document = manifest_source
+        .parse::<toml_edit::DocumentMut>()
+        .context("retread solve audit: failed parsing editable manifest")?;
+    if kept_environments.is_empty() {
+        document.as_table_mut().remove("environments");
+    } else {
+        let environments = document
+            .get_mut("environments")
+            .and_then(toml_edit::Item::as_table_like_mut)
+            .ok_or_else(|| {
+                anyhow::anyhow!("retread solve audit: `environments` must be a TOML table")
+            })?;
+        let names = environments
+            .iter()
+            .map(|(name, _)| name.to_string())
+            .collect::<Vec<_>>();
+        for name in names {
+            if !kept_environments.contains(&name) {
+                environments.remove(&name);
+            }
+        }
+        if !preserve_declared_default {
+            environments.remove("default");
+            let mut inert_default = toml_edit::InlineTable::new();
+            inert_default.insert("features", toml_edit::Value::Array(toml_edit::Array::new()));
+            inert_default.insert("no-default-feature", toml_edit::Value::from(true));
+            environments.insert(
+                "default",
+                toml_edit::Item::Value(toml_edit::Value::InlineTable(inert_default)),
+            );
+        }
+    }
+    Ok(document.to_string())
+}
+
+fn environment_solve_group(definition: &toml::Value) -> Option<&str> {
+    definition
+        .as_table()?
+        .get("solve-group")
+        .or_else(|| definition.as_table()?.get("solve_group"))
+        .and_then(toml::Value::as_str)
+}
+
+async fn run_workspace_audit(manifest_path: &Path, pixi_bin: &str) -> Result<AuditReport> {
+    let manifest_source = std::fs::read_to_string(manifest_path).with_context(|| {
+        format!(
+            "retread solve audit: failed reading manifest {}",
+            manifest_path.display()
+        )
+    })?;
+    let manifest: toml::Value = toml::from_str(&manifest_source).with_context(|| {
+        format!(
+            "retread solve audit: failed parsing manifest {}",
+            manifest_path.display()
+        )
+    })?;
+    let environments: Vec<String> = WorkspaceManifest::from_toml(&manifest)
+        .environments
+        .into_keys()
+        .collect();
+    let project_dir = manifest_path.parent().unwrap_or_else(|| Path::new("."));
+    let parser = RegexConflictParser::new();
+    let mut report = AuditReport::default();
+
+    for environment in environments {
+        status::tty(&format!(
+            "retread solve audit: validating environment {environment}"
+        ));
+        report.checked += 1;
+        let shadow = match AuditShadow::create(
+            project_dir,
+            manifest_path,
+            &manifest_source,
+            &manifest,
+            &environment,
+        ) {
+            Ok(shadow) => shadow,
+            Err(error) => {
+                report.environments.insert(
+                    environment,
+                    AuditEnvironmentFailure {
+                        fallback: Some(error.to_string()),
+                        ..AuditEnvironmentFailure::default()
+                    },
+                );
+                continue;
+            }
+        };
+        let result =
+            match run_pixi_audit(&shadow.root, &shadow.manifest, &environment, pixi_bin).await {
+                Ok(result) => result,
+                Err(error) => {
+                    report.environments.insert(
+                        environment,
+                        AuditEnvironmentFailure {
+                            fallback: Some(error.to_string()),
+                            ..AuditEnvironmentFailure::default()
+                        },
+                    );
+                    continue;
+                }
+            };
+        if result.interrupted {
+            report.interrupted = true;
+            report.environments.insert(
+                environment,
+                AuditEnvironmentFailure {
+                    fallback: Some("pixi audit solve was interrupted".into()),
+                    ..AuditEnvironmentFailure::default()
+                },
+            );
+            break;
+        }
+
+        let mut conflicts = extract_audit_conflicts(&parser, &result.raw_stderr);
+        conflicts.sort();
+        conflicts.dedup();
+        if result.success && conflicts.is_empty() {
+            continue;
+        }
+        let fallback = conflicts.is_empty().then(|| {
+            let flattened = collapse_diagnostic_whitespace(&parser.strip_ansi(&result.raw_stderr));
+            if flattened.is_empty() {
+                "pixi update --dry-run failed without stderr".to_string()
+            } else {
+                tail(&flattened, 2000)
+            }
+        });
+        report.environments.insert(
+            environment,
+            AuditEnvironmentFailure {
+                conflicts,
+                fallback,
+            },
+        );
+    }
+    Ok(report)
+}
+
+fn extract_audit_conflicts(parser: &RegexConflictParser, stderr: &str) -> Vec<AuditConflict> {
+    static CONFLICT: OnceLock<Regex> = OnceLock::new();
+
+    let flattened = collapse_diagnostic_whitespace(&parser.strip_ansi(stderr));
+    let conflict = CONFLICT.get_or_init(|| {
+        Regex::new(concat!(
+            r"dependency conflict in environments?\b.*?: `([^`]+)` ",
+            r"requirements are mutually unsatisfiable: (.*?)\. ",
+            r"(Resolve by pinning one side, or use `retread-relax`, ",
+            r"`retread-overrides`, or `retread-drop-deps` in the pack manifest ",
+            r"\(see README\)\.)",
+        ))
+        .expect("valid audit conflict regex")
+    });
+    let mut seen = BTreeSet::new();
+    conflict
+        .captures_iter(&flattened)
+        .filter_map(|captures| {
+            let package = captures.get(1)?.as_str().to_string();
+            let requirements = captures
+                .get(2)?
+                .as_str()
+                .split(';')
+                .map(str::trim)
+                .filter(|clause| !clause.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            let remediation = captures.get(3)?.as_str().to_string();
+            let conflict = AuditConflict {
+                package,
+                requirements,
+                remediation,
+            };
+            seen.insert(conflict.clone()).then_some(conflict)
+        })
+        .collect()
+}
+
+fn collapse_diagnostic_whitespace(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Shared, read-only solve-session state threaded into each per-environment
@@ -403,6 +878,28 @@ struct InstallResult {
     raw_stderr: String,
 }
 
+async fn run_pixi_audit(
+    project_dir: &Path,
+    manifest_path: &Path,
+    environment: &str,
+    pixi_bin: &str,
+) -> std::result::Result<InstallResult, SolveError> {
+    let mut cmd = Command::new(pixi_bin);
+    cmd.arg("update")
+        .arg("--dry-run")
+        .arg("--manifest-path")
+        .arg(manifest_path)
+        .arg("-e")
+        .arg(environment)
+        .arg("--color=never")
+        .current_dir(project_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("PIXI_COLOR", "never");
+    capture_pixi_output(cmd).await
+}
+
 async fn run_pixi_install(
     project_dir: &Path,
     env: Option<&str>,
@@ -418,7 +915,10 @@ async fn run_pixi_install(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env("PIXI_COLOR", "never");
+    capture_pixi_output(cmd).await
+}
 
+async fn capture_pixi_output(mut cmd: Command) -> std::result::Result<InstallResult, SolveError> {
     let mut child = cmd
         .spawn()
         .map_err(|e| SolveError::Usage(format!("retread solve: failed to spawn pixi: {e}")))?;
@@ -606,6 +1106,174 @@ fn print_success_summary(attempts: &[LedgerAttempt]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn audit_test_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "retread-solve-audit-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[cfg(unix)]
+    fn write_audit_pixi(dir: &Path) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let log = dir.join("pixi-invocations.log");
+        let script = dir.join("pixi");
+        let body = format!(
+            r#"#!/bin/bash
+printf '%s\n' "$*" >> "{log}"
+if [ "$1" != "update" ]; then
+  exit 97
+fi
+environment=""
+manifest=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-e" ]; then
+    shift
+    environment="$1"
+  elif [ "$1" = "--manifest-path" ]; then
+    shift
+    manifest="$1"
+  fi
+  shift
+done
+cp "$manifest" "{dir}/seen-$environment.toml"
+case "$environment" in
+  alpha)
+    cat >&2 <<'EOF'
+dependency conflict in environment 'alpha' for bundle 'alpha-pack' (platform linux-64, python 3.11): `numpy` requirements are mutually unsatisfiable: `<2` required by wheel `alpha-root==1.0`; `>=2` required by wheel `alpha-peer==1.0`. Resolve by pinning one side, or use `retread-relax`, `retread-overrides`, or `retread-drop-deps` in the pack manifest (see README).
+EOF
+    exit 1
+    ;;
+  beta)
+    cat >&2 <<'EOF'
+dependency conflict in environment 'beta' for bundle 'beta-pack' (platform linux-64, python 3.11): `psutil` requirements are mutually unsatisfiable: `==5.9.8` required by wheel `beta-root==1.0`; `>=7,<8` required by workspace conda fact. Resolve by pinning one side, or use `retread-relax`, `retread-overrides`, or `retread-drop-deps` in the pack manifest (see README).
+EOF
+    exit 1
+    ;;
+esac
+exit 0
+"#,
+            dir = dir.display(),
+            log = log.display(),
+        );
+        std::fs::write(&script, body).unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+        (script, log)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn audit_mode_checks_every_environment_and_consolidates_conflicts() {
+        let dir = audit_test_dir();
+        let manifest = dir.join("pixi.toml");
+        let manifest_source = r#"[workspace]
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[environments]
+beta = []
+alpha = []
+default = []
+
+# Keep this deliberately non-lexical: audit filtering must preserve target
+# selector declaration order because Pixi applies last-match-wins semantics.
+[target.z.dependencies]
+python = ">=3.11"
+
+[target.a.dependencies]
+python = "<3.13"
+"#;
+        std::fs::write(&manifest, manifest_source).unwrap();
+        let (pixi, log) = write_audit_pixi(&dir);
+
+        let report = run_workspace_audit(&manifest, pixi.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(report.checked, 3);
+        assert_eq!(report.conflict_count(), 2);
+        assert_eq!(report.exit_code(), EXIT_EXHAUSTED);
+        let rendered = report.render();
+        assert_eq!(rendered.matches("retread solve audit:").count(), 1);
+        assert!(rendered.contains("environment `alpha`:"));
+        assert!(rendered.contains("package `numpy`"));
+        assert!(rendered.contains("- `<2` required by wheel `alpha-root==1.0`"));
+        assert!(rendered.contains("- `>=2` required by wheel `alpha-peer==1.0`"));
+        assert!(rendered.contains("environment `beta`:"));
+        assert!(rendered.contains("package `psutil`"));
+        assert!(rendered.contains("- `>=7,<8` required by workspace conda fact"));
+        assert_eq!(rendered.matches("remediation:").count(), 2);
+        assert!(
+            rendered.find("environment `alpha`").unwrap()
+                < rendered.find("environment `beta`").unwrap()
+        );
+
+        let invocations = std::fs::read_to_string(&log).unwrap();
+        let invocations = invocations.lines().collect::<Vec<_>>();
+        assert_eq!(invocations.len(), 3);
+        for (line, environment) in invocations.iter().zip(["alpha", "beta", "default"]) {
+            assert!(
+                line.starts_with("update --dry-run --manifest-path "),
+                "{line}"
+            );
+            assert!(
+                line.ends_with(&format!("-e {environment} --color=never")),
+                "{line}"
+            );
+            let words = line.split_whitespace().collect::<Vec<_>>();
+            let manifest_arg = PathBuf::from(
+                words[words
+                    .iter()
+                    .position(|word| *word == "--manifest-path")
+                    .unwrap()
+                    + 1],
+            );
+            assert!(
+                !manifest_arg.exists(),
+                "shadow should be removed after {environment}"
+            );
+        }
+
+        for environment in ["alpha", "beta"] {
+            let seen_source =
+                std::fs::read_to_string(dir.join(format!("seen-{environment}.toml"))).unwrap();
+            assert!(
+                seen_source.find("[target.z.dependencies]").unwrap()
+                    < seen_source.find("[target.a.dependencies]").unwrap(),
+                "audit filtering reordered target selectors for {environment}"
+            );
+            assert!(
+                seen_source.contains(
+                    "# Keep this deliberately non-lexical: audit filtering must preserve target"
+                ),
+                "audit filtering dropped manifest comments for {environment}"
+            );
+            let seen: toml::Value = toml::from_str(&seen_source).unwrap();
+            let names = seen["environments"]
+                .as_table()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            assert_eq!(names, vec![environment, "default"]);
+            assert_eq!(
+                seen["environments"]["default"]["no-default-feature"].as_bool(),
+                Some(true)
+            );
+        }
+        assert_eq!(std::fs::read_to_string(&manifest).unwrap(), manifest_source);
+        assert!(!dir.join(".retread").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn feature_resolution_uses_single_no_default_feature() {

@@ -83,7 +83,7 @@ conda-forge, which lags the pinned version and will disagree on `fmt`/
 |---------|-------|
 | install | `retread install --lock <lock.json> --prefix <p>` |
 | verify | `retread verify --lock <lock.json> [--full]` |
-| solve | `retread solve --manifest pixi.toml -e <env>` |
+| solve | repair: `retread solve --manifest pixi.toml -e <env>`; audit all: `retread solve --manifest pixi.toml --audit` |
 | fast (env) | `eval "$(pixi-build-retread fast --print-env)"` |
 
 ## Fast path

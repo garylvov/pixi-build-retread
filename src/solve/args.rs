@@ -13,6 +13,8 @@ pub struct SolveArgs {
     pub smoke_modules: Vec<String>,
     pub dry_run: bool,
     pub clean_pins: bool,
+    /// Audit every manifest environment without applying repair edits.
+    pub audit: bool,
     /// Overrides `[tool.retread] relax-preference` to `"pypi"` for this
     /// run: widen the conda pin before trying a pypi dependency-override
     /// (the historical order, predating conda-as-truth).
@@ -31,6 +33,7 @@ impl Default for SolveArgs {
             smoke_modules: Vec::new(),
             dry_run: false,
             clean_pins: false,
+            audit: false,
             prefer_pypi: false,
         }
     }
@@ -39,6 +42,7 @@ impl Default for SolveArgs {
 pub fn parse(argv: &[String]) -> anyhow::Result<SolveArgs> {
     let mut args = SolveArgs::default();
     let mut non_clean_flag_seen = false;
+    let mut audit_incompatible_flag: Option<String> = None;
     let mut it = argv.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -50,6 +54,7 @@ pub fn parse(argv: &[String]) -> anyhow::Result<SolveArgs> {
             }
             "-e" | "--environment" => {
                 non_clean_flag_seen = true;
+                audit_incompatible_flag.get_or_insert_with(|| a.clone());
                 let env = it
                     .next()
                     .ok_or_else(|| SolveError::Usage(format!("{a} <env> required")))?;
@@ -57,6 +62,7 @@ pub fn parse(argv: &[String]) -> anyhow::Result<SolveArgs> {
             }
             "--feature" => {
                 non_clean_flag_seen = true;
+                audit_incompatible_flag.get_or_insert_with(|| a.clone());
                 let feature = it
                     .next()
                     .ok_or_else(|| SolveError::Usage("--feature <name> required".into()))?;
@@ -64,6 +70,7 @@ pub fn parse(argv: &[String]) -> anyhow::Result<SolveArgs> {
             }
             "--max-iters" => {
                 non_clean_flag_seen = true;
+                audit_incompatible_flag.get_or_insert_with(|| a.clone());
                 let raw = it
                     .next()
                     .ok_or_else(|| SolveError::Usage("--max-iters <N> required".into()))?;
@@ -73,14 +80,17 @@ pub fn parse(argv: &[String]) -> anyhow::Result<SolveArgs> {
             }
             "--no-smoke-test" => {
                 non_clean_flag_seen = true;
+                audit_incompatible_flag.get_or_insert_with(|| a.clone());
                 args.no_smoke_test = true;
             }
             "--keep-going" => {
                 non_clean_flag_seen = true;
+                audit_incompatible_flag.get_or_insert_with(|| a.clone());
                 args.keep_going = true;
             }
             "--smoke" => {
                 non_clean_flag_seen = true;
+                audit_incompatible_flag.get_or_insert_with(|| a.clone());
                 let raw = it.next().ok_or_else(|| {
                     SolveError::Usage("--smoke <module>[,<module>...] required".into())
                 })?;
@@ -92,13 +102,17 @@ pub fn parse(argv: &[String]) -> anyhow::Result<SolveArgs> {
             }
             "--dry-run" => {
                 non_clean_flag_seen = true;
+                audit_incompatible_flag.get_or_insert_with(|| a.clone());
                 args.dry_run = true;
             }
             "--clean-pins" => {
+                audit_incompatible_flag.get_or_insert_with(|| a.clone());
                 args.clean_pins = true;
             }
+            "--audit" | "--all-environments" => args.audit = true,
             "--prefer-pypi" => {
                 non_clean_flag_seen = true;
+                audit_incompatible_flag.get_or_insert_with(|| a.clone());
                 args.prefer_pypi = true;
             }
             other => anyhow::bail!("retread solve: unknown arg {other}"),
@@ -110,6 +124,14 @@ pub fn parse(argv: &[String]) -> anyhow::Result<SolveArgs> {
             "retread solve: --clean-pins is mutually exclusive with every flag except --manifest"
                 .into(),
         )
+        .into());
+    }
+    if args.audit
+        && let Some(flag) = audit_incompatible_flag
+    {
+        return Err(SolveError::Usage(format!(
+            "retread solve: --audit is mutually exclusive with {flag}"
+        ))
         .into());
     }
     Ok(args)
@@ -152,6 +174,23 @@ mod tests {
         assert!(args.prefer_pypi);
         let default_args = parse(&argv(&[])).unwrap();
         assert!(!default_args.prefer_pypi);
+    }
+
+    #[test]
+    fn parses_audit_and_all_environments_alias() {
+        assert!(parse(&argv(&["--audit"])).unwrap().audit);
+        assert!(parse(&argv(&["--all-environments"])).unwrap().audit);
+    }
+
+    #[test]
+    fn audit_rejects_repair_flags() {
+        let err = parse(&argv(&["--audit", "-e", "gpu"])).unwrap_err();
+        assert!(err.to_string().contains("mutually exclusive with -e"));
+        let err = parse(&argv(&["--audit", "--clean-pins"])).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("--audit is mutually exclusive with --clean-pins")
+        );
     }
 
     #[test]
