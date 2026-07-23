@@ -750,46 +750,28 @@ pub enum RelaxPolicy {
     /// the conda side to pick a working version.
     #[serde(rename = "strong-major")]
     StrongMajor,
-    /// v0.19.0+ "with-last-resort" family. Each behaves IDENTICALLY
-    /// to its base (patch / minor / major) at translate time, plus an
-    /// automated cascade for deps whose post-translate conda spec
-    /// turns out unsatisfiable on the workspace's channels. Cascade
-    /// per dep, in order:
-    ///   (1) try conda with the base-relaxed spec (probe)
-    ///   (2) try PyPI wheel (BFS)            -- wired since v0.13.x
-    ///   (3) try PyPI sdist (BFS fallback)   -- wired since v0.18.0
-    ///   (4) try conda with `*` (any version) -- last-resort widening
-    ///   (5) try PyPI bundle with empty spec  -- not yet implemented
-    /// Widening only triggers for deps that FAIL step 1; zero cost for
-    /// the common case where parselmouth-routed deps satisfy their
-    /// strict spec. `minor-with-last-resort` is the recommended
-    /// default; `patch-with-last-resort` for super-strict envs (still
-    /// auto-widens when forced); `major-with-last-resort` mostly
-    /// equivalent to plain `major` since major already widens broadly,
-    /// but exists for symmetry. Surgical alternative to `strong-major`
-    /// which strips upper bounds bundle-wide regardless of need.
+    /// "With-last-resort" family. Translation still behaves exactly like the
+    /// named base policy. In the normal auto-bundle restore path, an otherwise
+    /// empty intersection of index-wheel metadata requirements is retried at
+    /// the base tier and then at the existing StrongMajor transform: exact
+    /// pins become major floors and range upper caps are stripped. The first
+    /// satisfiable tier wins and emits a loud, source-rich warning. Already
+    /// satisfiable requirements and non-wheel authoritative constraints are
+    /// never loosened.
     #[serde(rename = "patch-with-last-resort")]
     PatchWithLastResort,
     #[serde(rename = "minor-with-last-resort")]
     MinorWithLastResort,
     #[serde(rename = "major-with-last-resort")]
     MajorWithLastResort,
-    /// v0.30.0+ tiered cascade. At translate time emits at the narrowest
-    /// (patch) widening, then per-dep escalates only when probes prove
-    /// the current widening level is unsatisfiable. Per dep, in order:
-    ///   (1) probe conda at the patch-widened spec
-    ///   (2) probe PyPI for a wheel matching the patch range -> bundle + drop conda emit
-    ///   (3) probe conda at the minor-widened spec
-    ///   (4) probe PyPI at the minor range -> bundle + drop conda emit
-    ///   (5) probe conda at the major-widened spec
-    ///   (6) probe PyPI at the major range -> bundle + drop conda emit
-    ///   (7) widen the emitted conda spec to `*` (any version)
-    /// At each conda step the workspace's conda solver picks the highest
-    /// in-range candidate; at each PyPI step the PyPI resolver picks the
-    /// highest in-range wheel. Decisions per step land in the audit
-    /// under stage `tiered-cascade-stepN-{conda,pypi}`. Use this when
-    /// you want strict-by-default behavior with automatic recovery
-    /// across multiple widening levels before reaching for `*`.
+    /// Tiered inline conflict recovery. Translation begins at Patch. When the
+    /// raw intersection of collected index-wheel metadata is empty in the
+    /// auto-bundle restore path, retread retries Patch, Minor, Major, then the
+    /// StrongMajor last-resort transform (major floors plus upper-cap
+    /// stripping). It stops at the narrowest satisfiable tier and loudly
+    /// reports every changed pin/cap with all wheel sources. If no tier can
+    /// reconcile the metadata with untouched hard constraints, the original
+    /// typed conflict is returned.
     #[default]
     #[serde(rename = "patch-then-minor-then-major-then-last-resort")]
     PatchThenMinorThenMajorThenLastResort,
@@ -816,8 +798,7 @@ pub enum RelaxPolicy {
 }
 
 impl RelaxPolicy {
-    /// True for any `*-with-last-resort` variant. Used by the pre/post
-    /// widen passes' simpler "widen unsat -> `*`" mutation path.
+    /// True for any `*-with-last-resort` variant.
     pub fn has_last_resort(self) -> bool {
         matches!(
             self,
@@ -827,17 +808,13 @@ impl RelaxPolicy {
         )
     }
 
-    /// True for the v0.30.0+ tiered cascade variant. Triggers the
-    /// patch -> minor -> major -> last-resort escalation in both
-    /// widening passes (pre-emit + post-emit).
+    /// True for the tiered Patch -> Minor -> Major -> last-resort policy.
     pub fn has_tiered_cascade(self) -> bool {
         matches!(self, RelaxPolicy::PatchThenMinorThenMajorThenLastResort)
     }
 
-    /// True if mutation (override injection / spec rewriting) is
-    /// allowed for unsat probes. Both passes always *probe* and
-    /// *record* regardless of policy; they only *mutate* when this
-    /// returns true.
+    /// True when the policy permits adaptive widening beyond its translation
+    /// tier after an unsatisfiable result.
     pub fn allows_widening_mutation(self) -> bool {
         self.has_last_resort() || self.has_tiered_cascade()
     }

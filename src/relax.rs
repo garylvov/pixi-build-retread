@@ -463,6 +463,30 @@ fn convert_specifiers(
     // Apply policy while the constraint is still PEP 440. The resulting
     // representation is retained for shared finalization; conda lowering is
     // a separate rendering step and is never used to reconstruct it.
+    let effective = relax_version_specifiers(specifiers, policy)?;
+
+    let mut conda = Vec::with_capacity(effective.len());
+    let mut pep440 = Vec::with_capacity(effective.len());
+    for specifier in effective.iter() {
+        pep440.push(specifier.to_string());
+        if let Some(rendered) = convert_one(specifier) {
+            conda.push(rendered);
+        }
+    }
+    Ok(ConvertedSpecifiers {
+        conda: conda.join(","),
+        pep440: pep440.join(","),
+    })
+}
+
+/// Apply one existing relax-policy tier while the requirement is still PEP
+/// 440. Both final recipe translation and the inline cross-wheel conflict
+/// recovery path use this function so exact-pin widening and cap stripping
+/// cannot drift.
+pub(crate) fn relax_version_specifiers(
+    specifiers: &uv_pep440::VersionSpecifiers,
+    policy: RelaxPolicy,
+) -> Result<uv_pep440::VersionSpecifiers> {
     let specs: Vec<uv_pep440::VersionSpecifier> = specifiers.iter().cloned().collect();
     let effective: Vec<uv_pep440::VersionSpecifier> = if specs.len() == 1
         && *specs[0].operator() == Operator::Equal
@@ -487,18 +511,7 @@ fn convert_specifiers(
     // candidates satisfy the bound; see RelaxPolicy::CondaAware doc.
     // Until that probe lands, conda-aware silently degrades to
     // strong-major.
-    let mut conda = Vec::with_capacity(effective.len());
-    let mut pep440 = Vec::with_capacity(effective.len());
-    for specifier in &effective {
-        pep440.push(specifier.to_string());
-        if let Some(rendered) = convert_one(specifier) {
-            conda.push(rendered);
-        }
-    }
-    Ok(ConvertedSpecifiers {
-        conda: conda.join(","),
-        pep440: pep440.join(","),
-    })
+    Ok(effective.into_iter().collect())
 }
 
 /// Drop specifiers that impose an upper bound, expand `~=` to its
@@ -596,17 +609,15 @@ pub fn widen_exact(v: &Version, policy: RelaxPolicy) -> Option<String> {
     let minor = r.get(1).copied().unwrap_or(0);
     let patch = r.get(2).copied().unwrap_or(0);
 
-    // The `*WithLastResort` variants behave IDENTICALLY to their base
-    // here; the cascade is a separate post-translate probe pass in
-    // handler.rs::last_resort_widen_pass that only widens further for
-    // unsatisfiable specs.
+    // The `*WithLastResort` variants behave IDENTICALLY to their base at
+    // translation time. The auto-bundle finalizer invokes this same primitive
+    // at broader tiers only after a collected wheel-metadata intersection is
+    // proven unsatisfiable.
     match policy {
         RelaxPolicy::None => Some(format!("=={v}")),
-        // Tiered cascade starts at the narrowest (patch) widening and
-        // escalates only when probes prove the current spec unsat. So
-        // translate-time emission mirrors plain Patch; the escalation
-        // happens in handler.rs's pre/post widen passes via override
-        // injection / spec mutation.
+        // Tiered recovery starts at the narrowest (patch) widening.
+        // Translate-time emission mirrors plain Patch; inline cross-wheel
+        // finalization escalates only after the raw intersection is empty.
         RelaxPolicy::Patch
         | RelaxPolicy::PatchWithLastResort
         | RelaxPolicy::PatchThenMinorThenMajorThenLastResort => {
@@ -1355,10 +1366,10 @@ mod tests {
     }
 
     #[test]
-    fn tiered_cascade_emits_at_patch_widening() {
-        // The new policy mirrors `Patch` at translate time; the
-        // patch -> minor -> major -> `*` escalation happens in
-        // handler.rs's pre_emit_widen_pass via override injection.
+    fn tiered_policy_translates_at_patch_widening() {
+        // The policy mirrors `Patch` at translation time; collected
+        // cross-wheel conflicts escalate through the same primitives in the
+        // auto-bundle finalizer.
         assert_eq!(
             t(
                 "numpy==1.26.4",
@@ -1367,8 +1378,9 @@ mod tests {
             .as_deref(),
             Some("numpy >=1.26.4,<1.27"),
         );
-        // Ranges pass through unchanged at translate time -- the
-        // cascade catches them post-emit if conda can't satisfy.
+        // Ranges pass through unchanged at translation time. The inline
+        // finalizer strips their caps only when the collected intersection is
+        // unsatisfiable through the Major tier.
         assert_eq!(
             t(
                 "pyglet<2",

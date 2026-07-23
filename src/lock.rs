@@ -653,7 +653,10 @@ pub const SCHEMA: u32 = 15;
 /// cannot share sibling constraints, artifacts, sidecars, builds, or replay.
 ///
 /// Epoch 29: auto-bundle diagnostics with unsat context are now persisted in lock.
-pub const EMIT_EPOCH: u32 = 29;
+///
+/// Epoch 30: unsatisfiable cross-wheel metadata constraints are relaxed inline
+/// before PyPI restoration, changing the selected wheel and emitted run list.
+pub const EMIT_EPOCH: u32 = 30;
 
 fn parse_stored_glibc(value: Option<&str>) -> Option<Option<(u32, u32)>> {
     match value {
