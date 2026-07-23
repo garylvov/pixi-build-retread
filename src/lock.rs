@@ -651,7 +651,9 @@ pub const SCHEMA: u32 = 15;
 /// target identity and is persisted in courier locks. Exact and directly
 /// inferred targets with otherwise identical contracts and consumer scopes
 /// cannot share sibling constraints, artifacts, sidecars, builds, or replay.
-pub const EMIT_EPOCH: u32 = 28;
+///
+/// Epoch 29: auto-bundle diagnostics with unsat context are now persisted in lock.
+pub const EMIT_EPOCH: u32 = 29;
 
 fn parse_stored_glibc(value: Option<&str>) -> Option<Option<(u32, u32)>> {
     match value {
