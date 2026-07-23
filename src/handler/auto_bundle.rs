@@ -421,8 +421,9 @@ fn try_relax_unsatisfiable_wheel_metadata(
     policy: RelaxPolicy,
     diagnostic_context: Option<&JointRouteDiagnosticContext>,
 ) -> Result<Option<(VersionSpecifiers, Vec<WheelMetadataRelaxation>)>> {
-    // Match final recipe translation: Python itself is never relaxed.
-    if package.as_str() == "python" {
+    // ABI anchors describe the binary contract of shipped wheels. Never
+    // mutate their pins, caps, or exclusions while recovering metadata.
+    if crate::solve::is_abi_anchor(package.as_str()) {
         return Ok(None);
     }
 
@@ -3995,6 +3996,59 @@ mod tests {
         let message = format!("{error:#}");
         assert!(message.contains("strict-a==1.0.0"), "{message}");
         assert!(message.contains("strict-b==1.0.0"), "{message}");
+    }
+
+    #[test]
+    fn numpy_and_cuda_abi_anchors_are_never_relaxed() {
+        for (package, pinned, conflicting) in
+            [("numpy", "==1.26.4", ">=2"), ("cuda", "==12.8", ">=13")]
+        {
+            assert!(
+                crate::solve::is_abi_anchor(package),
+                "fixture must exercise the shared ABI-anchor veto: {package}"
+            );
+            let constraints = vec![
+                Constraint {
+                    specifiers: VersionSpecifiers::from_str(pinned).unwrap(),
+                    provenance: Provenance::IndexWheelMetadata,
+                    source: format!("wheel `pinned==1` Requires-Dist `{package}{pinned}`"),
+                },
+                Constraint {
+                    specifiers: VersionSpecifiers::from_str(conflicting).unwrap(),
+                    provenance: Provenance::IndexWheelMetadata,
+                    source: format!("wheel `newer==1` Requires-Dist `{package}{conflicting}`"),
+                },
+            ];
+
+            assert!(
+                try_relax_unsatisfiable_wheel_metadata(
+                    &PypiKey::from_pypi(package),
+                    &constraints,
+                    RelaxPolicy::PatchThenMinorThenMajorThenLastResort,
+                    None,
+                )
+                .unwrap()
+                .is_none(),
+                "{package} must not be widened or stripped"
+            );
+
+            let mut builder = RestoreRequestBuilder::new(
+                package,
+                RelaxPolicy::PatchThenMinorThenMajorThenLastResort,
+            );
+            for constraint in constraints {
+                builder.add_constraint(constraint);
+            }
+            let error = builder
+                .finish()
+                .expect_err("the original ABI-anchor conflict must fail closed");
+            assert!(
+                error
+                    .downcast_ref::<crate::constraint::Conflict>()
+                    .is_some(),
+                "{package} lost the strict typed conflict: {error:#}"
+            );
+        }
     }
 
     #[test]

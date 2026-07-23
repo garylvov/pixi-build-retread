@@ -19,7 +19,12 @@ pub(crate) const ABI_ANCHOR_NAMES: &[&str] = &[
     // 3.14 against a 3.11-only workspace.
     "python",
     "python_abi",
+    "python-abi",
     "pypy",
+    // NumPy's C ABI is consumed directly by compiled extension wheels.
+    // A seemingly harmless metadata widen can therefore select a NumPy
+    // major that the shipped wheel was never built against.
+    "numpy",
     // glibc / libc: the C runtime ABI. Conda-forge encodes the floor
     // via `__glibc` virtual + `libc` direct; widening these would
     // claim retread's output runs on any libc, which is almost never
@@ -39,6 +44,10 @@ pub(crate) const ABI_ANCHOR_NAMES: &[&str] = &[
     // (driver match, sm arch). Widening lets the solver pick cuda 13
     // and break every cuda-bindings/cuda-toolkit/torch interaction.
     "cuda-version",
+    "cuda",
+    "cuda-toolkit",
+    "cuda-cudart",
+    "cudatoolkit",
     "__cuda",
     // Other rattler virtual packages (`__linux`, `__osx`, `__win`,
     // `__unix`, `__archspec`) are caught by the `__` prefix check
@@ -1944,16 +1953,28 @@ pub fn is_abi_anchor(name: &str) -> bool {
     ABI_ANCHOR_NAMES.contains(&name)
         || name.starts_with("__")
         || name.ends_with("_compiler")
+        || name.ends_with("-compiler")
+        || name.starts_with("cuda-")
+        || name.starts_with("cuda_")
         || [
             "gcc_",
+            "gcc-",
             "gxx_",
+            "gxx-",
             "g++_",
+            "g++-",
             "gfortran_",
+            "gfortran-",
             "clang_",
+            "clang-",
             "clangxx_",
+            "clangxx-",
             "binutils_",
+            "binutils-",
             "ld_",
+            "ld-",
             "sysroot_",
+            "sysroot-",
         ]
         .iter()
         .any(|p| name.starts_with(p))
@@ -4512,10 +4533,15 @@ holosoma-gpu = { features = ["holosoma"] }
     #[test]
     fn abi_guard_covers_exact_list_and_patterns() {
         assert!(is_abi_anchor("python"));
+        assert!(is_abi_anchor("numpy"));
+        assert!(is_abi_anchor("cuda"));
+        assert!(is_abi_anchor("cuda-cudart"));
         assert!(is_abi_anchor("__linux"));
         assert!(is_abi_anchor("cxx_compiler"));
+        assert!(is_abi_anchor("cxx-compiler"));
         assert!(is_abi_anchor("sysroot_linux-64"));
-        assert!(!is_abi_anchor("numpy"));
+        assert!(is_abi_anchor("sysroot-linux-64"));
+        assert!(!is_abi_anchor("packaging"));
     }
 
     // ---- P0 acceptance fixture (lock-succ-brief.md acceptance run #1/#2):
