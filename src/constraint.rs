@@ -155,6 +155,26 @@ pub(crate) fn aggregate_conflicts(mut conflicts: Vec<Conflict>) -> anyhow::Error
     }
 }
 
+/// Append a typed conflict error to a request-level collection.
+///
+/// `anyhow` context may wrap either a singleton [`Conflict`] or an already
+/// aggregated [`ConflictReport`]. Inspecting the chain by reference retains
+/// that typing without discarding the original error when it is unrelated.
+pub(crate) fn collect_conflicts(
+    error: anyhow::Error,
+    conflicts: &mut Vec<Conflict>,
+) -> Result<(), anyhow::Error> {
+    if let Some(report) = error.downcast_ref::<ConflictReport>() {
+        conflicts.extend(report.conflicts.iter().cloned());
+        Ok(())
+    } else if let Some(conflict) = error.downcast_ref::<Conflict>() {
+        conflicts.push(conflict.clone());
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum DedupeVersionKey {
     /// Ordinary PEP 440 comparison ignores trailing release zeroes.
@@ -583,5 +603,61 @@ mod tests {
             constraint("<2", Provenance::SourceBuiltRelaxed, "advisory cap"),
         ];
         finalize(&package(), &constraints).expect_err("advisory cap must remain active");
+    }
+
+    #[test]
+    fn request_collection_flattens_contextual_singletons_and_reports() {
+        let first = finalize(
+            &PypiKey::from_pypi("alpha"),
+            &[
+                constraint("<2", Provenance::UvRoot, "alpha root"),
+                constraint(">=3", Provenance::UvConstraint, "alpha constraint"),
+            ],
+        )
+        .unwrap_err();
+        let second = finalize(
+            &PypiKey::from_pypi("beta"),
+            &[
+                constraint("<4", Provenance::UvRoot, "beta root"),
+                constraint(">=5", Provenance::UvConstraint, "beta constraint"),
+            ],
+        )
+        .unwrap_err();
+        let third = finalize(
+            &PypiKey::from_pypi("gamma"),
+            &[
+                constraint("<6", Provenance::UvRoot, "gamma root"),
+                constraint(">=7", Provenance::UvConstraint, "gamma constraint"),
+            ],
+        )
+        .unwrap_err();
+
+        let mut collected = Vec::new();
+        collect_conflicts(
+            anyhow::Error::new(first).context("resolving bundle alpha"),
+            &mut collected,
+        )
+        .unwrap();
+        collect_conflicts(
+            aggregate_conflicts(vec![second, third]).context("resolving the remaining bundles"),
+            &mut collected,
+        )
+        .unwrap();
+
+        assert_eq!(
+            collected
+                .iter()
+                .map(|conflict| conflict.package.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha", "beta", "gamma"]
+        );
+
+        let unrelated = anyhow::anyhow!("network unavailable").context("fetching metadata");
+        let unrelated = collect_conflicts(unrelated, &mut collected)
+            .expect_err("non-conflict errors must propagate");
+        assert_eq!(
+            format!("{unrelated:#}"),
+            "fetching metadata: network unavailable"
+        );
     }
 }

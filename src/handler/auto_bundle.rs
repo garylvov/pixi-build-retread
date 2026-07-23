@@ -17,7 +17,10 @@ use uv_pep508::uv_pep440::Version;
 use uv_pep508::uv_pep440::VersionSpecifiers;
 
 use crate::config::RetreadConfig;
-use crate::constraint::{ConflictReport, Constraint, Provenance, aggregate_conflicts, finalize};
+use crate::constraint::{
+    Conflict, ConflictReport, Constraint, Provenance, aggregate_conflicts, collect_conflicts,
+    finalize,
+};
 use crate::pypi;
 use crate::relax::{
     CondaName, CondaTarget, NameMap, PypiKey, canonical_conda_name, default_marker_env,
@@ -285,6 +288,20 @@ impl JointRouteDiagnosticContext {
             },
         }
     }
+}
+
+pub(super) fn scope_conflicts_for_target(
+    conflicts: Vec<Conflict>,
+    bundle: &Bundle,
+    target: &crate::pypi::ResolutionTarget,
+) -> Vec<Conflict> {
+    let scope =
+        JointRouteDiagnosticContext::new(bundle, target.wheel_target(), target.workspace_scope())
+            .scope();
+    conflicts
+        .into_iter()
+        .map(|conflict| conflict.with_scope(scope.clone()))
+        .collect()
 }
 
 #[derive(Clone, Debug)]
@@ -1453,15 +1470,13 @@ where
                 .with_scope(diagnostic_context.scope())
         })
         .collect();
-    if !fixed_conflicts.is_empty() {
-        return Err(aggregate_conflicts(fixed_conflicts));
-    }
     let conflicted_keys: BTreeSet<String> = assembly_conflicts
         .iter()
         .map(|conflict| conflict.conda_name.key().into_string())
         .collect();
     let mut pre_rejected: Vec<_> = conflicted_keys
         .iter()
+        .filter(|name| mutable_conda_names.contains(*name))
         .filter_map(|name| emitted_by_conda.get(name).cloned())
         .collect();
     let mut mutable_candidates: Vec<_> = mutable_conda_names
@@ -1470,7 +1485,11 @@ where
         .filter_map(|name| emitted_by_conda.get(name).cloned())
         .collect();
     if mutable_candidates.is_empty() && pre_rejected.is_empty() {
-        return Ok(JointRouteOutcome::Unchanged);
+        return if fixed_conflicts.is_empty() {
+            Ok(JointRouteOutcome::Unchanged)
+        } else {
+            Err(aggregate_conflicts(fixed_conflicts))
+        };
     }
 
     // A globally unsatisfiable fixed baseline cannot identify ordinary route
@@ -1567,14 +1586,22 @@ where
     let mut seen_rejected = BTreeSet::new();
     rejected.retain(|route| seen_rejected.insert(route.conda_name.key().into_string()));
     if rejected.is_empty() {
-        return Ok(JointRouteOutcome::Unchanged);
+        return if fixed_conflicts.is_empty() {
+            Ok(JointRouteOutcome::Unchanged)
+        } else {
+            Err(aggregate_conflicts(fixed_conflicts))
+        };
     }
     let rejected_keys: BTreeSet<String> = rejected
         .iter()
         .map(|route| route.conda_name.key().into_string())
         .collect();
 
-    if uv_reresolve.mode.is_enabled() && uv_reresolve.uv_backed {
+    if uv_reresolve.mode.is_enabled() && uv_reresolve.uv_backed && fixed_conflicts.is_empty() {
+        // A keep-PyPI retry is useful only when every structural conflict is
+        // mutable. If a fixed route already conflicts, continue through the
+        // local restore preflight so its mutable peers can be reported with
+        // it in this request.
         // Preserve every PyPI origin, not just CondaRouteSpec::pypi_name:
         // emission groups aliases by conda identity, while uv's keep-pypi
         // policy is keyed by the original PyPI identity.
@@ -1711,12 +1738,10 @@ where
     for request in restore_requests.into_values() {
         match request.finish_with_context(Some(diagnostic_context)) {
             Ok(request) => finalized_restore_requests.push(request),
-            Err(error) => match error.downcast::<crate::constraint::Conflict>() {
-                Ok(conflict) => restore_conflicts.push(conflict),
-                Err(error) => return Err(error),
-            },
+            Err(error) => collect_conflicts(error, &mut restore_conflicts)?,
         }
     }
+    restore_conflicts.extend(fixed_conflicts);
     if !restore_conflicts.is_empty() {
         return Err(aggregate_conflicts(restore_conflicts));
     }
@@ -4533,13 +4558,15 @@ pillow = ">=10,<13"
         let allow_source_route = |_route: crate::uv_closure::CondaRouteSpec| async {
             crate::uv_closure::CoInstallVerdict::Sat
         };
+        let mut config = test_config();
+        config.conda_deps.push("pillow".to_string());
 
         let error = auto_bundle_transitives_with_route_precheck(
             &mut bundle,
             &[crate::workspace::DEFAULT_PYPI_INDEX.to_string()],
             &target,
             Some(&workspace_scope),
-            &test_config(),
+            &config,
             None,
             None,
             None,
@@ -4593,7 +4620,7 @@ pillow = ">=10,<13"
     }
 
     #[tokio::test]
-    async fn joint_unroute_aggregates_all_scoped_requirement_conflicts_before_fetch() {
+    async fn joint_unroute_aggregates_fixed_and_mutable_scoped_conflicts_before_fetch() {
         let fetch_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let fetch = {
             let fetch_calls = Arc::clone(&fetch_calls);
@@ -4651,13 +4678,18 @@ pillow = ">=10,<13"
         let allow_source_route = |_route: crate::uv_closure::CondaRouteSpec| async {
             crate::uv_closure::CoInstallVerdict::Sat
         };
+        let mut config = test_config();
+        // Pillow is fixed by explicit conda intent, while typing-extensions
+        // remains mutable and must be finalized through the restore path.
+        // Both conflicts belong to this one validation request.
+        config.conda_deps.push("pillow".to_string());
 
         let error = auto_bundle_transitives_with_route_precheck(
             &mut bundle,
             &[crate::workspace::DEFAULT_PYPI_INDEX.to_string()],
             &target,
             Some(&workspace_scope),
-            &test_config(),
+            &config,
             None,
             None,
             None,

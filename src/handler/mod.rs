@@ -7,7 +7,7 @@ mod auto_bundle;
 use auto_bundle::{
     AutoBundleOutcome, BfsFetched, Pending, PendingSource, UvReresolveContext, UvReresolveMode,
     auto_bundle_transitives, conda_probe_spec, metadata_preferring_sidecar, pick_conda_target,
-    seed_worklist, validated_conda_route,
+    scope_conflicts_for_target, seed_worklist, validated_conda_route,
 };
 
 mod resolve_state;
@@ -40,7 +40,7 @@ use uv_pep508::uv_pep440::VersionSpecifiers;
 
 use crate::config::{RelaxPolicy, RetreadConfig, WheelEntry};
 use crate::constraint::{
-    Authority, Conflict, Constraint, Provenance, aggregate_conflicts, finalize,
+    Authority, Conflict, Constraint, Provenance, aggregate_conflicts, collect_conflicts, finalize,
 };
 use crate::index_chain::{IndexPurpose, index_chain};
 use crate::pypi::{self, ResolutionTarget, WheelTarget, normalized_python_minor};
@@ -2745,6 +2745,7 @@ impl Handler {
         // per-entry context from resolve_all is the only way the user
         // ever learns which [retread-wheels] entry actually broke.
         let mut outputs = Vec::new();
+        let mut output_conflicts = Vec::new();
         // v4.2.0: the per-env pre-emission solve check (and its
         // bookkeeping / fail gate) was deleted with the legacy
         // mirror-solver; outputs ship unvalidated and `retread solve`
@@ -3033,7 +3034,7 @@ impl Handler {
                     let output_build_hash = courier_build_hash
                         .as_deref()
                         .or(non_courier_target_hash.as_deref());
-                    let output = produce_output(
+                    let output = match produce_output(
                         &bundle,
                         &effective,
                         params.host_platform,
@@ -3041,10 +3042,27 @@ impl Handler {
                         &siblings,
                         output_build_hash,
                         version_override_for_bundle,
-                    )
-                    .map_err(|e| {
-                        RpcError::internal(format!("output for {}: {e:#}", bundle.conda_name))
-                    })?;
+                    ) {
+                        Ok(output) => output,
+                        Err(error) => {
+                            let mut bundle_conflicts = Vec::new();
+                            if let Err(error) = collect_conflicts(error, &mut bundle_conflicts) {
+                                return Err(RpcError::internal(format!(
+                                    "output for {}: {error:#}",
+                                    bundle.conda_name
+                                )));
+                            }
+                            output_conflicts.extend(scope_conflicts_for_target(
+                                bundle_conflicts,
+                                &bundle,
+                                &target,
+                            ));
+                            // Every remaining emission/bundle pair is a
+                            // deterministic peer in this conda/outputs
+                            // request and may reveal another conflict.
+                            continue;
+                        }
+                    };
                     // v4.2.0: the in-backend per-env solve check +
                     // iterative widening cascade were removed with the
                     // legacy mirror-solver. Emitted run-deps go to pixi
@@ -3071,6 +3089,12 @@ impl Handler {
                     outputs.push(output);
                 }
             }
+        }
+        if !output_conflicts.is_empty() {
+            return Err(RpcError::internal(format!(
+                "{:#}",
+                aggregate_conflicts(output_conflicts)
+            )));
         }
         tracing::debug!(outputs = outputs.len(), "per-env emission loop complete");
         let result = CondaOutputsResult {
@@ -4205,6 +4229,7 @@ async fn resolve_all(
     workspace_dir: Option<&Path>,
 ) -> Result<(Vec<Bundle>, RetreadConfig)> {
     let mut bundles = Vec::with_capacity(config.retread_wheels.len());
+    let mut route_conflicts = Vec::new();
 
     // One complete workspace chain participates in every resolution path.
     // It retains the declared extras priority and either the explicit main
@@ -4542,7 +4567,7 @@ async fn resolve_all(
                     .collect()
             });
         if effective.auto_bundle || uv_closure.is_some() {
-            let outcome = auto_bundle_transitives(
+            let outcome = match auto_bundle_transitives(
                 &mut bundle,
                 &group_fallback_indexes,
                 target,
@@ -4559,7 +4584,17 @@ async fn resolve_all(
                     keep_pypi: uv_retry_keep.clone(),
                 },
             )
-            .await?;
+            .await
+            {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    collect_conflicts(error, &mut route_conflicts)?;
+                    // This bundle cannot produce valid output, but every
+                    // remaining BTreeMap group is independent validation
+                    // scope and may contribute another typed conflict.
+                    continue;
+                }
+            };
             match outcome {
                 AutoBundleOutcome::Complete => {}
                 AutoBundleOutcome::RetryKeepPypi { keep_pypi } => {
@@ -4590,6 +4625,9 @@ async fn resolve_all(
         bundles.push(bundle);
     }
 
+    if !route_conflicts.is_empty() {
+        return Err(aggregate_conflicts(route_conflicts));
+    }
     Ok((bundles, effective))
 }
 
