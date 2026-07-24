@@ -7,9 +7,12 @@
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
+use std::ops::Bound;
 use std::str::FromStr;
 
-use uv_pep508::uv_pep440::{Operator, Version, VersionSpecifier, VersionSpecifiers};
+use uv_pep508::uv_pep440::{
+    Operator, Version, VersionSpecifier, VersionSpecifiers, release_specifiers_to_ranges,
+};
 
 use crate::config::RelaxPolicy;
 use crate::constraint::{
@@ -169,18 +172,23 @@ pub fn decide(
             unsoftened_conflict,
         }) => {
             if is_anchor {
-                return Decision::Conflict(unsoftened_conflict);
+                // The legacy finalizer's advisory-floor fallback is not safe
+                // for an ABI anchor, but another explicit candidate may be.
+                // Preserve the unsoftened conflict as the fail-closed result
+                // and let the same candidate-level major check decide.
+                unsoftened_conflict
+            } else {
+                let diagnostics = advisory_floor_diagnostics(&canonical, &specifiers);
+                return Decision::Strict {
+                    specifiers,
+                    diagnostics,
+                };
             }
-            let diagnostics = advisory_floor_diagnostics(&canonical, &specifiers);
-            return Decision::Strict {
-                specifiers,
-                diagnostics,
-            };
         }
         Err(conflict) => conflict,
     };
 
-    if policy == RelaxPolicy::None || is_anchor {
+    if policy == RelaxPolicy::None {
         return Decision::Conflict(strict);
     }
 
@@ -211,6 +219,17 @@ pub fn decide(
         let candidate = apply_state(&canonical, &atoms, &entry.state);
         match finalize_quiet_detailed(package, &candidate) {
             Ok(FinalizeSuccess::Unchanged(specifiers)) => {
+                if is_anchor
+                    && !anchor_candidate_stays_within_original_major(
+                        &canonical,
+                        &atoms,
+                        &entry.state,
+                        &specifiers,
+                    )
+                {
+                    enqueue_all_mutations(&canonical, &atoms, &entry.state, &mut seen, &mut heap);
+                    continue;
+                }
                 let decisions = selected_decisions(&canonical, &candidate, &atoms, &entry.state);
                 return Decision::Relaxed {
                     specifiers,
@@ -218,6 +237,10 @@ pub fn decide(
                 };
             }
             Ok(FinalizeSuccess::AdvisoryFloorSoftened { specifiers, .. }) => {
+                if is_anchor {
+                    enqueue_all_mutations(&canonical, &atoms, &entry.state, &mut seen, &mut heap);
+                    continue;
+                }
                 let mut decisions =
                     selected_decisions(&canonical, &candidate, &atoms, &entry.state);
                 decisions.extend(advisory_floor_diagnostics(&candidate, &specifiers));
@@ -248,6 +271,60 @@ pub fn decide(
     }
 
     Decision::Conflict(strict)
+}
+
+/// ABI anchors may relax within a major, but a selected candidate must neither
+/// admit another major nor move an original edge into a major it never
+/// admitted. Compare effective PEP 440 ranges rather than the chosen policy
+/// tier: a `Major` primitive can still be safe when another constraint confines
+/// the finalized result to the original major.
+fn anchor_candidate_stays_within_original_major(
+    original: &[Constraint],
+    atoms: &[Atom],
+    state: &[u8],
+    result: &VersionSpecifiers,
+) -> bool {
+    let result_range = release_specifiers_to_ranges(result.clone());
+    let Some((lower, _)) = result_range.bounding_range() else {
+        return false;
+    };
+    let major = match lower {
+        Bound::Included(version) | Bound::Excluded(version) => {
+            let Some(major) = version.release().first().copied() else {
+                return false;
+            };
+            major
+        }
+        Bound::Unbounded => return false,
+    };
+    let Some(next_major) = major.checked_add(1) else {
+        return false;
+    };
+    let major_band: VersionSpecifiers = [
+        VersionSpecifier::greater_than_equal_version(Version::new([major])),
+        VersionSpecifier::less_than_version(Version::new([next_major])),
+    ]
+    .into_iter()
+    .collect();
+    let major_range = release_specifiers_to_ranges(major_band);
+    if !result_range
+        .intersection(&major_range.complement())
+        .is_empty()
+    {
+        return false;
+    }
+
+    let changed_constraints = atoms
+        .iter()
+        .zip(state)
+        .filter_map(|(atom, &choice)| (choice != 0).then_some(atom.constraint_index))
+        .collect::<BTreeSet<_>>();
+    !changed_constraints.is_empty()
+        && changed_constraints.into_iter().all(|constraint_index| {
+            let original_range =
+                release_specifiers_to_ranges(original[constraint_index].specifiers.clone());
+            !original_range.intersection(&major_range).is_empty()
+        })
 }
 
 fn provenance_rank(provenance: &Provenance) -> u8 {
@@ -671,6 +748,17 @@ fn enqueue_core_mutations(
     }
 }
 
+fn enqueue_all_mutations(
+    constraints: &[Constraint],
+    atoms: &[Atom],
+    state: &[u8],
+    seen: &mut BTreeSet<Vec<u8>>,
+    heap: &mut BinaryHeap<Reverse<QueueEntry>>,
+) {
+    let all_atoms = (0..atoms.len()).collect();
+    enqueue_core_mutations(constraints, atoms, state, &all_atoms, seen, heap);
+}
+
 fn selected_decisions(
     original: &[Constraint],
     relaxed: &[Constraint],
@@ -1045,7 +1133,57 @@ mod tests {
     }
 
     #[test]
-    fn numpy_and_cuda_anchors_are_protected_from_every_mutation() {
+    fn numpy_and_cuda_same_major_minor_conflicts_auto_resolve() {
+        for (name, old, new, admitted, next_major) in [
+            ("numpy", "==1.24", ">=1.25,<2", "1.25", "2"),
+            ("cuda", "==12.4", ">=12.5,<13", "12.5", "13"),
+        ] {
+            let constraints = vec![
+                constraint("old", old, Provenance::IndexWheelMetadata, "old wheel"),
+                constraint("new", new, Provenance::UvConstraint, "uv range"),
+            ];
+            assert!(crate::solve::is_abi_anchor(name));
+            let (specifiers, decisions) = relaxed(
+                name,
+                &constraints,
+                RelaxPolicy::PatchThenMinorThenMajorThenLastResort,
+            );
+            assert!(specifiers.contains(&Version::from_str(admitted).unwrap()));
+            assert!(!specifiers.contains(&Version::from_str(next_major).unwrap()));
+            assert_eq!(decisions.len(), 1);
+            assert_eq!(decisions[0].tier, RelaxPolicy::Minor);
+        }
+    }
+
+    #[test]
+    fn numpy_and_cuda_downward_minor_conflicts_allow_safe_major_primitive() {
+        for (name, old, new, admitted, upper) in [
+            ("numpy", "==1.26.4", ">=1.24,<1.25", "1.24.5", "1.25"),
+            ("cuda", "==12.8", ">=12.4,<12.5", "12.4.5", "12.5"),
+        ] {
+            let constraints = vec![
+                constraint(
+                    "newer-pin",
+                    old,
+                    Provenance::IndexWheelMetadata,
+                    "newer wheel",
+                ),
+                constraint("older-window", new, Provenance::UvConstraint, "uv range"),
+            ];
+            let (specifiers, decisions) = relaxed(
+                name,
+                &constraints,
+                RelaxPolicy::PatchThenMinorThenMajorThenLastResort,
+            );
+            assert!(specifiers.contains(&Version::from_str(admitted).unwrap()));
+            assert!(!specifiers.contains(&Version::from_str(upper).unwrap()));
+            assert_eq!(decisions.len(), 1);
+            assert_eq!(decisions[0].tier, RelaxPolicy::Major);
+        }
+    }
+
+    #[test]
+    fn numpy_and_cuda_major_crossings_fail_closed() {
         for (name, old, new) in [
             ("numpy", "==1.26.4", ">=2"),
             ("numpy", ">=1,<2", ">=2,<3"),
@@ -1067,7 +1205,7 @@ mod tests {
                     &SafetyContext::default(),
                 ),
                 Decision::Conflict(strict),
-                "{name} must retain its strict conflict for {old} versus {new}"
+                "{name} must reject the major crossing for {old} versus {new}"
             );
         }
     }
