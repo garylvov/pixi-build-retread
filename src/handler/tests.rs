@@ -1621,7 +1621,7 @@ fn explicit_native_conda_alternation_remains_allowed() {
 fn produce_output_omits_workspace_owned_auto_drops() {
     let mut bundle = solo_bundle(
         "owned-pack",
-        vec!["numpy>=2.0,<3", "gym==0.23.1", "requests>=2.31"],
+        vec!["numpy>=2.1,<3", "gym==0.23.1", "requests>=2.31"],
     );
     bundle.auto_dropped = ["numpy", "gym"]
         .into_iter()
@@ -3164,7 +3164,17 @@ fn output_abi_invariant_rejects_star_bare_major_and_uncovered_workspace_pin() {
     let overrides = BTreeMap::new();
     let python_workspace =
         BTreeMap::from([("python".to_string(), BTreeSet::from(["3.11".to_string()]))]);
-    for spec in ["", "*", "3.*", ">=3", "3.*|4.*", ">=3,<4,!=3.5"] {
+    for spec in [
+        "",
+        "*",
+        "3.*",
+        ">=3",
+        "3.*|4.*",
+        ">=3,<4,!=3.5",
+        ">=3,<4,>0.1",
+        ">0.1,>=3,<4",
+        ">=3,<4,<99.1",
+    ] {
         let violations = check_output_abi_invariants(
             &[("python".to_string(), spec.to_string())],
             &[],
@@ -3184,6 +3194,41 @@ fn output_abi_invariant_rejects_star_bare_major_and_uncovered_workspace_pin() {
     );
     assert_eq!(uncovered.len(), 1, "{uncovered:?}");
     assert!(uncovered[0].contains("does not cover workspace pin"));
+}
+
+#[test]
+fn bare_major_detection_uses_effective_parsed_bounds() {
+    for spec in [
+        ">=3,<4,>0.1",
+        ">0.1,>=3,<4",
+        ">=3,<4,<99.1",
+        ">=3.0,<4",
+        ">=3,<4.0",
+        "<4.0",
+    ] {
+        assert!(
+            is_bare_major_spec(spec),
+            "redundant textual minor bound must not hide bare-major range `{spec}`"
+        );
+    }
+    for spec in [
+        ">=3,<4,>3.1",
+        ">=3,<3.12",
+        ">=3.11,<4",
+        ">=3.0.1,<4",
+        "==12.0",
+    ] {
+        assert!(
+            !is_bare_major_spec(spec),
+            "effective minor bound must protect narrowed range `{spec}`"
+        );
+    }
+    for spec in ["", "!", ">=4,<3", ">=3,<"] {
+        assert!(
+            is_bare_major_spec(spec),
+            "empty, unsatisfiable, or unparseable ABI constraint must fail closed: `{spec}`"
+        );
+    }
 }
 
 #[test]
@@ -3211,11 +3256,13 @@ fn output_abi_invariant_accepts_minor_pin_and_rejects_anchor_override() {
         .is_empty()
     );
 
-    let overrides = BTreeMap::from([("numpy".to_string(), "*".to_string())]);
-    let violations =
-        check_output_abi_invariants(&[], &[], &workspace, &overrides, &BTreeMap::new());
-    assert_eq!(violations.len(), 1, "{violations:?}");
-    assert!(violations[0].contains("retread-overrides[numpy]"));
+    for spec in ["*", ">=1,<2,>0.1"] {
+        let overrides = BTreeMap::from([("numpy".to_string(), spec.to_string())]);
+        let violations =
+            check_output_abi_invariants(&[], &[], &workspace, &overrides, &BTreeMap::new());
+        assert_eq!(violations.len(), 1, "{spec}: {violations:?}");
+        assert!(violations[0].contains("retread-overrides[numpy]"));
+    }
 }
 
 #[test]
