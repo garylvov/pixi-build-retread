@@ -723,7 +723,10 @@ pub const SCHEMA: u32 = 17;
 ///
 /// Epoch 37: relaxed packages ship an activate.d warning hook and structured
 /// relaxation manifest, and courier locks retain that payload across replay.
-pub const EMIT_EPOCH: u32 = 37;
+///
+/// Epoch 38: activate.d hooks echo every relaxation regardless of count and
+/// always point to the package-bundled JSON manifest for full detail.
+pub const EMIT_EPOCH: u32 = 38;
 
 fn parse_stored_glibc(value: Option<&str>) -> Option<Option<(u32, u32)>> {
     match value {

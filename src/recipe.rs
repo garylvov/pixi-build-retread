@@ -1006,6 +1006,67 @@ mod courier_tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn relaxation_hook_chmod_failure_is_fatal() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let bash = which("bash").expect("bash is required for generated recipe tests");
+        let root = std::env::temp_dir().join(format!(
+            "retread-relaxation-chmod-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let src = root.join("src");
+        let prefix = root.join("prefix");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join(RELAXATION_JSON_FILENAME), "{}\n").unwrap();
+        let source_hook = src.join(RELAXATION_HOOK_FILENAME);
+        std::fs::write(&source_hook, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&source_hook, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let script = format!(
+            "chmod() {{\n\
+               printf '%s\\n' retread-chmod-failure >&2\n\
+               return 71\n\
+             }}\n\
+             set -euo pipefail\n{}",
+            relaxation_install_script("example-pack")
+        );
+        let failed = Command::new(&bash)
+            .arg("-c")
+            .arg(script)
+            .env("SRC_DIR", &src)
+            .env("PREFIX", &prefix)
+            .output()
+            .expect("run recipe with deliberately failing chmod");
+        let installed_hook = prefix.join(RELAXATION_HOOK_PATH);
+        let mode = std::fs::metadata(&installed_hook)
+            .expect("hook copy must complete before chmod")
+            .permissions()
+            .mode();
+        let stderr = String::from_utf8_lossy(&failed.stderr);
+
+        assert!(
+            !failed.status.success(),
+            "a relaxation hook chmod failure must abort the package build"
+        );
+        assert!(
+            stderr.contains("retread-chmod-failure"),
+            "the targeted chmod failure was not reached: {stderr}"
+        );
+        assert_eq!(
+            mode & 0o111,
+            0,
+            "failed chmod must leave the copied hook non-executable"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn courier_without_relaxation_injects_no_warning_payload() {
         use std::process::Command;
