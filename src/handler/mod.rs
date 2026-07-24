@@ -2470,6 +2470,10 @@ impl Handler {
         })?;
         let workspace_dir = params.workspace_directory;
         ensure_pixi_bld_symlink_target(workspace_dir.as_deref())?;
+        config.pack_manifest_path = Some(crate::pack_overrides::pack_manifest_display_path(
+            workspace_dir.as_deref(),
+            &params.manifest_path,
+        ));
 
         // Fix #22: merge this pack's auto-repaired overrides from the
         // workspace's `.retread/auto-overrides.json` ledger into
@@ -12053,6 +12057,11 @@ fn produce_output_with_conflicts(
                 run_dep_specs.push(spec_from_str(spec.as_str())?);
             }
             RelaxDecision::Conflict(conflict) => {
+                let conflict = auto_bundle::attach_leaf_conflict_suggestion(
+                    conflict,
+                    config.pack_manifest_path.as_deref(),
+                    &bundle.conda_name,
+                );
                 // Keep a name-only placeholder in the tolerant assembly so
                 // Rule 2 can identify and reject a wholly mutable route. The
                 // strict `produce_output` wrapper below always returns the

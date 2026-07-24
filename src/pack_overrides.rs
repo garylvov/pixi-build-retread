@@ -38,6 +38,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use toml_edit::{Array, DocumentMut, Item, Table, Value};
 
 use crate::config::RetreadConfig;
 
@@ -159,6 +160,101 @@ fn pack_key(workspace_dir: &Path, pack_pixi: &Path) -> String {
     let pack_dir = pack_abs.parent().unwrap_or(&pack_abs);
     let rel = pack_dir.strip_prefix(&ws).unwrap_or(pack_dir);
     rel.to_string_lossy().replace('\\', "/")
+}
+
+/// Workspace-relative manifest path used in user-facing diagnostics.
+///
+/// This shares [`pack_key`] with the ledger writer so an actionable
+/// suggestion names the same pack that an applied solve repair would target.
+/// It performs no I/O beyond the best-effort canonicalization in `pack_key`.
+pub(crate) fn pack_manifest_display_path(workspace_dir: Option<&Path>, pack_pixi: &Path) -> String {
+    let filename = pack_pixi
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("pixi.toml");
+    if let Some(workspace_dir) = workspace_dir {
+        return format!("{}/{filename}", pack_key(workspace_dir, pack_pixi));
+    }
+
+    let normalized = pack_pixi.to_string_lossy().replace('\\', "/");
+    if let Some(index) = normalized.find("pypi-packs/") {
+        return normalized[index..].to_string();
+    }
+    let pack = pack_pixi
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .unwrap_or("unknown-pack");
+    format!("pypi-packs/{pack}/{filename}")
+}
+
+fn ensure_toml_table<'a>(parent: &'a mut Table, key: &str) -> &'a mut Table {
+    if !parent.contains_key(key) {
+        let mut table = Table::new();
+        table.set_implicit(true);
+        parent.insert(key, Item::Table(table));
+    }
+    parent
+        .get_mut(key)
+        .and_then(Item::as_table_mut)
+        .expect("the inserted TOML item is a table")
+}
+
+/// Pure TOML counterpart to [`write_override`].
+///
+/// The package/spec pair has exactly the shape consumed by the pack's manual
+/// `retread-overrides` table, but this helper only renders an in-memory
+/// document. It never writes the pack manifest or the auto-overrides ledger.
+pub(crate) fn render_override_toml(package: &str, spec: &str) -> String {
+    let mut document = DocumentMut::new();
+    let package_table = ensure_toml_table(document.as_table_mut(), "package");
+    let build_table = ensure_toml_table(package_table, "build");
+    let config_table = ensure_toml_table(build_table, "config");
+    let overrides_table = ensure_toml_table(config_table, "retread-overrides");
+    overrides_table[package] = Item::Value(Value::from(spec));
+    document.to_string()
+}
+
+fn render_drop_deps_toml(package: &str) -> String {
+    let mut document = DocumentMut::new();
+    let package_table = ensure_toml_table(document.as_table_mut(), "package");
+    let build_table = ensure_toml_table(package_table, "build");
+    let config_table = ensure_toml_table(build_table, "config");
+    let mut drop_deps = Array::new();
+    drop_deps.push(package);
+    config_table["retread-drop-deps"] = Item::Value(Value::Array(drop_deps));
+    document.to_string()
+}
+
+fn append_commented(output: &mut String, text: &str) {
+    for line in text.trim_end().lines() {
+        output.push_str("# ");
+        output.push_str(line);
+        output.push('\n');
+    }
+}
+
+/// Render the primary drop-deps remediation plus one commented override
+/// alternative per conflicting requirement.
+pub(crate) fn render_drop_deps_with_override_menu(
+    package: &str,
+    alternatives: &[(String, String)],
+) -> String {
+    let mut rendered = render_drop_deps_toml(package);
+    for (index, (spec, source)) in alternatives.iter().enumerate() {
+        rendered.push('\n');
+        rendered.push_str(&format!(
+            "# Alternative {}: keep the requirement from:\n",
+            index + 1
+        ));
+        for source_line in source.lines() {
+            rendered.push_str("#   ");
+            rendered.push_str(source_line);
+            rendered.push('\n');
+        }
+        append_commented(&mut rendered, &render_override_toml(package, spec));
+    }
+    rendered
 }
 
 /// Append (or replace) an auto-repaired override for `pack_pixi`/`package`
@@ -566,6 +662,56 @@ mod tests {
         )
         .unwrap();
         pack_pixi
+    }
+
+    #[test]
+    fn diagnostic_manifest_path_tracks_pack_not_output_name() {
+        let tmp = TempDir::new("diagnostic-pack-path");
+        let pack_pixi = make_pack(tmp.path(), "pypi-packs/robotics-pack");
+
+        assert_eq!(
+            pack_manifest_display_path(Some(tmp.path()), &pack_pixi),
+            "pypi-packs/robotics-pack/pixi.toml"
+        );
+        assert_ne!(
+            pack_manifest_display_path(Some(tmp.path()), &pack_pixi),
+            "pypi-packs/robotics-output/pixi.toml",
+            "the output bundle name must not replace the initialized pack identity"
+        );
+    }
+
+    #[test]
+    fn diagnostic_override_menu_uses_parseable_pack_override_entries() {
+        let alternatives = vec![
+            (
+                "==1.26.4".to_string(),
+                "wheel `old-extension==1.0.0`".to_string(),
+            ),
+            (
+                ">=2,<3".to_string(),
+                "wheel `new-extension==2.0.0`".to_string(),
+            ),
+        ];
+        let menu = render_drop_deps_with_override_menu("numpy", &alternatives);
+        let parsed: toml::Value = toml::from_str(&menu).unwrap();
+        assert_eq!(
+            parsed["package"]["build"]["config"]["retread-drop-deps"][0].as_str(),
+            Some("numpy")
+        );
+
+        for (spec, _) in alternatives {
+            let rendered = render_override_toml("numpy", &spec);
+            let parsed: toml::Value = toml::from_str(&rendered).unwrap();
+            assert_eq!(
+                parsed["package"]["build"]["config"]["retread-overrides"]["numpy"].as_str(),
+                Some(spec.as_str())
+            );
+            let commented_entry = format!("# numpy = \"{spec}\"");
+            assert!(
+                menu.lines().any(|line| line == commented_entry),
+                "commented menu omitted the rendered override `{spec}`:\n{menu}"
+            );
+        }
     }
 
     #[test]

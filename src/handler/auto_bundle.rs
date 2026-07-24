@@ -20,7 +20,7 @@ use crate::config::{RelaxPolicy, RetreadConfig};
 use crate::constraint::finalize;
 use crate::constraint::{
     Conflict, ConflictReport, Constraint, ConstraintOriginId, Provenance, aggregate_conflicts,
-    collect_conflicts,
+    collect_conflicts, dedup_specifier_clauses, specifiers_unsatisfiable,
 };
 use crate::pypi;
 use crate::relax::{
@@ -410,6 +410,73 @@ fn render_specifiers(specifiers: &VersionSpecifiers) -> String {
     }
 }
 
+fn constraints_are_unsatisfiable(constraints: &[&Constraint]) -> bool {
+    let combined = dedup_specifier_clauses(
+        constraints
+            .iter()
+            .flat_map(|constraint| constraint.specifiers.iter().cloned()),
+    );
+    specifiers_unsatisfiable(&combined)
+}
+
+/// Reduce a fail-closed conflict to an inclusion-minimal set of requirements.
+///
+/// The strict finalizer deliberately retains every active requirement for the
+/// source-rich diagnostic. The override menu is easier to act on when it
+/// names only the sides needed to prove the contradiction.
+fn minimal_unsat_requirements(requirements: &[Constraint]) -> Vec<&Constraint> {
+    let mut core = requirements.iter().collect::<Vec<_>>();
+    if !constraints_are_unsatisfiable(&core) {
+        return core;
+    }
+
+    let mut index = 0;
+    while index < core.len() {
+        let mut trial = core.clone();
+        trial.remove(index);
+        if constraints_are_unsatisfiable(&trial) {
+            core = trial;
+        } else {
+            index += 1;
+        }
+    }
+    core
+}
+
+fn fallback_pack_manifest(bundle: &str) -> String {
+    format!("pypi-packs/{bundle}/pixi.toml")
+}
+
+/// Attach the ordinary leaf-level remediation used when no unique
+/// transitive root can be proven. This helper is pure: the rendered TOML is
+/// carried by the typed error and is never applied to the manifest.
+pub(super) fn attach_leaf_conflict_suggestion(
+    conflict: Conflict,
+    pack_manifest: Option<&str>,
+    bundle: &str,
+) -> Conflict {
+    let mut alternatives = minimal_unsat_requirements(conflict.requirements())
+        .into_iter()
+        .map(|constraint| {
+            (
+                render_specifiers(&constraint.specifiers),
+                constraint.source.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    alternatives.sort();
+    alternatives.dedup();
+
+    let package = conflict.package.as_str().to_string();
+    let toml = crate::pack_overrides::render_drop_deps_with_override_menu(&package, &alternatives);
+    conflict.with_suggestion(
+        pack_manifest
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| fallback_pack_manifest(bundle)),
+        toml,
+    )
+}
+
 pub(super) fn wheel_metadata_relaxations(
     package: &PypiKey,
     constraints: &[Constraint],
@@ -505,9 +572,18 @@ impl RestoreRequestBuilder {
         self.finish_with_context(None)
     }
 
+    #[cfg(test)]
     fn finish_with_context(
+        self,
+        diagnostic_context: Option<&JointRouteDiagnosticContext>,
+    ) -> Result<PypiFetchRequest> {
+        self.finish_with_context_and_pack(diagnostic_context, None)
+    }
+
+    fn finish_with_context_and_pack(
         mut self,
         diagnostic_context: Option<&JointRouteDiagnosticContext>,
+        pack_manifest: Option<&str>,
     ) -> Result<PypiFetchRequest> {
         let prior_constraints = self
             .route_preferences
@@ -597,6 +673,13 @@ impl RestoreRequestBuilder {
                 ),
             ),
             RelaxDecision::Conflict(original_conflict) => {
+                let original_conflict = attach_leaf_conflict_suggestion(
+                    original_conflict,
+                    pack_manifest,
+                    diagnostic_context
+                        .map(|context| context.bundle.as_str())
+                        .unwrap_or(&self.bundle_name),
+                );
                 return Err(anyhow::Error::new(match diagnostic_context {
                     Some(context) => original_conflict.with_scope(context.scope()),
                     None => original_conflict,
@@ -1995,7 +2078,10 @@ where
     let mut finalized_restore_requests = Vec::new();
     let mut restore_conflicts = Vec::new();
     for request in restore_requests.into_values() {
-        match request.finish_with_context(Some(diagnostic_context)) {
+        match request.finish_with_context_and_pack(
+            Some(diagnostic_context),
+            config.pack_manifest_path.as_deref(),
+        ) {
             Ok(request) => finalized_restore_requests.push(request),
             Err(error) => collect_conflicts(error, &mut restore_conflicts)?,
         }
@@ -4210,6 +4296,85 @@ mod tests {
                 "{package} lost the strict typed conflict: {error:#}"
             );
         }
+    }
+
+    #[test]
+    fn equal_authority_conflict_suggests_pack_drop_and_override_menu() {
+        let context = JointRouteDiagnosticContext {
+            bundle: "robotics-output".to_string(),
+            environments: vec!["robotics".to_string()],
+            profiles: vec!["linux-64".to_string()],
+            platform: "linux-64".to_string(),
+            python: "3.11".to_string(),
+        };
+        let mut builder =
+            RestoreRequestBuilder::new("numpy", RelaxPolicy::PatchThenMinorThenMajorThenLastResort);
+        for (wheel, version, specifier) in [
+            ("old-extension", "1.0.0", "==1.26.4"),
+            ("new-extension", "2.0.0", ">=2,<3"),
+        ] {
+            let requirement = format!("numpy{specifier}");
+            let specifiers = VersionSpecifiers::from_str(specifier).unwrap();
+            builder.add_constraint(Constraint {
+                specifiers: specifiers.clone(),
+                provenance: Provenance::IndexWheelMetadata,
+                source: format!("wheel `{wheel}=={version}` Requires-Dist `{requirement}`"),
+                origin_id: wheel_requirement_origin_id(
+                    wheel,
+                    version,
+                    "numpy",
+                    &specifiers,
+                    &requirement,
+                ),
+            });
+        }
+
+        let error = builder
+            .finish_with_context_and_pack(
+                Some(&context),
+                Some("pypi-packs/robotics-pack/pixi.toml"),
+            )
+            .expect_err("cross-major NumPy conflict must fail closed");
+        let conflict = error
+            .downcast_ref::<Conflict>()
+            .expect("the fail-closed decision must retain its typed conflict");
+        let suggestion = conflict
+            .suggestion()
+            .expect("the typed conflict must carry a paste-ready suggestion");
+        let message = conflict.to_string();
+
+        for expected in [
+            "in environment 'robotics' for bundle 'robotics-output' \
+             (target profile 'linux-64', platform linux-64, python 3.11)",
+            "wheel `old-extension==1.0.0` Requires-Dist `numpy==1.26.4`",
+            "wheel `new-extension==2.0.0` Requires-Dist `numpy>=2,<3`",
+        ] {
+            assert!(
+                message.contains(expected),
+                "missing `{expected}`:\n{message}"
+            );
+        }
+        assert!(message.contains("Suggested fix in pypi-packs/robotics-pack/pixi.toml:"));
+        assert!(!message.contains("pypi-packs/robotics-output/pixi.toml"));
+        assert!(suggestion.toml.contains("retread-drop-deps = [\"numpy\"]"));
+        assert_eq!(suggestion.toml.matches("# Alternative ").count(), 2);
+        assert!(
+            suggestion.toml.contains("# numpy = \"==1.26.4\""),
+            "{}",
+            suggestion.toml
+        );
+        assert!(
+            suggestion.toml.contains("# numpy = \">=2,<3\""),
+            "{}",
+            suggestion.toml
+        );
+
+        let parsed: toml::Value =
+            toml::from_str(&suggestion.toml).expect("suggested content must be valid TOML");
+        assert_eq!(
+            parsed["package"]["build"]["config"]["retread-drop-deps"][0].as_str(),
+            Some("numpy")
+        );
     }
 
     #[test]

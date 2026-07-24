@@ -636,6 +636,7 @@ fn pythons_for_rejects_bare_major_variant() {
         pin_version: false,
         deps_from: Default::default(),
         ledger_overrides: Default::default(),
+        pack_manifest_path: None,
     };
     let result = pythons_for(&cfg, Some(&variants));
     assert_eq!(
@@ -685,6 +686,7 @@ fn pythons_for_accepts_dotted_variant() {
         pin_version: false,
         deps_from: Default::default(),
         ledger_overrides: Default::default(),
+        pack_manifest_path: None,
     };
     let result = pythons_for(&cfg, Some(&variants));
     assert_eq!(result, vec!["3.11".to_string()]);
@@ -734,6 +736,7 @@ fn pythons_for_filters_bare_major_keeps_dotted() {
         pin_version: false,
         deps_from: Default::default(),
         ledger_overrides: Default::default(),
+        pack_manifest_path: None,
     };
     let result = pythons_for(&cfg, Some(&variants));
     assert_eq!(result, vec!["3.11".to_string(), "3.12".to_string()]);
@@ -2167,6 +2170,7 @@ fn cfg() -> RetreadConfig {
         pin_version: false,
         deps_from: Default::default(),
         ledger_overrides: Default::default(),
+        pack_manifest_path: None,
     }
 }
 

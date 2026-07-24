@@ -8,7 +8,6 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
 use uv_pep508::uv_pep440::{
     Operator, Version, VersionSpecifier, VersionSpecifiers, release_specifiers_to_ranges,
 };
@@ -126,16 +125,23 @@ impl Constraint {
 /// The package identity and complete source list remain structurally available
 /// to callers. Joint-route callers attach the concrete environment/target
 /// scope before surfacing the conflict.
-#[derive(Clone, Debug, PartialEq, Eq, Error)]
-#[error(
-    "dependency conflict{scope}: `{package}` requirements are mutually unsatisfiable: {sources}. \
-     Resolve by pinning one side, or use `retread-relax`, `retread-overrides`, or \
-     `retread-drop-deps` in the pack manifest (see README)."
-)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Conflict {
     pub package: PypiKey,
     pub sources: String,
     scope: String,
+    requirements: Vec<Constraint>,
+    suggestion: Option<ConflictSuggestion>,
+}
+
+/// A paste-ready manifest edit attached to one fail-closed conflict.
+///
+/// The suggestion is diagnostic only: constructing or rendering it never
+/// mutates the named pack manifest.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConflictSuggestion {
+    pub pack_manifest: String,
+    pub toml: String,
 }
 
 impl Conflict {
@@ -145,7 +151,50 @@ impl Conflict {
         self.scope = format!(" {}", scope.into());
         self
     }
+
+    pub(crate) fn with_suggestion(
+        mut self,
+        pack_manifest: impl Into<String>,
+        toml: impl Into<String>,
+    ) -> Self {
+        self.suggestion = Some(ConflictSuggestion {
+            pack_manifest: pack_manifest.into(),
+            toml: toml.into(),
+        });
+        self
+    }
+
+    pub(crate) fn requirements(&self) -> &[Constraint] {
+        &self.requirements
+    }
+
+    pub fn suggestion(&self) -> Option<&ConflictSuggestion> {
+        self.suggestion.as_ref()
+    }
 }
+
+impl fmt::Display for Conflict {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "dependency conflict{}: `{}` requirements are mutually unsatisfiable: {}. \
+             Resolve by pinning one side, or use `retread-relax`, `retread-overrides`, or \
+             `retread-drop-deps` in the pack manifest (see README).",
+            self.scope, self.package, self.sources
+        )?;
+        if let Some(suggestion) = &self.suggestion {
+            write!(
+                formatter,
+                "\n\nSuggested fix in {}:\n{}",
+                suggestion.pack_manifest,
+                suggestion.toml.trim_end()
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for Conflict {}
 
 /// A successful policy-neutral finalization, retaining whether the legacy
 /// conda-as-truth rule had to discard advisory floor/equality clauses.
@@ -214,11 +263,23 @@ impl std::error::Error for ConflictReport {}
 pub(crate) fn aggregate_conflicts(mut conflicts: Vec<Conflict>) -> anyhow::Error {
     assert!(!conflicts.is_empty(), "cannot aggregate zero conflicts");
     conflicts.sort_by(|left, right| {
-        (&left.package, &left.sources, &left.scope).cmp(&(
-            &right.package,
-            &right.sources,
-            &right.scope,
-        ))
+        (
+            &left.package,
+            &left.sources,
+            &left.scope,
+            left.suggestion
+                .as_ref()
+                .map(|suggestion| (&suggestion.pack_manifest, &suggestion.toml)),
+        )
+            .cmp(&(
+                &right.package,
+                &right.sources,
+                &right.scope,
+                right
+                    .suggestion
+                    .as_ref()
+                    .map(|suggestion| (&suggestion.pack_manifest, &suggestion.toml)),
+            ))
     });
     if conflicts.len() == 1 {
         anyhow::Error::new(conflicts.pop().expect("one conflict"))
@@ -425,6 +486,11 @@ fn conflict_from_active(package: &PypiKey, active: &[&Constraint]) -> Conflict {
         package: package.clone(),
         sources,
         scope: String::new(),
+        requirements: active
+            .iter()
+            .map(|constraint| (*constraint).clone())
+            .collect(),
+        suggestion: None,
     }
 }
 

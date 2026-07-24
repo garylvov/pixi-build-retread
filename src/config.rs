@@ -547,6 +547,13 @@ pub struct RetreadConfig {
     /// prevent.
     #[serde(skip)]
     pub ledger_overrides: std::collections::BTreeSet<String>,
+
+    /// Exact workspace-relative pack manifest used only for fail-closed
+    /// diagnostics. Populated by the build-backend initialize boundary and
+    /// excluded from user configuration and emitted artifact fingerprints.
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub pack_manifest_path: Option<String>,
 }
 
 /// `retread-deps-from`'s value: a bare source or a list of sources (union).
