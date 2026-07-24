@@ -32,7 +32,7 @@ use std::str::FromStr;
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
-use uv_pep508::Requirement;
+use uv_pep508::{MarkerEnvironment, MarkerTree, Requirement};
 
 use crate::constraint::{Authority, Provenance, authority};
 use crate::lock::{LockWheel, Origin};
@@ -206,6 +206,27 @@ pub struct UvClosureRequest {
 /// A computed closure: index wheels in lock shape + the name->version pin
 /// map (the seam consumed by the legacy materialization path as a locked
 /// closure until the M3 seam swap).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct UvDependencyEdge {
+    /// PEP 503-normalized package that declares the dependency.
+    pub parent: String,
+    /// PEP 503-normalized package named by the dependency.
+    pub child: String,
+}
+
+/// The complete selected-package adjacency retained from `uv.lock`.
+///
+/// Unlike the exported pylock closure, this includes routed/no-emit packages,
+/// so diagnostics can walk from a conflicting emitted leaf back through the
+/// exact resolution graph that introduced it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UvDependencyGraph {
+    /// Canonical parent-to-child edges selected into the lock.
+    pub edges: BTreeSet<UvDependencyEdge>,
+    /// Canonical package name -> version selected by uv.
+    pub selected_versions: BTreeMap<String, String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct UvClosure {
     /// One selected index wheel per resolved package, lock-shaped.
@@ -231,6 +252,9 @@ pub struct UvClosure {
     /// cross the request-aware solve boundary; route planning then derives the
     /// same map from its visible request.
     pub effective_input_requirements: Option<BTreeMap<String, Vec<AutoRouteInputRequirement>>>,
+    /// Full dependency adjacency and selected versions parsed from `uv.lock`,
+    /// including packages omitted from the exported wheel closure.
+    pub dependency_graph: UvDependencyGraph,
 }
 
 // ---------------------------------------------------------------------------
@@ -2792,6 +2816,7 @@ pub fn parse_pylock_closure(
         auto_routed: Vec::new(),
         auto_dropped: BTreeSet::new(),
         effective_input_requirements: None,
+        dependency_graph: UvDependencyGraph::default(),
     })
 }
 
@@ -4162,6 +4187,227 @@ fn build_export_args(
     args
 }
 
+/// Parse the complete package adjacency retained in `uv.lock`.
+///
+/// This deliberately reads the lock rather than the exported pylock: uv's
+/// export omits routed/no-emit nodes, while the lock still records the
+/// dependency path through those nodes.
+pub(crate) fn parse_uv_dependency_graph(
+    uv_lock: &str,
+    target: &MarkerEnvironment,
+) -> Result<UvDependencyGraph> {
+    let document: toml::Value =
+        toml::from_str(uv_lock).context("parsing uv.lock dependency graph")?;
+    let packages = document
+        .get("package")
+        .and_then(toml::Value::as_array)
+        .ok_or_else(|| anyhow!("uv.lock: missing [[package]] array"))?;
+    let mut graph = UvDependencyGraph::default();
+    let mut packages_by_name = BTreeMap::new();
+    let mut requested_extras: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+
+    for package in packages {
+        let raw_parent = package
+            .get("name")
+            .and_then(toml::Value::as_str)
+            .ok_or_else(|| anyhow!("uv.lock: package missing `name`"))?;
+        let parent = canonical_conda_name(raw_parent);
+        let version = package
+            .get("version")
+            .and_then(toml::Value::as_str)
+            .ok_or_else(|| anyhow!("uv.lock: package `{raw_parent}` missing `version`"))?;
+        if !package_resolution_active(package, raw_parent, version, target)? {
+            continue;
+        }
+        if let Some(previous_version) = graph
+            .selected_versions
+            .insert(parent.clone(), version.to_string())
+        {
+            bail!(
+                "uv.lock: canonical package `{parent}` has multiple package records \
+                 (`{previous_version}` and `{version}`); version/source/marker-forked \
+                 dependency adjacency is ambiguous"
+            );
+        }
+        packages_by_name.insert(parent.clone(), package);
+
+        for dependency in package
+            .get("dependencies")
+            .and_then(toml::Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some((child, extras)) = active_uv_dependency(dependency, raw_parent, target)?
+            else {
+                continue;
+            };
+            graph.edges.insert(UvDependencyEdge {
+                parent: parent.clone(),
+                child: child.clone(),
+            });
+            requested_extras.entry(child).or_default().extend(extras);
+        }
+    }
+
+    // uv records activated child extras on the parent dependency entry, while
+    // the extra's edges live under the child's `[package.optional-dependencies]`.
+    // Follow only explicitly requested extras and target-active entries.
+    // Newly activated entries can request further extras, so process a
+    // deterministic work queue to a fixed point.
+    let mut pending_extras: BTreeSet<(String, String)> = requested_extras
+        .into_iter()
+        .flat_map(|(package, extras)| {
+            extras
+                .into_iter()
+                .map(move |extra| (package.clone(), extra))
+        })
+        .collect();
+    let mut processed_extras = BTreeSet::new();
+    while let Some((parent, extra)) = pending_extras.pop_first() {
+        if !processed_extras.insert((parent.clone(), extra.clone())) {
+            continue;
+        }
+        let Some(package) = packages_by_name.get(&parent) else {
+            continue;
+        };
+        let Some(optional_dependencies) = package
+            .get("optional-dependencies")
+            .and_then(toml::Value::as_table)
+        else {
+            continue;
+        };
+        let Some(dependencies) = optional_dependencies
+            .iter()
+            .find(|(name, _)| canonical_conda_name(name) == extra)
+            .map(|(_, dependencies)| dependencies)
+            .and_then(toml::Value::as_array)
+        else {
+            continue;
+        };
+        for dependency in dependencies {
+            let Some((child, child_extras)) = active_uv_dependency(dependency, &parent, target)?
+            else {
+                continue;
+            };
+            graph.edges.insert(UvDependencyEdge {
+                parent: parent.clone(),
+                child: child.clone(),
+            });
+            pending_extras.extend(
+                child_extras
+                    .into_iter()
+                    .map(|child_extra| (child.clone(), child_extra)),
+            );
+        }
+    }
+
+    Ok(graph)
+}
+
+fn package_resolution_active(
+    package: &toml::Value,
+    name: &str,
+    version: &str,
+    target: &MarkerEnvironment,
+) -> Result<bool> {
+    let Some(markers) = package.get("resolution-markers") else {
+        return Ok(true);
+    };
+    let markers = markers.as_array().ok_or_else(|| {
+        anyhow!(
+            "uv.lock: package `{name}=={version}` has non-array \
+             `resolution-markers`"
+        )
+    })?;
+    for marker in markers {
+        let marker = marker.as_str().ok_or_else(|| {
+            anyhow!(
+                "uv.lock: package `{name}=={version}` has non-string \
+                 `resolution-markers` entry"
+            )
+        })?;
+        let marker = MarkerTree::from_str(marker).with_context(|| {
+            format!("parsing uv.lock resolution marker `{marker}` for `{name}=={version}`")
+        })?;
+        if marker.evaluate(target, &[]) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn active_uv_dependency(
+    dependency: &toml::Value,
+    parent: &str,
+    target: &MarkerEnvironment,
+) -> Result<Option<(String, BTreeSet<String>)>> {
+    match dependency {
+        toml::Value::Table(table) => {
+            if let Some(marker) = table.get("marker") {
+                let marker = marker.as_str().ok_or_else(|| {
+                    anyhow!("uv.lock: dependency of package `{parent}` has non-string `marker`")
+                })?;
+                let marker = MarkerTree::from_str(marker).with_context(|| {
+                    format!("parsing uv.lock dependency marker `{marker}` of package `{parent}`")
+                })?;
+                if !marker.evaluate(target, &[]) {
+                    return Ok(None);
+                }
+            }
+            let raw_child = table
+                .get("name")
+                .and_then(toml::Value::as_str)
+                .ok_or_else(|| {
+                    anyhow!("uv.lock: dependency of package `{parent}` missing `name`")
+                })?;
+            let extras = match table.get("extra") {
+                Some(extras) => extras
+                    .as_array()
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "uv.lock: dependency `{raw_child}` of package `{parent}` has \
+                             non-array `extra`"
+                        )
+                    })?
+                    .iter()
+                    .map(|extra| {
+                        extra.as_str().map(canonical_conda_name).ok_or_else(|| {
+                            anyhow!(
+                                "uv.lock: dependency `{raw_child}` of package `{parent}` has \
+                                 non-string extra"
+                            )
+                        })
+                    })
+                    .collect::<Result<_>>()?,
+                None => BTreeSet::new(),
+            };
+            Ok(Some((canonical_conda_name(raw_child), extras)))
+        }
+        toml::Value::String(raw_requirement) => {
+            let requirement: Requirement =
+                Requirement::from_str(raw_requirement).with_context(|| {
+                    format!("parsing uv.lock dependency `{raw_requirement}` of package `{parent}`")
+                })?;
+            if !requirement.marker.evaluate(target, &[]) {
+                return Ok(None);
+            }
+            let extras = requirement
+                .extras
+                .iter()
+                .map(|extra| canonical_conda_name(extra.as_ref()))
+                .collect();
+            Ok(Some((
+                canonical_conda_name(requirement.name.as_ref()),
+                extras,
+            )))
+        }
+        _ => bail!(
+            "uv.lock: dependency of package `{parent}` is neither a table nor a \
+             requirement string"
+        ),
+    }
+}
+
 fn workspace_owned_drops_from_lock(
     req: &UvClosureRequest,
     uv_lock: &str,
@@ -4198,6 +4444,33 @@ fn workspace_owned_drops_from_lock(
         }
     }
     Ok(dropped)
+}
+
+fn closure_metadata_from_lock(
+    req: &UvClosureRequest,
+    uv_lock: &str,
+) -> Result<(UvDependencyGraph, BTreeSet<String>)> {
+    // Workspace-owned validation remains authoritative and fail-loud. The
+    // retained graph is diagnostic context only: if a future uv lock shape is
+    // ambiguous or unparseable, keep the successful closure and let conflict
+    // diagnostics fall back to their leaf-level suggestion.
+    let owned_drops = workspace_owned_drops_from_lock(req, uv_lock)?;
+    let dependency_graph =
+        match crate::relax::marker_env_for(&req.conda_subdir, &req.python_version)
+            .and_then(|target| parse_uv_dependency_graph(uv_lock, &target))
+        {
+            Ok(graph) => graph,
+            Err(error) => {
+                tracing::warn!(
+                    bundle = %req.bundle,
+                    error = %format!("{error:#}"),
+                    "uv closure: dependency graph unavailable; conflict diagnostics \
+                     will fall back to leaf-level suggestions",
+                );
+                UvDependencyGraph::default()
+            }
+        };
+    Ok((dependency_graph, owned_drops))
 }
 
 fn validate_built_wheel_sources(
@@ -4490,8 +4763,9 @@ pub(crate) async fn compute_closure_for_target(
                     .collect();
                 match parse_pylock_closure(&pylock, target.wheel_target(), &exclude, &uv_version) {
                     Ok(mut closure) => match tokio::fs::read_to_string(&lock_file).await {
-                        Ok(uv_lock) => match workspace_owned_drops_from_lock(req, &uv_lock) {
-                            Ok(owned_drops) => {
+                        Ok(uv_lock) => match closure_metadata_from_lock(req, &uv_lock) {
+                            Ok((dependency_graph, owned_drops)) => {
+                                closure.dependency_graph = dependency_graph;
                                 closure.auto_dropped.extend(owned_drops);
                                 attach_effective_input_requirements(&mut closure, req)?;
                                 tracing::info!(
@@ -4507,7 +4781,7 @@ pub(crate) async fn compute_closure_for_target(
                                 tracing::warn!(
                                     bundle = %req.bundle,
                                     error = %format!("{error:#}"),
-                                    "uv closure: cached uv.lock unusable for workspace providers; \
+                                    "uv closure: cached uv.lock unusable for closure metadata; \
                                      re-resolving",
                                 );
                                 invalidate_cached_closure(project_dir)?;
@@ -4682,10 +4956,10 @@ pub(crate) async fn compute_closure_for_target(
     let mut closure = parse_pylock_closure(&pylock, target.wheel_target(), &exclude, &uv_version)?;
     let uv_lock = tokio::fs::read_to_string(&lock_file)
         .await
-        .context("reading uv.lock for workspace-owned providers")?;
-    closure
-        .auto_dropped
-        .extend(workspace_owned_drops_from_lock(req, &uv_lock)?);
+        .context("reading uv.lock closure metadata")?;
+    let (dependency_graph, owned_drops) = closure_metadata_from_lock(req, &uv_lock)?;
+    closure.dependency_graph = dependency_graph;
+    closure.auto_dropped.extend(owned_drops);
     attach_effective_input_requirements(&mut closure, req)?;
 
     write_closure_meta_atomic(
@@ -4721,6 +4995,10 @@ mod tests {
             conda_subdir: subdir.to_string(),
             max_glibc: None,
         }
+    }
+
+    fn marker_target(py: &str, subdir: &str) -> MarkerEnvironment {
+        crate::relax::marker_env_for(subdir, py).unwrap()
     }
 
     fn write_built_source_test_wheel(path: &Path, name: &str, version: &str) {
@@ -6174,6 +6452,7 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
                         auto_routed: vec![],
                         auto_dropped: BTreeSet::from(["opencv-python".to_string()]),
                         effective_input_requirements: None,
+                        dependency_graph: UvDependencyGraph::default(),
                     })
                 }) as futures::future::BoxFuture<'static, Result<UvClosure>>
             }
@@ -6340,6 +6619,7 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
                         auto_routed: vec![],
                         auto_dropped: req.workspace_owned.dropped_without_uv(),
                         effective_input_requirements: None,
+                        dependency_graph: UvDependencyGraph::default(),
                     })
                 }) as futures::future::BoxFuture<'static, Result<UvClosure>>
             }
@@ -6409,6 +6689,7 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
                         auto_routed: vec![],
                         auto_dropped: BTreeSet::new(),
                         effective_input_requirements: None,
+                        dependency_graph: UvDependencyGraph::default(),
                     })
                 }) as futures::future::BoxFuture<'static, Result<UvClosure>>
             }
@@ -6663,6 +6944,226 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
         assert_eq!(prov.conda_name, "numpy");
         assert_eq!(prov.conda_version, "==2.1.0");
         assert_eq!(prov.provenance, Provenance::PriorSelection);
+    }
+
+    #[test]
+    fn uv_dependency_graph_retains_transitive_lock_adjacency() {
+        let uv_lock = r#"
+            version = 1
+            revision = 3
+            requires-python = ">=3.12,<3.13"
+
+            [[package]]
+            name = "dex-retargeting"
+            version = "0"
+            dependencies = [
+                { name = "pin" },
+            ]
+
+            [[package]]
+            name = "pin"
+            version = "2.7.0"
+            dependencies = [
+                { name = "cmeel_boost" },
+            ]
+
+            [[package]]
+            name = "cmeel_boost"
+            version = "1.90.0"
+            dependencies = [
+                { name = "NumPy" },
+            ]
+
+            [[package]]
+            name = "NumPy"
+            version = "2.3.1"
+        "#;
+
+        let graph = parse_uv_dependency_graph(uv_lock, &marker_target("3.12", "linux-64")).unwrap();
+        assert_eq!(
+            graph.edges,
+            BTreeSet::from([
+                UvDependencyEdge {
+                    parent: "cmeel-boost".to_string(),
+                    child: "numpy".to_string(),
+                },
+                UvDependencyEdge {
+                    parent: "dex-retargeting".to_string(),
+                    child: "pin".to_string(),
+                },
+                UvDependencyEdge {
+                    parent: "pin".to_string(),
+                    child: "cmeel-boost".to_string(),
+                },
+            ])
+        );
+        assert_eq!(
+            graph.selected_versions,
+            BTreeMap::from([
+                ("cmeel-boost".to_string(), "1.90.0".to_string()),
+                ("dex-retargeting".to_string(), "0".to_string()),
+                ("numpy".to_string(), "2.3.1".to_string()),
+                ("pin".to_string(), "2.7.0".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn uv_dependency_graph_rejects_canonical_package_forks() {
+        let uv_lock = r#"
+            version = 1
+
+            [[package]]
+            name = "cmeel_boost"
+            version = "1.89.0"
+            source = { registry = "https://one.invalid/simple" }
+
+            [[package]]
+            name = "cmeel-boost"
+            version = "1.90.0"
+            source = { registry = "https://two.invalid/simple" }
+        "#;
+
+        let error =
+            parse_uv_dependency_graph(uv_lock, &marker_target("3.12", "linux-64")).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("canonical package `cmeel-boost`"),
+            "{message}"
+        );
+        assert!(message.contains("multiple package records"), "{message}");
+        assert!(message.contains("ambiguous"), "{message}");
+    }
+
+    #[test]
+    fn uv_dependency_graph_selects_active_package_resolution_marker_variant() {
+        let uv_lock = r#"
+            version = 1
+
+            [[package]]
+            name = "forked_name"
+            version = "1.0"
+            resolution-markers = ["sys_platform == 'win32'"]
+            dependencies = [
+                { name = "inactive-child" },
+            ]
+
+            [[package]]
+            name = "forked-name"
+            version = "2.0"
+            resolution-markers = ["sys_platform == 'linux'"]
+            dependencies = [
+                { name = "active-child" },
+            ]
+
+            [[package]]
+            name = "inactive-child"
+            version = "1.0"
+
+            [[package]]
+            name = "active-child"
+            version = "1.0"
+        "#;
+
+        let graph = parse_uv_dependency_graph(uv_lock, &marker_target("3.12", "linux-64")).unwrap();
+        assert_eq!(
+            graph
+                .selected_versions
+                .get("forked-name")
+                .map(String::as_str),
+            Some("2.0")
+        );
+        assert!(graph.edges.contains(&UvDependencyEdge {
+            parent: "forked-name".to_string(),
+            child: "active-child".to_string(),
+        }));
+        assert!(
+            !graph
+                .edges
+                .iter()
+                .any(|edge| edge.child == "inactive-child")
+        );
+    }
+
+    #[test]
+    fn uv_dependency_graph_evaluates_target_markers_and_requested_extras() {
+        let uv_lock = r#"
+            version = 1
+
+            [[package]]
+            name = "root"
+            version = "0"
+            dependencies = [
+                { name = "pin", extra = ["boost"] },
+                { name = "wrong-platform", marker = "sys_platform == 'win32'" },
+                "string-marked ; sys_platform == 'linux'",
+            ]
+
+            [[package]]
+            name = "pin"
+            version = "2.7.0"
+
+            [package.optional-dependencies]
+            boost = [
+                { name = "cmeel-boost" },
+                { name = "marked-extra", marker = "python_version < '3.12'" },
+            ]
+
+            [[package]]
+            name = "cmeel-boost"
+            version = "1.90.0"
+
+            [[package]]
+            name = "wrong-platform"
+            version = "1.0.0"
+
+            [[package]]
+            name = "marked-extra"
+            version = "1.0.0"
+
+            [[package]]
+            name = "string-marked"
+            version = "1.0.0"
+        "#;
+
+        let graph = parse_uv_dependency_graph(uv_lock, &marker_target("3.12", "linux-64")).unwrap();
+        assert!(graph.edges.contains(&UvDependencyEdge {
+            parent: "root".to_string(),
+            child: "pin".to_string(),
+        }));
+        assert!(graph.edges.contains(&UvDependencyEdge {
+            parent: "pin".to_string(),
+            child: "cmeel-boost".to_string(),
+        }));
+        assert!(graph.edges.contains(&UvDependencyEdge {
+            parent: "root".to_string(),
+            child: "string-marked".to_string(),
+        }));
+        assert!(
+            !graph
+                .edges
+                .iter()
+                .any(|edge| edge.child == "wrong-platform" || edge.child == "marked-extra")
+        );
+    }
+
+    #[test]
+    fn ambiguous_uv_dependency_graph_is_diagnostic_fail_soft() {
+        let uv_lock = r#"
+            version = 1
+
+            [[package]]
+            name = "forked_name"
+            version = "1.0"
+
+            [[package]]
+            name = "forked-name"
+            version = "2.0"
+        "#;
+
+        let (graph, owned_drops) = closure_metadata_from_lock(&auto_route_req(), uv_lock).unwrap();
+        assert_eq!(graph, UvDependencyGraph::default());
+        assert!(owned_drops.is_empty());
     }
 
     #[test]
@@ -6986,6 +7487,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
                         auto_routed: vec![],
                         auto_dropped: BTreeSet::new(),
                         effective_input_requirements: None,
+                        dependency_graph: UvDependencyGraph::default(),
                     })
                 }) as futures::future::BoxFuture<'static, Result<UvClosure>>
             }
@@ -7044,6 +7546,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
                         auto_routed: vec![],
                         auto_dropped: BTreeSet::new(),
                         effective_input_requirements: None,
+                        dependency_graph: UvDependencyGraph::default(),
                     })
                 }) as futures::future::BoxFuture<'static, Result<UvClosure>>
             }
@@ -7977,6 +8480,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
                     auto_routed: vec![],
                     auto_dropped: BTreeSet::new(),
                     effective_input_requirements: None,
+                    dependency_graph: UvDependencyGraph::default(),
                 })
             })
         }
@@ -9671,6 +10175,7 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
                             auto_dropped: BTreeSet::new(),
                             uv_version: "test".into(),
                             effective_input_requirements: None,
+                            dependency_graph: UvDependencyGraph::default(),
                         })
                     }
                 };

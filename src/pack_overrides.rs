@@ -38,7 +38,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use toml_edit::{Array, DocumentMut, Item, Table, Value};
+use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, Value};
 
 use crate::config::RetreadConfig;
 
@@ -212,6 +212,24 @@ pub(crate) fn render_override_toml(package: &str, spec: &str) -> String {
     let config_table = ensure_toml_table(build_table, "config");
     let overrides_table = ensure_toml_table(config_table, "retread-overrides");
     overrides_table[package] = Item::Value(Value::from(spec));
+    document.to_string()
+}
+
+/// Render a concrete version constraint for a transitive root in the pack's
+/// `retread-wheels` table.
+///
+/// Both the package key and version value are formatted by `toml_edit`, so
+/// package names that are not valid bare TOML keys are safely quoted. This is
+/// a pure diagnostic helper and never writes the pack manifest.
+pub(crate) fn render_root_pin_toml(package: &str, spec: &str) -> String {
+    let mut document = DocumentMut::new();
+    let package_table = ensure_toml_table(document.as_table_mut(), "package");
+    let build_table = ensure_toml_table(package_table, "build");
+    let config_table = ensure_toml_table(build_table, "config");
+    let wheels_table = ensure_toml_table(config_table, "retread-wheels");
+    let mut pin = InlineTable::new();
+    pin.insert("version", Value::from(spec));
+    wheels_table.insert(package, Item::Value(Value::InlineTable(pin)));
     document.to_string()
 }
 
@@ -712,6 +730,21 @@ mod tests {
                 "commented menu omitted the rendered override `{spec}`:\n{menu}"
             );
         }
+    }
+
+    #[test]
+    fn diagnostic_root_pin_is_parseable_and_safely_quotes_package_key() {
+        let rendered = render_root_pin_toml("pin.root", "==2.6.20");
+        let parsed: toml::Value = toml::from_str(&rendered).unwrap();
+
+        assert_eq!(
+            parsed["package"]["build"]["config"]["retread-wheels"]["pin.root"]["version"].as_str(),
+            Some("==2.6.20")
+        );
+        assert!(
+            rendered.contains("\"pin.root\" = { version = \"==2.6.20\" }"),
+            "root package key was not safely quoted in:\n{rendered}"
+        );
     }
 
     #[test]

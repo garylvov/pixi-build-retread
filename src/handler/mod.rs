@@ -2064,6 +2064,10 @@ struct Bundle {
     /// Empty on the legacy (non-uv) path, where the BFS bundles the
     /// full closure and the `vendored` set already covers members.
     uv_closure_names: std::collections::HashSet<String>,
+    /// Full uv-selected adjacency, including routed/no-emit packages that
+    /// are absent from the exported wheel set. Diagnostics use this only to
+    /// walk a conflict back to its introducing root edge.
+    uv_dependency_graph: crate::uv_closure::UvDependencyGraph,
     /// Exact conda versions selected identically in every precise consuming
     /// environment, including transitives. Membership in this map is the
     /// exact validation boundary; ownership evidence is carried separately in
@@ -4652,6 +4656,7 @@ async fn resolve_all(
                 .keys()
                 .map(|k| canonical_conda_name(k))
                 .collect();
+            bundle.uv_dependency_graph = closure.dependency_graph.clone();
         }
         bundle.workspace_conda_versions = workspace_facts.common_selected_versions.clone();
         bundle.workspace_conda_provider_facts = workspace_facts.provider_facts.clone();
@@ -8810,6 +8815,7 @@ async fn resolve_bundle(
             auto_routed: vec![],
             auto_dropped: Default::default(),
             uv_closure_names: Default::default(),
+            uv_dependency_graph: Default::default(),
             workspace_conda_versions: Default::default(),
             workspace_conda_provider_facts: Default::default(),
         });
@@ -9416,6 +9422,7 @@ async fn resolve_bundle(
         auto_routed: vec![],
         auto_dropped: Default::default(),
         uv_closure_names: Default::default(),
+        uv_dependency_graph: Default::default(),
         workspace_conda_versions: Default::default(),
         workspace_conda_provider_facts: Default::default(),
     };
@@ -12057,10 +12064,13 @@ fn produce_output_with_conflicts(
                 run_dep_specs.push(spec_from_str(spec.as_str())?);
             }
             RelaxDecision::Conflict(conflict) => {
-                let conflict = auto_bundle::attach_leaf_conflict_suggestion(
+                let platform = host_platform.to_string();
+                let conflict = auto_bundle::attach_conflict_suggestion(
                     conflict,
-                    config.pack_manifest_path.as_deref(),
-                    &bundle.conda_name,
+                    bundle,
+                    config,
+                    &platform,
+                    workspace_python_version,
                 );
                 // Keep a name-only placeholder in the tolerant assembly so
                 // Rule 2 can identify and reject a wholly mutable route. The
@@ -19060,6 +19070,7 @@ mod emit_wheel_upstream_url_tests {
             auto_routed: vec![],
             auto_dropped: Default::default(),
             uv_closure_names: Default::default(),
+            uv_dependency_graph: Default::default(),
             workspace_conda_versions: Default::default(),
             workspace_conda_provider_facts: Default::default(),
         };
@@ -19180,6 +19191,7 @@ mod emit_wheel_upstream_url_tests {
             auto_routed: vec![],
             auto_dropped: Default::default(),
             uv_closure_names: Default::default(),
+            uv_dependency_graph: Default::default(),
             workspace_conda_versions: Default::default(),
             workspace_conda_provider_facts: Default::default(),
         };
