@@ -3431,6 +3431,24 @@ fn output_abi_invariant_checks_embedded_wheel_metadata_and_aliases() {
 }
 
 #[test]
+fn output_abi_invariant_rejects_pep440_local_exclusion_contradictions() {
+    for requirement in ["numpy==3.1+cuda,!=3.1", "numpy==1!3.1+cuda,!=1!3.1"] {
+        let violations = check_output_abi_invariants(
+            &[],
+            &[("consumer-wheel".to_string(), requirement.to_string())],
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &AbiAliasGraph::new(),
+        );
+        assert_eq!(violations.len(), 1, "{requirement}: {violations:?}");
+        assert!(
+            violations[0].contains("unsatisfiable under PEP 440"),
+            "{requirement}: {violations:?}"
+        );
+    }
+}
+
+#[test]
 fn cross_output_siblings_appear_as_run_deps() {
     // Contract: when a pack emits multiple outputs (isaacsim,
     // isaaclab, isaaclab-arena, pytorch3d, ...), each output's

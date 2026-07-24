@@ -11289,7 +11289,7 @@ pub(crate) fn check_output_abi_invariants(
     let mut emitted = output_run_deps
         .iter()
         .cloned()
-        .map(|(name, spec)| (name, spec, "retread emitted".to_string()))
+        .map(|(name, spec)| (name, spec, "retread emitted".to_string(), None))
         .collect::<Vec<_>>();
     for (wheel, raw) in embedded_requires_dist {
         let Ok(requirement): Result<uv_pep508::Requirement, _> =
@@ -11297,11 +11297,12 @@ pub(crate) fn check_output_abi_invariants(
         else {
             continue;
         };
-        let spec = match requirement.version_or_url.as_ref() {
-            None => String::new(),
-            Some(uv_pep508::VersionOrUrl::VersionSpecifier(specifiers)) => {
-                specifiers.to_string().replace(", ", ",")
-            }
+        let (spec, pep440_specifiers) = match requirement.version_or_url.as_ref() {
+            None => (String::new(), Some(VersionSpecifiers::empty())),
+            Some(uv_pep508::VersionOrUrl::VersionSpecifier(specifiers)) => (
+                specifiers.to_string().replace(", ", ","),
+                Some(specifiers.clone()),
+            ),
             // A direct artifact URL is itself an exact artifact selection, not
             // an unconstrained version range.
             Some(uv_pep508::VersionOrUrl::Url(_)) => continue,
@@ -11310,11 +11311,12 @@ pub(crate) fn check_output_abi_invariants(
             requirement.name.to_string(),
             spec,
             format!("wheel `{wheel}` embeds"),
+            pep440_specifiers,
         ));
     }
-    emitted.sort();
+    emitted.sort_by(|left, right| (&left.0, &left.1, &left.2).cmp(&(&right.0, &right.1, &right.2)));
 
-    for (name, spec, origin) in emitted {
+    for (name, spec, origin, pep440_specifiers) in emitted {
         if !is_semantic_abi_anchor(&name, aliases) {
             continue;
         }
@@ -11326,6 +11328,15 @@ pub(crate) fn check_output_abi_invariants(
             ));
             continue;
         }
+        if pep440_specifiers
+            .as_ref()
+            .is_some_and(crate::constraint::specifiers_unsatisfiable)
+        {
+            violations.push(format!(
+                "ABI invariant: {origin} `{name} {trimmed}` is unsatisfiable under PEP 440"
+            ));
+            continue;
+        }
         if is_bare_major_spec(trimmed) {
             violations.push(format!(
                 "ABI invariant: {origin} `{name} {trimmed}` (bare-major); \
@@ -11334,15 +11345,31 @@ pub(crate) fn check_output_abi_invariants(
             continue;
         }
 
-        let parsed_spec =
-            VersionSpec::from_str(trimmed, rattler_conda_types::ParseStrictness::Lenient);
+        let parsed_conda_spec = pep440_specifiers
+            .is_none()
+            .then(|| VersionSpec::from_str(trimmed, rattler_conda_types::ParseStrictness::Lenient));
         for workspace_name in semantic_aliases(&name, aliases) {
             let Some(selected_versions) = workspace_versions.get(&workspace_name) else {
                 continue;
             };
             for workspace_version in selected_versions {
+                if let Some(specifiers) = &pep440_specifiers {
+                    match uv_pep508::uv_pep440::Version::from_str(workspace_version) {
+                        Ok(version) if specifiers.contains(&version) => {}
+                        Ok(_) => violations.push(format!(
+                            "ABI invariant: {origin} `{name} {trimmed}` does not cover workspace pin \
+                             `{workspace_name}=={workspace_version}`"
+                        )),
+                        Err(error) => violations.push(format!(
+                            "ABI invariant: workspace pin `{workspace_name}=={workspace_version}` \
+                             cannot be validated as PEP 440: {error}"
+                        )),
+                    }
+                    continue;
+                }
+
                 let parsed_version = rattler_conda_types::Version::from_str(workspace_version);
-                match (&parsed_version, &parsed_spec) {
+                match (&parsed_version, parsed_conda_spec.as_ref().unwrap()) {
                     (Ok(version), Ok(specifier)) if specifier.matches(version) => {}
                     (Ok(_), Ok(_)) => violations.push(format!(
                         "ABI invariant: {origin} `{name} {trimmed}` does not cover workspace pin \

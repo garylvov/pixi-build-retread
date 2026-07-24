@@ -351,7 +351,7 @@ fn remove_redundant_specifier_clauses(specifiers: VersionSpecifiers) -> VersionS
 
 /// True when the full PEP 440 intersection is empty, including arbitrary
 /// equality contradictions that ordered-version equality cannot distinguish.
-fn specifiers_unsatisfiable(specifiers: &VersionSpecifiers) -> bool {
+pub(crate) fn specifiers_unsatisfiable(specifiers: &VersionSpecifiers) -> bool {
     let full = release_specifiers_to_ranges(VersionSpecifiers::empty());
     let range_is_empty = full.intersection(&specifiers.clone().into()).is_empty();
     let arbitrary_exact_conflict = specifiers.iter().any(|specifier| {
