@@ -10708,6 +10708,7 @@ fn add_emission_constraint(
 struct EffectiveVersionRange {
     lower: Option<EffectiveVersionBound>,
     upper: Option<EffectiveVersionBound>,
+    predicates: Vec<EffectiveVersionPredicate>,
 }
 
 #[derive(Clone)]
@@ -10717,9 +10718,43 @@ struct EffectiveVersionBound {
     minor_anchor: bool,
 }
 
+#[derive(Clone)]
+enum EffectiveVersionPredicate {
+    StartsWith(rattler_conda_types::Version),
+    NotStartsWith(rattler_conda_types::Version),
+    Compatible(rattler_conda_types::Version),
+    NotCompatible(rattler_conda_types::Version),
+}
+
+impl EffectiveVersionPredicate {
+    fn anchor(&self) -> &rattler_conda_types::Version {
+        match self {
+            Self::StartsWith(version)
+            | Self::NotStartsWith(version)
+            | Self::Compatible(version)
+            | Self::NotCompatible(version) => version,
+        }
+    }
+
+    fn matches(&self, candidate: &rattler_conda_types::Version) -> bool {
+        match self {
+            Self::StartsWith(version) => candidate.starts_with(version),
+            Self::NotStartsWith(version) => !candidate.starts_with(version),
+            Self::Compatible(version) => candidate.compatible_with(version),
+            Self::NotCompatible(version) => !candidate.compatible_with(version),
+        }
+    }
+}
+
 impl EffectiveVersionRange {
     fn intersect(mut self, other: Self) -> Self {
-        self.lower = match (self.lower, other.lower) {
+        let Self {
+            lower: other_lower,
+            upper: other_upper,
+            predicates: other_predicates,
+        } = other;
+        self.predicates.extend(other_predicates);
+        self.lower = match (self.lower, other_lower) {
             (Some(left), Some(right)) => Some(if left.version > right.version {
                 left
             } else if right.version > left.version {
@@ -10734,7 +10769,7 @@ impl EffectiveVersionRange {
             (bound @ Some(_), None) | (None, bound @ Some(_)) => bound,
             (None, None) => None,
         };
-        self.upper = match (self.upper, other.upper) {
+        self.upper = match (self.upper, other_upper) {
             (Some(left), Some(right)) => Some(if left.version < right.version {
                 left
             } else if right.version < left.version {
@@ -10752,7 +10787,7 @@ impl EffectiveVersionRange {
         self
     }
 
-    fn is_empty(&self) -> bool {
+    fn bounds_are_empty(&self) -> bool {
         matches!(
             (&self.lower, &self.upper),
             (Some(lower), Some(upper))
@@ -10762,12 +10797,123 @@ impl EffectiveVersionRange {
         )
     }
 
+    fn contains(&self, candidate: &rattler_conda_types::Version) -> bool {
+        let above_lower = self.lower.as_ref().is_none_or(|lower| {
+            if lower.exclusive {
+                candidate > &lower.version
+            } else {
+                candidate >= &lower.version
+            }
+        });
+        let below_upper = self.upper.as_ref().is_none_or(|upper| {
+            if upper.exclusive {
+                candidate < &upper.version
+            } else {
+                candidate <= &upper.version
+            }
+        });
+        above_lower && below_upper
+    }
+
+    fn has_predicate_witness(&self) -> bool {
+        let candidates = self
+            .lower
+            .iter()
+            .chain(self.upper.iter())
+            .map(|bound| bound.version.clone())
+            .chain(
+                self.predicates
+                    .iter()
+                    .map(|predicate| predicate.anchor().clone()),
+            )
+            .collect::<BTreeSet<_>>();
+        candidates.into_iter().any(|candidate| {
+            self.contains(&candidate)
+                && self
+                    .predicates
+                    .iter()
+                    .all(|predicate| predicate.matches(&candidate))
+        })
+    }
+
+    fn is_singleton(&self) -> bool {
+        matches!(
+            (&self.lower, &self.upper),
+            (Some(lower), Some(upper))
+                if lower.version == upper.version
+                    && !lower.exclusive
+                    && !upper.exclusive
+        )
+    }
+
+    fn is_empty(&self) -> bool {
+        self.bounds_are_empty()
+            || (!self.predicates.is_empty() && self.is_singleton() && !self.has_predicate_witness())
+    }
+
+    fn is_proven_nonempty(&self) -> bool {
+        !self.bounds_are_empty() && (self.predicates.is_empty() || self.has_predicate_witness())
+    }
+
     fn has_effective_minor_bound(&self) -> bool {
         self.lower
             .iter()
             .chain(self.upper.iter())
             .any(|bound| bound.minor_anchor)
     }
+}
+
+/// Take the convex hull of the interval envelopes of a disjunction before
+/// deciding whether a minor boundary is load-bearing. Internal boundaries and
+/// gaps do not constrain the outer ABI range: `<=3.1|>3.1` becomes unbounded,
+/// while `>=3,<3.1|>=3.1,<4` becomes the bare-major interval `[3,4)`.
+///
+/// Predicate-bearing multi-range unions are rejected by the caller instead
+/// of being sent here: their interval envelopes can over-approximate the real
+/// prefix/compatible sets.
+fn convex_hull_effective_range_envelopes(
+    mut ranges: Vec<EffectiveVersionRange>,
+) -> Vec<EffectiveVersionRange> {
+    ranges.sort_by(|left, right| match (&left.lower, &right.lower) {
+        (None, None) => std::cmp::Ordering::Equal,
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (Some(left), Some(right)) => left
+            .version
+            .cmp(&right.version)
+            .then_with(|| left.exclusive.cmp(&right.exclusive)),
+    });
+
+    let mut merged: Vec<EffectiveVersionRange> = Vec::new();
+    for mut range in ranges {
+        let Some(last) = merged.last_mut() else {
+            range.predicates.clear();
+            merged.push(range);
+            continue;
+        };
+        if let (Some(left), Some(right)) = (&mut last.lower, &range.lower)
+            && left.version == right.version
+        {
+            left.exclusive &= right.exclusive;
+            left.minor_anchor |= right.minor_anchor;
+        }
+        last.upper = match (last.upper.take(), range.upper) {
+            (None, _) | (_, None) => None,
+            (Some(left), Some(right)) => Some(if left.version > right.version {
+                left
+            } else if right.version > left.version {
+                right
+            } else {
+                EffectiveVersionBound {
+                    version: left.version,
+                    exclusive: left.exclusive && right.exclusive,
+                    minor_anchor: left.minor_anchor || right.minor_anchor,
+                }
+            }),
+        };
+        last.predicates.clear();
+    }
+    merged
 }
 
 fn effective_version_ranges(spec: &VersionSpec) -> Vec<EffectiveVersionRange> {
@@ -10781,21 +10927,33 @@ fn effective_version_ranges(spec: &VersionSpec) -> Vec<EffectiveVersionRange> {
                 .with_segments(..1)
                 .is_some_and(|major| *version != major)
     };
-    let lower = |version: rattler_conda_types::Version, exclusive| EffectiveVersionRange {
-        lower: Some(EffectiveVersionBound {
-            minor_anchor: is_semantic_minor_boundary(&version),
-            version,
-            exclusive,
-        }),
-        upper: None,
+    let lower_with_anchor =
+        |version: rattler_conda_types::Version, exclusive, minor_anchor| EffectiveVersionRange {
+            lower: Some(EffectiveVersionBound {
+                minor_anchor,
+                version,
+                exclusive,
+            }),
+            upper: None,
+            predicates: Vec::new(),
+        };
+    let upper_with_anchor =
+        |version: rattler_conda_types::Version, exclusive, minor_anchor| EffectiveVersionRange {
+            lower: None,
+            upper: Some(EffectiveVersionBound {
+                minor_anchor,
+                version,
+                exclusive,
+            }),
+            predicates: Vec::new(),
+        };
+    let lower = |version: rattler_conda_types::Version, exclusive| {
+        let minor_anchor = is_semantic_minor_boundary(&version);
+        lower_with_anchor(version, exclusive, minor_anchor)
     };
-    let upper = |version: rattler_conda_types::Version, exclusive| EffectiveVersionRange {
-        lower: None,
-        upper: Some(EffectiveVersionBound {
-            minor_anchor: is_semantic_minor_boundary(&version),
-            version,
-            exclusive,
-        }),
+    let upper = |version: rattler_conda_types::Version, exclusive| {
+        let minor_anchor = is_semantic_minor_boundary(&version);
+        upper_with_anchor(version, exclusive, minor_anchor)
     };
 
     match spec {
@@ -10818,25 +10976,25 @@ fn effective_version_ranges(spec: &VersionSpec) -> Vec<EffectiveVersionRange> {
                 lower: Some(EffectiveVersionBound {
                     version: version.clone(),
                     exclusive: false,
-                    // Exact equality is concrete even when conda normalizes a
-                    // trailing-zero spelling such as `12.0` to `12`.
-                    minor_anchor: version.as_major_minor().is_some(),
+                    // Equality selects one concrete version even when it has
+                    // only a major segment (for example `==3`).
+                    minor_anchor: true,
                 }),
                 upper: Some(EffectiveVersionBound {
                     version: version.clone(),
                     exclusive: false,
-                    minor_anchor: version.as_major_minor().is_some(),
+                    minor_anchor: true,
                 }),
+                predicates: Vec::new(),
             }]
         }
-        VersionSpec::Exact(EqualityOperator::NotEquals, _)
-        | VersionSpec::StrictRange(
-            StrictRangeOperator::NotStartsWith | StrictRangeOperator::NotCompatible,
-            _,
-        ) => {
-            // Exclusions do not establish the positive minor anchor required
-            // for ABI safety. Their positive envelope remains unconstrained.
-            vec![EffectiveVersionRange::default()]
+        VersionSpec::Exact(EqualityOperator::NotEquals, version) => {
+            // The complement of one exact point. Exclusion-created bounds do
+            // not count as the positive minor anchor required for ABI safety.
+            vec![
+                upper_with_anchor(version.clone(), true, false),
+                lower_with_anchor(version.clone(), true, false),
+            ]
         }
         VersionSpec::StrictRange(StrictRangeOperator::StartsWith, version) => {
             let lower = lower(version.0.clone(), false);
@@ -10846,7 +11004,26 @@ fn effective_version_ranges(spec: &VersionSpec) -> Vec<EffectiveVersionRange> {
                 .ok()
                 .map(|version| upper(version, true))
                 .unwrap_or_default();
-            vec![lower.intersect(upper)]
+            let mut range = lower.intersect(upper);
+            range
+                .predicates
+                .push(EffectiveVersionPredicate::StartsWith(version.0.clone()));
+            vec![range]
+        }
+        VersionSpec::StrictRange(StrictRangeOperator::NotStartsWith, version) => {
+            // `!=P.*` is the complement of [P, bump_last(P)).
+            // Keep the real negative predicate as well: matching prereleases
+            // can sort below P while still starting with P.
+            let mut ranges = vec![upper_with_anchor(version.0.clone(), true, false)];
+            if let Ok(ceiling) = version.0.bump(rattler_conda_types::VersionBumpType::Last) {
+                ranges.push(lower_with_anchor(ceiling, false, false));
+            }
+            for range in &mut ranges {
+                range
+                    .predicates
+                    .push(EffectiveVersionPredicate::NotStartsWith(version.0.clone()));
+            }
+            ranges
         }
         VersionSpec::StrictRange(StrictRangeOperator::Compatible, version) => {
             let lower = lower(version.0.clone(), false);
@@ -10856,7 +11033,31 @@ fn effective_version_ranges(spec: &VersionSpec) -> Vec<EffectiveVersionRange> {
                 .and_then(|prefix| prefix.bump(rattler_conda_types::VersionBumpType::Last).ok())
                 .map(|version| upper(version, true))
                 .unwrap_or_default();
-            vec![lower.intersect(upper)]
+            let mut range = lower.intersect(upper);
+            range
+                .predicates
+                .push(EffectiveVersionPredicate::Compatible(version.0.clone()));
+            vec![range]
+        }
+        VersionSpec::StrictRange(StrictRangeOperator::NotCompatible, version) => {
+            // The positive compatible interval is [V, compatible_upper(V)).
+            // Keep its two complement branches; if the upper boundary cannot
+            // be represented, retain only the provable before-V branch. The
+            // real negative predicate closes prerelease ordering gaps.
+            let mut ranges = vec![upper_with_anchor(version.0.clone(), true, false)];
+            if let Some(ceiling) = version
+                .0
+                .pop_segments(1)
+                .and_then(|prefix| prefix.bump(rattler_conda_types::VersionBumpType::Last).ok())
+            {
+                ranges.push(lower_with_anchor(ceiling, false, false));
+            }
+            for range in &mut ranges {
+                range
+                    .predicates
+                    .push(EffectiveVersionPredicate::NotCompatible(version.0.clone()));
+            }
+            ranges
         }
         VersionSpec::Group(LogicalOperator::Or, members) => {
             members.iter().flat_map(effective_version_ranges).collect()
@@ -10889,17 +11090,31 @@ fn is_bare_major_spec(spec: &str) -> bool {
         // cannot demonstrate a load-bearing minor restriction, so fail closed.
         return true;
     };
-    let mut admitted_range = false;
+    let mut ranges = Vec::new();
     for range in effective_version_ranges(&spec) {
         if range.is_empty() {
             continue;
         }
-        admitted_range = true;
-        if !range.has_effective_minor_bound() {
+        if !range.is_proven_nonempty() {
             return true;
         }
+        ranges.push(range);
     }
-    !admitted_range
+    if ranges.is_empty() {
+        return true;
+    }
+    if ranges
+        .iter()
+        .any(|range| !range.has_effective_minor_bound())
+    {
+        return true;
+    }
+    if ranges.len() > 1 && ranges.iter().any(|range| !range.predicates.is_empty()) {
+        return true;
+    }
+    convex_hull_effective_range_envelopes(ranges)
+        .iter()
+        .any(|range| !range.has_effective_minor_bound())
 }
 
 type WorkspaceAbiVersions = BTreeMap<String, BTreeSet<String>>;

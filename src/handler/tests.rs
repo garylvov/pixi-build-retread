@@ -3268,6 +3268,95 @@ fn bare_major_detection_uses_effective_parsed_bounds() {
 }
 
 #[test]
+fn bare_major_detection_accepts_single_segment_exact_pin() {
+    assert!(
+        !is_bare_major_spec("==3"),
+        "an exact equality is concrete regardless of release segment count"
+    );
+}
+
+#[test]
+fn bare_major_detection_fails_closed_for_exclusion_emptied_ranges() {
+    for spec in [
+        "==3.1,!=3.1",
+        ">=3.1,<3.2,!=3.1.*",
+        "==3.1.0dev1,!=3.1.*",
+        "!=3.1",
+    ] {
+        assert!(
+            is_bare_major_spec(spec),
+            "empty or exclusion-only ABI constraint must fail closed: `{spec}`"
+        );
+    }
+}
+
+#[test]
+fn bare_major_effective_ranges_model_negative_compatible_exclusion() {
+    use rattler_conda_types::version_spec::{LogicalOperator, StrictRangeOperator};
+    use rattler_conda_types::{StrictVersion, Version};
+    use std::str::FromStr as _;
+
+    let version = Version::from_str("3.1").unwrap();
+    let contradictory = VersionSpec::Group(
+        LogicalOperator::And,
+        vec![
+            VersionSpec::StrictRange(
+                StrictRangeOperator::Compatible,
+                StrictVersion(version.clone()),
+            ),
+            VersionSpec::StrictRange(StrictRangeOperator::NotCompatible, StrictVersion(version)),
+        ],
+    );
+    assert!(
+        effective_version_ranges(&contradictory).is_empty(),
+        "compatible and negative-compatible clauses must form an empty branch"
+    );
+}
+
+#[test]
+fn bare_major_detection_checks_prefix_and_compatible_predicates() {
+    for spec in [
+        "3.1.*,==3.2a1",
+        "3.1.*,==3.1post1",
+        "~=3.1,==4a1",
+        "3.1.*,>=3.2a1,<3.2",
+        "~=3.1,>=4a1,<4",
+    ] {
+        assert!(
+            is_bare_major_spec(spec),
+            "an empty or unproved predicate range must fail closed: `{spec}`"
+        );
+    }
+    for spec in ["3.1.*", "~=3.1", "3.1.*,>=3.1.5,<3.2"] {
+        assert!(
+            !is_bare_major_spec(spec),
+            "a witnessed minor predicate range should remain accepted: `{spec}`"
+        );
+    }
+}
+
+#[test]
+fn bare_major_detection_merges_disjunctive_range_envelopes() {
+    for spec in [
+        "<=3.1|>3.1",
+        "<3.1|>=3.1",
+        "<3.1|>3.1",
+        ">=3,<3.1|>=3.1,<4",
+        ">=3,<3.1|>3.2,<4",
+        "==3|>=4,<5",
+    ] {
+        assert!(
+            is_bare_major_spec(spec),
+            "minor-looking internal OR boundaries must not hide an unconstrained union: `{spec}`"
+        );
+    }
+    assert!(
+        !is_bare_major_spec("==3.1|==3.2"),
+        "disjoint concrete alternatives retain their load-bearing boundaries"
+    );
+}
+
+#[test]
 fn output_abi_invariant_accepts_minor_pin_and_rejects_anchor_override() {
     let workspace = BTreeMap::from([
         ("python".to_string(), BTreeSet::from(["3.11".to_string()])),
