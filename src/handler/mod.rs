@@ -2994,6 +2994,9 @@ impl Handler {
                             lock_path_for_target(&source_dir, &bundle.conda_name, &target);
                         let relax_is_default =
                             config.relax == crate::config::RelaxPolicy::default();
+                        let replay_workspace_versions =
+                            output_workspace_abi_versions(&bundle, python_version);
+                        let replay_aliases = output_abi_aliases(&bundle, &effective);
                         match replay_from_lock_for_target(
                             &lock_path,
                             current_hash,
@@ -3004,6 +3007,9 @@ impl Handler {
                             config.build_number,
                             config.bundle_mode == crate::config::BundleMode::Loose,
                             &siblings,
+                            &replay_workspace_versions,
+                            &effective.overrides,
+                            &replay_aliases,
                         ) {
                             Ok(Some(replayed)) => {
                                 ensure_output_abi_invariants(
@@ -10917,6 +10923,40 @@ fn output_abi_aliases(bundle: &Bundle, config: &RetreadConfig) -> AbiAliasGraph 
     aliases
 }
 
+fn output_workspace_abi_versions(
+    bundle: &Bundle,
+    workspace_python_version: &str,
+) -> WorkspaceAbiVersions {
+    let mut workspace_versions = WorkspaceAbiVersions::new();
+    for (name, version) in &bundle.workspace_conda_versions {
+        workspace_versions
+            .entry(canonical_conda_name(name))
+            .or_default()
+            .insert(version.clone());
+    }
+    for (name, fact) in &bundle.workspace_conda_provider_facts {
+        workspace_versions
+            .entry(canonical_conda_name(name))
+            .or_default()
+            .extend(fact.selected_versions.iter().cloned());
+    }
+    for route in &bundle.auto_routed {
+        if let Some(provider) = &route.workspace_provider {
+            workspace_versions
+                .entry(provider.conda_name.key().into_string())
+                .or_default()
+                .extend(provider.selected_versions.iter().cloned());
+        }
+    }
+    if workspace_python_version.contains('.') {
+        workspace_versions
+            .entry("python".to_string())
+            .or_default()
+            .insert(workspace_python_version.to_string());
+    }
+    workspace_versions
+}
+
 /// Post-emission ABI safety net ported from the deleted cascade.
 ///
 /// The former implementation only logged and merely noticed workspace pins.
@@ -11040,33 +11080,7 @@ fn ensure_output_abi_invariants(
             )
         })
         .collect::<Vec<_>>();
-    let mut workspace_versions = WorkspaceAbiVersions::new();
-    for (name, version) in &bundle.workspace_conda_versions {
-        workspace_versions
-            .entry(canonical_conda_name(name))
-            .or_default()
-            .insert(version.clone());
-    }
-    for (name, fact) in &bundle.workspace_conda_provider_facts {
-        workspace_versions
-            .entry(canonical_conda_name(name))
-            .or_default()
-            .extend(fact.selected_versions.iter().cloned());
-    }
-    for route in &bundle.auto_routed {
-        if let Some(provider) = &route.workspace_provider {
-            workspace_versions
-                .entry(provider.conda_name.key().into_string())
-                .or_default()
-                .extend(provider.selected_versions.iter().cloned());
-        }
-    }
-    if workspace_python_version.contains('.') {
-        workspace_versions
-            .entry("python".to_string())
-            .or_default()
-            .insert(workspace_python_version.to_string());
-    }
+    let workspace_versions = output_workspace_abi_versions(bundle, workspace_python_version);
     // The courier performs one final metadata rewrite after phase D. Validate
     // the requirements uv will actually read, rather than the intermediate
     // phase-D lines: floor envelopes can reconcile several source-wheel
@@ -14475,6 +14489,34 @@ fn replay_from_lock(
     loose: bool,
     siblings: &[(String, String)],
 ) -> anyhow::Result<Option<CondaOutput>> {
+    replay_from_lock_with_abi_context(
+        lock_path,
+        current_inputs_hash,
+        relax_is_default,
+        host_platform,
+        build_number,
+        loose,
+        siblings,
+        &WorkspaceAbiVersions::new(),
+        &BTreeMap::new(),
+        &AbiAliasGraph::new(),
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn replay_from_lock_with_abi_context(
+    lock_path: &Path,
+    current_inputs_hash: &str,
+    relax_is_default: bool,
+    host_platform: Platform,
+    build_number: u64,
+    loose: bool,
+    siblings: &[(String, String)],
+    workspace_versions: &WorkspaceAbiVersions,
+    overrides: &BTreeMap<String, String>,
+    aliases: &AbiAliasGraph,
+) -> anyhow::Result<Option<CondaOutput>> {
     let Some(lock) = load_replayable_lock(lock_path, current_inputs_hash, relax_is_default)? else {
         return Ok(None);
     };
@@ -14485,10 +14527,81 @@ fn replay_from_lock(
         build_number,
         loose,
         siblings,
+        workspace_versions,
+        overrides,
+        aliases,
     )
     .map(Some)
 }
 
+/// Reconstruct the metadata lines written by the courier's final mapper.
+///
+/// `LockWheel::requires_dist` intentionally retains the pre-courier lines:
+/// build-v1 replay needs direct-URL requirements to recreate exact reroutes
+/// and orphan drops. The conda/outputs replay guard must nevertheless inspect
+/// the mapped metadata embedded in the locked wheel bytes.
+fn locked_final_requires_dist(lock: &crate::lock::RetreadLock) -> Vec<(String, String)> {
+    let emit_wheels = lock
+        .wheels
+        .iter()
+        .map(|wheel| {
+            let local_path = (wheel.origin == crate::lock::Origin::Built).then(|| {
+                if wheel.must_ship {
+                    let stem = wheel
+                        .filename
+                        .strip_suffix(".whl")
+                        .unwrap_or(&wheel.filename);
+                    PathBuf::from(format!("{stem}.injected.whl"))
+                } else {
+                    PathBuf::from(&wheel.filename)
+                }
+            });
+            crate::emit_pypi::EmitWheel {
+                pypi_name: wheel.name.clone(),
+                version: wheel.version.clone(),
+                requires_dist: wheel.requires_dist.clone(),
+                local_path,
+                wheel_filename: wheel.filename.clone(),
+                sha256: wheel.sha256.clone(),
+                locked_final_sha256: wheel.sha256.clone(),
+                remote_url: None,
+                upstream_url: None,
+                git_source: wheel.git_source.clone(),
+                sdist_source: wheel.sdist_source.clone(),
+            }
+        })
+        .collect::<Vec<_>>();
+    let conda_capable = lock.conda_capable.iter().cloned().collect::<HashSet<_>>();
+    let emit_plan = crate::emit_pypi::plan(&emit_wheels, &conda_capable);
+    let line_map = crate::emit_pypi::override_line_map(
+        &emit_plan.overrides,
+        &conda_capable,
+        &emit_plan.drop_url,
+    );
+    emit_wheels
+        .iter()
+        .zip(&lock.wheels)
+        .flat_map(|(wheel, locked)| {
+            wheel.requires_dist.iter().filter_map(|requirement| {
+                if locked.origin == crate::lock::Origin::Index {
+                    Some((wheel.pypi_name.clone(), requirement.clone()))
+                } else {
+                    match line_map(requirement) {
+                        crate::wheel_rewrite::LineAction::Keep => {
+                            Some((wheel.pypi_name.clone(), requirement.clone()))
+                        }
+                        crate::wheel_rewrite::LineAction::Replace(replacement) => {
+                            Some((wheel.pypi_name.clone(), replacement))
+                        }
+                        crate::wheel_rewrite::LineAction::Drop => None,
+                    }
+                }
+            })
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
 fn replay_loaded_lock(
     lock: crate::lock::RetreadLock,
     current_inputs_hash: &str,
@@ -14496,6 +14609,9 @@ fn replay_loaded_lock(
     build_number: u64,
     loose: bool,
     siblings: &[(String, String)],
+    workspace_versions: &WorkspaceAbiVersions,
+    overrides: &BTreeMap<String, String>,
+    aliases: &AbiAliasGraph,
 ) -> anyhow::Result<CondaOutput> {
     // ----- reconstruct CondaOutput from lock fields via the shared helper -----
     let python_version = crate::lock::normalized_target_python(&lock.python)
@@ -14558,27 +14674,18 @@ fn replay_loaded_lock(
             )
         })
         .collect::<Vec<_>>();
-    let workspace_versions = BTreeMap::from([(
-        "python".to_string(),
-        BTreeSet::from([python_version.trim_end_matches(".*").to_string()]),
-    )]);
-    let embedded_requires_dist = lock
-        .wheels
-        .iter()
-        .flat_map(|wheel| {
-            wheel
-                .requires_dist
-                .iter()
-                .cloned()
-                .map(|requirement| (wheel.name.clone(), requirement))
-        })
-        .collect::<Vec<_>>();
+    let mut workspace_versions = workspace_versions.clone();
+    workspace_versions
+        .entry("python".to_string())
+        .or_default()
+        .insert(python_version.trim_end_matches(".*").to_string());
+    let embedded_requires_dist = locked_final_requires_dist(&lock);
     let violations = check_output_abi_invariants(
         &emitted,
         &embedded_requires_dist,
         &workspace_versions,
-        &BTreeMap::new(),
-        &BTreeMap::new(),
+        overrides,
+        aliases,
     );
     if !violations.is_empty() {
         bail!(
@@ -14600,6 +14707,9 @@ fn replay_from_lock_for_target(
     build_number: u64,
     loose: bool,
     siblings: &[(String, String)],
+    workspace_versions: &WorkspaceAbiVersions,
+    overrides: &BTreeMap<String, String>,
+    aliases: &AbiAliasGraph,
 ) -> anyhow::Result<Option<CondaOutput>> {
     let Some(lock) = load_replayable_lock_for_target(
         lock_path,
@@ -14618,6 +14728,9 @@ fn replay_from_lock_for_target(
         build_number,
         loose,
         siblings,
+        workspace_versions,
+        overrides,
+        aliases,
     )
     .map(Some)
 }
@@ -14646,14 +14759,15 @@ mod replay_tests {
     use rattler_conda_types::Platform;
 
     use super::{
-        AutoDataConfig, git_auto_data_cache_key, load_replayable_lock,
+        AutoDataConfig, WorkspaceAbiVersions, git_auto_data_cache_key, load_replayable_lock,
         load_replayable_lock_for_target, materialize_from_lock_for_target, persist_git_auto_data,
-        prepare_replayed_class2_wheel, replay_from_lock, replay_git_auto_data,
-        replay_sdist_cache_key, validate_authoritative_replay_lock,
+        prepare_replayed_class2_wheel, replay_from_lock, replay_from_lock_with_abi_context,
+        replay_git_auto_data, replay_sdist_cache_key, validate_authoritative_replay_lock,
     };
     use crate::config::{RelaxPolicy, RetreadConfig, WheelEntry};
     use crate::lock::{CondaDep, GitWheelSource, LockWheel, Origin, RetreadLock, SCHEMA};
     use crate::pypi::ResolutionTarget;
+    use crate::relax::{AbiAliasGraph, add_abi_alias_edge};
     use crate::wheel_rewrite::rewrite_wheel;
 
     fn unique_tmp_dir() -> std::path::PathBuf {
@@ -15055,6 +15169,111 @@ mod replay_tests {
         assert!(
             format!("{error:#}").contains("courier replay rejected by ABI invariant"),
             "{error:#}"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn replay_rejects_widened_abi_alias_in_final_wheel_metadata() {
+        let _env_guard = super::TEST_ENV_MUTEX.lock().unwrap();
+        let dir = unique_tmp_dir();
+        let mut lock = make_test_lock("mypack", "1.2.3", "3.11", "alias-hash", true);
+        lock.wheels[0].origin = Origin::Built;
+        lock.wheels[0].filename = "mypack-1.2.3-999retread-py3-none-any.whl".to_string();
+        lock.wheels[0].url = None;
+        lock.wheels[0].upstream_url =
+            Some("https://example.com/mypack-1.2.3-py3-none-any.whl".to_string());
+        lock.wheels[0].requires_dist = vec!["nvidia-cuda-runtime-cu12==12.0".to_string()];
+
+        let mapped = super::locked_final_requires_dist(&lock);
+        assert_eq!(
+            mapped,
+            vec![(
+                "mypack".to_string(),
+                "nvidia-cuda-runtime-cu12>=12.0".to_string(),
+            )],
+            "the replay guard must inspect the courier-mapped metadata, not the stored pre-map line"
+        );
+
+        let lock_path = dir.join(RetreadLock::file_name("mypack"));
+        std::fs::write(&lock_path, lock.to_pretty_json().unwrap()).unwrap();
+        let mut aliases = AbiAliasGraph::new();
+        add_abi_alias_edge(&mut aliases, "nvidia-cuda-runtime-cu12", "cuda");
+        let error = replay_from_lock_with_abi_context(
+            &lock_path,
+            "alias-hash",
+            true,
+            Platform::Linux64,
+            0,
+            false,
+            &[],
+            &WorkspaceAbiVersions::new(),
+            &BTreeMap::new(),
+            &aliases,
+        )
+        .expect_err("widened hidden ABI-anchor metadata must fail closed on replay");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("courier replay rejected by ABI invariant")
+                && rendered.contains("wheel `mypack` embeds")
+                && rendered.contains("bare-major"),
+            "{rendered}"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn replay_validates_raw_index_wheel_metadata_without_courier_mapping() {
+        let _env_guard = super::TEST_ENV_MUTEX.lock().unwrap();
+        let dir = unique_tmp_dir();
+        let mut lock = make_test_lock("mypack", "1.2.3", "3.11", "index-hash", true);
+        lock.wheels[0].requires_dist = vec!["nvidia-cuda-runtime-cu12>=12".to_string()];
+        lock.wheels.push(LockWheel {
+            name: "nvidia-cuda-runtime-cu12".to_string(),
+            version: "12.0".to_string(),
+            origin: Origin::Index,
+            filename: "nvidia_cuda_runtime_cu12-12.0-py3-none-any.whl".to_string(),
+            url: Some(
+                "https://example.com/nvidia_cuda_runtime_cu12-12.0-py3-none-any.whl".to_string(),
+            ),
+            sha256: Some("22".repeat(32)),
+            requires_dist: vec![],
+            must_ship: false,
+            upstream_url: None,
+            git_source: None,
+            sdist_source: None,
+        });
+
+        assert_eq!(
+            super::locked_final_requires_dist(&lock),
+            vec![(
+                "mypack".to_string(),
+                "nvidia-cuda-runtime-cu12>=12".to_string(),
+            )],
+            "Origin::Index bytes are raw and must not be sanitized by the courier mapper"
+        );
+
+        let lock_path = dir.join(RetreadLock::file_name("mypack"));
+        std::fs::write(&lock_path, lock.to_pretty_json().unwrap()).unwrap();
+        let mut aliases = AbiAliasGraph::new();
+        add_abi_alias_edge(&mut aliases, "nvidia-cuda-runtime-cu12", "cuda");
+        let error = replay_from_lock_with_abi_context(
+            &lock_path,
+            "index-hash",
+            true,
+            Platform::Linux64,
+            0,
+            false,
+            &[],
+            &WorkspaceAbiVersions::new(),
+            &BTreeMap::new(),
+            &aliases,
+        )
+        .expect_err("unsafe raw Index metadata must fail closed on replay");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("wheel `mypack` embeds") && rendered.contains("bare-major"),
+            "{rendered}"
         );
         std::fs::remove_dir_all(dir).ok();
     }

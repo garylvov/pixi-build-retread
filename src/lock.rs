@@ -663,7 +663,11 @@ pub const SCHEMA: u32 = 15;
 ///
 /// Epoch 32: every metadata mutation path shares the transitive ABI-alias veto,
 /// and the fail-closed post-check also validates embedded wheel metadata.
-pub const EMIT_EPOCH: u32 = 32;
+///
+/// Epoch 33: committed-lock replay reconstructs the courier's final metadata
+/// mapper and validates those embedded lines with the live ABI aliases,
+/// overrides, and workspace pins instead of checking the pre-courier copy.
+pub const EMIT_EPOCH: u32 = 33;
 
 fn parse_stored_glibc(value: Option<&str>) -> Option<Option<(u32, u32)>> {
     match value {
