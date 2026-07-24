@@ -38,7 +38,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, Value};
+use toml_edit::{Array, DocumentMut, InlineTable, Item, Value};
 
 use crate::config::RetreadConfig;
 
@@ -188,59 +188,36 @@ pub(crate) fn pack_manifest_display_path(workspace_dir: Option<&Path>, pack_pixi
     format!("pypi-packs/{pack}/{filename}")
 }
 
-fn ensure_toml_table<'a>(parent: &'a mut Table, key: &str) -> &'a mut Table {
-    if !parent.contains_key(key) {
-        let mut table = Table::new();
-        table.set_implicit(true);
-        parent.insert(key, Item::Table(table));
-    }
-    parent
-        .get_mut(key)
-        .and_then(Item::as_table_mut)
-        .expect("the inserted TOML item is a table")
-}
-
-/// Pure TOML counterpart to [`write_override`].
+/// Render one table-body assignment for a manual `retread-overrides` edit.
 ///
 /// The package/spec pair has exactly the shape consumed by the pack's manual
-/// `retread-overrides` table, but this helper only renders an in-memory
-/// document. It never writes the pack manifest or the auto-overrides ledger.
+/// `retread-overrides` table. Omitting the table header is deliberate: the
+/// diagnostic tells the user to merge this assignment into the existing table,
+/// so it cannot create a duplicate-table TOML error.
 pub(crate) fn render_override_toml(package: &str, spec: &str) -> String {
     let mut document = DocumentMut::new();
-    let package_table = ensure_toml_table(document.as_table_mut(), "package");
-    let build_table = ensure_toml_table(package_table, "build");
-    let config_table = ensure_toml_table(build_table, "config");
-    let overrides_table = ensure_toml_table(config_table, "retread-overrides");
-    overrides_table[package] = Item::Value(Value::from(spec));
+    document[package] = Item::Value(Value::from(spec));
     document.to_string()
 }
 
-/// Render a concrete version constraint for a transitive root in the pack's
-/// `retread-wheels` table.
+/// Render one table-body assignment for a transitive root pin.
 ///
 /// Both the package key and version value are formatted by `toml_edit`, so
-/// package names that are not valid bare TOML keys are safely quoted. This is
-/// a pure diagnostic helper and never writes the pack manifest.
+/// package names that are not valid bare TOML keys are safely quoted. The
+/// existing `retread-wheels` table is intentionally not re-declared.
 pub(crate) fn render_root_pin_toml(package: &str, spec: &str) -> String {
     let mut document = DocumentMut::new();
-    let package_table = ensure_toml_table(document.as_table_mut(), "package");
-    let build_table = ensure_toml_table(package_table, "build");
-    let config_table = ensure_toml_table(build_table, "config");
-    let wheels_table = ensure_toml_table(config_table, "retread-wheels");
     let mut pin = InlineTable::new();
     pin.insert("version", Value::from(spec));
-    wheels_table.insert(package, Item::Value(Value::InlineTable(pin)));
+    document[package] = Item::Value(Value::InlineTable(pin));
     document.to_string()
 }
 
 fn render_drop_deps_toml(package: &str) -> String {
     let mut document = DocumentMut::new();
-    let package_table = ensure_toml_table(document.as_table_mut(), "package");
-    let build_table = ensure_toml_table(package_table, "build");
-    let config_table = ensure_toml_table(build_table, "config");
     let mut drop_deps = Array::new();
     drop_deps.push(package);
-    config_table["retread-drop-deps"] = Item::Value(Value::Array(drop_deps));
+    document["retread-drop-deps"] = Item::Value(Value::Array(drop_deps));
     document.to_string()
 }
 
@@ -258,7 +235,11 @@ pub(crate) fn render_drop_deps_with_override_menu(
     package: &str,
     alternatives: &[(String, String)],
 ) -> String {
-    let mut rendered = render_drop_deps_toml(package);
+    let mut rendered = format!(
+        "# Edit the existing [package.build.config] table.\n\
+         # Merge `{package}` into any existing retread-drop-deps array:\n"
+    );
+    rendered.push_str(&render_drop_deps_toml(package));
     for (index, (spec, source)) in alternatives.iter().enumerate() {
         rendered.push('\n');
         rendered.push_str(&format!(
@@ -270,6 +251,10 @@ pub(crate) fn render_drop_deps_with_override_menu(
             rendered.push_str(source_line);
             rendered.push('\n');
         }
+        rendered.push_str(
+            "# Under [package.build.config.retread-overrides], add or update \
+             (create that table once if absent):\n",
+        );
         append_commented(&mut rendered, &render_override_toml(package, spec));
     }
     rendered
@@ -699,7 +684,7 @@ mod tests {
     }
 
     #[test]
-    fn diagnostic_override_menu_uses_parseable_pack_override_entries() {
+    fn diagnostic_override_menu_merges_into_existing_config_table() {
         let alternatives = vec![
             (
                 "==1.26.4".to_string(),
@@ -711,19 +696,56 @@ mod tests {
             ),
         ];
         let menu = render_drop_deps_with_override_menu("numpy", &alternatives);
-        let parsed: toml::Value = toml::from_str(&menu).unwrap();
+        assert!(
+            !menu.contains("\n[package.build.config"),
+            "merge-oriented edit re-declared a table:\n{menu}"
+        );
+
+        let manifest = r#"
+[package]
+name = "robotics-pack"
+version = "1.0.0"
+
+[package.build]
+backend = { name = "pixi-build-retread", version = "*" }
+
+[package.build.config]
+retread-auto-bundle = true
+
+[package.build.config.retread-wheels]
+robotics = { version = "==1.0.0", bundle = "robotics-output" }
+
+[package.build.config.retread-overrides]
+packaging = ">=24"
+"#;
+        let merged = manifest.replacen(
+            "[package.build.config]\n",
+            &format!("[package.build.config]\n{menu}"),
+            1,
+        );
+        let parsed: toml::Value =
+            toml::from_str(&merged).expect("merge must not duplicate existing tables");
         assert_eq!(
             parsed["package"]["build"]["config"]["retread-drop-deps"][0].as_str(),
             Some("numpy")
+        );
+        assert_eq!(
+            parsed["package"]["build"]["config"]["retread-auto-bundle"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            parsed["package"]["build"]["config"]["retread-wheels"]["robotics"]["bundle"].as_str(),
+            Some("robotics-output")
+        );
+        assert_eq!(
+            parsed["package"]["build"]["config"]["retread-overrides"]["packaging"].as_str(),
+            Some(">=24")
         );
 
         for (spec, _) in alternatives {
             let rendered = render_override_toml("numpy", &spec);
             let parsed: toml::Value = toml::from_str(&rendered).unwrap();
-            assert_eq!(
-                parsed["package"]["build"]["config"]["retread-overrides"]["numpy"].as_str(),
-                Some(spec.as_str())
-            );
+            assert_eq!(parsed["numpy"].as_str(), Some(spec.as_str()));
             let commented_entry = format!("# numpy = \"{spec}\"");
             assert!(
                 menu.lines().any(|line| line == commented_entry),
@@ -737,10 +759,8 @@ mod tests {
         let rendered = render_root_pin_toml("pin.root", "==2.6.20");
         let parsed: toml::Value = toml::from_str(&rendered).unwrap();
 
-        assert_eq!(
-            parsed["package"]["build"]["config"]["retread-wheels"]["pin.root"]["version"].as_str(),
-            Some("==2.6.20")
-        );
+        assert_eq!(parsed["pin.root"]["version"].as_str(), Some("==2.6.20"));
+        assert!(!rendered.contains("[package.build.config"));
         assert!(
             rendered.contains("\"pin.root\" = { version = \"==2.6.20\" }"),
             "root package key was not safely quoted in:\n{rendered}"

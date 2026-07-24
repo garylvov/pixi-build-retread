@@ -809,7 +809,10 @@ fn transitive_root_pin_candidate(
 fn render_root_pin_suggestion(candidate: &RootPinCandidate, leaf: &PypiKey) -> String {
     let mut rendered = format!(
         "# Constrain the transitive root that introduced the `{leaf}` conflict.\n\
-         # `{}` Requires-Dist `{}`.\n",
+         # `{}` Requires-Dist `{}`.\n\
+         # Edit the existing [package.build.config.retread-wheels] table.\n\
+         # Add or update this entry, then confirm the version exists on the configured index\n\
+         # and resolves the conflict:\n",
         candidate.introduced_by, candidate.raw_requirement
     );
     rendered.push_str(&crate::pack_overrides::render_root_pin_toml(
@@ -4793,11 +4796,8 @@ mod tests {
         );
 
         let parsed: toml::Value =
-            toml::from_str(&suggestion.toml).expect("suggested content must be valid TOML");
-        assert_eq!(
-            parsed["package"]["build"]["config"]["retread-drop-deps"][0].as_str(),
-            Some("numpy")
-        );
+            toml::from_str(&suggestion.toml).expect("suggested table body must be valid TOML");
+        assert_eq!(parsed["retread-drop-deps"][0].as_str(), Some("numpy"));
     }
 
     fn transitive_numpy_conflict_fixture() -> (
@@ -4905,8 +4905,9 @@ mod tests {
             "wheel `dex-retargeting==1.0.0` Requires-Dist `numpy<2`",
             "wheel `cmeel-boost==1.89.0` Requires-Dist `numpy>=2`",
             "Suggested fix in pypi-packs/robotics-pack/pixi.toml:",
-            "[package.build.config.retread-wheels]",
+            "Edit the existing [package.build.config.retread-wheels] table.",
             "pin = { version = \"==2.6.20\" }",
+            "confirm the version exists on the configured index",
         ] {
             assert!(
                 message.contains(expected),
@@ -4917,12 +4918,9 @@ mod tests {
         assert!(!suggestion.toml.contains("retread-overrides"));
         assert!(!suggestion.toml.contains("[\"numpy\"]"));
 
-        let parsed: toml::Value =
-            toml::from_str(&suggestion.toml).expect("root suggestion must be valid TOML");
-        assert_eq!(
-            parsed["package"]["build"]["config"]["retread-wheels"]["pin"]["version"].as_str(),
-            Some("==2.6.20")
-        );
+        let parsed: toml::Value = toml::from_str(&suggestion.toml)
+            .expect("root table-body suggestion must be valid TOML");
+        assert_eq!(parsed["pin"]["version"].as_str(), Some("==2.6.20"));
     }
 
     #[test]
@@ -4995,8 +4993,9 @@ mod tests {
         );
         assert!(suggestion.toml.contains("retread-overrides"));
         assert!(!suggestion.toml.contains("retread-wheels"));
-        toml::from_str::<toml::Value>(&suggestion.toml)
-            .expect("fallback suggestion must remain valid TOML");
+        let parsed = toml::from_str::<toml::Value>(&suggestion.toml)
+            .expect("fallback table-body suggestion must remain valid TOML");
+        assert_eq!(parsed["retread-drop-deps"][0].as_str(), Some("numpy"));
     }
 
     #[test]

@@ -134,7 +134,7 @@ pub struct Conflict {
     suggestion: Option<Box<ConflictSuggestion>>,
 }
 
-/// A paste-ready manifest edit attached to one fail-closed conflict.
+/// A merge-oriented manifest edit attached to one fail-closed conflict.
 ///
 /// The suggestion is diagnostic only: constructing or rendering it never
 /// mutates the named pack manifest.
