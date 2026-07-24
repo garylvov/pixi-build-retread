@@ -3291,6 +3291,29 @@ fn bare_major_detection_fails_closed_for_exclusion_emptied_ranges() {
 }
 
 #[test]
+fn bare_major_detection_fails_closed_when_prefix_ceiling_overflows() {
+    let spec = "!=3.18446744073709551615.*";
+    assert!(
+        is_bare_major_spec(spec),
+        "an unrepresentable prefix ceiling must fail closed: `{spec}`"
+    );
+
+    let requirement = format!("numpy{spec}");
+    let violations = check_output_abi_invariants(
+        &[],
+        &[("consumer-wheel".to_string(), requirement.clone())],
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        &AbiAliasGraph::new(),
+    );
+    assert_eq!(violations.len(), 1, "{requirement}: {violations:?}");
+    assert!(
+        violations[0].contains("unsatisfiable under PEP 440"),
+        "{requirement}: {violations:?}"
+    );
+}
+
+#[test]
 fn bare_major_effective_ranges_model_negative_compatible_exclusion() {
     use rattler_conda_types::version_spec::{LogicalOperator, StrictRangeOperator};
     use rattler_conda_types::{StrictVersion, Version};

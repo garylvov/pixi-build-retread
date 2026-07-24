@@ -352,6 +352,34 @@ fn remove_redundant_specifier_clauses(specifiers: VersionSpecifiers) -> VersionS
 /// True when the full PEP 440 intersection is empty, including arbitrary
 /// equality contradictions that ordered-version equality cannot distinguish.
 pub(crate) fn specifiers_unsatisfiable(specifiers: &VersionSpecifiers) -> bool {
+    if specifiers.iter().any(|specifier| {
+        let version = specifier.version();
+        match *specifier.operator() {
+            Operator::TildeEqual => {
+                let release = version.release();
+                release.len() >= 2 && release[release.len() - 2] == u64::MAX
+            }
+            Operator::GreaterThan => match version.dev() {
+                Some(dev) => dev == u64::MAX,
+                None => version.post() == Some(u64::MAX),
+            },
+            Operator::EqualStar | Operator::NotEqualStar => {
+                version.post() == Some(u64::MAX)
+                    || version.pre().is_some_and(|pre| pre.number == u64::MAX)
+                    || version
+                        .release()
+                        .last()
+                        .is_some_and(|segment| *segment == u64::MAX)
+            }
+            _ => false,
+        }
+    }) {
+        // uv's range conversion constructs exclusive ceilings with unchecked
+        // `u64 + 1`. A ceiling that cannot be represented cannot prove a
+        // nonempty ABI constraint, so reject it before either conversion.
+        return true;
+    }
+
     let full = release_specifiers_to_ranges(VersionSpecifiers::empty());
     let range_is_empty = full.intersection(&specifiers.clone().into()).is_empty();
     let arbitrary_exact_conflict = specifiers.iter().any(|specifier| {

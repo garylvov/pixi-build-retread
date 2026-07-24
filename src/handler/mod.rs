@@ -10995,6 +10995,24 @@ fn convex_hull_effective_range_envelopes(
     merged
 }
 
+fn checked_bump_last(
+    version: &rattler_conda_types::Version,
+) -> Option<rattler_conda_types::Version> {
+    // Consume this iterator forward because rattler computes each segment's
+    // component offset as the iterator advances.
+    let last_segment = version.segments().fold(None, |_, segment| Some(segment))?;
+    let last_numeral = last_segment
+        .components()
+        .filter_map(rattler_conda_types::Component::as_number)
+        .next_back()?;
+    if last_numeral == u64::MAX {
+        return None;
+    }
+    version
+        .bump(rattler_conda_types::VersionBumpType::Last)
+        .ok()
+}
+
 fn effective_version_ranges(spec: &VersionSpec) -> Vec<EffectiveVersionRange> {
     use rattler_conda_types::version_spec::{
         EqualityOperator, LogicalOperator, RangeOperator, StrictRangeOperator,
@@ -11077,10 +11095,7 @@ fn effective_version_ranges(spec: &VersionSpec) -> Vec<EffectiveVersionRange> {
         }
         VersionSpec::StrictRange(StrictRangeOperator::StartsWith, version) => {
             let lower = lower(version.0.clone(), false);
-            let upper = version
-                .0
-                .bump(rattler_conda_types::VersionBumpType::Last)
-                .ok()
+            let upper = checked_bump_last(&version.0)
                 .map(|version| upper(version, true))
                 .unwrap_or_default();
             let mut range = lower.intersect(upper);
@@ -11094,7 +11109,7 @@ fn effective_version_ranges(spec: &VersionSpec) -> Vec<EffectiveVersionRange> {
             // Keep the real negative predicate as well: matching prereleases
             // can sort below P while still starting with P.
             let mut ranges = vec![upper_with_anchor(version.0.clone(), true, false)];
-            if let Ok(ceiling) = version.0.bump(rattler_conda_types::VersionBumpType::Last) {
+            if let Some(ceiling) = checked_bump_last(&version.0) {
                 ranges.push(lower_with_anchor(ceiling, false, false));
             }
             for range in &mut ranges {
@@ -11109,7 +11124,7 @@ fn effective_version_ranges(spec: &VersionSpec) -> Vec<EffectiveVersionRange> {
             let upper = version
                 .0
                 .pop_segments(1)
-                .and_then(|prefix| prefix.bump(rattler_conda_types::VersionBumpType::Last).ok())
+                .and_then(|prefix| checked_bump_last(&prefix))
                 .map(|version| upper(version, true))
                 .unwrap_or_default();
             let mut range = lower.intersect(upper);
@@ -11127,7 +11142,7 @@ fn effective_version_ranges(spec: &VersionSpec) -> Vec<EffectiveVersionRange> {
             if let Some(ceiling) = version
                 .0
                 .pop_segments(1)
-                .and_then(|prefix| prefix.bump(rattler_conda_types::VersionBumpType::Last).ok())
+                .and_then(|prefix| checked_bump_last(&prefix))
             {
                 ranges.push(lower_with_anchor(ceiling, false, false));
             }
