@@ -11686,6 +11686,12 @@ fn produce_output_with_conflicts(
                     conflict,
                 });
             }
+            RelaxDecision::SearchExhausted(exhausted) => {
+                return Err(anyhow::Error::new(exhausted.with_scope(format!(
+                    "while emitting conda dependency `{conda_name}` for bundle `{}`",
+                    bundle.conda_name
+                ))));
+            }
         }
     }
 

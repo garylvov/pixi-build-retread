@@ -5,8 +5,9 @@
 //! clause-level relaxations permitted by the caller's policy. It never logs,
 //! mutates caller-owned constraints, or drops a whole constraint edge.
 
-use std::cmp::Reverse;
+use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
+use std::fmt;
 use std::ops::Bound;
 use std::str::FromStr;
 
@@ -22,6 +23,7 @@ use crate::constraint::{
 use crate::relax::PypiKey;
 
 const MAX_SEARCH_STATES: usize = 65_536;
+const ADVISORY_FLOOR_DROP_DISTANCE: u32 = 4;
 
 /// Additional structured identity needed for safety checks.
 ///
@@ -97,6 +99,46 @@ pub enum Decision {
         decisions: Vec<RelaxationDecision>,
     },
     Conflict(Conflict),
+    SearchExhausted(SearchExhausted),
+}
+
+/// The bounded candidate search stopped with unexplored states remaining.
+///
+/// This is deliberately distinct from [`Decision::Conflict`]: the original
+/// strict conflict remains actionable, but exhaustion does not prove that no
+/// safe relaxation exists.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SearchExhausted {
+    pub original_conflict: Conflict,
+    pub searched_states: usize,
+    pub limit: usize,
+    pub pending_states: usize,
+}
+
+impl SearchExhausted {
+    pub(crate) fn with_scope(mut self, scope: impl Into<String>) -> Self {
+        self.original_conflict = self.original_conflict.with_scope(scope);
+        self
+    }
+}
+
+impl fmt::Display for SearchExhausted {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "auto-relax search exhausted after {} candidate states (limit {}, {} pending); \
+             this does not prove that no safe relaxation exists: {}",
+            self.searched_states, self.limit, self.pending_states, self.original_conflict
+        )
+    }
+}
+
+impl std::error::Error for SearchExhausted {}
+
+#[derive(Clone, Debug)]
+enum CandidateEvaluation {
+    Finalized(FinalizeSuccess),
+    Conflict,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -132,6 +174,30 @@ struct CandidateScore {
     stable_actions: Vec<StableActionKey>,
 }
 
+/// Monotonic explicit-loss prefix used as an admissible frontier bound.
+///
+/// Implicit advisory drops are deliberately excluded: descendants can remove
+/// the need for those drops, so charging them in the frontier order would not
+/// be monotonic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct CandidateLowerBound {
+    whole_edges_lost: u32,
+    constraints_changed: u32,
+    caps_or_exclusions_removed: u32,
+    widening_distance: u32,
+}
+
+impl CandidateScore {
+    const fn numeric(&self) -> CandidateLowerBound {
+        CandidateLowerBound {
+            whole_edges_lost: self.whole_edges_lost,
+            constraints_changed: self.constraints_changed,
+            caps_or_exclusions_removed: self.caps_or_exclusions_removed,
+            widening_distance: self.widening_distance,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct StableActionKey {
     origin_id: ConstraintOriginId,
@@ -140,10 +206,39 @@ struct StableActionKey {
     replacement: Vec<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug)]
 struct QueueEntry {
+    lower_bound: CandidateLowerBound,
     score: CandidateScore,
     state: Vec<u8>,
+    evaluation: CandidateEvaluation,
+}
+
+impl PartialEq for QueueEntry {
+    fn eq(&self, other: &Self) -> bool {
+        (&self.lower_bound, &self.state) == (&other.lower_bound, &other.state)
+    }
+}
+
+impl Eq for QueueEntry {}
+
+impl PartialOrd for QueueEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for QueueEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        (&self.lower_bound, &self.state).cmp(&(&other.lower_bound, &other.state))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct FinalizedCandidate {
+    score: CandidateScore,
+    state: Vec<u8>,
+    success: FinalizeSuccess,
 }
 
 /// Strictly finalize the input, then select the least-lossy safe relaxation
@@ -157,6 +252,16 @@ pub fn decide(
     constraints: &[Constraint],
     policy: RelaxPolicy,
     safety: &SafetyContext<'_>,
+) -> Decision {
+    decide_with_search_limit(package, constraints, policy, safety, MAX_SEARCH_STATES)
+}
+
+fn decide_with_search_limit(
+    package: &PypiKey,
+    constraints: &[Constraint],
+    policy: RelaxPolicy,
+    safety: &SafetyContext<'_>,
+    search_limit: usize,
 ) -> Decision {
     let canonical = canonical_constraints(constraints);
     let is_anchor = safety.protects(package);
@@ -202,6 +307,7 @@ pub fn decide(
     let mut heap = BinaryHeap::new();
     let mut seen = BTreeSet::from([initial.clone()]);
     enqueue_core_mutations(
+        package,
         &canonical,
         &atoms,
         &initial,
@@ -211,54 +317,83 @@ pub fn decide(
     );
 
     let mut searched = 0;
-    while let Some(Reverse(entry)) = heap.pop() {
-        searched += 1;
-        if searched > MAX_SEARCH_STATES {
-            break;
+    let mut best = None;
+    loop {
+        if let Some(finalized) = best.as_ref()
+            && frontier_cannot_beat(finalized, &heap)
+        {
+            return finalized_candidate_decision(&canonical, &atoms, finalized.clone());
         }
-        let candidate = apply_state(&canonical, &atoms, &entry.state);
-        match finalize_quiet_detailed(package, &candidate) {
-            Ok(FinalizeSuccess::Unchanged(specifiers)) => {
-                if is_anchor
-                    && !anchor_candidate_stays_within_original_major(
+        if heap.is_empty() {
+            return match best {
+                Some(finalized) => finalized_candidate_decision(&canonical, &atoms, finalized),
+                None => Decision::Conflict(strict),
+            };
+        }
+        if searched == search_limit {
+            return Decision::SearchExhausted(SearchExhausted {
+                original_conflict: strict,
+                searched_states: searched,
+                limit: search_limit,
+                pending_states: heap.len(),
+            });
+        }
+
+        let entry = match heap.pop() {
+            Some(Reverse(entry)) => entry,
+            None => {
+                return match best {
+                    Some(finalized) => finalized_candidate_decision(&canonical, &atoms, finalized),
+                    None => Decision::Conflict(strict),
+                };
+            }
+        };
+        searched += 1;
+        match entry.evaluation {
+            CandidateEvaluation::Finalized(success) => {
+                let safe = match &success {
+                    FinalizeSuccess::Unchanged(specifiers) => {
+                        !is_anchor
+                            || anchor_candidate_stays_within_original_major(
+                                &canonical,
+                                &atoms,
+                                &entry.state,
+                                specifiers,
+                            )
+                    }
+                    FinalizeSuccess::AdvisoryFloorSoftened { .. } => !is_anchor,
+                };
+                let softened = matches!(&success, FinalizeSuccess::AdvisoryFloorSoftened { .. });
+
+                // A softened success may hide a lower-loss descendant whose
+                // additional explicit widening makes the advisory floor
+                // satisfiable. Unsafe anchor successes likewise need their
+                // remaining successors explored before failing closed.
+                if softened || !safe {
+                    enqueue_all_mutations(
+                        package,
                         &canonical,
                         &atoms,
                         &entry.state,
-                        &specifiers,
-                    )
-                {
-                    enqueue_all_mutations(&canonical, &atoms, &entry.state, &mut seen, &mut heap);
-                    continue;
+                        &mut seen,
+                        &mut heap,
+                    );
                 }
-                let decisions = selected_decisions(&canonical, &candidate, &atoms, &entry.state);
-                return Decision::Relaxed {
-                    specifiers,
-                    decisions,
-                };
-            }
-            Ok(FinalizeSuccess::AdvisoryFloorSoftened { specifiers, .. }) => {
-                if is_anchor {
-                    enqueue_all_mutations(&canonical, &atoms, &entry.state, &mut seen, &mut heap);
-                    continue;
+                if safe {
+                    retain_better_candidate(
+                        &mut best,
+                        FinalizedCandidate {
+                            score: entry.score,
+                            state: entry.state,
+                            success,
+                        },
+                    );
                 }
-                let mut decisions =
-                    selected_decisions(&canonical, &candidate, &atoms, &entry.state);
-                decisions.extend(advisory_floor_diagnostics(&candidate, &specifiers));
-                decisions.sort_by(|left, right| {
-                    (&left.origin_id, &left.original_clause, left.kind).cmp(&(
-                        &right.origin_id,
-                        &right.original_clause,
-                        right.kind,
-                    ))
-                });
-                return Decision::Relaxed {
-                    specifiers,
-                    decisions,
-                };
             }
-            Err(_) => {
+            CandidateEvaluation::Conflict => {
                 let core = minimal_unsatisfiable_core(package, &canonical, &atoms, &entry.state);
                 enqueue_core_mutations(
+                    package,
                     &canonical,
                     &atoms,
                     &entry.state,
@@ -269,8 +404,55 @@ pub fn decide(
             }
         }
     }
+}
 
-    Decision::Conflict(strict)
+fn frontier_cannot_beat(best: &FinalizedCandidate, heap: &BinaryHeap<Reverse<QueueEntry>>) -> bool {
+    match heap.peek() {
+        None => true,
+        // The explicit numeric score is an admissible, monotonic lower
+        // bound for every descendant. Equal numeric scores must still be
+        // visited so provenance and stable-action tie-breakers remain exact.
+        Some(Reverse(next)) => next.lower_bound > best.score.numeric(),
+    }
+}
+
+fn retain_better_candidate(best: &mut Option<FinalizedCandidate>, candidate: FinalizedCandidate) {
+    let replaces = match best {
+        Some(current) => (&candidate.score, &candidate.state) < (&current.score, &current.state),
+        None => true,
+    };
+    if replaces {
+        *best = Some(candidate);
+    }
+}
+
+fn finalized_candidate_decision(
+    original: &[Constraint],
+    atoms: &[Atom],
+    finalized: FinalizedCandidate,
+) -> Decision {
+    let relaxed = apply_state(original, atoms, &finalized.state);
+    let mut decisions = selected_decisions(original, &relaxed, atoms, &finalized.state);
+    match finalized.success {
+        FinalizeSuccess::Unchanged(specifiers) => Decision::Relaxed {
+            specifiers,
+            decisions,
+        },
+        FinalizeSuccess::AdvisoryFloorSoftened { specifiers, .. } => {
+            decisions.extend(advisory_floor_diagnostics(&relaxed, &specifiers));
+            decisions.sort_by(|left, right| {
+                (&left.origin_id, &left.original_clause, left.kind).cmp(&(
+                    &right.origin_id,
+                    &right.original_clause,
+                    right.kind,
+                ))
+            });
+            Decision::Relaxed {
+                specifiers,
+                decisions,
+            }
+        }
+    }
 }
 
 /// ABI anchors may relax within a major, but a selected candidate must neither
@@ -357,14 +539,7 @@ fn advisory_floor_diagnostics(
     softened: &VersionSpecifiers,
 ) -> Vec<RelaxationDecision> {
     let relaxed = render_specifiers(softened);
-    let mut diagnostics = constraints
-        .iter()
-        .filter(|constraint| {
-            matches!(
-                constraint.provenance,
-                Provenance::SourceBuiltRelaxed | Provenance::DepsFromRelaxed
-            )
-        })
+    let mut diagnostics = softened_advisory_constraints(constraints)
         .flat_map(|constraint| {
             let relaxed = relaxed.clone();
             constraint
@@ -387,6 +562,16 @@ fn advisory_floor_diagnostics(
         (&left.origin_id, &left.original_clause).cmp(&(&right.origin_id, &right.original_clause))
     });
     diagnostics
+}
+
+fn softened_advisory_constraints(constraints: &[Constraint]) -> impl Iterator<Item = &Constraint> {
+    let has_override = constraints
+        .iter()
+        .any(|constraint| matches!(constraint.provenance, Provenance::UvOverride));
+    constraints.iter().filter(move |constraint| {
+        matches!(constraint.provenance, Provenance::DepsFromRelaxed)
+            || (!has_override && matches!(constraint.provenance, Provenance::SourceBuiltRelaxed))
+    })
 }
 
 fn render_specifiers(specifiers: &VersionSpecifiers) -> String {
@@ -634,10 +819,17 @@ fn state_loses_whole_edge(constraints: &[Constraint], atoms: &[Atom], state: &[u
         })
 }
 
-fn score_state(constraints: &[Constraint], atoms: &[Atom], state: &[u8]) -> CandidateScore {
+fn score_state(
+    constraints: &[Constraint],
+    candidate: &[Constraint],
+    atoms: &[Atom],
+    state: &[u8],
+    evaluation: &CandidateEvaluation,
+) -> (CandidateLowerBound, CandidateScore) {
     let mut origins = BTreeSet::new();
     let mut provenance = Vec::new();
     let mut stable_actions = Vec::new();
+    let mut whole_edges_lost = 0;
     let mut caps_or_exclusions_removed = 0;
     let mut widening_distance = 0;
     for (atom_index, &choice_index) in state.iter().enumerate() {
@@ -659,16 +851,59 @@ fn score_state(constraints: &[Constraint], atoms: &[Atom], state: &[u8]) -> Cand
             replacement: choice.replacement.iter().map(ToString::to_string).collect(),
         });
     }
-    provenance.sort_unstable();
-    stable_actions.sort();
-    CandidateScore {
+
+    let lower_bound = CandidateLowerBound {
         whole_edges_lost: 0,
         constraints_changed: origins.len() as u32,
         caps_or_exclusions_removed,
         widening_distance,
-        provenance_rank: provenance,
-        stable_actions,
+    };
+
+    if matches!(
+        evaluation,
+        CandidateEvaluation::Finalized(FinalizeSuccess::AdvisoryFloorSoftened { .. })
+    ) {
+        for constraint in softened_advisory_constraints(candidate) {
+            let dropped = constraint
+                .specifiers
+                .iter()
+                .filter(|clause| advisory_operator_forces_floor(*clause.operator()))
+                .collect::<Vec<_>>();
+            if dropped.is_empty() {
+                continue;
+            }
+            if dropped.len() == constraint.specifiers.len() {
+                whole_edges_lost += 1;
+            }
+            origins.insert(constraint.origin_id.clone());
+            for clause in dropped {
+                provenance.push(provenance_rank(&constraint.provenance));
+                // Dropping a lower bound admits an unbounded range beneath it,
+                // which is strictly broader than any bounded exact-pin tier.
+                widening_distance += ADVISORY_FLOOR_DROP_DISTANCE;
+                stable_actions.push(StableActionKey {
+                    origin_id: constraint.origin_id.clone(),
+                    clause: clause.to_string(),
+                    kind: RelaxationKind::AdvisoryFloorDropped,
+                    replacement: Vec::new(),
+                });
+            }
+        }
     }
+
+    provenance.sort_unstable();
+    stable_actions.sort();
+    (
+        lower_bound,
+        CandidateScore {
+            whole_edges_lost,
+            constraints_changed: origins.len() as u32,
+            caps_or_exclusions_removed,
+            widening_distance,
+            provenance_rank: provenance,
+            stable_actions,
+        },
+    )
 }
 
 fn minimal_unsatisfiable_core(
@@ -723,6 +958,7 @@ fn apply_active_state(
 }
 
 fn enqueue_core_mutations(
+    package: &PypiKey,
     constraints: &[Constraint],
     atoms: &[Atom],
     state: &[u8],
@@ -741,14 +977,24 @@ fn enqueue_core_mutations(
         {
             continue;
         }
+        let relaxed = apply_state(constraints, atoms, &candidate);
+        let evaluation = match finalize_quiet_detailed(package, &relaxed) {
+            Ok(success) => CandidateEvaluation::Finalized(success),
+            Err(_) => CandidateEvaluation::Conflict,
+        };
+        let (lower_bound, score) =
+            score_state(constraints, &relaxed, atoms, &candidate, &evaluation);
         heap.push(Reverse(QueueEntry {
-            score: score_state(constraints, atoms, &candidate),
+            lower_bound,
+            score,
             state: candidate,
+            evaluation,
         }));
     }
 }
 
 fn enqueue_all_mutations(
+    package: &PypiKey,
     constraints: &[Constraint],
     atoms: &[Atom],
     state: &[u8],
@@ -756,7 +1002,7 @@ fn enqueue_all_mutations(
     heap: &mut BinaryHeap<Reverse<QueueEntry>>,
 ) {
     let all_atoms = (0..atoms.len()).collect();
-    enqueue_core_mutations(constraints, atoms, state, &all_atoms, seen, heap);
+    enqueue_core_mutations(package, constraints, atoms, state, &all_atoms, seen, heap);
 }
 
 fn selected_decisions(
@@ -1316,6 +1562,120 @@ mod tests {
     }
 
     #[test]
+    fn implicit_advisory_floor_loss_is_scored_before_candidate_selection() {
+        let constraints = vec![
+            constraint(
+                "exact-pin",
+                "==1.26.4",
+                Provenance::IndexWheelMetadata,
+                "wheel exact pin",
+            ),
+            constraint(
+                "stale-cap",
+                ">=1,<1.26.4",
+                Provenance::IndexWheelMetadata,
+                "wheel stale cap",
+            ),
+            constraint(
+                "advisory-floor",
+                ">=1.26.4",
+                Provenance::SourceBuiltRelaxed,
+                "source-built floor",
+            ),
+        ];
+
+        let forward = decide(
+            &package("demo"),
+            &constraints,
+            RelaxPolicy::PatchThenMinorThenMajorThenLastResort,
+            &SafetyContext::default(),
+        );
+        let mut reversed = constraints;
+        reversed.reverse();
+        let backward = decide(
+            &package("demo"),
+            &reversed,
+            RelaxPolicy::PatchThenMinorThenMajorThenLastResort,
+            &SafetyContext::default(),
+        );
+        assert_eq!(forward, backward);
+        let Decision::Relaxed {
+            specifiers,
+            decisions,
+        } = forward
+        else {
+            panic!("the lower-loss cap-strip candidate must resolve the conflict")
+        };
+
+        assert!(specifiers.contains(&Version::from_str("1.26.4").unwrap()));
+        assert_eq!(decisions.len(), 1, "{decisions:?}");
+        assert_eq!(decisions[0].kind, RelaxationKind::UpperCapStripped);
+        assert_eq!(decisions[0].original_clause, "<1.26.4");
+        assert!(
+            decisions
+                .iter()
+                .all(|decision| decision.kind != RelaxationKind::AdvisoryFloorDropped),
+            "the lower-loss cap strip must beat exact widening plus an implicit floor drop"
+        );
+    }
+
+    #[test]
+    fn softened_success_expands_to_a_lower_loss_unsoftened_descendant() {
+        let constraints = vec![
+            constraint(
+                "mutable-pin",
+                "==1.2.3",
+                Provenance::IndexWheelMetadata,
+                "wheel exact pin",
+            ),
+            constraint(
+                "authoritative-range",
+                ">=1.5,<3",
+                Provenance::UvConstraint,
+                "uv range",
+            ),
+            constraint(
+                "advisory-range",
+                ">=2,<3",
+                Provenance::SourceBuiltRelaxed,
+                "source-built range",
+            ),
+        ];
+
+        let limited = decide_with_search_limit(
+            &package("demo"),
+            &constraints,
+            RelaxPolicy::PatchThenMinorThenMajorThenLastResort,
+            &SafetyContext::default(),
+            2,
+        );
+        let Decision::SearchExhausted(exhausted) = limited else {
+            panic!("a pending Major successor prevents accepting the provisional Minor result")
+        };
+        assert_eq!(exhausted.searched_states, 2);
+        assert!(exhausted.pending_states > 0);
+
+        let (specifiers, decisions) = relaxed(
+            "demo",
+            &constraints,
+            RelaxPolicy::PatchThenMinorThenMajorThenLastResort,
+        );
+
+        assert!(specifiers.contains(&Version::from_str("2").unwrap()));
+        assert!(!specifiers.contains(&Version::from_str("3").unwrap()));
+        assert_eq!(decisions.len(), 1, "{decisions:?}");
+        assert_eq!(decisions[0].kind, RelaxationKind::ExactPinWidened);
+        assert_eq!(decisions[0].tier, RelaxPolicy::Major);
+        assert_eq!(decisions[0].relaxed_clause.as_deref(), Some(">=1"));
+        assert!(
+            decisions
+                .iter()
+                .all(|decision| decision.kind != RelaxationKind::AdvisoryFloorDropped),
+            "the Major successor must beat its softened Minor parent"
+        );
+    }
+
+    #[test]
     fn equal_authority_drop_only_conflict_fails_closed_in_every_order() {
         let constraints = vec![
             constraint("old-cap", "<4", Provenance::IndexWheelMetadata, "wheel z"),
@@ -1347,6 +1707,79 @@ mod tests {
         );
         assert_eq!(forward, Decision::Conflict(strict));
         assert_eq!(forward, backward);
+    }
+
+    #[test]
+    fn search_exhaustion_is_distinct_from_a_drained_conflict() {
+        let constraints = (0..20)
+            .map(|minor| {
+                constraint(
+                    &format!("pin-{minor}"),
+                    &format!("==1.{minor}.0"),
+                    Provenance::IndexWheelMetadata,
+                    &format!("wheel pin {minor}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let canonical = canonical_constraints(&constraints);
+        let atoms = build_atoms(
+            &canonical,
+            RelaxPolicy::PatchThenMinorThenMajorThenLastResort,
+        );
+        let all_minor = atoms
+            .iter()
+            .map(|atom| {
+                atom.choices
+                    .iter()
+                    .position(|choice| choice.tier == RelaxPolicy::Minor)
+                    .map(|index| (index + 1) as u8)
+                    .expect("every exact pin has a minor candidate")
+            })
+            .collect::<Vec<_>>();
+        let safe_candidate = apply_state(&canonical, &atoms, &all_minor);
+        assert!(
+            finalize_quiet(&package("many-pins"), &safe_candidate).is_ok(),
+            "the high-cardinality fixture has a safe solution"
+        );
+
+        let decision = decide_with_search_limit(
+            &package("many-pins"),
+            &constraints,
+            RelaxPolicy::PatchThenMinorThenMajorThenLastResort,
+            &SafetyContext::default(),
+            8,
+        );
+        let Decision::SearchExhausted(exhausted) = decision else {
+            panic!("the bounded high-cardinality search must report exhaustion")
+        };
+        assert_eq!(exhausted.searched_states, 8);
+        assert_eq!(exhausted.limit, 8);
+        assert!(exhausted.pending_states > 0);
+        assert!(
+            exhausted
+                .to_string()
+                .contains("does not prove that no safe relaxation exists")
+        );
+
+        let hard_conflict = vec![
+            constraint("hard-one", "==1", Provenance::UvRoot, "root pin"),
+            constraint(
+                "hard-two",
+                "==2",
+                Provenance::UvConstraint,
+                "constraint pin",
+            ),
+        ];
+        assert!(matches!(
+            decide_with_search_limit(
+                &package("hard-pins"),
+                &hard_conflict,
+                RelaxPolicy::PatchThenMinorThenMajorThenLastResort,
+                &SafetyContext::default(),
+                8,
+            ),
+            Decision::Conflict(_)
+        ));
     }
 
     #[test]

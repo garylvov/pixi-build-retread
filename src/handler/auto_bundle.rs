@@ -602,6 +602,12 @@ impl RestoreRequestBuilder {
                     None => original_conflict,
                 }));
             }
+            RelaxDecision::SearchExhausted(exhausted) => {
+                return Err(anyhow::Error::new(match diagnostic_context {
+                    Some(context) => exhausted.with_scope(context.scope()),
+                    None => exhausted,
+                }));
+            }
         };
 
         Ok(PypiFetchRequest {
