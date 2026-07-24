@@ -354,7 +354,7 @@ fn decide_with_search_limit(
                 let safe = match &success {
                     FinalizeSuccess::Unchanged(specifiers) => {
                         !is_anchor
-                            || anchor_candidate_stays_within_original_major(
+                            || anchor_candidate_stays_within_original_compatibility_band(
                                 &canonical,
                                 &atoms,
                                 &entry.state,
@@ -455,12 +455,13 @@ fn finalized_candidate_decision(
     }
 }
 
-/// ABI anchors may relax within a major, but a selected candidate must neither
-/// admit another major nor move an original edge into a major it never
-/// admitted. Compare effective PEP 440 ranges rather than the chosen policy
-/// tier: a `Major` primitive can still be safe when another constraint confines
-/// the finalized result to the original major.
-fn anchor_candidate_stays_within_original_major(
+/// ABI anchors may relax within one compatibility band, but a selected
+/// candidate must neither admit another band nor move an original edge into a
+/// band it never admitted. For ordinary releases the band is one major; for
+/// `0.x` it is one `0.minor`, where SemVer permits breaking changes. Compare
+/// effective PEP 440 ranges rather than the chosen policy tier: a `Major`
+/// primitive can still be safe when another constraint confines the result.
+fn anchor_candidate_stays_within_original_compatibility_band(
     original: &[Constraint],
     atoms: &[Atom],
     state: &[u8],
@@ -470,27 +471,36 @@ fn anchor_candidate_stays_within_original_major(
     let Some((lower, _)) = result_range.bounding_range() else {
         return false;
     };
-    let major = match lower {
+    let (compatibility_lower, compatibility_upper) = match lower {
         Bound::Included(version) | Bound::Excluded(version) => {
-            let Some(major) = version.release().first().copied() else {
+            let release = version.release();
+            let Some(major) = release.first().copied() else {
                 return false;
             };
-            major
+            if major == 0 {
+                let minor = release.get(1).copied().unwrap_or(0);
+                let Some(next_minor) = minor.checked_add(1) else {
+                    return false;
+                };
+                (Version::new([0, minor]), Version::new([0, next_minor]))
+            } else {
+                let Some(next_major) = major.checked_add(1) else {
+                    return false;
+                };
+                (Version::new([major]), Version::new([next_major]))
+            }
         }
         Bound::Unbounded => return false,
     };
-    let Some(next_major) = major.checked_add(1) else {
-        return false;
-    };
-    let major_band: VersionSpecifiers = [
-        VersionSpecifier::greater_than_equal_version(Version::new([major])),
-        VersionSpecifier::less_than_version(Version::new([next_major])),
+    let compatibility_band: VersionSpecifiers = [
+        VersionSpecifier::greater_than_equal_version(compatibility_lower),
+        VersionSpecifier::less_than_version(compatibility_upper),
     ]
     .into_iter()
     .collect();
-    let major_range = release_specifiers_to_ranges(major_band);
+    let compatibility_range = release_specifiers_to_ranges(compatibility_band);
     if !result_range
-        .intersection(&major_range.complement())
+        .intersection(&compatibility_range.complement())
         .is_empty()
     {
         return false;
@@ -505,7 +515,7 @@ fn anchor_candidate_stays_within_original_major(
         && changed_constraints.into_iter().all(|constraint_index| {
             let original_range =
                 release_specifiers_to_ranges(original[constraint_index].specifiers.clone());
-            !original_range.intersection(&major_range).is_empty()
+            !original_range.intersection(&compatibility_range).is_empty()
         })
 }
 
@@ -1398,6 +1408,55 @@ mod tests {
             assert!(!specifiers.contains(&Version::from_str(next_major).unwrap()));
             assert_eq!(decisions.len(), 1);
             assert_eq!(decisions[0].tier, RelaxPolicy::Minor);
+        }
+    }
+
+    #[test]
+    fn zero_major_abi_anchor_patch_conflict_relaxes_within_minor() {
+        let constraints = vec![
+            constraint(
+                "old",
+                "==0.2.1",
+                Provenance::IndexWheelMetadata,
+                "old wheel",
+            ),
+            constraint("new", ">=0.2.2,<0.3", Provenance::UvConstraint, "uv range"),
+        ];
+        let (specifiers, decisions) = relaxed(
+            "numpy",
+            &constraints,
+            RelaxPolicy::PatchThenMinorThenMajorThenLastResort,
+        );
+        assert!(specifiers.contains(&Version::from_str("0.2.2").unwrap()));
+        assert!(!specifiers.contains(&Version::from_str("0.3").unwrap()));
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].tier, RelaxPolicy::Patch);
+    }
+
+    #[test]
+    fn zero_major_abi_anchor_cross_minor_conflicts_fail_closed() {
+        for new in [">=0.3,<0.4", ">=0.3"] {
+            let constraints = vec![
+                constraint(
+                    "old",
+                    "==0.2.1",
+                    Provenance::IndexWheelMetadata,
+                    "old wheel",
+                ),
+                constraint("new", new, Provenance::UvConstraint, "uv range"),
+            ];
+            let strict = finalize_quiet(&package("numpy"), &canonical_constraints(&constraints))
+                .unwrap_err();
+            assert_eq!(
+                decide(
+                    &package("numpy"),
+                    &constraints,
+                    RelaxPolicy::PatchThenMinorThenMajorThenLastResort,
+                    &SafetyContext::default(),
+                ),
+                Decision::Conflict(strict),
+                "0.x ABI anchors must not relax across a 0.minor boundary for `{new}`"
+            );
         }
     }
 
