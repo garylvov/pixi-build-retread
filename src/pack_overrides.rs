@@ -33,14 +33,19 @@
 //! (plus an `.absent` marker if the ledger didn't exist yet), restored on
 //! exhaustion/interrupt/crash, and dropped on convergence.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use toml_edit::{Array, DocumentMut, InlineTable, Item, Value};
 
 use crate::config::RetreadConfig;
+use crate::relax::canonical_conda_name;
+
+static ATOMIC_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// One auto-repaired override recorded in the ledger.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,6 +87,73 @@ pub struct AutoOverrideLedger {
     /// pack's own `pixi.toml` is never touched.
     #[serde(default)]
     pub unrouted: BTreeMap<String, BTreeMap<String, UnrouteEntry>>,
+    /// Explicit `retread solve --apply-ledger` decisions to omit a
+    /// dependency from the pack's emitted conda requirements. These merge
+    /// into `RetreadConfig.drop_deps` in memory; the pack manifest remains
+    /// byte-identical.
+    #[serde(default)]
+    pub dropped_dependencies: BTreeMap<String, BTreeMap<String, DropDependencyEntry>>,
+    /// Explicit `retread solve --apply-ledger` decisions to constrain a
+    /// transitive root wheel. These merge into
+    /// `RetreadConfig.retread_wheels` in memory; the pack manifest remains
+    /// byte-identical.
+    #[serde(default)]
+    pub root_pins: BTreeMap<String, BTreeMap<String, RootPinEntry>>,
+}
+
+/// One explicit solve decision to drop a dependency from conda run
+/// requirements. The package name is the inner map key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DropDependencyEntry {
+    /// The bundle/pack name as the triggering conflict reported it.
+    #[serde(default)]
+    pub bundle: String,
+    /// Human-readable description of the conflict and chosen repair.
+    #[serde(default)]
+    pub provenance: String,
+    /// `YYYY-MM-DD` the decision was recorded.
+    #[serde(default)]
+    pub date: String,
+}
+
+/// One explicit solve decision to pin a transitive root wheel. The package
+/// name is the inner map key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RootPinEntry {
+    /// PEP 440 spec written verbatim into the effective wheel entry.
+    pub spec: String,
+    /// Output bundle assigned to the effective wheel entry.
+    #[serde(default)]
+    pub bundle_group: String,
+    /// The bundle/pack name as the triggering conflict reported it.
+    #[serde(default)]
+    pub bundle: String,
+    /// Human-readable description of the conflict and chosen repair.
+    #[serde(default)]
+    pub provenance: String,
+    /// `YYYY-MM-DD` the decision was recorded.
+    #[serde(default)]
+    pub date: String,
+}
+
+/// One validated `retread solve --apply-ledger` mutation. The solve driver
+/// preflights and de-duplicates the complete audit before handing this batch
+/// to [`write_solve_updates`], which serializes every decision with one atomic
+/// ledger replacement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SolveLedgerUpdate {
+    pub pack_pixi: PathBuf,
+    pub bundle: String,
+    pub package: String,
+    pub provenance: String,
+    pub action: SolveLedgerAction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SolveLedgerAction {
+    DropDependency,
+    Override { spec: String },
+    RootPin { spec: String, bundle_group: String },
 }
 
 /// One auto-repaired un-route decision recorded in the ledger. Mirrors
@@ -114,18 +186,81 @@ impl AutoOverrideLedger {
 
     pub fn write_atomic(&self, workspace_dir: &Path) -> Result<()> {
         let path = ledger_path(workspace_dir);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
+        let parent = path
+            .parent()
+            .context("auto-overrides ledger path has no parent directory")?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
         let bytes = serde_json::to_vec_pretty(self)?;
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, bytes)
-            .with_context(|| format!("failed to write {}", tmp.display()))?;
-        std::fs::rename(&tmp, &path)
-            .with_context(|| format!("failed to rename into {}", path.display()))?;
+        let (tmp, mut file) = create_atomic_temp(&path)?;
+
+        if let Err(error) = file
+            .write_all(&bytes)
+            .with_context(|| format!("failed to write {}", tmp.display()))
+            .and_then(|()| {
+                file.sync_all()
+                    .with_context(|| format!("failed to sync {}", tmp.display()))
+            })
+        {
+            drop(file);
+            let _ = std::fs::remove_file(&tmp);
+            return Err(error);
+        }
+        drop(file);
+
+        if let Err(error) = std::fs::rename(&tmp, &path)
+            .with_context(|| format!("failed to rename into {}", path.display()))
+        {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(error);
+        }
+
+        // The file itself is durable before rename. Persisting the directory
+        // entry is supported on Unix; treat directory fsync as best-effort on
+        // filesystems that do not permit opening/syncing directories.
+        if let Ok(directory) = std::fs::File::open(parent) {
+            let _ = directory.sync_all();
+        }
         Ok(())
     }
+}
+
+fn create_atomic_temp(path: &Path) -> Result<(PathBuf, std::fs::File)> {
+    let parent = path
+        .parent()
+        .context("auto-overrides ledger path has no parent directory")?;
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("auto-overrides.json");
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+
+    for _ in 0..128 {
+        let sequence = ATOMIC_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let tmp = parent.join(format!(
+            ".{filename}.tmp-{}-{timestamp}-{sequence}",
+            std::process::id()
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(file) => return Ok((tmp, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to create {}", tmp.display()));
+            }
+        }
+    }
+
+    anyhow::bail!(
+        "failed to allocate a unique temporary ledger file beside {}",
+        path.display()
+    )
 }
 
 pub fn ledger_path(workspace_dir: &Path) -> PathBuf {
@@ -160,6 +295,150 @@ fn pack_key(workspace_dir: &Path, pack_pixi: &Path) -> String {
     let pack_dir = pack_abs.parent().unwrap_or(&pack_abs);
     let rel = pack_dir.strip_prefix(&ws).unwrap_or(pack_dir);
     rel.to_string_lossy().replace('\\', "/")
+}
+
+fn remove_canonical_package<V>(
+    actions: &mut BTreeMap<String, BTreeMap<String, V>>,
+    pack: &str,
+    package: &str,
+) {
+    let remove_pack = if let Some(entries) = actions.get_mut(pack) {
+        entries.retain(|name, _| canonical_conda_name(name) != package);
+        entries.is_empty()
+    } else {
+        false
+    };
+    if remove_pack {
+        actions.remove(pack);
+    }
+}
+
+fn has_canonical_package<V>(
+    actions: &BTreeMap<String, BTreeMap<String, V>>,
+    pack: &str,
+    package: &str,
+) -> bool {
+    actions.get(pack).is_some_and(|entries| {
+        entries
+            .keys()
+            .any(|name| canonical_conda_name(name) == package)
+    })
+}
+
+fn take_canonical_package<V: Default>(entries: &mut BTreeMap<String, V>, package: &str) -> V {
+    let aliases: Vec<String> = entries
+        .keys()
+        .filter(|name| canonical_conda_name(name) == package)
+        .cloned()
+        .collect();
+    let selected = aliases
+        .iter()
+        .find(|name| name.as_str() == package)
+        .or_else(|| aliases.first())
+        .cloned();
+    let entry = selected
+        .as_ref()
+        .and_then(|name| entries.remove(name))
+        .unwrap_or_default();
+    for alias in aliases {
+        entries.remove(&alias);
+    }
+    entry
+}
+
+fn pack_source_metadata_outputs(
+    workspace_dir: &Path,
+    pack_pixi: &Path,
+    triggering_bundle: &str,
+    ledger: &AutoOverrideLedger,
+) -> BTreeSet<String> {
+    let mut outputs = BTreeSet::new();
+    if !triggering_bundle.is_empty() {
+        outputs.insert(triggering_bundle.to_string());
+    }
+
+    let key = pack_key(workspace_dir, pack_pixi);
+    if let Ok(text) = std::fs::read_to_string(pack_pixi)
+        && let Ok(manifest) = toml::from_str::<toml::Value>(&text)
+    {
+        if let Some(name) = manifest
+            .get("package")
+            .and_then(|package| package.get("name"))
+            .and_then(toml::Value::as_str)
+        {
+            outputs.insert(name.to_string());
+        }
+
+        let config = manifest
+            .get("package")
+            .and_then(|package| package.get("build"))
+            .and_then(|build| build.get("config"));
+        let default_bundle = config
+            .and_then(|config| config.get("retread-bundle"))
+            .and_then(toml::Value::as_str);
+        if let Some(bundle) = default_bundle {
+            outputs.insert(bundle.to_string());
+        }
+        if let Some(wheels) = config
+            .and_then(|config| config.get("retread-wheels"))
+            .and_then(toml::Value::as_table)
+        {
+            for (package, entry) in wheels {
+                let output = entry
+                    .get("bundle")
+                    .and_then(toml::Value::as_str)
+                    .or(default_bundle)
+                    .unwrap_or(package);
+                outputs.insert(output.to_string());
+            }
+        }
+    }
+
+    if let Some(entries) = ledger.packs.get(&key) {
+        outputs.extend(
+            entries
+                .values()
+                .map(|entry| entry.bundle.clone())
+                .filter(|bundle| !bundle.is_empty()),
+        );
+    }
+    if let Some(entries) = ledger.unrouted.get(&key) {
+        outputs.extend(
+            entries
+                .values()
+                .map(|entry| entry.bundle.clone())
+                .filter(|bundle| !bundle.is_empty()),
+        );
+    }
+    if let Some(entries) = ledger.dropped_dependencies.get(&key) {
+        outputs.extend(
+            entries
+                .values()
+                .map(|entry| entry.bundle.clone())
+                .filter(|bundle| !bundle.is_empty()),
+        );
+    }
+    if let Some(entries) = ledger.root_pins.get(&key) {
+        outputs.extend(entries.values().flat_map(|entry| {
+            [entry.bundle.clone(), entry.bundle_group.clone()]
+                .into_iter()
+                .filter(|bundle| !bundle.is_empty())
+        }));
+    }
+
+    outputs
+}
+
+fn invalidate_pack_source_metadata(
+    workspace_dir: &Path,
+    pack_pixi: &Path,
+    triggering_bundle: &str,
+    ledger: &AutoOverrideLedger,
+) {
+    for output in pack_source_metadata_outputs(workspace_dir, pack_pixi, triggering_bundle, ledger)
+    {
+        invalidate_pixi_source_metadata(workspace_dir, &output);
+    }
 }
 
 /// Workspace-relative manifest path used in user-facing diagnostics.
@@ -275,15 +554,20 @@ pub fn write_override(
 ) -> Result<()> {
     let mut ledger = AutoOverrideLedger::load(workspace_dir)?;
     let key = pack_key(workspace_dir, pack_pixi);
-    ledger.packs.entry(key).or_default().insert(
-        package.to_string(),
-        AutoOverrideEntry {
-            spec: spec.to_string(),
-            bundle: bundle.to_string(),
-            provenance: provenance.to_string(),
-            date: local_date(),
-        },
-    );
+    let package = canonical_conda_name(package);
+    remove_canonical_package(&mut ledger.packs, &key, &package);
+    remove_canonical_package(&mut ledger.root_pins, &key, &package);
+    if !has_canonical_package(&ledger.dropped_dependencies, &key, &package) {
+        ledger.packs.entry(key).or_default().insert(
+            package,
+            AutoOverrideEntry {
+                spec: spec.to_string(),
+                bundle: bundle.to_string(),
+                provenance: provenance.to_string(),
+                date: local_date(),
+            },
+        );
+    }
     ledger.write_atomic(workspace_dir)?;
     // Run-12 (deps-from proof): pixi's own per-workspace source-metadata
     // cache (`.pixi/meta-v0/<output>-<hash>/<platform>-<hash>.json`)
@@ -312,11 +596,15 @@ pub fn invalidate_pixi_source_metadata(workspace_dir: &Path, bundle: &str) {
     let Ok(entries) = std::fs::read_dir(&meta_dir) else {
         return;
     };
-    let prefix = format!("{bundle}-");
+    let prefixes: BTreeSet<String> = [bundle.to_string(), canonical_conda_name(bundle)]
+        .into_iter()
+        .filter(|bundle| !bundle.is_empty())
+        .map(|bundle| format!("{bundle}-"))
+        .collect();
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        if name.starts_with(&prefix)
+        if prefixes.iter().any(|prefix| name.starts_with(prefix))
             && let Err(err) = std::fs::remove_dir_all(entry.path())
         {
             eprintln!(
@@ -354,6 +642,172 @@ pub fn write_unroute(
     Ok(())
 }
 
+/// Append (or replace) an explicit solve decision to drop `package` from
+/// the pack's conda run requirements. The decision is ledger-only:
+/// `pack_pixi` is used solely to derive the stable pack key and is never
+/// edited.
+pub fn write_drop_dependency(
+    workspace_dir: &Path,
+    pack_pixi: &Path,
+    bundle: &str,
+    package: &str,
+    provenance: &str,
+) -> Result<()> {
+    let mut ledger = AutoOverrideLedger::load(workspace_dir)?;
+    let key = pack_key(workspace_dir, pack_pixi);
+    let package = canonical_conda_name(package);
+
+    // A drop is the terminal action for this dependency: retaining an
+    // alternative override/root-pin under an equivalent PEP 503 spelling
+    // would make the effective repair depend on map iteration order.
+    remove_canonical_package(&mut ledger.packs, &key, &package);
+    remove_canonical_package(&mut ledger.root_pins, &key, &package);
+    remove_canonical_package(&mut ledger.dropped_dependencies, &key, &package);
+    ledger.dropped_dependencies.entry(key).or_default().insert(
+        package,
+        DropDependencyEntry {
+            bundle: bundle.to_string(),
+            provenance: provenance.to_string(),
+            date: local_date(),
+        },
+    );
+    ledger.write_atomic(workspace_dir)?;
+    invalidate_pack_source_metadata(workspace_dir, pack_pixi, bundle, &ledger);
+    Ok(())
+}
+
+/// Append (or replace) an explicit solve decision to pin a transitive root
+/// wheel. The decision is ledger-only: `pack_pixi` is used solely to derive
+/// the stable pack key and is never edited.
+pub fn write_root_pin(
+    workspace_dir: &Path,
+    pack_pixi: &Path,
+    bundle: &str,
+    package: &str,
+    spec: &str,
+    bundle_group: &str,
+    provenance: &str,
+) -> Result<()> {
+    let mut ledger = AutoOverrideLedger::load(workspace_dir)?;
+    let key = pack_key(workspace_dir, pack_pixi);
+    let mut affected_outputs =
+        pack_source_metadata_outputs(workspace_dir, pack_pixi, bundle, &ledger);
+    let package = canonical_conda_name(package);
+    remove_canonical_package(&mut ledger.root_pins, &key, &package);
+    remove_canonical_package(&mut ledger.packs, &key, &package);
+    if !has_canonical_package(&ledger.dropped_dependencies, &key, &package) {
+        ledger.root_pins.entry(key).or_default().insert(
+            package,
+            RootPinEntry {
+                spec: spec.to_string(),
+                bundle_group: bundle_group.to_string(),
+                bundle: bundle.to_string(),
+                provenance: provenance.to_string(),
+                date: local_date(),
+            },
+        );
+    }
+    ledger.write_atomic(workspace_dir)?;
+    affected_outputs.extend(pack_source_metadata_outputs(
+        workspace_dir,
+        pack_pixi,
+        bundle_group,
+        &ledger,
+    ));
+    for output in affected_outputs {
+        invalidate_pixi_source_metadata(workspace_dir, &output);
+    }
+    Ok(())
+}
+
+/// Persist one fully-preflighted solve audit as a single ledger transaction.
+///
+/// No update is serialized until every item has been folded into memory.
+/// Consequently an invalid later proposal cannot leave an earlier proposal
+/// committed. Cache eviction happens only after the one atomic ledger rename.
+pub(crate) fn write_solve_updates(
+    workspace_dir: &Path,
+    updates: &[SolveLedgerUpdate],
+) -> Result<()> {
+    if updates.is_empty() {
+        return Ok(());
+    }
+
+    let mut ledger = AutoOverrideLedger::load(workspace_dir)?;
+    let mut affected_outputs = BTreeSet::new();
+    for update in updates {
+        affected_outputs.extend(pack_source_metadata_outputs(
+            workspace_dir,
+            &update.pack_pixi,
+            &update.bundle,
+            &ledger,
+        ));
+        let key = pack_key(workspace_dir, &update.pack_pixi);
+        let package = canonical_conda_name(&update.package);
+        match &update.action {
+            SolveLedgerAction::DropDependency => {
+                remove_canonical_package(&mut ledger.packs, &key, &package);
+                remove_canonical_package(&mut ledger.root_pins, &key, &package);
+                remove_canonical_package(&mut ledger.dropped_dependencies, &key, &package);
+                ledger.dropped_dependencies.entry(key).or_default().insert(
+                    package,
+                    DropDependencyEntry {
+                        bundle: update.bundle.clone(),
+                        provenance: update.provenance.clone(),
+                        date: local_date(),
+                    },
+                );
+            }
+            SolveLedgerAction::Override { spec } => {
+                remove_canonical_package(&mut ledger.packs, &key, &package);
+                remove_canonical_package(&mut ledger.root_pins, &key, &package);
+                remove_canonical_package(&mut ledger.dropped_dependencies, &key, &package);
+                ledger.packs.entry(key).or_default().insert(
+                    package,
+                    AutoOverrideEntry {
+                        spec: spec.clone(),
+                        bundle: update.bundle.clone(),
+                        provenance: update.provenance.clone(),
+                        date: local_date(),
+                    },
+                );
+            }
+            SolveLedgerAction::RootPin { spec, bundle_group } => {
+                affected_outputs.insert(bundle_group.clone());
+                remove_canonical_package(&mut ledger.root_pins, &key, &package);
+                remove_canonical_package(&mut ledger.packs, &key, &package);
+                remove_canonical_package(&mut ledger.dropped_dependencies, &key, &package);
+                ledger.root_pins.entry(key).or_default().insert(
+                    package,
+                    RootPinEntry {
+                        spec: spec.clone(),
+                        bundle_group: bundle_group.clone(),
+                        bundle: update.bundle.clone(),
+                        provenance: update.provenance.clone(),
+                        date: local_date(),
+                    },
+                );
+            }
+        }
+    }
+
+    // Re-scan the final state so output groups introduced by this batch are
+    // invalidated along with any groups removed/replaced above.
+    for update in updates {
+        affected_outputs.extend(pack_source_metadata_outputs(
+            workspace_dir,
+            &update.pack_pixi,
+            &update.bundle,
+            &ledger,
+        ));
+    }
+    ledger.write_atomic(workspace_dir)?;
+    for output in affected_outputs {
+        invalidate_pixi_source_metadata(workspace_dir, &output);
+    }
+    Ok(())
+}
+
 /// Read-only: every PyPI name auto-repaired to un-route for `pack_pixi`.
 /// Never fails the caller -- see [`overrides_for_pack`]'s doc comment.
 pub fn unrouted_for_pack(
@@ -377,6 +831,53 @@ pub fn unrouted_for_pack(
         .get(&key)
         .map(|entries| entries.keys().cloned().collect())
         .unwrap_or_default()
+}
+
+/// Read-only: every dependency explicitly dropped for `pack_pixi`.
+/// Never fails the caller -- see [`overrides_for_pack`]'s doc comment.
+pub fn dropped_dependencies_for_pack(
+    workspace_dir: &Path,
+    pack_pixi: &Path,
+) -> std::collections::BTreeSet<String> {
+    let ledger = match AutoOverrideLedger::load(workspace_dir) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "retread: failed to read .retread/auto-overrides.json; \
+                 proceeding with no ledgered dropped dependencies for this pack"
+            );
+            return std::collections::BTreeSet::new();
+        }
+    };
+    let key = pack_key(workspace_dir, pack_pixi);
+    ledger
+        .dropped_dependencies
+        .get(&key)
+        .map(|entries| entries.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// Read-only: every transitive root pin explicitly recorded for
+/// `pack_pixi`, including its audit metadata. Never fails the caller -- see
+/// [`overrides_for_pack`]'s doc comment.
+pub fn root_pins_for_pack(
+    workspace_dir: &Path,
+    pack_pixi: &Path,
+) -> BTreeMap<String, RootPinEntry> {
+    let ledger = match AutoOverrideLedger::load(workspace_dir) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "retread: failed to read .retread/auto-overrides.json; \
+                 proceeding with no ledgered root pins for this pack"
+            );
+            return BTreeMap::new();
+        }
+    };
+    let key = pack_key(workspace_dir, pack_pixi);
+    ledger.root_pins.get(&key).cloned().unwrap_or_default()
 }
 
 /// Read-only: every auto-repaired override recorded for `pack_pixi`, as a
@@ -409,26 +910,39 @@ pub fn overrides_for_pack(workspace_dir: &Path, pack_pixi: &Path) -> BTreeMap<St
         .unwrap_or_default()
 }
 
-/// Merge this pack's ledger entries into `config.overrides`, in memory
-/// only. Ledger entries take the same "last write wins" precedence a
-/// repeated fix #20 pack-manifest write used to have: if a ledger entry
-/// and a user's manual `retread-overrides` entry share a key, the ledger
-/// (the more recently auto-repaired value) wins, matching the byte-for-
-/// byte overwrite `write_override`'s old `pixi.toml` sink used to perform.
+/// Merge this pack's ledger entries into its effective `RetreadConfig`, in
+/// memory only. Ledger entries take the same "last write wins" precedence a
+/// repeated fix #20 pack-manifest write used to have: if an override/root pin
+/// and a user's manual entry share a key, the ledger (the more recently
+/// repaired value) wins. Set-like drop-dependency and un-route decisions are
+/// appended only when the manual config does not already contain them.
 ///
 /// Called once per pack, from `Handler::initialize`, before the config is
-/// stored in `state.config` -- every downstream consumer (`resolve_all`,
-/// `apply_emission`'s `effective.overrides`, and `courier::
-/// config_fingerprint`'s `declared_config`) sees the merged result with no
-/// further special-casing, and a ledger change busts the fingerprint
-/// exactly like a manifest edit would.
+/// stored in `state.config` -- every downstream consumer sees the merged
+/// result with no further special-casing, and a ledger change busts the
+/// fingerprint exactly like a manifest edit would.
 pub fn merge_ledger_overrides(config: &mut RetreadConfig, workspace_dir: &Path, pack_pixi: &Path) {
+    let dropped: BTreeSet<String> = dropped_dependencies_for_pack(workspace_dir, pack_pixi)
+        .into_iter()
+        .map(|package| canonical_conda_name(&package))
+        .collect();
+
     for (package, spec) in overrides_for_pack(workspace_dir, pack_pixi) {
+        let package = canonical_conda_name(&package);
+        if dropped.contains(&package) {
+            continue;
+        }
         // Record ledger provenance so the conda run-dep emission's
         // manual-override exemption doesn't mistake this repair-derived
         // pypi override for hand-written intent (run-31 regression: the
         // pack re-emitted an exact `==` conda pin for every ledgered
         // package, undoing the bounded-range emission).
+        config
+            .ledger_overrides
+            .retain(|name| canonical_conda_name(name) != package);
+        config
+            .overrides
+            .retain(|name, _| canonical_conda_name(name) != package);
         config.ledger_overrides.insert(package.clone());
         config.overrides.insert(package, spec);
     }
@@ -438,9 +952,47 @@ pub fn merge_ledger_overrides(config: &mut RetreadConfig, workspace_dir: &Path, 
     // very next render -- see `AutoRouteOptions.keep_pypi` in
     // `uv_closure.rs`, sourced from `config.keep_pypi` in `handler/mod.rs`.
     for package in unrouted_for_pack(workspace_dir, pack_pixi) {
-        if !config.keep_pypi.contains(&package) {
+        let package = canonical_conda_name(&package);
+        if !config
+            .keep_pypi
+            .iter()
+            .any(|name| canonical_conda_name(name) == package)
+        {
             config.keep_pypi.push(package);
         }
+    }
+    for package in &dropped {
+        if !config
+            .drop_deps
+            .iter()
+            .any(|name| canonical_conda_name(name) == *package)
+        {
+            config.drop_deps.push(package.clone());
+        }
+    }
+    for (package, pin) in root_pins_for_pack(workspace_dir, pack_pixi) {
+        let package = canonical_conda_name(&package);
+        if dropped.contains(&package) {
+            continue;
+        }
+        let mut entry = take_canonical_package(&mut config.retread_wheels, &package);
+        if entry.url.is_some()
+            || entry.path.is_some()
+            || entry.git.is_some()
+            || entry.from.is_some()
+        {
+            // The Track-2 root-pin proposal deliberately changes this root
+            // to an exact index-resolved version. Keeping a URL/path/git
+            // source alongside `version` would create a multi-form
+            // WheelEntry after manifest validation has already run, and
+            // URL form would silently take precedence over the ledger pin.
+            // Replace incompatible source forms; ordinary spec entries keep
+            // their index/extras and receive only the version/bundle overlay.
+            entry = Default::default();
+        }
+        entry.version = Some(pin.spec);
+        entry.bundle = Some(pin.bundle_group);
+        config.retread_wheels.insert(package, entry);
     }
 }
 
@@ -479,23 +1031,49 @@ pub fn rollback_all(workspace_dir: &Path) -> Result<()> {
     // pixi's cache key can't see the ledger (see `write_override`), so a
     // stale post-override render would otherwise replay after rollback.
     // Collected before the revert so the run's own additions are included.
-    let touched_bundles: std::collections::BTreeSet<String> =
-        AutoOverrideLedger::load(workspace_dir)
-            .map(|ledger| {
-                ledger
-                    .packs
-                    .values()
-                    .flat_map(|entries| entries.values().map(|e| e.bundle.clone()))
-                    .chain(
-                        ledger
-                            .unrouted
-                            .values()
-                            .flat_map(|entries| entries.values().map(|e| e.bundle.clone())),
-                    )
-                    .filter(|b| !b.is_empty())
-                    .collect()
-            })
-            .unwrap_or_default();
+    let current_ledger = AutoOverrideLedger::load(workspace_dir).ok();
+    let mut touched_bundles: BTreeSet<String> = current_ledger
+        .as_ref()
+        .map(|ledger| {
+            ledger
+                .packs
+                .values()
+                .flat_map(|entries| entries.values().map(|e| e.bundle.clone()))
+                .chain(
+                    ledger
+                        .unrouted
+                        .values()
+                        .flat_map(|entries| entries.values().map(|e| e.bundle.clone())),
+                )
+                .chain(
+                    ledger
+                        .dropped_dependencies
+                        .values()
+                        .flat_map(|entries| entries.values().map(|e| e.bundle.clone())),
+                )
+                .chain(ledger.root_pins.values().flat_map(|entries| {
+                    entries
+                        .values()
+                        .flat_map(|e| [e.bundle.clone(), e.bundle_group.clone()])
+                }))
+                .filter(|b| !b.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(ledger) = current_ledger.as_ref() {
+        for (pack, entries) in &ledger.dropped_dependencies {
+            if entries.is_empty() {
+                continue;
+            }
+            let pack_pixi = workspace_dir.join(pack).join("pixi.toml");
+            touched_bundles.extend(pack_source_metadata_outputs(
+                workspace_dir,
+                &pack_pixi,
+                "",
+                ledger,
+            ));
+        }
+    }
     let bak = snapshot_path(workspace_dir);
     let marker = snapshot_absent_marker(workspace_dir);
     let path = ledger_path(workspace_dir);
@@ -669,6 +1247,162 @@ mod tests {
         pack_pixi
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn atomic_ledger_write_never_follows_fixed_temp_or_destination_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new("atomic-symlink");
+        let ws = tmp.path();
+        let pack_pixi = make_pack(ws, "pypi-packs/atomic-pack");
+        let original = std::fs::read(&pack_pixi).unwrap();
+        let retread_dir = ws.join(".retread");
+        std::fs::create_dir_all(&retread_dir).unwrap();
+
+        // The former predictable temp name was writable through this link.
+        // Also make the destination itself a link: rename must replace that
+        // directory entry rather than following it.
+        let fixed_tmp = ledger_path(ws).with_extension("json.tmp");
+        symlink(&pack_pixi, &fixed_tmp).unwrap();
+        symlink(&pack_pixi, ledger_path(ws)).unwrap();
+
+        AutoOverrideLedger::default().write_atomic(ws).unwrap();
+
+        assert_eq!(
+            std::fs::read(&pack_pixi).unwrap(),
+            original,
+            "neither an attacker-controlled temp nor destination symlink may modify pixi.toml"
+        );
+        assert!(
+            std::fs::symlink_metadata(&fixed_tmp)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the obsolete fixed temp path must never be opened"
+        );
+        assert!(
+            !std::fs::symlink_metadata(ledger_path(ws))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "atomic rename must replace, not follow, the destination symlink"
+        );
+        assert_eq!(
+            AutoOverrideLedger::load(ws).unwrap(),
+            AutoOverrideLedger::default()
+        );
+    }
+
+    #[test]
+    fn solve_updates_commit_complete_batch_without_touching_pack_manifests() {
+        let tmp = TempDir::new("solve-batch");
+        let ws = tmp.path();
+        let first = make_pack(ws, "pypi-packs/first");
+        let second = make_pack(ws, "pypi-packs/second");
+        let first_before = std::fs::read(&first).unwrap();
+        let second_before = std::fs::read(&second).unwrap();
+
+        write_solve_updates(
+            ws,
+            &[
+                SolveLedgerUpdate {
+                    pack_pixi: first.clone(),
+                    bundle: "first-output".into(),
+                    package: "NumPy".into(),
+                    provenance: "equal-authority conflict".into(),
+                    action: SolveLedgerAction::DropDependency,
+                },
+                SolveLedgerUpdate {
+                    pack_pixi: second.clone(),
+                    bundle: "second-output".into(),
+                    package: "torch".into(),
+                    provenance: "graph-root conflict".into(),
+                    action: SolveLedgerAction::RootPin {
+                        spec: "==2.10.0".into(),
+                        bundle_group: "second-output".into(),
+                    },
+                },
+            ],
+        )
+        .unwrap();
+
+        let ledger = AutoOverrideLedger::load(ws).unwrap();
+        assert!(ledger.dropped_dependencies["pypi-packs/first"].contains_key("numpy"));
+        assert_eq!(
+            ledger.root_pins["pypi-packs/second"]["torch"].spec,
+            "==2.10.0"
+        );
+        assert_eq!(std::fs::read(first).unwrap(), first_before);
+        assert_eq!(std::fs::read(second).unwrap(), second_before);
+    }
+
+    #[test]
+    fn explicit_solve_action_switch_replaces_every_stale_canonical_action() {
+        let tmp = TempDir::new("solve-action-switch");
+        let ws = tmp.path();
+        let pack = make_pack(ws, "pypi-packs/switch");
+        let update = |package: &str, action| SolveLedgerUpdate {
+            pack_pixi: pack.clone(),
+            bundle: "switch-output".into(),
+            package: package.into(),
+            provenance: "latest Track-2 decision".into(),
+            action,
+        };
+
+        write_solve_updates(ws, &[update("Demo_Pkg", SolveLedgerAction::DropDependency)]).unwrap();
+        write_solve_updates(
+            ws,
+            &[update(
+                "demo-pkg",
+                SolveLedgerAction::Override { spec: ">=2".into() },
+            )],
+        )
+        .unwrap();
+        let after_override = AutoOverrideLedger::load(ws).unwrap();
+        assert!(after_override.packs["pypi-packs/switch"].contains_key("demo-pkg"));
+        assert!(
+            !after_override
+                .dropped_dependencies
+                .get("pypi-packs/switch")
+                .is_some_and(|entries| entries.contains_key("demo-pkg"))
+        );
+        assert!(
+            !after_override
+                .root_pins
+                .get("pypi-packs/switch")
+                .is_some_and(|entries| entries.contains_key("demo-pkg"))
+        );
+
+        write_solve_updates(
+            ws,
+            &[update(
+                "DEMO.PKG",
+                SolveLedgerAction::RootPin {
+                    spec: "==3".into(),
+                    bundle_group: "switch-output".into(),
+                },
+            )],
+        )
+        .unwrap();
+        let after_root = AutoOverrideLedger::load(ws).unwrap();
+        assert!(
+            !after_root
+                .packs
+                .get("pypi-packs/switch")
+                .is_some_and(|entries| entries.contains_key("demo-pkg"))
+        );
+        assert_eq!(
+            after_root.root_pins["pypi-packs/switch"]["demo-pkg"].spec,
+            "==3"
+        );
+        assert!(
+            !after_root
+                .dropped_dependencies
+                .get("pypi-packs/switch")
+                .is_some_and(|entries| entries.contains_key("demo-pkg"))
+        );
+    }
+
     #[test]
     fn diagnostic_manifest_path_tracks_pack_not_output_name() {
         let tmp = TempDir::new("diagnostic-pack-path");
@@ -812,6 +1546,95 @@ packaging = ">=24"
     }
 
     #[test]
+    fn write_root_pin_evicts_triggering_bundle_and_target_group_metadata() {
+        let tmp = TempDir::new("root-pin-evict");
+        let ws = tmp.path();
+        let pack_pixi = make_pack(ws, "pypi-packs/isaac-pack-latest");
+        write_root_pin(
+            ws,
+            &pack_pixi,
+            "isaac-pack-latest",
+            "CMEEL_Boost",
+            "==1.87.0",
+            "old_output",
+            "prior root pin",
+        )
+        .unwrap();
+
+        let triggering = ws.join(".pixi/meta-v0/isaac-pack-latest-trigger");
+        let target_group = ws.join(".pixi/meta-v0/robotics-output-target");
+        let prior_group = ws.join(".pixi/meta-v0/old-output-prior");
+        let sibling = ws.join(".pixi/meta-v0/other-pack-sibling");
+        std::fs::create_dir_all(&triggering).unwrap();
+        std::fs::create_dir_all(&target_group).unwrap();
+        std::fs::create_dir_all(&prior_group).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+
+        write_root_pin(
+            ws,
+            &pack_pixi,
+            "ISAAC_PACK_LATEST",
+            "cmeel.boost",
+            "==1.88.0",
+            "robotics_output",
+            "transitive root conflict",
+        )
+        .unwrap();
+
+        assert!(!triggering.exists());
+        assert!(!target_group.exists());
+        assert!(!prior_group.exists());
+        assert!(sibling.exists());
+    }
+
+    #[test]
+    fn write_drop_evicts_every_output_metadata_entry_for_multi_output_pack() {
+        let tmp = TempDir::new("drop-pack-wide-evict");
+        let ws = tmp.path();
+        let pack_pixi = make_pack(ws, "pypi-packs/multi-pack");
+        std::fs::write(
+            &pack_pixi,
+            r#"[package]
+name = "multi-pack"
+version = "1.0.0"
+
+[package.build.config]
+retread-bundle = "core-output"
+
+[package.build.config.retread-wheels]
+core-wheel = { version = "==1.0.0" }
+vision-wheel = { version = "==2.0.0", bundle = "vision-output" }
+audio-wheel = { version = "==3.0.0", bundle = "audio-output" }
+"#,
+        )
+        .unwrap();
+
+        let outputs = ["multi-pack", "core-output", "vision-output", "audio-output"];
+        for output in outputs {
+            std::fs::create_dir_all(ws.join(format!(".pixi/meta-v0/{output}-stale"))).unwrap();
+        }
+        let sibling = ws.join(".pixi/meta-v0/unrelated-output-still-valid");
+        std::fs::create_dir_all(&sibling).unwrap();
+
+        write_drop_dependency(
+            ws,
+            &pack_pixi,
+            "vision-output",
+            "shared-dependency",
+            "equal-authority conflict",
+        )
+        .unwrap();
+
+        for output in outputs {
+            assert!(
+                !ws.join(format!(".pixi/meta-v0/{output}-stale")).exists(),
+                "drop must evict stale metadata for pack output {output}"
+            );
+        }
+        assert!(sibling.exists(), "unrelated output metadata must survive");
+    }
+
+    #[test]
     fn rollback_all_evicts_pixi_source_metadata_for_touched_packs() {
         // Metadata pixi recomputed DURING the run reflects overrides that
         // rollback removes; those entries must be evicted too or the
@@ -846,6 +1669,62 @@ packaging = ">=24"
     }
 
     #[test]
+    fn rollback_evicts_metadata_for_solve_ledger_relaxations() {
+        let tmp = TempDir::new("solve-rollback-evict");
+        let ws = tmp.path();
+        let drop_pack = make_pack(ws, "pypi-packs/drop-pack");
+        let pin_pack = make_pack(ws, "pypi-packs/pin-pack");
+        std::fs::write(
+            &drop_pack,
+            r#"[package]
+name = "drop-pack"
+version = "1.0.0"
+
+[package.build.config.retread-wheels]
+primary = { version = "==1.0.0", bundle = "drop-pack" }
+secondary = { version = "==1.0.0", bundle = "drop-secondary" }
+"#,
+        )
+        .unwrap();
+        ensure_snapshot(ws).unwrap();
+        write_drop_dependency(
+            ws,
+            &drop_pack,
+            "drop-pack",
+            "numpy",
+            "equal-authority conflict",
+        )
+        .unwrap();
+        write_root_pin(
+            ws,
+            &pin_pack,
+            "pin-pack",
+            "cmeel-boost",
+            "==1.88.0",
+            "pin-output",
+            "transitive conflict",
+        )
+        .unwrap();
+
+        let drop_metadata = ws.join(".pixi/meta-v0/drop-pack-recomputed");
+        let drop_secondary_metadata = ws.join(".pixi/meta-v0/drop-secondary-recomputed");
+        let pin_metadata = ws.join(".pixi/meta-v0/pin-pack-recomputed");
+        let pin_group_metadata = ws.join(".pixi/meta-v0/pin-output-recomputed");
+        std::fs::create_dir_all(&drop_metadata).unwrap();
+        std::fs::create_dir_all(&drop_secondary_metadata).unwrap();
+        std::fs::create_dir_all(&pin_metadata).unwrap();
+        std::fs::create_dir_all(&pin_group_metadata).unwrap();
+
+        rollback_all(ws).unwrap();
+
+        assert!(!drop_metadata.exists());
+        assert!(!drop_secondary_metadata.exists());
+        assert!(!pin_metadata.exists());
+        assert!(!pin_group_metadata.exists());
+        assert!(!ledger_path(ws).exists());
+    }
+
+    #[test]
     fn write_override_lands_in_ledger_not_pack_manifest() {
         let tmp = TempDir::new("write");
         let ws = tmp.path();
@@ -876,6 +1755,285 @@ packaging = ">=24"
         assert_eq!(entry.spec, "==2.10.0");
         assert_eq!(entry.bundle, "isaac-pack-latest");
         assert!(entry.provenance.contains("2.11.0"));
+    }
+
+    #[test]
+    fn solve_relaxations_land_in_ledger_not_pack_manifest() {
+        let tmp = TempDir::new("solve-ledger-write");
+        let ws = tmp.path();
+        let pack_pixi = make_pack(ws, "pypi-packs/isaac-pack-latest");
+        let original = std::fs::read(&pack_pixi).unwrap();
+
+        write_drop_dependency(
+            ws,
+            &pack_pixi,
+            "isaac-pack-latest",
+            "numpy",
+            "equal-authority conflict between wheel requirements",
+        )
+        .unwrap();
+        write_root_pin(
+            ws,
+            &pack_pixi,
+            "isaac-pack-latest",
+            "cmeel-boost",
+            "==1.88.0",
+            "isaac-pack-latest",
+            "transitive root introduced the conflicting numpy pin",
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(&pack_pixi).unwrap(),
+            original,
+            "ledger apply must leave pixi.toml byte-identical"
+        );
+
+        let ledger = AutoOverrideLedger::load(ws).unwrap();
+        let pack = "pypi-packs/isaac-pack-latest";
+        let drop = &ledger.dropped_dependencies[pack]["numpy"];
+        assert_eq!(drop.bundle, "isaac-pack-latest");
+        assert!(drop.provenance.contains("equal-authority"));
+        assert!(!drop.date.is_empty());
+
+        let pin = &ledger.root_pins[pack]["cmeel-boost"];
+        assert_eq!(pin.spec, "==1.88.0");
+        assert_eq!(pin.bundle_group, "isaac-pack-latest");
+        assert_eq!(pin.bundle, "isaac-pack-latest");
+        assert!(pin.provenance.contains("transitive root"));
+        assert!(!pin.date.is_empty());
+
+        assert!(dropped_dependencies_for_pack(ws, &pack_pixi).contains("numpy"));
+        assert_eq!(
+            root_pins_for_pack(ws, &pack_pixi)["cmeel-boost"].spec,
+            "==1.88.0"
+        );
+    }
+
+    #[test]
+    fn drop_removes_canonical_override_and_root_pin_actions() {
+        let tmp = TempDir::new("drop-action-precedence");
+        let ws = tmp.path();
+        let pack_pixi = make_pack(ws, "pypi-packs/action-pack");
+
+        write_override(
+            ws,
+            &pack_pixi,
+            "action-pack",
+            "Shared_Dependency",
+            ">=1,<2",
+            "earlier override",
+        )
+        .unwrap();
+        write_root_pin(
+            ws,
+            &pack_pixi,
+            "action-pack",
+            "shared.dependency",
+            "==1.5.0",
+            "action-output",
+            "earlier root pin",
+        )
+        .unwrap();
+        write_drop_dependency(
+            ws,
+            &pack_pixi,
+            "action-pack",
+            "SHARED---DEPENDENCY",
+            "chosen drop",
+        )
+        .unwrap();
+
+        let ledger = AutoOverrideLedger::load(ws).unwrap();
+        let pack = "pypi-packs/action-pack";
+        assert!(
+            ledger.packs.get(pack).is_none_or(BTreeMap::is_empty),
+            "drop must remove the same canonical override action"
+        );
+        assert!(
+            ledger.root_pins.get(pack).is_none_or(BTreeMap::is_empty),
+            "drop must remove the same canonical root-pin action"
+        );
+        assert!(
+            ledger.dropped_dependencies[pack].contains_key("shared-dependency"),
+            "drop key must use the shared canonical package spelling"
+        );
+
+        let mut config: RetreadConfig = serde_json::from_value(serde_json::json!({
+            "retread-wheels": { "unrelated": { "version": "==1.0.0" } }
+        }))
+        .unwrap();
+        merge_ledger_overrides(&mut config, ws, &pack_pixi);
+        assert!(!config.overrides.contains_key("shared-dependency"));
+        assert!(!config.retread_wheels.contains_key("shared-dependency"));
+        assert_eq!(config.drop_deps, vec!["shared-dependency".to_string()]);
+    }
+
+    #[test]
+    fn root_pin_merges_into_existing_canonical_wheel_key() {
+        let tmp = TempDir::new("root-pin-canonical-merge");
+        let ws = tmp.path();
+        let pack_pixi = make_pack(ws, "pypi-packs/root-pack");
+        write_root_pin(
+            ws,
+            &pack_pixi,
+            "root-pack",
+            "Shared.Dependency",
+            "==2.0.0",
+            "root-output",
+            "canonical collision",
+        )
+        .unwrap();
+
+        let mut config: RetreadConfig = serde_json::from_value(serde_json::json!({
+            "retread-wheels": {
+                "shared_dependency": {
+                    "version": "==1.0.0",
+                    "index": "https://packages.example/simple"
+                }
+            }
+        }))
+        .unwrap();
+        merge_ledger_overrides(&mut config, ws, &pack_pixi);
+
+        assert_eq!(config.retread_wheels.len(), 1);
+        let entry = &config.retread_wheels["shared-dependency"];
+        assert_eq!(entry.version.as_deref(), Some("==2.0.0"));
+        assert_eq!(entry.bundle.as_deref(), Some("root-output"));
+        assert_eq!(
+            entry.index.as_deref(),
+            Some("https://packages.example/simple")
+        );
+    }
+
+    #[test]
+    fn solve_ledger_relaxations_merge_into_effective_config() {
+        let tmp = TempDir::new("solve-ledger-merge");
+        let ws = tmp.path();
+        let pack_pixi = make_pack(ws, "pypi-packs/isaac-pack-latest");
+
+        write_drop_dependency(
+            ws,
+            &pack_pixi,
+            "isaac-pack-latest",
+            "numpy",
+            "equal-authority conflict",
+        )
+        .unwrap();
+        write_root_pin(
+            ws,
+            &pack_pixi,
+            "isaac-pack-latest",
+            "existing-root",
+            "==2.6.20",
+            "robotics-output",
+            "pin existing transitive root",
+        )
+        .unwrap();
+        write_root_pin(
+            ws,
+            &pack_pixi,
+            "isaac-pack-latest",
+            "new-root",
+            "==0.9.0",
+            "robotics-output",
+            "pin previously implicit transitive root",
+        )
+        .unwrap();
+        write_root_pin(
+            ws,
+            &pack_pixi,
+            "isaac-pack-latest",
+            "url-root",
+            "==4.2.0",
+            "robotics-output",
+            "replace an incompatible direct-url root",
+        )
+        .unwrap();
+
+        let mut config: RetreadConfig = serde_json::from_value(serde_json::json!({
+            "retread-wheels": {
+                "existing-root": {
+                    "version": "==3.0.0",
+                    "index": "https://packages.example/simple",
+                    "extras": ["feature"],
+                    "bundle": "old-output"
+                },
+                "url-root": {
+                    "url": "https://packages.example/url-root-4.1.0.whl",
+                    "sha256": "deadbeef",
+                    "bundle": "old-output"
+                }
+            },
+            "retread-drop-deps": ["manual-drop"]
+        }))
+        .unwrap();
+
+        merge_ledger_overrides(&mut config, ws, &pack_pixi);
+
+        assert_eq!(
+            config.drop_deps,
+            vec!["manual-drop".to_string(), "numpy".to_string()]
+        );
+        let existing = &config.retread_wheels["existing-root"];
+        assert_eq!(existing.version.as_deref(), Some("==2.6.20"));
+        assert_eq!(existing.bundle.as_deref(), Some("robotics-output"));
+        assert_eq!(
+            existing.index.as_deref(),
+            Some("https://packages.example/simple")
+        );
+        assert_eq!(existing.extras, vec!["feature".to_string()]);
+
+        let added = &config.retread_wheels["new-root"];
+        assert_eq!(added.version.as_deref(), Some("==0.9.0"));
+        assert_eq!(added.bundle.as_deref(), Some("robotics-output"));
+        assert!(added.url.is_none());
+        assert!(added.path.is_none());
+        assert!(added.git.is_none());
+        added
+            .validate("new-root")
+            .expect("an absent root must be constructed as a valid spec wheel");
+
+        let replaced = &config.retread_wheels["url-root"];
+        assert_eq!(replaced.version.as_deref(), Some("==4.2.0"));
+        assert_eq!(replaced.bundle.as_deref(), Some("robotics-output"));
+        assert!(replaced.url.is_none());
+        assert!(replaced.sha256.is_none());
+        assert!(replaced.path.is_none());
+        assert!(replaced.git.is_none());
+        assert!(replaced.from.is_none());
+        replaced
+            .validate("url-root")
+            .expect("the exact ledger root pin must replace incompatible source forms");
+    }
+
+    #[test]
+    fn old_ledger_without_solve_fields_loads_with_empty_defaults() {
+        let tmp = TempDir::new("solve-ledger-backcompat");
+        let ws = tmp.path();
+        std::fs::create_dir_all(ws.join(".retread")).unwrap();
+        std::fs::write(
+            ledger_path(ws),
+            r#"{
+  "packs": {
+    "pypi-packs/p": {
+      "torch": {
+        "spec": "==2.10.0",
+        "bundle": "p",
+        "provenance": "old ledger",
+        "date": "2026-07-01"
+      }
+    }
+  },
+  "unrouted": {}
+}"#,
+        )
+        .unwrap();
+
+        let ledger = AutoOverrideLedger::load(ws).unwrap();
+        assert!(ledger.dropped_dependencies.is_empty());
+        assert!(ledger.root_pins.is_empty());
+        assert_eq!(ledger.packs["pypi-packs/p"]["torch"].spec, "==2.10.0");
     }
 
     #[test]
