@@ -23,6 +23,7 @@ pub mod probe;
 pub mod pypi;
 pub mod recipe;
 pub mod relax;
+pub mod relax_decision;
 pub mod repodata;
 pub mod rpc;
 pub mod solve;

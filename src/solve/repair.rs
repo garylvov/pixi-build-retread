@@ -55,6 +55,24 @@ pub(crate) const ABI_ANCHOR_NAMES: &[&str] = &[
     // prefix list. `*_compiler` suffix is caught by the predicate.
 ];
 
+// Track 1 broadens the shared ABI classifier used by emission and metadata
+// relaxation. The existing `retread solve` repair policy is Track 4 and must
+// retain its pre-refactor behavior until that track deliberately migrates it.
+const LEGACY_SOLVE_REPAIR_ABI_ANCHOR_NAMES: &[&str] = &[
+    "python",
+    "python_abi",
+    "pypy",
+    "libc",
+    "glibc",
+    "__glibc",
+    "libstdcxx-ng",
+    "libstdcxx",
+    "libcxx",
+    "libcxx-devel",
+    "cuda-version",
+    "__cuda",
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Strategy {
@@ -570,7 +588,7 @@ impl RepairPlanner {
         let mut candidates: Vec<&str> = vec![conflict_package];
         candidates.extend(requiring_chain.iter().map(String::as_str));
         for pkg in candidates {
-            if tried.has(pkg, Strategy::PypiOverride) || is_abi_anchor(pkg) {
+            if tried.has(pkg, Strategy::PypiOverride) || is_solve_repair_anchor(pkg) {
                 continue;
             }
             for conda_name in conda_name_family(pkg, &self.conda_name_map) {
@@ -868,7 +886,7 @@ impl RepairPlanner {
         bundle: &str,
         editor: &ManifestEditor,
     ) -> Option<RepairOutcome> {
-        if is_abi_anchor(pkg) {
+        if is_solve_repair_anchor(pkg) {
             return None;
         }
         // Oscillation guard shares the planner-run set with the other tiers.
@@ -1511,7 +1529,7 @@ impl RepairPlanner {
     }
 
     fn guard_anchor(&self, package: &str) -> std::result::Result<(), String> {
-        if is_abi_anchor(package) {
+        if is_solve_repair_anchor(package) {
             eprintln!(
                 "retread solve: refusing to auto-pin ABI anchor {package}; edit the manifest manually"
             );
@@ -1950,6 +1968,8 @@ fn intersect_range_with_cap(
 }
 
 pub fn is_abi_anchor(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    let name = name.as_str();
     ABI_ANCHOR_NAMES.contains(&name)
         || name.starts_with("__")
         || name.ends_with("_compiler")
@@ -1978,6 +1998,25 @@ pub fn is_abi_anchor(name: &str) -> bool {
         ]
         .iter()
         .any(|p| name.starts_with(p))
+}
+
+pub(super) fn is_solve_repair_anchor(name: &str) -> bool {
+    LEGACY_SOLVE_REPAIR_ABI_ANCHOR_NAMES.contains(&name)
+        || name.starts_with("__")
+        || name.ends_with("_compiler")
+        || [
+            "gcc_",
+            "gxx_",
+            "g++_",
+            "gfortran_",
+            "clang_",
+            "clangxx_",
+            "binutils_",
+            "ld_",
+            "sysroot_",
+        ]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
 }
 
 fn widen_spec(op: &str, floor: &str, policy: WidenCeilingPolicy) -> String {
@@ -2096,8 +2135,8 @@ pub enum Ownership {
     /// widened; the auto-routed side yields toward it instead (doctrine
     /// (i), mirroring `CondaRangeVsPackPin`).
     WorkspacePin,
-    /// One of `ABI_ANCHOR_NAMES` / the `is_abi_anchor` predicate --
-    /// immutable guardrail, never touched.
+    /// One of the legacy solve-repair anchors recognized by
+    /// `is_solve_repair_anchor` -- immutable guardrail, never touched.
     AbiAnchor,
     /// None of the above: someone else's transitive dependency this
     /// workspace has no ownership stake in. Untouchable.
@@ -2187,7 +2226,7 @@ impl RepairPlanner {
         pack_name: Option<&str>,
         package: &str,
     ) -> Ownership {
-        if is_abi_anchor(package) {
+        if is_solve_repair_anchor(package) {
             return Ownership::AbiAnchor;
         }
         let Some(bundle) = pack_name else {
@@ -2774,7 +2813,7 @@ impl RepairPlanner {
             let Some(requirer) = &m.requirer else {
                 continue;
             };
-            if is_abi_anchor(&m.package)
+            if is_solve_repair_anchor(&m.package)
                 || self.workspace_pin_governs_pack(editor, bundle, &m.package)
             {
                 continue;
@@ -2826,7 +2865,7 @@ impl RepairPlanner {
         // correct here: relaxing the conda pin would let conda install a
         // triton whose version contradicts torch's own PyPI metadata.
         for m in mentions {
-            if !is_abi_anchor(&m.package) {
+            if !is_solve_repair_anchor(&m.package) {
                 continue;
             }
             let Some(requirer) = &m.requirer else {
@@ -2930,7 +2969,7 @@ impl RepairPlanner {
             if !requirer.eq_ignore_ascii_case(bundle) {
                 continue;
             }
-            if is_abi_anchor(&m.package)
+            if is_solve_repair_anchor(&m.package)
                 || self.workspace_pin_governs_pack(editor, bundle, &m.package)
             {
                 continue;
@@ -3071,7 +3110,7 @@ impl RepairPlanner {
                     _ => continue,
                 };
                 let target = &mentions[emitted_mention];
-                if is_abi_anchor(&target.package)
+                if is_solve_repair_anchor(&target.package)
                     || pack_emitted_pin_floor(&target.spec).is_none()
                     || self.workspace_pin_governs_pack_family(editor, &pack, &target.package)
                     || self.classify_mention_ownership(editor, Some(&pack), &target.package)
@@ -3341,7 +3380,7 @@ impl RepairPlanner {
         stderr: &str,
         package: &str,
     ) -> Vec<PackOverrideWrite> {
-        if is_abi_anchor(package) {
+        if is_solve_repair_anchor(package) {
             return Vec::new();
         }
         let Some(ws) = crate::workspace::WorkspaceManifest::load(editor.project_dir()) else {
@@ -4532,16 +4571,41 @@ holosoma-gpu = { features = ["holosoma"] }
 
     #[test]
     fn abi_guard_covers_exact_list_and_patterns() {
-        assert!(is_abi_anchor("python"));
-        assert!(is_abi_anchor("numpy"));
-        assert!(is_abi_anchor("cuda"));
+        for anchor in [
+            "python",
+            "python_abi",
+            "pypy",
+            "numpy",
+            "cuda",
+            "cuda-version",
+            "glibc",
+            "libstdcxx",
+            "libstdcxx-ng",
+            "libcxx",
+            "libcxx-devel",
+            "__linux",
+            "cxx_compiler",
+            "gcc_linux-64",
+            "gxx_linux-64",
+            "g++_linux-64",
+            "gfortran_linux-64",
+            "clang_linux-64",
+            "clangxx_linux-64",
+            "binutils_linux-64",
+            "ld_linux-64",
+            "sysroot_linux-64",
+        ] {
+            assert!(is_abi_anchor(anchor), "{anchor}");
+        }
+        assert!(is_abi_anchor("CUDA"));
         assert!(is_abi_anchor("cuda-cudart"));
-        assert!(is_abi_anchor("__linux"));
-        assert!(is_abi_anchor("cxx_compiler"));
         assert!(is_abi_anchor("cxx-compiler"));
-        assert!(is_abi_anchor("sysroot_linux-64"));
         assert!(is_abi_anchor("sysroot-linux-64"));
         assert!(!is_abi_anchor("packaging"));
+        assert!(
+            !is_solve_repair_anchor("numpy") && !is_solve_repair_anchor("cuda"),
+            "Track 1 must not silently activate Track 4 solve-repair policy"
+        );
     }
 
     // ---- P0 acceptance fixture (lock-succ-brief.md acceptance run #1/#2):

@@ -18,7 +18,7 @@ use super::manifest::{AppliedEdit, ManifestEditor, copy_atomic};
 use super::parse::{ConflictParser, RegexConflictParser, tail};
 use super::repair::{
     PackOverrideKind, PackOverrideWrite, RelaxPreference, RepairPlanner, SolveLedger, Strategy,
-    append_attempt, is_abi_anchor, ledger_path, manifest_sha256, mark_last_widen_failed,
+    append_attempt, is_solve_repair_anchor, ledger_path, manifest_sha256, mark_last_widen_failed,
     persist_conflict_trace, retread_dir, snapshot_path,
 };
 
@@ -326,7 +326,7 @@ async fn run_with_pixi_bin(args: LockArgs, pixi_bin: &str) -> Result<i32> {
                     crate::pack_overrides::rollback_all(&project_dir)?;
                     ledger.finish_run(run_idx, "exhausted");
                     ledger.write_atomic(&ledger_path)?;
-                    if is_abi_anchor(&package) {
+                    if is_solve_repair_anchor(&package) {
                         eprintln!(
                             "retread lock: ABI-anchor package {package} cannot be auto-repaired; edit the manifest manually"
                         );

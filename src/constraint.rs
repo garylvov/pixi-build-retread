@@ -16,7 +16,7 @@ use uv_pep508::uv_pep440::{
 use crate::relax::PypiKey;
 
 /// Where a constraint entered the composed dependency graph.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Provenance {
     /// `Requires-Dist` metadata from an index-fetched wheel.
     #[default]
@@ -58,12 +58,60 @@ pub fn authority(provenance: &Provenance) -> Authority {
     }
 }
 
+/// Stable identity for the structured origin of one constraint.
+///
+/// The encoded value is assembled from semantic fields supplied by the
+/// constraint producer (for example wheel name/version and normalized
+/// requirement), never from the free-form, user-facing [`Constraint::source`].
+/// Every field is byte-length-prefixed so distinct component boundaries cannot
+/// collide (`["ab", "c"]` and `["a", "bc"]` remain different identities).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ConstraintOriginId(String);
+
+impl ConstraintOriginId {
+    /// Construct an origin identity from a stable kind and ordered semantic
+    /// components.
+    ///
+    /// Callers must pass canonical structured values, not diagnostic prose or
+    /// [`Constraint::source`]. No `From<String>` or unstructured constructor is
+    /// provided so origin creation remains explicit at each source boundary.
+    pub fn from_parts<I, S>(kind: &str, parts: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        fn push_part(encoded: &mut String, part: &str) {
+            encoded.push_str(&part.len().to_string());
+            encoded.push(':');
+            encoded.push_str(part);
+        }
+
+        let mut encoded = String::new();
+        push_part(&mut encoded, kind);
+        for part in parts {
+            push_part(&mut encoded, part.as_ref());
+        }
+        Self(encoded)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ConstraintOriginId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// One version constraint with enough provenance to determine its authority.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Constraint {
     pub specifiers: VersionSpecifiers,
     pub provenance: Provenance,
     pub source: String,
+    pub origin_id: ConstraintOriginId,
 }
 
 impl Constraint {
@@ -96,6 +144,30 @@ impl Conflict {
     pub(crate) fn with_scope(mut self, scope: impl Into<String>) -> Self {
         self.scope = format!(" {}", scope.into());
         self
+    }
+}
+
+/// A successful policy-neutral finalization, retaining whether the legacy
+/// conda-as-truth rule had to discard advisory floor/equality clauses.
+///
+/// The detailed form lets ABI-sensitive callers fail closed without changing
+/// the public [`finalize`] contract for ordinary packages.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum FinalizeSuccess {
+    Unchanged(VersionSpecifiers),
+    AdvisoryFloorSoftened {
+        specifiers: VersionSpecifiers,
+        unsoftened_conflict: Conflict,
+    },
+}
+
+impl FinalizeSuccess {
+    fn into_specifiers(self) -> VersionSpecifiers {
+        match self {
+            Self::Unchanged(specifiers) | Self::AdvisoryFloorSoftened { specifiers, .. } => {
+                specifiers
+            }
+        }
     }
 }
 
@@ -213,7 +285,9 @@ fn specifier_dedupe_key(specifier: &VersionSpecifier) -> SpecifierDedupeKey {
 
 /// Deduplicate without collapsing clauses whose written release length or
 /// spelling changes their semantics.
-fn dedup_specifier_clauses(clauses: impl Iterator<Item = VersionSpecifier>) -> VersionSpecifiers {
+pub(crate) fn dedup_specifier_clauses(
+    clauses: impl Iterator<Item = VersionSpecifier>,
+) -> VersionSpecifiers {
     let mut unique: BTreeMap<SpecifierDedupeKey, (String, VersionSpecifier)> = BTreeMap::new();
     for specifier in clauses {
         let rendered = specifier.to_string();
@@ -306,6 +380,26 @@ fn operator_forces_floor(operator: Operator) -> bool {
     )
 }
 
+fn conflict_from_active(package: &PypiKey, active: &[&Constraint]) -> Conflict {
+    let sources = active
+        .iter()
+        .map(|constraint| {
+            let rendered = if constraint.specifiers.is_empty() {
+                "*".to_string()
+            } else {
+                constraint.specifiers.to_string()
+            };
+            format!("`{rendered}` required by {}", constraint.source)
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Conflict {
+        package: package.clone(),
+        sources,
+        scope: String::new(),
+    }
+}
+
 /// Apply override replacement, exclude preferences, deduplicate, and prove
 /// the active constraint intersection satisfiable.
 ///
@@ -317,6 +411,34 @@ pub fn finalize(
     package: &PypiKey,
     constraints: &[Constraint],
 ) -> Result<VersionSpecifiers, Conflict> {
+    finalize_impl(package, constraints, true).map(FinalizeSuccess::into_specifiers)
+}
+
+/// The exact strict finalization semantics without diagnostic side effects.
+///
+/// Candidate search uses this oracle for speculative subsets. The public
+/// [`finalize`] wrapper retains its existing committed-path warning behavior.
+pub(crate) fn finalize_quiet(
+    package: &PypiKey,
+    constraints: &[Constraint],
+) -> Result<VersionSpecifiers, Conflict> {
+    finalize_impl(package, constraints, false).map(FinalizeSuccess::into_specifiers)
+}
+
+/// Quiet policy-neutral finalization with enough detail for ABI callers to
+/// reject a success that depended on discarding an advisory clause.
+pub(crate) fn finalize_quiet_detailed(
+    package: &PypiKey,
+    constraints: &[Constraint],
+) -> Result<FinalizeSuccess, Conflict> {
+    finalize_impl(package, constraints, false)
+}
+
+fn finalize_impl(
+    package: &PypiKey,
+    constraints: &[Constraint],
+    emit_diagnostics: bool,
+) -> Result<FinalizeSuccess, Conflict> {
     let has_override = constraints
         .iter()
         .any(|constraint| matches!(&constraint.provenance, Provenance::UvOverride));
@@ -337,7 +459,9 @@ pub fn finalize(
 
     let combined = intersect(&active);
     if !specifiers_unsatisfiable(&combined) {
-        return Ok(remove_redundant_specifier_clauses(combined));
+        return Ok(FinalizeSuccess::Unchanged(
+            remove_redundant_specifier_clauses(combined),
+        ));
     }
 
     let authoritative: Vec<&Constraint> = active
@@ -373,33 +497,23 @@ pub fn finalize(
         }
         let softened = dedup_specifier_clauses(kept.into_iter());
         if dropped_floor && !specifiers_unsatisfiable(&softened) {
-            tracing::warn!(
-                package = %package,
-                softened = %softened,
-                "an advisory lower bound conflicted with an authoritative constraint; \
-                 dropped the advisory floor (conda-as-truth)",
-            );
-            return Ok(remove_redundant_specifier_clauses(softened));
+            let unsoftened_conflict = conflict_from_active(package, &active);
+            if emit_diagnostics {
+                tracing::warn!(
+                    package = %package,
+                    softened = %softened,
+                    "an advisory lower bound conflicted with an authoritative constraint; \
+                     dropped the advisory floor (conda-as-truth)",
+                );
+            }
+            return Ok(FinalizeSuccess::AdvisoryFloorSoftened {
+                specifiers: remove_redundant_specifier_clauses(softened),
+                unsoftened_conflict,
+            });
         }
     }
 
-    let sources = active
-        .iter()
-        .map(|constraint| {
-            let rendered = if constraint.specifiers.is_empty() {
-                "*".to_string()
-            } else {
-                constraint.specifiers.to_string()
-            };
-            format!("`{rendered}` required by {}", constraint.source)
-        })
-        .collect::<Vec<_>>()
-        .join("; ");
-    Err(Conflict {
-        package: package.clone(),
-        sources,
-        scope: String::new(),
-    })
+    Err(conflict_from_active(package, &active))
 }
 
 #[cfg(test)]
@@ -409,6 +523,16 @@ mod tests {
     use super::*;
 
     fn constraint(specifiers: &str, provenance: Provenance, source: &str) -> Constraint {
+        let provenance_tag = match &provenance {
+            Provenance::IndexWheelMetadata => "index-wheel-metadata",
+            Provenance::SourceBuiltRelaxed => "source-built-relaxed",
+            Provenance::DepsFromRelaxed => "deps-from-relaxed",
+            Provenance::WorkspaceCondaFact(_) => "workspace-conda-fact",
+            Provenance::UvRoot => "uv-root",
+            Provenance::UvConstraint => "uv-constraint",
+            Provenance::UvOverride => "uv-override",
+            Provenance::PriorSelection => "prior-selection",
+        };
         Constraint {
             specifiers: if specifiers.is_empty() {
                 VersionSpecifiers::empty()
@@ -417,11 +541,31 @@ mod tests {
             },
             provenance,
             source: source.to_string(),
+            origin_id: ConstraintOriginId::from_parts(
+                "constraint-unit-test",
+                [provenance_tag, specifiers],
+            ),
         }
     }
 
     fn package() -> PypiKey {
         PypiKey::from_pypi("example_package")
+    }
+
+    #[test]
+    fn structured_origin_ids_preserve_component_boundaries_and_order() {
+        let first = ConstraintOriginId::from_parts("wheel", ["a", "bc"]);
+        let second = ConstraintOriginId::from_parts("wheel", ["ab", "c"]);
+        let repeated = ConstraintOriginId::from_parts("wheel", ["a", "bc"]);
+        let other_kind = ConstraintOriginId::from_parts("route", ["a", "bc"]);
+
+        assert_eq!(first, repeated);
+        assert_ne!(first, second);
+        assert_ne!(first, other_kind);
+
+        let lower = ConstraintOriginId::from_parts("wheel", ["a"]);
+        let upper = ConstraintOriginId::from_parts("wheel", ["b"]);
+        assert!(lower < upper);
     }
 
     #[test]

@@ -656,7 +656,11 @@ pub const SCHEMA: u32 = 15;
 ///
 /// Epoch 30: unsatisfiable cross-wheel metadata constraints are relaxed inline
 /// before PyPI restoration, changing the selected wheel and emitted run list.
-pub const EMIT_EPOCH: u32 = 30;
+///
+/// Epoch 31: relaxation is selected strictly and at clause granularity, with a
+/// fail-closed ABI-anchor post-check. Identical inputs can therefore emit a
+/// narrower dependency or reject an unsafe cached result.
+pub const EMIT_EPOCH: u32 = 31;
 
 fn parse_stored_glibc(value: Option<&str>) -> Option<Option<(u32, u32)>> {
     match value {

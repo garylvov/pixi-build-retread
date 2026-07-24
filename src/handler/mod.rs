@@ -40,7 +40,8 @@ use uv_pep508::uv_pep440::VersionSpecifiers;
 
 use crate::config::{RelaxPolicy, RetreadConfig, WheelEntry};
 use crate::constraint::{
-    Authority, Conflict, Constraint, Provenance, aggregate_conflicts, collect_conflicts, finalize,
+    Authority, Conflict, Constraint, ConstraintOriginId, Provenance, aggregate_conflicts,
+    collect_conflicts, finalize,
 };
 use crate::index_chain::{IndexPurpose, index_chain};
 use crate::pypi::{self, ResolutionTarget, WheelTarget, normalized_python_minor};
@@ -50,6 +51,9 @@ use crate::recipe::{
 use crate::relax::{
     CondaConstraintOrigin, CondaDep, CondaName, CondaTarget, NameMap, PypiKey,
     canonical_conda_name, emit_python_version, marker_env_for,
+};
+use crate::relax_decision::{
+    Decision as RelaxDecision, SafetyContext, decide as decide_relaxation,
 };
 use crate::rpc::{RpcError, ok, parse_params};
 use crate::wheel::WheelMetadata;
@@ -2312,6 +2316,10 @@ fn workspace_conda_provider_route(
             specifiers,
             provenance: provenance.clone(),
             source: format!("workspace conda declaration `{provider} {trimmed}`"),
+            origin_id: ConstraintOriginId::from_parts(
+                "workspace-provider-declaration",
+                [provider, trimmed],
+            ),
         });
     }
     if declared_constraints.is_empty() {
@@ -2319,6 +2327,10 @@ fn workspace_conda_provider_route(
             specifiers: VersionSpecifiers::empty(),
             provenance: provenance.clone(),
             source: format!("workspace-selected transitive conda provider `{provider}`"),
+            origin_id: ConstraintOriginId::from_parts(
+                "workspace-provider-fallback",
+                [provider, "*"],
+            ),
         });
     }
     let provider_key = PypiKey::from_pypi(provider);
@@ -2342,6 +2354,10 @@ fn workspace_conda_provider_route(
             provenance,
             source: format!(
                 "workspace conda provider `{provider} {rendered}` selected as {selected_versions} in precise consuming environments"
+            ),
+            origin_id: ConstraintOriginId::from_parts(
+                "workspace-provider-route",
+                [provider, rendered.as_str()],
             ),
         },
     })
@@ -2746,6 +2762,7 @@ impl Handler {
         // ever learns which [retread-wheels] entry actually broke.
         let mut outputs = Vec::new();
         let mut output_conflicts = Vec::new();
+        let mut pending_output_relaxations = Vec::new();
         // v4.2.0: the per-env pre-emission solve check (and its
         // bookkeeping / fail gate) was deleted with the legacy
         // mirror-solver; outputs ship unvalidated and `retread solve`
@@ -2766,7 +2783,7 @@ impl Handler {
             // Phase 1: materialize wheels + auto-bundle. Env-agnostic;
             // results reused across all per-env emissions.
             let t_materialize = std::time::Instant::now();
-            let (materialized, base_config) = resolve_all(
+            let (materialized, base_config, restore_relaxations) = resolve_all(
                 &config,
                 &target,
                 &download_dir,
@@ -2781,6 +2798,7 @@ impl Handler {
                     "resolving wheels for python {python_version}: {e:#}"
                 ))
             })?;
+            pending_output_relaxations.extend(restore_relaxations);
             tracing::info!(
                 python = %python_version,
                 elapsed_ms = t_materialize.elapsed().as_millis() as u64,
@@ -2987,6 +3005,18 @@ impl Handler {
                             &siblings,
                         ) {
                             Ok(Some(replayed)) => {
+                                ensure_output_abi_invariants(
+                                    &replayed,
+                                    &bundle,
+                                    &effective,
+                                    python_version,
+                                )
+                                .map_err(|error| {
+                                    RpcError::internal(format!(
+                                        "courier replay for {} failed ABI validation: {error:#}",
+                                        bundle.conda_name
+                                    ))
+                                })?;
                                 tracing::info!(
                                     bundle = %bundle.conda_name,
                                     "WS-B: cold-solve replay hit -- \
@@ -3034,7 +3064,7 @@ impl Handler {
                     let output_build_hash = courier_build_hash
                         .as_deref()
                         .or(non_courier_target_hash.as_deref());
-                    let output = match produce_output(
+                    let (output, relaxations) = match produce_output_pending_relaxations(
                         &bundle,
                         &effective,
                         params.host_platform,
@@ -3063,6 +3093,7 @@ impl Handler {
                             continue;
                         }
                     };
+                    pending_output_relaxations.extend(relaxations);
                     // v4.2.0: the in-backend per-env solve check +
                     // iterative widening cascade were removed with the
                     // legacy mirror-solver. Emitted run-deps go to pixi
@@ -3140,6 +3171,9 @@ impl Handler {
         // recomputed by each backend process so build_v1 has their plan.
         if !requires_prepared_plan {
             write_conda_outputs_disk_cache(&disk_cache_path, &result).await;
+        }
+        for relaxation in pending_output_relaxations {
+            relaxation.emit();
         }
         Ok(result)
     }
@@ -3661,7 +3695,7 @@ impl Handler {
 
         // Re-resolve materialized bundles, then autodiscover emissions
         // and pick the one matching the requested output name.
-        let (materialized, base_config) = resolve_all(
+        let (materialized, base_config, restore_relaxations) = resolve_all(
             &config,
             &target,
             &download_dir,
@@ -3755,7 +3789,12 @@ impl Handler {
         )
         .await
         .map_err(|e| RpcError::internal(format!("build {}: {e:#}", bundle.conda_name)))?;
-        finalize_fasttmp_build_output(result, stage_output_dir.as_deref(), &output_dir).await
+        let result =
+            finalize_fasttmp_build_output(result, stage_output_dir.as_deref(), &output_dir).await?;
+        for relaxation in restore_relaxations {
+            relaxation.emit();
+        }
+        Ok(result)
     }
 
     async fn begin_prepared_transaction(&self, generation: u64) -> Option<u64> {
@@ -4227,9 +4266,14 @@ async fn resolve_all(
     cache_dir: &Path,
     conda_channels: &[ChannelUrl],
     workspace_dir: Option<&Path>,
-) -> Result<(Vec<Bundle>, RetreadConfig)> {
+) -> Result<(
+    Vec<Bundle>,
+    RetreadConfig,
+    Vec<auto_bundle::WheelMetadataRelaxation>,
+)> {
     let mut bundles = Vec::with_capacity(config.retread_wheels.len());
     let mut route_conflicts = Vec::new();
+    let mut pending_relaxations = Vec::new();
 
     // One complete workspace chain participates in every resolution path.
     // It retains the declared extras priority and either the explicit main
@@ -4596,7 +4640,9 @@ async fn resolve_all(
                 }
             };
             match outcome {
-                AutoBundleOutcome::Complete => {}
+                AutoBundleOutcome::Complete { relaxations } => {
+                    pending_relaxations.extend(relaxations);
+                }
                 AutoBundleOutcome::RetryKeepPypi { keep_pypi } => {
                     let accumulated = uv_retry_keep_by_group
                         .entry(group_name.clone())
@@ -4628,7 +4674,7 @@ async fn resolve_all(
     if !route_conflicts.is_empty() {
         return Err(aggregate_conflicts(route_conflicts));
     }
-    Ok((bundles, effective))
+    Ok((bundles, effective, pending_relaxations))
 }
 
 /// Compose the persisted sdist source URL, appending the advertised
@@ -10399,10 +10445,11 @@ struct EmittedBundleRouteAssembly {
 
 #[derive(Clone, Debug)]
 struct PypiEmissionGroup {
-    pypi_name: PypiKey,
+    pypi_names: BTreeSet<PypiKey>,
     conda_name: CondaName,
+    conda_name_is_authoritative: bool,
     constraints: Vec<Constraint>,
-    native_conda_override: Option<String>,
+    native_conda_overrides: BTreeSet<String>,
 }
 
 #[derive(Debug)]
@@ -10495,30 +10542,304 @@ fn add_emission_constraint(
     indexes: &mut BTreeMap<PypiKey, usize>,
     pypi_name: PypiKey,
     conda_name: CondaName,
+    conda_name_is_authoritative: bool,
     constraint: Constraint,
     native_conda_override: Option<String>,
-) {
-    let index = match indexes.get(&pypi_name) {
+) -> Result<()> {
+    let conda_key = conda_name.key();
+    let index = match indexes.get(&conda_key) {
         Some(index) => *index,
         None => {
             let index = groups.len();
-            indexes.insert(pypi_name.clone(), index);
+            indexes.insert(conda_key, index);
             groups.push(PypiEmissionGroup {
-                pypi_name,
-                conda_name,
+                pypi_names: BTreeSet::new(),
+                conda_name: conda_name.clone(),
+                conda_name_is_authoritative,
                 constraints: Vec::new(),
-                native_conda_override: None,
+                native_conda_overrides: BTreeSet::new(),
             });
             index
         }
     };
     let group = &mut groups[index];
+    if group.conda_name != conda_name {
+        match (
+            group.conda_name_is_authoritative,
+            conda_name_is_authoritative,
+        ) {
+            (false, true) => {
+                group.conda_name = conda_name;
+                group.conda_name_is_authoritative = true;
+            }
+            (true, false) => {}
+            _ => {
+                bail!(
+                    "multiple equal-authority raw conda targets `{}` and `{}` share canonical \
+                     identity `{}`; refusing to discard either dependency edge",
+                    group.conda_name,
+                    conda_name,
+                    group.conda_name.key()
+                );
+            }
+        }
+    }
+    group.pypi_names.insert(pypi_name);
     if !group.constraints.contains(&constraint) {
         group.constraints.push(constraint);
     }
-    if native_conda_override.is_some() {
-        group.native_conda_override = native_conda_override;
+    if let Some(native_conda_override) = native_conda_override {
+        group.native_conda_overrides.insert(native_conda_override);
+        if group.native_conda_overrides.len() > 1 {
+            bail!(
+                "conflicting native conda overrides target `{}`: {}",
+                group.conda_name,
+                group
+                    .native_conda_overrides
+                    .iter()
+                    .map(|spec| format!("`{spec}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
     }
+    Ok(())
+}
+
+fn is_bare_major_spec(spec: &str) -> bool {
+    fn has_positive_minor_anchor(clause: &str) -> bool {
+        let clause = clause.trim();
+        if clause.starts_with("!=") {
+            return false;
+        }
+        let payload = clause
+            .trim_start_matches(['<', '>', '=', '~'])
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .trim_end_matches(".*");
+        let release = payload
+            .rsplit_once('!')
+            .map_or(payload, |(_, release)| release);
+        let mut components = release.split('.');
+        matches!(
+            (components.next(), components.next()),
+            (Some(major), Some(minor))
+                if !major.is_empty()
+                    && !minor.is_empty()
+                    && major.chars().all(|character| character.is_ascii_digit())
+                    && minor.chars().all(|character| character.is_ascii_digit())
+        )
+    }
+
+    let mut branches = spec.split('|').peekable();
+    branches.peek().is_some()
+        && branches.any(|branch| !branch.split(',').any(has_positive_minor_anchor))
+}
+
+type AbiAliasGraph = BTreeMap<String, BTreeSet<String>>;
+type WorkspaceAbiVersions = BTreeMap<String, BTreeSet<String>>;
+
+fn add_abi_alias_edge(aliases: &mut AbiAliasGraph, left: &str, right: &str) {
+    let left = canonical_conda_name(left);
+    let right = canonical_conda_name(right);
+    if left == right {
+        return;
+    }
+    aliases
+        .entry(left.clone())
+        .or_default()
+        .insert(right.clone());
+    aliases.entry(right).or_default().insert(left);
+}
+
+fn semantic_aliases(name: &str, aliases: &AbiAliasGraph) -> BTreeSet<String> {
+    let root = canonical_conda_name(name);
+    let mut seen = BTreeSet::from([root.clone()]);
+    let mut pending = vec![root];
+    while let Some(current) = pending.pop() {
+        if let Some(neighbors) = aliases.get(&current) {
+            for neighbor in neighbors {
+                if seen.insert(neighbor.clone()) {
+                    pending.push(neighbor.clone());
+                }
+            }
+        }
+    }
+    seen
+}
+
+fn is_semantic_abi_anchor(name: &str, aliases: &AbiAliasGraph) -> bool {
+    semantic_aliases(name, aliases)
+        .iter()
+        .any(|alias| crate::solve::is_abi_anchor(alias))
+}
+
+fn output_abi_aliases(bundle: &Bundle, config: &RetreadConfig) -> AbiAliasGraph {
+    let mut aliases = AbiAliasGraph::new();
+    for (pypi_name, target) in &config.name_map {
+        if let Some(conda_name) = target.mapped_name() {
+            add_abi_alias_edge(&mut aliases, pypi_name.as_str(), conda_name.as_spec());
+        }
+    }
+    for route in &bundle.auto_routed {
+        add_abi_alias_edge(
+            &mut aliases,
+            &route.route.pypi_name,
+            &route.route.conda_name,
+        );
+        if let Some(provider) = &route.workspace_provider {
+            add_abi_alias_edge(
+                &mut aliases,
+                &route.route.pypi_name,
+                provider.conda_name.as_spec(),
+            );
+        }
+    }
+    aliases
+}
+
+/// Post-emission ABI safety net ported from the deleted cascade.
+///
+/// The former implementation only logged and merely noticed workspace pins.
+/// This pure check returns stable violations so every emission caller can
+/// reject corruption in release builds.
+pub(crate) fn check_output_abi_invariants(
+    output_run_deps: &[(String, String)],
+    workspace_versions: &WorkspaceAbiVersions,
+    overrides: &BTreeMap<String, String>,
+    aliases: &AbiAliasGraph,
+) -> Vec<String> {
+    let mut emitted = output_run_deps.to_vec();
+    emitted.sort();
+    let mut violations = Vec::new();
+
+    for (name, spec) in emitted {
+        if !is_semantic_abi_anchor(&name, aliases) {
+            continue;
+        }
+        let trimmed = spec.trim();
+        if trimmed.is_empty() || trimmed == "*" {
+            violations.push(format!(
+                "ABI invariant: retread emitted `{name} {trimmed}` (empty/*); \
+                 ABI anchors must carry a concrete spec"
+            ));
+            continue;
+        }
+        if is_bare_major_spec(trimmed) {
+            violations.push(format!(
+                "ABI invariant: retread emitted `{name} {trimmed}` (bare-major); \
+                 ABI anchors must carry a minor or stricter spec"
+            ));
+            continue;
+        }
+
+        let parsed_spec =
+            VersionSpec::from_str(trimmed, rattler_conda_types::ParseStrictness::Lenient);
+        for workspace_name in semantic_aliases(&name, aliases) {
+            let Some(selected_versions) = workspace_versions.get(&workspace_name) else {
+                continue;
+            };
+            for workspace_version in selected_versions {
+                let parsed_version = rattler_conda_types::Version::from_str(workspace_version);
+                match (&parsed_version, &parsed_spec) {
+                    (Ok(version), Ok(specifier)) if specifier.matches(version) => {}
+                    (Ok(_), Ok(_)) => violations.push(format!(
+                        "ABI invariant: emitted `{name} {trimmed}` does not cover workspace pin \
+                         `{workspace_name}=={workspace_version}`"
+                    )),
+                    (Err(error), _) => violations.push(format!(
+                        "ABI invariant: workspace pin `{workspace_name}=={workspace_version}` \
+                         cannot be validated: {error}"
+                    )),
+                    (_, Err(error)) => violations.push(format!(
+                        "ABI invariant: emitted anchor spec `{name} {trimmed}` cannot be \
+                         validated: {error}"
+                    )),
+                }
+            }
+        }
+    }
+
+    for (name, spec) in overrides {
+        if !is_semantic_abi_anchor(name, aliases) {
+            continue;
+        }
+        let trimmed = spec.trim();
+        if trimmed.is_empty() || trimmed == "*" || is_bare_major_spec(trimmed) {
+            violations.push(format!(
+                "ABI invariant: `retread-overrides[{name}]` is `{trimmed}`; \
+                 ABI anchors must never be widened to */bare-major"
+            ));
+        }
+    }
+
+    violations.sort();
+    violations.dedup();
+    violations
+}
+
+fn ensure_output_abi_invariants(
+    output: &CondaOutput,
+    bundle: &Bundle,
+    config: &RetreadConfig,
+    workspace_python_version: &str,
+) -> Result<()> {
+    let emitted = output
+        .run_dependencies
+        .depends
+        .iter()
+        .map(|dependency| {
+            (
+                dependency.name.as_str().to_string(),
+                audit_report::format_packagespec(&dependency.spec),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut workspace_versions = WorkspaceAbiVersions::new();
+    for (name, version) in &bundle.workspace_conda_versions {
+        workspace_versions
+            .entry(canonical_conda_name(name))
+            .or_default()
+            .insert(version.clone());
+    }
+    for (name, fact) in &bundle.workspace_conda_provider_facts {
+        workspace_versions
+            .entry(canonical_conda_name(name))
+            .or_default()
+            .extend(fact.selected_versions.iter().cloned());
+    }
+    for route in &bundle.auto_routed {
+        if let Some(provider) = &route.workspace_provider {
+            workspace_versions
+                .entry(provider.conda_name.key().into_string())
+                .or_default()
+                .extend(provider.selected_versions.iter().cloned());
+        }
+    }
+    if workspace_python_version.contains('.') {
+        workspace_versions
+            .entry("python".to_string())
+            .or_default()
+            .insert(workspace_python_version.to_string());
+    }
+    let aliases = output_abi_aliases(bundle, config);
+    let violations =
+        check_output_abi_invariants(&emitted, &workspace_versions, &config.overrides, &aliases);
+    if violations.is_empty() {
+        return Ok(());
+    }
+    for violation in &violations {
+        tracing::error!(
+            bundle = %bundle.conda_name,
+            violation = %violation,
+            "bundle emission rejected by ABI invariant",
+        );
+    }
+    bail!(
+        "bundle emission rejected by ABI invariant: {}",
+        violations.join("; ")
+    )
 }
 
 fn produce_output_with_conflicts(
@@ -10533,7 +10854,11 @@ fn produce_output_with_conflicts(
     // on an incremental add).  `None` → use bundle.primary.metadata.version
     // (today's behaviour, always chosen when RETREAD_INCREMENTAL is unset).
     version_override: Option<&str>,
-) -> Result<(CondaOutput, Vec<EmissionConstraintConflict>)> {
+) -> Result<(
+    CondaOutput,
+    Vec<EmissionConstraintConflict>,
+    Vec<auto_bundle::WheelMetadataRelaxation>,
+)> {
     // Python version for the emitted variant/build/`python` dep. Shared with
     // the build recipe via `emit_python_version` so the metadata and the
     // recipe can never disagree. NEVER bare-major: a `py3-none-manylinux`
@@ -10654,9 +10979,10 @@ fn produce_output_with_conflicts(
                 &mut emission_group_indexes,
                 pypi_name,
                 workspace_provider.conda_name.clone(),
+                true,
                 workspace_provider.constraint.clone(),
                 None,
-            );
+            )?;
             continue;
         }
 
@@ -10672,18 +10998,20 @@ fn produce_output_with_conflicts(
         let manual_override = config.overrides.contains_key(conda_key.as_str())
             && !config.ledger_overrides.contains(conda_key.as_str());
         if !matches!(auto_route.provenance, Provenance::DepsFromRelaxed) {
-            let (route_spec, provenance) =
-                if crate::solve::is_abi_anchor(conda_key.as_str()) || manual_override {
-                    (format!("=={conda_version}"), Provenance::UvConstraint)
-                } else {
-                    match bounded_range_ceiling(conda_version) {
-                        Some(ceiling) => (
-                            format!(">={conda_version},<{ceiling}"),
-                            Provenance::UvConstraint,
-                        ),
-                        None => (format!("=={conda_version}"), Provenance::UvConstraint),
-                    }
-                };
+            let route_is_abi_anchor = crate::solve::is_abi_anchor(&auto_route.route.pypi_name)
+                || crate::solve::is_abi_anchor(auto_route.route.conda_name.as_str())
+                || crate::solve::is_abi_anchor(conda_key.as_str());
+            let (route_spec, provenance) = if route_is_abi_anchor || manual_override {
+                (format!("=={conda_version}"), Provenance::UvConstraint)
+            } else {
+                match bounded_range_ceiling(conda_version) {
+                    Some(ceiling) => (
+                        format!(">={conda_version},<{ceiling}"),
+                        Provenance::UvConstraint,
+                    ),
+                    None => (format!("=={conda_version}"), Provenance::UvConstraint),
+                }
+            };
             let specifiers = VersionSpecifiers::from_str(&route_spec).with_context(|| {
                 format!(
                     "parsing generated conda route constraint `{} {route_spec}`",
@@ -10695,6 +11023,7 @@ fn produce_output_with_conflicts(
                 &mut emission_group_indexes,
                 pypi_name.clone(),
                 conda_name.clone(),
+                true,
                 Constraint {
                     specifiers,
                     provenance,
@@ -10705,23 +11034,35 @@ fn produce_output_with_conflicts(
                         auto_route.route.conda_name,
                         auto_route.route.conda_version
                     ),
+                    origin_id: ConstraintOriginId::from_parts(
+                        "auto-route",
+                        [
+                            auto_route.route.pypi_name.as_str(),
+                            auto_route.route.pypi_version.as_str(),
+                            auto_route.route.conda_name.as_str(),
+                            auto_route.route.conda_version.as_str(),
+                            auto_route.route.channel.as_str(),
+                            "conda-selection",
+                            route_spec.as_str(),
+                        ],
+                    ),
                 },
                 None,
-            );
+            )?;
         }
-        let prior_specifiers =
-            VersionSpecifiers::from_str(&format!("=={}", auto_route.route.pypi_version))
-                .with_context(|| {
-                    format!(
-                        "parsing prior uv selection `{}=={}`",
-                        auto_route.route.pypi_name, auto_route.route.pypi_version
-                    )
-                })?;
+        let prior_spec = format!("=={}", auto_route.route.pypi_version);
+        let prior_specifiers = VersionSpecifiers::from_str(&prior_spec).with_context(|| {
+            format!(
+                "parsing prior uv selection `{}=={}`",
+                auto_route.route.pypi_name, auto_route.route.pypi_version
+            )
+        })?;
         add_emission_constraint(
             &mut emission_groups,
             &mut emission_group_indexes,
             pypi_name.clone(),
             conda_name.clone(),
+            true,
             Constraint {
                 specifiers: prior_specifiers,
                 provenance: Provenance::PriorSelection,
@@ -10729,10 +11070,27 @@ fn produce_output_with_conflicts(
                     "prior uv selection `{}=={}`",
                     auto_route.route.pypi_name, auto_route.route.pypi_version
                 ),
+                origin_id: ConstraintOriginId::from_parts(
+                    "auto-route",
+                    [
+                        auto_route.route.pypi_name.as_str(),
+                        auto_route.route.pypi_version.as_str(),
+                        auto_route.route.conda_name.as_str(),
+                        auto_route.route.conda_version.as_str(),
+                        auto_route.route.channel.as_str(),
+                        "prior-selection",
+                        prior_spec.as_str(),
+                    ],
+                ),
             },
             None,
-        );
+        )?;
         for input in &auto_route.route.input_requirements {
+            let input_role = match input.role {
+                crate::uv_closure::AutoRouteInputRole::Requirement => "requirement",
+                crate::uv_closure::AutoRouteInputRole::Constraint => "constraint",
+                crate::uv_closure::AutoRouteInputRole::Override => "override",
+            };
             let specifiers = if input.specifiers.trim().is_empty() {
                 VersionSpecifiers::empty()
             } else {
@@ -10748,13 +11106,26 @@ fn produce_output_with_conflicts(
                 &mut emission_group_indexes,
                 pypi_name.clone(),
                 conda_name.clone(),
+                true,
                 Constraint {
                     specifiers,
                     provenance: input.effective_provenance(),
                     source: input.source.clone(),
+                    origin_id: ConstraintOriginId::from_parts(
+                        "auto-route",
+                        [
+                            auto_route.route.pypi_name.as_str(),
+                            auto_route.route.pypi_version.as_str(),
+                            auto_route.route.conda_name.as_str(),
+                            auto_route.route.conda_version.as_str(),
+                            auto_route.route.channel.as_str(),
+                            input_role,
+                            input.specifiers.trim(),
+                        ],
+                    ),
                 },
                 None,
-            );
+            )?;
         }
     }
 
@@ -10767,7 +11138,10 @@ fn produce_output_with_conflicts(
                 &env,
                 &config.name_map,
                 &config.overrides,
-                config.relax,
+                // Final emission is strict-first. Collect the original wheel
+                // clause here; `relax_decision::decide` below is the sole
+                // policy-aware conflict relaxation boundary.
+                RelaxPolicy::None,
             )?
             else {
                 continue;
@@ -10853,6 +11227,7 @@ fn produce_output_with_conflicts(
                 &mut emission_group_indexes,
                 pypi_name,
                 conda_name,
+                false,
                 Constraint {
                     specifiers: translated.specifiers,
                     provenance: translated.provenance,
@@ -10860,9 +11235,17 @@ fn produce_output_with_conflicts(
                         "wheel `{}=={}` Requires-Dist `{raw}`",
                         wheel.metadata.name, wheel.metadata.version
                     ),
+                    origin_id: ConstraintOriginId::from_parts(
+                        "wheel-requires-dist",
+                        [
+                            wheel.metadata.name.as_str(),
+                            wheel.metadata.version.as_str(),
+                            raw.as_str(),
+                        ],
+                    ),
                 },
                 translated.native_conda_override,
-            );
+            )?;
         }
     }
 
@@ -10874,6 +11257,12 @@ fn produce_output_with_conflicts(
     // still requires the configured route edge used by translation.
     for group in &mut emission_groups {
         let conda_key = group.conda_name.key();
+        let pypi_names = group
+            .pypi_names
+            .iter()
+            .map(PypiKey::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
         let Some(version) = bundle.workspace_conda_versions.get(conda_key.as_str()) else {
             continue;
         };
@@ -10887,8 +11276,8 @@ fn produce_output_with_conflicts(
         let workspace_version =
             uv_pep508::uv_pep440::Version::from_str(version).with_context(|| {
                 format!(
-                    "parsing common workspace conda version `{version}` for PyPI `{}`",
-                    group.pypi_name
+                    "parsing common workspace conda version `{version}` for PyPI origin(s) \
+                     `{pypi_names}`"
                 )
             })?;
         if !group.constraints.iter().any(|constraint| {
@@ -10900,8 +11289,9 @@ fn produce_output_with_conflicts(
         let specifiers =
             VersionSpecifiers::from_str(&format!("=={version}")).with_context(|| {
                 format!(
-                    "parsing common workspace conda fact `{}=={version}` for PyPI `{}`",
-                    group.conda_name, group.pypi_name
+                    "parsing common workspace conda fact `{}=={version}` for PyPI origin(s) \
+                     `{pypi_names}`",
+                    group.conda_name
                 )
             })?;
         let constraint = Constraint {
@@ -10911,34 +11301,94 @@ fn produce_output_with_conflicts(
                 "workspace conda fact `{}=={version}` shared by precise consuming environments",
                 group.conda_name
             ),
+            origin_id: ConstraintOriginId::from_parts(
+                "workspace-conda-fact",
+                [conda_key.as_str(), version.as_str()],
+            ),
         };
         if !group.constraints.contains(&constraint) {
             group.constraints.push(constraint);
         }
     }
 
+    emission_groups.sort_by(|left, right| {
+        (left.conda_name.as_spec(), &left.pypi_names)
+            .cmp(&(right.conda_name.as_spec(), &right.pypi_names))
+    });
+    let abi_aliases = output_abi_aliases(bundle, config);
     let mut conflicts = Vec::new();
+    let mut pending_relaxations = Vec::new();
     for group in emission_groups {
-        let conda_key = group.conda_name.key().into_string();
+        let PypiEmissionGroup {
+            pypi_names,
+            conda_name,
+            conda_name_is_authoritative: _,
+            constraints,
+            native_conda_overrides,
+        } = group;
+        let pypi_name = pypi_names
+            .iter()
+            .find(|name| crate::solve::is_abi_anchor(name.as_str()))
+            .or_else(|| pypi_names.iter().next())
+            .cloned()
+            .expect("every emission group has a PyPI origin");
+        let has_anchor_alias = pypi_names
+            .iter()
+            .any(|name| crate::solve::is_abi_anchor(name.as_str()))
+            || is_semantic_abi_anchor(conda_name.as_spec(), &abi_aliases);
+        let native_conda_override = native_conda_overrides.into_iter().next();
+        let conda_key = conda_name.key().into_string();
         if !seen_dep_names.insert(conda_key) {
-            continue;
+            bail!(
+                "duplicate conda dependency target `{conda_name}` reached final emission; \
+                 refusing to discard a whole constraint edge"
+            );
         }
-        match finalize(&group.pypi_name, &group.constraints) {
-            Ok(specifiers) => {
-                let rendered = group
-                    .native_conda_override
+        match decide_relaxation(
+            &pypi_name,
+            &constraints,
+            config.relax,
+            &SafetyContext::new(Some(conda_name.as_spec())).with_abi_anchor_alias(has_anchor_alias),
+        ) {
+            RelaxDecision::Strict {
+                specifiers,
+                diagnostics,
+            } => {
+                pending_relaxations.extend(auto_bundle::wheel_metadata_relaxations(
+                    &pypi_name,
+                    &constraints,
+                    diagnostics,
+                    format!(" for bundle '{}'", bundle.conda_name),
+                ));
+                let rendered = native_conda_override
+                    .clone()
                     .unwrap_or_else(|| specifiers.to_string().replace(", ", ","));
-                let spec = group.conda_name.match_spec(&rendered);
+                let spec = conda_name.match_spec(&rendered);
                 run_dep_specs.push(spec_from_str(spec.as_str())?);
             }
-            Err(conflict) => {
+            RelaxDecision::Relaxed {
+                specifiers,
+                decisions,
+            } => {
+                pending_relaxations.extend(auto_bundle::wheel_metadata_relaxations(
+                    &pypi_name,
+                    &constraints,
+                    decisions,
+                    format!(" for bundle '{}'", bundle.conda_name),
+                ));
+                let rendered = native_conda_override
+                    .unwrap_or_else(|| specifiers.to_string().replace(", ", ","));
+                let spec = conda_name.match_spec(&rendered);
+                run_dep_specs.push(spec_from_str(spec.as_str())?);
+            }
+            RelaxDecision::Conflict(conflict) => {
                 // Keep a name-only placeholder in the tolerant assembly so
                 // Rule 2 can identify and reject a wholly mutable route. The
                 // strict `produce_output` wrapper below always returns the
                 // structural conflict instead of emitting this placeholder.
-                run_dep_specs.push(spec_from_str(group.conda_name.as_spec())?);
+                run_dep_specs.push(spec_from_str(conda_name.as_spec())?);
                 conflicts.push(EmissionConstraintConflict {
-                    conda_name: group.conda_name,
+                    conda_name,
                     conflict,
                 });
             }
@@ -10972,10 +11422,13 @@ fn produce_output_with_conflicts(
         config.bundle_mode == crate::config::BundleMode::Loose,
         siblings,
     )?;
-    Ok((output, conflicts))
+    if conflicts.is_empty() {
+        ensure_output_abi_invariants(&output, bundle, config, workspace_python_version)?;
+    }
+    Ok((output, conflicts, pending_relaxations))
 }
 
-fn produce_output(
+fn produce_output_pending_relaxations(
     bundle: &Bundle,
     config: &RetreadConfig,
     host_platform: Platform,
@@ -10983,8 +11436,8 @@ fn produce_output(
     siblings: &[(String, String)],
     courier_build_hash: Option<&str>,
     version_override: Option<&str>,
-) -> Result<CondaOutput> {
-    let (output, conflicts) = produce_output_with_conflicts(
+) -> Result<(CondaOutput, Vec<auto_bundle::WheelMetadataRelaxation>)> {
+    let (output, conflicts, pending_relaxations) = produce_output_with_conflicts(
         bundle,
         config,
         host_platform,
@@ -11029,6 +11482,31 @@ fn produce_output(
             .collect();
         return Err(aggregate_conflicts(conflicts)).with_context(|| context);
     }
+    Ok((output, pending_relaxations))
+}
+
+#[cfg(test)]
+fn produce_output(
+    bundle: &Bundle,
+    config: &RetreadConfig,
+    host_platform: Platform,
+    workspace_python_version: &str,
+    siblings: &[(String, String)],
+    courier_build_hash: Option<&str>,
+    version_override: Option<&str>,
+) -> Result<CondaOutput> {
+    let (output, pending_relaxations) = produce_output_pending_relaxations(
+        bundle,
+        config,
+        host_platform,
+        workspace_python_version,
+        siblings,
+        courier_build_hash,
+        version_override,
+    )?;
+    for relaxation in pending_relaxations {
+        relaxation.emit();
+    }
     Ok(output)
 }
 
@@ -11045,7 +11523,7 @@ fn emitted_bundle_route_assembly(
 ) -> Result<EmittedBundleRouteAssembly> {
     let host_platform = Platform::from_str(&target.conda_subdir)
         .with_context(|| format!("parsing target conda subdir `{}`", target.conda_subdir))?;
-    let (output, conflicts) = produce_output_with_conflicts(
+    let (output, conflicts, _pending_relaxations) = produce_output_with_conflicts(
         bundle,
         config,
         host_platform,
@@ -13741,6 +14219,33 @@ fn replay_loaded_lock(
         loose,
         siblings,
     )?;
+    let emitted = output
+        .run_dependencies
+        .depends
+        .iter()
+        .map(|dependency| {
+            (
+                dependency.name.as_str().to_string(),
+                audit_report::format_packagespec(&dependency.spec),
+            )
+        })
+        .collect::<Vec<_>>();
+    let workspace_versions = BTreeMap::from([(
+        "python".to_string(),
+        BTreeSet::from([python_version.trim_end_matches(".*").to_string()]),
+    )]);
+    let violations = check_output_abi_invariants(
+        &emitted,
+        &workspace_versions,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+    );
+    if !violations.is_empty() {
+        bail!(
+            "courier replay rejected by ABI invariant: {}",
+            violations.join("; ")
+        );
+    }
     Ok(output)
 }
 
@@ -14181,6 +14686,35 @@ mod replay_tests {
         assert!(
             dep_names.contains(&"numpy"),
             "run_deps must include numpy from lock: {dep_names:?}"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn replay_rejects_bare_abi_anchor_from_committed_lock() {
+        let _env_guard = super::TEST_ENV_MUTEX.lock().unwrap();
+        let dir = unique_tmp_dir();
+        let mut lock = make_test_lock("mypack", "1.2.3", "3.11", "unsafe-hash", true);
+        lock.conda_run_deps = vec![CondaDep {
+            name: "numpy".into(),
+            spec: "*".into(),
+        }];
+        let lock_path = dir.join(RetreadLock::file_name("mypack"));
+        std::fs::write(&lock_path, lock.to_pretty_json().unwrap()).unwrap();
+
+        let error = replay_from_lock(
+            &lock_path,
+            "unsafe-hash",
+            true,
+            Platform::Linux64,
+            0,
+            false,
+            &[],
+        )
+        .expect_err("an unsafe ABI-anchor lock must not replay");
+        assert!(
+            format!("{error:#}").contains("courier replay rejected by ABI invariant"),
+            "{error:#}"
         );
         std::fs::remove_dir_all(dir).ok();
     }

@@ -13,17 +13,23 @@ use std::str::FromStr;
 use anyhow::{Context, Result, anyhow};
 use rattler_conda_types::ChannelUrl;
 use uv_pep508::MarkerEnvironment;
-use uv_pep508::uv_pep440::{Operator, Version, VersionSpecifiers};
+use uv_pep508::uv_pep440::{Version, VersionSpecifiers};
 
 use crate::config::{RelaxPolicy, RetreadConfig};
+#[cfg(test)]
+use crate::constraint::finalize;
 use crate::constraint::{
-    Conflict, ConflictReport, Constraint, Provenance, aggregate_conflicts, collect_conflicts,
-    finalize,
+    Conflict, ConflictReport, Constraint, ConstraintOriginId, Provenance, aggregate_conflicts,
+    collect_conflicts,
 };
 use crate::pypi;
 use crate::relax::{
     CondaName, CondaTarget, NameMap, PypiKey, canonical_conda_name, default_marker_env,
-    marker_env_for, relax_version_specifiers,
+    marker_env_for,
+};
+use crate::relax_decision::{
+    Decision as RelaxDecision, RelaxationDecision, RelaxationKind as WheelMetadataRelaxationKind,
+    SafetyContext, decide as decide_relaxation,
 };
 use crate::wheel::WheelMetadata;
 
@@ -85,8 +91,12 @@ pub(crate) struct UvReresolveContext {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AutoBundleOutcome {
-    Complete,
-    RetryKeepPypi { keep_pypi: BTreeSet<PypiKey> },
+    Complete {
+        relaxations: Vec<WheelMetadataRelaxation>,
+    },
+    RetryKeepPypi {
+        keep_pypi: BTreeSet<PypiKey>,
+    },
 }
 
 /// Returns `true` if `pypi_key` has an enabled, unambiguous conda equivalent
@@ -180,23 +190,8 @@ struct PypiFetchRequest {
     relaxations: Vec<WheelMetadataRelaxation>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum WheelMetadataRelaxationKind {
-    ExactPinWidened,
-    UpperCapStripped,
-}
-
-impl WheelMetadataRelaxationKind {
-    fn label(self) -> &'static str {
-        match self {
-            Self::ExactPinWidened => "exact pin widened",
-            Self::UpperCapStripped => "upper cap stripped",
-        }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct WheelMetadataRelaxation {
+pub(super) struct WheelMetadataRelaxation {
     package: PypiKey,
     kind: WheelMetadataRelaxationKind,
     original: String,
@@ -225,7 +220,7 @@ impl std::fmt::Display for WheelMetadataRelaxation {
 }
 
 impl WheelMetadataRelaxation {
-    fn emit(&self) {
+    pub(super) fn emit(&self) {
         let message = self.to_string();
         tracing::warn!(
             package = %self.package,
@@ -247,18 +242,59 @@ impl WheelMetadataRelaxation {
 /// resolved authority and produced a source-rich conflict, if any.
 type ObservedRequirements = BTreeMap<PypiKey, Vec<Constraint>>;
 
+fn wheel_requirement_origin_id(
+    wheel_name: &str,
+    wheel_version: &str,
+    dependency_name: &str,
+    specifiers: &VersionSpecifiers,
+    raw_requirement: &str,
+) -> ConstraintOriginId {
+    ConstraintOriginId::from_parts(
+        "wheel-requirement",
+        [
+            PypiKey::from_pypi(wheel_name).into_string(),
+            wheel_version.to_string(),
+            PypiKey::from_pypi(dependency_name).into_string(),
+            render_specifiers(specifiers),
+            raw_requirement.to_string(),
+        ],
+    )
+}
+
+fn provenance_origin_label(provenance: &Provenance) -> String {
+    match provenance {
+        Provenance::IndexWheelMetadata => "index-wheel-metadata".to_string(),
+        Provenance::SourceBuiltRelaxed => "source-built-relaxed".to_string(),
+        Provenance::DepsFromRelaxed => "deps-from-relaxed".to_string(),
+        Provenance::WorkspaceCondaFact(scope) => format!("workspace-conda-fact:{scope}"),
+        Provenance::UvRoot => "uv-root".to_string(),
+        Provenance::UvConstraint => "uv-constraint".to_string(),
+        Provenance::UvOverride => "uv-override".to_string(),
+        Provenance::PriorSelection => "prior-selection".to_string(),
+    }
+}
+
 fn observe_requirement(
     observed: &mut ObservedRequirements,
     pypi_name: &str,
     specifiers: &VersionSpecifiers,
-    source: String,
+    wheel_name: &str,
+    wheel_version: &str,
+    raw_requirement: &str,
     provenance: Provenance,
 ) {
     let observations = observed.entry(PypiKey::from_pypi(pypi_name)).or_default();
     let observation = Constraint {
         specifiers: specifiers.clone(),
-        source,
+        source: format!("wheel `{wheel_name}=={wheel_version}` Requires-Dist `{raw_requirement}`"),
         provenance,
+        origin_id: wheel_requirement_origin_id(
+            wheel_name,
+            wheel_version,
+            pypi_name,
+            specifiers,
+            raw_requirement,
+        ),
     };
     if !observations.contains(&observation) {
         observations.push(observation);
@@ -366,26 +402,6 @@ pub(super) fn scope_conflicts_for_target(
         .collect()
 }
 
-fn inline_wheel_metadata_relaxation_tiers(policy: RelaxPolicy) -> &'static [RelaxPolicy] {
-    use RelaxPolicy::{
-        CondaAware, Major, MajorWithLastResort, Minor, MinorWithLastResort, None, Patch,
-        PatchThenMinorThenMajorThenLastResort, PatchWithLastResort, StrongMajor,
-    };
-
-    match policy {
-        None => &[],
-        Patch => &[Patch],
-        Minor => &[Minor],
-        Major => &[Major],
-        StrongMajor => &[StrongMajor],
-        CondaAware => &[CondaAware],
-        PatchWithLastResort => &[Patch, StrongMajor],
-        MinorWithLastResort => &[Minor, StrongMajor],
-        MajorWithLastResort => &[Major, StrongMajor],
-        PatchThenMinorThenMajorThenLastResort => &[Patch, Minor, Major, StrongMajor],
-    }
-}
-
 fn render_specifiers(specifiers: &VersionSpecifiers) -> String {
     if specifiers.is_empty() {
         "*".to_string()
@@ -394,100 +410,47 @@ fn render_specifiers(specifiers: &VersionSpecifiers) -> String {
     }
 }
 
-fn relaxation_kind(specifiers: &VersionSpecifiers) -> WheelMetadataRelaxationKind {
-    let mut clauses = specifiers.iter();
-    if clauses
-        .next()
-        .is_some_and(|specifier| *specifier.operator() == Operator::Equal)
-        && clauses.next().is_none()
-    {
-        WheelMetadataRelaxationKind::ExactPinWidened
-    } else {
-        WheelMetadataRelaxationKind::UpperCapStripped
-    }
-}
-
-#[derive(Debug)]
-struct PendingWheelMetadataRelaxation {
-    kind: WheelMetadataRelaxationKind,
-    original: String,
-    relaxed: String,
-    source: String,
-}
-
-fn try_relax_unsatisfiable_wheel_metadata(
+pub(super) fn wheel_metadata_relaxations(
     package: &PypiKey,
     constraints: &[Constraint],
-    policy: RelaxPolicy,
-    diagnostic_context: Option<&JointRouteDiagnosticContext>,
-) -> Result<Option<(VersionSpecifiers, Vec<WheelMetadataRelaxation>)>> {
-    // ABI anchors describe the binary contract of shipped wheels. Never
-    // mutate their pins, caps, or exclusions while recovering metadata.
-    if crate::solve::is_abi_anchor(package.as_str()) {
-        return Ok(None);
-    }
-
+    decisions: Vec<RelaxationDecision>,
+    scope: String,
+) -> Vec<WheelMetadataRelaxation> {
     let involved_sources: Vec<String> = constraints
         .iter()
-        .filter(|constraint| matches!(&constraint.provenance, Provenance::IndexWheelMetadata))
+        .filter(|constraint| {
+            matches!(
+                &constraint.provenance,
+                Provenance::IndexWheelMetadata
+                    | Provenance::SourceBuiltRelaxed
+                    | Provenance::DepsFromRelaxed
+            )
+        })
         .map(|constraint| constraint.source.clone())
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
-
-    for &tier in inline_wheel_metadata_relaxation_tiers(policy) {
-        let mut candidate = constraints.to_vec();
-        let mut pending = Vec::new();
-        for constraint in &mut candidate {
-            if !matches!(&constraint.provenance, Provenance::IndexWheelMetadata) {
-                continue;
-            }
-            let relaxed =
-                relax_version_specifiers(&constraint.specifiers, tier).with_context(|| {
-                    format!("applying {tier:?} inline wheel-metadata relaxation for `{package}`")
-                })?;
-            if relaxed == constraint.specifiers {
-                continue;
-            }
-            pending.push(PendingWheelMetadataRelaxation {
-                kind: relaxation_kind(&constraint.specifiers),
-                original: render_specifiers(&constraint.specifiers),
-                relaxed: render_specifiers(&relaxed),
-                source: constraint.source.clone(),
-            });
-            constraint.specifiers = relaxed;
-        }
-        if pending.is_empty() {
-            continue;
-        }
-        let Ok(specifiers) = finalize(package, &candidate) else {
-            continue;
-        };
-        let scope = diagnostic_context
-            .map(|context| format!(" {}", context.scope()))
-            .unwrap_or_default();
-        let relaxations = pending
-            .into_iter()
-            .map(|pending| WheelMetadataRelaxation {
-                package: package.clone(),
-                kind: pending.kind,
-                original: pending.original,
-                relaxed: pending.relaxed,
-                source: pending.source,
-                involved_sources: involved_sources.clone(),
-                scope: scope.clone(),
-                tier,
-            })
-            .collect();
-        return Ok(Some((specifiers, relaxations)));
-    }
-    Ok(None)
+    decisions
+        .into_iter()
+        .map(|decision| WheelMetadataRelaxation {
+            package: package.clone(),
+            kind: decision.kind,
+            original: decision.original,
+            relaxed: decision.relaxed,
+            source: decision.source,
+            involved_sources: involved_sources.clone(),
+            scope: scope.clone(),
+            tier: decision.tier,
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug)]
 struct RestoreRequestBuilder {
     pypi_name: String,
     bundle_name: String,
+    safety_conda_names: BTreeSet<String>,
+    abi_anchor_alias: bool,
     constraints: Vec<Constraint>,
     route_preferences: BTreeMap<String, BTreeSet<String>>,
     lock_preferences: BTreeMap<String, BTreeSet<String>>,
@@ -499,6 +462,8 @@ impl RestoreRequestBuilder {
         Self {
             pypi_name: pypi_name.to_string(),
             bundle_name: canonical_conda_name(pypi_name),
+            safety_conda_names: BTreeSet::new(),
+            abi_anchor_alias: false,
             constraints: Vec::new(),
             route_preferences: BTreeMap::new(),
             lock_preferences: BTreeMap::new(),
@@ -510,6 +475,14 @@ impl RestoreRequestBuilder {
         if !self.constraints.contains(&constraint) {
             self.constraints.push(constraint);
         }
+    }
+
+    fn add_safety_conda_name(&mut self, conda_name: &str) {
+        self.safety_conda_names.insert(conda_name.to_string());
+    }
+
+    fn add_abi_anchor_alias(&mut self, abi_anchor_alias: bool) {
+        self.abi_anchor_alias |= abi_anchor_alias;
     }
 
     fn add_preference(
@@ -539,8 +512,13 @@ impl RestoreRequestBuilder {
         let prior_constraints = self
             .route_preferences
             .iter()
-            .chain(self.lock_preferences.iter())
-            .map(|(version, sources)| {
+            .map(|preference| ("route-prior-selection", preference))
+            .chain(
+                self.lock_preferences
+                    .iter()
+                    .map(|preference| ("lock-prior-selection", preference)),
+            )
+            .map(|(origin_kind, (version, sources))| {
                 let specifiers = VersionSpecifiers::from_str(&format!("=={version}"))
                     .with_context(|| {
                         format!(
@@ -552,6 +530,14 @@ impl RestoreRequestBuilder {
                     specifiers,
                     provenance: Provenance::PriorSelection,
                     source: sources.iter().cloned().collect::<Vec<_>>().join(", "),
+                    origin_id: ConstraintOriginId::from_parts(
+                        origin_kind,
+                        [
+                            PypiKey::from_pypi(&self.pypi_name).into_string(),
+                            version.clone(),
+                            format!("=={version}"),
+                        ],
+                    ),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -571,23 +557,50 @@ impl RestoreRequestBuilder {
         let route_preference = Self::unique_preference(&self.route_preferences);
         let lock_preference = Self::unique_preference(&self.lock_preferences);
         let package = PypiKey::from_pypi(&self.pypi_name);
-        let (specifiers, relaxations) = match finalize(&package, &self.constraints) {
-            Ok(specifiers) => (specifiers, Vec::new()),
-            Err(original_conflict) => {
-                match try_relax_unsatisfiable_wheel_metadata(
+        let mapped_anchor = self
+            .safety_conda_names
+            .iter()
+            .find(|name| crate::solve::is_abi_anchor(name))
+            .map(String::as_str);
+        let (specifiers, relaxations) = match decide_relaxation(
+            &package,
+            &self.constraints,
+            self.relax,
+            &SafetyContext::new(mapped_anchor).with_abi_anchor_alias(self.abi_anchor_alias),
+        ) {
+            RelaxDecision::Strict {
+                specifiers,
+                diagnostics,
+            } => (
+                specifiers,
+                wheel_metadata_relaxations(
                     &package,
                     &self.constraints,
-                    self.relax,
-                    diagnostic_context,
-                )? {
-                    Some(relaxed) => relaxed,
-                    None => {
-                        return Err(anyhow::Error::new(match diagnostic_context {
-                            Some(context) => original_conflict.with_scope(context.scope()),
-                            None => original_conflict,
-                        }));
-                    }
-                }
+                    diagnostics,
+                    diagnostic_context
+                        .map(|context| format!(" {}", context.scope()))
+                        .unwrap_or_default(),
+                ),
+            ),
+            RelaxDecision::Relaxed {
+                specifiers,
+                decisions,
+            } => (
+                specifiers,
+                wheel_metadata_relaxations(
+                    &package,
+                    &self.constraints,
+                    decisions,
+                    diagnostic_context
+                        .map(|context| format!(" {}", context.scope()))
+                        .unwrap_or_default(),
+                ),
+            ),
+            RelaxDecision::Conflict(original_conflict) => {
+                return Err(anyhow::Error::new(match diagnostic_context {
+                    Some(context) => original_conflict.with_scope(context.scope()),
+                    None => original_conflict,
+                }));
             }
         };
 
@@ -619,8 +632,12 @@ type ProvisionalMetadataRoutes = BTreeMap<String, Vec<ProvisionalMetadataRoute>>
 #[derive(Debug, PartialEq, Eq)]
 enum JointRouteOutcome {
     Unchanged,
-    Mutated,
-    RetryKeepPypi { keep_pypi: BTreeSet<PypiKey> },
+    Mutated {
+        relaxations: Vec<WheelMetadataRelaxation>,
+    },
+    RetryKeepPypi {
+        keep_pypi: BTreeSet<PypiKey>,
+    },
 }
 
 #[cfg(test)]
@@ -930,6 +947,7 @@ where
     // wheels are added. Cycle-detected via seen_candidate, which
     // accumulates across iterations.
     let mut seen_candidate: HashSet<String> = skip.clone();
+    let mut committed_relaxations = Vec::new();
     // incremental-add: pre-fill with locked names so we don't re-bundle them.
     if let Some(closure) = locked_closure {
         seen_candidate.extend(closure.keys().map(|n| canonical_conda_name(n)));
@@ -973,10 +991,9 @@ where
                         &mut observed_requirements,
                         &name,
                         &specifiers,
-                        format!(
-                            "wheel `{}=={}` Requires-Dist `{raw}`",
-                            wheel.metadata.name, wheel.metadata.version
-                        ),
+                        &wheel.metadata.name,
+                        &wheel.metadata.version,
+                        raw,
                         wheel.metadata_provenance.clone(),
                     );
                     let conda_name = canonical_conda_name(&name);
@@ -989,10 +1006,9 @@ where
                         &mut observed_requirements,
                         &name,
                         &specs,
-                        format!(
-                            "wheel `{}=={}` Requires-Dist `{raw}`",
-                            wheel.metadata.name, wheel.metadata.version
-                        ),
+                        &wheel.metadata.name,
+                        &wheel.metadata.version,
+                        raw,
                         wheel.metadata_provenance.clone(),
                     );
                     let conda_name = canonical_conda_name(&name);
@@ -1026,7 +1042,8 @@ where
             .await?
             {
                 JointRouteOutcome::Unchanged => break,
-                JointRouteOutcome::Mutated => {
+                JointRouteOutcome::Mutated { relaxations } => {
+                    committed_relaxations.extend(relaxations);
                     // The legacy path restored wheels. Scan restored metadata
                     // before accepting the remaining conda routes.
                     continue;
@@ -1407,7 +1424,10 @@ where
             .await?
             {
                 JointRouteOutcome::Unchanged => {}
-                JointRouteOutcome::Mutated => added_any = true,
+                JointRouteOutcome::Mutated { relaxations } => {
+                    committed_relaxations.extend(relaxations);
+                    added_any = true;
+                }
                 JointRouteOutcome::RetryKeepPypi { keep_pypi } => {
                     return Ok(AutoBundleOutcome::RetryKeepPypi { keep_pypi });
                 }
@@ -1420,7 +1440,9 @@ where
             break;
         }
     }
-    Ok(AutoBundleOutcome::Complete)
+    Ok(AutoBundleOutcome::Complete {
+        relaxations: committed_relaxations,
+    })
 }
 
 /// Does this canonical conda dependency disappear if every provisional
@@ -1835,6 +1857,7 @@ where
         .collect();
     let mut restore_requests: BTreeMap<String, RestoreRequestBuilder> = BTreeMap::new();
     let mut audit_origins: BTreeSet<(String, String)> = BTreeSet::new();
+    let abi_aliases = super::output_abi_aliases(bundle, config);
     for route in &bundle.auto_routed {
         let conda_name = canonical_conda_name(&route.route.conda_name);
         if !rejected_keys.contains(&conda_name) {
@@ -1844,6 +1867,11 @@ where
         let request = restore_requests
             .entry(key)
             .or_insert_with(|| RestoreRequestBuilder::new(&route.route.pypi_name, config.relax));
+        request.add_safety_conda_name(&route.route.conda_name);
+        request.add_abi_anchor_alias(
+            super::is_semantic_abi_anchor(&route.route.pypi_name, &abi_aliases)
+                || super::is_semantic_abi_anchor(&route.route.conda_name, &abi_aliases),
+        );
         for input in &route.route.input_requirements {
             let specifiers = if input.specifiers.trim().is_empty() {
                 VersionSpecifiers::empty()
@@ -1855,10 +1883,30 @@ where
                     )
                 })?
             };
+            let provenance = input.effective_provenance();
+            let role = match input.role {
+                crate::uv_closure::AutoRouteInputRole::Requirement => "requirement",
+                crate::uv_closure::AutoRouteInputRole::Constraint => "constraint",
+                crate::uv_closure::AutoRouteInputRole::Override => "override",
+            };
+            let origin_id = ConstraintOriginId::from_parts(
+                "auto-route-input",
+                [
+                    PypiKey::from_pypi(&route.route.pypi_name).into_string(),
+                    route.route.conda_name.clone(),
+                    route.route.pypi_version.clone(),
+                    route.route.conda_version.clone(),
+                    route.route.channel.clone(),
+                    role.to_string(),
+                    provenance_origin_label(&provenance),
+                    render_specifiers(&specifiers),
+                ],
+            );
             let requirement = Constraint {
                 specifiers,
                 source: input.source.clone(),
-                provenance: input.effective_provenance(),
+                origin_id,
+                provenance,
             };
             request.add_constraint(requirement);
         }
@@ -1893,6 +1941,11 @@ where
                 let request = restore_requests
                     .entry(key.clone())
                     .or_insert_with(|| RestoreRequestBuilder::new(&origin.pypi_name, config.relax));
+                request.add_safety_conda_name(&origin.conda_name);
+                request.add_abi_anchor_alias(
+                    super::is_semantic_abi_anchor(&origin.pypi_name, &abi_aliases)
+                        || super::is_semantic_abi_anchor(&origin.conda_name, &abi_aliases),
+                );
                 let requirements = observed_requirements
                     .get(&PypiKey::from_pypi(&key))
                     .ok_or_else(|| {
@@ -2042,10 +2095,9 @@ where
 
     *bundle = trial;
     metadata_routes.retain(|conda_name, _| !rejected_keys.contains(conda_name));
-    for relaxation in pending_relaxations {
-        relaxation.emit();
-    }
-    Ok(JointRouteOutcome::Mutated)
+    Ok(JointRouteOutcome::Mutated {
+        relaxations: pending_relaxations,
+    })
 }
 
 /// Returns Some((name, exact_version)) if `raw` is a base dep (no
@@ -2611,6 +2663,13 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use url::Url;
 
+    fn test_origin(label: &str, specifiers: &str) -> ConstraintOriginId {
+        ConstraintOriginId::from_parts(
+            "auto-bundle-test",
+            [label.to_string(), specifiers.to_string()],
+        )
+    }
+
     fn metadata_test_wheel() -> Vec<u8> {
         use std::io::Write as _;
         let mut cursor = std::io::Cursor::new(Vec::new());
@@ -2922,11 +2981,13 @@ mod tests {
                 source: "isaaclab==0.54.2, isaaclab_rl==0.4.7, \
                          isaaclab_tasks==0.11.12"
                     .to_string(),
+                origin_id: test_origin("isaaclab-family-numpy-cap", "<2"),
             },
             Constraint {
                 specifiers: VersionSpecifiers::from_str(">=2.0").unwrap(),
                 provenance: Provenance::UvConstraint,
                 source: "cmeel-boost==1.90.0".to_string(),
+                origin_id: test_origin("cmeel-boost-numpy-floor", ">=2.0"),
             },
         ];
 
@@ -2963,7 +3024,9 @@ mod tests {
             &mut observed,
             "index-alias",
             &specifiers,
-            "index wheel metadata".to_string(),
+            "index-origin",
+            "1.0.0",
+            "index-alias>=4.0.1,<4.1",
             Provenance::IndexWheelMetadata,
         );
         assert!(
@@ -2982,7 +3045,9 @@ mod tests {
             &mut observed,
             "source-alias",
             &specifiers,
-            "source-built wheel metadata".to_string(),
+            "source-origin",
+            "1.0.0",
+            "source-alias>=4.0.1,<4.1",
             Provenance::SourceBuiltRelaxed,
         );
         assert!(
@@ -3040,7 +3105,9 @@ mod tests {
             &mut source_only,
             "source-first",
             &VersionSpecifiers::empty(),
-            "source-built wheel metadata".to_string(),
+            "source-first-origin",
+            "1.0.0",
+            "source-first",
             Provenance::SourceBuiltRelaxed,
         );
         let later_missing = metadata_route_group_has_source_built_origin(
@@ -3195,7 +3262,9 @@ mod tests {
             &mut observed_requirements,
             "pillow-metadata-alias",
             &VersionSpecifiers::empty(),
-            "test index metadata route origin".to_string(),
+            "pillow-metadata-origin",
+            "1.0.0",
+            "pillow-metadata-alias",
             Provenance::IndexWheelMetadata,
         );
         let target = crate::pypi::WheelTarget::for_subdir("3.11", "linux-64");
@@ -3588,7 +3657,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(outcome, AutoBundleOutcome::Complete);
+        assert!(matches!(outcome, AutoBundleOutcome::Complete { .. }));
         assert_eq!(probe_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert_eq!(solve_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert_eq!(fetch_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
@@ -3672,7 +3741,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(outcome, AutoBundleOutcome::Complete);
+        assert!(matches!(outcome, AutoBundleOutcome::Complete { .. }));
         assert_eq!(probe_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert_eq!(solve_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert_eq!(fetch_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
@@ -3721,7 +3790,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(outcome, AutoBundleOutcome::Complete);
+        assert!(matches!(outcome, AutoBundleOutcome::Complete { .. }));
         let requests = requests.lock().unwrap();
         assert_eq!(
             requests.len(),
@@ -3764,7 +3833,7 @@ mod tests {
                     "==5.9.8",
                     ">=5",
                     "wheel `isaacsim-kernel==5.1.0.0` Requires-Dist `psutil==5.9.8`",
-                    RelaxPolicy::StrongMajor,
+                    RelaxPolicy::Major,
                 ),
                 (
                     WheelMetadataRelaxationKind::UpperCapStripped,
@@ -3867,7 +3936,14 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(outcome, AutoBundleOutcome::Complete);
+        let AutoBundleOutcome::Complete { relaxations } = outcome else {
+            panic!("typing-extensions restoration must complete")
+        };
+        assert_eq!(
+            relaxations.len(),
+            1,
+            "the warning must remain pending for the outer transaction"
+        );
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
         let request = &requests[0];
@@ -3933,6 +4009,75 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn outer_fixed_point_failure_discards_pending_relaxation_warning() {
+        let target = crate::pypi::WheelTarget::for_subdir("3.11", "linux-64");
+        let config = tiered_mapped_config("typing-extensions");
+        let mut bundle = isaacsim_typing_extensions_conflict_bundle();
+        let requests = Arc::new(Mutex::new(Vec::<PypiFetchRequest>::new()));
+        let fetch = {
+            let requests = Arc::clone(&requests);
+            move |request: PypiFetchRequest, _indexes: Vec<String>, _failure_context: String| {
+                let requested = request.pypi_name.clone();
+                requests.lock().unwrap().push(request);
+                async move {
+                    if PypiKey::from_pypi(&requested) == PypiKey::from_pypi("typing-extensions") {
+                        Ok(test_wheel(
+                            "typing-extensions",
+                            "typing-extensions",
+                            "4.15.0",
+                            &["late-missing==1"],
+                        ))
+                    } else {
+                        Err(anyhow!(
+                            "deliberate late fixed-point fetch failure for {requested}"
+                        ))
+                    }
+                }
+            }
+        };
+        let allow_source_route = |_route: crate::uv_closure::CondaRouteSpec| async {
+            crate::uv_closure::CoInstallVerdict::Sat
+        };
+
+        let error = auto_bundle_transitives_with_route_precheck(
+            &mut bundle,
+            &[crate::workspace::DEFAULT_PYPI_INDEX.to_string()],
+            &target,
+            None,
+            &config,
+            None,
+            None,
+            None,
+            &validated_probe,
+            &reject_every_mutable_route,
+            &allow_source_route,
+            &fetch,
+            &["conda-forge/linux-64".to_string()],
+            &UvReresolveContext::default(),
+        )
+        .await
+        .expect_err("a later fixed-point fetch must roll back the whole warning transaction");
+        assert!(
+            format!("{error:#}").contains("deliberate late fixed-point fetch failure"),
+            "{error:#}"
+        );
+
+        let requests = requests.lock().unwrap();
+        assert!(requests.len() >= 2, "{requests:?}");
+        assert_eq!(
+            requests[0].relaxations.len(),
+            1,
+            "the first inner restore selected a warning that must remain uncommitted"
+        );
+        assert!(
+            requests[1..]
+                .iter()
+                .all(|request| request.relaxations.is_empty()),
+            "no later request may inherit the rolled-back warning: {requests:?}"
+        );
+    }
+
     #[test]
     fn satisfiable_wheel_metadata_is_never_relaxed() {
         let mut builder = RestoreRequestBuilder::new(
@@ -3945,11 +4090,13 @@ mod tests {
             source: "wheel `isaacsim==5.1.0.0` Requires-Dist \
                      `typing-extensions==4.12.2`"
                 .to_string(),
+            origin_id: test_origin("isaacsim-typing-extensions-pin", "==4.12.2"),
         });
         builder.add_constraint(Constraint {
             specifiers: VersionSpecifiers::from_str(">=4.10").unwrap(),
             provenance: Provenance::IndexWheelMetadata,
             source: "wheel `compatible==1.0.0` Requires-Dist `typing-extensions>=4.10`".to_string(),
+            origin_id: test_origin("compatible-typing-extensions-floor", ">=4.10"),
         });
 
         let request = builder.finish().unwrap();
@@ -3977,11 +4124,13 @@ mod tests {
             specifiers: VersionSpecifiers::from_str("==1.0.0").unwrap(),
             provenance: Provenance::IndexWheelMetadata,
             source: "wheel `strict-a==1.0.0` Requires-Dist `strict-wheel-dep==1.0.0`".to_string(),
+            origin_id: test_origin("strict-a-wheel-pin", "==1.0.0"),
         });
         builder.add_constraint(Constraint {
             specifiers: VersionSpecifiers::from_str(">=2.0.0").unwrap(),
             provenance: Provenance::IndexWheelMetadata,
             source: "wheel `strict-b==1.0.0` Requires-Dist `strict-wheel-dep>=2.0.0`".to_string(),
+            origin_id: test_origin("strict-b-wheel-floor", ">=2.0.0"),
         });
 
         let error = builder
@@ -4012,23 +4161,26 @@ mod tests {
                     specifiers: VersionSpecifiers::from_str(pinned).unwrap(),
                     provenance: Provenance::IndexWheelMetadata,
                     source: format!("wheel `pinned==1` Requires-Dist `{package}{pinned}`"),
+                    origin_id: test_origin(&format!("{package}-pinned-wheel"), pinned),
                 },
                 Constraint {
                     specifiers: VersionSpecifiers::from_str(conflicting).unwrap(),
                     provenance: Provenance::IndexWheelMetadata,
                     source: format!("wheel `newer==1` Requires-Dist `{package}{conflicting}`"),
+                    origin_id: test_origin(&format!("{package}-newer-wheel"), conflicting),
                 },
             ];
 
             assert!(
-                try_relax_unsatisfiable_wheel_metadata(
-                    &PypiKey::from_pypi(package),
-                    &constraints,
-                    RelaxPolicy::PatchThenMinorThenMajorThenLastResort,
-                    None,
-                )
-                .unwrap()
-                .is_none(),
+                matches!(
+                    decide_relaxation(
+                        &PypiKey::from_pypi(package),
+                        &constraints,
+                        RelaxPolicy::PatchThenMinorThenMajorThenLastResort,
+                        &SafetyContext::default(),
+                    ),
+                    RelaxDecision::Conflict(_)
+                ),
                 "{package} must not be widened or stripped"
             );
 
@@ -4052,6 +4204,33 @@ mod tests {
     }
 
     #[test]
+    fn mapped_conda_abi_anchor_vetoes_non_anchor_pypi_restore() {
+        let mut builder = RestoreRequestBuilder::new(
+            "array-provider",
+            RelaxPolicy::PatchThenMinorThenMajorThenLastResort,
+        );
+        builder.add_safety_conda_name("numpy");
+        for (label, specifiers) in [("old", "==1.26.4"), ("new", ">=2")] {
+            builder.add_constraint(Constraint {
+                specifiers: VersionSpecifiers::from_str(specifiers).unwrap(),
+                provenance: Provenance::IndexWheelMetadata,
+                source: format!("wheel `{label}==1` Requires-Dist `array-provider{specifiers}`"),
+                origin_id: test_origin(&format!("mapped-anchor-{label}"), specifiers),
+            });
+        }
+
+        let error = builder
+            .finish()
+            .expect_err("the mapped NumPy ABI anchor must retain the strict conflict");
+        assert!(
+            error
+                .downcast_ref::<crate::constraint::Conflict>()
+                .is_some(),
+            "mapped anchor lost its typed strict conflict: {error:#}"
+        );
+    }
+
+    #[test]
     fn two_non_metadata_hard_exact_pins_remain_a_scoped_conflict() {
         let context = JointRouteDiagnosticContext {
             bundle: "hard-pins-pack".to_string(),
@@ -4065,22 +4244,25 @@ mod tests {
                 specifiers: VersionSpecifiers::from_str("==1.0.0").unwrap(),
                 provenance: Provenance::UvRoot,
                 source: "uv root requirement `hard-pins==1.0.0`".to_string(),
+                origin_id: test_origin("hard-pins-uv-root", "==1.0.0"),
             },
             Constraint {
                 specifiers: VersionSpecifiers::from_str("==2.0.0").unwrap(),
                 provenance: Provenance::UvConstraint,
                 source: "uv constraint `hard-pins==2.0.0`".to_string(),
+                origin_id: test_origin("hard-pins-uv-constraint", "==2.0.0"),
             },
         ];
         assert!(
-            try_relax_unsatisfiable_wheel_metadata(
-                &PypiKey::from_pypi("hard-pins"),
-                &constraints,
-                RelaxPolicy::PatchThenMinorThenMajorThenLastResort,
-                Some(&context),
-            )
-            .unwrap()
-            .is_none(),
+            matches!(
+                decide_relaxation(
+                    &PypiKey::from_pypi("hard-pins"),
+                    &constraints,
+                    RelaxPolicy::PatchThenMinorThenMajorThenLastResort,
+                    &SafetyContext::default(),
+                ),
+                RelaxDecision::Conflict(_)
+            ),
             "hard non-metadata pins must produce no relaxation record"
         );
 
@@ -4125,7 +4307,8 @@ mod tests {
             }
         };
         let target = crate::pypi::WheelTarget::for_subdir("3.11", "linux-64");
-        let config = test_config();
+        let mut config = test_config();
+        config.relax = RelaxPolicy::PatchThenMinorThenMajorThenLastResort;
         let mut bundle = holosoma_numpy_conflict_bundle();
         let unrelated =
             single_provider_facts("packaging", &[("holosoma", Some("26.2"), Some(">=24"))]);
@@ -4626,6 +4809,7 @@ mod tests {
                 specifiers: VersionSpecifiers::from_str(raw).unwrap(),
                 source: format!("test source `{raw}`"),
                 provenance: Provenance::IndexWheelMetadata,
+                origin_id: test_origin("ordinary-aliases", raw),
             })
             .collect::<Vec<_>>();
         let ordinary =
@@ -4641,6 +4825,7 @@ mod tests {
                 specifiers: VersionSpecifiers::from_str(raw).unwrap(),
                 source: format!("test source `{raw}`"),
                 provenance: Provenance::IndexWheelMetadata,
+                origin_id: test_origin("length-sensitive-aliases", raw),
             })
             .collect::<Vec<_>>();
         assert_eq!(
@@ -4656,6 +4841,7 @@ mod tests {
                 specifiers: VersionSpecifiers::from_str(raw).unwrap(),
                 source: format!("test source `{raw}`"),
                 provenance: Provenance::IndexWheelMetadata,
+                origin_id: test_origin("arbitrary-exact-aliases", raw),
             })
             .collect::<Vec<_>>();
         assert!(
@@ -4712,7 +4898,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(outcome, AutoBundleOutcome::Complete);
+        assert!(matches!(outcome, AutoBundleOutcome::Complete { .. }));
 
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
@@ -4730,6 +4916,10 @@ mod tests {
         Constraint {
             specifiers: VersionSpecifiers::from_str(specifiers).unwrap(),
             source: source.to_string(),
+            origin_id: test_origin(
+                &format!("observed-{}", provenance_origin_label(&provenance)),
+                specifiers,
+            ),
             provenance,
         }
     }
@@ -5048,7 +5238,7 @@ pillow = ">=10,<13"
     }
 
     #[tokio::test]
-    async fn joint_unroute_aggregates_fixed_and_mutable_scoped_conflicts_before_fetch() {
+    async fn joint_unroute_typing_extensions_drop_only_conflict_fails_closed_before_fetch() {
         let fetch_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let fetch = {
             let fetch_calls = Arc::clone(&fetch_calls);
@@ -5107,9 +5297,10 @@ pillow = ">=10,<13"
             crate::uv_closure::CoInstallVerdict::Sat
         };
         let mut config = test_config();
-        // Pillow is fixed by explicit conda intent, while typing-extensions
-        // remains mutable and must be finalized through the restore path.
-        // Both conflicts belong to this one validation request.
+        config.relax = RelaxPolicy::PatchThenMinorThenMajorThenLastResort;
+        // Pillow is safely cap-relaxable, while typing-extensions can be
+        // reconciled only by erasing the whole `<4` wheel edge. The latter
+        // must remain a hard typed conflict under the active policy.
         config.conda_deps.push("pillow".to_string());
 
         let error = auto_bundle_transitives_with_route_precheck(
@@ -5132,26 +5323,23 @@ pillow = ">=10,<13"
         .unwrap_err();
 
         let message = format!("{error:#}");
-        let report = error
-            .downcast_ref::<crate::constraint::ConflictReport>()
-            .expect("multiple package conflicts must retain a typed aggregate");
-        assert_eq!(report.conflicts.len(), 2, "{message}");
         assert!(
-            message.starts_with("2 dependency conflicts found:"),
+            error
+                .downcast_ref::<crate::constraint::Conflict>()
+                .is_some(),
+            "drop-only failure must retain the strict typed conflict: {message}"
+        );
+        assert!(
+            message.contains(
+                "dependency conflict in environment 'uwlab-gpu' for bundle \
+                 'regression-pack' (target profile 'linux-64-cuda-12', platform \
+                 linux-64, python 3.10): `typing-extensions` requirements are mutually \
+                 unsatisfiable"
+            ),
             "{message}"
         );
-        for package in ["pillow", "typing-extensions"] {
-            assert!(
-                message.contains(&format!(
-                    "dependency conflict in environment 'uwlab-gpu' for bundle \
-                     'regression-pack' (target profile 'linux-64-cuda-12', platform \
-                     linux-64, python 3.10): `{package}` requirements are mutually \
-                     unsatisfiable"
-                )),
-                "{message}"
-            );
-        }
-        assert!(message.contains("\n\n2. dependency conflict"), "{message}");
+        assert!(message.contains("typing-extensions<4"), "{message}");
+        assert!(message.contains("typing-extensions>=5,<6"), "{message}");
         assert_eq!(
             fetch_calls.load(std::sync::atomic::Ordering::SeqCst),
             0,
@@ -5166,16 +5354,19 @@ pillow = ">=10,<13"
             specifiers: VersionSpecifiers::from_str("<2").unwrap(),
             source: "wheel metadata requires overridden<2".to_string(),
             provenance: Provenance::IndexWheelMetadata,
+            origin_id: test_origin("overridden-wheel-cap", "<2"),
         });
         overridden.add_constraint(Constraint {
             specifiers: VersionSpecifiers::from_str("==3").unwrap(),
             source: "uv override requirement `overridden==3`".to_string(),
             provenance: Provenance::UvOverride,
+            origin_id: test_origin("overridden-uv-override", "==3"),
         });
         overridden.add_constraint(Constraint {
             specifiers: VersionSpecifiers::from_str("<4").unwrap(),
             source: "uv constraint `overridden<4`".to_string(),
             provenance: Provenance::UvConstraint,
+            origin_id: test_origin("overridden-uv-constraint", "<4"),
         });
         let overridden = overridden.finish().unwrap();
         assert!(
@@ -5194,6 +5385,7 @@ pillow = ">=10,<13"
             specifiers: VersionSpecifiers::from_str(">=1").unwrap(),
             source: "wheel `root==1` Requires-Dist `soft-hints>=1`".to_string(),
             provenance: Provenance::IndexWheelMetadata,
+            origin_id: test_origin("soft-hints-root-wheel", ">=1"),
         });
         RestoreRequestBuilder::add_preference(
             &mut soft_hints.route_preferences,
@@ -5230,6 +5422,7 @@ pillow = ">=10,<13"
             specifiers: VersionSpecifiers::from_str("==0.13.1").unwrap(),
             provenance: Provenance::IndexWheelMetadata,
             source: "index wheel Requires-Dist `s3transfer==0.13.1`".to_string(),
+            origin_id: test_origin("s3transfer-index-wheel", "==0.13.1"),
         });
         assert_eq!(
             index_pin.finish().unwrap().specifiers,

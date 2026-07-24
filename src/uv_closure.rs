@@ -5421,11 +5421,19 @@ isaaclab = { path = "wheels/isaaclab/isaaclab-2.0.0-py3-none-any.whl" }
                 specifiers: routed.specifiers.parse().unwrap(),
                 provenance: routed.effective_provenance(),
                 source: routed.source.clone(),
+                origin_id: crate::constraint::ConstraintOriginId::from_parts(
+                    "uv-closure-test-route-input",
+                    ["starlette", routed.specifiers.as_str()],
+                ),
             },
             crate::constraint::Constraint {
                 specifiers: ">=0.40,<0.46".parse().unwrap(),
                 provenance: Provenance::IndexWheelMetadata,
                 source: "index wheel `fastapi` Requires-Dist".to_string(),
+                origin_id: crate::constraint::ConstraintOriginId::from_parts(
+                    "uv-closure-test-wheel-requirement",
+                    ["fastapi", "starlette", ">=0.40,<0.46"],
+                ),
             },
         ];
         let finalized = crate::constraint::finalize(&PypiKey::from_pypi("starlette"), &constraints)
