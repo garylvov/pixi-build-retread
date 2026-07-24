@@ -43,6 +43,12 @@ impl<'a> SafetyContext<'a> {
         self.abi_anchor_alias = abi_anchor_alias;
         self
     }
+
+    fn protects(self, package: &PypiKey) -> bool {
+        crate::solve::is_abi_anchor(package.as_str())
+            || self.conda_name.is_some_and(crate::solve::is_abi_anchor)
+            || self.abi_anchor_alias
+    }
 }
 
 /// The semantic operation selected for one original clause.
@@ -150,9 +156,7 @@ pub fn decide(
     safety: &SafetyContext<'_>,
 ) -> Decision {
     let canonical = canonical_constraints(constraints);
-    let is_anchor = crate::solve::is_abi_anchor(package.as_str())
-        || safety.conda_name.is_some_and(crate::solve::is_abi_anchor)
-        || safety.abi_anchor_alias;
+    let is_anchor = safety.protects(package);
     let strict = match finalize_quiet_detailed(package, &canonical) {
         Ok(FinalizeSuccess::Unchanged(specifiers)) => {
             return Decision::Strict {
