@@ -1,0 +1,488 @@
+//! Durable, package-bundled records for safe automatic constraint relaxation.
+//!
+//! Successful relaxed builds ship both a machine-readable JSON manifest and
+//! an activate.d hook. The files are staged as ordinary recipe sources so
+//! write failures happen before packaging and recipe copy failures remain
+//! fatal under the generated build script's `set -euo pipefail`.
+
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
+
+use crate::config::RelaxPolicy;
+use crate::pypi::ResolutionTarget;
+
+pub const RELAXATION_MANIFEST_SCHEMA: u32 = 1;
+pub const RELAXATION_JSON_FILENAME: &str = "retread-relaxations.json";
+pub const RELAXATION_HOOK_FILENAME: &str = "retread-relaxations.sh";
+pub const RELAXATION_HOOK_PATH: &str = "etc/conda/activate.d/retread-relaxations.sh";
+
+/// Stable serialized identity for the selected relaxation operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RelaxationRecordKind {
+    ExactPinWidened,
+    UpperCapStripped,
+    AdvisoryFloorDropped,
+}
+
+impl RelaxationRecordKind {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::ExactPinWidened => "exact pin widened",
+            Self::UpperCapStripped => "upper cap stripped",
+            Self::AdvisoryFloorDropped => "advisory floor dropped",
+        }
+    }
+}
+
+impl From<crate::relax_decision::RelaxationKind> for RelaxationRecordKind {
+    fn from(kind: crate::relax_decision::RelaxationKind) -> Self {
+        match kind {
+            crate::relax_decision::RelaxationKind::ExactPinWidened => Self::ExactPinWidened,
+            crate::relax_decision::RelaxationKind::UpperCapStripped => Self::UpperCapStripped,
+            crate::relax_decision::RelaxationKind::AdvisoryFloorDropped => {
+                Self::AdvisoryFloorDropped
+            }
+        }
+    }
+}
+
+/// The exact consumer scope for which a relaxation was selected.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelaxationScope {
+    #[serde(default)]
+    pub environments: Vec<String>,
+    #[serde(default)]
+    pub targets: Vec<String>,
+    pub platform: String,
+    pub python: String,
+}
+
+impl RelaxationScope {
+    pub(crate) fn for_target(target: &ResolutionTarget) -> Self {
+        let (environments, targets) = target
+            .workspace_scope()
+            .map(|scope| (scope.environments.clone(), scope.profiles.clone()))
+            .unwrap_or_default();
+        Self {
+            environments,
+            targets,
+            platform: target.conda_subdir().to_string(),
+            python: target.python_version().to_string(),
+        }
+    }
+}
+
+/// One final, applied constraint transformation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelaxationRecord {
+    pub package: String,
+    pub original_spec: String,
+    pub resulting_spec: String,
+    pub tier: RelaxPolicy,
+    pub kind: RelaxationRecordKind,
+    pub source: String,
+    pub involved_wheels: Vec<String>,
+    pub scope: RelaxationScope,
+}
+
+/// Stable payload written to `share/retread/<bundle>/retread-relaxations.json`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelaxationManifest {
+    pub schema_version: u32,
+    pub bundle: String,
+    pub relaxations: Vec<RelaxationRecord>,
+}
+
+impl RelaxationManifest {
+    pub fn new(bundle: impl Into<String>, mut relaxations: Vec<RelaxationRecord>) -> Option<Self> {
+        if relaxations.is_empty() {
+            return None;
+        }
+        canonicalize_relaxation_records(&mut relaxations);
+        Some(Self {
+            schema_version: RELAXATION_MANIFEST_SCHEMA,
+            bundle: bundle.into(),
+            relaxations,
+        })
+    }
+
+    pub fn to_pretty_json(&self) -> Result<String> {
+        let mut rendered =
+            serde_json::to_string_pretty(self).context("serializing relaxation manifest")?;
+        rendered.push('\n');
+        Ok(rendered)
+    }
+
+    pub fn payload_path(&self) -> String {
+        format!("share/retread/{}/{}", self.bundle, RELAXATION_JSON_FILENAME)
+    }
+
+    /// Render the sourced hook without shell-interpolating metadata.
+    pub fn activate_script(&self) -> String {
+        if self.relaxations.len() <= 3 {
+            let details = self
+                .relaxations
+                .iter()
+                .map(|record| {
+                    format!(
+                        "{} {} -> {} ({})",
+                        record.package,
+                        record.original_spec,
+                        record.resulting_spec,
+                        record.kind.label(),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            let message = format!("[retread] auto-relaxed: {details}");
+            format!(
+                "#!/bin/sh\n\
+                 # Generated by pixi-build-retread; sourced on every activation.\n\
+                 printf '%s\\n' {} >&2\n",
+                shell_single_quote(&message),
+            )
+        } else {
+            let message = format!(
+                "[retread] auto-relaxed {} constraints; details: ",
+                self.relaxations.len(),
+            );
+            let relative_path = self.payload_path();
+            format!(
+                "#!/bin/sh\n\
+                 # Generated by pixi-build-retread; sourced on every activation.\n\
+                 _retread_relax_prefix=${{CONDA_PREFIX:-${{PREFIX:-}}}}\n\
+                 if [ -n \"$_retread_relax_prefix\" ]; then\n\
+                   printf '%s%s%s\\n' {} \"$_retread_relax_prefix\" {} >&2\n\
+                 else\n\
+                   printf '%s%s\\n' {} {} >&2\n\
+                 fi\n\
+                 unset _retread_relax_prefix\n",
+                shell_single_quote(&message),
+                shell_single_quote(&format!("/{relative_path}")),
+                shell_single_quote(&message),
+                shell_single_quote(&relative_path),
+            )
+        }
+    }
+
+    pub fn records(&self) -> &[RelaxationRecord] {
+        &self.relaxations
+    }
+
+    pub(crate) fn validate_for(&self, bundle: &str, target: &ResolutionTarget) -> Result<()> {
+        if self.schema_version != RELAXATION_MANIFEST_SCHEMA {
+            bail!(
+                "unsupported relaxation manifest schema {}",
+                self.schema_version
+            );
+        }
+        if self.bundle != bundle {
+            bail!(
+                "relaxation manifest bundle `{}` does not match emitted bundle `{bundle}`",
+                self.bundle
+            );
+        }
+        if !bundle.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        }) {
+            bail!("relaxation manifest bundle `{bundle}` is not a safe package path component");
+        }
+        if self.relaxations.is_empty() {
+            bail!("relaxation manifest for `{bundle}` is empty");
+        }
+        let expected_scope = RelaxationScope::for_target(target);
+        if self
+            .relaxations
+            .iter()
+            .any(|record| record.scope != expected_scope)
+        {
+            bail!(
+                "relaxation manifest for `{bundle}` does not match target {}/python {}",
+                target.conda_subdir(),
+                target.python_version()
+            );
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn canonicalize_relaxation_records(records: &mut [RelaxationRecord]) {
+    for record in records.iter_mut() {
+        record.involved_wheels.sort();
+        record.involved_wheels.dedup();
+        record.scope.environments.sort();
+        record.scope.environments.dedup();
+        record.scope.targets.sort();
+        record.scope.targets.dedup();
+    }
+    records.sort_by(|left, right| {
+        left.package
+            .cmp(&right.package)
+            .then_with(|| left.original_spec.cmp(&right.original_spec))
+            .then_with(|| left.resulting_spec.cmp(&right.resulting_spec))
+            .then_with(|| relax_policy_rank(left.tier).cmp(&relax_policy_rank(right.tier)))
+            .then_with(|| left.kind.cmp(&right.kind))
+            .then_with(|| left.source.cmp(&right.source))
+            .then_with(|| left.involved_wheels.cmp(&right.involved_wheels))
+            .then_with(|| left.scope.platform.cmp(&right.scope.platform))
+            .then_with(|| left.scope.python.cmp(&right.scope.python))
+            .then_with(|| left.scope.environments.cmp(&right.scope.environments))
+            .then_with(|| left.scope.targets.cmp(&right.scope.targets))
+    });
+}
+
+fn relax_policy_rank(policy: RelaxPolicy) -> u8 {
+    match policy {
+        RelaxPolicy::None => 0,
+        RelaxPolicy::Patch => 1,
+        RelaxPolicy::Minor => 2,
+        RelaxPolicy::Major => 3,
+        RelaxPolicy::StrongMajor => 4,
+        RelaxPolicy::PatchWithLastResort => 5,
+        RelaxPolicy::MinorWithLastResort => 6,
+        RelaxPolicy::MajorWithLastResort => 7,
+        RelaxPolicy::PatchThenMinorThenMajorThenLastResort => 8,
+        RelaxPolicy::CondaAware => 9,
+    }
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+/// The two real files added to a recipe's `source:` list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StagedRelaxationPayload {
+    pub source_urls: Vec<String>,
+    pub json_path: PathBuf,
+    pub hook_path: PathBuf,
+}
+
+/// Stage both durable warning files atomically enough for the build boundary.
+///
+/// Both temporary writes and both final placements are mandatory. A partial
+/// staging directory is harmless because the caller must not invoke
+/// rattler-build after any returned error.
+pub async fn stage_relaxation_payload(
+    staging_dir: &Path,
+    manifest: &RelaxationManifest,
+) -> Result<StagedRelaxationPayload> {
+    if manifest.relaxations.is_empty() {
+        bail!("refusing to stage an empty relaxation manifest");
+    }
+    static STAGE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let nonce = STAGE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let staging_dir = staging_dir.join(format!(
+        ".retread-relaxations-{}-{nonce}",
+        std::process::id()
+    ));
+    tokio::fs::create_dir_all(&staging_dir)
+        .await
+        .with_context(|| {
+            format!(
+                "creating relaxation payload staging directory {}",
+                staging_dir.display()
+            )
+        })?;
+
+    let json_path = staging_dir.join(RELAXATION_JSON_FILENAME);
+    let hook_path = staging_dir.join(RELAXATION_HOOK_FILENAME);
+    let json_tmp = staging_dir.join(format!(".{RELAXATION_JSON_FILENAME}.tmp"));
+    let hook_tmp = staging_dir.join(format!(".{RELAXATION_HOOK_FILENAME}.tmp"));
+
+    tokio::fs::write(&json_tmp, manifest.to_pretty_json()?.as_bytes())
+        .await
+        .with_context(|| format!("writing relaxation JSON tmp {}", json_tmp.display()))?;
+    tokio::fs::write(&hook_tmp, manifest.activate_script().as_bytes())
+        .await
+        .with_context(|| format!("writing relaxation hook tmp {}", hook_tmp.display()))?;
+    tokio::fs::rename(&json_tmp, &json_path)
+        .await
+        .with_context(|| format!("atomically placing relaxation JSON {}", json_path.display()))?;
+    tokio::fs::rename(&hook_tmp, &hook_path)
+        .await
+        .with_context(|| format!("atomically placing relaxation hook {}", hook_path.display()))?;
+
+    Ok(StagedRelaxationPayload {
+        source_urls: vec![file_url(&json_path)?, file_url(&hook_path)?],
+        json_path,
+        hook_path,
+    })
+}
+
+fn file_url(path: &Path) -> Result<String> {
+    url::Url::from_file_path(path)
+        .map(|url| url.to_string())
+        .map_err(|()| anyhow::anyhow!("cannot convert {} to file URL", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::process::Command;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    fn test_dir(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "retread-relaxation-{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos(),
+        ))
+    }
+
+    fn record(package: &str) -> RelaxationRecord {
+        RelaxationRecord {
+            package: package.to_string(),
+            original_spec: ">=1.24,<1.26".to_string(),
+            resulting_spec: ">=1.24,<2".to_string(),
+            tier: RelaxPolicy::Minor,
+            kind: RelaxationRecordKind::UpperCapStripped,
+            source: "wheel `consumer==1` Requires-Dist `numpy>=1.24,<1.26`".to_string(),
+            involved_wheels: vec![
+                "wheel `consumer==1` Requires-Dist `numpy>=1.24,<1.26`".to_string(),
+                "wheel `peer==2` Requires-Dist `numpy==1.26`".to_string(),
+            ],
+            scope: RelaxationScope {
+                environments: vec!["gpu".to_string()],
+                targets: vec!["linux-64".to_string()],
+                platform: "linux-64".to_string(),
+                python: "3.11".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn structured_scope_comes_from_the_exact_resolution_target() {
+        let contract = crate::workspace::WorkspaceTargetContract {
+            subdir: "linux-64".to_string(),
+            declared_virtual_packages: Default::default(),
+            detected_virtual_packages: std::collections::BTreeMap::from([(
+                "glibc".to_string(),
+                "2.28".to_string(),
+            )]),
+        };
+        let target = ResolutionTarget::try_for_contract("3.11", contract.clone())
+            .unwrap()
+            .with_workspace_scope(crate::workspace::ResolvedWorkspaceTarget {
+                contract,
+                profiles: vec!["linux-64-cuda-12".to_string()],
+                environments: vec!["isaacsim".to_string()],
+            })
+            .unwrap();
+        assert_eq!(
+            RelaxationScope::for_target(&target),
+            RelaxationScope {
+                environments: vec!["isaacsim".to_string()],
+                targets: vec!["linux-64-cuda-12".to_string()],
+                platform: "linux-64".to_string(),
+                python: "3.11".to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn staged_payload_is_parseable_json_and_valid_shell() {
+        let root = test_dir("valid");
+        let manifest = RelaxationManifest::new("example-pack", vec![record("numpy")])
+            .expect("non-empty manifest");
+        let staged = stage_relaxation_payload(&root, &manifest)
+            .await
+            .expect("stage payload");
+
+        assert_eq!(staged.source_urls.len(), 2);
+        let parsed: RelaxationManifest =
+            serde_json::from_slice(&std::fs::read(&staged.json_path).expect("read JSON"))
+                .expect("parse JSON");
+        assert_eq!(parsed, manifest);
+        let syntax = Command::new("sh")
+            .arg("-n")
+            .arg(&staged.hook_path)
+            .status()
+            .expect("run sh -n");
+        assert!(syntax.success(), "generated activate.d hook must parse");
+        let hook = std::fs::read_to_string(&staged.hook_path).expect("read activate hook");
+        assert!(hook.contains(
+            "[retread] auto-relaxed: numpy >=1.24,<1.26 -> >=1.24,<2 (upper cap stripped)"
+        ));
+        let sourced = Command::new("sh")
+            .arg("-c")
+            .arg(format!(". {}", staged.hook_path.display()))
+            .output()
+            .expect("source activate hook");
+        assert!(sourced.status.success());
+        assert!(String::from_utf8_lossy(&sourced.stderr).contains(
+            "[retread] auto-relaxed: numpy >=1.24,<1.26 -> >=1.24,<2 (upper cap stripped)"
+        ));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn many_relaxations_are_summarized_with_json_pointer() {
+        let manifest = RelaxationManifest::new(
+            "example-pack",
+            ["a", "b", "c", "d"].into_iter().map(record).collect(),
+        )
+        .expect("non-empty manifest");
+        let hook = manifest.activate_script();
+        assert!(hook.contains("[retread] auto-relaxed 4 constraints"));
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(&hook)
+            .env("CONDA_PREFIX", "/tmp/example-prefix")
+            .output()
+            .expect("execute summarized hook");
+        assert!(output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(
+                "/tmp/example-prefix/share/retread/example-pack/retread-relaxations.json"
+            )
+        );
+        assert!(!hook.contains("a >=1.24"));
+    }
+
+    #[test]
+    fn manifest_record_order_is_canonical() {
+        let numpy = record("numpy");
+        let mut reversed_numpy = numpy.clone();
+        reversed_numpy.involved_wheels.reverse();
+        let forward =
+            RelaxationManifest::new("example-pack", vec![numpy, record("typing-extensions")])
+                .unwrap();
+        let reverse = RelaxationManifest::new(
+            "example-pack",
+            vec![record("typing-extensions"), reversed_numpy],
+        )
+        .unwrap();
+        assert_eq!(forward, reverse);
+        assert_eq!(
+            forward.to_pretty_json().unwrap(),
+            reverse.to_pretty_json().unwrap()
+        );
+        assert_eq!(forward.activate_script(), reverse.activate_script());
+    }
+
+    #[tokio::test]
+    async fn payload_write_failure_is_fatal() {
+        let root = test_dir("failure");
+        std::fs::write(&root, b"not a directory").expect("create blocking staging root");
+        let manifest = RelaxationManifest::new("example-pack", vec![record("numpy")])
+            .expect("non-empty manifest");
+        let error = stage_relaxation_payload(&root, &manifest)
+            .await
+            .expect_err("directory at JSON destination must make staging fail");
+        assert!(
+            format!("{error:#}").contains("creating relaxation payload staging directory"),
+            "unexpected error: {error:#}"
+        );
+        let _ = std::fs::remove_file(root);
+    }
+}

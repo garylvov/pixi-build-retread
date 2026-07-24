@@ -1781,6 +1781,7 @@ dependencies = [
  "pixi_build_types",
  "rattler_conda_types",
  "rattler_digest",
+ "rattler_package_streaming",
  "rattler_repodata_gateway",
  "rattler_solve",
  "rattler_virtual_packages",

@@ -30,6 +30,7 @@ use crate::lock::{
     CondaDep, LockAbiContext, LockWheel, LockWheelAbiMetadata, Origin, RetreadLock, SCHEMA,
 };
 use crate::pypi::{ResolutionTarget, WheelTarget};
+use crate::relaxation_record::{RelaxationManifest, stage_relaxation_payload};
 
 const SHADOW_DOWNLOAD_ATTEMPTS: usize = 5;
 const SHADOW_RETRY_BASE_DELAY_MS: u64 = if cfg!(test) { 10 } else { 250 };
@@ -1614,6 +1615,44 @@ pub(crate) async fn stage_for_target_with_store_root(
     staging_dir: &Path,
     wheel_store_root_override: Option<&Path>,
 ) -> anyhow::Result<CourierStaged> {
+    stage_for_target_with_store_root_and_relaxations(
+        config,
+        bundle_name,
+        input_bundle_name,
+        version,
+        target,
+        emit_wheels,
+        conda_capable,
+        run_deps,
+        index_urls,
+        config_fp,
+        source_dir,
+        staging_dir,
+        wheel_store_root_override,
+        None,
+    )
+    .await
+}
+
+/// Track-3 staging form: persist the exact relaxation payload in both the
+/// replay lock and two tiny recipe sources.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn stage_for_target_with_store_root_and_relaxations(
+    config: &RetreadConfig,
+    bundle_name: &str,
+    input_bundle_name: &str,
+    version: &str,
+    target: &ResolutionTarget,
+    emit_wheels: &[EmitWheel],
+    conda_capable: &HashSet<String>,
+    run_deps: &[String],
+    index_urls: &[String],
+    config_fp: &str,
+    source_dir: &Path,
+    staging_dir: &Path,
+    wheel_store_root_override: Option<&Path>,
+    relaxations: Option<&RelaxationManifest>,
+) -> anyhow::Result<CourierStaged> {
     // Run both guards before status output, directory creation, cache writes,
     // or current_exe packaging. A foreign target must leave no staged state.
     let python = crate::lock::normalized_target_python(target.python_version())
@@ -1621,6 +1660,9 @@ pub(crate) async fn stage_for_target_with_store_root(
     validate_native_stage_target(target, Platform::current())?;
     validate_reserved_meta_wheel_collisions(emit_wheels, bundle_name, version)?;
     validate_emit_wheels(emit_wheels, target.wheel_target())?;
+    if let Some(relaxations) = relaxations {
+        relaxations.validate_for(bundle_name, target)?;
+    }
 
     let t_stage = std::time::Instant::now();
     crate::status::phase(source_dir, bundle_name, "staging: planning emit set");
@@ -2479,6 +2521,9 @@ pub(crate) async fn stage_for_target_with_store_root(
         // portable_wheel_store_path). Fat bundles carry their bytes.
         wheel_store: loose.then(|| portable_wheel_store_path(&wheel_store_root)),
         abi_context: Some(abi_context),
+        relaxations: relaxations
+            .map(|manifest| manifest.records().to_vec())
+            .unwrap_or_default(),
     };
     if !lock.is_for_resolution_target(target) {
         anyhow::bail!(
@@ -2505,6 +2550,13 @@ pub(crate) async fn stage_for_target_with_store_root(
         .await
         .with_context(|| format!("atomically placing lock {}", lock_dst.display()))?;
     source_urls.push(file_url(&lock_dst)?);
+    if let Some(relaxations) = relaxations {
+        let payload_dir = staging_dir.join(format!("relaxations-{}", target.resolution_identity()));
+        let payload = stage_relaxation_payload(&payload_dir, relaxations)
+            .await
+            .context("staging mandatory relaxation warning payload")?;
+        source_urls.extend(payload.source_urls);
+    }
 
     tracing::info!(
         bundle = %bundle_name,
@@ -5213,7 +5265,24 @@ version = "1.0.0"
         let config = minimal_loose_config(bundle);
 
         let target = ResolutionTarget::for_subdir("3.11", Platform::current().as_str());
-        let result = stage_for_target_with_store_root(
+        let relaxation_manifest = RelaxationManifest::new(
+            bundle,
+            vec![crate::relaxation_record::RelaxationRecord {
+                package: "numpy".to_string(),
+                original_spec: "==1.24.0".to_string(),
+                resulting_spec: ">=1.24,<2".to_string(),
+                tier: crate::config::RelaxPolicy::Minor,
+                kind: crate::relaxation_record::RelaxationRecordKind::ExactPinWidened,
+                source: "wheel `loosepkg==1.0.0` Requires-Dist `numpy==1.24.0`".to_string(),
+                involved_wheels: vec![
+                    "wheel `loosepkg==1.0.0` Requires-Dist `numpy==1.24.0`".to_string(),
+                    "wheel `peer==2.0.0` Requires-Dist `numpy>=1.26`".to_string(),
+                ],
+                scope: crate::relaxation_record::RelaxationScope::for_target(&target),
+            }],
+        )
+        .unwrap();
+        let result = stage_for_target_with_store_root_and_relaxations(
             &config,
             bundle,
             bundle,
@@ -5227,6 +5296,7 @@ version = "1.0.0"
             &tmp,
             &staging,
             Some(&store),
+            Some(&relaxation_manifest),
         )
         .await
         .unwrap();
@@ -5298,6 +5368,80 @@ version = "1.0.0"
                 .iter()
                 .any(|u| u.ends_with("retread-installer")),
             "installer binary must remain a recipe source"
+        );
+        assert_eq!(
+            result.lock.relaxations, relaxation_manifest.relaxations,
+            "courier replay lock must retain the exact warning payload"
+        );
+        let staged_lock =
+            RetreadLock::load(&staging.join(RetreadLock::file_name_for_target(bundle, &target)))
+                .unwrap();
+        assert_eq!(
+            staged_lock.relaxations, relaxation_manifest.relaxations,
+            "serialized courier lock must retain the warning payload for replay"
+        );
+        assert!(
+            result
+                .source_urls
+                .iter()
+                .any(|url| url.ends_with(crate::relaxation_record::RELAXATION_JSON_FILENAME)),
+            "metadata-light courier must ship the tiny JSON record"
+        );
+        assert!(
+            result
+                .source_urls
+                .iter()
+                .any(|url| url.ends_with(crate::relaxation_record::RELAXATION_HOOK_FILENAME)),
+            "metadata-light courier must ship the tiny activate.d hook"
+        );
+        let staged_json_url = result
+            .source_urls
+            .iter()
+            .find(|url| url.ends_with(crate::relaxation_record::RELAXATION_JSON_FILENAME))
+            .unwrap();
+        let staged_json_path = url::Url::parse(staged_json_url)
+            .unwrap()
+            .to_file_path()
+            .unwrap();
+        let staged_manifest: RelaxationManifest =
+            serde_json::from_slice(&std::fs::read(staged_json_path).unwrap()).unwrap();
+        assert_eq!(staged_manifest, relaxation_manifest);
+        let replay_manifest =
+            RelaxationManifest::new(staged_lock.bundle.clone(), staged_lock.relaxations.clone())
+                .unwrap();
+        let replay_payload = crate::relaxation_record::stage_relaxation_payload(
+            &tmp.join("replay-payload"),
+            &replay_manifest,
+        )
+        .await
+        .unwrap();
+        let cold_json_url = result
+            .source_urls
+            .iter()
+            .find(|url| url.ends_with(crate::relaxation_record::RELAXATION_JSON_FILENAME))
+            .unwrap();
+        let cold_hook_url = result
+            .source_urls
+            .iter()
+            .find(|url| url.ends_with(crate::relaxation_record::RELAXATION_HOOK_FILENAME))
+            .unwrap();
+        let cold_json = url::Url::parse(cold_json_url)
+            .unwrap()
+            .to_file_path()
+            .unwrap();
+        let cold_hook = url::Url::parse(cold_hook_url)
+            .unwrap()
+            .to_file_path()
+            .unwrap();
+        assert_eq!(
+            std::fs::read(cold_json).unwrap(),
+            std::fs::read(replay_payload.json_path).unwrap(),
+            "cold and replay JSON payloads must be byte-identical"
+        );
+        assert_eq!(
+            std::fs::read(cold_hook).unwrap(),
+            std::fs::read(replay_payload.hook_path).unwrap(),
+            "cold and replay hooks must be byte-identical"
         );
         let _ = std::fs::remove_dir_all(&tmp);
     }

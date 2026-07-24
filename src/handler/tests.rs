@@ -936,6 +936,218 @@ fn final_emission_opts_into_minimal_stale_cap_relaxation() {
 }
 
 #[test]
+fn within_major_relaxation_becomes_the_final_structured_bundle_record() {
+    let mut bundle = solo_bundle("relax-record-pack", vec!["demo==1.24.0"]);
+    bundle.extras.push(rw(
+        "newer-consumer",
+        meta("newer-consumer", "2.0.0", vec!["demo>=1.26"], true),
+    ));
+    let mut config = cfg();
+    config.relax = RelaxPolicy::PatchThenMinorThenMajorThenLastResort;
+
+    let (output, relaxations) = produce_output_pending_relaxations(
+        &bundle,
+        &config,
+        Platform::Linux64,
+        "3.11",
+        &[],
+        None,
+        None,
+    )
+    .unwrap();
+    let emitted = output
+        .run_dependencies
+        .depends
+        .iter()
+        .find(|dependency| dependency.name == "demo")
+        .map(|dependency| format_packagespec(&dependency.spec))
+        .expect("demo run dependency");
+    let emitted =
+        VersionSpec::from_str(&emitted, rattler_conda_types::ParseStrictness::Lenient).unwrap();
+    assert!(emitted.matches(&rattler_conda_types::Version::from_str("1.26").unwrap()));
+    assert!(!emitted.matches(&rattler_conda_types::Version::from_str("2").unwrap()));
+
+    let target = ResolutionTarget::for_subdir("3.11", "linux-64");
+    let manifest = bundled_relaxations_for_output(
+        "relax-record-pack",
+        "relax-record-pack",
+        &target,
+        &[],
+        &relaxations,
+    )
+    .expect("safe within-major relaxation must produce a bundled record");
+    assert_eq!(manifest.relaxations.len(), 1);
+    let record = &manifest.relaxations[0];
+    assert_eq!(record.package, "demo");
+    assert_eq!(record.original_spec, "==1.24.0");
+    assert_eq!(record.resulting_spec, ">=1.24,<2");
+    assert_eq!(record.tier, RelaxPolicy::Minor);
+    assert_eq!(
+        record.kind,
+        crate::relaxation_record::RelaxationRecordKind::ExactPinWidened
+    );
+    assert_eq!(record.scope.platform, "linux-64");
+    assert_eq!(record.scope.python, "3.11");
+    assert_eq!(record.scope.environments, Vec::<String>::new());
+    assert_eq!(record.scope.targets, Vec::<String>::new());
+    assert!(
+        record
+            .involved_wheels
+            .iter()
+            .any(|wheel| wheel.contains("newer-consumer==2.0.0"))
+    );
+    let reparsed: RelaxationManifest =
+        serde_json::from_str(&manifest.to_pretty_json().unwrap()).unwrap();
+    assert_eq!(reparsed, manifest);
+    assert!(
+        manifest
+            .activate_script()
+            .contains("[retread] auto-relaxed: demo ==1.24.0 -> >=1.24,<2 (exact pin widened)")
+    );
+}
+
+#[test]
+fn satisfiable_final_emission_has_no_bundle_record() {
+    let mut bundle = solo_bundle("strict-record-pack", vec!["demo>=1"]);
+    bundle.extras.push(rw(
+        "compatible-consumer",
+        meta("compatible-consumer", "2.0.0", vec!["demo<2"], true),
+    ));
+    let config = cfg();
+    let (_, relaxations) = produce_output_pending_relaxations(
+        &bundle,
+        &config,
+        Platform::Linux64,
+        "3.11",
+        &[],
+        None,
+        None,
+    )
+    .unwrap();
+    assert!(relaxations.is_empty());
+    assert!(
+        bundled_relaxations_for_output(
+            "strict-record-pack",
+            "strict-record-pack",
+            &ResolutionTarget::for_subdir("3.11", "linux-64"),
+            &[],
+            &relaxations,
+        )
+        .is_none(),
+        "strict packages must inject neither warning file"
+    );
+}
+
+#[test]
+fn noarch_relaxation_record_uses_the_concrete_resolution_platform() {
+    let mut bundle = solo_bundle(
+        "win-relax-record-pack",
+        vec!["demo==1.24.0 ; sys_platform == 'win32'"],
+    );
+    bundle.extras.push(rw(
+        "newer-win-consumer",
+        meta(
+            "newer-win-consumer",
+            "2.0.0",
+            vec!["demo>=1.26 ; sys_platform == 'win32'"],
+            true,
+        ),
+    ));
+    let mut config = cfg();
+    config.relax = RelaxPolicy::PatchThenMinorThenMajorThenLastResort;
+
+    let (_, win_relaxations) = produce_output_pending_relaxations(
+        &bundle,
+        &config,
+        Platform::Win64,
+        "3.11",
+        &[],
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        win_relaxations.len(),
+        1,
+        "the concrete Win target must retain and relax both marked constraints"
+    );
+    let (_, noarch_relaxations) = produce_output_pending_relaxations(
+        &bundle,
+        &config,
+        Platform::NoArch,
+        "3.11",
+        &[],
+        None,
+        None,
+    )
+    .unwrap();
+    assert!(
+        noarch_relaxations.is_empty(),
+        "evaluating a noarch artifact as a target would silently lose the Win relaxation record"
+    );
+}
+
+#[test]
+fn relaxation_parity_allows_run_exports_but_rejects_replaced_ranges() {
+    let mut bundle = solo_bundle("relax-parity-pack", vec!["demo==1.24.0"]);
+    bundle.extras.push(rw(
+        "newer-consumer",
+        meta("newer-consumer", "2.0.0", vec!["demo>=1.26"], true),
+    ));
+    let mut config = cfg();
+    config.relax = RelaxPolicy::PatchThenMinorThenMajorThenLastResort;
+    let (output, _) = produce_output_pending_relaxations(
+        &bundle,
+        &config,
+        Platform::Linux64,
+        "3.11",
+        &[],
+        None,
+        None,
+    )
+    .unwrap();
+    let mut build_dependencies = output
+        .run_dependencies
+        .depends
+        .iter()
+        .map(|dependency| {
+            let spec = format_packagespec(&dependency.spec);
+            if spec.is_empty() {
+                dependency.name.clone()
+            } else {
+                format!("{} {spec}", dependency.name)
+            }
+        })
+        .collect::<Vec<_>>();
+    build_dependencies.push("python_abi 3.11.* *_cp311".to_string());
+    assert!(
+        run_dependencies_match(&output.run_dependencies.depends, Some(&build_dependencies))
+            .unwrap(),
+        "Pixi-added run exports are a valid superset of advertised deps"
+    );
+    let mut intersected_dependencies = build_dependencies.clone();
+    intersected_dependencies.push("demo >=1.27,<2".to_string());
+    assert!(
+        !run_dependencies_match(
+            &output.run_dependencies.depends,
+            Some(&intersected_dependencies)
+        )
+        .unwrap(),
+        "a same-name extra must not silently intersect the recorded result"
+    );
+    let demo = build_dependencies
+        .iter_mut()
+        .find(|dependency| dependency.starts_with("demo "))
+        .unwrap();
+    *demo = "demo >=1.27,<2".to_string();
+    assert!(
+        !run_dependencies_match(&output.run_dependencies.depends, Some(&build_dependencies))
+            .unwrap(),
+        "replacing the recorded result with a tighter build spec must fail closed"
+    );
+}
+
+#[test]
 fn final_emission_never_pre_relaxes_numpy_or_cuda_anchors() {
     let bundle = solo_bundle("anchor-pack", vec!["numpy==1.26.4", "cuda>=12.8,<13"]);
     let mut config = cfg();
@@ -4302,6 +4514,7 @@ async fn pure_noarch_prepared_handoff_retains_rich_target_contract() {
         local_wheel_stamps: capture_local_wheel_stamps(std::slice::from_ref(&base_bundle)),
         materialized: vec![base_bundle],
         base_config: config.clone(),
+        restore_relaxations: vec![],
         declared_config: config,
         target: p1.clone(),
         work_directory: work_dir.clone(),
@@ -4314,6 +4527,8 @@ async fn pure_noarch_prepared_handoff_retains_rich_target_contract() {
         bundle_index: 0,
         emission,
         advertised: PreparedOutputIdentity::from_metadata(&advertised.metadata),
+        advertised_run_dependencies: advertised.run_dependencies.clone(),
+        relaxations: None,
         incremental_version_override: None,
     };
     let request = pixi_build_types::procedures::conda_build_v1::CondaBuildV1Output {
@@ -4520,6 +4735,7 @@ async fn conda_outputs_cache_and_prepared_handoff_round_trip() {
         local_wheel_stamps: capture_local_wheel_stamps(std::slice::from_ref(&base_bundle)),
         materialized: vec![base_bundle],
         base_config: declared_config.clone(),
+        restore_relaxations: vec![],
         declared_config: declared_config.clone(),
         target: crate::pypi::ResolutionTarget::for_subdir("3.11", "linux-64"),
         work_directory: work_dir.clone(),
@@ -4532,6 +4748,8 @@ async fn conda_outputs_cache_and_prepared_handoff_round_trip() {
         bundle_index: 0,
         emission,
         advertised: PreparedOutputIdentity::from_metadata(&advertised_output.metadata),
+        advertised_run_dependencies: advertised_output.run_dependencies.clone(),
+        relaxations: None,
         incremental_version_override: None,
     };
     let request = pixi_build_types::procedures::conda_build_v1::CondaBuildV1Output {
@@ -4604,6 +4822,7 @@ async fn conda_outputs_cache_and_prepared_handoff_round_trip() {
         local_wheel_stamps: capture_local_wheel_stamps(std::slice::from_ref(&py312_bundle)),
         materialized: vec![py312_bundle],
         base_config: declared_config.clone(),
+        restore_relaxations: vec![],
         declared_config: declared_config.clone(),
         target: crate::pypi::ResolutionTarget::for_subdir("3.12", "linux-64"),
         work_directory: work_dir.clone(),
@@ -4616,6 +4835,8 @@ async fn conda_outputs_cache_and_prepared_handoff_round_trip() {
         bundle_index: 0,
         emission: prepared.emission.clone(),
         advertised: prepared.advertised.clone(),
+        advertised_run_dependencies: prepared.advertised_run_dependencies.clone(),
+        relaxations: None,
         incremental_version_override: None,
     };
     handler
@@ -4701,6 +4922,7 @@ async fn conda_outputs_cache_and_prepared_handoff_round_trip() {
     let local_plan = Arc::new(ResolvedTargetPlan {
         materialized: vec![local_bundle],
         base_config: declared_config.clone(),
+        restore_relaxations: vec![],
         declared_config,
         target: crate::pypi::ResolutionTarget::for_subdir("3.11", "linux-64"),
         work_directory: work_dir.clone(),
@@ -4714,6 +4936,8 @@ async fn conda_outputs_cache_and_prepared_handoff_round_trip() {
         bundle_index: 0,
         emission: hit.prepared.emission.clone(),
         advertised: hit.prepared.advertised.clone(),
+        advertised_run_dependencies: hit.prepared.advertised_run_dependencies.clone(),
+        relaxations: None,
         incremental_version_override: None,
     };
     let transaction = handler.begin_prepared_transaction(8).await.unwrap();
@@ -4781,6 +5005,7 @@ async fn incremental_cold_fallback_requires_exact_prepared_plan() {
         local_wheel_stamps: capture_local_wheel_stamps(std::slice::from_ref(&base_bundle)),
         materialized: vec![base_bundle],
         base_config: config.clone(),
+        restore_relaxations: vec![],
         declared_config: config,
         target: ResolutionTarget::for_subdir("3.11", "linux-64"),
         work_directory: work_dir.clone(),
@@ -4793,6 +5018,8 @@ async fn incremental_cold_fallback_requires_exact_prepared_plan() {
         bundle_index: 0,
         emission,
         advertised: PreparedOutputIdentity::from_metadata(&output.metadata),
+        advertised_run_dependencies: output.run_dependencies.clone(),
+        relaxations: None,
         incremental_version_override: Some("1.0.0".to_string()),
     };
     let mut sibling = prepared.clone();

@@ -1749,6 +1749,7 @@ mod tests {
             entry_specs: Vec::new(),
             wheel_store: None,
             abi_context: None,
+            relaxations: vec![],
         }
     }
 

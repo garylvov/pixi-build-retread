@@ -45,8 +45,11 @@ use crate::constraint::{
 };
 use crate::index_chain::{IndexPurpose, index_chain};
 use crate::pypi::{self, ResolutionTarget, WheelTarget, normalized_python_minor};
+#[cfg(test)]
+use crate::recipe::build_courier_recipe_with_mode_and_lock_filename;
 use crate::recipe::{
-    BundleSource, build_bundle_recipe, build_courier_recipe_with_mode_and_lock_filename, to_yaml,
+    BundleSource, build_bundle_recipe_with_relaxations,
+    build_courier_recipe_with_mode_lock_and_relaxations, to_yaml,
 };
 use crate::relax::{
     AbiAliasGraph, CondaConstraintOrigin, CondaDep, CondaName, CondaTarget, NameMap, PypiKey,
@@ -56,6 +59,7 @@ use crate::relax::{
 use crate::relax_decision::{
     Decision as RelaxDecision, SafetyContext, decide as decide_relaxation,
 };
+use crate::relaxation_record::{RelaxationManifest, RelaxationScope, stage_relaxation_payload};
 use crate::rpc::{RpcError, ok, parse_params};
 use crate::wheel::WheelMetadata;
 use crate::wheel_rewrite::rewrite_wheel_with_abi_aliases;
@@ -1261,6 +1265,7 @@ composed = { features = ["composed"], no-default-feature = true }
             entry_specs: vec!["sibling-root@git:deadbeef".to_string()],
             wheel_store: None,
             abi_context: None,
+            relaxations: vec![],
         };
         let lock_path = dir
             .join("sibling")
@@ -1536,6 +1541,7 @@ alias = { features = ["sibling", "alias"], no-default-feature = true }
             entry_specs: vec!["sibling-root==1.0.0".to_string()],
             wheel_store: None,
             abi_context: None,
+            relaxations: vec![],
         };
         let lock_path = dir.join("sibling").join(RetreadLock::file_name_for_target(
             "sibling.pack",
@@ -2809,7 +2815,7 @@ impl Handler {
                     "resolving wheels for python {python_version}: {e:#}"
                 ))
             })?;
-            pending_output_relaxations.extend(restore_relaxations);
+            pending_output_relaxations.extend(restore_relaxations.iter().cloned());
             tracing::info!(
                 python = %python_version,
                 elapsed_ms = t_materialize.elapsed().as_millis() as u64,
@@ -2862,6 +2868,7 @@ impl Handler {
             let plan = Arc::new(ResolvedTargetPlan {
                 materialized,
                 base_config,
+                restore_relaxations,
                 declared_config: config.clone(),
                 target: target.clone(),
                 work_directory: params.work_directory.clone(),
@@ -3049,16 +3056,64 @@ impl Handler {
                                     ),
                                 );
                                 if plan.local_wheel_stamps.is_some() {
-                                    prepared_builds.push(PreparedBuild {
-                                        locator_id: prepared_builds.len(),
-                                        plan: Arc::clone(&plan),
-                                        bundle_index,
-                                        emission: emission.clone(),
-                                        advertised: PreparedOutputIdentity::from_metadata(
-                                            &replayed.metadata,
-                                        ),
-                                        incremental_version_override: None,
-                                    });
+                                    // A prepared fallback builds the fresh
+                                    // resolved plan, not the committed lock.
+                                    // Pair it only with records re-derived
+                                    // from that same plan, and only when its
+                                    // final run-deps still match the replayed
+                                    // metadata that pixi will solve.
+                                    match produce_output_pending_relaxations(
+                                        &bundle,
+                                        &effective,
+                                        params.host_platform,
+                                        python_version,
+                                        &siblings,
+                                        courier_build_hash.as_deref(),
+                                        None,
+                                    ) {
+                                        Ok((fresh, emission_relaxations))
+                                            if fresh.run_dependencies
+                                                == replayed.run_dependencies
+                                                && outputs_share_identity(&fresh, &replayed) =>
+                                        {
+                                            let relaxations = bundled_relaxations_for_output(
+                                                &bundle.conda_name,
+                                                &base_bundle.conda_name,
+                                                &target,
+                                                &plan.restore_relaxations,
+                                                &emission_relaxations,
+                                            );
+                                            prepared_builds.push(PreparedBuild {
+                                                locator_id: prepared_builds.len(),
+                                                plan: Arc::clone(&plan),
+                                                bundle_index,
+                                                emission: emission.clone(),
+                                                advertised: PreparedOutputIdentity::from_metadata(
+                                                    &replayed.metadata,
+                                                ),
+                                                advertised_run_dependencies: replayed
+                                                    .run_dependencies
+                                                    .clone(),
+                                                relaxations,
+                                                incremental_version_override: None,
+                                            });
+                                        }
+                                        Ok(_) => {
+                                            tracing::debug!(
+                                                bundle = %bundle.conda_name,
+                                                "replay metadata differs from the fresh plan; \
+                                                 withholding prepared fallback"
+                                            );
+                                        }
+                                        Err(error) => {
+                                            tracing::debug!(
+                                                bundle = %bundle.conda_name,
+                                                error = %format!("{error:#}"),
+                                                "fresh plan cannot reproduce replay metadata; \
+                                                 withholding prepared fallback"
+                                            );
+                                        }
+                                    }
                                 }
                                 outputs.push(replayed);
                                 continue;
@@ -3122,7 +3177,14 @@ impl Handler {
                             continue;
                         }
                     };
-                    pending_output_relaxations.extend(relaxations);
+                    let bundled_relaxations = bundled_relaxations_for_output(
+                        &bundle.conda_name,
+                        &base_bundle.conda_name,
+                        &target,
+                        &plan.restore_relaxations,
+                        &relaxations,
+                    );
+                    pending_output_relaxations.extend(relaxations.iter().cloned());
                     // v4.2.0: the in-backend per-env solve check +
                     // iterative widening cascade were removed with the
                     // legacy mirror-solver. Emitted run-deps go to pixi
@@ -3142,6 +3204,8 @@ impl Handler {
                             bundle_index,
                             emission: emission.clone(),
                             advertised: PreparedOutputIdentity::from_metadata(&output.metadata),
+                            advertised_run_dependencies: output.run_dependencies.clone(),
+                            relaxations: bundled_relaxations,
                             incremental_version_override: version_override_for_bundle
                                 .map(str::to_owned),
                         });
@@ -3738,6 +3802,22 @@ impl Handler {
                 detected_incremental_fallback_version.as_deref(),
                 &bundle.conda_name,
             )?;
+            if !run_dependencies_match(
+                &prepared.advertised_run_dependencies.depends,
+                run_override.as_deref(),
+            )
+            .map_err(|error| {
+                RpcError::internal(format!(
+                    "validating prepared run-dependency parity for {}: {error:#}",
+                    bundle.conda_name
+                ))
+            })? {
+                return Err(RpcError::invalid_params(format!(
+                    "run_dependencies for `{}` changed after conda/outputs; refusing to \
+                     build with a stale relaxation record",
+                    bundle.conda_name
+                )));
+            }
             let prepared_workspace_manifest = workspace_dir
                 .as_deref()
                 .and_then(crate::workspace::WorkspaceManifest::load);
@@ -3771,6 +3851,7 @@ impl Handler {
                 Some(expected_build),
                 prepared.incremental_version_override.as_deref(),
                 run_override.as_deref(),
+                prepared.relaxations.as_ref(),
             )
             .await
             .map_err(|e| RpcError::internal(format!("build {}: {e:#}", bundle.conda_name)))?;
@@ -3835,21 +3916,103 @@ impl Handler {
                     emissions.iter().map(|e| &e.output_name).collect::<Vec<_>>()
                 ))
             })?;
-        // Apply emission to the matching base bundle. For typical
-        // single-bundle source packs there's one bundle; for multi-
-        // bundle packs we pick the bundle whose name starts the same.
-        // Falling back to materialized[0] keeps single-pack behavior
-        // identical to before.
-        let base_bundle = materialized.first().ok_or_else(|| {
-            RpcError::invalid_params("no bundles produced; check [retread-wheels]".to_string())
-        })?;
+        let env_bundles: Vec<Bundle> = materialized
+            .iter()
+            .map(|base| apply_emission(base, &base_config, picked_emission).0)
+            .collect();
+        let siblings: Vec<(String, String)> = env_bundles
+            .iter()
+            .map(|sibling| {
+                (
+                    sibling.conda_name.clone(),
+                    sibling.primary.metadata.version.clone(),
+                )
+            })
+            .collect();
+        let cold_workspace_manifest = workspace_dir
+            .as_deref()
+            .and_then(crate::workspace::WorkspaceManifest::load);
+        let courier_channels = cold_workspace_manifest
+            .as_ref()
+            .map(|manifest| {
+                workspace_courier_channels(
+                    manifest,
+                    workspace_dir.as_deref().unwrap_or(source_dir.as_path()),
+                    &source_dir,
+                    &target,
+                )
+            })
+            .unwrap_or_default();
+        let mut matching_bundles = Vec::new();
+        for (bundle_index, base_bundle) in materialized.iter().enumerate() {
+            let (bundle, effective) = apply_emission(base_bundle, &base_config, picked_emission);
+            let courier_hash = config.courier.then(|| {
+                courier_inputs_hash(
+                    &config,
+                    &base_bundle.conda_name,
+                    &target,
+                    &courier_channels,
+                    cold_workspace_manifest.as_ref(),
+                    workspace_dir.as_deref().unwrap_or(source_dir.as_path()),
+                    &source_dir,
+                )
+            });
+            let rich_target_hash = (!config.courier)
+                .then(|| {
+                    target
+                        .target_contract()
+                        .map(|_| target.resolution_identity())
+                })
+                .flatten();
+            let output_hash = courier_hash.as_deref().or(rich_target_hash.as_deref());
+            let (candidate, emission_relaxations) = produce_output_pending_relaxations(
+                &bundle,
+                &effective,
+                resolution_subdir,
+                target.python_version(),
+                &siblings,
+                output_hash,
+                None,
+            )
+            .map_err(|error| {
+                RpcError::internal(format!(
+                    "reconstructing final relaxation record for {}: {error:#}",
+                    bundle.conda_name
+                ))
+            })?;
+            if output_matches_build_request(&candidate, &params.output)
+                && output_run_dependencies_match(&candidate, run_override.as_deref()).map_err(
+                    |error| {
+                        RpcError::internal(format!(
+                            "validating cached output parity for {}: {error:#}",
+                            bundle.conda_name
+                        ))
+                    },
+                )?
+            {
+                matching_bundles.push((bundle_index, bundle, effective, emission_relaxations));
+            }
+        }
+        let [(bundle_index, bundle, effective, emission_relaxations)] = matching_bundles.as_slice()
+        else {
+            return Err(RpcError::invalid_params(format!(
+                "the current source plan has {} exact matches for advertised output \
+                 `{}`; refusing to build with a stale or ambiguous relaxation record",
+                matching_bundles.len(),
+                params.output.name.as_normalized(),
+            )));
+        };
+        let base_bundle = &materialized[*bundle_index];
         let input_bundle_name = base_bundle.conda_name.clone();
-        let (bundle, effective) = apply_emission(base_bundle, &base_config, picked_emission);
+        let bundled_relaxations = bundled_relaxations_for_output(
+            &bundle.conda_name,
+            &input_bundle_name,
+            &target,
+            &restore_relaxations,
+            emission_relaxations,
+        );
 
         if config.courier {
-            let cold_workspace_manifest = workspace_dir
-                .as_deref()
-                .and_then(crate::workspace::WorkspaceManifest::load);
             validate_advertised_courier_build(
                 &config,
                 &input_bundle_name,
@@ -3860,15 +4023,15 @@ impl Handler {
                 params.output.build.as_deref(),
             )?;
             validate_advertised_courier_version(
-                &bundle,
+                bundle,
                 advertised_output_version.as_deref(),
                 None,
             )?;
         }
 
         let result = build_one(
-            &bundle,
-            &effective,
+            bundle,
+            effective,
             &config,
             &params.work_directory,
             &build_output_dir,
@@ -3880,6 +4043,7 @@ impl Handler {
             params.output.build.as_deref(),
             None,
             run_override.as_deref(),
+            bundled_relaxations.as_ref(),
         )
         .await
         .map_err(|e| RpcError::internal(format!("build {}: {e:#}", bundle.conda_name)))?;
@@ -7734,6 +7898,7 @@ struct DiscoveredEmission {
 struct ResolvedTargetPlan {
     materialized: Vec<Bundle>,
     base_config: RetreadConfig,
+    restore_relaxations: Vec<auto_bundle::WheelMetadataRelaxation>,
     declared_config: RetreadConfig,
     target: ResolutionTarget,
     work_directory: PathBuf,
@@ -7775,6 +7940,10 @@ struct PreparedBuild {
     bundle_index: usize,
     emission: DiscoveredEmission,
     advertised: PreparedOutputIdentity,
+    /// Exact run dependencies paired with the recorded decisions.
+    advertised_run_dependencies: CondaOutputDependencies,
+    /// Exact final warning payload paired with the advertised output.
+    relaxations: Option<RelaxationManifest>,
     /// Present only when conda/outputs intentionally advertised the version
     /// of a matching incremental lock rather than the cold primary wheel.
     /// This typed origin never crosses the process-local metadata/build
@@ -12053,6 +12222,7 @@ fn produce_output_with_conflicts(
                     &pypi_name,
                     &constraints,
                     diagnostics,
+                    &bundle.conda_name,
                     format!(" for bundle '{}'", bundle.conda_name),
                 ));
                 let rendered = native_conda_override
@@ -12069,6 +12239,7 @@ fn produce_output_with_conflicts(
                     &pypi_name,
                     &constraints,
                     decisions,
+                    &bundle.conda_name,
                     format!(" for bundle '{}'", bundle.conda_name),
                 ));
                 let rendered = native_conda_override
@@ -12190,6 +12361,108 @@ fn produce_output_pending_relaxations(
     }
     ensure_output_abi_invariants(&output, bundle, config, workspace_python_version)?;
     Ok((output, pending_relaxations))
+}
+
+fn bundled_relaxations_for_output(
+    emitted_bundle: &str,
+    input_bundle: &str,
+    target: &ResolutionTarget,
+    restore_relaxations: &[auto_bundle::WheelMetadataRelaxation],
+    emission_relaxations: &[auto_bundle::WheelMetadataRelaxation],
+) -> Option<RelaxationManifest> {
+    let scope = RelaxationScope::for_target(target);
+    let records = restore_relaxations
+        .iter()
+        .filter(|relaxation| relaxation.bundle() == input_bundle)
+        .chain(
+            emission_relaxations
+                .iter()
+                .filter(|relaxation| relaxation.bundle() == emitted_bundle),
+        )
+        .map(|relaxation| relaxation.to_record(&scope))
+        .collect();
+    RelaxationManifest::new(emitted_bundle, records)
+}
+
+fn output_matches_build_request(
+    output: &CondaOutput,
+    requested: &pixi_build_types::procedures::conda_build_v1::CondaBuildV1Output,
+) -> bool {
+    output.metadata.name.as_normalized() == requested.name.as_normalized()
+        && requested
+            .version
+            .as_ref()
+            .is_none_or(|version| output.metadata.version.to_string() == version.to_string())
+        && requested
+            .build
+            .as_ref()
+            .is_none_or(|build| output.metadata.build == *build)
+        && output.metadata.subdir == requested.subdir
+}
+
+fn outputs_share_identity(left: &CondaOutput, right: &CondaOutput) -> bool {
+    left.metadata.name == right.metadata.name
+        && left.metadata.version.to_string() == right.metadata.version.to_string()
+        && left.metadata.build == right.metadata.build
+        && left.metadata.build_number == right.metadata.build_number
+        && left.metadata.subdir == right.metadata.subdir
+        && left.metadata.noarch == right.metadata.noarch
+}
+
+fn output_run_dependencies_match(
+    output: &CondaOutput,
+    advertised: Option<&[String]>,
+) -> Result<bool> {
+    run_dependencies_match(&output.run_dependencies.depends, advertised)
+}
+
+fn run_dependencies_match(
+    actual: &[NamedSpec<PackageSpec>],
+    advertised: Option<&[String]>,
+) -> Result<bool> {
+    let Some(advertised) = advertised else {
+        return Ok(true);
+    };
+    let expected = advertised
+        .iter()
+        .map(|raw| {
+            let spec = rattler_conda_types::MatchSpec::from_str(
+                raw,
+                rattler_conda_types::ParseStrictness::Lenient,
+            )
+            .with_context(|| format!("parsing advertised run dependency `{raw}`"))?;
+            let name = spec
+                .name
+                .as_ref()
+                .ok_or_else(|| anyhow!("advertised run dependency `{raw}` has no package name"))?;
+            let mut normalized = name.to_string();
+            if let Some(version) = spec.version {
+                normalized.push(' ');
+                normalized.push_str(&version.to_string());
+            }
+            if let Some(build) = spec.build {
+                normalized.push(' ');
+                normalized.push_str(&build.to_string());
+            }
+            spec_from_str(&normalized)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    // Pixi may append host/build run exports (notably python_abi) before
+    // build_v1. Those extras are legitimate, but every dependency advertised
+    // by conda/outputs must remain byte-for-byte semantically present: replacing
+    // a relaxed range or intersecting it with an extra same-name spec would
+    // make the durable record stale.
+    let actual_names = actual
+        .iter()
+        .map(|dependency| canonical_conda_name(&dependency.name))
+        .collect::<BTreeSet<_>>();
+    Ok(actual
+        .iter()
+        .all(|dependency| expected.contains(dependency))
+        && expected.iter().all(|dependency| {
+            !actual_names.contains(&canonical_conda_name(&dependency.name))
+                || actual.contains(dependency)
+        }))
 }
 
 #[cfg(test)]
@@ -13268,6 +13541,7 @@ async fn materialize_from_lock_for_target(
         wheels = emit_wheels.len(),
         "courier build_v1 replay: re-materializing from lock (derivation skipped)",
     );
+    let replay_relaxations = RelaxationManifest::new(bundle_name.clone(), lock.relaxations.clone());
 
     let result = materialize_and_pack(
         None, // bundle=None: replay path, audit skipped
@@ -13286,6 +13560,7 @@ async fn materialize_from_lock_for_target(
         output_dir,
         source_dir,
         expected_build,
+        replay_relaxations.as_ref(),
     )
     .await?;
     Ok(Some(result))
@@ -13319,6 +13594,7 @@ async fn materialize_and_pack(
     output_dir: &Path,
     source_dir: &Path,
     expected_build: Option<&str>,
+    relaxations: Option<&RelaxationManifest>,
 ) -> Result<CondaBuildV1Result> {
     let staging = work_dir.join(format!("courier-{bundle_name}"));
     // `~/...` is an intentionally portable store identity: expand it against
@@ -13330,7 +13606,7 @@ async fn materialize_and_pack(
         .and_then(|lock| lock.wheel_store.as_deref())
         .filter(|recorded| recorded.starts_with("~/"))
         .map(crate::courier::expand_wheel_store_path);
-    let staged = crate::courier::stage_for_target_with_store_root(
+    let staged = crate::courier::stage_for_target_with_store_root_and_relaxations(
         config,
         bundle_name,
         input_bundle_name,
@@ -13344,6 +13620,7 @@ async fn materialize_and_pack(
         source_dir,
         &staging,
         replay_store_root.as_deref(),
+        relaxations,
     )
     .await
     .context("courier staging")?;
@@ -13372,7 +13649,7 @@ async fn materialize_and_pack(
     let courier_lock_to_commit = (lock_path, staged.lock.to_pretty_json()?);
 
     let lock_filename = crate::lock::RetreadLock::file_name_for_target(bundle_name, target);
-    let recipe = build_courier_recipe_with_mode_and_lock_filename(
+    let recipe = build_courier_recipe_with_mode_lock_and_relaxations(
         bundle_name,
         version,
         target.python_version(),
@@ -13384,6 +13661,7 @@ async fn materialize_and_pack(
         Some(&resolved_build),
         config.courier_mode,
         &lock_filename,
+        relaxations.is_some(),
     );
     let yaml = to_yaml(&recipe)?;
 
@@ -13798,6 +14076,7 @@ async fn resolve_incremental_add(
         new = new_count,
         "incremental-add: localized resolve succeeded; building courier package"
     );
+    let replay_relaxations = RelaxationManifest::new(bundle_name.clone(), lock.relaxations.clone());
 
     // ── A6: write lock only after ALL checks pass ─────────────────────────
     let result = materialize_and_pack(
@@ -13817,6 +14096,7 @@ async fn resolve_incremental_add(
         output_dir,
         source_dir,
         expected_build,
+        replay_relaxations.as_ref(),
     )
     .await?;
 
@@ -14056,6 +14336,7 @@ async fn build_one(
     expected_build: Option<&str>,
     courier_version_override: Option<&str>,
     run_override: Option<&[String]>,
+    relaxations: Option<&RelaxationManifest>,
 ) -> Result<CondaBuildV1Result> {
     validate_resolution_artifact_subdir(target, target_subdir)?;
     let workspace_python_version = target.python_version();
@@ -14254,13 +14535,37 @@ async fn build_one(
             output_dir,
             source_dir,
             expected_build,
+            relaxations,
         )
         .await
         .context("courier materialize_and_pack");
     }
 
-    // Non-courier path: build a bundled conda package with the wheel payload.
-    let recipe = build_bundle_recipe(
+    // Non-courier path: stage the same two tiny mandatory warning files used
+    // by courier packages, then add them to the recipe's ordinary sources.
+    let relaxation_payload = match relaxations {
+        Some(manifest) => {
+            manifest.validate_for(&bundle.conda_name, target)?;
+            Some(
+                stage_relaxation_payload(
+                    &work_dir.join(format!(
+                        "relaxations-{}-{}",
+                        bundle.conda_name,
+                        target.resolution_identity(),
+                    )),
+                    manifest,
+                )
+                .await
+                .context("staging mandatory relaxation warning payload")?,
+            )
+        }
+        None => None,
+    };
+    let relaxation_source_urls = relaxation_payload
+        .as_ref()
+        .map(|payload| payload.source_urls.as_slice())
+        .unwrap_or_default();
+    let recipe = build_bundle_recipe_with_relaxations(
         &bundle.conda_name,
         &sources,
         config,
@@ -14270,6 +14575,7 @@ async fn build_one(
         // blueprint="only" payload-skip is deprecated (v2.0.0); the
         // non-courier conda path always carries its wheel payload.
         true,
+        relaxation_source_urls,
     )?;
     let yaml = to_yaml(&recipe)?;
 
@@ -15245,6 +15551,7 @@ mod replay_tests {
                     requires_dist: vec![],
                 }],
             }),
+            relaxations: vec![],
         }
     }
 
@@ -16126,6 +16433,7 @@ mod replay_tests {
             entry_specs: vec![],
             wheel_store: None,
             abi_context: None,
+            relaxations: vec![],
         };
         // Config has no retread_wheels entries — wheel is a class-3 orphan.
         // Use serde_json to construct a minimal config (RetreadConfig has no
@@ -16203,6 +16511,7 @@ mod replay_tests {
             entry_specs: vec![],
             wheel_store: None,
             abi_context: None,
+            relaxations: vec![],
         };
         let config: RetreadConfig =
             serde_json::from_value(serde_json::json!({"retread-wheels": {}})).unwrap();
@@ -16317,6 +16626,7 @@ mod replay_tests {
             entry_specs: vec![],
             wheel_store: None,
             abi_context: None,
+            relaxations: vec![],
         };
         let config: RetreadConfig =
             serde_json::from_value(serde_json::json!({"retread-wheels": {}})).unwrap();
@@ -16525,6 +16835,7 @@ mod replay_tests {
             entry_specs: vec![],
             wheel_store: None,
             abi_context: None,
+            relaxations: vec![],
         };
         let config: RetreadConfig = serde_json::from_value(serde_json::json!({"retread-wheels": {
             "gympack": { "version": "==1.0.0" }
@@ -16910,6 +17221,7 @@ mod replay_tests {
             entry_specs: vec![],
             wheel_store: None,
             abi_context: None,
+            relaxations: vec![],
         };
 
         // Build the replay EmitWheel exactly as the new Class-2 arm would:
@@ -17108,6 +17420,7 @@ mod replay_tests {
             entry_specs: vec![],
             wheel_store: None,
             abi_context: None,
+            relaxations: vec![],
         };
         let config: RetreadConfig = serde_json::from_value(serde_json::json!({"retread-wheels": {
             "reqpack": { "version": "==1.0.0" }
@@ -18240,6 +18553,7 @@ include = ["retread_bfs_git_leaf*"]
             entry_specs: vec![],
             wheel_store: None,
             abi_context: None,
+            relaxations: vec![],
         };
 
         // Config has no retread_wheels entries.
@@ -19307,6 +19621,7 @@ mod load_favored_versions_tests {
             entry_specs: vec![],
             wheel_store: None,
             abi_context: None,
+            relaxations: vec![],
         };
         let json = lock.to_pretty_json().unwrap();
         let path = dir.join(RetreadLock::file_name(bundle));
@@ -21240,6 +21555,7 @@ mod incremental_add_tests {
             entry_specs,
             wheel_store: None,
             abi_context: None,
+            relaxations: vec![],
         };
         let json = lock.to_pretty_json().unwrap();
         std::fs::write(path, json).unwrap();
@@ -21341,6 +21657,7 @@ mod incremental_add_tests {
             entry_specs: vec!["test-bundle==1.0".into()],
             wheel_store: None,
             abi_context: None,
+            relaxations: vec![],
         };
         let mut json: serde_json::Value =
             serde_json::from_str(&lock.to_pretty_json().unwrap()).unwrap();
@@ -21428,6 +21745,7 @@ mod incremental_add_tests {
             entry_specs,
             wheel_store: None,
             abi_context: None,
+            relaxations: vec![],
         };
         let json = lock.to_pretty_json().unwrap();
         std::fs::write(path, json).unwrap();
@@ -21980,6 +22298,7 @@ mod incremental_add_tests {
             entry_specs: vec!["test-bundle==1.0".into()],
             wheel_store: None,
             abi_context: None,
+            relaxations: vec![],
         };
         let json = lock.to_pretty_json().unwrap();
         std::fs::write(path, json).unwrap();

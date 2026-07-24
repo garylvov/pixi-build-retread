@@ -23,6 +23,9 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::relax::canonical_conda_name;
+use crate::relaxation_record::{
+    RelaxationManifest, RelaxationRecord, canonicalize_relaxation_records,
+};
 use crate::workspace::WorkspaceTargetContract;
 
 fn default_target_subdir() -> String {
@@ -400,6 +403,12 @@ pub struct RetreadLock {
     /// Missing on pre-schema-16 locks, which the replay schema gate rejects.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub abi_context: Option<LockAbiContext>,
+    /// Final safe auto-relaxations applied while producing this artifact.
+    ///
+    /// Replay copies these records into the rebuilt package so a cold and
+    /// replayed courier expose the same activate.d warning and JSON payload.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relaxations: Vec<RelaxationRecord>,
     /// Shared transitives routed to conda (the courier package's run-deps).
     pub conda_run_deps: Vec<CondaDep>,
     /// Producer-side index chain used during pack build/solve. Install replay
@@ -466,6 +475,12 @@ pub struct RetreadLock {
     pub wheel_store: Option<String>,
 }
 
+/// Schema 17: durable final auto-relaxation records.
+///
+/// `relaxations` preserves the exact warning payload across courier replay.
+/// Older locks cannot prove whether an emitted package was relaxed, so the
+/// producer replay gate cold-derives once under the new schema.
+///
 /// Schema 16: SHA-bound final wheel metadata and replay ABI context.
 ///
 /// `abi_context` records final `Requires-Dist` lines beside the digest of each
@@ -537,7 +552,7 @@ pub struct RetreadLock {
 /// On the consumer-side install path, old schemas are hard errors: install
 /// replay must not fall back to resolver-backed uv. SCHEMA is NOT an epoch bump
 /// (output SEMANTICS for identical inputs are unchanged; [emit-epoch-ok]).
-pub const SCHEMA: u32 = 16;
+pub const SCHEMA: u32 = 17;
 
 /// Bump EMIT_EPOCH in the SAME commit as ANY change that can alter the bytes
 /// retread emits for identical manifest inputs (relax/version-selection
@@ -705,7 +720,10 @@ pub const SCHEMA: u32 = 16;
 ///
 /// Epoch 36: an overflowing CUDA-family major ceiling now emits a strict
 /// same-major wildcard constraint instead of dropping CUDA-major protection.
-pub const EMIT_EPOCH: u32 = 36;
+///
+/// Epoch 37: relaxed packages ship an activate.d warning hook and structured
+/// relaxation manifest, and courier locks retain that payload across replay.
+pub const EMIT_EPOCH: u32 = 37;
 
 fn parse_stored_glibc(value: Option<&str>) -> Option<Option<(u32, u32)>> {
     match value {
@@ -938,6 +956,13 @@ impl RetreadLock {
                 "retread lock records bundle `{}`, but replay requested `{expected_bundle}`",
                 self.bundle,
             );
+        }
+        if let Some(manifest) =
+            RelaxationManifest::new(self.bundle.clone(), self.relaxations.clone())
+        {
+            manifest
+                .validate_for(expected_bundle, target)
+                .context("retread lock records an invalid relaxation warning payload")?;
         }
         let safe_component = |value: &str| {
             !value.trim().is_empty()
@@ -1299,6 +1324,7 @@ impl RetreadLock {
     /// - `conda_run_deps[]`: (name, spec)
     /// - `root_requirements[]`: lexicographic
     /// - `conda_capable[]`: lexicographic (supersedes the inline sort in courier::stage)
+    /// - `relaxations[]`: stable semantic tuple
     /// - `index_urls[]`: NOT sorted — chain order is semantically significant.
     /// - `prerelease`: BTreeMap — already key-ordered.
     ///
@@ -1306,6 +1332,7 @@ impl RetreadLock {
     /// - `LockWheel.requires_dist[]`: lexicographic (order-insensitive per §A.5)
     /// - `LockAbiContext.wheels[]`: canonical name + digest
     /// - `LockWheelAbiMetadata.requires_dist[]`: lexicographic
+    /// - `RelaxationRecord.involved_wheels[]`: lexicographic
     /// - `GitWheelSource.extras[]`: lexicographic
     /// - `GitWheelSource.auto_data.skip_subdirectories[]`: lexicographic
     pub fn canonicalize(&mut self) {
@@ -1338,6 +1365,7 @@ impl RetreadLock {
 
         // Top-level: conda_capable lexicographic.
         self.conda_capable.sort();
+        canonicalize_relaxation_records(&mut self.relaxations);
 
         // Top-level: entry_specs lexicographic (already sorted by
         // courier_input_specs, but sort here defensively so the invariant
@@ -1503,6 +1531,7 @@ mod tests {
             entry_specs: vec!["isaaclab==0.51.1".into()],
             wheel_store: None,
             abi_context: None,
+            relaxations: vec![],
         };
         let json = lock.to_pretty_json().unwrap();
         let back: RetreadLock = serde_json::from_str(&json).unwrap();
@@ -2254,6 +2283,7 @@ mod tests {
             entry_specs: vec![],
             wheel_store: None,
             abi_context: None,
+            relaxations: vec![],
         };
 
         let err = lock.validate_replay_provenance().unwrap_err();
@@ -2455,6 +2485,7 @@ mod tests {
             entry_specs: vec!["torch==2.0.0".into(), "numpy==1.26.0".into()],
             wheel_store: None,
             abi_context: None,
+            relaxations: vec![],
         }
     }
 

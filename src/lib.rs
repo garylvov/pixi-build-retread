@@ -24,6 +24,7 @@ pub mod pypi;
 pub mod recipe;
 pub mod relax;
 pub(crate) mod relax_decision;
+pub mod relaxation_record;
 pub mod repodata;
 pub mod rpc;
 pub mod solve;

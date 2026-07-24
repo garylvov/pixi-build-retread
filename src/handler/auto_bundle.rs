@@ -32,6 +32,7 @@ use crate::relax_decision::{
     Decision as RelaxDecision, RelaxationDecision, RelaxationKind as WheelMetadataRelaxationKind,
     SafetyContext, decide as decide_relaxation,
 };
+use crate::relaxation_record::{RelaxationRecord, RelaxationScope};
 use crate::wheel::WheelMetadata;
 
 use super::resolve_state::ResolveState;
@@ -193,6 +194,7 @@ struct PypiFetchRequest {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct WheelMetadataRelaxation {
+    bundle: String,
     package: PypiKey,
     kind: WheelMetadataRelaxationKind,
     original: String,
@@ -221,6 +223,23 @@ impl std::fmt::Display for WheelMetadataRelaxation {
 }
 
 impl WheelMetadataRelaxation {
+    pub(super) fn bundle(&self) -> &str {
+        &self.bundle
+    }
+
+    pub(super) fn to_record(&self, scope: &RelaxationScope) -> RelaxationRecord {
+        RelaxationRecord {
+            package: self.package.as_str().to_string(),
+            original_spec: self.original.clone(),
+            resulting_spec: self.relaxed.clone(),
+            tier: self.tier,
+            kind: self.kind.into(),
+            source: self.source.clone(),
+            involved_wheels: self.involved_sources.clone(),
+            scope: scope.clone(),
+        }
+    }
+
     pub(super) fn emit(&self) {
         let message = self.to_string();
         tracing::warn!(
@@ -1038,6 +1057,7 @@ pub(super) fn wheel_metadata_relaxations(
     package: &PypiKey,
     constraints: &[Constraint],
     decisions: Vec<RelaxationDecision>,
+    bundle: &str,
     scope: String,
 ) -> Vec<WheelMetadataRelaxation> {
     let involved_sources: Vec<String> = constraints
@@ -1057,6 +1077,7 @@ pub(super) fn wheel_metadata_relaxations(
     decisions
         .into_iter()
         .map(|decision| WheelMetadataRelaxation {
+            bundle: bundle.to_string(),
             package: package.clone(),
             kind: decision.kind,
             original: decision.original,
@@ -1235,6 +1256,10 @@ impl RestoreRequestBuilder {
             .iter()
             .find(|name| crate::solve::is_abi_anchor(name))
             .map(String::as_str);
+        let record_bundle = diagnostic_context
+            .map(|context| context.bundle.as_str())
+            .unwrap_or(&self.bundle_name)
+            .to_string();
         let (specifiers, relaxations) = match decide_relaxation(
             &package,
             &self.constraints,
@@ -1250,6 +1275,7 @@ impl RestoreRequestBuilder {
                     &package,
                     &self.constraints,
                     diagnostics,
+                    &record_bundle,
                     diagnostic_context
                         .map(|context| format!(" {}", context.scope()))
                         .unwrap_or_default(),
@@ -1264,6 +1290,7 @@ impl RestoreRequestBuilder {
                     &package,
                     &self.constraints,
                     decisions,
+                    &record_bundle,
                     diagnostic_context
                         .map(|context| format!(" {}", context.scope()))
                         .unwrap_or_default(),
@@ -4673,6 +4700,7 @@ mod tests {
         );
         assert_eq!(request.relaxations.len(), 1);
         let relaxation = &request.relaxations[0];
+        assert_eq!(relaxation.bundle(), "isaacsim-pack");
         assert_eq!(
             (
                 relaxation.kind,

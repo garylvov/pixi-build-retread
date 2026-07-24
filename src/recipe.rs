@@ -11,6 +11,9 @@ use serde::Serialize;
 
 use crate::config::RetreadConfig;
 use crate::relax::{default_marker_env, emit_python_version, translate};
+use crate::relaxation_record::{
+    RELAXATION_HOOK_FILENAME, RELAXATION_HOOK_PATH, RELAXATION_JSON_FILENAME,
+};
 use crate::wheel::WheelMetadata;
 
 #[derive(Debug, Serialize)]
@@ -122,6 +125,35 @@ pub fn build_bundle_recipe(
     build_string: Option<&str>,
     payload: bool,
 ) -> anyhow::Result<Recipe> {
+    build_bundle_recipe_with_relaxations(
+        conda_name,
+        sources,
+        config,
+        workspace_python_version,
+        run_override,
+        build_string,
+        payload,
+        &[],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_bundle_recipe_with_relaxations(
+    conda_name: &str,
+    sources: &[BundleSource<'_>],
+    config: &RetreadConfig,
+    workspace_python_version: &str,
+    run_override: Option<&[String]>,
+    build_string: Option<&str>,
+    payload: bool,
+    relaxation_source_urls: &[String],
+) -> anyhow::Result<Recipe> {
+    if !relaxation_source_urls.is_empty() && run_override.is_none() {
+        anyhow::bail!(
+            "refusing to build relaxed package `{conda_name}` without the authoritative \
+             run_dependencies that selected its final relaxation record"
+        );
+    }
     let primary = sources
         .first()
         .ok_or_else(|| anyhow::anyhow!("bundle must have at least one source"))?;
@@ -198,7 +230,7 @@ pub fn build_bundle_recipe(
     // no-op script, and therefore seconds of packaging instead of
     // minutes of zstd. (An earlier empty-stub shape flipped noarch and
     // zeroed run-deps; pixi rejected the artifact and the lock lied.)
-    let recipe_sources = if payload {
+    let mut recipe_sources: Vec<Source> = if payload {
         sources
             .iter()
             .map(|s| Source {
@@ -208,6 +240,26 @@ pub fn build_bundle_recipe(
             .collect()
     } else {
         Vec::new()
+    };
+    recipe_sources.extend(relaxation_source_urls.iter().map(|url| Source {
+        url: url.clone(),
+        sha256: None,
+    }));
+
+    let payload_script = if payload {
+        "${{ PYTHON }} -m pip install *.whl -vv --no-deps --no-build-isolation".to_string()
+    } else {
+        // Payload-skip: the package carries metadata only; the
+        // content is consumed through the blueprint find-links.
+        "echo retread-blueprint=only: payload skipped".to_string()
+    };
+    let script = if relaxation_source_urls.is_empty() {
+        payload_script
+    } else {
+        format!(
+            "set -euo pipefail\n{payload_script}\n{}",
+            relaxation_install_script(conda_name)
+        )
     };
 
     Ok(Recipe {
@@ -240,13 +292,7 @@ pub fn build_bundle_recipe(
             },
             // `--no-deps` is essential: conda solves deps from the run: list,
             // not from pip re-resolving Requires-Dist at install time.
-            script: if payload {
-                "${{ PYTHON }} -m pip install *.whl -vv --no-deps --no-build-isolation".to_string()
-            } else {
-                // Payload-skip: the package carries metadata only; the
-                // content is consumed through the blueprint find-links.
-                "echo retread-blueprint=only: payload skipped".to_string()
-            },
+            script,
         },
         requirements: Requirements { host, run },
         about: About {
@@ -344,6 +390,33 @@ pub(crate) fn build_courier_recipe_with_mode_and_lock_filename(
     courier_mode: crate::config::CourierMode,
     lock_filename: &str,
 ) -> Recipe {
+    build_courier_recipe_with_mode_lock_and_relaxations(
+        conda_name,
+        version,
+        python_version,
+        run_deps,
+        source_urls,
+        build_number,
+        expected_build,
+        courier_mode,
+        lock_filename,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_courier_recipe_with_mode_lock_and_relaxations(
+    conda_name: &str,
+    version: &str,
+    python_version: &str,
+    run_deps: &[String],
+    source_urls: &[String],
+    build_number: u64,
+    expected_build: Option<&str>,
+    courier_mode: crate::config::CourierMode,
+    lock_filename: &str,
+    has_relaxations: bool,
+) -> Recipe {
     let python_pin = format!("python {python_version}.*");
 
     let mut run: Vec<String> = run_deps.to_vec();
@@ -394,6 +467,11 @@ pub(crate) fn build_courier_recipe_with_mode_and_lock_filename(
     let activate_guard = format!("$PREFIX/etc/conda/activate.d/zzz-retread-{conda_name}.sh");
     let deactivate_guard = format!("$PREFIX/etc/conda/deactivate.d/zzz-retread-{conda_name}.sh");
     let var_pack = shell_ident(conda_name);
+    let relaxation_section = if has_relaxations {
+        relaxation_install_script(conda_name)
+    } else {
+        String::new()
+    };
     let script = format!(
         "set -euo pipefail\n\
          SHARE=\"$PREFIX/share/retread\"\n\
@@ -463,7 +541,8 @@ pub(crate) fn build_courier_recipe_with_mode_and_lock_filename(
          fi\n\
          unset _RETREAD_SAVED_LDLP_{var_pack}\n\
          DEACTIVATE\n\
-         chmod +x \"{deactivate_guard}\"\n"
+         chmod +x \"{deactivate_guard}\"\n\
+         {relaxation_section}"
     );
 
     let source = source_urls
@@ -511,6 +590,25 @@ pub(crate) fn build_courier_recipe_with_mode_and_lock_filename(
     }
 }
 
+fn relaxation_install_script(conda_name: &str) -> String {
+    let payload_dir = shell_literal(&format!("share/retread/{conda_name}"));
+    let payload_json = shell_literal(&format!(
+        "share/retread/{conda_name}/{RELAXATION_JSON_FILENAME}"
+    ));
+    let hook_path = shell_literal(RELAXATION_HOOK_PATH);
+    format!(
+        "mkdir -p \"$PREFIX\"/{payload_dir} \"$PREFIX/etc/conda/activate.d\"\n\
+         cp \"$SRC_DIR/{RELAXATION_JSON_FILENAME}\" \
+         \"$PREFIX\"/{payload_json}\n\
+         cp \"$SRC_DIR/{RELAXATION_HOOK_FILENAME}\" \"$PREFIX\"/{hook_path}\n\
+         chmod +x \"$PREFIX\"/{hook_path}\n"
+    )
+}
+
+fn shell_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
 pub fn to_yaml(recipe: &Recipe) -> anyhow::Result<String> {
     Ok(serde_yaml::to_string(recipe)?)
 }
@@ -518,6 +616,48 @@ pub fn to_yaml(recipe: &Recipe) -> anyhow::Result<String> {
 #[cfg(test)]
 mod courier_tests {
     use super::*;
+
+    fn package_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        fn visit(dir: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    visit(&path, files);
+                } else {
+                    files.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        visit(root, &mut files);
+        files
+    }
+
+    fn round_trip_conda_payload(
+        prefix: &std::path::Path,
+        root: &std::path::Path,
+        name: &str,
+    ) -> std::path::PathBuf {
+        let archive = root.join(format!("{name}.conda"));
+        rattler_package_streaming::write::write_conda_package(
+            std::fs::File::create(&archive).unwrap(),
+            prefix,
+            &package_files(prefix),
+            rattler_conda_types::compression_level::CompressionLevel::Default,
+            Some(1),
+            name,
+            None,
+            None,
+        )
+        .unwrap();
+        let extracted = root.join(format!("{name}-extracted"));
+        rattler_package_streaming::read::extract_conda_via_streaming(
+            std::fs::File::open(&archive).unwrap(),
+            &extracted,
+        )
+        .unwrap();
+        extracted
+    }
 
     #[test]
     fn courier_recipe_shape() {
@@ -690,6 +830,244 @@ mod courier_tests {
         assert_eq!(recipe.build.number, build_number);
         assert!(recipe.build.script.contains(exact));
         assert!(!recipe.build.script.contains("retread-isaac-pack.lock.json"));
+    }
+
+    #[test]
+    fn courier_relaxation_payload_is_installed_and_copy_failure_is_fatal() {
+        use std::process::Command;
+
+        use crate::config::RelaxPolicy;
+        use crate::relaxation_record::{
+            RelaxationManifest, RelaxationRecord, RelaxationRecordKind, RelaxationScope,
+        };
+
+        let bash = which("bash").expect("bash is required for generated recipe tests");
+        let root = std::env::temp_dir().join(format!(
+            "retread-relaxation-recipe-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let src = root.join("src");
+        let prefix = root.join("prefix");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&prefix).unwrap();
+        std::fs::write(src.join("retread-isaac-pack.lock.json"), "{}").unwrap();
+        std::fs::write(src.join("retread-installer"), "#!/bin/sh\n").unwrap();
+
+        let manifest = RelaxationManifest::new(
+            "isaac-pack",
+            vec![RelaxationRecord {
+                package: "typing-extensions".to_string(),
+                original_spec: "==4.12.2".to_string(),
+                resulting_spec: ">=4.12,<5".to_string(),
+                tier: RelaxPolicy::Minor,
+                kind: RelaxationRecordKind::ExactPinWidened,
+                source: "wheel `isaacsim==5.1.0.0` Requires-Dist \
+                         `typing-extensions==4.12.2`"
+                    .to_string(),
+                involved_wheels: vec![
+                    "wheel `isaacsim==5.1.0.0` Requires-Dist \
+                     `typing-extensions==4.12.2`"
+                        .to_string(),
+                    "wheel `onnx==1.22.0` Requires-Dist `typing-extensions>=4.15.0`".to_string(),
+                ],
+                scope: RelaxationScope {
+                    environments: vec!["isaacsim".to_string()],
+                    targets: vec!["linux-64-cuda-12".to_string()],
+                    platform: "linux-64".to_string(),
+                    python: "3.11".to_string(),
+                },
+            }],
+        )
+        .unwrap();
+        std::fs::write(
+            src.join(RELAXATION_JSON_FILENAME),
+            manifest.to_pretty_json().unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            src.join(RELAXATION_HOOK_FILENAME),
+            manifest.activate_script(),
+        )
+        .unwrap();
+
+        let recipe = build_courier_recipe_with_mode_lock_and_relaxations(
+            "isaac-pack",
+            "5.1.0",
+            "3.11",
+            &[],
+            &[
+                format!("file:///x/{RELAXATION_JSON_FILENAME}"),
+                format!("file:///x/{RELAXATION_HOOK_FILENAME}"),
+            ],
+            0,
+            None,
+            crate::config::CourierMode::PostLink,
+            "retread-isaac-pack.lock.json",
+            true,
+        );
+        let build = Command::new(&bash)
+            .arg("-c")
+            .arg(&recipe.build.script)
+            .env("SRC_DIR", &src)
+            .env("PREFIX", &prefix)
+            .output()
+            .expect("run relaxed courier build script");
+        assert!(
+            build.status.success(),
+            "relaxed courier build failed: {}",
+            String::from_utf8_lossy(&build.stderr)
+        );
+
+        let installed_json = prefix
+            .join("share/retread/isaac-pack")
+            .join(RELAXATION_JSON_FILENAME);
+        let installed_hook = prefix.join(RELAXATION_HOOK_PATH);
+        let parsed: RelaxationManifest =
+            serde_json::from_slice(&std::fs::read(&installed_json).unwrap()).unwrap();
+        assert_eq!(parsed, manifest);
+        assert!(installed_hook.is_file());
+        assert!(
+            Command::new("sh")
+                .arg("-n")
+                .arg(&installed_hook)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let hook = std::fs::read_to_string(&installed_hook).unwrap();
+        assert!(hook.contains(
+            "[retread] auto-relaxed: typing-extensions ==4.12.2 -> >=4.12,<5 \
+             (exact pin widened)"
+        ));
+        let extracted = round_trip_conda_payload(&prefix, &root, "isaac-pack-5.1.0-test_0");
+        let artifact_json = extracted
+            .join("share/retread/isaac-pack")
+            .join(RELAXATION_JSON_FILENAME);
+        let artifact_hook = extracted.join(RELAXATION_HOOK_PATH);
+        let artifact_manifest: RelaxationManifest =
+            serde_json::from_slice(&std::fs::read(artifact_json).unwrap()).unwrap();
+        assert_eq!(artifact_manifest, manifest);
+        assert!(
+            std::process::Command::new("sh")
+                .arg("-n")
+                .arg(artifact_hook)
+                .status()
+                .unwrap()
+                .success(),
+            "the emitted .conda hook must be valid shell"
+        );
+
+        // The same generated recipe must fail closed if the JSON cannot be
+        // placed. `/dev/full` deterministically rejects writes even as root.
+        #[cfg(unix)]
+        {
+            let failed_prefix = root.join("failed-json-prefix");
+            let failed_payload_dir = failed_prefix.join("share/retread/isaac-pack");
+            std::fs::create_dir_all(failed_payload_dir.join("wheels")).unwrap();
+            std::os::unix::fs::symlink(
+                "/dev/full",
+                failed_payload_dir.join(RELAXATION_JSON_FILENAME),
+            )
+            .unwrap();
+            let failed = Command::new(&bash)
+                .arg("-c")
+                .arg(&recipe.build.script)
+                .env("SRC_DIR", &src)
+                .env("PREFIX", &failed_prefix)
+                .output()
+                .expect("run deliberately failing relaxed courier build");
+            assert!(
+                !failed.status.success(),
+                "a relaxation JSON copy failure must fail the package build"
+            );
+
+            let failed_prefix = root.join("failed-hook-prefix");
+            let failed_hook_dir = failed_prefix.join("etc/conda/activate.d");
+            std::fs::create_dir_all(&failed_hook_dir).unwrap();
+            std::os::unix::fs::symlink("/dev/full", failed_hook_dir.join(RELAXATION_HOOK_FILENAME))
+                .unwrap();
+            let failed = Command::new(&bash)
+                .arg("-c")
+                .arg(&recipe.build.script)
+                .env("SRC_DIR", &src)
+                .env("PREFIX", &failed_prefix)
+                .output()
+                .expect("run deliberately failing relaxed courier build");
+            assert!(
+                !failed.status.success(),
+                "a relaxation hook copy failure must fail the package build"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn courier_without_relaxation_injects_no_warning_payload() {
+        use std::process::Command;
+
+        let root = std::env::temp_dir().join(format!(
+            "retread-strict-recipe-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let src = root.join("src");
+        let prefix = root.join("prefix");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&prefix).unwrap();
+        std::fs::write(src.join("retread-plain-pack.lock.json"), "{}").unwrap();
+        std::fs::write(src.join("retread-installer"), "#!/bin/sh\n").unwrap();
+        let recipe = build_courier_recipe(
+            "plain-pack",
+            "1.0.0",
+            "3.11",
+            &[],
+            &["file:///x/retread-plain-pack.lock.json".to_string()],
+            None,
+        );
+        assert!(
+            !recipe.build.script.contains(RELAXATION_JSON_FILENAME),
+            "strict builds must not copy an empty relaxation JSON"
+        );
+        assert!(
+            !recipe.build.script.contains(RELAXATION_HOOK_PATH),
+            "strict builds must not install an empty relaxation hook"
+        );
+        assert!(
+            recipe
+                .source
+                .iter()
+                .all(|source| !source.url.ends_with(RELAXATION_JSON_FILENAME)
+                    && !source.url.ends_with(RELAXATION_HOOK_FILENAME))
+        );
+        let build = Command::new(which("bash").expect("bash is required"))
+            .arg("-c")
+            .arg(&recipe.build.script)
+            .env("SRC_DIR", &src)
+            .env("PREFIX", &prefix)
+            .output()
+            .expect("run strict courier build script");
+        assert!(
+            build.status.success(),
+            "strict courier build failed: {}",
+            String::from_utf8_lossy(&build.stderr)
+        );
+        let extracted = round_trip_conda_payload(&prefix, &root, "plain-pack-1.0.0-test_0");
+        assert!(!extracted.join(RELAXATION_HOOK_PATH).exists());
+        assert!(
+            !extracted
+                .join("share/retread/plain-pack")
+                .join(RELAXATION_JSON_FILENAME)
+                .exists()
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     // End-to-end: render the REAL courier build script, run it with bash to
@@ -1449,5 +1827,35 @@ mod tests {
             "python must remain in run-deps: {:?}",
             r.requirements.run
         );
+    }
+
+    #[test]
+    fn relaxed_rich_recipe_without_authoritative_run_deps_fails_closed() {
+        let meta = WheelMetadata {
+            name: "example-pkg".into(),
+            version: "1.2.3".into(),
+            requires_dist: vec!["demo==1.24.0".into()],
+            is_pure_python: true,
+            sha256: "deadbeef".into(),
+            filename: "example_pkg-1.2.3-py3-none-any.whl".into(),
+        };
+        let url = "https://example.com/example_pkg-1.2.3-py3-none-any.whl"
+            .parse()
+            .unwrap();
+        let error = build_bundle_recipe_with_relaxations(
+            "example-pkg",
+            &one_source(&meta, &url),
+            &cfg(),
+            "3.11",
+            None,
+            None,
+            true,
+            &[
+                "file:///tmp/retread-relaxations.json".to_string(),
+                "file:///tmp/retread-relaxations.sh".to_string(),
+            ],
+        )
+        .expect_err("a relaxed rich build needs exact solved run deps");
+        assert!(format!("{error:#}").contains("authoritative run_dependencies"));
     }
 }
