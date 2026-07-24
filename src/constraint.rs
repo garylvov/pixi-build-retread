@@ -131,7 +131,7 @@ pub struct Conflict {
     pub sources: String,
     scope: String,
     requirements: Vec<Constraint>,
-    suggestion: Option<ConflictSuggestion>,
+    suggestion: Option<Box<ConflictSuggestion>>,
 }
 
 /// A paste-ready manifest edit attached to one fail-closed conflict.
@@ -157,10 +157,10 @@ impl Conflict {
         pack_manifest: impl Into<String>,
         toml: impl Into<String>,
     ) -> Self {
-        self.suggestion = Some(ConflictSuggestion {
+        self.suggestion = Some(Box::new(ConflictSuggestion {
             pack_manifest: pack_manifest.into(),
             toml: toml.into(),
-        });
+        }));
         self
     }
 
@@ -169,7 +169,7 @@ impl Conflict {
     }
 
     pub fn suggestion(&self) -> Option<&ConflictSuggestion> {
-        self.suggestion.as_ref()
+        self.suggestion.as_deref()
     }
 }
 
