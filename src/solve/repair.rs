@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::manifest::{AppliedEdit, EntrySnapshot, ManifestEditor, TableKind, write_atomic};
-use super::parse::Conflict;
+use super::parse::{Conflict, RetreadConflictSuggestion, RetreadMutuallyUnsatisfiable};
 use crate::handler::PypiToCondaMap;
 use crate::relax::{canonical_conda_name, checked_version_ceiling};
 
@@ -638,6 +638,9 @@ impl RepairPlanner {
         iter: u32,
     ) -> std::result::Result<RepairOutcome, String> {
         match conflict {
+            Conflict::RetreadMutuallyUnsatisfiable(retread) => {
+                Ok(self.retread_mutually_unsatisfiable(conflict, retread, iter))
+            }
             Conflict::NoCandidates { package, version } => {
                 let target = PinTarget {
                     package,
@@ -748,6 +751,62 @@ impl RepairPlanner {
                 };
                 self.nested_conda_cap(editor, tried, &target, pack_name, cap_op, cap_version)
             }
+        }
+    }
+
+    /// Preserve the remediation Track 2 already selected in the backend.
+    ///
+    /// This planner branch is intentionally pure: it never asks
+    /// `ManifestEditor` for an edit and never writes the pack-overrides
+    /// ledger itself. The read-only driver prints `summary_line`; only its
+    /// explicit `--apply-ledger` path persists the structured suggestion.
+    fn retread_mutually_unsatisfiable(
+        &self,
+        conflict: &Conflict,
+        retread: &RetreadMutuallyUnsatisfiable,
+        iter: u32,
+    ) -> RepairOutcome {
+        let (version, action) = match &retread.suggestion {
+            RetreadConflictSuggestion::DropDependency { .. } => (
+                "*".to_string(),
+                format!("drop dependency `{}`", retread.package),
+            ),
+            RetreadConflictSuggestion::Override { package, spec, .. } => {
+                (spec.clone(), format!("override `{package}` with `{spec}`"))
+            }
+            RetreadConflictSuggestion::RootPin {
+                package,
+                spec,
+                bundle_group,
+                ..
+            } => (
+                spec.clone(),
+                format!("pin root `{package}` to `{spec}` in bundle `{bundle_group}`"),
+            ),
+        };
+        let target = PinTarget {
+            package: &retread.package,
+            version: &version,
+            iter,
+            conflict,
+        };
+        RepairOutcome {
+            attempt: self.ledger_attempt(
+                &target,
+                Strategy::PypiOverride,
+                "retread-track-2-suggestion",
+                AttemptDetails {
+                    new_spec: (version != "*").then(|| version.clone()),
+                    ..AttemptDetails::default()
+                },
+            ),
+            extra_attempts: Vec::new(),
+            applied: Vec::new(),
+            summary_line: format!(
+                "proposed ledger relaxation for pack `{}`: {action}",
+                retread.suggestion.pack_manifest()
+            ),
+            pack_override: None,
         }
     }
 
@@ -3648,6 +3707,46 @@ mod tests {
             widen_spec(">=", &format!("1.{max}.0"), WidenCeilingPolicy::SameMinor),
             None
         );
+    }
+
+    #[test]
+    fn retread_own_conflict_plans_without_manifest_or_ledger_side_effects() {
+        let path = temp_manifest("[dependencies]\n");
+        let before = std::fs::read(&path).unwrap();
+        let mut editor = ManifestEditor::open(path.clone()).unwrap();
+        let mut planner = RepairPlanner::new("default".into());
+        let mut tried = TriedState::default();
+        let conflict = Conflict::RetreadMutuallyUnsatisfiable(RetreadMutuallyUnsatisfiable {
+            scope: "in environment 'robotics'".into(),
+            bundle: "robotics-output".into(),
+            platform: "linux-64".into(),
+            python: "3.11".into(),
+            package: "numpy".into(),
+            requirements: vec![
+                super::super::parse::RetreadConflictRequirement {
+                    spec: "==1.26.4".into(),
+                    source: "wheel `old-extension==1.0.0`".into(),
+                },
+                super::super::parse::RetreadConflictRequirement {
+                    spec: ">=2,<3".into(),
+                    source: "wheel `new-extension==2.0.0`".into(),
+                },
+            ],
+            suggestion: RetreadConflictSuggestion::DropDependency {
+                pack_manifest: "pypi-packs/robotics-pack/pixi.toml".into(),
+                alternatives: Vec::new(),
+            },
+            suggestion_from_backend: true,
+        });
+
+        let outcome = planner
+            .repair(&mut editor, &mut tried, &conflict, 1)
+            .unwrap();
+        assert!(outcome.applied.is_empty());
+        assert!(outcome.pack_override.is_none());
+        assert!(outcome.summary_line.contains("drop dependency `numpy`"));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(!path.parent().unwrap().join(".retread").exists());
     }
 
     #[test]
