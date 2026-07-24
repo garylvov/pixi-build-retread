@@ -1260,6 +1260,7 @@ composed = { features = ["composed"], no-default-feature = true }
             conda_capable: Vec::new(),
             entry_specs: vec!["sibling-root@git:deadbeef".to_string()],
             wheel_store: None,
+            abi_context: None,
         };
         let lock_path = dir
             .join("sibling")
@@ -1534,6 +1535,7 @@ alias = { features = ["sibling", "alias"], no-default-feature = true }
             conda_capable: Vec::new(),
             entry_specs: vec!["sibling-root==1.0.0".to_string()],
             wheel_store: None,
+            abi_context: None,
         };
         let lock_path = dir.join("sibling").join(RetreadLock::file_name_for_target(
             "sibling.pack",
@@ -3038,6 +3040,18 @@ impl Handler {
                                         bundle.conda_name,
                                     ),
                                 );
+                                if plan.local_wheel_stamps.is_some() {
+                                    prepared_builds.push(PreparedBuild {
+                                        locator_id: prepared_builds.len(),
+                                        plan: Arc::clone(&plan),
+                                        bundle_index,
+                                        emission: emission.clone(),
+                                        advertised: PreparedOutputIdentity::from_metadata(
+                                            &replayed.metadata,
+                                        ),
+                                        incremental_version_override: None,
+                                    });
+                                }
                                 outputs.push(replayed);
                                 continue;
                             }
@@ -3335,6 +3349,21 @@ impl Handler {
         // granted only after build_v1 independently proves that this request
         // came from an incremental lock and its localized attempt escalates.
         let advertised_output_version = params.output.version.as_ref().map(ToString::to_string);
+        // Fast replay must use the same current solved ABI facts that
+        // conda/outputs used to advertise this exact output. A committed lock
+        // cannot substitute producer-time selections: a ranged workspace
+        // dependency can solve to a newer ABI version without changing the
+        // manifest-derived inputs hash.
+        let mut prepared_build_selection = self
+            .lookup_prepared_build_for_target(
+                generation,
+                &params.work_directory,
+                workspace_dir.as_deref(),
+                exact_variant_python.as_deref(),
+                &target,
+                &params.output,
+            )
+            .await;
         let mut detected_incremental_fallback_version = None;
         if config.courier {
             // Need workspace_manifest to compute the config fingerprint
@@ -3395,13 +3424,28 @@ impl Handler {
             if fast_identity_matches {
                 let lock_path = lock_path_for_target(&source_dir, &bundle_name_for_hash, &target);
                 let relax_is_default = config.relax == crate::config::RelaxPolicy::default();
-                match load_replayable_lock_for_target(
-                    &lock_path,
-                    &current_hash,
-                    relax_is_default,
-                    &target,
-                    &bundle_name_for_hash,
-                ) {
+                let replay_lock = if let Some(selection) = prepared_build_selection.as_ref() {
+                    let abi_context = replay_abi_context_for_bundle(
+                        &selection.bundle,
+                        &selection.effective,
+                        target.python_version(),
+                    );
+                    load_replayable_lock_for_target(
+                        &lock_path,
+                        &current_hash,
+                        relax_is_default,
+                        &target,
+                        &bundle_name_for_hash,
+                        &abi_context,
+                    )
+                } else {
+                    tracing::debug!(
+                        bundle = %bundle_name_for_hash,
+                        "WS-B build_v1 replay skipped: current prepared ABI context unavailable",
+                    );
+                    Ok(None)
+                };
+                match replay_lock {
                     Ok(Some(lock))
                         if advertised_version_matches(
                             advertised_output_version.as_deref(),
@@ -3454,12 +3498,21 @@ impl Handler {
                         .await
                         {
                             Ok(Some(result)) => {
-                                return finalize_fasttmp_build_output(
+                                let result = finalize_fasttmp_build_output(
                                     result,
                                     stage_output_dir.as_deref(),
                                     &output_dir,
                                 )
-                                .await;
+                                .await?;
+                                if let Some(selection) = prepared_build_selection.take() {
+                                    self.consume_prepared_build(
+                                        generation,
+                                        selection.transaction,
+                                        selection.prepared.locator_id,
+                                    )
+                                    .await;
+                                }
+                                return Ok(result);
                             }
                             Ok(None) => {
                                 // Provenance gap (class 3 / schema-5 class 2):
@@ -3510,7 +3563,7 @@ impl Handler {
                         .map(|m| m.resolution_pypi_index_urls())
                         .unwrap_or_else(|| vec![crate::index_chain::PUBLIC_PYPI.to_string()]);
                     let relax_str = format!("{:?}", config.relax);
-                    if let Some(incr) = detect_incremental_add_for_target(
+                    let incremental = detect_incremental_add_for_target(
                         &lock_path,
                         &config,
                         declared_input_bundle
@@ -3520,7 +3573,33 @@ impl Handler {
                         &relax_str,
                         &target,
                         &config_fp,
-                    ) {
+                    );
+                    let incremental = incremental.filter(|incr| {
+                        let Some(selection) = prepared_build_selection.as_ref() else {
+                            tracing::debug!(
+                                bundle = %bundle_name_for_hash,
+                                "incremental-add skipped: current prepared ABI context unavailable",
+                            );
+                            return false;
+                        };
+                        let abi_context = replay_abi_context_for_bundle(
+                            &selection.bundle,
+                            &selection.effective,
+                            target.python_version(),
+                        );
+                        match validate_loaded_lock_abi(&incr.lock, &abi_context) {
+                            Ok(()) => true,
+                            Err(error) => {
+                                tracing::debug!(
+                                    bundle = %bundle_name_for_hash,
+                                    error = %format!("{error:#}"),
+                                    "incremental-add skipped: prior lock failed current ABI validation",
+                                );
+                                false
+                            }
+                        }
+                    });
+                    if let Some(incr) = incremental {
                         match incremental_version_plan(
                             advertised_output_version.as_deref(),
                             &incr.lock.version,
@@ -3555,12 +3634,21 @@ impl Handler {
                                             bundle = %bundle_name_for_hash,
                                             "incremental-add: localized resolve succeeded"
                                         );
-                                        return finalize_fasttmp_build_output(
+                                        let result = finalize_fasttmp_build_output(
                                             result,
                                             stage_output_dir.as_deref(),
                                             &output_dir,
                                         )
-                                        .await;
+                                        .await?;
+                                        if let Some(selection) = prepared_build_selection.take() {
+                                            self.consume_prepared_build(
+                                                generation,
+                                                selection.transaction,
+                                                selection.prepared.locator_id,
+                                            )
+                                            .await;
+                                        }
+                                        return Ok(result);
                                     }
                                     Ok(None) => {
                                         detected_incremental_fallback_version =
@@ -3614,16 +3702,7 @@ impl Handler {
             prepared,
             bundle,
             effective,
-        }) = self
-            .lookup_prepared_build_for_target(
-                generation,
-                &params.work_directory,
-                workspace_dir.as_deref(),
-                exact_variant_python.as_deref(),
-                &target,
-                &params.output,
-            )
-            .await
+        }) = prepared_build_selection.take()
         {
             tracing::info!(
                 bundle = %bundle.conda_name,
@@ -11172,6 +11251,28 @@ fn output_workspace_abi_versions(
     workspace_versions
 }
 
+/// Current, solved ABI facts attached to one advertised output.
+///
+/// This is process-local on purpose: producer-time lock facts cannot stand in
+/// for the versions conda/outputs selected for the current build request.
+struct ReplayAbiContext {
+    workspace_versions: WorkspaceAbiVersions,
+    overrides: BTreeMap<String, String>,
+    aliases: AbiAliasGraph,
+}
+
+fn replay_abi_context_for_bundle(
+    bundle: &Bundle,
+    config: &RetreadConfig,
+    workspace_python_version: &str,
+) -> ReplayAbiContext {
+    ReplayAbiContext {
+        workspace_versions: output_workspace_abi_versions(bundle, workspace_python_version),
+        overrides: config.overrides.clone(),
+        aliases: output_abi_aliases(bundle, config),
+    }
+}
+
 /// Post-emission ABI safety net ported from the deleted cascade.
 ///
 /// The former implementation only logged and merely noticed workspace pins.
@@ -13454,7 +13555,6 @@ async fn resolve_incremental_add(
     };
     let mut effective = config.clone();
     effective.name_map = effective_name_map(&config.name_map, &pypi_to_conda);
-
     // ── Step B: resolve each added entry ──────────────────────────────────
     let mut new_emit: Vec<crate::emit_pypi::EmitWheel> = Vec::new();
     let mut new_conda_capable: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -13508,7 +13608,6 @@ async fn resolve_incremental_add(
                 return Err(e);
             }
         };
-
         // Incremental merge reuses the committed lock's conda run-deps and
         // only appends wheel payloads. A dependency that this new bundle
         // short-circuited to conda would therefore be absent from BOTH sets.
@@ -14578,6 +14677,41 @@ fn merge_uv_pins_into_prefs(
     merged
 }
 
+fn validate_loaded_lock_abi(
+    lock: &crate::lock::RetreadLock,
+    context: &ReplayAbiContext,
+) -> Result<()> {
+    let python_version = crate::lock::normalized_target_python(&lock.python)
+        .context("normalizing replay lock Python target")?;
+    let mut workspace_versions = context.workspace_versions.clone();
+    workspace_versions
+        .entry("python".to_string())
+        .or_default()
+        .insert(python_version.clone());
+    let mut emitted = vec![("python".to_string(), format!("{python_version}.*"))];
+    emitted.extend(
+        lock.conda_run_deps
+            .iter()
+            .filter(|dependency| dependency.name != "python_abi")
+            .map(|dependency| (dependency.name.clone(), dependency.spec.clone())),
+    );
+    let embedded_requires_dist = locked_final_requires_dist(lock)?;
+    let violations = check_output_abi_invariants(
+        &emitted,
+        &embedded_requires_dist,
+        &workspace_versions,
+        &context.overrides,
+        &context.aliases,
+    );
+    if !violations.is_empty() {
+        bail!(
+            "courier replay rejected by ABI invariant: {}",
+            violations.join("; ")
+        );
+    }
+    Ok(())
+}
+
 /// Authority gate for the courier replay path.
 ///
 /// Returns `Some(lock)` iff ALL of the following hold:
@@ -14592,9 +14726,11 @@ fn merge_uv_pins_into_prefs(
 ///    cannot detect if the upstream changed its Requires-Dist between
 ///    lock writes, and the replay would silently propagate stale relax
 ///    bytes. Warn and return `None` to fall through to full derivation.
+/// 5. The SHA-bound final wheel metadata satisfies the current solved
+///    workspace versions, effective overrides, and ABI alias graph.
 ///
 /// Returns `None` (non-fatal miss) on any mismatch.
-/// Returns `Err` only when the file exists but is malformed.
+/// Returns `Err` when the file exists but is malformed or ABI-unsafe.
 ///
 /// `RETREAD_NO_REPLAY=1` unconditionally returns `None` (test knob;
 /// lets tests force cold-path exercising without touching the hash).
@@ -14613,14 +14749,20 @@ fn load_replayable_lock_for_target(
     relax_is_default: bool,
     target: &ResolutionTarget,
     expected_bundle: &str,
+    abi_context: &ReplayAbiContext,
 ) -> anyhow::Result<Option<crate::lock::RetreadLock>> {
-    load_replayable_lock_inner(
+    let lock = load_replayable_lock_inner(
         lock_path,
         current_inputs_hash,
         relax_is_default,
         Some(target),
         Some(expected_bundle),
-    )
+    )?;
+    let Some(lock) = lock else {
+        return Ok(None);
+    };
+    validate_loaded_lock_abi(&lock, abi_context)?;
+    Ok(Some(lock))
 }
 
 fn load_replayable_lock_inner(
@@ -14735,6 +14877,12 @@ fn replay_from_lock_with_abi_context(
     let Some(lock) = load_replayable_lock(lock_path, current_inputs_hash, relax_is_default)? else {
         return Ok(None);
     };
+    let abi_context = ReplayAbiContext {
+        workspace_versions: workspace_versions.clone(),
+        overrides: overrides.clone(),
+        aliases: aliases.clone(),
+    };
+    validate_loaded_lock_abi(&lock, &abi_context)?;
     replay_loaded_lock(
         lock,
         current_inputs_hash,
@@ -14742,78 +14890,70 @@ fn replay_from_lock_with_abi_context(
         build_number,
         loose,
         siblings,
-        workspace_versions,
-        overrides,
-        aliases,
     )
     .map(Some)
 }
 
-/// Reconstruct the metadata lines written by the courier's final mapper.
+/// Return the persisted metadata from the exact final wheel artifacts.
 ///
-/// `LockWheel::requires_dist` intentionally retains the pre-courier lines:
-/// build-v1 replay needs direct-URL requirements to recreate exact reroutes
-/// and orphan drops. The conda/outputs replay guard must nevertheless inspect
-/// the mapped metadata embedded in the locked wheel bytes.
-fn locked_final_requires_dist(lock: &crate::lock::RetreadLock) -> Vec<(String, String)> {
-    let emit_wheels = lock
+/// Every metadata entry repeats the final wheel SHA recorded by `LockWheel`;
+/// validating that join here prevents pre-courier fields or unrelated lock
+/// records from standing in for the bytes the installer will consume.
+fn locked_final_requires_dist(lock: &crate::lock::RetreadLock) -> Result<Vec<(String, String)>> {
+    let context = lock
+        .abi_context
+        .as_ref()
+        .context("courier replay lock is missing its persisted ABI context")?;
+    let locked_wheels = lock
         .wheels
         .iter()
-        .map(|wheel| {
-            let local_path = (wheel.origin == crate::lock::Origin::Built).then(|| {
-                if wheel.must_ship {
-                    let stem = wheel
-                        .filename
-                        .strip_suffix(".whl")
-                        .unwrap_or(&wheel.filename);
-                    PathBuf::from(format!("{stem}.injected.whl"))
-                } else {
-                    PathBuf::from(&wheel.filename)
-                }
-            });
-            crate::emit_pypi::EmitWheel {
-                pypi_name: wheel.name.clone(),
-                version: wheel.version.clone(),
-                requires_dist: wheel.requires_dist.clone(),
-                local_path,
-                wheel_filename: wheel.filename.clone(),
-                sha256: wheel.sha256.clone(),
-                locked_final_sha256: wheel.sha256.clone(),
-                remote_url: None,
-                upstream_url: None,
-                git_source: wheel.git_source.clone(),
-                sdist_source: wheel.sdist_source.clone(),
-            }
-        })
-        .collect::<Vec<_>>();
-    let conda_capable = lock.conda_capable.iter().cloned().collect::<HashSet<_>>();
-    let emit_plan = crate::emit_pypi::plan(&emit_wheels, &conda_capable);
-    let line_map = crate::emit_pypi::override_line_map(
-        &emit_plan.overrides,
-        &conda_capable,
-        &emit_plan.drop_url,
-    );
-    emit_wheels
-        .iter()
-        .zip(&lock.wheels)
-        .flat_map(|(wheel, locked)| {
-            wheel.requires_dist.iter().filter_map(|requirement| {
-                if locked.origin == crate::lock::Origin::Index {
-                    Some((wheel.pypi_name.clone(), requirement.clone()))
-                } else {
-                    match line_map(requirement) {
-                        crate::wheel_rewrite::LineAction::Keep => {
-                            Some((wheel.pypi_name.clone(), requirement.clone()))
-                        }
-                        crate::wheel_rewrite::LineAction::Replace(replacement) => {
-                            Some((wheel.pypi_name.clone(), replacement))
-                        }
-                        crate::wheel_rewrite::LineAction::Drop => None,
-                    }
-                }
-            })
-        })
-        .collect()
+        .map(|wheel| (canonical_conda_name(&wheel.name), wheel))
+        .collect::<BTreeMap<_, _>>();
+    if context.wheels.len() != locked_wheels.len() {
+        bail!(
+            "courier replay ABI context covers {} final wheels, but the lock contains {}",
+            context.wheels.len(),
+            locked_wheels.len(),
+        );
+    }
+    let mut seen = BTreeSet::new();
+    let mut requirements = Vec::new();
+    for final_wheel in &context.wheels {
+        let canonical = canonical_conda_name(&final_wheel.name);
+        if !seen.insert(canonical.clone()) {
+            bail!(
+                "courier replay ABI context contains duplicate final metadata for `{}`",
+                final_wheel.name,
+            );
+        }
+        let locked = locked_wheels.get(&canonical).ok_or_else(|| {
+            anyhow!(
+                "courier replay ABI context names unknown final wheel `{}`",
+                final_wheel.name,
+            )
+        })?;
+        let locked_sha = locked.sha256.as_deref().ok_or_else(|| {
+            anyhow!(
+                "courier replay final wheel {}=={} has no locked SHA-256",
+                locked.name,
+                locked.version,
+            )
+        })?;
+        if final_wheel.name != locked.name || !final_wheel.sha256.eq_ignore_ascii_case(locked_sha) {
+            bail!(
+                "courier replay final metadata for `{}` is not bound to its locked wheel SHA-256",
+                final_wheel.name,
+            );
+        }
+        requirements.extend(
+            final_wheel
+                .requires_dist
+                .iter()
+                .cloned()
+                .map(|requirement| (final_wheel.name.clone(), requirement)),
+        );
+    }
+    Ok(requirements)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -14824,9 +14964,6 @@ fn replay_loaded_lock(
     build_number: u64,
     loose: bool,
     siblings: &[(String, String)],
-    workspace_versions: &WorkspaceAbiVersions,
-    overrides: &BTreeMap<String, String>,
-    aliases: &AbiAliasGraph,
 ) -> anyhow::Result<CondaOutput> {
     // ----- reconstruct CondaOutput from lock fields via the shared helper -----
     let python_version = crate::lock::normalized_target_python(&lock.python)
@@ -14878,36 +15015,6 @@ fn replay_loaded_lock(
         loose,
         siblings,
     )?;
-    let emitted = output
-        .run_dependencies
-        .depends
-        .iter()
-        .map(|dependency| {
-            (
-                dependency.name.as_str().to_string(),
-                audit_report::format_packagespec(&dependency.spec),
-            )
-        })
-        .collect::<Vec<_>>();
-    let mut workspace_versions = workspace_versions.clone();
-    workspace_versions
-        .entry("python".to_string())
-        .or_default()
-        .insert(python_version.trim_end_matches(".*").to_string());
-    let embedded_requires_dist = locked_final_requires_dist(&lock);
-    let violations = check_output_abi_invariants(
-        &emitted,
-        &embedded_requires_dist,
-        &workspace_versions,
-        overrides,
-        aliases,
-    );
-    if !violations.is_empty() {
-        bail!(
-            "courier replay rejected by ABI invariant: {}",
-            violations.join("; ")
-        );
-    }
     Ok(output)
 }
 
@@ -14932,6 +15039,11 @@ fn replay_from_lock_for_target(
         relax_is_default,
         target,
         expected_bundle,
+        &ReplayAbiContext {
+            workspace_versions: workspace_versions.clone(),
+            overrides: overrides.clone(),
+            aliases: aliases.clone(),
+        },
     )?
     else {
         return Ok(None);
@@ -14943,9 +15055,6 @@ fn replay_from_lock_for_target(
         build_number,
         loose,
         siblings,
-        workspace_versions,
-        overrides,
-        aliases,
     )
     .map(Some)
 }
@@ -14980,7 +15089,10 @@ mod replay_tests {
         replay_git_auto_data, replay_sdist_cache_key, validate_authoritative_replay_lock,
     };
     use crate::config::{RelaxPolicy, RetreadConfig, WheelEntry};
-    use crate::lock::{CondaDep, GitWheelSource, LockWheel, Origin, RetreadLock, SCHEMA};
+    use crate::lock::{
+        CondaDep, GitWheelSource, LockAbiContext, LockWheel, LockWheelAbiMetadata, Origin,
+        RetreadLock, SCHEMA,
+    };
     use crate::pypi::ResolutionTarget;
     use crate::relax::{AbiAliasGraph, add_abi_alias_edge};
     use crate::wheel_rewrite::rewrite_wheel;
@@ -15052,6 +15164,13 @@ mod replay_tests {
             conda_capable: vec![],
             entry_specs: vec![],
             wheel_store: None,
+            abi_context: Some(LockAbiContext {
+                wheels: vec![LockWheelAbiMetadata {
+                    name: bundle.into(),
+                    sha256: "11".repeat(32),
+                    requires_dist: vec![],
+                }],
+            }),
         }
     }
 
@@ -15063,6 +15182,28 @@ mod replay_tests {
                 max_glibc: None,
             },
             None,
+        )
+    }
+
+    fn load_test_lock_for_target(
+        path: &std::path::Path,
+        inputs_hash: &str,
+        relax_is_default: bool,
+        target: &ResolutionTarget,
+        bundle: &str,
+    ) -> anyhow::Result<Option<RetreadLock>> {
+        let abi_context = super::ReplayAbiContext {
+            workspace_versions: super::WorkspaceAbiVersions::new(),
+            overrides: BTreeMap::new(),
+            aliases: AbiAliasGraph::new(),
+        };
+        load_replayable_lock_for_target(
+            path,
+            inputs_hash,
+            relax_is_default,
+            target,
+            bundle,
+            &abi_context,
         )
     }
 
@@ -15151,7 +15292,7 @@ mod replay_tests {
 
         let native = replay_target("3.11.0", "linux-64");
         assert!(
-            load_replayable_lock_for_target(&path, "same-hash", true, &native, "pack")
+            load_test_lock_for_target(&path, "same-hash", true, &native, "pack")
                 .unwrap()
                 .is_some(),
             "numeric Python patch spelling must match the same resolution target"
@@ -15161,7 +15302,7 @@ mod replay_tests {
             replay_target("3.11", "linux-aarch64"),
         ] {
             assert!(
-                load_replayable_lock_for_target(&path, "same-hash", true, &foreign, "pack")
+                load_test_lock_for_target(&path, "same-hash", true, &foreign, "pack")
                     .unwrap()
                     .is_none(),
                 "matching inputs hashes must never bypass target identity"
@@ -15189,7 +15330,7 @@ mod replay_tests {
         let path = dir.join(RetreadLock::file_name_for_target("pack", &target));
         std::fs::write(&path, lock.to_pretty_json().unwrap()).unwrap();
 
-        let replayed = load_replayable_lock_for_target(&path, "same-hash", true, &target, "pack")
+        let replayed = load_test_lock_for_target(&path, "same-hash", true, &target, "pack")
             .unwrap()
             .expect("a SHA-256-format Git commit object ID must be replayable");
         assert_eq!(
@@ -15320,6 +15461,71 @@ mod replay_tests {
     }
 
     #[test]
+    fn build_v1_lock_ingress_rejects_abi_violating_final_wheel_metadata() {
+        let _env_guard = super::TEST_ENV_MUTEX.lock().unwrap();
+        let dir = unique_tmp_dir();
+        let target = replay_target("3.11", "linux-64");
+        let mut lock = make_test_lock("pack", "1.0.0", "3.11", "abi-hash", true);
+        // Replay reconstruction still needs the safe pre-courier metadata.
+        lock.wheels[0].requires_dist = vec!["nvidia-cuda-runtime-cu12>=12.8,<13".to_string()];
+        let mut aliases = AbiAliasGraph::new();
+        add_abi_alias_edge(&mut aliases, "nvidia-cuda-runtime-cu12", "cuda-version");
+        // These are the SHA-bound FINAL bytes. They covered the producer's
+        // old 12.8 selection but exclude the current 13.1 workspace solve.
+        lock.abi_context.as_mut().unwrap().wheels[0].requires_dist =
+            vec!["nvidia-cuda-runtime-cu12>=12.8,<13".to_string()];
+
+        let lock_path = dir.join(RetreadLock::file_name_for_target("pack", &target));
+        std::fs::write(&lock_path, lock.to_pretty_json().unwrap()).unwrap();
+        let producer_context = super::ReplayAbiContext {
+            workspace_versions: BTreeMap::from([(
+                "cuda-version".to_string(),
+                std::collections::BTreeSet::from(["12.8".to_string()]),
+            )]),
+            overrides: BTreeMap::new(),
+            aliases: aliases.clone(),
+        };
+        assert!(
+            load_replayable_lock_for_target(
+                &lock_path,
+                "abi-hash",
+                true,
+                &target,
+                "pack",
+                &producer_context,
+            )
+            .unwrap()
+            .is_some(),
+            "test setup: producer-time ABI facts must still accept the old lock"
+        );
+        let current_context = super::ReplayAbiContext {
+            workspace_versions: BTreeMap::from([(
+                "cuda-version".to_string(),
+                std::collections::BTreeSet::from(["13.1".to_string()]),
+            )]),
+            overrides: BTreeMap::new(),
+            aliases,
+        };
+        let error = load_replayable_lock_for_target(
+            &lock_path,
+            "abi-hash",
+            true,
+            &target,
+            "pack",
+            &current_context,
+        )
+        .expect_err("build-v1 lock ingress must use current solved ABI facts");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("courier replay rejected by ABI invariant")
+                && rendered.contains("does not cover workspace pin")
+                && rendered.contains("cuda-version==13.1"),
+            "{rendered}"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
     fn matching_hash_returns_some_with_correct_fields() {
         // Hold env-lock: prevents RETREAD_NO_REPLAY=1 from returning None here.
         let _env_guard = super::TEST_ENV_MUTEX.lock().unwrap();
@@ -15399,21 +15605,23 @@ mod replay_tests {
         lock.wheels[0].upstream_url =
             Some("https://example.com/mypack-1.2.3-py3-none-any.whl".to_string());
         lock.wheels[0].requires_dist = vec!["nvidia-cuda-runtime-cu12==12.0".to_string()];
+        let mut aliases = AbiAliasGraph::new();
+        add_abi_alias_edge(&mut aliases, "nvidia-cuda-runtime-cu12", "cuda");
+        let abi_context = lock.abi_context.as_mut().unwrap();
+        abi_context.wheels[0].requires_dist = vec!["nvidia-cuda-runtime-cu12>=12.0".to_string()];
 
-        let mapped = super::locked_final_requires_dist(&lock);
+        let mapped = super::locked_final_requires_dist(&lock).unwrap();
         assert_eq!(
             mapped,
             vec![(
                 "mypack".to_string(),
                 "nvidia-cuda-runtime-cu12>=12.0".to_string(),
             )],
-            "the replay guard must inspect the courier-mapped metadata, not the stored pre-map line"
+            "the replay guard must inspect the SHA-bound final metadata, not the stored pre-map line"
         );
 
         let lock_path = dir.join(RetreadLock::file_name("mypack"));
         std::fs::write(&lock_path, lock.to_pretty_json().unwrap()).unwrap();
-        let mut aliases = AbiAliasGraph::new();
-        add_abi_alias_edge(&mut aliases, "nvidia-cuda-runtime-cu12", "cuda");
         let error = replay_from_lock_with_abi_context(
             &lock_path,
             "alias-hash",
@@ -15458,9 +15666,16 @@ mod replay_tests {
             git_source: None,
             sdist_source: None,
         });
+        let abi_context = lock.abi_context.as_mut().unwrap();
+        abi_context.wheels[0].requires_dist = vec!["nvidia-cuda-runtime-cu12>=12".to_string()];
+        abi_context.wheels.push(LockWheelAbiMetadata {
+            name: "nvidia-cuda-runtime-cu12".to_string(),
+            sha256: "22".repeat(32),
+            requires_dist: vec![],
+        });
 
         assert_eq!(
-            super::locked_final_requires_dist(&lock),
+            super::locked_final_requires_dist(&lock).unwrap(),
             vec![(
                 "mypack".to_string(),
                 "nvidia-cuda-runtime-cu12>=12".to_string(),
@@ -15836,6 +16051,7 @@ mod replay_tests {
             conda_capable: vec![],
             entry_specs: vec![],
             wheel_store: None,
+            abi_context: None,
         };
         // Config has no retread_wheels entries — wheel is a class-3 orphan.
         // Use serde_json to construct a minimal config (RetreadConfig has no
@@ -15912,6 +16128,7 @@ mod replay_tests {
             conda_capable: vec![],
             entry_specs: vec![],
             wheel_store: None,
+            abi_context: None,
         };
         let config: RetreadConfig =
             serde_json::from_value(serde_json::json!({"retread-wheels": {}})).unwrap();
@@ -16025,6 +16242,7 @@ mod replay_tests {
             conda_capable: vec![],
             entry_specs: vec![],
             wheel_store: None,
+            abi_context: None,
         };
         let config: RetreadConfig =
             serde_json::from_value(serde_json::json!({"retread-wheels": {}})).unwrap();
@@ -16232,6 +16450,7 @@ mod replay_tests {
             conda_capable: vec![],
             entry_specs: vec![],
             wheel_store: None,
+            abi_context: None,
         };
         let config: RetreadConfig = serde_json::from_value(serde_json::json!({"retread-wheels": {
             "gympack": { "version": "==1.0.0" }
@@ -16616,6 +16835,7 @@ mod replay_tests {
             conda_capable: vec![wheel_name.to_string()],
             entry_specs: vec![],
             wheel_store: None,
+            abi_context: None,
         };
 
         // Build the replay EmitWheel exactly as the new Class-2 arm would:
@@ -16813,6 +17033,7 @@ mod replay_tests {
             conda_capable: vec!["requests".into()],
             entry_specs: vec![],
             wheel_store: None,
+            abi_context: None,
         };
         let config: RetreadConfig = serde_json::from_value(serde_json::json!({"retread-wheels": {
             "reqpack": { "version": "==1.0.0" }
@@ -17944,6 +18165,7 @@ include = ["retread_bfs_git_leaf*"]
             conda_capable: vec![],
             entry_specs: vec![],
             wheel_store: None,
+            abi_context: None,
         };
 
         // Config has no retread_wheels entries.
@@ -19008,6 +19230,7 @@ mod load_favored_versions_tests {
             conda_capable: vec![],
             entry_specs: vec![],
             wheel_store: None,
+            abi_context: None,
         };
         let json = lock.to_pretty_json().unwrap();
         let path = dir.join(RetreadLock::file_name(bundle));
@@ -20940,6 +21163,7 @@ mod incremental_add_tests {
             conda_capable: vec![],
             entry_specs,
             wheel_store: None,
+            abi_context: None,
         };
         let json = lock.to_pretty_json().unwrap();
         std::fs::write(path, json).unwrap();
@@ -21040,6 +21264,7 @@ mod incremental_add_tests {
             conda_capable: vec![],
             entry_specs: vec!["test-bundle==1.0".into()],
             wheel_store: None,
+            abi_context: None,
         };
         let mut json: serde_json::Value =
             serde_json::from_str(&lock.to_pretty_json().unwrap()).unwrap();
@@ -21126,6 +21351,7 @@ mod incremental_add_tests {
             conda_capable: vec![],
             entry_specs,
             wheel_store: None,
+            abi_context: None,
         };
         let json = lock.to_pretty_json().unwrap();
         std::fs::write(path, json).unwrap();
@@ -21677,6 +21903,7 @@ mod incremental_add_tests {
             conda_capable: vec![],
             entry_specs: vec!["test-bundle==1.0".into()],
             wheel_store: None,
+            abi_context: None,
         };
         let json = lock.to_pretty_json().unwrap();
         std::fs::write(path, json).unwrap();

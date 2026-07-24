@@ -51,15 +51,14 @@ pub enum LineAction {
 ///
 /// Returns the new sha256 of the rewritten wheel (useful for recipe
 /// generation).
-pub fn rewrite_wheel(src: &Path, dst: &Path, relax: RelaxPolicy) -> Result<String> {
+#[cfg(test)]
+pub(crate) fn rewrite_wheel(src: &Path, dst: &Path, relax: RelaxPolicy) -> Result<String> {
     rewrite_wheel_with_abi_aliases(src, dst, relax, &AbiAliasGraph::new())
 }
 
-/// Alias-aware form of [`rewrite_wheel`].
+/// Alias-aware production wheel rewrite.
 ///
-/// Production callers that have an effective PyPI-to-conda name map pass its
-/// shared ABI alias graph here. The public compatibility wrapper still
-/// protects every directly named/canonicalized anchor.
+/// Callers pass the effective PyPI-to-conda name map's shared ABI alias graph.
 pub(crate) fn rewrite_wheel_with_abi_aliases(
     src: &Path,
     dst: &Path,
@@ -80,7 +79,7 @@ pub(crate) fn rewrite_wheel_with_abi_aliases(
     .map(|(sha, _)| sha)
 }
 
-/// Generic core of [`rewrite_wheel`]: apply `map` to every
+/// Generic wheel-rewrite core: apply `map` to every
 /// `Requires-Dist:` value. [`LineAction::Keep`] leaves a line unchanged,
 /// [`LineAction::Replace`] substitutes, [`LineAction::Drop`] omits the line
 /// entirely. When no line changes or is dropped, the output is a hard link

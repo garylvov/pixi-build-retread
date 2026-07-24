@@ -1748,6 +1748,7 @@ mod tests {
             conda_capable: Vec::new(),
             entry_specs: Vec::new(),
             wheel_store: None,
+            abi_context: None,
         }
     }
 

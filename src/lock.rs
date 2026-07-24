@@ -315,6 +315,23 @@ pub struct LockWheel {
     pub sdist_source: Option<SdistWheelSource>,
 }
 
+/// SHA-bound final wheel metadata captured after courier mapping (schema 16+).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LockAbiContext {
+    /// Metadata read from (or, for a remote unchanged index wheel, recorded
+    /// alongside) each exact final wheel artifact.
+    pub wheels: Vec<LockWheelAbiMetadata>,
+}
+
+/// Final wheel metadata bound to the same digest recorded in `LockWheel`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LockWheelAbiMetadata {
+    pub name: String,
+    pub sha256: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requires_dist: Vec<String>,
+}
+
 /// A conda run-dep retread routed to the conda side (a shared transitive
 /// the consumer's conda solve provides). Carried so the courier conda
 /// package can declare them as its own run-deps.
@@ -379,6 +396,10 @@ pub struct RetreadLock {
     pub root_requirements: Vec<String>,
     /// Wheels to install at link time (built ship in pkg + index fetched).
     pub wheels: Vec<LockWheel>,
+    /// Exact ABI validation context plus SHA-bound final wheel metadata.
+    /// Missing on pre-schema-16 locks, which the replay schema gate rejects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abi_context: Option<LockAbiContext>,
     /// Shared transitives routed to conda (the courier package's run-deps).
     pub conda_run_deps: Vec<CondaDep>,
     /// Producer-side index chain used during pack build/solve. Install replay
@@ -445,6 +466,12 @@ pub struct RetreadLock {
     pub wheel_store: Option<String>,
 }
 
+/// Schema 16: SHA-bound final wheel metadata and replay ABI context.
+///
+/// `abi_context` records final `Requires-Dist` lines beside the digest of each
+/// final wheel. Both replay callers validate those lines against the current
+/// live workspace versions, effective overrides, and ABI alias graph.
+///
 /// Schema 14: complete Pixi workspace target contract.
 ///
 /// `RetreadLock.target_contract` preserves the canonical rich-profile virtual
@@ -510,7 +537,7 @@ pub struct RetreadLock {
 /// On the consumer-side install path, old schemas are hard errors: install
 /// replay must not fall back to resolver-backed uv. SCHEMA is NOT an epoch bump
 /// (output SEMANTICS for identical inputs are unchanged; [emit-epoch-ok]).
-pub const SCHEMA: u32 = 15;
+pub const SCHEMA: u32 = 16;
 
 /// Bump EMIT_EPOCH in the SAME commit as ANY change that can alter the bytes
 /// retread emits for identical manifest inputs (relax/version-selection
@@ -667,7 +694,11 @@ pub const SCHEMA: u32 = 15;
 /// Epoch 33: committed-lock replay reconstructs the courier's final metadata
 /// mapper and validates those embedded lines with the live ABI aliases,
 /// overrides, and workspace pins instead of checking the pre-courier copy.
-pub const EMIT_EPOCH: u32 = 33;
+///
+/// Epoch 34: committed locks persist SHA-bound final wheel metadata, and both
+/// conda/outputs and conda/build_v1 validate it against the current solved ABI
+/// context at their shared ingress before replay can win.
+pub const EMIT_EPOCH: u32 = 34;
 
 fn parse_stored_glibc(value: Option<&str>) -> Option<Option<(u32, u32)>> {
     match value {
@@ -1266,6 +1297,8 @@ impl RetreadLock {
     ///
     /// Nested sorts (A-1):
     /// - `LockWheel.requires_dist[]`: lexicographic (order-insensitive per §A.5)
+    /// - `LockAbiContext.wheels[]`: canonical name + digest
+    /// - `LockWheelAbiMetadata.requires_dist[]`: lexicographic
     /// - `GitWheelSource.extras[]`: lexicographic
     /// - `GitWheelSource.auto_data.skip_subdirectories[]`: lexicographic
     pub fn canonicalize(&mut self) {
@@ -1316,6 +1349,16 @@ impl RetreadLock {
                     skip_subdirectories.sort();
                     skip_subdirectories.dedup();
                 }
+            }
+        }
+        if let Some(context) = &mut self.abi_context {
+            context.wheels.sort_by(|left, right| {
+                canonical_conda_name(&left.name)
+                    .cmp(&canonical_conda_name(&right.name))
+                    .then_with(|| left.sha256.cmp(&right.sha256))
+            });
+            for wheel in &mut context.wheels {
+                wheel.requires_dist.sort();
             }
         }
     }
@@ -1452,6 +1495,7 @@ mod tests {
             conda_capable: vec!["numpy".into(), "torch".into()],
             entry_specs: vec!["isaaclab==0.51.1".into()],
             wheel_store: None,
+            abi_context: None,
         };
         let json = lock.to_pretty_json().unwrap();
         let back: RetreadLock = serde_json::from_str(&json).unwrap();
@@ -2202,6 +2246,7 @@ mod tests {
             conda_capable: vec![],
             entry_specs: vec![],
             wheel_store: None,
+            abi_context: None,
         };
 
         let err = lock.validate_replay_provenance().unwrap_err();
@@ -2402,6 +2447,7 @@ mod tests {
             conda_capable: vec!["zlib".into(), "blas".into()],
             entry_specs: vec!["torch==2.0.0".into(), "numpy==1.26.0".into()],
             wheel_store: None,
+            abi_context: None,
         }
     }
 

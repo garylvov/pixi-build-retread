@@ -26,7 +26,9 @@ use crate::emit_pypi::{
     EmitWheel, build_meta_wheel, collect_prerelease_pins, insert_build_tag, override_line_map,
     plan, standard_wheel_filename,
 };
-use crate::lock::{CondaDep, LockWheel, Origin, RetreadLock, SCHEMA};
+use crate::lock::{
+    CondaDep, LockAbiContext, LockWheel, LockWheelAbiMetadata, Origin, RetreadLock, SCHEMA,
+};
 use crate::pypi::{ResolutionTarget, WheelTarget};
 
 const SHADOW_DOWNLOAD_ATTEMPTS: usize = 5;
@@ -633,7 +635,7 @@ fn shadow_cache_stage_validated(
             expected_sha256,
             "courier changed shadow cache entry",
         ) {
-            Ok(sha) => sha,
+            Ok(metadata) => metadata.sha256,
             Err(err) => {
                 let _ = std::fs::remove_file(dst);
                 let _ = std::fs::remove_file(&hit_changed);
@@ -657,7 +659,7 @@ fn shadow_cache_stage_validated(
             expected_sha256,
             "courier unchanged shadow cache entry",
         ) {
-            Ok(sha) => sha,
+            Ok(metadata) => metadata.sha256,
             Err(err) => {
                 let _ = std::fs::remove_file(dst);
                 let _ = std::fs::remove_file(&hit_same);
@@ -704,7 +706,7 @@ fn shadow_cache_stage_validated(
         expected_sha256,
         "courier new shadow cache entry",
     ) {
-        Ok(sha) => sha,
+        Ok(metadata) => metadata.sha256,
         Err(err) => {
             let _ = std::fs::remove_file(&cache_tmp);
             return Err(err);
@@ -1221,7 +1223,7 @@ fn validate_wheel_archive_identity_and_sha(
     wheel_path: &Path,
     expected_sha256: Option<&str>,
     provenance: &str,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<crate::wheel::WheelMetadata> {
     let metadata = read_wheel_metadata_streaming(wheel_path).with_context(|| {
         format!(
             "reading {provenance} METADATA from {}",
@@ -1245,16 +1247,16 @@ fn validate_wheel_archive_identity_and_sha(
             metadata.sha256,
         );
     }
-    Ok(metadata.sha256)
+    Ok(metadata)
 }
 
-fn validate_wheel_file_identity_and_sha(
+fn validate_wheel_file_metadata_and_sha(
     expected_name: &str,
     expected_version: &str,
     wheel_path: &Path,
     expected_sha256: Option<&str>,
     provenance: &str,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<crate::wheel::WheelMetadata> {
     let filename = wheel_path
         .file_name()
         .and_then(|name| name.to_str())
@@ -1272,6 +1274,23 @@ fn validate_wheel_file_identity_and_sha(
         expected_sha256,
         provenance,
     )
+}
+
+fn validate_wheel_file_identity_and_sha(
+    expected_name: &str,
+    expected_version: &str,
+    wheel_path: &Path,
+    expected_sha256: Option<&str>,
+    provenance: &str,
+) -> anyhow::Result<String> {
+    validate_wheel_file_metadata_and_sha(
+        expected_name,
+        expected_version,
+        wheel_path,
+        expected_sha256,
+        provenance,
+    )
+    .map(|metadata| metadata.sha256)
 }
 
 pub(crate) fn validate_wheel_file_identity(
@@ -1670,6 +1689,7 @@ pub(crate) async fn stage_for_target_with_store_root(
 
     // Step 3: Classify and stage each wheel.
     let mut lock_wheels: Vec<LockWheel> = Vec::new();
+    let mut final_requires_dist: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut source_urls: Vec<String> = Vec::new();
     let shadow_download_client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(15))
@@ -1763,7 +1783,7 @@ pub(crate) async fn stage_for_target_with_store_root(
                 })??;
             }
 
-            let staged_sha = validate_wheel_file_identity_and_sha(
+            let staged_metadata = validate_wheel_file_metadata_and_sha(
                 &w.pypi_name,
                 &w.version,
                 &dst,
@@ -1779,7 +1799,11 @@ pub(crate) async fn stage_for_target_with_store_root(
                 &w.version,
             )
             .await?;
-            let lock_sha = stored_sha.unwrap_or(staged_sha);
+            let lock_sha = stored_sha.unwrap_or_else(|| staged_metadata.sha256.clone());
+            final_requires_dist.insert(
+                crate::relax::canonical_conda_name(&w.pypi_name),
+                staged_metadata.requires_dist,
+            );
             lock_wheels.push(LockWheel {
                 name: w.pypi_name.clone(),
                 version: w.version.clone(),
@@ -2016,6 +2040,10 @@ pub(crate) async fn stage_for_target_with_store_root(
                                 index_url
                             )
                         })?;
+                        final_requires_dist.insert(
+                            crate::relax::canonical_conda_name(&w.pypi_name),
+                            w.requires_dist.clone(),
+                        );
                         lock_wheels.push(LockWheel {
                             name: w.pypi_name.clone(),
                             version: w.version.clone(),
@@ -2047,7 +2075,7 @@ pub(crate) async fn stage_for_target_with_store_root(
                                     src.display()
                                 )
                             })?;
-                        let staged_sha = validate_wheel_file_identity_and_sha(
+                        let staged_metadata = validate_wheel_file_metadata_and_sha(
                             &w.pypi_name,
                             &w.version,
                             &dst,
@@ -2063,7 +2091,11 @@ pub(crate) async fn stage_for_target_with_store_root(
                             &w.version,
                         )
                         .await?;
-                        let lock_sha = stored_sha.unwrap_or(staged_sha);
+                        let lock_sha = stored_sha.unwrap_or_else(|| staged_metadata.sha256.clone());
+                        final_requires_dist.insert(
+                            crate::relax::canonical_conda_name(&w.pypi_name),
+                            staged_metadata.requires_dist,
+                        );
                         lock_wheels.push(LockWheel {
                             name: w.pypi_name.clone(),
                             version: w.version.clone(),
@@ -2095,7 +2127,7 @@ pub(crate) async fn stage_for_target_with_store_root(
                             dst.display()
                         )
                     })?;
-                    let staged_sha = validate_wheel_file_identity_and_sha(
+                    let staged_metadata = validate_wheel_file_metadata_and_sha(
                         &w.pypi_name,
                         &w.version,
                         &dst,
@@ -2111,7 +2143,11 @@ pub(crate) async fn stage_for_target_with_store_root(
                         &w.version,
                     )
                     .await?;
-                    let lock_sha = stored_sha.unwrap_or(staged_sha);
+                    let lock_sha = stored_sha.unwrap_or_else(|| staged_metadata.sha256.clone());
+                    final_requires_dist.insert(
+                        crate::relax::canonical_conda_name(&w.pypi_name),
+                        staged_metadata.requires_dist,
+                    );
                     // Prefer upstream_url (pristine pre-localization index URL,
                     // set for local-path shadows when EmitWheel was built from
                     // the cold produce path) over remote_url (set only for
@@ -2161,7 +2197,7 @@ pub(crate) async fn stage_for_target_with_store_root(
                     .with_context(|| {
                         format!("spawn_blocking shadow-rewrite of {}", w.pypi_name)
                     })??;
-                    let staged_sha = validate_wheel_file_identity_and_sha(
+                    let staged_metadata = validate_wheel_file_metadata_and_sha(
                         &w.pypi_name,
                         &w.version,
                         &dst,
@@ -2177,7 +2213,11 @@ pub(crate) async fn stage_for_target_with_store_root(
                         &w.version,
                     )
                     .await?;
-                    let lock_sha = stored_sha.unwrap_or(staged_sha);
+                    let lock_sha = stored_sha.unwrap_or_else(|| staged_metadata.sha256.clone());
+                    final_requires_dist.insert(
+                        crate::relax::canonical_conda_name(&w.pypi_name),
+                        staged_metadata.requires_dist,
+                    );
                     // Prefer upstream_url over remote_url (same rationale as
                     // the Rewritten arm above).
                     let upstream_url = w
@@ -2381,6 +2421,36 @@ pub(crate) async fn stage_for_target_with_store_root(
         .iter()
         .map(|(path, policy)| (path.clone(), policy.as_lock_value().to_string()))
         .collect();
+    let abi_context = LockAbiContext {
+        wheels: lock_wheels
+            .iter()
+            .map(|wheel| {
+                let sha256 = wheel.sha256.clone().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "courier: final ABI metadata for {}=={} has no wheel digest",
+                        wheel.name,
+                        wheel.version,
+                    )
+                })?;
+                let canonical = crate::relax::canonical_conda_name(&wheel.name);
+                let requires_dist = final_requires_dist.remove(&canonical).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "courier: final ABI metadata for {}=={} was not captured",
+                        wheel.name,
+                        wheel.version,
+                    )
+                })?;
+                Ok(LockWheelAbiMetadata {
+                    name: wheel.name.clone(),
+                    sha256,
+                    requires_dist,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?,
+    };
+    if !final_requires_dist.is_empty() {
+        anyhow::bail!("courier: captured final ABI metadata for an unclassified wheel");
+    }
     let mut lock = RetreadLock {
         schema: SCHEMA,
         retread_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -2408,6 +2478,7 @@ pub(crate) async fn stage_for_target_with_store_root(
         // differs from the build machine's (home-relative "~" form; see
         // portable_wheel_store_path). Fat bundles carry their bytes.
         wheel_store: loose.then(|| portable_wheel_store_path(&wheel_store_root)),
+        abi_context: Some(abi_context),
     };
     if !lock.is_for_resolution_target(target) {
         anyhow::bail!(
@@ -5127,10 +5198,11 @@ version = "1.0.0"
         let bundle = "loosepkg";
         let built_whl_name = format!("{bundle}-1.0.0-py3-none-any.injected.whl");
         let built_whl = tmp.join(&built_whl_name);
-        let bytes = make_wheel_bytes(bundle, "1.0.0", &[]);
+        let requires_dist = ["numpy>=1.26,<2"];
+        let bytes = make_wheel_bytes(bundle, "1.0.0", &requires_dist);
         std::fs::write(&built_whl, &bytes).unwrap();
 
-        let built = make_emit_wheel(bundle, "1.0.0", &[], Some(&built_whl), None);
+        let built = make_emit_wheel(bundle, "1.0.0", &requires_dist, Some(&built_whl), None);
         assert!(
             built.must_ship(),
             "test setup: .injected infix => must_ship"
@@ -5170,6 +5242,21 @@ version = "1.0.0"
             .sha256
             .as_deref()
             .expect("loose lock must record the store sha for built wheels");
+        let final_metadata = result
+            .lock
+            .abi_context
+            .as_ref()
+            .expect("courier lock must persist its ABI context")
+            .wheels
+            .iter()
+            .find(|wheel| wheel.name == bundle)
+            .expect("courier lock must persist final metadata for every wheel");
+        assert_eq!(final_metadata.sha256, sha);
+        assert_eq!(
+            final_metadata.requires_dist,
+            ["numpy>=1.26"],
+            "persisted ABI metadata must come from the final courier-mapped wheel bytes"
+        );
         let stored = store.join(sha).join(&lw.filename);
         assert!(
             stored.is_file(),
