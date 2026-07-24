@@ -702,7 +702,10 @@ pub const SCHEMA: u32 = 16;
 /// Epoch 35: exact-version relaxation fails closed for non-zero epochs and
 /// prerelease/dev versions instead of emitting a range that drops the epoch or
 /// excludes the original prerelease.
-pub const EMIT_EPOCH: u32 = 35;
+///
+/// Epoch 36: an overflowing CUDA-family major ceiling now emits a strict
+/// same-major wildcard constraint instead of dropping CUDA-major protection.
+pub const EMIT_EPOCH: u32 = 36;
 
 fn parse_stored_glibc(value: Option<&str>) -> Option<Option<(u32, u32)>> {
     match value {

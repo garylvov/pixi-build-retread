@@ -2346,18 +2346,20 @@ pub fn cuda_major_from_specs(specs: &[String]) -> Option<u32> {
 }
 
 /// Constraint lines capping [`CUDA_MAJOR_TRACKED_PYPI_FAMILIES`] to the
-/// given CUDA major (`>=X,<X+1`). Harmless to add unconditionally: a
-/// uv constraints file entry for a package absent from the resolved
-/// graph is simply never applied (constraints never pull in a package
-/// on their own), so these are only load-bearing for bundles that
-/// actually depend on one of the tracked families.
+/// given CUDA major (`>=X,<X+1`, or `==X.*` when `X+1` cannot be
+/// represented). Harmless to add unconditionally: a uv constraints
+/// file entry for a package absent from the resolved graph is simply
+/// never applied (constraints never pull in a package on their own), so
+/// these are only load-bearing for bundles that actually depend on one
+/// of the tracked families.
 pub fn cuda_family_constraints(cuda_major: u32) -> Vec<(&'static str, String)> {
-    let Some(cuda_ceiling) = cuda_major.checked_add(1) else {
-        return Vec::new();
+    let constraint = match cuda_major.checked_add(1) {
+        Some(cuda_ceiling) => format!(">={cuda_major},<{cuda_ceiling}"),
+        None => format!("=={cuda_major}.*"),
     };
     CUDA_MAJOR_TRACKED_PYPI_FAMILIES
         .iter()
-        .map(|name| (*name, format!(">={cuda_major},<{cuda_ceiling}")))
+        .map(|name| (*name, constraint.clone()))
         .collect()
 }
 
@@ -5566,7 +5568,13 @@ isaaclab = { path = "wheels/isaaclab/isaaclab-2.0.0-py3-none-any.whl" }
         let major =
             cuda_major_from_specs(&[format!("=={}.0", u32::MAX)]).expect("maximum major parses");
         assert_eq!(major, u32::MAX);
-        assert!(cuda_family_constraints(major).is_empty());
+        assert_eq!(
+            cuda_family_constraints(major),
+            vec![
+                ("cuda-bindings", format!("=={}.*", u32::MAX)),
+                ("cuda-python", format!("=={}.*", u32::MAX)),
+            ]
+        );
     }
 
     #[test]
