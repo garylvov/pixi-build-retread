@@ -9075,6 +9075,7 @@ async fn resolve_bundle(
         let fetched: Vec<(Pending, Result<Option<BfsFetched>>)> = {
             use futures::stream::{self, StreamExt};
             let favor_lock_snap_ref = &favor_lock_snap;
+            let abi_aliases_ref = &abi_aliases;
             stream::iter(to_materialize)
                 .map(|pending| async move {
                     let dep_canon = crate::relax::canonical_conda_name(&pending.pypi_name);
@@ -9098,6 +9099,7 @@ async fn resolve_bundle(
                             target,
                             download_dir,
                             relax,
+                            abi_aliases_ref,
                             prefer_version.as_deref(),
                             format!(
                                 "BFS could not resolve `{pypi_name}` from any configured PyPI index"
@@ -9340,12 +9342,14 @@ fn relaxed_retry_specs(
     pypi_name: &str,
     specifiers: &VersionSpecifiers,
     relax: RelaxPolicy,
+    abi_aliases: &AbiAliasGraph,
 ) -> Option<VersionSpecifiers> {
     if relax == RelaxPolicy::None {
         return None;
     }
     let original = format!("{pypi_name}{specifiers}");
-    let relaxed_line = crate::wheel_rewrite::relax_pep508(&original, relax).ok()?;
+    let relaxed_line =
+        crate::wheel_rewrite::relax_pep508_with_abi_aliases(&original, relax, abi_aliases).ok()?;
     if relaxed_line == original {
         return None;
     }
@@ -9407,10 +9411,11 @@ async fn bfs_fetch_pypi_from_chain(
     target: &ResolutionTarget,
     download_dir: &Path,
     relax: RelaxPolicy,
+    abi_aliases: &AbiAliasGraph,
     prefer_version: Option<&str>,
     exhaustion_context: String,
 ) -> Result<BfsFetched> {
-    let relaxed = relaxed_retry_specs(pypi_name, specifiers, relax);
+    let relaxed = relaxed_retry_specs(pypi_name, specifiers, relax, abi_aliases);
     let try_relaxed = relaxed.is_some();
     fetch_artifact_from_pypi_index_chain(
         indexes,

@@ -784,6 +784,7 @@ pub(crate) async fn auto_bundle_transitives(
     let fetch_target = target.clone();
     let download_dir = download_dir.to_path_buf();
     let relax = config.relax;
+    let abi_aliases = super::output_abi_aliases(bundle, config);
     // Production resolution owns the complete chain here. The generic harness
     // passes the whole ordered chain and caller-specific exhaustion context to
     // this callback once, avoiding the old chain-inside-chain retry shape.
@@ -791,6 +792,7 @@ pub(crate) async fn auto_bundle_transitives(
         move |request: PypiFetchRequest, indexes: Vec<String>, failure_context: String| {
             let target = fetch_target.clone();
             let download_dir = download_dir.clone();
+            let abi_aliases = abi_aliases.clone();
             async move {
                 let (resolved_url, metadata, sdist_prov) = super::bfs_fetch_pypi_from_chain(
                     &request.pypi_name,
@@ -799,6 +801,7 @@ pub(crate) async fn auto_bundle_transitives(
                     &target,
                     &download_dir,
                     relax,
+                    &abi_aliases,
                     request.preferred_version.as_deref(),
                     failure_context,
                 )

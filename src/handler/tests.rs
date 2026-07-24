@@ -2326,6 +2326,7 @@ fn relaxed_retry_specs_table() {
         "isaacsim-kernel",
         &specs("==6.0.0.0"),
         RelaxPolicy::PatchThenMinorThenMajorThenLastResort,
+        &AbiAliasGraph::new(),
     )
     .expect("exact pin must produce a retry range");
     // PEP 440 normalization may render >=6.0.0.0 as >=6; assert
@@ -2338,9 +2339,44 @@ fn relaxed_retry_specs_table() {
     assert_ne!(relaxed, specs("==6.0.0.0"));
 
     // Range specs pass through relax untouched -> no fallback.
-    assert!(relaxed_retry_specs("etgen", &specs(">=0.8.2,<0.9"), RelaxPolicy::Minor).is_none());
+    assert!(
+        relaxed_retry_specs(
+            "etgen",
+            &specs(">=0.8.2,<0.9"),
+            RelaxPolicy::Minor,
+            &AbiAliasGraph::new(),
+        )
+        .is_none()
+    );
     // Policy None never falls back.
-    assert!(relaxed_retry_specs("foo", &specs("==1.0.0"), RelaxPolicy::None).is_none());
+    assert!(
+        relaxed_retry_specs(
+            "foo",
+            &specs("==1.0.0"),
+            RelaxPolicy::None,
+            &AbiAliasGraph::new(),
+        )
+        .is_none()
+    );
+}
+
+#[test]
+fn relaxed_retry_specs_vetoes_hidden_cuda_alias() {
+    use std::str::FromStr as _;
+
+    let package = "nvidia-cuda-runtime-cu12";
+    let specs = VersionSpecifiers::from_str("==12.8.90").unwrap();
+    let mut aliases = AbiAliasGraph::new();
+    add_abi_alias_edge(&mut aliases, package, "cuda");
+
+    assert!(!crate::solve::is_abi_anchor(package));
+    assert!(is_semantic_abi_anchor(package, &aliases));
+    for policy in [RelaxPolicy::Major, RelaxPolicy::StrongMajor] {
+        assert!(
+            relaxed_retry_specs(package, &specs, policy, &aliases).is_none(),
+            "{policy:?} retry must not widen a hidden ABI-anchor exact pin"
+        );
+    }
 }
 
 #[test]

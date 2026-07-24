@@ -247,6 +247,7 @@ fn rewrite_metadata_text_with(content: &str, map: &dyn Fn(&str) -> LineAction) -
 /// Parse one PEP 508 requirement string. If it carries a single exact
 /// `==X.Y.Z` specifier, widen it per `policy` and return the rebuilt
 /// requirement (still PEP 508 syntax). All other shapes pass through.
+#[cfg(test)]
 pub(crate) fn relax_pep508(raw: &str, policy: RelaxPolicy) -> Result<String> {
     relax_pep508_with_abi_aliases(raw, policy, &AbiAliasGraph::new())
 }
