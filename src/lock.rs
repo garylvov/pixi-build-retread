@@ -698,7 +698,11 @@ pub const SCHEMA: u32 = 16;
 /// Epoch 34: committed locks persist SHA-bound final wheel metadata, and both
 /// conda/outputs and conda/build_v1 validate it against the current solved ABI
 /// context at their shared ingress before replay can win.
-pub const EMIT_EPOCH: u32 = 34;
+///
+/// Epoch 35: exact-version relaxation fails closed for non-zero epochs and
+/// prerelease/dev versions instead of emitting a range that drops the epoch or
+/// excludes the original prerelease.
+pub const EMIT_EPOCH: u32 = 35;
 
 fn parse_stored_glibc(value: Option<&str>) -> Option<Option<(u32, u32)>> {
     match value {

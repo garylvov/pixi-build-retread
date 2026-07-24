@@ -348,7 +348,7 @@ fn strip_upper_bounds_pep508(specs: &[&uv_pep508::uv_pep440::VersionSpecifier]) 
 
 fn widen_exact_to_pep508(v: &Version, policy: RelaxPolicy) -> Option<String> {
     let r = v.release();
-    if r.is_empty() {
+    if r.is_empty() || !crate::relax::exact_version_can_widen(v) {
         return None;
     }
     let major = r[0];
@@ -487,6 +487,21 @@ mod tests {
 
         let minor = "demo==18446744073709551615.0";
         assert_eq!(relax_pep508(minor, RelaxPolicy::Minor).unwrap(), minor);
+    }
+
+    #[test]
+    fn epoch_and_prerelease_exact_versions_stay_strict() {
+        for raw in ["demo==1!3.1", "demo==2.0.0a1"] {
+            for policy in [
+                RelaxPolicy::Patch,
+                RelaxPolicy::Minor,
+                RelaxPolicy::Major,
+                RelaxPolicy::StrongMajor,
+                RelaxPolicy::PatchThenMinorThenMajorThenLastResort,
+            ] {
+                assert_eq!(relax_pep508(raw, policy).unwrap(), raw, "{raw}/{policy:?}");
+            }
+        }
     }
 
     #[test]

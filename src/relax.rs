@@ -625,6 +625,12 @@ pub(crate) fn checked_version_ceiling(release_prefix: &[u64]) -> Option<String> 
     )
 }
 
+/// True when release-only range rendering cannot drop epoch or prerelease
+/// semantics from an exact version.
+pub(crate) fn exact_version_can_widen(version: &Version) -> bool {
+    version.epoch() == 0 && !version.any_prerelease()
+}
+
 fn convert_one(spec: &uv_pep440::VersionSpecifier) -> Option<String> {
     let op = match spec.operator() {
         Operator::Equal => "==",
@@ -670,6 +676,9 @@ fn convert_one(spec: &uv_pep440::VersionSpecifier) -> Option<String> {
 pub fn widen_exact(v: &Version, policy: RelaxPolicy) -> Option<String> {
     let r = v.release();
     if r.is_empty() {
+        return None;
+    }
+    if policy != RelaxPolicy::None && !exact_version_can_widen(v) {
         return None;
     }
     let major = r[0];

@@ -1389,6 +1389,64 @@ mod tests {
     }
 
     #[test]
+    fn epoch_exact_pin_conflict_keeps_strict_result() {
+        let constraints = vec![
+            constraint(
+                "epoch-pin",
+                "==1!3.1",
+                Provenance::IndexWheelMetadata,
+                "wheel epoch pin",
+            ),
+            constraint(
+                "stable-range",
+                ">=3,<4",
+                Provenance::UvConstraint,
+                "uv stable range",
+            ),
+        ];
+        let strict =
+            finalize_quiet(&package("demo"), &canonical_constraints(&constraints)).unwrap_err();
+        assert_eq!(
+            decide(
+                &package("demo"),
+                &constraints,
+                RelaxPolicy::PatchThenMinorThenMajorThenLastResort,
+                &SafetyContext::default(),
+            ),
+            Decision::Conflict(strict)
+        );
+    }
+
+    #[test]
+    fn prerelease_exact_pin_conflict_keeps_strict_result() {
+        let constraints = vec![
+            constraint(
+                "prerelease-pin",
+                "==2.0.0a1",
+                Provenance::IndexWheelMetadata,
+                "wheel prerelease pin",
+            ),
+            constraint(
+                "stable-range",
+                ">=2,<3",
+                Provenance::UvConstraint,
+                "uv stable range",
+            ),
+        ];
+        let strict =
+            finalize_quiet(&package("demo"), &canonical_constraints(&constraints)).unwrap_err();
+        assert_eq!(
+            decide(
+                &package("demo"),
+                &constraints,
+                RelaxPolicy::PatchThenMinorThenMajorThenLastResort,
+                &SafetyContext::default(),
+            ),
+            Decision::Conflict(strict)
+        );
+    }
+
+    #[test]
     fn numpy_and_cuda_same_major_minor_conflicts_auto_resolve() {
         for (name, old, new, admitted, next_major) in [
             ("numpy", "==1.24", ">=1.25,<2", "1.25", "2"),
