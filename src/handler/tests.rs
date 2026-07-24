@@ -1771,6 +1771,12 @@ fn bounded_range_ceiling_unparseable_returns_none() {
 }
 
 #[test]
+fn bounded_range_ceiling_overflow_returns_none() {
+    assert!(bounded_range_ceiling("18446744073709551615.1").is_none());
+    assert!(bounded_range_ceiling("0.18446744073709551615").is_none());
+}
+
+#[test]
 fn produce_output_auto_routed_pin_widens_to_bounded_range() {
     // The core fix under test: a plain (non-floor) auto-routed pin
     // widens from the exact `==X.Y.Z` uv resolved to `>=X.Y.Z,<next-major`

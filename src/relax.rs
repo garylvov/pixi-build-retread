@@ -609,6 +609,22 @@ fn strip_upper_bounds(specs: &[&uv_pep440::VersionSpecifier]) -> Vec<uv_pep440::
     kept
 }
 
+/// Construct a dot-separated exclusive ceiling by incrementing the last
+/// release component. An empty prefix or an unrepresentable increment fails
+/// closed instead of panicking in debug builds or wrapping in release builds.
+pub(crate) fn checked_version_ceiling(release_prefix: &[u64]) -> Option<String> {
+    let mut ceiling = release_prefix.to_vec();
+    let last = ceiling.last_mut()?;
+    *last = last.checked_add(1)?;
+    Some(
+        ceiling
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("."),
+    )
+}
+
 fn convert_one(spec: &uv_pep440::VersionSpecifier) -> Option<String> {
     let op = match spec.operator() {
         Operator::Equal => "==",
@@ -625,14 +641,7 @@ fn convert_one(spec: &uv_pep440::VersionSpecifier) -> Option<String> {
                 return None;
             }
             let lower = spec.version();
-            let mut upper = release[..release.len() - 1].to_vec();
-            let last = upper.len() - 1;
-            upper[last] += 1;
-            let upper_release = upper
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(".");
+            let upper_release = checked_version_ceiling(&release[..release.len() - 1])?;
             let upper = if spec.version().epoch() == 0 {
                 upper_release
             } else {
@@ -679,10 +688,12 @@ pub fn widen_exact(v: &Version, policy: RelaxPolicy) -> Option<String> {
         RelaxPolicy::Patch
         | RelaxPolicy::PatchWithLastResort
         | RelaxPolicy::PatchThenMinorThenMajorThenLastResort => {
-            Some(format!(">={major}.{minor}.{patch},<{major}.{}", minor + 1))
+            let upper = checked_version_ceiling(&[major, minor])?;
+            Some(format!(">={major}.{minor}.{patch},<{upper}"))
         }
         RelaxPolicy::Minor | RelaxPolicy::MinorWithLastResort => {
-            Some(format!(">={major}.{minor},<{}", major + 1))
+            let upper = checked_version_ceiling(&[major])?;
+            Some(format!(">={major}.{minor},<{upper}"))
         }
         // Major / StrongMajor all widen exact pins to bare-major; the
         // difference is range handling (Major: passthrough;
@@ -712,14 +723,7 @@ fn widen_star(v: &Version, negate: bool) -> Option<String> {
         .join(".")
         .to_string();
     // Bump the last digit for the upper bound.
-    let mut upper = r.to_vec();
-    let last = upper.len() - 1;
-    upper[last] += 1;
-    let hi = upper
-        .iter()
-        .map(|n| n.to_string())
-        .collect::<Vec<_>>()
-        .join(".");
+    let hi = checked_version_ceiling(&r)?;
     if negate {
         Some(format!("<{lo}|>={hi}"))
     } else {
@@ -1168,6 +1172,30 @@ mod tests {
             t("pillow==12.1.4", RelaxPolicy::Minor).as_deref(),
             Some("pillow >=12.1,<13")
         );
+    }
+
+    #[test]
+    fn compatible_release_ceiling_overflow_fails_closed() {
+        let specifier =
+            uv_pep440::VersionSpecifier::from_str("~=1.18446744073709551615.0").unwrap();
+        assert_eq!(convert_one(&specifier), None);
+    }
+
+    #[test]
+    fn exact_widening_ceiling_overflow_fails_closed() {
+        let patch = Version::from_str("1.18446744073709551615.0").unwrap();
+        assert_eq!(widen_exact(&patch, RelaxPolicy::Patch), None);
+
+        let minor = Version::from_str("18446744073709551615.0").unwrap();
+        assert_eq!(widen_exact(&minor, RelaxPolicy::Minor), None);
+    }
+
+    #[test]
+    fn wildcard_ceiling_overflow_fails_closed() {
+        for raw in ["==1.18446744073709551615.*", "!=1.18446744073709551615.*"] {
+            let specifier = uv_pep440::VersionSpecifier::from_str(raw).unwrap();
+            assert_eq!(convert_one(&specifier), None, "{raw}");
+        }
     }
 
     #[test]

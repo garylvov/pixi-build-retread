@@ -380,10 +380,12 @@ fn widen_exact_to_pep508(v: &Version, policy: RelaxPolicy) -> Option<String> {
         RelaxPolicy::Patch
         | RelaxPolicy::PatchWithLastResort
         | RelaxPolicy::PatchThenMinorThenMajorThenLastResort => {
-            Some(format!(">={lower_patch},<{major}.{}", minor + 1))
+            let upper = crate::relax::checked_version_ceiling(&[major, minor])?;
+            Some(format!(">={lower_patch},<{upper}"))
         }
         RelaxPolicy::Minor | RelaxPolicy::MinorWithLastResort => {
-            Some(format!(">={lower_minor},<{}", major + 1))
+            let upper = crate::relax::checked_version_ceiling(&[major])?;
+            Some(format!(">={lower_minor},<{upper}"))
         }
         // TODO(conda-aware): grouped with Major/StrongMajor as a
         // stopgap; the real probe-and-decide logic is not wired up.
@@ -476,6 +478,15 @@ mod tests {
         let raw = "starlette==0.45.3";
         let out = relax_pep508(raw, RelaxPolicy::Patch).unwrap();
         assert_eq!(out, "starlette>=0.45.3,<0.46");
+    }
+
+    #[test]
+    fn exact_widening_ceiling_overflow_keeps_requirement_strict() {
+        let patch = "demo==1.18446744073709551615.0";
+        assert_eq!(relax_pep508(patch, RelaxPolicy::Patch).unwrap(), patch);
+
+        let minor = "demo==18446744073709551615.0";
+        assert_eq!(relax_pep508(minor, RelaxPolicy::Minor).unwrap(), minor);
     }
 
     #[test]

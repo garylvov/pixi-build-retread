@@ -14351,9 +14351,9 @@ fn bounded_range_ceiling(version: &str) -> Option<String> {
     let major: u64 = parts.next()?.parse().ok()?;
     if major == 0 {
         let minor: u64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-        Some(format!("0.{}", minor + 1))
+        crate::relax::checked_version_ceiling(&[major, minor])
     } else {
-        Some((major + 1).to_string())
+        crate::relax::checked_version_ceiling(&[major])
     }
 }
 
