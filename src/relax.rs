@@ -1,6 +1,6 @@
 //! PEP 508 -> conda match-spec translation with version-pin widening.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::str::FromStr;
 
@@ -305,13 +305,14 @@ pub fn translate(
         )));
     }
 
-    // `python` is fully off-limits to relax: every widened form
-    // (`python >=3,<4` from major, `python >=3` from strong-major,
-    // and the bare `python` that strong-major produces from a single
-    // `==X.Y.Z`) is either meaningless or rejected by the conda solver
-    // (`python 3` => "missing range specifier"). Pass python through
-    // untouched under every policy.
-    let effective_policy = if conda_name.as_spec() == "python" {
+    // ABI anchors and every configured semantic alias that reaches one are
+    // fully off-limits to this legacy translate-time policy mutation. The
+    // strict-first decision engine is the sole place that may prove a
+    // same-major anchor relaxation safe.
+    let abi_aliases = abi_aliases_from_name_map(name_map);
+    let effective_policy = if is_semantic_abi_anchor(pypi_key.as_str(), &abi_aliases)
+        || is_semantic_abi_anchor(conda_name.as_spec(), &abi_aliases)
+    {
         RelaxPolicy::None
     } else {
         policy
@@ -377,6 +378,63 @@ pub(crate) fn canonical_conda_name(name: &str) -> String {
         }
     }
     out.trim_matches('-').to_string()
+}
+
+/// Canonical, undirected semantic-name graph used by every ABI safety gate.
+///
+/// An undirected graph is intentional: two PyPI names that map to the same
+/// conda provider are semantic aliases even when neither maps directly to the
+/// other. This closes hidden many-to-one aliases such as
+/// `array-provider -> shared-runtime <- numpy`.
+pub(crate) type AbiAliasGraph = BTreeMap<String, BTreeSet<String>>;
+
+/// Add one canonical, bidirectional semantic-name edge.
+pub(crate) fn add_abi_alias_edge(aliases: &mut AbiAliasGraph, left: &str, right: &str) {
+    let left = canonical_conda_name(left);
+    let right = canonical_conda_name(right);
+    if left == right {
+        return;
+    }
+    aliases
+        .entry(left.clone())
+        .or_default()
+        .insert(right.clone());
+    aliases.entry(right).or_default().insert(left);
+}
+
+/// Return the complete transitive semantic-name component containing `name`.
+pub(crate) fn semantic_aliases(name: &str, aliases: &AbiAliasGraph) -> BTreeSet<String> {
+    let root = canonical_conda_name(name);
+    let mut seen = BTreeSet::from([root.clone()]);
+    let mut pending = vec![root];
+    while let Some(current) = pending.pop() {
+        if let Some(neighbors) = aliases.get(&current) {
+            for neighbor in neighbors {
+                if seen.insert(neighbor.clone()) {
+                    pending.push(neighbor.clone());
+                }
+            }
+        }
+    }
+    seen
+}
+
+/// Whether `name` itself, or any transitive semantic alias, is an ABI anchor.
+pub(crate) fn is_semantic_abi_anchor(name: &str, aliases: &AbiAliasGraph) -> bool {
+    semantic_aliases(name, aliases)
+        .iter()
+        .any(|alias| crate::solve::is_abi_anchor(alias))
+}
+
+/// Build the ABI alias graph represented by a configured/effective name map.
+pub(crate) fn abi_aliases_from_name_map(name_map: &NameMap) -> AbiAliasGraph {
+    let mut aliases = AbiAliasGraph::new();
+    for (pypi_name, target) in name_map {
+        if let Some(conda_name) = target.mapped_name() {
+            add_abi_alias_edge(&mut aliases, pypi_name.as_str(), conda_name.as_spec());
+        }
+    }
+    aliases
 }
 
 /// P2 (bloat M2 / grizzly #2): dual-namespace set membership. True
@@ -463,6 +521,30 @@ fn convert_specifiers(
     // Apply policy while the constraint is still PEP 440. The resulting
     // representation is retained for shared finalization; conda lowering is
     // a separate rendering step and is never used to reconstruct it.
+    let effective = relax_version_specifiers(specifiers, policy)?;
+
+    let mut conda = Vec::with_capacity(effective.len());
+    let mut pep440 = Vec::with_capacity(effective.len());
+    for specifier in effective.iter() {
+        pep440.push(specifier.to_string());
+        if let Some(rendered) = convert_one(specifier) {
+            conda.push(rendered);
+        }
+    }
+    Ok(ConvertedSpecifiers {
+        conda: conda.join(","),
+        pep440: pep440.join(","),
+    })
+}
+
+/// Apply one existing relax-policy tier while the requirement is still PEP
+/// 440. Both final recipe translation and the inline cross-wheel conflict
+/// recovery path use this function so exact-pin widening and cap stripping
+/// cannot drift.
+pub(crate) fn relax_version_specifiers(
+    specifiers: &uv_pep440::VersionSpecifiers,
+    policy: RelaxPolicy,
+) -> Result<uv_pep440::VersionSpecifiers> {
     let specs: Vec<uv_pep440::VersionSpecifier> = specifiers.iter().cloned().collect();
     let effective: Vec<uv_pep440::VersionSpecifier> = if specs.len() == 1
         && *specs[0].operator() == Operator::Equal
@@ -487,18 +569,7 @@ fn convert_specifiers(
     // candidates satisfy the bound; see RelaxPolicy::CondaAware doc.
     // Until that probe lands, conda-aware silently degrades to
     // strong-major.
-    let mut conda = Vec::with_capacity(effective.len());
-    let mut pep440 = Vec::with_capacity(effective.len());
-    for specifier in &effective {
-        pep440.push(specifier.to_string());
-        if let Some(rendered) = convert_one(specifier) {
-            conda.push(rendered);
-        }
-    }
-    Ok(ConvertedSpecifiers {
-        conda: conda.join(","),
-        pep440: pep440.join(","),
-    })
+    Ok(effective.into_iter().collect())
 }
 
 /// Drop specifiers that impose an upper bound, expand `~=` to its
@@ -538,6 +609,28 @@ fn strip_upper_bounds(specs: &[&uv_pep440::VersionSpecifier]) -> Vec<uv_pep440::
     kept
 }
 
+/// Construct a dot-separated exclusive ceiling by incrementing the last
+/// release component. An empty prefix or an unrepresentable increment fails
+/// closed instead of panicking in debug builds or wrapping in release builds.
+pub(crate) fn checked_version_ceiling(release_prefix: &[u64]) -> Option<String> {
+    let mut ceiling = release_prefix.to_vec();
+    let last = ceiling.last_mut()?;
+    *last = last.checked_add(1)?;
+    Some(
+        ceiling
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("."),
+    )
+}
+
+/// True when release-only range rendering cannot drop epoch or prerelease
+/// semantics from an exact version.
+pub(crate) fn exact_version_can_widen(version: &Version) -> bool {
+    version.epoch() == 0 && !version.any_prerelease()
+}
+
 fn convert_one(spec: &uv_pep440::VersionSpecifier) -> Option<String> {
     let op = match spec.operator() {
         Operator::Equal => "==",
@@ -554,14 +647,7 @@ fn convert_one(spec: &uv_pep440::VersionSpecifier) -> Option<String> {
                 return None;
             }
             let lower = spec.version();
-            let mut upper = release[..release.len() - 1].to_vec();
-            let last = upper.len() - 1;
-            upper[last] += 1;
-            let upper_release = upper
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(".");
+            let upper_release = checked_version_ceiling(&release[..release.len() - 1])?;
             let upper = if spec.version().epoch() == 0 {
                 upper_release
             } else {
@@ -592,28 +678,31 @@ pub fn widen_exact(v: &Version, policy: RelaxPolicy) -> Option<String> {
     if r.is_empty() {
         return None;
     }
+    if policy != RelaxPolicy::None && !exact_version_can_widen(v) {
+        return None;
+    }
     let major = r[0];
     let minor = r.get(1).copied().unwrap_or(0);
     let patch = r.get(2).copied().unwrap_or(0);
 
-    // The `*WithLastResort` variants behave IDENTICALLY to their base
-    // here; the cascade is a separate post-translate probe pass in
-    // handler.rs::last_resort_widen_pass that only widens further for
-    // unsatisfiable specs.
+    // The `*WithLastResort` variants behave IDENTICALLY to their base at
+    // translation time. The auto-bundle finalizer invokes this same primitive
+    // at broader tiers only after a collected wheel-metadata intersection is
+    // proven unsatisfiable.
     match policy {
         RelaxPolicy::None => Some(format!("=={v}")),
-        // Tiered cascade starts at the narrowest (patch) widening and
-        // escalates only when probes prove the current spec unsat. So
-        // translate-time emission mirrors plain Patch; the escalation
-        // happens in handler.rs's pre/post widen passes via override
-        // injection / spec mutation.
+        // Tiered recovery starts at the narrowest (patch) widening.
+        // Translate-time emission mirrors plain Patch; inline cross-wheel
+        // finalization escalates only after the raw intersection is empty.
         RelaxPolicy::Patch
         | RelaxPolicy::PatchWithLastResort
         | RelaxPolicy::PatchThenMinorThenMajorThenLastResort => {
-            Some(format!(">={major}.{minor}.{patch},<{major}.{}", minor + 1))
+            let upper = checked_version_ceiling(&[major, minor])?;
+            Some(format!(">={major}.{minor}.{patch},<{upper}"))
         }
         RelaxPolicy::Minor | RelaxPolicy::MinorWithLastResort => {
-            Some(format!(">={major}.{minor},<{}", major + 1))
+            let upper = checked_version_ceiling(&[major])?;
+            Some(format!(">={major}.{minor},<{upper}"))
         }
         // Major / StrongMajor all widen exact pins to bare-major; the
         // difference is range handling (Major: passthrough;
@@ -643,14 +732,7 @@ fn widen_star(v: &Version, negate: bool) -> Option<String> {
         .join(".")
         .to_string();
     // Bump the last digit for the upper bound.
-    let mut upper = r.to_vec();
-    let last = upper.len() - 1;
-    upper[last] += 1;
-    let hi = upper
-        .iter()
-        .map(|n| n.to_string())
-        .collect::<Vec<_>>()
-        .join(".");
+    let hi = checked_version_ceiling(&r)?;
     if negate {
         Some(format!("<{lo}|>={hi}"))
     } else {
@@ -1061,7 +1143,7 @@ mod tests {
         // Translate round-trip: the joined form from Display must match what
         // the old CondaDep(String) tuple-struct produced.
         let from_translate = translate(
-            "numpy==1.26.4",
+            "pillow==12.1.4",
             &env(),
             &BTreeMap::new(),
             &BTreeMap::new(),
@@ -1069,14 +1151,14 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(from_translate.to_string(), "numpy >=1.26,<2");
-        assert_eq!(from_translate.name, "numpy");
-        assert_eq!(from_translate.pypi_name, PypiKey::from_pypi("numpy"));
+        assert_eq!(from_translate.to_string(), "pillow >=12.1,<13");
+        assert_eq!(from_translate.name, "pillow");
+        assert_eq!(from_translate.pypi_name, PypiKey::from_pypi("pillow"));
         assert_eq!(
             from_translate.constraint_origin,
             CondaConstraintOrigin::Pypi {
-                original_specifiers: "==1.26.4".to_string(),
-                effective_specifiers: ">=1.26,<2".to_string(),
+                original_specifiers: "==12.1.4".to_string(),
+                effective_specifiers: ">=12.1,<13".to_string(),
             }
         );
     }
@@ -1096,9 +1178,33 @@ mod tests {
     #[test]
     fn exact_pin_minor_relax() {
         assert_eq!(
-            t("numpy==1.26.4", RelaxPolicy::Minor).as_deref(),
-            Some("numpy >=1.26,<2")
+            t("pillow==12.1.4", RelaxPolicy::Minor).as_deref(),
+            Some("pillow >=12.1,<13")
         );
+    }
+
+    #[test]
+    fn compatible_release_ceiling_overflow_fails_closed() {
+        let specifier =
+            uv_pep440::VersionSpecifier::from_str("~=1.18446744073709551615.0").unwrap();
+        assert_eq!(convert_one(&specifier), None);
+    }
+
+    #[test]
+    fn exact_widening_ceiling_overflow_fails_closed() {
+        let patch = Version::from_str("1.18446744073709551615.0").unwrap();
+        assert_eq!(widen_exact(&patch, RelaxPolicy::Patch), None);
+
+        let minor = Version::from_str("18446744073709551615.0").unwrap();
+        assert_eq!(widen_exact(&minor, RelaxPolicy::Minor), None);
+    }
+
+    #[test]
+    fn wildcard_ceiling_overflow_fails_closed() {
+        for raw in ["==1.18446744073709551615.*", "!=1.18446744073709551615.*"] {
+            let specifier = uv_pep440::VersionSpecifier::from_str(raw).unwrap();
+            assert_eq!(convert_one(&specifier), None, "{raw}");
+        }
     }
 
     #[test]
@@ -1177,7 +1283,7 @@ mod tests {
 
     #[test]
     fn effective_pep440_tracks_strong_major_and_unsupported_exact_equal() {
-        let strong = translated("numpy>=1.26,<2", RelaxPolicy::StrongMajor);
+        let strong = translated("demo>=1.26,<2", RelaxPolicy::StrongMajor);
         assert_eq!(strong.spec, ">=1.26");
         assert_eq!(
             strong.constraint_origin,
@@ -1212,6 +1318,22 @@ mod tests {
         assert_eq!(
             t("torch==2.7.1", RelaxPolicy::None).as_deref(),
             Some("torch ==2.7.1")
+        );
+    }
+
+    #[test]
+    fn no_relax_preserves_epoch_and_prerelease_exact_versions() {
+        assert_eq!(
+            t("demo==1!3.1", RelaxPolicy::None).as_deref(),
+            Some("demo ==1!3.1")
+        );
+        assert_eq!(
+            t("demo==3.1.dev1", RelaxPolicy::None).as_deref(),
+            Some("demo ==3.1.dev1")
+        );
+        assert_eq!(
+            t("demo==3.1a1", RelaxPolicy::None).as_deref(),
+            Some("demo ==3.1a1")
         );
     }
 
@@ -1254,6 +1376,25 @@ mod tests {
             dep.constraint_origin,
             CondaConstraintOrigin::ExplicitOverride
         );
+
+        // Explicit user intent still wins before the automatic ABI veto. The
+        // post-emission invariant remains responsible for rejecting an unsafe
+        // anchor override such as `*`.
+        overrides.insert("numpy".to_string(), "*".to_string());
+        let anchor = translate(
+            "numpy==1.26.4",
+            &env(),
+            &BTreeMap::new(),
+            &overrides,
+            RelaxPolicy::Major,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(anchor.to_string(), "numpy *");
+        assert_eq!(
+            anchor.constraint_origin,
+            CondaConstraintOrigin::ExplicitOverride
+        );
     }
 
     #[test]
@@ -1272,20 +1413,19 @@ mod tests {
             t("pyglet<2", RelaxPolicy::StrongMajor).as_deref(),
             Some("pyglet")
         );
-        // >=A,<B keeps the lower bound, drops the upper.
+        // ABI-anchor ranges and exact pins remain untouched.
         assert_eq!(
             t("numpy>=1.26,<2", RelaxPolicy::StrongMajor).as_deref(),
-            Some("numpy >=1.26"),
+            Some("numpy >=1.26,<2"),
         );
         // ~=A.B becomes >=A.B (no upper).
         assert_eq!(
             t("requests~=2.0", RelaxPolicy::StrongMajor).as_deref(),
             Some("requests >=2.0"),
         );
-        // Exact pins behave like Major.
         assert_eq!(
             t("numpy==1.26.4", RelaxPolicy::StrongMajor).as_deref(),
-            Some("numpy >=1"),
+            Some("numpy ==1.26.4"),
         );
         // Pure lower bound passes through.
         assert_eq!(
@@ -1306,7 +1446,7 @@ mod tests {
         );
         assert_eq!(
             t("numpy==1.26.4", RelaxPolicy::CondaAware).as_deref(),
-            Some("numpy >=1"),
+            Some("numpy ==1.26.4"),
         );
     }
 
@@ -1322,19 +1462,18 @@ mod tests {
     }
 
     #[test]
-    fn python_dep_is_never_relaxed() {
-        // No relax policy may widen a python requirement. Major would
-        // emit `python >=3,<4`; strong-major / conda-aware would strip
-        // the upper to give `python >=3` (and `python` from a single
-        // exact pin), all of which either lose ABI meaning or trip
-        // rattler-build's "missing range specifier" error. Pass through
-        // unchanged regardless of policy.
+    fn abi_deps_are_never_relaxed() {
         for policy in [
+            RelaxPolicy::None,
             RelaxPolicy::Patch,
             RelaxPolicy::Minor,
             RelaxPolicy::Major,
             RelaxPolicy::StrongMajor,
             RelaxPolicy::CondaAware,
+            RelaxPolicy::PatchWithLastResort,
+            RelaxPolicy::MinorWithLastResort,
+            RelaxPolicy::MajorWithLastResort,
+            RelaxPolicy::PatchThenMinorThenMajorThenLastResort,
         ] {
             assert_eq!(
                 t("python==3.11.0", policy).as_deref(),
@@ -1346,29 +1485,75 @@ mod tests {
                 Some("python >=3.9,<3.13"),
                 "policy {policy:?} must not modify python range",
             );
+            assert_eq!(
+                t("numpy==1.26.4", policy).as_deref(),
+                Some("numpy ==1.26.4"),
+                "policy {policy:?} must not modify numpy",
+            );
+            assert_eq!(
+                t("cuda-cudart>=12,<13", policy).as_deref(),
+                Some("cuda-cudart >=12,<13"),
+                "policy {policy:?} must not modify cuda",
+            );
         }
-        // Sanity: non-python deps under Major still get bare-major widening.
+        // Sanity: ordinary deps under Major still get bare-major widening.
         assert_eq!(
-            t("numpy==1.26.4", RelaxPolicy::Major).as_deref(),
-            Some("numpy >=1"),
+            t("pillow==12.1.4", RelaxPolicy::Major).as_deref(),
+            Some("pillow >=12"),
         );
     }
 
     #[test]
-    fn tiered_cascade_emits_at_patch_widening() {
-        // The new policy mirrors `Patch` at translate time; the
-        // patch -> minor -> major -> `*` escalation happens in
-        // handler.rs's pre_emit_widen_pass via override injection.
+    fn translate_protects_transitive_many_to_one_anchor_alias() {
+        let name_map = NameMap::from([
+            (
+                PypiKey::from_pypi("array-provider"),
+                CondaTarget::Mapped(CondaName::new("shared-array-runtime")),
+            ),
+            (
+                PypiKey::from_pypi("numpy"),
+                CondaTarget::Mapped(CondaName::new("shared-array-runtime")),
+            ),
+        ]);
+        let aliases = abi_aliases_from_name_map(&name_map);
+        assert!(is_semantic_abi_anchor("array-provider", &aliases));
+        assert!(semantic_aliases("array-provider", &aliases).contains("numpy"));
+
+        let translated = translate(
+            "array-provider==1.26.4",
+            &env(),
+            &name_map,
+            &BTreeMap::new(),
+            RelaxPolicy::Major,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(translated.to_string(), "shared-array-runtime ==1.26.4");
+        assert_eq!(
+            translated.constraint_origin,
+            CondaConstraintOrigin::Pypi {
+                original_specifiers: "==1.26.4".to_string(),
+                effective_specifiers: "==1.26.4".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn tiered_policy_translates_at_patch_widening() {
+        // The policy mirrors `Patch` at translation time; collected
+        // cross-wheel conflicts escalate through the same primitives in the
+        // auto-bundle finalizer.
         assert_eq!(
             t(
-                "numpy==1.26.4",
+                "pillow==12.1.4",
                 RelaxPolicy::PatchThenMinorThenMajorThenLastResort
             )
             .as_deref(),
-            Some("numpy >=1.26.4,<1.27"),
+            Some("pillow >=12.1.4,<12.2"),
         );
-        // Ranges pass through unchanged at translate time -- the
-        // cascade catches them post-emit if conda can't satisfy.
+        // Ranges pass through unchanged at translation time. The inline
+        // finalizer strips their caps only when the collected intersection is
+        // unsatisfiable through the Major tier.
         assert_eq!(
             t(
                 "pyglet<2",

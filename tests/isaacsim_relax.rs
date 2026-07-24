@@ -81,6 +81,7 @@ fn baseline_config() -> RetreadConfig {
         pin_version: false,
         deps_from: Default::default(),
         ledger_overrides: Default::default(),
+        pack_manifest_path: None,
         sdist_build: Default::default(),
     }
 }
@@ -137,19 +138,15 @@ fn isaacsim_kernel_pins_widen_under_minor_relax() {
     .unwrap();
     let yaml = to_yaml(&recipe).unwrap();
 
-    // These are the deps that the manual gigastrap workaround pins to keep
-    // ros2 + isaacsim happy. With retread, each should appear in the rendered
-    // recipe as a *range*, not an exact pin.
+    // Ordinary Python dependencies are widened, while NumPy remains exact
+    // because it is an ABI anchor.
     let numpy = find_run_dep(&yaml, "numpy").expect("numpy must appear in run deps");
     let pillow = find_run_dep(&yaml, "pillow").expect("pillow must appear in run deps");
     let requests = find_run_dep(&yaml, "requests").expect("requests must appear in run deps");
 
     // Real isaacsim-kernel 5.1.0 pins: numpy==1.26.0, Pillow==11.3.0,
-    // requests==2.32.3. Under minor relax we expect "name >=X.Y,<X+1".
-    assert!(
-        numpy.starts_with("numpy >=1.26,<"),
-        "numpy should be widened to a minor range, got: {numpy}"
-    );
+    // requests==2.32.3.
+    assert_eq!(numpy, "numpy ==1.26.0");
     assert!(
         pillow.starts_with("pillow >=11.3,<") || pillow.starts_with("pillow >=11,<"),
         "pillow should be widened, got: {pillow}"
@@ -159,12 +156,12 @@ fn isaacsim_kernel_pins_widen_under_minor_relax() {
         "requests should be widened, got: {requests}"
     );
 
-    // No exact pin should leak through (sanity: == followed by a digit).
+    // No ordinary-package exact pin should leak through.
     for line in yaml.lines() {
         let t = line.trim_start();
         if let Some(spec) = t.strip_prefix("- ") {
             assert!(
-                !spec.contains(" =="),
+                spec.starts_with("numpy ") || !spec.contains(" =="),
                 "found exact pin under minor relax: {spec}\nfull recipe:\n{yaml}"
             );
         }
@@ -256,7 +253,7 @@ fn name_map_remaps_opencv_to_conda() {
 }
 
 #[test]
-fn aggressive_major_relax_drops_upper_bounds() {
+fn aggressive_major_relax_preserves_abi_anchors() {
     // Demonstrate that the policy knob actually works end-to-end.
     let (raw, filename, sha256, pure) = load_fixture("isaacsim_kernel");
     let metadata = parse_metadata(&raw, filename.clone(), pure, sha256).unwrap();
@@ -283,5 +280,7 @@ fn aggressive_major_relax_drops_upper_bounds() {
     let yaml = to_yaml(&recipe).unwrap();
 
     let numpy = find_run_dep(&yaml, "numpy").expect("numpy must appear");
-    assert_eq!(numpy, "numpy >=1", "major relax drops upper bound: {numpy}");
+    let pillow = find_run_dep(&yaml, "pillow").expect("pillow must appear");
+    assert_eq!(numpy, "numpy ==1.26.0", "ABI anchor changed: {numpy}");
+    assert_eq!(pillow, "pillow >=11", "ordinary dependency: {pillow}");
 }

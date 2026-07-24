@@ -573,11 +573,17 @@ fn emission_workspace_snapshot_cannot_override_wheel_metadata() {
     let aiohappy = deps
         .iter()
         .find(|(name, _)| name == "aiohappyeyeballs")
-        .map(|(_, spec)| spec.as_str());
-    assert_eq!(
-        aiohappy,
-        Some(">=2.4.4,<3"),
-        "the relaxed but 2.4-compatible wheel intersection must survive emission: {deps:?}"
+        .map(|(_, spec)| {
+            VersionSpec::from_str(spec, rattler_conda_types::ParseStrictness::Lenient).unwrap()
+        })
+        .expect("aiohappyeyeballs run dependency");
+    assert!(
+        aiohappy.matches(&rattler_conda_types::Version::from_str("2.4.4").unwrap()),
+        "{deps:?}"
+    );
+    assert!(
+        !aiohappy.matches(&rattler_conda_types::Version::from_str("2.4.5").unwrap()),
+        "the strict 2.4.4 wheel pin must survive the compatible route envelope: {deps:?}"
     );
 }
 
@@ -630,6 +636,7 @@ fn pythons_for_rejects_bare_major_variant() {
         pin_version: false,
         deps_from: Default::default(),
         ledger_overrides: Default::default(),
+        pack_manifest_path: None,
     };
     let result = pythons_for(&cfg, Some(&variants));
     assert_eq!(
@@ -679,6 +686,7 @@ fn pythons_for_accepts_dotted_variant() {
         pin_version: false,
         deps_from: Default::default(),
         ledger_overrides: Default::default(),
+        pack_manifest_path: None,
     };
     let result = pythons_for(&cfg, Some(&variants));
     assert_eq!(result, vec!["3.11".to_string()]);
@@ -728,6 +736,7 @@ fn pythons_for_filters_bare_major_keeps_dotted() {
         pin_version: false,
         deps_from: Default::default(),
         ledger_overrides: Default::default(),
+        pack_manifest_path: None,
     };
     let result = pythons_for(&cfg, Some(&variants));
     assert_eq!(result, vec!["3.11".to_string(), "3.12".to_string()]);
@@ -753,6 +762,7 @@ fn courier_pure_python_bundle_is_platform_specific_not_noarch() {
         auto_routed: vec![],
         auto_dropped: Default::default(),
         uv_closure_names: Default::default(),
+        uv_dependency_graph: Default::default(),
         workspace_conda_versions: Default::default(),
         workspace_conda_provider_facts: Default::default(),
     };
@@ -814,7 +824,8 @@ fn produce_output_emits_auto_routed_conda_run_deps() {
     // For a name a wheel DOES declare (numpy), the auto-route pin wins
     // over the wheel's looser spec (first-insert dedup). Since the
     // bounded-range fix, non-deps-from, non-anchor, non-overridden pins
-    // are emitted as `>=locked,<next-major` rather than an exact `==`.
+    // are emitted as `>=locked,<next-major`. NumPy is an ABI anchor, so its
+    // route retains the exact selected version.
     let bundle = Bundle {
         conda_name: "auto-pack".into(),
         primary: rw(
@@ -830,6 +841,7 @@ fn produce_output_emits_auto_routed_conda_run_deps() {
         ],
         auto_dropped: Default::default(),
         uv_closure_names: Default::default(),
+        uv_dependency_graph: Default::default(),
         workspace_conda_versions: Default::default(),
         workspace_conda_provider_facts: Default::default(),
     };
@@ -841,9 +853,9 @@ fn produce_output_emits_auto_routed_conda_run_deps() {
         .map(|d| (d.name.clone(), format_packagespec(&d.spec)))
         .collect();
     assert!(
-        deps.contains(&("numpy".to_string(), ">=2.1.0,<3".to_string())),
-        "auto-routed numpy must be a bounded-range run-dep floored at the \
-         locked version (won over the wheel's numpy>=1.21): {deps:?}"
+        deps.contains(&("numpy".to_string(), ">=1.21,==2.1.0".to_string())),
+        "auto-routed numpy must retain its exact ABI selection while also \
+         preserving the compatible wheel floor: {deps:?}"
     );
     assert!(
         deps.contains(&("scipy".to_string(), ">=1.14.1,<2".to_string())),
@@ -862,6 +874,7 @@ fn produce_output_emits_auto_routed_conda_run_deps() {
     let plain = Bundle {
         auto_routed: vec![],
         uv_closure_names: Default::default(),
+        uv_dependency_graph: Default::default(),
         ..bundle
     };
     let out = produce_output(&plain, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
@@ -895,6 +908,460 @@ fn auto_route_envelope_does_not_override_index_metadata_cap() {
     assert!(message.contains("pillow<11.1"), "{message}");
     assert!(message.contains(">=12.3.0"), "{message}");
     assert!(message.contains("<13"), "{message}");
+}
+
+#[test]
+fn final_emission_opts_into_minimal_stale_cap_relaxation() {
+    let mut bundle = solo_bundle("relax-pack", vec!["demo>=1,<2", "demo<99"]);
+    bundle.extras.push(rw(
+        "current-wheel",
+        meta("current-wheel", "2.0.0", vec!["demo>=2.1,<3"], true),
+    ));
+    let mut config = cfg();
+    config.relax = RelaxPolicy::PatchThenMinorThenMajorThenLastResort;
+
+    let output =
+        produce_output(&bundle, &config, Platform::Linux64, "3.11", &[], None, None).unwrap();
+    let spec = output
+        .run_dependencies
+        .depends
+        .iter()
+        .find(|dependency| dependency.name == "demo")
+        .map(|dependency| format_packagespec(&dependency.spec))
+        .expect("demo run dependency");
+    let parsed =
+        VersionSpec::from_str(&spec, rattler_conda_types::ParseStrictness::Lenient).unwrap();
+    assert!(parsed.matches(&rattler_conda_types::Version::from_str("2.1").unwrap()));
+    assert!(!parsed.matches(&rattler_conda_types::Version::from_str("3").unwrap()));
+}
+
+#[test]
+fn within_major_relaxation_becomes_the_final_structured_bundle_record() {
+    let mut bundle = solo_bundle("relax-record-pack", vec!["demo==1.24.0"]);
+    bundle.extras.push(rw(
+        "newer-consumer",
+        meta("newer-consumer", "2.0.0", vec!["demo>=1.26"], true),
+    ));
+    let mut config = cfg();
+    config.relax = RelaxPolicy::PatchThenMinorThenMajorThenLastResort;
+
+    let (output, relaxations) = produce_output_pending_relaxations(
+        &bundle,
+        &config,
+        Platform::Linux64,
+        "3.11",
+        &[],
+        None,
+        None,
+    )
+    .unwrap();
+    let emitted = output
+        .run_dependencies
+        .depends
+        .iter()
+        .find(|dependency| dependency.name == "demo")
+        .map(|dependency| format_packagespec(&dependency.spec))
+        .expect("demo run dependency");
+    let emitted =
+        VersionSpec::from_str(&emitted, rattler_conda_types::ParseStrictness::Lenient).unwrap();
+    assert!(emitted.matches(&rattler_conda_types::Version::from_str("1.26").unwrap()));
+    assert!(!emitted.matches(&rattler_conda_types::Version::from_str("2").unwrap()));
+
+    let target = ResolutionTarget::for_subdir("3.11", "linux-64");
+    let manifest = bundled_relaxations_for_output(
+        "relax-record-pack",
+        "relax-record-pack",
+        &target,
+        &[],
+        &relaxations,
+    )
+    .expect("safe within-major relaxation must produce a bundled record");
+    assert_eq!(manifest.relaxations.len(), 1);
+    let record = &manifest.relaxations[0];
+    assert_eq!(record.package, "demo");
+    assert_eq!(record.original_spec, "==1.24.0");
+    assert_eq!(record.resulting_spec, ">=1.24,<2");
+    assert_eq!(record.tier, RelaxPolicy::Minor);
+    assert_eq!(
+        record.kind,
+        crate::relaxation_record::RelaxationRecordKind::ExactPinWidened
+    );
+    assert_eq!(record.scope.platform, "linux-64");
+    assert_eq!(record.scope.python, "3.11");
+    assert_eq!(record.scope.environments, Vec::<String>::new());
+    assert_eq!(record.scope.targets, Vec::<String>::new());
+    assert!(
+        record
+            .involved_wheels
+            .iter()
+            .any(|wheel| wheel.contains("newer-consumer==2.0.0"))
+    );
+    let reparsed: RelaxationManifest =
+        serde_json::from_str(&manifest.to_pretty_json().unwrap()).unwrap();
+    assert_eq!(reparsed, manifest);
+    assert!(
+        manifest
+            .activate_script()
+            .contains("[retread] auto-relaxed: demo ==1.24.0 -> >=1.24,<2 (exact pin widened)")
+    );
+}
+
+#[test]
+fn satisfiable_final_emission_has_no_bundle_record() {
+    let mut bundle = solo_bundle("strict-record-pack", vec!["demo>=1"]);
+    bundle.extras.push(rw(
+        "compatible-consumer",
+        meta("compatible-consumer", "2.0.0", vec!["demo<2"], true),
+    ));
+    let config = cfg();
+    let (_, relaxations) = produce_output_pending_relaxations(
+        &bundle,
+        &config,
+        Platform::Linux64,
+        "3.11",
+        &[],
+        None,
+        None,
+    )
+    .unwrap();
+    assert!(relaxations.is_empty());
+    assert!(
+        bundled_relaxations_for_output(
+            "strict-record-pack",
+            "strict-record-pack",
+            &ResolutionTarget::for_subdir("3.11", "linux-64"),
+            &[],
+            &relaxations,
+        )
+        .is_none(),
+        "strict packages must inject neither warning file"
+    );
+}
+
+#[test]
+fn noarch_relaxation_record_uses_the_concrete_resolution_platform() {
+    let mut bundle = solo_bundle(
+        "win-relax-record-pack",
+        vec!["demo==1.24.0 ; sys_platform == 'win32'"],
+    );
+    bundle.extras.push(rw(
+        "newer-win-consumer",
+        meta(
+            "newer-win-consumer",
+            "2.0.0",
+            vec!["demo>=1.26 ; sys_platform == 'win32'"],
+            true,
+        ),
+    ));
+    let mut config = cfg();
+    config.relax = RelaxPolicy::PatchThenMinorThenMajorThenLastResort;
+
+    let (_, win_relaxations) = produce_output_pending_relaxations(
+        &bundle,
+        &config,
+        Platform::Win64,
+        "3.11",
+        &[],
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        win_relaxations.len(),
+        1,
+        "the concrete Win target must retain and relax both marked constraints"
+    );
+    let (_, noarch_relaxations) = produce_output_pending_relaxations(
+        &bundle,
+        &config,
+        Platform::NoArch,
+        "3.11",
+        &[],
+        None,
+        None,
+    )
+    .unwrap();
+    assert!(
+        noarch_relaxations.is_empty(),
+        "evaluating a noarch artifact as a target would silently lose the Win relaxation record"
+    );
+}
+
+#[test]
+fn relaxation_parity_allows_run_exports_but_rejects_replaced_ranges() {
+    let mut bundle = solo_bundle("relax-parity-pack", vec!["demo==1.24.0"]);
+    bundle.extras.push(rw(
+        "newer-consumer",
+        meta("newer-consumer", "2.0.0", vec!["demo>=1.26"], true),
+    ));
+    let mut config = cfg();
+    config.relax = RelaxPolicy::PatchThenMinorThenMajorThenLastResort;
+    let (output, _) = produce_output_pending_relaxations(
+        &bundle,
+        &config,
+        Platform::Linux64,
+        "3.11",
+        &[],
+        None,
+        None,
+    )
+    .unwrap();
+    let mut build_dependencies = output
+        .run_dependencies
+        .depends
+        .iter()
+        .map(|dependency| {
+            let spec = format_packagespec(&dependency.spec);
+            if spec.is_empty() {
+                dependency.name.clone()
+            } else {
+                format!("{} {spec}", dependency.name)
+            }
+        })
+        .collect::<Vec<_>>();
+    build_dependencies.push("python_abi 3.11.* *_cp311".to_string());
+    assert!(
+        run_dependencies_match(&output.run_dependencies.depends, Some(&build_dependencies))
+            .unwrap(),
+        "Pixi-added run exports are a valid superset of advertised deps"
+    );
+    let mut intersected_dependencies = build_dependencies.clone();
+    intersected_dependencies.push("demo >=1.27,<2".to_string());
+    assert!(
+        !run_dependencies_match(
+            &output.run_dependencies.depends,
+            Some(&intersected_dependencies)
+        )
+        .unwrap(),
+        "a same-name extra must not silently intersect the recorded result"
+    );
+    let demo = build_dependencies
+        .iter_mut()
+        .find(|dependency| dependency.starts_with("demo "))
+        .unwrap();
+    *demo = "demo >=1.27,<2".to_string();
+    assert!(
+        !run_dependencies_match(&output.run_dependencies.depends, Some(&build_dependencies))
+            .unwrap(),
+        "replacing the recorded result with a tighter build spec must fail closed"
+    );
+}
+
+#[test]
+fn final_emission_never_pre_relaxes_numpy_or_cuda_anchors() {
+    let bundle = solo_bundle("anchor-pack", vec!["numpy==1.26.4", "cuda>=12.8,<13"]);
+    let mut config = cfg();
+    config.relax = RelaxPolicy::StrongMajor;
+
+    let output =
+        produce_output(&bundle, &config, Platform::Linux64, "3.11", &[], None, None).unwrap();
+    let emitted = output
+        .run_dependencies
+        .depends
+        .iter()
+        .map(|dependency| {
+            (
+                dependency.name.as_str(),
+                VersionSpec::from_str(
+                    &format_packagespec(&dependency.spec),
+                    rattler_conda_types::ParseStrictness::Lenient,
+                )
+                .unwrap(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let numpy = &emitted["numpy"];
+    assert!(numpy.matches(&rattler_conda_types::Version::from_str("1.26.4").unwrap()));
+    assert!(
+        !numpy.matches(&rattler_conda_types::Version::from_str("1.26.5").unwrap()),
+        "the exact NumPy ABI pin must not be widened"
+    );
+    let cuda = &emitted["cuda"];
+    assert!(cuda.matches(&rattler_conda_types::Version::from_str("12.8").unwrap()));
+    assert!(
+        !cuda.matches(&rattler_conda_types::Version::from_str("13").unwrap()),
+        "the CUDA cap must not be stripped"
+    );
+}
+
+#[test]
+fn emission_merges_alias_constraints_by_conda_target() {
+    let bundle = solo_bundle("alias-pack", vec!["alpha-provider>=1", "beta-provider<2"]);
+    let mut config = cfg();
+    config.name_map = name_map(&[
+        ("alpha-provider", "shared-provider"),
+        ("beta-provider", "shared-provider"),
+    ]);
+    config.relax = RelaxPolicy::None;
+
+    let output =
+        produce_output(&bundle, &config, Platform::Linux64, "3.11", &[], None, None).unwrap();
+    let shared = output
+        .run_dependencies
+        .depends
+        .iter()
+        .filter(|dependency| dependency.name == "shared-provider")
+        .collect::<Vec<_>>();
+    assert_eq!(shared.len(), 1, "{shared:?}");
+    let spec = VersionSpec::from_str(
+        &format_packagespec(&shared[0].spec),
+        rattler_conda_types::ParseStrictness::Lenient,
+    )
+    .unwrap();
+    assert!(spec.matches(&rattler_conda_types::Version::from_str("1.5").unwrap()));
+    assert!(!spec.matches(&rattler_conda_types::Version::from_str("0.9").unwrap()));
+    assert!(!spec.matches(&rattler_conda_types::Version::from_str("2").unwrap()));
+}
+
+#[test]
+fn conflicting_alias_constraints_to_one_conda_target_fail_closed() {
+    let emit = |reverse: bool| {
+        let mut requirements = vec!["alpha-provider<2", "beta-provider>=2"];
+        if reverse {
+            requirements.reverse();
+        }
+        let bundle = solo_bundle("alias-conflict-pack", requirements);
+        let mut config = cfg();
+        config.name_map = name_map(&[
+            ("alpha-provider", "shared-provider"),
+            ("beta-provider", "shared-provider"),
+        ]);
+        config.relax = RelaxPolicy::None;
+        let error = produce_output(&bundle, &config, Platform::Linux64, "3.11", &[], None, None)
+            .expect_err("both aliases must participate in one strict intersection");
+        format!("{error:#}")
+    };
+
+    let forward = emit(false);
+    let backward = emit(true);
+    assert_eq!(forward, backward);
+    assert!(forward.contains("alpha-provider<2"), "{forward}");
+    assert!(forward.contains("beta-provider>=2"), "{forward}");
+    assert!(forward.contains("mutually unsatisfiable"), "{forward}");
+}
+
+#[test]
+fn mapped_anchor_alias_native_star_override_fails_closed() {
+    let bundle = solo_bundle("mapped-anchor-pack", vec!["numpy==1.26.4"]);
+    let mut config = cfg();
+    config.name_map = name_map(&[("numpy", "array-runtime")]);
+    config
+        .overrides
+        .insert("array-runtime".to_string(), "*".to_string());
+
+    let error = produce_output(&bundle, &config, Platform::Linux64, "3.11", &[], None, None)
+        .expect_err("a mapped NumPy target must not bypass the ABI star-spec check");
+    let message = format!("{error:#}");
+    assert!(message.contains("ABI invariant"), "{message}");
+    assert!(message.contains("array-runtime"), "{message}");
+    assert!(message.contains("empty/*"), "{message}");
+}
+
+#[test]
+fn hidden_many_to_one_anchor_alias_vetoes_relaxation() {
+    let mut bundle = solo_bundle("hidden-anchor-pack", vec!["array-provider==1.26.4"]);
+    bundle.extras.push(rw(
+        "newer-consumer",
+        meta(
+            "newer-consumer",
+            "1.0.0",
+            vec!["array-provider>=2,<3"],
+            true,
+        ),
+    ));
+    let mut config = cfg();
+    config.name_map = name_map(&[
+        ("array-provider", "shared-array-runtime"),
+        ("numpy", "shared-array-runtime"),
+    ]);
+    config.relax = RelaxPolicy::PatchThenMinorThenMajorThenLastResort;
+
+    let error = produce_output(&bundle, &config, Platform::Linux64, "3.11", &[], None, None)
+        .expect_err("a semantic NumPy alias must veto exact-pin widening");
+    let message = format!("{error:#}");
+    assert!(message.contains("mutually unsatisfiable"), "{message}");
+    assert!(message.contains("array-provider==1.26.4"), "{message}");
+    assert!(message.contains("array-provider>=2,<3"), "{message}");
+}
+
+#[test]
+fn abi_postcheck_rejects_divergent_workspace_anchor_versions() {
+    let mut bundle = solo_bundle("divergent-anchor-pack", vec!["numpy>=2.1,<3"]);
+    bundle.workspace_conda_provider_facts.insert(
+        "numpy".to_string(),
+        WorkspaceCondaProviderFact {
+            selected_versions: BTreeSet::from(["1.26.4".to_string(), "2.1.0".to_string()]),
+            declared_specs: BTreeSet::new(),
+            present_in_all_consumers: true,
+        },
+    );
+    assert!(bundle.workspace_conda_versions.is_empty());
+
+    let error = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None)
+        .expect_err("the emitted NumPy range must cover every precise consumer selection");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("does not cover workspace pin"),
+        "{message}"
+    );
+    assert!(message.contains("numpy==1.26.4"), "{message}");
+}
+
+#[test]
+fn final_emission_is_deterministic_under_wheel_and_requirement_permutations() {
+    let emit = |reverse: bool| {
+        let mut bundle = solo_bundle("permutation-pack", vec!["helper>=1", "demo==1.2.3"]);
+        bundle.extras = vec![
+            rw(
+                "newer-wheel",
+                meta(
+                    "newer-wheel",
+                    "2.0.0",
+                    vec!["demo==1.2.4", "helper<3"],
+                    true,
+                ),
+            ),
+            rw(
+                "noise-wheel",
+                meta("noise-wheel", "1.0.0", vec!["helper>=1", "noise<2"], true),
+            ),
+        ];
+        if reverse {
+            bundle.primary.metadata.requires_dist.reverse();
+            for wheel in &mut bundle.extras {
+                wheel.metadata.requires_dist.reverse();
+            }
+            bundle.extras.reverse();
+        }
+        let mut config = cfg();
+        config.relax = RelaxPolicy::PatchThenMinorThenMajorThenLastResort;
+        produce_output(&bundle, &config, Platform::Linux64, "3.11", &[], None, None)
+            .unwrap()
+            .run_dependencies
+            .depends
+            .into_iter()
+            .map(|dependency| {
+                (
+                    dependency.name.as_str().to_string(),
+                    format_packagespec(&dependency.spec),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let forward = emit(false);
+    let backward = emit(true);
+    assert_eq!(forward, backward);
+    let demo = forward
+        .iter()
+        .find(|(name, _)| name == "demo")
+        .map(|(_, spec)| {
+            VersionSpec::from_str(spec, rattler_conda_types::ParseStrictness::Lenient).unwrap()
+        })
+        .expect("demo run dependency");
+    assert!(demo.matches(&rattler_conda_types::Version::from_str("1.2.4").unwrap()));
+    assert!(!demo.matches(&rattler_conda_types::Version::from_str("1.2.5").unwrap()));
 }
 
 fn insert_exact_workspace_provider(bundle: &mut Bundle, name: &str, version: &str) {
@@ -1372,7 +1839,7 @@ fn explicit_native_conda_alternation_remains_allowed() {
 fn produce_output_omits_workspace_owned_auto_drops() {
     let mut bundle = solo_bundle(
         "owned-pack",
-        vec!["numpy>=2", "gym==0.23.1", "requests>=2.31"],
+        vec!["numpy>=2.1,<3", "gym==0.23.1", "requests>=2.31"],
     );
     bundle.auto_dropped = ["numpy", "gym"]
         .into_iter()
@@ -1425,6 +1892,7 @@ fn produce_output_softens_deps_from_floor_pin_to_floor_spec() {
         ],
         auto_dropped: Default::default(),
         uv_closure_names: Default::default(),
+        uv_dependency_graph: Default::default(),
         workspace_conda_versions: Default::default(),
         workspace_conda_provider_facts: Default::default(),
     };
@@ -1442,9 +1910,8 @@ fn produce_output_softens_deps_from_floor_pin_to_floor_spec() {
          priority over the bounded-range path): {deps:?}"
     );
     assert!(
-        deps.contains(&("numpy".to_string(), ">=2.1.0,<3".to_string())),
-        "non-deps-from auto-routed pins get a bounded range, not an exact \
-         pin: {deps:?}"
+        deps.contains(&("numpy".to_string(), "==2.1.0".to_string())),
+        "ABI-anchor auto-routes retain an exact pin: {deps:?}"
     );
 }
 
@@ -1482,6 +1949,7 @@ fn produce_output_preserves_deps_from_bare_and_range_specs() {
         auto_routed: vec![pandas, scipy],
         auto_dropped: Default::default(),
         uv_closure_names: Default::default(),
+        uv_dependency_graph: Default::default(),
         workspace_conda_versions: Default::default(),
         workspace_conda_provider_facts: Default::default(),
     };
@@ -1520,6 +1988,12 @@ fn bounded_range_ceiling_zero_x_caps_at_next_minor() {
 fn bounded_range_ceiling_unparseable_returns_none() {
     assert!(bounded_range_ceiling("not-a-version").is_none());
     assert!(bounded_range_ceiling("").is_none());
+}
+
+#[test]
+fn bounded_range_ceiling_overflow_returns_none() {
+    assert!(bounded_range_ceiling("18446744073709551615.1").is_none());
+    assert!(bounded_range_ceiling("0.18446744073709551615").is_none());
 }
 
 #[test]
@@ -1597,6 +2071,25 @@ fn produce_output_auto_routed_abi_anchor_stays_exact() {
         deps.contains(&("cuda-version".to_string(), "==12.8".to_string())),
         "ABI anchor auto-routed pin must stay exact, not widen: {deps:?}"
     );
+}
+
+#[test]
+fn produce_output_mapped_pypi_abi_anchor_stays_exact() {
+    let mut route = bundle_auto_route("numpy", "2.1.0", Provenance::PriorSelection);
+    route.route.conda_name = "array-runtime".to_string();
+    let bundle = Bundle {
+        auto_routed: vec![route],
+        ..solo_bundle("mapped-anchor-pack", vec![])
+    };
+    let out = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
+    let mapped = out
+        .run_dependencies
+        .depends
+        .iter()
+        .find(|dependency| dependency.name == "array-runtime")
+        .map(|dependency| format_packagespec(&dependency.spec))
+        .expect("mapped NumPy route");
+    assert_eq!(mapped, "==2.1.0");
 }
 
 #[test]
@@ -1742,8 +2235,8 @@ fn produce_output_closure_gate_keeps_auto_routed_pins_and_base_deps_undoubled() 
         .map(|d| (d.name.clone(), format_packagespec(&d.spec)))
         .collect();
     assert!(
-        deps.contains(&("numpy".to_string(), ">=2.1.0,<3".to_string())),
-        "auto-routed package must appear (as a bounded range) even though \
+        deps.contains(&("numpy".to_string(), "==2.1.0".to_string())),
+        "auto-routed ABI anchor must appear exact-pinned even though \
          it is also named by a wheel and present in uv pins pre-route: \
          {deps:?}"
     );
@@ -1894,6 +2387,7 @@ fn cfg() -> RetreadConfig {
         pin_version: false,
         deps_from: Default::default(),
         ledger_overrides: Default::default(),
+        pack_manifest_path: None,
     }
 }
 
@@ -1941,6 +2435,7 @@ fn solo_bundle(name: &str, requires: Vec<&str>) -> Bundle {
         auto_routed: vec![],
         auto_dropped: Default::default(),
         uv_closure_names: Default::default(),
+        uv_dependency_graph: Default::default(),
         workspace_conda_versions: Default::default(),
         workspace_conda_provider_facts: Default::default(),
     }
@@ -1984,10 +2479,7 @@ fn auto_routed_underscored_conda_name_emits_raw() {
         .find(|route| route.pypi_name == PypiKey::from_pypi("cuda-nvcc-linux-64"))
         .expect("the raw auto-route must reach the co-solve boundary");
     assert_eq!(route.conda_name.as_spec(), "cuda-nvcc_linux-64");
-    assert_eq!(
-        route.match_spec().as_str(),
-        "cuda-nvcc_linux-64 >=12.9.1,<13"
-    );
+    assert_eq!(route.match_spec().as_str(), "cuda-nvcc_linux-64 ==12.9.1");
 }
 
 // -----------------------------------------------------------------
@@ -2062,6 +2554,7 @@ fn relaxed_retry_specs_table() {
         "isaacsim-kernel",
         &specs("==6.0.0.0"),
         RelaxPolicy::PatchThenMinorThenMajorThenLastResort,
+        &AbiAliasGraph::new(),
     )
     .expect("exact pin must produce a retry range");
     // PEP 440 normalization may render >=6.0.0.0 as >=6; assert
@@ -2074,9 +2567,44 @@ fn relaxed_retry_specs_table() {
     assert_ne!(relaxed, specs("==6.0.0.0"));
 
     // Range specs pass through relax untouched -> no fallback.
-    assert!(relaxed_retry_specs("etgen", &specs(">=0.8.2,<0.9"), RelaxPolicy::Minor).is_none());
+    assert!(
+        relaxed_retry_specs(
+            "etgen",
+            &specs(">=0.8.2,<0.9"),
+            RelaxPolicy::Minor,
+            &AbiAliasGraph::new(),
+        )
+        .is_none()
+    );
     // Policy None never falls back.
-    assert!(relaxed_retry_specs("foo", &specs("==1.0.0"), RelaxPolicy::None).is_none());
+    assert!(
+        relaxed_retry_specs(
+            "foo",
+            &specs("==1.0.0"),
+            RelaxPolicy::None,
+            &AbiAliasGraph::new(),
+        )
+        .is_none()
+    );
+}
+
+#[test]
+fn relaxed_retry_specs_vetoes_hidden_cuda_alias() {
+    use std::str::FromStr as _;
+
+    let package = "nvidia-cuda-runtime-cu12";
+    let specs = VersionSpecifiers::from_str("==12.8.90").unwrap();
+    let mut aliases = AbiAliasGraph::new();
+    add_abi_alias_edge(&mut aliases, package, "cuda");
+
+    assert!(!crate::solve::is_abi_anchor(package));
+    assert!(is_semantic_abi_anchor(package, &aliases));
+    for policy in [RelaxPolicy::Major, RelaxPolicy::StrongMajor] {
+        assert!(
+            relaxed_retry_specs(package, &specs, policy, &aliases).is_none(),
+            "{policy:?} retry must not widen a hidden ABI-anchor exact pin"
+        );
+    }
 }
 
 #[test]
@@ -2092,7 +2620,7 @@ fn vendored_filter_matches_underscore_pypi_name() {
         meta("opencv_python", "4.9.0", vec![], true),
     ));
     let output =
-        produce_output(&bundle, &cfg(), Platform::Linux64, "3.12", &[], None, None).unwrap();
+        produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
     let names: Vec<String> = output
         .run_dependencies
         .depends
@@ -2149,7 +2677,7 @@ fn name_mapped_dep_dropped_by_pypi_name() {
         &bundle,
         &dropped_cfg,
         Platform::Linux64,
-        "3.12",
+        "3.11",
         &[],
         None,
         None,
@@ -2181,7 +2709,7 @@ fn name_mapped_dep_dropped_by_pypi_name() {
         &vendored_bundle,
         &config,
         Platform::Linux64,
-        "3.12",
+        "3.11",
         &[],
         None,
         None,
@@ -2578,6 +3106,7 @@ fn vendored_sub_packages_dropped_from_run_deps() {
         auto_routed: vec![],
         auto_dropped: Default::default(),
         uv_closure_names: Default::default(),
+        uv_dependency_graph: Default::default(),
         workspace_conda_versions: Default::default(),
         workspace_conda_provider_facts: Default::default(),
     };
@@ -2732,6 +3261,7 @@ fn bundle_field_groups_entries_into_one_output() {
         auto_routed: vec![],
         auto_dropped: Default::default(),
         uv_closure_names: Default::default(),
+        uv_dependency_graph: Default::default(),
         workspace_conda_versions: Default::default(),
         workspace_conda_provider_facts: Default::default(),
     };
@@ -2828,6 +3358,7 @@ fn relaxed_pure_python_primary_pins_python_to_workspace_variant() {
         auto_routed: vec![],
         auto_dropped: Default::default(),
         uv_closure_names: Default::default(),
+        uv_dependency_graph: Default::default(),
         workspace_conda_versions: Default::default(),
         workspace_conda_provider_facts: Default::default(),
     };
@@ -2879,35 +3410,296 @@ fn relaxed_pure_python_primary_pins_python_to_workspace_variant() {
 }
 
 #[test]
-fn bare_major_python_emits_glob_not_strict_equals() {
-    // Regression: when python_version is bare-major like "3" (e.g.
-    // wheel tag parsing yields just the major, or a workspace
-    // variant is "python = [\"3\"]"), the emitted host-dep was
-    // `python 3` which rattler-conda-types Lenient-parses as
-    // `==3` strict, causing rattler-build to fail the host solve
-    // with "No candidates were found for python ==3". Always
-    // append `.*` so the glob form is used.
-    //
-    // Construct a bundle whose primary wheel produces python_version
-    // = "3" via the pure-Python fallback (workspace_python_version)
-    // -- pass "3" as the workspace_python_version arg.
+fn bare_major_workspace_python_input_still_emits_a_minor_anchor() {
     let bundle = solo_bundle("foo", vec![]);
     let output = produce_output(&bundle, &cfg(), Platform::Linux64, "3", &[], None, None).unwrap();
-
-    // python must appear with a wildcard, NOT as strict equals.
-    let python = output
-        .host_dependencies
-        .as_ref()
-        .unwrap()
+    let emitted = output
+        .run_dependencies
         .depends
         .iter()
-        .find(|d| d.name == "python")
-        .expect("python in host_deps");
-    let rendered = format!("{:?}", python.spec);
+        .find(|dependency| dependency.name == "python")
+        .map(|dependency| format_packagespec(&dependency.spec))
+        .expect("python run dependency");
     assert!(
-        !rendered.contains("Equals") || rendered.contains("Glob") || rendered.contains("*"),
-        "host python dep must be a glob, not strict ==; got: {rendered}",
+        !is_bare_major_spec(&emitted),
+        "post-emission ABI check requires a minor anchor, got {emitted}"
     );
+}
+
+#[test]
+fn output_abi_invariant_rejects_star_bare_major_and_uncovered_workspace_pin() {
+    let overrides = BTreeMap::new();
+    let python_workspace =
+        BTreeMap::from([("python".to_string(), BTreeSet::from(["3.11".to_string()]))]);
+    for spec in [
+        "",
+        "*",
+        "3.*",
+        ">=3",
+        "3.*|4.*",
+        ">=3,<4,!=3.5",
+        ">=3,<4,>0.1",
+        ">0.1,>=3,<4",
+        ">=3,<4,<99.1",
+    ] {
+        let violations = check_output_abi_invariants(
+            &[("python".to_string(), spec.to_string())],
+            &[],
+            &python_workspace,
+            &overrides,
+            &BTreeMap::new(),
+        );
+        assert_eq!(violations.len(), 1, "{spec}: {violations:?}");
+    }
+
+    let uncovered = check_output_abi_invariants(
+        &[("python".to_string(), ">=3.12,<4".to_string())],
+        &[],
+        &python_workspace,
+        &overrides,
+        &BTreeMap::new(),
+    );
+    assert_eq!(uncovered.len(), 1, "{uncovered:?}");
+    assert!(uncovered[0].contains("does not cover workspace pin"));
+}
+
+#[test]
+fn bare_major_detection_uses_effective_parsed_bounds() {
+    for spec in [
+        ">=3,<4,>0.1",
+        ">0.1,>=3,<4",
+        ">=3,<4,<99.1",
+        ">=3.0,<4",
+        ">=3,<4.0",
+        "<4.0",
+    ] {
+        assert!(
+            is_bare_major_spec(spec),
+            "redundant textual minor bound must not hide bare-major range `{spec}`"
+        );
+    }
+    for spec in [
+        ">=3,<4,>3.1",
+        ">=3,<3.12",
+        ">=3.11,<4",
+        ">=3.0.1,<4",
+        "==12.0",
+    ] {
+        assert!(
+            !is_bare_major_spec(spec),
+            "effective minor bound must protect narrowed range `{spec}`"
+        );
+    }
+    for spec in ["", "!", ">=4,<3", ">=3,<"] {
+        assert!(
+            is_bare_major_spec(spec),
+            "empty, unsatisfiable, or unparseable ABI constraint must fail closed: `{spec}`"
+        );
+    }
+}
+
+#[test]
+fn bare_major_detection_accepts_single_segment_exact_pin() {
+    assert!(
+        !is_bare_major_spec("==3"),
+        "an exact equality is concrete regardless of release segment count"
+    );
+}
+
+#[test]
+fn bare_major_detection_fails_closed_for_exclusion_emptied_ranges() {
+    for spec in [
+        "==3.1,!=3.1",
+        ">=3.1,<3.2,!=3.1.*",
+        "==3.1.0dev1,!=3.1.*",
+        "!=3.1",
+    ] {
+        assert!(
+            is_bare_major_spec(spec),
+            "empty or exclusion-only ABI constraint must fail closed: `{spec}`"
+        );
+    }
+}
+
+#[test]
+fn bare_major_detection_fails_closed_when_prefix_ceiling_overflows() {
+    let spec = "!=3.18446744073709551615.*";
+    assert!(
+        is_bare_major_spec(spec),
+        "an unrepresentable prefix ceiling must fail closed: `{spec}`"
+    );
+
+    let requirement = format!("numpy{spec}");
+    let violations = check_output_abi_invariants(
+        &[],
+        &[("consumer-wheel".to_string(), requirement.clone())],
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        &AbiAliasGraph::new(),
+    );
+    assert_eq!(violations.len(), 1, "{requirement}: {violations:?}");
+    assert!(
+        violations[0].contains("unsatisfiable under PEP 440"),
+        "{requirement}: {violations:?}"
+    );
+}
+
+#[test]
+fn bare_major_effective_ranges_model_negative_compatible_exclusion() {
+    use rattler_conda_types::version_spec::{LogicalOperator, StrictRangeOperator};
+    use rattler_conda_types::{StrictVersion, Version};
+    use std::str::FromStr as _;
+
+    let version = Version::from_str("3.1").unwrap();
+    let contradictory = VersionSpec::Group(
+        LogicalOperator::And,
+        vec![
+            VersionSpec::StrictRange(
+                StrictRangeOperator::Compatible,
+                StrictVersion(version.clone()),
+            ),
+            VersionSpec::StrictRange(StrictRangeOperator::NotCompatible, StrictVersion(version)),
+        ],
+    );
+    assert!(
+        effective_version_ranges(&contradictory).is_empty(),
+        "compatible and negative-compatible clauses must form an empty branch"
+    );
+}
+
+#[test]
+fn bare_major_detection_checks_prefix_and_compatible_predicates() {
+    for spec in [
+        "3.1.*,==3.2a1",
+        "3.1.*,==3.1post1",
+        "~=3.1,==4a1",
+        "3.1.*,>=3.2a1,<3.2",
+        "~=3.1,>=4a1,<4",
+    ] {
+        assert!(
+            is_bare_major_spec(spec),
+            "an empty or unproved predicate range must fail closed: `{spec}`"
+        );
+    }
+    for spec in ["3.1.*", "~=3.1", "3.1.*,>=3.1.5,<3.2"] {
+        assert!(
+            !is_bare_major_spec(spec),
+            "a witnessed minor predicate range should remain accepted: `{spec}`"
+        );
+    }
+}
+
+#[test]
+fn bare_major_detection_merges_disjunctive_range_envelopes() {
+    for spec in [
+        "<=3.1|>3.1",
+        "<3.1|>=3.1",
+        "<3.1|>3.1",
+        ">=3,<3.1|>=3.1,<4",
+        ">=3,<3.1|>3.2,<4",
+        "==3|>=4,<5",
+    ] {
+        assert!(
+            is_bare_major_spec(spec),
+            "minor-looking internal OR boundaries must not hide an unconstrained union: `{spec}`"
+        );
+    }
+    assert!(
+        !is_bare_major_spec("==3.1|==3.2"),
+        "disjoint concrete alternatives retain their load-bearing boundaries"
+    );
+}
+
+#[test]
+fn output_abi_invariant_accepts_minor_pin_and_rejects_anchor_override() {
+    let workspace = BTreeMap::from([
+        ("python".to_string(), BTreeSet::from(["3.11".to_string()])),
+        (
+            "cuda-version".to_string(),
+            BTreeSet::from(["12.8".to_string()]),
+        ),
+    ]);
+    let emitted = vec![
+        ("python".to_string(), "3.11.*".to_string()),
+        ("cuda-version".to_string(), "==12.8".to_string()),
+        ("packaging".to_string(), "*".to_string()),
+    ];
+    assert!(
+        check_output_abi_invariants(
+            &emitted,
+            &[],
+            &workspace,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .is_empty()
+    );
+
+    for spec in ["*", ">=1,<2,>0.1"] {
+        let overrides = BTreeMap::from([("numpy".to_string(), spec.to_string())]);
+        let violations =
+            check_output_abi_invariants(&[], &[], &workspace, &overrides, &BTreeMap::new());
+        assert_eq!(violations.len(), 1, "{spec}: {violations:?}");
+        assert!(violations[0].contains("retread-overrides[numpy]"));
+    }
+}
+
+#[test]
+fn output_abi_invariant_checks_embedded_wheel_metadata_and_aliases() {
+    let workspace = BTreeMap::from([("numpy".to_string(), BTreeSet::from(["1.26.4".to_string()]))]);
+    let embedded = vec![("consumer-wheel".to_string(), "numpy>=1".to_string())];
+    let violations = check_output_abi_invariants(
+        &[],
+        &embedded,
+        &workspace,
+        &BTreeMap::new(),
+        &AbiAliasGraph::new(),
+    );
+    assert_eq!(violations.len(), 1, "{violations:?}");
+    assert!(violations[0].contains("wheel `consumer-wheel` embeds"));
+    assert!(violations[0].contains("bare-major"));
+
+    let safe = vec![("consumer-wheel".to_string(), "numpy>=1.26,<2".to_string())];
+    assert!(
+        check_output_abi_invariants(
+            &[],
+            &safe,
+            &workspace,
+            &BTreeMap::new(),
+            &AbiAliasGraph::new(),
+        )
+        .is_empty()
+    );
+
+    let mut aliases = AbiAliasGraph::new();
+    add_abi_alias_edge(&mut aliases, "array-provider", "shared-runtime");
+    add_abi_alias_edge(&mut aliases, "numpy", "shared-runtime");
+    let hidden_alias = vec![(
+        "consumer-wheel".to_string(),
+        "array-provider>=1".to_string(),
+    )];
+    let violations =
+        check_output_abi_invariants(&[], &hidden_alias, &workspace, &BTreeMap::new(), &aliases);
+    assert_eq!(violations.len(), 1, "{violations:?}");
+    assert!(violations[0].contains("array-provider >=1"));
+}
+
+#[test]
+fn output_abi_invariant_rejects_pep440_local_exclusion_contradictions() {
+    for requirement in ["numpy==3.1+cuda,!=3.1", "numpy==1!3.1+cuda,!=1!3.1"] {
+        let violations = check_output_abi_invariants(
+            &[],
+            &[("consumer-wheel".to_string(), requirement.to_string())],
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &AbiAliasGraph::new(),
+        );
+        assert_eq!(violations.len(), 1, "{requirement}: {violations:?}");
+        assert!(
+            violations[0].contains("unsatisfiable under PEP 440"),
+            "{requirement}: {violations:?}"
+        );
+    }
 }
 
 #[test]
@@ -3150,11 +3942,19 @@ fn path_built_wheel_floor_is_advisory_during_finalization() {
             specifiers: ">=0.49.1,<0.50".parse().unwrap(),
             provenance: path_provenance,
             source: "path-built wheel `isaaclab` Requires-Dist".to_string(),
+            origin_id: crate::constraint::ConstraintOriginId::from_parts(
+                "handler-test-wheel-requirement",
+                ["isaaclab", "starlette", ">=0.49.1,<0.50"],
+            ),
         },
         crate::constraint::Constraint {
             specifiers: ">=0.40,<0.46".parse().unwrap(),
             provenance: Provenance::IndexWheelMetadata,
             source: "index wheel `fastapi` Requires-Dist".to_string(),
+            origin_id: crate::constraint::ConstraintOriginId::from_parts(
+                "handler-test-wheel-requirement",
+                ["fastapi", "starlette", ">=0.40,<0.46"],
+            ),
         },
     ];
     let finalized = crate::constraint::finalize(&PypiKey::from_pypi("starlette"), &constraints)
@@ -3714,6 +4514,7 @@ async fn pure_noarch_prepared_handoff_retains_rich_target_contract() {
         local_wheel_stamps: capture_local_wheel_stamps(std::slice::from_ref(&base_bundle)),
         materialized: vec![base_bundle],
         base_config: config.clone(),
+        restore_relaxations: vec![],
         declared_config: config,
         target: p1.clone(),
         work_directory: work_dir.clone(),
@@ -3726,6 +4527,8 @@ async fn pure_noarch_prepared_handoff_retains_rich_target_contract() {
         bundle_index: 0,
         emission,
         advertised: PreparedOutputIdentity::from_metadata(&advertised.metadata),
+        advertised_run_dependencies: advertised.run_dependencies.clone(),
+        relaxations: None,
         incremental_version_override: None,
     };
     let request = pixi_build_types::procedures::conda_build_v1::CondaBuildV1Output {
@@ -3932,6 +4735,7 @@ async fn conda_outputs_cache_and_prepared_handoff_round_trip() {
         local_wheel_stamps: capture_local_wheel_stamps(std::slice::from_ref(&base_bundle)),
         materialized: vec![base_bundle],
         base_config: declared_config.clone(),
+        restore_relaxations: vec![],
         declared_config: declared_config.clone(),
         target: crate::pypi::ResolutionTarget::for_subdir("3.11", "linux-64"),
         work_directory: work_dir.clone(),
@@ -3944,6 +4748,8 @@ async fn conda_outputs_cache_and_prepared_handoff_round_trip() {
         bundle_index: 0,
         emission,
         advertised: PreparedOutputIdentity::from_metadata(&advertised_output.metadata),
+        advertised_run_dependencies: advertised_output.run_dependencies.clone(),
+        relaxations: None,
         incremental_version_override: None,
     };
     let request = pixi_build_types::procedures::conda_build_v1::CondaBuildV1Output {
@@ -4016,6 +4822,7 @@ async fn conda_outputs_cache_and_prepared_handoff_round_trip() {
         local_wheel_stamps: capture_local_wheel_stamps(std::slice::from_ref(&py312_bundle)),
         materialized: vec![py312_bundle],
         base_config: declared_config.clone(),
+        restore_relaxations: vec![],
         declared_config: declared_config.clone(),
         target: crate::pypi::ResolutionTarget::for_subdir("3.12", "linux-64"),
         work_directory: work_dir.clone(),
@@ -4028,6 +4835,8 @@ async fn conda_outputs_cache_and_prepared_handoff_round_trip() {
         bundle_index: 0,
         emission: prepared.emission.clone(),
         advertised: prepared.advertised.clone(),
+        advertised_run_dependencies: prepared.advertised_run_dependencies.clone(),
+        relaxations: None,
         incremental_version_override: None,
     };
     handler
@@ -4113,6 +4922,7 @@ async fn conda_outputs_cache_and_prepared_handoff_round_trip() {
     let local_plan = Arc::new(ResolvedTargetPlan {
         materialized: vec![local_bundle],
         base_config: declared_config.clone(),
+        restore_relaxations: vec![],
         declared_config,
         target: crate::pypi::ResolutionTarget::for_subdir("3.11", "linux-64"),
         work_directory: work_dir.clone(),
@@ -4126,6 +4936,8 @@ async fn conda_outputs_cache_and_prepared_handoff_round_trip() {
         bundle_index: 0,
         emission: hit.prepared.emission.clone(),
         advertised: hit.prepared.advertised.clone(),
+        advertised_run_dependencies: hit.prepared.advertised_run_dependencies.clone(),
+        relaxations: None,
         incremental_version_override: None,
     };
     let transaction = handler.begin_prepared_transaction(8).await.unwrap();
@@ -4193,6 +5005,7 @@ async fn incremental_cold_fallback_requires_exact_prepared_plan() {
         local_wheel_stamps: capture_local_wheel_stamps(std::slice::from_ref(&base_bundle)),
         materialized: vec![base_bundle],
         base_config: config.clone(),
+        restore_relaxations: vec![],
         declared_config: config,
         target: ResolutionTarget::for_subdir("3.11", "linux-64"),
         work_directory: work_dir.clone(),
@@ -4205,6 +5018,8 @@ async fn incremental_cold_fallback_requires_exact_prepared_plan() {
         bundle_index: 0,
         emission,
         advertised: PreparedOutputIdentity::from_metadata(&output.metadata),
+        advertised_run_dependencies: output.run_dependencies.clone(),
+        relaxations: None,
         incremental_version_override: Some("1.0.0".to_string()),
     };
     let mut sibling = prepared.clone();

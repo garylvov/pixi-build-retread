@@ -7,7 +7,7 @@ mod auto_bundle;
 use auto_bundle::{
     AutoBundleOutcome, BfsFetched, Pending, PendingSource, UvReresolveContext, UvReresolveMode,
     auto_bundle_transitives, conda_probe_spec, metadata_preferring_sidecar, pick_conda_target,
-    seed_worklist, validated_conda_route,
+    scope_conflicts_for_target, seed_worklist, validated_conda_route,
 };
 
 mod resolve_state;
@@ -39,19 +39,30 @@ use tokio::sync::RwLock;
 use uv_pep508::uv_pep440::VersionSpecifiers;
 
 use crate::config::{RelaxPolicy, RetreadConfig, WheelEntry};
-use crate::constraint::{Authority, Conflict, Constraint, Provenance, finalize};
+use crate::constraint::{
+    Authority, Conflict, Constraint, ConstraintOriginId, Provenance, aggregate_conflicts,
+    collect_conflicts, finalize,
+};
 use crate::index_chain::{IndexPurpose, index_chain};
 use crate::pypi::{self, ResolutionTarget, WheelTarget, normalized_python_minor};
+#[cfg(test)]
+use crate::recipe::build_courier_recipe_with_mode_and_lock_filename;
 use crate::recipe::{
-    BundleSource, build_bundle_recipe, build_courier_recipe_with_mode_and_lock_filename, to_yaml,
+    BundleSource, build_bundle_recipe_with_relaxations,
+    build_courier_recipe_with_mode_lock_and_relaxations, to_yaml,
 };
 use crate::relax::{
-    CondaConstraintOrigin, CondaDep, CondaName, CondaTarget, NameMap, PypiKey,
-    canonical_conda_name, emit_python_version, marker_env_for,
+    AbiAliasGraph, CondaConstraintOrigin, CondaDep, CondaName, CondaTarget, NameMap, PypiKey,
+    abi_aliases_from_name_map, add_abi_alias_edge, canonical_conda_name, emit_python_version,
+    is_semantic_abi_anchor, marker_env_for, semantic_aliases,
 };
+use crate::relax_decision::{
+    Decision as RelaxDecision, SafetyContext, decide as decide_relaxation,
+};
+use crate::relaxation_record::{RelaxationManifest, RelaxationScope, stage_relaxation_payload};
 use crate::rpc::{RpcError, ok, parse_params};
 use crate::wheel::WheelMetadata;
-use crate::wheel_rewrite::rewrite_wheel;
+use crate::wheel_rewrite::rewrite_wheel_with_abi_aliases;
 use crate::workspace::{ResolvedWorkspaceTarget, WorkspaceTargetContract, WorkspaceTargetEnvelope};
 
 /// Process-global memo of `conda/outputs` results, keyed by the params
@@ -1253,6 +1264,8 @@ composed = { features = ["composed"], no-default-feature = true }
             conda_capable: Vec::new(),
             entry_specs: vec!["sibling-root@git:deadbeef".to_string()],
             wheel_store: None,
+            abi_context: None,
+            relaxations: vec![],
         };
         let lock_path = dir
             .join("sibling")
@@ -1527,6 +1540,8 @@ alias = { features = ["sibling", "alias"], no-default-feature = true }
             conda_capable: Vec::new(),
             entry_specs: vec!["sibling-root==1.0.0".to_string()],
             wheel_store: None,
+            abi_context: None,
+            relaxations: vec![],
         };
         let lock_path = dir.join("sibling").join(RetreadLock::file_name_for_target(
             "sibling.pack",
@@ -2055,6 +2070,10 @@ struct Bundle {
     /// Empty on the legacy (non-uv) path, where the BFS bundles the
     /// full closure and the `vendored` set already covers members.
     uv_closure_names: std::collections::HashSet<String>,
+    /// Full uv-selected adjacency, including routed/no-emit packages that
+    /// are absent from the exported wheel set. Diagnostics use this only to
+    /// walk a conflict back to its introducing root edge.
+    uv_dependency_graph: crate::uv_closure::UvDependencyGraph,
     /// Exact conda versions selected identically in every precise consuming
     /// environment, including transitives. Membership in this map is the
     /// exact validation boundary; ownership evidence is carried separately in
@@ -2310,6 +2329,10 @@ fn workspace_conda_provider_route(
             specifiers,
             provenance: provenance.clone(),
             source: format!("workspace conda declaration `{provider} {trimmed}`"),
+            origin_id: ConstraintOriginId::from_parts(
+                "workspace-provider-declaration",
+                [provider, trimmed],
+            ),
         });
     }
     if declared_constraints.is_empty() {
@@ -2317,6 +2340,10 @@ fn workspace_conda_provider_route(
             specifiers: VersionSpecifiers::empty(),
             provenance: provenance.clone(),
             source: format!("workspace-selected transitive conda provider `{provider}`"),
+            origin_id: ConstraintOriginId::from_parts(
+                "workspace-provider-fallback",
+                [provider, "*"],
+            ),
         });
     }
     let provider_key = PypiKey::from_pypi(provider);
@@ -2340,6 +2367,10 @@ fn workspace_conda_provider_route(
             provenance,
             source: format!(
                 "workspace conda provider `{provider} {rendered}` selected as {selected_versions} in precise consuming environments"
+            ),
+            origin_id: ConstraintOriginId::from_parts(
+                "workspace-provider-route",
+                [provider, rendered.as_str()],
             ),
         },
     })
@@ -2449,6 +2480,10 @@ impl Handler {
         })?;
         let workspace_dir = params.workspace_directory;
         ensure_pixi_bld_symlink_target(workspace_dir.as_deref())?;
+        config.pack_manifest_path = Some(crate::pack_overrides::pack_manifest_display_path(
+            workspace_dir.as_deref(),
+            &params.manifest_path,
+        ));
 
         // Fix #22: merge this pack's auto-repaired overrides from the
         // workspace's `.retread/auto-overrides.json` ledger into
@@ -2743,6 +2778,8 @@ impl Handler {
         // per-entry context from resolve_all is the only way the user
         // ever learns which [retread-wheels] entry actually broke.
         let mut outputs = Vec::new();
+        let mut output_conflicts = Vec::new();
+        let mut pending_output_relaxations = Vec::new();
         // v4.2.0: the per-env pre-emission solve check (and its
         // bookkeeping / fail gate) was deleted with the legacy
         // mirror-solver; outputs ship unvalidated and `retread solve`
@@ -2763,7 +2800,7 @@ impl Handler {
             // Phase 1: materialize wheels + auto-bundle. Env-agnostic;
             // results reused across all per-env emissions.
             let t_materialize = std::time::Instant::now();
-            let (materialized, base_config) = resolve_all(
+            let (materialized, base_config, restore_relaxations) = resolve_all(
                 &config,
                 &target,
                 &download_dir,
@@ -2778,6 +2815,7 @@ impl Handler {
                     "resolving wheels for python {python_version}: {e:#}"
                 ))
             })?;
+            pending_output_relaxations.extend(restore_relaxations.iter().cloned());
             tracing::info!(
                 python = %python_version,
                 elapsed_ms = t_materialize.elapsed().as_millis() as u64,
@@ -2830,6 +2868,7 @@ impl Handler {
             let plan = Arc::new(ResolvedTargetPlan {
                 materialized,
                 base_config,
+                restore_relaxations,
                 declared_config: config.clone(),
                 target: target.clone(),
                 work_directory: params.work_directory.clone(),
@@ -2972,6 +3011,9 @@ impl Handler {
                             lock_path_for_target(&source_dir, &bundle.conda_name, &target);
                         let relax_is_default =
                             config.relax == crate::config::RelaxPolicy::default();
+                        let replay_workspace_versions =
+                            output_workspace_abi_versions(&bundle, python_version);
+                        let replay_aliases = output_abi_aliases(&bundle, &effective);
                         match replay_from_lock_for_target(
                             &lock_path,
                             current_hash,
@@ -2982,8 +3024,23 @@ impl Handler {
                             config.build_number,
                             config.bundle_mode == crate::config::BundleMode::Loose,
                             &siblings,
+                            &replay_workspace_versions,
+                            &effective.overrides,
+                            &replay_aliases,
                         ) {
                             Ok(Some(replayed)) => {
+                                ensure_output_abi_invariants(
+                                    &replayed,
+                                    &bundle,
+                                    &effective,
+                                    python_version,
+                                )
+                                .map_err(|error| {
+                                    RpcError::internal(format!(
+                                        "courier replay for {} failed ABI validation: {error:#}",
+                                        bundle.conda_name
+                                    ))
+                                })?;
                                 tracing::info!(
                                     bundle = %bundle.conda_name,
                                     "WS-B: cold-solve replay hit -- \
@@ -2998,6 +3055,66 @@ impl Handler {
                                         bundle.conda_name,
                                     ),
                                 );
+                                if plan.local_wheel_stamps.is_some() {
+                                    // A prepared fallback builds the fresh
+                                    // resolved plan, not the committed lock.
+                                    // Pair it only with records re-derived
+                                    // from that same plan, and only when its
+                                    // final run-deps still match the replayed
+                                    // metadata that pixi will solve.
+                                    match produce_output_pending_relaxations(
+                                        &bundle,
+                                        &effective,
+                                        params.host_platform,
+                                        python_version,
+                                        &siblings,
+                                        courier_build_hash.as_deref(),
+                                        None,
+                                    ) {
+                                        Ok((fresh, emission_relaxations))
+                                            if fresh.run_dependencies
+                                                == replayed.run_dependencies
+                                                && outputs_share_identity(&fresh, &replayed) =>
+                                        {
+                                            let relaxations = bundled_relaxations_for_output(
+                                                &bundle.conda_name,
+                                                &base_bundle.conda_name,
+                                                &target,
+                                                &plan.restore_relaxations,
+                                                &emission_relaxations,
+                                            );
+                                            prepared_builds.push(PreparedBuild {
+                                                locator_id: prepared_builds.len(),
+                                                plan: Arc::clone(&plan),
+                                                bundle_index,
+                                                emission: emission.clone(),
+                                                advertised: PreparedOutputIdentity::from_metadata(
+                                                    &replayed.metadata,
+                                                ),
+                                                advertised_run_dependencies: replayed
+                                                    .run_dependencies
+                                                    .clone(),
+                                                relaxations,
+                                                incremental_version_override: None,
+                                            });
+                                        }
+                                        Ok(_) => {
+                                            tracing::debug!(
+                                                bundle = %bundle.conda_name,
+                                                "replay metadata differs from the fresh plan; \
+                                                 withholding prepared fallback"
+                                            );
+                                        }
+                                        Err(error) => {
+                                            tracing::debug!(
+                                                bundle = %bundle.conda_name,
+                                                error = %format!("{error:#}"),
+                                                "fresh plan cannot reproduce replay metadata; \
+                                                 withholding prepared fallback"
+                                            );
+                                        }
+                                    }
+                                }
                                 outputs.push(replayed);
                                 continue;
                             }
@@ -3031,7 +3148,7 @@ impl Handler {
                     let output_build_hash = courier_build_hash
                         .as_deref()
                         .or(non_courier_target_hash.as_deref());
-                    let output = produce_output(
+                    let (output, relaxations) = match produce_output_pending_relaxations(
                         &bundle,
                         &effective,
                         params.host_platform,
@@ -3039,10 +3156,35 @@ impl Handler {
                         &siblings,
                         output_build_hash,
                         version_override_for_bundle,
-                    )
-                    .map_err(|e| {
-                        RpcError::internal(format!("output for {}: {e:#}", bundle.conda_name))
-                    })?;
+                    ) {
+                        Ok(output) => output,
+                        Err(error) => {
+                            let mut bundle_conflicts = Vec::new();
+                            if let Err(error) = collect_conflicts(error, &mut bundle_conflicts) {
+                                return Err(RpcError::internal(format!(
+                                    "output for {}: {error:#}",
+                                    bundle.conda_name
+                                )));
+                            }
+                            output_conflicts.extend(scope_conflicts_for_target(
+                                bundle_conflicts,
+                                &bundle,
+                                &target,
+                            ));
+                            // Every remaining emission/bundle pair is a
+                            // deterministic peer in this conda/outputs
+                            // request and may reveal another conflict.
+                            continue;
+                        }
+                    };
+                    let bundled_relaxations = bundled_relaxations_for_output(
+                        &bundle.conda_name,
+                        &base_bundle.conda_name,
+                        &target,
+                        &plan.restore_relaxations,
+                        &relaxations,
+                    );
+                    pending_output_relaxations.extend(relaxations.iter().cloned());
                     // v4.2.0: the in-backend per-env solve check +
                     // iterative widening cascade were removed with the
                     // legacy mirror-solver. Emitted run-deps go to pixi
@@ -3062,6 +3204,8 @@ impl Handler {
                             bundle_index,
                             emission: emission.clone(),
                             advertised: PreparedOutputIdentity::from_metadata(&output.metadata),
+                            advertised_run_dependencies: output.run_dependencies.clone(),
+                            relaxations: bundled_relaxations,
                             incremental_version_override: version_override_for_bundle
                                 .map(str::to_owned),
                         });
@@ -3069,6 +3213,12 @@ impl Handler {
                     outputs.push(output);
                 }
             }
+        }
+        if !output_conflicts.is_empty() {
+            return Err(RpcError::internal(format!(
+                "{:#}",
+                aggregate_conflicts(output_conflicts)
+            )));
         }
         tracing::debug!(outputs = outputs.len(), "per-env emission loop complete");
         let result = CondaOutputsResult {
@@ -3114,6 +3264,9 @@ impl Handler {
         // recomputed by each backend process so build_v1 has their plan.
         if !requires_prepared_plan {
             write_conda_outputs_disk_cache(&disk_cache_path, &result).await;
+        }
+        for relaxation in pending_output_relaxations {
+            relaxation.emit();
         }
         Ok(result)
     }
@@ -3268,6 +3421,21 @@ impl Handler {
         // granted only after build_v1 independently proves that this request
         // came from an incremental lock and its localized attempt escalates.
         let advertised_output_version = params.output.version.as_ref().map(ToString::to_string);
+        // Fast replay must use the same current solved ABI facts that
+        // conda/outputs used to advertise this exact output. A committed lock
+        // cannot substitute producer-time selections: a ranged workspace
+        // dependency can solve to a newer ABI version without changing the
+        // manifest-derived inputs hash.
+        let mut prepared_build_selection = self
+            .lookup_prepared_build_for_target(
+                generation,
+                &params.work_directory,
+                workspace_dir.as_deref(),
+                exact_variant_python.as_deref(),
+                &target,
+                &params.output,
+            )
+            .await;
         let mut detected_incremental_fallback_version = None;
         if config.courier {
             // Need workspace_manifest to compute the config fingerprint
@@ -3328,13 +3496,28 @@ impl Handler {
             if fast_identity_matches {
                 let lock_path = lock_path_for_target(&source_dir, &bundle_name_for_hash, &target);
                 let relax_is_default = config.relax == crate::config::RelaxPolicy::default();
-                match load_replayable_lock_for_target(
-                    &lock_path,
-                    &current_hash,
-                    relax_is_default,
-                    &target,
-                    &bundle_name_for_hash,
-                ) {
+                let replay_lock = if let Some(selection) = prepared_build_selection.as_ref() {
+                    let abi_context = replay_abi_context_for_bundle(
+                        &selection.bundle,
+                        &selection.effective,
+                        target.python_version(),
+                    );
+                    load_replayable_lock_for_target(
+                        &lock_path,
+                        &current_hash,
+                        relax_is_default,
+                        &target,
+                        &bundle_name_for_hash,
+                        &abi_context,
+                    )
+                } else {
+                    tracing::debug!(
+                        bundle = %bundle_name_for_hash,
+                        "WS-B build_v1 replay skipped: current prepared ABI context unavailable",
+                    );
+                    Ok(None)
+                };
+                match replay_lock {
                     Ok(Some(lock))
                         if advertised_version_matches(
                             advertised_output_version.as_deref(),
@@ -3387,12 +3570,21 @@ impl Handler {
                         .await
                         {
                             Ok(Some(result)) => {
-                                return finalize_fasttmp_build_output(
+                                let result = finalize_fasttmp_build_output(
                                     result,
                                     stage_output_dir.as_deref(),
                                     &output_dir,
                                 )
-                                .await;
+                                .await?;
+                                if let Some(selection) = prepared_build_selection.take() {
+                                    self.consume_prepared_build(
+                                        generation,
+                                        selection.transaction,
+                                        selection.prepared.locator_id,
+                                    )
+                                    .await;
+                                }
+                                return Ok(result);
                             }
                             Ok(None) => {
                                 // Provenance gap (class 3 / schema-5 class 2):
@@ -3443,7 +3635,7 @@ impl Handler {
                         .map(|m| m.resolution_pypi_index_urls())
                         .unwrap_or_else(|| vec![crate::index_chain::PUBLIC_PYPI.to_string()]);
                     let relax_str = format!("{:?}", config.relax);
-                    if let Some(incr) = detect_incremental_add_for_target(
+                    let incremental = detect_incremental_add_for_target(
                         &lock_path,
                         &config,
                         declared_input_bundle
@@ -3453,7 +3645,33 @@ impl Handler {
                         &relax_str,
                         &target,
                         &config_fp,
-                    ) {
+                    );
+                    let incremental = incremental.filter(|incr| {
+                        let Some(selection) = prepared_build_selection.as_ref() else {
+                            tracing::debug!(
+                                bundle = %bundle_name_for_hash,
+                                "incremental-add skipped: current prepared ABI context unavailable",
+                            );
+                            return false;
+                        };
+                        let abi_context = replay_abi_context_for_bundle(
+                            &selection.bundle,
+                            &selection.effective,
+                            target.python_version(),
+                        );
+                        match validate_loaded_lock_abi(&incr.lock, &abi_context) {
+                            Ok(()) => true,
+                            Err(error) => {
+                                tracing::debug!(
+                                    bundle = %bundle_name_for_hash,
+                                    error = %format!("{error:#}"),
+                                    "incremental-add skipped: prior lock failed current ABI validation",
+                                );
+                                false
+                            }
+                        }
+                    });
+                    if let Some(incr) = incremental {
                         match incremental_version_plan(
                             advertised_output_version.as_deref(),
                             &incr.lock.version,
@@ -3488,12 +3706,21 @@ impl Handler {
                                             bundle = %bundle_name_for_hash,
                                             "incremental-add: localized resolve succeeded"
                                         );
-                                        return finalize_fasttmp_build_output(
+                                        let result = finalize_fasttmp_build_output(
                                             result,
                                             stage_output_dir.as_deref(),
                                             &output_dir,
                                         )
-                                        .await;
+                                        .await?;
+                                        if let Some(selection) = prepared_build_selection.take() {
+                                            self.consume_prepared_build(
+                                                generation,
+                                                selection.transaction,
+                                                selection.prepared.locator_id,
+                                            )
+                                            .await;
+                                        }
+                                        return Ok(result);
                                     }
                                     Ok(None) => {
                                         detected_incremental_fallback_version =
@@ -3547,16 +3774,7 @@ impl Handler {
             prepared,
             bundle,
             effective,
-        }) = self
-            .lookup_prepared_build_for_target(
-                generation,
-                &params.work_directory,
-                workspace_dir.as_deref(),
-                exact_variant_python.as_deref(),
-                &target,
-                &params.output,
-            )
-            .await
+        }) = prepared_build_selection.take()
         {
             tracing::info!(
                 bundle = %bundle.conda_name,
@@ -3584,6 +3802,22 @@ impl Handler {
                 detected_incremental_fallback_version.as_deref(),
                 &bundle.conda_name,
             )?;
+            if !run_dependencies_match(
+                &prepared.advertised_run_dependencies.depends,
+                run_override.as_deref(),
+            )
+            .map_err(|error| {
+                RpcError::internal(format!(
+                    "validating prepared run-dependency parity for {}: {error:#}",
+                    bundle.conda_name
+                ))
+            })? {
+                return Err(RpcError::invalid_params(format!(
+                    "run_dependencies for `{}` changed after conda/outputs; refusing to \
+                     build with a stale relaxation record",
+                    bundle.conda_name
+                )));
+            }
             let prepared_workspace_manifest = workspace_dir
                 .as_deref()
                 .and_then(crate::workspace::WorkspaceManifest::load);
@@ -3617,6 +3851,7 @@ impl Handler {
                 Some(expected_build),
                 prepared.incremental_version_override.as_deref(),
                 run_override.as_deref(),
+                prepared.relaxations.as_ref(),
             )
             .await
             .map_err(|e| RpcError::internal(format!("build {}: {e:#}", bundle.conda_name)))?;
@@ -3635,7 +3870,7 @@ impl Handler {
 
         // Re-resolve materialized bundles, then autodiscover emissions
         // and pick the one matching the requested output name.
-        let (materialized, base_config) = resolve_all(
+        let (materialized, base_config, restore_relaxations) = resolve_all(
             &config,
             &target,
             &download_dir,
@@ -3681,21 +3916,103 @@ impl Handler {
                     emissions.iter().map(|e| &e.output_name).collect::<Vec<_>>()
                 ))
             })?;
-        // Apply emission to the matching base bundle. For typical
-        // single-bundle source packs there's one bundle; for multi-
-        // bundle packs we pick the bundle whose name starts the same.
-        // Falling back to materialized[0] keeps single-pack behavior
-        // identical to before.
-        let base_bundle = materialized.first().ok_or_else(|| {
-            RpcError::invalid_params("no bundles produced; check [retread-wheels]".to_string())
-        })?;
+        let env_bundles: Vec<Bundle> = materialized
+            .iter()
+            .map(|base| apply_emission(base, &base_config, picked_emission).0)
+            .collect();
+        let siblings: Vec<(String, String)> = env_bundles
+            .iter()
+            .map(|sibling| {
+                (
+                    sibling.conda_name.clone(),
+                    sibling.primary.metadata.version.clone(),
+                )
+            })
+            .collect();
+        let cold_workspace_manifest = workspace_dir
+            .as_deref()
+            .and_then(crate::workspace::WorkspaceManifest::load);
+        let courier_channels = cold_workspace_manifest
+            .as_ref()
+            .map(|manifest| {
+                workspace_courier_channels(
+                    manifest,
+                    workspace_dir.as_deref().unwrap_or(source_dir.as_path()),
+                    &source_dir,
+                    &target,
+                )
+            })
+            .unwrap_or_default();
+        let mut matching_bundles = Vec::new();
+        for (bundle_index, base_bundle) in materialized.iter().enumerate() {
+            let (bundle, effective) = apply_emission(base_bundle, &base_config, picked_emission);
+            let courier_hash = config.courier.then(|| {
+                courier_inputs_hash(
+                    &config,
+                    &base_bundle.conda_name,
+                    &target,
+                    &courier_channels,
+                    cold_workspace_manifest.as_ref(),
+                    workspace_dir.as_deref().unwrap_or(source_dir.as_path()),
+                    &source_dir,
+                )
+            });
+            let rich_target_hash = (!config.courier)
+                .then(|| {
+                    target
+                        .target_contract()
+                        .map(|_| target.resolution_identity())
+                })
+                .flatten();
+            let output_hash = courier_hash.as_deref().or(rich_target_hash.as_deref());
+            let (candidate, emission_relaxations) = produce_output_pending_relaxations(
+                &bundle,
+                &effective,
+                resolution_subdir,
+                target.python_version(),
+                &siblings,
+                output_hash,
+                None,
+            )
+            .map_err(|error| {
+                RpcError::internal(format!(
+                    "reconstructing final relaxation record for {}: {error:#}",
+                    bundle.conda_name
+                ))
+            })?;
+            if output_matches_build_request(&candidate, &params.output)
+                && output_run_dependencies_match(&candidate, run_override.as_deref()).map_err(
+                    |error| {
+                        RpcError::internal(format!(
+                            "validating cached output parity for {}: {error:#}",
+                            bundle.conda_name
+                        ))
+                    },
+                )?
+            {
+                matching_bundles.push((bundle_index, bundle, effective, emission_relaxations));
+            }
+        }
+        let [(bundle_index, bundle, effective, emission_relaxations)] = matching_bundles.as_slice()
+        else {
+            return Err(RpcError::invalid_params(format!(
+                "the current source plan has {} exact matches for advertised output \
+                 `{}`; refusing to build with a stale or ambiguous relaxation record",
+                matching_bundles.len(),
+                params.output.name.as_normalized(),
+            )));
+        };
+        let base_bundle = &materialized[*bundle_index];
         let input_bundle_name = base_bundle.conda_name.clone();
-        let (bundle, effective) = apply_emission(base_bundle, &base_config, picked_emission);
+        let bundled_relaxations = bundled_relaxations_for_output(
+            &bundle.conda_name,
+            &input_bundle_name,
+            &target,
+            &restore_relaxations,
+            emission_relaxations,
+        );
 
         if config.courier {
-            let cold_workspace_manifest = workspace_dir
-                .as_deref()
-                .and_then(crate::workspace::WorkspaceManifest::load);
             validate_advertised_courier_build(
                 &config,
                 &input_bundle_name,
@@ -3706,15 +4023,15 @@ impl Handler {
                 params.output.build.as_deref(),
             )?;
             validate_advertised_courier_version(
-                &bundle,
+                bundle,
                 advertised_output_version.as_deref(),
                 None,
             )?;
         }
 
         let result = build_one(
-            &bundle,
-            &effective,
+            bundle,
+            effective,
             &config,
             &params.work_directory,
             &build_output_dir,
@@ -3726,10 +4043,16 @@ impl Handler {
             params.output.build.as_deref(),
             None,
             run_override.as_deref(),
+            bundled_relaxations.as_ref(),
         )
         .await
         .map_err(|e| RpcError::internal(format!("build {}: {e:#}", bundle.conda_name)))?;
-        finalize_fasttmp_build_output(result, stage_output_dir.as_deref(), &output_dir).await
+        let result =
+            finalize_fasttmp_build_output(result, stage_output_dir.as_deref(), &output_dir).await?;
+        for relaxation in restore_relaxations {
+            relaxation.emit();
+        }
+        Ok(result)
     }
 
     async fn begin_prepared_transaction(&self, generation: u64) -> Option<u64> {
@@ -4201,8 +4524,14 @@ async fn resolve_all(
     cache_dir: &Path,
     conda_channels: &[ChannelUrl],
     workspace_dir: Option<&Path>,
-) -> Result<(Vec<Bundle>, RetreadConfig)> {
+) -> Result<(
+    Vec<Bundle>,
+    RetreadConfig,
+    Vec<auto_bundle::WheelMetadataRelaxation>,
+)> {
     let mut bundles = Vec::with_capacity(config.retread_wheels.len());
+    let mut route_conflicts = Vec::new();
+    let mut pending_relaxations = Vec::new();
 
     // One complete workspace chain participates in every resolution path.
     // It retains the declared extras priority and either the explicit main
@@ -4491,6 +4820,20 @@ async fn resolve_all(
                 .keys()
                 .map(|k| canonical_conda_name(k))
                 .collect();
+            bundle.uv_dependency_graph = closure.dependency_graph.clone();
+            bundle.uv_dependency_graph.deps_from_root_requirements = deps_from_root_names
+                .iter()
+                .filter_map(|name| {
+                    let inputs = closure.effective_input_requirements.as_ref()?.get(name)?;
+                    let specifiers = inputs
+                        .iter()
+                        .map(|input| input.specifiers.clone())
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .collect::<Vec<_>>();
+                    Some((canonical_conda_name(name), specifiers))
+                })
+                .collect();
         }
         bundle.workspace_conda_versions = workspace_facts.common_selected_versions.clone();
         bundle.workspace_conda_provider_facts = workspace_facts.provider_facts.clone();
@@ -4540,7 +4883,7 @@ async fn resolve_all(
                     .collect()
             });
         if effective.auto_bundle || uv_closure.is_some() {
-            let outcome = auto_bundle_transitives(
+            let outcome = match auto_bundle_transitives(
                 &mut bundle,
                 &group_fallback_indexes,
                 target,
@@ -4557,9 +4900,21 @@ async fn resolve_all(
                     keep_pypi: uv_retry_keep.clone(),
                 },
             )
-            .await?;
+            .await
+            {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    collect_conflicts(error, &mut route_conflicts)?;
+                    // This bundle cannot produce valid output, but every
+                    // remaining BTreeMap group is independent validation
+                    // scope and may contribute another typed conflict.
+                    continue;
+                }
+            };
             match outcome {
-                AutoBundleOutcome::Complete => {}
+                AutoBundleOutcome::Complete { relaxations } => {
+                    pending_relaxations.extend(relaxations);
+                }
                 AutoBundleOutcome::RetryKeepPypi { keep_pypi } => {
                     let accumulated = uv_retry_keep_by_group
                         .entry(group_name.clone())
@@ -4588,7 +4943,10 @@ async fn resolve_all(
         bundles.push(bundle);
     }
 
-    Ok((bundles, effective))
+    if !route_conflicts.is_empty() {
+        return Err(aggregate_conflicts(route_conflicts));
+    }
+    Ok((bundles, effective, pending_relaxations))
 }
 
 /// Compose the persisted sdist source URL, appending the advertised
@@ -7540,6 +7898,7 @@ struct DiscoveredEmission {
 struct ResolvedTargetPlan {
     materialized: Vec<Bundle>,
     base_config: RetreadConfig,
+    restore_relaxations: Vec<auto_bundle::WheelMetadataRelaxation>,
     declared_config: RetreadConfig,
     target: ResolutionTarget,
     work_directory: PathBuf,
@@ -7581,6 +7940,10 @@ struct PreparedBuild {
     bundle_index: usize,
     emission: DiscoveredEmission,
     advertised: PreparedOutputIdentity,
+    /// Exact run dependencies paired with the recorded decisions.
+    advertised_run_dependencies: CondaOutputDependencies,
+    /// Exact final warning payload paired with the advertised output.
+    relaxations: Option<RelaxationManifest>,
     /// Present only when conda/outputs intentionally advertised the version
     /// of a matching incremental lock rather than the cold primary wheel.
     /// This typed origin never crosses the process-local metadata/build
@@ -8549,6 +8912,7 @@ async fn resolve_bundle(
     sibling_names: &std::collections::HashSet<String>,
 ) -> Result<Bundle> {
     let conda_name = canonical_conda_name(entry_name);
+    let abi_aliases = abi_aliases_from_name_map(route_policy.name_map);
     let mut state = ResolveState::default();
     let mut work: BTreeMap<String, Pending> = BTreeMap::new();
     // v0.14.1+: collect every probe + routing decision so the audit
@@ -8571,7 +8935,7 @@ async fn resolve_bundle(
     } else {
         None
     };
-    let (primary, primary_original_rd) = materialize_and_rewrite(
+    let (primary, primary_original_rd) = materialize_and_rewrite_with_abi_aliases(
         entry,
         entry_name,
         None,
@@ -8586,6 +8950,7 @@ async fn resolve_bundle(
             extras_requested: entry.extras.clone(),
             dedup_skipped_root,
         },
+        &abi_aliases,
     )
     .await?;
     // P2 (grizzly #2): canonical seed -- the BFS dedups candidates in
@@ -8632,6 +8997,7 @@ async fn resolve_bundle(
             auto_routed: vec![],
             auto_dropped: Default::default(),
             uv_closure_names: Default::default(),
+            uv_dependency_graph: Default::default(),
             workspace_conda_versions: Default::default(),
             workspace_conda_provider_facts: Default::default(),
         });
@@ -8986,6 +9352,7 @@ async fn resolve_bundle(
         let fetched: Vec<(Pending, Result<Option<BfsFetched>>)> = {
             use futures::stream::{self, StreamExt};
             let favor_lock_snap_ref = &favor_lock_snap;
+            let abi_aliases_ref = &abi_aliases;
             stream::iter(to_materialize)
                 .map(|pending| async move {
                     let dep_canon = crate::relax::canonical_conda_name(&pending.pypi_name);
@@ -9009,6 +9376,7 @@ async fn resolve_bundle(
                             target,
                             download_dir,
                             relax,
+                            abi_aliases_ref,
                             prefer_version.as_deref(),
                             format!(
                                 "BFS could not resolve `{pypi_name}` from any configured PyPI index"
@@ -9080,7 +9448,7 @@ async fn resolve_bundle(
                         ..Default::default()
                     };
                     let synth_name = pending.pypi_name.clone();
-                    let (sub, sub_original_rd) = materialize_and_rewrite(
+                    let (sub, sub_original_rd) = materialize_and_rewrite_with_abi_aliases(
                         &synth,
                         &synth_name,
                         None,
@@ -9092,6 +9460,7 @@ async fn resolve_bundle(
                         git_sources,
                         None,
                         EntryAuditInfo::default(),
+                        &abi_aliases,
                     )
                     .await
                     .with_context(|| {
@@ -9120,7 +9489,7 @@ async fn resolve_bundle(
                         ..Default::default()
                     };
                     let synth_name = pending.pypi_name.clone();
-                    let (sub, sub_original_rd) = materialize_and_rewrite(
+                    let (sub, sub_original_rd) = materialize_and_rewrite_with_abi_aliases(
                         &synth,
                         &synth_name,
                         None,
@@ -9132,6 +9501,7 @@ async fn resolve_bundle(
                         git_sources,
                         None,
                         EntryAuditInfo::default(),
+                        &abi_aliases,
                     )
                     .await
                     .with_context(|| {
@@ -9234,6 +9604,7 @@ async fn resolve_bundle(
         auto_routed: vec![],
         auto_dropped: Default::default(),
         uv_closure_names: Default::default(),
+        uv_dependency_graph: Default::default(),
         workspace_conda_versions: Default::default(),
         workspace_conda_provider_facts: Default::default(),
     };
@@ -9249,12 +9620,14 @@ fn relaxed_retry_specs(
     pypi_name: &str,
     specifiers: &VersionSpecifiers,
     relax: RelaxPolicy,
+    abi_aliases: &AbiAliasGraph,
 ) -> Option<VersionSpecifiers> {
     if relax == RelaxPolicy::None {
         return None;
     }
     let original = format!("{pypi_name}{specifiers}");
-    let relaxed_line = crate::wheel_rewrite::relax_pep508(&original, relax).ok()?;
+    let relaxed_line =
+        crate::wheel_rewrite::relax_pep508_with_abi_aliases(&original, relax, abi_aliases).ok()?;
     if relaxed_line == original {
         return None;
     }
@@ -9316,10 +9689,11 @@ async fn bfs_fetch_pypi_from_chain(
     target: &ResolutionTarget,
     download_dir: &Path,
     relax: RelaxPolicy,
+    abi_aliases: &AbiAliasGraph,
     prefer_version: Option<&str>,
     exhaustion_context: String,
 ) -> Result<BfsFetched> {
-    let relaxed = relaxed_retry_specs(pypi_name, specifiers, relax);
+    let relaxed = relaxed_retry_specs(pypi_name, specifiers, relax, abi_aliases);
     let try_relaxed = relaxed.is_some();
     fetch_artifact_from_pypi_index_chain(
         indexes,
@@ -9516,6 +9890,49 @@ fn is_fresh(output: &Path, input: &Path) -> Result<bool> {
     Ok(true)
 }
 
+fn relaxed_wheel_cache_stamp_path(wheel: &Path) -> PathBuf {
+    let filename = wheel
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_default();
+    wheel.with_file_name(format!("{filename}.retread-cache"))
+}
+
+fn relaxed_wheel_cache_stamp(relax: RelaxPolicy, abi_aliases: &AbiAliasGraph) -> String {
+    format!(
+        "emit-epoch={}\npolicy={relax:?}\nabi-aliases={abi_aliases:?}\n",
+        crate::lock::EMIT_EPOCH
+    )
+}
+
+fn is_relaxed_wheel_cache_fresh(
+    output: &Path,
+    input: &Path,
+    relax: RelaxPolicy,
+    abi_aliases: &AbiAliasGraph,
+) -> Result<bool> {
+    if !is_fresh(output, input)? {
+        return Ok(false);
+    }
+    let expected = relaxed_wheel_cache_stamp(relax, abi_aliases);
+    Ok(
+        std::fs::read_to_string(relaxed_wheel_cache_stamp_path(output))
+            .is_ok_and(|actual| actual == expected),
+    )
+}
+
+fn write_relaxed_wheel_cache_stamp(
+    output: &Path,
+    relax: RelaxPolicy,
+    abi_aliases: &AbiAliasGraph,
+) -> Result<()> {
+    std::fs::write(
+        relaxed_wheel_cache_stamp_path(output),
+        relaxed_wheel_cache_stamp(relax, abi_aliases),
+    )
+    .with_context(|| format!("writing relaxed-wheel cache stamp for {}", output.display()))
+}
+
 /// After the user-driven (extras + prefix) BFS, optionally bundle any
 /// exact-pinned base deps that resolve cleanly on the entry's PyPI index.
 /// Compute the upstream checkout root for an entry, when one exists.
@@ -9655,6 +10072,7 @@ pub(crate) struct EntryAuditInfo {
 
 /// Build / fetch the primary wheel for an entry, apply D, return as
 /// a [`ResolvedWheel`].
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn materialize_and_rewrite(
     entry: &crate::config::WheelEntry,
@@ -9669,7 +10087,38 @@ async fn materialize_and_rewrite(
     auto_data: Option<AutoDataConfig>,
     audit_info: EntryAuditInfo,
 ) -> Result<(ResolvedWheel, Vec<String>)> {
-    use crate::wheel_rewrite::rewrite_wheel;
+    materialize_and_rewrite_with_abi_aliases(
+        entry,
+        entry_name,
+        expected_version,
+        target,
+        download_dir,
+        source_dir,
+        cache_dir,
+        relax,
+        git_sources,
+        auto_data,
+        audit_info,
+        &AbiAliasGraph::new(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn materialize_and_rewrite_with_abi_aliases(
+    entry: &crate::config::WheelEntry,
+    entry_name: &str,
+    expected_version: Option<&str>,
+    target: &ResolutionTarget,
+    download_dir: &Path,
+    source_dir: &Path,
+    cache_dir: &Path,
+    relax: RelaxPolicy,
+    git_sources: &std::collections::BTreeMap<String, crate::config::NamedGitSource>,
+    auto_data: Option<AutoDataConfig>,
+    audit_info: EntryAuditInfo,
+    abi_aliases: &AbiAliasGraph,
+) -> Result<(ResolvedWheel, Vec<String>)> {
     let pypi_name = canonical_conda_name(entry_name);
     let persisted_auto_data = persist_git_auto_data(auto_data.as_ref())?;
 
@@ -10096,7 +10545,7 @@ async fn materialize_and_rewrite(
         with_data_path
     } else {
         let rewritten = with_data_path.with_extension("relaxed.whl");
-        if is_fresh(&rewritten, &with_data_path)? {
+        if is_relaxed_wheel_cache_fresh(&rewritten, &with_data_path, relax, abi_aliases)? {
             tracing::info!(
                 entry = %entry_name,
                 wheel = %rewritten.display(),
@@ -10108,14 +10557,21 @@ async fn materialize_and_rewrite(
                 policy = ?relax,
                 "applying relax policy to wheel METADATA",
             );
-            let _new_sha = rewrite_wheel(&with_data_path, &rewritten, relax)
-                .with_context(|| {
-                    format!(
-                        "phase 2 wheel METADATA rewrite for entry `{entry_name}` (policy={relax:?}, \
+            let _new_sha = rewrite_wheel_with_abi_aliases(
+                &with_data_path,
+                &rewritten,
+                relax,
+                abi_aliases,
+            )
+            .with_context(|| {
+                format!(
+                    "phase 2 wheel METADATA rewrite for entry `{entry_name}` (policy={relax:?}, \
                          input={}, output={})",
-                        with_data_path.display(), rewritten.display(),
-                    )
-                })?;
+                    with_data_path.display(),
+                    rewritten.display(),
+                )
+            })?;
+            write_relaxed_wheel_cache_stamp(&rewritten, relax, abi_aliases)?;
         }
         rewritten
     };
@@ -10359,10 +10815,11 @@ struct EmittedBundleRouteAssembly {
 
 #[derive(Clone, Debug)]
 struct PypiEmissionGroup {
-    pypi_name: PypiKey,
+    pypi_names: BTreeSet<PypiKey>,
     conda_name: CondaName,
+    conda_name_is_authoritative: bool,
     constraints: Vec<Constraint>,
-    native_conda_override: Option<String>,
+    native_conda_overrides: BTreeSet<String>,
 }
 
 #[derive(Debug)]
@@ -10455,30 +10912,798 @@ fn add_emission_constraint(
     indexes: &mut BTreeMap<PypiKey, usize>,
     pypi_name: PypiKey,
     conda_name: CondaName,
+    conda_name_is_authoritative: bool,
     constraint: Constraint,
     native_conda_override: Option<String>,
-) {
-    let index = match indexes.get(&pypi_name) {
+) -> Result<()> {
+    let conda_key = conda_name.key();
+    let index = match indexes.get(&conda_key) {
         Some(index) => *index,
         None => {
             let index = groups.len();
-            indexes.insert(pypi_name.clone(), index);
+            indexes.insert(conda_key, index);
             groups.push(PypiEmissionGroup {
-                pypi_name,
-                conda_name,
+                pypi_names: BTreeSet::new(),
+                conda_name: conda_name.clone(),
+                conda_name_is_authoritative,
                 constraints: Vec::new(),
-                native_conda_override: None,
+                native_conda_overrides: BTreeSet::new(),
             });
             index
         }
     };
     let group = &mut groups[index];
+    if group.conda_name != conda_name {
+        match (
+            group.conda_name_is_authoritative,
+            conda_name_is_authoritative,
+        ) {
+            (false, true) => {
+                group.conda_name = conda_name;
+                group.conda_name_is_authoritative = true;
+            }
+            (true, false) => {}
+            _ => {
+                bail!(
+                    "multiple equal-authority raw conda targets `{}` and `{}` share canonical \
+                     identity `{}`; refusing to discard either dependency edge",
+                    group.conda_name,
+                    conda_name,
+                    group.conda_name.key()
+                );
+            }
+        }
+    }
+    group.pypi_names.insert(pypi_name);
     if !group.constraints.contains(&constraint) {
         group.constraints.push(constraint);
     }
-    if native_conda_override.is_some() {
-        group.native_conda_override = native_conda_override;
+    if let Some(native_conda_override) = native_conda_override {
+        group.native_conda_overrides.insert(native_conda_override);
+        if group.native_conda_overrides.len() > 1 {
+            bail!(
+                "conflicting native conda overrides target `{}`: {}",
+                group.conda_name,
+                group
+                    .native_conda_overrides
+                    .iter()
+                    .map(|spec| format!("`{spec}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
     }
+    Ok(())
+}
+
+#[derive(Clone, Default)]
+struct EffectiveVersionRange {
+    lower: Option<EffectiveVersionBound>,
+    upper: Option<EffectiveVersionBound>,
+    predicates: Vec<EffectiveVersionPredicate>,
+}
+
+#[derive(Clone)]
+struct EffectiveVersionBound {
+    version: rattler_conda_types::Version,
+    exclusive: bool,
+    minor_anchor: bool,
+}
+
+#[derive(Clone)]
+enum EffectiveVersionPredicate {
+    StartsWith(rattler_conda_types::Version),
+    NotStartsWith(rattler_conda_types::Version),
+    Compatible(rattler_conda_types::Version),
+    NotCompatible(rattler_conda_types::Version),
+}
+
+impl EffectiveVersionPredicate {
+    fn anchor(&self) -> &rattler_conda_types::Version {
+        match self {
+            Self::StartsWith(version)
+            | Self::NotStartsWith(version)
+            | Self::Compatible(version)
+            | Self::NotCompatible(version) => version,
+        }
+    }
+
+    fn matches(&self, candidate: &rattler_conda_types::Version) -> bool {
+        match self {
+            Self::StartsWith(version) => candidate.starts_with(version),
+            Self::NotStartsWith(version) => !candidate.starts_with(version),
+            Self::Compatible(version) => candidate.compatible_with(version),
+            Self::NotCompatible(version) => !candidate.compatible_with(version),
+        }
+    }
+}
+
+impl EffectiveVersionRange {
+    fn intersect(mut self, other: Self) -> Self {
+        let Self {
+            lower: other_lower,
+            upper: other_upper,
+            predicates: other_predicates,
+        } = other;
+        self.predicates.extend(other_predicates);
+        self.lower = match (self.lower, other_lower) {
+            (Some(left), Some(right)) => Some(if left.version > right.version {
+                left
+            } else if right.version > left.version {
+                right
+            } else {
+                EffectiveVersionBound {
+                    version: left.version,
+                    exclusive: left.exclusive || right.exclusive,
+                    minor_anchor: left.minor_anchor || right.minor_anchor,
+                }
+            }),
+            (bound @ Some(_), None) | (None, bound @ Some(_)) => bound,
+            (None, None) => None,
+        };
+        self.upper = match (self.upper, other_upper) {
+            (Some(left), Some(right)) => Some(if left.version < right.version {
+                left
+            } else if right.version < left.version {
+                right
+            } else {
+                EffectiveVersionBound {
+                    version: left.version,
+                    exclusive: left.exclusive || right.exclusive,
+                    minor_anchor: left.minor_anchor || right.minor_anchor,
+                }
+            }),
+            (bound @ Some(_), None) | (None, bound @ Some(_)) => bound,
+            (None, None) => None,
+        };
+        self
+    }
+
+    fn bounds_are_empty(&self) -> bool {
+        matches!(
+            (&self.lower, &self.upper),
+            (Some(lower), Some(upper))
+                if lower.version > upper.version
+                    || (lower.version == upper.version
+                        && (lower.exclusive || upper.exclusive))
+        )
+    }
+
+    fn contains(&self, candidate: &rattler_conda_types::Version) -> bool {
+        let above_lower = self.lower.as_ref().is_none_or(|lower| {
+            if lower.exclusive {
+                candidate > &lower.version
+            } else {
+                candidate >= &lower.version
+            }
+        });
+        let below_upper = self.upper.as_ref().is_none_or(|upper| {
+            if upper.exclusive {
+                candidate < &upper.version
+            } else {
+                candidate <= &upper.version
+            }
+        });
+        above_lower && below_upper
+    }
+
+    fn has_predicate_witness(&self) -> bool {
+        let candidates = self
+            .lower
+            .iter()
+            .chain(self.upper.iter())
+            .map(|bound| bound.version.clone())
+            .chain(
+                self.predicates
+                    .iter()
+                    .map(|predicate| predicate.anchor().clone()),
+            )
+            .collect::<BTreeSet<_>>();
+        candidates.into_iter().any(|candidate| {
+            self.contains(&candidate)
+                && self
+                    .predicates
+                    .iter()
+                    .all(|predicate| predicate.matches(&candidate))
+        })
+    }
+
+    fn is_singleton(&self) -> bool {
+        matches!(
+            (&self.lower, &self.upper),
+            (Some(lower), Some(upper))
+                if lower.version == upper.version
+                    && !lower.exclusive
+                    && !upper.exclusive
+        )
+    }
+
+    fn is_empty(&self) -> bool {
+        self.bounds_are_empty()
+            || (!self.predicates.is_empty() && self.is_singleton() && !self.has_predicate_witness())
+    }
+
+    fn is_proven_nonempty(&self) -> bool {
+        !self.bounds_are_empty() && (self.predicates.is_empty() || self.has_predicate_witness())
+    }
+
+    fn has_effective_minor_bound(&self) -> bool {
+        self.lower
+            .iter()
+            .chain(self.upper.iter())
+            .any(|bound| bound.minor_anchor)
+    }
+}
+
+/// Take the convex hull of the interval envelopes of a disjunction before
+/// deciding whether a minor boundary is load-bearing. Internal boundaries and
+/// gaps do not constrain the outer ABI range: `<=3.1|>3.1` becomes unbounded,
+/// while `>=3,<3.1|>=3.1,<4` becomes the bare-major interval `[3,4)`.
+///
+/// Predicate-bearing multi-range unions are rejected by the caller instead
+/// of being sent here: their interval envelopes can over-approximate the real
+/// prefix/compatible sets.
+fn convex_hull_effective_range_envelopes(
+    mut ranges: Vec<EffectiveVersionRange>,
+) -> Vec<EffectiveVersionRange> {
+    ranges.sort_by(|left, right| match (&left.lower, &right.lower) {
+        (None, None) => std::cmp::Ordering::Equal,
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (Some(left), Some(right)) => left
+            .version
+            .cmp(&right.version)
+            .then_with(|| left.exclusive.cmp(&right.exclusive)),
+    });
+
+    let mut merged: Vec<EffectiveVersionRange> = Vec::new();
+    for mut range in ranges {
+        let Some(last) = merged.last_mut() else {
+            range.predicates.clear();
+            merged.push(range);
+            continue;
+        };
+        if let (Some(left), Some(right)) = (&mut last.lower, &range.lower)
+            && left.version == right.version
+        {
+            left.exclusive &= right.exclusive;
+            left.minor_anchor |= right.minor_anchor;
+        }
+        last.upper = match (last.upper.take(), range.upper) {
+            (None, _) | (_, None) => None,
+            (Some(left), Some(right)) => Some(if left.version > right.version {
+                left
+            } else if right.version > left.version {
+                right
+            } else {
+                EffectiveVersionBound {
+                    version: left.version,
+                    exclusive: left.exclusive && right.exclusive,
+                    minor_anchor: left.minor_anchor || right.minor_anchor,
+                }
+            }),
+        };
+        last.predicates.clear();
+    }
+    merged
+}
+
+fn checked_bump_last(
+    version: &rattler_conda_types::Version,
+) -> Option<rattler_conda_types::Version> {
+    // Consume this iterator forward because rattler computes each segment's
+    // component offset as the iterator advances.
+    let last_segment = version.segments().fold(None, |_, segment| Some(segment))?;
+    let last_numeral = last_segment
+        .components()
+        .filter_map(rattler_conda_types::Component::as_number)
+        .next_back()?;
+    if last_numeral == u64::MAX {
+        return None;
+    }
+    version
+        .bump(rattler_conda_types::VersionBumpType::Last)
+        .ok()
+}
+
+fn effective_version_ranges(spec: &VersionSpec) -> Vec<EffectiveVersionRange> {
+    use rattler_conda_types::version_spec::{
+        EqualityOperator, LogicalOperator, RangeOperator, StrictRangeOperator,
+    };
+
+    let is_semantic_minor_boundary = |version: &rattler_conda_types::Version| {
+        version.as_major_minor().is_some()
+            && version
+                .with_segments(..1)
+                .is_some_and(|major| *version != major)
+    };
+    let lower_with_anchor =
+        |version: rattler_conda_types::Version, exclusive, minor_anchor| EffectiveVersionRange {
+            lower: Some(EffectiveVersionBound {
+                minor_anchor,
+                version,
+                exclusive,
+            }),
+            upper: None,
+            predicates: Vec::new(),
+        };
+    let upper_with_anchor =
+        |version: rattler_conda_types::Version, exclusive, minor_anchor| EffectiveVersionRange {
+            lower: None,
+            upper: Some(EffectiveVersionBound {
+                minor_anchor,
+                version,
+                exclusive,
+            }),
+            predicates: Vec::new(),
+        };
+    let lower = |version: rattler_conda_types::Version, exclusive| {
+        let minor_anchor = is_semantic_minor_boundary(&version);
+        lower_with_anchor(version, exclusive, minor_anchor)
+    };
+    let upper = |version: rattler_conda_types::Version, exclusive| {
+        let minor_anchor = is_semantic_minor_boundary(&version);
+        upper_with_anchor(version, exclusive, minor_anchor)
+    };
+
+    match spec {
+        VersionSpec::None => Vec::new(),
+        VersionSpec::Any => vec![EffectiveVersionRange::default()],
+        VersionSpec::Range(RangeOperator::Greater, version) => {
+            vec![lower(version.clone(), true)]
+        }
+        VersionSpec::Range(RangeOperator::GreaterEquals, version) => {
+            vec![lower(version.clone(), false)]
+        }
+        VersionSpec::Range(RangeOperator::Less, version) => {
+            vec![upper(version.clone(), true)]
+        }
+        VersionSpec::Range(RangeOperator::LessEquals, version) => {
+            vec![upper(version.clone(), false)]
+        }
+        VersionSpec::Exact(EqualityOperator::Equals, version) => {
+            vec![EffectiveVersionRange {
+                lower: Some(EffectiveVersionBound {
+                    version: version.clone(),
+                    exclusive: false,
+                    // Equality selects one concrete version even when it has
+                    // only a major segment (for example `==3`).
+                    minor_anchor: true,
+                }),
+                upper: Some(EffectiveVersionBound {
+                    version: version.clone(),
+                    exclusive: false,
+                    minor_anchor: true,
+                }),
+                predicates: Vec::new(),
+            }]
+        }
+        VersionSpec::Exact(EqualityOperator::NotEquals, version) => {
+            // The complement of one exact point. Exclusion-created bounds do
+            // not count as the positive minor anchor required for ABI safety.
+            vec![
+                upper_with_anchor(version.clone(), true, false),
+                lower_with_anchor(version.clone(), true, false),
+            ]
+        }
+        VersionSpec::StrictRange(StrictRangeOperator::StartsWith, version) => {
+            let lower = lower(version.0.clone(), false);
+            let upper = checked_bump_last(&version.0)
+                .map(|version| upper(version, true))
+                .unwrap_or_default();
+            let mut range = lower.intersect(upper);
+            range
+                .predicates
+                .push(EffectiveVersionPredicate::StartsWith(version.0.clone()));
+            vec![range]
+        }
+        VersionSpec::StrictRange(StrictRangeOperator::NotStartsWith, version) => {
+            // `!=P.*` is the complement of [P, bump_last(P)).
+            // Keep the real negative predicate as well: matching prereleases
+            // can sort below P while still starting with P.
+            let mut ranges = vec![upper_with_anchor(version.0.clone(), true, false)];
+            if let Some(ceiling) = checked_bump_last(&version.0) {
+                ranges.push(lower_with_anchor(ceiling, false, false));
+            }
+            for range in &mut ranges {
+                range
+                    .predicates
+                    .push(EffectiveVersionPredicate::NotStartsWith(version.0.clone()));
+            }
+            ranges
+        }
+        VersionSpec::StrictRange(StrictRangeOperator::Compatible, version) => {
+            let lower = lower(version.0.clone(), false);
+            let upper = version
+                .0
+                .pop_segments(1)
+                .and_then(|prefix| checked_bump_last(&prefix))
+                .map(|version| upper(version, true))
+                .unwrap_or_default();
+            let mut range = lower.intersect(upper);
+            range
+                .predicates
+                .push(EffectiveVersionPredicate::Compatible(version.0.clone()));
+            vec![range]
+        }
+        VersionSpec::StrictRange(StrictRangeOperator::NotCompatible, version) => {
+            // The positive compatible interval is [V, compatible_upper(V)).
+            // Keep its two complement branches; if the upper boundary cannot
+            // be represented, retain only the provable before-V branch. The
+            // real negative predicate closes prerelease ordering gaps.
+            let mut ranges = vec![upper_with_anchor(version.0.clone(), true, false)];
+            if let Some(ceiling) = version
+                .0
+                .pop_segments(1)
+                .and_then(|prefix| checked_bump_last(&prefix))
+            {
+                ranges.push(lower_with_anchor(ceiling, false, false));
+            }
+            for range in &mut ranges {
+                range
+                    .predicates
+                    .push(EffectiveVersionPredicate::NotCompatible(version.0.clone()));
+            }
+            ranges
+        }
+        VersionSpec::Group(LogicalOperator::Or, members) => {
+            members.iter().flat_map(effective_version_ranges).collect()
+        }
+        VersionSpec::Group(LogicalOperator::And, members) => {
+            members
+                .iter()
+                .fold(vec![EffectiveVersionRange::default()], |ranges, member| {
+                    let member_ranges = effective_version_ranges(member);
+                    ranges
+                        .into_iter()
+                        .flat_map(|range| {
+                            member_ranges
+                                .iter()
+                                .cloned()
+                                .map(move |member_range| range.clone().intersect(member_range))
+                        })
+                        .filter(|range| !range.is_empty())
+                        .collect()
+                })
+        }
+    }
+}
+
+fn is_bare_major_spec(spec: &str) -> bool {
+    let Ok(spec) =
+        VersionSpec::from_str(spec.trim(), rattler_conda_types::ParseStrictness::Lenient)
+    else {
+        // This is a release-mode safety net. An unparseable anchor constraint
+        // cannot demonstrate a load-bearing minor restriction, so fail closed.
+        return true;
+    };
+    let mut ranges = Vec::new();
+    for range in effective_version_ranges(&spec) {
+        if range.is_empty() {
+            continue;
+        }
+        if !range.is_proven_nonempty() {
+            return true;
+        }
+        ranges.push(range);
+    }
+    if ranges.is_empty() {
+        return true;
+    }
+    if ranges
+        .iter()
+        .any(|range| !range.has_effective_minor_bound())
+    {
+        return true;
+    }
+    if ranges.len() > 1 && ranges.iter().any(|range| !range.predicates.is_empty()) {
+        return true;
+    }
+    convex_hull_effective_range_envelopes(ranges)
+        .iter()
+        .any(|range| !range.has_effective_minor_bound())
+}
+
+type WorkspaceAbiVersions = BTreeMap<String, BTreeSet<String>>;
+
+fn output_abi_aliases(bundle: &Bundle, config: &RetreadConfig) -> AbiAliasGraph {
+    let mut aliases = abi_aliases_from_name_map(&config.name_map);
+    for route in &bundle.auto_routed {
+        add_abi_alias_edge(
+            &mut aliases,
+            &route.route.pypi_name,
+            &route.route.conda_name,
+        );
+        if let Some(provider) = &route.workspace_provider {
+            add_abi_alias_edge(
+                &mut aliases,
+                &route.route.pypi_name,
+                provider.conda_name.as_spec(),
+            );
+        }
+    }
+    aliases
+}
+
+fn output_workspace_abi_versions(
+    bundle: &Bundle,
+    workspace_python_version: &str,
+) -> WorkspaceAbiVersions {
+    let mut workspace_versions = WorkspaceAbiVersions::new();
+    for (name, version) in &bundle.workspace_conda_versions {
+        workspace_versions
+            .entry(canonical_conda_name(name))
+            .or_default()
+            .insert(version.clone());
+    }
+    for (name, fact) in &bundle.workspace_conda_provider_facts {
+        workspace_versions
+            .entry(canonical_conda_name(name))
+            .or_default()
+            .extend(fact.selected_versions.iter().cloned());
+    }
+    for route in &bundle.auto_routed {
+        if let Some(provider) = &route.workspace_provider {
+            workspace_versions
+                .entry(provider.conda_name.key().into_string())
+                .or_default()
+                .extend(provider.selected_versions.iter().cloned());
+        }
+    }
+    if workspace_python_version.contains('.') {
+        workspace_versions
+            .entry("python".to_string())
+            .or_default()
+            .insert(workspace_python_version.to_string());
+    }
+    workspace_versions
+}
+
+/// Current, solved ABI facts attached to one advertised output.
+///
+/// This is process-local on purpose: producer-time lock facts cannot stand in
+/// for the versions conda/outputs selected for the current build request.
+struct ReplayAbiContext {
+    workspace_versions: WorkspaceAbiVersions,
+    overrides: BTreeMap<String, String>,
+    aliases: AbiAliasGraph,
+}
+
+fn replay_abi_context_for_bundle(
+    bundle: &Bundle,
+    config: &RetreadConfig,
+    workspace_python_version: &str,
+) -> ReplayAbiContext {
+    ReplayAbiContext {
+        workspace_versions: output_workspace_abi_versions(bundle, workspace_python_version),
+        overrides: config.overrides.clone(),
+        aliases: output_abi_aliases(bundle, config),
+    }
+}
+
+/// Post-emission ABI safety net ported from the deleted cascade.
+///
+/// The former implementation only logged and merely noticed workspace pins.
+/// This pure check returns stable violations so every emission caller can
+/// reject corruption in release builds.
+pub(crate) fn check_output_abi_invariants(
+    output_run_deps: &[(String, String)],
+    embedded_requires_dist: &[(String, String)],
+    workspace_versions: &WorkspaceAbiVersions,
+    overrides: &BTreeMap<String, String>,
+    aliases: &AbiAliasGraph,
+) -> Vec<String> {
+    let mut violations = Vec::new();
+    let mut emitted = output_run_deps
+        .iter()
+        .cloned()
+        .map(|(name, spec)| (name, spec, "retread emitted".to_string(), None))
+        .collect::<Vec<_>>();
+    for (wheel, raw) in embedded_requires_dist {
+        let Ok(requirement): Result<uv_pep508::Requirement, _> =
+            uv_pep508::Requirement::from_str(raw)
+        else {
+            continue;
+        };
+        let (spec, pep440_specifiers) = match requirement.version_or_url.as_ref() {
+            None => (String::new(), Some(VersionSpecifiers::empty())),
+            Some(uv_pep508::VersionOrUrl::VersionSpecifier(specifiers)) => (
+                specifiers.to_string().replace(", ", ","),
+                Some(specifiers.clone()),
+            ),
+            // A direct artifact URL is itself an exact artifact selection, not
+            // an unconstrained version range.
+            Some(uv_pep508::VersionOrUrl::Url(_)) => continue,
+        };
+        emitted.push((
+            requirement.name.to_string(),
+            spec,
+            format!("wheel `{wheel}` embeds"),
+            pep440_specifiers,
+        ));
+    }
+    emitted.sort_by(|left, right| (&left.0, &left.1, &left.2).cmp(&(&right.0, &right.1, &right.2)));
+
+    for (name, spec, origin, pep440_specifiers) in emitted {
+        if !is_semantic_abi_anchor(&name, aliases) {
+            continue;
+        }
+        let trimmed = spec.trim();
+        if trimmed.is_empty() || trimmed == "*" {
+            violations.push(format!(
+                "ABI invariant: {origin} `{name} {trimmed}` (empty/*); \
+                 ABI anchors must carry a concrete spec"
+            ));
+            continue;
+        }
+        if pep440_specifiers
+            .as_ref()
+            .is_some_and(crate::constraint::specifiers_unsatisfiable)
+        {
+            violations.push(format!(
+                "ABI invariant: {origin} `{name} {trimmed}` is unsatisfiable under PEP 440"
+            ));
+            continue;
+        }
+        if is_bare_major_spec(trimmed) {
+            violations.push(format!(
+                "ABI invariant: {origin} `{name} {trimmed}` (bare-major); \
+                 ABI anchors must carry a minor or stricter spec"
+            ));
+            continue;
+        }
+
+        let parsed_conda_spec = pep440_specifiers
+            .is_none()
+            .then(|| VersionSpec::from_str(trimmed, rattler_conda_types::ParseStrictness::Lenient));
+        for workspace_name in semantic_aliases(&name, aliases) {
+            let Some(selected_versions) = workspace_versions.get(&workspace_name) else {
+                continue;
+            };
+            for workspace_version in selected_versions {
+                if let Some(specifiers) = &pep440_specifiers {
+                    match uv_pep508::uv_pep440::Version::from_str(workspace_version) {
+                        Ok(version) if specifiers.contains(&version) => {}
+                        Ok(_) => violations.push(format!(
+                            "ABI invariant: {origin} `{name} {trimmed}` does not cover workspace pin \
+                             `{workspace_name}=={workspace_version}`"
+                        )),
+                        Err(error) => violations.push(format!(
+                            "ABI invariant: workspace pin `{workspace_name}=={workspace_version}` \
+                             cannot be validated as PEP 440: {error}"
+                        )),
+                    }
+                    continue;
+                }
+
+                let parsed_version = rattler_conda_types::Version::from_str(workspace_version);
+                match (&parsed_version, parsed_conda_spec.as_ref().unwrap()) {
+                    (Ok(version), Ok(specifier)) if specifier.matches(version) => {}
+                    (Ok(_), Ok(_)) => violations.push(format!(
+                        "ABI invariant: {origin} `{name} {trimmed}` does not cover workspace pin \
+                         `{workspace_name}=={workspace_version}`"
+                    )),
+                    (Err(error), _) => violations.push(format!(
+                        "ABI invariant: workspace pin `{workspace_name}=={workspace_version}` \
+                         cannot be validated: {error}"
+                    )),
+                    (_, Err(error)) => violations.push(format!(
+                        "ABI invariant: {origin} anchor spec `{name} {trimmed}` cannot be \
+                         validated: {error}"
+                    )),
+                }
+            }
+        }
+    }
+
+    for (name, spec) in overrides {
+        if !is_semantic_abi_anchor(name, aliases) {
+            continue;
+        }
+        let trimmed = spec.trim();
+        if trimmed.is_empty() || trimmed == "*" || is_bare_major_spec(trimmed) {
+            violations.push(format!(
+                "ABI invariant: `retread-overrides[{name}]` is `{trimmed}`; \
+                 ABI anchors must never be widened to */bare-major"
+            ));
+        }
+    }
+
+    violations.sort();
+    violations.dedup();
+    violations
+}
+
+fn ensure_output_abi_invariants(
+    output: &CondaOutput,
+    bundle: &Bundle,
+    config: &RetreadConfig,
+    workspace_python_version: &str,
+) -> Result<()> {
+    let emitted = output
+        .run_dependencies
+        .depends
+        .iter()
+        .map(|dependency| {
+            (
+                dependency.name.as_str().to_string(),
+                audit_report::format_packagespec(&dependency.spec),
+            )
+        })
+        .collect::<Vec<_>>();
+    let workspace_versions = output_workspace_abi_versions(bundle, workspace_python_version);
+    // The courier performs one final metadata rewrite after phase D. Validate
+    // the requirements uv will actually read, rather than the intermediate
+    // phase-D lines: floor envelopes can reconcile several source-wheel
+    // clauses, and orphan URL requirements can be removed entirely.
+    let emit_wheels = bundle
+        .all_wheels()
+        .map(|wheel| crate::emit_pypi::EmitWheel {
+            pypi_name: wheel.pypi_name.clone(),
+            version: wheel.metadata.version.clone(),
+            requires_dist: wheel.metadata.requires_dist.clone(),
+            local_path: wheel.url.to_file_path().ok(),
+            wheel_filename: wheel.metadata.filename.clone(),
+            sha256: Some(wheel.metadata.sha256.clone()),
+            locked_final_sha256: None,
+            remote_url: (wheel.url.scheme() != "file").then(|| wheel.url.clone()),
+            upstream_url: wheel.upstream_url.clone(),
+            git_source: wheel.git_source.clone(),
+            sdist_source: wheel.sdist_source.clone(),
+        })
+        .collect::<Vec<_>>();
+    let mut conda_capable = bundle
+        .probe_decisions
+        .iter()
+        .filter(|decision| decision.matching_candidates > 0)
+        .map(|decision| canonical_conda_name(&decision.pypi_name))
+        .collect::<HashSet<_>>();
+    conda_capable.extend(config.name_map.keys().map(|key| key.as_str().to_owned()));
+    let emit_plan = crate::emit_pypi::plan(&emit_wheels, &conda_capable);
+    let line_map = crate::emit_pypi::override_line_map(
+        &emit_plan.overrides,
+        &conda_capable,
+        &emit_plan.drop_url,
+    );
+    let embedded_requires_dist = emit_wheels
+        .iter()
+        .flat_map(|wheel| {
+            wheel
+                .requires_dist
+                .iter()
+                .filter_map(|requirement| match line_map(requirement) {
+                    crate::wheel_rewrite::LineAction::Keep => {
+                        Some((wheel.pypi_name.clone(), requirement.clone()))
+                    }
+                    crate::wheel_rewrite::LineAction::Replace(replacement) => {
+                        Some((wheel.pypi_name.clone(), replacement))
+                    }
+                    crate::wheel_rewrite::LineAction::Drop => None,
+                })
+        })
+        .collect::<Vec<_>>();
+    let aliases = output_abi_aliases(bundle, config);
+    let violations = check_output_abi_invariants(
+        &emitted,
+        &embedded_requires_dist,
+        &workspace_versions,
+        &config.overrides,
+        &aliases,
+    );
+    if violations.is_empty() {
+        return Ok(());
+    }
+    for violation in &violations {
+        tracing::error!(
+            bundle = %bundle.conda_name,
+            violation = %violation,
+            "bundle emission rejected by ABI invariant",
+        );
+    }
+    bail!(
+        "bundle emission rejected by ABI invariant: {}",
+        violations.join("; ")
+    )
 }
 
 fn produce_output_with_conflicts(
@@ -10493,7 +11718,11 @@ fn produce_output_with_conflicts(
     // on an incremental add).  `None` → use bundle.primary.metadata.version
     // (today's behaviour, always chosen when RETREAD_INCREMENTAL is unset).
     version_override: Option<&str>,
-) -> Result<(CondaOutput, Vec<EmissionConstraintConflict>)> {
+) -> Result<(
+    CondaOutput,
+    Vec<EmissionConstraintConflict>,
+    Vec<auto_bundle::WheelMetadataRelaxation>,
+)> {
     // Python version for the emitted variant/build/`python` dep. Shared with
     // the build recipe via `emit_python_version` so the metadata and the
     // recipe can never disagree. NEVER bare-major: a `py3-none-manylinux`
@@ -10614,9 +11843,10 @@ fn produce_output_with_conflicts(
                 &mut emission_group_indexes,
                 pypi_name,
                 workspace_provider.conda_name.clone(),
+                true,
                 workspace_provider.constraint.clone(),
                 None,
-            );
+            )?;
             continue;
         }
 
@@ -10632,18 +11862,20 @@ fn produce_output_with_conflicts(
         let manual_override = config.overrides.contains_key(conda_key.as_str())
             && !config.ledger_overrides.contains(conda_key.as_str());
         if !matches!(auto_route.provenance, Provenance::DepsFromRelaxed) {
-            let (route_spec, provenance) =
-                if crate::solve::is_abi_anchor(conda_key.as_str()) || manual_override {
-                    (format!("=={conda_version}"), Provenance::UvConstraint)
-                } else {
-                    match bounded_range_ceiling(conda_version) {
-                        Some(ceiling) => (
-                            format!(">={conda_version},<{ceiling}"),
-                            Provenance::UvConstraint,
-                        ),
-                        None => (format!("=={conda_version}"), Provenance::UvConstraint),
-                    }
-                };
+            let route_is_abi_anchor = crate::solve::is_abi_anchor(&auto_route.route.pypi_name)
+                || crate::solve::is_abi_anchor(auto_route.route.conda_name.as_str())
+                || crate::solve::is_abi_anchor(conda_key.as_str());
+            let (route_spec, provenance) = if route_is_abi_anchor || manual_override {
+                (format!("=={conda_version}"), Provenance::UvConstraint)
+            } else {
+                match bounded_range_ceiling(conda_version) {
+                    Some(ceiling) => (
+                        format!(">={conda_version},<{ceiling}"),
+                        Provenance::UvConstraint,
+                    ),
+                    None => (format!("=={conda_version}"), Provenance::UvConstraint),
+                }
+            };
             let specifiers = VersionSpecifiers::from_str(&route_spec).with_context(|| {
                 format!(
                     "parsing generated conda route constraint `{} {route_spec}`",
@@ -10655,6 +11887,7 @@ fn produce_output_with_conflicts(
                 &mut emission_group_indexes,
                 pypi_name.clone(),
                 conda_name.clone(),
+                true,
                 Constraint {
                     specifiers,
                     provenance,
@@ -10665,23 +11898,35 @@ fn produce_output_with_conflicts(
                         auto_route.route.conda_name,
                         auto_route.route.conda_version
                     ),
+                    origin_id: ConstraintOriginId::from_parts(
+                        "auto-route",
+                        [
+                            auto_route.route.pypi_name.as_str(),
+                            auto_route.route.pypi_version.as_str(),
+                            auto_route.route.conda_name.as_str(),
+                            auto_route.route.conda_version.as_str(),
+                            auto_route.route.channel.as_str(),
+                            "conda-selection",
+                            route_spec.as_str(),
+                        ],
+                    ),
                 },
                 None,
-            );
+            )?;
         }
-        let prior_specifiers =
-            VersionSpecifiers::from_str(&format!("=={}", auto_route.route.pypi_version))
-                .with_context(|| {
-                    format!(
-                        "parsing prior uv selection `{}=={}`",
-                        auto_route.route.pypi_name, auto_route.route.pypi_version
-                    )
-                })?;
+        let prior_spec = format!("=={}", auto_route.route.pypi_version);
+        let prior_specifiers = VersionSpecifiers::from_str(&prior_spec).with_context(|| {
+            format!(
+                "parsing prior uv selection `{}=={}`",
+                auto_route.route.pypi_name, auto_route.route.pypi_version
+            )
+        })?;
         add_emission_constraint(
             &mut emission_groups,
             &mut emission_group_indexes,
             pypi_name.clone(),
             conda_name.clone(),
+            true,
             Constraint {
                 specifiers: prior_specifiers,
                 provenance: Provenance::PriorSelection,
@@ -10689,10 +11934,27 @@ fn produce_output_with_conflicts(
                     "prior uv selection `{}=={}`",
                     auto_route.route.pypi_name, auto_route.route.pypi_version
                 ),
+                origin_id: ConstraintOriginId::from_parts(
+                    "auto-route",
+                    [
+                        auto_route.route.pypi_name.as_str(),
+                        auto_route.route.pypi_version.as_str(),
+                        auto_route.route.conda_name.as_str(),
+                        auto_route.route.conda_version.as_str(),
+                        auto_route.route.channel.as_str(),
+                        "prior-selection",
+                        prior_spec.as_str(),
+                    ],
+                ),
             },
             None,
-        );
+        )?;
         for input in &auto_route.route.input_requirements {
+            let input_role = match input.role {
+                crate::uv_closure::AutoRouteInputRole::Requirement => "requirement",
+                crate::uv_closure::AutoRouteInputRole::Constraint => "constraint",
+                crate::uv_closure::AutoRouteInputRole::Override => "override",
+            };
             let specifiers = if input.specifiers.trim().is_empty() {
                 VersionSpecifiers::empty()
             } else {
@@ -10708,13 +11970,26 @@ fn produce_output_with_conflicts(
                 &mut emission_group_indexes,
                 pypi_name.clone(),
                 conda_name.clone(),
+                true,
                 Constraint {
                     specifiers,
                     provenance: input.effective_provenance(),
                     source: input.source.clone(),
+                    origin_id: ConstraintOriginId::from_parts(
+                        "auto-route",
+                        [
+                            auto_route.route.pypi_name.as_str(),
+                            auto_route.route.pypi_version.as_str(),
+                            auto_route.route.conda_name.as_str(),
+                            auto_route.route.conda_version.as_str(),
+                            auto_route.route.channel.as_str(),
+                            input_role,
+                            input.specifiers.trim(),
+                        ],
+                    ),
                 },
                 None,
-            );
+            )?;
         }
     }
 
@@ -10727,7 +12002,10 @@ fn produce_output_with_conflicts(
                 &env,
                 &config.name_map,
                 &config.overrides,
-                config.relax,
+                // Final emission is strict-first. Collect the original wheel
+                // clause here; `relax_decision::decide` below is the sole
+                // policy-aware conflict relaxation boundary.
+                RelaxPolicy::None,
             )?
             else {
                 continue;
@@ -10813,6 +12091,7 @@ fn produce_output_with_conflicts(
                 &mut emission_group_indexes,
                 pypi_name,
                 conda_name,
+                false,
                 Constraint {
                     specifiers: translated.specifiers,
                     provenance: translated.provenance,
@@ -10820,9 +12099,17 @@ fn produce_output_with_conflicts(
                         "wheel `{}=={}` Requires-Dist `{raw}`",
                         wheel.metadata.name, wheel.metadata.version
                     ),
+                    origin_id: ConstraintOriginId::from_parts(
+                        "wheel-requires-dist",
+                        [
+                            wheel.metadata.name.as_str(),
+                            wheel.metadata.version.as_str(),
+                            raw.as_str(),
+                        ],
+                    ),
                 },
                 translated.native_conda_override,
-            );
+            )?;
         }
     }
 
@@ -10834,6 +12121,12 @@ fn produce_output_with_conflicts(
     // still requires the configured route edge used by translation.
     for group in &mut emission_groups {
         let conda_key = group.conda_name.key();
+        let pypi_names = group
+            .pypi_names
+            .iter()
+            .map(PypiKey::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
         let Some(version) = bundle.workspace_conda_versions.get(conda_key.as_str()) else {
             continue;
         };
@@ -10847,8 +12140,8 @@ fn produce_output_with_conflicts(
         let workspace_version =
             uv_pep508::uv_pep440::Version::from_str(version).with_context(|| {
                 format!(
-                    "parsing common workspace conda version `{version}` for PyPI `{}`",
-                    group.pypi_name
+                    "parsing common workspace conda version `{version}` for PyPI origin(s) \
+                     `{pypi_names}`"
                 )
             })?;
         if !group.constraints.iter().any(|constraint| {
@@ -10860,8 +12153,9 @@ fn produce_output_with_conflicts(
         let specifiers =
             VersionSpecifiers::from_str(&format!("=={version}")).with_context(|| {
                 format!(
-                    "parsing common workspace conda fact `{}=={version}` for PyPI `{}`",
-                    group.conda_name, group.pypi_name
+                    "parsing common workspace conda fact `{}=={version}` for PyPI origin(s) \
+                     `{pypi_names}`",
+                    group.conda_name
                 )
             })?;
         let constraint = Constraint {
@@ -10871,36 +12165,112 @@ fn produce_output_with_conflicts(
                 "workspace conda fact `{}=={version}` shared by precise consuming environments",
                 group.conda_name
             ),
+            origin_id: ConstraintOriginId::from_parts(
+                "workspace-conda-fact",
+                [conda_key.as_str(), version.as_str()],
+            ),
         };
         if !group.constraints.contains(&constraint) {
             group.constraints.push(constraint);
         }
     }
 
+    emission_groups.sort_by(|left, right| {
+        (left.conda_name.as_spec(), &left.pypi_names)
+            .cmp(&(right.conda_name.as_spec(), &right.pypi_names))
+    });
+    let abi_aliases = output_abi_aliases(bundle, config);
     let mut conflicts = Vec::new();
+    let mut pending_relaxations = Vec::new();
     for group in emission_groups {
-        let conda_key = group.conda_name.key().into_string();
+        let PypiEmissionGroup {
+            pypi_names,
+            conda_name,
+            conda_name_is_authoritative: _,
+            constraints,
+            native_conda_overrides,
+        } = group;
+        let pypi_name = pypi_names
+            .iter()
+            .find(|name| crate::solve::is_abi_anchor(name.as_str()))
+            .or_else(|| pypi_names.iter().next())
+            .cloned()
+            .expect("every emission group has a PyPI origin");
+        let has_anchor_alias = pypi_names
+            .iter()
+            .any(|name| crate::solve::is_abi_anchor(name.as_str()))
+            || is_semantic_abi_anchor(conda_name.as_spec(), &abi_aliases);
+        let native_conda_override = native_conda_overrides.into_iter().next();
+        let conda_key = conda_name.key().into_string();
         if !seen_dep_names.insert(conda_key) {
-            continue;
+            bail!(
+                "duplicate conda dependency target `{conda_name}` reached final emission; \
+                 refusing to discard a whole constraint edge"
+            );
         }
-        match finalize(&group.pypi_name, &group.constraints) {
-            Ok(specifiers) => {
-                let rendered = group
-                    .native_conda_override
+        match decide_relaxation(
+            &pypi_name,
+            &constraints,
+            config.relax,
+            &SafetyContext::new(Some(conda_name.as_spec())).with_abi_anchor_alias(has_anchor_alias),
+        ) {
+            RelaxDecision::Strict {
+                specifiers,
+                diagnostics,
+            } => {
+                pending_relaxations.extend(auto_bundle::wheel_metadata_relaxations(
+                    &pypi_name,
+                    &constraints,
+                    diagnostics,
+                    &bundle.conda_name,
+                    format!(" for bundle '{}'", bundle.conda_name),
+                ));
+                let rendered = native_conda_override
+                    .clone()
                     .unwrap_or_else(|| specifiers.to_string().replace(", ", ","));
-                let spec = group.conda_name.match_spec(&rendered);
+                let spec = conda_name.match_spec(&rendered);
                 run_dep_specs.push(spec_from_str(spec.as_str())?);
             }
-            Err(conflict) => {
+            RelaxDecision::Relaxed {
+                specifiers,
+                decisions,
+            } => {
+                pending_relaxations.extend(auto_bundle::wheel_metadata_relaxations(
+                    &pypi_name,
+                    &constraints,
+                    decisions,
+                    &bundle.conda_name,
+                    format!(" for bundle '{}'", bundle.conda_name),
+                ));
+                let rendered = native_conda_override
+                    .unwrap_or_else(|| specifiers.to_string().replace(", ", ","));
+                let spec = conda_name.match_spec(&rendered);
+                run_dep_specs.push(spec_from_str(spec.as_str())?);
+            }
+            RelaxDecision::Conflict(conflict) => {
+                let platform = host_platform.to_string();
+                let conflict = auto_bundle::attach_conflict_suggestion(
+                    conflict,
+                    bundle,
+                    config,
+                    &platform,
+                    workspace_python_version,
+                );
                 // Keep a name-only placeholder in the tolerant assembly so
                 // Rule 2 can identify and reject a wholly mutable route. The
                 // strict `produce_output` wrapper below always returns the
                 // structural conflict instead of emitting this placeholder.
-                run_dep_specs.push(spec_from_str(group.conda_name.as_spec())?);
+                run_dep_specs.push(spec_from_str(conda_name.as_spec())?);
                 conflicts.push(EmissionConstraintConflict {
-                    conda_name: group.conda_name,
+                    conda_name,
                     conflict,
                 });
+            }
+            RelaxDecision::SearchExhausted(exhausted) => {
+                return Err(anyhow::Error::new(exhausted.with_scope(format!(
+                    "while emitting conda dependency `{conda_name}` for bundle `{}`",
+                    bundle.conda_name
+                ))));
             }
         }
     }
@@ -10932,9 +12302,170 @@ fn produce_output_with_conflicts(
         config.bundle_mode == crate::config::BundleMode::Loose,
         siblings,
     )?;
-    Ok((output, conflicts))
+    Ok((output, conflicts, pending_relaxations))
 }
 
+fn produce_output_pending_relaxations(
+    bundle: &Bundle,
+    config: &RetreadConfig,
+    host_platform: Platform,
+    workspace_python_version: &str,
+    siblings: &[(String, String)],
+    courier_build_hash: Option<&str>,
+    version_override: Option<&str>,
+) -> Result<(CondaOutput, Vec<auto_bundle::WheelMetadataRelaxation>)> {
+    let (output, conflicts, pending_relaxations) = produce_output_with_conflicts(
+        bundle,
+        config,
+        host_platform,
+        workspace_python_version,
+        siblings,
+        courier_build_hash,
+        version_override,
+    )?;
+    if !conflicts.is_empty() {
+        let conda_names = conflicts
+            .iter()
+            .map(|conflict| conflict.conda_name.as_spec().to_string())
+            .collect::<Vec<_>>();
+        for conflict in &conflicts {
+            let conda_name = conflict.conda_name.as_spec().to_string();
+            tracing::error!(
+                bundle = %bundle.conda_name,
+                conda_dep = %conda_name,
+                error = %conflict.conflict,
+                "bundle emission rejected by structural constraint conflict",
+            );
+        }
+        let context = if conda_names.len() == 1 {
+            format!(
+                "emitting conda dependency `{}` for bundle `{}`",
+                conda_names[0], bundle.conda_name
+            )
+        } else {
+            format!(
+                "emitting conda dependencies {} for bundle `{}`",
+                conda_names
+                    .iter()
+                    .map(|name| format!("`{name}`"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                bundle.conda_name
+            )
+        };
+        let conflicts = conflicts
+            .into_iter()
+            .map(|conflict| conflict.conflict)
+            .collect();
+        return Err(aggregate_conflicts(conflicts)).with_context(|| context);
+    }
+    ensure_output_abi_invariants(&output, bundle, config, workspace_python_version)?;
+    Ok((output, pending_relaxations))
+}
+
+fn bundled_relaxations_for_output(
+    emitted_bundle: &str,
+    input_bundle: &str,
+    target: &ResolutionTarget,
+    restore_relaxations: &[auto_bundle::WheelMetadataRelaxation],
+    emission_relaxations: &[auto_bundle::WheelMetadataRelaxation],
+) -> Option<RelaxationManifest> {
+    let scope = RelaxationScope::for_target(target);
+    let records = restore_relaxations
+        .iter()
+        .filter(|relaxation| relaxation.bundle() == input_bundle)
+        .chain(
+            emission_relaxations
+                .iter()
+                .filter(|relaxation| relaxation.bundle() == emitted_bundle),
+        )
+        .map(|relaxation| relaxation.to_record(&scope))
+        .collect();
+    RelaxationManifest::new(emitted_bundle, records)
+}
+
+fn output_matches_build_request(
+    output: &CondaOutput,
+    requested: &pixi_build_types::procedures::conda_build_v1::CondaBuildV1Output,
+) -> bool {
+    output.metadata.name.as_normalized() == requested.name.as_normalized()
+        && requested
+            .version
+            .as_ref()
+            .is_none_or(|version| output.metadata.version.to_string() == version.to_string())
+        && requested
+            .build
+            .as_ref()
+            .is_none_or(|build| output.metadata.build == *build)
+        && output.metadata.subdir == requested.subdir
+}
+
+fn outputs_share_identity(left: &CondaOutput, right: &CondaOutput) -> bool {
+    left.metadata.name == right.metadata.name
+        && left.metadata.version.to_string() == right.metadata.version.to_string()
+        && left.metadata.build == right.metadata.build
+        && left.metadata.build_number == right.metadata.build_number
+        && left.metadata.subdir == right.metadata.subdir
+        && left.metadata.noarch == right.metadata.noarch
+}
+
+fn output_run_dependencies_match(
+    output: &CondaOutput,
+    advertised: Option<&[String]>,
+) -> Result<bool> {
+    run_dependencies_match(&output.run_dependencies.depends, advertised)
+}
+
+fn run_dependencies_match(
+    actual: &[NamedSpec<PackageSpec>],
+    advertised: Option<&[String]>,
+) -> Result<bool> {
+    let Some(advertised) = advertised else {
+        return Ok(true);
+    };
+    let expected = advertised
+        .iter()
+        .map(|raw| {
+            let spec = rattler_conda_types::MatchSpec::from_str(
+                raw,
+                rattler_conda_types::ParseStrictness::Lenient,
+            )
+            .with_context(|| format!("parsing advertised run dependency `{raw}`"))?;
+            let name = spec
+                .name
+                .as_ref()
+                .ok_or_else(|| anyhow!("advertised run dependency `{raw}` has no package name"))?;
+            let mut normalized = name.to_string();
+            if let Some(version) = spec.version {
+                normalized.push(' ');
+                normalized.push_str(&version.to_string());
+            }
+            if let Some(build) = spec.build {
+                normalized.push(' ');
+                normalized.push_str(&build.to_string());
+            }
+            spec_from_str(&normalized)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    // Pixi may append host/build run exports (notably python_abi) before
+    // build_v1. Those extras are legitimate, but every dependency advertised
+    // by conda/outputs must remain byte-for-byte semantically present: replacing
+    // a relaxed range or intersecting it with an extra same-name spec would
+    // make the durable record stale.
+    let actual_names = actual
+        .iter()
+        .map(|dependency| canonical_conda_name(&dependency.name))
+        .collect::<BTreeSet<_>>();
+    Ok(actual
+        .iter()
+        .all(|dependency| expected.contains(dependency))
+        && expected.iter().all(|dependency| {
+            !actual_names.contains(&canonical_conda_name(&dependency.name))
+                || actual.contains(dependency)
+        }))
+}
+
+#[cfg(test)]
 fn produce_output(
     bundle: &Bundle,
     config: &RetreadConfig,
@@ -10944,7 +12475,7 @@ fn produce_output(
     courier_build_hash: Option<&str>,
     version_override: Option<&str>,
 ) -> Result<CondaOutput> {
-    let (output, conflicts) = produce_output_with_conflicts(
+    let (output, pending_relaxations) = produce_output_pending_relaxations(
         bundle,
         config,
         host_platform,
@@ -10953,20 +12484,8 @@ fn produce_output(
         courier_build_hash,
         version_override,
     )?;
-    if let Some(conflict) = conflicts.into_iter().next() {
-        let conda_name = conflict.conda_name.as_spec().to_string();
-        tracing::error!(
-            bundle = %bundle.conda_name,
-            conda_dep = %conda_name,
-            error = %conflict.conflict,
-            "bundle emission rejected by structural constraint conflict",
-        );
-        return Err(anyhow::Error::new(conflict.conflict)).with_context(|| {
-            format!(
-                "emitting conda dependency `{conda_name}` for bundle `{}`",
-                bundle.conda_name
-            )
-        });
+    for relaxation in pending_relaxations {
+        relaxation.emit();
     }
     Ok(output)
 }
@@ -10984,7 +12503,7 @@ fn emitted_bundle_route_assembly(
 ) -> Result<EmittedBundleRouteAssembly> {
     let host_platform = Platform::from_str(&target.conda_subdir)
         .with_context(|| format!("parsing target conda subdir `{}`", target.conda_subdir))?;
-    let (output, conflicts) = produce_output_with_conflicts(
+    let (output, conflicts, _pending_relaxations) = produce_output_with_conflicts(
         bundle,
         config,
         host_platform,
@@ -11022,8 +12541,14 @@ fn emitted_bundle_route_specs(
     target: &WheelTarget,
 ) -> Result<Vec<crate::uv_closure::CondaRouteSpec>> {
     let assembly = emitted_bundle_route_assembly(bundle, config, target)?;
-    if let Some(conflict) = assembly.conflicts.into_iter().next() {
-        return Err(anyhow::Error::new(conflict.conflict));
+    if !assembly.conflicts.is_empty() {
+        return Err(aggregate_conflicts(
+            assembly
+                .conflicts
+                .into_iter()
+                .map(|conflict| conflict.conflict)
+                .collect(),
+        ));
     }
     Ok(assembly.routes)
 }
@@ -11153,6 +12678,8 @@ async fn emit_wheels_from_lock(
     cache_dir: &Path,
 ) -> Result<Option<Vec<crate::emit_pypi::EmitWheel>>> {
     use crate::lock::Origin;
+
+    let abi_aliases = abi_aliases_from_name_map(&config.name_map);
 
     // Provenance gaps are a legitimate signal to cold-resolve, but detect all
     // of them before the first checkout, download, or build. Otherwise a later
@@ -11437,7 +12964,7 @@ async fn emit_wheels_from_lock(
                                     has_auto_data = member_auto_data.is_some(),
                                     "courier replay (phase 2.5): building group member"
                                 );
-                                let (resolved, _rd) = materialize_and_rewrite(
+                                let (resolved, _rd) = materialize_and_rewrite_with_abi_aliases(
                                     &synth_entry,
                                     &member_lw.name,
                                     Some(&member_lw.version),
@@ -11449,6 +12976,7 @@ async fn emit_wheels_from_lock(
                                     &config.git_sources,
                                     member_auto_data,
                                     EntryAuditInfo::default(),
+                                    &abi_aliases,
                                 )
                                 .await
                                 .with_context(|| {
@@ -11519,7 +13047,7 @@ async fn emit_wheels_from_lock(
                             ..crate::config::WheelEntry::default()
                         };
                         let auto_data = replay_git_auto_data(gs, checkout_root)?;
-                        let (resolved, _rd) = materialize_and_rewrite(
+                        let (resolved, _rd) = materialize_and_rewrite_with_abi_aliases(
                             &synth_entry,
                             &lw.name,
                             Some(&lw.version),
@@ -11531,6 +13059,7 @@ async fn emit_wheels_from_lock(
                             &config.git_sources,
                             auto_data,
                             EntryAuditInfo::default(),
+                            &abi_aliases,
                         )
                         .await
                         .with_context(|| {
@@ -11588,7 +13117,7 @@ async fn emit_wheels_from_lock(
                                 checkout_root,
                                 skip_subdirs: vec![],
                             });
-                    let (resolved, _rd) = materialize_and_rewrite(
+                    let (resolved, _rd) = materialize_and_rewrite_with_abi_aliases(
                         entry,
                         &lw.name,
                         Some(&lw.version),
@@ -11600,6 +13129,7 @@ async fn emit_wheels_from_lock(
                         &config.git_sources,
                         auto_data,
                         EntryAuditInfo::default(),
+                        &abi_aliases,
                     )
                     .await
                     .with_context(|| {
@@ -11829,10 +13359,11 @@ async fn emit_wheels_from_lock(
                 // policy before courier performs its override/provider rewrite.
                 // Replay must feed courier the same phase-D bytes, not the raw
                 // upstream wheel, or the authoritative final SHA can drift.
-                let replay_local = prepare_replayed_class2_wheel(
+                let replay_local = prepare_replayed_class2_wheel_with_abi_aliases(
                     fetched,
                     config.relax,
                     config.retread_wheels.contains_key(&lw.name),
+                    &abi_aliases,
                 )
                 .await?;
 
@@ -11867,10 +13398,26 @@ async fn emit_wheels_from_lock(
 /// raw upstream wheel on replay skips phase D and can therefore produce bytes
 /// that differ from the authoritative lock whenever the general relax policy
 /// widened an exact pin before courier staging.
+#[cfg(test)]
 async fn prepare_replayed_class2_wheel(
     fetched: PathBuf,
     relax: RelaxPolicy,
     declared_root: bool,
+) -> Result<PathBuf> {
+    prepare_replayed_class2_wheel_with_abi_aliases(
+        fetched,
+        relax,
+        declared_root,
+        &AbiAliasGraph::new(),
+    )
+    .await
+}
+
+async fn prepare_replayed_class2_wheel_with_abi_aliases(
+    fetched: PathBuf,
+    relax: RelaxPolicy,
+    declared_root: bool,
+    abi_aliases: &AbiAliasGraph,
 ) -> Result<PathBuf> {
     // Cold phase D runs in materialize_and_rewrite for declared roots. A
     // remote-only BFS transitive is first downloaded inside courier itself,
@@ -11882,15 +13429,18 @@ async fn prepare_replayed_class2_wheel(
     let rewritten = fetched.with_extension("relaxed.whl");
     let src = fetched.clone();
     let dst = rewritten.clone();
-    tokio::task::spawn_blocking(move || rewrite_wheel(&src, &dst, relax))
-        .await
-        .context("Class-2 replay relax rewrite panicked")?
-        .with_context(|| {
-            format!(
-                "Class-2 replay phase-D rewrite for {} (policy={relax:?})",
-                fetched.display(),
-            )
-        })?;
+    let abi_aliases = abi_aliases.clone();
+    tokio::task::spawn_blocking(move || {
+        rewrite_wheel_with_abi_aliases(&src, &dst, relax, &abi_aliases)
+    })
+    .await
+    .context("Class-2 replay relax rewrite panicked")?
+    .with_context(|| {
+        format!(
+            "Class-2 replay phase-D rewrite for {} (policy={relax:?})",
+            fetched.display(),
+        )
+    })?;
     Ok(rewritten)
 }
 
@@ -11991,6 +13541,7 @@ async fn materialize_from_lock_for_target(
         wheels = emit_wheels.len(),
         "courier build_v1 replay: re-materializing from lock (derivation skipped)",
     );
+    let replay_relaxations = RelaxationManifest::new(bundle_name.clone(), lock.relaxations.clone());
 
     let result = materialize_and_pack(
         None, // bundle=None: replay path, audit skipped
@@ -12009,6 +13560,7 @@ async fn materialize_from_lock_for_target(
         output_dir,
         source_dir,
         expected_build,
+        replay_relaxations.as_ref(),
     )
     .await?;
     Ok(Some(result))
@@ -12042,6 +13594,7 @@ async fn materialize_and_pack(
     output_dir: &Path,
     source_dir: &Path,
     expected_build: Option<&str>,
+    relaxations: Option<&RelaxationManifest>,
 ) -> Result<CondaBuildV1Result> {
     let staging = work_dir.join(format!("courier-{bundle_name}"));
     // `~/...` is an intentionally portable store identity: expand it against
@@ -12053,7 +13606,7 @@ async fn materialize_and_pack(
         .and_then(|lock| lock.wheel_store.as_deref())
         .filter(|recorded| recorded.starts_with("~/"))
         .map(crate::courier::expand_wheel_store_path);
-    let staged = crate::courier::stage_for_target_with_store_root(
+    let staged = crate::courier::stage_for_target_with_store_root_and_relaxations(
         config,
         bundle_name,
         input_bundle_name,
@@ -12067,6 +13620,7 @@ async fn materialize_and_pack(
         source_dir,
         &staging,
         replay_store_root.as_deref(),
+        relaxations,
     )
     .await
     .context("courier staging")?;
@@ -12095,7 +13649,7 @@ async fn materialize_and_pack(
     let courier_lock_to_commit = (lock_path, staged.lock.to_pretty_json()?);
 
     let lock_filename = crate::lock::RetreadLock::file_name_for_target(bundle_name, target);
-    let recipe = build_courier_recipe_with_mode_and_lock_filename(
+    let recipe = build_courier_recipe_with_mode_lock_and_relaxations(
         bundle_name,
         version,
         target.python_version(),
@@ -12107,6 +13661,7 @@ async fn materialize_and_pack(
         Some(&resolved_build),
         config.courier_mode,
         &lock_filename,
+        relaxations.is_some(),
     );
     let yaml = to_yaml(&recipe)?;
 
@@ -12352,7 +13907,6 @@ async fn resolve_incremental_add(
     };
     let mut effective = config.clone();
     effective.name_map = effective_name_map(&config.name_map, &pypi_to_conda);
-
     // ── Step B: resolve each added entry ──────────────────────────────────
     let mut new_emit: Vec<crate::emit_pypi::EmitWheel> = Vec::new();
     let mut new_conda_capable: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -12406,7 +13960,6 @@ async fn resolve_incremental_add(
                 return Err(e);
             }
         };
-
         // Incremental merge reuses the committed lock's conda run-deps and
         // only appends wheel payloads. A dependency that this new bundle
         // short-circuited to conda would therefore be absent from BOTH sets.
@@ -12523,6 +14076,7 @@ async fn resolve_incremental_add(
         new = new_count,
         "incremental-add: localized resolve succeeded; building courier package"
     );
+    let replay_relaxations = RelaxationManifest::new(bundle_name.clone(), lock.relaxations.clone());
 
     // ── A6: write lock only after ALL checks pass ─────────────────────────
     let result = materialize_and_pack(
@@ -12542,6 +14096,7 @@ async fn resolve_incremental_add(
         output_dir,
         source_dir,
         expected_build,
+        replay_relaxations.as_ref(),
     )
     .await?;
 
@@ -12781,6 +14336,7 @@ async fn build_one(
     expected_build: Option<&str>,
     courier_version_override: Option<&str>,
     run_override: Option<&[String]>,
+    relaxations: Option<&RelaxationManifest>,
 ) -> Result<CondaBuildV1Result> {
     validate_resolution_artifact_subdir(target, target_subdir)?;
     let workspace_python_version = target.python_version();
@@ -12979,13 +14535,37 @@ async fn build_one(
             output_dir,
             source_dir,
             expected_build,
+            relaxations,
         )
         .await
         .context("courier materialize_and_pack");
     }
 
-    // Non-courier path: build a bundled conda package with the wheel payload.
-    let recipe = build_bundle_recipe(
+    // Non-courier path: stage the same two tiny mandatory warning files used
+    // by courier packages, then add them to the recipe's ordinary sources.
+    let relaxation_payload = match relaxations {
+        Some(manifest) => {
+            manifest.validate_for(&bundle.conda_name, target)?;
+            Some(
+                stage_relaxation_payload(
+                    &work_dir.join(format!(
+                        "relaxations-{}-{}",
+                        bundle.conda_name,
+                        target.resolution_identity(),
+                    )),
+                    manifest,
+                )
+                .await
+                .context("staging mandatory relaxation warning payload")?,
+            )
+        }
+        None => None,
+    };
+    let relaxation_source_urls = relaxation_payload
+        .as_ref()
+        .map(|payload| payload.source_urls.as_slice())
+        .unwrap_or_default();
+    let recipe = build_bundle_recipe_with_relaxations(
         &bundle.conda_name,
         &sources,
         config,
@@ -12995,6 +14575,7 @@ async fn build_one(
         // blueprint="only" payload-skip is deprecated (v2.0.0); the
         // non-courier conda path always carries its wheel payload.
         true,
+        relaxation_source_urls,
     )?;
     let yaml = to_yaml(&recipe)?;
 
@@ -13108,9 +14689,9 @@ fn bounded_range_ceiling(version: &str) -> Option<String> {
     let major: u64 = parts.next()?.parse().ok()?;
     if major == 0 {
         let minor: u64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-        Some(format!("0.{}", minor + 1))
+        crate::relax::checked_version_ceiling(&[major, minor])
     } else {
-        Some((major + 1).to_string())
+        crate::relax::checked_version_ceiling(&[major])
     }
 }
 
@@ -13476,6 +15057,41 @@ fn merge_uv_pins_into_prefs(
     merged
 }
 
+fn validate_loaded_lock_abi(
+    lock: &crate::lock::RetreadLock,
+    context: &ReplayAbiContext,
+) -> Result<()> {
+    let python_version = crate::lock::normalized_target_python(&lock.python)
+        .context("normalizing replay lock Python target")?;
+    let mut workspace_versions = context.workspace_versions.clone();
+    workspace_versions
+        .entry("python".to_string())
+        .or_default()
+        .insert(python_version.clone());
+    let mut emitted = vec![("python".to_string(), format!("{python_version}.*"))];
+    emitted.extend(
+        lock.conda_run_deps
+            .iter()
+            .filter(|dependency| dependency.name != "python_abi")
+            .map(|dependency| (dependency.name.clone(), dependency.spec.clone())),
+    );
+    let embedded_requires_dist = locked_final_requires_dist(lock)?;
+    let violations = check_output_abi_invariants(
+        &emitted,
+        &embedded_requires_dist,
+        &workspace_versions,
+        &context.overrides,
+        &context.aliases,
+    );
+    if !violations.is_empty() {
+        bail!(
+            "courier replay rejected by ABI invariant: {}",
+            violations.join("; ")
+        );
+    }
+    Ok(())
+}
+
 /// Authority gate for the courier replay path.
 ///
 /// Returns `Some(lock)` iff ALL of the following hold:
@@ -13490,9 +15106,11 @@ fn merge_uv_pins_into_prefs(
 ///    cannot detect if the upstream changed its Requires-Dist between
 ///    lock writes, and the replay would silently propagate stale relax
 ///    bytes. Warn and return `None` to fall through to full derivation.
+/// 5. The SHA-bound final wheel metadata satisfies the current solved
+///    workspace versions, effective overrides, and ABI alias graph.
 ///
 /// Returns `None` (non-fatal miss) on any mismatch.
-/// Returns `Err` only when the file exists but is malformed.
+/// Returns `Err` when the file exists but is malformed or ABI-unsafe.
 ///
 /// `RETREAD_NO_REPLAY=1` unconditionally returns `None` (test knob;
 /// lets tests force cold-path exercising without touching the hash).
@@ -13511,14 +15129,20 @@ fn load_replayable_lock_for_target(
     relax_is_default: bool,
     target: &ResolutionTarget,
     expected_bundle: &str,
+    abi_context: &ReplayAbiContext,
 ) -> anyhow::Result<Option<crate::lock::RetreadLock>> {
-    load_replayable_lock_inner(
+    let lock = load_replayable_lock_inner(
         lock_path,
         current_inputs_hash,
         relax_is_default,
         Some(target),
         Some(expected_bundle),
-    )
+    )?;
+    let Some(lock) = lock else {
+        return Ok(None);
+    };
+    validate_loaded_lock_abi(&lock, abi_context)?;
+    Ok(Some(lock))
 }
 
 fn load_replayable_lock_inner(
@@ -13602,9 +15226,43 @@ fn replay_from_lock(
     loose: bool,
     siblings: &[(String, String)],
 ) -> anyhow::Result<Option<CondaOutput>> {
+    replay_from_lock_with_abi_context(
+        lock_path,
+        current_inputs_hash,
+        relax_is_default,
+        host_platform,
+        build_number,
+        loose,
+        siblings,
+        &WorkspaceAbiVersions::new(),
+        &BTreeMap::new(),
+        &AbiAliasGraph::new(),
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn replay_from_lock_with_abi_context(
+    lock_path: &Path,
+    current_inputs_hash: &str,
+    relax_is_default: bool,
+    host_platform: Platform,
+    build_number: u64,
+    loose: bool,
+    siblings: &[(String, String)],
+    workspace_versions: &WorkspaceAbiVersions,
+    overrides: &BTreeMap<String, String>,
+    aliases: &AbiAliasGraph,
+) -> anyhow::Result<Option<CondaOutput>> {
     let Some(lock) = load_replayable_lock(lock_path, current_inputs_hash, relax_is_default)? else {
         return Ok(None);
     };
+    let abi_context = ReplayAbiContext {
+        workspace_versions: workspace_versions.clone(),
+        overrides: overrides.clone(),
+        aliases: aliases.clone(),
+    };
+    validate_loaded_lock_abi(&lock, &abi_context)?;
     replay_loaded_lock(
         lock,
         current_inputs_hash,
@@ -13616,6 +15274,69 @@ fn replay_from_lock(
     .map(Some)
 }
 
+/// Return the persisted metadata from the exact final wheel artifacts.
+///
+/// Every metadata entry repeats the final wheel SHA recorded by `LockWheel`;
+/// validating that join here prevents pre-courier fields or unrelated lock
+/// records from standing in for the bytes the installer will consume.
+fn locked_final_requires_dist(lock: &crate::lock::RetreadLock) -> Result<Vec<(String, String)>> {
+    let context = lock
+        .abi_context
+        .as_ref()
+        .context("courier replay lock is missing its persisted ABI context")?;
+    let locked_wheels = lock
+        .wheels
+        .iter()
+        .map(|wheel| (canonical_conda_name(&wheel.name), wheel))
+        .collect::<BTreeMap<_, _>>();
+    if context.wheels.len() != locked_wheels.len() {
+        bail!(
+            "courier replay ABI context covers {} final wheels, but the lock contains {}",
+            context.wheels.len(),
+            locked_wheels.len(),
+        );
+    }
+    let mut seen = BTreeSet::new();
+    let mut requirements = Vec::new();
+    for final_wheel in &context.wheels {
+        let canonical = canonical_conda_name(&final_wheel.name);
+        if !seen.insert(canonical.clone()) {
+            bail!(
+                "courier replay ABI context contains duplicate final metadata for `{}`",
+                final_wheel.name,
+            );
+        }
+        let locked = locked_wheels.get(&canonical).ok_or_else(|| {
+            anyhow!(
+                "courier replay ABI context names unknown final wheel `{}`",
+                final_wheel.name,
+            )
+        })?;
+        let locked_sha = locked.sha256.as_deref().ok_or_else(|| {
+            anyhow!(
+                "courier replay final wheel {}=={} has no locked SHA-256",
+                locked.name,
+                locked.version,
+            )
+        })?;
+        if final_wheel.name != locked.name || !final_wheel.sha256.eq_ignore_ascii_case(locked_sha) {
+            bail!(
+                "courier replay final metadata for `{}` is not bound to its locked wheel SHA-256",
+                final_wheel.name,
+            );
+        }
+        requirements.extend(
+            final_wheel
+                .requires_dist
+                .iter()
+                .cloned()
+                .map(|requirement| (final_wheel.name.clone(), requirement)),
+        );
+    }
+    Ok(requirements)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn replay_loaded_lock(
     lock: crate::lock::RetreadLock,
     current_inputs_hash: &str,
@@ -13688,6 +15409,9 @@ fn replay_from_lock_for_target(
     build_number: u64,
     loose: bool,
     siblings: &[(String, String)],
+    workspace_versions: &WorkspaceAbiVersions,
+    overrides: &BTreeMap<String, String>,
+    aliases: &AbiAliasGraph,
 ) -> anyhow::Result<Option<CondaOutput>> {
     let Some(lock) = load_replayable_lock_for_target(
         lock_path,
@@ -13695,6 +15419,11 @@ fn replay_from_lock_for_target(
         relax_is_default,
         target,
         expected_bundle,
+        &ReplayAbiContext {
+            workspace_versions: workspace_versions.clone(),
+            overrides: overrides.clone(),
+            aliases: aliases.clone(),
+        },
     )?
     else {
         return Ok(None);
@@ -13734,14 +15463,18 @@ mod replay_tests {
     use rattler_conda_types::Platform;
 
     use super::{
-        AutoDataConfig, git_auto_data_cache_key, load_replayable_lock,
+        AutoDataConfig, WorkspaceAbiVersions, git_auto_data_cache_key, load_replayable_lock,
         load_replayable_lock_for_target, materialize_from_lock_for_target, persist_git_auto_data,
-        prepare_replayed_class2_wheel, replay_from_lock, replay_git_auto_data,
-        replay_sdist_cache_key, validate_authoritative_replay_lock,
+        prepare_replayed_class2_wheel, replay_from_lock, replay_from_lock_with_abi_context,
+        replay_git_auto_data, replay_sdist_cache_key, validate_authoritative_replay_lock,
     };
     use crate::config::{RelaxPolicy, RetreadConfig, WheelEntry};
-    use crate::lock::{CondaDep, GitWheelSource, LockWheel, Origin, RetreadLock, SCHEMA};
+    use crate::lock::{
+        CondaDep, GitWheelSource, LockAbiContext, LockWheel, LockWheelAbiMetadata, Origin,
+        RetreadLock, SCHEMA,
+    };
     use crate::pypi::ResolutionTarget;
+    use crate::relax::{AbiAliasGraph, add_abi_alias_edge};
     use crate::wheel_rewrite::rewrite_wheel;
 
     fn unique_tmp_dir() -> std::path::PathBuf {
@@ -13811,6 +15544,14 @@ mod replay_tests {
             conda_capable: vec![],
             entry_specs: vec![],
             wheel_store: None,
+            abi_context: Some(LockAbiContext {
+                wheels: vec![LockWheelAbiMetadata {
+                    name: bundle.into(),
+                    sha256: "11".repeat(32),
+                    requires_dist: vec![],
+                }],
+            }),
+            relaxations: vec![],
         }
     }
 
@@ -13822,6 +15563,28 @@ mod replay_tests {
                 max_glibc: None,
             },
             None,
+        )
+    }
+
+    fn load_test_lock_for_target(
+        path: &std::path::Path,
+        inputs_hash: &str,
+        relax_is_default: bool,
+        target: &ResolutionTarget,
+        bundle: &str,
+    ) -> anyhow::Result<Option<RetreadLock>> {
+        let abi_context = super::ReplayAbiContext {
+            workspace_versions: super::WorkspaceAbiVersions::new(),
+            overrides: BTreeMap::new(),
+            aliases: AbiAliasGraph::new(),
+        };
+        load_replayable_lock_for_target(
+            path,
+            inputs_hash,
+            relax_is_default,
+            target,
+            bundle,
+            &abi_context,
         )
     }
 
@@ -13910,7 +15673,7 @@ mod replay_tests {
 
         let native = replay_target("3.11.0", "linux-64");
         assert!(
-            load_replayable_lock_for_target(&path, "same-hash", true, &native, "pack")
+            load_test_lock_for_target(&path, "same-hash", true, &native, "pack")
                 .unwrap()
                 .is_some(),
             "numeric Python patch spelling must match the same resolution target"
@@ -13920,7 +15683,7 @@ mod replay_tests {
             replay_target("3.11", "linux-aarch64"),
         ] {
             assert!(
-                load_replayable_lock_for_target(&path, "same-hash", true, &foreign, "pack")
+                load_test_lock_for_target(&path, "same-hash", true, &foreign, "pack")
                     .unwrap()
                     .is_none(),
                 "matching inputs hashes must never bypass target identity"
@@ -13948,7 +15711,7 @@ mod replay_tests {
         let path = dir.join(RetreadLock::file_name_for_target("pack", &target));
         std::fs::write(&path, lock.to_pretty_json().unwrap()).unwrap();
 
-        let replayed = load_replayable_lock_for_target(&path, "same-hash", true, &target, "pack")
+        let replayed = load_test_lock_for_target(&path, "same-hash", true, &target, "pack")
             .unwrap()
             .expect("a SHA-256-format Git commit object ID must be replayable");
         assert_eq!(
@@ -14079,6 +15842,71 @@ mod replay_tests {
     }
 
     #[test]
+    fn build_v1_lock_ingress_rejects_abi_violating_final_wheel_metadata() {
+        let _env_guard = super::TEST_ENV_MUTEX.lock().unwrap();
+        let dir = unique_tmp_dir();
+        let target = replay_target("3.11", "linux-64");
+        let mut lock = make_test_lock("pack", "1.0.0", "3.11", "abi-hash", true);
+        // Replay reconstruction still needs the safe pre-courier metadata.
+        lock.wheels[0].requires_dist = vec!["nvidia-cuda-runtime-cu12>=12.8,<13".to_string()];
+        let mut aliases = AbiAliasGraph::new();
+        add_abi_alias_edge(&mut aliases, "nvidia-cuda-runtime-cu12", "cuda-version");
+        // These are the SHA-bound FINAL bytes. They covered the producer's
+        // old 12.8 selection but exclude the current 13.1 workspace solve.
+        lock.abi_context.as_mut().unwrap().wheels[0].requires_dist =
+            vec!["nvidia-cuda-runtime-cu12>=12.8,<13".to_string()];
+
+        let lock_path = dir.join(RetreadLock::file_name_for_target("pack", &target));
+        std::fs::write(&lock_path, lock.to_pretty_json().unwrap()).unwrap();
+        let producer_context = super::ReplayAbiContext {
+            workspace_versions: BTreeMap::from([(
+                "cuda-version".to_string(),
+                std::collections::BTreeSet::from(["12.8".to_string()]),
+            )]),
+            overrides: BTreeMap::new(),
+            aliases: aliases.clone(),
+        };
+        assert!(
+            load_replayable_lock_for_target(
+                &lock_path,
+                "abi-hash",
+                true,
+                &target,
+                "pack",
+                &producer_context,
+            )
+            .unwrap()
+            .is_some(),
+            "test setup: producer-time ABI facts must still accept the old lock"
+        );
+        let current_context = super::ReplayAbiContext {
+            workspace_versions: BTreeMap::from([(
+                "cuda-version".to_string(),
+                std::collections::BTreeSet::from(["13.1".to_string()]),
+            )]),
+            overrides: BTreeMap::new(),
+            aliases,
+        };
+        let error = load_replayable_lock_for_target(
+            &lock_path,
+            "abi-hash",
+            true,
+            &target,
+            "pack",
+            &current_context,
+        )
+        .expect_err("build-v1 lock ingress must use current solved ABI facts");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("courier replay rejected by ABI invariant")
+                && rendered.contains("does not cover workspace pin")
+                && rendered.contains("cuda-version==13.1"),
+            "{rendered}"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
     fn matching_hash_returns_some_with_correct_fields() {
         // Hold env-lock: prevents RETREAD_NO_REPLAY=1 from returning None here.
         let _env_guard = super::TEST_ENV_MUTEX.lock().unwrap();
@@ -14114,6 +15942,149 @@ mod replay_tests {
         assert!(
             dep_names.contains(&"numpy"),
             "run_deps must include numpy from lock: {dep_names:?}"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn replay_rejects_bare_abi_anchor_from_committed_lock() {
+        let _env_guard = super::TEST_ENV_MUTEX.lock().unwrap();
+        let dir = unique_tmp_dir();
+        let mut lock = make_test_lock("mypack", "1.2.3", "3.11", "unsafe-hash", true);
+        lock.conda_run_deps = vec![CondaDep {
+            name: "numpy".into(),
+            spec: "*".into(),
+        }];
+        let lock_path = dir.join(RetreadLock::file_name("mypack"));
+        std::fs::write(&lock_path, lock.to_pretty_json().unwrap()).unwrap();
+
+        let error = replay_from_lock(
+            &lock_path,
+            "unsafe-hash",
+            true,
+            Platform::Linux64,
+            0,
+            false,
+            &[],
+        )
+        .expect_err("an unsafe ABI-anchor lock must not replay");
+        assert!(
+            format!("{error:#}").contains("courier replay rejected by ABI invariant"),
+            "{error:#}"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn replay_rejects_widened_abi_alias_in_final_wheel_metadata() {
+        let _env_guard = super::TEST_ENV_MUTEX.lock().unwrap();
+        let dir = unique_tmp_dir();
+        let mut lock = make_test_lock("mypack", "1.2.3", "3.11", "alias-hash", true);
+        lock.wheels[0].origin = Origin::Built;
+        lock.wheels[0].filename = "mypack-1.2.3-999retread-py3-none-any.whl".to_string();
+        lock.wheels[0].url = None;
+        lock.wheels[0].upstream_url =
+            Some("https://example.com/mypack-1.2.3-py3-none-any.whl".to_string());
+        lock.wheels[0].requires_dist = vec!["nvidia-cuda-runtime-cu12==12.0".to_string()];
+        let mut aliases = AbiAliasGraph::new();
+        add_abi_alias_edge(&mut aliases, "nvidia-cuda-runtime-cu12", "cuda");
+        let abi_context = lock.abi_context.as_mut().unwrap();
+        abi_context.wheels[0].requires_dist = vec!["nvidia-cuda-runtime-cu12>=12.0".to_string()];
+
+        let mapped = super::locked_final_requires_dist(&lock).unwrap();
+        assert_eq!(
+            mapped,
+            vec![(
+                "mypack".to_string(),
+                "nvidia-cuda-runtime-cu12>=12.0".to_string(),
+            )],
+            "the replay guard must inspect the SHA-bound final metadata, not the stored pre-map line"
+        );
+
+        let lock_path = dir.join(RetreadLock::file_name("mypack"));
+        std::fs::write(&lock_path, lock.to_pretty_json().unwrap()).unwrap();
+        let error = replay_from_lock_with_abi_context(
+            &lock_path,
+            "alias-hash",
+            true,
+            Platform::Linux64,
+            0,
+            false,
+            &[],
+            &WorkspaceAbiVersions::new(),
+            &BTreeMap::new(),
+            &aliases,
+        )
+        .expect_err("widened hidden ABI-anchor metadata must fail closed on replay");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("courier replay rejected by ABI invariant")
+                && rendered.contains("wheel `mypack` embeds")
+                && rendered.contains("bare-major"),
+            "{rendered}"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn replay_validates_raw_index_wheel_metadata_without_courier_mapping() {
+        let _env_guard = super::TEST_ENV_MUTEX.lock().unwrap();
+        let dir = unique_tmp_dir();
+        let mut lock = make_test_lock("mypack", "1.2.3", "3.11", "index-hash", true);
+        lock.wheels[0].requires_dist = vec!["nvidia-cuda-runtime-cu12>=12".to_string()];
+        lock.wheels.push(LockWheel {
+            name: "nvidia-cuda-runtime-cu12".to_string(),
+            version: "12.0".to_string(),
+            origin: Origin::Index,
+            filename: "nvidia_cuda_runtime_cu12-12.0-py3-none-any.whl".to_string(),
+            url: Some(
+                "https://example.com/nvidia_cuda_runtime_cu12-12.0-py3-none-any.whl".to_string(),
+            ),
+            sha256: Some("22".repeat(32)),
+            requires_dist: vec![],
+            must_ship: false,
+            upstream_url: None,
+            git_source: None,
+            sdist_source: None,
+        });
+        let abi_context = lock.abi_context.as_mut().unwrap();
+        abi_context.wheels[0].requires_dist = vec!["nvidia-cuda-runtime-cu12>=12".to_string()];
+        abi_context.wheels.push(LockWheelAbiMetadata {
+            name: "nvidia-cuda-runtime-cu12".to_string(),
+            sha256: "22".repeat(32),
+            requires_dist: vec![],
+        });
+
+        assert_eq!(
+            super::locked_final_requires_dist(&lock).unwrap(),
+            vec![(
+                "mypack".to_string(),
+                "nvidia-cuda-runtime-cu12>=12".to_string(),
+            )],
+            "Origin::Index bytes are raw and must not be sanitized by the courier mapper"
+        );
+
+        let lock_path = dir.join(RetreadLock::file_name("mypack"));
+        std::fs::write(&lock_path, lock.to_pretty_json().unwrap()).unwrap();
+        let mut aliases = AbiAliasGraph::new();
+        add_abi_alias_edge(&mut aliases, "nvidia-cuda-runtime-cu12", "cuda");
+        let error = replay_from_lock_with_abi_context(
+            &lock_path,
+            "index-hash",
+            true,
+            Platform::Linux64,
+            0,
+            false,
+            &[],
+            &WorkspaceAbiVersions::new(),
+            &BTreeMap::new(),
+            &aliases,
+        )
+        .expect_err("unsafe raw Index metadata must fail closed on replay");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("wheel `mypack` embeds") && rendered.contains("bare-major"),
+            "{rendered}"
         );
         std::fs::remove_dir_all(dir).ok();
     }
@@ -14461,6 +16432,8 @@ mod replay_tests {
             conda_capable: vec![],
             entry_specs: vec![],
             wheel_store: None,
+            abi_context: None,
+            relaxations: vec![],
         };
         // Config has no retread_wheels entries — wheel is a class-3 orphan.
         // Use serde_json to construct a minimal config (RetreadConfig has no
@@ -14537,6 +16510,8 @@ mod replay_tests {
             conda_capable: vec![],
             entry_specs: vec![],
             wheel_store: None,
+            abi_context: None,
+            relaxations: vec![],
         };
         let config: RetreadConfig =
             serde_json::from_value(serde_json::json!({"retread-wheels": {}})).unwrap();
@@ -14650,6 +16625,8 @@ mod replay_tests {
             conda_capable: vec![],
             entry_specs: vec![],
             wheel_store: None,
+            abi_context: None,
+            relaxations: vec![],
         };
         let config: RetreadConfig =
             serde_json::from_value(serde_json::json!({"retread-wheels": {}})).unwrap();
@@ -14857,6 +16834,8 @@ mod replay_tests {
             conda_capable: vec![],
             entry_specs: vec![],
             wheel_store: None,
+            abi_context: None,
+            relaxations: vec![],
         };
         let config: RetreadConfig = serde_json::from_value(serde_json::json!({"retread-wheels": {
             "gympack": { "version": "==1.0.0" }
@@ -15241,6 +17220,8 @@ mod replay_tests {
             conda_capable: vec![wheel_name.to_string()],
             entry_specs: vec![],
             wheel_store: None,
+            abi_context: None,
+            relaxations: vec![],
         };
 
         // Build the replay EmitWheel exactly as the new Class-2 arm would:
@@ -15438,6 +17419,8 @@ mod replay_tests {
             conda_capable: vec!["requests".into()],
             entry_specs: vec![],
             wheel_store: None,
+            abi_context: None,
+            relaxations: vec![],
         };
         let config: RetreadConfig = serde_json::from_value(serde_json::json!({"retread-wheels": {
             "reqpack": { "version": "==1.0.0" }
@@ -16569,6 +18552,8 @@ include = ["retread_bfs_git_leaf*"]
             conda_capable: vec![],
             entry_specs: vec![],
             wheel_store: None,
+            abi_context: None,
+            relaxations: vec![],
         };
 
         // Config has no retread_wheels entries.
@@ -17412,6 +19397,7 @@ mod emit_wheel_upstream_url_tests {
             auto_routed: vec![],
             auto_dropped: Default::default(),
             uv_closure_names: Default::default(),
+            uv_dependency_graph: Default::default(),
             workspace_conda_versions: Default::default(),
             workspace_conda_provider_facts: Default::default(),
         };
@@ -17532,6 +19518,7 @@ mod emit_wheel_upstream_url_tests {
             auto_routed: vec![],
             auto_dropped: Default::default(),
             uv_closure_names: Default::default(),
+            uv_dependency_graph: Default::default(),
             workspace_conda_versions: Default::default(),
             workspace_conda_provider_facts: Default::default(),
         };
@@ -17633,6 +19620,8 @@ mod load_favored_versions_tests {
             conda_capable: vec![],
             entry_specs: vec![],
             wheel_store: None,
+            abi_context: None,
+            relaxations: vec![],
         };
         let json = lock.to_pretty_json().unwrap();
         let path = dir.join(RetreadLock::file_name(bundle));
@@ -19565,6 +21554,8 @@ mod incremental_add_tests {
             conda_capable: vec![],
             entry_specs,
             wheel_store: None,
+            abi_context: None,
+            relaxations: vec![],
         };
         let json = lock.to_pretty_json().unwrap();
         std::fs::write(path, json).unwrap();
@@ -19665,6 +21656,8 @@ mod incremental_add_tests {
             conda_capable: vec![],
             entry_specs: vec!["test-bundle==1.0".into()],
             wheel_store: None,
+            abi_context: None,
+            relaxations: vec![],
         };
         let mut json: serde_json::Value =
             serde_json::from_str(&lock.to_pretty_json().unwrap()).unwrap();
@@ -19751,6 +21744,8 @@ mod incremental_add_tests {
             conda_capable: vec![],
             entry_specs,
             wheel_store: None,
+            abi_context: None,
+            relaxations: vec![],
         };
         let json = lock.to_pretty_json().unwrap();
         std::fs::write(path, json).unwrap();
@@ -20302,6 +22297,8 @@ mod incremental_add_tests {
             conda_capable: vec![],
             entry_specs: vec!["test-bundle==1.0".into()],
             wheel_store: None,
+            abi_context: None,
+            relaxations: vec![],
         };
         let json = lock.to_pretty_json().unwrap();
         std::fs::write(path, json).unwrap();

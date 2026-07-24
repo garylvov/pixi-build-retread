@@ -24,6 +24,7 @@ use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 use crate::config::RelaxPolicy;
+use crate::relax::{AbiAliasGraph, is_semantic_abi_anchor};
 
 /// 3-way outcome for the per-`Requires-Dist` mapper passed to
 /// [`rewrite_wheel_with`] / [`rewrite_metadata_text_with`].
@@ -50,8 +51,27 @@ pub enum LineAction {
 ///
 /// Returns the new sha256 of the rewritten wheel (useful for recipe
 /// generation).
-pub fn rewrite_wheel(src: &Path, dst: &Path, relax: RelaxPolicy) -> Result<String> {
-    rewrite_wheel_with(src, dst, &|line| match relax_pep508(line, relax).ok() {
+#[cfg(test)]
+pub(crate) fn rewrite_wheel(src: &Path, dst: &Path, relax: RelaxPolicy) -> Result<String> {
+    rewrite_wheel_with_abi_aliases(src, dst, relax, &AbiAliasGraph::new())
+}
+
+/// Alias-aware production wheel rewrite.
+///
+/// Callers pass the effective PyPI-to-conda name map's shared ABI alias graph.
+pub(crate) fn rewrite_wheel_with_abi_aliases(
+    src: &Path,
+    dst: &Path,
+    relax: RelaxPolicy,
+    abi_aliases: &AbiAliasGraph,
+) -> Result<String> {
+    rewrite_wheel_with(src, dst, &|line| match relax_pep508_with_abi_aliases(
+        line,
+        relax,
+        abi_aliases,
+    )
+    .ok()
+    {
         None => LineAction::Keep,
         Some(s) if s == line => LineAction::Keep,
         Some(s) => LineAction::Replace(s),
@@ -59,7 +79,7 @@ pub fn rewrite_wheel(src: &Path, dst: &Path, relax: RelaxPolicy) -> Result<Strin
     .map(|(sha, _)| sha)
 }
 
-/// Generic core of [`rewrite_wheel`]: apply `map` to every
+/// Generic wheel-rewrite core: apply `map` to every
 /// `Requires-Dist:` value. [`LineAction::Keep`] leaves a line unchanged,
 /// [`LineAction::Replace`] substitutes, [`LineAction::Drop`] omits the line
 /// entirely. When no line changes or is dropped, the output is a hard link
@@ -226,14 +246,23 @@ fn rewrite_metadata_text_with(content: &str, map: &dyn Fn(&str) -> LineAction) -
 /// Parse one PEP 508 requirement string. If it carries a single exact
 /// `==X.Y.Z` specifier, widen it per `policy` and return the rebuilt
 /// requirement (still PEP 508 syntax). All other shapes pass through.
+#[cfg(test)]
 pub(crate) fn relax_pep508(raw: &str, policy: RelaxPolicy) -> Result<String> {
+    relax_pep508_with_abi_aliases(raw, policy, &AbiAliasGraph::new())
+}
+
+/// Alias-aware form of [`relax_pep508`].
+pub(crate) fn relax_pep508_with_abi_aliases(
+    raw: &str,
+    policy: RelaxPolicy,
+    abi_aliases: &AbiAliasGraph,
+) -> Result<String> {
     let req: Requirement =
         Requirement::from_str(raw).map_err(|e| anyhow!("parsing `{raw}`: {e}"))?;
-    // `python` is off-limits to every relax policy; see the matching
-    // guard in src/relax.rs::translate. METADATA rewrites must stay in
-    // lock-step or pip on the consumer side would still see the widened
-    // python pin and re-resolve against it.
-    if req.name.as_ref().eq_ignore_ascii_case("python") {
+    // ABI anchors and every transitive semantic alias are off-limits to this
+    // blanket policy rewrite. Candidate-level, same-major relaxation belongs
+    // exclusively to the strict-first decision engine.
+    if is_semantic_abi_anchor(req.name.as_ref(), abi_aliases) {
         return Ok(raw.to_string());
     }
     let Some(uv_pep508::VersionOrUrl::VersionSpecifier(specs)) = req.version_or_url.as_ref() else {
@@ -319,7 +348,7 @@ fn strip_upper_bounds_pep508(specs: &[&uv_pep508::uv_pep440::VersionSpecifier]) 
 
 fn widen_exact_to_pep508(v: &Version, policy: RelaxPolicy) -> Option<String> {
     let r = v.release();
-    if r.is_empty() {
+    if r.is_empty() || !crate::relax::exact_version_can_widen(v) {
         return None;
     }
     let major = r[0];
@@ -351,10 +380,12 @@ fn widen_exact_to_pep508(v: &Version, policy: RelaxPolicy) -> Option<String> {
         RelaxPolicy::Patch
         | RelaxPolicy::PatchWithLastResort
         | RelaxPolicy::PatchThenMinorThenMajorThenLastResort => {
-            Some(format!(">={lower_patch},<{major}.{}", minor + 1))
+            let upper = crate::relax::checked_version_ceiling(&[major, minor])?;
+            Some(format!(">={lower_patch},<{upper}"))
         }
         RelaxPolicy::Minor | RelaxPolicy::MinorWithLastResort => {
-            Some(format!(">={lower_minor},<{}", major + 1))
+            let upper = crate::relax::checked_version_ceiling(&[major])?;
+            Some(format!(">={lower_minor},<{upper}"))
         }
         // TODO(conda-aware): grouped with Major/StrongMajor as a
         // stopgap; the real probe-and-decide logic is not wired up.
@@ -450,19 +481,43 @@ mod tests {
     }
 
     #[test]
+    fn exact_widening_ceiling_overflow_keeps_requirement_strict() {
+        let patch = "demo==1.18446744073709551615.0";
+        assert_eq!(relax_pep508(patch, RelaxPolicy::Patch).unwrap(), patch);
+
+        let minor = "demo==18446744073709551615.0";
+        assert_eq!(relax_pep508(minor, RelaxPolicy::Minor).unwrap(), minor);
+    }
+
+    #[test]
+    fn epoch_and_prerelease_exact_versions_stay_strict() {
+        for raw in ["demo==1!3.1", "demo==2.0.0a1"] {
+            for policy in [
+                RelaxPolicy::Patch,
+                RelaxPolicy::Minor,
+                RelaxPolicy::Major,
+                RelaxPolicy::StrongMajor,
+                RelaxPolicy::PatchThenMinorThenMajorThenLastResort,
+            ] {
+                assert_eq!(relax_pep508(raw, policy).unwrap(), raw, "{raw}/{policy:?}");
+            }
+        }
+    }
+
+    #[test]
     fn rewrites_with_major() {
-        let raw = "numpy==1.26.0";
+        let raw = "scipy==1.15.0";
         let out = relax_pep508(raw, RelaxPolicy::Major).unwrap();
-        assert_eq!(out, "numpy>=1");
+        assert_eq!(out, "scipy>=1");
     }
 
     #[test]
     fn tiered_cascade_rewrites_exact_pin_to_patch_range() {
         // The tiered cascade mirrors Patch at wheel rewrite time; the
         // conda-side escalation is independent.
-        let raw = "numpy==1.26.4";
+        let raw = "scipy==1.15.4";
         let out = relax_pep508(raw, RelaxPolicy::PatchThenMinorThenMajorThenLastResort).unwrap();
-        assert_eq!(out, "numpy>=1.26.4,<1.27");
+        assert_eq!(out, "scipy>=1.15.4,<1.16");
     }
 
     #[test]
@@ -508,7 +563,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(out.contains("numpy>=1.26,<2"));
+        assert!(out.contains("numpy==1.26.0"));
         assert!(out.contains("scipy>=1.15,<2"));
         assert!(out.contains("Body line that mentions Requires-Dist: should not change"));
         assert!(out.contains("Metadata-Version: 2.1"));
@@ -524,7 +579,7 @@ mod tests {
         assert_eq!(out, "pyglet", "got: {out}");
 
         let out = relax_pep508("numpy>=1.26,<2", RelaxPolicy::StrongMajor).unwrap();
-        assert_eq!(out, "numpy>=1.26", "got: {out}");
+        assert_eq!(out, "numpy>=1.26,<2", "got: {out}");
 
         let out = relax_pep508("requests~=2.0", RelaxPolicy::StrongMajor).unwrap();
         assert_eq!(out, "requests>=2.0", "got: {out}");
@@ -532,9 +587,9 @@ mod tests {
         let out = relax_pep508("requests~=2.0.4", RelaxPolicy::StrongMajor).unwrap();
         assert_eq!(out, "requests>=2.0.4", "got: {out}");
 
-        // Exact pins still widen.
+        // ABI-anchor exact pins remain exact.
         let out = relax_pep508("numpy==1.26.4", RelaxPolicy::StrongMajor).unwrap();
-        assert_eq!(out, "numpy>=1");
+        assert_eq!(out, "numpy==1.26.4");
 
         // Major still leaves ranges alone.
         let out = relax_pep508("pyglet<2", RelaxPolicy::Major).unwrap();
@@ -566,6 +621,64 @@ mod tests {
         // `pyglet` with no version, marker preserved.
         assert!(out.starts_with("pyglet"));
         assert!(!out.contains("<2"));
+    }
+
+    #[test]
+    fn abi_anchors_are_unchanged_under_every_policy() {
+        let policies = [
+            RelaxPolicy::None,
+            RelaxPolicy::Patch,
+            RelaxPolicy::Minor,
+            RelaxPolicy::Major,
+            RelaxPolicy::StrongMajor,
+            RelaxPolicy::CondaAware,
+            RelaxPolicy::PatchWithLastResort,
+            RelaxPolicy::MinorWithLastResort,
+            RelaxPolicy::MajorWithLastResort,
+            RelaxPolicy::PatchThenMinorThenMajorThenLastResort,
+        ];
+        for raw in [
+            "numpy==1.26.4",
+            "numpy>=1.26,<2",
+            "cuda-cudart==12.8.90",
+            "cuda>=12,<13",
+        ] {
+            for &policy in &policies {
+                assert_eq!(
+                    relax_pep508(raw, policy).unwrap(),
+                    raw,
+                    "{raw} must be protected under {policy:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn transitive_many_to_one_anchor_alias_is_unchanged() {
+        use crate::relax::{CondaName, CondaTarget, NameMap, PypiKey, abi_aliases_from_name_map};
+
+        let name_map = NameMap::from([
+            (
+                PypiKey::from_pypi("array-provider"),
+                CondaTarget::Mapped(CondaName::new("shared-array-runtime")),
+            ),
+            (
+                PypiKey::from_pypi("numpy"),
+                CondaTarget::Mapped(CondaName::new("shared-array-runtime")),
+            ),
+        ]);
+        let aliases = abi_aliases_from_name_map(&name_map);
+        let raw = "array-provider==1.26.4";
+        assert_eq!(
+            relax_pep508_with_abi_aliases(raw, RelaxPolicy::Major, &aliases).unwrap(),
+            raw,
+        );
+
+        let ordinary = "ordinary-provider==1.26.4";
+        assert_eq!(
+            relax_pep508_with_abi_aliases(ordinary, RelaxPolicy::Major, &aliases).unwrap(),
+            "ordinary-provider>=1",
+        );
     }
 
     /// Build a minimal in-memory wheel zip for test use.

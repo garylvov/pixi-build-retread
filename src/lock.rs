@@ -23,6 +23,9 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::relax::canonical_conda_name;
+use crate::relaxation_record::{
+    RelaxationManifest, RelaxationRecord, canonicalize_relaxation_records,
+};
 use crate::workspace::WorkspaceTargetContract;
 
 fn default_target_subdir() -> String {
@@ -315,6 +318,23 @@ pub struct LockWheel {
     pub sdist_source: Option<SdistWheelSource>,
 }
 
+/// SHA-bound final wheel metadata captured after courier mapping (schema 16+).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LockAbiContext {
+    /// Metadata read from (or, for a remote unchanged index wheel, recorded
+    /// alongside) each exact final wheel artifact.
+    pub wheels: Vec<LockWheelAbiMetadata>,
+}
+
+/// Final wheel metadata bound to the same digest recorded in `LockWheel`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LockWheelAbiMetadata {
+    pub name: String,
+    pub sha256: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requires_dist: Vec<String>,
+}
+
 /// A conda run-dep retread routed to the conda side (a shared transitive
 /// the consumer's conda solve provides). Carried so the courier conda
 /// package can declare them as its own run-deps.
@@ -379,6 +399,16 @@ pub struct RetreadLock {
     pub root_requirements: Vec<String>,
     /// Wheels to install at link time (built ship in pkg + index fetched).
     pub wheels: Vec<LockWheel>,
+    /// Exact ABI validation context plus SHA-bound final wheel metadata.
+    /// Missing on pre-schema-16 locks, which the replay schema gate rejects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abi_context: Option<LockAbiContext>,
+    /// Final safe auto-relaxations applied while producing this artifact.
+    ///
+    /// Replay copies these records into the rebuilt package so a cold and
+    /// replayed courier expose the same activate.d warning and JSON payload.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relaxations: Vec<RelaxationRecord>,
     /// Shared transitives routed to conda (the courier package's run-deps).
     pub conda_run_deps: Vec<CondaDep>,
     /// Producer-side index chain used during pack build/solve. Install replay
@@ -445,6 +475,18 @@ pub struct RetreadLock {
     pub wheel_store: Option<String>,
 }
 
+/// Schema 17: durable final auto-relaxation records.
+///
+/// `relaxations` preserves the exact warning payload across courier replay.
+/// Older locks cannot prove whether an emitted package was relaxed, so the
+/// producer replay gate cold-derives once under the new schema.
+///
+/// Schema 16: SHA-bound final wheel metadata and replay ABI context.
+///
+/// `abi_context` records final `Requires-Dist` lines beside the digest of each
+/// final wheel. Both replay callers validate those lines against the current
+/// live workspace versions, effective overrides, and ABI alias graph.
+///
 /// Schema 14: complete Pixi workspace target contract.
 ///
 /// `RetreadLock.target_contract` preserves the canonical rich-profile virtual
@@ -510,7 +552,7 @@ pub struct RetreadLock {
 /// On the consumer-side install path, old schemas are hard errors: install
 /// replay must not fall back to resolver-backed uv. SCHEMA is NOT an epoch bump
 /// (output SEMANTICS for identical inputs are unchanged; [emit-epoch-ok]).
-pub const SCHEMA: u32 = 15;
+pub const SCHEMA: u32 = 17;
 
 /// Bump EMIT_EPOCH in the SAME commit as ANY change that can alter the bytes
 /// retread emits for identical manifest inputs (relax/version-selection
@@ -651,7 +693,40 @@ pub const SCHEMA: u32 = 15;
 /// target identity and is persisted in courier locks. Exact and directly
 /// inferred targets with otherwise identical contracts and consumer scopes
 /// cannot share sibling constraints, artifacts, sidecars, builds, or replay.
-pub const EMIT_EPOCH: u32 = 28;
+///
+/// Epoch 29: auto-bundle diagnostics with unsat context are now persisted in lock.
+///
+/// Epoch 30: unsatisfiable cross-wheel metadata constraints are relaxed inline
+/// before PyPI restoration, changing the selected wheel and emitted run list.
+///
+/// Epoch 31: relaxation is selected strictly and at clause granularity, with a
+/// fail-closed ABI-anchor post-check. Identical inputs can therefore emit a
+/// narrower dependency or reject an unsafe cached result.
+///
+/// Epoch 32: every metadata mutation path shares the transitive ABI-alias veto,
+/// and the fail-closed post-check also validates embedded wheel metadata.
+///
+/// Epoch 33: committed-lock replay reconstructs the courier's final metadata
+/// mapper and validates those embedded lines with the live ABI aliases,
+/// overrides, and workspace pins instead of checking the pre-courier copy.
+///
+/// Epoch 34: committed locks persist SHA-bound final wheel metadata, and both
+/// conda/outputs and conda/build_v1 validate it against the current solved ABI
+/// context at their shared ingress before replay can win.
+///
+/// Epoch 35: exact-version relaxation fails closed for non-zero epochs and
+/// prerelease/dev versions instead of emitting a range that drops the epoch or
+/// excludes the original prerelease.
+///
+/// Epoch 36: an overflowing CUDA-family major ceiling now emits a strict
+/// same-major wildcard constraint instead of dropping CUDA-major protection.
+///
+/// Epoch 37: relaxed packages ship an activate.d warning hook and structured
+/// relaxation manifest, and courier locks retain that payload across replay.
+///
+/// Epoch 38: activate.d hooks echo every relaxation regardless of count and
+/// always point to the package-bundled JSON manifest for full detail.
+pub const EMIT_EPOCH: u32 = 38;
 
 fn parse_stored_glibc(value: Option<&str>) -> Option<Option<(u32, u32)>> {
     match value {
@@ -884,6 +959,13 @@ impl RetreadLock {
                 "retread lock records bundle `{}`, but replay requested `{expected_bundle}`",
                 self.bundle,
             );
+        }
+        if let Some(manifest) =
+            RelaxationManifest::new(self.bundle.clone(), self.relaxations.clone())
+        {
+            manifest
+                .validate_for(expected_bundle, target)
+                .context("retread lock records an invalid relaxation warning payload")?;
         }
         let safe_component = |value: &str| {
             !value.trim().is_empty()
@@ -1245,11 +1327,15 @@ impl RetreadLock {
     /// - `conda_run_deps[]`: (name, spec)
     /// - `root_requirements[]`: lexicographic
     /// - `conda_capable[]`: lexicographic (supersedes the inline sort in courier::stage)
+    /// - `relaxations[]`: stable semantic tuple
     /// - `index_urls[]`: NOT sorted — chain order is semantically significant.
     /// - `prerelease`: BTreeMap — already key-ordered.
     ///
     /// Nested sorts (A-1):
     /// - `LockWheel.requires_dist[]`: lexicographic (order-insensitive per §A.5)
+    /// - `LockAbiContext.wheels[]`: canonical name + digest
+    /// - `LockWheelAbiMetadata.requires_dist[]`: lexicographic
+    /// - `RelaxationRecord.involved_wheels[]`: lexicographic
     /// - `GitWheelSource.extras[]`: lexicographic
     /// - `GitWheelSource.auto_data.skip_subdirectories[]`: lexicographic
     pub fn canonicalize(&mut self) {
@@ -1282,6 +1368,7 @@ impl RetreadLock {
 
         // Top-level: conda_capable lexicographic.
         self.conda_capable.sort();
+        canonicalize_relaxation_records(&mut self.relaxations);
 
         // Top-level: entry_specs lexicographic (already sorted by
         // courier_input_specs, but sort here defensively so the invariant
@@ -1300,6 +1387,16 @@ impl RetreadLock {
                     skip_subdirectories.sort();
                     skip_subdirectories.dedup();
                 }
+            }
+        }
+        if let Some(context) = &mut self.abi_context {
+            context.wheels.sort_by(|left, right| {
+                canonical_conda_name(&left.name)
+                    .cmp(&canonical_conda_name(&right.name))
+                    .then_with(|| left.sha256.cmp(&right.sha256))
+            });
+            for wheel in &mut context.wheels {
+                wheel.requires_dist.sort();
             }
         }
     }
@@ -1436,6 +1533,8 @@ mod tests {
             conda_capable: vec!["numpy".into(), "torch".into()],
             entry_specs: vec!["isaaclab==0.51.1".into()],
             wheel_store: None,
+            abi_context: None,
+            relaxations: vec![],
         };
         let json = lock.to_pretty_json().unwrap();
         let back: RetreadLock = serde_json::from_str(&json).unwrap();
@@ -2186,6 +2285,8 @@ mod tests {
             conda_capable: vec![],
             entry_specs: vec![],
             wheel_store: None,
+            abi_context: None,
+            relaxations: vec![],
         };
 
         let err = lock.validate_replay_provenance().unwrap_err();
@@ -2386,6 +2487,8 @@ mod tests {
             conda_capable: vec!["zlib".into(), "blas".into()],
             entry_specs: vec!["torch==2.0.0".into(), "numpy==1.26.0".into()],
             wheel_store: None,
+            abi_context: None,
+            relaxations: vec![],
         }
     }
 

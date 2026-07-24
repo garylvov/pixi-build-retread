@@ -8,9 +8,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::manifest::{AppliedEdit, EntrySnapshot, ManifestEditor, TableKind, write_atomic};
-use super::parse::Conflict;
+use super::parse::{Conflict, RetreadConflictSuggestion, RetreadMutuallyUnsatisfiable};
 use crate::handler::PypiToCondaMap;
-use crate::relax::canonical_conda_name;
+use crate::relax::{canonical_conda_name, checked_version_ceiling};
 
 // Copied from src/conflict_classifier.rs:52 so solve has no dependency on cascade-era modules.
 pub(crate) const ABI_ANCHOR_NAMES: &[&str] = &[
@@ -19,7 +19,12 @@ pub(crate) const ABI_ANCHOR_NAMES: &[&str] = &[
     // 3.14 against a 3.11-only workspace.
     "python",
     "python_abi",
+    "python-abi",
     "pypy",
+    // NumPy's C ABI is consumed directly by compiled extension wheels.
+    // A seemingly harmless metadata widen can therefore select a NumPy
+    // major that the shipped wheel was never built against.
+    "numpy",
     // glibc / libc: the C runtime ABI. Conda-forge encodes the floor
     // via `__glibc` virtual + `libc` direct; widening these would
     // claim retread's output runs on any libc, which is almost never
@@ -39,11 +44,33 @@ pub(crate) const ABI_ANCHOR_NAMES: &[&str] = &[
     // (driver match, sm arch). Widening lets the solver pick cuda 13
     // and break every cuda-bindings/cuda-toolkit/torch interaction.
     "cuda-version",
+    "cuda",
+    "cuda-toolkit",
+    "cuda-cudart",
+    "cudatoolkit",
     "__cuda",
     // Other rattler virtual packages (`__linux`, `__osx`, `__win`,
     // `__unix`, `__archspec`) are caught by the `__` prefix check
     // below. Arch-tagged compilers + binutils are caught by the
     // prefix list. `*_compiler` suffix is caught by the predicate.
+];
+
+// Track 1 broadens the shared ABI classifier used by emission and metadata
+// relaxation. The existing `retread solve` repair policy is Track 4 and must
+// retain its pre-refactor behavior until that track deliberately migrates it.
+const LEGACY_SOLVE_REPAIR_ABI_ANCHOR_NAMES: &[&str] = &[
+    "python",
+    "python_abi",
+    "pypy",
+    "libc",
+    "glibc",
+    "__glibc",
+    "libstdcxx-ng",
+    "libstdcxx",
+    "libcxx",
+    "libcxx-devel",
+    "cuda-version",
+    "__cuda",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -561,7 +588,7 @@ impl RepairPlanner {
         let mut candidates: Vec<&str> = vec![conflict_package];
         candidates.extend(requiring_chain.iter().map(String::as_str));
         for pkg in candidates {
-            if tried.has(pkg, Strategy::PypiOverride) || is_abi_anchor(pkg) {
+            if tried.has(pkg, Strategy::PypiOverride) || is_solve_repair_anchor(pkg) {
                 continue;
             }
             for conda_name in conda_name_family(pkg, &self.conda_name_map) {
@@ -611,6 +638,9 @@ impl RepairPlanner {
         iter: u32,
     ) -> std::result::Result<RepairOutcome, String> {
         match conflict {
+            Conflict::RetreadMutuallyUnsatisfiable(retread) => {
+                Ok(self.retread_mutually_unsatisfiable(conflict, retread, iter))
+            }
             Conflict::NoCandidates { package, version } => {
                 let target = PinTarget {
                     package,
@@ -721,6 +751,62 @@ impl RepairPlanner {
                 };
                 self.nested_conda_cap(editor, tried, &target, pack_name, cap_op, cap_version)
             }
+        }
+    }
+
+    /// Preserve the remediation Track 2 already selected in the backend.
+    ///
+    /// This planner branch is intentionally pure: it never asks
+    /// `ManifestEditor` for an edit and never writes the pack-overrides
+    /// ledger itself. The read-only driver prints `summary_line`; only its
+    /// explicit `--apply-ledger` path persists the structured suggestion.
+    fn retread_mutually_unsatisfiable(
+        &self,
+        conflict: &Conflict,
+        retread: &RetreadMutuallyUnsatisfiable,
+        iter: u32,
+    ) -> RepairOutcome {
+        let (version, action) = match &retread.suggestion {
+            RetreadConflictSuggestion::DropDependency { .. } => (
+                "*".to_string(),
+                format!("drop dependency `{}`", retread.package),
+            ),
+            RetreadConflictSuggestion::Override { package, spec, .. } => {
+                (spec.clone(), format!("override `{package}` with `{spec}`"))
+            }
+            RetreadConflictSuggestion::RootPin {
+                package,
+                spec,
+                bundle_group,
+                ..
+            } => (
+                spec.clone(),
+                format!("pin root `{package}` to `{spec}` in bundle `{bundle_group}`"),
+            ),
+        };
+        let target = PinTarget {
+            package: &retread.package,
+            version: &version,
+            iter,
+            conflict,
+        };
+        RepairOutcome {
+            attempt: self.ledger_attempt(
+                &target,
+                Strategy::PypiOverride,
+                "retread-track-2-suggestion",
+                AttemptDetails {
+                    new_spec: (version != "*").then(|| version.clone()),
+                    ..AttemptDetails::default()
+                },
+            ),
+            extra_attempts: Vec::new(),
+            applied: Vec::new(),
+            summary_line: format!(
+                "proposed ledger relaxation for pack `{}`: {action}",
+                retread.suggestion.pack_manifest()
+            ),
+            pack_override: None,
         }
     }
 
@@ -859,7 +945,7 @@ impl RepairPlanner {
         bundle: &str,
         editor: &ManifestEditor,
     ) -> Option<RepairOutcome> {
-        if is_abi_anchor(pkg) {
+        if is_solve_repair_anchor(pkg) {
             return None;
         }
         // Oscillation guard shares the planner-run set with the other tiers.
@@ -1415,7 +1501,7 @@ impl RepairPlanner {
         // from the pypi `package` name via the name-family match), so ABI
         // anchors are protected regardless of which side named the conflict.
         self.guard_anchor(conda_name)?;
-        let spec = widen_spec(op, floor, self.ceiling_policy);
+        let spec = widen_spec(op, floor, self.ceiling_policy).ok_or_else(|| package.to_string())?;
         self.guard_oscillation(package, &spec, Strategy::WidenConda)?;
         let edit = editor.set_conda_widen(&self.feature, conda_name, &spec);
         let old_spec = edit.before.value.clone();
@@ -1502,7 +1588,7 @@ impl RepairPlanner {
     }
 
     fn guard_anchor(&self, package: &str) -> std::result::Result<(), String> {
-        if is_abi_anchor(package) {
+        if is_solve_repair_anchor(package) {
             eprintln!(
                 "retread solve: refusing to auto-pin ABI anchor {package}; edit the manifest manually"
             );
@@ -1941,7 +2027,40 @@ fn intersect_range_with_cap(
 }
 
 pub fn is_abi_anchor(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    let name = name.as_str();
     ABI_ANCHOR_NAMES.contains(&name)
+        || name.starts_with("__")
+        || name.ends_with("_compiler")
+        || name.ends_with("-compiler")
+        || name.starts_with("cuda-")
+        || name.starts_with("cuda_")
+        || [
+            "gcc_",
+            "gcc-",
+            "gxx_",
+            "gxx-",
+            "g++_",
+            "g++-",
+            "gfortran_",
+            "gfortran-",
+            "clang_",
+            "clang-",
+            "clangxx_",
+            "clangxx-",
+            "binutils_",
+            "binutils-",
+            "ld_",
+            "ld-",
+            "sysroot_",
+            "sysroot-",
+        ]
+        .iter()
+        .any(|p| name.starts_with(p))
+}
+
+pub(super) fn is_solve_repair_anchor(name: &str) -> bool {
+    LEGACY_SOLVE_REPAIR_ABI_ANCHOR_NAMES.contains(&name)
         || name.starts_with("__")
         || name.ends_with("_compiler")
         || [
@@ -1956,21 +2075,15 @@ pub fn is_abi_anchor(name: &str) -> bool {
             "sysroot_",
         ]
         .iter()
-        .any(|p| name.starts_with(p))
+        .any(|prefix| name.starts_with(prefix))
 }
 
-fn widen_spec(op: &str, floor: &str, policy: WidenCeilingPolicy) -> String {
+fn widen_spec(op: &str, floor: &str, policy: WidenCeilingPolicy) -> Option<String> {
     let lower = format!("{op}{floor}");
     match policy {
-        WidenCeilingPolicy::None => lower,
-        WidenCeilingPolicy::NextMajor => match next_major(floor) {
-            Some(ceil) => format!("{lower},<{ceil}"),
-            None => lower,
-        },
-        WidenCeilingPolicy::SameMinor => match next_minor(floor) {
-            Some(ceil) => format!("{lower},<{ceil}"),
-            None => lower,
-        },
+        WidenCeilingPolicy::None => Some(lower),
+        WidenCeilingPolicy::NextMajor => Some(format!("{lower},<{}", next_major(floor)?)),
+        WidenCeilingPolicy::SameMinor => Some(format!("{lower},<{}", next_minor(floor)?)),
     }
 }
 
@@ -1983,14 +2096,14 @@ fn strip_version_op(spec: &str) -> &str {
 
 fn next_major(version: &str) -> Option<String> {
     let major = version.split('.').next()?.parse::<u64>().ok()?;
-    Some((major + 1).to_string())
+    checked_version_ceiling(&[major])
 }
 
 fn next_minor(version: &str) -> Option<String> {
     let mut parts = version.split('.');
     let major = parts.next()?.parse::<u64>().ok()?;
     let minor = parts.next().unwrap_or("0").parse::<u64>().ok()?;
-    Some(format!("{major}.{}", minor + 1))
+    checked_version_ceiling(&[major, minor])
 }
 
 fn parse_strategy(raw: &str) -> Strategy {
@@ -2075,8 +2188,8 @@ pub enum Ownership {
     /// widened; the auto-routed side yields toward it instead (doctrine
     /// (i), mirroring `CondaRangeVsPackPin`).
     WorkspacePin,
-    /// One of `ABI_ANCHOR_NAMES` / the `is_abi_anchor` predicate --
-    /// immutable guardrail, never touched.
+    /// One of the legacy solve-repair anchors recognized by
+    /// `is_solve_repair_anchor` -- immutable guardrail, never touched.
     AbiAnchor,
     /// None of the above: someone else's transitive dependency this
     /// workspace has no ownership stake in. Untouchable.
@@ -2166,7 +2279,7 @@ impl RepairPlanner {
         pack_name: Option<&str>,
         package: &str,
     ) -> Ownership {
-        if is_abi_anchor(package) {
+        if is_solve_repair_anchor(package) {
             return Ownership::AbiAnchor;
         }
         let Some(bundle) = pack_name else {
@@ -2753,7 +2866,7 @@ impl RepairPlanner {
             let Some(requirer) = &m.requirer else {
                 continue;
             };
-            if is_abi_anchor(&m.package)
+            if is_solve_repair_anchor(&m.package)
                 || self.workspace_pin_governs_pack(editor, bundle, &m.package)
             {
                 continue;
@@ -2805,7 +2918,7 @@ impl RepairPlanner {
         // correct here: relaxing the conda pin would let conda install a
         // triton whose version contradicts torch's own PyPI metadata.
         for m in mentions {
-            if !is_abi_anchor(&m.package) {
+            if !is_solve_repair_anchor(&m.package) {
                 continue;
             }
             let Some(requirer) = &m.requirer else {
@@ -2909,7 +3022,7 @@ impl RepairPlanner {
             if !requirer.eq_ignore_ascii_case(bundle) {
                 continue;
             }
-            if is_abi_anchor(&m.package)
+            if is_solve_repair_anchor(&m.package)
                 || self.workspace_pin_governs_pack(editor, bundle, &m.package)
             {
                 continue;
@@ -3050,7 +3163,7 @@ impl RepairPlanner {
                     _ => continue,
                 };
                 let target = &mentions[emitted_mention];
-                if is_abi_anchor(&target.package)
+                if is_solve_repair_anchor(&target.package)
                     || pack_emitted_pin_floor(&target.spec).is_none()
                     || self.workspace_pin_governs_pack_family(editor, &pack, &target.package)
                     || self.classify_mention_ownership(editor, Some(&pack), &target.package)
@@ -3320,7 +3433,7 @@ impl RepairPlanner {
         stderr: &str,
         package: &str,
     ) -> Vec<PackOverrideWrite> {
-        if is_abi_anchor(package) {
+        if is_solve_repair_anchor(package) {
             return Vec::new();
         }
         let Some(ws) = crate::workspace::WorkspaceManifest::load(editor.project_dir()) else {
@@ -3580,6 +3693,60 @@ mod tests {
         let path = dir.join("pixi.toml");
         std::fs::write(&path, text).unwrap();
         path
+    }
+
+    #[test]
+    fn widen_spec_ceiling_overflow_fails_closed() {
+        let max = u64::MAX.to_string();
+
+        assert_eq!(
+            widen_spec(">=", &format!("{max}.1"), WidenCeilingPolicy::NextMajor),
+            None
+        );
+        assert_eq!(
+            widen_spec(">=", &format!("1.{max}.0"), WidenCeilingPolicy::SameMinor),
+            None
+        );
+    }
+
+    #[test]
+    fn retread_own_conflict_plans_without_manifest_or_ledger_side_effects() {
+        let path = temp_manifest("[dependencies]\n");
+        let before = std::fs::read(&path).unwrap();
+        let mut editor = ManifestEditor::open(path.clone()).unwrap();
+        let mut planner = RepairPlanner::new("default".into());
+        let mut tried = TriedState::default();
+        let conflict = Conflict::RetreadMutuallyUnsatisfiable(RetreadMutuallyUnsatisfiable {
+            scope: "in environment 'robotics'".into(),
+            bundle: "robotics-output".into(),
+            platform: "linux-64".into(),
+            python: "3.11".into(),
+            package: "numpy".into(),
+            requirements: vec![
+                super::super::parse::RetreadConflictRequirement {
+                    spec: "==1.26.4".into(),
+                    source: "wheel `old-extension==1.0.0`".into(),
+                },
+                super::super::parse::RetreadConflictRequirement {
+                    spec: ">=2,<3".into(),
+                    source: "wheel `new-extension==2.0.0`".into(),
+                },
+            ],
+            suggestion: RetreadConflictSuggestion::DropDependency {
+                pack_manifest: "pypi-packs/robotics-pack/pixi.toml".into(),
+                alternatives: Vec::new(),
+            },
+            suggestion_from_backend: true,
+        });
+
+        let outcome = planner
+            .repair(&mut editor, &mut tried, &conflict, 1)
+            .unwrap();
+        assert!(outcome.applied.is_empty());
+        assert!(outcome.pack_override.is_none());
+        assert!(outcome.summary_line.contains("drop dependency `numpy`"));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(!path.parent().unwrap().join(".retread").exists());
     }
 
     #[test]
@@ -4511,11 +4678,41 @@ holosoma-gpu = { features = ["holosoma"] }
 
     #[test]
     fn abi_guard_covers_exact_list_and_patterns() {
-        assert!(is_abi_anchor("python"));
-        assert!(is_abi_anchor("__linux"));
-        assert!(is_abi_anchor("cxx_compiler"));
-        assert!(is_abi_anchor("sysroot_linux-64"));
-        assert!(!is_abi_anchor("numpy"));
+        for anchor in [
+            "python",
+            "python_abi",
+            "pypy",
+            "numpy",
+            "cuda",
+            "cuda-version",
+            "glibc",
+            "libstdcxx",
+            "libstdcxx-ng",
+            "libcxx",
+            "libcxx-devel",
+            "__linux",
+            "cxx_compiler",
+            "gcc_linux-64",
+            "gxx_linux-64",
+            "g++_linux-64",
+            "gfortran_linux-64",
+            "clang_linux-64",
+            "clangxx_linux-64",
+            "binutils_linux-64",
+            "ld_linux-64",
+            "sysroot_linux-64",
+        ] {
+            assert!(is_abi_anchor(anchor), "{anchor}");
+        }
+        assert!(is_abi_anchor("CUDA"));
+        assert!(is_abi_anchor("cuda-cudart"));
+        assert!(is_abi_anchor("cxx-compiler"));
+        assert!(is_abi_anchor("sysroot-linux-64"));
+        assert!(!is_abi_anchor("packaging"));
+        assert!(
+            !is_solve_repair_anchor("numpy") && !is_solve_repair_anchor("cuda"),
+            "Track 1 must not silently activate Track 4 solve-repair policy"
+        );
     }
 
     // ---- P0 acceptance fixture (lock-succ-brief.md acceptance run #1/#2):

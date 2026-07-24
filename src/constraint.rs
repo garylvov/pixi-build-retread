@@ -5,9 +5,9 @@
 //! new source of constraints cannot acquire independent hard/soft semantics.
 
 use std::collections::BTreeMap;
+use std::fmt;
 
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
 use uv_pep508::uv_pep440::{
     Operator, Version, VersionSpecifier, VersionSpecifiers, release_specifiers_to_ranges,
 };
@@ -15,7 +15,7 @@ use uv_pep508::uv_pep440::{
 use crate::relax::PypiKey;
 
 /// Where a constraint entered the composed dependency graph.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Provenance {
     /// `Requires-Dist` metadata from an index-fetched wheel.
     #[default]
@@ -57,12 +57,60 @@ pub fn authority(provenance: &Provenance) -> Authority {
     }
 }
 
+/// Stable identity for the structured origin of one constraint.
+///
+/// The encoded value is assembled from semantic fields supplied by the
+/// constraint producer (for example wheel name/version and normalized
+/// requirement), never from the free-form, user-facing [`Constraint::source`].
+/// Every field is byte-length-prefixed so distinct component boundaries cannot
+/// collide (`["ab", "c"]` and `["a", "bc"]` remain different identities).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ConstraintOriginId(String);
+
+impl ConstraintOriginId {
+    /// Construct an origin identity from a stable kind and ordered semantic
+    /// components.
+    ///
+    /// Callers must pass canonical structured values, not diagnostic prose or
+    /// [`Constraint::source`]. No `From<String>` or unstructured constructor is
+    /// provided so origin creation remains explicit at each source boundary.
+    pub fn from_parts<I, S>(kind: &str, parts: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        fn push_part(encoded: &mut String, part: &str) {
+            encoded.push_str(&part.len().to_string());
+            encoded.push(':');
+            encoded.push_str(part);
+        }
+
+        let mut encoded = String::new();
+        push_part(&mut encoded, kind);
+        for part in parts {
+            push_part(&mut encoded, part.as_ref());
+        }
+        Self(encoded)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ConstraintOriginId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// One version constraint with enough provenance to determine its authority.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Constraint {
     pub specifiers: VersionSpecifiers,
     pub provenance: Provenance,
     pub source: String,
+    pub origin_id: ConstraintOriginId,
 }
 
 impl Constraint {
@@ -74,15 +122,190 @@ impl Constraint {
 /// A finalized requirement whose active constraints have an empty
 /// intersection.
 ///
-/// The display text preserves the existing joint-route diagnostic while the
-/// package identity and source list remain structurally available to callers.
-#[derive(Clone, Debug, PartialEq, Eq, Error)]
-#[error(
-    "joint route validation cannot restore `{package}` to PyPI: active requirements are mutually unsatisfiable:\n{sources}"
-)]
+/// The package identity and complete source list remain structurally available
+/// to callers. Joint-route callers attach the concrete environment/target
+/// scope before surfacing the conflict.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Conflict {
     pub package: PypiKey,
     pub sources: String,
+    scope: String,
+    requirements: Vec<Constraint>,
+    suggestion: Option<Box<ConflictSuggestion>>,
+}
+
+/// A merge-oriented manifest edit attached to one fail-closed conflict.
+///
+/// The suggestion is diagnostic only: constructing or rendering it never
+/// mutates the named pack manifest.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConflictSuggestion {
+    pub pack_manifest: String,
+    pub toml: String,
+}
+
+impl Conflict {
+    /// Add a user-facing solve scope such as an environment, target profile,
+    /// platform, Python version, and bundle identity.
+    pub(crate) fn with_scope(mut self, scope: impl Into<String>) -> Self {
+        self.scope = format!(" {}", scope.into());
+        self
+    }
+
+    pub(crate) fn with_suggestion(
+        mut self,
+        pack_manifest: impl Into<String>,
+        toml: impl Into<String>,
+    ) -> Self {
+        self.suggestion = Some(Box::new(ConflictSuggestion {
+            pack_manifest: pack_manifest.into(),
+            toml: toml.into(),
+        }));
+        self
+    }
+
+    pub(crate) fn requirements(&self) -> &[Constraint] {
+        &self.requirements
+    }
+
+    pub fn suggestion(&self) -> Option<&ConflictSuggestion> {
+        self.suggestion.as_deref()
+    }
+}
+
+impl fmt::Display for Conflict {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "dependency conflict{}: `{}` requirements are mutually unsatisfiable: {}. \
+             Resolve by pinning one side, or use `retread-relax`, `retread-overrides`, or \
+             `retread-drop-deps` in the pack manifest (see README).",
+            self.scope, self.package, self.sources
+        )?;
+        if let Some(suggestion) = &self.suggestion {
+            write!(
+                formatter,
+                "\n\nSuggested fix in {}:\n{}",
+                suggestion.pack_manifest,
+                suggestion.toml.trim_end()
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for Conflict {}
+
+/// A successful policy-neutral finalization, retaining whether the legacy
+/// conda-as-truth rule had to discard advisory floor/equality clauses.
+///
+/// The detailed form lets ABI-sensitive callers fail closed without changing
+/// the public [`finalize`] contract for ordinary packages.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum FinalizeSuccess {
+    Unchanged(VersionSpecifiers),
+    AdvisoryFloorSoftened {
+        specifiers: VersionSpecifiers,
+        unsoftened_conflict: Conflict,
+    },
+}
+
+impl FinalizeSuccess {
+    fn into_specifiers(self) -> VersionSpecifiers {
+        match self {
+            Self::Unchanged(specifiers) | Self::AdvisoryFloorSoftened { specifiers, .. } => {
+                specifiers
+            }
+        }
+    }
+}
+
+/// Every structural dependency conflict found while validating one solve
+/// request.
+///
+/// Individual entries retain the ordinary [`Conflict`] rendering so package,
+/// provenance, solve scope, and remediation stay actionable. The report only
+/// adds deterministic numbering and separation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConflictReport {
+    pub conflicts: Vec<Conflict>,
+}
+
+impl ConflictReport {
+    pub(crate) fn with_scope(mut self, scope: impl Into<String>) -> Self {
+        let scope = scope.into();
+        self.conflicts = self
+            .conflicts
+            .into_iter()
+            .map(|conflict| conflict.with_scope(scope.clone()))
+            .collect();
+        self
+    }
+}
+
+impl fmt::Display for ConflictReport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "{} dependency conflicts found:", self.conflicts.len())?;
+        for (index, conflict) in self.conflicts.iter().enumerate() {
+            if index > 0 {
+                write!(f, "\n\n")?;
+            }
+            write!(f, "{}. {conflict}", index + 1)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for ConflictReport {}
+
+/// Preserve the existing typed single-conflict error while representing two
+/// or more conflicts as one report.
+pub(crate) fn aggregate_conflicts(mut conflicts: Vec<Conflict>) -> anyhow::Error {
+    assert!(!conflicts.is_empty(), "cannot aggregate zero conflicts");
+    conflicts.sort_by(|left, right| {
+        (
+            &left.package,
+            &left.sources,
+            &left.scope,
+            left.suggestion
+                .as_ref()
+                .map(|suggestion| (&suggestion.pack_manifest, &suggestion.toml)),
+        )
+            .cmp(&(
+                &right.package,
+                &right.sources,
+                &right.scope,
+                right
+                    .suggestion
+                    .as_ref()
+                    .map(|suggestion| (&suggestion.pack_manifest, &suggestion.toml)),
+            ))
+    });
+    if conflicts.len() == 1 {
+        anyhow::Error::new(conflicts.pop().expect("one conflict"))
+    } else {
+        anyhow::Error::new(ConflictReport { conflicts })
+    }
+}
+
+/// Append a typed conflict error to a request-level collection.
+///
+/// `anyhow` context may wrap either a singleton [`Conflict`] or an already
+/// aggregated [`ConflictReport`]. Inspecting the chain by reference retains
+/// that typing without discarding the original error when it is unrelated.
+pub(crate) fn collect_conflicts(
+    error: anyhow::Error,
+    conflicts: &mut Vec<Conflict>,
+) -> Result<(), anyhow::Error> {
+    if let Some(report) = error.downcast_ref::<ConflictReport>() {
+        conflicts.extend(report.conflicts.iter().cloned());
+        Ok(())
+    } else if let Some(conflict) = error.downcast_ref::<Conflict>() {
+        conflicts.push(conflict.clone());
+        Ok(())
+    } else {
+        Err(error)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -123,7 +346,9 @@ fn specifier_dedupe_key(specifier: &VersionSpecifier) -> SpecifierDedupeKey {
 
 /// Deduplicate without collapsing clauses whose written release length or
 /// spelling changes their semantics.
-fn dedup_specifier_clauses(clauses: impl Iterator<Item = VersionSpecifier>) -> VersionSpecifiers {
+pub(crate) fn dedup_specifier_clauses(
+    clauses: impl Iterator<Item = VersionSpecifier>,
+) -> VersionSpecifiers {
     let mut unique: BTreeMap<SpecifierDedupeKey, (String, VersionSpecifier)> = BTreeMap::new();
     for specifier in clauses {
         let rendered = specifier.to_string();
@@ -187,7 +412,35 @@ fn remove_redundant_specifier_clauses(specifiers: VersionSpecifiers) -> VersionS
 
 /// True when the full PEP 440 intersection is empty, including arbitrary
 /// equality contradictions that ordered-version equality cannot distinguish.
-fn specifiers_unsatisfiable(specifiers: &VersionSpecifiers) -> bool {
+pub(crate) fn specifiers_unsatisfiable(specifiers: &VersionSpecifiers) -> bool {
+    if specifiers.iter().any(|specifier| {
+        let version = specifier.version();
+        match *specifier.operator() {
+            Operator::TildeEqual => {
+                let release = version.release();
+                release.len() >= 2 && release[release.len() - 2] == u64::MAX
+            }
+            Operator::GreaterThan => match version.dev() {
+                Some(dev) => dev == u64::MAX,
+                None => version.post() == Some(u64::MAX),
+            },
+            Operator::EqualStar | Operator::NotEqualStar => {
+                version.post() == Some(u64::MAX)
+                    || version.pre().is_some_and(|pre| pre.number == u64::MAX)
+                    || version
+                        .release()
+                        .last()
+                        .is_some_and(|segment| *segment == u64::MAX)
+            }
+            _ => false,
+        }
+    }) {
+        // uv's range conversion constructs exclusive ceilings with unchecked
+        // `u64 + 1`. A ceiling that cannot be represented cannot prove a
+        // nonempty ABI constraint, so reject it before either conversion.
+        return true;
+    }
+
     let full = release_specifiers_to_ranges(VersionSpecifiers::empty());
     let range_is_empty = full.intersection(&specifiers.clone().into()).is_empty();
     let arbitrary_exact_conflict = specifiers.iter().any(|specifier| {
@@ -216,6 +469,31 @@ fn operator_forces_floor(operator: Operator) -> bool {
     )
 }
 
+fn conflict_from_active(package: &PypiKey, active: &[&Constraint]) -> Conflict {
+    let sources = active
+        .iter()
+        .map(|constraint| {
+            let rendered = if constraint.specifiers.is_empty() {
+                "*".to_string()
+            } else {
+                constraint.specifiers.to_string()
+            };
+            format!("`{rendered}` required by {}", constraint.source)
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Conflict {
+        package: package.clone(),
+        sources,
+        scope: String::new(),
+        requirements: active
+            .iter()
+            .map(|constraint| (*constraint).clone())
+            .collect(),
+        suggestion: None,
+    }
+}
+
 /// Apply override replacement, exclude preferences, deduplicate, and prove
 /// the active constraint intersection satisfiable.
 ///
@@ -227,6 +505,34 @@ pub fn finalize(
     package: &PypiKey,
     constraints: &[Constraint],
 ) -> Result<VersionSpecifiers, Conflict> {
+    finalize_impl(package, constraints, true).map(FinalizeSuccess::into_specifiers)
+}
+
+/// The exact strict finalization semantics without diagnostic side effects.
+///
+/// Candidate search uses this oracle for speculative subsets. The public
+/// [`finalize`] wrapper retains its existing committed-path warning behavior.
+pub(crate) fn finalize_quiet(
+    package: &PypiKey,
+    constraints: &[Constraint],
+) -> Result<VersionSpecifiers, Conflict> {
+    finalize_impl(package, constraints, false).map(FinalizeSuccess::into_specifiers)
+}
+
+/// Quiet policy-neutral finalization with enough detail for ABI callers to
+/// reject a success that depended on discarding an advisory clause.
+pub(crate) fn finalize_quiet_detailed(
+    package: &PypiKey,
+    constraints: &[Constraint],
+) -> Result<FinalizeSuccess, Conflict> {
+    finalize_impl(package, constraints, false)
+}
+
+fn finalize_impl(
+    package: &PypiKey,
+    constraints: &[Constraint],
+    emit_diagnostics: bool,
+) -> Result<FinalizeSuccess, Conflict> {
     let has_override = constraints
         .iter()
         .any(|constraint| matches!(&constraint.provenance, Provenance::UvOverride));
@@ -247,7 +553,9 @@ pub fn finalize(
 
     let combined = intersect(&active);
     if !specifiers_unsatisfiable(&combined) {
-        return Ok(remove_redundant_specifier_clauses(combined));
+        return Ok(FinalizeSuccess::Unchanged(
+            remove_redundant_specifier_clauses(combined),
+        ));
     }
 
     let authoritative: Vec<&Constraint> = active
@@ -283,32 +591,23 @@ pub fn finalize(
         }
         let softened = dedup_specifier_clauses(kept.into_iter());
         if dropped_floor && !specifiers_unsatisfiable(&softened) {
-            tracing::warn!(
-                package = %package,
-                softened = %softened,
-                "an advisory lower bound conflicted with an authoritative constraint; \
-                 dropped the advisory floor (conda-as-truth)",
-            );
-            return Ok(remove_redundant_specifier_clauses(softened));
+            let unsoftened_conflict = conflict_from_active(package, &active);
+            if emit_diagnostics {
+                tracing::warn!(
+                    package = %package,
+                    softened = %softened,
+                    "an advisory lower bound conflicted with an authoritative constraint; \
+                     dropped the advisory floor (conda-as-truth)",
+                );
+            }
+            return Ok(FinalizeSuccess::AdvisoryFloorSoftened {
+                specifiers: remove_redundant_specifier_clauses(softened),
+                unsoftened_conflict,
+            });
         }
     }
 
-    let sources = active
-        .iter()
-        .map(|constraint| {
-            let rendered = if constraint.specifiers.is_empty() {
-                "*".to_string()
-            } else {
-                constraint.specifiers.to_string()
-            };
-            format!("  - `{rendered}` from {}", constraint.source)
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    Err(Conflict {
-        package: package.clone(),
-        sources,
-    })
+    Err(conflict_from_active(package, &active))
 }
 
 #[cfg(test)]
@@ -318,6 +617,16 @@ mod tests {
     use super::*;
 
     fn constraint(specifiers: &str, provenance: Provenance, source: &str) -> Constraint {
+        let provenance_tag = match &provenance {
+            Provenance::IndexWheelMetadata => "index-wheel-metadata",
+            Provenance::SourceBuiltRelaxed => "source-built-relaxed",
+            Provenance::DepsFromRelaxed => "deps-from-relaxed",
+            Provenance::WorkspaceCondaFact(_) => "workspace-conda-fact",
+            Provenance::UvRoot => "uv-root",
+            Provenance::UvConstraint => "uv-constraint",
+            Provenance::UvOverride => "uv-override",
+            Provenance::PriorSelection => "prior-selection",
+        };
         Constraint {
             specifiers: if specifiers.is_empty() {
                 VersionSpecifiers::empty()
@@ -326,11 +635,31 @@ mod tests {
             },
             provenance,
             source: source.to_string(),
+            origin_id: ConstraintOriginId::from_parts(
+                "constraint-unit-test",
+                [provenance_tag, specifiers],
+            ),
         }
     }
 
     fn package() -> PypiKey {
         PypiKey::from_pypi("example_package")
+    }
+
+    #[test]
+    fn structured_origin_ids_preserve_component_boundaries_and_order() {
+        let first = ConstraintOriginId::from_parts("wheel", ["a", "bc"]);
+        let second = ConstraintOriginId::from_parts("wheel", ["ab", "c"]);
+        let repeated = ConstraintOriginId::from_parts("wheel", ["a", "bc"]);
+        let other_kind = ConstraintOriginId::from_parts("route", ["a", "bc"]);
+
+        assert_eq!(first, repeated);
+        assert_ne!(first, second);
+        assert_ne!(first, other_kind);
+
+        let lower = ConstraintOriginId::from_parts("wheel", ["a"]);
+        let upper = ConstraintOriginId::from_parts("wheel", ["b"]);
+        assert!(lower < upper);
     }
 
     #[test]
@@ -512,5 +841,61 @@ mod tests {
             constraint("<2", Provenance::SourceBuiltRelaxed, "advisory cap"),
         ];
         finalize(&package(), &constraints).expect_err("advisory cap must remain active");
+    }
+
+    #[test]
+    fn request_collection_flattens_contextual_singletons_and_reports() {
+        let first = finalize(
+            &PypiKey::from_pypi("alpha"),
+            &[
+                constraint("<2", Provenance::UvRoot, "alpha root"),
+                constraint(">=3", Provenance::UvConstraint, "alpha constraint"),
+            ],
+        )
+        .unwrap_err();
+        let second = finalize(
+            &PypiKey::from_pypi("beta"),
+            &[
+                constraint("<4", Provenance::UvRoot, "beta root"),
+                constraint(">=5", Provenance::UvConstraint, "beta constraint"),
+            ],
+        )
+        .unwrap_err();
+        let third = finalize(
+            &PypiKey::from_pypi("gamma"),
+            &[
+                constraint("<6", Provenance::UvRoot, "gamma root"),
+                constraint(">=7", Provenance::UvConstraint, "gamma constraint"),
+            ],
+        )
+        .unwrap_err();
+
+        let mut collected = Vec::new();
+        collect_conflicts(
+            anyhow::Error::new(first).context("resolving bundle alpha"),
+            &mut collected,
+        )
+        .unwrap();
+        collect_conflicts(
+            aggregate_conflicts(vec![second, third]).context("resolving the remaining bundles"),
+            &mut collected,
+        )
+        .unwrap();
+
+        assert_eq!(
+            collected
+                .iter()
+                .map(|conflict| conflict.package.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha", "beta", "gamma"]
+        );
+
+        let unrelated = anyhow::anyhow!("network unavailable").context("fetching metadata");
+        let unrelated = collect_conflicts(unrelated, &mut collected)
+            .expect_err("non-conflict errors must propagate");
+        assert_eq!(
+            format!("{unrelated:#}"),
+            "fetching metadata: network unavailable"
+        );
     }
 }

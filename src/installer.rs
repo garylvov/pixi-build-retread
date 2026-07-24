@@ -1709,6 +1709,8 @@ mod tests {
             conda_capable: vec![],
             entry_specs: vec![],
             wheel_store: None,
+            abi_context: None,
+            relaxations: vec![],
         }
     }
 

@@ -1,5 +1,115 @@
 use regex::Regex;
 
+/// One side of a fail-closed constraint conflict emitted by retread itself.
+///
+/// The source remains separate from the version specifier so the solve
+/// report can name the exact wheel (or workspace fact) and the Track-2
+/// override menu can be rendered without reverse-parsing display prose.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+pub struct RetreadConflictRequirement {
+    pub spec: String,
+    pub source: String,
+}
+
+/// The already-selected Track-2 remediation carried in retread's own error.
+///
+/// The backend owns the dependency graph, so it is also the only place that
+/// can safely choose a transitive root. `retread solve` preserves that choice
+/// structurally instead of attempting a second graph walk from solver prose.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum RetreadConflictSuggestion {
+    DropDependency {
+        pack_manifest: String,
+        alternatives: Vec<(String, String)>,
+    },
+    Override {
+        pack_manifest: String,
+        package: String,
+        spec: String,
+    },
+    RootPin {
+        pack_manifest: String,
+        package: String,
+        spec: String,
+        bundle_group: String,
+    },
+}
+
+impl RetreadConflictSuggestion {
+    pub fn pack_manifest(&self) -> &str {
+        match self {
+            Self::DropDependency { pack_manifest, .. }
+            | Self::Override { pack_manifest, .. }
+            | Self::RootPin { pack_manifest, .. } => pack_manifest,
+        }
+    }
+
+    /// Re-render through the same merge-oriented helpers Track 2 uses.
+    pub fn render_toml(&self, conflict_package: &str) -> String {
+        match self {
+            Self::DropDependency { alternatives, .. } => {
+                crate::pack_overrides::render_drop_deps_with_override_menu(
+                    conflict_package,
+                    alternatives,
+                )
+            }
+            Self::Override { package, spec, .. } => {
+                crate::pack_overrides::render_override_toml(package, spec)
+            }
+            Self::RootPin {
+                package,
+                spec,
+                bundle_group,
+                ..
+            } => crate::pack_overrides::render_root_pin_toml(package, spec, bundle_group),
+        }
+    }
+}
+
+/// A structured form of retread's own fail-closed
+/// "requirements are mutually unsatisfiable" diagnostic.
+///
+/// This is deliberately shared by the ordinary conflict parser, the
+/// read-only workspace audit, and the repair planner. Before Track 4 the
+/// audit driver carried a second regex and discarded the pack/scope/Track-2
+/// suggestion, while the live parser returned `None`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+pub struct RetreadMutuallyUnsatisfiable {
+    pub scope: String,
+    pub bundle: String,
+    pub platform: String,
+    pub python: String,
+    pub package: String,
+    pub requirements: Vec<RetreadConflictRequirement>,
+    pub suggestion: RetreadConflictSuggestion,
+    /// True only when the action came from Track 2's embedded
+    /// `Suggested fix` payload. Older diagnostics still get a useful
+    /// read-only fallback menu, but apply mode must not treat that
+    /// inference as a backend-selected relaxation.
+    pub suggestion_from_backend: bool,
+}
+
+impl RetreadMutuallyUnsatisfiable {
+    pub fn provenance(&self) -> String {
+        let requirements = self
+            .requirements
+            .iter()
+            .map(|requirement| format!("`{}` required by {}", requirement.spec, requirement.source))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let scope = if self.scope.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", self.scope)
+        };
+        format!(
+            "`{}` requirements are mutually unsatisfiable{scope}: {requirements}",
+            self.package
+        )
+    }
+}
+
 /// One `<package> <version-specifier>` clause found anywhere in a failed
 /// solve's error text by the generic fallback extractor
 /// ([`RegexConflictParser::extract_generic_mentions`]) -- the raw
@@ -26,6 +136,10 @@ pub struct Mention {
 /// One actionable fact extracted from a failed solve.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum Conflict {
+    /// A fail-closed conflict produced by this backend's structured
+    /// constraint aggregation. It carries the complete Track-2 suggestion,
+    /// including a graph-walked root pin when the backend selected one.
+    RetreadMutuallyUnsatisfiable(RetreadMutuallyUnsatisfiable),
     /// A previously injected `==version` pin has no candidate in the ecosystem just tried.
     NoCandidates { package: String, version: String },
     /// conda-pinned version clashes with a pypi requirement.
@@ -193,6 +307,7 @@ pub enum Conflict {
 impl Conflict {
     pub fn kind(&self) -> &'static str {
         match self {
+            Conflict::RetreadMutuallyUnsatisfiable(_) => "RetreadMutuallyUnsatisfiable",
             Conflict::NoCandidates { .. } => "NoCandidates",
             Conflict::CondaBoundary { .. } => "CondaBoundary",
             Conflict::PypiInternal { .. } => "PypiInternal",
@@ -212,6 +327,7 @@ pub trait ConflictParser {
 
 pub struct RegexConflictParser {
     ansi: Regex,
+    retread_mutually_unsatisfiable: Regex,
     no_candidates: Regex,
     help_conda: Regex,
     // uv-closure JSON-RPC ErrorObject shape (pixi-build-retread wraps a uv
@@ -291,6 +407,19 @@ impl RegexConflictParser {
     pub fn new() -> Self {
         Self {
             ansi: Regex::new(r"\x1b\[[0-9;]*m").expect("valid ansi regex"),
+            retread_mutually_unsatisfiable: Regex::new(concat!(
+                r"dependency conflict(?:",
+                r"(?P<scope>.*?) for bundle '(?P<bundle>[^']+)'",
+                r"| in bundle '(?P<bundle_only>[^']+)'",
+                r") ",
+                r"\((?P<context>[^)]*?platform (?P<platform>[^,\s)]+), ",
+                r"python (?P<python>[^)]+))\): `(?P<package>[^`]+)` ",
+                r"requirements are mutually unsatisfiable: (?P<requirements>.*?)\. ",
+                r"Resolve by pinning one side, or use `retread-relax`, ",
+                r"`retread-overrides`, or `retread-drop-deps` in the pack manifest ",
+                r"\(see README\)\.",
+            ))
+            .expect("valid retread-mutually-unsatisfiable regex"),
             // dumb-hack.py line 47:
             // No candidates were found for ([a-zA-Z0-9_-]+)\s*==\s*([0-9][0-9a-zA-Z.]*[0-9a-zA-Z])
             no_candidates: Regex::new(
@@ -777,6 +906,85 @@ impl RegexConflictParser {
         self.whitespace.replace_all(&joined, " ").trim().to_string()
     }
 
+    /// Extract every retread-owned fail-closed conflict from one solver
+    /// failure. Aggregated backend errors can contain several numbered
+    /// conflicts, so the audit consumes the whole vector while the legacy
+    /// single-conflict parser returns its first item.
+    pub fn parse_retread_conflicts(&self, stderr: &str) -> Vec<RetreadMutuallyUnsatisfiable> {
+        #[derive(Debug)]
+        struct Base {
+            start: usize,
+            end: usize,
+            scope: String,
+            bundle: String,
+            platform: String,
+            python: String,
+            package: String,
+            requirements: Vec<RetreadConflictRequirement>,
+        }
+
+        let text = self.flatten_for_generic_scan(stderr).replace("\\\"", "\"");
+        let bases = self
+            .retread_mutually_unsatisfiable
+            .captures_iter(&text)
+            .filter_map(|captures| {
+                let whole = captures.get(0)?;
+                let requirements =
+                    split_retread_requirements(captures.name("requirements")?.as_str())
+                        .into_iter()
+                        .filter_map(parse_retread_requirement)
+                        .collect::<Vec<_>>();
+                let bundle = captures
+                    .name("bundle")
+                    .or_else(|| captures.name("bundle_only"))?
+                    .as_str()
+                    .to_string();
+                let platform = captures.name("platform")?.as_str().to_string();
+                let python = captures.name("python")?.as_str().trim().to_string();
+                let package = captures.name("package")?.as_str().to_string();
+                let scope = captures
+                    .name("scope")
+                    .map(|value| value.as_str().trim().to_string())
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| format!("in bundle '{bundle}'"));
+                (!requirements.is_empty()).then(|| Base {
+                    start: whole.start(),
+                    end: whole.end(),
+                    scope,
+                    bundle,
+                    platform,
+                    python,
+                    package,
+                    requirements,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        bases
+            .iter()
+            .enumerate()
+            .map(|(index, base)| {
+                let tail_end = bases
+                    .get(index + 1)
+                    .map(|next| next.start)
+                    .unwrap_or(text.len());
+                let tail = &text[base.end..tail_end];
+                let (suggestion, suggestion_from_backend) =
+                    parse_retread_suggestion(tail, &base.bundle, &base.package, &base.requirements);
+                RetreadMutuallyUnsatisfiable {
+                    scope: base.scope.clone(),
+                    bundle: base.bundle.clone(),
+                    platform: base.platform.clone(),
+                    python: base.python.clone(),
+                    package: base.package.clone(),
+                    requirements: base.requirements.clone(),
+                    suggestion,
+                    suggestion_from_backend,
+                }
+            })
+            .collect()
+    }
+
     /// Generic (shape-agnostic) extraction of every
     /// `<package-name> <version-specifier>` clause anywhere in a failed
     /// solve's error text -- the corpus in `tests/fixtures/solve_errors/`
@@ -1014,6 +1222,218 @@ pub fn diagnose_constrained_renamed_companion(stderr: &str) -> Option<String> {
     ))
 }
 
+fn split_retread_requirements(requirements: &str) -> Vec<&str> {
+    let mut clauses = Vec::new();
+    let mut clause_start = 0;
+    for (separator, _) in requirements.match_indices("; ") {
+        let next_start = separator + 2;
+        let next = &requirements[next_start..];
+        let Some(after_opening_tick) = next.strip_prefix('`') else {
+            continue;
+        };
+        let Some(spec_end) = after_opening_tick.find('`') else {
+            continue;
+        };
+        if !after_opening_tick[spec_end + 1..].starts_with(" required by ") {
+            continue;
+        }
+        clauses.push(&requirements[clause_start..separator]);
+        clause_start = next_start;
+    }
+    clauses.push(&requirements[clause_start..]);
+    clauses
+}
+
+fn parse_retread_requirement(clause: &str) -> Option<RetreadConflictRequirement> {
+    let clause = clause.trim();
+    let clause = clause.strip_prefix('`')?;
+    let (spec, source) = clause.split_once("` required by ")?;
+    Some(RetreadConflictRequirement {
+        spec: spec.trim().to_string(),
+        source: source.trim().to_string(),
+    })
+}
+
+fn fallback_pack_manifest(bundle: &str) -> String {
+    format!("pypi-packs/{bundle}/pixi.toml")
+}
+
+fn parse_embedded_drop_alternatives(
+    body: &str,
+    conflict_package: &str,
+    requirements: &[RetreadConflictRequirement],
+) -> Option<Vec<(String, String)>> {
+    let alternative_marker =
+        Regex::new(r"#\s*Alternative\s+\d+\s*:").expect("valid Track-2 alternative marker regex");
+    let markers = alternative_marker.find_iter(body).collect::<Vec<_>>();
+    if markers.is_empty() {
+        return None;
+    }
+
+    let override_assignment =
+        Regex::new(r#"(?:"(?P<quoted>[^"]+)"|(?P<bare>[A-Za-z0-9_.-]+))\s*=\s*"(?P<spec>[^"]+)""#)
+            .expect("valid Track-2 commented override regex");
+    let embedded_source = Regex::new(
+        r"keep the requirement from:\s*#\s*(?P<source>.*?)\s*#\s*Under \[package\.build\.config\.retread-overrides\]",
+    )
+    .expect("valid Track-2 embedded alternative source regex");
+    let conflict_package = crate::relax::canonical_conda_name(conflict_package);
+    let mut alternatives = Vec::new();
+
+    for (index, marker) in markers.iter().enumerate() {
+        let end = markers
+            .get(index + 1)
+            .map(|next| next.start())
+            .unwrap_or(body.len());
+        let segment = &body[marker.end()..end];
+        let selected = override_assignment
+            .captures_iter(segment)
+            .filter_map(|captures| {
+                let package = captures
+                    .name("quoted")
+                    .or_else(|| captures.name("bare"))?
+                    .as_str();
+                (crate::relax::canonical_conda_name(package) == conflict_package).then(|| {
+                    captures
+                        .name("spec")
+                        .expect("override regex always captures spec")
+                        .as_str()
+                        .to_string()
+                })
+            })
+            .last();
+        let Some(spec) = selected else {
+            continue;
+        };
+        let source = embedded_source
+            .captures(segment)
+            .and_then(|captures| captures.name("source"))
+            .map(|source| source.as_str().trim().to_string())
+            .or_else(|| {
+                requirements
+                    .iter()
+                    .find(|requirement| requirement.spec == spec)
+                    .map(|requirement| requirement.source.clone())
+            });
+        if let Some(source) = source {
+            alternatives.push((spec, source));
+        }
+    }
+
+    Some(alternatives)
+}
+
+fn parse_retread_suggestion(
+    tail: &str,
+    bundle: &str,
+    conflict_package: &str,
+    requirements: &[RetreadConflictRequirement],
+) -> (RetreadConflictSuggestion, bool) {
+    let marker = "Suggested fix in ";
+    let parsed_payload = tail.find(marker).and_then(|start| {
+        let rest = &tail[start + marker.len()..];
+        let manifest_end = rest
+            .find(".toml:")
+            .map(|index| index + ".toml".len())
+            .or_else(|| rest.find(':'));
+        manifest_end.map(|end| {
+            (
+                rest[..end].trim().to_string(),
+                rest[end + 1..].trim().to_string(),
+            )
+        })
+    });
+    let (pack_manifest, body) =
+        parsed_payload.unwrap_or_else(|| (fallback_pack_manifest(bundle), String::new()));
+
+    // The phrase is emitted only by Track 2 after its dependency-graph walk
+    // selected a unique root. Keep that decision rather than mistaking a
+    // commented equal-authority override alternative for the primary fix.
+    if body.contains("Constrain the transitive root") {
+        let root_pin = Regex::new(
+            r#"(?:"([^"]+)"|([A-Za-z0-9_.-]+))\s*=\s*\{\s*version\s*=\s*"([^"]+)"\s*,\s*bundle\s*=\s*"([^"]+)"\s*\}"#,
+        )
+        .expect("valid Track-2 root-pin regex");
+        if let Some(captures) = root_pin.captures(&body) {
+            let package = captures
+                .get(1)
+                .or_else(|| captures.get(2))
+                .expect("one root package capture")
+                .as_str()
+                .to_string();
+            return (
+                RetreadConflictSuggestion::RootPin {
+                    pack_manifest,
+                    package,
+                    spec: captures[3].to_string(),
+                    bundle_group: captures[4].to_string(),
+                },
+                true,
+            );
+        }
+
+        // A deps-from graph root is expressed as a retread-overrides scalar
+        // assignment rather than a retread-wheels inline table.
+        let root_override = Regex::new(r#"(?:"([^"]+)"|([A-Za-z0-9_.-]+))\s*=\s*"([^"]+)""#)
+            .expect("valid Track-2 root-override regex");
+        if let Some(captures) = root_override.captures_iter(&body).last() {
+            let package = captures
+                .get(1)
+                .or_else(|| captures.get(2))
+                .expect("one override package capture")
+                .as_str()
+                .to_string();
+            return (
+                RetreadConflictSuggestion::Override {
+                    pack_manifest,
+                    package,
+                    spec: captures[3].to_string(),
+                },
+                true,
+            );
+        }
+    }
+
+    let drop_deps =
+        Regex::new(r#"retread-drop-deps\s*=\s*\[[^\]]*\]"#).expect("valid Track-2 drop-deps regex");
+    let conflict_package = crate::relax::canonical_conda_name(conflict_package);
+    let drop_matches_conflict = drop_deps.captures_iter(&body).any(|captures| {
+        let Some(assignment) = captures.get(0) else {
+            return false;
+        };
+        let Ok(document) = assignment.as_str().parse::<toml_edit::DocumentMut>() else {
+            return false;
+        };
+        document
+            .get("retread-drop-deps")
+            .and_then(toml_edit::Item::as_array)
+            .is_some_and(|dependencies| {
+                dependencies.iter().any(|dependency| {
+                    dependency.as_str().is_some_and(|package| {
+                        crate::relax::canonical_conda_name(package) == conflict_package
+                    })
+                })
+            })
+    });
+    let alternatives = parse_embedded_drop_alternatives(&body, &conflict_package, requirements)
+        .unwrap_or_else(|| {
+            let mut alternatives = requirements
+                .iter()
+                .map(|requirement| (requirement.spec.clone(), requirement.source.clone()))
+                .collect::<Vec<_>>();
+            alternatives.sort();
+            alternatives.dedup();
+            alternatives
+        });
+    (
+        RetreadConflictSuggestion::DropDependency {
+            pack_manifest,
+            alternatives,
+        },
+        drop_matches_conflict,
+    )
+}
+
 impl Default for RegexConflictParser {
     fn default() -> Self {
         Self::new()
@@ -1022,6 +1442,12 @@ impl Default for RegexConflictParser {
 
 impl ConflictParser for RegexConflictParser {
     fn parse(&self, stderr: &str) -> Option<Conflict> {
+        // Retread's own structured fail-closed diagnostic must run before
+        // the JSON-RPC uv-closure early return below. The read-only audit
+        // calls the same multi-conflict extractor directly.
+        if let Some(conflict) = self.parse_retread_conflicts(stderr).into_iter().next() {
+            return Some(Conflict::RetreadMutuallyUnsatisfiable(conflict));
+        }
         // Newest, most specific shapes first: a backend-wrapped uv-closure
         // JSON-RPC ErrorObject, or (failing that) the plain resolvo-style
         // incompatible-range prose. Both are distinct from the classic
@@ -1131,6 +1557,262 @@ pub fn tail(s: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const RETREAD_EQUAL_AUTHORITY: &str = "\
+dependency conflict in environment 'robotics' for bundle 'robotics-output' \
+(target profile 'linux-64', platform linux-64, python 3.11): `numpy` \
+requirements are mutually unsatisfiable: `==1.26.4` required by wheel \
+`old-extension==1.0.0` Requires-Dist `numpy==1.26.4`; `>=2,<3` required by \
+wheel `new-extension==2.0.0` Requires-Dist `numpy>=2,<3`. Resolve by pinning \
+one side, or use `retread-relax`, `retread-overrides`, or `retread-drop-deps` \
+in the pack manifest (see README).\n\n\
+Suggested fix in pypi-packs/robotics-pack/pixi.toml:\n\
+# Edit the existing [package.build.config] table.\n\
+retread-drop-deps = [\"numpy\"]\n\
+# Alternative 1:\n\
+# numpy = \"==1.26.4\"\n\
+# Alternative 2:\n\
+# numpy = \">=2,<3\"\n";
+
+    const RETREAD_BUNDLE_ONLY: &str = "\
+dependency conflict in bundle 'robotics-output' (platform linux-64, python 3.11): \
+`numpy` requirements are mutually unsatisfiable: `==1.26.4` required by wheel \
+`old-extension==1.0.0` Requires-Dist `numpy==1.26.4`; `>=2,<3` required by \
+wheel `new-extension==2.0.0` Requires-Dist `numpy>=2,<3`. Resolve by pinning \
+one side, or use `retread-relax`, `retread-overrides`, or `retread-drop-deps` \
+in the pack manifest (see README).\n\n\
+Suggested fix in pypi-packs/robotics-pack/pixi.toml:\n\
+# Edit the existing [package.build.config] table.\n\
+retread-drop-deps = [\"numpy\"]\n";
+
+    const RETREAD_ROOT_PIN: &str = "\
+dependency conflict in environment 'robotics' for bundle 'robotics-output' \
+(target profile 'linux-64', platform linux-64, python 3.11): `numpy` \
+requirements are mutually unsatisfiable: `<2` required by wheel \
+`dex-retargeting==1.0.0` Requires-Dist `numpy<2`; `>=2` required by wheel \
+`cmeel-boost==1.89.0` Requires-Dist `numpy>=2`. Resolve by pinning one side, \
+or use `retread-relax`, `retread-overrides`, or `retread-drop-deps` in the \
+pack manifest (see README).\n\n\
+Suggested fix in pypi-packs/robotics-pack/pixi.toml:\n\
+# Constrain the transitive root that introduced the `numpy` conflict.\n\
+# Edit the existing [package.build.config.retread-wheels] table.\n\
+pin = { version = \"==2.6.20\", bundle = \"robotics-output\" }\n";
+
+    const RETREAD_MINIMAL_DROP_MENU: &str = "\
+dependency conflict in environment 'robotics' for bundle 'robotics-output' \
+(platform linux-64, python 3.11): `numpy` requirements are mutually \
+unsatisfiable: `==1.26.4` required by wheel `old-extension==1.0.0` \
+Requires-Dist `numpy==1.26.4`; `>=1` required by wheel \
+`compatible-extension==1.0.0` Requires-Dist `numpy>=1`; `>=2,<3` required by \
+wheel `new-extension==2.0.0` Requires-Dist `numpy>=2,<3`. Resolve by pinning \
+one side, or use `retread-relax`, `retread-overrides`, or `retread-drop-deps` \
+in the pack manifest (see README).\n\n\
+Suggested fix in pypi-packs/robotics-pack/pixi.toml:\n\
+# Edit the existing [package.build.config] table.\n\
+# Merge `numpy` into any existing retread-drop-deps array:\n\
+retread-drop-deps = [\"numpy\"]\n\
+\n\
+# Alternative 1: keep the requirement from:\n\
+#   wheel `old-extension==1.0.0` Requires-Dist `numpy==1.26.4`\n\
+# Under [package.build.config.retread-overrides], add or update (create that table once if absent):\n\
+# numpy = \"==1.26.4\"\n\
+\n\
+# Alternative 2: keep the requirement from:\n\
+#   wheel `new-extension==2.0.0` Requires-Dist `numpy>=2,<3`\n\
+# Under [package.build.config.retread-overrides], add or update (create that table once if absent):\n\
+# numpy = \">=2,<3\"\n";
+
+    #[test]
+    fn retread_own_conflict_is_shared_structured_parser_input() {
+        let parser = RegexConflictParser::new();
+        let conflicts = parser.parse_retread_conflicts(RETREAD_EQUAL_AUTHORITY);
+        assert_eq!(conflicts.len(), 1);
+        let conflict = &conflicts[0];
+        assert_eq!(conflict.bundle, "robotics-output");
+        assert_eq!(conflict.platform, "linux-64");
+        assert_eq!(conflict.python, "3.11");
+        assert_eq!(conflict.package, "numpy");
+        assert_eq!(conflict.requirements.len(), 2);
+        assert_eq!(
+            conflict.requirements[0].source,
+            "wheel `old-extension==1.0.0` Requires-Dist `numpy==1.26.4`"
+        );
+        assert!(matches!(
+            conflict.suggestion,
+            RetreadConflictSuggestion::DropDependency { .. }
+        ));
+        assert_eq!(
+            conflict.suggestion.pack_manifest(),
+            "pypi-packs/robotics-pack/pixi.toml"
+        );
+        assert!(conflict.suggestion_from_backend);
+        assert!(
+            conflict
+                .suggestion
+                .render_toml(&conflict.package)
+                .contains("retread-drop-deps = [\"numpy\"]")
+        );
+
+        assert_eq!(
+            parser.parse(RETREAD_EQUAL_AUTHORITY),
+            Some(Conflict::RetreadMutuallyUnsatisfiable(conflict.clone()))
+        );
+
+        let legacy = RETREAD_EQUAL_AUTHORITY
+            .split("Suggested fix in")
+            .next()
+            .unwrap();
+        let legacy = &parser.parse_retread_conflicts(legacy)[0];
+        assert!(!legacy.suggestion_from_backend);
+        assert!(matches!(
+            legacy.suggestion,
+            RetreadConflictSuggestion::DropDependency { .. }
+        ));
+    }
+
+    #[test]
+    fn retread_own_conflict_accepts_bundle_only_producer_scope() {
+        let conflict = RegexConflictParser::new()
+            .parse_retread_conflicts(RETREAD_BUNDLE_ONLY)
+            .into_iter()
+            .next()
+            .expect("bundle-only retread conflict must parse");
+        assert_eq!(conflict.scope, "in bundle 'robotics-output'");
+        assert_eq!(conflict.bundle, "robotics-output");
+        assert_eq!(conflict.platform, "linux-64");
+        assert_eq!(conflict.python, "3.11");
+        assert_eq!(conflict.package, "numpy");
+        assert!(conflict.suggestion_from_backend);
+    }
+
+    #[test]
+    fn retread_requirement_split_preserves_pep508_marker_semicolon() {
+        let marker_bearing = RETREAD_EQUAL_AUTHORITY.replacen(
+            "Requires-Dist `numpy==1.26.4`;",
+            "Requires-Dist `numpy==1.26.4; python_version < \"3.12\"`;",
+            1,
+        );
+        let conflict = &RegexConflictParser::new().parse_retread_conflicts(&marker_bearing)[0];
+        assert_eq!(conflict.requirements.len(), 2);
+        assert_eq!(
+            conflict.requirements[0].source,
+            "wheel `old-extension==1.0.0` Requires-Dist \
+             `numpy==1.26.4; python_version < \"3.12\"`"
+        );
+        assert_eq!(conflict.requirements[1].spec, ">=2,<3");
+    }
+
+    #[test]
+    fn retread_drop_preserves_embedded_minimal_override_menu() {
+        let conflict =
+            &RegexConflictParser::new().parse_retread_conflicts(RETREAD_MINIMAL_DROP_MENU)[0];
+        assert_eq!(
+            conflict.requirements.len(),
+            3,
+            "the diagnostic retains every aggregated constraint"
+        );
+        let RetreadConflictSuggestion::DropDependency { alternatives, .. } = &conflict.suggestion
+        else {
+            panic!("equal-authority conflict must retain its drop suggestion");
+        };
+        assert_eq!(
+            alternatives,
+            &vec![
+                (
+                    "==1.26.4".to_string(),
+                    "wheel `old-extension==1.0.0` Requires-Dist `numpy==1.26.4`".to_string(),
+                ),
+                (
+                    ">=2,<3".to_string(),
+                    "wheel `new-extension==2.0.0` Requires-Dist `numpy>=2,<3`".to_string(),
+                ),
+            ],
+            "the read-only report must preserve Track 2's inclusion-minimal menu"
+        );
+        assert!(conflict.suggestion_from_backend);
+    }
+
+    #[test]
+    fn retread_drop_apply_requires_matching_concrete_backend_action() {
+        let parser = RegexConflictParser::new();
+
+        let bare_marker = RETREAD_EQUAL_AUTHORITY
+            .split("Suggested fix in")
+            .next()
+            .expect("fixture has a suggestion")
+            .to_string()
+            + "Suggested fix in pypi-packs/robotics-pack/pixi.toml:\n";
+        let conflict = &parser.parse_retread_conflicts(&bare_marker)[0];
+        assert!(!conflict.suggestion_from_backend);
+        assert!(matches!(
+            conflict.suggestion,
+            RetreadConflictSuggestion::DropDependency { .. }
+        ));
+
+        let mismatched = RETREAD_EQUAL_AUTHORITY.replacen(
+            "retread-drop-deps = [\"numpy\"]",
+            "retread-drop-deps = [\"scipy\"]",
+            1,
+        );
+        let conflict = &parser.parse_retread_conflicts(&mismatched)[0];
+        assert!(!conflict.suggestion_from_backend);
+        assert!(matches!(
+            conflict.suggestion,
+            RetreadConflictSuggestion::DropDependency { .. }
+        ));
+
+        let malformed = RETREAD_EQUAL_AUTHORITY.replacen(
+            "retread-drop-deps = [\"numpy\"]",
+            "retread-drop-deps = [\"numpy\" this-is-not-toml]",
+            1,
+        );
+        let conflict = &parser.parse_retread_conflicts(&malformed)[0];
+        assert!(!conflict.suggestion_from_backend);
+    }
+
+    #[test]
+    fn retread_own_conflict_survives_json_rpc_wrapping_and_keeps_graph_root() {
+        let escaped = RETREAD_ROOT_PIN
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n");
+        let wrapped =
+            format!("ErrorObject {{ code: InvalidParams, message: \"{escaped}\", data: None }}");
+        let parser = RegexConflictParser::new();
+        let conflict = parser
+            .parse_retread_conflicts(&wrapped)
+            .into_iter()
+            .next()
+            .expect("wrapped retread conflict must parse");
+        assert!(matches!(
+            &conflict.suggestion,
+            RetreadConflictSuggestion::RootPin {
+                package,
+                spec,
+                bundle_group,
+                ..
+            } if package == "pin"
+                && spec == "==2.6.20"
+                && bundle_group == "robotics-output"
+        ));
+        assert!(conflict.suggestion_from_backend);
+        assert!(matches!(
+            parser.parse(&wrapped),
+            Some(Conflict::RetreadMutuallyUnsatisfiable(_))
+        ));
+    }
+
+    #[test]
+    fn retread_aggregate_parser_returns_every_conflict() {
+        let aggregate = format!(
+            "2 dependency conflicts found:\n1. {RETREAD_EQUAL_AUTHORITY}\n\n2. {}",
+            RETREAD_ROOT_PIN.replace("`numpy`", "`scipy`")
+        );
+        let conflicts = RegexConflictParser::new().parse_retread_conflicts(&aggregate);
+        assert_eq!(conflicts.len(), 2);
+        assert_eq!(conflicts[0].package, "numpy");
+        assert_eq!(conflicts[1].package, "scipy");
+    }
 
     const CONDA_ABI_BUILD_TAIL_RUN38: &str =
         include_str!("../../tests/fixtures/solve_errors/conda_abi_build_tail_torchaudio_run38.txt");

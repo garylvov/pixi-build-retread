@@ -55,11 +55,24 @@ isaacsim = { version = "==6.0.0.1", index = "https://pypi.nvidia.com" }
 # ...
 ```
 
+Dependency-conflict escape hatches live in that pack manifest. Relax upstream
+pins globally, override one dependency explicitly, or omit a dependency from
+the generated conda run dependencies:
+
+```toml
+[package.build.config]
+retread-relax = "minor"
+retread-drop-deps = ["optional-package"]
+
+[package.build.config.retread-overrides]
+numpy = ">=1.26,<2"
+```
+
 ## Rust toolchain
 
-The exact Rust version is pinned in `rust-toolchain.toml` (kept in sync with
-CI's `dtolnay/rust-toolchain` pin) so `fmt`/`clippy` never drift between local
-and CI. Install it with [rustup](https://rustup.rs) (which reads
+Rust `1.97.0` is pinned in `rust-toolchain.toml` (kept in sync with CI's
+`dtolnay/rust-toolchain` pin) so `fmt`/`clippy` never drift between local and
+CI. Install it with [rustup](https://rustup.rs) (which reads
 `rust-toolchain.toml` automatically) -- `pixi exec --spec rust` pulls from
 conda-forge, which lags the pinned version and will disagree on `fmt`/
 `clippy` output.
@@ -70,7 +83,7 @@ conda-forge, which lags the pinned version and will disagree on `fmt`/
 |---------|-------|
 | install | `retread install --lock <lock.json> --prefix <p>` |
 | verify | `retread verify --lock <lock.json> [--full]` |
-| solve | `retread solve --manifest pixi.toml -e <env>` |
+| solve | repair: `retread solve --manifest pixi.toml -e <env>`; audit all: `retread solve --manifest pixi.toml --audit` |
 | fast (env) | `eval "$(pixi-build-retread fast --print-env)"` |
 
 ## Fast path
@@ -84,16 +97,21 @@ environment snapshots are intentionally unsupported because Pixi embeds the deta
 prefix in scripts and metadata, making snapshots unsafe to move between job roots. On
 a local machine with fast disk, fast-tmp auto-disengages.
 
-## Config
-
-Default solver is uv; set `retread-resolver = "legacy"` to fall back.
+Configuration is optional: the default `mode = "auto"` engages on slow shared
+filesystems and auto-disengages on fast local disk; `RETREAD_FAST_TMP`,
+`RETREAD_FAST_TMP_ROOT`, `RETREAD_FAST_TMP_BUDGET_BYTES`, and
+`RETREAD_SHARED_CACHE_DIR` override the TOML.
 
 ```toml
-[package.build.config]
-retread-resolver = "uv"        # default; or "legacy" fallback
-
 [tool.retread.fast-tmp]
 mode = "auto"                  # auto | on | off
 tmp-root = "/tmp"
 blob-caches = "shared"
+```
+
+## Config
+
+```toml
+[package.build.config]
+retread-resolver = "uv"        # default
 ```
