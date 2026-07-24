@@ -1,6 +1,6 @@
 //! PEP 508 -> conda match-spec translation with version-pin widening.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::str::FromStr;
 
@@ -305,13 +305,14 @@ pub fn translate(
         )));
     }
 
-    // `python` is fully off-limits to relax: every widened form
-    // (`python >=3,<4` from major, `python >=3` from strong-major,
-    // and the bare `python` that strong-major produces from a single
-    // `==X.Y.Z`) is either meaningless or rejected by the conda solver
-    // (`python 3` => "missing range specifier"). Pass python through
-    // untouched under every policy.
-    let effective_policy = if conda_name.as_spec() == "python" {
+    // ABI anchors and every configured semantic alias that reaches one are
+    // fully off-limits to this legacy translate-time policy mutation. The
+    // strict-first decision engine is the sole place that may prove a
+    // same-major anchor relaxation safe.
+    let abi_aliases = abi_aliases_from_name_map(name_map);
+    let effective_policy = if is_semantic_abi_anchor(pypi_key.as_str(), &abi_aliases)
+        || is_semantic_abi_anchor(conda_name.as_spec(), &abi_aliases)
+    {
         RelaxPolicy::None
     } else {
         policy
@@ -377,6 +378,63 @@ pub(crate) fn canonical_conda_name(name: &str) -> String {
         }
     }
     out.trim_matches('-').to_string()
+}
+
+/// Canonical, undirected semantic-name graph used by every ABI safety gate.
+///
+/// An undirected graph is intentional: two PyPI names that map to the same
+/// conda provider are semantic aliases even when neither maps directly to the
+/// other. This closes hidden many-to-one aliases such as
+/// `array-provider -> shared-runtime <- numpy`.
+pub(crate) type AbiAliasGraph = BTreeMap<String, BTreeSet<String>>;
+
+/// Add one canonical, bidirectional semantic-name edge.
+pub(crate) fn add_abi_alias_edge(aliases: &mut AbiAliasGraph, left: &str, right: &str) {
+    let left = canonical_conda_name(left);
+    let right = canonical_conda_name(right);
+    if left == right {
+        return;
+    }
+    aliases
+        .entry(left.clone())
+        .or_default()
+        .insert(right.clone());
+    aliases.entry(right).or_default().insert(left);
+}
+
+/// Return the complete transitive semantic-name component containing `name`.
+pub(crate) fn semantic_aliases(name: &str, aliases: &AbiAliasGraph) -> BTreeSet<String> {
+    let root = canonical_conda_name(name);
+    let mut seen = BTreeSet::from([root.clone()]);
+    let mut pending = vec![root];
+    while let Some(current) = pending.pop() {
+        if let Some(neighbors) = aliases.get(&current) {
+            for neighbor in neighbors {
+                if seen.insert(neighbor.clone()) {
+                    pending.push(neighbor.clone());
+                }
+            }
+        }
+    }
+    seen
+}
+
+/// Whether `name` itself, or any transitive semantic alias, is an ABI anchor.
+pub(crate) fn is_semantic_abi_anchor(name: &str, aliases: &AbiAliasGraph) -> bool {
+    semantic_aliases(name, aliases)
+        .iter()
+        .any(|alias| crate::solve::is_abi_anchor(alias))
+}
+
+/// Build the ABI alias graph represented by a configured/effective name map.
+pub(crate) fn abi_aliases_from_name_map(name_map: &NameMap) -> AbiAliasGraph {
+    let mut aliases = AbiAliasGraph::new();
+    for (pypi_name, target) in name_map {
+        if let Some(conda_name) = target.mapped_name() {
+            add_abi_alias_edge(&mut aliases, pypi_name.as_str(), conda_name.as_spec());
+        }
+    }
+    aliases
 }
 
 /// P2 (bloat M2 / grizzly #2): dual-namespace set membership. True
@@ -1072,7 +1130,7 @@ mod tests {
         // Translate round-trip: the joined form from Display must match what
         // the old CondaDep(String) tuple-struct produced.
         let from_translate = translate(
-            "numpy==1.26.4",
+            "pillow==12.1.4",
             &env(),
             &BTreeMap::new(),
             &BTreeMap::new(),
@@ -1080,14 +1138,14 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(from_translate.to_string(), "numpy >=1.26,<2");
-        assert_eq!(from_translate.name, "numpy");
-        assert_eq!(from_translate.pypi_name, PypiKey::from_pypi("numpy"));
+        assert_eq!(from_translate.to_string(), "pillow >=12.1,<13");
+        assert_eq!(from_translate.name, "pillow");
+        assert_eq!(from_translate.pypi_name, PypiKey::from_pypi("pillow"));
         assert_eq!(
             from_translate.constraint_origin,
             CondaConstraintOrigin::Pypi {
-                original_specifiers: "==1.26.4".to_string(),
-                effective_specifiers: ">=1.26,<2".to_string(),
+                original_specifiers: "==12.1.4".to_string(),
+                effective_specifiers: ">=12.1,<13".to_string(),
             }
         );
     }
@@ -1107,8 +1165,8 @@ mod tests {
     #[test]
     fn exact_pin_minor_relax() {
         assert_eq!(
-            t("numpy==1.26.4", RelaxPolicy::Minor).as_deref(),
-            Some("numpy >=1.26,<2")
+            t("pillow==12.1.4", RelaxPolicy::Minor).as_deref(),
+            Some("pillow >=12.1,<13")
         );
     }
 
@@ -1188,7 +1246,7 @@ mod tests {
 
     #[test]
     fn effective_pep440_tracks_strong_major_and_unsupported_exact_equal() {
-        let strong = translated("numpy>=1.26,<2", RelaxPolicy::StrongMajor);
+        let strong = translated("demo>=1.26,<2", RelaxPolicy::StrongMajor);
         assert_eq!(strong.spec, ">=1.26");
         assert_eq!(
             strong.constraint_origin,
@@ -1265,6 +1323,25 @@ mod tests {
             dep.constraint_origin,
             CondaConstraintOrigin::ExplicitOverride
         );
+
+        // Explicit user intent still wins before the automatic ABI veto. The
+        // post-emission invariant remains responsible for rejecting an unsafe
+        // anchor override such as `*`.
+        overrides.insert("numpy".to_string(), "*".to_string());
+        let anchor = translate(
+            "numpy==1.26.4",
+            &env(),
+            &BTreeMap::new(),
+            &overrides,
+            RelaxPolicy::Major,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(anchor.to_string(), "numpy *");
+        assert_eq!(
+            anchor.constraint_origin,
+            CondaConstraintOrigin::ExplicitOverride
+        );
     }
 
     #[test]
@@ -1283,20 +1360,19 @@ mod tests {
             t("pyglet<2", RelaxPolicy::StrongMajor).as_deref(),
             Some("pyglet")
         );
-        // >=A,<B keeps the lower bound, drops the upper.
+        // ABI-anchor ranges and exact pins remain untouched.
         assert_eq!(
             t("numpy>=1.26,<2", RelaxPolicy::StrongMajor).as_deref(),
-            Some("numpy >=1.26"),
+            Some("numpy >=1.26,<2"),
         );
         // ~=A.B becomes >=A.B (no upper).
         assert_eq!(
             t("requests~=2.0", RelaxPolicy::StrongMajor).as_deref(),
             Some("requests >=2.0"),
         );
-        // Exact pins behave like Major.
         assert_eq!(
             t("numpy==1.26.4", RelaxPolicy::StrongMajor).as_deref(),
-            Some("numpy >=1"),
+            Some("numpy ==1.26.4"),
         );
         // Pure lower bound passes through.
         assert_eq!(
@@ -1317,7 +1393,7 @@ mod tests {
         );
         assert_eq!(
             t("numpy==1.26.4", RelaxPolicy::CondaAware).as_deref(),
-            Some("numpy >=1"),
+            Some("numpy ==1.26.4"),
         );
     }
 
@@ -1333,19 +1409,18 @@ mod tests {
     }
 
     #[test]
-    fn python_dep_is_never_relaxed() {
-        // No relax policy may widen a python requirement. Major would
-        // emit `python >=3,<4`; strong-major / conda-aware would strip
-        // the upper to give `python >=3` (and `python` from a single
-        // exact pin), all of which either lose ABI meaning or trip
-        // rattler-build's "missing range specifier" error. Pass through
-        // unchanged regardless of policy.
+    fn abi_deps_are_never_relaxed() {
         for policy in [
+            RelaxPolicy::None,
             RelaxPolicy::Patch,
             RelaxPolicy::Minor,
             RelaxPolicy::Major,
             RelaxPolicy::StrongMajor,
             RelaxPolicy::CondaAware,
+            RelaxPolicy::PatchWithLastResort,
+            RelaxPolicy::MinorWithLastResort,
+            RelaxPolicy::MajorWithLastResort,
+            RelaxPolicy::PatchThenMinorThenMajorThenLastResort,
         ] {
             assert_eq!(
                 t("python==3.11.0", policy).as_deref(),
@@ -1357,11 +1432,56 @@ mod tests {
                 Some("python >=3.9,<3.13"),
                 "policy {policy:?} must not modify python range",
             );
+            assert_eq!(
+                t("numpy==1.26.4", policy).as_deref(),
+                Some("numpy ==1.26.4"),
+                "policy {policy:?} must not modify numpy",
+            );
+            assert_eq!(
+                t("cuda-cudart>=12,<13", policy).as_deref(),
+                Some("cuda-cudart >=12,<13"),
+                "policy {policy:?} must not modify cuda",
+            );
         }
-        // Sanity: non-python deps under Major still get bare-major widening.
+        // Sanity: ordinary deps under Major still get bare-major widening.
         assert_eq!(
-            t("numpy==1.26.4", RelaxPolicy::Major).as_deref(),
-            Some("numpy >=1"),
+            t("pillow==12.1.4", RelaxPolicy::Major).as_deref(),
+            Some("pillow >=12"),
+        );
+    }
+
+    #[test]
+    fn translate_protects_transitive_many_to_one_anchor_alias() {
+        let name_map = NameMap::from([
+            (
+                PypiKey::from_pypi("array-provider"),
+                CondaTarget::Mapped(CondaName::new("shared-array-runtime")),
+            ),
+            (
+                PypiKey::from_pypi("numpy"),
+                CondaTarget::Mapped(CondaName::new("shared-array-runtime")),
+            ),
+        ]);
+        let aliases = abi_aliases_from_name_map(&name_map);
+        assert!(is_semantic_abi_anchor("array-provider", &aliases));
+        assert!(semantic_aliases("array-provider", &aliases).contains("numpy"));
+
+        let translated = translate(
+            "array-provider==1.26.4",
+            &env(),
+            &name_map,
+            &BTreeMap::new(),
+            RelaxPolicy::Major,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(translated.to_string(), "shared-array-runtime ==1.26.4");
+        assert_eq!(
+            translated.constraint_origin,
+            CondaConstraintOrigin::Pypi {
+                original_specifiers: "==1.26.4".to_string(),
+                effective_specifiers: "==1.26.4".to_string(),
+            }
         );
     }
 
@@ -1372,11 +1492,11 @@ mod tests {
         // auto-bundle finalizer.
         assert_eq!(
             t(
-                "numpy==1.26.4",
+                "pillow==12.1.4",
                 RelaxPolicy::PatchThenMinorThenMajorThenLastResort
             )
             .as_deref(),
-            Some("numpy >=1.26.4,<1.27"),
+            Some("pillow >=12.1.4,<12.2"),
         );
         // Ranges pass through unchanged at translation time. The inline
         // finalizer strips their caps only when the collected intersection is

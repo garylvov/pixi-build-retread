@@ -1621,7 +1621,7 @@ fn explicit_native_conda_alternation_remains_allowed() {
 fn produce_output_omits_workspace_owned_auto_drops() {
     let mut bundle = solo_bundle(
         "owned-pack",
-        vec!["numpy>=2", "gym==0.23.1", "requests>=2.31"],
+        vec!["numpy>=2.0,<3", "gym==0.23.1", "requests>=2.31"],
     );
     bundle.auto_dropped = ["numpy", "gym"]
         .into_iter()
@@ -3167,6 +3167,7 @@ fn output_abi_invariant_rejects_star_bare_major_and_uncovered_workspace_pin() {
     for spec in ["", "*", "3.*", ">=3", "3.*|4.*", ">=3,<4,!=3.5"] {
         let violations = check_output_abi_invariants(
             &[("python".to_string(), spec.to_string())],
+            &[],
             &python_workspace,
             &overrides,
             &BTreeMap::new(),
@@ -3176,6 +3177,7 @@ fn output_abi_invariant_rejects_star_bare_major_and_uncovered_workspace_pin() {
 
     let uncovered = check_output_abi_invariants(
         &[("python".to_string(), ">=3.12,<4".to_string())],
+        &[],
         &python_workspace,
         &overrides,
         &BTreeMap::new(),
@@ -3199,14 +3201,61 @@ fn output_abi_invariant_accepts_minor_pin_and_rejects_anchor_override() {
         ("packaging".to_string(), "*".to_string()),
     ];
     assert!(
-        check_output_abi_invariants(&emitted, &workspace, &BTreeMap::new(), &BTreeMap::new())
-            .is_empty()
+        check_output_abi_invariants(
+            &emitted,
+            &[],
+            &workspace,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .is_empty()
     );
 
     let overrides = BTreeMap::from([("numpy".to_string(), "*".to_string())]);
-    let violations = check_output_abi_invariants(&[], &workspace, &overrides, &BTreeMap::new());
+    let violations =
+        check_output_abi_invariants(&[], &[], &workspace, &overrides, &BTreeMap::new());
     assert_eq!(violations.len(), 1, "{violations:?}");
     assert!(violations[0].contains("retread-overrides[numpy]"));
+}
+
+#[test]
+fn output_abi_invariant_checks_embedded_wheel_metadata_and_aliases() {
+    let workspace = BTreeMap::from([("numpy".to_string(), BTreeSet::from(["1.26.4".to_string()]))]);
+    let embedded = vec![("consumer-wheel".to_string(), "numpy>=1".to_string())];
+    let violations = check_output_abi_invariants(
+        &[],
+        &embedded,
+        &workspace,
+        &BTreeMap::new(),
+        &AbiAliasGraph::new(),
+    );
+    assert_eq!(violations.len(), 1, "{violations:?}");
+    assert!(violations[0].contains("wheel `consumer-wheel` embeds"));
+    assert!(violations[0].contains("bare-major"));
+
+    let safe = vec![("consumer-wheel".to_string(), "numpy>=1.26,<2".to_string())];
+    assert!(
+        check_output_abi_invariants(
+            &[],
+            &safe,
+            &workspace,
+            &BTreeMap::new(),
+            &AbiAliasGraph::new(),
+        )
+        .is_empty()
+    );
+
+    let mut aliases = AbiAliasGraph::new();
+    add_abi_alias_edge(&mut aliases, "array-provider", "shared-runtime");
+    add_abi_alias_edge(&mut aliases, "numpy", "shared-runtime");
+    let hidden_alias = vec![(
+        "consumer-wheel".to_string(),
+        "array-provider>=1".to_string(),
+    )];
+    let violations =
+        check_output_abi_invariants(&[], &hidden_alias, &workspace, &BTreeMap::new(), &aliases);
+    assert_eq!(violations.len(), 1, "{violations:?}");
+    assert!(violations[0].contains("array-provider >=1"));
 }
 
 #[test]

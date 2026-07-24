@@ -1257,7 +1257,7 @@ mod tests {
         .unwrap();
         let yaml = to_yaml(&r).unwrap();
         assert!(yaml.contains("python 3.11.*"), "yaml:\n{yaml}");
-        assert!(yaml.contains("numpy >=1.26,<2"), "yaml:\n{yaml}");
+        assert!(yaml.contains("numpy ==1.26.4"), "yaml:\n{yaml}");
         assert!(yaml.contains("torch >=2.7,<3"), "yaml:\n{yaml}");
         assert!(yaml.contains("requests >=2.0"), "yaml:\n{yaml}");
         assert!(!yaml.contains("noarch"), "should be platform-specific");
@@ -1384,8 +1384,8 @@ mod tests {
 
         assert_eq!(r.source.len(), 2, "two sources in the recipe");
         assert!(
-            yaml.contains("numpy >=1.26,<2"),
-            "primary dep stays: {yaml}"
+            yaml.contains("numpy ==1.26.4"),
+            "ABI anchor remains exact: {yaml}"
         );
         assert!(
             yaml.contains("pillow >=12.0,<13"),

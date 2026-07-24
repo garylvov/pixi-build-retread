@@ -49,15 +49,16 @@ use crate::recipe::{
     BundleSource, build_bundle_recipe, build_courier_recipe_with_mode_and_lock_filename, to_yaml,
 };
 use crate::relax::{
-    CondaConstraintOrigin, CondaDep, CondaName, CondaTarget, NameMap, PypiKey,
-    canonical_conda_name, emit_python_version, marker_env_for,
+    AbiAliasGraph, CondaConstraintOrigin, CondaDep, CondaName, CondaTarget, NameMap, PypiKey,
+    abi_aliases_from_name_map, add_abi_alias_edge, canonical_conda_name, emit_python_version,
+    is_semantic_abi_anchor, marker_env_for, semantic_aliases,
 };
 use crate::relax_decision::{
     Decision as RelaxDecision, SafetyContext, decide as decide_relaxation,
 };
 use crate::rpc::{RpcError, ok, parse_params};
 use crate::wheel::WheelMetadata;
-use crate::wheel_rewrite::rewrite_wheel;
+use crate::wheel_rewrite::rewrite_wheel_with_abi_aliases;
 use crate::workspace::{ResolvedWorkspaceTarget, WorkspaceTargetContract, WorkspaceTargetEnvelope};
 
 /// Process-global memo of `conda/outputs` results, keyed by the params
@@ -8635,6 +8636,7 @@ async fn resolve_bundle(
     sibling_names: &std::collections::HashSet<String>,
 ) -> Result<Bundle> {
     let conda_name = canonical_conda_name(entry_name);
+    let abi_aliases = abi_aliases_from_name_map(route_policy.name_map);
     let mut state = ResolveState::default();
     let mut work: BTreeMap<String, Pending> = BTreeMap::new();
     // v0.14.1+: collect every probe + routing decision so the audit
@@ -8657,7 +8659,7 @@ async fn resolve_bundle(
     } else {
         None
     };
-    let (primary, primary_original_rd) = materialize_and_rewrite(
+    let (primary, primary_original_rd) = materialize_and_rewrite_with_abi_aliases(
         entry,
         entry_name,
         None,
@@ -8672,6 +8674,7 @@ async fn resolve_bundle(
             extras_requested: entry.extras.clone(),
             dedup_skipped_root,
         },
+        &abi_aliases,
     )
     .await?;
     // P2 (grizzly #2): canonical seed -- the BFS dedups candidates in
@@ -9166,7 +9169,7 @@ async fn resolve_bundle(
                         ..Default::default()
                     };
                     let synth_name = pending.pypi_name.clone();
-                    let (sub, sub_original_rd) = materialize_and_rewrite(
+                    let (sub, sub_original_rd) = materialize_and_rewrite_with_abi_aliases(
                         &synth,
                         &synth_name,
                         None,
@@ -9178,6 +9181,7 @@ async fn resolve_bundle(
                         git_sources,
                         None,
                         EntryAuditInfo::default(),
+                        &abi_aliases,
                     )
                     .await
                     .with_context(|| {
@@ -9206,7 +9210,7 @@ async fn resolve_bundle(
                         ..Default::default()
                     };
                     let synth_name = pending.pypi_name.clone();
-                    let (sub, sub_original_rd) = materialize_and_rewrite(
+                    let (sub, sub_original_rd) = materialize_and_rewrite_with_abi_aliases(
                         &synth,
                         &synth_name,
                         None,
@@ -9218,6 +9222,7 @@ async fn resolve_bundle(
                         git_sources,
                         None,
                         EntryAuditInfo::default(),
+                        &abi_aliases,
                     )
                     .await
                     .with_context(|| {
@@ -9602,6 +9607,49 @@ fn is_fresh(output: &Path, input: &Path) -> Result<bool> {
     Ok(true)
 }
 
+fn relaxed_wheel_cache_stamp_path(wheel: &Path) -> PathBuf {
+    let filename = wheel
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_default();
+    wheel.with_file_name(format!("{filename}.retread-cache"))
+}
+
+fn relaxed_wheel_cache_stamp(relax: RelaxPolicy, abi_aliases: &AbiAliasGraph) -> String {
+    format!(
+        "emit-epoch={}\npolicy={relax:?}\nabi-aliases={abi_aliases:?}\n",
+        crate::lock::EMIT_EPOCH
+    )
+}
+
+fn is_relaxed_wheel_cache_fresh(
+    output: &Path,
+    input: &Path,
+    relax: RelaxPolicy,
+    abi_aliases: &AbiAliasGraph,
+) -> Result<bool> {
+    if !is_fresh(output, input)? {
+        return Ok(false);
+    }
+    let expected = relaxed_wheel_cache_stamp(relax, abi_aliases);
+    Ok(
+        std::fs::read_to_string(relaxed_wheel_cache_stamp_path(output))
+            .is_ok_and(|actual| actual == expected),
+    )
+}
+
+fn write_relaxed_wheel_cache_stamp(
+    output: &Path,
+    relax: RelaxPolicy,
+    abi_aliases: &AbiAliasGraph,
+) -> Result<()> {
+    std::fs::write(
+        relaxed_wheel_cache_stamp_path(output),
+        relaxed_wheel_cache_stamp(relax, abi_aliases),
+    )
+    .with_context(|| format!("writing relaxed-wheel cache stamp for {}", output.display()))
+}
+
 /// After the user-driven (extras + prefix) BFS, optionally bundle any
 /// exact-pinned base deps that resolve cleanly on the entry's PyPI index.
 /// Compute the upstream checkout root for an entry, when one exists.
@@ -9741,6 +9789,7 @@ pub(crate) struct EntryAuditInfo {
 
 /// Build / fetch the primary wheel for an entry, apply D, return as
 /// a [`ResolvedWheel`].
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn materialize_and_rewrite(
     entry: &crate::config::WheelEntry,
@@ -9755,7 +9804,38 @@ async fn materialize_and_rewrite(
     auto_data: Option<AutoDataConfig>,
     audit_info: EntryAuditInfo,
 ) -> Result<(ResolvedWheel, Vec<String>)> {
-    use crate::wheel_rewrite::rewrite_wheel;
+    materialize_and_rewrite_with_abi_aliases(
+        entry,
+        entry_name,
+        expected_version,
+        target,
+        download_dir,
+        source_dir,
+        cache_dir,
+        relax,
+        git_sources,
+        auto_data,
+        audit_info,
+        &AbiAliasGraph::new(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn materialize_and_rewrite_with_abi_aliases(
+    entry: &crate::config::WheelEntry,
+    entry_name: &str,
+    expected_version: Option<&str>,
+    target: &ResolutionTarget,
+    download_dir: &Path,
+    source_dir: &Path,
+    cache_dir: &Path,
+    relax: RelaxPolicy,
+    git_sources: &std::collections::BTreeMap<String, crate::config::NamedGitSource>,
+    auto_data: Option<AutoDataConfig>,
+    audit_info: EntryAuditInfo,
+    abi_aliases: &AbiAliasGraph,
+) -> Result<(ResolvedWheel, Vec<String>)> {
     let pypi_name = canonical_conda_name(entry_name);
     let persisted_auto_data = persist_git_auto_data(auto_data.as_ref())?;
 
@@ -10182,7 +10262,7 @@ async fn materialize_and_rewrite(
         with_data_path
     } else {
         let rewritten = with_data_path.with_extension("relaxed.whl");
-        if is_fresh(&rewritten, &with_data_path)? {
+        if is_relaxed_wheel_cache_fresh(&rewritten, &with_data_path, relax, abi_aliases)? {
             tracing::info!(
                 entry = %entry_name,
                 wheel = %rewritten.display(),
@@ -10194,14 +10274,21 @@ async fn materialize_and_rewrite(
                 policy = ?relax,
                 "applying relax policy to wheel METADATA",
             );
-            let _new_sha = rewrite_wheel(&with_data_path, &rewritten, relax)
-                .with_context(|| {
-                    format!(
-                        "phase 2 wheel METADATA rewrite for entry `{entry_name}` (policy={relax:?}, \
+            let _new_sha = rewrite_wheel_with_abi_aliases(
+                &with_data_path,
+                &rewritten,
+                relax,
+                abi_aliases,
+            )
+            .with_context(|| {
+                format!(
+                    "phase 2 wheel METADATA rewrite for entry `{entry_name}` (policy={relax:?}, \
                          input={}, output={})",
-                        with_data_path.display(), rewritten.display(),
-                    )
-                })?;
+                    with_data_path.display(),
+                    rewritten.display(),
+                )
+            })?;
+            write_relaxed_wheel_cache_stamp(&rewritten, relax, abi_aliases)?;
         }
         rewritten
     };
@@ -10637,51 +10724,10 @@ fn is_bare_major_spec(spec: &str) -> bool {
         && branches.any(|branch| !branch.split(',').any(has_positive_minor_anchor))
 }
 
-type AbiAliasGraph = BTreeMap<String, BTreeSet<String>>;
 type WorkspaceAbiVersions = BTreeMap<String, BTreeSet<String>>;
 
-fn add_abi_alias_edge(aliases: &mut AbiAliasGraph, left: &str, right: &str) {
-    let left = canonical_conda_name(left);
-    let right = canonical_conda_name(right);
-    if left == right {
-        return;
-    }
-    aliases
-        .entry(left.clone())
-        .or_default()
-        .insert(right.clone());
-    aliases.entry(right).or_default().insert(left);
-}
-
-fn semantic_aliases(name: &str, aliases: &AbiAliasGraph) -> BTreeSet<String> {
-    let root = canonical_conda_name(name);
-    let mut seen = BTreeSet::from([root.clone()]);
-    let mut pending = vec![root];
-    while let Some(current) = pending.pop() {
-        if let Some(neighbors) = aliases.get(&current) {
-            for neighbor in neighbors {
-                if seen.insert(neighbor.clone()) {
-                    pending.push(neighbor.clone());
-                }
-            }
-        }
-    }
-    seen
-}
-
-fn is_semantic_abi_anchor(name: &str, aliases: &AbiAliasGraph) -> bool {
-    semantic_aliases(name, aliases)
-        .iter()
-        .any(|alias| crate::solve::is_abi_anchor(alias))
-}
-
 fn output_abi_aliases(bundle: &Bundle, config: &RetreadConfig) -> AbiAliasGraph {
-    let mut aliases = AbiAliasGraph::new();
-    for (pypi_name, target) in &config.name_map {
-        if let Some(conda_name) = target.mapped_name() {
-            add_abi_alias_edge(&mut aliases, pypi_name.as_str(), conda_name.as_spec());
-        }
-    }
+    let mut aliases = abi_aliases_from_name_map(&config.name_map);
     for route in &bundle.auto_routed {
         add_abi_alias_edge(
             &mut aliases,
@@ -10706,29 +10752,55 @@ fn output_abi_aliases(bundle: &Bundle, config: &RetreadConfig) -> AbiAliasGraph 
 /// reject corruption in release builds.
 pub(crate) fn check_output_abi_invariants(
     output_run_deps: &[(String, String)],
+    embedded_requires_dist: &[(String, String)],
     workspace_versions: &WorkspaceAbiVersions,
     overrides: &BTreeMap<String, String>,
     aliases: &AbiAliasGraph,
 ) -> Vec<String> {
-    let mut emitted = output_run_deps.to_vec();
-    emitted.sort();
     let mut violations = Vec::new();
+    let mut emitted = output_run_deps
+        .iter()
+        .cloned()
+        .map(|(name, spec)| (name, spec, "retread emitted".to_string()))
+        .collect::<Vec<_>>();
+    for (wheel, raw) in embedded_requires_dist {
+        let Ok(requirement): Result<uv_pep508::Requirement, _> =
+            uv_pep508::Requirement::from_str(raw)
+        else {
+            continue;
+        };
+        let spec = match requirement.version_or_url.as_ref() {
+            None => String::new(),
+            Some(uv_pep508::VersionOrUrl::VersionSpecifier(specifiers)) => {
+                specifiers.to_string().replace(", ", ",")
+            }
+            // A direct artifact URL is itself an exact artifact selection, not
+            // an unconstrained version range.
+            Some(uv_pep508::VersionOrUrl::Url(_)) => continue,
+        };
+        emitted.push((
+            requirement.name.to_string(),
+            spec,
+            format!("wheel `{wheel}` embeds"),
+        ));
+    }
+    emitted.sort();
 
-    for (name, spec) in emitted {
+    for (name, spec, origin) in emitted {
         if !is_semantic_abi_anchor(&name, aliases) {
             continue;
         }
         let trimmed = spec.trim();
         if trimmed.is_empty() || trimmed == "*" {
             violations.push(format!(
-                "ABI invariant: retread emitted `{name} {trimmed}` (empty/*); \
+                "ABI invariant: {origin} `{name} {trimmed}` (empty/*); \
                  ABI anchors must carry a concrete spec"
             ));
             continue;
         }
         if is_bare_major_spec(trimmed) {
             violations.push(format!(
-                "ABI invariant: retread emitted `{name} {trimmed}` (bare-major); \
+                "ABI invariant: {origin} `{name} {trimmed}` (bare-major); \
                  ABI anchors must carry a minor or stricter spec"
             ));
             continue;
@@ -10745,7 +10817,7 @@ pub(crate) fn check_output_abi_invariants(
                 match (&parsed_version, &parsed_spec) {
                     (Ok(version), Ok(specifier)) if specifier.matches(version) => {}
                     (Ok(_), Ok(_)) => violations.push(format!(
-                        "ABI invariant: emitted `{name} {trimmed}` does not cover workspace pin \
+                        "ABI invariant: {origin} `{name} {trimmed}` does not cover workspace pin \
                          `{workspace_name}=={workspace_version}`"
                     )),
                     (Err(error), _) => violations.push(format!(
@@ -10753,7 +10825,7 @@ pub(crate) fn check_output_abi_invariants(
                          cannot be validated: {error}"
                     )),
                     (_, Err(error)) => violations.push(format!(
-                        "ABI invariant: emitted anchor spec `{name} {trimmed}` cannot be \
+                        "ABI invariant: {origin} anchor spec `{name} {trimmed}` cannot be \
                          validated: {error}"
                     )),
                 }
@@ -10823,9 +10895,64 @@ fn ensure_output_abi_invariants(
             .or_default()
             .insert(workspace_python_version.to_string());
     }
+    // The courier performs one final metadata rewrite after phase D. Validate
+    // the requirements uv will actually read, rather than the intermediate
+    // phase-D lines: floor envelopes can reconcile several source-wheel
+    // clauses, and orphan URL requirements can be removed entirely.
+    let emit_wheels = bundle
+        .all_wheels()
+        .map(|wheel| crate::emit_pypi::EmitWheel {
+            pypi_name: wheel.pypi_name.clone(),
+            version: wheel.metadata.version.clone(),
+            requires_dist: wheel.metadata.requires_dist.clone(),
+            local_path: wheel.url.to_file_path().ok(),
+            wheel_filename: wheel.metadata.filename.clone(),
+            sha256: Some(wheel.metadata.sha256.clone()),
+            locked_final_sha256: None,
+            remote_url: (wheel.url.scheme() != "file").then(|| wheel.url.clone()),
+            upstream_url: wheel.upstream_url.clone(),
+            git_source: wheel.git_source.clone(),
+            sdist_source: wheel.sdist_source.clone(),
+        })
+        .collect::<Vec<_>>();
+    let mut conda_capable = bundle
+        .probe_decisions
+        .iter()
+        .filter(|decision| decision.matching_candidates > 0)
+        .map(|decision| canonical_conda_name(&decision.pypi_name))
+        .collect::<HashSet<_>>();
+    conda_capable.extend(config.name_map.keys().map(|key| key.as_str().to_owned()));
+    let emit_plan = crate::emit_pypi::plan(&emit_wheels, &conda_capable);
+    let line_map = crate::emit_pypi::override_line_map(
+        &emit_plan.overrides,
+        &conda_capable,
+        &emit_plan.drop_url,
+    );
+    let embedded_requires_dist = emit_wheels
+        .iter()
+        .flat_map(|wheel| {
+            wheel
+                .requires_dist
+                .iter()
+                .filter_map(|requirement| match line_map(requirement) {
+                    crate::wheel_rewrite::LineAction::Keep => {
+                        Some((wheel.pypi_name.clone(), requirement.clone()))
+                    }
+                    crate::wheel_rewrite::LineAction::Replace(replacement) => {
+                        Some((wheel.pypi_name.clone(), replacement))
+                    }
+                    crate::wheel_rewrite::LineAction::Drop => None,
+                })
+        })
+        .collect::<Vec<_>>();
     let aliases = output_abi_aliases(bundle, config);
-    let violations =
-        check_output_abi_invariants(&emitted, &workspace_versions, &config.overrides, &aliases);
+    let violations = check_output_abi_invariants(
+        &emitted,
+        &embedded_requires_dist,
+        &workspace_versions,
+        &config.overrides,
+        &aliases,
+    );
     if violations.is_empty() {
         return Ok(());
     }
@@ -11422,9 +11549,6 @@ fn produce_output_with_conflicts(
         config.bundle_mode == crate::config::BundleMode::Loose,
         siblings,
     )?;
-    if conflicts.is_empty() {
-        ensure_output_abi_invariants(&output, bundle, config, workspace_python_version)?;
-    }
     Ok((output, conflicts, pending_relaxations))
 }
 
@@ -11482,6 +11606,7 @@ fn produce_output_pending_relaxations(
             .collect();
         return Err(aggregate_conflicts(conflicts)).with_context(|| context);
     }
+    ensure_output_abi_invariants(&output, bundle, config, workspace_python_version)?;
     Ok((output, pending_relaxations))
 }
 
@@ -11698,6 +11823,8 @@ async fn emit_wheels_from_lock(
     cache_dir: &Path,
 ) -> Result<Option<Vec<crate::emit_pypi::EmitWheel>>> {
     use crate::lock::Origin;
+
+    let abi_aliases = abi_aliases_from_name_map(&config.name_map);
 
     // Provenance gaps are a legitimate signal to cold-resolve, but detect all
     // of them before the first checkout, download, or build. Otherwise a later
@@ -11982,7 +12109,7 @@ async fn emit_wheels_from_lock(
                                     has_auto_data = member_auto_data.is_some(),
                                     "courier replay (phase 2.5): building group member"
                                 );
-                                let (resolved, _rd) = materialize_and_rewrite(
+                                let (resolved, _rd) = materialize_and_rewrite_with_abi_aliases(
                                     &synth_entry,
                                     &member_lw.name,
                                     Some(&member_lw.version),
@@ -11994,6 +12121,7 @@ async fn emit_wheels_from_lock(
                                     &config.git_sources,
                                     member_auto_data,
                                     EntryAuditInfo::default(),
+                                    &abi_aliases,
                                 )
                                 .await
                                 .with_context(|| {
@@ -12064,7 +12192,7 @@ async fn emit_wheels_from_lock(
                             ..crate::config::WheelEntry::default()
                         };
                         let auto_data = replay_git_auto_data(gs, checkout_root)?;
-                        let (resolved, _rd) = materialize_and_rewrite(
+                        let (resolved, _rd) = materialize_and_rewrite_with_abi_aliases(
                             &synth_entry,
                             &lw.name,
                             Some(&lw.version),
@@ -12076,6 +12204,7 @@ async fn emit_wheels_from_lock(
                             &config.git_sources,
                             auto_data,
                             EntryAuditInfo::default(),
+                            &abi_aliases,
                         )
                         .await
                         .with_context(|| {
@@ -12133,7 +12262,7 @@ async fn emit_wheels_from_lock(
                                 checkout_root,
                                 skip_subdirs: vec![],
                             });
-                    let (resolved, _rd) = materialize_and_rewrite(
+                    let (resolved, _rd) = materialize_and_rewrite_with_abi_aliases(
                         entry,
                         &lw.name,
                         Some(&lw.version),
@@ -12145,6 +12274,7 @@ async fn emit_wheels_from_lock(
                         &config.git_sources,
                         auto_data,
                         EntryAuditInfo::default(),
+                        &abi_aliases,
                     )
                     .await
                     .with_context(|| {
@@ -12374,10 +12504,11 @@ async fn emit_wheels_from_lock(
                 // policy before courier performs its override/provider rewrite.
                 // Replay must feed courier the same phase-D bytes, not the raw
                 // upstream wheel, or the authoritative final SHA can drift.
-                let replay_local = prepare_replayed_class2_wheel(
+                let replay_local = prepare_replayed_class2_wheel_with_abi_aliases(
                     fetched,
                     config.relax,
                     config.retread_wheels.contains_key(&lw.name),
+                    &abi_aliases,
                 )
                 .await?;
 
@@ -12412,10 +12543,26 @@ async fn emit_wheels_from_lock(
 /// raw upstream wheel on replay skips phase D and can therefore produce bytes
 /// that differ from the authoritative lock whenever the general relax policy
 /// widened an exact pin before courier staging.
+#[cfg(test)]
 async fn prepare_replayed_class2_wheel(
     fetched: PathBuf,
     relax: RelaxPolicy,
     declared_root: bool,
+) -> Result<PathBuf> {
+    prepare_replayed_class2_wheel_with_abi_aliases(
+        fetched,
+        relax,
+        declared_root,
+        &AbiAliasGraph::new(),
+    )
+    .await
+}
+
+async fn prepare_replayed_class2_wheel_with_abi_aliases(
+    fetched: PathBuf,
+    relax: RelaxPolicy,
+    declared_root: bool,
+    abi_aliases: &AbiAliasGraph,
 ) -> Result<PathBuf> {
     // Cold phase D runs in materialize_and_rewrite for declared roots. A
     // remote-only BFS transitive is first downloaded inside courier itself,
@@ -12427,15 +12574,18 @@ async fn prepare_replayed_class2_wheel(
     let rewritten = fetched.with_extension("relaxed.whl");
     let src = fetched.clone();
     let dst = rewritten.clone();
-    tokio::task::spawn_blocking(move || rewrite_wheel(&src, &dst, relax))
-        .await
-        .context("Class-2 replay relax rewrite panicked")?
-        .with_context(|| {
-            format!(
-                "Class-2 replay phase-D rewrite for {} (policy={relax:?})",
-                fetched.display(),
-            )
-        })?;
+    let abi_aliases = abi_aliases.clone();
+    tokio::task::spawn_blocking(move || {
+        rewrite_wheel_with_abi_aliases(&src, &dst, relax, &abi_aliases)
+    })
+    .await
+    .context("Class-2 replay relax rewrite panicked")?
+    .with_context(|| {
+        format!(
+            "Class-2 replay phase-D rewrite for {} (policy={relax:?})",
+            fetched.display(),
+        )
+    })?;
     Ok(rewritten)
 }
 
@@ -14234,8 +14384,20 @@ fn replay_loaded_lock(
         "python".to_string(),
         BTreeSet::from([python_version.trim_end_matches(".*").to_string()]),
     )]);
+    let embedded_requires_dist = lock
+        .wheels
+        .iter()
+        .flat_map(|wheel| {
+            wheel
+                .requires_dist
+                .iter()
+                .cloned()
+                .map(|requirement| (wheel.name.clone(), requirement))
+        })
+        .collect::<Vec<_>>();
     let violations = check_output_abi_invariants(
         &emitted,
+        &embedded_requires_dist,
         &workspace_versions,
         &BTreeMap::new(),
         &BTreeMap::new(),
