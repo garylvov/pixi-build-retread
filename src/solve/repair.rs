@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use super::manifest::{AppliedEdit, EntrySnapshot, ManifestEditor, TableKind, write_atomic};
 use super::parse::Conflict;
 use crate::handler::PypiToCondaMap;
-use crate::relax::canonical_conda_name;
+use crate::relax::{canonical_conda_name, checked_version_ceiling};
 
 // Copied from src/conflict_classifier.rs:52 so solve has no dependency on cascade-era modules.
 pub(crate) const ABI_ANCHOR_NAMES: &[&str] = &[
@@ -1442,7 +1442,7 @@ impl RepairPlanner {
         // from the pypi `package` name via the name-family match), so ABI
         // anchors are protected regardless of which side named the conflict.
         self.guard_anchor(conda_name)?;
-        let spec = widen_spec(op, floor, self.ceiling_policy);
+        let spec = widen_spec(op, floor, self.ceiling_policy).ok_or_else(|| package.to_string())?;
         self.guard_oscillation(package, &spec, Strategy::WidenConda)?;
         let edit = editor.set_conda_widen(&self.feature, conda_name, &spec);
         let old_spec = edit.before.value.clone();
@@ -2019,18 +2019,12 @@ pub(super) fn is_solve_repair_anchor(name: &str) -> bool {
         .any(|prefix| name.starts_with(prefix))
 }
 
-fn widen_spec(op: &str, floor: &str, policy: WidenCeilingPolicy) -> String {
+fn widen_spec(op: &str, floor: &str, policy: WidenCeilingPolicy) -> Option<String> {
     let lower = format!("{op}{floor}");
     match policy {
-        WidenCeilingPolicy::None => lower,
-        WidenCeilingPolicy::NextMajor => match next_major(floor) {
-            Some(ceil) => format!("{lower},<{ceil}"),
-            None => lower,
-        },
-        WidenCeilingPolicy::SameMinor => match next_minor(floor) {
-            Some(ceil) => format!("{lower},<{ceil}"),
-            None => lower,
-        },
+        WidenCeilingPolicy::None => Some(lower),
+        WidenCeilingPolicy::NextMajor => Some(format!("{lower},<{}", next_major(floor)?)),
+        WidenCeilingPolicy::SameMinor => Some(format!("{lower},<{}", next_minor(floor)?)),
     }
 }
 
@@ -2043,14 +2037,14 @@ fn strip_version_op(spec: &str) -> &str {
 
 fn next_major(version: &str) -> Option<String> {
     let major = version.split('.').next()?.parse::<u64>().ok()?;
-    Some((major + 1).to_string())
+    checked_version_ceiling(&[major])
 }
 
 fn next_minor(version: &str) -> Option<String> {
     let mut parts = version.split('.');
     let major = parts.next()?.parse::<u64>().ok()?;
     let minor = parts.next().unwrap_or("0").parse::<u64>().ok()?;
-    Some(format!("{major}.{}", minor + 1))
+    checked_version_ceiling(&[major, minor])
 }
 
 fn parse_strategy(raw: &str) -> Strategy {
@@ -3640,6 +3634,20 @@ mod tests {
         let path = dir.join("pixi.toml");
         std::fs::write(&path, text).unwrap();
         path
+    }
+
+    #[test]
+    fn widen_spec_ceiling_overflow_fails_closed() {
+        let max = u64::MAX.to_string();
+
+        assert_eq!(
+            widen_spec(">=", &format!("{max}.1"), WidenCeilingPolicy::NextMajor),
+            None
+        );
+        assert_eq!(
+            widen_spec(">=", &format!("1.{max}.0"), WidenCeilingPolicy::SameMinor),
+            None
+        );
     }
 
     #[test]

@@ -2352,9 +2352,12 @@ pub fn cuda_major_from_specs(specs: &[String]) -> Option<u32> {
 /// on their own), so these are only load-bearing for bundles that
 /// actually depend on one of the tracked families.
 pub fn cuda_family_constraints(cuda_major: u32) -> Vec<(&'static str, String)> {
+    let Some(cuda_ceiling) = cuda_major.checked_add(1) else {
+        return Vec::new();
+    };
     CUDA_MAJOR_TRACKED_PYPI_FAMILIES
         .iter()
-        .map(|name| (*name, format!(">={cuda_major},<{}", cuda_major + 1)))
+        .map(|name| (*name, format!(">={cuda_major},<{cuda_ceiling}")))
         .collect()
 }
 
@@ -5556,6 +5559,14 @@ isaaclab = { path = "wheels/isaaclab/isaaclab-2.0.0-py3-none-any.whl" }
             caps.contains(&("cuda-python", ">=12,<13".to_string())),
             "caps: {caps:?}"
         );
+    }
+
+    #[test]
+    fn cuda_family_constraints_u32_max_fails_closed() {
+        let major =
+            cuda_major_from_specs(&[format!("=={}.0", u32::MAX)]).expect("maximum major parses");
+        assert_eq!(major, u32::MAX);
+        assert!(cuda_family_constraints(major).is_empty());
     }
 
     #[test]

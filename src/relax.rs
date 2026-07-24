@@ -1322,6 +1322,22 @@ mod tests {
     }
 
     #[test]
+    fn no_relax_preserves_epoch_and_prerelease_exact_versions() {
+        assert_eq!(
+            t("demo==1!3.1", RelaxPolicy::None).as_deref(),
+            Some("demo ==1!3.1")
+        );
+        assert_eq!(
+            t("demo==3.1.dev1", RelaxPolicy::None).as_deref(),
+            Some("demo ==3.1.dev1")
+        );
+        assert_eq!(
+            t("demo==3.1a1", RelaxPolicy::None).as_deref(),
+            Some("demo ==3.1a1")
+        );
+    }
+
+    #[test]
     fn range_pass_through() {
         assert_eq!(
             t("requests>=2.0,<3", RelaxPolicy::Minor).as_deref(),
