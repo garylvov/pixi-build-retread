@@ -16,7 +16,7 @@ use rattler_conda_types::ChannelUrl;
 use uv_pep508::MarkerEnvironment;
 use uv_pep508::uv_pep440::{Version, VersionSpecifiers, release_specifiers_to_ranges};
 
-use crate::config::{RelaxPolicy, RetreadConfig};
+use crate::config::{RelaxPolicy, RetreadConfig, WheelEntry};
 #[cfg(test)]
 use crate::constraint::finalize;
 use crate::constraint::{
@@ -488,17 +488,72 @@ struct ClosureDependencyEdge {
     raw_requirement: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum RootPinOrigin {
+    DepsFromRoot {
+        requirement: String,
+    },
+    RequiresDist {
+        parent: PypiKey,
+        requirement: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct RootPinCandidate {
     package: PypiKey,
     specifier: String,
-    introduced_by: PypiKey,
-    raw_requirement: String,
+    edit: RootPinEdit,
+    origin: RootPinOrigin,
 }
 
-fn configured_bundle_roots(bundle: &Bundle, config: &RetreadConfig) -> BTreeSet<PypiKey> {
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum RootPinEdit {
+    Override,
+    RetreadWheel { bundle_group: String },
+}
+
+#[derive(Clone, Debug)]
+struct BundleRoot {
+    constraint: ConfiguredRootConstraint,
+    bundle_group: String,
+    deps_from: bool,
+}
+
+fn configured_primary_bundle_group(bundle: &Bundle, config: &RetreadConfig) -> String {
+    for primary_name in [
+        PypiKey::from_pypi(&bundle.primary.pypi_name),
+        PypiKey::from_pypi(&bundle.primary.metadata.name),
+    ] {
+        if let Some((name, entry)) = config
+            .retread_wheels
+            .iter()
+            .find(|(name, _)| PypiKey::from_pypi(name) == primary_name)
+        {
+            return super::bundle_group_for(name, entry, config.default_bundle.as_deref());
+        }
+    }
+
     let bundle_key = canonical_conda_name(&bundle.conda_name);
-    let mut declared = config
+    let groups = config
+        .retread_wheels
+        .iter()
+        .map(|(name, entry)| super::bundle_group_for(name, entry, config.default_bundle.as_deref()))
+        .filter(|group| canonical_conda_name(group) == bundle_key)
+        .collect::<BTreeSet<_>>();
+    if groups.len() == 1 {
+        return groups.into_iter().next().expect("one bundle group exists");
+    }
+    bundle.conda_name.clone()
+}
+
+fn configured_bundle_roots(
+    bundle: &Bundle,
+    config: &RetreadConfig,
+) -> BTreeMap<PypiKey, BundleRoot> {
+    let bundle_group = configured_primary_bundle_group(bundle, config);
+    let bundle_key = canonical_conda_name(&bundle_group);
+    let declared = config
         .retread_wheels
         .iter()
         .filter(|(name, entry)| {
@@ -508,39 +563,49 @@ fn configured_bundle_roots(bundle: &Bundle, config: &RetreadConfig) -> BTreeSet<
                 config.default_bundle.as_deref(),
             )) == bundle_key
         })
-        .map(|(name, _)| PypiKey::from_pypi(name))
-        .collect::<BTreeSet<_>>();
-    if declared.is_empty() {
-        let wheel_names = bundle
-            .all_wheels()
-            .flat_map(|wheel| {
-                [
-                    PypiKey::from_pypi(&wheel.pypi_name),
-                    PypiKey::from_pypi(&wheel.metadata.name),
-                ]
-            })
-            .collect::<BTreeSet<_>>();
-        declared.extend(
-            config
-                .retread_wheels
-                .keys()
-                .map(|name| PypiKey::from_pypi(name))
-                .filter(|name| wheel_names.contains(name)),
-        );
-    }
+        .collect::<Vec<_>>();
 
-    let mut roots = declared.clone();
+    let mut roots = declared
+        .into_iter()
+        .map(|(name, entry)| {
+            let package = PypiKey::from_pypi(name);
+            (
+                package.clone(),
+                BundleRoot {
+                    constraint: configured_root_constraint(&package, entry),
+                    bundle_group: super::bundle_group_for(
+                        name,
+                        entry,
+                        config.default_bundle.as_deref(),
+                    ),
+                    deps_from: false,
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     for wheel in bundle.all_wheels() {
-        if declared.contains(&PypiKey::from_pypi(&wheel.pypi_name))
-            || declared.contains(&PypiKey::from_pypi(&wheel.metadata.name))
-        {
-            roots.insert(PypiKey::from_pypi(&wheel.pypi_name));
-            roots.insert(PypiKey::from_pypi(&wheel.metadata.name));
+        let pypi_name = PypiKey::from_pypi(&wheel.pypi_name);
+        let metadata_name = PypiKey::from_pypi(&wheel.metadata.name);
+        let root = roots
+            .get(&pypi_name)
+            .or_else(|| roots.get(&metadata_name))
+            .cloned();
+        if let Some(root) = root {
+            roots.insert(pypi_name, root.clone());
+            roots.insert(metadata_name, root);
         }
     }
-    if roots.is_empty() {
-        roots.insert(PypiKey::from_pypi(&bundle.primary.pypi_name));
-        roots.insert(PypiKey::from_pypi(&bundle.primary.metadata.name));
+
+    for (name, requirements) in &bundle.uv_dependency_graph.deps_from_root_requirements {
+        let package = PypiKey::from_pypi(name);
+        roots.insert(
+            package.clone(),
+            BundleRoot {
+                constraint: root_constraint_from_requirements(&package, requirements),
+                bundle_group: bundle_group.clone(),
+                deps_from: true,
+            },
+        );
     }
     roots
 }
@@ -611,10 +676,81 @@ fn concrete_open_floor(specifiers: &VersionSpecifiers) -> Option<String> {
     specifiers.contains(version).then(|| format!("=={version}"))
 }
 
-fn dependency_topology(
-    bundle: &Bundle,
-    metadata_edges: &[ClosureDependencyEdge],
-) -> BTreeMap<PypiKey, Vec<PypiKey>> {
+#[derive(Clone, Debug)]
+enum ConfiguredRootConstraint {
+    OpenFloor {
+        specifier: String,
+        requirement: String,
+    },
+    Fixed,
+    Unactionable,
+}
+
+fn root_constraint_from_specifiers(
+    package: &PypiKey,
+    specifiers: &VersionSpecifiers,
+) -> ConfiguredRootConstraint {
+    if specifiers.is_empty() {
+        return ConfiguredRootConstraint::Unactionable;
+    }
+    if let Some(specifier) = concrete_open_floor(specifiers) {
+        return ConfiguredRootConstraint::OpenFloor {
+            specifier,
+            requirement: format!("{package}{}", render_specifiers(specifiers)),
+        };
+    }
+    let rendered = render_specifiers(specifiers);
+    let exact = rendered
+        .strip_prefix("===")
+        .or_else(|| rendered.strip_prefix("=="))
+        .filter(|version| {
+            !version.is_empty()
+                && !version.contains([',', '*'])
+                && Version::from_str(version).is_ok()
+        })
+        .is_some();
+    if exact {
+        ConfiguredRootConstraint::Fixed
+    } else {
+        ConfiguredRootConstraint::Unactionable
+    }
+}
+
+fn root_constraint_from_requirements(
+    package: &PypiKey,
+    requirements: &[String],
+) -> ConfiguredRootConstraint {
+    let mut clauses = Vec::new();
+    for raw in requirements {
+        let Ok(specifiers) = VersionSpecifiers::from_str(raw) else {
+            return ConfiguredRootConstraint::Unactionable;
+        };
+        clauses.extend(specifiers);
+    }
+    let combined = dedup_specifier_clauses(clauses.into_iter());
+    root_constraint_from_specifiers(package, &combined)
+}
+
+fn configured_root_constraint(package: &PypiKey, entry: &WheelEntry) -> ConfiguredRootConstraint {
+    let Some(raw_version) = entry.version.as_deref() else {
+        return ConfiguredRootConstraint::Fixed;
+    };
+    let raw_version = raw_version.trim();
+    if raw_version.is_empty() || raw_version == "*" {
+        return ConfiguredRootConstraint::Unactionable;
+    }
+    let normalized = if raw_version.starts_with(['<', '>', '=', '!', '~']) {
+        raw_version.to_string()
+    } else {
+        format!("=={raw_version}")
+    };
+    let Ok(specifiers) = VersionSpecifiers::from_str(&normalized) else {
+        return ConfiguredRootConstraint::Unactionable;
+    };
+    root_constraint_from_specifiers(package, &specifiers)
+}
+
+fn dependency_topology(bundle: &Bundle) -> BTreeMap<PypiKey, Vec<PypiKey>> {
     let edges = bundle
         .uv_dependency_graph
         .edges
@@ -625,11 +761,6 @@ fn dependency_topology(
                 PypiKey::from_pypi(&edge.child),
             )
         })
-        .chain(
-            metadata_edges
-                .iter()
-                .map(|edge| (edge.parent.clone(), edge.child.clone())),
-        )
         .collect::<BTreeSet<_>>();
     let mut parents: BTreeMap<PypiKey, Vec<PypiKey>> = BTreeMap::new();
     for (parent, child) in edges {
@@ -641,8 +772,29 @@ fn dependency_topology(
 fn root_boundary_candidate(
     parent: &PypiKey,
     child: &PypiKey,
+    root: &BundleRoot,
     metadata_edges: &[ClosureDependencyEdge],
 ) -> Option<RootPinCandidate> {
+    match &root.constraint {
+        ConfiguredRootConstraint::OpenFloor {
+            specifier,
+            requirement,
+        } if root.deps_from => {
+            return Some(RootPinCandidate {
+                package: parent.clone(),
+                specifier: specifier.clone(),
+                edit: RootPinEdit::Override,
+                origin: RootPinOrigin::DepsFromRoot {
+                    requirement: requirement.clone(),
+                },
+            });
+        }
+        ConfiguredRootConstraint::OpenFloor { .. } => return None,
+        ConfiguredRootConstraint::Fixed if !root.deps_from => {}
+        ConfiguredRootConstraint::Fixed => return None,
+        ConfiguredRootConstraint::Unactionable => return None,
+    }
+
     let boundary = metadata_edges
         .iter()
         .filter(|edge| &edge.parent == parent && &edge.child == child)
@@ -665,20 +817,26 @@ fn root_boundary_candidate(
     Some(RootPinCandidate {
         package: child.clone(),
         specifier: concrete_open_floor(&combined)?,
-        introduced_by: parent.clone(),
-        raw_requirement,
+        edit: RootPinEdit::RetreadWheel {
+            bundle_group: root.bundle_group.clone(),
+        },
+        origin: RootPinOrigin::RequiresDist {
+            parent: parent.clone(),
+            requirement: raw_requirement,
+        },
     })
 }
 
 /// Reverse-walk every parent path until it reaches a configured pack root.
 ///
-/// Only an open-ended root edge with an included concrete floor is
-/// actionable without inventing a version. Missing parents, cycles, bounded
-/// root edges, or divergent paths therefore return `None` and preserve the
-/// ordinary leaf suggestion.
+/// An open-ended deps-from root is the outermost package the user can pin.
+/// For an already-fixed configured wheel, its first open-ended Requires-Dist
+/// edge is the outermost remaining choice. Missing parents, cycles, bounded
+/// constraints, or divergent paths return `None` and preserve the ordinary
+/// leaf suggestion.
 fn walk_to_root_pin(
     package: &PypiKey,
-    roots: &BTreeSet<PypiKey>,
+    roots: &BTreeMap<PypiKey, BundleRoot>,
     parents: &BTreeMap<PypiKey, Vec<PypiKey>>,
     metadata_edges: &[ClosureDependencyEdge],
     visiting: &mut BTreeSet<PypiKey>,
@@ -689,8 +847,13 @@ fn walk_to_root_pin(
     let incoming = parents.get(package)?;
     let mut candidates = Vec::new();
     for parent in incoming {
-        if roots.contains(parent) {
-            candidates.push(root_boundary_candidate(parent, package, metadata_edges)?);
+        if let Some(root) = roots.get(parent) {
+            candidates.push(root_boundary_candidate(
+                parent,
+                package,
+                root,
+                metadata_edges,
+            )?);
         } else {
             candidates.extend(walk_to_root_pin(
                 parent,
@@ -720,15 +883,17 @@ fn transitive_root_pin_candidate(
     platform: &str,
     python: &str,
 ) -> Option<RootPinCandidate> {
+    if bundle.uv_dependency_graph.edges.is_empty() {
+        return None;
+    }
     let roots = configured_bundle_roots(bundle, config);
     if roots.is_empty() {
         return None;
     }
     let edges = closure_dependency_edges(bundle, platform, python)?;
-    let parents = dependency_topology(bundle, &edges);
+    let parents = dependency_topology(bundle);
 
-    let mut candidates: BTreeMap<(PypiKey, String, PypiKey, String), RootPinCandidate> =
-        BTreeMap::new();
+    let mut candidates = BTreeSet::new();
     let mut saw_transitive_side = false;
     for constraint in minimal_unsat_requirements(conflict.requirements()) {
         if !matches!(
@@ -765,28 +930,21 @@ fn transitive_root_pin_candidate(
             return None;
         }
         for edge in matching {
-            if roots.contains(&edge.parent) {
+            if roots.contains_key(&edge.parent) {
                 continue;
             }
             saw_transitive_side = true;
             let path_candidates =
                 walk_to_root_pin(&edge.parent, &roots, &parents, &edges, &mut BTreeSet::new())?;
             for candidate in path_candidates {
-                candidates
-                    .entry((
-                        candidate.package.clone(),
-                        candidate.specifier.clone(),
-                        candidate.introduced_by.clone(),
-                        candidate.raw_requirement.clone(),
-                    ))
-                    .or_insert(candidate);
+                candidates.insert(candidate);
             }
         }
     }
     if !saw_transitive_side || candidates.len() != 1 {
         return None;
     }
-    let candidate = candidates.into_values().next()?;
+    let candidate = candidates.into_iter().next()?;
     let selected = bundle
         .uv_dependency_graph
         .selected_versions
@@ -807,18 +965,46 @@ fn transitive_root_pin_candidate(
 }
 
 fn render_root_pin_suggestion(candidate: &RootPinCandidate, leaf: &PypiKey) -> String {
+    let origin = match &candidate.origin {
+        RootPinOrigin::DepsFromRoot { requirement } => {
+            format!("# Deps-from root requirement `{requirement}` starts that transitive path.\n")
+        }
+        RootPinOrigin::RequiresDist {
+            parent,
+            requirement,
+        } => format!("# `{parent}` Requires-Dist `{requirement}`.\n"),
+    };
     let mut rendered = format!(
         "# Constrain the transitive root that introduced the `{leaf}` conflict.\n\
-         # `{}` Requires-Dist `{}`.\n\
-         # Edit the existing [package.build.config.retread-wheels] table.\n\
-         # Add or update this entry, then confirm the version exists on the configured index\n\
-         # and resolves the conflict:\n",
-        candidate.introduced_by, candidate.raw_requirement
+         {origin}"
     );
-    rendered.push_str(&crate::pack_overrides::render_root_pin_toml(
-        candidate.package.as_str(),
-        &candidate.specifier,
-    ));
+    match &candidate.edit {
+        RootPinEdit::Override => {
+            rendered.push_str(
+                "# Under [package.build.config.retread-overrides], add or update this key\n\
+                 # (create that table once if absent).\n\
+                 # This override must replace the deps-from floor for the pin to take effect.\n\
+                 # Confirm the version exists on the configured index\n\
+                 # and resolves the conflict:\n",
+            );
+            rendered.push_str(&crate::pack_overrides::render_override_toml(
+                candidate.package.as_str(),
+                &candidate.specifier,
+            ));
+        }
+        RootPinEdit::RetreadWheel { bundle_group } => {
+            rendered.push_str(
+                "# Edit the existing [package.build.config.retread-wheels] table.\n\
+         # Add or update this entry, then confirm the version exists on the configured index\n\
+                 # and resolves the conflict:\n",
+            );
+            rendered.push_str(&crate::pack_overrides::render_root_pin_toml(
+                candidate.package.as_str(),
+                &candidate.specifier,
+                bundle_group,
+            ));
+        }
+    }
     rendered
 }
 
@@ -4846,6 +5032,7 @@ mod tests {
                 },
             ]),
             selected_versions: BTreeMap::from([("pin".to_string(), "4.0.0".to_string())]),
+            deps_from_root_requirements: BTreeMap::new(),
         };
         let mut config: RetreadConfig = serde_json::from_value(serde_json::json!({
             "retread-wheels": {
@@ -4879,6 +5066,106 @@ mod tests {
         (context, bundle, config, constraints)
     }
 
+    fn deps_from_pin_root_conflict_fixture() -> (
+        JointRouteDiagnosticContext,
+        Bundle,
+        RetreadConfig,
+        Vec<Constraint>,
+    ) {
+        let context = JointRouteDiagnosticContext {
+            bundle: "robotics-output".to_string(),
+            environments: vec!["robotics".to_string()],
+            profiles: vec!["linux-64".to_string()],
+            platform: "linux-64".to_string(),
+            python: "3.11".to_string(),
+        };
+        let mut bundle = test_bundle(&[]);
+        bundle.conda_name = context.bundle.clone();
+        bundle.primary = test_wheel("robotics-root", "robotics-root", "1.0.0", &[]);
+        bundle.extras = vec![
+            test_wheel("pin", "pin", "4.0.0", &["cmeel-boost>=1.89.0"]),
+            test_wheel("cmeel-boost", "cmeel-boost", "1.89.0", &["numpy>=2"]),
+        ];
+        bundle.uv_dependency_graph = crate::uv_closure::UvDependencyGraph {
+            edges: BTreeSet::from([
+                crate::uv_closure::UvDependencyEdge {
+                    parent: "pin".to_string(),
+                    child: "cmeel-boost".to_string(),
+                },
+                crate::uv_closure::UvDependencyEdge {
+                    parent: "cmeel-boost".to_string(),
+                    child: "numpy".to_string(),
+                },
+            ]),
+            selected_versions: BTreeMap::from([
+                ("pin".to_string(), "4.0.0".to_string()),
+                ("cmeel-boost".to_string(), "1.89.0".to_string()),
+                ("numpy".to_string(), "2.0.0".to_string()),
+            ]),
+            deps_from_root_requirements: BTreeMap::from([(
+                "pin".to_string(),
+                vec![">=2.6.20".to_string()],
+            )]),
+        };
+        let mut config: RetreadConfig = serde_json::from_value(serde_json::json!({
+            "retread-deps-from": "requirements.txt",
+            "retread-wheels": {
+                "robotics-root": {
+                    "version": "1.0.0",
+                    "bundle": "robotics-output"
+                }
+            }
+        }))
+        .unwrap();
+        config.pack_manifest_path = Some("pypi-packs/robotics-pack/pixi.toml".to_string());
+
+        let baseline = Constraint {
+            specifiers: VersionSpecifiers::from_str("<2").unwrap(),
+            provenance: Provenance::UvRoot,
+            source: "uv root requirement `numpy<2`".to_string(),
+            origin_id: test_origin("numpy-root-cap", "<2"),
+        };
+        let mut observed = ObservedRequirements::new();
+        observe_requirement(
+            &mut observed,
+            "numpy",
+            &VersionSpecifiers::from_str(">=2").unwrap(),
+            "cmeel-boost",
+            "1.89.0",
+            "numpy>=2",
+            Provenance::IndexWheelMetadata,
+        );
+        let mut constraints = vec![baseline];
+        constraints.extend(
+            observed
+                .remove(&PypiKey::from_pypi("numpy"))
+                .expect("the fixture must record the cmeel NumPy floor"),
+        );
+        (context, bundle, config, constraints)
+    }
+
+    fn graph_conflict_suggestion(
+        context: &JointRouteDiagnosticContext,
+        bundle: &Bundle,
+        config: &RetreadConfig,
+        constraints: Vec<Constraint>,
+    ) -> crate::constraint::ConflictSuggestion {
+        let mut builder =
+            RestoreRequestBuilder::new("numpy", RelaxPolicy::PatchThenMinorThenMajorThenLastResort);
+        for constraint in constraints {
+            builder.add_constraint(constraint);
+        }
+        let target = crate::pypi::WheelTarget::for_subdir(&context.python, &context.platform);
+        let error = builder
+            .finish_with_graph_context(Some(context), bundle, config, &target)
+            .expect_err("the cross-major NumPy conflict must fail closed");
+        error
+            .downcast_ref::<Conflict>()
+            .and_then(Conflict::suggestion)
+            .cloned()
+            .expect("the fail-closed conflict must retain a suggestion")
+    }
+
     #[test]
     fn transitive_numpy_conflict_suggests_pin_root_not_leaf() {
         let (context, bundle, config, constraints) = transitive_numpy_conflict_fixture();
@@ -4906,7 +5193,7 @@ mod tests {
             "wheel `cmeel-boost==1.89.0` Requires-Dist `numpy>=2`",
             "Suggested fix in pypi-packs/robotics-pack/pixi.toml:",
             "Edit the existing [package.build.config.retread-wheels] table.",
-            "pin = { version = \"==2.6.20\" }",
+            "pin = { version = \"==2.6.20\", bundle = \"robotics-output\" }",
             "confirm the version exists on the configured index",
         ] {
             assert!(
@@ -4921,6 +5208,156 @@ mod tests {
         let parsed: toml::Value = toml::from_str(&suggestion.toml)
             .expect("root table-body suggestion must be valid TOML");
         assert_eq!(parsed["pin"]["version"].as_str(), Some("==2.6.20"));
+        assert_eq!(parsed["pin"]["bundle"].as_str(), Some("robotics-output"));
+    }
+
+    #[test]
+    fn deps_from_pin_root_is_suggested_without_masking_parent_edge() {
+        let (context, bundle, config, constraints) = deps_from_pin_root_conflict_fixture();
+        assert!(
+            !config.retread_wheels.contains_key("pin"),
+            "`pin` must enter as a uv/deps-from root, not an invalid ranged wheel entry"
+        );
+        assert!(
+            !config.deps_from.is_empty(),
+            "the direct-root regression must model a production deps-from root"
+        );
+        assert_eq!(
+            bundle
+                .uv_dependency_graph
+                .deps_from_root_requirements
+                .get("pin")
+                .and_then(|requirements| requirements.first())
+                .map(String::as_str),
+            Some(">=2.6.20")
+        );
+        assert_eq!(
+            bundle.uv_dependency_graph.edges,
+            BTreeSet::from([
+                crate::uv_closure::UvDependencyEdge {
+                    parent: "pin".to_string(),
+                    child: "cmeel-boost".to_string(),
+                },
+                crate::uv_closure::UvDependencyEdge {
+                    parent: "cmeel-boost".to_string(),
+                    child: "numpy".to_string(),
+                },
+            ]),
+            "the regression topology must not contain a masking parent of `pin`"
+        );
+
+        let suggestion = graph_conflict_suggestion(&context, &bundle, &config, constraints);
+        let parsed: toml::Value = toml::from_str(&suggestion.toml).unwrap();
+
+        assert_eq!(parsed["pin"].as_str(), Some("==2.6.20"));
+        assert!(parsed.get("cmeel-boost").is_none(), "{}", suggestion.toml);
+        assert!(
+            suggestion
+                .toml
+                .contains("Deps-from root requirement `pin>=2.6.20`"),
+            "{}",
+            suggestion.toml
+        );
+        assert!(
+            suggestion
+                .toml
+                .contains("Under [package.build.config.retread-overrides], add or update this key"),
+            "{}",
+            suggestion.toml
+        );
+        assert!(
+            suggestion
+                .toml
+                .contains("override must replace the deps-from floor"),
+            "{}",
+            suggestion.toml
+        );
+
+        let merged_manifest = format!(
+            r#"[package]
+name = "robotics-pack"
+version = "1.0.0"
+
+[package.build.config]
+retread-deps-from = "requirements.txt"
+
+[package.build.config.retread-wheels]
+robotics-root = {{ version = "1.0.0", bundle = "robotics-output" }}
+
+[package.build.config.retread-overrides]
+{}"#,
+            suggestion.toml
+        );
+        let merged: toml::Value = toml::from_str(&merged_manifest)
+            .expect("creating the override table once and merging the suggestion must parse");
+        assert_eq!(
+            merged["package"]["build"]["config"]["retread-overrides"]["pin"].as_str(),
+            Some("==2.6.20")
+        );
+    }
+
+    #[test]
+    fn deps_from_root_pin_combines_effective_constraints() {
+        let (context, mut bundle, config, constraints) = deps_from_pin_root_conflict_fixture();
+        bundle
+            .uv_dependency_graph
+            .deps_from_root_requirements
+            .insert(
+                "pin".to_string(),
+                vec![">=2.6.20".to_string(), ">=3.0".to_string()],
+            );
+
+        let suggestion = graph_conflict_suggestion(&context, &bundle, &config, constraints);
+        let parsed: toml::Value = toml::from_str(&suggestion.toml).unwrap();
+
+        assert_eq!(
+            parsed["pin"].as_str(),
+            Some("==3.0"),
+            "additive effective constraints must raise the suggested floor"
+        );
+    }
+
+    #[test]
+    fn root_pin_carries_exact_failing_bundle_group() {
+        let (context, mut bundle, mut config, constraints) = transitive_numpy_conflict_fixture();
+        config
+            .retread_wheels
+            .get_mut("dex-retargeting")
+            .expect("the configured root must exist")
+            .bundle = Some("robotics_output".to_string());
+        bundle.conda_name = "workspace-alias".to_string();
+        assert!(!config.retread_wheels.contains_key("pin"));
+
+        let suggestion = graph_conflict_suggestion(&context, &bundle, &config, constraints);
+        let parsed: toml::Value = toml::from_str(&suggestion.toml).unwrap();
+
+        assert_eq!(
+            parsed["pin"]["bundle"].as_str(),
+            Some("robotics_output"),
+            "the edit must preserve the raw group spelling that produced the failing output"
+        );
+    }
+
+    #[test]
+    fn configured_roots_ignore_other_bundle_wheels_after_output_alias() {
+        let (_context, mut bundle, mut config, _constraints) = transitive_numpy_conflict_fixture();
+        config.retread_wheels.insert(
+            "cmeel-boost".to_string(),
+            serde_json::from_value(serde_json::json!({
+                "version": "1.89.0",
+                "bundle": "another-output"
+            }))
+            .unwrap(),
+        );
+        bundle.conda_name = "workspace-alias".to_string();
+
+        let roots = configured_bundle_roots(&bundle, &config);
+
+        assert!(roots.contains_key(&PypiKey::from_pypi("dex-retargeting")));
+        assert!(
+            !roots.contains_key(&PypiKey::from_pypi("cmeel-boost")),
+            "a configured root from another output must not truncate this bundle's graph walk"
+        );
     }
 
     #[test]
@@ -4943,7 +5380,7 @@ mod tests {
             "{message}"
         );
         assert!(
-            message.contains("pin = { version = \"==2.6.20\" }"),
+            message.contains("pin = { version = \"==2.6.20\", bundle = \"robotics-output\" }"),
             "{message}"
         );
         assert!(!message.contains("retread-drop-deps = [\"numpy\"]"));
@@ -4996,6 +5433,42 @@ mod tests {
         let parsed = toml::from_str::<toml::Value>(&suggestion.toml)
             .expect("fallback table-body suggestion must remain valid TOML");
         assert_eq!(parsed["retread-drop-deps"][0].as_str(), Some("numpy"));
+    }
+
+    #[test]
+    fn empty_dependency_graph_falls_back_to_leaf_suggestion() {
+        let (context, mut bundle, config, constraints) = deps_from_pin_root_conflict_fixture();
+        bundle.uv_dependency_graph.edges.clear();
+
+        let suggestion = graph_conflict_suggestion(&context, &bundle, &config, constraints);
+
+        assert!(
+            suggestion.toml.contains("retread-drop-deps = [\"numpy\"]"),
+            "{}",
+            suggestion.toml
+        );
+        assert!(!suggestion.toml.contains("retread-wheels"));
+    }
+
+    #[test]
+    fn cyclic_dependency_graph_falls_back_to_leaf_suggestion() {
+        let (context, mut bundle, config, constraints) = transitive_numpy_conflict_fixture();
+        bundle
+            .uv_dependency_graph
+            .edges
+            .insert(crate::uv_closure::UvDependencyEdge {
+                parent: "cmeel-boost".to_string(),
+                child: "pin".to_string(),
+            });
+
+        let suggestion = graph_conflict_suggestion(&context, &bundle, &config, constraints);
+
+        assert!(
+            suggestion.toml.contains("retread-drop-deps = [\"numpy\"]"),
+            "{}",
+            suggestion.toml
+        );
+        assert!(!suggestion.toml.contains("retread-wheels"));
     }
 
     #[test]

@@ -200,15 +200,17 @@ pub(crate) fn render_override_toml(package: &str, spec: &str) -> String {
     document.to_string()
 }
 
-/// Render one table-body assignment for a transitive root pin.
+/// Render one table-body assignment for a transitive root pin in the failing
+/// bundle group.
 ///
 /// Both the package key and version value are formatted by `toml_edit`, so
 /// package names that are not valid bare TOML keys are safely quoted. The
 /// existing `retread-wheels` table is intentionally not re-declared.
-pub(crate) fn render_root_pin_toml(package: &str, spec: &str) -> String {
+pub(crate) fn render_root_pin_toml(package: &str, spec: &str, bundle_group: &str) -> String {
     let mut document = DocumentMut::new();
     let mut pin = InlineTable::new();
     pin.insert("version", Value::from(spec));
+    pin.insert("bundle", Value::from(bundle_group));
     document[package] = Item::Value(Value::InlineTable(pin));
     document.to_string()
 }
@@ -756,13 +758,19 @@ packaging = ">=24"
 
     #[test]
     fn diagnostic_root_pin_is_parseable_and_safely_quotes_package_key() {
-        let rendered = render_root_pin_toml("pin.root", "==2.6.20");
+        let rendered = render_root_pin_toml("pin.root", "==2.6.20", "robotics-output");
         let parsed: toml::Value = toml::from_str(&rendered).unwrap();
 
         assert_eq!(parsed["pin.root"]["version"].as_str(), Some("==2.6.20"));
+        assert_eq!(
+            parsed["pin.root"]["bundle"].as_str(),
+            Some("robotics-output")
+        );
         assert!(!rendered.contains("[package.build.config"));
         assert!(
-            rendered.contains("\"pin.root\" = { version = \"==2.6.20\" }"),
+            rendered.contains(
+                "\"pin.root\" = { version = \"==2.6.20\", bundle = \"robotics-output\" }"
+            ),
             "root package key was not safely quoted in:\n{rendered}"
         );
     }

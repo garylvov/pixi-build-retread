@@ -225,6 +225,13 @@ pub struct UvDependencyGraph {
     pub edges: BTreeSet<UvDependencyEdge>,
     /// Canonical package name -> version selected by uv.
     pub selected_versions: BTreeMap<String, String>,
+    /// Canonical deps-from root name -> effective PEP 440 input specifiers.
+    ///
+    /// This is diagnostic-only request context. Deps-from roots can be absent
+    /// from `[retread-wheels]` while still being the outermost package a user
+    /// can constrain. Effective overrides replace the root requirement here,
+    /// while constraints remain additive, matching the request uv solved.
+    pub deps_from_root_requirements: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone)]

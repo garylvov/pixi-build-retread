@@ -4657,6 +4657,19 @@ async fn resolve_all(
                 .map(|k| canonical_conda_name(k))
                 .collect();
             bundle.uv_dependency_graph = closure.dependency_graph.clone();
+            bundle.uv_dependency_graph.deps_from_root_requirements = deps_from_root_names
+                .iter()
+                .filter_map(|name| {
+                    let inputs = closure.effective_input_requirements.as_ref()?.get(name)?;
+                    let specifiers = inputs
+                        .iter()
+                        .map(|input| input.specifiers.clone())
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .collect::<Vec<_>>();
+                    Some((canonical_conda_name(name), specifiers))
+                })
+                .collect();
         }
         bundle.workspace_conda_versions = workspace_facts.common_selected_versions.clone();
         bundle.workspace_conda_provider_facts = workspace_facts.provider_facts.clone();
