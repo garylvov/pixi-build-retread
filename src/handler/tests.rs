@@ -825,7 +825,7 @@ fn produce_output_emits_auto_routed_conda_run_deps() {
     // over the wheel's looser spec (first-insert dedup). Since the
     // bounded-range fix, non-deps-from, non-anchor, non-overridden pins
     // are emitted as `>=locked,<next-major`. NumPy is an ABI anchor, so its
-    // route retains the exact selected version.
+    // route selection is confined to the selected within-minor ABI band.
     let bundle = Bundle {
         conda_name: "auto-pack".into(),
         primary: rw(
@@ -853,9 +853,8 @@ fn produce_output_emits_auto_routed_conda_run_deps() {
         .map(|d| (d.name.clone(), format_packagespec(&d.spec)))
         .collect();
     assert!(
-        deps.contains(&("numpy".to_string(), ">=1.21,==2.1.0".to_string())),
-        "auto-routed numpy must retain its exact ABI selection while also \
-         preserving the compatible wheel floor: {deps:?}"
+        deps.contains(&("numpy".to_string(), ">=2.1,<2.2".to_string())),
+        "auto-routed numpy must emit the selected within-minor ABI band: {deps:?}"
     );
     assert!(
         deps.contains(&("scipy".to_string(), ">=1.14.1,<2".to_string())),
@@ -1148,7 +1147,7 @@ fn relaxation_parity_allows_run_exports_but_rejects_replaced_ranges() {
 }
 
 #[test]
-fn final_emission_never_pre_relaxes_numpy_or_cuda_anchors() {
+fn final_emission_bands_numpy_exact_pin_but_preserves_cuda_cap() {
     let bundle = solo_bundle("anchor-pack", vec!["numpy==1.26.4", "cuda>=12.8,<13"]);
     let mut config = cfg();
     config.relax = RelaxPolicy::StrongMajor;
@@ -1174,8 +1173,12 @@ fn final_emission_never_pre_relaxes_numpy_or_cuda_anchors() {
     let numpy = &emitted["numpy"];
     assert!(numpy.matches(&rattler_conda_types::Version::from_str("1.26.4").unwrap()));
     assert!(
-        !numpy.matches(&rattler_conda_types::Version::from_str("1.26.5").unwrap()),
-        "the exact NumPy ABI pin must not be widened"
+        numpy.matches(&rattler_conda_types::Version::from_str("1.26.5").unwrap()),
+        "the NumPy exact pin must admit a higher within-minor patch"
+    );
+    assert!(
+        !numpy.matches(&rattler_conda_types::Version::from_str("1.27").unwrap()),
+        "the NumPy exact pin must not widen beyond its minor ABI band"
     );
     let cuda = &emitted["cuda"];
     assert!(cuda.matches(&rattler_conda_types::Version::from_str("12.8").unwrap()));
@@ -2007,8 +2010,8 @@ fn produce_output_softens_deps_from_floor_pin_to_floor_spec() {
          priority over the bounded-range path): {deps:?}"
     );
     assert!(
-        deps.contains(&("numpy".to_string(), "==2.1.0".to_string())),
-        "ABI-anchor auto-routes retain an exact pin: {deps:?}"
+        deps.contains(&("numpy".to_string(), ">=2.1,<2.2".to_string())),
+        "ABI-anchor auto-routes emit a within-minor band: {deps:?}"
     );
 }
 
@@ -2145,10 +2148,9 @@ fn produce_output_auto_routed_pin_zero_x_widens_to_next_minor() {
 }
 
 #[test]
-fn produce_output_auto_routed_abi_anchor_stays_exact() {
-    // ABI anchors (python/python_abi/libc/cuda family) must never widen:
-    // "any newer build" is a lie about what this pack's wheels actually
-    // run on.
+fn produce_output_auto_routed_abi_anchor_stays_within_minor() {
+    // ABI anchors (python/python_abi/libc/cuda family) may move to a newer
+    // patch in the same minor ABI band, but never across that boundary.
     let bundle = Bundle {
         auto_routed: vec![bundle_auto_route(
             "cuda-version",
@@ -2165,13 +2167,13 @@ fn produce_output_auto_routed_abi_anchor_stays_exact() {
         .map(|d| (d.name.clone(), format_packagespec(&d.spec)))
         .collect();
     assert!(
-        deps.contains(&("cuda-version".to_string(), "==12.8".to_string())),
-        "ABI anchor auto-routed pin must stay exact, not widen: {deps:?}"
+        deps.contains(&("cuda-version".to_string(), ">=12.8,<12.9".to_string())),
+        "ABI anchor auto-routed pin must stay within-minor: {deps:?}"
     );
 }
 
 #[test]
-fn produce_output_mapped_pypi_abi_anchor_stays_exact() {
+fn produce_output_mapped_pypi_abi_anchor_stays_within_minor() {
     let mut route = bundle_auto_route("numpy", "2.1.0", Provenance::PriorSelection);
     route.route.conda_name = "array-runtime".to_string();
     let bundle = Bundle {
@@ -2186,7 +2188,7 @@ fn produce_output_mapped_pypi_abi_anchor_stays_exact() {
         .find(|dependency| dependency.name == "array-runtime")
         .map(|dependency| format_packagespec(&dependency.spec))
         .expect("mapped NumPy route");
-    assert_eq!(mapped, "==2.1.0");
+    assert_eq!(mapped, ">=2.1,<2.2");
 }
 
 #[test]
@@ -2254,6 +2256,59 @@ fn produce_output_auto_routed_manual_override_stays_exact() {
         deps.contains(&("sentry-sdk".to_string(), "==1.2.3".to_string())),
         "manually-overridden name must stay exact, not widen: {deps:?}"
     );
+
+    let mut anchor_config = cfg();
+    anchor_config
+        .overrides
+        .insert("numpy".to_string(), "==1.26.0".to_string());
+    let anchor = Bundle {
+        auto_routed: vec![bundle_auto_route(
+            "numpy",
+            "1.26.0",
+            Provenance::PriorSelection,
+        )],
+        ..solo_bundle("anchor-override-pack", vec!["numpy>=1.26"])
+    };
+    let (output, warnings) = produce_output_pending_relaxations(
+        &anchor,
+        &anchor_config,
+        Platform::Linux64,
+        "3.11",
+        &[],
+        None,
+        None,
+    )
+    .unwrap();
+    let numpy = output
+        .run_dependencies
+        .depends
+        .iter()
+        .find(|dependency| dependency.name == "numpy")
+        .map(|dependency| format_packagespec(&dependency.spec))
+        .expect("manually-overridden NumPy route");
+    assert_eq!(numpy, "==1.26.0");
+    assert!(warnings.is_empty(), "{warnings:?}");
+
+    anchor_config.ledger_overrides.insert("numpy".to_string());
+    let (output, warnings) = produce_output_pending_relaxations(
+        &anchor,
+        &anchor_config,
+        Platform::Linux64,
+        "3.11",
+        &[],
+        None,
+        None,
+    )
+    .unwrap();
+    let numpy = output
+        .run_dependencies
+        .depends
+        .iter()
+        .find(|dependency| dependency.name == "numpy")
+        .map(|dependency| format_packagespec(&dependency.spec))
+        .expect("ledger-overridden NumPy route");
+    assert_eq!(numpy, ">=1.26,<1.27");
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
 }
 
 #[test]
@@ -2332,8 +2387,8 @@ fn produce_output_closure_gate_keeps_auto_routed_pins_and_base_deps_undoubled() 
         .map(|d| (d.name.clone(), format_packagespec(&d.spec)))
         .collect();
     assert!(
-        deps.contains(&("numpy".to_string(), "==2.1.0".to_string())),
-        "auto-routed ABI anchor must appear exact-pinned even though \
+        deps.contains(&("numpy".to_string(), ">=2.1,<2.2".to_string())),
+        "auto-routed ABI anchor must appear within-minor banded even though \
          it is also named by a wheel and present in uv pins pre-route: \
          {deps:?}"
     );
@@ -2576,7 +2631,10 @@ fn auto_routed_underscored_conda_name_emits_raw() {
         .find(|route| route.pypi_name == PypiKey::from_pypi("cuda-nvcc-linux-64"))
         .expect("the raw auto-route must reach the co-solve boundary");
     assert_eq!(route.conda_name.as_spec(), "cuda-nvcc_linux-64");
-    assert_eq!(route.match_spec().as_str(), "cuda-nvcc_linux-64 ==12.9.1");
+    assert_eq!(
+        route.match_spec().as_str(),
+        "cuda-nvcc_linux-64 >=12.9,<12.10"
+    );
 }
 
 // -----------------------------------------------------------------
@@ -3588,6 +3646,95 @@ fn bare_major_abi_anchor_emission_auto_completes_within_major_cap_and_warning() 
 }
 
 #[test]
+fn abi_anchor_exact_pin_normalizes_to_within_minor_band() {
+    for (original, normalized) in [
+        ("==1.26.0", ">=1.26,<1.27"),
+        (">=1.23.5,==1.26.0,~=1.26.0,<2.5", ">=1.26.0,<1.27"),
+        (">=1.26.0,<=1.26.0", ">=1.26.0,<1.27"),
+        ("==2.0.0", ">=2.0,<2.1"),
+    ] {
+        assert_eq!(
+            widen_exact_abi_anchor_spec_to_minor_band(original).as_deref(),
+            Some(normalized),
+            "{original}"
+        );
+    }
+
+    let normalized = widen_exact_abi_anchor_spec_to_minor_band(">=1.23.5,==1.26.0,~=1.26.0,<2.5")
+        .expect("joined exact anchor must normalize");
+    let normalized = VersionSpecifiers::from_str(&normalized).unwrap();
+    assert!(normalized.contains(&Version::from_str("1.26.0").unwrap()));
+    assert!(
+        normalized.contains(&Version::from_str("1.26.4").unwrap()),
+        "higher patches in the same NumPy ABI band must remain selectable"
+    );
+    assert!(!normalized.contains(&Version::from_str("1.27").unwrap()));
+
+    for already_banded in [">=1.26,<1.27", "==1.26.*"] {
+        assert!(
+            widen_exact_abi_anchor_spec_to_minor_band(already_banded).is_none(),
+            "{already_banded}"
+        );
+    }
+
+    let excluded = widen_exact_abi_anchor_spec_to_minor_band("==1.26.0,!=1.26.2")
+        .expect("an exclusion must survive exact-pin banding");
+    let excluded = VersionSpecifiers::from_str(&excluded).unwrap();
+    assert!(!excluded.contains(&Version::from_str("1.26.2").unwrap()));
+    assert!(excluded.contains(&Version::from_str("1.26.4").unwrap()));
+}
+
+#[test]
+fn abi_anchor_exact_pin_band_resolves_cross_pack_patch_shape() {
+    let mut isaaclab = solo_bundle(
+        "isaaclab-2.3x-pack",
+        vec!["numpy>=1.23.5", "numpy~=1.26.0", "numpy<2.5"],
+    );
+    isaaclab.auto_routed.push(bundle_auto_route(
+        "numpy",
+        "1.26.0",
+        Provenance::PriorSelection,
+    ));
+    let (output, warnings) = produce_output_pending_relaxations(
+        &isaaclab,
+        &cfg(),
+        Platform::Linux64,
+        "3.11",
+        &[],
+        None,
+        None,
+    )
+    .unwrap();
+    let emitted = output
+        .run_dependencies
+        .depends
+        .iter()
+        .find(|dependency| dependency.name == "numpy")
+        .map(|dependency| format_packagespec(&dependency.spec))
+        .expect("isaaclab NumPy run dependency");
+    assert_eq!(emitted, ">=1.26.0,<1.27");
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0]
+            .to_string()
+            .contains("RETREAD AUTO-COMPLETED ABI anchor")
+    );
+
+    let candidate = rattler_conda_types::Version::from_str("1.26.4").unwrap();
+    let isaaclab =
+        VersionSpec::from_str(&emitted, rattler_conda_types::ParseStrictness::Lenient).unwrap();
+    let protomotions = VersionSpec::from_str(
+        ">=1.26.4,<2.7",
+        rattler_conda_types::ParseStrictness::Lenient,
+    )
+    .unwrap();
+    assert!(
+        isaaclab.matches(&candidate) && protomotions.matches(&candidate),
+        "NumPy 1.26.4 must satisfy both independently-emitted pack constraints"
+    );
+}
+
+#[test]
 fn abi_anchor_cap_completion_intersects_compatible_clauses_and_stays_source_scoped() {
     for (original, normalized) in [
         (">=2.0,!=2.1", ">=2.0,!=2.1,<3"),
@@ -3715,7 +3862,7 @@ fn abi_anchor_cap_completion_sha_bound_lock_replay_round_trips() {
     let filename = format!("{}-{VERSION}-py3-none-any.whl", BUNDLE.replace('-', "_"));
     let lock = crate::lock::RetreadLock {
         schema: crate::lock::SCHEMA,
-        retread_version: "4.10.41".to_string(),
+        retread_version: env!("CARGO_PKG_VERSION").to_string(),
         bundle: BUNDLE.to_string(),
         version: VERSION.to_string(),
         python: "3.11".to_string(),
@@ -3808,44 +3955,42 @@ fn abi_anchor_cap_completion_sha_bound_lock_replay_round_trips() {
 }
 
 #[test]
-fn abi_anchor_cap_completion_preserves_capped_pinned_and_non_anchor_specs() {
+fn abi_anchor_emission_preserves_banded_anchor_and_exact_non_anchor_specs() {
     let mut config = cfg();
     config.relax = RelaxPolicy::None;
-    for spec in [">=2.0,<2.3", "==2.0.1"] {
-        let mut numpy = bundle_auto_route("numpy", "2.0.1", Provenance::DepsFromRelaxed);
-        numpy
-            .route
-            .input_requirements
-            .push(crate::uv_closure::AutoRouteInputRequirement {
-                specifiers: spec.to_string(),
-                source: format!("typed NumPy input `{spec}`"),
-                provenance: Provenance::DepsFromRelaxed,
-                role: crate::uv_closure::AutoRouteInputRole::Requirement,
-            });
-        let mut bundle = solo_bundle("anchor-pack", vec![]);
-        bundle.auto_routed.push(numpy);
-        let (output, warnings) = produce_output_pending_relaxations(
-            &bundle,
-            &config,
-            Platform::Linux64,
-            "3.11",
-            &[],
-            None,
-            None,
-        )
-        .unwrap();
-        let emitted = output
-            .run_dependencies
-            .depends
-            .iter()
-            .find(|dependency| dependency.name == "numpy")
-            .map(|dependency| format_packagespec(&dependency.spec))
-            .expect("NumPy run dependency");
-        assert_eq!(emitted, spec);
-        assert!(warnings.is_empty(), "{spec}: {warnings:?}");
-    }
+    let mut numpy = bundle_auto_route("numpy", "2.0.1", Provenance::DepsFromRelaxed);
+    numpy
+        .route
+        .input_requirements
+        .push(crate::uv_closure::AutoRouteInputRequirement {
+            specifiers: ">=2.0,<2.3".to_string(),
+            source: "typed NumPy input `>=2.0,<2.3`".to_string(),
+            provenance: Provenance::DepsFromRelaxed,
+            role: crate::uv_closure::AutoRouteInputRole::Requirement,
+        });
+    let mut bundle = solo_bundle("anchor-pack", vec![]);
+    bundle.auto_routed.push(numpy);
+    let (output, warnings) = produce_output_pending_relaxations(
+        &bundle,
+        &config,
+        Platform::Linux64,
+        "3.11",
+        &[],
+        None,
+        None,
+    )
+    .unwrap();
+    let emitted = output
+        .run_dependencies
+        .depends
+        .iter()
+        .find(|dependency| dependency.name == "numpy")
+        .map(|dependency| format_packagespec(&dependency.spec))
+        .expect("NumPy run dependency");
+    assert_eq!(emitted, ">=2.0,<2.3");
+    assert!(warnings.is_empty(), "{warnings:?}");
 
-    let bundle = solo_bundle("ordinary-pack", vec!["packaging>=2"]);
+    let bundle = solo_bundle("ordinary-pack", vec!["packaging==2.0.1"]);
     let (output, warnings) = produce_output_pending_relaxations(
         &bundle,
         &config,
@@ -3863,13 +4008,28 @@ fn abi_anchor_cap_completion_preserves_capped_pinned_and_non_anchor_specs() {
         .find(|dependency| dependency.name == "packaging")
         .map(|dependency| format_packagespec(&dependency.spec))
         .expect("packaging run dependency");
-    assert_eq!(emitted, ">=2");
+    assert_eq!(emitted, "==2.0.1");
     assert!(warnings.is_empty());
 }
 
 #[test]
 fn abi_anchor_cap_completion_leaves_unparseable_specs_fail_closed() {
     assert!(auto_complete_bare_major_abi_anchor_spec("!").is_none());
+    for spec in [
+        "!",
+        "===2.0.0",
+        "==1!2.0.0",
+        "==2.0rc1",
+        "==2.0.post1",
+        "==2.0.dev0",
+        "==2.0.0+local",
+        "==2.18446744073709551615",
+    ] {
+        assert!(
+            widen_exact_abi_anchor_spec_to_minor_band(spec).is_none(),
+            "{spec}"
+        );
+    }
     let violations = check_output_abi_invariants(
         &[("numpy".to_string(), "!".to_string())],
         &[],
