@@ -14,7 +14,8 @@ use serde::{Deserialize, Serialize};
 use crate::config::RelaxPolicy;
 use crate::pypi::ResolutionTarget;
 
-pub const RELAXATION_MANIFEST_SCHEMA: u32 = 1;
+/// Schema 2 adds the serialized `abi-anchor-cap-completed` record kind.
+pub const RELAXATION_MANIFEST_SCHEMA: u32 = 2;
 pub const RELAXATION_JSON_FILENAME: &str = "retread-relaxations.json";
 pub const RELAXATION_HOOK_FILENAME: &str = "retread-relaxations.sh";
 pub const RELAXATION_HOOK_PATH: &str = "etc/conda/activate.d/retread-relaxations.sh";

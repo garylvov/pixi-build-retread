@@ -36,7 +36,7 @@ use rattler_conda_types::{
 };
 use serde_json::Value;
 use tokio::sync::RwLock;
-use uv_pep508::uv_pep440::{Operator, VersionSpecifier, VersionSpecifiers};
+use uv_pep508::uv_pep440::{Operator, Version, VersionSpecifier, VersionSpecifiers};
 
 use crate::config::{RelaxPolicy, RetreadConfig, WheelEntry};
 use crate::constraint::{
@@ -53,8 +53,8 @@ use crate::recipe::{
 };
 use crate::relax::{
     AbiAliasGraph, CondaConstraintOrigin, CondaDep, CondaName, CondaTarget, NameMap, PypiKey,
-    abi_aliases_from_name_map, add_abi_alias_edge, canonical_conda_name, checked_version_ceiling,
-    emit_python_version, is_semantic_abi_anchor, marker_env_for, semantic_aliases,
+    abi_aliases_from_name_map, add_abi_alias_edge, canonical_conda_name, emit_python_version,
+    is_semantic_abi_anchor, marker_env_for, semantic_aliases,
 };
 use crate::relax_decision::{Decision as RelaxDecision, SafetyContext, decide_for_emission};
 use crate::relaxation_record::{RelaxationManifest, RelaxationScope, stage_relaxation_payload};
@@ -11407,41 +11407,66 @@ fn is_bare_major_spec(spec: &str) -> bool {
 /// Complete one open, bare-major PEP 440 lower bound into the canonical
 /// within-major interval accepted for retread's own ABI-anchor emission.
 ///
-/// This deliberately requires an inclusive lower-bound clause whose release
-/// is `M` or `M.0[.0...]`. Compatible extra clauses are preserved and the
-/// within-major cap is intersected with them; other shapes stay untouched so
-/// the post-emission invariant can reject them without guessing at intent.
-fn bare_major_floor(specifier: &VersionSpecifier) -> Option<u64> {
+/// This deliberately requires an inclusive lower-bound clause with a
+/// PEP 440-parsed release major. Compatible extra clauses are preserved and
+/// the within-major cap is intersected with them; other shapes stay untouched
+/// so the post-emission invariant can reject them without guessing at intent.
+fn bare_major_floor(specifier: &VersionSpecifier) -> Option<(u64, u64)> {
     if *specifier.operator() != Operator::GreaterThanEqual {
         return None;
     }
     let version = specifier.version();
-    if version.epoch() != 0
+    Some((version.epoch(), *version.release().first()?))
+}
+
+fn is_plain_epochless_bare_major_floor(specifier: &VersionSpecifier) -> bool {
+    let version = specifier.version();
+    version.epoch() == 0
+        && !version.is_pre()
+        && !version.is_post()
+        && !version.is_dev()
+        && !version.is_local()
+        && version
+            .release()
+            .iter()
+            .skip(1)
+            .all(|component| *component == 0)
+}
+
+fn has_qualified_floor_version(specifier: &VersionSpecifier) -> bool {
+    let version = specifier.version();
+    version.epoch() != 0
         || version.is_pre()
         || version.is_post()
         || version.is_dev()
         || version.is_local()
-    {
-        return None;
-    }
-    let release = version.release();
-    let major = *release.first()?;
-    release
-        .iter()
-        .skip(1)
-        .all(|component| *component == 0)
-        .then_some(major)
 }
 
-fn is_exact_next_major_cap(specifier: &VersionSpecifier, major: u64) -> bool {
+fn specifier_caps_before_next_major(specifier: &VersionSpecifier, next_major: &Version) -> bool {
+    match specifier.operator() {
+        Operator::LessThan => specifier.version() <= next_major,
+        Operator::LessThanEqual
+        | Operator::Equal
+        | Operator::ExactEqual
+        | Operator::EqualStar
+        | Operator::TildeEqual => specifier.version() < next_major,
+        Operator::GreaterThan
+        | Operator::GreaterThanEqual
+        | Operator::NotEqual
+        | Operator::NotEqualStar => false,
+    }
+}
+
+fn is_exact_next_major_cap(specifier: &VersionSpecifier, floor: (u64, u64)) -> bool {
     if *specifier.operator() != Operator::LessThan {
         return false;
     }
+    let (epoch, major) = floor;
     let Some(next_major) = major.checked_add(1) else {
         return false;
     };
     let version = specifier.version();
-    version.epoch() == 0
+    version.epoch() == epoch
         && !version.is_pre()
         && !version.is_post()
         && !version.is_dev()
@@ -11451,28 +11476,48 @@ fn is_exact_next_major_cap(specifier: &VersionSpecifier, major: u64) -> bool {
 }
 
 fn auto_complete_bare_major_abi_anchor_spec(spec: &str) -> Option<String> {
-    if !is_bare_major_spec(spec) || is_auto_completed_abi_anchor_spec(spec) {
+    let specifiers = VersionSpecifiers::from_str(spec.trim()).ok()?;
+    let floor = specifiers.iter().filter_map(bare_major_floor).max()?;
+    let (epoch, major) = floor;
+    let next_major = major.checked_add(1)?;
+    let cap_version = Version::new([next_major]).with_epoch(epoch);
+    let qualified_floor = specifiers.iter().any(|specifier| {
+        bare_major_floor(specifier) == Some(floor) && has_qualified_floor_version(specifier)
+    });
+    let qualified_floor_needs_cap = qualified_floor
+        && !specifiers
+            .iter()
+            .any(|specifier| specifier_caps_before_next_major(specifier, &cap_version));
+    if (!is_bare_major_spec(spec) && !qualified_floor_needs_cap)
+        || is_auto_completed_abi_anchor_spec(spec)
+    {
         return None;
     }
-    let specifiers = VersionSpecifiers::from_str(spec.trim()).ok()?;
-    let major = specifiers.iter().filter_map(bare_major_floor).max()?;
-    let ceiling = checked_version_ceiling(&[major])?;
+    let cap = VersionSpecifier::less_than_version(cap_version);
     let mut normalized = Vec::with_capacity(specifiers.len() + 1);
-    let mut normalized_floor = false;
+    let mut normalized_plain_floor = false;
     let mut has_cap = false;
     for specifier in specifiers.iter() {
-        if bare_major_floor(specifier) == Some(major) {
-            if !normalized_floor {
+        if bare_major_floor(specifier) == Some(floor) {
+            if is_plain_epochless_bare_major_floor(specifier) {
+                if normalized_plain_floor {
+                    continue;
+                }
                 normalized.push(format!(">={major}.0"));
-                normalized_floor = true;
+                normalized_plain_floor = true;
+            } else {
+                // Epoch, pre, post, dev, and any other PEP 440 semantics on
+                // the floor are load-bearing. The cap is derived solely from
+                // the parsed release major; the floor itself stays exact.
+                normalized.push(specifier.to_string());
             }
             continue;
         }
-        has_cap |= is_exact_next_major_cap(specifier, major);
+        has_cap |= is_exact_next_major_cap(specifier, floor);
         normalized.push(specifier.to_string());
     }
     if !has_cap {
-        normalized.push(format!("<{ceiling}"));
+        normalized.push(cap.to_string());
     }
     let normalized = normalized.join(",");
     let parsed = VersionSpecifiers::from_str(&normalized).ok()?;
@@ -11496,15 +11541,16 @@ fn is_auto_completed_abi_anchor_spec(spec: &str) -> bool {
         return false;
     }
     specifiers.iter().any(|floor| {
-        let Some(major) = bare_major_floor(floor) else {
+        let Some(floor_key) = bare_major_floor(floor) else {
             return false;
         };
-        floor.version().release().len() == 2
-            && floor.version().release().first() == Some(&major)
-            && floor.version().release().get(1) == Some(&0)
+        let canonical_floor = !is_plain_epochless_bare_major_floor(floor)
+            || (floor.version().release().len() == 2
+                && floor.version().release().get(1) == Some(&0));
+        canonical_floor
             && specifiers
                 .iter()
-                .any(|cap| is_exact_next_major_cap(cap, major))
+                .any(|cap| is_exact_next_major_cap(cap, floor_key))
     })
 }
 

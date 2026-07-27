@@ -3643,6 +3643,171 @@ fn abi_anchor_cap_completion_intersects_compatible_clauses_and_stays_source_scop
 }
 
 #[test]
+fn abi_anchor_cap_completion_normalizes_qualified_version_floors() {
+    for (original, normalized) in [
+        (">=2!2.0", ">=2!2.0,<2!3"),
+        (">=2!2.0rc1", ">=2!2.0rc1,<2!3"),
+        (">=2.0rc1", ">=2.0rc1,<3"),
+        (">=2.0a1", ">=2.0a1,<3"),
+        (">=2.0b2", ">=2.0b2,<3"),
+        (">=2.0.post1", ">=2.0.post1,<3"),
+        (">=2.0.dev0", ">=2.0.dev0,<3"),
+    ] {
+        assert_eq!(
+            auto_complete_bare_major_abi_anchor_spec(original).as_deref(),
+            Some(normalized),
+            "{original}: bare-major={}",
+            is_bare_major_spec(original),
+        );
+        assert!(
+            is_auto_completed_abi_anchor_spec(normalized),
+            "{normalized}"
+        );
+    }
+    for already_capped in [
+        ">=2!2.0,<2!3",
+        ">=2.0rc1,<3",
+        ">=2.0.post1,<2.3",
+        ">=2.0.dev0,~=2.1",
+    ] {
+        assert!(
+            auto_complete_bare_major_abi_anchor_spec(already_capped).is_none(),
+            "{already_capped}",
+        );
+    }
+    assert!(auto_complete_bare_major_abi_anchor_spec("==2.0rc1").is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn abi_anchor_cap_completion_sha_bound_lock_replay_round_trips() {
+    const BUNDLE: &str = "abi-cap-replay-pack";
+    const VERSION: &str = "1.0.0";
+    const INPUTS_HASH: &str = "abi-cap-record-hash";
+    const ORIGINAL: &str = ">=2.0";
+    const NORMALIZED: &str = ">=2.0,<3";
+
+    let _env_guard = TEST_ENV_MUTEX.lock().unwrap();
+    let target = ResolutionTarget::from_wheel_target(
+        crate::pypi::WheelTarget {
+            python_version: "3.11".to_string(),
+            conda_subdir: "linux-64".to_string(),
+            max_glibc: None,
+        },
+        None,
+    );
+    let completion = auto_bundle::abi_anchor_cap_completion(
+        BUNDLE,
+        &PypiKey::from_pypi("numpy"),
+        ORIGINAL,
+        NORMALIZED,
+        vec!["wheel `consumer==1` Requires-Dist `numpy>=2.0`".to_string()],
+    );
+    let manifest = bundled_relaxations_for_output(BUNDLE, BUNDLE, &target, &[], &[completion])
+        .expect("ABI-anchor completion must produce a durable manifest");
+    assert_eq!(
+        manifest.schema_version,
+        crate::relaxation_record::RELAXATION_MANIFEST_SCHEMA
+    );
+    assert_eq!(crate::relaxation_record::RELAXATION_MANIFEST_SCHEMA, 2);
+
+    let sha256 = "11".repeat(32);
+    let filename = format!("{}-{VERSION}-py3-none-any.whl", BUNDLE.replace('-', "_"));
+    let lock = crate::lock::RetreadLock {
+        schema: crate::lock::SCHEMA,
+        retread_version: "4.10.41".to_string(),
+        bundle: BUNDLE.to_string(),
+        version: VERSION.to_string(),
+        python: "3.11".to_string(),
+        target_subdir: "linux-64".to_string(),
+        target_contract: None,
+        target_identity: None,
+        target_scope: None,
+        exact_workspace_envelope: false,
+        inputs_hash: INPUTS_HASH.to_string(),
+        root_requirements: vec![format!("{BUNDLE}=={VERSION}")],
+        wheels: vec![crate::lock::LockWheel {
+            name: BUNDLE.to_string(),
+            version: VERSION.to_string(),
+            origin: crate::lock::Origin::Index,
+            filename: filename.clone(),
+            url: Some(format!("https://example.com/{filename}")),
+            sha256: Some(sha256.clone()),
+            requires_dist: vec![],
+            must_ship: false,
+            upstream_url: None,
+            git_source: None,
+            sdist_source: None,
+        }],
+        abi_context: Some(crate::lock::LockAbiContext {
+            wheels: vec![crate::lock::LockWheelAbiMetadata {
+                name: BUNDLE.to_string(),
+                sha256,
+                requires_dist: vec![],
+            }],
+        }),
+        relaxations: manifest.records().to_vec(),
+        conda_run_deps: vec![crate::lock::CondaDep {
+            name: "numpy".to_string(),
+            spec: NORMALIZED.to_string(),
+        }],
+        index_urls: vec!["https://pypi.org/simple/".to_string()],
+        prerelease: BTreeMap::new(),
+        shadow_libs: BTreeMap::new(),
+        declared_glibc: None,
+        resolution_glibc: None,
+        conda_capable: vec!["numpy".to_string()],
+        entry_specs: vec![format!("{BUNDLE}=={VERSION}")],
+        wheel_store: None,
+    };
+
+    let root = unique_test_dir("abi-cap-record-replay");
+    std::fs::create_dir_all(&root).unwrap();
+    let lock_path = root.join(crate::lock::RetreadLock::file_name_for_target(
+        BUNDLE, &target,
+    ));
+    std::fs::write(&lock_path, lock.to_pretty_json().unwrap()).unwrap();
+
+    let reloaded = crate::lock::RetreadLock::load(&lock_path).unwrap();
+    assert_eq!(reloaded.schema, crate::lock::SCHEMA);
+    assert_eq!(crate::lock::SCHEMA, 18);
+    assert_eq!(reloaded.relaxations, manifest.records());
+    assert_eq!(
+        reloaded.relaxations[0].kind,
+        crate::relaxation_record::RelaxationRecordKind::AbiAnchorCapCompleted
+    );
+    let replay_manifest = RelaxationManifest::new(BUNDLE, reloaded.relaxations.clone()).unwrap();
+    replay_manifest.validate_for(BUNDLE, &target).unwrap();
+
+    let replay = replay_from_lock_for_target(
+        &lock_path,
+        INPUTS_HASH,
+        true,
+        &target,
+        BUNDLE,
+        Platform::Linux64,
+        0,
+        false,
+        &[],
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        &AbiAliasGraph::new(),
+    )
+    .expect("schema-current SHA-bound lock must validate without stale relaxation errors")
+    .expect("matching SHA-bound lock must replay");
+    let numpy = replay
+        .run_dependencies
+        .depends
+        .iter()
+        .find(|dependency| dependency.name == "numpy")
+        .map(|dependency| format_packagespec(&dependency.spec))
+        .expect("replayed NumPy run dependency");
+    assert_eq!(numpy, NORMALIZED);
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn abi_anchor_cap_completion_preserves_capped_pinned_and_non_anchor_specs() {
     let mut config = cfg();
     config.relax = RelaxPolicy::None;

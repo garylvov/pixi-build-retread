@@ -475,6 +475,12 @@ pub struct RetreadLock {
     pub wheel_store: Option<String>,
 }
 
+/// Schema 18: ABI-anchor cap-completion relaxation records.
+///
+/// `RelaxationRecordKind::AbiAnchorCapCompleted` is a new serialized enum
+/// value. Older readers must reject the lock instead of interpreting a record
+/// set whose complete kind vocabulary they do not understand.
+///
 /// Schema 17: durable final auto-relaxation records.
 ///
 /// `relaxations` preserves the exact warning payload across courier replay.
@@ -552,7 +558,7 @@ pub struct RetreadLock {
 /// On the consumer-side install path, old schemas are hard errors: install
 /// replay must not fall back to resolver-backed uv. SCHEMA is NOT an epoch bump
 /// (output SEMANTICS for identical inputs are unchanged; [emit-epoch-ok]).
-pub const SCHEMA: u32 = 17;
+pub const SCHEMA: u32 = 18;
 
 /// Bump EMIT_EPOCH in the SAME commit as ANY change that can alter the bytes
 /// retread emits for identical manifest inputs (relax/version-selection
