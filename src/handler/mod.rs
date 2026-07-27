@@ -36,7 +36,7 @@ use rattler_conda_types::{
 };
 use serde_json::Value;
 use tokio::sync::RwLock;
-use uv_pep508::uv_pep440::VersionSpecifiers;
+use uv_pep508::uv_pep440::{Operator, Version, VersionSpecifier, VersionSpecifiers};
 
 use crate::config::{RelaxPolicy, RetreadConfig, WheelEntry};
 use crate::constraint::{
@@ -11404,6 +11404,181 @@ fn is_bare_major_spec(spec: &str) -> bool {
         .any(|range| !range.has_effective_minor_bound())
 }
 
+/// Complete one open, bare-major PEP 440 lower bound into the canonical
+/// within-major interval accepted for retread's own ABI-anchor emission.
+///
+/// This deliberately requires an inclusive lower-bound clause with a
+/// PEP 440-parsed release major. Compatible extra clauses are preserved and
+/// the within-major cap is intersected with them; other shapes stay untouched
+/// so the post-emission invariant can reject them without guessing at intent.
+fn bare_major_floor(specifier: &VersionSpecifier) -> Option<(u64, u64)> {
+    if *specifier.operator() != Operator::GreaterThanEqual {
+        return None;
+    }
+    let version = specifier.version();
+    Some((version.epoch(), *version.release().first()?))
+}
+
+fn is_plain_epochless_bare_major_floor(specifier: &VersionSpecifier) -> bool {
+    let version = specifier.version();
+    version.epoch() == 0
+        && !version.is_pre()
+        && !version.is_post()
+        && !version.is_dev()
+        && !version.is_local()
+        && version
+            .release()
+            .iter()
+            .skip(1)
+            .all(|component| *component == 0)
+}
+
+fn has_qualified_floor_version(specifier: &VersionSpecifier) -> bool {
+    let version = specifier.version();
+    version.epoch() != 0
+        || version.is_pre()
+        || version.is_post()
+        || version.is_dev()
+        || version.is_local()
+}
+
+fn specifier_caps_before_next_major(specifier: &VersionSpecifier, next_major: &Version) -> bool {
+    match specifier.operator() {
+        Operator::LessThan => specifier.version() <= next_major,
+        Operator::LessThanEqual
+        | Operator::Equal
+        | Operator::ExactEqual
+        | Operator::EqualStar
+        | Operator::TildeEqual => specifier.version() < next_major,
+        Operator::GreaterThan
+        | Operator::GreaterThanEqual
+        | Operator::NotEqual
+        | Operator::NotEqualStar => false,
+    }
+}
+
+fn is_exact_next_major_cap(specifier: &VersionSpecifier, floor: (u64, u64)) -> bool {
+    if *specifier.operator() != Operator::LessThan {
+        return false;
+    }
+    let (epoch, major) = floor;
+    let Some(next_major) = major.checked_add(1) else {
+        return false;
+    };
+    let version = specifier.version();
+    version.epoch() == epoch
+        && !version.is_pre()
+        && !version.is_post()
+        && !version.is_dev()
+        && !version.is_local()
+        && version.release().len() == 1
+        && version.release().first() == Some(&next_major)
+}
+
+fn auto_complete_bare_major_abi_anchor_spec(spec: &str) -> Option<String> {
+    let specifiers = VersionSpecifiers::from_str(spec.trim()).ok()?;
+    let floor = specifiers.iter().filter_map(bare_major_floor).max()?;
+    let (epoch, major) = floor;
+    let next_major = major.checked_add(1)?;
+    let cap_version = Version::new([next_major]).with_epoch(epoch);
+    let qualified_floor = specifiers.iter().any(|specifier| {
+        bare_major_floor(specifier) == Some(floor) && has_qualified_floor_version(specifier)
+    });
+    let qualified_floor_needs_cap = qualified_floor
+        && !specifiers
+            .iter()
+            .any(|specifier| specifier_caps_before_next_major(specifier, &cap_version));
+    if (!is_bare_major_spec(spec) && !qualified_floor_needs_cap)
+        || is_auto_completed_abi_anchor_spec(spec)
+    {
+        return None;
+    }
+    let cap = VersionSpecifier::less_than_version(cap_version);
+    let mut normalized = Vec::with_capacity(specifiers.len() + 1);
+    let mut normalized_plain_floor = false;
+    let mut has_cap = false;
+    for specifier in specifiers.iter() {
+        if bare_major_floor(specifier) == Some(floor) {
+            if is_plain_epochless_bare_major_floor(specifier) {
+                if normalized_plain_floor {
+                    continue;
+                }
+                normalized.push(format!(">={major}.0"));
+                normalized_plain_floor = true;
+            } else {
+                // Epoch, pre, post, dev, and any other PEP 440 semantics on
+                // the floor are load-bearing. The cap is derived solely from
+                // the parsed release major; the floor itself stays exact.
+                normalized.push(specifier.to_string());
+            }
+            continue;
+        }
+        has_cap |= is_exact_next_major_cap(specifier, floor);
+        normalized.push(specifier.to_string());
+    }
+    if !has_cap {
+        normalized.push(cap.to_string());
+    }
+    let normalized = normalized.join(",");
+    let parsed = VersionSpecifiers::from_str(&normalized).ok()?;
+    if crate::constraint::specifiers_unsatisfiable(&parsed) || normalized == spec.trim() {
+        return None;
+    }
+    Some(normalized)
+}
+
+/// The emission guard's narrow exception for a canonical within-major
+/// interval produced by [`auto_complete_bare_major_abi_anchor_spec`].
+///
+/// `is_bare_major_spec` remains intentionally strict for embedded wheel
+/// metadata and overrides. Only a retread-emitted `>=M.0,<M+1` intersection,
+/// optionally tightened by compatible extra clauses, is recognized here.
+fn is_auto_completed_abi_anchor_spec(spec: &str) -> bool {
+    let Ok(specifiers) = VersionSpecifiers::from_str(spec.trim()) else {
+        return false;
+    };
+    if crate::constraint::specifiers_unsatisfiable(&specifiers) {
+        return false;
+    }
+    specifiers.iter().any(|floor| {
+        let Some(floor_key) = bare_major_floor(floor) else {
+            return false;
+        };
+        let canonical_floor = !is_plain_epochless_bare_major_floor(floor)
+            || (floor.version().release().len() == 2
+                && floor.version().release().get(1) == Some(&0));
+        canonical_floor
+            && specifiers
+                .iter()
+                .any(|cap| is_exact_next_major_cap(cap, floor_key))
+    })
+}
+
+fn auto_complete_emitted_abi_anchor_spec(
+    bundle: &str,
+    package: &PypiKey,
+    constraints: &[Constraint],
+    rendered: String,
+) -> (String, Option<auto_bundle::WheelMetadataRelaxation>) {
+    let Some(normalized) = auto_complete_bare_major_abi_anchor_spec(&rendered) else {
+        return (rendered, None);
+    };
+    let involved_sources = constraints
+        .iter()
+        .map(|constraint| constraint.source.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let warning = auto_bundle::abi_anchor_cap_completion(
+        bundle,
+        package,
+        rendered.clone(),
+        normalized.clone(),
+        involved_sources,
+    );
+    (normalized, Some(warning))
+}
+
 type WorkspaceAbiVersions = BTreeMap<String, BTreeSet<String>>;
 
 fn output_abi_aliases(bundle: &Bundle, config: &RetreadConfig) -> AbiAliasGraph {
@@ -11497,7 +11672,7 @@ pub(crate) fn check_output_abi_invariants(
     let mut emitted = output_run_deps
         .iter()
         .cloned()
-        .map(|(name, spec)| (name, spec, "retread emitted".to_string(), None))
+        .map(|(name, spec)| (name, spec, "retread emitted".to_string(), None, true))
         .collect::<Vec<_>>();
     for (wheel, raw) in embedded_requires_dist {
         let Ok(requirement): Result<uv_pep508::Requirement, _> =
@@ -11520,11 +11695,12 @@ pub(crate) fn check_output_abi_invariants(
             spec,
             format!("wheel `{wheel}` embeds"),
             pep440_specifiers,
+            false,
         ));
     }
     emitted.sort_by(|left, right| (&left.0, &left.1, &left.2).cmp(&(&right.0, &right.1, &right.2)));
 
-    for (name, spec, origin, pep440_specifiers) in emitted {
+    for (name, spec, origin, pep440_specifiers, allow_auto_completed_cap) in emitted {
         if !is_semantic_abi_anchor(&name, aliases) {
             continue;
         }
@@ -11545,7 +11721,9 @@ pub(crate) fn check_output_abi_invariants(
             ));
             continue;
         }
-        if is_bare_major_spec(trimmed) {
+        if is_bare_major_spec(trimmed)
+            && !(allow_auto_completed_cap && is_auto_completed_abi_anchor_spec(trimmed))
+        {
             violations.push(format!(
                 "ABI invariant: {origin} `{name} {trimmed}` (bare-major); \
                  ABI anchors must carry a minor or stricter spec"
@@ -12242,6 +12420,18 @@ fn produce_output_with_conflicts(
                 let rendered = native_conda_override
                     .clone()
                     .unwrap_or_else(|| specifiers.to_string().replace(", ", ","));
+                let rendered = if has_anchor_alias && native_conda_override.is_none() {
+                    let (rendered, warning) = auto_complete_emitted_abi_anchor_spec(
+                        &bundle.conda_name,
+                        &pypi_name,
+                        &constraints,
+                        rendered,
+                    );
+                    pending_relaxations.extend(warning);
+                    rendered
+                } else {
+                    rendered
+                };
                 let spec = conda_name.match_spec(&rendered);
                 run_dep_specs.push(spec_from_str(spec.as_str())?);
             }
@@ -12256,8 +12446,21 @@ fn produce_output_with_conflicts(
                     &bundle.conda_name,
                     format!(" for bundle '{}'", bundle.conda_name),
                 ));
+                let can_auto_complete = has_anchor_alias && native_conda_override.is_none();
                 let rendered = native_conda_override
                     .unwrap_or_else(|| specifiers.to_string().replace(", ", ","));
+                let rendered = if can_auto_complete {
+                    let (rendered, warning) = auto_complete_emitted_abi_anchor_spec(
+                        &bundle.conda_name,
+                        &pypi_name,
+                        &constraints,
+                        rendered,
+                    );
+                    pending_relaxations.extend(warning);
+                    rendered
+                } else {
+                    rendered
+                };
                 let spec = conda_name.match_spec(&rendered);
                 run_dep_specs.push(spec_from_str(spec.as_str())?);
             }

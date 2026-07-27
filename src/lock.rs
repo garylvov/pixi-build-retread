@@ -475,6 +475,12 @@ pub struct RetreadLock {
     pub wheel_store: Option<String>,
 }
 
+/// Schema 18: ABI-anchor cap-completion relaxation records.
+///
+/// `RelaxationRecordKind::AbiAnchorCapCompleted` is a new serialized enum
+/// value. Older readers must reject the lock instead of interpreting a record
+/// set whose complete kind vocabulary they do not understand.
+///
 /// Schema 17: durable final auto-relaxation records.
 ///
 /// `relaxations` preserves the exact warning payload across courier replay.
@@ -552,7 +558,7 @@ pub struct RetreadLock {
 /// On the consumer-side install path, old schemas are hard errors: install
 /// replay must not fall back to resolver-backed uv. SCHEMA is NOT an epoch bump
 /// (output SEMANTICS for identical inputs are unchanged; [emit-epoch-ok]).
-pub const SCHEMA: u32 = 17;
+pub const SCHEMA: u32 = 18;
 
 /// Bump EMIT_EPOCH in the SAME commit as ANY change that can alter the bytes
 /// retread emits for identical manifest inputs (relax/version-selection
@@ -734,7 +740,10 @@ pub const SCHEMA: u32 = 17;
 /// Epoch 40: existing identity-fallback auto-routes bypass duplicate metadata
 /// fetching so final joint validation sees the complete wheel constraint set;
 /// conflicting non-anchor routes may therefore restore a reconciled PyPI wheel.
-pub const EMIT_EPOCH: u32 = 40;
+///
+/// Epoch 41: fresh emission auto-completes an open bare-major ABI-anchor lower
+/// bound to a canonical within-major cap and records the completion warning.
+pub const EMIT_EPOCH: u32 = 41;
 
 fn parse_stored_glibc(value: Option<&str>) -> Option<Option<(u32, u32)>> {
     match value {

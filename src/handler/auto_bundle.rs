@@ -207,6 +207,18 @@ pub(super) struct WheelMetadataRelaxation {
 
 impl std::fmt::Display for WheelMetadataRelaxation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.kind == WheelMetadataRelaxationKind::AbiAnchorCapCompleted {
+            return write!(
+                f,
+                "RETREAD AUTO-COMPLETED ABI anchor in bundle `{}`: package `{}` `{}` -> `{}`; \
+                 sources involved: {}",
+                self.bundle,
+                self.package,
+                self.original,
+                self.relaxed,
+                self.involved_sources.join("; "),
+            );
+        }
         write!(
             f,
             "RETREAD AUTO-RELAXED unsatisfiable wheel metadata{}: `{}` {} `{}` -> `{}` \
@@ -219,6 +231,26 @@ impl std::fmt::Display for WheelMetadataRelaxation {
             self.source,
             self.involved_sources.join("; "),
         )
+    }
+}
+
+pub(super) fn abi_anchor_cap_completion(
+    bundle: &str,
+    package: &PypiKey,
+    original: impl Into<String>,
+    normalized: impl Into<String>,
+    involved_sources: Vec<String>,
+) -> WheelMetadataRelaxation {
+    WheelMetadataRelaxation {
+        bundle: bundle.to_string(),
+        package: package.clone(),
+        kind: WheelMetadataRelaxationKind::AbiAnchorCapCompleted,
+        original: original.into(),
+        relaxed: normalized.into(),
+        source: "retread ABI-anchor emission invariant".to_string(),
+        involved_sources,
+        scope: String::new(),
+        tier: RelaxPolicy::Minor,
     }
 }
 
@@ -3425,6 +3457,41 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use url::Url;
+
+    #[test]
+    fn abi_anchor_cap_completion_has_loud_warning_and_durable_record() {
+        let relaxation = abi_anchor_cap_completion(
+            "flashsac-pack",
+            &PypiKey::from_pypi("numpy"),
+            ">=2",
+            ">=2.0,<3",
+            vec!["wheel `consumer==1` Requires-Dist `numpy>=2`".to_string()],
+        );
+
+        let warning = relaxation.to_string();
+        assert!(warning.contains("RETREAD AUTO-COMPLETED ABI anchor"));
+        assert!(warning.contains("bundle `flashsac-pack`"));
+        assert!(warning.contains("package `numpy`"));
+        assert!(warning.contains("`>=2` -> `>=2.0,<3`"));
+        assert!(warning.contains("wheel `consumer==1` Requires-Dist `numpy>=2`"));
+
+        let scope = RelaxationScope {
+            environments: vec!["flashsac-gpu".to_string()],
+            targets: vec!["linux-64".to_string()],
+            platform: "linux-64".to_string(),
+            python: "3.11".to_string(),
+        };
+        let record = relaxation.to_record(&scope);
+        assert_eq!(
+            record.kind,
+            crate::relaxation_record::RelaxationRecordKind::AbiAnchorCapCompleted
+        );
+        assert_eq!(record.tier, RelaxPolicy::Minor);
+        assert_eq!(record.original_spec, ">=2");
+        assert_eq!(record.resulting_spec, ">=2.0,<3");
+        assert_eq!(record.involved_wheels, relaxation.involved_sources);
+        assert_eq!(record.scope, scope);
+    }
 
     fn test_origin(label: &str, specifiers: &str) -> ConstraintOriginId {
         ConstraintOriginId::from_parts(
