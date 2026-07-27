@@ -57,6 +57,21 @@ pub fn authority(provenance: &Provenance) -> Authority {
     }
 }
 
+/// Whether a constraint participates in finalization when an override exists.
+///
+/// Keep callers that decide whether to add validation inputs aligned with the
+/// active projection used by [`finalize_impl`].
+pub(crate) fn active_for_finalization(constraint: &Constraint, has_override: bool) -> bool {
+    !has_override
+        || matches!(
+            &constraint.provenance,
+            Provenance::UvOverride
+                | Provenance::UvConstraint
+                | Provenance::WorkspaceCondaFact(_)
+                | Provenance::DepsFromRelaxed
+        )
+}
+
 /// Stable identity for the structured origin of one constraint.
 ///
 /// The encoded value is assembled from semantic fields supplied by the
@@ -539,16 +554,7 @@ fn finalize_impl(
     let active: Vec<&Constraint> = constraints
         .iter()
         .filter(|constraint| constraint.authority() != Authority::Preference)
-        .filter(|constraint| {
-            !has_override
-                || matches!(
-                    &constraint.provenance,
-                    Provenance::UvOverride
-                        | Provenance::UvConstraint
-                        | Provenance::WorkspaceCondaFact(_)
-                        | Provenance::DepsFromRelaxed
-                )
-        })
+        .filter(|constraint| active_for_finalization(constraint, has_override))
         .collect();
 
     let combined = intersect(&active);

@@ -1186,6 +1186,103 @@ fn final_emission_never_pre_relaxes_numpy_or_cuda_anchors() {
 }
 
 #[test]
+fn authoritative_numpy_pin_uses_conflicting_workspace_patch_fact_only_for_validation() {
+    let mut bundle = solo_bundle("anchor-pack", vec!["numpy==1.26.0"]);
+    bundle
+        .workspace_conda_versions
+        .insert("numpy".to_string(), "1.26.4".to_string());
+    let mut config = cfg();
+    config.relax = RelaxPolicy::PatchThenMinorThenMajorThenLastResort;
+
+    let (output, relaxations) = produce_output_pending_relaxations(
+        &bundle,
+        &config,
+        Platform::Linux64,
+        "3.11",
+        &[],
+        None,
+        None,
+    )
+    .unwrap();
+    let emitted = output
+        .run_dependencies
+        .depends
+        .iter()
+        .find(|dependency| dependency.name == "numpy")
+        .map(|dependency| format_packagespec(&dependency.spec))
+        .expect("NumPy run dependency");
+    let emitted =
+        VersionSpec::from_str(&emitted, rattler_conda_types::ParseStrictness::Lenient).unwrap();
+    assert!(emitted.matches(&rattler_conda_types::Version::from_str("1.26.1").unwrap()));
+    assert!(emitted.matches(&rattler_conda_types::Version::from_str("1.26.4").unwrap()));
+    assert!(!emitted.matches(&rattler_conda_types::Version::from_str("1.27").unwrap()));
+    assert_eq!(relaxations.len(), 1);
+    assert!(
+        relaxations[0].to_string().contains(">=1.26.0,<1.27"),
+        "{relaxations:?}"
+    );
+
+    let mut compatible = solo_bundle("compatible-anchor-pack", vec!["numpy>=1.26,<1.27"]);
+    compatible
+        .workspace_conda_versions
+        .insert("numpy".to_string(), "1.26.4".to_string());
+    let (output, relaxations) = produce_output_pending_relaxations(
+        &compatible,
+        &config,
+        Platform::Linux64,
+        "3.11",
+        &[],
+        None,
+        None,
+    )
+    .unwrap();
+    let emitted = output
+        .run_dependencies
+        .depends
+        .iter()
+        .find(|dependency| dependency.name == "numpy")
+        .map(|dependency| format_packagespec(&dependency.spec))
+        .expect("compatible NumPy run dependency");
+    let emitted =
+        VersionSpec::from_str(&emitted, rattler_conda_types::ParseStrictness::Lenient).unwrap();
+    assert!(
+        emitted.matches(&rattler_conda_types::Version::from_str("1.26.5").unwrap()),
+        "a compatible precise fact must not be attached to or narrow the emitted range"
+    );
+    assert!(relaxations.is_empty());
+
+    let mut advisory = solo_bundle("advisory-pack", vec!["starlette>=0.49,<0.50"]);
+    advisory.primary.metadata_provenance = Provenance::SourceBuiltRelaxed;
+    advisory
+        .workspace_conda_versions
+        .insert("starlette".to_string(), "0.45.3".to_string());
+    let output = produce_output(
+        &advisory,
+        &config,
+        Platform::Linux64,
+        "3.11",
+        &[],
+        None,
+        None,
+    )
+    .unwrap();
+    let emitted = output
+        .run_dependencies
+        .depends
+        .iter()
+        .find(|dependency| dependency.name == "starlette")
+        .map(|dependency| format_packagespec(&dependency.spec))
+        .expect("advisory Starlette run dependency");
+    let emitted =
+        VersionSpec::from_str(&emitted, rattler_conda_types::ParseStrictness::Lenient).unwrap();
+    assert!(emitted.matches(&rattler_conda_types::Version::from_str("0.45.3").unwrap()));
+    assert!(
+        !emitted.matches(&rattler_conda_types::Version::from_str("0.45.4").unwrap()),
+        "the pre-existing advisory-only workspace fact path must retain its exact intersection"
+    );
+}
+
+#[test]
 fn emission_merges_alias_constraints_by_conda_target() {
     let bundle = solo_bundle("alias-pack", vec!["alpha-provider>=1", "beta-provider<2"]);
     let mut config = cfg();

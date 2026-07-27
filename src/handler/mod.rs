@@ -40,8 +40,8 @@ use uv_pep508::uv_pep440::VersionSpecifiers;
 
 use crate::config::{RelaxPolicy, RetreadConfig, WheelEntry};
 use crate::constraint::{
-    Authority, Conflict, Constraint, ConstraintOriginId, Provenance, aggregate_conflicts,
-    collect_conflicts, finalize,
+    Authority, Conflict, Constraint, ConstraintOriginId, Provenance, active_for_finalization,
+    aggregate_conflicts, collect_conflicts, finalize,
 };
 use crate::index_chain::{IndexPurpose, index_chain};
 use crate::pypi::{self, ResolutionTarget, WheelTarget, normalized_python_minor};
@@ -56,9 +56,7 @@ use crate::relax::{
     abi_aliases_from_name_map, add_abi_alias_edge, canonical_conda_name, emit_python_version,
     is_semantic_abi_anchor, marker_env_for, semantic_aliases,
 };
-use crate::relax_decision::{
-    Decision as RelaxDecision, SafetyContext, decide as decide_relaxation,
-};
+use crate::relax_decision::{Decision as RelaxDecision, SafetyContext, decide_for_emission};
 use crate::relaxation_record::{RelaxationManifest, RelaxationScope, stage_relaxation_payload};
 use crate::rpc::{RpcError, ok, parse_params};
 use crate::wheel::WheelMetadata;
@@ -10819,6 +10817,7 @@ struct PypiEmissionGroup {
     conda_name: CondaName,
     conda_name_is_authoritative: bool,
     constraints: Vec<Constraint>,
+    validation_only_origins: BTreeSet<ConstraintOriginId>,
     native_conda_overrides: BTreeSet<String>,
 }
 
@@ -10927,6 +10926,7 @@ fn add_emission_constraint(
                 conda_name: conda_name.clone(),
                 conda_name_is_authoritative,
                 constraints: Vec::new(),
+                validation_only_origins: BTreeSet::new(),
                 native_conda_overrides: BTreeSet::new(),
             });
             index
@@ -12116,9 +12116,13 @@ fn produce_output_with_conflicts(
     // Workspace facts normally disappeared through `auto_dropped` before this
     // assembly. A fact retained by an explicit PyPI-side exclusion remains
     // authoritative validation input: attach it only when a concrete
-    // emission route's advisory clause excludes that record. Compatible
-    // advisory ranges keep their portable range, and cross-ecosystem identity
-    // still requires the configured route edge used by translation.
+    // emission route's advisory or authoritative clause excludes that record.
+    // Compatible ranges keep their portable form, and cross-ecosystem identity
+    // still requires the configured route edge used by translation. For a new
+    // authoritative conflict, the fact validates relaxation search but is
+    // excluded from the emitted projection so a reconciled wheel pin remains
+    // a portable compatibility band. The established advisory-only path keeps
+    // its existing emitted intersection.
     for group in &mut emission_groups {
         let conda_key = group.conda_name.key();
         let pypi_names = group
@@ -12130,13 +12134,6 @@ fn produce_output_with_conflicts(
         let Some(version) = bundle.workspace_conda_versions.get(conda_key.as_str()) else {
             continue;
         };
-        if !group
-            .constraints
-            .iter()
-            .any(|constraint| constraint.authority() == Authority::Advisory)
-        {
-            continue;
-        }
         let workspace_version =
             uv_pep508::uv_pep440::Version::from_str(version).with_context(|| {
                 format!(
@@ -12144,10 +12141,20 @@ fn produce_output_with_conflicts(
                      `{pypi_names}`"
                 )
             })?;
-        if !group.constraints.iter().any(|constraint| {
-            constraint.authority() == Authority::Advisory
-                && !constraint.specifiers.contains(&workspace_version)
-        }) {
+        let has_override = group
+            .constraints
+            .iter()
+            .any(|constraint| matches!(&constraint.provenance, Provenance::UvOverride));
+        let excludes_workspace_fact = |authority| {
+            group.constraints.iter().any(|constraint| {
+                active_for_finalization(constraint, has_override)
+                    && constraint.authority() == authority
+                    && !constraint.specifiers.contains(&workspace_version)
+            })
+        };
+        let conflicting_authoritative = excludes_workspace_fact(Authority::Authoritative);
+        let conflicting_advisory = excludes_workspace_fact(Authority::Advisory);
+        if !conflicting_authoritative && !conflicting_advisory {
             continue;
         }
         let specifiers =
@@ -12171,6 +12178,11 @@ fn produce_output_with_conflicts(
             ),
         };
         if !group.constraints.contains(&constraint) {
+            if conflicting_authoritative {
+                group
+                    .validation_only_origins
+                    .insert(constraint.origin_id.clone());
+            }
             group.constraints.push(constraint);
         }
     }
@@ -12188,6 +12200,7 @@ fn produce_output_with_conflicts(
             conda_name,
             conda_name_is_authoritative: _,
             constraints,
+            validation_only_origins,
             native_conda_overrides,
         } = group;
         let pypi_name = pypi_names
@@ -12208,9 +12221,10 @@ fn produce_output_with_conflicts(
                  refusing to discard a whole constraint edge"
             );
         }
-        match decide_relaxation(
+        match decide_for_emission(
             &pypi_name,
             &constraints,
+            &validation_only_origins,
             config.relax,
             &SafetyContext::new(Some(conda_name.as_spec())).with_abi_anchor_alias(has_anchor_alias),
         ) {
