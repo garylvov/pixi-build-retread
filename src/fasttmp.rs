@@ -31,6 +31,10 @@ const RETREAD_BASE_PIXI_CONFIG: &str = "RETREAD_FAST_TMP_BASE_PIXI_CONFIG_FILE";
 const RETREAD_MANAGED_KEYS: &str = "RETREAD_FAST_TMP_MANAGED_KEYS";
 const RETREAD_BASE_ENV_JSON: &str = "RETREAD_FAST_TMP_BASE_ENV_JSON";
 const RETREAD_EXPECTED_ENV_JSON: &str = "RETREAD_FAST_TMP_EXPECTED_ENV_JSON";
+const FAST_WORKSPACE_LINK_LOCK: &str = ".retread-fast-envs-link.lock";
+const RETREAD_BLD_OWNER_MARKER: &str = ".retread-bld-owner";
+const RETREAD_BLD_OWNER_FORMAT: &str = "pixi-build-retread fast-tmp bld v1";
+const BLD_IDLE_THRESHOLD: Duration = Duration::from_secs(90);
 
 /// User-facing variables Retread may own. Inherited ownership metadata is
 /// untrusted because `--print-env` is evaluated by a shell, so cleanup must
@@ -547,9 +551,7 @@ fn engage_inner(
         if wrapper_side_effects && !in_slurm_job() {
             let pixi = workspace_root.join(".pixi");
             fs::create_dir_all(&pixi).with_context(|| format!("creating {}", pixi.display()))?;
-            with_file_lock(&pixi.join(".retread-fast-envs-link.lock"), || {
-                setup_bld_symlink(workspace_root, &ns)
-            })?;
+            setup_bld_symlink(workspace_root, &ns)?;
         } else if wrapper_side_effects {
             tracing::info!(
                 workspace = %workspace_root.display(),
@@ -643,6 +645,7 @@ fn prepare_namespace_dirs(
     ] {
         fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     }
+    write_bld_owner_marker(ns, canonical_workspace)?;
     set_dir_mode_0700(&ns.root);
     fs::write(
         ns.root.join("workspace-path"),
@@ -661,6 +664,42 @@ fn prepare_namespace_dirs(
     }
     prepare_pixi_config_overlay(ns)?;
     Ok(())
+}
+
+fn bld_owner_marker_contents(canonical_workspace: &Path) -> Vec<u8> {
+    format!(
+        "{RETREAD_BLD_OWNER_FORMAT}\nworkspace={}\n",
+        canonical_workspace.display()
+    )
+    .into_bytes()
+}
+
+fn write_bld_owner_marker(ns: &Namespace, canonical_workspace: &Path) -> Result<()> {
+    let marker = ns.bld_dir().join(RETREAD_BLD_OWNER_MARKER);
+    let expected = bld_owner_marker_contents(canonical_workspace);
+    match fs::symlink_metadata(&marker) {
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            bail!(
+                "retread fast-tmp ownership marker {} is not a regular file",
+                marker.display()
+            );
+        }
+        Ok(_) => {
+            if fs::read(&marker)
+                .with_context(|| format!("reading bld ownership marker {}", marker.display()))?
+                == expected
+            {
+                return Ok(());
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("checking bld ownership marker {}", marker.display()));
+        }
+    }
+    fs::write(&marker, expected)
+        .with_context(|| format!("writing bld ownership marker {}", marker.display()))
 }
 
 /// Return the Pixi config file that was active before retread installed its
@@ -1483,7 +1522,7 @@ fn cleanup_owned_workspace_links(workspace_root: &Path) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error).with_context(|| format!("checking {}", pixi.display())),
     }
-    with_file_lock(&pixi.join(".retread-fast-envs-link.lock"), || {
+    with_file_lock(&pixi.join(FAST_WORKSPACE_LINK_LOCK), || {
         remove_owned_workspace_symlink(workspace_root, &pixi.join("bld"))
     })
 }
@@ -1577,6 +1616,131 @@ fn setup_bld_symlink(workspace_root: &Path, ns: &Namespace) -> Result<()> {
     setup_bld_symlink_with_hook(workspace_root, ns, || {})
 }
 
+#[derive(Debug)]
+enum ExpectedBldPath {
+    Missing,
+    StaleSymlink {
+        target: PathBuf,
+        reason: StaleSymlinkReason,
+    },
+    Directory {
+        device: u64,
+        inode: u64,
+        proof: BldDirectoryProof,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BldDirectoryProof {
+    Empty,
+    RetreadMarked,
+    Idle,
+}
+
+#[derive(Debug)]
+enum StaleSymlinkReason {
+    Dangling,
+    OwnedNamespace,
+}
+
+impl ExpectedBldPath {
+    fn stale_kind(&self) -> Option<&'static str> {
+        match self {
+            Self::Missing => None,
+            Self::StaleSymlink {
+                reason: StaleSymlinkReason::Dangling,
+                ..
+            } => Some("dangling symlink"),
+            Self::StaleSymlink {
+                reason: StaleSymlinkReason::OwnedNamespace,
+                ..
+            } => Some("previous Retread namespace symlink"),
+            Self::Directory { .. } => Some("real build directory"),
+        }
+    }
+}
+
+fn bld_has_valid_owner_marker(workspace_root: &Path, directory: &Path) -> Result<bool> {
+    let marker = directory.join(RETREAD_BLD_OWNER_MARKER);
+    match fs::symlink_metadata(&marker) {
+        Ok(metadata) if metadata.file_type().is_file() && metadata.len() <= 16 * 1024 => {}
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("checking bld ownership marker {}", marker.display()));
+        }
+    }
+    let canonical_workspace = fs::canonicalize(workspace_root)
+        .with_context(|| format!("canonicalizing workspace {}", workspace_root.display()))?;
+    let contents = fs::read(&marker)
+        .with_context(|| format!("reading bld ownership marker {}", marker.display()))?;
+    Ok(contents == bld_owner_marker_contents(&canonical_workspace))
+}
+
+fn newest_bld_entry_mtime(directory: &Path) -> Result<Option<SystemTime>> {
+    let mut pending = vec![directory.to_path_buf()];
+    let mut newest: Option<SystemTime> = None;
+    while let Some(current) = pending.pop() {
+        for entry in fs::read_dir(&current)
+            .with_context(|| format!("reading real build directory {}", current.display()))?
+        {
+            let entry = entry.with_context(|| format!("reading entry in {}", current.display()))?;
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)
+                .with_context(|| format!("checking build-directory entry {}", path.display()))?;
+            let modified = metadata
+                .modified()
+                .with_context(|| format!("reading modification time for {}", path.display()))?;
+            if newest.is_none_or(|current| modified > current) {
+                newest = Some(modified);
+            }
+            if metadata.file_type().is_dir() {
+                pending.push(path);
+            }
+        }
+    }
+    Ok(newest)
+}
+
+fn bld_directory_proof(
+    workspace_root: &Path,
+    directory: &Path,
+    observed_at: SystemTime,
+) -> Result<Option<BldDirectoryProof>> {
+    if bld_has_valid_owner_marker(workspace_root, directory)? {
+        return Ok(Some(BldDirectoryProof::RetreadMarked));
+    }
+    let Some(newest) = newest_bld_entry_mtime(directory)? else {
+        return Ok(Some(BldDirectoryProof::Empty));
+    };
+    if observed_at
+        .duration_since(newest)
+        .is_ok_and(|age| age > BLD_IDLE_THRESHOLD)
+    {
+        Ok(Some(BldDirectoryProof::Idle))
+    } else {
+        Ok(None)
+    }
+}
+
+fn ensure_bld_target_is_disjoint(link: &Path, target: &Path) -> Result<()> {
+    let canonical_link =
+        fs::canonicalize(link).with_context(|| format!("canonicalizing {}", link.display()))?;
+    let canonical_target =
+        fs::canonicalize(target).with_context(|| format!("canonicalizing {}", target.display()))?;
+    if canonical_link.starts_with(&canonical_target)
+        || canonical_target.starts_with(&canonical_link)
+    {
+        bail!(
+            "retread fast-tmp refuses to auto-heal {} because build target {} overlaps it",
+            link.display(),
+            target.display()
+        );
+    }
+    Ok(())
+}
+
 fn setup_bld_symlink_with_hook(
     workspace_root: &Path,
     ns: &Namespace,
@@ -1586,33 +1750,85 @@ fn setup_bld_symlink_with_hook(
     fs::create_dir_all(&pixi).with_context(|| format!("creating {}", pixi.display()))?;
     let link = pixi.join("bld");
     let target = ns.bld_dir();
-    let expected_current = match fs::symlink_metadata(&link) {
+    let lock_path = pixi.join(FAST_WORKSPACE_LINK_LOCK);
+    let Some(_lock) = try_open_and_lock(&lock_path)? else {
+        bail!(
+            "retread fast-tmp: {} may be changing concurrently; another fast-tmp build holds {}, so refusing to replace it",
+            link.display(),
+            lock_path.display()
+        );
+    };
+    let expected = match fs::symlink_metadata(&link) {
         Ok(meta) if meta.file_type().is_symlink() => {
             let current = fs::read_link(&link)
                 .with_context(|| format!("reading build symlink {}", link.display()))?;
             if current == target {
                 return Ok(());
             }
-            if !workspace_link_target_is_owned(workspace_root, &current)? {
+            let reason = match fs::metadata(&link) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    StaleSymlinkReason::Dangling
+                }
+                Ok(_) if workspace_link_target_is_owned(workspace_root, &current)? => {
+                    StaleSymlinkReason::OwnedNamespace
+                }
+                Ok(_) => {
+                    bail!(
+                        "retread fast-tmp refuses to replace live unowned symlink {} -> {}. Move it aside or remove it before enabling fast-tmp.",
+                        link.display(),
+                        current.display()
+                    );
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("checking target of {}", link.display()));
+                }
+            };
+            ExpectedBldPath::StaleSymlink {
+                target: current,
+                reason,
+            }
+        }
+        Ok(meta) if meta.is_dir() => {
+            ensure_bld_target_is_disjoint(&link, &target)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt as _;
+
+                let Some(proof) = bld_directory_proof(workspace_root, &link, SystemTime::now())?
+                else {
+                    bail!(
+                        "retread fast-tmp refuses to auto-heal real build directory {} because it shows activity within the last {} seconds and may belong to a live Pixi/non-Retread build. Remove {} manually only if you know it is stale, then retry.",
+                        link.display(),
+                        BLD_IDLE_THRESHOLD.as_secs(),
+                        link.display()
+                    );
+                };
+                ExpectedBldPath::Directory {
+                    device: meta.dev(),
+                    inode: meta.ino(),
+                    proof,
+                }
+            }
+            #[cfg(not(unix))]
+            {
                 bail!(
-                    "retread fast-tmp refuses to replace unowned symlink {} -> {}. Move it aside or remove it before enabling fast-tmp.",
-                    link.display(),
-                    current.display()
+                    "retread fast-tmp cannot safely auto-heal real build directory {} on this platform",
+                    link.display()
                 );
             }
-            Some(current)
         }
         Ok(_) => {
             bail!(
-                "retread fast-tmp refuses to replace real path {}. Move it aside before enabling fast-tmp.",
+                "retread fast-tmp refuses to replace non-directory real path {}. Move it aside before enabling fast-tmp.",
                 link.display()
             );
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => ExpectedBldPath::Missing,
         Err(e) => return Err(e).with_context(|| format!("checking {}", link.display())),
     };
     before_mutation();
-    atomic_symlink_replace(workspace_root, &target, &link, expected_current.as_deref())?;
+    atomic_symlink_replace(workspace_root, &target, &link, &expected)?;
     let now = fs::read_link(&link).with_context(|| format!("reading {}", link.display()))?;
     if now != target {
         bail!(
@@ -1622,7 +1838,69 @@ fn setup_bld_symlink_with_hook(
             now.display()
         );
     }
+    if let Some(kind) = expected.stale_kind() {
+        warn_msg(&format!(
+            "retread fast-tmp: auto-healed stale {kind} {} to point at {}",
+            link.display(),
+            target.display()
+        ));
+    }
     Ok(())
+}
+
+#[cfg(unix)]
+fn quarantined_bld_matches(
+    workspace_root: &Path,
+    quarantine: &Path,
+    expected: &ExpectedBldPath,
+) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let Ok(metadata) = fs::symlink_metadata(quarantine) else {
+        return Ok(false);
+    };
+    match expected {
+        ExpectedBldPath::Missing => Ok(false),
+        ExpectedBldPath::StaleSymlink { target, reason } => {
+            if !metadata.file_type().is_symlink()
+                || fs::read_link(quarantine).ok().as_deref() != Some(target.as_path())
+            {
+                return Ok(false);
+            }
+            match reason {
+                StaleSymlinkReason::Dangling => match fs::metadata(quarantine) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+                    Ok(_) => Ok(false),
+                    Err(error) => Err(error)
+                        .with_context(|| format!("rechecking target of {}", quarantine.display())),
+                },
+                StaleSymlinkReason::OwnedNamespace => {
+                    workspace_link_target_is_owned(workspace_root, target)
+                }
+            }
+        }
+        ExpectedBldPath::Directory { device, inode, .. } => {
+            if !metadata.is_dir() || metadata.dev() != *device || metadata.ino() != *inode {
+                return Ok(false);
+            }
+            Ok(bld_directory_proof(workspace_root, quarantine, SystemTime::now())?.is_some())
+        }
+    }
+}
+
+fn remove_quarantined_bld_path(
+    quarantine: &Path,
+    expected: &ExpectedBldPath,
+) -> std::io::Result<()> {
+    match expected {
+        ExpectedBldPath::Missing => Ok(()),
+        ExpectedBldPath::StaleSymlink { .. } => fs::remove_file(quarantine),
+        ExpectedBldPath::Directory {
+            proof: BldDirectoryProof::Empty,
+            ..
+        } => fs::remove_dir(quarantine),
+        ExpectedBldPath::Directory { .. } => fs::remove_dir_all(quarantine),
+    }
 }
 
 #[cfg(unix)]
@@ -1630,7 +1908,7 @@ fn atomic_symlink_replace(
     workspace_root: &Path,
     target: &Path,
     link: &Path,
-    expected_current: Option<&Path>,
+    expected: &ExpectedBldPath,
 ) -> Result<()> {
     let parent = link
         .parent()
@@ -1649,7 +1927,7 @@ fn atomic_symlink_replace(
         )
     })?;
     let result = (|| -> Result<()> {
-        let Some(expected) = expected_current else {
+        if matches!(expected, ExpectedBldPath::Missing) {
             return match rename_noreplace(&tmp, link) {
                 Ok(()) => Ok(()),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => bail!(
@@ -1663,7 +1941,7 @@ fn atomic_symlink_replace(
                     )
                 }),
             };
-        };
+        }
 
         let quarantine = parent.join(format!(
             ".{}.retread-quarantine.{}.{}",
@@ -1680,24 +1958,17 @@ fn atomic_symlink_replace(
             )
         })?;
 
-        let moved_target = fs::symlink_metadata(&quarantine)
-            .ok()
-            .filter(|metadata| metadata.file_type().is_symlink())
-            .and_then(|_| fs::read_link(&quarantine).ok());
-        let still_owned = if moved_target.as_deref() == Some(expected) {
-            match workspace_link_target_is_owned(workspace_root, expected) {
-                Ok(owned) => owned,
+        let unchanged_and_stale =
+            match quarantined_bld_matches(workspace_root, &quarantine, expected) {
+                Ok(matches) => matches,
                 Err(error) => {
                     restore_quarantined_path(&quarantine, link)?;
                     return Err(error).context(
-                        "revalidating Retread bld ownership before replacement; restored the workspace path",
-                    );
+                    "revalidating stale bld path before replacement; restored the workspace path",
+                );
                 }
-            }
-        } else {
-            false
-        };
-        if !still_owned {
+            };
+        if !unchanged_and_stale {
             restore_quarantined_path(&quarantine, link)?;
             bail!(
                 "retread fast-tmp: {} changed concurrently; restored it and refused replacement",
@@ -1706,18 +1977,12 @@ fn atomic_symlink_replace(
         }
 
         match rename_noreplace(&tmp, link) {
-            Ok(()) => fs::remove_file(&quarantine).with_context(|| {
-                format!(
-                    "removing replaced Retread-owned symlink {}",
-                    quarantine.display()
-                )
+            Ok(()) => remove_quarantined_bld_path(&quarantine, expected).with_context(|| {
+                format!("removing replaced stale bld path {}", quarantine.display())
             }),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                fs::remove_file(&quarantine).with_context(|| {
-                    format!(
-                        "removing displaced Retread-owned symlink {}",
-                        quarantine.display()
-                    )
+                remove_quarantined_bld_path(&quarantine, expected).with_context(|| {
+                    format!("removing displaced stale bld path {}", quarantine.display())
                 })?;
                 bail!(
                     "retread fast-tmp: {} changed concurrently; refusing to replace the newer workspace path",
@@ -1746,7 +2011,7 @@ fn atomic_symlink_replace(
     _workspace_root: &Path,
     _target: &Path,
     _link: &Path,
-    _expected_current: Option<&Path>,
+    _expected: &ExpectedBldPath,
 ) -> Result<()> {
     bail!("retread fast-tmp symlink setup is only supported on Unix")
 }
@@ -2264,18 +2529,33 @@ impl Drop for FileLock {
 }
 
 fn open_and_lock(lock_path: &Path) -> Result<FileLock> {
+    let file = open_lock_file(lock_path)?;
+    fs4::fs_std::FileExt::lock_exclusive(&file)
+        .with_context(|| format!("locking {}", lock_path.display()))?;
+    Ok(FileLock { file })
+}
+
+fn try_open_and_lock(lock_path: &Path) -> Result<Option<FileLock>> {
+    let file = open_lock_file(lock_path)?;
+    if fs4::fs_std::FileExt::try_lock_exclusive(&file)
+        .with_context(|| format!("try-locking {}", lock_path.display()))?
+    {
+        Ok(Some(FileLock { file }))
+    } else {
+        Ok(None)
+    }
+}
+
+fn open_lock_file(lock_path: &Path) -> Result<File> {
     if let Some(parent) = lock_path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
-    let file = OpenOptions::new()
+    OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
         .open(lock_path)
-        .with_context(|| format!("opening lock file {}", lock_path.display()))?;
-    fs4::fs_std::FileExt::lock_exclusive(&file)
-        .with_context(|| format!("locking {}", lock_path.display()))?;
-    Ok(FileLock { file })
+        .with_context(|| format!("opening lock file {}", lock_path.display()))
 }
 
 fn unique_nonce() -> u128 {
@@ -3199,6 +3479,10 @@ fi
             fs::read_link(ws.join(".pixi").join("bld")).unwrap(),
             first.ns.bld_dir()
         );
+        assert_eq!(
+            fs::read(first.ns.bld_dir().join(RETREAD_BLD_OWNER_MARKER)).unwrap(),
+            bld_owner_marker_contents(&fs::canonicalize(&ws).unwrap())
+        );
         assert!(
             !first.env.iter().any(|(k, _)| k == "UV_CACHE_DIR"),
             "pre-set UV_CACHE_DIR must not be overridden"
@@ -3206,21 +3490,222 @@ fi
         fs::remove_dir_all(root).ok();
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
-    fn engage_rejects_real_bld_path() {
+    fn setup_auto_heals_stale_real_bld_directory() {
         let _lock = ENV_MUTEX.lock().unwrap();
-        let guard = EnvGuard::new(&fasttmp_env_keys());
         let root = tmp_dir("real-bld");
         let ws = root.join("workspace");
         write_workspace(&ws);
-        fs::create_dir_all(ws.join(".pixi").join("bld")).unwrap();
-        guard.set("RETREAD_FAST_TMP_FORCE_FS", "nfs");
-        guard.set("RETREAD_FAST_TMP_ROOT", root.join("tmp").to_str().unwrap());
-        guard.set("RETREAD_FAST_TMP_BUDGET_BYTES", "200G");
-        let cfg = FastTmpConfig::load(&ws);
-        let err = engage(&ws, &cfg).unwrap_err().to_string();
-        assert!(err.contains("refuses to replace real path"));
+        let link = ws.join(".pixi/bld");
+        fs::create_dir_all(&link).unwrap();
+        let stale_file = link.join("stale-scratch");
+        fs::write(&stale_file, b"regenerable").unwrap();
+        let stale_time = SystemTime::now()
+            .checked_sub(BLD_IDLE_THRESHOLD + Duration::from_secs(5))
+            .unwrap();
+        File::options()
+            .write(true)
+            .open(&stale_file)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(stale_time))
+            .unwrap();
+        let ns = Namespace {
+            root: root.join("new-namespace").join("nojob"),
+        };
+        fs::create_dir_all(ns.bld_dir()).unwrap();
+
+        setup_bld_symlink(&ws, &ns).unwrap();
+
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_link(&link).unwrap(), ns.bld_dir());
+        assert!(!link.join("stale-scratch").exists());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn setup_refuses_recent_unmarked_real_bld_directory_without_deleting_it() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let root = tmp_dir("recent-foreign-bld");
+        let ws = root.join("workspace");
+        write_workspace(&ws);
+        let link = ws.join(".pixi/bld");
+        fs::create_dir_all(&link).unwrap();
+        fs::write(link.join("keep"), b"possibly live foreign build").unwrap();
+        let ns = Namespace {
+            root: root.join("new-namespace").join("nojob"),
+        };
+        fs::create_dir_all(ns.bld_dir()).unwrap();
+
+        let error = setup_bld_symlink(&ws, &ns).unwrap_err().to_string();
+
+        assert!(error.contains("may belong to a live Pixi/non-Retread build"));
+        assert!(fs::symlink_metadata(&link).unwrap().is_dir());
+        assert_eq!(
+            fs::read(link.join("keep")).unwrap(),
+            b"possibly live foreign build"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn setup_auto_heals_empty_real_bld_directory() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let root = tmp_dir("empty-real-bld");
+        let ws = root.join("workspace");
+        write_workspace(&ws);
+        let link = ws.join(".pixi/bld");
+        fs::create_dir_all(&link).unwrap();
+        let ns = Namespace {
+            root: root.join("new-namespace").join("nojob"),
+        };
+        fs::create_dir_all(ns.bld_dir()).unwrap();
+
+        setup_bld_symlink(&ws, &ns).unwrap();
+
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_link(&link).unwrap(), ns.bld_dir());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn setup_auto_heals_recent_retread_marked_real_bld_directory() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let root = tmp_dir("marked-real-bld");
+        let ws = root.join("workspace");
+        write_workspace(&ws);
+        let link = ws.join(".pixi/bld");
+        fs::create_dir_all(&link).unwrap();
+        fs::write(link.join("scratch"), b"recent but Retread-owned").unwrap();
+        fs::write(
+            link.join(RETREAD_BLD_OWNER_MARKER),
+            bld_owner_marker_contents(&fs::canonicalize(&ws).unwrap()),
+        )
+        .unwrap();
+        let ns = Namespace {
+            root: root.join("new-namespace").join("nojob"),
+        };
+        fs::create_dir_all(ns.bld_dir()).unwrap();
+
+        setup_bld_symlink(&ws, &ns).unwrap();
+
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_link(&link).unwrap(), ns.bld_dir());
+        assert!(!link.join("scratch").exists());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn setup_rejects_stale_bld_directory_that_contains_target() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let root = tmp_dir("overlapping-bld");
+        let ws = root.join("workspace");
+        write_workspace(&ws);
+        let link = ws.join(".pixi/bld");
+        fs::create_dir_all(&link).unwrap();
+        let ns = Namespace {
+            root: link.join("namespace"),
+        };
+        fs::create_dir_all(ns.bld_dir()).unwrap();
+        fs::write(ns.bld_dir().join("keep"), b"live target").unwrap();
+
+        let error = setup_bld_symlink(&ws, &ns).unwrap_err().to_string();
+
+        assert!(error.contains("overlaps"));
+        assert!(fs::symlink_metadata(&link).unwrap().is_dir());
+        assert_eq!(fs::read(ns.bld_dir().join("keep")).unwrap(), b"live target");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn setup_keeps_correct_bld_symlink_without_mutation() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let root = tmp_dir("correct-bld");
+        let ws = root.join("workspace");
+        write_workspace(&ws);
+        fs::create_dir_all(ws.join(".pixi")).unwrap();
+        let ns = Namespace {
+            root: root.join("namespace").join("nojob"),
+        };
+        fs::create_dir_all(ns.bld_dir()).unwrap();
+        let link = ws.join(".pixi/bld");
+        std::os::unix::fs::symlink(ns.bld_dir(), &link).unwrap();
+
+        setup_bld_symlink_with_hook(&ws, &ns, || {
+            panic!("correct symlink must be a no-op");
+        })
+        .unwrap();
+
+        assert_eq!(fs::read_link(&link).unwrap(), ns.bld_dir());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn setup_auto_heals_dangling_bld_symlink() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let root = tmp_dir("dangling-bld");
+        let ws = root.join("workspace");
+        write_workspace(&ws);
+        fs::create_dir_all(ws.join(".pixi")).unwrap();
+        let dead_target = root.join("missing-old-job/bld");
+        let link = ws.join(".pixi/bld");
+        std::os::unix::fs::symlink(&dead_target, &link).unwrap();
+        let ns = Namespace {
+            root: root.join("new-namespace").join("nojob"),
+        };
+        fs::create_dir_all(ns.bld_dir()).unwrap();
+
+        setup_bld_symlink(&ws, &ns).unwrap();
+
+        assert_eq!(fs::read_link(&link).unwrap(), ns.bld_dir());
+        assert!(!dead_target.exists());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn setup_refuses_to_heal_while_workspace_lock_is_held() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let root = tmp_dir("locked-bld");
+        let ws = root.join("workspace");
+        write_workspace(&ws);
+        let link = ws.join(".pixi/bld");
+        fs::create_dir_all(&link).unwrap();
+        fs::write(link.join("keep"), b"live scratch").unwrap();
+        let ns = Namespace {
+            root: root.join("new-namespace").join("nojob"),
+        };
+        fs::create_dir_all(ns.bld_dir()).unwrap();
+        let concurrent_lock =
+            open_and_lock(&ws.join(".pixi").join(FAST_WORKSPACE_LINK_LOCK)).unwrap();
+
+        let error = setup_bld_symlink(&ws, &ns).unwrap_err().to_string();
+
+        assert!(error.contains("another fast-tmp build holds"));
+        assert!(fs::symlink_metadata(&link).unwrap().is_dir());
+        assert_eq!(fs::read(link.join("keep")).unwrap(), b"live scratch");
+        drop(concurrent_lock);
         fs::remove_dir_all(root).ok();
     }
 
@@ -3307,6 +3792,7 @@ fi
         fs::create_dir_all(ws.join(".pixi")).unwrap();
         let link = ws.join(".pixi/bld");
         let user_target = root.join("unrelated-user-bld");
+        fs::create_dir_all(&user_target).unwrap();
         std::os::unix::fs::symlink(&user_target, &link).unwrap();
         let ns = Namespace {
             root: root.join("new-namespace").join("nojob"),
@@ -3449,6 +3935,23 @@ fi
         .to_string();
         assert!(error.contains("changed concurrently"));
         assert_eq!(fs::read(link.join("keep")).unwrap(), b"user directory");
+
+        fs::write(
+            link.join(RETREAD_BLD_OWNER_MARKER),
+            bld_owner_marker_contents(&fs::canonicalize(&ws).unwrap()),
+        )
+        .unwrap();
+        let displaced = pixi.join("bld-before-directory-race");
+        let error = setup_bld_symlink_with_hook(&ws, &new_ns, || {
+            fs::rename(&link, &displaced).unwrap();
+            fs::create_dir(&link).unwrap();
+            fs::write(link.join("keep"), b"newer directory").unwrap();
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("changed concurrently"));
+        assert_eq!(fs::read(link.join("keep")).unwrap(), b"newer directory");
+        assert_eq!(fs::read(displaced.join("keep")).unwrap(), b"user directory");
         assert!(
             fs::read_dir(&pixi)
                 .unwrap()
