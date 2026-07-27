@@ -734,7 +734,10 @@ pub const SCHEMA: u32 = 17;
 /// Epoch 40: existing identity-fallback auto-routes bypass duplicate metadata
 /// fetching so final joint validation sees the complete wheel constraint set;
 /// conflicting non-anchor routes may therefore restore a reconciled PyPI wheel.
-pub const EMIT_EPOCH: u32 = 40;
+///
+/// Epoch 41: fresh emission auto-completes an open bare-major ABI-anchor lower
+/// bound to a canonical within-major cap and records the completion warning.
+pub const EMIT_EPOCH: u32 = 41;
 
 fn parse_stored_glibc(value: Option<&str>) -> Option<Option<(u32, u32)>> {
     match value {

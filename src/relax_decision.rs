@@ -62,6 +62,7 @@ pub enum RelaxationKind {
     ExactPinWidened,
     UpperCapStripped,
     AdvisoryFloorDropped,
+    AbiAnchorCapCompleted,
 }
 
 impl RelaxationKind {
@@ -70,6 +71,7 @@ impl RelaxationKind {
             Self::ExactPinWidened => "exact pin widened",
             Self::UpperCapStripped => "upper cap stripped",
             Self::AdvisoryFloorDropped => "advisory floor dropped",
+            Self::AbiAnchorCapCompleted => "ABI anchor cap completed",
         }
     }
 }

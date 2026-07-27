@@ -3524,6 +3524,200 @@ fn bare_major_workspace_python_input_still_emits_a_minor_anchor() {
 }
 
 #[test]
+fn bare_major_abi_anchor_emission_auto_completes_within_major_cap_and_warning() {
+    for original in [">=2.0", ">=2"] {
+        // The deps-from route suppresses the incidental selected-version pin;
+        // the constraint itself retains its real index-wheel provenance.
+        let mut numpy = bundle_auto_route("numpy", "2.2.6", Provenance::DepsFromRelaxed);
+        numpy
+            .route
+            .input_requirements
+            .push(crate::uv_closure::AutoRouteInputRequirement {
+                specifiers: original.to_string(),
+                source: format!("wheel `jax==0.7.2` Requires-Dist `numpy{original}`"),
+                provenance: Provenance::IndexWheelMetadata,
+                role: crate::uv_closure::AutoRouteInputRole::Requirement,
+            });
+        let mut bundle = solo_bundle("flashsac-pack", vec![]);
+        bundle.auto_routed.push(numpy);
+
+        let (output, warnings) = produce_output_pending_relaxations(
+            &bundle,
+            &cfg(),
+            Platform::Linux64,
+            "3.11",
+            &[],
+            None,
+            None,
+        )
+        .unwrap();
+        let emitted = output
+            .run_dependencies
+            .depends
+            .iter()
+            .find(|dependency| dependency.name == "numpy")
+            .map(|dependency| format_packagespec(&dependency.spec))
+            .expect("NumPy run dependency");
+        assert_eq!(emitted, ">=2.0,<3", "{original}");
+        assert_eq!(warnings.len(), 1, "{original}: {warnings:?}");
+
+        let warning = warnings[0].to_string();
+        assert!(warning.contains("RETREAD AUTO-COMPLETED ABI anchor"));
+        assert!(warning.contains("bundle `flashsac-pack`"));
+        assert!(warning.contains("package `numpy`"));
+        assert!(warning.contains(&format!("`{original}` -> `>=2.0,<3`")));
+        assert!(warning.contains("wheel `jax==0.7.2`"));
+
+        let manifest = bundled_relaxations_for_output(
+            "flashsac-pack",
+            "flashsac-pack",
+            &ResolutionTarget::for_subdir("3.11", "linux-64"),
+            &[],
+            &warnings,
+        )
+        .expect("ABI-anchor completion must reach the courier warning payload");
+        assert_eq!(manifest.records().len(), 1);
+        assert_eq!(
+            manifest.records()[0].kind,
+            crate::relaxation_record::RelaxationRecordKind::AbiAnchorCapCompleted
+        );
+        let hook = manifest.activate_script();
+        assert!(hook.contains("bundle `flashsac-pack`"));
+        assert!(hook.contains(&format!("numpy {original} -> >=2.0,<3")));
+    }
+}
+
+#[test]
+fn abi_anchor_cap_completion_intersects_compatible_clauses_and_stays_source_scoped() {
+    for (original, normalized) in [
+        (">=2.0,!=2.1", ">=2.0,!=2.1,<3"),
+        (">=2.0,<4", ">=2.0,<4,<3"),
+        (">=2,<3", ">=2.0,<3"),
+    ] {
+        assert_eq!(
+            auto_complete_bare_major_abi_anchor_spec(original).as_deref(),
+            Some(normalized),
+            "{original}"
+        );
+        assert!(
+            is_auto_completed_abi_anchor_spec(normalized),
+            "{normalized}"
+        );
+    }
+    for already_safe in [">=2.0,<3", ">=2.0,<3,!=2.1"] {
+        assert!(
+            auto_complete_bare_major_abi_anchor_spec(already_safe).is_none(),
+            "{already_safe}"
+        );
+        assert!(
+            is_auto_completed_abi_anchor_spec(already_safe),
+            "{already_safe}"
+        );
+    }
+    for irreconcilable in ["!", "<3", ">=2.0,<2", ">=18446744073709551615"] {
+        assert!(
+            auto_complete_bare_major_abi_anchor_spec(irreconcilable).is_none(),
+            "{irreconcilable}"
+        );
+    }
+
+    assert!(
+        check_output_abi_invariants(
+            &[("numpy".to_string(), ">=2.0,<3".to_string())],
+            &[],
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &AbiAliasGraph::new(),
+        )
+        .is_empty()
+    );
+    let embedded = check_output_abi_invariants(
+        &[],
+        &[("consumer-wheel".to_string(), "numpy>=2.0,<3".to_string())],
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        &AbiAliasGraph::new(),
+    );
+    assert_eq!(embedded.len(), 1, "{embedded:?}");
+    assert!(embedded[0].contains("wheel `consumer-wheel` embeds"));
+}
+
+#[test]
+fn abi_anchor_cap_completion_preserves_capped_pinned_and_non_anchor_specs() {
+    let mut config = cfg();
+    config.relax = RelaxPolicy::None;
+    for spec in [">=2.0,<2.3", "==2.0.1"] {
+        let mut numpy = bundle_auto_route("numpy", "2.0.1", Provenance::DepsFromRelaxed);
+        numpy
+            .route
+            .input_requirements
+            .push(crate::uv_closure::AutoRouteInputRequirement {
+                specifiers: spec.to_string(),
+                source: format!("typed NumPy input `{spec}`"),
+                provenance: Provenance::DepsFromRelaxed,
+                role: crate::uv_closure::AutoRouteInputRole::Requirement,
+            });
+        let mut bundle = solo_bundle("anchor-pack", vec![]);
+        bundle.auto_routed.push(numpy);
+        let (output, warnings) = produce_output_pending_relaxations(
+            &bundle,
+            &config,
+            Platform::Linux64,
+            "3.11",
+            &[],
+            None,
+            None,
+        )
+        .unwrap();
+        let emitted = output
+            .run_dependencies
+            .depends
+            .iter()
+            .find(|dependency| dependency.name == "numpy")
+            .map(|dependency| format_packagespec(&dependency.spec))
+            .expect("NumPy run dependency");
+        assert_eq!(emitted, spec);
+        assert!(warnings.is_empty(), "{spec}: {warnings:?}");
+    }
+
+    let bundle = solo_bundle("ordinary-pack", vec!["packaging>=2"]);
+    let (output, warnings) = produce_output_pending_relaxations(
+        &bundle,
+        &config,
+        Platform::Linux64,
+        "3.11",
+        &[],
+        None,
+        None,
+    )
+    .unwrap();
+    let emitted = output
+        .run_dependencies
+        .depends
+        .iter()
+        .find(|dependency| dependency.name == "packaging")
+        .map(|dependency| format_packagespec(&dependency.spec))
+        .expect("packaging run dependency");
+    assert_eq!(emitted, ">=2");
+    assert!(warnings.is_empty());
+}
+
+#[test]
+fn abi_anchor_cap_completion_leaves_unparseable_specs_fail_closed() {
+    assert!(auto_complete_bare_major_abi_anchor_spec("!").is_none());
+    let violations = check_output_abi_invariants(
+        &[("numpy".to_string(), "!".to_string())],
+        &[],
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        &AbiAliasGraph::new(),
+    );
+    assert_eq!(violations.len(), 1, "{violations:?}");
+    assert!(violations[0].contains("ABI invariant"));
+    assert!(violations[0].contains("bare-major"));
+}
+
+#[test]
 fn output_abi_invariant_rejects_star_bare_major_and_uncovered_workspace_pin() {
     let overrides = BTreeMap::new();
     let python_workspace =
@@ -3732,7 +3926,7 @@ fn output_abi_invariant_accepts_minor_pin_and_rejects_anchor_override() {
         .is_empty()
     );
 
-    for spec in ["*", ">=1,<2,>0.1"] {
+    for spec in ["*", ">=1,<2,>0.1", ">=1.0,<2"] {
         let overrides = BTreeMap::from([("numpy".to_string(), spec.to_string())]);
         let violations =
             check_output_abi_invariants(&[], &[], &workspace, &overrides, &BTreeMap::new());
