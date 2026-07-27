@@ -726,7 +726,11 @@ pub const SCHEMA: u32 = 17;
 ///
 /// Epoch 38: activate.d hooks echo every relaxation regardless of count and
 /// always point to the package-bundled JSON manifest for full detail.
-pub const EMIT_EPOCH: u32 = 38;
+///
+/// Epoch 39: conflicting precise workspace ABI-anchor patch facts participate
+/// in emission relaxation while remaining validation-only, so compatible
+/// wheel pins emit a portable patch band.
+pub const EMIT_EPOCH: u32 = 39;
 
 fn parse_stored_glibc(value: Option<&str>) -> Option<Option<(u32, u32)>> {
     match value {

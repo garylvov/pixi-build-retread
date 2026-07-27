@@ -256,9 +256,50 @@ pub fn decide(
     decide_with_search_limit(package, constraints, policy, safety, MAX_SEARCH_STATES)
 }
 
+/// Decide against every constraint while omitting validation-only origins from
+/// the successful emitted projection.
+///
+/// The omitted constraints remain authoritative during strict finalization,
+/// candidate search, and ABI safety checks. This is used for precise workspace
+/// facts that validate a portable emitted range without becoming that range.
+pub(crate) fn decide_for_emission(
+    package: &PypiKey,
+    constraints: &[Constraint],
+    validation_only_origins: &BTreeSet<ConstraintOriginId>,
+    policy: RelaxPolicy,
+    safety: &SafetyContext<'_>,
+) -> Decision {
+    decide_with_search_limit_and_projection(
+        package,
+        constraints,
+        validation_only_origins,
+        policy,
+        safety,
+        MAX_SEARCH_STATES,
+    )
+}
+
 fn decide_with_search_limit(
     package: &PypiKey,
     constraints: &[Constraint],
+    policy: RelaxPolicy,
+    safety: &SafetyContext<'_>,
+    search_limit: usize,
+) -> Decision {
+    decide_with_search_limit_and_projection(
+        package,
+        constraints,
+        &BTreeSet::new(),
+        policy,
+        safety,
+        search_limit,
+    )
+}
+
+fn decide_with_search_limit_and_projection(
+    package: &PypiKey,
+    constraints: &[Constraint],
+    validation_only_origins: &BTreeSet<ConstraintOriginId>,
     policy: RelaxPolicy,
     safety: &SafetyContext<'_>,
     search_limit: usize,
@@ -268,7 +309,12 @@ fn decide_with_search_limit(
     let strict = match finalize_quiet_detailed(package, &canonical) {
         Ok(FinalizeSuccess::Unchanged(specifiers)) => {
             return Decision::Strict {
-                specifiers,
+                specifiers: projected_specifiers(
+                    package,
+                    &canonical,
+                    validation_only_origins,
+                    specifiers,
+                ),
                 diagnostics: Vec::new(),
             };
         }
@@ -285,7 +331,12 @@ fn decide_with_search_limit(
             } else {
                 let diagnostics = advisory_floor_diagnostics(&canonical, &specifiers);
                 return Decision::Strict {
-                    specifiers,
+                    specifiers: projected_specifiers(
+                        package,
+                        &canonical,
+                        validation_only_origins,
+                        specifiers,
+                    ),
                     diagnostics,
                 };
             }
@@ -322,11 +373,23 @@ fn decide_with_search_limit(
         if let Some(finalized) = best.as_ref()
             && frontier_cannot_beat(finalized, &heap)
         {
-            return finalized_candidate_decision(&canonical, &atoms, finalized.clone());
+            return finalized_candidate_decision(
+                package,
+                &canonical,
+                &atoms,
+                finalized.clone(),
+                validation_only_origins,
+            );
         }
         if heap.is_empty() {
             return match best {
-                Some(finalized) => finalized_candidate_decision(&canonical, &atoms, finalized),
+                Some(finalized) => finalized_candidate_decision(
+                    package,
+                    &canonical,
+                    &atoms,
+                    finalized,
+                    validation_only_origins,
+                ),
                 None => Decision::Conflict(strict),
             };
         }
@@ -343,7 +406,13 @@ fn decide_with_search_limit(
             Some(Reverse(entry)) => entry,
             None => {
                 return match best {
-                    Some(finalized) => finalized_candidate_decision(&canonical, &atoms, finalized),
+                    Some(finalized) => finalized_candidate_decision(
+                        package,
+                        &canonical,
+                        &atoms,
+                        finalized,
+                        validation_only_origins,
+                    ),
                     None => Decision::Conflict(strict),
                 };
             }
@@ -351,18 +420,28 @@ fn decide_with_search_limit(
         searched += 1;
         match entry.evaluation {
             CandidateEvaluation::Finalized(success) => {
-                let safe = match &success {
-                    FinalizeSuccess::Unchanged(specifiers) => {
-                        !is_anchor
-                            || anchor_candidate_stays_within_original_compatibility_band(
-                                &canonical,
-                                &atoms,
-                                &entry.state,
-                                specifiers,
-                            )
-                    }
-                    FinalizeSuccess::AdvisoryFloorSoftened { .. } => !is_anchor,
-                };
+                let validation_safe = workspace_validation_mutations_are_patch_exact(
+                    &canonical,
+                    &atoms,
+                    &entry.state,
+                    validation_only_origins,
+                );
+                let validation_result_safe = validation_only_origins.is_empty()
+                    || matches!(&success, FinalizeSuccess::Unchanged(_));
+                let safe = validation_safe
+                    && validation_result_safe
+                    && match &success {
+                        FinalizeSuccess::Unchanged(specifiers) => {
+                            !is_anchor
+                                || anchor_candidate_stays_within_original_compatibility_band(
+                                    &canonical,
+                                    &atoms,
+                                    &entry.state,
+                                    specifiers,
+                                )
+                        }
+                        FinalizeSuccess::AdvisoryFloorSoftened { .. } => !is_anchor,
+                    };
                 let softened = matches!(&success, FinalizeSuccess::AdvisoryFloorSoftened { .. });
 
                 // A softened success may hide a lower-loss descendant whose
@@ -427,13 +506,26 @@ fn retain_better_candidate(best: &mut Option<FinalizedCandidate>, candidate: Fin
 }
 
 fn finalized_candidate_decision(
+    package: &PypiKey,
     original: &[Constraint],
     atoms: &[Atom],
     finalized: FinalizedCandidate,
+    validation_only_origins: &BTreeSet<ConstraintOriginId>,
 ) -> Decision {
     let relaxed = apply_state(original, atoms, &finalized.state);
     let mut decisions = selected_decisions(original, &relaxed, atoms, &finalized.state);
-    match finalized.success {
+    let success = if validation_only_origins.is_empty() {
+        finalized.success
+    } else {
+        let emitted = relaxed
+            .iter()
+            .filter(|constraint| !validation_only_origins.contains(&constraint.origin_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        finalize_quiet_detailed(package, &emitted)
+            .expect("removing validation-only constraints cannot create an emission conflict")
+    };
+    match success {
         FinalizeSuccess::Unchanged(specifiers) => Decision::Relaxed {
             specifiers,
             decisions,
@@ -453,6 +545,93 @@ fn finalized_candidate_decision(
             }
         }
     }
+}
+
+fn projected_specifiers(
+    package: &PypiKey,
+    constraints: &[Constraint],
+    validation_only_origins: &BTreeSet<ConstraintOriginId>,
+    fallback: VersionSpecifiers,
+) -> VersionSpecifiers {
+    if validation_only_origins.is_empty() {
+        return fallback;
+    }
+    let emitted = constraints
+        .iter()
+        .filter(|constraint| !validation_only_origins.contains(&constraint.origin_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    match finalize_quiet_detailed(package, &emitted)
+        .expect("removing validation-only constraints cannot create an emission conflict")
+    {
+        FinalizeSuccess::Unchanged(specifiers)
+        | FinalizeSuccess::AdvisoryFloorSoftened { specifiers, .. } => specifiers,
+    }
+}
+
+/// A precise workspace ABI fact may justify only a patch-tier widening of an
+/// authoritative wheel exact pin in the same epoch/major/minor line. Cap
+/// stripping and broader exact tiers fail closed; the general anchor rule
+/// intentionally remains same-major for other origin pairs.
+fn workspace_validation_mutations_are_patch_exact(
+    original: &[Constraint],
+    atoms: &[Atom],
+    state: &[u8],
+    validation_only_origins: &BTreeSet<ConstraintOriginId>,
+) -> bool {
+    if validation_only_origins.is_empty() {
+        return true;
+    }
+    let workspace_fact_versions = original
+        .iter()
+        .filter(|constraint| {
+            validation_only_origins.contains(&constraint.origin_id)
+                && matches!(&constraint.provenance, Provenance::WorkspaceCondaFact(_))
+        })
+        .flat_map(|constraint| constraint.specifiers.iter())
+        .filter_map(|specifier| {
+            (*specifier.operator() == Operator::Equal).then_some(specifier.version())
+        })
+        .collect::<Vec<_>>();
+    let has_workspace_fact = original.iter().any(|constraint| {
+        validation_only_origins.contains(&constraint.origin_id)
+            && matches!(&constraint.provenance, Provenance::WorkspaceCondaFact(_))
+    });
+    if !has_workspace_fact {
+        return false;
+    }
+
+    let selected = atoms
+        .iter()
+        .zip(state)
+        .filter(|(_, choice_index)| **choice_index != 0)
+        .map(|(atom, choice_index)| {
+            (
+                atom,
+                &atom.choices[usize::from(*choice_index) - 1],
+                &original[atom.constraint_index],
+            )
+        })
+        .collect::<Vec<_>>();
+    !selected.is_empty()
+        && selected.into_iter().all(|(atom, choice, constraint)| {
+            matches!(&constraint.provenance, Provenance::IndexWheelMetadata)
+                && choice.kind == RelaxationKind::ExactPinWidened
+                && choice.tier == RelaxPolicy::Patch
+                && *atom.original.operator() == Operator::Equal
+                && !workspace_fact_versions.is_empty()
+                && workspace_fact_versions
+                    .iter()
+                    .all(|fact| same_epoch_major_minor(atom.original.version(), fact))
+        })
+}
+
+fn same_epoch_major_minor(left: &Version, right: &Version) -> bool {
+    let left_release = left.release();
+    let right_release = right.release();
+    left.epoch() == right.epoch()
+        && left_release.first().copied().unwrap_or(0) == right_release.first().copied().unwrap_or(0)
+        && left_release.get(1).copied().unwrap_or(0) == right_release.get(1).copied().unwrap_or(0)
 }
 
 /// ABI anchors may relax within one compatibility band, but a selected
@@ -1467,6 +1646,165 @@ mod tests {
             assert_eq!(decisions.len(), 1);
             assert_eq!(decisions[0].tier, RelaxPolicy::Minor);
         }
+    }
+
+    #[test]
+    fn numpy_workspace_patch_fact_emits_portable_patch_band() {
+        let constraints = vec![
+            constraint(
+                "wheel-pin",
+                "==1.26.0",
+                Provenance::IndexWheelMetadata,
+                "authoritative wheel pin",
+            ),
+            constraint(
+                "workspace-fact",
+                "==1.26.4",
+                Provenance::WorkspaceCondaFact("precise-consuming-envs".to_string()),
+                "precise workspace fact",
+            ),
+        ];
+        let validation_only_origins = BTreeSet::from([constraints[1].origin_id.clone()]);
+        let Decision::Relaxed {
+            specifiers,
+            decisions,
+        } = decide_for_emission(
+            &package("numpy"),
+            &constraints,
+            &validation_only_origins,
+            RelaxPolicy::PatchThenMinorThenMajorThenLastResort,
+            &SafetyContext::default(),
+        )
+        else {
+            panic!("a same-minor workspace patch fact must relax the wheel pin")
+        };
+
+        assert_eq!(render_specifiers(&specifiers), ">=1.26.0,<1.27");
+        assert!(specifiers.contains(&Version::from_str("1.26.4").unwrap()));
+        assert!(!specifiers.contains(&Version::from_str("1.27").unwrap()));
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].tier, RelaxPolicy::Patch);
+        assert_eq!(
+            decisions[0].relaxed_clause.as_deref(),
+            Some(">=1.26.0,<1.27")
+        );
+    }
+
+    #[test]
+    fn numpy_workspace_cross_minor_facts_fail_closed() {
+        for package_name in ["numpy", "ordinary-package"] {
+            for wheel_spec in ["==1.26.0", ">=1.26,<1.27"] {
+                let constraints = vec![
+                    constraint(
+                        "wheel-constraint",
+                        wheel_spec,
+                        Provenance::IndexWheelMetadata,
+                        "authoritative wheel constraint",
+                    ),
+                    constraint(
+                        "workspace-fact",
+                        "==1.27.0",
+                        Provenance::WorkspaceCondaFact("precise-consuming-envs".to_string()),
+                        "precise workspace fact",
+                    ),
+                ];
+                let strict =
+                    finalize_quiet(&package(package_name), &canonical_constraints(&constraints))
+                        .unwrap_err();
+                let validation_only_origins = BTreeSet::from([constraints[1].origin_id.clone()]);
+
+                assert_eq!(
+                    decide_for_emission(
+                        &package(package_name),
+                        &constraints,
+                        &validation_only_origins,
+                        RelaxPolicy::PatchThenMinorThenMajorThenLastResort,
+                        &SafetyContext::default(),
+                    ),
+                    Decision::Conflict(strict),
+                    "a precise workspace fact must not reconcile `{wheel_spec}` across minors \
+                     for `{package_name}`"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn workspace_validation_does_not_hide_advisory_floor_softening() {
+        let constraints = vec![
+            constraint(
+                "wheel-pin",
+                "==1.26.0",
+                Provenance::IndexWheelMetadata,
+                "authoritative wheel pin",
+            ),
+            constraint(
+                "advisory-floor",
+                ">=1.27",
+                Provenance::SourceBuiltRelaxed,
+                "source-built advisory floor",
+            ),
+            constraint(
+                "workspace-fact",
+                "==1.26.4",
+                Provenance::WorkspaceCondaFact("precise-consuming-envs".to_string()),
+                "precise workspace fact",
+            ),
+        ];
+        let strict = finalize_quiet(
+            &package("ordinary-package"),
+            &canonical_constraints(&constraints),
+        )
+        .unwrap_err();
+        let validation_only_origins = BTreeSet::from([constraints[2].origin_id.clone()]);
+
+        assert_eq!(
+            decide_for_emission(
+                &package("ordinary-package"),
+                &constraints,
+                &validation_only_origins,
+                RelaxPolicy::PatchThenMinorThenMajorThenLastResort,
+                &SafetyContext::default(),
+            ),
+            Decision::Conflict(strict),
+            "workspace validation must not hide implicit advisory-floor loss"
+        );
+    }
+
+    #[test]
+    fn validation_projection_does_not_narrow_an_active_override() {
+        let constraints = vec![
+            constraint(
+                "ignored-wheel-pin",
+                "==1.25.0",
+                Provenance::IndexWheelMetadata,
+                "wheel pin ignored by override",
+            ),
+            constraint(
+                "active-override",
+                ">=1.26,<1.27",
+                Provenance::UvOverride,
+                "active UV override",
+            ),
+            constraint(
+                "workspace-fact",
+                "==1.26.4",
+                Provenance::WorkspaceCondaFact("precise-consuming-envs".to_string()),
+                "precise workspace fact",
+            ),
+        ];
+        let validation_only_origins = BTreeSet::from([constraints[2].origin_id.clone()]);
+        let Decision::Strict { specifiers, .. } = decide_for_emission(
+            &package("numpy"),
+            &constraints,
+            &validation_only_origins,
+            RelaxPolicy::PatchThenMinorThenMajorThenLastResort,
+            &SafetyContext::default(),
+        ) else {
+            panic!("the active override and workspace fact are compatible")
+        };
+        assert_eq!(render_specifiers(&specifiers), ">=1.26,<1.27");
+        assert!(specifiers.contains(&Version::from_str("1.26.5").unwrap()));
     }
 
     #[test]
