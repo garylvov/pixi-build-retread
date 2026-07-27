@@ -1679,6 +1679,19 @@ where
     // wheels are added. Cycle-detected via seen_candidate, which
     // accumulates across iterations.
     let mut seen_candidate: HashSet<String> = skip.clone();
+    // A uv auto-route is already a complete routing decision. Do not send its
+    // PyPI identity through the independent metadata-probe/fetch path again:
+    // an identity-fallback route need not have a name-map entry, so that path
+    // can otherwise fetch the route's old exact wheel before Rule 2 sees the
+    // complete set of wheel constraints. Requirements are observed before the
+    // seen check below, preserving every declaring wheel for the final joint
+    // route precheck.
+    seen_candidate.extend(
+        bundle
+            .auto_routed
+            .iter()
+            .map(|route| canonical_conda_name(&route.route.pypi_name)),
+    );
     let mut committed_relaxations = Vec::new();
     // incremental-add: pre-fill with locked names so we don't re-bundle them.
     if let Some(closure) = locked_closure {
@@ -2370,6 +2383,7 @@ where
         )
         .collect();
     expand_name_map_groups(&mut fixed_by_config, &config.name_map);
+    let abi_aliases = super::output_abi_aliases(bundle, config);
 
     // Route ownership is grouped by the canonical conda dependency because
     // emission deduplicates there. If any alias in a group is force-conda,
@@ -2396,6 +2410,24 @@ where
                 .any(|origin| fixed_by_config.contains(&canonical_conda_name(&origin.pypi_name)))
         });
         if uv_forced || metadata_forced {
+            continue;
+        }
+        let route_group_is_abi_anchor = super::is_semantic_abi_anchor(&conda_name, &abi_aliases)
+            || bundle.auto_routed.iter().any(|route| {
+                canonical_conda_name(&route.route.conda_name) == conda_name
+                    && (super::is_semantic_abi_anchor(&route.route.pypi_name, &abi_aliases)
+                        || super::is_semantic_abi_anchor(&route.route.conda_name, &abi_aliases))
+            })
+            || metadata_routes.get(&conda_name).is_some_and(|origins| {
+                origins.iter().any(|origin| {
+                    super::is_semantic_abi_anchor(&origin.pypi_name, &abi_aliases)
+                        || super::is_semantic_abi_anchor(&origin.conda_name, &abi_aliases)
+                })
+            });
+        // Route rejection changes the provider ecosystem. ABI anchors keep
+        // their validated conda provider even when the corresponding wheel
+        // constraints could be reconciled after removing that route.
+        if route_group_is_abi_anchor {
             continue;
         }
         if metadata_route_group_has_source_built_origin(
@@ -2589,7 +2621,6 @@ where
         .collect();
     let mut restore_requests: BTreeMap<String, RestoreRequestBuilder> = BTreeMap::new();
     let mut audit_origins: BTreeSet<(String, String)> = BTreeSet::new();
-    let abi_aliases = super::output_abi_aliases(bundle, config);
     for route in &bundle.auto_routed {
         let conda_name = canonical_conda_name(&route.route.conda_name);
         if !rejected_keys.contains(&conda_name) {
@@ -4615,6 +4646,171 @@ mod tests {
                 .iter()
                 .all(|route| route.conda_name.key().as_str() != "psutil"),
             "the restored PyPI wheel must replace the conflicting conda run dep: {emitted:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn immutable_psutil_auto_route_unroutes_against_full_wheel_closure() {
+        let target = crate::pypi::WheelTarget::for_subdir("3.11", "linux-64");
+        let mut config = test_config();
+        config.relax = RelaxPolicy::PatchThenMinorThenMajorThenLastResort;
+        let mut bundle = isaaclab_psutil_conflict_bundle();
+        bundle
+            .auto_routed
+            .push(prior_selection_route("psutil", "5.9.8"));
+        let requests = Arc::new(Mutex::new(Vec::<PypiFetchRequest>::new()));
+        let fetch = {
+            let requests = Arc::clone(&requests);
+            move |request: PypiFetchRequest, _indexes: Vec<String>, _failure_context: String| {
+                requests.lock().unwrap().push(request);
+                async { Ok(test_wheel("psutil", "psutil", "7.2.2", &[])) }
+            }
+        };
+        let accept_route_probe = |_routes: Vec<crate::uv_closure::CondaRouteSpec>| async {
+            crate::uv_closure::CoInstallVerdict::Sat
+        };
+
+        let outcome = auto_bundle_transitives_with(
+            &mut bundle,
+            &[crate::workspace::DEFAULT_PYPI_INDEX.to_string()],
+            &target,
+            &config,
+            None,
+            None,
+            None,
+            &validated_probe,
+            &accept_route_probe,
+            &fetch,
+            &["conda-forge/linux-64".to_string()],
+            &UvReresolveContext::default(),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(outcome, AutoBundleOutcome::Complete { .. }));
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "the full wheel closure must reject the otherwise-solvable conda route"
+        );
+        assert_eq!(requests[0].pypi_name, "psutil");
+        assert_eq!(
+            render_specifiers(&requests[0].specifiers),
+            ">=7",
+            "after unroute, ordinary wheel auto-relax must let IPython's floor win"
+        );
+        assert!(
+            requests[0]
+                .specifiers
+                .contains(&Version::from_str("7.2.2").unwrap())
+        );
+        assert!(
+            !requests[0]
+                .specifiers
+                .contains(&Version::from_str("5.9.8").unwrap())
+        );
+        assert_eq!(
+            requests[0]
+                .relaxations
+                .iter()
+                .map(|relaxation| relaxation.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                WheelMetadataRelaxationKind::ExactPinWidened,
+                WheelMetadataRelaxationKind::UpperCapStripped,
+            ],
+            "the restored wheel closure must widen Isaac Sim's exact pin and strip rl_games' cap"
+        );
+        drop(requests);
+
+        assert!(
+            bundle
+                .auto_routed
+                .iter()
+                .all(|route| canonical_conda_name(&route.route.conda_name) != "psutil"),
+            "the immutable route envelope must disappear with the rejected route"
+        );
+        assert!(bundle.all_wheels().any(|wheel| {
+            PypiKey::from_pypi(&wheel.pypi_name) == PypiKey::from_pypi("psutil")
+                && wheel.metadata.version == "7.2.2"
+        }));
+        let emitted = super::super::emitted_bundle_route_specs(&bundle, &config, &target).unwrap();
+        assert!(
+            emitted
+                .iter()
+                .all(|route| route.conda_name.key().as_str() != "psutil"),
+            "the restored PyPI wheel must replace the conflicting auto route: {emitted:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn immutable_abi_anchor_auto_route_remains_fail_closed() {
+        let target = crate::pypi::WheelTarget::for_subdir("3.11", "linux-64");
+        let mut config = test_config();
+        config.relax = RelaxPolicy::PatchThenMinorThenMajorThenLastResort;
+        let mut bundle = test_bundle(&["numpy==1.26.0"]);
+        bundle.extras.push(test_wheel(
+            "newer-numpy-floor",
+            "newer-numpy-floor",
+            "1.0.0",
+            &["numpy>=1.26.4"],
+        ));
+        bundle
+            .auto_routed
+            .push(prior_selection_route("numpy", "1.26.0"));
+        let fetch_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fetch = {
+            let fetch_calls = Arc::clone(&fetch_calls);
+            move |_request: PypiFetchRequest, _indexes: Vec<String>, _failure_context: String| {
+                fetch_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { Ok(test_wheel("numpy", "numpy", "1.26.4", &[])) }
+            }
+        };
+        let accept_route_probe = |_routes: Vec<crate::uv_closure::CondaRouteSpec>| async {
+            crate::uv_closure::CoInstallVerdict::Sat
+        };
+
+        let error = auto_bundle_transitives_with(
+            &mut bundle,
+            &[crate::workspace::DEFAULT_PYPI_INDEX.to_string()],
+            &target,
+            &config,
+            None,
+            None,
+            None,
+            &validated_probe,
+            &accept_route_probe,
+            &fetch,
+            &["conda-forge/linux-64".to_string()],
+            &UvReresolveContext::default(),
+        )
+        .await
+        .expect_err("an ABI-anchor route conflict must remain fail-closed");
+
+        assert!(
+            error
+                .downcast_ref::<crate::constraint::Conflict>()
+                .is_some(),
+            "the anchor failure must retain its typed conflict: {error:#}"
+        );
+        assert_eq!(
+            fetch_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "ABI anchors must be rejected before any PyPI restore"
+        );
+        assert!(
+            bundle
+                .auto_routed
+                .iter()
+                .any(|route| canonical_conda_name(&route.route.conda_name) == "numpy"),
+            "the ABI-anchor conda route must remain intact"
+        );
+        assert!(
+            bundle
+                .all_wheels()
+                .all(|wheel| canonical_conda_name(&wheel.pypi_name) != "numpy"),
+            "the ABI anchor must not be restored as a PyPI wheel"
         );
     }
 

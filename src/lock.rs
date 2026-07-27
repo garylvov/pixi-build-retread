@@ -730,7 +730,11 @@ pub const SCHEMA: u32 = 17;
 /// Epoch 39: conflicting precise workspace ABI-anchor patch facts participate
 /// in emission relaxation while remaining validation-only, so compatible
 /// wheel pins emit a portable patch band.
-pub const EMIT_EPOCH: u32 = 39;
+///
+/// Epoch 40: existing identity-fallback auto-routes bypass duplicate metadata
+/// fetching so final joint validation sees the complete wheel constraint set;
+/// conflicting non-anchor routes may therefore restore a reconciled PyPI wheel.
+pub const EMIT_EPOCH: u32 = 40;
 
 fn parse_stored_glibc(value: Option<&str>) -> Option<Option<(u32, u32)>> {
     match value {
