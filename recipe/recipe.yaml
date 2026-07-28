@@ -2,7 +2,7 @@ schema_version: 1
 
 context:
   name: pixi-build-retread
-  version: "4.10.42"
+  version: "4.10.43"
 
 package:
   name: ${{ name }}
