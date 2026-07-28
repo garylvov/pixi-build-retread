@@ -14,6 +14,7 @@ mod resolve_state;
 use resolve_state::{ObserveEdgeResult, ResolveState};
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -13916,6 +13917,110 @@ async fn materialize_from_lock_for_target(
     Ok(Some(result))
 }
 
+const DEFAULT_COMPRESSION_THREADS_CAP: usize = 8;
+const FALLBACK_AVAILABLE_PARALLELISM: usize = 4;
+const COMPRESSION_THREADS_ENV: &str = "RETREAD_COMPRESSION_THREADS";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompressionThreadsSource {
+    Default,
+    Env,
+    Config,
+}
+
+impl CompressionThreadsSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Env => "env",
+            Self::Config => "config",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CompressionThreads {
+    value: NonZeroUsize,
+    source: CompressionThreadsSource,
+}
+
+fn default_compression_threads(available_parallelism: NonZeroUsize) -> NonZeroUsize {
+    NonZeroUsize::new(
+        available_parallelism
+            .get()
+            .min(DEFAULT_COMPRESSION_THREADS_CAP),
+    )
+    .expect("available parallelism and the default cap are nonzero")
+}
+
+fn select_compression_threads(
+    available_parallelism: NonZeroUsize,
+    env_value: Option<&str>,
+    config_value: Option<NonZeroUsize>,
+) -> (CompressionThreads, bool) {
+    let default = || CompressionThreads {
+        value: default_compression_threads(available_parallelism),
+        source: CompressionThreadsSource::Default,
+    };
+    match env_value {
+        Some(value) => match value.parse::<NonZeroUsize>() {
+            Ok(value) => (
+                CompressionThreads {
+                    value,
+                    source: CompressionThreadsSource::Env,
+                },
+                false,
+            ),
+            Err(_) => (default(), true),
+        },
+        None => (
+            config_value.map_or_else(default, |value| CompressionThreads {
+                value,
+                source: CompressionThreadsSource::Config,
+            }),
+            false,
+        ),
+    }
+}
+
+fn rattler_build_compression_threads(config: &RetreadConfig) -> CompressionThreads {
+    let available_parallelism = std::thread::available_parallelism().unwrap_or_else(|error| {
+        tracing::warn!(
+            error = %error,
+            fallback = FALLBACK_AVAILABLE_PARALLELISM,
+            "could not determine available parallelism for rattler-build compression",
+        );
+        NonZeroUsize::new(FALLBACK_AVAILABLE_PARALLELISM)
+            .expect("fallback available parallelism is nonzero")
+    });
+    let raw_env = std::env::var_os(COMPRESSION_THREADS_ENV);
+    let (selected, invalid_env) = match raw_env.as_deref() {
+        Some(value) => match value.to_str() {
+            Some(value) => select_compression_threads(
+                available_parallelism,
+                Some(value),
+                config.compression_threads,
+            ),
+            None => (
+                CompressionThreads {
+                    value: default_compression_threads(available_parallelism),
+                    source: CompressionThreadsSource::Default,
+                },
+                true,
+            ),
+        },
+        None => select_compression_threads(available_parallelism, None, config.compression_threads),
+    };
+    if invalid_env {
+        tracing::warn!(
+            value = ?raw_env,
+            chosen = selected.value.get(),
+            "invalid RETREAD_COMPRESSION_THREADS; expected an integer >= 1; using capped default",
+        );
+    }
+    selected
+}
+
 /// Shared courier pack tail: stage wheels, build the courier recipe, run
 /// rattler-build, flush the deferred committed lock, and return the
 /// [`CondaBuildV1Result`].
@@ -14045,10 +14150,7 @@ async fn materialize_and_pack(
             target.conda_subdir()
         )
     })?;
-    let compression_threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .to_string();
+    let compression_threads = rattler_build_compression_threads(config);
     let mut cmd = tokio::process::Command::new("rattler-build");
     cmd.arg("build")
         .arg("--recipe")
@@ -14058,7 +14160,7 @@ async fn materialize_and_pack(
         .arg("--target-platform")
         .arg(&target_platform)
         .arg("--compression-threads")
-        .arg(&compression_threads)
+        .arg(compression_threads.value.get().to_string())
         .arg("--no-test");
     crate::fasttmp::apply_backend_env(&mut cmd);
     if let Some(level) = config.compression_level {
@@ -14075,7 +14177,8 @@ async fn materialize_and_pack(
     tracing::info!(
         output = %recipe.package.name,
         elapsed_ms = packaging_started.elapsed().as_millis() as u64,
-        compression_threads = %compression_threads,
+        compression_threads = compression_threads.value.get(),
+        compression_threads_source = compression_threads.source.as_str(),
         compression_level = ?config.compression_level,
         "bench: rattler-build finished",
     );
@@ -14954,15 +15057,9 @@ async fn build_one(
     tokio::fs::create_dir_all(output_dir).await?;
 
     let target_platform = target_subdir.to_string();
-    // v1.5.8: rattler-build's zstd packaging defaults to ONE thread.
-    // For isaac-scale bundles that means single-threaded compression
-    // of a ~15GB build prefix -- the dominant wall-clock chunk of
-    // pixi's "preparing packages" phase. zstd scales near-linearly
-    // with threads on inputs this size, so hand it every core.
-    let compression_threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .to_string();
+    // Keep each pack bounded on shared nodes; explicit env/config knobs can
+    // raise or lower the default when the operator knows the workload.
+    let compression_threads = rattler_build_compression_threads(config);
     // CRITICAL: rattler-build writes progress to stdout, but retread's
     // stdout is the JSON-RPC channel to pixi. Capture both streams so
     // they don't corrupt the protocol. Surface them via tracing
@@ -14976,7 +15073,7 @@ async fn build_one(
         .arg("--target-platform")
         .arg(&target_platform)
         .arg("--compression-threads")
-        .arg(&compression_threads)
+        .arg(compression_threads.value.get().to_string())
         .arg("--no-test");
     crate::fasttmp::apply_backend_env(&mut cmd);
     // v1.5.8: user-tunable zstd level (retread-compression-level).
@@ -14996,7 +15093,8 @@ async fn build_one(
     tracing::info!(
         output = %recipe.package.name,
         elapsed_ms = packaging_started.elapsed().as_millis() as u64,
-        compression_threads = %compression_threads,
+        compression_threads = compression_threads.value.get(),
+        compression_threads_source = compression_threads.source.as_str(),
         compression_level = ?config.compression_level,
         "bench: rattler-build finished",
     );

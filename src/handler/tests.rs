@@ -10,6 +10,52 @@ use crate::index_chain::{IndexPurpose, PUBLIC_PYPI, index_chain};
 use crate::relax::{CondaName, CondaTarget, NameMap, PypiKey};
 use std::collections::BTreeMap;
 
+fn nonzero(value: usize) -> std::num::NonZeroUsize {
+    std::num::NonZeroUsize::new(value).unwrap()
+}
+
+#[test]
+fn compression_threads_default_caps_at_eight() {
+    for (available, expected) in [(64, 8), (8, 8), (4, 4), (1, 1)] {
+        let (selected, invalid_env) = select_compression_threads(nonzero(available), None, None);
+        assert_eq!(selected.value.get(), expected);
+        assert_eq!(selected.source, CompressionThreadsSource::Default);
+        assert!(!invalid_env);
+    }
+}
+
+#[test]
+fn compression_threads_env_override_wins() {
+    let (selected, invalid_env) =
+        select_compression_threads(nonzero(64), Some("12"), Some(nonzero(6)));
+    assert_eq!(selected.value.get(), 12);
+    assert_eq!(selected.source, CompressionThreadsSource::Env);
+    assert!(!invalid_env);
+}
+
+#[test]
+fn compression_threads_invalid_env_falls_back_to_default() {
+    for value in ["0", "not-a-number", "-1", " 3"] {
+        let (selected, invalid_env) =
+            select_compression_threads(nonzero(64), Some(value), Some(nonzero(6)));
+        assert_eq!(selected.value.get(), 8, "{value}");
+        assert_eq!(
+            selected.source,
+            CompressionThreadsSource::Default,
+            "{value}"
+        );
+        assert!(invalid_env, "{value}");
+    }
+}
+
+#[test]
+fn compression_threads_config_wins_over_default() {
+    let (selected, invalid_env) = select_compression_threads(nonzero(64), None, Some(nonzero(6)));
+    assert_eq!(selected.value.get(), 6);
+    assert_eq!(selected.source, CompressionThreadsSource::Config);
+    assert!(!invalid_env);
+}
+
 #[cfg(unix)]
 fn unique_test_dir(label: &str) -> std::path::PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -625,6 +671,7 @@ fn pythons_for_rejects_bare_major_variant() {
         conda_deps: Vec::new(),
         default_bundle: None,
         compression_level: None,
+        compression_threads: None,
         emit_pypi: false,
         bundle_mode: crate::config::BundleMode::Fat,
         courier: false,
@@ -675,6 +722,7 @@ fn pythons_for_accepts_dotted_variant() {
         conda_deps: Vec::new(),
         default_bundle: None,
         compression_level: None,
+        compression_threads: None,
         emit_pypi: false,
         bundle_mode: crate::config::BundleMode::Fat,
         courier: false,
@@ -725,6 +773,7 @@ fn pythons_for_filters_bare_major_keeps_dotted() {
         conda_deps: Vec::new(),
         default_bundle: None,
         compression_level: None,
+        compression_threads: None,
         emit_pypi: false,
         bundle_mode: crate::config::BundleMode::Fat,
         courier: false,
@@ -2528,6 +2577,7 @@ fn cfg() -> RetreadConfig {
         conda_deps: Vec::new(),
         default_bundle: None,
         compression_level: None,
+        compression_threads: None,
         emit_pypi: false,
         bundle_mode: crate::config::BundleMode::Fat,
         courier: false,
