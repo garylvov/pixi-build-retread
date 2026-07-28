@@ -49,6 +49,8 @@ fs4 = "0.13.1"
 reqwest = { version = "0.12.12", default-features = false, features = ["rustls-tls", "json", "stream", "blocking"] }
 zip = { version = "6.0.0", default-features = false, features = ["deflate"] }
 sha2 = "0.10"
+# Match Pixi's detached-environment directory identity exactly.
+xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 # uv's PEP 508 parser is the gold standard for Requires-Dist values.
 uv-pep508 = { git = "https://github.com/astral-sh/uv", tag = "0.9.5" }
 uv-normalize = { git = "https://github.com/astral-sh/uv", tag = "0.9.5" }

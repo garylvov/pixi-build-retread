@@ -5,7 +5,7 @@
 //! without mutating workspace symlinks.
 
 use std::collections::{HashMap, HashSet};
-use std::ffi::{CString, OsString};
+use std::ffi::{CString, OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -16,6 +16,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use sha2::{Digest, Sha256};
+use xxhash_rust::xxh3::xxh3_64;
 
 const DEFAULT_TMP_ROOT: &str = "/tmp";
 const DEFAULT_ESTIMATE_BYTES: u64 = 80 * 1024 * 1024 * 1024;
@@ -645,8 +646,21 @@ fn prepare_namespace_dirs(
     ] {
         fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     }
-    write_bld_owner_marker(ns, canonical_workspace)?;
     set_dir_mode_0700(&ns.root);
+    write_namespace_ownership_proof(ns, canonical_workspace)?;
+    if cfg.blob_caches == BlobCacheMode::Shared {
+        let shared = shared_blob_cache_dir(cfg, workspace_root);
+        fs::create_dir_all(&shared)
+            .with_context(|| format!("creating shared retread blob cache {}", shared.display()))?;
+    }
+    prepare_pixi_config_overlay(ns)?;
+    Ok(())
+}
+
+fn write_namespace_ownership_proof(ns: &Namespace, canonical_workspace: &Path) -> Result<()> {
+    fs::create_dir_all(ns.bld_dir())
+        .with_context(|| format!("creating {}", ns.bld_dir().display()))?;
+    write_bld_owner_marker(ns, canonical_workspace)?;
     fs::write(
         ns.root.join("workspace-path"),
         canonical_workspace.to_string_lossy().as_bytes(),
@@ -657,12 +671,6 @@ fn prepare_namespace_dirs(
             ns.root.join("workspace-path").display()
         )
     })?;
-    if cfg.blob_caches == BlobCacheMode::Shared {
-        let shared = shared_blob_cache_dir(cfg, workspace_root);
-        fs::create_dir_all(&shared)
-            .with_context(|| format!("creating shared retread blob cache {}", shared.display()))?;
-    }
-    prepare_pixi_config_overlay(ns)?;
     Ok(())
 }
 
@@ -672,6 +680,38 @@ fn bld_owner_marker_contents(canonical_workspace: &Path) -> Vec<u8> {
         canonical_workspace.display()
     )
     .into_bytes()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnershipMarkerStatus {
+    Absent,
+    Valid,
+    Invalid,
+}
+
+fn ownership_marker_status(
+    marker: &Path,
+    expected: &[u8],
+    description: &str,
+) -> Result<OwnershipMarkerStatus> {
+    match fs::symlink_metadata(marker) {
+        Ok(metadata) if metadata.file_type().is_file() && metadata.len() <= 16 * 1024 => {}
+        Ok(_) => return Ok(OwnershipMarkerStatus::Invalid),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(OwnershipMarkerStatus::Absent);
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("checking {description} {}", marker.display()));
+        }
+    }
+    let contents =
+        fs::read(marker).with_context(|| format!("reading {description} {}", marker.display()))?;
+    Ok(if contents == expected {
+        OwnershipMarkerStatus::Valid
+    } else {
+        OwnershipMarkerStatus::Invalid
+    })
 }
 
 fn write_bld_owner_marker(ns: &Namespace, canonical_workspace: &Path) -> Result<()> {
@@ -1456,19 +1496,173 @@ fn workspace_link_target_is_owned(workspace_root: &Path, raw_target: &Path) -> R
     )
 }
 
-fn is_pixi_envs_namespace_relative(relative: &Path) -> bool {
+fn pixi_envs_workspace_component(
+    workspace_root: &Path,
+    canonical_workspace: &Path,
+) -> Result<String> {
+    let manifest_path = workspace_root.join("pixi.toml");
+    let manifest = fs::read_to_string(&manifest_path).with_context(|| {
+        format!(
+            "reading Pixi workspace manifest {}",
+            manifest_path.display()
+        )
+    })?;
+    let parsed: toml::Value = toml::from_str(&manifest).with_context(|| {
+        format!(
+            "parsing Pixi workspace manifest {}",
+            manifest_path.display()
+        )
+    })?;
+    let display_name = parsed
+        .get("workspace")
+        .and_then(|workspace| workspace.get("name"))
+        .and_then(toml::Value::as_str)
+        .or_else(|| {
+            parsed
+                .get("project")
+                .and_then(|project| project.get("name"))
+                .and_then(toml::Value::as_str)
+        })
+        .or_else(|| {
+            parsed
+                .get("package")
+                .and_then(|package| package.get("name"))
+                .and_then(toml::Value::as_str)
+        })
+        .map(str::to_string)
+        .or_else(|| {
+            canonical_workspace
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "workspace".to_string());
+    Ok(format!(
+        "{display_name}-{}",
+        xxh3_64(canonical_workspace.to_string_lossy().as_bytes())
+    ))
+}
+
+fn is_pixi_envs_namespace_relative(relative: &Path, workspace_component: &str) -> bool {
     let mut components = relative.iter();
     components.next().is_some_and(|value| value == "envs")
-        && components.next().is_some()
+        && components
+            .next()
+            .is_some_and(|value| value == workspace_component)
         && components.next().is_some_and(|value| value == "envs")
         && components.next().is_none()
 }
 
+fn envs_target_components_are_real_directories(
+    configured_tmp_root: &Path,
+    raw_target: &Path,
+) -> Result<bool> {
+    let Ok(relative) = raw_target.strip_prefix(configured_tmp_root) else {
+        return Ok(false);
+    };
+    let mut current = configured_tmp_root.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(value) = component else {
+            return Ok(false);
+        };
+        current.push(value);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Ok(false);
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "checking fast-tmp namespace component {}",
+                        current.display()
+                    )
+                });
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn envs_namespace_marker_status(
+    workspace_root: &Path,
+    namespace_root: &Path,
+) -> Result<OwnershipMarkerStatus> {
+    let canonical_workspace = fs::canonicalize(workspace_root)
+        .with_context(|| format!("canonicalizing workspace {}", workspace_root.display()))?;
+    let workspace_path = canonical_workspace.to_string_lossy();
+    let breadcrumb = ownership_marker_status(
+        &namespace_root.join("workspace-path"),
+        workspace_path.as_bytes(),
+        "fast-tmp workspace breadcrumb",
+    )?;
+    let bld_marker = ownership_marker_status(
+        &namespace_root.join("bld").join(RETREAD_BLD_OWNER_MARKER),
+        &bld_owner_marker_contents(&canonical_workspace),
+        "bld ownership marker",
+    )?;
+    Ok(
+        if matches!(breadcrumb, OwnershipMarkerStatus::Invalid)
+            || matches!(bld_marker, OwnershipMarkerStatus::Invalid)
+        {
+            OwnershipMarkerStatus::Invalid
+        } else if matches!(breadcrumb, OwnershipMarkerStatus::Valid)
+            || matches!(bld_marker, OwnershipMarkerStatus::Valid)
+        {
+            OwnershipMarkerStatus::Valid
+        } else {
+            OwnershipMarkerStatus::Absent
+        },
+    )
+}
+
 fn workspace_envs_link_target(
     workspace_root: &Path,
+    configured_tmp_root: &Path,
     raw_target: &Path,
+    allow_dangling_shape_proof: bool,
 ) -> Result<Option<OwnedWorkspaceNamespaceTarget>> {
-    owned_workspace_namespace_target(workspace_root, raw_target, is_pixi_envs_namespace_relative)
+    let canonical_workspace = fs::canonicalize(workspace_root)
+        .with_context(|| format!("canonicalizing workspace {}", workspace_root.display()))?;
+    let pixi_workspace_component =
+        pixi_envs_workspace_component(workspace_root, &canonical_workspace)?;
+    let Some(owned) = owned_workspace_namespace_target(workspace_root, raw_target, |relative| {
+        is_pixi_envs_namespace_relative(relative, &pixi_workspace_component)
+    })?
+    else {
+        return Ok(None);
+    };
+    let workspace_component_matches = owned
+        .namespace_root
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value == workspace_hash(&canonical_workspace));
+    let user_component_matches = owned
+        .namespace_root
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::file_name)
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value == user_namespace_component());
+    if !workspace_component_matches || !user_component_matches {
+        return Ok(None);
+    }
+
+    let expected_namespace_root = configured_tmp_root
+        .join(user_namespace_component())
+        .join(workspace_hash(&canonical_workspace))
+        .join(&owned.job_component);
+    if owned.namespace_root != expected_namespace_root
+        || !envs_target_components_are_real_directories(configured_tmp_root, raw_target)?
+    {
+        return Ok(None);
+    }
+    match envs_namespace_marker_status(workspace_root, &owned.namespace_root)? {
+        OwnershipMarkerStatus::Valid => Ok(Some(owned)),
+        OwnershipMarkerStatus::Absent if allow_dangling_shape_proof => Ok(Some(owned)),
+        OwnershipMarkerStatus::Absent | OwnershipMarkerStatus::Invalid => Ok(None),
+    }
 }
 
 /// Atomically move `source` to an absent `destination`. Linux's
@@ -1476,8 +1670,12 @@ fn workspace_envs_link_target(
 /// it works for symlinks, files, and directories without ever replacing a
 /// concurrently installed user path.
 #[cfg(target_os = "linux")]
-fn rename_noreplace(source: &Path, destination: &Path) -> std::io::Result<()> {
-    use rustix::fs::{RenameFlags, renameat_with};
+fn rename_with_flags(
+    source: &Path,
+    destination: &Path,
+    flags: rustix::fs::RenameFlags,
+) -> std::io::Result<()> {
+    use rustix::fs::renameat_with;
 
     let source_parent = source.parent().ok_or_else(|| {
         std::io::Error::new(
@@ -1495,7 +1693,7 @@ fn rename_noreplace(source: &Path, destination: &Path) -> std::io::Result<()> {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
-                "safe no-replace rename requires one lexical parent: {} != {}",
+                "safe rename requires one lexical parent: {} != {}",
                 source_parent.display(),
                 destination_parent.display()
             ),
@@ -1516,14 +1714,13 @@ fn rename_noreplace(source: &Path, destination: &Path) -> std::io::Result<()> {
     // Open once: even if `.pixi` itself is concurrently renamed/replaced, both
     // operands remain anchored to the exact same directory inode.
     let directory = File::open(source_parent)?;
-    renameat_with(
-        &directory,
-        source_name,
-        &directory,
-        destination_name,
-        RenameFlags::NOREPLACE,
-    )
-    .map_err(std::io::Error::from)
+    renameat_with(&directory, source_name, &directory, destination_name, flags)
+        .map_err(std::io::Error::from)
+}
+
+#[cfg(target_os = "linux")]
+fn rename_noreplace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    rename_with_flags(source, destination, rustix::fs::RenameFlags::NOREPLACE)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1705,20 +1902,13 @@ impl ExpectedBldPath {
 
 fn bld_has_valid_owner_marker(workspace_root: &Path, directory: &Path) -> Result<bool> {
     let marker = directory.join(RETREAD_BLD_OWNER_MARKER);
-    match fs::symlink_metadata(&marker) {
-        Ok(metadata) if metadata.file_type().is_file() && metadata.len() <= 16 * 1024 => {}
-        Ok(_) => return Ok(false),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("checking bld ownership marker {}", marker.display()));
-        }
-    }
     let canonical_workspace = fs::canonicalize(workspace_root)
         .with_context(|| format!("canonicalizing workspace {}", workspace_root.display()))?;
-    let contents = fs::read(&marker)
-        .with_context(|| format!("reading bld ownership marker {}", marker.display()))?;
-    Ok(contents == bld_owner_marker_contents(&canonical_workspace))
+    Ok(ownership_marker_status(
+        &marker,
+        &bld_owner_marker_contents(&canonical_workspace),
+        "bld ownership marker",
+    )? == OwnershipMarkerStatus::Valid)
 }
 
 fn newest_bld_entry_mtime(directory: &Path) -> Result<Option<SystemTime>> {
@@ -2084,10 +2274,24 @@ pub fn heal_stale_envs_symlink_at_backend_startup(workspace_root: &Path) -> Resu
         FastTmpMode::Auto if !is_slow(workspace_root, &cfg) => None,
         FastTmpMode::Auto | FastTmpMode::On => Some(namespace(&cfg, workspace_root)),
     };
-    heal_stale_envs_symlink(workspace_root, current_ns.as_ref())
+    heal_stale_envs_symlink(workspace_root, &cfg.tmp_root, current_ns.as_ref())
 }
 
-fn heal_stale_envs_symlink(workspace_root: &Path, current_ns: Option<&Namespace>) -> Result<()> {
+fn heal_stale_envs_symlink(
+    workspace_root: &Path,
+    configured_tmp_root: &Path,
+    current_ns: Option<&Namespace>,
+) -> Result<()> {
+    heal_stale_envs_symlink_with_warning(workspace_root, configured_tmp_root, current_ns, warn_msg)
+}
+
+#[cfg(target_os = "linux")]
+fn heal_stale_envs_symlink_with_warning(
+    workspace_root: &Path,
+    configured_tmp_root: &Path,
+    current_ns: Option<&Namespace>,
+    emit_warning: impl Fn(&str),
+) -> Result<()> {
     let pixi = workspace_root.join(".pixi");
     match fs::metadata(&pixi) {
         Ok(metadata) if metadata.is_dir() => {}
@@ -2096,189 +2300,418 @@ fn heal_stale_envs_symlink(workspace_root: &Path, current_ns: Option<&Namespace>
         Err(error) => return Err(error).with_context(|| format!("checking {}", pixi.display())),
     }
 
+    let directory = AnchoredEnvsDirectory::open(&pixi)
+        .with_context(|| format!("opening envs-link directory {}", pixi.display()))?;
+    let lock_path = pixi.join(FAST_WORKSPACE_LINK_LOCK);
+    let _lock = directory.lock(&lock_path)?;
     let link = pixi.join("envs");
-    with_file_lock(&pixi.join(FAST_WORKSPACE_LINK_LOCK), || {
-        let metadata = match fs::symlink_metadata(&link) {
-            Ok(metadata) if metadata.file_type().is_symlink() => metadata,
-            Ok(_) => return Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => {
-                return Err(error).with_context(|| format!("checking {}", link.display()));
-            }
-        };
-        debug_assert!(metadata.file_type().is_symlink());
+    let link_name = OsStr::new("envs");
+    let stat = match directory.stat(link_name) {
+        Ok(stat) if rustix::fs::FileType::from_raw_mode(stat.st_mode).is_symlink() => stat,
+        Ok(_) => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("checking {}", link.display()));
+        }
+    };
+    debug_assert!(rustix::fs::FileType::from_raw_mode(stat.st_mode).is_symlink());
 
-        let raw_target =
-            fs::read_link(&link).with_context(|| format!("reading {}", link.display()))?;
-        let Some(owned) = workspace_envs_link_target(workspace_root, &raw_target)? else {
-            return Ok(());
-        };
-        let dangling = match fs::metadata(&link) {
-            Ok(_) => false,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("checking target of {}", link.display()));
-            }
-        };
-        let current_job = current_job_component();
+    let raw_target = directory
+        .read_link(link_name)
+        .with_context(|| format!("reading {}", link.display()))?;
+    let dangling = match fs::metadata(&raw_target) {
+        Ok(_) => false,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(error) => {
+            return Err(error).with_context(|| format!("checking target {}", raw_target.display()));
+        }
+    };
+    let Some(owned) =
+        workspace_envs_link_target(workspace_root, configured_tmp_root, &raw_target, dangling)?
+    else {
+        return Ok(());
+    };
+    let current_job = current_job_component();
 
-        let Some(current_ns) = current_ns else {
-            if !dangling {
-                return Ok(());
-            }
-            let expected = ExpectedEnvsSymlink {
-                raw_target,
-                owned,
-                current_job_component: current_job,
-                reason: StaleEnvsSymlinkReason::Dangling,
-            };
-            atomic_remove_stale_envs_symlink(workspace_root, &link, &expected)?;
-            warn_msg(&format!(
-                "retread fast-tmp: removed dangling envs symlink while fast-tmp is disabled (old job {}) at {}",
-                envs_job_label(&expected.owned.job_component),
-                link.display()
-            ));
-            return Ok(());
-        };
-
-        let foreign_job = owned.job_component != current_job;
-        if !dangling && !foreign_job {
+    let Some(current_ns) = current_ns else {
+        if !dangling {
             return Ok(());
         }
-        let reason = if foreign_job {
-            StaleEnvsSymlinkReason::ForeignJob
-        } else {
-            StaleEnvsSymlinkReason::DanglingTargetPrepared
-        };
-        let tmp_root = current_ns.root.ancestors().nth(3).ok_or_else(|| {
-            anyhow!(
-                "Retread envs namespace {} has no tmp root",
-                current_ns.root.display()
-            )
-        })?;
-        fs::create_dir_all(tmp_root)
-            .with_context(|| format!("creating tmp root {}", tmp_root.display()))?;
-        enforce_tmp_user_dir(tmp_root)?;
-        let new_target = current_ns.root.join(&owned.relative);
-        fs::create_dir_all(&new_target)
-            .with_context(|| format!("creating current envs target {}", new_target.display()))?;
-        set_dir_mode_0700(&current_ns.root);
         let expected = ExpectedEnvsSymlink {
             raw_target,
             owned,
             current_job_component: current_job,
-            reason,
+            reason: StaleEnvsSymlinkReason::Dangling,
         };
-        atomic_replace_stale_envs_symlink(workspace_root, &link, &new_target, &expected)?;
-        let installed =
-            fs::read_link(&link).with_context(|| format!("reading {}", link.display()))?;
-        if installed != new_target {
-            bail!(
-                "retread fast-tmp failed to point {} at {}; it points at {}",
-                link.display(),
-                new_target.display(),
-                installed.display()
-            );
-        }
-        warn_msg(&format!(
-            "retread fast-tmp: healed stale envs symlink (old job {} -> job {}) {} -> {}",
+        atomic_remove_stale_envs_symlink(
+            &directory,
+            link_name,
+            workspace_root,
+            configured_tmp_root,
+            &link,
+            &expected,
+        )?;
+        emit_warning(&format!(
+            "retread fast-tmp: removed dangling envs symlink while fast-tmp is disabled (old job {}) at {}",
             envs_job_label(&expected.owned.job_component),
-            envs_job_label(&expected.current_job_component),
-            link.display(),
-            new_target.display()
+            link.display()
         ));
-        Ok(())
-    })
+        return Ok(());
+    };
+
+    let foreign_job = owned.job_component != current_job;
+    if !dangling {
+        if foreign_job {
+            emit_warning(&live_foreign_envs_warning(
+                workspace_root,
+                &link,
+                &owned.job_component,
+                &current_job,
+            ));
+        }
+        return Ok(());
+    }
+    let reason = if foreign_job {
+        StaleEnvsSymlinkReason::ForeignJob
+    } else {
+        StaleEnvsSymlinkReason::DanglingTargetPrepared
+    };
+    let tmp_root = current_ns.root.ancestors().nth(3).ok_or_else(|| {
+        anyhow!(
+            "Retread envs namespace {} has no tmp root",
+            current_ns.root.display()
+        )
+    })?;
+    fs::create_dir_all(tmp_root)
+        .with_context(|| format!("creating tmp root {}", tmp_root.display()))?;
+    enforce_tmp_user_dir(tmp_root)?;
+    let new_target = current_ns.root.join(&owned.relative);
+    fs::create_dir_all(&new_target)
+        .with_context(|| format!("creating current envs target {}", new_target.display()))?;
+    set_dir_mode_0700(&current_ns.root);
+    let canonical_workspace = fs::canonicalize(workspace_root)
+        .with_context(|| format!("canonicalizing workspace {}", workspace_root.display()))?;
+    write_namespace_ownership_proof(current_ns, &canonical_workspace)?;
+    let expected = ExpectedEnvsSymlink {
+        raw_target,
+        owned,
+        current_job_component: current_job,
+        reason,
+    };
+    if let Err(error) = atomic_replace_stale_envs_symlink(
+        &directory,
+        link_name,
+        workspace_root,
+        configured_tmp_root,
+        &link,
+        &new_target,
+        &expected,
+    ) {
+        let became_live = matches!(expected.reason, StaleEnvsSymlinkReason::ForeignJob)
+            && directory.read_link(link_name).ok().as_deref()
+                == Some(expected.raw_target.as_path())
+            && fs::metadata(&expected.raw_target).is_ok();
+        if became_live {
+            emit_warning(&live_foreign_envs_warning(
+                workspace_root,
+                &link,
+                &expected.owned.job_component,
+                &expected.current_job_component,
+            ));
+            return Ok(());
+        }
+        return Err(error);
+    }
+    let installed = directory
+        .read_link(link_name)
+        .with_context(|| format!("reading {}", link.display()))?;
+    if installed != new_target {
+        bail!(
+            "retread fast-tmp failed to point {} at {}; it points at {}",
+            link.display(),
+            new_target.display(),
+            installed.display()
+        );
+    }
+    emit_warning(&format!(
+        "retread fast-tmp: healed stale envs symlink (old job {} -> job {}) {} -> {}",
+        envs_job_label(&expected.owned.job_component),
+        envs_job_label(&expected.current_job_component),
+        link.display(),
+        new_target.display()
+    ));
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn heal_stale_envs_symlink_with_warning(
+    _workspace_root: &Path,
+    _configured_tmp_root: &Path,
+    _current_ns: Option<&Namespace>,
+    _emit_warning: impl Fn(&str),
+) -> Result<()> {
+    Ok(())
 }
 
 fn envs_job_label(job_component: &str) -> &str {
     job_component.strip_prefix("job-").unwrap_or(job_component)
 }
 
-fn quarantined_envs_symlink_matches(
+fn live_foreign_envs_warning(
     workspace_root: &Path,
-    quarantine: &Path,
+    link: &Path,
+    foreign_job_component: &str,
+    current_job_component: &str,
+) -> String {
+    format!(
+        "retread fast-tmp: LIVE JOB COLLISION: refusing to repoint {} from live job {} to current job {} because two live jobs share workspace {}; use a per-job workspace or disable fast-tmp",
+        link.display(),
+        envs_job_label(foreign_job_component),
+        envs_job_label(current_job_component),
+        workspace_root.display()
+    )
+}
+
+fn expected_envs_raw_target_matches(
+    workspace_root: &Path,
+    configured_tmp_root: &Path,
+    raw_target: &Path,
     expected: &ExpectedEnvsSymlink,
 ) -> Result<bool> {
-    let Ok(metadata) = fs::symlink_metadata(quarantine) else {
-        return Ok(false);
-    };
-    if !metadata.file_type().is_symlink()
-        || fs::read_link(quarantine).ok().as_deref() != Some(expected.raw_target.as_path())
-    {
+    if raw_target != expected.raw_target {
         return Ok(false);
     }
-    let Some(owned) = workspace_envs_link_target(workspace_root, &expected.raw_target)? else {
+    let Some(owned) =
+        workspace_envs_link_target(workspace_root, configured_tmp_root, raw_target, true)?
+    else {
         return Ok(false);
     };
     if owned != expected.owned {
         return Ok(false);
     }
     match expected.reason {
-        StaleEnvsSymlinkReason::Dangling => match fs::metadata(quarantine) {
+        StaleEnvsSymlinkReason::Dangling => match fs::metadata(raw_target) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
             Ok(_) => Ok(false),
             Err(error) => {
-                Err(error).with_context(|| format!("rechecking target of {}", quarantine.display()))
+                Err(error).with_context(|| format!("rechecking target {}", raw_target.display()))
             }
         },
         StaleEnvsSymlinkReason::DanglingTargetPrepared => Ok(true),
-        StaleEnvsSymlinkReason::ForeignJob => {
-            Ok(owned.job_component != expected.current_job_component)
+        StaleEnvsSymlinkReason::ForeignJob
+            if owned.job_component != expected.current_job_component =>
+        {
+            match fs::metadata(raw_target) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+                Ok(_) => Ok(false),
+                Err(error) => Err(error)
+                    .with_context(|| format!("rechecking target {}", raw_target.display())),
+            }
         }
+        StaleEnvsSymlinkReason::ForeignJob => Ok(false),
     }
 }
 
-fn quarantine_expected_envs_symlink(
+#[cfg(target_os = "linux")]
+fn restore_anchored_envs_quarantine(
+    directory: &AnchoredEnvsDirectory,
+    quarantine_name: &OsStr,
+    quarantine_display: &Path,
+    quarantine_identity: AnchoredPathIdentity,
+    link_name: &OsStr,
+    link_display: &Path,
+) -> Result<()> {
+    if directory.identity(quarantine_name).with_context(|| {
+        format!(
+            "checking quarantined envs symlink {} before restoration",
+            quarantine_display.display()
+        )
+    })? != quarantine_identity
+    {
+        bail!(
+            "retread fast-tmp: quarantine {} changed concurrently; preserved it and refused to overwrite {}",
+            quarantine_display.display(),
+            link_display.display()
+        );
+    }
+    match directory.stat(link_name) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => bail!(
+            "retread fast-tmp: {} changed concurrently; preserved the displaced path at {} without replacing the newer workspace path",
+            link_display.display(),
+            quarantine_display.display()
+        ),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "checking {} before restoring {}",
+                    link_display.display(),
+                    quarantine_display.display()
+                )
+            });
+        }
+    }
+    directory
+        .rename_over(quarantine_name, link_name)
+        .with_context(|| {
+            format!(
+                "atomically restoring {} from {}",
+                link_display.display(),
+                quarantine_display.display()
+            )
+        })
+}
+
+#[cfg(target_os = "linux")]
+fn atomic_remove_stale_envs_symlink(
+    directory: &AnchoredEnvsDirectory,
+    link_name: &OsStr,
     workspace_root: &Path,
+    configured_tmp_root: &Path,
     link: &Path,
     expected: &ExpectedEnvsSymlink,
-) -> Result<PathBuf> {
+) -> Result<()> {
     let parent = link
         .parent()
         .ok_or_else(|| anyhow!("symlink path {} has no parent", link.display()))?;
-    let quarantine = parent.join(format!(
+    let quarantine_name = OsString::from(format!(
         ".envs.retread-quarantine.{}.{}",
         std::process::id(),
         unique_nonce()
     ));
-    rename_noreplace(link, &quarantine).with_context(|| {
+    let quarantine = parent.join(&quarantine_name);
+    if !expected_envs_symlink_matches_at(
+        directory,
+        link_name,
+        workspace_root,
+        configured_tmp_root,
+        expected,
+    )? {
+        bail!(
+            "retread fast-tmp: {} changed or became live concurrently; refused envs-link removal",
+            link.display()
+        );
+    }
+    match directory.stat(&quarantine_name) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => bail!(
+            "retread fast-tmp: refusing to overwrite unexpected quarantine path {}",
+            quarantine.display()
+        ),
+        Err(error) => {
+            return Err(error).with_context(|| format!("checking {}", quarantine.display()));
+        }
+    }
+    directory
+        .rename_over(link_name, &quarantine_name)
+        .with_context(|| {
+            format!(
+                "atomically quarantining stale envs symlink {} as {}",
+                link.display(),
+                quarantine.display()
+            )
+        })?;
+    let quarantine_identity = directory.identity(&quarantine_name).with_context(|| {
         format!(
-            "quarantining stale envs symlink {} as {}",
-            link.display(),
+            "identifying quarantined envs symlink {}",
             quarantine.display()
         )
     })?;
-    let matches = match quarantined_envs_symlink_matches(workspace_root, &quarantine, expected) {
+    let matches = match expected_envs_symlink_matches_at(
+        directory,
+        &quarantine_name,
+        workspace_root,
+        configured_tmp_root,
+        expected,
+    ) {
         Ok(matches) => matches,
         Err(error) => {
-            restore_quarantined_path(&quarantine, link)?;
+            restore_anchored_envs_quarantine(
+                directory,
+                &quarantine_name,
+                &quarantine,
+                quarantine_identity,
+                link_name,
+                link,
+            )?;
             return Err(error).context(
                 "revalidating stale envs symlink before mutation; restored the workspace path",
             );
         }
     };
     if !matches {
-        restore_quarantined_path(&quarantine, link)?;
+        restore_anchored_envs_quarantine(
+            directory,
+            &quarantine_name,
+            &quarantine,
+            quarantine_identity,
+            link_name,
+            link,
+        )?;
         bail!(
             "retread fast-tmp: {} changed concurrently; restored it and refused envs-link mutation",
             link.display()
         );
     }
-    Ok(quarantine)
-}
-
-fn atomic_remove_stale_envs_symlink(
-    workspace_root: &Path,
-    link: &Path,
-    expected: &ExpectedEnvsSymlink,
-) -> Result<()> {
-    let quarantine = quarantine_expected_envs_symlink(workspace_root, link, expected)?;
-    match fs::remove_file(&quarantine) {
+    if directory.identity(&quarantine_name).with_context(|| {
+        format!(
+            "rechecking quarantined envs symlink {} before unlink",
+            quarantine.display()
+        )
+    })? != quarantine_identity
+    {
+        bail!(
+            "retread fast-tmp: quarantine {} changed concurrently; preserved the newer path",
+            quarantine.display()
+        );
+    }
+    let still_dangling = match expected_envs_symlink_matches_at(
+        directory,
+        &quarantine_name,
+        workspace_root,
+        configured_tmp_root,
+        expected,
+    ) {
+        Ok(matches) => matches,
+        Err(error) => {
+            restore_anchored_envs_quarantine(
+                directory,
+                &quarantine_name,
+                &quarantine,
+                quarantine_identity,
+                link_name,
+                link,
+            )?;
+            return Err(error).context(
+                "final dangling-target check failed; restored the workspace envs symlink",
+            );
+        }
+    };
+    if !still_dangling {
+        restore_anchored_envs_quarantine(
+            directory,
+            &quarantine_name,
+            &quarantine,
+            quarantine_identity,
+            link_name,
+            link,
+        )?;
+        bail!(
+            "retread fast-tmp: target of {} became live concurrently; restored it and refused envs-link removal",
+            link.display()
+        );
+    }
+    match directory.unlink(&quarantine_name) {
         Ok(()) => Ok(()),
         Err(error) => {
-            restore_quarantined_path(&quarantine, link)?;
+            restore_anchored_envs_quarantine(
+                directory,
+                &quarantine_name,
+                &quarantine,
+                quarantine_identity,
+                link_name,
+                link,
+            )?;
             Err(error).with_context(|| {
                 format!(
                     "removing quarantined stale envs symlink {}",
@@ -2289,66 +2722,268 @@ fn atomic_remove_stale_envs_symlink(
     }
 }
 
-#[cfg(unix)]
-fn atomic_replace_stale_envs_symlink(
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AnchoredPathIdentity {
+    device: u64,
+    inode: u64,
+}
+
+/// All names involved in the envs-link swap stay relative to one open
+/// directory. A concurrent rename/replacement of `.pixi` therefore cannot
+/// redirect validation, publication, or cleanup into a different directory.
+#[cfg(target_os = "linux")]
+struct AnchoredEnvsDirectory {
+    directory: File,
+}
+
+#[cfg(target_os = "linux")]
+impl AnchoredEnvsDirectory {
+    fn open(parent: &Path) -> std::io::Result<Self> {
+        Ok(Self {
+            directory: File::open(parent)?,
+        })
+    }
+
+    fn stat(&self, name: &OsStr) -> std::io::Result<rustix::fs::Stat> {
+        rustix::fs::statat(&self.directory, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(std::io::Error::from)
+    }
+
+    fn identity(&self, name: &OsStr) -> std::io::Result<AnchoredPathIdentity> {
+        let stat = self.stat(name)?;
+        Ok(AnchoredPathIdentity {
+            device: stat.st_dev,
+            inode: stat.st_ino,
+        })
+    }
+
+    fn read_link(&self, name: &OsStr) -> std::io::Result<PathBuf> {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let target = rustix::fs::readlinkat(&self.directory, name, Vec::new())
+            .map_err(std::io::Error::from)?;
+        Ok(PathBuf::from(OsString::from_vec(target.into_bytes())))
+    }
+
+    fn symlink(&self, target: &Path, name: &OsStr) -> std::io::Result<()> {
+        rustix::fs::symlinkat(target, &self.directory, name).map_err(std::io::Error::from)
+    }
+
+    fn rename_over(&self, source: &OsStr, destination: &OsStr) -> std::io::Result<()> {
+        rustix::fs::renameat(&self.directory, source, &self.directory, destination)
+            .map_err(std::io::Error::from)
+    }
+
+    fn unlink(&self, name: &OsStr) -> std::io::Result<()> {
+        rustix::fs::unlinkat(&self.directory, name, rustix::fs::AtFlags::empty())
+            .map_err(std::io::Error::from)
+    }
+
+    fn lock(&self, lock_display: &Path) -> Result<FileLock> {
+        let file = rustix::fs::openat(
+            &self.directory,
+            FAST_WORKSPACE_LINK_LOCK,
+            rustix::fs::OFlags::CREATE
+                | rustix::fs::OFlags::WRONLY
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::NOFOLLOW,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        )
+        .map(File::from)
+        .map_err(std::io::Error::from)
+        .with_context(|| format!("opening anchored lock file {}", lock_display.display()))?;
+        fs4::fs_std::FileExt::lock_exclusive(&file)
+            .with_context(|| format!("locking {}", lock_display.display()))?;
+        Ok(FileLock { file })
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn expected_envs_symlink_matches_at(
+    directory: &AnchoredEnvsDirectory,
+    name: &OsStr,
     workspace_root: &Path,
+    configured_tmp_root: &Path,
+    expected: &ExpectedEnvsSymlink,
+) -> Result<bool> {
+    let stat = match directory.stat(name) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).context("checking anchored envs-link entry"),
+    };
+    if !rustix::fs::FileType::from_raw_mode(stat.st_mode).is_symlink() {
+        return Ok(false);
+    }
+    let raw_target = directory
+        .read_link(name)
+        .context("reading anchored envs-link entry")?;
+    expected_envs_raw_target_matches(workspace_root, configured_tmp_root, &raw_target, expected)
+}
+
+#[cfg(target_os = "linux")]
+fn cleanup_prepared_envs_symlink(
+    directory: &AnchoredEnvsDirectory,
+    tmp_name: &OsStr,
+    tmp_display: &Path,
+    prepared_identity: AnchoredPathIdentity,
+) -> Result<()> {
+    match directory.identity(tmp_name) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error)
+            .with_context(|| format!("checking temporary envs symlink {}", tmp_display.display())),
+        Ok(identity) if identity != prepared_identity => bail!(
+            "retread fast-tmp: temporary path {} changed concurrently; preserved the newer path",
+            tmp_display.display()
+        ),
+        Ok(_) => directory.unlink(tmp_name).with_context(|| {
+            format!(
+                "removing uninstalled temporary envs symlink {}",
+                tmp_display.display()
+            )
+        }),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn atomic_replace_stale_envs_symlink(
+    directory: &AnchoredEnvsDirectory,
+    link_name: &OsStr,
+    workspace_root: &Path,
+    configured_tmp_root: &Path,
     link: &Path,
     new_target: &Path,
     expected: &ExpectedEnvsSymlink,
 ) -> Result<()> {
+    atomic_replace_stale_envs_symlink_with_hook(
+        directory,
+        link_name,
+        workspace_root,
+        configured_tmp_root,
+        link,
+        new_target,
+        expected,
+        |_| {},
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn atomic_replace_stale_envs_symlink_with_hook(
+    directory: &AnchoredEnvsDirectory,
+    link_name: &OsStr,
+    workspace_root: &Path,
+    configured_tmp_root: &Path,
+    link: &Path,
+    new_target: &Path,
+    expected: &ExpectedEnvsSymlink,
+    before_rename: impl FnOnce(&Path),
+) -> Result<()> {
     let parent = link
         .parent()
         .ok_or_else(|| anyhow!("symlink path {} has no parent", link.display()))?;
-    let tmp = parent.join(format!(
+    let tmp_name = OsString::from(format!(
         ".envs.retread-tmp.{}.{}",
         std::process::id(),
         unique_nonce()
     ));
-    std::os::unix::fs::symlink(new_target, &tmp).with_context(|| {
+    let tmp = parent.join(&tmp_name);
+    directory.symlink(new_target, &tmp_name).with_context(|| {
         format!(
             "creating temporary envs symlink {} -> {}",
             tmp.display(),
             new_target.display()
         )
     })?;
-    let result = (|| -> Result<()> {
-        let quarantine = quarantine_expected_envs_symlink(workspace_root, link, expected)?;
-        match rename_noreplace(&tmp, link) {
-            Ok(()) => fs::remove_file(&quarantine).with_context(|| {
-                format!(
-                    "removing replaced stale envs symlink {}",
-                    quarantine.display()
-                )
-            }),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                fs::remove_file(&quarantine).with_context(|| {
+    let prepared_identity = match directory.identity(&tmp_name) {
+        Ok(identity) => identity,
+        Err(error) => {
+            let cleanup = directory.unlink(&tmp_name);
+            if let Err(cleanup_error) = cleanup {
+                return Err(cleanup_error).with_context(|| {
                     format!(
-                        "removing displaced stale envs symlink {}",
-                        quarantine.display()
+                        "cleaning temporary envs symlink {} after identity check failed: {error}",
+                        tmp.display()
                     )
-                })?;
-                bail!(
-                    "retread fast-tmp: {} changed concurrently; refusing to replace the newer workspace path",
+                });
+            }
+            return Err(error)
+                .with_context(|| format!("identifying temporary envs symlink {}", tmp.display()));
+        }
+    };
+
+    let result = (|| -> Result<()> {
+        if !expected_envs_symlink_matches_at(
+            directory,
+            link_name,
+            workspace_root,
+            configured_tmp_root,
+            expected,
+        )? {
+            bail!(
+                "retread fast-tmp: {} changed concurrently; refused envs-link replacement",
+                link.display()
+            );
+        }
+        before_rename(&tmp);
+        if directory.identity(&tmp_name).with_context(|| {
+            format!(
+                "rechecking prepared envs symlink {} before publication",
+                tmp.display()
+            )
+        })? != prepared_identity
+        {
+            bail!(
+                "retread fast-tmp: prepared envs symlink {} changed concurrently; refused publication",
+                tmp.display()
+            );
+        }
+        // This is the final check immediately adjacent to publication. In
+        // particular, a foreign target that became live while we prepared the
+        // replacement is never repointed, even transiently.
+        if !expected_envs_symlink_matches_at(
+            directory,
+            link_name,
+            workspace_root,
+            configured_tmp_root,
+            expected,
+        )? {
+            bail!(
+                "retread fast-tmp: {} changed or became live concurrently; refused envs-link replacement",
+                link.display()
+            );
+        }
+        // POSIX rename-over is one atomic namespace operation and is supported
+        // by the NFS/Lustre workspace filesystems fast-tmp is designed for.
+        // The caller holds the flock opened through this same directory FD,
+        // which serializes this final proof/publication pair with writers.
+        directory
+            .rename_over(&tmp_name, link_name)
+            .with_context(|| {
+                format!(
+                    "atomically renaming prepared Retread envs symlink {} over {}",
+                    tmp.display(),
                     link.display()
                 )
-            }
-            Err(error) => {
-                restore_quarantined_path(&quarantine, link)?;
-                Err(error).with_context(|| {
-                    format!("installing current Retread envs symlink {}", link.display())
-                })
-            }
-        }
+            })
     })();
-    if result.is_err() {
-        let _ = fs::remove_file(&tmp);
+
+    if let Err(operation_error) = result {
+        if let Err(cleanup_error) =
+            cleanup_prepared_envs_symlink(directory, &tmp_name, &tmp, prepared_identity)
+        {
+            return Err(cleanup_error).context(format!(
+                "envs-link replacement also failed: {operation_error:#}"
+            ));
+        }
+        return Err(operation_error);
     }
-    result
+    Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(not(target_os = "linux"))]
 fn atomic_replace_stale_envs_symlink(
     _workspace_root: &Path,
+    _configured_tmp_root: &Path,
     _link: &Path,
     _new_target: &Path,
     _expected: &ExpectedEnvsSymlink,
@@ -3120,13 +3755,31 @@ mod tests {
 
     fn retread_envs_target(tmp_root: &Path, workspace: &Path, job: &str) -> PathBuf {
         let canonical = fs::canonicalize(workspace).unwrap();
+        let pixi_workspace_component =
+            pixi_envs_workspace_component(workspace, &canonical).unwrap();
         tmp_root
             .join(user_namespace_component())
             .join(workspace_hash(&canonical))
             .join(job)
             .join("envs")
-            .join("workspace-123456789")
+            .join(pixi_workspace_component)
             .join("envs")
+    }
+
+    fn write_envs_namespace_ownership_proof(target: &Path, workspace: &Path) {
+        let namespace_root = target.ancestors().nth(3).unwrap();
+        let canonical_workspace = fs::canonicalize(workspace).unwrap();
+        fs::create_dir_all(namespace_root.join("bld")).unwrap();
+        fs::write(
+            namespace_root.join("workspace-path"),
+            canonical_workspace.to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+        fs::write(
+            namespace_root.join("bld").join(RETREAD_BLD_OWNER_MARKER),
+            bld_owner_marker_contents(&canonical_workspace),
+        )
+        .unwrap();
     }
 
     fn pair_map(pairs: &[(String, String)]) -> HashMap<String, String> {
@@ -3798,6 +4451,37 @@ fi
     }
 
     #[test]
+    fn pixi_envs_component_honors_legacy_project_and_package_names() {
+        let root = tmp_dir("pixi-envs-name-fallbacks");
+        for (directory, manifest, expected_name) in [
+            (
+                "project",
+                "[project]\nname = \"legacy-project\"\nchannels = []\n",
+                "legacy-project",
+            ),
+            (
+                "package",
+                "[workspace]\nchannels = []\n\n[package]\nname = \"package-name\"\nversion = \"1.0.0\"\n",
+                "package-name",
+            ),
+        ] {
+            let workspace = root.join(directory);
+            fs::create_dir_all(&workspace).unwrap();
+            fs::write(workspace.join("pixi.toml"), manifest).unwrap();
+            let canonical = fs::canonicalize(&workspace).unwrap();
+
+            assert_eq!(
+                pixi_envs_workspace_component(&workspace, &canonical).unwrap(),
+                format!(
+                    "{expected_name}-{}",
+                    xxh3_64(canonical.to_string_lossy().as_bytes())
+                )
+            );
+        }
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn probe_failure_is_not_slow() {
         let _lock = ENV_MUTEX.lock().unwrap();
         let guard = EnvGuard::new(&fasttmp_env_keys());
@@ -4065,7 +4749,10 @@ fi
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn backend_heals_foreign_job_retread_envs_symlink() {
+    fn backend_preserves_live_foreign_job_retread_envs_symlink_and_warns() {
+        use std::cell::RefCell;
+        use std::os::unix::fs::MetadataExt as _;
+
         let _lock = ENV_MUTEX.lock().unwrap();
         let guard = EnvGuard::new(&fasttmp_env_keys());
         let root = tmp_dir("foreign-job-envs");
@@ -4078,8 +4765,62 @@ fi
         let new_target = retread_envs_target(&tmp_root, &ws, "job-4305035");
         fs::create_dir_all(&old_target).unwrap();
         fs::write(old_target.join("keep"), b"old job environment").unwrap();
+        write_envs_namespace_ownership_proof(&old_target, &ws);
         let link = pixi.join("envs");
         std::os::unix::fs::symlink(&old_target, &link).unwrap();
+        let inode_before = fs::symlink_metadata(&link).unwrap().ino();
+        guard.set("SLURM_JOB_ID", "4305035");
+        guard.set("RETREAD_FAST_TMP", "on");
+        guard.set("RETREAD_FAST_TMP_ROOT", tmp_root.to_str().unwrap());
+        let cfg = FastTmpConfig::load(&ws);
+        let current_ns = namespace(&cfg, &ws);
+        let warnings = RefCell::new(Vec::new());
+
+        heal_stale_envs_symlink_with_warning(&ws, &cfg.tmp_root, Some(&current_ns), |message| {
+            warnings.borrow_mut().push(message.to_string())
+        })
+        .unwrap();
+
+        assert_eq!(fs::read_link(&link).unwrap(), old_target);
+        assert_eq!(fs::symlink_metadata(&link).unwrap().ino(), inode_before);
+        assert!(!new_target.exists());
+        assert_eq!(
+            fs::read(old_target.join("keep")).unwrap(),
+            b"old job environment"
+        );
+        let warnings = warnings.into_inner();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        let warning = &warnings[0];
+        assert!(warning.contains("LIVE JOB COLLISION"), "{warning}");
+        assert!(
+            warning.contains("two live jobs share workspace"),
+            "{warning}"
+        );
+        assert!(warning.contains("4305034"), "{warning}");
+        assert!(warning.contains("4305035"), "{warning}");
+        assert!(warning.contains("per-job workspace"), "{warning}");
+        assert!(warning.contains("disable fast-tmp"), "{warning}");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn backend_heals_dangling_foreign_job_retread_envs_symlink() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let guard = EnvGuard::new(&fasttmp_env_keys());
+        let root = tmp_dir("dangling-foreign-job-envs");
+        let ws = root.join("workspace");
+        write_workspace(&ws);
+        let pixi = ws.join(".pixi");
+        fs::create_dir_all(&pixi).unwrap();
+        let tmp_root = root.join("tmp");
+        let old_target = retread_envs_target(&tmp_root, &ws, "job-4305034");
+        let new_target = retread_envs_target(&tmp_root, &ws, "job-4305035");
+        let link = pixi.join("envs");
+        std::os::unix::fs::symlink(&old_target, &link).unwrap();
+        let inode_before = fs::symlink_metadata(&link).unwrap().ino();
         guard.set("SLURM_JOB_ID", "4305035");
         guard.set("RETREAD_FAST_TMP", "on");
         guard.set("RETREAD_FAST_TMP_ROOT", tmp_root.to_str().unwrap());
@@ -4087,11 +4828,55 @@ fi
         heal_stale_envs_symlink_at_backend_startup(&ws).unwrap();
 
         assert_eq!(fs::read_link(&link).unwrap(), new_target);
+        assert_ne!(fs::symlink_metadata(&link).unwrap().ino(), inode_before);
         assert!(new_target.is_dir());
-        assert_eq!(
-            fs::read(old_target.join("keep")).unwrap(),
-            b"old job environment"
+        assert!(!old_target.exists());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn healed_namespace_proves_later_live_foreign_job_collision() {
+        use std::cell::RefCell;
+
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let guard = EnvGuard::new(&fasttmp_env_keys());
+        let root = tmp_dir("healed-live-foreign-proof");
+        let ws = root.join("workspace");
+        write_workspace(&ws);
+        let pixi = ws.join(".pixi");
+        fs::create_dir_all(&pixi).unwrap();
+        let tmp_root = root.join("tmp");
+        let old_target = retread_envs_target(&tmp_root, &ws, "job-4305034");
+        let healed_target = retread_envs_target(&tmp_root, &ws, "job-4305035");
+        let link = pixi.join("envs");
+        std::os::unix::fs::symlink(&old_target, &link).unwrap();
+        guard.set("SLURM_JOB_ID", "4305035");
+        guard.set("RETREAD_FAST_TMP", "on");
+        guard.set("RETREAD_FAST_TMP_ROOT", tmp_root.to_str().unwrap());
+
+        heal_stale_envs_symlink_at_backend_startup(&ws).unwrap();
+        assert_eq!(fs::read_link(&link).unwrap(), healed_target);
+
+        guard.set("SLURM_JOB_ID", "4305036");
+        let cfg = FastTmpConfig::load(&ws);
+        let next_ns = namespace(&cfg, &ws);
+        let warnings = RefCell::new(Vec::new());
+        heal_stale_envs_symlink_with_warning(&ws, &cfg.tmp_root, Some(&next_ns), |message| {
+            warnings.borrow_mut().push(message.to_string())
+        })
+        .unwrap();
+
+        assert_eq!(fs::read_link(&link).unwrap(), healed_target);
+        let warnings = warnings.into_inner();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("LIVE JOB COLLISION"),
+            "{}",
+            warnings[0]
         );
+        assert!(warnings[0].contains("4305035"), "{}", warnings[0]);
+        assert!(warnings[0].contains("4305036"), "{}", warnings[0]);
         fs::remove_dir_all(root).ok();
     }
 
@@ -4110,6 +4895,7 @@ fi
         let tmp_root = root.join("tmp");
         let target = retread_envs_target(&tmp_root, &ws, "job-4305035");
         fs::create_dir_all(&target).unwrap();
+        write_envs_namespace_ownership_proof(&target, &ws);
         let link = pixi.join("envs");
         std::os::unix::fs::symlink(&target, &link).unwrap();
         let inode_before = fs::symlink_metadata(&link).unwrap().ino();
@@ -4150,6 +4936,82 @@ fi
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn backend_preserves_prefix_shaped_unowned_envs_symlink() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let guard = EnvGuard::new(&fasttmp_env_keys());
+        let root = tmp_dir("prefix-shaped-user-envs");
+        let ws = root.join("workspace");
+        write_workspace(&ws);
+        let pixi = ws.join(".pixi");
+        fs::create_dir_all(&pixi).unwrap();
+        let rogue_tmp_root = root.join("rogue-tmp");
+        let configured_tmp_root = root.join("managed-tmp");
+        let user_target = retread_envs_target(&rogue_tmp_root, &ws, "job-4305034");
+        let managed_target = retread_envs_target(&configured_tmp_root, &ws, "job-4305035");
+        write_envs_namespace_ownership_proof(&user_target, &ws);
+        let link = pixi.join("envs");
+        std::os::unix::fs::symlink(&user_target, &link).unwrap();
+        let inode_before = fs::symlink_metadata(&link).unwrap().ino();
+        guard.set("SLURM_JOB_ID", "4305035");
+        guard.set("RETREAD_FAST_TMP", "on");
+        guard.set(
+            "RETREAD_FAST_TMP_ROOT",
+            configured_tmp_root.to_str().unwrap(),
+        );
+
+        heal_stale_envs_symlink_at_backend_startup(&ws).unwrap();
+
+        assert_eq!(fs::read_link(&link).unwrap(), user_target);
+        assert_eq!(fs::symlink_metadata(&link).unwrap().ino(), inode_before);
+        assert!(!user_target.exists());
+        assert!(!managed_target.exists());
+        assert!(!configured_tmp_root.exists());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn backend_preserves_forged_pixi_workspace_hash_envs_symlink() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let guard = EnvGuard::new(&fasttmp_env_keys());
+        let root = tmp_dir("forged-pixi-workspace-hash");
+        let ws = root.join("workspace");
+        write_workspace(&ws);
+        let pixi = ws.join(".pixi");
+        fs::create_dir_all(&pixi).unwrap();
+        let configured_tmp_root = root.join("managed-tmp");
+        let canonical_workspace = fs::canonicalize(&ws).unwrap();
+        let user_target = configured_tmp_root
+            .join(user_namespace_component())
+            .join(workspace_hash(&canonical_workspace))
+            .join("job-4305034")
+            .join("envs")
+            .join("workspace-1")
+            .join("envs");
+        let link = pixi.join("envs");
+        std::os::unix::fs::symlink(&user_target, &link).unwrap();
+        let inode_before = fs::symlink_metadata(&link).unwrap().ino();
+        guard.set("SLURM_JOB_ID", "4305035");
+        guard.set("RETREAD_FAST_TMP", "on");
+        guard.set(
+            "RETREAD_FAST_TMP_ROOT",
+            configured_tmp_root.to_str().unwrap(),
+        );
+
+        heal_stale_envs_symlink_at_backend_startup(&ws).unwrap();
+
+        assert_eq!(fs::read_link(&link).unwrap(), user_target);
+        assert_eq!(fs::symlink_metadata(&link).unwrap().ino(), inode_before);
+        assert!(!configured_tmp_root.exists());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn backend_preserves_real_envs_directory() {
         let _lock = ENV_MUTEX.lock().unwrap();
         let guard = EnvGuard::new(&fasttmp_env_keys());
@@ -4185,11 +5047,326 @@ fi
         std::os::unix::fs::symlink(&target, &link).unwrap();
         guard.set("SLURM_JOB_ID", "4305035");
         guard.set("RETREAD_FAST_TMP", "off");
+        guard.set("RETREAD_FAST_TMP_ROOT", root.join("tmp").to_str().unwrap());
 
         heal_stale_envs_symlink_at_backend_startup(&ws).unwrap();
 
         assert!(fs::symlink_metadata(&link).is_err());
         assert!(!target.exists());
+        assert!(
+            fs::read_dir(&pixi)
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("retread-quarantine"))
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn envs_replacement_renames_prepared_symlink_over_existing_link() {
+        use std::cell::Cell;
+        use std::os::unix::fs::MetadataExt as _;
+
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let guard = EnvGuard::new(&fasttmp_env_keys());
+        let root = tmp_dir("atomic-envs-replace");
+        let ws = root.join("workspace");
+        write_workspace(&ws);
+        let pixi = ws.join(".pixi");
+        fs::create_dir_all(&pixi).unwrap();
+        let tmp_root = root.join("tmp");
+        let old_target = retread_envs_target(&tmp_root, &ws, "job-4305034");
+        let new_target = retread_envs_target(&tmp_root, &ws, "job-4305035");
+        fs::create_dir_all(&new_target).unwrap();
+        let link = pixi.join("envs");
+        std::os::unix::fs::symlink(&old_target, &link).unwrap();
+        let inode_before = fs::symlink_metadata(&link).unwrap().ino();
+        guard.set("SLURM_JOB_ID", "4305035");
+        let owned = workspace_envs_link_target(&ws, &tmp_root, &old_target, true)
+            .unwrap()
+            .unwrap();
+        let expected = ExpectedEnvsSymlink {
+            raw_target: old_target.clone(),
+            owned,
+            current_job_component: current_job_component(),
+            reason: StaleEnvsSymlinkReason::ForeignJob,
+        };
+        let rename_observed = Cell::new(false);
+        let _link_lock = open_and_lock(&pixi.join(FAST_WORKSPACE_LINK_LOCK)).unwrap();
+        let directory = AnchoredEnvsDirectory::open(&pixi).unwrap();
+
+        atomic_replace_stale_envs_symlink_with_hook(
+            &directory,
+            OsStr::new("envs"),
+            &ws,
+            &tmp_root,
+            &link,
+            &new_target,
+            &expected,
+            |prepared| {
+                assert_eq!(fs::read_link(&link).unwrap(), old_target);
+                assert_eq!(fs::read_link(prepared).unwrap(), new_target);
+                assert!(
+                    prepared
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with(".envs.retread-tmp.")
+                );
+                rename_observed.set(true);
+            },
+        )
+        .unwrap();
+
+        assert!(rename_observed.get());
+        assert_eq!(fs::read_link(&link).unwrap(), new_target);
+        assert_ne!(fs::symlink_metadata(&link).unwrap().ino(), inode_before);
+        assert!(
+            fs::read_dir(&pixi)
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| !entry.file_name().to_string_lossy().contains("retread-tmp"))
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn envs_rename_stays_anchored_when_pixi_directory_moves() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let guard = EnvGuard::new(&fasttmp_env_keys());
+        let root = tmp_dir("envs-pixi-directory-race");
+        let ws = root.join("workspace");
+        write_workspace(&ws);
+        let pixi = ws.join(".pixi");
+        fs::create_dir_all(&pixi).unwrap();
+        let displaced_pixi = ws.join(".pixi-displaced");
+        let tmp_root = root.join("tmp");
+        let old_target = retread_envs_target(&tmp_root, &ws, "job-4305034");
+        let new_target = retread_envs_target(&tmp_root, &ws, "job-4305035");
+        fs::create_dir_all(&new_target).unwrap();
+        let user_target = root.join("user-envs");
+        let link = pixi.join("envs");
+        std::os::unix::fs::symlink(&old_target, &link).unwrap();
+        guard.set("SLURM_JOB_ID", "4305035");
+        let owned = workspace_envs_link_target(&ws, &tmp_root, &old_target, true)
+            .unwrap()
+            .unwrap();
+        let expected = ExpectedEnvsSymlink {
+            raw_target: old_target,
+            owned,
+            current_job_component: current_job_component(),
+            reason: StaleEnvsSymlinkReason::ForeignJob,
+        };
+        let _link_lock = open_and_lock(&pixi.join(FAST_WORKSPACE_LINK_LOCK)).unwrap();
+        let directory = AnchoredEnvsDirectory::open(&pixi).unwrap();
+
+        atomic_replace_stale_envs_symlink_with_hook(
+            &directory,
+            OsStr::new("envs"),
+            &ws,
+            &tmp_root,
+            &link,
+            &new_target,
+            &expected,
+            |_| {
+                fs::rename(&pixi, &displaced_pixi).unwrap();
+                fs::create_dir_all(&pixi).unwrap();
+                std::os::unix::fs::symlink(&user_target, &link).unwrap();
+            },
+        )
+        .unwrap();
+
+        assert_eq!(fs::read_link(&link).unwrap(), user_target);
+        assert_eq!(
+            fs::read_link(displaced_pixi.join("envs")).unwrap(),
+            new_target
+        );
+        assert!(
+            fs::read_dir(&displaced_pixi)
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| !entry.file_name().to_string_lossy().contains("retread-tmp"))
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn envs_rename_refuses_concurrently_installed_user_symlink() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let guard = EnvGuard::new(&fasttmp_env_keys());
+        let root = tmp_dir("envs-user-link-race");
+        let ws = root.join("workspace");
+        write_workspace(&ws);
+        let pixi = ws.join(".pixi");
+        fs::create_dir_all(&pixi).unwrap();
+        let tmp_root = root.join("tmp");
+        let old_target = retread_envs_target(&tmp_root, &ws, "job-4305034");
+        let new_target = retread_envs_target(&tmp_root, &ws, "job-4305035");
+        fs::create_dir_all(&new_target).unwrap();
+        let user_target = root.join("user-envs");
+        let link = pixi.join("envs");
+        std::os::unix::fs::symlink(&old_target, &link).unwrap();
+        guard.set("SLURM_JOB_ID", "4305035");
+        let owned = workspace_envs_link_target(&ws, &tmp_root, &old_target, true)
+            .unwrap()
+            .unwrap();
+        let expected = ExpectedEnvsSymlink {
+            raw_target: old_target,
+            owned,
+            current_job_component: current_job_component(),
+            reason: StaleEnvsSymlinkReason::ForeignJob,
+        };
+        let _link_lock = open_and_lock(&pixi.join(FAST_WORKSPACE_LINK_LOCK)).unwrap();
+        let directory = AnchoredEnvsDirectory::open(&pixi).unwrap();
+
+        let error = atomic_replace_stale_envs_symlink_with_hook(
+            &directory,
+            OsStr::new("envs"),
+            &ws,
+            &tmp_root,
+            &link,
+            &new_target,
+            &expected,
+            |_| {
+                fs::remove_file(&link).unwrap();
+                std::os::unix::fs::symlink(&user_target, &link).unwrap();
+            },
+        )
+        .unwrap_err();
+        let error = format!("{error:#}");
+
+        assert!(
+            error.contains("changed or became live concurrently"),
+            "{error}"
+        );
+        assert_eq!(fs::read_link(&link).unwrap(), user_target);
+        assert!(
+            fs::read_dir(&pixi)
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| !entry.file_name().to_string_lossy().contains("retread-tmp"))
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn envs_rename_refuses_replaced_prepared_symlink() {
+        use std::cell::RefCell;
+
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let guard = EnvGuard::new(&fasttmp_env_keys());
+        let root = tmp_dir("envs-prepared-link-race");
+        let ws = root.join("workspace");
+        write_workspace(&ws);
+        let pixi = ws.join(".pixi");
+        fs::create_dir_all(&pixi).unwrap();
+        let tmp_root = root.join("tmp");
+        let old_target = retread_envs_target(&tmp_root, &ws, "job-4305034");
+        let new_target = retread_envs_target(&tmp_root, &ws, "job-4305035");
+        fs::create_dir_all(&new_target).unwrap();
+        let user_target = root.join("user-prepared-envs");
+        let link = pixi.join("envs");
+        std::os::unix::fs::symlink(&old_target, &link).unwrap();
+        guard.set("SLURM_JOB_ID", "4305035");
+        let owned = workspace_envs_link_target(&ws, &tmp_root, &old_target, true)
+            .unwrap()
+            .unwrap();
+        let expected = ExpectedEnvsSymlink {
+            raw_target: old_target.clone(),
+            owned,
+            current_job_component: current_job_component(),
+            reason: StaleEnvsSymlinkReason::ForeignJob,
+        };
+        let _link_lock = open_and_lock(&pixi.join(FAST_WORKSPACE_LINK_LOCK)).unwrap();
+        let directory = AnchoredEnvsDirectory::open(&pixi).unwrap();
+        let prepared_path = RefCell::new(None);
+
+        let error = atomic_replace_stale_envs_symlink_with_hook(
+            &directory,
+            OsStr::new("envs"),
+            &ws,
+            &tmp_root,
+            &link,
+            &new_target,
+            &expected,
+            |prepared| {
+                *prepared_path.borrow_mut() = Some(prepared.to_path_buf());
+                fs::remove_file(prepared).unwrap();
+                std::os::unix::fs::symlink(&user_target, prepared).unwrap();
+            },
+        )
+        .unwrap_err();
+        let error = format!("{error:#}");
+
+        assert!(error.contains("preserved the newer path"), "{error}");
+        assert_eq!(fs::read_link(&link).unwrap(), old_target);
+        let prepared_path = prepared_path.into_inner().unwrap();
+        assert_eq!(fs::read_link(&prepared_path).unwrap(), user_target);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn envs_rename_never_repoints_foreign_link_if_target_becomes_live() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let guard = EnvGuard::new(&fasttmp_env_keys());
+        let root = tmp_dir("envs-foreign-target-race");
+        let ws = root.join("workspace");
+        write_workspace(&ws);
+        let pixi = ws.join(".pixi");
+        fs::create_dir_all(&pixi).unwrap();
+        let tmp_root = root.join("tmp");
+        let old_target = retread_envs_target(&tmp_root, &ws, "job-4305034");
+        let new_target = retread_envs_target(&tmp_root, &ws, "job-4305035");
+        fs::create_dir_all(&new_target).unwrap();
+        let link = pixi.join("envs");
+        std::os::unix::fs::symlink(&old_target, &link).unwrap();
+        let inode_before = fs::symlink_metadata(&link).unwrap().ino();
+        guard.set("SLURM_JOB_ID", "4305035");
+        let owned = workspace_envs_link_target(&ws, &tmp_root, &old_target, true)
+            .unwrap()
+            .unwrap();
+        let expected = ExpectedEnvsSymlink {
+            raw_target: old_target.clone(),
+            owned,
+            current_job_component: current_job_component(),
+            reason: StaleEnvsSymlinkReason::ForeignJob,
+        };
+        let _link_lock = open_and_lock(&pixi.join(FAST_WORKSPACE_LINK_LOCK)).unwrap();
+        let directory = AnchoredEnvsDirectory::open(&pixi).unwrap();
+
+        let error = atomic_replace_stale_envs_symlink_with_hook(
+            &directory,
+            OsStr::new("envs"),
+            &ws,
+            &tmp_root,
+            &link,
+            &new_target,
+            &expected,
+            |_| fs::create_dir_all(&old_target).unwrap(),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("became live concurrently"), "{error}");
+        assert_eq!(fs::read_link(&link).unwrap(), old_target);
+        assert_eq!(fs::symlink_metadata(&link).unwrap().ino(), inode_before);
+        assert!(old_target.is_dir());
+        assert!(
+            fs::read_dir(&pixi)
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| !entry.file_name().to_string_lossy().contains("retread-tmp"))
+        );
         fs::remove_dir_all(root).ok();
     }
 
@@ -4206,7 +5383,6 @@ fi
         let tmp_root = root.join("tmp");
         let old_target = retread_envs_target(&tmp_root, &ws, "job-4305034");
         let new_target = retread_envs_target(&tmp_root, &ws, "job-4305035");
-        fs::create_dir_all(&old_target).unwrap();
         let link = pixi.join("envs");
         std::os::unix::fs::symlink(&old_target, &link).unwrap();
         guard.set("SLURM_JOB_ID", "4305035");
