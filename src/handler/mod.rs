@@ -2480,6 +2480,11 @@ impl Handler {
         })?;
         let workspace_dir = params.workspace_directory;
         ensure_pixi_bld_symlink_target(workspace_dir.as_deref())?;
+        if let Some(workspace_root) = pixi_workspace_dir(workspace_dir.as_deref()) {
+            crate::fasttmp::heal_stale_envs_symlink_at_backend_startup(&workspace_root).map_err(
+                |error| RpcError::internal(format!("fast-tmp backend envs-link heal: {error:#}")),
+            )?;
+        }
         config.pack_manifest_path = Some(crate::pack_overrides::pack_manifest_display_path(
             workspace_dir.as_deref(),
             &params.manifest_path,
