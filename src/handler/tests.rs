@@ -3650,7 +3650,6 @@ fn abi_anchor_exact_pin_normalizes_to_within_minor_band() {
     for (original, normalized) in [
         ("==1.26.0", ">=1.26,<1.27"),
         (">=1.23.5,==1.26.0,~=1.26.0,<2.5", ">=1.26.0,<1.27"),
-        (">=1.26.0,<=1.26.0", ">=1.26.0,<1.27"),
         ("==2.0.0", ">=2.0,<2.1"),
     ] {
         assert_eq!(
@@ -3670,10 +3669,10 @@ fn abi_anchor_exact_pin_normalizes_to_within_minor_band() {
     );
     assert!(!normalized.contains(&Version::from_str("1.27").unwrap()));
 
-    for already_banded in [">=1.26,<1.27", "==1.26.*"] {
+    for not_an_exact_pin in [">=1.26,<1.27", "==1.26.*", ">=1.26.0,<=1.26.0"] {
         assert!(
-            widen_exact_abi_anchor_spec_to_minor_band(already_banded).is_none(),
-            "{already_banded}"
+            widen_exact_abi_anchor_spec_to_minor_band(not_an_exact_pin).is_none(),
+            "{not_an_exact_pin}"
         );
     }
 
@@ -3682,6 +3681,43 @@ fn abi_anchor_exact_pin_normalizes_to_within_minor_band() {
     let excluded = VersionSpecifiers::from_str(&excluded).unwrap();
     assert!(!excluded.contains(&Version::from_str("1.26.2").unwrap()));
     assert!(excluded.contains(&Version::from_str("1.26.4").unwrap()));
+}
+
+#[test]
+fn abi_anchor_exact_pin_band_preserves_joined_source_upper_bound() {
+    let mut bundle = solo_bundle("anchor-cobound-pack", vec!["numpy<=1.26.0"]);
+    bundle.auto_routed.push(bundle_auto_route(
+        "numpy",
+        "1.26.0",
+        Provenance::PriorSelection,
+    ));
+
+    let (output, warnings) = produce_output_pending_relaxations(
+        &bundle,
+        &cfg(),
+        Platform::Linux64,
+        "3.11",
+        &[],
+        None,
+        None,
+    )
+    .unwrap();
+    let emitted = output
+        .run_dependencies
+        .depends
+        .iter()
+        .find(|dependency| dependency.name == "numpy")
+        .map(|dependency| format_packagespec(&dependency.spec))
+        .expect("NumPy run dependency");
+
+    assert_eq!(emitted, ">=1.26,<=1.26.0");
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    let emitted =
+        VersionSpec::from_str(&emitted, rattler_conda_types::ParseStrictness::Lenient).unwrap();
+    assert!(
+        !emitted.matches(&rattler_conda_types::Version::from_str("1.26.4").unwrap()),
+        "the independent <=1.26.0 source bound must remain load-bearing"
+    );
 }
 
 #[test]
@@ -3717,7 +3753,7 @@ fn abi_anchor_exact_pin_band_resolves_cross_pack_patch_shape() {
     assert!(
         warnings[0]
             .to_string()
-            .contains("RETREAD AUTO-COMPLETED ABI anchor")
+            .contains("RETREAD AUTO-WIDENED ABI anchor exact pin")
     );
 
     let candidate = rattler_conda_types::Version::from_str("1.26.4").unwrap();
@@ -3942,6 +3978,170 @@ fn abi_anchor_cap_completion_sha_bound_lock_replay_round_trips() {
     )
     .expect("schema-current SHA-bound lock must validate without stale relaxation errors")
     .expect("matching SHA-bound lock must replay");
+    let numpy = replay
+        .run_dependencies
+        .depends
+        .iter()
+        .find(|dependency| dependency.name == "numpy")
+        .map(|dependency| format_packagespec(&dependency.spec))
+        .expect("replayed NumPy run dependency");
+    assert_eq!(numpy, NORMALIZED);
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn abi_anchor_exact_pin_widening_sha_bound_lock_replay_round_trips() {
+    const BUNDLE: &str = "abi-exact-replay-pack";
+    const VERSION: &str = "1.0.0";
+    const INPUTS_HASH: &str = "abi-exact-record-hash";
+    const ORIGINAL: &str = "==1.26.0";
+    const NORMALIZED: &str = ">=1.26,<1.27";
+
+    let _env_guard = TEST_ENV_MUTEX.lock().unwrap();
+    let target = ResolutionTarget::from_wheel_target(
+        crate::pypi::WheelTarget {
+            python_version: "3.11".to_string(),
+            conda_subdir: "linux-64".to_string(),
+            max_glibc: None,
+        },
+        None,
+    );
+    let mut bundle = solo_bundle(BUNDLE, vec![]);
+    bundle.auto_routed.push(bundle_auto_route(
+        "numpy",
+        "1.26.0",
+        Provenance::PriorSelection,
+    ));
+    let (output, warnings) = produce_output_pending_relaxations(
+        &bundle,
+        &cfg(),
+        Platform::Linux64,
+        "3.11",
+        &[],
+        None,
+        None,
+    )
+    .unwrap();
+    let emitted = output
+        .run_dependencies
+        .depends
+        .iter()
+        .find(|dependency| dependency.name == "numpy")
+        .map(|dependency| format_packagespec(&dependency.spec))
+        .expect("emitted NumPy run dependency");
+    assert_eq!(emitted, NORMALIZED);
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    let warning = warnings[0].to_string();
+    assert!(
+        warning.contains("RETREAD AUTO-WIDENED ABI anchor exact pin"),
+        "{warning}"
+    );
+    assert!(
+        warning.contains(&format!("`{ORIGINAL}` -> `{NORMALIZED}`")),
+        "{warning}"
+    );
+
+    let manifest = bundled_relaxations_for_output(BUNDLE, BUNDLE, &target, &[], &warnings)
+        .expect("ABI-anchor exact-pin widening must produce a durable manifest");
+    assert_eq!(
+        manifest.schema_version,
+        crate::relaxation_record::RELAXATION_MANIFEST_SCHEMA
+    );
+    assert_eq!(crate::relaxation_record::RELAXATION_MANIFEST_SCHEMA, 2);
+    assert_eq!(manifest.records().len(), 1);
+    assert_eq!(manifest.records()[0].original_spec, ORIGINAL);
+    assert_eq!(manifest.records()[0].resulting_spec, NORMALIZED);
+    assert_eq!(
+        manifest.records()[0].kind,
+        crate::relaxation_record::RelaxationRecordKind::ExactPinWidened
+    );
+
+    let sha256 = "22".repeat(32);
+    let filename = format!("{}-{VERSION}-py3-none-any.whl", BUNDLE.replace('-', "_"));
+    let lock = crate::lock::RetreadLock {
+        schema: crate::lock::SCHEMA,
+        retread_version: env!("CARGO_PKG_VERSION").to_string(),
+        bundle: BUNDLE.to_string(),
+        version: VERSION.to_string(),
+        python: "3.11".to_string(),
+        target_subdir: "linux-64".to_string(),
+        target_contract: None,
+        target_identity: None,
+        target_scope: None,
+        exact_workspace_envelope: false,
+        inputs_hash: INPUTS_HASH.to_string(),
+        root_requirements: vec![format!("{BUNDLE}=={VERSION}")],
+        wheels: vec![crate::lock::LockWheel {
+            name: BUNDLE.to_string(),
+            version: VERSION.to_string(),
+            origin: crate::lock::Origin::Index,
+            filename: filename.clone(),
+            url: Some(format!("https://example.com/{filename}")),
+            sha256: Some(sha256.clone()),
+            requires_dist: vec![],
+            must_ship: false,
+            upstream_url: None,
+            git_source: None,
+            sdist_source: None,
+        }],
+        abi_context: Some(crate::lock::LockAbiContext {
+            wheels: vec![crate::lock::LockWheelAbiMetadata {
+                name: BUNDLE.to_string(),
+                sha256,
+                requires_dist: vec![],
+            }],
+        }),
+        relaxations: manifest.records().to_vec(),
+        conda_run_deps: vec![crate::lock::CondaDep {
+            name: "numpy".to_string(),
+            spec: NORMALIZED.to_string(),
+        }],
+        index_urls: vec!["https://pypi.org/simple/".to_string()],
+        prerelease: BTreeMap::new(),
+        shadow_libs: BTreeMap::new(),
+        declared_glibc: None,
+        resolution_glibc: None,
+        conda_capable: vec!["numpy".to_string()],
+        entry_specs: vec![format!("{BUNDLE}=={VERSION}")],
+        wheel_store: None,
+    };
+
+    let root = unique_test_dir("abi-exact-record-replay");
+    std::fs::create_dir_all(&root).unwrap();
+    let lock_path = root.join(crate::lock::RetreadLock::file_name_for_target(
+        BUNDLE, &target,
+    ));
+    std::fs::write(&lock_path, lock.to_pretty_json().unwrap()).unwrap();
+
+    let reloaded = crate::lock::RetreadLock::load(&lock_path).unwrap();
+    assert_eq!(reloaded.schema, crate::lock::SCHEMA);
+    assert_eq!(crate::lock::SCHEMA, 18);
+    assert_eq!(reloaded.relaxations, manifest.records());
+    assert_eq!(
+        reloaded.relaxations[0].kind,
+        crate::relaxation_record::RelaxationRecordKind::ExactPinWidened
+    );
+    let replay_manifest = RelaxationManifest::new(BUNDLE, reloaded.relaxations.clone()).unwrap();
+    replay_manifest.validate_for(BUNDLE, &target).unwrap();
+
+    let replay = replay_from_lock_for_target(
+        &lock_path,
+        INPUTS_HASH,
+        true,
+        &target,
+        BUNDLE,
+        Platform::Linux64,
+        0,
+        false,
+        &[],
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        &AbiAliasGraph::new(),
+    )
+    .expect("schema-current SHA-bound lock must validate the exact-pin relaxation record")
+    .expect("matching SHA-bound exact-pin lock must replay");
     let numpy = replay
         .run_dependencies
         .depends

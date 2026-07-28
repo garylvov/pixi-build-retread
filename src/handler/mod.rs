@@ -11596,10 +11596,7 @@ fn widen_exact_abi_anchor_spec_to_minor_band(spec: &str) -> Option<String> {
         .iter()
         .filter_map(|specifier| {
             let pins_exact_release = specifier.version().only_release() == exact;
-            if (*specifier.operator() == Operator::Equal
-                || *specifier.operator() == Operator::LessThanEqual)
-                && pins_exact_release
-            {
+            if *specifier.operator() == Operator::Equal && pins_exact_release {
                 removed_exact_constraint = true;
                 None
             } else {
@@ -11668,8 +11665,11 @@ fn normalize_emitted_abi_anchor_spec(
     } else {
         None
     };
-    let Some(normalized) =
-        exact_band.or_else(|| auto_complete_bare_major_abi_anchor_spec(&rendered))
+    let Some((normalized, widened_exact_pin)) =
+        exact_band.map(|normalized| (normalized, true)).or_else(|| {
+            auto_complete_bare_major_abi_anchor_spec(&rendered)
+                .map(|normalized| (normalized, false))
+        })
     else {
         return (rendered, None);
     };
@@ -11679,13 +11679,23 @@ fn normalize_emitted_abi_anchor_spec(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
-    let warning = auto_bundle::abi_anchor_cap_completion(
-        bundle,
-        package,
-        rendered.clone(),
-        normalized.clone(),
-        involved_sources,
-    );
+    let warning = if widened_exact_pin {
+        auto_bundle::abi_anchor_exact_pin_widening(
+            bundle,
+            package,
+            rendered.clone(),
+            normalized.clone(),
+            involved_sources,
+        )
+    } else {
+        auto_bundle::abi_anchor_cap_completion(
+            bundle,
+            package,
+            rendered.clone(),
+            normalized.clone(),
+            involved_sources,
+        )
+    };
     (normalized, Some(warning))
 }
 

@@ -205,6 +205,8 @@ pub(super) struct WheelMetadataRelaxation {
     tier: RelaxPolicy,
 }
 
+const ABI_ANCHOR_EMISSION_SOURCE: &str = "retread ABI-anchor emission invariant";
+
 impl std::fmt::Display for WheelMetadataRelaxation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.kind == WheelMetadataRelaxationKind::AbiAnchorCapCompleted {
@@ -212,6 +214,20 @@ impl std::fmt::Display for WheelMetadataRelaxation {
                 f,
                 "RETREAD AUTO-COMPLETED ABI anchor in bundle `{}`: package `{}` `{}` -> `{}`; \
                  sources involved: {}",
+                self.bundle,
+                self.package,
+                self.original,
+                self.relaxed,
+                self.involved_sources.join("; "),
+            );
+        }
+        if self.kind == WheelMetadataRelaxationKind::ExactPinWidened
+            && self.source == ABI_ANCHOR_EMISSION_SOURCE
+        {
+            return write!(
+                f,
+                "RETREAD AUTO-WIDENED ABI anchor exact pin in bundle `{}`: package `{}` \
+                 `{}` -> `{}`; sources involved: {}",
                 self.bundle,
                 self.package,
                 self.original,
@@ -247,7 +263,27 @@ pub(super) fn abi_anchor_cap_completion(
         kind: WheelMetadataRelaxationKind::AbiAnchorCapCompleted,
         original: original.into(),
         relaxed: normalized.into(),
-        source: "retread ABI-anchor emission invariant".to_string(),
+        source: ABI_ANCHOR_EMISSION_SOURCE.to_string(),
+        involved_sources,
+        scope: String::new(),
+        tier: RelaxPolicy::Minor,
+    }
+}
+
+pub(super) fn abi_anchor_exact_pin_widening(
+    bundle: &str,
+    package: &PypiKey,
+    original: impl Into<String>,
+    normalized: impl Into<String>,
+    involved_sources: Vec<String>,
+) -> WheelMetadataRelaxation {
+    WheelMetadataRelaxation {
+        bundle: bundle.to_string(),
+        package: package.clone(),
+        kind: WheelMetadataRelaxationKind::ExactPinWidened,
+        original: original.into(),
+        relaxed: normalized.into(),
+        source: ABI_ANCHOR_EMISSION_SOURCE.to_string(),
         involved_sources,
         scope: String::new(),
         tier: RelaxPolicy::Minor,
