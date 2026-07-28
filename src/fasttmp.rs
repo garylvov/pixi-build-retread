@@ -5272,6 +5272,7 @@ fi
         let new_target = retread_envs_target(&tmp_root, &ws, "job-4305035");
         fs::create_dir_all(&new_target).unwrap();
         let user_target = root.join("user-prepared-envs");
+        let displaced_prepared = pixi.join(".envs.displaced-prepared");
         let link = pixi.join("envs");
         std::os::unix::fs::symlink(&old_target, &link).unwrap();
         guard.set("SLURM_JOB_ID", "4305035");
@@ -5298,7 +5299,7 @@ fi
             &expected,
             |prepared| {
                 *prepared_path.borrow_mut() = Some(prepared.to_path_buf());
-                fs::remove_file(prepared).unwrap();
+                fs::rename(prepared, &displaced_prepared).unwrap();
                 std::os::unix::fs::symlink(&user_target, prepared).unwrap();
             },
         )
@@ -5309,6 +5310,7 @@ fi
         assert_eq!(fs::read_link(&link).unwrap(), old_target);
         let prepared_path = prepared_path.into_inner().unwrap();
         assert_eq!(fs::read_link(&prepared_path).unwrap(), user_target);
+        assert_eq!(fs::read_link(displaced_prepared).unwrap(), new_target);
         fs::remove_dir_all(root).ok();
     }
 
