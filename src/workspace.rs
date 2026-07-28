@@ -2822,9 +2822,10 @@ fn fold_transitive_constraints(
         // "retread's verdict predicts pixi's" contract. The skip set
         // stays python/python_abi-ONLY deliberately: recording a
         // workspace-imposed anchor constraint (cuda-version,
-        // libstdcxx-ng) is INPUT-side parity; the never-widen-anchor
-        // rule is EMISSION-side and enforced at its own three layers
-        // (classifier, refinement re-check, output invariant).
+        // libstdcxx-ng) is INPUT-side parity; the rule never to widen
+        // beyond the ABI compatibility band is EMISSION-side and
+        // enforced at its own three layers (classifier, refinement
+        // re-check, output invariant).
         for (trans_name, trans_spec) in constraint_lines(
             &record.package_record.depends,
             &record.package_record.constrains,
@@ -2983,8 +2984,8 @@ async fn extract_transitive_constraints_with_inputs(
 /// present; they share the dep-line shape so the same parsing applies.
 /// Skips stay python/python_abi-ONLY: recording a workspace-imposed
 /// anchor constraint (cuda-version, libstdcxx-ng) is INPUT-side
-/// parity; the never-widen-anchor rule is EMISSION-side, enforced at
-/// its own three layers. Empty/`*` specs impose nothing and would
+/// parity; the rule never to widen beyond the ABI compatibility band
+/// is EMISSION-side, enforced at its own three layers. Empty/`*` specs impose nothing and would
 /// corrupt the comma-AND join, so they're dropped.
 fn constraint_lines(depends: &[String], constrains: &[String]) -> Vec<(String, String)> {
     let mut out = Vec::new();
@@ -6267,8 +6268,9 @@ channels = ["https://prefix.dev/robostack-humble", "https://prefix.dev/conda-for
         // P3 (grizzly #6): run_constrained entries are recorded
         // alongside depends. Anchors like cuda-version are KEPT --
         // recording a workspace-imposed constraint is input-side
-        // parity; never-widening it is emission-side and enforced
-        // elsewhere. python/python_abi stay skipped (relax never
+        // parity; never widening it beyond the ABI compatibility band
+        // is emission-side and enforced elsewhere. python/python_abi
+        // stay skipped (relax never
         // touches them; they'd clutter the comma-join).
         let depends = vec![
             "numpy >=1.26,<2".to_string(),

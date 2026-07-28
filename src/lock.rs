@@ -743,7 +743,11 @@ pub const SCHEMA: u32 = 18;
 ///
 /// Epoch 41: fresh emission auto-completes an open bare-major ABI-anchor lower
 /// bound to a canonical within-major cap and records the completion warning.
-pub const EMIT_EPOCH: u32 = 41;
+///
+/// Epoch 42: fresh emission widens an effective exact ABI-anchor selection to
+/// its within-minor band so independently-built packs can compose on a newer
+/// ABI-compatible patch.
+pub const EMIT_EPOCH: u32 = 42;
 
 fn parse_stored_glibc(value: Option<&str>) -> Option<Option<(u32, u32)>> {
     match value {

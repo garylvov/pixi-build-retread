@@ -36,7 +36,9 @@ use rattler_conda_types::{
 };
 use serde_json::Value;
 use tokio::sync::RwLock;
-use uv_pep508::uv_pep440::{Operator, Version, VersionSpecifier, VersionSpecifiers};
+use uv_pep508::uv_pep440::{
+    Operator, Version, VersionSpecifier, VersionSpecifiers, release_specifiers_to_ranges,
+};
 
 use crate::config::{RelaxPolicy, RetreadConfig, WheelEntry};
 use crate::constraint::{
@@ -11554,13 +11556,121 @@ fn is_auto_completed_abi_anchor_spec(spec: &str) -> bool {
     })
 }
 
-fn auto_complete_emitted_abi_anchor_spec(
+/// Replace one effective exact ABI-anchor selection with its canonical
+/// within-minor compatibility band.
+///
+/// Final emission can join an auto-routed `==X.Y.Z` selection with looser
+/// wheel clauses such as `~=X.Y.Z`. The exact selection is useful while
+/// building one pack, but retaining it in the advertised conda dependency
+/// prevents independently-built packs from composing on a newer ABI-compatible
+/// patch. Qualified and arbitrary equalities stay fail-closed because the
+/// release-only range projection would erase their load-bearing semantics.
+fn widen_exact_abi_anchor_spec_to_minor_band(spec: &str) -> Option<String> {
+    let specifiers = VersionSpecifiers::from_str(spec.trim()).ok()?;
+    if crate::constraint::specifiers_unsatisfiable(&specifiers)
+        || specifiers.iter().any(|specifier| {
+            let version = specifier.version();
+            *specifier.operator() == Operator::ExactEqual
+                || version.epoch() != 0
+                || version.is_pre()
+                || version.is_post()
+                || version.is_dev()
+                || version.is_local()
+        })
+    {
+        return None;
+    }
+
+    let exact = release_specifiers_to_ranges(specifiers.clone())
+        .as_singleton()
+        .cloned()?;
+    let release = exact.release();
+    let major = *release.first()?;
+    let minor = *release.get(1)?;
+    let next_minor = minor.checked_add(1)?;
+    let lower = Version::new([major, minor]);
+    let upper = Version::new([major, next_minor]);
+
+    let mut removed_exact_constraint = false;
+    let mut normalized = specifiers
+        .iter()
+        .filter_map(|specifier| {
+            let pins_exact_release = specifier.version().only_release() == exact;
+            if *specifier.operator() == Operator::Equal && pins_exact_release {
+                removed_exact_constraint = true;
+                None
+            } else {
+                Some(specifier.clone())
+            }
+        })
+        .collect::<Vec<_>>();
+    if !removed_exact_constraint {
+        return None;
+    }
+    normalized.extend([
+        VersionSpecifier::greater_than_equal_version(lower),
+        VersionSpecifier::less_than_version(upper),
+    ]);
+    let normalized: VersionSpecifiers = normalized.into_iter().collect();
+    if crate::constraint::specifiers_unsatisfiable(&normalized) {
+        return None;
+    }
+
+    // A convex intersection has a lossless canonical floor/cap rendering.
+    // Preserve the explicit clauses for a non-convex result so exclusions
+    // and other holes remain load-bearing.
+    let ranges = release_specifiers_to_ranges(normalized.clone());
+    let mut intervals = ranges.iter();
+    let rendered = if let Some((lower, upper)) = intervals.next()
+        && intervals.next().is_none()
+    {
+        let lower = match lower {
+            std::ops::Bound::Included(version) => {
+                let preferred = normalized
+                    .iter()
+                    .filter(|specifier| {
+                        matches!(
+                            specifier.operator(),
+                            Operator::GreaterThanEqual | Operator::TildeEqual | Operator::EqualStar
+                        ) && specifier.version().only_release() == *version
+                    })
+                    .map(|specifier| specifier.version().only_release())
+                    .max_by_key(|version| version.release().len())
+                    .unwrap_or_else(|| version.clone());
+                Some(VersionSpecifier::greater_than_equal_version(preferred))
+            }
+            _ => VersionSpecifier::from_lower_bound(lower),
+        };
+        [lower, VersionSpecifier::from_upper_bound(upper)]
+            .into_iter()
+            .flatten()
+            .map(|specifier| specifier.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    } else {
+        normalized.to_string().replace(", ", ",")
+    };
+    (rendered != spec.trim()).then_some(rendered)
+}
+
+fn normalize_emitted_abi_anchor_spec(
     bundle: &str,
     package: &PypiKey,
     constraints: &[Constraint],
     rendered: String,
+    allow_exact_widening: bool,
 ) -> (String, Option<auto_bundle::WheelMetadataRelaxation>) {
-    let Some(normalized) = auto_complete_bare_major_abi_anchor_spec(&rendered) else {
+    let exact_band = if allow_exact_widening {
+        widen_exact_abi_anchor_spec_to_minor_band(&rendered)
+    } else {
+        None
+    };
+    let Some((normalized, widened_exact_pin)) =
+        exact_band.map(|normalized| (normalized, true)).or_else(|| {
+            auto_complete_bare_major_abi_anchor_spec(&rendered)
+                .map(|normalized| (normalized, false))
+        })
+    else {
         return (rendered, None);
     };
     let involved_sources = constraints
@@ -11569,13 +11679,23 @@ fn auto_complete_emitted_abi_anchor_spec(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
-    let warning = auto_bundle::abi_anchor_cap_completion(
-        bundle,
-        package,
-        rendered.clone(),
-        normalized.clone(),
-        involved_sources,
-    );
+    let warning = if widened_exact_pin {
+        auto_bundle::abi_anchor_exact_pin_widening(
+            bundle,
+            package,
+            rendered.clone(),
+            normalized.clone(),
+            involved_sources,
+        )
+    } else {
+        auto_bundle::abi_anchor_cap_completion(
+            bundle,
+            package,
+            rendered.clone(),
+            normalized.clone(),
+            involved_sources,
+        )
+    };
     (normalized, Some(warning))
 }
 
@@ -12000,13 +12120,12 @@ fn produce_output_with_conflicts(
     // locked version -- the uv closure was solved against exactly this
     // version, so the floor must not move -- capped at the next MAJOR,
     // semver's `0.x` convention capping at the next MINOR instead) lets
-    // most of these clashes solve clean on the first render. Two cases
-    // still keep the exact pin, because widening them is wrong, not just
-    // unnecessary: ABI anchors (`is_abi_anchor` -- python/libc/cuda
-    // family, where "any newer build" is a lie about what this pack's
-    // wheels actually run on) and names the user gave an explicit
-    // `retread-overrides` entry for (hand-written intent always wins over
-    // an auto-derived range).
+    // most of these clashes solve clean on the first render. ABI anchors
+    // (`is_abi_anchor` -- python/libc/cuda family) retain the exact selection
+    // through constraint joining, then the final anchor-only emission
+    // normalizer converts an effective singleton to its within-minor ABI band.
+    // Names with an explicit `retread-overrides` entry remain exact because
+    // hand-written intent always wins over an auto-derived range.
     for auto_route in &bundle.auto_routed {
         let pypi_name = PypiKey::from_pypi(&auto_route.route.pypi_name);
         if let Some(workspace_provider) = &auto_route.workspace_provider {
@@ -12391,6 +12510,13 @@ fn produce_output_with_conflicts(
             .iter()
             .any(|name| crate::solve::is_abi_anchor(name.as_str()))
             || is_semantic_abi_anchor(conda_name.as_spec(), &abi_aliases);
+        let has_manual_override = pypi_names
+            .iter()
+            .map(PypiKey::as_str)
+            .chain(std::iter::once(conda_name.as_spec()))
+            .any(|name| {
+                config.overrides.contains_key(name) && !config.ledger_overrides.contains(name)
+            });
         let native_conda_override = native_conda_overrides.into_iter().next();
         let conda_key = conda_name.key().into_string();
         if !seen_dep_names.insert(conda_key) {
@@ -12421,11 +12547,12 @@ fn produce_output_with_conflicts(
                     .clone()
                     .unwrap_or_else(|| specifiers.to_string().replace(", ", ","));
                 let rendered = if has_anchor_alias && native_conda_override.is_none() {
-                    let (rendered, warning) = auto_complete_emitted_abi_anchor_spec(
+                    let (rendered, warning) = normalize_emitted_abi_anchor_spec(
                         &bundle.conda_name,
                         &pypi_name,
                         &constraints,
                         rendered,
+                        !has_manual_override,
                     );
                     pending_relaxations.extend(warning);
                     rendered
@@ -12446,15 +12573,16 @@ fn produce_output_with_conflicts(
                     &bundle.conda_name,
                     format!(" for bundle '{}'", bundle.conda_name),
                 ));
-                let can_auto_complete = has_anchor_alias && native_conda_override.is_none();
+                let can_normalize = has_anchor_alias && native_conda_override.is_none();
                 let rendered = native_conda_override
                     .unwrap_or_else(|| specifiers.to_string().replace(", ", ","));
-                let rendered = if can_auto_complete {
-                    let (rendered, warning) = auto_complete_emitted_abi_anchor_spec(
+                let rendered = if can_normalize {
+                    let (rendered, warning) = normalize_emitted_abi_anchor_spec(
                         &bundle.conda_name,
                         &pypi_name,
                         &constraints,
                         rendered,
+                        !has_manual_override,
                     );
                     pending_relaxations.extend(warning);
                     rendered
