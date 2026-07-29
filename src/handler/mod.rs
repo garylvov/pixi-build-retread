@@ -5288,9 +5288,9 @@ fn workspace_conda_provider_candidates(
 /// channel-priority setting?
 #[derive(Debug, Clone)]
 pub(crate) struct CondaCoSolveContext {
-    channels: Vec<ChannelUrl>,
+    channels: Arc<[ChannelUrl]>,
+    shared_solve: crate::conda_solve::SharedSparseSolveData,
     python: String,
-    subdir: String,
     bundle: PypiKey,
     channel_priority: rattler_solve::ChannelPriority,
     system_requirements: BTreeMap<String, String>,
@@ -5380,10 +5380,12 @@ impl CondaCoSolveContext {
         let detected_virtual_packages = target
             .target_contract()
             .map(|contract| contract.detected_virtual_packages.clone());
+        let shared_solve =
+            crate::conda_solve::SharedSparseSolveData::new(conda_channels, target.conda_subdir());
         Self {
-            channels: conda_channels.to_vec(),
+            channels: conda_channels.to_vec().into(),
+            shared_solve,
             python: target.python_version().to_string(),
-            subdir: target.conda_subdir().to_string(),
             bundle: PypiKey::from_pypi(bundle),
             channel_priority,
             system_requirements,
@@ -5412,11 +5414,10 @@ impl CondaCoSolveContext {
             }
         }
         specs.push(CondaName::new("python").match_spec(&format!("{}.*", self.python)));
-        match crate::conda_solve::solve_selected_records_for_target(
-            &self.channels,
+        match crate::conda_solve::solve_selected_records_for_target_shared(
+            &self.shared_solve,
             &specs,
             &self.python,
-            &self.subdir,
             self.channel_priority,
             &self.system_requirements,
             self.detected_virtual_packages.as_ref(),
@@ -5481,11 +5482,10 @@ impl CondaCoSolveContext {
             route.match_spec(),
             CondaName::new("python").match_spec(&format!("{}.*", self.python)),
         ];
-        match crate::conda_solve::solve_selected_records_for_target(
-            &self.channels,
+        match crate::conda_solve::solve_selected_records_for_target_shared(
+            &self.shared_solve,
             &specs,
             &self.python,
-            &self.subdir,
             self.channel_priority,
             &self.system_requirements,
             self.detected_virtual_packages.as_ref(),
