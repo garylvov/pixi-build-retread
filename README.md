@@ -109,6 +109,47 @@ tmp-root = "/tmp"
 blob-caches = "shared"
 ```
 
+## Concurrency & requirements
+
+Retread requires a Pixi that provides `pixi-build-api-version >=4,<6`; that
+protocol range is pinned in `recipe/recipe.yaml`. Rich platform envelopes such
+as `platforms = [{ platform = "linux-64", glibc = "2.35" }]` require Pixi 0.71
+or newer. Pixi 0.73 is the recommended, known-good version. Some sibling
+backends, including `pixi-build-rattler-build` 0.4.4.20260707 and newer, require
+API v5, so run `pixi self-update` when a workspace mixes backends.
+
+Starting with retread 4.10.44, retread bounds rattler-build compression threads
+node-wide per user through a PID-lease registry. A solo build gets full
+parallelism; concurrent builds share the budget, and the sum of coordinated
+grants never exceeds it. `RETREAD_COMPRESSION_THREADS` is a hard per-build
+override, `RETREAD_COMPRESSION_BUDGET` overrides the node budget (which defaults
+to available parallelism), and `RETREAD_THREAD_LEASE_DIR` overrides the
+registry location, mainly for tests. The registry is node-local; remote
+filesystems are rejected and retread uses a conservative fallback.
+
+**Known Pixi issue (not a retread bug):** Pixi's build dispatch is not safe
+under concurrent solves involving source packs. Two Pixi processes using one
+workspace can panic at
+`pixi_core/src/lock_file/resolve/build_dispatch.rs:477` with `could not
+initialize build dispatch correctly`. Even one `pixi install --all` can fail
+during concurrent environment solves with `build dispatch initialization
+failed: failed to build <pack>`, which wraps the underlying error. Until Pixi
+fixes this upstream, use `--concurrent-solves 1`, or persist the workspace
+setting with `pixi config set --local concurrency.solves 1`. Never run two Pixi
+processes against one workspace concurrently; serialize them externally (for
+example, with `flock`). For genuinely parallel installs, use one clone per
+install.
+
+In Pixi 0.73, the local config command writes `[concurrency]` to
+`.pixi/config.toml`; `pixi.toml` does not accept a `concurrency` key. A fresh
+`pixi init` ignores `.pixi/*` but explicitly re-includes `.pixi/config.toml`, so
+the workspace-local configuration can be committed.
+
+The shared wheel store defaults to `~/.cache/retread/wheels` and can be
+overridden with `RETREAD_WHEEL_STORE`. It is deliberately independent of
+`RETREAD_CACHE_DIR` and fast-tmp. Do not delete it casually: lock records
+reference its content SHAs.
+
 ## Config
 
 ```toml
