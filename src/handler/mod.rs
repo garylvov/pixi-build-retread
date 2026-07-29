@@ -14045,11 +14045,10 @@ async fn materialize_and_pack(
             target.conda_subdir()
         )
     })?;
-    let compression_threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .to_string();
+    let mut compression_lease = crate::thread_budget::acquire(config.compression_threads).await;
+    let compression = compression_lease.decision();
     let mut cmd = tokio::process::Command::new("rattler-build");
+    cmd.kill_on_drop(true);
     cmd.arg("build")
         .arg("--recipe")
         .arg(&recipe_path)
@@ -14058,24 +14057,38 @@ async fn materialize_and_pack(
         .arg("--target-platform")
         .arg(&target_platform)
         .arg("--compression-threads")
-        .arg(&compression_threads)
+        .arg(compression.threads.get().to_string())
         .arg("--no-test");
     crate::fasttmp::apply_backend_env(&mut cmd);
     if let Some(level) = config.compression_level {
         cmd.arg("--package-format").arg(format!("conda:{level}"));
     }
     let packaging_started = std::time::Instant::now();
-    let output = cmd
-        .stdin(std::process::Stdio::null())
+    cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .await
+        .stderr(std::process::Stdio::piped());
+    let child = cmd
+        .spawn()
         .context("spawning rattler-build (is it on PATH?)")?;
+    // No separate process group is created: `kill_on_drop(true)` cleans up
+    // the direct child during ordinary async cancellation. Parent SIGKILL
+    // cannot run Drop, so persist the child's PID/start identity before
+    // waiting; an orphaned rattler-build then remains charged to this lease.
+    if let Some(child_pid) = child.id() {
+        compression_lease.record_child(child_pid).await;
+    } else {
+        tracing::warn!("spawned rattler-build did not expose a PID for lease tracking");
+    }
+    let output = child.wait_with_output().await;
+    compression_lease.release();
+    let output = output.context("waiting for rattler-build")?;
     tracing::info!(
         output = %recipe.package.name,
         elapsed_ms = packaging_started.elapsed().as_millis() as u64,
-        compression_threads = %compression_threads,
+        compression_threads = compression.threads.get(),
+        compression_active_leases = compression.active_leases,
+        compression_budget = compression.budget.get(),
+        compression_threads_source = compression.source.as_str(),
         compression_level = ?config.compression_level,
         "bench: rattler-build finished",
     );
@@ -14954,20 +14967,14 @@ async fn build_one(
     tokio::fs::create_dir_all(output_dir).await?;
 
     let target_platform = target_subdir.to_string();
-    // v1.5.8: rattler-build's zstd packaging defaults to ONE thread.
-    // For isaac-scale bundles that means single-threaded compression
-    // of a ~15GB build prefix -- the dominant wall-clock chunk of
-    // pixi's "preparing packages" phase. zstd scales near-linearly
-    // with threads on inputs this size, so hand it every core.
-    let compression_threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .to_string();
+    let mut compression_lease = crate::thread_budget::acquire(config.compression_threads).await;
+    let compression = compression_lease.decision();
     // CRITICAL: rattler-build writes progress to stdout, but retread's
     // stdout is the JSON-RPC channel to pixi. Capture both streams so
     // they don't corrupt the protocol. Surface them via tracing
     // (which writes to OUR stderr) on failure.
     let mut cmd = tokio::process::Command::new("rattler-build");
+    cmd.kill_on_drop(true);
     cmd.arg("build")
         .arg("--recipe")
         .arg(&recipe_path)
@@ -14976,7 +14983,7 @@ async fn build_one(
         .arg("--target-platform")
         .arg(&target_platform)
         .arg("--compression-threads")
-        .arg(&compression_threads)
+        .arg(compression.threads.get().to_string())
         .arg("--no-test");
     crate::fasttmp::apply_backend_env(&mut cmd);
     // v1.5.8: user-tunable zstd level (retread-compression-level).
@@ -14986,17 +14993,31 @@ async fn build_one(
     }
     // v1.6.0: time the packaging stage explicitly.
     let packaging_started = std::time::Instant::now();
-    let output = cmd
-        .stdin(std::process::Stdio::null())
+    cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .await
+        .stderr(std::process::Stdio::piped());
+    let child = cmd
+        .spawn()
         .context("spawning rattler-build (is it on PATH?)")?;
+    // No separate process group is created: `kill_on_drop(true)` cleans up
+    // the direct child during ordinary async cancellation. Parent SIGKILL
+    // cannot run Drop, so persist the child's PID/start identity before
+    // waiting; an orphaned rattler-build then remains charged to this lease.
+    if let Some(child_pid) = child.id() {
+        compression_lease.record_child(child_pid).await;
+    } else {
+        tracing::warn!("spawned rattler-build did not expose a PID for lease tracking");
+    }
+    let output = child.wait_with_output().await;
+    compression_lease.release();
+    let output = output.context("waiting for rattler-build")?;
     tracing::info!(
         output = %recipe.package.name,
         elapsed_ms = packaging_started.elapsed().as_millis() as u64,
-        compression_threads = %compression_threads,
+        compression_threads = compression.threads.get(),
+        compression_active_leases = compression.active_leases,
+        compression_budget = compression.budget.get(),
+        compression_threads_source = compression.source.as_str(),
         compression_level = ?config.compression_level,
         "bench: rattler-build finished",
     );

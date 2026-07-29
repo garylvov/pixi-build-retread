@@ -30,6 +30,7 @@ pub mod rpc;
 pub mod solve;
 pub mod source_build;
 pub mod status;
+pub(crate) mod thread_budget;
 pub mod uv_closure;
 pub mod wheel;
 pub mod wheel_inject;

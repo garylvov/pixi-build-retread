@@ -3,6 +3,7 @@
 //! Lives under `[build.config]` in the consumer's `pixi.toml`.
 
 use std::collections::BTreeMap;
+use std::num::NonZeroUsize;
 
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
@@ -253,6 +254,17 @@ pub struct RetreadConfig {
         alias = "compression-level"
     )]
     pub compression_level: Option<u32>,
+
+    /// Number of rattler-build compression threads for this pack.
+    /// The process-wide `RETREAD_COMPRESSION_THREADS` environment override
+    /// takes precedence. Unset shares the node-wide compression budget with
+    /// other active retread builds.
+    #[serde(
+        default,
+        rename = "retread-compression-threads",
+        alias = "compression-threads"
+    )]
+    pub compression_threads: Option<NonZeroUsize>,
 
     /// DEPRECATED (v2.0.0), parsed and ignored. Use `retread-courier`
     /// instead. This field is retained so `deny_unknown_fields` does not
@@ -1251,6 +1263,28 @@ mod tests {
         });
         let cfg: RetreadConfig = serde_json::from_value(json).unwrap();
         assert_eq!(cfg.compression_level, None);
+    }
+
+    #[test]
+    fn parses_retread_compression_threads_key() {
+        let json = serde_json::json!({
+            "retread-wheels": { "foo": { "version": "==1.0" } },
+            "retread-compression-threads": 6,
+        });
+        let cfg: RetreadConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.compression_threads.map(NonZeroUsize::get), Some(6));
+
+        let json = serde_json::json!({
+            "retread-wheels": { "foo": { "version": "==1.0" } },
+        });
+        let cfg: RetreadConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.compression_threads, None);
+
+        let json = serde_json::json!({
+            "retread-wheels": { "foo": { "version": "==1.0" } },
+            "retread-compression-threads": 0,
+        });
+        assert!(serde_json::from_value::<RetreadConfig>(json).is_err());
     }
 
     #[test]

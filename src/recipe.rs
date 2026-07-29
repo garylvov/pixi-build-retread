@@ -1644,6 +1644,7 @@ mod tests {
             conda_deps: Vec::new(),
             default_bundle: None,
             compression_level: None,
+            compression_threads: None,
             emit_pypi: false,
             bundle_mode: crate::config::BundleMode::Fat,
             courier_mode: Default::default(),

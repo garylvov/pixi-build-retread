@@ -70,6 +70,7 @@ fn baseline_config() -> RetreadConfig {
         conda_deps: Vec::new(),
         default_bundle: None,
         compression_level: None,
+        compression_threads: None,
         emit_pypi: false,
         bundle_mode: pixi_build_retread::config::BundleMode::Fat,
         courier_mode: Default::default(),
