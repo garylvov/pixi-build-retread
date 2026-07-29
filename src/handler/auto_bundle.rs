@@ -2612,7 +2612,8 @@ where
             rejected: Vec::new(),
         })
     } else {
-        crate::uv_closure::select_jointly_solvable_routes(
+        crate::uv_closure::select_jointly_solvable_routes_for_bundle(
+            &diagnostic_context.bundle,
             fixed,
             mutable_candidates.clone(),
             co_solve,
