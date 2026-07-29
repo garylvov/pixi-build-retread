@@ -2625,6 +2625,7 @@ impl Handler {
                 crate::status::tty(
                     "reusing already-computed outputs (pixi re-requested this package for another environment).",
                 );
+                log_final_bundle_outputs(&cached.result);
                 return Ok(cached.result);
             }
             // The memo advertised an incremental lock version, but its exact
@@ -2692,6 +2693,7 @@ impl Handler {
                     },
                 );
             self.invalidate_prepared_builds().await;
+            log_final_bundle_outputs(&cached);
             return Ok(cached);
         }
         // Coalesce simultaneous cold requests for this exact source/target
@@ -2737,6 +2739,7 @@ impl Handler {
                     },
                 );
             self.invalidate_prepared_builds().await;
+            log_final_bundle_outputs(&cached);
             return Ok(cached);
         }
         let prepared_transaction = self.begin_prepared_transaction(generation).await;
@@ -3230,6 +3233,7 @@ impl Handler {
             outputs,
             input_globs: Default::default(),
         };
+        log_final_bundle_outputs(&result);
         tracing::info!(
             elapsed_ms = phase_start.elapsed().as_millis() as u64,
             outputs = result.outputs.len(),
@@ -12535,7 +12539,7 @@ fn produce_output_with_conflicts(
                 .auto_dropped
                 .contains(&canonical_conda_name(raw_pypi_name))
             {
-                tracing::info!(
+                tracing::debug!(
                     dep = %dep_name,
                     bundle = %bundle.conda_name,
                     "dropping wheel dependency owned by a workspace conda provider",
@@ -12823,12 +12827,11 @@ fn produce_output_with_conflicts(
         }
     }
 
-    // Surface the final run-dep list at info level so users can spot
-    // potentially-problematic deps before conda's solver complains.
-    // Anything here that fails downstream is a candidate for
-    // retread-drop-deps, retread-overrides, or retread-name-map.
+    // Probe and conflict-localization assemblies pass through here repeatedly.
+    // Keep their full dependency lists out of normal logs; the committed
+    // outputs are logged exactly once by `log_final_bundle_outputs`.
     let emitted: Vec<&str> = run_dep_specs.iter().map(|s| s.name.as_str()).collect();
-    tracing::info!(
+    tracing::debug!(
         bundle = %bundle.conda_name,
         run_deps = ?emitted,
         "bundle run-deps emitted; if conda can't find one, add it to \
@@ -12956,6 +12959,23 @@ fn outputs_share_identity(left: &CondaOutput, right: &CondaOutput) -> bool {
         && left.metadata.build_number == right.metadata.build_number
         && left.metadata.subdir == right.metadata.subdir
         && left.metadata.noarch == right.metadata.noarch
+}
+
+fn log_final_bundle_outputs(result: &CondaOutputsResult) {
+    for output in &result.outputs {
+        let emitted = output
+            .run_dependencies
+            .depends
+            .iter()
+            .map(|dependency| dependency.name.as_str())
+            .collect::<Vec<_>>();
+        tracing::info!(
+            bundle = %output.metadata.name.as_normalized(),
+            run_deps = ?emitted,
+            "bundle run-deps emitted; if conda can't find one, add it to \
+             retread-drop-deps / retread-overrides / retread-name-map"
+        );
+    }
 }
 
 fn output_run_dependencies_match(

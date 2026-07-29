@@ -2001,6 +2001,47 @@ fn produce_output_omits_workspace_owned_auto_drops() {
 }
 
 #[test]
+fn speculative_emissions_are_debug_only_and_final_output_logs_once() {
+    let mut bundle = solo_bundle(
+        "owned-pack",
+        vec!["numpy>=2.1,<3", "gym==0.23.1", "requests>=2.31"],
+    );
+    bundle.auto_dropped = ["numpy", "gym"]
+        .into_iter()
+        .map(crate::relax::canonical_conda_name)
+        .collect();
+
+    let logs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::INFO)
+        .with_writer({
+            let logs = std::sync::Arc::clone(&logs);
+            move || SharedLogWriter(std::sync::Arc::clone(&logs))
+        })
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        for _ in 0..3 {
+            produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
+        }
+        let output =
+            produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
+        log_final_bundle_outputs(&CondaOutputsResult {
+            outputs: vec![output],
+            input_globs: Default::default(),
+        });
+    });
+
+    let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+    assert_eq!(logs.matches("bundle run-deps emitted").count(), 1, "{logs}");
+    assert!(
+        !logs.contains("dropping wheel dependency owned by a workspace conda provider"),
+        "{logs}"
+    );
+}
+
+#[test]
 fn bundle_probe_metrics_aggregate_retries_and_zero_probe_bundles() {
     let logs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let subscriber = tracing_subscriber::fmt()
