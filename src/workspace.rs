@@ -882,8 +882,26 @@ impl WorkspaceManifest {
                 );
             }
         }
-        let detected = parse_virtual_package_lines(&envelope.profile.detected_virtual_packages)
+        let mut detected = parse_virtual_package_lines(&envelope.profile.detected_virtual_packages)
             .context("invalid target envelope detected_virtual_packages")?;
+
+        // Pixi 0.73 does not put deprecated system requirements in the build
+        // RPC. Exact orchestration can therefore arrive with glibc represented
+        // only by the synthesized profile name
+        // (`linux-64-cuda-12-glibc-2-35`). Restrict this fallback to manifest-
+        // verified legacy composition; explicit rich profiles continue to
+        // require their structured declaration/detection contract.
+        if self.uses_legacy_platform_composition()
+            && !detected.contains_key("glibc")
+            && let Some(fallback) = profile_declared.get("glibc").cloned().or_else(|| {
+                glibc_from_derived_profile_name(&envelope.profile.name, &envelope.profile.subdir)
+                    .map(crate::glibc::format_glibc)
+            })
+            && effective_profile.declared_virtual_packages.get("glibc") == Some(&fallback)
+        {
+            detected.insert("glibc".to_string(), fallback);
+        }
+
         for (name, value) in &effective_profile.declared_virtual_packages {
             if !pixi_detects_declared_virtual_package(name) {
                 continue;
@@ -3422,6 +3440,28 @@ fn sanitize_workspace_profile_name_segment(value: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
+/// Recover the glibc component from a Pixi-derived rich profile name.
+///
+/// Derived names start with the concrete conda subdir and sanitize `2.35` to
+/// `glibc-2-35`. Requiring that prefix and two wholly numeric components keeps
+/// this a narrow fallback rather than interpreting arbitrary named profiles.
+fn glibc_from_derived_profile_name(profile_name: &str, subdir: &str) -> Option<(u32, u32)> {
+    if !subdir.starts_with("linux-") {
+        return None;
+    }
+    let suffix = profile_name.strip_prefix(subdir)?.strip_prefix('-')?;
+    let components: Vec<&str> = suffix.split('-').collect();
+    components.windows(3).find_map(|window| {
+        if window[0] != "glibc"
+            || !window[1].bytes().all(|byte| byte.is_ascii_digit())
+            || !window[2].bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return None;
+        }
+        Some((window[1].parse().ok()?, window[2].parse().ok()?))
+    })
+}
+
 fn derive_unambiguous_platform_values(
     profiles: &[WorkspaceProfile],
     virtual_package: &str,
@@ -5705,35 +5745,38 @@ new = { features = ["new"] }
     }
 
     #[test]
-    fn exact_target_envelope_overlays_verified_environment_legacy_requirements() {
-        let tmp = temp_workspace("target-envelope-legacy");
-        let source = tmp.join("demo-pack");
+    fn derived_envelope_glibc_populates_resolution_target_and_allows_equal_floor() {
+        let tmp = temp_workspace("target-envelope-derived-glibc");
+        let source = tmp.join("flashsac-pack");
         std::fs::create_dir_all(&source).unwrap();
         let ws = ws_toml(
             r#"
 [workspace]
 platforms = ["linux-64"]
 
-[feature.old]
+[feature.flashsac]
 platforms = ["linux-64"]
-[feature.old.dependencies]
-demo-pack = { path = "./demo-pack" }
-[feature.old.system-requirements]
-libc = "2.35"
+[feature.flashsac.dependencies]
+flashsac-pack = { path = "./flashsac-pack" }
+[feature.flashsac.system-requirements]
+cuda = "12"
+libc = { family = "glibc", version = "2.35" }
 
 [environments]
-old = { features = ["old"], no-default-feature = true }
+flashsac = { features = ["flashsac"], no-default-feature = true }
 "#,
         );
         let envelope = WorkspaceTargetEnvelope {
             schema: 1,
-            environment: "old".to_string(),
+            environment: "flashsac".to_string(),
             profile: WorkspaceTargetEnvelopeProfile {
-                name: "linux-64-glibc-2-35".to_string(),
+                name: "linux-64-cuda-12-glibc-2-35".to_string(),
                 subdir: "linux-64".to_string(),
-                virtual_packages: vec!["glibc=2.35".to_string()],
+                // The typed RPC has no system-requirements field, and this
+                // sparse envelope carries glibc only in its derived name.
+                virtual_packages: vec!["cuda=12".to_string()],
                 detected_virtual_packages: vec![
-                    "glibc=2.35".to_string(),
+                    "cuda=12".to_string(),
                     "linux=4.18".to_string(),
                     "__archspec=1=x86_64".to_string(),
                     "__unix".to_string(),
@@ -5750,6 +5793,64 @@ old = { features = ["old"], no-default-feature = true }
             target.contract.detected_virtual_packages.get("glibc"),
             Some(&"2.35".to_string())
         );
+
+        let target = crate::pypi::ResolutionTarget::try_for_contract_on_subdir(
+            "3.11",
+            "linux-64",
+            target.contract,
+        )
+        .unwrap();
+        assert_eq!(target.declared_glibc(), Some((2, 35)));
+        assert_eq!(
+            crate::pypi::native_source_build_policy(
+                "linux-64",
+                "linux-64",
+                target.declared_glibc(),
+                Some((2, 35)),
+                true,
+            ),
+            crate::pypi::NativeSourceBuildPolicy::AnyWheel,
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn structured_envelope_glibc_wins_over_derived_profile_name() {
+        let tmp = temp_workspace("target-envelope-structured-glibc");
+        let source = tmp.join("demo-pack");
+        std::fs::create_dir_all(&source).unwrap();
+        let ws = ws_toml(
+            r#"
+[workspace]
+platforms = [
+  { name = "linux-64-glibc-2-35", platform = "linux-64", glibc = "2.39" },
+]
+[dependencies]
+demo-pack = { path = "./demo-pack" }
+[environments]
+default = []
+"#,
+        );
+        let envelope = WorkspaceTargetEnvelope {
+            schema: 1,
+            environment: "default".to_string(),
+            profile: WorkspaceTargetEnvelopeProfile {
+                name: "linux-64-glibc-2-35".to_string(),
+                subdir: "linux-64".to_string(),
+                virtual_packages: vec!["glibc=2.39".to_string()],
+                detected_virtual_packages: vec![
+                    "glibc=2.39".to_string(),
+                    "linux=4.18".to_string(),
+                    "__archspec=1=x86_64".to_string(),
+                    "__unix".to_string(),
+                ],
+            },
+        };
+        let resolved = ws
+            .resolve_target_for_source(&tmp, &source, "linux-64", Some(&envelope))
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.contract.effective_glibc(), Some((2, 39)));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

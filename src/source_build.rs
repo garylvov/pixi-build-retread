@@ -397,24 +397,25 @@ fn source_build_refusal_error_for_host(
                 crate::glibc::format_glibc(host),
             ),
             (Some(target_floor), None) => anyhow!(
-                "refusing to source-build for native target `{}`: target floor glibc {} is \
-                 known but host glibc is unavailable, so platform-wheel compatibility cannot \
-                 be proven; use a validated artifact-cache hit or a host with detectable \
-                 glibc at or below the floor",
+                "refusing to source-build for native target `{}`: host glibc undetected; \
+                 target glibc floor is {}, so platform-wheel compatibility cannot be proven; \
+                 use a validated artifact-cache hit or a host with detectable glibc at or \
+                 below the floor",
                 target.conda_subdir(),
                 crate::glibc::format_glibc(target_floor),
             ),
             (None, Some(host)) => anyhow!(
-                "refusing to source-build for native target `{}`: target glibc floor is \
-                 unavailable while host glibc is {}, so platform-wheel compatibility cannot \
-                 be proven; declare the target floor or use a validated artifact-cache hit",
+                "refusing to source-build for native target `{}`: target glibc floor unknown \
+                 (declare glibc on the platform envelope); host glibc is {}, so platform-wheel \
+                 compatibility cannot be proven; use a validated artifact-cache hit",
                 target.conda_subdir(),
                 crate::glibc::format_glibc(host),
             ),
             (None, None) => anyhow!(
-                "refusing to source-build for native target `{}`: target glibc floor and host \
-                 glibc are unavailable, so platform-wheel compatibility cannot be proven; \
-                 declare the target floor or use a validated artifact-cache hit",
+                "refusing to source-build for native target `{}`: target glibc floor unknown \
+                 (declare glibc on the platform envelope) and host glibc undetected, so \
+                 platform-wheel compatibility cannot be proven; use a validated artifact-cache \
+                 hit",
                 target.conda_subdir(),
             ),
             (Some(target_floor), Some(host)) => anyhow!(
@@ -7590,11 +7591,26 @@ version = "0.1.0"
     }
 
     #[test]
-    fn same_subdir_unknown_host_glibc_is_not_reported_as_foreign() {
+    fn unknown_host_glibc_names_host_side() {
         let target = ResolutionTarget::from_parts("3.11", "linux-64", Some((2, 35)));
         let message = source_build_refusal_error_for_host(&target, "linux-64", None).to_string();
-        assert!(message.contains("target floor glibc 2.35"), "{message}");
-        assert!(message.contains("host glibc is unavailable"), "{message}");
+        assert!(message.contains("host glibc undetected"), "{message}");
+        assert!(message.contains("target glibc floor is 2.35"), "{message}");
+        assert!(!message.contains("target glibc floor unknown"), "{message}");
+        assert!(!message.contains("foreign target"), "{message}");
+    }
+
+    #[test]
+    fn unknown_target_glibc_names_target_side() {
+        let target = ResolutionTarget::from_parts("3.11", "linux-64", None);
+        let message =
+            source_build_refusal_error_for_host(&target, "linux-64", Some((2, 35))).to_string();
+        assert!(
+            message.contains("target glibc floor unknown (declare glibc on the platform envelope)"),
+            "{message}"
+        );
+        assert!(message.contains("host glibc is 2.35"), "{message}");
+        assert!(!message.contains("host glibc undetected"), "{message}");
         assert!(!message.contains("foreign target"), "{message}");
     }
 
