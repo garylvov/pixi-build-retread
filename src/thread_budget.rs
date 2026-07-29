@@ -35,6 +35,7 @@ const LEASE_FILE_PREFIX: &str = "lease-";
 const LEASE_FILE_SUFFIX: &str = ".json";
 const NONCE_BYTES: usize = 16;
 const NONCE_HEX_LEN: usize = NONCE_BYTES * 2;
+const MAX_NONCE_ATTEMPTS: usize = 16;
 const MAX_LEASE_BYTES: u64 = 16 * 1024;
 const LEASE_STALE_AFTER: Duration = Duration::from_secs(6 * 60 * 60);
 const CAPACITY_RETRY_DELAY: Duration = Duration::from_millis(25);
@@ -355,6 +356,7 @@ struct LoadedLease {
 }
 
 enum RegistryAttempt {
+    Collision,
     Waiting,
     Granted {
         threads: NonZeroUsize,
@@ -364,57 +366,77 @@ enum RegistryAttempt {
 
 #[cfg(target_os = "linux")]
 fn acquire_coordinated(settings: AcquireSettings, pid: u32) -> Result<CompressionThreadLease> {
+    acquire_coordinated_with_nonce_generator(settings, pid, random_nonce)
+}
+
+#[cfg(target_os = "linux")]
+fn acquire_coordinated_with_nonce_generator(
+    settings: AcquireSettings,
+    pid: u32,
+    mut nonce_generator: impl FnMut() -> Result<String>,
+) -> Result<CompressionThreadLease> {
     let registry = prepare_registry_dir(&lease_registry_dir())?;
     let starttime = process_starttime(pid)?
         .ok_or_else(|| anyhow!("compression lease owner PID {pid} is not alive"))?;
-    let nonce = random_nonce()?;
-    let file_name = lease_file_name(pid, &nonce);
-    let registration = LeaseRegistration {
-        registry,
-        file_name,
-        pid,
-        nonce,
-    };
 
-    loop {
-        match registry_admission_pass(&registration, starttime, settings) {
-            Ok(RegistryAttempt::Waiting) => std::thread::sleep(CAPACITY_RETRY_DELAY),
-            Ok(RegistryAttempt::Granted {
-                threads,
-                active_leases,
-            }) => {
-                let source = if settings.config_threads.is_some() {
-                    CompressionThreadSource::Override
-                } else if active_leases > 1 || settings.budget_is_overridden {
-                    CompressionThreadSource::BudgetShare
-                } else {
-                    CompressionThreadSource::Default
-                };
-                return Ok(CompressionThreadLease {
-                    decision: CompressionThreadDecision {
-                        threads,
-                        active_leases,
-                        budget: settings.budget,
-                        source,
-                    },
-                    registration: Some(registration),
-                    released: false,
-                });
-            }
-            Err(error) => {
-                if let Err(cleanup_error) = remove_registered_lease(&registration) {
-                    tracing::warn!(
-                        error = %cleanup_error,
-                        pid,
-                        nonce = %registration.nonce,
-                        lease_dir = %registration.registry.path.display(),
-                        "failed to roll back pending compression lease",
-                    );
+    for _ in 0..MAX_NONCE_ATTEMPTS {
+        let nonce = nonce_generator()?;
+        let file_name = lease_file_name(pid, &nonce);
+        let registration = LeaseRegistration {
+            registry: registry.clone(),
+            file_name,
+            pid,
+            nonce,
+        };
+        let mut registered = false;
+
+        loop {
+            match registry_admission_pass(&registration, starttime, settings, registered) {
+                Ok(RegistryAttempt::Collision) => break,
+                Ok(RegistryAttempt::Waiting) => {
+                    registered = true;
+                    std::thread::sleep(CAPACITY_RETRY_DELAY);
                 }
-                return Err(error);
+                Ok(RegistryAttempt::Granted {
+                    threads,
+                    active_leases,
+                }) => {
+                    let source = if settings.config_threads.is_some() {
+                        CompressionThreadSource::Override
+                    } else if active_leases > 1 || settings.budget_is_overridden {
+                        CompressionThreadSource::BudgetShare
+                    } else {
+                        CompressionThreadSource::Default
+                    };
+                    return Ok(CompressionThreadLease {
+                        decision: CompressionThreadDecision {
+                            threads,
+                            active_leases,
+                            budget: settings.budget,
+                            source,
+                        },
+                        registration: Some(registration),
+                        released: false,
+                    });
+                }
+                Err(error) => {
+                    if registered && let Err(cleanup_error) = remove_registered_lease(&registration)
+                    {
+                        tracing::warn!(
+                            error = %cleanup_error,
+                            pid,
+                            nonce = %registration.nonce,
+                            lease_dir = %registration.registry.path.display(),
+                            "failed to roll back pending compression lease",
+                        );
+                    }
+                    return Err(error);
+                }
             }
         }
     }
+
+    bail!("failed to allocate a unique compression lease nonce after {MAX_NONCE_ATTEMPTS} attempts")
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -427,8 +449,31 @@ fn registry_admission_pass(
     registration: &LeaseRegistration,
     starttime: u64,
     settings: AcquireSettings,
+    registered: bool,
 ) -> Result<RegistryAttempt> {
     with_registry_lock(&registration.registry, || {
+        if !registered {
+            match rustix::fs::statat(
+                &*registration.registry.dir,
+                &registration.file_name,
+                rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+            ) {
+                Ok(_) => return Ok(RegistryAttempt::Collision),
+                Err(rustix::io::Errno::NOENT) => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "checking compression lease path {}",
+                            registration
+                                .registry
+                                .path
+                                .join(&registration.file_name)
+                                .display()
+                        )
+                    });
+                }
+            }
+        }
         let now = unix_now_secs()?;
         let leases = load_and_prune_leases(&registration.registry, now)?;
         let own = leases
@@ -867,17 +912,22 @@ fn validate_lease_record(record: &LeaseRecord, identity: LeaseFileIdentity<'_>) 
 }
 
 fn lease_is_live(record: &LeaseRecord, now: u64) -> Result<bool> {
-    if now.saturating_sub(record.refreshed_at_unix_secs) > LEASE_STALE_AFTER.as_secs() {
-        return Ok(false);
-    }
-    if process_identity_matches(record.pid, record.starttime)? {
+    if matches!(
+        process_identity_matches(record.pid, record.starttime),
+        Ok(true)
+    ) {
         return Ok(true);
     }
-    match (record.child_pid, record.child_starttime) {
-        (Some(pid), Some(starttime)) => process_identity_matches(pid, starttime),
-        (None, None) => Ok(false),
+    if match (record.child_pid, record.child_starttime) {
+        (Some(pid), Some(starttime)) => {
+            matches!(process_identity_matches(pid, starttime), Ok(true))
+        }
+        (None, None) => false,
         _ => unreachable!("validated leases have paired child identity fields"),
+    } {
+        return Ok(true);
     }
+    Ok(now.saturating_sub(record.refreshed_at_unix_secs) <= LEASE_STALE_AFTER.as_secs())
 }
 
 fn process_identity_matches(pid: u32, expected_starttime: u64) -> Result<bool> {
@@ -1258,6 +1308,12 @@ mod tests {
         }
     }
 
+    fn expire_record(record: &mut LeaseRecord) {
+        record.refreshed_at_unix_secs = unix_now_secs()
+            .unwrap()
+            .saturating_sub(LEASE_STALE_AFTER.as_secs() + 1);
+    }
+
     fn seed_record(registry_path: &Path, record: &LeaseRecord) -> String {
         let registry = prepare_registry_dir(registry_path).unwrap();
         let file_name = lease_file_name(record.pid, &record.nonce);
@@ -1558,7 +1614,7 @@ mod tests {
     }
 
     #[test]
-    fn dead_pid_lease_is_pruned() {
+    fn dead_pid_lease_is_retained_until_ttl() {
         let (_guard, env) = TestEnvironment::new("dead-pid");
         let mut child = Command::new("sleep").arg("30").spawn().unwrap();
         let pid = child.id();
@@ -1567,6 +1623,26 @@ mod tests {
         child.wait().unwrap();
         assert_eq!(process_starttime(pid).unwrap(), None);
         let stale_name = seed_record(&env.dir, &make_record(pid, starttime, 2));
+
+        let mut lease = acquire_for_pid(Some(nonzero(1)), nonzero(8), std::process::id());
+
+        assert!(env.dir.join(stale_name).is_file());
+        assert_eq!(lease.decision().active_leases, 2);
+        lease.release();
+    }
+
+    #[test]
+    fn lease_older_than_ttl_with_dead_identity_is_pruned() {
+        let (_guard, env) = TestEnvironment::new("expired-dead-pid");
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        let starttime = process_starttime(pid).unwrap().unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(process_starttime(pid).unwrap(), None);
+        let mut record = make_record(pid, starttime, 2);
+        expire_record(&mut record);
+        let stale_name = seed_record(&env.dir, &record);
 
         let mut lease = acquire_for_pid(Some(nonzero(1)), nonzero(8), std::process::id());
 
@@ -1607,11 +1683,13 @@ mod tests {
     }
 
     #[test]
-    fn live_pid_with_wrong_starttime_is_pruned() {
+    fn lease_older_than_ttl_with_wrong_starttime_is_pruned() {
         let (_guard, env) = TestEnvironment::new("wrong-starttime");
         let pid = std::process::id();
         let starttime = process_starttime(pid).unwrap().unwrap();
-        let stale_name = seed_record(&env.dir, &make_record(pid, starttime.saturating_add(1), 2));
+        let mut record = make_record(pid, starttime.saturating_add(1), 2);
+        expire_record(&mut record);
+        let stale_name = seed_record(&env.dir, &record);
 
         let mut lease = acquire_for_pid(Some(nonzero(1)), nonzero(8), std::process::id());
 
@@ -1621,18 +1699,18 @@ mod tests {
     }
 
     #[test]
-    fn expired_live_pid_lease_is_pruned_by_ttl() {
+    fn lease_older_than_ttl_with_live_validated_identity_survives_pruning() {
         let (_guard, env) = TestEnvironment::new("expired");
         let pid = std::process::id();
         let starttime = process_starttime(pid).unwrap().unwrap();
         let mut record = make_record(pid, starttime, 2);
-        record.refreshed_at_unix_secs = unix_now_secs().unwrap() - LEASE_STALE_AFTER.as_secs() - 1;
-        let stale_name = seed_record(&env.dir, &record);
+        expire_record(&mut record);
+        let live_name = seed_record(&env.dir, &record);
 
         let mut lease = acquire_for_pid(Some(nonzero(1)), nonzero(8), std::process::id());
 
-        assert!(!env.dir.join(stale_name).exists());
-        assert_eq!(lease.decision().active_leases, 1);
+        assert!(env.dir.join(live_name).is_file());
+        assert_eq!(lease.decision().active_leases, 2);
         lease.release();
     }
 
@@ -1676,6 +1754,57 @@ mod tests {
     }
 
     #[test]
+    fn nonce_collision_retries_with_new_independent_lease() {
+        let (_guard, env) = TestEnvironment::new("nonce-collision");
+        let pid = std::process::id();
+        let starttime = process_starttime(pid).unwrap().unwrap();
+        let existing_record = make_record(pid, starttime, 2);
+        let collision_nonce = existing_record.nonce.clone();
+        let existing_name = seed_record(&env.dir, &existing_record);
+        let new_nonce = test_nonce();
+        let mut nonces = [collision_nonce, new_nonce.clone()].into_iter();
+        let settings = resolve_settings(Some(nonzero(3)), nonzero(8));
+
+        let mut lease = acquire_coordinated_with_nonce_generator(settings, pid, || {
+            Ok(nonces.next().expect("nonce retry should be bounded"))
+        })
+        .unwrap();
+        let new_name = lease.registration.as_ref().unwrap().file_name.clone();
+        let records = snapshot_records(&env.dir);
+
+        assert_eq!(lease.registration.as_ref().unwrap().nonce, new_nonce);
+        assert_ne!(new_name, existing_name);
+        assert!(env.dir.join(&existing_name).is_file());
+        assert!(env.dir.join(&new_name).is_file());
+        assert_eq!(records.len(), 2);
+        assert_eq!(
+            records
+                .iter()
+                .find(|record| record.nonce == existing_record.nonce)
+                .unwrap()
+                .granted_threads,
+            2
+        );
+        assert_eq!(
+            records
+                .iter()
+                .find(|record| record.nonce == new_nonce)
+                .unwrap()
+                .granted_threads,
+            3
+        );
+
+        lease.release();
+
+        assert!(env.dir.join(&existing_name).is_file());
+        assert!(!env.dir.join(new_name).exists());
+        let records = snapshot_records(&env.dir);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].nonce, existing_record.nonce);
+        assert_eq!(records[0].granted_threads, 2);
+    }
+
+    #[test]
     fn record_child_persists_pid_and_starttime() {
         let (_guard, _env) = TestEnvironment::new("record-child");
         let mut lease = acquire_for_pid(Some(nonzero(2)), nonzero(16), std::process::id());
@@ -1697,7 +1826,7 @@ mod tests {
     }
 
     #[test]
-    fn live_child_keeps_lease_when_parent_identity_is_stale() {
+    fn lease_older_than_ttl_with_live_child_survives_when_parent_identity_is_stale() {
         let (_guard, env) = TestEnvironment::new("orphan-child");
         let child = ChildGuard(Command::new("sleep").arg("30").spawn().unwrap());
         let child_pid = child.0.id();
@@ -1711,6 +1840,7 @@ mod tests {
         );
         record.child_pid = Some(child_pid);
         record.child_starttime = process_starttime(child_pid).unwrap();
+        expire_record(&mut record);
         let live_name = seed_record(&env.dir, &record);
 
         let mut lease = acquire_for_pid(Some(nonzero(1)), nonzero(8), std::process::id());
@@ -1721,7 +1851,7 @@ mod tests {
     }
 
     #[test]
-    fn wrong_child_starttime_is_pruned_when_parent_identity_is_stale() {
+    fn expired_wrong_child_starttime_is_pruned_when_parent_identity_is_stale() {
         let (_guard, env) = TestEnvironment::new("wrong-child-starttime");
         let child = ChildGuard(Command::new("sleep").arg("30").spawn().unwrap());
         let child_pid = child.0.id();
@@ -1737,6 +1867,7 @@ mod tests {
         record.child_starttime = process_starttime(child_pid)
             .unwrap()
             .map(|starttime| starttime.saturating_add(1));
+        expire_record(&mut record);
         let stale_name = seed_record(&env.dir, &record);
 
         let mut lease = acquire_for_pid(Some(nonzero(1)), nonzero(8), std::process::id());
