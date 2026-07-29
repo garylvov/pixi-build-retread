@@ -9,8 +9,9 @@
 //! the conda-first preference plumbing (conda pins flow into emissions
 //! and into the uv resolver's constraint set).
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::str::FromStr;
+use std::sync::Arc;
 
 use rattler_conda_types::{
     ChannelUrl, GenericVirtualPackage, MatchSpec, PackageName, ParseStrictness, RepoDataRecord,
@@ -19,6 +20,28 @@ use rattler_conda_types::{
 use rattler_solve::{ChannelPriority, SolveStrategy, SolverImpl, SolverTask, resolvo};
 
 use crate::relax::CondaMatchSpec;
+
+/// Failure classification retained at the bundle-scoped probe boundary.
+///
+/// Only `Unsolvable` is a monotone proof suitable for block deletion.
+/// Operational/configuration failures and unavailable repodata must never be
+/// promoted into such a proof by the conflict-localization reducer.
+#[derive(Debug)]
+pub(crate) enum SharedSolveFailure {
+    Unsolvable(Vec<String>),
+    Unproven(Vec<String>),
+    Unavailable(Vec<String>),
+}
+
+impl SharedSolveFailure {
+    fn into_reasons(self) -> Vec<String> {
+        match self {
+            Self::Unsolvable(reasons) | Self::Unproven(reasons) | Self::Unavailable(reasons) => {
+                reasons
+            }
+        }
+    }
+}
 
 /// Solve a spec set against already-loaded records and return the
 /// concrete records the solver selected. Shared by the pre-emission
@@ -46,31 +69,56 @@ fn solve_selected_records_from_records(
     solve_selected_records_from_records_for_target(
         parsed_specs,
         all_records,
-        target_python,
-        channel_priority,
-        system_requirements,
-        None,
-        strategy,
+        &SolveTarget {
+            python: target_python,
+            channel_priority,
+            system_requirements,
+            detected_virtual_packages: None,
+            strategy,
+        },
         preferred,
     )
+    .map_err(SharedSolveFailure::into_reasons)
+}
+
+pub(crate) struct SolveTarget<'a> {
+    python: &'a str,
+    channel_priority: ChannelPriority,
+    system_requirements: &'a BTreeMap<String, String>,
+    detected_virtual_packages: Option<&'a BTreeMap<String, String>>,
+    strategy: SolveStrategy,
+}
+
+impl<'a> SolveTarget<'a> {
+    pub(crate) fn new(
+        python: &'a str,
+        channel_priority: ChannelPriority,
+        system_requirements: &'a BTreeMap<String, String>,
+        detected_virtual_packages: Option<&'a BTreeMap<String, String>>,
+        strategy: SolveStrategy,
+    ) -> Self {
+        Self {
+            python,
+            channel_priority,
+            system_requirements,
+            detected_virtual_packages,
+            strategy,
+        }
+    }
 }
 
 fn solve_selected_records_from_records_for_target(
     parsed_specs: Vec<MatchSpec>,
     all_records: &[RepoDataRecord],
-    target_python: &str,
-    channel_priority: ChannelPriority,
-    system_requirements: &BTreeMap<String, String>,
-    detected_virtual_packages: Option<&BTreeMap<String, String>>,
-    strategy: SolveStrategy,
+    target: &SolveTarget<'_>,
     preferred: Vec<RepoDataRecord>,
-) -> std::result::Result<Vec<RepoDataRecord>, Vec<String>> {
+) -> std::result::Result<Vec<RepoDataRecord>, SharedSolveFailure> {
     let virtual_packages = build_virtual_packages_for_target(
-        target_python,
-        system_requirements,
-        detected_virtual_packages,
+        target.python,
+        target.system_requirements,
+        target.detected_virtual_packages,
     )
-    .map_err(|error| vec![error])?;
+    .map_err(|error| SharedSolveFailure::Unproven(vec![error]))?;
     let task = SolverTask {
         available_packages: vec![all_records],
         // `locked_packages` = soft preference in rattler_solve: the solver
@@ -85,16 +133,20 @@ fn solve_selected_records_from_records_for_target(
         specs: parsed_specs,
         constraints: Vec::new(),
         timeout: Some(std::time::Duration::from_secs(60)),
-        channel_priority,
+        channel_priority: target.channel_priority,
         exclude_newer: None,
         min_age: None,
-        strategy,
+        strategy: target.strategy,
     };
     let mut solver = resolvo::Solver;
     match solver.solve(task) {
         Ok(solution) => Ok(solution.records),
-        Err(rattler_solve::SolveError::Unsolvable(reasons)) => Err(reasons),
-        Err(other) => Err(vec![format!("solver error: {other}")]),
+        Err(rattler_solve::SolveError::Unsolvable(reasons)) => {
+            Err(SharedSolveFailure::Unsolvable(reasons))
+        }
+        Err(other) => Err(SharedSolveFailure::Unproven(vec![format!(
+            "solver error: {other}"
+        )])),
     }
 }
 
@@ -119,44 +171,64 @@ async fn solve_on_blocking_pool(
 ) -> std::result::Result<Vec<RepoDataRecord>, Vec<String>> {
     solve_on_blocking_pool_for_target(
         parsed_specs,
-        records,
-        target_python,
-        channel_priority,
-        system_requirements,
+        records.into(),
         None,
-        strategy,
+        SolveTarget {
+            python: &target_python,
+            channel_priority,
+            system_requirements: &system_requirements,
+            detected_virtual_packages: None,
+            strategy,
+        },
         preferred,
     )
     .await
+    .map_err(SharedSolveFailure::into_reasons)
 }
 
 async fn solve_on_blocking_pool_for_target(
     parsed_specs: Vec<MatchSpec>,
-    records: Vec<RepoDataRecord>,
-    target_python: String,
-    channel_priority: ChannelPriority,
-    system_requirements: BTreeMap<String, String>,
-    detected_virtual_packages: Option<BTreeMap<String, String>>,
-    strategy: SolveStrategy,
+    records: Arc<[RepoDataRecord]>,
+    probe_grant: Option<crate::thread_budget::ProbePoolGrant>,
+    target: SolveTarget<'_>,
     preferred: Vec<RepoDataRecord>,
-) -> std::result::Result<Vec<RepoDataRecord>, Vec<String>> {
+) -> std::result::Result<Vec<RepoDataRecord>, SharedSolveFailure> {
+    let probe_task = match &probe_grant {
+        Some(grant) => Some(grant.acquire_task().await),
+        None => None,
+    };
     let t_solve = std::time::Instant::now();
     let specs_count = parsed_specs.len();
     let records_count = records.len();
+    let target_python = target.python.to_string();
+    let system_requirements = target.system_requirements.clone();
+    let detected_virtual_packages = target.detected_virtual_packages.cloned();
+    let channel_priority = target.channel_priority;
+    let strategy = target.strategy;
     let result = tokio::task::spawn_blocking(move || {
+        // Keep the bundle's one coordinated grant alive until this CPU task
+        // actually exits, even if its async waiter is cancelled.
+        let _probe_grant = probe_grant;
+        let _probe_task = probe_task;
         solve_selected_records_from_records_for_target(
             parsed_specs,
             &records,
-            &target_python,
-            channel_priority,
-            &system_requirements,
-            detected_virtual_packages.as_ref(),
-            strategy,
+            &SolveTarget {
+                python: &target_python,
+                channel_priority,
+                system_requirements: &system_requirements,
+                detected_virtual_packages: detected_virtual_packages.as_ref(),
+                strategy,
+            },
             preferred,
         )
     })
     .await
-    .unwrap_or_else(|e| Err(vec![format!("solver task panicked: {e}")]));
+    .unwrap_or_else(|e| {
+        Err(SharedSolveFailure::Unproven(vec![format!(
+            "solver task panicked: {e}"
+        )]))
+    });
     tracing::info!(
         elapsed_ms = t_solve.elapsed().as_millis() as u64,
         satisfiable = result.is_ok(),
@@ -178,6 +250,146 @@ fn parse_match_specs(specs: &[String]) -> Vec<MatchSpec> {
         }
     }
     parsed_specs
+}
+
+type SparsePair = (
+    String,
+    Arc<rattler_repodata_gateway::sparse::SparseRepoData>,
+);
+type SparseLoadResult = std::result::Result<(Vec<RepoDataRecord>, Vec<String>), Vec<String>>;
+
+/// Bundle-scoped sparse-repodata and reachable-record cache.
+///
+/// The same [`CondaCoSolveContext`](crate::handler::CondaCoSolveContext) runs
+/// many counterfactual solves whose root sets are subsets of the first full
+/// route set. Sparse handles are shared once, and reachable records grow only
+/// when a later phase introduces a root that was not covered previously.
+/// Returning `Arc` snapshots lets concurrent solves share the exact record
+/// allocation while a later root expansion safely replaces the cached union.
+#[derive(Clone)]
+pub(crate) struct SharedSparseSolveData {
+    channels: Arc<[ChannelUrl]>,
+    target_subdir: Arc<str>,
+    pairs: Arc<tokio::sync::OnceCell<Arc<[SparsePair]>>>,
+    reachable: Arc<tokio::sync::Mutex<ReachableState>>,
+}
+
+impl std::fmt::Debug for SharedSparseSolveData {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SharedSparseSolveData")
+            .field("channels", &self.channels)
+            .field("target_subdir", &self.target_subdir)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Default)]
+struct ReachableState {
+    root_order: Vec<PackageName>,
+    covered_roots: BTreeSet<PackageName>,
+    record_names: BTreeSet<PackageName>,
+    records: Option<Arc<[RepoDataRecord]>>,
+    consulted: Arc<[String]>,
+}
+
+impl SharedSparseSolveData {
+    pub(crate) fn new(channels: &[ChannelUrl], target_subdir: &str) -> Self {
+        Self {
+            channels: channels.to_vec().into(),
+            target_subdir: Arc::from(target_subdir),
+            pairs: Arc::new(tokio::sync::OnceCell::new()),
+            reachable: Arc::new(tokio::sync::Mutex::new(ReachableState::default())),
+        }
+    }
+
+    async fn pairs(&self) -> Arc<[SparsePair]> {
+        self.pairs
+            .get_or_init(|| async {
+                crate::repodata::sparse_pairs(&self.channels, &self.target_subdir)
+                    .await
+                    .into()
+            })
+            .await
+            .clone()
+    }
+
+    async fn records_for(
+        &self,
+        parsed_specs: &[MatchSpec],
+    ) -> (Arc<[RepoDataRecord]>, Arc<[String]>) {
+        self.records_for_with_loader(parsed_specs, load_selected_records_sparse_from_pairs)
+            .await
+    }
+
+    async fn records_for_with_loader<Load, LoadFuture>(
+        &self,
+        parsed_specs: &[MatchSpec],
+        load: Load,
+    ) -> (Arc<[RepoDataRecord]>, Arc<[String]>)
+    where
+        Load: FnOnce(Arc<[SparsePair]>, Vec<PackageName>) -> LoadFuture,
+        LoadFuture: std::future::Future<Output = SparseLoadResult>,
+    {
+        let requested_roots = exact_root_names(parsed_specs);
+        let mut state = self.reachable.lock().await;
+        if requested_roots
+            .iter()
+            .all(|root| state.covered_roots.contains(root) || state.record_names.contains(root))
+            && let Some(records) = &state.records
+        {
+            tracing::debug!(
+                records = records.len(),
+                covered_roots = state.covered_roots.len(),
+                requested_roots = requested_roots.len(),
+                "bench: reusing bundle-scoped sparse reachable records",
+            );
+            return (Arc::clone(records), Arc::clone(&state.consulted));
+        }
+
+        let mut root_order = state.root_order.clone();
+        let mut covered_roots = state.covered_roots.clone();
+        for root in requested_roots {
+            if !covered_roots.contains(&root) && !state.record_names.contains(&root) {
+                covered_roots.insert(root.clone());
+                root_order.push(root);
+            }
+        }
+        let pairs = self.pairs().await;
+        let (records, consulted) = match load(pairs, root_order.clone()).await {
+            Ok(loaded) => loaded,
+            // Gateway errors and spawn-blocking panics both take this path.
+            // Keep the last good snapshot intact so a later probe can retry.
+            Err(consulted) => return (Arc::from([]), consulted.into()),
+        };
+        let record_names = records
+            .iter()
+            .map(|record| record.package_record.name.clone())
+            .collect();
+        let records: Arc<[RepoDataRecord]> = records.into();
+        let consulted: Arc<[String]> = consulted.into();
+        state.root_order = root_order;
+        state.covered_roots = covered_roots;
+        state.record_names = record_names;
+        state.records = Some(Arc::clone(&records));
+        state.consulted = Arc::clone(&consulted);
+        (records, consulted)
+    }
+}
+
+fn exact_root_names(parsed_specs: &[MatchSpec]) -> Vec<PackageName> {
+    let mut seen = BTreeSet::new();
+    parsed_specs
+        .iter()
+        .filter_map(|spec| match spec.name.as_ref() {
+            Some(rattler_conda_types::PackageNameMatcher::Exact(name))
+                if seen.insert(name.clone()) =>
+            {
+                Some(name.clone())
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -408,29 +620,34 @@ async fn load_selected_records_sparse(
     target_subdir: &str,
     parsed_specs: &[MatchSpec],
 ) -> (Vec<RepoDataRecord>, Vec<String>) {
-    use rattler_repodata_gateway::sparse::{PackageFormatSelection, SparseRepoData};
-    let pairs = crate::repodata::sparse_pairs(channels, target_subdir).await;
+    let pairs: Arc<[SparsePair]> = crate::repodata::sparse_pairs(channels, target_subdir)
+        .await
+        .into();
     if pairs.is_empty() {
         return (Vec::new(), Vec::new());
     }
-    let consulted: Vec<String> = pairs.iter().map(|(label, _)| label.clone()).collect();
     // Exact-named specs seed the reachable-set walk. Glob/regex
     // matchers (rare; retread never emits them) can't seed a name walk
     // -- they're skipped here and simply unmatchable in the subset,
     // identical to how an absent package behaved in the full set.
-    let root_names: Vec<PackageName> = parsed_specs
-        .iter()
-        .filter_map(|spec| match spec.name.as_ref() {
-            Some(rattler_conda_types::PackageNameMatcher::Exact(name)) => Some(name.clone()),
-            _ => None,
-        })
-        .collect();
+    let root_names = exact_root_names(parsed_specs);
+    match load_selected_records_sparse_from_pairs(pairs, root_names).await {
+        Ok(loaded) => loaded,
+        Err(consulted) => (Vec::new(), consulted),
+    }
+}
+
+async fn load_selected_records_sparse_from_pairs(
+    pairs: Arc<[SparsePair]>,
+    root_names: Vec<PackageName>,
+) -> SparseLoadResult {
+    use rattler_repodata_gateway::sparse::{PackageFormatSelection, SparseRepoData};
+    let consulted: Vec<String> = pairs.iter().map(|(label, _)| label.clone()).collect();
     let roots = root_names.len();
     let t = std::time::Instant::now();
-    let handles: Vec<_> = pairs.into_iter().map(|(_, h)| h).collect();
     let per_repo = match tokio::task::spawn_blocking(move || {
         SparseRepoData::load_records_recursive(
-            handles.iter().map(|h| h.as_ref()),
+            pairs.iter().map(|(_, handle)| handle.as_ref()),
             root_names,
             None,
             PackageFormatSelection::default(),
@@ -441,11 +658,11 @@ async fn load_selected_records_sparse(
         Ok(Ok(v)) => v,
         Ok(Err(e)) => {
             tracing::warn!(error = %e, "solve-check: sparse record load failed");
-            return (Vec::new(), consulted);
+            return Err(consulted);
         }
         Err(e) => {
             tracing::warn!(error = %e, "solve-check: sparse record load panicked");
-            return (Vec::new(), consulted);
+            return Err(consulted);
         }
     };
     let mut records: Vec<RepoDataRecord> = Vec::new();
@@ -464,7 +681,7 @@ async fn load_selected_records_sparse(
         pairs = consulted.len(),
         "bench: sparse reachable records loaded",
     );
-    (records, consulted)
+    Ok((records, consulted))
 }
 
 /// Solve a spec set against cached repodata and return the concrete
@@ -499,6 +716,7 @@ pub async fn solve_selected_records(
 /// detected map is Pixi's complete virtual-package set for the selected rich
 /// target. `Some(empty)` remains contract-qualified and suppresses host
 /// detection; only `None` selects legacy host inference.
+#[allow(clippy::too_many_arguments)]
 pub async fn solve_selected_records_for_target(
     channels: &[ChannelUrl],
     specs: &[CondaMatchSpec],
@@ -524,15 +742,64 @@ pub async fn solve_selected_records_for_target(
     }
     solve_on_blocking_pool_for_target(
         parsed_specs,
-        records,
-        target_python.to_string(),
-        channel_priority,
-        system_requirements.clone(),
-        detected_virtual_packages.cloned(),
-        strategy,
+        records.into(),
+        None,
+        SolveTarget {
+            python: target_python,
+            channel_priority,
+            system_requirements,
+            detected_virtual_packages,
+            strategy,
+        },
         Vec::new(),
     )
     .await
+    .map_err(SharedSolveFailure::into_reasons)
+}
+
+/// Bundle-scoped form of [`solve_selected_records_for_target`] that shares
+/// sparse handles and the grow-only reachable record union across probes.
+pub(crate) async fn solve_selected_records_for_target_shared(
+    shared: &SharedSparseSolveData,
+    specs: &[CondaMatchSpec],
+    probe_grant: Option<crate::thread_budget::ProbePoolGrant>,
+    target: &SolveTarget<'_>,
+) -> std::result::Result<Vec<RepoDataRecord>, SharedSolveFailure> {
+    let rendered_specs: Vec<String> = specs.iter().map(ToString::to_string).collect();
+    let parsed_specs = parse_match_specs(&rendered_specs);
+    let (records, _consulted) = shared.records_for(&parsed_specs).await;
+    if records.is_empty() {
+        return Err(SharedSolveFailure::Unavailable(vec![
+            "solve-check skipped: no repodata available from disk cache".into(),
+        ]));
+    }
+    solve_on_blocking_pool_for_target(
+        parsed_specs,
+        records,
+        probe_grant,
+        SolveTarget {
+            python: target.python,
+            channel_priority: target.channel_priority,
+            system_requirements: target.system_requirements,
+            detected_virtual_packages: target.detected_virtual_packages,
+            strategy: target.strategy,
+        },
+        Vec::new(),
+    )
+    .await
+}
+
+/// Populate the bundle-scoped reachable-record union without running resolvo.
+///
+/// Standalone provider probes can then share one complete immutable snapshot
+/// instead of introducing roots one at a time and rebuilding a growing union.
+pub(crate) async fn prewarm_selected_records_for_target_shared(
+    shared: &SharedSparseSolveData,
+    specs: &[CondaMatchSpec],
+) {
+    let rendered_specs: Vec<String> = specs.iter().map(ToString::to_string).collect();
+    let parsed_specs = parse_match_specs(&rendered_specs);
+    let _ = shared.records_for(&parsed_specs).await;
 }
 
 #[cfg(test)]
@@ -574,6 +841,185 @@ mod tests {
             version: Version::from_str(version).unwrap(),
             build_string: build_string.to_string(),
         }
+    }
+
+    fn shared_sparse_fixture(state: ReachableState) -> SharedSparseSolveData {
+        let pairs = tokio::sync::OnceCell::new();
+        assert!(pairs.set(Vec::<SparsePair>::new().into()).is_ok());
+        SharedSparseSolveData {
+            channels: Arc::from([]),
+            target_subdir: Arc::from("linux-64"),
+            pairs: Arc::new(pairs),
+            reachable: Arc::new(tokio::sync::Mutex::new(state)),
+        }
+    }
+
+    #[test]
+    fn exact_root_names_preserve_first_seen_order() {
+        let specs = parse_match_specs(&[
+            "zlib >=1.2".to_string(),
+            "numpy >=2".to_string(),
+            "zlib <2".to_string(),
+            "python 3.11.*".to_string(),
+        ]);
+
+        let roots = exact_root_names(&specs)
+            .into_iter()
+            .map(|name| name.as_normalized().to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(roots, ["zlib", "numpy", "python"]);
+    }
+
+    #[tokio::test]
+    async fn shared_sparse_solve_data_reuses_covered_record_arc() {
+        let records: Arc<[RepoDataRecord]> = vec![
+            repo_record("python", "3.11.5", &[]),
+            repo_record("numpy", "2.1.0", &["python >=3.11,<3.12"]),
+        ]
+        .into();
+        let shared = SharedSparseSolveData {
+            channels: Arc::from([]),
+            target_subdir: Arc::from("linux-64"),
+            pairs: Arc::new(tokio::sync::OnceCell::new()),
+            reachable: Arc::new(tokio::sync::Mutex::new(ReachableState {
+                root_order: vec![
+                    PackageName::from_str("python").unwrap(),
+                    PackageName::from_str("numpy").unwrap(),
+                ],
+                covered_roots: BTreeSet::from([
+                    PackageName::from_str("numpy").unwrap(),
+                    PackageName::from_str("python").unwrap(),
+                ]),
+                record_names: BTreeSet::from([
+                    PackageName::from_str("numpy").unwrap(),
+                    PackageName::from_str("python").unwrap(),
+                ]),
+                records: Some(Arc::clone(&records)),
+                consulted: Arc::from(["fixture/linux-64".to_string()]),
+            })),
+        };
+
+        let full = parse_match_specs(&["python 3.11.*".into(), "numpy >=2".into()]);
+        let subset = parse_match_specs(&["python 3.11.*".into()]);
+        let (full_records, full_consulted) = shared.records_for(&full).await;
+        let (subset_records, subset_consulted) = shared.records_for(&subset).await;
+
+        assert!(Arc::ptr_eq(&records, &full_records));
+        assert!(Arc::ptr_eq(&full_records, &subset_records));
+        assert_eq!(&*full_consulted, &*subset_consulted);
+    }
+
+    #[tokio::test]
+    async fn shared_sparse_solve_data_reuses_transitively_loaded_root() {
+        let parent = PackageName::from_str("parent").unwrap();
+        let child = PackageName::from_str("child").unwrap();
+        let records: Arc<[RepoDataRecord]> = vec![
+            repo_record("parent", "1.0", &["child >=1"]),
+            repo_record("child", "1.0", &[]),
+        ]
+        .into();
+        let shared = shared_sparse_fixture(ReachableState {
+            root_order: vec![parent.clone()],
+            covered_roots: BTreeSet::from([parent.clone()]),
+            record_names: BTreeSet::from([parent, child]),
+            records: Some(Arc::clone(&records)),
+            consulted: Arc::from(["fixture/linux-64".to_string()]),
+        });
+        let loader_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let loader_calls_for_probe = Arc::clone(&loader_calls);
+        let specs = parse_match_specs(&["child >=1".to_string()]);
+
+        let (reused, consulted) = shared
+            .records_for_with_loader(&specs, move |_pairs, _roots| async move {
+                loader_calls_for_probe.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok((Vec::new(), Vec::new()))
+            })
+            .await;
+
+        assert_eq!(loader_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(Arc::ptr_eq(&records, &reused));
+        assert_eq!(&*consulted, ["fixture/linux-64"]);
+    }
+
+    #[tokio::test]
+    async fn failed_sparse_load_does_not_poison_reachable_cache() {
+        let parent = PackageName::from_str("parent").unwrap();
+        let child = PackageName::from_str("child").unwrap();
+        let missing = PackageName::from_str("missing").unwrap();
+        let original_records: Arc<[RepoDataRecord]> = vec![
+            repo_record("parent", "1.0", &["child >=1"]),
+            repo_record("child", "1.0", &[]),
+        ]
+        .into();
+        let shared = shared_sparse_fixture(ReachableState {
+            root_order: vec![parent.clone()],
+            covered_roots: BTreeSet::from([parent.clone()]),
+            record_names: BTreeSet::from([parent.clone(), child.clone()]),
+            records: Some(Arc::clone(&original_records)),
+            consulted: Arc::from(["fixture/linux-64".to_string()]),
+        });
+        let specs = parse_match_specs(&["missing >=1".to_string()]);
+        let failed_roots = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let failed_roots_for_probe = Arc::clone(&failed_roots);
+
+        let (failed_records, failed_consulted) = shared
+            .records_for_with_loader(&specs, move |_pairs, roots| async move {
+                failed_roots_for_probe.lock().unwrap().push(roots);
+                Err(vec!["fixture/linux-64".to_string()])
+            })
+            .await;
+
+        assert!(failed_records.is_empty());
+        assert_eq!(&*failed_consulted, ["fixture/linux-64"]);
+        {
+            let state = shared.reachable.lock().await;
+            assert_eq!(state.root_order, [parent.clone()]);
+            assert_eq!(state.covered_roots, BTreeSet::from([parent.clone()]));
+            assert_eq!(
+                state.record_names,
+                BTreeSet::from([parent.clone(), child.clone()])
+            );
+            assert!(Arc::ptr_eq(
+                state.records.as_ref().unwrap(),
+                &original_records
+            ));
+        }
+
+        let expanded_records = vec![
+            repo_record("parent", "1.0", &["child >=1"]),
+            repo_record("child", "1.0", &[]),
+            repo_record("missing", "1.0", &[]),
+        ];
+        let retried_roots = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let retried_roots_for_probe = Arc::clone(&retried_roots);
+        let expected_records = expanded_records.clone();
+        let (loaded_records, loaded_consulted) = shared
+            .records_for_with_loader(&specs, move |_pairs, roots| async move {
+                retried_roots_for_probe.lock().unwrap().push(roots);
+                Ok((expected_records, vec!["fixture/linux-64".to_string()]))
+            })
+            .await;
+
+        assert_eq!(loaded_records.len(), 3);
+        assert_eq!(&*loaded_consulted, ["fixture/linux-64"]);
+        let expected_root_order = vec![parent.clone(), missing.clone()];
+        assert_eq!(*failed_roots.lock().unwrap(), [expected_root_order.clone()]);
+        assert_eq!(*retried_roots.lock().unwrap(), [expected_root_order]);
+        let state = shared.reachable.lock().await;
+        assert_eq!(state.root_order, [parent, missing.clone()]);
+        assert_eq!(
+            state.covered_roots,
+            BTreeSet::from([PackageName::from_str("parent").unwrap(), missing])
+        );
+        assert_eq!(
+            state.record_names,
+            BTreeSet::from([
+                PackageName::from_str("parent").unwrap(),
+                child,
+                PackageName::from_str("missing").unwrap(),
+            ])
+        );
     }
 
     #[test]
@@ -901,6 +1347,37 @@ mod tests {
         assert!(
             reasons.iter().any(|reason| unsat_mentions(reason, "numba")),
             "unsat reasons should name numba: {reasons:?}",
+        );
+    }
+
+    #[test]
+    fn resolvo_unsat_is_typed_as_monotone_probe_proof() {
+        let records = vec![
+            repo_record("python", "3.11.5", &[]),
+            repo_record("fixture-dep", "1.0.0", &[]),
+        ];
+        let specs = parse_match_specs(&[
+            "python 3.11.*".to_string(),
+            "fixture-dep ==2.0.0".to_string(),
+        ]);
+
+        let failure = solve_selected_records_from_records_for_target(
+            specs,
+            &records,
+            &SolveTarget::new(
+                "3.11",
+                ChannelPriority::Strict,
+                &BTreeMap::new(),
+                None,
+                SolveStrategy::Highest,
+            ),
+            Vec::new(),
+        )
+        .expect_err("the unavailable exact version must be unsatisfiable");
+
+        assert!(
+            matches!(failure, SharedSolveFailure::Unsolvable(_)),
+            "only resolvo's genuine Unsolvable result may authorize block deletion: {failure:?}",
         );
     }
 

@@ -1007,14 +1007,26 @@ where
 pub enum CoInstallVerdict {
     /// The pins co-install: accept the round.
     Sat,
-    /// The conda solver reported unsat; the reason strings are scanned
-    /// for auto-routed names to un-route.
+    /// The conda solver proved the package set unsatisfiable. This verdict is
+    /// monotone: every superset is also unsatisfiable, so delta-debugging may
+    /// safely remove a whole block at once.
     Unsat(Vec<String>),
+    /// A policy check or solver failure rejected this exact package set
+    /// without proving monotone solver unsatisfiability. Exact-unsat sets are
+    /// still handled as unsatisfiable by the legacy linear reducer, but must
+    /// never authorize block deletion or reason-hint pruning.
+    ExactUnsat(Vec<String>),
     /// The check could not run (no repodata on disk, offline, ...).
     /// Routing proceeds UNCHECKED — identical to pre-check behavior —
     /// so a missing cache can never veto a build. Deterministic given
     /// the same cache state.
     Skipped(String),
+}
+
+impl CoInstallVerdict {
+    fn is_unsat(&self) -> bool {
+        matches!(self, Self::Unsat(_) | Self::ExactUnsat(_))
+    }
 }
 
 /// One conda route considered for generated run-dependency emission.
@@ -1067,6 +1079,52 @@ where
     C: Fn(Vec<CondaRouteSpec>) -> F,
     F: std::future::Future<Output = CoInstallVerdict>,
 {
+    select_jointly_solvable_routes_inner(fixed, candidates, co_solve, 1, CoreReducer::Bisect).await
+}
+
+/// Bundle-qualified production entry point. The bundle is intentionally not
+/// logged here:
+/// [`crate::handler::CondaCoSolveContext`] owns aggregate per-bundle probe
+/// accounting across pre-lock, provider, and localization probes.
+pub(crate) async fn select_jointly_solvable_routes_for_bundle<C, F>(
+    _bundle: &str,
+    fixed: Vec<CondaRouteSpec>,
+    candidates: Vec<CondaRouteSpec>,
+    co_solve: &C,
+    parallelism: usize,
+) -> Option<JointRouteSelection>
+where
+    C: Fn(Vec<CondaRouteSpec>) -> F,
+    F: std::future::Future<Output = CoInstallVerdict>,
+{
+    select_jointly_solvable_routes_inner(
+        fixed,
+        candidates,
+        co_solve,
+        parallelism.max(1),
+        CoreReducer::Bisect,
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+enum CoreReducer {
+    Bisect,
+    #[cfg(test)]
+    Linear,
+}
+
+async fn select_jointly_solvable_routes_inner<C, F>(
+    fixed: Vec<CondaRouteSpec>,
+    candidates: Vec<CondaRouteSpec>,
+    co_solve: &C,
+    parallelism: usize,
+    reducer: CoreReducer,
+) -> Option<JointRouteSelection>
+where
+    C: Fn(Vec<CondaRouteSpec>) -> F,
+    F: std::future::Future<Output = CoInstallVerdict>,
+{
     let fixed: Vec<CondaRouteSpec> = fixed
         .into_iter()
         .collect::<BTreeSet<_>>()
@@ -1078,19 +1136,9 @@ where
         .into_iter()
         .collect();
 
-    let combined = |accepted: &[CondaRouteSpec]| {
-        fixed
-            .iter()
-            .chain(accepted)
-            .cloned()
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>()
-    };
-
     // Retain the first complete-set verdict so an unsatisfiable request is not
     // immediately solved a second time after the fixed-baseline check.
-    let mut next_verdict = Some(co_solve(combined(&candidates)).await);
+    let mut next_verdict = Some(co_solve(combined_routes(&fixed, &candidates)).await);
     if matches!(next_verdict.as_ref(), Some(CoInstallVerdict::Sat)) {
         return Some(JointRouteSelection {
             accepted: candidates,
@@ -1107,8 +1155,9 @@ where
     loop {
         let verdict = match next_verdict.take() {
             Some(verdict) => verdict,
-            None => co_solve(combined(&remaining)).await,
+            None => co_solve(combined_routes(&fixed, &remaining)).await,
         };
+        let use_exact_linear = matches!(&verdict, CoInstallVerdict::ExactUnsat(_));
         match verdict {
             CoInstallVerdict::Sat => {
                 return Some(JointRouteSelection {
@@ -1144,15 +1193,30 @@ where
                     .cloned()
                     .collect();
                 if !hinted.is_empty() && hinted.len() <= SINGLETON_HINT_LIMIT {
-                    let mut singleton_cores = Vec::new();
-                    for candidate in hinted {
-                        if matches!(
-                            co_solve(combined(std::slice::from_ref(&candidate))).await,
-                            CoInstallVerdict::Unsat(_)
-                        ) {
-                            singleton_cores.push(candidate);
-                        }
-                    }
+                    use futures::StreamExt;
+
+                    let fixed_for_trials = fixed.as_slice();
+                    let co_solve_for_trials = co_solve;
+                    let mut singleton_trials =
+                        futures::stream::iter(hinted.into_iter().enumerate())
+                            .map(move |(index, candidate)| async move {
+                                let verdict = co_solve_for_trials(combined_routes(
+                                    fixed_for_trials,
+                                    std::slice::from_ref(&candidate),
+                                ))
+                                .await;
+                                (index, candidate, verdict)
+                            })
+                            .buffer_unordered(parallelism)
+                            .collect::<Vec<_>>()
+                            .await;
+                    singleton_trials.sort_by_key(|(index, _, _)| *index);
+                    let singleton_cores = singleton_trials
+                        .into_iter()
+                        .filter_map(|(_, candidate, verdict)| {
+                            matches!(verdict, CoInstallVerdict::Unsat(_)).then_some(candidate)
+                        })
+                        .collect::<Vec<_>>();
                     if !singleton_cores.is_empty() {
                         tracing::info!(
                             routes = ?singleton_cores
@@ -1168,20 +1232,23 @@ where
                     }
                 }
             }
+            CoInstallVerdict::ExactUnsat(_) => {}
         }
 
-        // Reduce the failing set to a deletion-minimal unsatisfiable core:
-        // if removing one route leaves the trial unsatisfiable, that route
-        // is unrelated to this core and stays eligible for a later round.
         let mut core = remaining.clone();
-        for candidate in remaining.clone() {
-            let Some(pos) = core.iter().position(|route| route == &candidate) else {
-                continue;
-            };
-            let mut trial = core.clone();
-            trial.remove(pos);
-            if matches!(co_solve(combined(&trial)).await, CoInstallVerdict::Unsat(_)) {
-                core = trial;
+        match (reducer, use_exact_linear) {
+            (_, true) => {
+                reduce_unsat_core_linear(&fixed, &remaining, &mut core, co_solve, parallelism)
+                    .await;
+            }
+            (CoreReducer::Bisect, false) => {
+                reduce_unsat_core_bisect(&fixed, &remaining, &mut core, co_solve, parallelism)
+                    .await;
+            }
+            #[cfg(test)]
+            (CoreReducer::Linear, false) => {
+                reduce_unsat_core_linear(&fixed, &remaining, &mut core, co_solve, parallelism)
+                    .await;
             }
         }
 
@@ -1198,6 +1265,197 @@ where
         rejected.extend(core);
         remaining.retain(|route| !core_set.contains(route));
     }
+}
+
+fn combined_routes(fixed: &[CondaRouteSpec], accepted: &[CondaRouteSpec]) -> Vec<CondaRouteSpec> {
+    fixed
+        .iter()
+        .chain(accepted)
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// Ordered block-deletion delta debugging.
+///
+/// For a block `H`, an UNSAT verdict for `core - H` proves by monotonicity
+/// that the legacy left-to-right scan would remove every member of `H`.
+/// Otherwise the block is split left then right against the updated core.
+/// Residual blocks use the original linear scan verbatim. This preserves the
+/// exact deletion-minimal core and rejection order while reducing irrelevant
+/// candidate probes from O(N) to O(log N) per small core.
+async fn reduce_unsat_core_bisect<C, F>(
+    fixed: &[CondaRouteSpec],
+    ordered: &[CondaRouteSpec],
+    core: &mut Vec<CondaRouteSpec>,
+    co_solve: &C,
+    parallelism: usize,
+) where
+    C: Fn(Vec<CondaRouteSpec>) -> F,
+    F: std::future::Future<Output = CoInstallVerdict>,
+{
+    const LINEAR_RESIDUAL: usize = 4;
+
+    if ordered.len() <= LINEAR_RESIDUAL {
+        reduce_unsat_core_linear(fixed, ordered, core, co_solve, parallelism).await;
+        return;
+    }
+
+    // If an exact-only failure appears anywhere in the speculative bisection,
+    // discard every bulk mutation and replay the complete legacy scan. This
+    // protects byte-for-byte output even for nonmonotone policy oracles.
+    let original_core = core.clone();
+
+    // The root complement is the fixed baseline, which the caller already
+    // proved SAT. Start with its two children and process left before right.
+    let midpoint = ordered.len() / 2;
+    let mut pending = vec![(midpoint, ordered.len()), (0, midpoint)];
+    let mut bulk_deleted = false;
+    while let Some((start, end)) = pending.pop() {
+        let active = ordered[start..end]
+            .iter()
+            .filter(|candidate| core.contains(candidate))
+            .cloned()
+            .collect::<Vec<_>>();
+        if active.is_empty() {
+            continue;
+        }
+        if active.len() <= LINEAR_RESIDUAL {
+            // Before any bulk deletion, trials in a dense residual are
+            // independent and can use the bounded probe pool. Once a block
+            // has been removed, keep the legacy replay probe-minimal: every
+            // later trial depends on the updated core.
+            let residual_parallelism = if bulk_deleted { 1 } else { parallelism };
+            reduce_unsat_core_linear(
+                fixed,
+                &ordered[start..end],
+                core,
+                co_solve,
+                residual_parallelism,
+            )
+            .await;
+            continue;
+        }
+
+        let active: BTreeSet<_> = active.into_iter().collect();
+        let trial = core
+            .iter()
+            .filter(|route| !active.contains(*route))
+            .cloned()
+            .collect::<Vec<_>>();
+        match co_solve(combined_routes(fixed, &trial)).await {
+            CoInstallVerdict::Unsat(_) => {
+                *core = trial;
+                bulk_deleted = true;
+                continue;
+            }
+            CoInstallVerdict::ExactUnsat(_) => {
+                *core = original_core;
+                reduce_unsat_core_linear(fixed, ordered, core, co_solve, parallelism).await;
+                return;
+            }
+            CoInstallVerdict::Sat | CoInstallVerdict::Skipped(_) => {}
+        }
+
+        let midpoint = start + (end - start) / 2;
+        pending.push((midpoint, end));
+        pending.push((start, midpoint));
+    }
+}
+
+async fn reduce_unsat_core_linear<C, F>(
+    fixed: &[CondaRouteSpec],
+    ordered: &[CondaRouteSpec],
+    core: &mut Vec<CondaRouteSpec>,
+    co_solve: &C,
+    parallelism: usize,
+) where
+    C: Fn(Vec<CondaRouteSpec>) -> F,
+    F: std::future::Future<Output = CoInstallVerdict>,
+{
+    use futures::StreamExt;
+
+    let parallelism = parallelism.max(1);
+    let mut cursor = 0usize;
+    while cursor < ordered.len() {
+        // Every trial in a wave is derived from the same immutable core.
+        // Sat/skipped results can be replayed in order. The first unsat
+        // commits its trial; every later result is stale and discarded.
+        let snapshot = core.clone();
+        let mut batch = Vec::with_capacity(parallelism);
+        while cursor < ordered.len() && batch.len() < parallelism {
+            let index = cursor;
+            cursor += 1;
+            if snapshot.contains(&ordered[index]) {
+                batch.push((index, ordered[index].clone()));
+            }
+        }
+        if batch.is_empty() {
+            continue;
+        }
+
+        let fixed_for_trials = fixed;
+        let snapshot_for_trials = &snapshot;
+        let co_solve_for_trials = co_solve;
+        let mut trials = futures::stream::iter(batch)
+            .map(move |(index, candidate)| async move {
+                let mut trial = snapshot_for_trials.clone();
+                let pos = trial
+                    .iter()
+                    .position(|route| route == &candidate)
+                    .expect("batched deletion candidate belongs to the core snapshot");
+                trial.remove(pos);
+                let verdict = co_solve_for_trials(combined_routes(fixed_for_trials, &trial)).await;
+                (index, trial, verdict)
+            })
+            .buffer_unordered(parallelism)
+            .collect::<Vec<_>>()
+            .await;
+        trials.sort_by_key(|(index, _, _)| *index);
+
+        for (index, trial, verdict) in trials {
+            if verdict.is_unsat() {
+                *core = trial;
+                cursor = index + 1;
+                break;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) async fn select_jointly_solvable_routes_linear_reference<C, F>(
+    fixed: Vec<CondaRouteSpec>,
+    candidates: Vec<CondaRouteSpec>,
+    co_solve: &C,
+) -> Option<JointRouteSelection>
+where
+    C: Fn(Vec<CondaRouteSpec>) -> F,
+    F: std::future::Future<Output = CoInstallVerdict>,
+{
+    select_jointly_solvable_routes_inner(fixed, candidates, co_solve, 1, CoreReducer::Linear).await
+}
+
+#[cfg(test)]
+pub(crate) async fn select_jointly_solvable_routes_bisect_for_test<C, F>(
+    fixed: Vec<CondaRouteSpec>,
+    candidates: Vec<CondaRouteSpec>,
+    co_solve: &C,
+    parallelism: usize,
+) -> Option<JointRouteSelection>
+where
+    C: Fn(Vec<CondaRouteSpec>) -> F,
+    F: std::future::Future<Output = CoInstallVerdict>,
+{
+    select_jointly_solvable_routes_inner(
+        fixed,
+        candidates,
+        co_solve,
+        parallelism.max(1),
+        CoreReducer::Bisect,
+    )
+    .await
 }
 
 /// Does one resolvo unsat-reason line name this conda package?
@@ -1375,7 +1633,7 @@ where
         let mut candidate = routed.clone();
         candidate.extend(new_routes.iter().cloned());
         let verdict = co_solve(candidate.clone()).await;
-        if let CoInstallVerdict::Unsat(reasons) = &verdict {
+        if let CoInstallVerdict::Unsat(reasons) | CoInstallVerdict::ExactUnsat(reasons) = &verdict {
             let mut named: Vec<AutoRoutedPackage> = Vec::new();
             for pkg in &candidate {
                 let in_report = reasons
@@ -1510,10 +1768,7 @@ where
                 // removal — once it's already Sat/Skipped, stop; a
                 // single-candidate subset of an already-satisfiable set
                 // is not evidence that subset was the offender.
-                if !matches!(
-                    co_solve(probe_set.clone()).await,
-                    CoInstallVerdict::Unsat(_)
-                ) {
+                if !co_solve(probe_set.clone()).await.is_unsat() {
                     break;
                 }
                 let mut healed_idx: Option<usize> = None;
@@ -1523,7 +1778,7 @@ where
                     }
                     let mut trial = probe_set.clone();
                     trial.remove(i);
-                    if !matches!(co_solve(trial).await, CoInstallVerdict::Unsat(_)) {
+                    if !co_solve(trial).await.is_unsat() {
                         healed_idx = Some(i);
                         break;
                     }
@@ -8149,6 +8404,407 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
             conda_name: CondaName::new(conda_name),
             spec: spec.to_string(),
         }
+    }
+
+    fn fixture_route_co_solve(
+        conflicts: Arc<Vec<BTreeSet<String>>>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        delay: std::time::Duration,
+    ) -> impl Fn(Vec<CondaRouteSpec>) -> futures::future::BoxFuture<'static, CoInstallVerdict> {
+        move |routes: Vec<CondaRouteSpec>| {
+            use std::sync::atomic::Ordering;
+
+            calls.fetch_add(1, Ordering::SeqCst);
+            let conflicts = Arc::clone(&conflicts);
+            let names = routes
+                .iter()
+                .map(|route| route.conda_name.as_spec().to_string())
+                .collect::<BTreeSet<_>>();
+            Box::pin(async move {
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+                if conflicts.iter().any(|core| core.is_subset(&names)) {
+                    // Deliberately name no route: the fixture must exercise the
+                    // core reducer rather than the singleton-reason shortcut.
+                    CoInstallVerdict::Unsat(vec!["fixture graph conflict".to_string()])
+                } else {
+                    CoInstallVerdict::Sat
+                }
+            })
+        }
+    }
+
+    fn route_selection_bytes(selection: &JointRouteSelection) -> Vec<u8> {
+        let project = |routes: &[CondaRouteSpec]| {
+            routes
+                .iter()
+                .map(|route| {
+                    (
+                        route.pypi_name.as_str().to_string(),
+                        route.conda_name.as_spec().to_string(),
+                        route.spec.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        serde_json::to_vec(&(project(&selection.accepted), project(&selection.rejected))).unwrap()
+    }
+
+    #[tokio::test]
+    async fn rule2_bisect_matches_linear_on_multi_culprit_fixture_graphs() {
+        let cases = [
+            ("singleton", vec![BTreeSet::from(["dep-002".to_string()])]),
+            (
+                "independent-singletons",
+                vec![
+                    BTreeSet::from(["dep-003".to_string()]),
+                    BTreeSet::from(["dep-026".to_string()]),
+                ],
+            ),
+            (
+                "cross-half-pair",
+                vec![BTreeSet::from([
+                    "dep-005".to_string(),
+                    "dep-026".to_string(),
+                ])],
+            ),
+            (
+                "independent-pairs",
+                vec![
+                    BTreeSet::from(["dep-003".to_string(), "dep-010".to_string()]),
+                    BTreeSet::from(["dep-021".to_string(), "dep-028".to_string()]),
+                ],
+            ),
+            (
+                "overlapping-cores",
+                vec![
+                    BTreeSet::from(["dep-003".to_string(), "dep-017".to_string()]),
+                    BTreeSet::from(["dep-003".to_string(), "dep-029".to_string()]),
+                ],
+            ),
+        ];
+
+        for (case, conflict_sets) in cases {
+            // Reverse order plus a duplicate proves both implementations see
+            // the established BTree-sorted/deduplicated route order.
+            let mut candidates = (0..32)
+                .rev()
+                .map(|index| {
+                    let name = format!("dep-{index:03}");
+                    emitted_route(&name, &name, "==1")
+                })
+                .collect::<Vec<_>>();
+            candidates.push(emitted_route("dep-003", "dep-003", "==1"));
+            let conflicts = Arc::new(conflict_sets);
+            let linear_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let bisect_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let linear_oracle = fixture_route_co_solve(
+                Arc::clone(&conflicts),
+                linear_calls,
+                std::time::Duration::ZERO,
+            );
+            let bisect_oracle =
+                fixture_route_co_solve(conflicts, bisect_calls, std::time::Duration::ZERO);
+
+            let linear = select_jointly_solvable_routes_linear_reference(
+                Vec::new(),
+                candidates.clone(),
+                &linear_oracle,
+            )
+            .await
+            .expect("fixture baseline is satisfiable");
+            let bisect = select_jointly_solvable_routes_bisect_for_test(
+                Vec::new(),
+                candidates,
+                &bisect_oracle,
+                4,
+            )
+            .await
+            .expect("fixture baseline is satisfiable");
+
+            assert_eq!(bisect, linear, "selection drifted for {case}");
+            assert_eq!(
+                route_selection_bytes(&bisect),
+                route_selection_bytes(&linear),
+                "serialized route decision drifted for {case}",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rule2_exact_unsat_nonmonotone_matches_linear_reference() {
+        let candidates = (0..32)
+            .map(|index| {
+                let name = format!("dep-{index:03}");
+                emitted_route(&name, &name, "==1")
+            })
+            .collect::<Vec<_>>();
+        let right_half = (16..32)
+            .map(|index| format!("dep-{index:03}"))
+            .collect::<BTreeSet<_>>();
+        let high_quarter = (24..32)
+            .map(|index| format!("dep-{index:03}"))
+            .collect::<BTreeSet<_>>();
+        let linear_oracle = {
+            let right_half = right_half.clone();
+            let high_quarter = high_quarter.clone();
+            move |routes: Vec<CondaRouteSpec>| {
+                let right_half = right_half.clone();
+                let high_quarter = high_quarter.clone();
+                async move {
+                    let names = routes
+                        .iter()
+                        .map(|route| route.conda_name.as_spec().to_string())
+                        .collect::<BTreeSet<_>>();
+                    if right_half.is_subset(&names) {
+                        CoInstallVerdict::Unsat(vec!["solver conflict".to_string()])
+                    } else if names == high_quarter {
+                        CoInstallVerdict::ExactUnsat(vec!["exact-only policy conflict".to_string()])
+                    } else {
+                        CoInstallVerdict::Sat
+                    }
+                }
+            }
+        };
+        // The first half deletion is a genuine solver proof and mutates the
+        // bisection core. A later exact-only/nonmonotone failure must discard
+        // that mutation and replay the complete legacy scan.
+        let bisect_events = Arc::new(Mutex::new(Vec::new()));
+        let bisect_oracle = {
+            let events = Arc::clone(&bisect_events);
+            move |routes: Vec<CondaRouteSpec>| {
+                let events = Arc::clone(&events);
+                let right_half = right_half.clone();
+                let high_quarter = high_quarter.clone();
+                async move {
+                    let names = routes
+                        .iter()
+                        .map(|route| route.conda_name.as_spec().to_string())
+                        .collect::<BTreeSet<_>>();
+                    let (event, verdict) = if routes.len() == 32 {
+                        (
+                            "full-unsat",
+                            CoInstallVerdict::Unsat(vec!["solver conflict".to_string()]),
+                        )
+                    } else if names == right_half {
+                        (
+                            "bulk-unsat",
+                            CoInstallVerdict::Unsat(vec!["solver conflict".to_string()]),
+                        )
+                    } else if names == high_quarter {
+                        (
+                            "exact-reset",
+                            CoInstallVerdict::ExactUnsat(vec![
+                                "exact-only policy conflict".to_string(),
+                            ]),
+                        )
+                    } else if right_half.is_subset(&names) {
+                        (
+                            if routes.len() == 31 {
+                                "full-replay"
+                            } else {
+                                "replay-unsat"
+                            },
+                            CoInstallVerdict::Unsat(vec!["solver conflict".to_string()]),
+                        )
+                    } else {
+                        ("other", CoInstallVerdict::Sat)
+                    };
+                    events.lock().unwrap().push(event);
+                    verdict
+                }
+            }
+        };
+        let linear = select_jointly_solvable_routes_linear_reference(
+            Vec::new(),
+            candidates.clone(),
+            &linear_oracle,
+        )
+        .await
+        .expect("fixture baseline is satisfiable");
+        let bisect = select_jointly_solvable_routes_bisect_for_test(
+            Vec::new(),
+            candidates,
+            &bisect_oracle,
+            4,
+        )
+        .await
+        .expect("fixture baseline is satisfiable");
+
+        assert_eq!(bisect, linear);
+        assert_eq!(
+            route_selection_bytes(&bisect),
+            route_selection_bytes(&linear),
+        );
+        let events = bisect_events.lock().unwrap();
+        let bulk = events
+            .iter()
+            .position(|event| *event == "bulk-unsat")
+            .expect("fixture must commit one bulk deletion");
+        let reset = events
+            .iter()
+            .position(|event| *event == "exact-reset")
+            .expect("fixture must hit an exact-only verdict after mutation");
+        let replay = events
+            .iter()
+            .position(|event| *event == "full-replay")
+            .expect("exact-only reset must replay deletion trials from the full core");
+        assert!(
+            bulk < reset && reset < replay,
+            "bulk deletion must precede exact reset and full-core replay: {events:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn rule2_bisect_64_deps_two_culprits_reduces_probe_count() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let candidates = (0..64)
+            .map(|index| {
+                let name = format!("dep-{index:03}");
+                emitted_route(&name, &name, "==1")
+            })
+            .collect::<Vec<_>>();
+        let conflicts = Arc::new(vec![
+            BTreeSet::from(["dep-017".to_string()]),
+            BTreeSet::from(["dep-049".to_string()]),
+        ]);
+        let linear_calls = Arc::new(AtomicUsize::new(0));
+        let bisect_calls = Arc::new(AtomicUsize::new(0));
+        let delay = std::time::Duration::from_millis(1);
+        let linear_oracle =
+            fixture_route_co_solve(Arc::clone(&conflicts), Arc::clone(&linear_calls), delay);
+        let bisect_oracle = fixture_route_co_solve(conflicts, Arc::clone(&bisect_calls), delay);
+
+        let linear_started = std::time::Instant::now();
+        let linear = select_jointly_solvable_routes_linear_reference(
+            Vec::new(),
+            candidates.clone(),
+            &linear_oracle,
+        )
+        .await
+        .expect("fixture baseline is satisfiable");
+        let linear_elapsed = linear_started.elapsed();
+
+        let bisect_started = std::time::Instant::now();
+        let bisect = select_jointly_solvable_routes_bisect_for_test(
+            Vec::new(),
+            candidates,
+            &bisect_oracle,
+            4,
+        )
+        .await
+        .expect("fixture baseline is satisfiable");
+        let bisect_elapsed = bisect_started.elapsed();
+
+        let before = linear_calls.load(Ordering::SeqCst);
+        let after = bisect_calls.load(Ordering::SeqCst);
+        eprintln!(
+            "64-dep/2-culprit fixture: linear probes={before} wall_ms={}; \
+             bisect probes={after} wall_ms={}",
+            linear_elapsed.as_millis(),
+            bisect_elapsed.as_millis(),
+        );
+        assert_eq!(before, 131, "legacy fixture count must remain pinned");
+        assert!(
+            after <= 40,
+            "bisection must stay O(log N * culprits + residual): {after} probes",
+        );
+        assert_eq!(bisect, linear);
+        assert_eq!(
+            route_selection_bytes(&bisect),
+            route_selection_bytes(&linear),
+        );
+    }
+
+    #[tokio::test]
+    async fn rule2_generic_probe_pool_parallelism_is_bounded_and_matches_linear() {
+        let candidates = (0..12)
+            .map(|index| {
+                let name = format!("dense-core-{index:02}");
+                emitted_route(&name, &name, "==1")
+            })
+            .collect::<Vec<_>>();
+        let required = candidates
+            .iter()
+            .map(|route| route.conda_name.as_spec().to_string())
+            .collect::<BTreeSet<_>>();
+        let linear_oracle = {
+            let required = required.clone();
+            move |routes: Vec<CondaRouteSpec>| {
+                let required = required.clone();
+                async move {
+                    let names = routes
+                        .iter()
+                        .map(|route| route.conda_name.as_spec().to_string())
+                        .collect::<BTreeSet<_>>();
+                    if required.is_subset(&names) {
+                        CoInstallVerdict::Unsat(vec!["dense fixture conflict".to_string()])
+                    } else {
+                        CoInstallVerdict::Sat
+                    }
+                }
+            }
+        };
+        let linear = select_jointly_solvable_routes_linear_reference(
+            Vec::new(),
+            candidates.clone(),
+            &linear_oracle,
+        )
+        .await
+        .expect("fixture baseline is satisfiable");
+
+        // (in_flight, max_in_flight, generic_probe_calls)
+        let gauge = Arc::new(Mutex::new((0usize, 0usize, 0usize)));
+        let oracle = {
+            let gauge = Arc::clone(&gauge);
+            let required = required.clone();
+            move |routes: Vec<CondaRouteSpec>| {
+                let gauge = Arc::clone(&gauge);
+                let required = required.clone();
+                Box::pin(async move {
+                    let names = routes
+                        .iter()
+                        .map(|route| route.conda_name.as_spec().to_string())
+                        .collect::<BTreeSet<_>>();
+                    if required.is_subset(&names) {
+                        return CoInstallVerdict::Unsat(vec!["dense fixture conflict".to_string()]);
+                    }
+                    if routes.is_empty() {
+                        return CoInstallVerdict::Sat;
+                    }
+                    {
+                        let mut gauge = gauge.lock().unwrap();
+                        gauge.0 += 1;
+                        gauge.1 = gauge.1.max(gauge.0);
+                        gauge.2 += 1;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                    gauge.lock().unwrap().0 -= 1;
+                    CoInstallVerdict::Sat
+                }) as futures::future::BoxFuture<'static, CoInstallVerdict>
+            }
+        };
+
+        let selection =
+            select_jointly_solvable_routes_bisect_for_test(Vec::new(), candidates, &oracle, 3)
+                .await
+                .expect("fixture baseline is satisfiable");
+
+        assert!(selection.accepted.is_empty());
+        assert_eq!(selection.rejected.len(), 12);
+        assert_eq!(selection, linear);
+        assert_eq!(
+            route_selection_bytes(&selection),
+            route_selection_bytes(&linear),
+        );
+        let (_, max_in_flight, generic_probe_calls) = *gauge.lock().unwrap();
+        assert!(generic_probe_calls > 3);
+        assert_eq!(
+            max_in_flight, 3,
+            "generic no-hint solves must overlap without exceeding width K",
+        );
     }
 
     #[tokio::test]
