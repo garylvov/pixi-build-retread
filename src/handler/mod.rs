@@ -14045,7 +14045,7 @@ async fn materialize_and_pack(
             target.conda_subdir()
         )
     })?;
-    let mut compression_lease = crate::thread_budget::acquire(config.compression_threads).await?;
+    let mut compression_lease = crate::thread_budget::acquire(config.compression_threads).await;
     let compression = compression_lease.decision();
     let mut cmd = tokio::process::Command::new("rattler-build");
     cmd.kill_on_drop(true);
@@ -14064,14 +14064,24 @@ async fn materialize_and_pack(
         cmd.arg("--package-format").arg(format!("conda:{level}"));
     }
     let packaging_started = std::time::Instant::now();
-    let output = cmd
-        .stdin(std::process::Stdio::null())
+    cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .await;
+        .stderr(std::process::Stdio::piped());
+    let child = cmd
+        .spawn()
+        .context("spawning rattler-build (is it on PATH?)")?;
+    // No separate process group is created: `kill_on_drop(true)` cleans up
+    // the direct child during ordinary async cancellation. Parent SIGKILL
+    // cannot run Drop, so persist the child's PID/start identity before
+    // waiting; an orphaned rattler-build then remains charged to this lease.
+    if let Some(child_pid) = child.id() {
+        compression_lease.record_child(child_pid).await;
+    } else {
+        tracing::warn!("spawned rattler-build did not expose a PID for lease tracking");
+    }
+    let output = child.wait_with_output().await;
     compression_lease.release();
-    let output = output.context("spawning rattler-build (is it on PATH?)")?;
+    let output = output.context("waiting for rattler-build")?;
     tracing::info!(
         output = %recipe.package.name,
         elapsed_ms = packaging_started.elapsed().as_millis() as u64,
@@ -14957,7 +14967,7 @@ async fn build_one(
     tokio::fs::create_dir_all(output_dir).await?;
 
     let target_platform = target_subdir.to_string();
-    let mut compression_lease = crate::thread_budget::acquire(config.compression_threads).await?;
+    let mut compression_lease = crate::thread_budget::acquire(config.compression_threads).await;
     let compression = compression_lease.decision();
     // CRITICAL: rattler-build writes progress to stdout, but retread's
     // stdout is the JSON-RPC channel to pixi. Capture both streams so
@@ -14983,14 +14993,24 @@ async fn build_one(
     }
     // v1.6.0: time the packaging stage explicitly.
     let packaging_started = std::time::Instant::now();
-    let output = cmd
-        .stdin(std::process::Stdio::null())
+    cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .await;
+        .stderr(std::process::Stdio::piped());
+    let child = cmd
+        .spawn()
+        .context("spawning rattler-build (is it on PATH?)")?;
+    // No separate process group is created: `kill_on_drop(true)` cleans up
+    // the direct child during ordinary async cancellation. Parent SIGKILL
+    // cannot run Drop, so persist the child's PID/start identity before
+    // waiting; an orphaned rattler-build then remains charged to this lease.
+    if let Some(child_pid) = child.id() {
+        compression_lease.record_child(child_pid).await;
+    } else {
+        tracing::warn!("spawned rattler-build did not expose a PID for lease tracking");
+    }
+    let output = child.wait_with_output().await;
     compression_lease.release();
-    let output = output.context("spawning rattler-build (is it on PATH?)")?;
+    let output = output.context("waiting for rattler-build")?;
     tracing::info!(
         output = %recipe.package.name,
         elapsed_ms = packaging_started.elapsed().as_millis() as u64,
