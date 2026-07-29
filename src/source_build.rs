@@ -26,7 +26,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
-use crate::pypi::{ResolutionTarget, normalized_python_minor};
+use crate::pypi::{NativeSourceBuildPolicy, ResolutionTarget, normalized_python_minor};
 
 const BUILT_WHEEL_CACHE_SCHEMA: &str = "retread-built-wheel-v6";
 const BUILT_WHEEL_CACHE_ROOT: &str = "built-wheels";
@@ -50,6 +50,21 @@ pub(crate) struct ExpectedWheel {
 pub(crate) struct SdistWheelBuild {
     pub(crate) wheel_path: PathBuf,
     pub(crate) sdist_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BuiltWheelRequirement {
+    TargetCompatible,
+    ClosureSdistPlatformIndependent { package: String },
+}
+
+impl BuiltWheelRequirement {
+    fn closure_sdist_package(&self) -> Option<&str> {
+        match self {
+            Self::TargetCompatible => None,
+            Self::ClosureSdistPlatformIndependent { package } => Some(package),
+        }
+    }
 }
 
 impl ExpectedWheel {
@@ -347,9 +362,21 @@ fn native_build_allowed(target: &ResolutionTarget) -> bool {
 }
 
 fn source_build_refusal_error(target: &ResolutionTarget) -> anyhow::Error {
-    if target.conda_subdir() == crate::glibc::current_pixi_platform()
+    source_build_refusal_error_for_host(
+        target,
+        crate::glibc::current_pixi_platform(),
+        crate::glibc::host_glibc(),
+    )
+}
+
+fn source_build_refusal_error_for_host(
+    target: &ResolutionTarget,
+    host_subdir: &str,
+    host_glibc: Option<(u32, u32)>,
+) -> anyhow::Error {
+    if target.conda_subdir() == host_subdir
         && target.conda_subdir() == "linux-aarch64"
-        && let (Some(declared), Some(host)) = (target.declared_glibc(), crate::glibc::host_glibc())
+        && let (Some(declared), Some(host)) = (target.declared_glibc(), host_glibc)
         && host > declared
     {
         return anyhow!(
@@ -358,10 +385,82 @@ fn source_build_refusal_error(target: &ResolutionTarget) -> anyhow::Error {
             crate::glibc::format_glibc(host),
         );
     }
+    if target.conda_subdir() == host_subdir && target.conda_subdir().starts_with("linux-") {
+        return match (target.declared_glibc(), host_glibc) {
+            (Some(target_floor), Some(host)) if host > target_floor => anyhow!(
+                "refusing to source-build for native target `{}`: target floor glibc {} < \
+                 host glibc {}; a natively built platform-tagged wheel would not run on the \
+                 target — use a validated artifact-cache hit or build on a host at or below \
+                 the floor",
+                target.conda_subdir(),
+                crate::glibc::format_glibc(target_floor),
+                crate::glibc::format_glibc(host),
+            ),
+            (Some(target_floor), None) => anyhow!(
+                "refusing to source-build for native target `{}`: target floor glibc {} is \
+                 known but host glibc is unavailable, so platform-wheel compatibility cannot \
+                 be proven; use a validated artifact-cache hit or a host with detectable \
+                 glibc at or below the floor",
+                target.conda_subdir(),
+                crate::glibc::format_glibc(target_floor),
+            ),
+            (None, Some(host)) => anyhow!(
+                "refusing to source-build for native target `{}`: target glibc floor is \
+                 unavailable while host glibc is {}, so platform-wheel compatibility cannot \
+                 be proven; declare the target floor or use a validated artifact-cache hit",
+                target.conda_subdir(),
+                crate::glibc::format_glibc(host),
+            ),
+            (None, None) => anyhow!(
+                "refusing to source-build for native target `{}`: target glibc floor and host \
+                 glibc are unavailable, so platform-wheel compatibility cannot be proven; \
+                 declare the target floor or use a validated artifact-cache hit",
+                target.conda_subdir(),
+            ),
+            (Some(target_floor), Some(host)) => anyhow!(
+                "refusing to source-build for native target `{}` despite compatible target \
+                 floor glibc {} and host glibc {}; source-build policy denied the attempt",
+                target.conda_subdir(),
+                crate::glibc::format_glibc(target_floor),
+                crate::glibc::format_glibc(host),
+            ),
+        };
+    }
     anyhow!(
         "refusing to build a wheel natively for foreign target `{}` on host `{}` after an exact validated artifact-cache miss",
         target.conda_subdir(),
-        crate::glibc::current_pixi_platform(),
+        host_subdir,
+    )
+}
+
+fn platform_tagged_floor_error(
+    target: &ResolutionTarget,
+    target_floor: (u32, u32),
+    host_glibc: (u32, u32),
+    filename: &str,
+    closure_sdist_package: Option<&str>,
+) -> anyhow::Error {
+    let aarch64_context = (target.conda_subdir() == "linux-aarch64")
+        .then_some("refusing to source-build for native target `linux-aarch64`: ")
+        .unwrap_or_default();
+    let closure_context = closure_sdist_package
+        .map(|package| format!("closure-blocking sdist auto-build for `{package}`: "))
+        .unwrap_or_default();
+    anyhow!(
+        "{aarch64_context}{closure_context}target floor glibc {} < host glibc {}; \
+         a natively built platform-tagged wheel would not run on the target — \
+         build produced a platform-tagged wheel `{filename}`; use a validated \
+         artifact-cache hit or build on a host at or below the floor",
+        crate::glibc::format_glibc(target_floor),
+        crate::glibc::format_glibc(host_glibc),
+    )
+}
+
+fn closure_sdist_platform_error(package: &str, filename: &str) -> anyhow::Error {
+    anyhow!(
+        "closure-blocking sdist auto-build for `{package}` produced platform-tagged wheel \
+         `{filename}`; automatic closure healing accepts only platform-independent wheels; \
+         provide a validated wheel artifact for native-extension sdists",
     )
 }
 
@@ -965,6 +1064,33 @@ where
     F: FnOnce(PathBuf) -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
 {
+    cached_build_with_acceptance(
+        kind,
+        source_identity,
+        target,
+        out_dir,
+        expected,
+        target.native_source_build_policy(),
+        BuiltWheelRequirement::TargetCompatible,
+        build,
+    )
+    .await
+}
+
+async fn cached_build_with_acceptance<F, Fut>(
+    kind: &str,
+    source_identity: &str,
+    target: &ResolutionTarget,
+    out_dir: &Path,
+    expected: Option<&ExpectedWheel>,
+    native_policy: NativeSourceBuildPolicy,
+    requirement: BuiltWheelRequirement,
+    build: F,
+) -> Result<PathBuf>
+where
+    F: FnOnce(PathBuf) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
     let cache_dir = built_wheel_cache_dir(kind, source_identity, target);
     let materialized_out = materialized_wheel_output_dir(out_dir, source_identity, target);
     let _lock = acquire_artifact_cache_lock(&cache_dir).await?;
@@ -978,7 +1104,17 @@ where
     .await
     .context("built-wheel cache validation task panicked")?;
     match cached {
-        Ok(Some(wheel)) => return materialize_validated_wheel(&wheel, &materialized_out).await,
+        Ok(Some(wheel)) => {
+            if let Some(package) = requirement.closure_sdist_package()
+                && !crate::wheel::is_pure_python_wheel_filename(&wheel.marker.filename)
+            {
+                return Err(closure_sdist_platform_error(
+                    package,
+                    &wheel.marker.filename,
+                ));
+            }
+            return materialize_validated_wheel(&wheel, &materialized_out).await;
+        }
         Ok(None) => {}
         Err(error) if is_expected_wheel_mismatch(&error) => return Err(error),
         Err(error) => {
@@ -990,7 +1126,7 @@ where
             remove_owned_cache_entry(&cache_dir)?;
         }
     }
-    if !native_build_allowed(target) {
+    if native_policy == NativeSourceBuildPolicy::Refuse {
         return Err(source_build_refusal_error(target));
     }
 
@@ -1004,8 +1140,50 @@ where
         let built = built.clone();
         let target = target.clone();
         let expected = expected.cloned();
+        let requirement = requirement.clone();
         move || {
             normalize_source_built_wheel(&built)?;
+            let filename = built
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| built.display().to_string());
+            let floor_mismatch = match native_policy {
+                NativeSourceBuildPolicy::PlatformIndependentOnly {
+                    target_floor,
+                    host_glibc,
+                } => Some((target_floor, host_glibc)),
+                NativeSourceBuildPolicy::AnyWheel | NativeSourceBuildPolicy::Refuse => None,
+            };
+            let platform_independent_required =
+                floor_mismatch.is_some() || requirement.closure_sdist_package().is_some();
+            if platform_independent_required
+                && !crate::wheel::is_pure_python_wheel_filename(&filename)
+            {
+                let rejection = if let Some((target_floor, host_glibc)) = floor_mismatch {
+                    platform_tagged_floor_error(
+                        &target,
+                        target_floor,
+                        host_glibc,
+                        &filename,
+                        requirement.closure_sdist_package(),
+                    )
+                } else {
+                    closure_sdist_platform_error(
+                        requirement
+                            .closure_sdist_package()
+                            .expect("closure requirement was checked above"),
+                        &filename,
+                    )
+                };
+                if let Err(delete_error) = std::fs::remove_file(&built) {
+                    return Err(anyhow!(
+                        "{rejection}; additionally failed to delete rejected artifact {}: \
+                         {delete_error}",
+                        built.display(),
+                    ));
+                }
+                return Err(rejection);
+            }
             validate_wheel_file(&built, &target, expected.as_ref())
         }
     })
@@ -2770,6 +2948,49 @@ pub(crate) async fn build_wheel_from_sdist_url_for_target(
     advertised_sha256: Option<&str>,
     expected: Option<&ExpectedWheel>,
 ) -> Result<SdistWheelBuild> {
+    build_wheel_from_sdist_url_for_target_with_requirement(
+        sdist_url,
+        out_dir,
+        target,
+        advertised_sha256,
+        expected,
+        BuiltWheelRequirement::TargetCompatible,
+    )
+    .await
+}
+
+/// Controlled sdist build used only by closure healing. Unlike ordinary
+/// explicitly requested sdist builds, this fallback accepts no native wheel:
+/// a closure-blocking package may be auto-built only when its resulting wheel
+/// has a platform-independent `any` tag.
+pub(crate) async fn build_platform_independent_wheel_from_sdist_url_for_target(
+    sdist_url: &url::Url,
+    out_dir: &Path,
+    target: &ResolutionTarget,
+    advertised_sha256: Option<&str>,
+    expected: &ExpectedWheel,
+) -> Result<SdistWheelBuild> {
+    build_wheel_from_sdist_url_for_target_with_requirement(
+        sdist_url,
+        out_dir,
+        target,
+        advertised_sha256,
+        Some(expected),
+        BuiltWheelRequirement::ClosureSdistPlatformIndependent {
+            package: crate::relax::canonical_conda_name(&expected.name),
+        },
+    )
+    .await
+}
+
+async fn build_wheel_from_sdist_url_for_target_with_requirement(
+    sdist_url: &url::Url,
+    out_dir: &Path,
+    target: &ResolutionTarget,
+    advertised_sha256: Option<&str>,
+    expected: Option<&ExpectedWheel>,
+    requirement: BuiltWheelRequirement,
+) -> Result<SdistWheelBuild> {
     let python = normalized_python_minor(target.python_version())?;
     let filename = sdist_filename(sdist_url)?;
     let advertised_sha256 = sdist_advertised_sha256(sdist_url, advertised_sha256)?;
@@ -2797,12 +3018,14 @@ pub(crate) async fn build_wheel_from_sdist_url_for_target(
     let url = sdist_url.clone();
     let filename_for_build = filename.clone();
     let expected_content_sha = content_sha.clone();
-    let wheel_path = cached_build(
+    let wheel_path = cached_build_with_acceptance(
         "sdist",
         &source_identity,
         target,
         out_dir,
         expected,
+        target.native_source_build_policy(),
+        requirement,
         move |private_out| async move {
             let bytes = match prefetched {
                 Some(bytes) => bytes,
@@ -7208,6 +7431,219 @@ version = "0.1.0"
         .unwrap();
         let error = sdist_advertised_sha256(&url, Some(&advertised)).unwrap_err();
         assert!(format!("{error:#}").contains("hash disagreement"));
+    }
+
+    #[tokio::test]
+    async fn newer_host_floor_accepts_platform_independent_source_build() {
+        let target = ResolutionTarget::from_parts("3.11", "linux-64", Some((2, 35)));
+        let source_identity = hash_fields(
+            b"pure-floor-accept-test\0",
+            &[unique_test_dir("pure-floor-accept")
+                .to_string_lossy()
+                .as_bytes()],
+        );
+        let cache = built_wheel_cache_dir("path", &source_identity, &target);
+        remove_owned_cache_entry(&cache).unwrap();
+        let output = unique_test_dir("pure-floor-accept-output");
+        let policy = crate::pypi::native_source_build_policy(
+            "linux-64",
+            "linux-64",
+            Some((2, 35)),
+            Some((2, 39)),
+            true,
+        );
+
+        let wheel = cached_build_with_acceptance(
+            "path",
+            &source_identity,
+            &target,
+            &output,
+            Some(&ExpectedWheel::exact("pkg", "1.0.0")),
+            policy,
+            BuiltWheelRequirement::TargetCompatible,
+            move |private_out| async move {
+                write_test_wheel(
+                    &private_out.join("pkg-1.0.0-py3-none-any.whl"),
+                    "pkg",
+                    "1.0.0",
+                );
+                Ok(())
+            },
+        )
+        .await
+        .expect("a platform-independent wheel must be accepted above the target floor");
+
+        assert!(wheel.is_file());
+        assert_eq!(
+            wheel.file_name().and_then(|name| name.to_str()),
+            Some("pkg-1.0.0-py3-none-any.whl"),
+        );
+        assert!(cache.join("pkg-1.0.0-py3-none-any.whl").is_file());
+        remove_owned_cache_entry(&cache).unwrap();
+        let _ = std::fs::remove_dir_all(&output);
+    }
+
+    #[tokio::test]
+    async fn newer_host_floor_rejects_and_deletes_platform_source_build() {
+        let target = ResolutionTarget::from_parts("3.11", "linux-64", Some((2, 35)));
+        let source_identity = hash_fields(
+            b"platform-floor-reject-test\0",
+            &[unique_test_dir("platform-floor-reject")
+                .to_string_lossy()
+                .as_bytes()],
+        );
+        let cache = built_wheel_cache_dir("git", &source_identity, &target);
+        remove_owned_cache_entry(&cache).unwrap();
+        let output = unique_test_dir("platform-floor-reject-output");
+        let built_path = Arc::new(Mutex::new(None));
+        let built_path_from_callback = Arc::clone(&built_path);
+        let policy = crate::pypi::native_source_build_policy(
+            "linux-64",
+            "linux-64",
+            Some((2, 35)),
+            Some((2, 39)),
+            true,
+        );
+
+        let error = cached_build_with_acceptance(
+            "git",
+            &source_identity,
+            &target,
+            &output,
+            Some(&ExpectedWheel::exact("pkg", "1.0.0")),
+            policy,
+            BuiltWheelRequirement::TargetCompatible,
+            move |private_out| async move {
+                let wheel = private_out.join("pkg-1.0.0-cp311-cp311-linux_x86_64.whl");
+                write_test_wheel(&wheel, "pkg", "1.0.0");
+                *built_path_from_callback.lock().unwrap() = Some(wheel);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap_err();
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("target floor glibc 2.35 < host glibc 2.39"),
+            "{message}",
+        );
+        assert!(
+            message.contains("build produced a platform-tagged wheel"),
+            "{message}",
+        );
+        assert!(!cache.exists(), "a rejected wheel must never be cached");
+        assert!(
+            !built_path
+                .lock()
+                .unwrap()
+                .as_ref()
+                .expect("build callback recorded its artifact")
+                .exists(),
+            "the rejected build artifact must be deleted",
+        );
+        let _ = std::fs::remove_dir_all(&output);
+    }
+
+    #[test]
+    fn floor_mismatch_error_explains_target_and_host_glibc() {
+        let target = ResolutionTarget::from_parts("3.11", "linux-64", Some((2, 35)));
+        let message = platform_tagged_floor_error(
+            &target,
+            (2, 35),
+            (2, 39),
+            "pkg-1.0.0-cp311-cp311-linux_x86_64.whl",
+            None,
+        )
+        .to_string();
+        assert!(
+            message.contains("target floor glibc 2.35 < host glibc 2.39"),
+            "{message}",
+        );
+        assert!(
+            message.contains("a natively built platform-tagged wheel would not run"),
+            "{message}",
+        );
+        assert!(
+            !message.contains("foreign target `linux-64` on host `linux-64`"),
+            "{message}",
+        );
+    }
+
+    #[test]
+    fn aarch64_floor_error_keeps_native_target_context() {
+        let target = ResolutionTarget::from_parts("3.11", "linux-aarch64", Some((2, 35)));
+        let message = platform_tagged_floor_error(
+            &target,
+            (2, 35),
+            (2, 39),
+            "pkg-1.0.0-cp311-cp311-linux_aarch64.whl",
+            None,
+        )
+        .to_string();
+        assert!(
+            message.starts_with(
+                "refusing to source-build for native target `linux-aarch64`: target floor glibc"
+            ),
+            "{message}",
+        );
+    }
+
+    #[test]
+    fn same_subdir_unknown_host_glibc_is_not_reported_as_foreign() {
+        let target = ResolutionTarget::from_parts("3.11", "linux-64", Some((2, 35)));
+        let message = source_build_refusal_error_for_host(&target, "linux-64", None).to_string();
+        assert!(message.contains("target floor glibc 2.35"), "{message}");
+        assert!(message.contains("host glibc is unavailable"), "{message}");
+        assert!(!message.contains("foreign target"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn closure_sdist_rejects_native_wheel_and_names_dependency() {
+        let target = ResolutionTarget::from_parts("3.11", "linux-64", Some((2, 39)));
+        let source_identity = hash_fields(
+            b"closure-native-sdist-reject-test\0",
+            &[unique_test_dir("closure-native-sdist-reject")
+                .to_string_lossy()
+                .as_bytes()],
+        );
+        let cache = built_wheel_cache_dir("sdist", &source_identity, &target);
+        remove_owned_cache_entry(&cache).unwrap();
+        let output = unique_test_dir("closure-native-sdist-reject-output");
+        let error = cached_build_with_acceptance(
+            "sdist",
+            &source_identity,
+            &target,
+            &output,
+            Some(&ExpectedWheel::exact("native-dep", "1.0.0")),
+            NativeSourceBuildPolicy::AnyWheel,
+            BuiltWheelRequirement::ClosureSdistPlatformIndependent {
+                package: "native-dep".to_string(),
+            },
+            move |private_out| async move {
+                write_test_wheel(
+                    &private_out.join("native_dep-1.0.0-cp311-cp311-linux_x86_64.whl"),
+                    "native-dep",
+                    "1.0.0",
+                );
+                Ok(())
+            },
+        )
+        .await
+        .unwrap_err();
+
+        let message = format!("{error:#}");
+        assert!(message.contains("closure-blocking sdist"), "{message}");
+        assert!(message.contains("`native-dep`"), "{message}");
+        assert!(
+            message.contains("accepts only platform-independent wheels"),
+            "{message}",
+        );
+        assert!(
+            !cache.exists(),
+            "a native closure fallback must not be cached"
+        );
+        let _ = std::fs::remove_dir_all(&output);
     }
 
     #[tokio::test]

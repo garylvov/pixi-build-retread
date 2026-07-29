@@ -747,7 +747,11 @@ pub const SCHEMA: u32 = 18;
 /// Epoch 42: fresh emission widens an effective exact ABI-anchor selection to
 /// its within-minor band so independently-built packs can compose on a newer
 /// ABI-compatible patch.
-pub const EMIT_EPOCH: u32 = 42;
+///
+/// Epoch 43: cold closure resolution may auto-build and ship an exact-pinned,
+/// sdist-only dependency when the controlled build proves its wheel is
+/// platform-independent.
+pub const EMIT_EPOCH: u32 = 43;
 
 fn parse_stored_glibc(value: Option<&str>) -> Option<Option<(u32, u32)>> {
     match value {

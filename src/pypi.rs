@@ -204,6 +204,26 @@ pub(crate) struct ResolutionTarget {
     exact_workspace_envelope: bool,
 }
 
+/// What this host may do when a source artifact is missing from the validated
+/// build cache. A same-subdir glibc-floor mismatch may still prove that its
+/// output is platform-independent after the build; a genuinely foreign target
+/// must be refused before any source materialization or build subprocess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NativeSourceBuildPolicy {
+    AnyWheel,
+    PlatformIndependentOnly {
+        target_floor: (u32, u32),
+        host_glibc: (u32, u32),
+    },
+    Refuse,
+}
+
+impl NativeSourceBuildPolicy {
+    fn allows_attempt(self) -> bool {
+        self != Self::Refuse
+    }
+}
+
 impl ResolutionTarget {
     /// Fallible production constructor. Python is validated before any host
     /// or workspace target state is inspected, so malformed declarations can
@@ -435,14 +455,23 @@ impl ResolutionTarget {
         self.exact_workspace_envelope
     }
 
-    /// Whether this process may execute a source build for the target. A
+    /// Source-build policy for this target on the current host.
+    pub(crate) fn native_source_build_policy(&self) -> NativeSourceBuildPolicy {
+        native_source_build_policy(
+            self.conda_subdir(),
+            crate::glibc::current_pixi_platform(),
+            self.declared_glibc,
+            crate::glibc::host_glibc(),
+            self.target_contract.is_some(),
+        )
+    }
+
+    /// Whether this process may attempt a source build for the target. A
     /// noarch artifact is intentionally buildable on every host; platform
-    /// artifacts require an exact host-subdir match. Exact Linux contracts and
-    /// native aarch64 also refuse a build when the host glibc is newer than an
-    /// explicit deployment ceiling: a generic Linux wheel can contain ELF
-    /// symbols from the host and must not be cached as compatible with the
-    /// older target. Unqualified native linux-64 retains its established
-    /// behavior for compatibility.
+    /// artifacts require an exact host-subdir match. When a known Linux glibc
+    /// floor is older than the host, the attempt is allowed but the fresh
+    /// result must prove platform independence before it can be cached.
+    /// Unknown required glibc facts and genuinely foreign subdirs fail closed.
     pub(crate) fn is_native_build_target(&self) -> bool {
         native_source_build_compatible(
             self.conda_subdir(),
@@ -596,25 +625,56 @@ fn native_source_build_compatible(
     host_glibc: Option<(u32, u32)>,
     contract_qualified: bool,
 ) -> bool {
+    native_source_build_policy(
+        target_subdir,
+        host_subdir,
+        declared_glibc,
+        host_glibc,
+        contract_qualified,
+    )
+    .allows_attempt()
+}
+
+pub(crate) fn native_source_build_policy(
+    target_subdir: &str,
+    host_subdir: &str,
+    declared_glibc: Option<(u32, u32)>,
+    host_glibc: Option<(u32, u32)>,
+    contract_qualified: bool,
+) -> NativeSourceBuildPolicy {
     if target_subdir == "noarch" {
-        return true;
+        return NativeSourceBuildPolicy::AnyWheel;
     }
     if target_subdir != host_subdir {
-        return false;
+        return NativeSourceBuildPolicy::Refuse;
     }
     if contract_qualified && target_subdir.starts_with("linux-") {
         let (Some(host), Some(target)) = (host_glibc, declared_glibc) else {
-            return false;
+            return NativeSourceBuildPolicy::Refuse;
         };
-        return host <= target;
+        return if host <= target {
+            NativeSourceBuildPolicy::AnyWheel
+        } else {
+            NativeSourceBuildPolicy::PlatformIndependentOnly {
+                target_floor: target,
+                host_glibc: host,
+            }
+        };
     }
     if target_subdir == "linux-aarch64" {
         let Some(host) = host_glibc else {
-            return false;
+            return NativeSourceBuildPolicy::Refuse;
         };
-        return declared_glibc.is_none_or(|declared| host <= declared);
+        if let Some(target) = declared_glibc
+            && host > target
+        {
+            return NativeSourceBuildPolicy::PlatformIndependentOnly {
+                target_floor: target,
+                host_glibc: host,
+            };
+        }
     }
-    true
+    NativeSourceBuildPolicy::AnyWheel
 }
 
 impl std::ops::Deref for ResolutionTarget {
@@ -2049,14 +2109,27 @@ mod tests {
     }
 
     #[test]
-    fn native_arm_source_build_refuses_newer_host_glibc() {
-        assert!(!native_source_build_compatible(
+    fn native_arm_source_build_allows_pure_only_attempt_on_newer_host_glibc() {
+        assert!(native_source_build_compatible(
             "linux-aarch64",
             "linux-aarch64",
             Some((2, 35)),
             Some((2, 39)),
             false,
         ));
+        assert_eq!(
+            native_source_build_policy(
+                "linux-aarch64",
+                "linux-aarch64",
+                Some((2, 35)),
+                Some((2, 39)),
+                false,
+            ),
+            NativeSourceBuildPolicy::PlatformIndependentOnly {
+                target_floor: (2, 35),
+                host_glibc: (2, 39),
+            },
+        );
         assert!(native_source_build_compatible(
             "linux-aarch64",
             "linux-aarch64",
@@ -2094,14 +2167,21 @@ mod tests {
     }
 
     #[test]
-    fn exact_native_x86_source_build_refuses_newer_or_unknown_host_glibc() {
-        assert!(!native_source_build_compatible(
+    fn exact_native_x86_source_build_is_pure_only_on_newer_host() {
+        assert!(native_source_build_compatible(
             "linux-64",
             "linux-64",
             Some((2, 28)),
             Some((2, 39)),
             true,
         ));
+        assert_eq!(
+            native_source_build_policy("linux-64", "linux-64", Some((2, 28)), Some((2, 39)), true,),
+            NativeSourceBuildPolicy::PlatformIndependentOnly {
+                target_floor: (2, 28),
+                host_glibc: (2, 39),
+            },
+        );
         assert!(native_source_build_compatible(
             "linux-64",
             "linux-64",
