@@ -888,15 +888,29 @@ impl WorkspaceManifest {
         // Pixi 0.73 does not put deprecated system requirements in the build
         // RPC. Exact orchestration can therefore arrive with glibc represented
         // only by the synthesized profile name
-        // (`linux-64-cuda-12-glibc-2-35`). Restrict this fallback to manifest-
-        // verified legacy composition; explicit rich profiles continue to
-        // require their structured declaration/detection contract.
+        // (`linux-64-cuda-12-glibc-2-35`), or only by the effective manifest
+        // profile when Pixi omits its default glibc 2.28 from that name.
+        // Restrict this fallback to manifest-verified legacy composition;
+        // explicit rich profiles continue to require their structured
+        // declaration/detection contract.
         if self.uses_legacy_platform_composition()
             && !detected.contains_key("glibc")
-            && let Some(fallback) = profile_declared.get("glibc").cloned().or_else(|| {
-                glibc_from_derived_profile_name(&envelope.profile.name, &envelope.profile.subdir)
+            && let Some(fallback) = profile_declared
+                .get("glibc")
+                .cloned()
+                .or_else(|| {
+                    glibc_from_derived_profile_name(
+                        &envelope.profile.name,
+                        &envelope.profile.subdir,
+                    )
                     .map(crate::glibc::format_glibc)
-            })
+                })
+                .or_else(|| {
+                    effective_profile
+                        .declared_virtual_packages
+                        .get("glibc")
+                        .cloned()
+                })
             && effective_profile.declared_virtual_packages.get("glibc") == Some(&fallback)
         {
             detected.insert("glibc".to_string(), fallback);
@@ -5807,6 +5821,76 @@ flashsac = { features = ["flashsac"], no-default-feature = true }
                 "linux-64",
                 target.declared_glibc(),
                 Some((2, 35)),
+                true,
+            ),
+            crate::pypi::NativeSourceBuildPolicy::AnyWheel,
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn legacy_envelope_default_glibc_populates_resolution_target_and_allows_equal_floor() {
+        let tmp = temp_workspace("target-envelope-default-glibc");
+        let source = tmp.join("flashsac-pack");
+        std::fs::create_dir_all(&source).unwrap();
+        let ws = ws_toml(
+            r#"
+[workspace]
+platforms = ["linux-64"]
+
+[feature.flashsac]
+platforms = ["linux-64"]
+[feature.flashsac.dependencies]
+flashsac-pack = { path = "./flashsac-pack" }
+[feature.flashsac.system-requirements]
+cuda = "12"
+libc = { family = "glibc", version = "2.28" }
+
+[environments]
+flashsac = { features = ["flashsac"], no-default-feature = true }
+"#,
+        );
+        let envelope = WorkspaceTargetEnvelope {
+            schema: 1,
+            environment: "flashsac".to_string(),
+            profile: WorkspaceTargetEnvelopeProfile {
+                // Pixi omits its default glibc 2.28 from derived names.
+                name: "linux-64-cuda-12".to_string(),
+                subdir: "linux-64".to_string(),
+                // The deprecated-system-requirements RPC shape is sparse.
+                virtual_packages: vec!["cuda=12".to_string()],
+                detected_virtual_packages: vec![
+                    "cuda=12".to_string(),
+                    "linux=4.18".to_string(),
+                    "__archspec=1=x86_64".to_string(),
+                    "__unix".to_string(),
+                ],
+            },
+        };
+        let target = ws
+            .resolve_target_for_source(&tmp, &source, "linux-64", Some(&envelope))
+            .unwrap()
+            .unwrap();
+        assert_eq!(target.contract.declared_glibc(), Some((2, 28)));
+        assert_eq!(target.contract.effective_glibc(), Some((2, 28)));
+        assert_eq!(
+            target.contract.detected_virtual_packages.get("glibc"),
+            Some(&"2.28".to_string())
+        );
+
+        let target = crate::pypi::ResolutionTarget::try_for_contract_on_subdir(
+            "3.11",
+            "linux-64",
+            target.contract,
+        )
+        .unwrap();
+        assert_eq!(target.declared_glibc(), Some((2, 28)));
+        assert_eq!(
+            crate::pypi::native_source_build_policy(
+                "linux-64",
+                "linux-64",
+                target.declared_glibc(),
+                Some((2, 28)),
                 true,
             ),
             crate::pypi::NativeSourceBuildPolicy::AnyWheel,

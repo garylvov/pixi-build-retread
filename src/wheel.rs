@@ -1190,11 +1190,10 @@ pub async fn prefetch_url_wheel_as_source(
     }
 }
 
-/// Returns `true` if the wheel filename's PEP 425 platform tag is `any`
-/// (i.e. the wheel is pure-Python and runs on every platform).
+/// Returns `true` if the wheel filename parses as PEP 427 and its ABI/platform
+/// tags are exactly `none-any`.
 ///
 /// PEP 425 wheel filenames are `{name}-{version}(-{build})?-{python}-{abi}-{platform}.whl`,
-/// so the platform tag is the LAST hyphen-separated segment of the stem.
 /// **Important**: D rewrites the wheel and renames it from `foo-1.0-py3-none-any.whl`
 /// to `foo-1.0-py3-none-any.relaxed.whl` (cosmetic suffix so the original wheel
 /// stays on disk untouched). A naive `filename.contains("-none-any.whl")` check
@@ -1206,19 +1205,159 @@ pub async fn prefetch_url_wheel_as_source(
 /// the conda solver then read `python 3.*` and bound python to 3.14, and the
 /// workspace's `python==3.11` pin rejected the implied `python_abi 3.14.* *_cp314`.
 ///
-/// Strip the well-known `.relaxed.whl` suffix first so the canonical PEP 425
-/// suffix `.whl` is restored, then inspect the platform tag. Any future
-/// rewrite suffix needs to be added here in lock-step.
+/// Strip Retread's well-known processing infixes first so the canonical PEP
+/// 427 filename is restored, then validate the complete filename before
+/// inspecting both tags. A platform field of `any` alone is insufficient:
+/// malformed/native-capable names such as `cp311-abi3-any` are not pure.
 pub fn is_pure_python_wheel_filename(filename: &str) -> bool {
-    let canonical = filename
-        .strip_suffix(".relaxed.whl")
-        .map(|stem| format!("{stem}.whl"))
-        .unwrap_or_else(|| filename.to_string());
+    let canonical = crate::emit_pypi::standard_wheel_filename(filename);
+    if crate::pypi::wheel_filename_identity(&canonical).is_none() {
+        return false;
+    }
     let Some(stem) = canonical.strip_suffix(".whl") else {
         return false;
     };
-    // Platform tag is the LAST hyphen segment. `any` => pure-Python.
-    stem.rsplit('-').next() == Some("any")
+    let mut fields = stem.rsplitn(4, '-');
+    let (Some(platform), Some(abi), Some(python), Some(_identity)) =
+        (fields.next(), fields.next(), fields.next(), fields.next())
+    else {
+        return false;
+    };
+    valid_wheel_tag_field(python) && abi == "none" && platform == "any"
+}
+
+fn valid_wheel_tag_field(field: &str) -> bool {
+    !field.is_empty()
+        && field.split('.').all(|component| {
+            !component.is_empty()
+                && component
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        })
+}
+
+fn wheel_metadata_tag_is_pure(tag: &str) -> bool {
+    let mut fields = tag.split('-');
+    let (Some(python), Some(abi), Some(platform)) = (fields.next(), fields.next(), fields.next())
+    else {
+        return false;
+    };
+    fields.next().is_none() && valid_wheel_tag_field(python) && abi == "none" && platform == "any"
+}
+
+/// Validate that a local wheel is pure at both the filename and archive level.
+///
+/// This is the source-build cache boundary, so the archive itself must attest
+/// to purity and contain no native-capable payload even when its filename says
+/// `none-any`.
+pub(crate) fn validate_pure_python_wheel_archive(wheel_path: &Path) -> Result<()> {
+    let filename = wheel_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("wheel path has no UTF-8 filename"))?;
+    if !is_pure_python_wheel_filename(filename) {
+        bail!("wheel filename `{filename}` is not a valid `none-any` wheel");
+    }
+
+    let file = std::fs::File::open(wheel_path)
+        .with_context(|| format!("opening wheel archive {}", wheel_path.display()))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .with_context(|| format!("reading wheel archive {}", wheel_path.display()))?;
+    let mut root_metadata_dirs = Vec::new();
+    let mut wheel_metadata = Vec::new();
+
+    for index in 0..archive.len() {
+        let mut entry = archive
+            .by_index(index)
+            .with_context(|| format!("opening ZIP member {index} in {}", wheel_path.display()))?;
+        let member = entry.name().replace('\\', "/");
+        let lower = member.to_ascii_lowercase();
+        let components: Vec<&str> = lower
+            .split('/')
+            .filter(|component| !component.is_empty() && *component != ".")
+            .collect();
+
+        if components
+            .windows(2)
+            .any(|pair| pair[0].ends_with(".data") && pair[1] == "platlib")
+        {
+            bail!("wheel archive contains platform payload member `{member}`");
+        }
+        if !entry.is_dir()
+            && components.last().is_some_and(|name| {
+                name.ends_with(".so") || name.ends_with(".dylib") || name.ends_with(".pyd")
+            })
+        {
+            bail!("wheel archive contains native payload member `{member}`");
+        }
+
+        if member.ends_with(".dist-info/METADATA") && member.matches('/').count() == 1 {
+            root_metadata_dirs.push(
+                member
+                    .strip_suffix("/METADATA")
+                    .expect("metadata suffix was checked")
+                    .to_string(),
+            );
+        }
+        if member.ends_with(".dist-info/WHEEL") && member.matches('/').count() == 1 {
+            let mut raw = String::new();
+            entry.read_to_string(&mut raw).with_context(|| {
+                format!(
+                    "reading wheel metadata member `{member}` in {}",
+                    wheel_path.display()
+                )
+            })?;
+            wheel_metadata.push((
+                member
+                    .strip_suffix("/WHEEL")
+                    .expect("WHEEL suffix was checked")
+                    .to_string(),
+                raw,
+            ));
+        }
+    }
+
+    if root_metadata_dirs.len() != 1 || wheel_metadata.len() != 1 {
+        bail!("wheel `{filename}` must contain exactly one root METADATA and WHEEL file");
+    }
+    let (wheel_dist_info, raw_wheel) = &wheel_metadata[0];
+    if &root_metadata_dirs[0] != wheel_dist_info {
+        bail!("wheel `{filename}` has METADATA and WHEEL files in different dist-info directories");
+    }
+
+    let mut root_is_purelib = Vec::new();
+    let mut tags = Vec::new();
+    for line in raw_wheel.lines() {
+        if line.trim().is_empty() {
+            break;
+        }
+        if line.starts_with(' ') || line.starts_with('\t') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        if key.trim().eq_ignore_ascii_case("Root-Is-Purelib") {
+            root_is_purelib.push(value);
+        } else if key.trim().eq_ignore_ascii_case("Tag") {
+            tags.push(value);
+        }
+    }
+
+    if root_is_purelib.len() != 1 || !root_is_purelib[0].eq_ignore_ascii_case("true") {
+        bail!("wheel `{filename}` does not declare `Root-Is-Purelib: true`");
+    }
+    if tags.is_empty() {
+        bail!("wheel `{filename}` has no `Tag:` entries in WHEEL metadata");
+    }
+    if let Some(tag) = tags
+        .into_iter()
+        .find(|tag| !wheel_metadata_tag_is_pure(tag))
+    {
+        bail!("wheel `{filename}` has non-pure WHEEL metadata tag `{tag}`");
+    }
+    Ok(())
 }
 
 /// v1.4.3: fetch a wheel's METADATA via its PEP 658/714 sidecar
@@ -2376,6 +2515,131 @@ mod tests {
         ));
         // Not a wheel at all: false.
         assert!(!is_pure_python_wheel_filename("foo.tar.gz"));
+    }
+
+    fn write_purity_test_wheel(
+        filename: &str,
+        wheel_metadata: &str,
+        extra_members: &[&str],
+    ) -> PathBuf {
+        use std::io::Write as _;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "retread-pure-wheel-{}-{}",
+            std::process::id(),
+            ATOMIC_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join(filename);
+        let file = std::fs::File::create(&path).unwrap();
+        let mut archive = zip::ZipWriter::new(file);
+        let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+        archive
+            .start_file("foo-1.0.dist-info/METADATA", options)
+            .unwrap();
+        archive
+            .write_all(b"Metadata-Version: 2.1\nName: foo\nVersion: 1.0\n\n")
+            .unwrap();
+        archive
+            .start_file("foo-1.0.dist-info/WHEEL", options)
+            .unwrap();
+        archive.write_all(wheel_metadata.as_bytes()).unwrap();
+        for member in extra_members {
+            archive.start_file(member, options).unwrap();
+            archive.write_all(b"test payload").unwrap();
+        }
+        archive.finish().unwrap();
+        path
+    }
+
+    #[test]
+    fn strict_pure_wheel_rejects_abi3_filename() {
+        const WHEEL: &str = "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n";
+        for filename in [
+            "foo-1.0-cp311-abi3-any.whl",
+            "foo-1.0-py3-none.abi3-any.whl",
+        ] {
+            let path = write_purity_test_wheel(filename, WHEEL, &[]);
+            let error = validate_pure_python_wheel_archive(&path).unwrap_err();
+            assert!(format!("{error:#}").contains("filename"));
+            let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        }
+    }
+
+    #[test]
+    fn strict_pure_wheel_rejects_malformed_filename_tag() {
+        let path = write_purity_test_wheel(
+            "foo-1.0-py3..py2-none-any.whl",
+            "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+            &[],
+        );
+        let error = validate_pure_python_wheel_archive(&path).unwrap_err();
+        assert!(format!("{error:#}").contains("filename"));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn strict_pure_wheel_rejects_platform_in_metadata_tag() {
+        let path = write_purity_test_wheel(
+            "foo-1.0-py3-none-any.whl",
+            concat!(
+                "Wheel-Version: 1.0\n",
+                "Root-Is-Purelib: true\n",
+                "Tag: py3-none-any\n",
+                "Tag: py3-none-manylinux_2_28_x86_64\n",
+            ),
+            &[],
+        );
+        let error = validate_pure_python_wheel_archive(&path).unwrap_err();
+        assert!(format!("{error:#}").contains("manylinux_2_28_x86_64"));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn strict_pure_wheel_rejects_false_root_is_purelib() {
+        let path = write_purity_test_wheel(
+            "foo-1.0-py3-none-any.whl",
+            "Wheel-Version: 1.0\nRoot-Is-Purelib: false\nTag: py3-none-any\n",
+            &[],
+        );
+        let error = validate_pure_python_wheel_archive(&path).unwrap_err();
+        assert!(format!("{error:#}").contains("Root-Is-Purelib: true"));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn strict_pure_wheel_rejects_native_payload() {
+        let path = write_purity_test_wheel(
+            "foo-1.0-py3-none-any.whl",
+            "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+            &["foo/_native.cpython-311-x86_64-linux-gnu.so"],
+        );
+        let error = validate_pure_python_wheel_archive(&path).unwrap_err();
+        assert!(format!("{error:#}").contains("native payload"));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn strict_pure_wheel_rejects_platlib_member() {
+        let path = write_purity_test_wheel(
+            "foo-1.0-py3-none-any.whl",
+            "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+            &["foo-1.0.data/platlib/foo.py"],
+        );
+        let error = validate_pure_python_wheel_archive(&path).unwrap_err();
+        assert!(format!("{error:#}").contains("platform payload"));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn strict_pure_wheel_accepts_clean_archive() {
+        let path = write_purity_test_wheel(
+            "foo-1.0-py3-none-any.whl",
+            "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+            &["foo/__init__.py"],
+        );
+        validate_pure_python_wheel_archive(&path).unwrap();
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     // Defensive: read_metadata's `is_pure_python` flag uses the same helper,

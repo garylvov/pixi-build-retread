@@ -1106,13 +1106,19 @@ where
     .context("built-wheel cache validation task panicked")?;
     match cached {
         Ok(Some(wheel)) => {
-            if let Some(package) = requirement.closure_sdist_package()
-                && !crate::wheel::is_pure_python_wheel_filename(&wheel.marker.filename)
-            {
-                return Err(closure_sdist_platform_error(
-                    package,
-                    &wheel.marker.filename,
-                ));
+            if let Some(package) = requirement.closure_sdist_package() {
+                let wheel_path = wheel.path.clone();
+                let purity = tokio::task::spawn_blocking(move || {
+                    crate::wheel::validate_pure_python_wheel_archive(&wheel_path)
+                })
+                .await
+                .context("cached wheel purity validation task panicked")?;
+                if let Err(purity_error) = purity {
+                    return Err(anyhow!(
+                        "{}; strict wheel purity validation failed: {purity_error:#}",
+                        closure_sdist_platform_error(package, &wheel.marker.filename),
+                    ));
+                }
             }
             return materialize_validated_wheel(&wheel, &materialized_out).await;
         }
@@ -1158,7 +1164,7 @@ where
             let platform_independent_required =
                 floor_mismatch.is_some() || requirement.closure_sdist_package().is_some();
             if platform_independent_required
-                && !crate::wheel::is_pure_python_wheel_filename(&filename)
+                && let Err(purity_error) = crate::wheel::validate_pure_python_wheel_archive(&built)
             {
                 let rejection = if let Some((target_floor, host_glibc)) = floor_mismatch {
                     platform_tagged_floor_error(
@@ -1178,12 +1184,15 @@ where
                 };
                 if let Err(delete_error) = std::fs::remove_file(&built) {
                     return Err(anyhow!(
-                        "{rejection}; additionally failed to delete rejected artifact {}: \
+                        "{rejection}; strict wheel purity validation failed: \
+                         {purity_error:#}; additionally failed to delete rejected artifact {}: \
                          {delete_error}",
                         built.display(),
                     ));
                 }
-                return Err(rejection);
+                return Err(anyhow!(
+                    "{rejection}; strict wheel purity validation failed: {purity_error:#}"
+                ));
             }
             validate_wheel_file(&built, &target, expected.as_ref())
         }
@@ -7133,10 +7142,11 @@ version = "0.1.0"
         );
     }
 
-    fn write_test_wheel_with_payload(
+    fn write_test_wheel_with_named_payload(
         path: &Path,
         metadata_name: &str,
         metadata_version: &str,
+        payload_name: &str,
         payload: &[u8],
     ) {
         let file = File::create(path).unwrap();
@@ -7161,11 +7171,39 @@ version = "0.1.0"
                 .as_bytes(),
             )
             .unwrap();
+        archive
+            .start_file(
+                format!(
+                    "{}-{}.dist-info/WHEEL",
+                    metadata_name.replace('-', "_"),
+                    metadata_version
+                ),
+                options,
+            )
+            .unwrap();
+        archive
+            .write_all(b"Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n")
+            .unwrap();
         if !payload.is_empty() {
-            archive.start_file("payload.bin", options).unwrap();
+            archive.start_file(payload_name, options).unwrap();
             archive.write_all(payload).unwrap();
         }
         archive.finish().unwrap();
+    }
+
+    fn write_test_wheel_with_payload(
+        path: &Path,
+        metadata_name: &str,
+        metadata_version: &str,
+        payload: &[u8],
+    ) {
+        write_test_wheel_with_named_payload(
+            path,
+            metadata_name,
+            metadata_version,
+            "payload.bin",
+            payload,
+        );
     }
 
     fn write_test_wheel(path: &Path, metadata_name: &str, metadata_version: &str) {
@@ -7659,6 +7697,75 @@ version = "0.1.0"
             !cache.exists(),
             "a native closure fallback must not be cached"
         );
+        let _ = std::fs::remove_dir_all(&output);
+    }
+
+    #[tokio::test]
+    async fn closure_sdist_cache_hit_rejects_mislabeled_native_archive() {
+        let target = ResolutionTarget::from_parts("3.11", "linux-64", Some((2, 39)));
+        let source_identity = hash_fields(
+            b"closure-native-cache-hit-test\0",
+            &[unique_test_dir("closure-native-cache-hit")
+                .to_string_lossy()
+                .as_bytes()],
+        );
+        let cache = built_wheel_cache_dir("sdist", &source_identity, &target);
+        remove_owned_cache_entry(&cache).unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+        let wheel = cache.join("native_dep-1.0.0-py3-none-any.whl");
+        write_test_wheel_with_named_payload(
+            &wheel,
+            "native-dep",
+            "1.0.0",
+            "native_dep/_native.so",
+            b"native bytes",
+        );
+        let mut marker = validate_wheel_file(
+            &wheel,
+            &target,
+            Some(&ExpectedWheel::exact("native-dep", "1.0.0")),
+        )
+        .unwrap();
+        marker.source_identity = source_identity.clone();
+        std::fs::write(
+            cache.join("artifact.json"),
+            serde_json::to_vec_pretty(&marker).unwrap(),
+        )
+        .unwrap();
+
+        let callback_ran = Arc::new(AtomicBool::new(false));
+        let callback_flag = Arc::clone(&callback_ran);
+        let output = unique_test_dir("closure-native-cache-hit-output");
+        let error = cached_build_with_acceptance(
+            "sdist",
+            &source_identity,
+            &target,
+            &output,
+            Some(&ExpectedWheel::exact("native-dep", "1.0.0")),
+            NativeSourceBuildPolicy::AnyWheel,
+            BuiltWheelRequirement::ClosureSdistPlatformIndependent {
+                package: "native-dep".to_string(),
+            },
+            move |_private_out| async move {
+                callback_flag.store(true, Ordering::Relaxed);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap_err();
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("strict wheel purity validation"),
+            "{message}"
+        );
+        assert!(message.contains("native payload"), "{message}");
+        assert!(!callback_ran.load(Ordering::Relaxed));
+        assert!(
+            !output.exists(),
+            "a mislabeled native cache hit must not reach caller output"
+        );
+        remove_owned_cache_entry(&cache).unwrap();
         let _ = std::fs::remove_dir_all(&output);
     }
 
