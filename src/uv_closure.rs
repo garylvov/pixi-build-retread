@@ -9243,6 +9243,115 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
         assert_eq!(built.version, "1.8.2");
     }
 
+    /// An exact-pinned, sdist-only transitive is built once and injected into
+    /// the retry request as both a local source and an explicit first-party pin.
+    #[tokio::test]
+    async fn heal_retries_once_after_building_exact_pinned_sdist_only_dep() {
+        let wheel_path = PathBuf::from("/tmp/wheels/pyperclip-1.8.0-py3-none-any.whl");
+        let solve_requests = Arc::new(Mutex::new(Vec::new()));
+        let solve = {
+            let solve_requests = Arc::clone(&solve_requests);
+            let wheel_path = wheel_path.clone();
+            move |r: UvClosureRequest| {
+                let solve_requests = Arc::clone(&solve_requests);
+                let wheel_path = wheel_path.clone();
+                Box::pin(async move {
+                    solve_requests.lock().unwrap().push((
+                        r.built_wheel_sources.get("pyperclip").cloned(),
+                        r.explicit_pins.get("pyperclip").cloned(),
+                    ));
+                    if r.built_wheel_sources.get("pyperclip") != Some(&wheel_path)
+                        || r.explicit_pins.get("pyperclip").map(String::as_str) != Some("1.8.0")
+                    {
+                        return Err(heal_needed(
+                            &[("pyperclip", "1.8.0")],
+                            &[],
+                            "package `pyperclip==1.8.0` has no usable wheels",
+                        ));
+                    }
+                    parse_pylock_closure(
+                        PYLOCK_FIXTURE,
+                        &target("3.12", "linux-64"),
+                        &BTreeSet::new(),
+                        "0.11.15",
+                    )
+                }) as futures::future::BoxFuture<'static, Result<UvClosure>>
+            }
+        };
+        let probe = |_n: String, _s: String| {
+            Box::pin(async { None }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
+        };
+        let sdist_probe_calls = Arc::new(Mutex::new(Vec::new()));
+        let sdist_probe = {
+            let sdist_probe_calls = Arc::clone(&sdist_probe_calls);
+            move |name: String, spec: String| {
+                let sdist_probe_calls = Arc::clone(&sdist_probe_calls);
+                Box::pin(async move {
+                    sdist_probe_calls.lock().unwrap().push((name, spec));
+                    None
+                }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
+            }
+        };
+        let build_calls = Arc::new(Mutex::new(Vec::new()));
+        let sdist_build = {
+            let build_calls = Arc::clone(&build_calls);
+            let wheel_path = wheel_path.clone();
+            move |name: String, requirement: Option<String>| {
+                let build_calls = Arc::clone(&build_calls);
+                let wheel_path = wheel_path.clone();
+                Box::pin(async move {
+                    build_calls
+                        .lock()
+                        .unwrap()
+                        .push((name.clone(), requirement));
+                    Ok(BuiltSdistWheel {
+                        pypi_name: name,
+                        version: "1.8.0".to_string(),
+                        filename: "pyperclip-1.8.0-py3-none-any.whl".to_string(),
+                        wheel_path,
+                        sha256: "b".repeat(64),
+                        sdist_source: sdist_source_fixture("pyperclip", "1.8.0"),
+                    })
+                }) as futures::future::BoxFuture<'static, Result<BuiltSdistWheel>>
+            }
+        };
+
+        let closure = auto_route_fixpoint_with_sdist_heal(
+            &auto_route_req(),
+            &auto_route_opts(),
+            solve,
+            probe,
+            sdist_probe,
+            Some(sdist_build),
+        )
+        .await
+        .expect("sdist build must heal the closure");
+
+        assert_eq!(
+            *solve_requests.lock().unwrap(),
+            vec![(None, None), (Some(wheel_path), Some("1.8.0".to_string())),],
+            "the second and only retry must carry the built source and exact pin",
+        );
+        assert_eq!(
+            *sdist_probe_calls.lock().unwrap(),
+            vec![("pyperclip".to_string(), "==1.8.0".to_string())],
+            "the conda route is probed once and deliberately misses",
+        );
+        assert_eq!(
+            *build_calls.lock().unwrap(),
+            vec![("pyperclip".to_string(), Some("==1.8.0".to_string()),)],
+            "the exact-pinned sdist must be built once",
+        );
+        assert!(closure.auto_routed.is_empty(), "no conda route was found");
+        let built = closure
+            .wheels
+            .iter()
+            .find(|wheel| wheel.name == "pyperclip")
+            .expect("built pyperclip wheel must be spliced into the closure");
+        assert!(matches!(built.origin, Origin::Built));
+        assert_eq!(built.version, "1.8.0");
+    }
+
     /// A build FAILURE surfaces the original error plus the build log tail
     /// and never silently drops the dependency.
     #[tokio::test]

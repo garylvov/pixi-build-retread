@@ -5043,12 +5043,12 @@ async fn build_sdist_wheel(
         .join("sdist-auto-build-outputs")
         .join(canonical_conda_name(&name));
     let expected = crate::source_build::ExpectedWheel::exact(name.clone(), version.to_string());
-    let built = crate::source_build::build_wheel_from_sdist_url_for_target(
+    let built = crate::source_build::build_platform_independent_wheel_from_sdist_url_for_target(
         &sdist.url,
         &out_dir,
         &target,
         sdist.sha256.as_deref(),
-        Some(&expected),
+        &expected,
     )
     .await
     .with_context(|| format!("sdist auto-build: building `{name}` from {}", sdist.url))?;

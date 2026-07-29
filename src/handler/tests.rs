@@ -10,6 +10,31 @@ use crate::index_chain::{IndexPurpose, PUBLIC_PYPI, index_chain};
 use crate::relax::{CondaName, CondaTarget, NameMap, PypiKey};
 use std::collections::BTreeMap;
 
+#[test]
+fn deprecated_system_requirements_rpc_shape_omits_glibc_contract() {
+    use pixi_build_types::procedures::conda_outputs::CondaOutputsParams;
+
+    // Pixi 0.73 sends only workspace build variants here. Deprecated
+    // system-requirements affect its selected rich platform envelope, not the
+    // typed conda/outputs parameters.
+    let params: CondaOutputsParams = serde_json::from_value(serde_json::json!({
+        "channels": [],
+        "hostPlatform": "linux-64",
+        "buildPlatform": "linux-64",
+        "variantConfiguration": {},
+        "variantFiles": [],
+        "workDirectory": "/tmp/retread-rpc-glibc"
+    }))
+    .unwrap();
+    assert_eq!(params.host_platform.as_str(), "linux-64");
+    assert!(
+        params
+            .variant_configuration
+            .as_ref()
+            .is_some_and(BTreeMap::is_empty)
+    );
+}
+
 #[cfg(unix)]
 fn unique_test_dir(label: &str) -> std::path::PathBuf {
     let nanos = std::time::SystemTime::now()
