@@ -10,6 +10,20 @@ use crate::index_chain::{IndexPurpose, PUBLIC_PYPI, index_chain};
 use crate::relax::{CondaName, CondaTarget, NameMap, PypiKey};
 use std::collections::BTreeMap;
 
+#[derive(Clone)]
+struct SharedLogWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for SharedLogWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 #[test]
 fn deprecated_system_requirements_rpc_shape_omits_glibc_contract() {
     use pixi_build_types::procedures::conda_outputs::CondaOutputsParams;
@@ -1984,6 +1998,78 @@ fn produce_output_omits_workspace_owned_auto_drops() {
     assert!(!names.contains(&"numpy"), "{names:?}");
     assert!(!names.contains(&"gym"), "{names:?}");
     assert!(names.contains(&"requests"), "{names:?}");
+}
+
+#[test]
+fn bundle_probe_metrics_aggregate_retries_and_zero_probe_bundles() {
+    let logs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::INFO)
+        .with_writer({
+            let logs = std::sync::Arc::clone(&logs);
+            move || SharedLogWriter(std::sync::Arc::clone(&logs))
+        })
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        let metrics = std::sync::Arc::new(BundleProbeMetrics::new("retried-pack"));
+        let retry_owner = std::sync::Arc::clone(&metrics);
+
+        let first = metrics.enter();
+        let overlapping = metrics.enter();
+        drop(overlapping);
+        drop(first);
+        let first_finished = metrics
+            .timing
+            .lock()
+            .unwrap()
+            .finished
+            .expect("the first probe wave records its completion");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        assert_eq!(
+            metrics.timing.lock().unwrap().finished,
+            Some(first_finished),
+            "post-probe work must not extend the recorded finish time",
+        );
+
+        let second = metrics.enter();
+        drop(second);
+        let timing = metrics.timing.lock().unwrap();
+        assert_eq!(metrics.probes.load(std::sync::atomic::Ordering::Relaxed), 3);
+        assert_eq!(timing.rounds, 2);
+        assert_eq!(timing.active, 0);
+        assert!(
+            timing.finished.unwrap() > first_finished,
+            "wall time must span from the first probe start through the final round",
+        );
+        drop(timing);
+
+        drop(metrics);
+        assert!(
+            logs.lock()
+                .unwrap()
+                .windows(b"bench: bundle route probes finished".len())
+                .all(|window| window != b"bench: bundle route probes finished"),
+            "a retry owner must keep the one bundle summary open",
+        );
+        drop(retry_owner);
+
+        drop(BundleProbeMetrics::new("zero-probe-pack"));
+    });
+
+    let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+    assert_eq!(
+        logs.matches("bench: bundle route probes finished").count(),
+        2,
+        "{logs}",
+    );
+    assert_eq!(logs.matches("bundle=retried-pack").count(), 1, "{logs}");
+    assert_eq!(logs.matches("bundle=zero-probe-pack").count(), 1, "{logs}");
+    assert!(logs.contains("probes=3"), "{logs}");
+    assert!(logs.contains("rounds=2"), "{logs}");
+    assert!(logs.contains("probes=0"), "{logs}");
+    assert!(logs.contains("rounds=0"), "{logs}");
 }
 
 #[test]

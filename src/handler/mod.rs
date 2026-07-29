@@ -4588,6 +4588,18 @@ async fn resolve_all(
             .or_default()
             .push((entry_name.clone(), entry.clone()));
     }
+    // Retried materialization attempts share one aggregate probe ledger.
+    // Keeping this owner at bundle-loop scope emits exactly one summary per
+    // configured bundle, including a zero-probe summary.
+    let probe_metrics_by_group = groups
+        .keys()
+        .map(|group| {
+            (
+                group.clone(),
+                Arc::new(BundleProbeMetrics::new(group.as_str())),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
 
     let uv_reresolve_env = std::env::var_os("RETREAD_UV_RERESOLVE");
     let uv_reresolve_mode = UvReresolveMode::from_env_value(uv_reresolve_env.as_deref());
@@ -4694,6 +4706,11 @@ async fn resolve_all(
             &workspace_pypi_indexes,
             conda_channels,
             &uv_retry_keep,
+            Arc::clone(
+                probe_metrics_by_group
+                    .get(&group_name)
+                    .expect("every bundle group has one probe metrics ledger"),
+            ),
         )
         .await
         .with_context(|| format!("computing uv closure for bundle `{group_name}`"))?;
@@ -5286,10 +5303,87 @@ fn workspace_conda_provider_candidates(
 /// must ask the same question: can these route specs solve together with every
 /// consuming workspace constraint, target Python, system requirements, and
 /// channel-priority setting?
+#[derive(Debug)]
+struct BundleProbeMetrics {
+    bundle: String,
+    probes: std::sync::atomic::AtomicUsize,
+    timing: std::sync::Mutex<BundleProbeTiming>,
+}
+
+#[derive(Debug, Default)]
+struct BundleProbeTiming {
+    rounds: usize,
+    active: usize,
+    started: Option<std::time::Instant>,
+    finished: Option<std::time::Instant>,
+}
+
+impl BundleProbeMetrics {
+    fn new(bundle: &str) -> Self {
+        Self {
+            bundle: bundle.to_string(),
+            probes: std::sync::atomic::AtomicUsize::new(0),
+            timing: std::sync::Mutex::new(BundleProbeTiming::default()),
+        }
+    }
+
+    fn enter(self: &Arc<Self>) -> BundleProbeGuard {
+        use std::sync::atomic::Ordering;
+
+        self.probes.fetch_add(1, Ordering::Relaxed);
+        let mut timing = self.timing.lock().unwrap();
+        timing.started.get_or_insert_with(std::time::Instant::now);
+        if timing.active == 0 {
+            timing.rounds += 1;
+        }
+        timing.active += 1;
+        drop(timing);
+        BundleProbeGuard {
+            metrics: Arc::clone(self),
+        }
+    }
+}
+
+impl Drop for BundleProbeMetrics {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+
+        let probes = self.probes.load(Ordering::Relaxed);
+        let timing = self.timing.lock().unwrap();
+        let wall_ms = timing
+            .started
+            .zip(timing.finished)
+            .map_or(0, |(started, finished)| {
+                finished.duration_since(started).as_millis() as u64
+            });
+        tracing::info!(
+            bundle = %self.bundle,
+            probes,
+            rounds = timing.rounds,
+            wall_ms,
+            "bench: bundle route probes finished",
+        );
+    }
+}
+
+struct BundleProbeGuard {
+    metrics: Arc<BundleProbeMetrics>,
+}
+
+impl Drop for BundleProbeGuard {
+    fn drop(&mut self) {
+        let mut timing = self.metrics.timing.lock().unwrap();
+        debug_assert!(timing.active > 0, "probe activity counter underflow");
+        timing.active -= 1;
+        timing.finished = Some(std::time::Instant::now());
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct CondaCoSolveContext {
     channels: Arc<[ChannelUrl]>,
     shared_solve: crate::conda_solve::SharedSparseSolveData,
+    probe_pool: Option<crate::thread_budget::ProbePoolGrant>,
     python: String,
     bundle: PypiKey,
     channel_priority: rattler_solve::ChannelPriority,
@@ -5306,9 +5400,11 @@ pub(crate) struct CondaCoSolveContext {
     /// the conda version (for example `tensordict -> pytorch 2.7.1` against an
     /// explicit PyPI `torch==2.7.0`).
     workspace_pypi_providers: BTreeMap<CondaName, PypiKey>,
+    probe_metrics: Arc<BundleProbeMetrics>,
 }
 
 impl CondaCoSolveContext {
+    #[cfg_attr(not(test), allow(dead_code))]
     fn new(
         manifest: Option<&crate::workspace::WorkspaceManifest>,
         workspace_dir: Option<&Path>,
@@ -5318,6 +5414,31 @@ impl CondaCoSolveContext {
         bundle: &str,
         owned_pypi: &BTreeSet<String>,
         fact_name_map: &NameMap,
+    ) -> Self {
+        Self::new_with_probe_metrics(
+            manifest,
+            workspace_dir,
+            source_dir,
+            target,
+            conda_channels,
+            bundle,
+            owned_pypi,
+            fact_name_map,
+            Arc::new(BundleProbeMetrics::new(bundle)),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_probe_metrics(
+        manifest: Option<&crate::workspace::WorkspaceManifest>,
+        workspace_dir: Option<&Path>,
+        source_dir: &Path,
+        target: &ResolutionTarget,
+        conda_channels: &[ChannelUrl],
+        bundle: &str,
+        owned_pypi: &BTreeSet<String>,
+        fact_name_map: &NameMap,
+        probe_metrics: Arc<BundleProbeMetrics>,
     ) -> Self {
         let (channel_priority, system_requirements, raw_workspace_deps) = match manifest {
             Some(manifest) => (
@@ -5385,6 +5506,7 @@ impl CondaCoSolveContext {
         Self {
             channels: conda_channels.to_vec().into(),
             shared_solve,
+            probe_pool: None,
             python: target.python_version().to_string(),
             bundle: PypiKey::from_pypi(bundle),
             channel_priority,
@@ -5392,13 +5514,25 @@ impl CondaCoSolveContext {
             detected_virtual_packages,
             workspace_deps,
             workspace_pypi_providers,
+            probe_metrics,
         }
     }
 
-    pub(crate) async fn solve(
+    fn with_probe_pool(mut self, probe_pool: crate::thread_budget::ProbePoolGrant) -> Self {
+        self.probe_pool = Some(probe_pool);
+        self
+    }
+
+    pub(crate) fn probe_parallelism(&self) -> usize {
+        self.probe_pool
+            .as_ref()
+            .map_or(1, |pool| pool.threads().get())
+    }
+
+    fn specs_for_routes(
         &self,
-        routed: Vec<crate::uv_closure::CondaRouteSpec>,
-    ) -> crate::uv_closure::CoInstallVerdict {
+        routed: &[crate::uv_closure::CondaRouteSpec],
+    ) -> Vec<crate::relax::CondaMatchSpec> {
         let mut specs = routed
             .iter()
             .map(crate::uv_closure::CondaRouteSpec::match_spec)
@@ -5414,9 +5548,25 @@ impl CondaCoSolveContext {
             }
         }
         specs.push(CondaName::new("python").match_spec(&format!("{}.*", self.python)));
+        specs
+    }
+
+    pub(crate) async fn prewarm(&self, routed: Vec<crate::uv_closure::CondaRouteSpec>) {
+        let specs = self.specs_for_routes(&routed);
+        crate::conda_solve::prewarm_selected_records_for_target_shared(&self.shared_solve, &specs)
+            .await;
+    }
+
+    pub(crate) async fn solve(
+        &self,
+        routed: Vec<crate::uv_closure::CondaRouteSpec>,
+    ) -> crate::uv_closure::CoInstallVerdict {
+        let specs = self.specs_for_routes(&routed);
+        let _probe = self.probe_metrics.enter();
         match crate::conda_solve::solve_selected_records_for_target_shared(
             &self.shared_solve,
             &specs,
+            self.probe_pool.clone(),
             &self.python,
             self.channel_priority,
             &self.system_requirements,
@@ -5450,17 +5600,18 @@ impl CondaCoSolveContext {
                             }));
                         }
                     }
-                    crate::uv_closure::CoInstallVerdict::Unsat(reasons)
+                    crate::uv_closure::CoInstallVerdict::ExactUnsat(reasons)
                 }
             }
-            Err(reasons)
-                if reasons
-                    .iter()
-                    .any(|reason| reason.contains("no repodata available from disk cache")) =>
-            {
+            Err(crate::conda_solve::SharedSolveFailure::Unavailable(reasons)) => {
                 crate::uv_closure::CoInstallVerdict::Skipped(reasons.join("; "))
             }
-            Err(reasons) => crate::uv_closure::CoInstallVerdict::Unsat(reasons),
+            Err(crate::conda_solve::SharedSolveFailure::Unsolvable(reasons)) => {
+                crate::uv_closure::CoInstallVerdict::Unsat(reasons)
+            }
+            Err(crate::conda_solve::SharedSolveFailure::Unproven(reasons)) => {
+                crate::uv_closure::CoInstallVerdict::ExactUnsat(reasons)
+            }
         }
     }
 
@@ -5482,9 +5633,11 @@ impl CondaCoSolveContext {
             route.match_spec(),
             CondaName::new("python").match_spec(&format!("{}.*", self.python)),
         ];
+        let _probe = self.probe_metrics.enter();
         match crate::conda_solve::solve_selected_records_for_target_shared(
             &self.shared_solve,
             &specs,
+            self.probe_pool.clone(),
             &self.python,
             self.channel_priority,
             &self.system_requirements,
@@ -5503,7 +5656,7 @@ impl CondaCoSolveContext {
                 if conflicts.is_empty() {
                     crate::uv_closure::CoInstallVerdict::Sat
                 } else {
-                    crate::uv_closure::CoInstallVerdict::Unsat(
+                    crate::uv_closure::CoInstallVerdict::ExactUnsat(
                         conflicts
                             .into_iter()
                             .map(|(conda, pypi)| {
@@ -5516,14 +5669,15 @@ impl CondaCoSolveContext {
                     )
                 }
             }
-            Err(reasons)
-                if reasons
-                    .iter()
-                    .any(|reason| reason.contains("no repodata available from disk cache")) =>
-            {
+            Err(crate::conda_solve::SharedSolveFailure::Unavailable(reasons)) => {
                 crate::uv_closure::CoInstallVerdict::Skipped(reasons.join("; "))
             }
-            Err(reasons) => crate::uv_closure::CoInstallVerdict::Unsat(reasons),
+            Err(crate::conda_solve::SharedSolveFailure::Unsolvable(reasons)) => {
+                crate::uv_closure::CoInstallVerdict::Unsat(reasons)
+            }
+            Err(crate::conda_solve::SharedSolveFailure::Unproven(reasons)) => {
+                crate::uv_closure::CoInstallVerdict::ExactUnsat(reasons)
+            }
         }
     }
 
@@ -6132,6 +6286,7 @@ async fn uv_group_closure(
     workspace_pypi_indexes: &[String],
     conda_channels: &[ChannelUrl],
     uv_retry_keep: &BTreeSet<PypiKey>,
+    probe_metrics: Arc<BundleProbeMetrics>,
 ) -> Result<(
     Option<crate::uv_closure::UvClosure>,
     std::collections::BTreeSet<String>,
@@ -6357,7 +6512,13 @@ async fn uv_group_closure(
     // non-destructive validation edge: use the effective Parselmouth-backed
     // map so a workspace-owned `torch` also protects its conda `pytorch`
     // provider without requiring every pack to repeat retread-name-map.
-    let conda_co_solve = CondaCoSolveContext::new(
+    const PROBE_POOL_CAP: usize = 4;
+    let requested_probe_threads = std::num::NonZeroUsize::new(
+        crate::concurrency::max_concurrent_builds().clamp(1, PROBE_POOL_CAP),
+    )
+    .expect("the probe pool cap is nonzero");
+    let probe_pool = crate::thread_budget::acquire_probe_pool(requested_probe_threads).await;
+    let conda_co_solve = CondaCoSolveContext::new_with_probe_metrics(
         manifest_opt.as_ref(),
         workspace_dir,
         source_dir,
@@ -6366,7 +6527,9 @@ async fn uv_group_closure(
         group_name,
         &workspace_facts.owned_pypi,
         &effective.name_map,
-    );
+        probe_metrics,
+    )
+    .with_probe_pool(probe_pool);
 
     // Rule-3-capable policies receive only precise, solved, agreed facts.
     // Aggressive deliberately retains its legacy declared-constraint input,
@@ -10816,6 +10979,22 @@ struct EmissionConstraintConflict {
 struct EmittedBundleRouteAssembly {
     routes: Vec<crate::uv_closure::CondaRouteSpec>,
     conflicts: Vec<EmissionConstraintConflict>,
+    supports_by_conda: BTreeMap<String, BTreeSet<EmissionSupport>>,
+}
+
+/// Structural provenance for an edge that reached final emission.
+///
+/// Rule 2 uses this index to prove that a wholly provisional route can
+/// disappear without rendering the complete bundle once per dependency.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum EmissionSupport {
+    AutoRoute {
+        owner_conda_name: String,
+    },
+    WheelRequirement {
+        translated_conda_name: String,
+        raw_pypi_name: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -10826,6 +11005,7 @@ struct PypiEmissionGroup {
     constraints: Vec<Constraint>,
     validation_only_origins: BTreeSet<ConstraintOriginId>,
     native_conda_overrides: BTreeSet<String>,
+    supports: BTreeSet<EmissionSupport>,
 }
 
 #[derive(Debug)]
@@ -10921,6 +11101,7 @@ fn add_emission_constraint(
     conda_name_is_authoritative: bool,
     constraint: Constraint,
     native_conda_override: Option<String>,
+    support: EmissionSupport,
 ) -> Result<()> {
     let conda_key = conda_name.key();
     let index = match indexes.get(&conda_key) {
@@ -10935,6 +11116,7 @@ fn add_emission_constraint(
                 constraints: Vec::new(),
                 validation_only_origins: BTreeSet::new(),
                 native_conda_overrides: BTreeSet::new(),
+                supports: BTreeSet::new(),
             });
             index
         }
@@ -10980,6 +11162,7 @@ fn add_emission_constraint(
             );
         }
     }
+    group.supports.insert(support);
     Ok(())
 }
 
@@ -12025,6 +12208,7 @@ fn produce_output_with_conflicts(
     CondaOutput,
     Vec<EmissionConstraintConflict>,
     Vec<auto_bundle::WheelMetadataRelaxation>,
+    BTreeMap<String, BTreeSet<EmissionSupport>>,
 )> {
     // Python version for the emitted variant/build/`python` dep. Shared with
     // the build recipe via `emit_python_version` so the metadata and the
@@ -12133,6 +12317,9 @@ fn produce_output_with_conflicts(
     // hand-written intent always wins over an auto-derived range.
     for auto_route in &bundle.auto_routed {
         let pypi_name = PypiKey::from_pypi(&auto_route.route.pypi_name);
+        let route_support = EmissionSupport::AutoRoute {
+            owner_conda_name: canonical_conda_name(&auto_route.route.conda_name),
+        };
         if let Some(workspace_provider) = &auto_route.workspace_provider {
             // A partial workspace fact retains the ordinary route so the
             // generated pack supplies conda provision to consumers that did
@@ -12148,6 +12335,7 @@ fn produce_output_with_conflicts(
                 true,
                 workspace_provider.constraint.clone(),
                 None,
+                route_support,
             )?;
             continue;
         }
@@ -12214,6 +12402,7 @@ fn produce_output_with_conflicts(
                     ),
                 },
                 None,
+                route_support.clone(),
             )?;
         }
         let prior_spec = format!("=={}", auto_route.route.pypi_version);
@@ -12250,6 +12439,7 @@ fn produce_output_with_conflicts(
                 ),
             },
             None,
+            route_support.clone(),
         )?;
         for input in &auto_route.route.input_requirements {
             let input_role = match input.role {
@@ -12291,6 +12481,7 @@ fn produce_output_with_conflicts(
                     ),
                 },
                 None,
+                route_support.clone(),
             )?;
         }
     }
@@ -12411,6 +12602,10 @@ fn produce_output_with_conflicts(
                     ),
                 },
                 translated.native_conda_override,
+                EmissionSupport::WheelRequirement {
+                    translated_conda_name: dep_name,
+                    raw_pypi_name: raw_pypi_name.to_string(),
+                },
             )?;
         }
     }
@@ -12496,6 +12691,7 @@ fn produce_output_with_conflicts(
     let abi_aliases = output_abi_aliases(bundle, config);
     let mut conflicts = Vec::new();
     let mut pending_relaxations = Vec::new();
+    let mut supports_by_conda = BTreeMap::new();
     for group in emission_groups {
         let PypiEmissionGroup {
             pypi_names,
@@ -12504,6 +12700,7 @@ fn produce_output_with_conflicts(
             constraints,
             validation_only_origins,
             native_conda_overrides,
+            supports,
         } = group;
         let pypi_name = pypi_names
             .iter()
@@ -12524,6 +12721,7 @@ fn produce_output_with_conflicts(
             });
         let native_conda_override = native_conda_overrides.into_iter().next();
         let conda_key = conda_name.key().into_string();
+        supports_by_conda.insert(conda_key.clone(), supports);
         if !seen_dep_names.insert(conda_key) {
             bail!(
                 "duplicate conda dependency target `{conda_name}` reached final emission; \
@@ -12652,7 +12850,7 @@ fn produce_output_with_conflicts(
         config.bundle_mode == crate::config::BundleMode::Loose,
         siblings,
     )?;
-    Ok((output, conflicts, pending_relaxations))
+    Ok((output, conflicts, pending_relaxations, supports_by_conda))
 }
 
 fn produce_output_pending_relaxations(
@@ -12664,15 +12862,16 @@ fn produce_output_pending_relaxations(
     courier_build_hash: Option<&str>,
     version_override: Option<&str>,
 ) -> Result<(CondaOutput, Vec<auto_bundle::WheelMetadataRelaxation>)> {
-    let (output, conflicts, pending_relaxations) = produce_output_with_conflicts(
-        bundle,
-        config,
-        host_platform,
-        workspace_python_version,
-        siblings,
-        courier_build_hash,
-        version_override,
-    )?;
+    let (output, conflicts, pending_relaxations, _supports_by_conda) =
+        produce_output_with_conflicts(
+            bundle,
+            config,
+            host_platform,
+            workspace_python_version,
+            siblings,
+            courier_build_hash,
+            version_override,
+        )?;
     if !conflicts.is_empty() {
         let conda_names = conflicts
             .iter()
@@ -12853,15 +13052,16 @@ fn emitted_bundle_route_assembly(
 ) -> Result<EmittedBundleRouteAssembly> {
     let host_platform = Platform::from_str(&target.conda_subdir)
         .with_context(|| format!("parsing target conda subdir `{}`", target.conda_subdir))?;
-    let (output, conflicts, _pending_relaxations) = produce_output_with_conflicts(
-        bundle,
-        config,
-        host_platform,
-        &target.python_version,
-        &[],
-        None,
-        None,
-    )?;
+    let (output, conflicts, _pending_relaxations, supports_by_conda) =
+        produce_output_with_conflicts(
+            bundle,
+            config,
+            host_platform,
+            &target.python_version,
+            &[],
+            None,
+            None,
+        )?;
     let routes = output
         .run_dependencies
         .depends
@@ -12882,7 +13082,11 @@ fn emitted_bundle_route_assembly(
             }
         })
         .collect();
-    Ok(EmittedBundleRouteAssembly { routes, conflicts })
+    Ok(EmittedBundleRouteAssembly {
+        routes,
+        conflicts,
+        supports_by_conda,
+    })
 }
 
 fn emitted_bundle_route_specs(

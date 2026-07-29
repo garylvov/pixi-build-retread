@@ -161,6 +161,92 @@ impl Drop for CompressionThreadLease {
     }
 }
 
+/// One coordinated grant shared by every resolvo probe in a bundle.
+///
+/// Clones retain the same underlying lease; they never register additional
+/// capacity. A clone is moved into each blocking solver task so cancellation
+/// of its async waiter cannot release the node-budget tokens before the CPU
+/// work actually exits.
+#[derive(Clone)]
+pub(crate) struct ProbePoolGrant {
+    lease: Arc<CompressionThreadLease>,
+    threads: NonZeroUsize,
+    task_semaphore: Arc<tokio::sync::Semaphore>,
+}
+
+/// One task slot from a [`ProbePoolGrant`].
+///
+/// Move this guard into the blocking solver task. It owns both the semaphore
+/// permit and a clone of the pool's original lease, so cancelling the async
+/// waiter cannot release either resource while CPU work is still running.
+#[must_use = "the task grant must remain live for the complete probe solve"]
+pub(crate) struct ProbeTaskGrant {
+    _pool: ProbePoolGrant,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl std::fmt::Debug for ProbePoolGrant {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProbePoolGrant")
+            .field("threads", &self.threads)
+            .field("decision", &self.lease.decision())
+            .finish()
+    }
+}
+
+impl ProbePoolGrant {
+    fn from_lease(lease: CompressionThreadLease, max_threads: NonZeroUsize) -> Self {
+        let lease = Arc::new(lease);
+        let threads =
+            NonZeroUsize::new(lease.decision().threads.get().min(max_threads.get()).max(1))
+                .expect("the capped probe pool grant is nonzero");
+        Self {
+            lease,
+            threads,
+            task_semaphore: Arc::new(tokio::sync::Semaphore::new(threads.get())),
+        }
+    }
+
+    pub(crate) fn threads(&self) -> NonZeroUsize {
+        self.threads
+    }
+
+    /// Wait for one task slot within this grant.
+    ///
+    /// This only acquires an in-process semaphore permit. It never calls
+    /// [`acquire`] or registers another node-budget lease.
+    pub(crate) async fn acquire_task(&self) -> ProbeTaskGrant {
+        let permit = Arc::clone(&self.task_semaphore)
+            .acquire_owned()
+            .await
+            .expect("the private probe-pool semaphore is never closed");
+        ProbeTaskGrant {
+            _pool: self.clone(),
+            _permit: permit,
+        }
+    }
+}
+
+/// Acquire one existing thread-budget lease for a complete bundle probe pool.
+///
+/// `RETREAD_COMPRESSION_THREADS` is an explicit detached override and may
+/// exceed the caller's requested ceiling, so the exposed pool width is capped
+/// again after acquisition. The lease itself remains singular and lives until
+/// the last pool/task clone drops.
+pub(crate) async fn acquire_probe_pool(max_threads: NonZeroUsize) -> ProbePoolGrant {
+    let grant = ProbePoolGrant::from_lease(acquire(Some(max_threads)).await, max_threads);
+    tracing::info!(
+        threads = grant.threads.get(),
+        requested = max_threads.get(),
+        active_leases = grant.lease.decision().active_leases,
+        budget = grant.lease.decision().budget.get(),
+        source = grant.lease.decision().source.as_str(),
+        "probe solve pool acquired one thread-budget grant",
+    );
+    grant
+}
+
 /// Acquire this build's compression budget lease.
 ///
 /// Registry setup, locking, parsing, pruning, and persistence failures all
@@ -1286,6 +1372,62 @@ mod tests {
 
     fn nonzero(value: usize) -> NonZeroUsize {
         NonZeroUsize::new(value).unwrap()
+    }
+
+    #[test]
+    fn probe_pool_clones_share_one_capped_lease() {
+        let lease = detached_lease(nonzero(12), nonzero(12), CompressionThreadSource::Override);
+        let grant = ProbePoolGrant::from_lease(lease, nonzero(4));
+        let clone = grant.clone();
+
+        assert_eq!(grant.threads().get(), 4);
+        assert_eq!(clone.threads().get(), 4);
+        assert!(
+            Arc::ptr_eq(&grant.lease, &clone.lease),
+            "pool workers must share one registry grant, not acquire per probe",
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_pool_task_slots_are_bounded_and_share_one_lease() {
+        let lease = detached_lease(nonzero(12), nonzero(12), CompressionThreadSource::Override);
+        let grant = ProbePoolGrant::from_lease(lease, nonzero(3));
+        let mut held = Vec::new();
+        for _ in 0..grant.threads().get() {
+            let task_grant = grant.acquire_task().await;
+            assert!(
+                Arc::ptr_eq(&grant.lease, &task_grant._pool.lease),
+                "task slots must retain the pool's original registry grant",
+            );
+            held.push(task_grant);
+        }
+
+        let waiting_pool = grant.clone();
+        let (acquired_tx, acquired_rx) = tokio::sync::oneshot::channel();
+        let waiter = tokio::spawn(async move {
+            let task_grant = waiting_pool.acquire_task().await;
+            let _ = acquired_tx.send(());
+            task_grant
+        });
+        let mut acquired_rx = Box::pin(acquired_rx);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut acquired_rx)
+                .await
+                .is_err(),
+            "the K+1 task must wait while all K task slots are held",
+        );
+
+        drop(held.pop());
+        tokio::time::timeout(Duration::from_secs(1), &mut acquired_rx)
+            .await
+            .expect("releasing a task slot must wake the next waiter")
+            .expect("the waiter must report its acquired task slot");
+        let resumed = waiter.await.expect("the task-slot waiter must not panic");
+        assert!(
+            Arc::ptr_eq(&grant.lease, &resumed._pool.lease),
+            "the resumed task must still retain the same registry grant",
+        );
     }
 
     fn test_nonce() -> String {

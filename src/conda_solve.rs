@@ -21,6 +21,28 @@ use rattler_solve::{ChannelPriority, SolveStrategy, SolverImpl, SolverTask, reso
 
 use crate::relax::CondaMatchSpec;
 
+/// Failure classification retained at the bundle-scoped probe boundary.
+///
+/// Only `Unsolvable` is a monotone proof suitable for block deletion.
+/// Operational/configuration failures and unavailable repodata must never be
+/// promoted into such a proof by the conflict-localization reducer.
+#[derive(Debug)]
+pub(crate) enum SharedSolveFailure {
+    Unsolvable(Vec<String>),
+    Unproven(Vec<String>),
+    Unavailable(Vec<String>),
+}
+
+impl SharedSolveFailure {
+    fn into_reasons(self) -> Vec<String> {
+        match self {
+            Self::Unsolvable(reasons) | Self::Unproven(reasons) | Self::Unavailable(reasons) => {
+                reasons
+            }
+        }
+    }
+}
+
 /// Solve a spec set against already-loaded records and return the
 /// concrete records the solver selected. Shared by the pre-emission
 /// solve check and workspace transitive extraction so both reason
@@ -54,8 +76,10 @@ fn solve_selected_records_from_records(
         strategy,
         preferred,
     )
+    .map_err(SharedSolveFailure::into_reasons)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn solve_selected_records_from_records_for_target(
     parsed_specs: Vec<MatchSpec>,
     all_records: &[RepoDataRecord],
@@ -65,13 +89,13 @@ fn solve_selected_records_from_records_for_target(
     detected_virtual_packages: Option<&BTreeMap<String, String>>,
     strategy: SolveStrategy,
     preferred: Vec<RepoDataRecord>,
-) -> std::result::Result<Vec<RepoDataRecord>, Vec<String>> {
+) -> std::result::Result<Vec<RepoDataRecord>, SharedSolveFailure> {
     let virtual_packages = build_virtual_packages_for_target(
         target_python,
         system_requirements,
         detected_virtual_packages,
     )
-    .map_err(|error| vec![error])?;
+    .map_err(|error| SharedSolveFailure::Unproven(vec![error]))?;
     let task = SolverTask {
         available_packages: vec![all_records],
         // `locked_packages` = soft preference in rattler_solve: the solver
@@ -94,8 +118,12 @@ fn solve_selected_records_from_records_for_target(
     let mut solver = resolvo::Solver;
     match solver.solve(task) {
         Ok(solution) => Ok(solution.records),
-        Err(rattler_solve::SolveError::Unsolvable(reasons)) => Err(reasons),
-        Err(other) => Err(vec![format!("solver error: {other}")]),
+        Err(rattler_solve::SolveError::Unsolvable(reasons)) => {
+            Err(SharedSolveFailure::Unsolvable(reasons))
+        }
+        Err(other) => Err(SharedSolveFailure::Unproven(vec![format!(
+            "solver error: {other}"
+        )])),
     }
 }
 
@@ -121,6 +149,7 @@ async fn solve_on_blocking_pool(
     solve_on_blocking_pool_for_target(
         parsed_specs,
         records.into(),
+        None,
         target_python,
         channel_priority,
         system_requirements,
@@ -129,22 +158,33 @@ async fn solve_on_blocking_pool(
         preferred,
     )
     .await
+    .map_err(SharedSolveFailure::into_reasons)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn solve_on_blocking_pool_for_target(
     parsed_specs: Vec<MatchSpec>,
     records: Arc<[RepoDataRecord]>,
+    probe_grant: Option<crate::thread_budget::ProbePoolGrant>,
     target_python: String,
     channel_priority: ChannelPriority,
     system_requirements: BTreeMap<String, String>,
     detected_virtual_packages: Option<BTreeMap<String, String>>,
     strategy: SolveStrategy,
     preferred: Vec<RepoDataRecord>,
-) -> std::result::Result<Vec<RepoDataRecord>, Vec<String>> {
+) -> std::result::Result<Vec<RepoDataRecord>, SharedSolveFailure> {
+    let probe_task = match &probe_grant {
+        Some(grant) => Some(grant.acquire_task().await),
+        None => None,
+    };
     let t_solve = std::time::Instant::now();
     let specs_count = parsed_specs.len();
     let records_count = records.len();
     let result = tokio::task::spawn_blocking(move || {
+        // Keep the bundle's one coordinated grant alive until this CPU task
+        // actually exits, even if its async waiter is cancelled.
+        let _probe_grant = probe_grant;
+        let _probe_task = probe_task;
         solve_selected_records_from_records_for_target(
             parsed_specs,
             &records,
@@ -157,7 +197,11 @@ async fn solve_on_blocking_pool_for_target(
         )
     })
     .await
-    .unwrap_or_else(|e| Err(vec![format!("solver task panicked: {e}")]));
+    .unwrap_or_else(|e| {
+        Err(SharedSolveFailure::Unproven(vec![format!(
+            "solver task panicked: {e}"
+        )]))
+    });
     tracing::info!(
         elapsed_ms = t_solve.elapsed().as_millis() as u64,
         satisfiable = result.is_ok(),
@@ -645,6 +689,7 @@ pub async fn solve_selected_records(
 /// detected map is Pixi's complete virtual-package set for the selected rich
 /// target. `Some(empty)` remains contract-qualified and suppresses host
 /// detection; only `None` selects legacy host inference.
+#[allow(clippy::too_many_arguments)]
 pub async fn solve_selected_records_for_target(
     channels: &[ChannelUrl],
     specs: &[CondaMatchSpec],
@@ -671,6 +716,43 @@ pub async fn solve_selected_records_for_target(
     solve_on_blocking_pool_for_target(
         parsed_specs,
         records.into(),
+        None,
+        target_python.to_string(),
+        channel_priority,
+        system_requirements.clone(),
+        detected_virtual_packages.cloned(),
+        strategy,
+        Vec::new(),
+    )
+    .await
+    .map_err(SharedSolveFailure::into_reasons)
+}
+
+/// Bundle-scoped form of [`solve_selected_records_for_target`] that shares
+/// sparse handles and the grow-only reachable record union across probes.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn solve_selected_records_for_target_shared(
+    shared: &SharedSparseSolveData,
+    specs: &[CondaMatchSpec],
+    probe_grant: Option<crate::thread_budget::ProbePoolGrant>,
+    target_python: &str,
+    channel_priority: ChannelPriority,
+    system_requirements: &BTreeMap<String, String>,
+    detected_virtual_packages: Option<&BTreeMap<String, String>>,
+    strategy: SolveStrategy,
+) -> std::result::Result<Vec<RepoDataRecord>, SharedSolveFailure> {
+    let rendered_specs: Vec<String> = specs.iter().map(ToString::to_string).collect();
+    let parsed_specs = parse_match_specs(&rendered_specs);
+    let (records, _consulted) = shared.records_for(&parsed_specs).await;
+    if records.is_empty() {
+        return Err(SharedSolveFailure::Unavailable(vec![
+            "solve-check skipped: no repodata available from disk cache".into(),
+        ]));
+    }
+    solve_on_blocking_pool_for_target(
+        parsed_specs,
+        records,
+        probe_grant,
         target_python.to_string(),
         channel_priority,
         system_requirements.clone(),
@@ -681,37 +763,17 @@ pub async fn solve_selected_records_for_target(
     .await
 }
 
-/// Bundle-scoped form of [`solve_selected_records_for_target`] that shares
-/// sparse handles and the grow-only reachable record union across probes.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn solve_selected_records_for_target_shared(
+/// Populate the bundle-scoped reachable-record union without running resolvo.
+///
+/// Standalone provider probes can then share one complete immutable snapshot
+/// instead of introducing roots one at a time and rebuilding a growing union.
+pub(crate) async fn prewarm_selected_records_for_target_shared(
     shared: &SharedSparseSolveData,
     specs: &[CondaMatchSpec],
-    target_python: &str,
-    channel_priority: ChannelPriority,
-    system_requirements: &BTreeMap<String, String>,
-    detected_virtual_packages: Option<&BTreeMap<String, String>>,
-    strategy: SolveStrategy,
-) -> std::result::Result<Vec<RepoDataRecord>, Vec<String>> {
+) {
     let rendered_specs: Vec<String> = specs.iter().map(ToString::to_string).collect();
     let parsed_specs = parse_match_specs(&rendered_specs);
-    let (records, _consulted) = shared.records_for(&parsed_specs).await;
-    if records.is_empty() {
-        return Err(vec![
-            "solve-check skipped: no repodata available from disk cache".into(),
-        ]);
-    }
-    solve_on_blocking_pool_for_target(
-        parsed_specs,
-        records,
-        target_python.to_string(),
-        channel_priority,
-        system_requirements.clone(),
-        detected_virtual_packages.cloned(),
-        strategy,
-        Vec::new(),
-    )
-    .await
+    let _ = shared.records_for(&parsed_specs).await;
 }
 
 #[cfg(test)]
@@ -1259,6 +1321,35 @@ mod tests {
         assert!(
             reasons.iter().any(|reason| unsat_mentions(reason, "numba")),
             "unsat reasons should name numba: {reasons:?}",
+        );
+    }
+
+    #[test]
+    fn resolvo_unsat_is_typed_as_monotone_probe_proof() {
+        let records = vec![
+            repo_record("python", "3.11.5", &[]),
+            repo_record("fixture-dep", "1.0.0", &[]),
+        ];
+        let specs = parse_match_specs(&[
+            "python 3.11.*".to_string(),
+            "fixture-dep ==2.0.0".to_string(),
+        ]);
+
+        let failure = solve_selected_records_from_records_for_target(
+            specs,
+            &records,
+            "3.11",
+            ChannelPriority::Strict,
+            &BTreeMap::new(),
+            None,
+            SolveStrategy::Highest,
+            Vec::new(),
+        )
+        .expect_err("the unavailable exact version must be unsatisfiable");
+
+        assert!(
+            matches!(failure, SharedSolveFailure::Unsolvable(_)),
+            "only resolvo's genuine Unsolvable result may authorize block deletion: {failure:?}",
         );
     }
 
