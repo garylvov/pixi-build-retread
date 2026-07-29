@@ -257,7 +257,8 @@ pub struct RetreadConfig {
 
     /// Number of rattler-build compression threads for this pack.
     /// The process-wide `RETREAD_COMPRESSION_THREADS` environment override
-    /// takes precedence. Unset uses the runtime default capped at 8.
+    /// takes precedence. Unset shares the node-wide compression budget with
+    /// other active retread builds.
     #[serde(
         default,
         rename = "retread-compression-threads",
