@@ -523,24 +523,37 @@ fn registry_admission_pass(
 
         if grant == 0 {
             if own.is_none() {
-                write_record_atomic(
+                let result = write_record_atomic(
                     &registration.registry,
                     &registration.file_name,
                     &record,
                     false,
-                )?;
+                );
+                if let Err(error) = result {
+                    if root_io_error_kind(&error) == Some(std::io::ErrorKind::AlreadyExists) {
+                        return Ok(RegistryAttempt::Collision);
+                    }
+                    return Err(error);
+                }
             }
             return Ok(RegistryAttempt::Waiting);
         }
 
         record.granted_threads = grant;
         record.refreshed_at_unix_secs = now;
-        write_record_atomic(
+        let replace = own.is_some();
+        let result = write_record_atomic(
             &registration.registry,
             &registration.file_name,
             &record,
-            own.is_some(),
-        )?;
+            replace,
+        );
+        if let Err(error) = result {
+            if !replace && root_io_error_kind(&error) == Some(std::io::ErrorKind::AlreadyExists) {
+                return Ok(RegistryAttempt::Collision);
+            }
+            return Err(error);
+        }
         Ok(RegistryAttempt::Granted {
             threads: NonZeroUsize::new(grant).expect("registry grants are positive"),
             active_leases,
@@ -879,6 +892,12 @@ fn root_io_error_kind(error: &anyhow::Error) -> Option<std::io::ErrorKind> {
         .any(|cause| cause.downcast_ref::<rustix::io::Errno>() == Some(&rustix::io::Errno::NOENT))
     {
         return Some(std::io::ErrorKind::NotFound);
+    }
+    if error
+        .chain()
+        .any(|cause| cause.downcast_ref::<rustix::io::Errno>() == Some(&rustix::io::Errno::EXIST))
+    {
+        return Some(std::io::ErrorKind::AlreadyExists);
     }
     error
         .chain()
