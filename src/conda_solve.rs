@@ -69,31 +69,54 @@ fn solve_selected_records_from_records(
     solve_selected_records_from_records_for_target(
         parsed_specs,
         all_records,
-        target_python,
-        channel_priority,
-        system_requirements,
-        None,
-        strategy,
+        &SolveTarget {
+            python: target_python,
+            channel_priority,
+            system_requirements,
+            detected_virtual_packages: None,
+            strategy,
+        },
         preferred,
     )
     .map_err(SharedSolveFailure::into_reasons)
 }
 
-#[allow(clippy::too_many_arguments)]
+pub(crate) struct SolveTarget<'a> {
+    python: &'a str,
+    channel_priority: ChannelPriority,
+    system_requirements: &'a BTreeMap<String, String>,
+    detected_virtual_packages: Option<&'a BTreeMap<String, String>>,
+    strategy: SolveStrategy,
+}
+
+impl<'a> SolveTarget<'a> {
+    pub(crate) fn new(
+        python: &'a str,
+        channel_priority: ChannelPriority,
+        system_requirements: &'a BTreeMap<String, String>,
+        detected_virtual_packages: Option<&'a BTreeMap<String, String>>,
+        strategy: SolveStrategy,
+    ) -> Self {
+        Self {
+            python,
+            channel_priority,
+            system_requirements,
+            detected_virtual_packages,
+            strategy,
+        }
+    }
+}
+
 fn solve_selected_records_from_records_for_target(
     parsed_specs: Vec<MatchSpec>,
     all_records: &[RepoDataRecord],
-    target_python: &str,
-    channel_priority: ChannelPriority,
-    system_requirements: &BTreeMap<String, String>,
-    detected_virtual_packages: Option<&BTreeMap<String, String>>,
-    strategy: SolveStrategy,
+    target: &SolveTarget<'_>,
     preferred: Vec<RepoDataRecord>,
 ) -> std::result::Result<Vec<RepoDataRecord>, SharedSolveFailure> {
     let virtual_packages = build_virtual_packages_for_target(
-        target_python,
-        system_requirements,
-        detected_virtual_packages,
+        target.python,
+        target.system_requirements,
+        target.detected_virtual_packages,
     )
     .map_err(|error| SharedSolveFailure::Unproven(vec![error]))?;
     let task = SolverTask {
@@ -110,10 +133,10 @@ fn solve_selected_records_from_records_for_target(
         specs: parsed_specs,
         constraints: Vec::new(),
         timeout: Some(std::time::Duration::from_secs(60)),
-        channel_priority,
+        channel_priority: target.channel_priority,
         exclude_newer: None,
         min_age: None,
-        strategy,
+        strategy: target.strategy,
     };
     let mut solver = resolvo::Solver;
     match solver.solve(task) {
@@ -150,27 +173,24 @@ async fn solve_on_blocking_pool(
         parsed_specs,
         records.into(),
         None,
-        target_python,
-        channel_priority,
-        system_requirements,
-        None,
-        strategy,
+        SolveTarget {
+            python: &target_python,
+            channel_priority,
+            system_requirements: &system_requirements,
+            detected_virtual_packages: None,
+            strategy,
+        },
         preferred,
     )
     .await
     .map_err(SharedSolveFailure::into_reasons)
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn solve_on_blocking_pool_for_target(
     parsed_specs: Vec<MatchSpec>,
     records: Arc<[RepoDataRecord]>,
     probe_grant: Option<crate::thread_budget::ProbePoolGrant>,
-    target_python: String,
-    channel_priority: ChannelPriority,
-    system_requirements: BTreeMap<String, String>,
-    detected_virtual_packages: Option<BTreeMap<String, String>>,
-    strategy: SolveStrategy,
+    target: SolveTarget<'_>,
     preferred: Vec<RepoDataRecord>,
 ) -> std::result::Result<Vec<RepoDataRecord>, SharedSolveFailure> {
     let probe_task = match &probe_grant {
@@ -180,6 +200,11 @@ async fn solve_on_blocking_pool_for_target(
     let t_solve = std::time::Instant::now();
     let specs_count = parsed_specs.len();
     let records_count = records.len();
+    let target_python = target.python.to_string();
+    let system_requirements = target.system_requirements.clone();
+    let detected_virtual_packages = target.detected_virtual_packages.cloned();
+    let channel_priority = target.channel_priority;
+    let strategy = target.strategy;
     let result = tokio::task::spawn_blocking(move || {
         // Keep the bundle's one coordinated grant alive until this CPU task
         // actually exits, even if its async waiter is cancelled.
@@ -188,11 +213,13 @@ async fn solve_on_blocking_pool_for_target(
         solve_selected_records_from_records_for_target(
             parsed_specs,
             &records,
-            &target_python,
-            channel_priority,
-            &system_requirements,
-            detected_virtual_packages.as_ref(),
-            strategy,
+            &SolveTarget {
+                python: &target_python,
+                channel_priority,
+                system_requirements: &system_requirements,
+                detected_virtual_packages: detected_virtual_packages.as_ref(),
+                strategy,
+            },
             preferred,
         )
     })
@@ -717,11 +744,13 @@ pub async fn solve_selected_records_for_target(
         parsed_specs,
         records.into(),
         None,
-        target_python.to_string(),
-        channel_priority,
-        system_requirements.clone(),
-        detected_virtual_packages.cloned(),
-        strategy,
+        SolveTarget {
+            python: target_python,
+            channel_priority,
+            system_requirements,
+            detected_virtual_packages,
+            strategy,
+        },
         Vec::new(),
     )
     .await
@@ -730,16 +759,11 @@ pub async fn solve_selected_records_for_target(
 
 /// Bundle-scoped form of [`solve_selected_records_for_target`] that shares
 /// sparse handles and the grow-only reachable record union across probes.
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn solve_selected_records_for_target_shared(
     shared: &SharedSparseSolveData,
     specs: &[CondaMatchSpec],
     probe_grant: Option<crate::thread_budget::ProbePoolGrant>,
-    target_python: &str,
-    channel_priority: ChannelPriority,
-    system_requirements: &BTreeMap<String, String>,
-    detected_virtual_packages: Option<&BTreeMap<String, String>>,
-    strategy: SolveStrategy,
+    target: &SolveTarget<'_>,
 ) -> std::result::Result<Vec<RepoDataRecord>, SharedSolveFailure> {
     let rendered_specs: Vec<String> = specs.iter().map(ToString::to_string).collect();
     let parsed_specs = parse_match_specs(&rendered_specs);
@@ -753,11 +777,13 @@ pub(crate) async fn solve_selected_records_for_target_shared(
         parsed_specs,
         records,
         probe_grant,
-        target_python.to_string(),
-        channel_priority,
-        system_requirements.clone(),
-        detected_virtual_packages.cloned(),
-        strategy,
+        SolveTarget {
+            python: target.python,
+            channel_priority: target.channel_priority,
+            system_requirements: target.system_requirements,
+            detected_virtual_packages: target.detected_virtual_packages,
+            strategy: target.strategy,
+        },
         Vec::new(),
     )
     .await
@@ -1338,11 +1364,13 @@ mod tests {
         let failure = solve_selected_records_from_records_for_target(
             specs,
             &records,
-            "3.11",
-            ChannelPriority::Strict,
-            &BTreeMap::new(),
-            None,
-            SolveStrategy::Highest,
+            &SolveTarget::new(
+                "3.11",
+                ChannelPriority::Strict,
+                &BTreeMap::new(),
+                None,
+                SolveStrategy::Highest,
+            ),
             Vec::new(),
         )
         .expect_err("the unavailable exact version must be unsatisfiable");

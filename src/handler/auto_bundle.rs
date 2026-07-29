@@ -1620,28 +1620,29 @@ pub(crate) async fn auto_bundle_transitives(
         };
     let channels_consulted = conda_co_solve.channels_consulted();
     auto_bundle_transitives_with_route_precheck_and_prewarm(
-        bundle,
-        indexes,
-        target.wheel_target(),
-        target.workspace_scope(),
-        config,
-        locked_closure,
-        favor_lock_prefs,
-        uv_closure_wheels,
+        AutoBundleInputs {
+            bundle,
+            indexes,
+            target: target.wheel_target(),
+            workspace_scope: target.workspace_scope(),
+            config,
+            locked_closure,
+            favor_lock_prefs,
+            uv_closure_wheels,
+            channels_consulted: &channels_consulted,
+            probe_parallelism: conda_co_solve.probe_parallelism(),
+            uv_reresolve,
+        },
         &probe_many,
         &co_solve,
         &prewarm_routes,
         &validate_standalone_provider_route,
         &fetch_pypi,
-        &channels_consulted,
-        conda_co_solve.probe_parallelism(),
-        uv_reresolve,
     )
     .await
 }
 
 #[allow(clippy::too_many_arguments)]
-#[cfg_attr(not(test), allow(dead_code))]
 async fn auto_bundle_transitives_with<P, PF, C, CF, X, XF>(
     bundle: &mut Bundle,
     indexes: &[String],
@@ -1667,28 +1668,32 @@ where
     let allow_source_route = |_route: crate::uv_closure::CondaRouteSpec| async {
         crate::uv_closure::CoInstallVerdict::Sat
     };
-    auto_bundle_transitives_with_route_precheck(
-        bundle,
-        indexes,
-        target,
-        None,
-        config,
-        locked_closure,
-        favor_lock_prefs,
-        uv_closure_wheels,
+    let no_prewarm = |_routes: Vec<crate::uv_closure::CondaRouteSpec>| async {};
+    auto_bundle_transitives_with_route_precheck_and_prewarm(
+        AutoBundleInputs {
+            bundle,
+            indexes,
+            target,
+            workspace_scope: None,
+            config,
+            locked_closure,
+            favor_lock_prefs,
+            uv_closure_wheels,
+            channels_consulted,
+            probe_parallelism: 1,
+            uv_reresolve,
+        },
         probe_many,
         co_solve,
+        &no_prewarm,
         &allow_source_route,
         fetch_pypi,
-        channels_consulted,
-        1,
-        uv_reresolve,
     )
     .await
 }
 
 #[allow(clippy::too_many_arguments)]
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 async fn auto_bundle_transitives_with_route_precheck<P, PF, C, CF, V, VF, X, XF>(
     bundle: &mut Bundle,
     indexes: &[String],
@@ -1718,27 +1723,42 @@ where
 {
     let no_prewarm = |_routes: Vec<crate::uv_closure::CondaRouteSpec>| async {};
     auto_bundle_transitives_with_route_precheck_and_prewarm(
-        bundle,
-        indexes,
-        target,
-        workspace_scope,
-        config,
-        locked_closure,
-        favor_lock_prefs,
-        uv_closure_wheels,
+        AutoBundleInputs {
+            bundle,
+            indexes,
+            target,
+            workspace_scope,
+            config,
+            locked_closure,
+            favor_lock_prefs,
+            uv_closure_wheels,
+            channels_consulted,
+            probe_parallelism,
+            uv_reresolve,
+        },
         probe_many,
         co_solve,
         &no_prewarm,
         validate_standalone_provider_route,
         fetch_pypi,
-        channels_consulted,
-        probe_parallelism,
-        uv_reresolve,
     )
     .await
 }
 
-#[allow(clippy::too_many_arguments)]
+struct AutoBundleInputs<'a> {
+    bundle: &'a mut Bundle,
+    indexes: &'a [String],
+    target: &'a crate::pypi::WheelTarget,
+    workspace_scope: Option<&'a crate::workspace::ResolvedWorkspaceTarget>,
+    config: &'a RetreadConfig,
+    locked_closure: Option<&'a BTreeMap<String, String>>,
+    favor_lock_prefs: Option<&'a BTreeMap<String, String>>,
+    uv_closure_wheels: Option<&'a BTreeMap<String, String>>,
+    channels_consulted: &'a [String],
+    probe_parallelism: usize,
+    uv_reresolve: &'a UvReresolveContext,
+}
+
 async fn auto_bundle_transitives_with_route_precheck_and_prewarm<
     P,
     PF,
@@ -1751,22 +1771,12 @@ async fn auto_bundle_transitives_with_route_precheck_and_prewarm<
     X,
     XF,
 >(
-    bundle: &mut Bundle,
-    indexes: &[String],
-    target: &crate::pypi::WheelTarget,
-    workspace_scope: Option<&crate::workspace::ResolvedWorkspaceTarget>,
-    config: &RetreadConfig,
-    locked_closure: Option<&BTreeMap<String, String>>,
-    favor_lock_prefs: Option<&BTreeMap<String, String>>,
-    uv_closure_wheels: Option<&BTreeMap<String, String>>,
+    inputs: AutoBundleInputs<'_>,
     probe_many: &P,
     co_solve: &C,
     prewarm_routes: &W,
     validate_standalone_provider_route: &V,
     fetch_pypi: &X,
-    channels_consulted: &[String],
-    probe_parallelism: usize,
-    uv_reresolve: &UvReresolveContext,
 ) -> Result<AutoBundleOutcome>
 where
     P: Fn(Vec<(String, String)>) -> PF,
@@ -1780,6 +1790,19 @@ where
     X: Fn(PypiFetchRequest, Vec<String>, String) -> XF,
     XF: Future<Output = Result<ResolvedWheel>>,
 {
+    let AutoBundleInputs {
+        bundle,
+        indexes,
+        target,
+        workspace_scope,
+        config,
+        locked_closure,
+        favor_lock_prefs,
+        uv_closure_wheels,
+        channels_consulted,
+        probe_parallelism,
+        uv_reresolve,
+    } = inputs;
     let diagnostic_context = JointRouteDiagnosticContext::new(bundle, target, workspace_scope);
 
     // Build the skip set: anything already in the bundle, plus the user's
@@ -2548,7 +2571,6 @@ fn metadata_route_group_has_source_built_origin(
 /// requirements declared by source-built roots, are mutable until this check
 /// succeeds. Rejected routes are restored through the same ordered PyPI
 /// fallback chain before the bundle is changed.
-#[cfg_attr(not(test), allow(dead_code))]
 async fn jointly_unroute_unsolvable<C, CF, X, XF>(
     bundle: &mut Bundle,
     metadata_routes: &mut ProvisionalMetadataRoutes,
@@ -6415,22 +6437,24 @@ robotics-root = {{ version = "1.0.0", bundle = "robotics-output" }}
         bundle.primary.metadata_provenance = Provenance::SourceBuiltRelaxed;
 
         auto_bundle_transitives_with_route_precheck_and_prewarm(
-            &mut bundle,
-            &[crate::workspace::DEFAULT_PYPI_INDEX.to_string()],
-            &target,
-            None,
-            &config,
-            None,
-            None,
-            None,
+            AutoBundleInputs {
+                bundle: &mut bundle,
+                indexes: &[crate::workspace::DEFAULT_PYPI_INDEX.to_string()],
+                target: &target,
+                workspace_scope: None,
+                config: &config,
+                locked_closure: None,
+                favor_lock_prefs: None,
+                uv_closure_wheels: None,
+                channels_consulted: &["conda-forge/linux-64".to_string()],
+                probe_parallelism: 1,
+                uv_reresolve: &UvReresolveContext::default(),
+            },
             &validated_probe,
             &co_solve,
             &prewarm,
             &provider_check,
             &fetch,
-            &["conda-forge/linux-64".to_string()],
-            1,
-            &UvReresolveContext::default(),
         )
         .await
         .unwrap();

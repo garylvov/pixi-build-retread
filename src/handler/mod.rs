@@ -5407,8 +5407,18 @@ pub(crate) struct CondaCoSolveContext {
     probe_metrics: Arc<BundleProbeMetrics>,
 }
 
+struct CondaCoSolveInputs<'a> {
+    manifest: Option<&'a crate::workspace::WorkspaceManifest>,
+    workspace_dir: Option<&'a Path>,
+    source_dir: &'a Path,
+    target: &'a ResolutionTarget,
+    conda_channels: &'a [ChannelUrl],
+    bundle: &'a str,
+    owned_pypi: &'a BTreeSet<String>,
+    fact_name_map: &'a NameMap,
+}
+
 impl CondaCoSolveContext {
-    #[cfg_attr(not(test), allow(dead_code))]
     fn new(
         manifest: Option<&crate::workspace::WorkspaceManifest>,
         workspace_dir: Option<&Path>,
@@ -5420,6 +5430,30 @@ impl CondaCoSolveContext {
         fact_name_map: &NameMap,
     ) -> Self {
         Self::new_with_probe_metrics(
+            CondaCoSolveInputs {
+                manifest,
+                workspace_dir,
+                source_dir,
+                target,
+                conda_channels,
+                bundle,
+                owned_pypi,
+                fact_name_map,
+            },
+            Arc::new(BundleProbeMetrics::new(bundle)),
+        )
+    }
+
+    fn with_probe_metrics(mut self, probe_metrics: Arc<BundleProbeMetrics>) -> Self {
+        self.probe_metrics = probe_metrics;
+        self
+    }
+
+    fn new_with_probe_metrics(
+        inputs: CondaCoSolveInputs<'_>,
+        probe_metrics: Arc<BundleProbeMetrics>,
+    ) -> Self {
+        let CondaCoSolveInputs {
             manifest,
             workspace_dir,
             source_dir,
@@ -5428,22 +5462,7 @@ impl CondaCoSolveContext {
             bundle,
             owned_pypi,
             fact_name_map,
-            Arc::new(BundleProbeMetrics::new(bundle)),
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn new_with_probe_metrics(
-        manifest: Option<&crate::workspace::WorkspaceManifest>,
-        workspace_dir: Option<&Path>,
-        source_dir: &Path,
-        target: &ResolutionTarget,
-        conda_channels: &[ChannelUrl],
-        bundle: &str,
-        owned_pypi: &BTreeSet<String>,
-        fact_name_map: &NameMap,
-        probe_metrics: Arc<BundleProbeMetrics>,
-    ) -> Self {
+        } = inputs;
         let (channel_priority, system_requirements, raw_workspace_deps) = match manifest {
             Some(manifest) => (
                 match manifest.channel_priority.as_deref() {
@@ -5571,11 +5590,13 @@ impl CondaCoSolveContext {
             &self.shared_solve,
             &specs,
             self.probe_pool.clone(),
-            &self.python,
-            self.channel_priority,
-            &self.system_requirements,
-            self.detected_virtual_packages.as_ref(),
-            rattler_solve::SolveStrategy::Highest,
+            &crate::conda_solve::SolveTarget::new(
+                &self.python,
+                self.channel_priority,
+                &self.system_requirements,
+                self.detected_virtual_packages.as_ref(),
+                rattler_solve::SolveStrategy::Highest,
+            ),
         )
         .await
         {
@@ -5642,11 +5663,13 @@ impl CondaCoSolveContext {
             &self.shared_solve,
             &specs,
             self.probe_pool.clone(),
-            &self.python,
-            self.channel_priority,
-            &self.system_requirements,
-            self.detected_virtual_packages.as_ref(),
-            rattler_solve::SolveStrategy::Highest,
+            &crate::conda_solve::SolveTarget::new(
+                &self.python,
+                self.channel_priority,
+                &self.system_requirements,
+                self.detected_virtual_packages.as_ref(),
+                rattler_solve::SolveStrategy::Highest,
+            ),
         )
         .await
         {
@@ -6522,7 +6545,7 @@ async fn uv_group_closure(
     )
     .expect("the probe pool cap is nonzero");
     let probe_pool = crate::thread_budget::acquire_probe_pool(requested_probe_threads).await;
-    let conda_co_solve = CondaCoSolveContext::new_with_probe_metrics(
+    let conda_co_solve = CondaCoSolveContext::new(
         manifest_opt.as_ref(),
         workspace_dir,
         source_dir,
@@ -6531,8 +6554,8 @@ async fn uv_group_closure(
         group_name,
         &workspace_facts.owned_pypi,
         &effective.name_map,
-        probe_metrics,
     )
+    .with_probe_metrics(probe_metrics)
     .with_probe_pool(probe_pool);
 
     // Rule-3-capable policies receive only precise, solved, agreed facts.
@@ -11097,16 +11120,28 @@ fn translated_emission_constraint(
     }
 }
 
-fn add_emission_constraint(
-    groups: &mut Vec<PypiEmissionGroup>,
-    indexes: &mut BTreeMap<PypiKey, usize>,
+struct EmissionConstraintInput {
     pypi_name: PypiKey,
     conda_name: CondaName,
     conda_name_is_authoritative: bool,
     constraint: Constraint,
     native_conda_override: Option<String>,
     support: EmissionSupport,
+}
+
+fn add_emission_constraint(
+    groups: &mut Vec<PypiEmissionGroup>,
+    indexes: &mut BTreeMap<PypiKey, usize>,
+    input: EmissionConstraintInput,
 ) -> Result<()> {
+    let EmissionConstraintInput {
+        pypi_name,
+        conda_name,
+        conda_name_is_authoritative,
+        constraint,
+        native_conda_override,
+        support,
+    } = input;
     let conda_key = conda_name.key();
     let index = match indexes.get(&conda_key) {
         Some(index) => *index,
@@ -12196,6 +12231,13 @@ fn ensure_output_abi_invariants(
     )
 }
 
+type ProducedOutput = (
+    CondaOutput,
+    Vec<EmissionConstraintConflict>,
+    Vec<auto_bundle::WheelMetadataRelaxation>,
+    BTreeMap<String, BTreeSet<EmissionSupport>>,
+);
+
 fn produce_output_with_conflicts(
     bundle: &Bundle,
     config: &RetreadConfig,
@@ -12208,12 +12250,7 @@ fn produce_output_with_conflicts(
     // on an incremental add).  `None` → use bundle.primary.metadata.version
     // (today's behaviour, always chosen when RETREAD_INCREMENTAL is unset).
     version_override: Option<&str>,
-) -> Result<(
-    CondaOutput,
-    Vec<EmissionConstraintConflict>,
-    Vec<auto_bundle::WheelMetadataRelaxation>,
-    BTreeMap<String, BTreeSet<EmissionSupport>>,
-)> {
+) -> Result<ProducedOutput> {
     // Python version for the emitted variant/build/`python` dep. Shared with
     // the build recipe via `emit_python_version` so the metadata and the
     // recipe can never disagree. NEVER bare-major: a `py3-none-manylinux`
@@ -12334,12 +12371,14 @@ fn produce_output_with_conflicts(
             add_emission_constraint(
                 &mut emission_groups,
                 &mut emission_group_indexes,
-                pypi_name,
-                workspace_provider.conda_name.clone(),
-                true,
-                workspace_provider.constraint.clone(),
-                None,
-                route_support,
+                EmissionConstraintInput {
+                    pypi_name,
+                    conda_name: workspace_provider.conda_name.clone(),
+                    conda_name_is_authoritative: true,
+                    constraint: workspace_provider.constraint.clone(),
+                    native_conda_override: None,
+                    support: route_support,
+                },
             )?;
             continue;
         }
@@ -12379,34 +12418,36 @@ fn produce_output_with_conflicts(
             add_emission_constraint(
                 &mut emission_groups,
                 &mut emission_group_indexes,
-                pypi_name.clone(),
-                conda_name.clone(),
-                true,
-                Constraint {
-                    specifiers,
-                    provenance,
-                    source: format!(
-                        "auto-route `{}=={}` to conda `{}=={}`",
-                        auto_route.route.pypi_name,
-                        auto_route.route.pypi_version,
-                        auto_route.route.conda_name,
-                        auto_route.route.conda_version
-                    ),
-                    origin_id: ConstraintOriginId::from_parts(
-                        "auto-route",
-                        [
-                            auto_route.route.pypi_name.as_str(),
-                            auto_route.route.pypi_version.as_str(),
-                            auto_route.route.conda_name.as_str(),
-                            auto_route.route.conda_version.as_str(),
-                            auto_route.route.channel.as_str(),
-                            "conda-selection",
-                            route_spec.as_str(),
-                        ],
-                    ),
+                EmissionConstraintInput {
+                    pypi_name: pypi_name.clone(),
+                    conda_name: conda_name.clone(),
+                    conda_name_is_authoritative: true,
+                    constraint: Constraint {
+                        specifiers,
+                        provenance,
+                        source: format!(
+                            "auto-route `{}=={}` to conda `{}=={}`",
+                            auto_route.route.pypi_name,
+                            auto_route.route.pypi_version,
+                            auto_route.route.conda_name,
+                            auto_route.route.conda_version
+                        ),
+                        origin_id: ConstraintOriginId::from_parts(
+                            "auto-route",
+                            [
+                                auto_route.route.pypi_name.as_str(),
+                                auto_route.route.pypi_version.as_str(),
+                                auto_route.route.conda_name.as_str(),
+                                auto_route.route.conda_version.as_str(),
+                                auto_route.route.channel.as_str(),
+                                "conda-selection",
+                                route_spec.as_str(),
+                            ],
+                        ),
+                    },
+                    native_conda_override: None,
+                    support: route_support.clone(),
                 },
-                None,
-                route_support.clone(),
             )?;
         }
         let prior_spec = format!("=={}", auto_route.route.pypi_version);
@@ -12419,31 +12460,33 @@ fn produce_output_with_conflicts(
         add_emission_constraint(
             &mut emission_groups,
             &mut emission_group_indexes,
-            pypi_name.clone(),
-            conda_name.clone(),
-            true,
-            Constraint {
-                specifiers: prior_specifiers,
-                provenance: Provenance::PriorSelection,
-                source: format!(
-                    "prior uv selection `{}=={}`",
-                    auto_route.route.pypi_name, auto_route.route.pypi_version
-                ),
-                origin_id: ConstraintOriginId::from_parts(
-                    "auto-route",
-                    [
-                        auto_route.route.pypi_name.as_str(),
-                        auto_route.route.pypi_version.as_str(),
-                        auto_route.route.conda_name.as_str(),
-                        auto_route.route.conda_version.as_str(),
-                        auto_route.route.channel.as_str(),
-                        "prior-selection",
-                        prior_spec.as_str(),
-                    ],
-                ),
+            EmissionConstraintInput {
+                pypi_name: pypi_name.clone(),
+                conda_name: conda_name.clone(),
+                conda_name_is_authoritative: true,
+                constraint: Constraint {
+                    specifiers: prior_specifiers,
+                    provenance: Provenance::PriorSelection,
+                    source: format!(
+                        "prior uv selection `{}=={}`",
+                        auto_route.route.pypi_name, auto_route.route.pypi_version
+                    ),
+                    origin_id: ConstraintOriginId::from_parts(
+                        "auto-route",
+                        [
+                            auto_route.route.pypi_name.as_str(),
+                            auto_route.route.pypi_version.as_str(),
+                            auto_route.route.conda_name.as_str(),
+                            auto_route.route.conda_version.as_str(),
+                            auto_route.route.channel.as_str(),
+                            "prior-selection",
+                            prior_spec.as_str(),
+                        ],
+                    ),
+                },
+                native_conda_override: None,
+                support: route_support.clone(),
             },
-            None,
-            route_support.clone(),
         )?;
         for input in &auto_route.route.input_requirements {
             let input_role = match input.role {
@@ -12464,28 +12507,30 @@ fn produce_output_with_conflicts(
             add_emission_constraint(
                 &mut emission_groups,
                 &mut emission_group_indexes,
-                pypi_name.clone(),
-                conda_name.clone(),
-                true,
-                Constraint {
-                    specifiers,
-                    provenance: input.effective_provenance(),
-                    source: input.source.clone(),
-                    origin_id: ConstraintOriginId::from_parts(
-                        "auto-route",
-                        [
-                            auto_route.route.pypi_name.as_str(),
-                            auto_route.route.pypi_version.as_str(),
-                            auto_route.route.conda_name.as_str(),
-                            auto_route.route.conda_version.as_str(),
-                            auto_route.route.channel.as_str(),
-                            input_role,
-                            input.specifiers.trim(),
-                        ],
-                    ),
+                EmissionConstraintInput {
+                    pypi_name: pypi_name.clone(),
+                    conda_name: conda_name.clone(),
+                    conda_name_is_authoritative: true,
+                    constraint: Constraint {
+                        specifiers,
+                        provenance: input.effective_provenance(),
+                        source: input.source.clone(),
+                        origin_id: ConstraintOriginId::from_parts(
+                            "auto-route",
+                            [
+                                auto_route.route.pypi_name.as_str(),
+                                auto_route.route.pypi_version.as_str(),
+                                auto_route.route.conda_name.as_str(),
+                                auto_route.route.conda_version.as_str(),
+                                auto_route.route.channel.as_str(),
+                                input_role,
+                                input.specifiers.trim(),
+                            ],
+                        ),
+                    },
+                    native_conda_override: None,
+                    support: route_support.clone(),
                 },
-                None,
-                route_support.clone(),
             )?;
         }
     }
@@ -12586,29 +12631,31 @@ fn produce_output_with_conflicts(
             add_emission_constraint(
                 &mut emission_groups,
                 &mut emission_group_indexes,
-                pypi_name,
-                conda_name,
-                false,
-                Constraint {
-                    specifiers: translated.specifiers,
-                    provenance: translated.provenance,
-                    source: format!(
-                        "wheel `{}=={}` Requires-Dist `{raw}`",
-                        wheel.metadata.name, wheel.metadata.version
-                    ),
-                    origin_id: ConstraintOriginId::from_parts(
-                        "wheel-requires-dist",
-                        [
-                            wheel.metadata.name.as_str(),
-                            wheel.metadata.version.as_str(),
-                            raw.as_str(),
-                        ],
-                    ),
-                },
-                translated.native_conda_override,
-                EmissionSupport::WheelRequirement {
-                    translated_conda_name: dep_name,
-                    raw_pypi_name: raw_pypi_name.to_string(),
+                EmissionConstraintInput {
+                    pypi_name,
+                    conda_name,
+                    conda_name_is_authoritative: false,
+                    constraint: Constraint {
+                        specifiers: translated.specifiers,
+                        provenance: translated.provenance,
+                        source: format!(
+                            "wheel `{}=={}` Requires-Dist `{raw}`",
+                            wheel.metadata.name, wheel.metadata.version
+                        ),
+                        origin_id: ConstraintOriginId::from_parts(
+                            "wheel-requires-dist",
+                            [
+                                wheel.metadata.name.as_str(),
+                                wheel.metadata.version.as_str(),
+                                raw.as_str(),
+                            ],
+                        ),
+                    },
+                    native_conda_override: translated.native_conda_override,
+                    support: EmissionSupport::WheelRequirement {
+                        translated_conda_name: dep_name,
+                        raw_pypi_name: raw_pypi_name.to_string(),
+                    },
                 },
             )?;
         }
