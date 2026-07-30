@@ -4,6 +4,23 @@
 
 Bundles PyPI wheel closures into conda packages, crossing the conda↔uv boundary.
 
+## Requirements
+
+- Pixi providing `pixi-build-api-version >=4,<6` (pinned in `recipe/recipe.yaml`).
+  Rich platform envelopes (`platforms = [{ platform = "linux-64", glibc = "2.35" }]`)
+  need Pixi >= 0.71; recommended: **Pixi 0.73**.
+- Commit a workspace `.pixi/config.toml` (a fresh `pixi init` re-includes it):
+
+  ```toml
+  [concurrency]
+  solves = 1
+  run-post-link-scripts = "insecure"   # courier post-link install (retread's own script)
+  ```
+
+  One Pixi process per workspace; for parallel installs, one clone per install.
+  Alternatively set `retread-courier-mode = "activation"` to skip the post-link
+  and install lazily on first activation.
+
 ## Setup
 
 ```toml
@@ -11,8 +28,7 @@ Bundles PyPI wheel closures into conda packages, crossing the conda↔uv boundar
 [workspace]
 preview = ["pixi-build"]
 channels = ["https://prefix.dev/conda-forge"]
-[system-requirements]
-libc = "2.35"
+platforms = [{ platform = "linux-64", glibc = "2.35" }]
 [dependencies]
 isaac-pack = { path = "./isaac-pack" }
 
@@ -26,20 +42,16 @@ retread-bundle = "isaac-pack"
 isaacsim = { version = "==5.1.0", index = "https://pypi.nvidia.com" }
 ```
 
-The backend itself is published on `prefix.dev/garylvov`, not conda-forge, so
-`channels` in the backend spec (separate from the workspace `channels` above)
-must list it -- omitting it leaves the backend unresolvable.
+The backend is published on `prefix.dev/garylvov` (not conda-forge), so the
+backend `channels` list must include it.
 
 Run: `pixi install`
 
-Courier installs via a conda post-link script (retread's own, not
-third-party), so the workspace `.pixi/config.toml` needs
-`run-post-link-scripts = "insecure"`. Set `retread-courier-mode =
-"activation"` to skip the post-link and install lazily on first `pixi
-run`/`shell` instead -- no insecure config, slower first activation.
+## Pack Configuration
 
-## Pack Configuration Example
-A pack's `pixi.toml` (e.g., `examples/isaac6/isaac-pack/`) declares package metadata and wheels to bundle:
+A pack's `pixi.toml` (e.g., `examples/isaac6/isaac-pack/`) declares package
+metadata and wheels to bundle:
+
 ```toml
 [package]
 name = "isaac-pack-6"
@@ -49,15 +61,13 @@ backend = { name = "pixi-build-retread", version = "*", channels = ["https://pre
 [package.build.config]
 retread-python   = "3.12"
 retread-bundle   = "isaac-pack-6"
-retread-resolver = "uv"
+retread-resolver = "uv"        # default
 [package.build.config.retread-wheels]
 isaacsim = { version = "==6.0.0.1", index = "https://pypi.nvidia.com" }
-# ...
 ```
 
-Dependency-conflict escape hatches live in that pack manifest. Relax upstream
-pins globally, override one dependency explicitly, or omit a dependency from
-the generated conda run dependencies:
+Dependency-conflict escape hatches, in the same manifest — relax upstream pins
+globally, override one dependency, or drop one from the emitted run deps:
 
 ```toml
 [package.build.config]
@@ -67,15 +77,6 @@ retread-drop-deps = ["optional-package"]
 [package.build.config.retread-overrides]
 numpy = ">=1.26,<2"
 ```
-
-## Rust toolchain
-
-Rust `1.97.0` is pinned in `rust-toolchain.toml` (kept in sync with CI's
-`dtolnay/rust-toolchain` pin) so `fmt`/`clippy` never drift between local and
-CI. Install it with [rustup](https://rustup.rs) (which reads
-`rust-toolchain.toml` automatically) -- `pixi exec --spec rust` pulls from
-conda-forge, which lags the pinned version and will disagree on `fmt`/
-`clippy` output.
 
 ## Commands
 
@@ -88,19 +89,11 @@ conda-forge, which lags the pinned version and will disagree on `fmt`/
 
 ## Fast path
 
-For shared-filesystem machines (SLURM clusters, EC2+EFS) where the project and caches
-sit on slow shared storage: `eval "$(pixi-build-retread fast --print-env)"` reroutes
-caches and env storage to fast machine-local disk (Pixi 0.70 or newer is required).
-`pixi install` then materializes the environment with a no-resolve frozen rebuild
-backed by the shared package cache. Raw
-environment snapshots are intentionally unsupported because Pixi embeds the detached
-prefix in scripts and metadata, making snapshots unsafe to move between job roots. On
-a local machine with fast disk, fast-tmp auto-disengages.
-
-Configuration is optional: the default `mode = "auto"` engages on slow shared
-filesystems and auto-disengages on fast local disk; `RETREAD_FAST_TMP`,
-`RETREAD_FAST_TMP_ROOT`, `RETREAD_FAST_TMP_BUDGET_BYTES`, and
-`RETREAD_SHARED_CACHE_DIR` override the TOML.
+On shared-filesystem machines (SLURM clusters, EC2+EFS),
+`eval "$(pixi-build-retread fast --print-env)"` reroutes caches and env storage
+to fast machine-local disk; `pixi install` then materializes environments with a
+no-resolve frozen rebuild backed by the shared package cache. On fast local
+disk, fast-tmp auto-disengages. Defaults work unconfigured; overrides:
 
 ```toml
 [tool.retread.fast-tmp]
@@ -109,39 +102,22 @@ tmp-root = "/tmp"
 blob-caches = "shared"
 ```
 
-## Requirements & concurrency
+Env vars `RETREAD_FAST_TMP`, `RETREAD_FAST_TMP_ROOT`,
+`RETREAD_FAST_TMP_BUDGET_BYTES`, and `RETREAD_SHARED_CACHE_DIR` override the TOML.
 
-- Pixi providing `pixi-build-api-version >=4,<6` (pinned in `recipe/recipe.yaml`).
-- Rich platform envelopes (`platforms = [{ platform = "linux-64", glibc = "2.35" }]`)
-  need **Pixi >= 0.71**. Recommended, known-good: **Pixi 0.73**.
-- Workspaces with source packs should serialize environment solves. Commit a
-  `.pixi/config.toml` containing:
+## Threads & caches
 
-  ```toml
-  [concurrency]
-  solves = 1
-  ```
+Compression threads are budgeted node-wide per user (PID-lease registry): a
+solo build gets full parallelism; concurrent builds share the budget. Knobs:
+`RETREAD_COMPRESSION_THREADS` (per-build override), `RETREAD_COMPRESSION_BUDGET`
+(node budget; default = available parallelism), `RETREAD_THREAD_LEASE_DIR`
+(registry location, mainly for tests).
 
-  (`pixi config set --local concurrency.solves 1` writes the same file, and a
-  fresh `pixi init` re-includes it, so it can be committed.) Run one Pixi
-  process per workspace; for parallel installs use one clone per install.
+The shared wheel store (`~/.cache/retread/wheels`, override
+`RETREAD_WHEEL_STORE`) is independent of `RETREAD_CACHE_DIR` and fast-tmp;
+lock records reference its content SHAs, so do not delete it casually.
 
-Retread bounds rattler-build compression threads node-wide per user via a
-PID-lease registry (since 4.10.44): a solo build gets full parallelism,
-concurrent builds share the budget, and coordinated grants never exceed it.
-Knobs: `RETREAD_COMPRESSION_THREADS` (hard per-build override),
-`RETREAD_COMPRESSION_BUDGET` (node budget; default = available parallelism),
-`RETREAD_THREAD_LEASE_DIR` (registry location, mainly for tests). The registry
-is node-local; remote filesystems fall back conservatively.
+## Rust toolchain
 
-The shared wheel store defaults to `~/.cache/retread/wheels` and can be
-overridden with `RETREAD_WHEEL_STORE`. It is deliberately independent of
-`RETREAD_CACHE_DIR` and fast-tmp. Do not delete it casually: lock records
-reference its content SHAs.
-
-## Config
-
-```toml
-[package.build.config]
-retread-resolver = "uv"        # default
-```
+Rust `1.97.0` is pinned in `rust-toolchain.toml` (matching CI). Install via
+[rustup](https://rustup.rs), which reads the pin automatically.
