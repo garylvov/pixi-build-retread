@@ -12,9 +12,10 @@ Bundles PyPI wheel closures into conda packages, crossing the conda↔uv boundar
 - Commit a workspace `.pixi/config.toml` (a fresh `pixi init` re-includes it):
 
   ```toml
+  run-post-link-scripts = "insecure"   # courier post-link install (retread's own script)
+
   [concurrency]
   solves = 1
-  run-post-link-scripts = "insecure"   # courier post-link install (retread's own script)
   ```
 
   One Pixi process per workspace; for parallel installs, one clone per install.
