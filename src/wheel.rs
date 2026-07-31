@@ -1227,13 +1227,14 @@ pub fn is_pure_python_wheel_filename(filename: &str) -> bool {
 }
 
 fn valid_wheel_tag_field(field: &str) -> bool {
-    !field.is_empty()
-        && field.split('.').all(|component| {
-            !component.is_empty()
-                && component
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-        })
+    !field.is_empty() && field.split('.').all(valid_wheel_tag_component)
+}
+
+fn valid_wheel_tag_component(component: &str) -> bool {
+    !component.is_empty()
+        && component
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
 fn wheel_metadata_tag_is_pure(tag: &str) -> bool {
@@ -1243,6 +1244,74 @@ fn wheel_metadata_tag_is_pure(tag: &str) -> bool {
         return false;
     };
     fields.next().is_none() && valid_wheel_tag_field(python) && abi == "none" && platform == "any"
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WheelNativePayloadKind {
+    Platlib,
+    NativeLibrary,
+}
+
+fn wheel_native_payload_kind(member: &str, is_dir: bool) -> Option<WheelNativePayloadKind> {
+    let lower = member.to_ascii_lowercase();
+    let components: Vec<&str> = lower
+        .split('/')
+        .filter(|component| !component.is_empty() && *component != ".")
+        .collect();
+    if components
+        .windows(2)
+        .any(|pair| pair[0].ends_with(".data") && pair[1] == "platlib")
+    {
+        return Some(WheelNativePayloadKind::Platlib);
+    }
+    if !is_dir
+        && components.last().is_some_and(|name| {
+            name.ends_with(".so") || name.ends_with(".dylib") || name.ends_with(".pyd")
+        })
+    {
+        return Some(WheelNativePayloadKind::NativeLibrary);
+    }
+    None
+}
+
+/// Classify a source-built wheel before deciding whether a hermetic native
+/// retry is warranted.
+///
+/// Inspect the payload regardless of its filename: a platform tag, platlib
+/// placement, or native-looking suffix alone is not proof that compilation was
+/// genuinely needed. Linux hermetic builds engage only for an actual ELF
+/// member, including versioned DSOs and extensionless executables. Returning
+/// `false` is intentionally stronger than "no native suffix found": the
+/// existing strict pure-wheel validator must also accept the archive.
+pub(crate) fn wheel_archive_requires_native_build(wheel_path: &Path) -> Result<bool> {
+    let filename = wheel_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("wheel path has no UTF-8 filename"))?;
+    let canonical = crate::emit_pypi::standard_wheel_filename(filename);
+    if crate::pypi::wheel_filename_identity(&canonical).is_none() {
+        bail!("wheel filename `{filename}` is not a valid PEP 427 wheel filename");
+    }
+    let file = std::fs::File::open(wheel_path)
+        .with_context(|| format!("opening wheel archive {}", wheel_path.display()))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .with_context(|| format!("reading wheel archive {}", wheel_path.display()))?;
+    for index in 0..archive.len() {
+        let mut entry = archive
+            .by_index(index)
+            .with_context(|| format!("opening ZIP member {index} in {}", wheel_path.display()))?;
+        if entry.is_dir() {
+            continue;
+        }
+        let mut magic = [0u8; 4];
+        if entry.read_exact(&mut magic).is_ok() && magic == *b"\x7fELF" {
+            return Ok(true);
+        }
+    }
+    drop(archive);
+
+    validate_pure_python_wheel_archive(wheel_path)?;
+    Ok(false)
 }
 
 /// Validate that a local wheel is pure at both the filename and archive level.
@@ -1271,24 +1340,14 @@ pub(crate) fn validate_pure_python_wheel_archive(wheel_path: &Path) -> Result<()
             .by_index(index)
             .with_context(|| format!("opening ZIP member {index} in {}", wheel_path.display()))?;
         let member = entry.name().replace('\\', "/");
-        let lower = member.to_ascii_lowercase();
-        let components: Vec<&str> = lower
-            .split('/')
-            .filter(|component| !component.is_empty() && *component != ".")
-            .collect();
-
-        if components
-            .windows(2)
-            .any(|pair| pair[0].ends_with(".data") && pair[1] == "platlib")
-        {
-            bail!("wheel archive contains platform payload member `{member}`");
-        }
-        if !entry.is_dir()
-            && components.last().is_some_and(|name| {
-                name.ends_with(".so") || name.ends_with(".dylib") || name.ends_with(".pyd")
-            })
-        {
-            bail!("wheel archive contains native payload member `{member}`");
+        match wheel_native_payload_kind(&member, entry.is_dir()) {
+            Some(WheelNativePayloadKind::Platlib) => {
+                bail!("wheel archive contains platform payload member `{member}`");
+            }
+            Some(WheelNativePayloadKind::NativeLibrary) => {
+                bail!("wheel archive contains native payload member `{member}`");
+            }
+            None => {}
         }
 
         if member.ends_with(".dist-info/METADATA") && member.matches('/').count() == 1 {
@@ -1356,6 +1415,179 @@ pub(crate) fn validate_pure_python_wheel_archive(wheel_path: &Path) -> Result<()
         .find(|tag| !wheel_metadata_tag_is_pure(tag))
     {
         bail!("wheel `{filename}` has non-pure WHEEL metadata tag `{tag}`");
+    }
+    Ok(())
+}
+
+/// Validate a native wheel's archive metadata against the platform selected by
+/// its hermetic build environment.
+///
+/// A wheel filename may compress compatible Python and ABI tags with dots, but
+/// each `Tag:` header in `WHEEL` is one expanded compatibility triple. Every
+/// expanded header must therefore select members advertised by the filename.
+/// The platform field is deliberately stricter: hermetic builds publish one
+/// exact sysroot-derived manylinux tag, so neither a legacy `linux_x86_64` tag
+/// nor a compressed set containing a different glibc floor is acceptable.
+pub(crate) fn validate_native_wheel_archive_tag(
+    wheel_path: &Path,
+    expected_platform_tag: &str,
+) -> Result<()> {
+    if !valid_wheel_tag_component(expected_platform_tag) || expected_platform_tag == "any" {
+        bail!(
+            "expected native wheel platform tag `{expected_platform_tag}` is not a valid platform component"
+        );
+    }
+
+    let filename = wheel_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("wheel path has no UTF-8 filename"))?;
+    let canonical = crate::emit_pypi::standard_wheel_filename(filename);
+    if crate::pypi::wheel_filename_identity(&canonical).is_none() {
+        bail!("wheel filename `{filename}` is not a valid PEP 427 wheel filename");
+    }
+    let stem = canonical
+        .strip_suffix(".whl")
+        .expect("validated wheel filename has .whl suffix");
+    let mut filename_fields = stem.rsplitn(4, '-');
+    let (Some(filename_platform), Some(filename_abi), Some(filename_python), Some(_identity)) = (
+        filename_fields.next(),
+        filename_fields.next(),
+        filename_fields.next(),
+        filename_fields.next(),
+    ) else {
+        bail!("wheel filename `{filename}` has no complete compatibility tag");
+    };
+    if !valid_wheel_tag_field(filename_python)
+        || !valid_wheel_tag_field(filename_abi)
+        || !valid_wheel_tag_field(filename_platform)
+    {
+        bail!("wheel filename `{filename}` has a malformed compatibility tag");
+    }
+    if filename_platform != expected_platform_tag {
+        bail!(
+            "wheel filename `{filename}` has platform `{filename_platform}`, expected exact platform `{expected_platform_tag}`"
+        );
+    }
+
+    let file = std::fs::File::open(wheel_path)
+        .with_context(|| format!("opening wheel archive {}", wheel_path.display()))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .with_context(|| format!("reading wheel archive {}", wheel_path.display()))?;
+    let mut root_metadata_dirs = Vec::new();
+    let mut wheel_metadata = Vec::new();
+
+    for index in 0..archive.len() {
+        let mut entry = archive
+            .by_index(index)
+            .with_context(|| format!("opening ZIP member {index} in {}", wheel_path.display()))?;
+        let member = entry.name().replace('\\', "/");
+        if member.ends_with(".dist-info/METADATA") && member.matches('/').count() == 1 {
+            root_metadata_dirs.push(
+                member
+                    .strip_suffix("/METADATA")
+                    .expect("metadata suffix was checked")
+                    .to_string(),
+            );
+        }
+        if member.ends_with(".dist-info/WHEEL") && member.matches('/').count() == 1 {
+            let mut raw = String::new();
+            entry.read_to_string(&mut raw).with_context(|| {
+                format!(
+                    "reading wheel metadata member `{member}` in {}",
+                    wheel_path.display()
+                )
+            })?;
+            wheel_metadata.push((
+                member
+                    .strip_suffix("/WHEEL")
+                    .expect("WHEEL suffix was checked")
+                    .to_string(),
+                raw,
+            ));
+        }
+    }
+
+    if root_metadata_dirs.len() != 1 || wheel_metadata.len() != 1 {
+        bail!("wheel `{filename}` must contain exactly one root METADATA and WHEEL file");
+    }
+    let (wheel_dist_info, raw_wheel) = &wheel_metadata[0];
+    if &root_metadata_dirs[0] != wheel_dist_info {
+        bail!("wheel `{filename}` has METADATA and WHEEL files in different dist-info directories");
+    }
+
+    let mut root_is_purelib = Vec::new();
+    let mut tags = Vec::new();
+    for line in raw_wheel.lines() {
+        if line.trim().is_empty() {
+            break;
+        }
+        if line.starts_with(' ') || line.starts_with('\t') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        if key.trim().eq_ignore_ascii_case("Root-Is-Purelib") {
+            root_is_purelib.push(value);
+        } else if key.trim().eq_ignore_ascii_case("Tag") {
+            tags.push(value);
+        }
+    }
+
+    if root_is_purelib.len() != 1 || !root_is_purelib[0].eq_ignore_ascii_case("false") {
+        bail!("wheel `{filename}` does not declare `Root-Is-Purelib: false`");
+    }
+    if tags.is_empty() {
+        bail!("wheel `{filename}` has no `Tag:` entries in WHEEL metadata");
+    }
+
+    let expected_tags = filename_python
+        .split('.')
+        .flat_map(|python| {
+            filename_abi
+                .split('.')
+                .map(move |abi| format!("{python}-{abi}-{expected_platform_tag}"))
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut actual_tags = std::collections::BTreeSet::new();
+    for tag in tags {
+        let mut fields = tag.split('-');
+        let (Some(python), Some(abi), Some(platform)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            bail!("wheel `{filename}` has malformed WHEEL metadata tag `{tag}`");
+        };
+        if fields.next().is_some()
+            || python.contains('.')
+            || abi.contains('.')
+            || platform.contains('.')
+            || !valid_wheel_tag_field(python)
+            || !valid_wheel_tag_field(abi)
+            || !valid_wheel_tag_field(platform)
+        {
+            bail!("wheel `{filename}` has malformed WHEEL metadata tag `{tag}`");
+        }
+        let expanded_tag = format!("{python}-{abi}-{platform}");
+        if !expected_tags.contains(&expanded_tag) {
+            bail!(
+                "wheel `{filename}` has WHEEL metadata tag `{tag}` that is not compatible with its compressed filename tag"
+            );
+        }
+        if platform != expected_platform_tag {
+            bail!(
+                "wheel `{filename}` has WHEEL metadata platform `{platform}`, expected `{expected_platform_tag}`"
+            );
+        }
+        if !actual_tags.insert(expanded_tag.clone()) {
+            bail!("wheel `{filename}` has duplicate WHEEL metadata tag `{expanded_tag}`");
+        }
+    }
+    if actual_tags != expected_tags {
+        bail!(
+            "wheel `{filename}` WHEEL metadata tags do not exactly expand its compressed filename tag"
+        );
     }
     Ok(())
 }
@@ -2546,7 +2778,14 @@ mod tests {
         archive.write_all(wheel_metadata.as_bytes()).unwrap();
         for member in extra_members {
             archive.start_file(member, options).unwrap();
-            archive.write_all(b"test payload").unwrap();
+            if member.ends_with(".so")
+                || member.contains(".so.")
+                || member.ends_with("/native-tool")
+            {
+                archive.write_all(b"\x7fELFtest payload").unwrap();
+            } else {
+                archive.write_all(b"test payload").unwrap();
+            }
         }
         archive.finish().unwrap();
         path
@@ -2640,6 +2879,155 @@ mod tests {
         );
         validate_pure_python_wheel_archive(&path).unwrap();
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn strict_native_wheel_accepts_matching_manylinux_tag() {
+        let path = write_purity_test_wheel(
+            "foo-1.0-cp311-cp311-manylinux_2_28_x86_64.whl",
+            concat!(
+                "Wheel-Version: 1.0\n",
+                "Root-Is-Purelib: false\n",
+                "Tag: cp311-cp311-manylinux_2_28_x86_64\n",
+            ),
+            &["foo/_native.cpython-311-x86_64-linux-gnu.so"],
+        );
+        validate_native_wheel_archive_tag(&path, "manylinux_2_28_x86_64").unwrap();
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn strict_native_wheel_accepts_expanded_compressed_filename_tags() {
+        let path = write_purity_test_wheel(
+            "foo-1.0-cp311.cp312-abi3-manylinux_2_28_x86_64.whl",
+            concat!(
+                "Wheel-Version: 1.0\n",
+                "Root-Is-Purelib: false\n",
+                "Tag: cp311-abi3-manylinux_2_28_x86_64\n",
+                "Tag: cp312-abi3-manylinux_2_28_x86_64\n",
+            ),
+            &["foo/_native.abi3.so"],
+        );
+        validate_native_wheel_archive_tag(&path, "manylinux_2_28_x86_64").unwrap();
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn strict_native_wheel_rejects_incomplete_compressed_tag_expansion() {
+        let path = write_purity_test_wheel(
+            "foo-1.0-cp311.cp312-abi3-manylinux_2_28_x86_64.whl",
+            concat!(
+                "Wheel-Version: 1.0\n",
+                "Root-Is-Purelib: false\n",
+                "Tag: cp311-abi3-manylinux_2_28_x86_64\n",
+            ),
+            &["foo/_native.abi3.so"],
+        );
+        let error = validate_native_wheel_archive_tag(&path, "manylinux_2_28_x86_64").unwrap_err();
+        assert!(format!("{error:#}").contains("exactly expand"));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn strict_native_wheel_rejects_wrong_filename_platform() {
+        let path = write_purity_test_wheel(
+            "foo-1.0-cp311-cp311-linux_x86_64.whl",
+            concat!(
+                "Wheel-Version: 1.0\n",
+                "Root-Is-Purelib: false\n",
+                "Tag: cp311-cp311-linux_x86_64\n",
+            ),
+            &["foo/_native.so"],
+        );
+        let error = validate_native_wheel_archive_tag(&path, "manylinux_2_28_x86_64").unwrap_err();
+        assert!(format!("{error:#}").contains("expected exact platform"));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn strict_native_wheel_rejects_mismatched_wheel_tag() {
+        let path = write_purity_test_wheel(
+            "foo-1.0-cp311-cp311-manylinux_2_28_x86_64.whl",
+            concat!(
+                "Wheel-Version: 1.0\n",
+                "Root-Is-Purelib: false\n",
+                "Tag: cp310-cp310-manylinux_2_28_x86_64\n",
+            ),
+            &["foo/_native.so"],
+        );
+        let error = validate_native_wheel_archive_tag(&path, "manylinux_2_28_x86_64").unwrap_err();
+        assert!(format!("{error:#}").contains("compressed filename tag"));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn strict_native_wheel_rejects_wrong_wheel_metadata_platform() {
+        let path = write_purity_test_wheel(
+            "foo-1.0-cp311-cp311-manylinux_2_28_x86_64.whl",
+            concat!(
+                "Wheel-Version: 1.0\n",
+                "Root-Is-Purelib: false\n",
+                "Tag: cp311-cp311-manylinux_2_17_x86_64\n",
+            ),
+            &["foo/_native.so"],
+        );
+        let error = validate_native_wheel_archive_tag(&path, "manylinux_2_28_x86_64").unwrap_err();
+        assert!(format!("{error:#}").contains("manylinux_2_17_x86_64"));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn native_build_classifier_is_strict_for_pure_and_detects_native_payload() {
+        let pure = write_purity_test_wheel(
+            "foo-1.0-py3-none-any.whl",
+            "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+            &["foo/__init__.py"],
+        );
+        assert!(!wheel_archive_requires_native_build(&pure).unwrap());
+        let pure_parent = pure.parent().unwrap().to_path_buf();
+
+        let mistagged = write_purity_test_wheel(
+            "foo-1.0-py3-none-any.whl",
+            "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+            &["foo/_native.so"],
+        );
+        assert!(wheel_archive_requires_native_build(&mistagged).unwrap());
+
+        let native = write_purity_test_wheel(
+            "foo-1.0-cp311-cp311-linux_x86_64.whl",
+            "Wheel-Version: 1.0\nRoot-Is-Purelib: false\nTag: cp311-cp311-linux_x86_64\n",
+            &["foo/_native.so"],
+        );
+        assert!(wheel_archive_requires_native_build(&native).unwrap());
+
+        let versioned_dso = write_purity_test_wheel(
+            "foo-1.0-cp311-cp311-linux_x86_64.whl",
+            "Wheel-Version: 1.0\nRoot-Is-Purelib: false\nTag: cp311-cp311-linux_x86_64\n",
+            &["foo/libfoo.so.1"],
+        );
+        assert!(wheel_archive_requires_native_build(&versioned_dso).unwrap());
+
+        let data_only = write_purity_test_wheel(
+            "foo-1.0-py3-none-linux_x86_64.whl",
+            "Wheel-Version: 1.0\nRoot-Is-Purelib: false\nTag: py3-none-linux_x86_64\n",
+            &["foo-1.0.data/platlib/foo.py"],
+        );
+        assert!(wheel_archive_requires_native_build(&data_only).is_err());
+
+        let malformed_pure = write_purity_test_wheel(
+            "foo-1.0-py3-none-any.whl",
+            "Wheel-Version: 1.0\nRoot-Is-Purelib: false\nTag: py3-none-any\n",
+            &[],
+        );
+        let error = wheel_archive_requires_native_build(&malformed_pure).unwrap_err();
+        assert!(format!("{error:#}").contains("Root-Is-Purelib: true"));
+
+        let _ = std::fs::remove_dir_all(pure_parent);
+        let _ = std::fs::remove_dir_all(mistagged.parent().unwrap());
+        let _ = std::fs::remove_dir_all(native.parent().unwrap());
+        let _ = std::fs::remove_dir_all(versioned_dso.parent().unwrap());
+        let _ = std::fs::remove_dir_all(data_only.parent().unwrap());
+        let _ = std::fs::remove_dir_all(malformed_pure.parent().unwrap());
     }
 
     // Defensive: read_metadata's `is_pure_python` flag uses the same helper,
