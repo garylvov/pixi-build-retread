@@ -114,6 +114,10 @@ solo build gets full parallelism; concurrent builds share the budget. Knobs:
 (node budget; default = available parallelism), `RETREAD_THREAD_LEASE_DIR`
 (registry location, mainly for tests).
 
+Probe solves are serial by default. `RETREAD_PARALLEL_PROBES=1` opts into the
+experimental bounded parallel probe pool; bisection and shared repodata remain
+enabled either way.
+
 The shared wheel store (`~/.cache/retread/wheels`, override
 `RETREAD_WHEEL_STORE`) is independent of `RETREAD_CACHE_DIR` and fast-tmp;
 lock records reference its content SHAs, so do not delete it casually.
