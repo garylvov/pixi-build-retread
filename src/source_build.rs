@@ -396,6 +396,21 @@ fn native_build_allowed(target: &ResolutionTarget) -> bool {
     target.is_native_build_target()
 }
 
+/// Whether a same-architecture linux-64 source build can safely fall back to
+/// the pinned compiler/sysroot environment even when host glibc detection
+/// could not authorize the host toolchain itself. Foreign targets stay
+/// fail-closed: the solved linux-64 compiler binaries must run on this host.
+fn hermetic_build_may_engage(target: &ResolutionTarget) -> bool {
+    target.hermetic_builds()
+        && target.conda_subdir() == "linux-64"
+        && crate::glibc::current_pixi_platform() == "linux-64"
+        && target.declared_glibc().is_some()
+}
+
+fn source_build_attempt_allowed(target: &ResolutionTarget) -> bool {
+    native_build_allowed(target) || hermetic_build_may_engage(target)
+}
+
 fn source_build_refusal_error(target: &ResolutionTarget) -> anyhow::Error {
     source_build_refusal_error_for_host(
         target,
@@ -480,9 +495,11 @@ fn platform_tagged_floor_error(
     filename: &str,
     closure_sdist_package: Option<&str>,
 ) -> anyhow::Error {
-    let aarch64_context = (target.conda_subdir() == "linux-aarch64")
-        .then_some("refusing to source-build for native target `linux-aarch64`: ")
-        .unwrap_or_default();
+    let aarch64_context = if target.conda_subdir() == "linux-aarch64" {
+        "refusing to source-build for native target `linux-aarch64`: "
+    } else {
+        ""
+    };
     let closure_context = closure_sdist_package
         .map(|package| format!("closure-blocking sdist auto-build for `{package}`: "))
         .unwrap_or_default();
@@ -1318,10 +1335,7 @@ where
                             false
                         }
                     };
-                    rebuild_hermetically = needs_native
-                        && target.hermetic_builds()
-                        && target.conda_subdir() == "linux-64"
-                        && target.declared_glibc().is_some();
+                    rebuild_hermetically = needs_native && hermetic_build_may_engage(target);
                     if rebuild_hermetically {
                         tracing::info!(
                             cache = %cache_dir.display(),
@@ -1352,7 +1366,8 @@ where
             remove_owned_cache_entry(&cache_dir)?;
         }
     }
-    if native_policy == NativeSourceBuildPolicy::Refuse {
+    let hermetic_candidate = hermetic_build_may_engage(target);
+    if native_policy == NativeSourceBuildPolicy::Refuse && !hermetic_candidate {
         return Err(source_build_refusal_error(target));
     }
 
@@ -1363,11 +1378,14 @@ where
         } => Some((target_floor, host_glibc)),
         NativeSourceBuildPolicy::AnyWheel | NativeSourceBuildPolicy::Refuse => None,
     };
-    let platform_independent_required =
-        floor_mismatch.is_some() || requirement.closure_sdist_package().is_some();
-    let hermetic_floor = target
-        .declared_glibc()
-        .filter(|_| target.hermetic_builds() && target.conda_subdir() == "linux-64");
+    let platform_independent_required = floor_mismatch.is_some()
+        || requirement.closure_sdist_package().is_some()
+        || (native_policy == NativeSourceBuildPolicy::Refuse && hermetic_candidate);
+    let hermetic_floor = hermetic_candidate.then(|| {
+        target
+            .declared_glibc()
+            .expect("hermetic candidacy requires a target glibc floor")
+    });
 
     let staging = unique_staging_dir(&cache_dir)?;
     let build_dir = staging.0.join("build");
@@ -3125,6 +3143,7 @@ pub(crate) async fn build_wheel_from_path_for_target(
                         &build_source.display().to_string(),
                     ],
                     environment.hermetic(),
+                    Some(&private_out),
                 )
                 .await
             }
@@ -3306,11 +3325,11 @@ async fn build_wheel_from_sdist_url_for_target_with_requirement(
             .is_some();
     let advertised_sha256 = sdist_advertised_sha256(sdist_url, advertised_sha256)?;
     // A hash-bearing source has an exact cache identity before any network
-    // access.  An unhashed source must be fetched to discover its content key;
-    // foreign targets are rejected before that fetch because they cannot be
-    // built natively on this host.
+    // access. An unhashed source must be fetched to discover its content key;
+    // targets without either a safe host build or a runnable pinned hermetic
+    // toolchain are rejected before that fetch.
     let prefetched = if advertised_sha256.is_none() {
-        if !native_build_allowed(target) {
+        if !source_build_attempt_allowed(target) {
             return Err(source_build_refusal_error(target));
         }
         Some(download_sdist(sdist_url, None).await?)
@@ -3424,7 +3443,7 @@ async fn build_wheel_from_sdist_url_for_target_with_requirement(
                 }
                 args.push(sdist_path.display().to_string());
                 let args = args.iter().map(String::as_str).collect::<Vec<_>>();
-                run_capturing_uv_in(&args, environment.hermetic()).await
+                run_capturing_uv_in(&args, environment.hermetic(), Some(&private_out)).await
             }
         },
     )
@@ -5187,7 +5206,7 @@ async fn build_wheel_from_git_inner(
     // A foreign build may consume a previously validated compatible artifact,
     // but it must not clone/download merely to discover a moving ref or build
     // natively. Exact commit pins can probe the v3 artifact cache first.
-    if !native_build_allowed(target) {
+    if !source_build_attempt_allowed(target) {
         if !exact_rev {
             return Err(source_build_refusal_error(target)).with_context(|| {
                 format!("git source `{url}` uses moving/non-exact revision `{rev}`")
@@ -5344,6 +5363,7 @@ async fn build_wheel_from_git_inner(
                         &private_project_root.display().to_string(),
                     ],
                     environment.hermetic(),
+                    Some(&private_out),
                 )
                 .await?;
                 let cache_dir = canonical_for_build
@@ -5523,15 +5543,63 @@ fn source_build_uv_executable() -> Result<PathBuf> {
     )
 }
 
+fn prepare_hermetic_build_scratch(private_build_dir: &Path) -> Result<PathBuf> {
+    let scratch = private_build_dir.join(".retread-hermetic-scratch");
+    if std::fs::symlink_metadata(&scratch).is_ok() {
+        remove_owned_cache_entry(&scratch)?;
+    }
+    std::fs::create_dir(&scratch)
+        .with_context(|| format!("creating hermetic build scratch {}", scratch.display()))?;
+    let scratch_names = [
+        "activation-tmp",
+        "build",
+        "ccache",
+        "home",
+        "pip-cache",
+        "runtime",
+        "tmp",
+        "uv-cache",
+        "xdg-cache",
+        "xdg-config",
+        "xdg-data",
+    ];
+    for name in scratch_names {
+        let path = scratch.join(name);
+        std::fs::create_dir(&path)
+            .with_context(|| format!("creating hermetic scratch directory {}", path.display()))?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for path in std::iter::once(scratch.clone())
+            .chain(scratch_names.into_iter().map(|name| scratch.join(name)))
+        {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("securing hermetic scratch {}", path.display()))?;
+        }
+    }
+    std::fs::canonicalize(&scratch).with_context(|| {
+        format!(
+            "canonicalizing hermetic build scratch {}",
+            scratch.display()
+        )
+    })
+}
+
 async fn run_capturing_uv_in(
     args: &[&str],
     hermetic: Option<&crate::hermetic_build::HermeticBuildEnvironment>,
+    private_build_dir: Option<&Path>,
 ) -> Result<()> {
     // The callers above have already exhausted their wheel-cache paths. Hold
     // the process-wide permit only for the real build subprocess so nested
     // handler concurrency cannot multiply expensive `uv build` work.
     let _build_permit = crate::concurrency::acquire_build_permit().await;
     let mut cmd = if let Some(environment) = hermetic {
+        let private_build_dir = private_build_dir.ok_or_else(|| {
+            anyhow!("hermetic source build is missing its private build directory")
+        })?;
+        let scratch = prepare_hermetic_build_scratch(private_build_dir)?;
         let uv = source_build_uv_executable()?;
         let mut command = Command::new("/bin/bash");
         // Rattler-build's generated script is the authoritative conda
@@ -5539,48 +5607,202 @@ async fn run_capturing_uv_in(
         // and the host-prefix Python headers. Source it only in this child;
         // it intentionally mutates HOME/PATH and other build variables.
         command
+            .env_clear()
+            .arg("-p")
             .arg("-c")
-            .arg(
-                "unset PYTHON CONDA_BUILD_SYSROOT CC CXX CFLAGS CXXFLAGS CPPFLAGS LDFLAGS BLDSHARED LDSHARED LDCXXSHARED \
-                 LD_RUN_PATH CPATH C_INCLUDE_PATH CPLUS_INCLUDE_PATH LIBRARY_PATH LD_LIBRARY_PATH \
-                 PKG_CONFIG_PATH CMAKE_PREFIX_PATH \
-                 CUDACXX CUDA_PATH CUDA_HOME NVCC CUDAHOSTCXX CUDAFLAGS NVCCFLAGS; \
-                 source \"$1\" >/dev/null 2>&1 || true; \
-                 expected_python=$2; expected_sysroot=$3; expected_cuda=$4; shift 4; \
-                 test \"$(readlink -f \"${PYTHON:-/missing}\")\" = \"$expected_python\" && test -x \"$PYTHON\" && \
-                 test \"$(readlink -f \"${CONDA_BUILD_SYSROOT:-/missing}\")\" = \"$expected_sysroot\" && \
-                 test -n \"${CC:-}\" && test -n \"${CXX:-}\" && \
-                 test -d \"${CONDA_BUILD_SYSROOT:-}\" || exit 86; \
-                 if test -n \"$expected_cuda\"; then \
-                   actual_cuda=$(command -v \"${CUDACXX:-${NVCC:-nvcc}}\" || true); \
-                   test \"$(readlink -f \"${actual_cuda:-/missing}\")\" = \"$expected_cuda\" || exit 87; \
-                 fi; \
-                 unset CPLUS_INCLUDE_PATH LD_RUN_PATH; \
-                 export CPATH=\"$CONDA_BUILD_SYSROOT/usr/include\"; \
-                 export C_INCLUDE_PATH=\"$CONDA_BUILD_SYSROOT/usr/include\"; \
-                 export BLDSHARED=\"$CC -shared\"; \
-                 export LDSHARED=\"$CC -shared\"; \
-                 export LDCXXSHARED=\"$CXX -shared\"; \
-                 clean_ldflags=; skip_rpath_value=0; \
-                 for flag in ${LDFLAGS:-}; do \
-                   if test \"$skip_rpath_value\" = 1; then skip_rpath_value=0; continue; fi; \
-                   case \"$flag\" in \
-                     -Wl,-rpath|-Wl,-R|-rpath|-R) skip_rpath_value=1 ;; \
-                     -Wl,-rpath,*|-Wl,-rpath=*|-Wl,-R,*|-Wl,-R*|-R/*) ;; \
-                     *) clean_ldflags=\"${clean_ldflags}${clean_ldflags:+ }${flag}\" ;; \
-                   esac; \
-                 done; \
-                 export LDFLAGS=\"$clean_ldflags\"; \
-                 unset PIP_NO_INDEX PIP_NO_DEPENDENCIES; exec \"$@\"",
-            )
+            .arg(r#"
+set -euo pipefail
+umask 077
+activation=$1
+expected_python=$2
+expected_sysroot=$3
+expected_cuda=$4
+expected_build_prefix=$5
+expected_host_prefix=$6
+expected_cc=$7
+expected_cxx=$8
+scratch=$9
+shift 9
+
+test -d "$scratch/activation-tmp"
+export HOME="$scratch/home"
+export TMPDIR="$scratch/tmp"
+export TMP="$scratch/tmp"
+export TEMP="$scratch/tmp"
+export XDG_CACHE_HOME="$scratch/xdg-cache"
+export XDG_CONFIG_HOME="$scratch/xdg-config"
+export XDG_DATA_HOME="$scratch/xdg-data"
+export XDG_RUNTIME_DIR="$scratch/runtime"
+export PIP_CACHE_DIR="$scratch/pip-cache"
+export UV_CACHE_DIR="$scratch/uv-cache"
+export CCACHE_DIR="$scratch/ccache"
+export CCACHE_DISABLE=1
+export RETREAD_ACTIVATION_TMPDIR="$scratch/activation-tmp"
+export PATH=/usr/bin:/bin
+retread_ssl_cert_file=${SSL_CERT_FILE-}
+retread_ssl_cert_file_set=${SSL_CERT_FILE+x}
+retread_ssl_cert_dir=${SSL_CERT_DIR-}
+retread_ssl_cert_dir_set=${SSL_CERT_DIR+x}
+retread_requests_ca_bundle=${REQUESTS_CA_BUNDLE-}
+retread_requests_ca_bundle_set=${REQUESTS_CA_BUNDLE+x}
+retread_curl_ca_bundle=${CURL_CA_BUNDLE-}
+retread_curl_ca_bundle_set=${CURL_CA_BUNDLE+x}
+unset PYTHON PYTHONHOME PYTHONPATH CONDA_BUILD_SYSROOT CC CXX AR CFLAGS CXXFLAGS CPPFLAGS LDFLAGS LDFLAGS_LD DEBUG_CPPFLAGS DEBUG_CFLAGS DEBUG_CXXFLAGS QEMU_LD_PREFIX COMPILER_PATH GCC_EXEC_PREFIX OBJC_INCLUDE_PATH DEPENDENCIES_OUTPUT SUNPRO_DEPENDENCIES BLDSHARED LDSHARED LDCXXSHARED
+unset LD_RUN_PATH CPATH C_INCLUDE_PATH CPLUS_INCLUDE_PATH LIBRARY_PATH LD_LIBRARY_PATH LD_PRELOAD
+unset PKG_CONFIG_PATH PKG_CONFIG_LIBDIR PKG_CONFIG_SYSROOT_DIR CMAKE_PREFIX_PATH CMAKE_FIND_ROOT_PATH CMAKE_TOOLCHAIN_FILE CMAKE_PROJECT_INCLUDE CMAKE_PROJECT_INCLUDE_BEFORE CMAKE_PROJECT_TOP_LEVEL_INCLUDES
+unset CUDACXX CUDA_PATH CUDA_HOME NVCC CUDAHOSTCXX CUDAFLAGS NVCCFLAGS NVCC_PREPEND_FLAGS NVCC_APPEND_FLAGS
+unset AUDITWHEEL_LD_LIBRARY_PATH AUDITWHEEL_ZIP_COMPRESSION_LEVEL
+unset BUILD_DIR SRC_DIR RECIPE_DIR RATTLER_BUILD_PACKAGE_FILES
+activation_cwd=$PWD
+cd "$RETREAD_ACTIVATION_TMPDIR"
+set +o pipefail
+source "$activation" >/dev/null 2>&1
+set -o pipefail
+cd "$activation_cwd"
+
+test "$(/usr/bin/readlink -f "${PYTHON:-/missing}")" = "$expected_python" && test -x "$PYTHON" || exit 86
+test "$(/usr/bin/readlink -f "${CONDA_BUILD_SYSROOT:-/missing}")" = "$expected_sysroot" || exit 86
+test "$(/usr/bin/readlink -f "${BUILD_PREFIX:-/missing}")" = "$expected_build_prefix" || exit 86
+test "$(/usr/bin/readlink -f "${PREFIX:-/missing}")" = "$expected_host_prefix" || exit 86
+export PATH="$expected_build_prefix/bin:$expected_host_prefix/bin:/usr/bin:/bin"
+export HOME="$scratch/home"
+export TMPDIR="$scratch/tmp"
+export TMP="$scratch/tmp"
+export TEMP="$scratch/tmp"
+export XDG_CACHE_HOME="$scratch/xdg-cache"
+export XDG_CONFIG_HOME="$scratch/xdg-config"
+export XDG_DATA_HOME="$scratch/xdg-data"
+export XDG_RUNTIME_DIR="$scratch/runtime"
+export PIP_CACHE_DIR="$scratch/pip-cache"
+export UV_CACHE_DIR="$scratch/uv-cache"
+export CCACHE_DIR="$scratch/ccache"
+export CCACHE_DISABLE=1
+export RETREAD_ACTIVATION_TMPDIR="$scratch/activation-tmp"
+retread_sysroot=$CONDA_BUILD_SYSROOT
+for retread_name in ${!CONDA_@}; do unset "$retread_name"; done
+export CONDA_BUILD_SYSROOT="$retread_sysroot"
+for retread_name in ${!PKG_@} ${!CONDA_ENV_SHLVL_@} ${!RATTLER_BUILD_@}; do unset "$retread_name"; done
+unset SOURCE_DATE_EPOCH CONDA_BUILD CONDA_BUILD_STATE CONDA_BUILD_CROSS_COMPILATION
+unset CONDA_PREFIX CONDA_DEFAULT_ENV CONDA_PROMPT_MODIFIER CONDA_SHLVL _CE_CONDA _CE_M
+unset BUILD HOST build_platform target_platform CMAKE_GENERATOR CMAKE_ARGS MAKEFLAGS
+unset PIP_IGNORE_INSTALLED PIP_NO_BUILD_ISOLATION PYTHONNOUSERSITE
+unset RUSTFLAGS RUSTDOCFLAGS CARGO_TARGET_DIR CARGO_ENCODED_RUSTFLAGS
+unset LDFLAGS_LD DEBUG_CPPFLAGS DEBUG_CFLAGS DEBUG_CXXFLAGS QEMU_LD_PREFIX COMPILER_PATH GCC_EXEC_PREFIX OBJC_INCLUDE_PATH DEPENDENCIES_OUTPUT SUNPRO_DEPENDENCIES
+unset CMAKE_TOOLCHAIN_FILE CMAKE_PROJECT_INCLUDE CMAKE_PROJECT_INCLUDE_BEFORE CMAKE_PROJECT_TOP_LEVEL_INCLUDES
+unset NVCC_PREPEND_FLAGS NVCC_APPEND_FLAGS
+if test "$retread_ssl_cert_file_set" = x; then export SSL_CERT_FILE="$retread_ssl_cert_file"; else unset SSL_CERT_FILE; fi
+if test "$retread_ssl_cert_dir_set" = x; then export SSL_CERT_DIR="$retread_ssl_cert_dir"; else unset SSL_CERT_DIR; fi
+if test "$retread_requests_ca_bundle_set" = x; then export REQUESTS_CA_BUNDLE="$retread_requests_ca_bundle"; else unset REQUESTS_CA_BUNDLE; fi
+if test "$retread_curl_ca_bundle_set" = x; then export CURL_CA_BUNDLE="$retread_curl_ca_bundle"; else unset CURL_CA_BUNDLE; fi
+export USER=$(/usr/bin/id -un)
+export LOGNAME="$USER"
+actual_cc=$(command -v "${CC:-/missing}" || true)
+actual_cxx=$(command -v "${CXX:-/missing}" || true)
+actual_ar=$(command -v "${AR:-/missing}" || true)
+test "$(/usr/bin/readlink -f "${actual_cc:-/missing}")" = "$expected_cc" || exit 86
+test "$(/usr/bin/readlink -f "${actual_cxx:-/missing}")" = "$expected_cxx" || exit 86
+test "$(/usr/bin/readlink -f "$("$actual_cc" -print-sysroot)")" = "$expected_sysroot" || exit 86
+test "$(/usr/bin/readlink -f "$("$actual_cxx" -print-sysroot)")" = "$expected_sysroot" || exit 86
+case "$(/usr/bin/readlink -f "${actual_ar:-/missing}")" in "$expected_build_prefix"/*) ;; *) exit 86 ;; esac
+test -n "${CFLAGS:-}" && test -n "${CXXFLAGS:-}" && test -n "${LDFLAGS:-}" || exit 86
+if test -n "$expected_cuda"; then
+  actual_cuda=$(command -v "${CUDACXX:-${NVCC:-nvcc}}" || true)
+  test "$(/usr/bin/readlink -f "${actual_cuda:-/missing}")" = "$expected_cuda" || exit 87
+elif command -v nvcc >/dev/null 2>&1; then
+  exit 87
+fi
+
+# Activation supplies the wrapper's --sysroot flags. Replace only search
+# variables that could point outside the solved tuple, and give pkg-config an
+# explicit sysroot/prefix universe instead of its host defaults.
+unset CPLUS_INCLUDE_PATH LD_RUN_PATH LD_LIBRARY_PATH LD_PRELOAD
+export CPATH="$expected_sysroot/usr/include"
+export C_INCLUDE_PATH="$expected_sysroot/usr/include"
+export PKG_CONFIG_SYSROOT_DIR="$expected_sysroot"
+export PKG_CONFIG_LIBDIR="$expected_host_prefix/lib/pkgconfig:$expected_host_prefix/share/pkgconfig:$expected_sysroot/usr/lib64/pkgconfig:$expected_sysroot/usr/lib/pkgconfig:$expected_sysroot/usr/share/pkgconfig"
+export CMAKE_PREFIX_PATH="$expected_host_prefix:$expected_build_prefix"
+export CMAKE_GENERATOR=Ninja
+export CMAKE_MAKE_PROGRAM="$expected_build_prefix/bin/ninja"
+export CMAKE_ARGS="-DCMAKE_SYSROOT=$expected_sysroot -DCMAKE_C_COMPILER=$expected_cc -DCMAKE_CXX_COMPILER=$expected_cxx -DCMAKE_AR=$actual_ar -DCMAKE_MAKE_PROGRAM=$expected_build_prefix/bin/ninja -DCMAKE_FIND_ROOT_PATH=$expected_host_prefix;$expected_sysroot -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY -DCMAKE_BUILD_RPATH_USE_ORIGIN=ON"
+export BUILD_DIR="$scratch/build"
+unset PREFIX BUILD_PREFIX SRC_DIR RECIPE_DIR RATTLER_BUILD_PACKAGE_FILES MESON_ARGS MESON_CROSS_FILE
+
+clean_ldflags=
+skip_rpath_value=0
+for flag in ${LDFLAGS:-}; do
+  if test "$skip_rpath_value" = 1; then skip_rpath_value=0; continue; fi
+  case "$flag" in
+    -Wl,-rpath|-Wl,-R|-rpath|-R) skip_rpath_value=1 ;;
+    -Wl,-rpath,*|-Wl,-rpath=*|-Wl,-R,*|-Wl,-R*|-R/*) ;;
+    *) clean_ldflags="${clean_ldflags}${clean_ldflags:+ }${flag}" ;;
+  esac
+done
+# PEP 600 covers glibc; auditwheel also enforces GLIBCXX/CXXABI policy. Static
+# compiler runtimes prevent a new conda GCC from requiring a libstdc++ newer
+# than the selected manylinux policy while preserving the exact sysroot tag.
+export LDFLAGS="${clean_ldflags}${clean_ldflags:+ }-static-libgcc -static-libstdc++"
+export BLDSHARED="$CC -shared -static-libgcc"
+export LDSHARED="$CC -shared -static-libgcc"
+export LDCXXSHARED="$CXX -shared -static-libgcc -static-libstdc++"
+export PYTHONNOUSERSITE=1
+export PYTHONDONTWRITEBYTECODE=1
+export PIP_CONFIG_FILE=/dev/null
+unset PYTHONHOME PYTHONPATH PIP_NO_INDEX PIP_NO_DEPENDENCIES AUDITWHEEL_LD_LIBRARY_PATH AUDITWHEEL_ZIP_COMPRESSION_LEVEL
+exec "$@"
+"#)
             .arg("retread-hermetic-build")
             .arg(environment.activation_script())
             .arg(environment.python_executable())
             .arg(environment.sysroot_path())
             .arg(environment.cuda_executable().unwrap_or_else(|| Path::new("")))
+            .arg(environment.build_prefix())
+            .arg(environment.host_prefix())
+            .arg(environment.c_compiler())
+            .arg(environment.cxx_compiler())
+            .arg(&scratch)
             .arg(uv);
+        for key in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "no_proxy",
+            "SSL_CERT_FILE",
+            "SSL_CERT_DIR",
+            "REQUESTS_CA_BUNDLE",
+            "CURL_CA_BUNDLE",
+            "UV_INDEX_URL",
+            "UV_INDEX",
+            "UV_EXTRA_INDEX_URL",
+            "UV_DEFAULT_INDEX",
+            "PIP_INDEX_URL",
+            "PIP_EXTRA_INDEX_URL",
+            "PIP_TRUSTED_HOST",
+            "SETUPTOOLS_SCM_PRETEND_VERSION",
+        ] {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
+        }
+        for (key, value) in std::env::vars_os() {
+            let rendered = key.to_string_lossy();
+            if rendered.starts_with("UV_INDEX_")
+                || rendered.starts_with("SETUPTOOLS_SCM_PRETEND_VERSION_FOR_")
+            {
+                command.env(key, value);
+            }
+        }
+        command.env("LANG", "C.UTF-8").env("LC_ALL", "C.UTF-8");
         command.args(args);
         command.env("UV_PYTHON_DOWNLOADS", "never");
+        command
+            .env_remove("BASH_ENV")
+            .env_remove("ENV")
+            .env_remove("LD_LIBRARY_PATH")
+            .env_remove("LD_PRELOAD");
         command
     } else {
         let mut command = Command::new("uv");
@@ -5591,7 +5813,9 @@ async fn run_capturing_uv_in(
     if hermetic.is_some() {
         cmd.env("UV_NO_CONFIG", "1");
     }
-    crate::fasttmp::apply_backend_env(&mut cmd);
+    if hermetic.is_none() {
+        crate::fasttmp::apply_backend_env(&mut cmd);
+    }
     configure_reproducible_source_build(&mut cmd);
     #[cfg(unix)]
     cmd.process_group(0);
@@ -6071,7 +6295,7 @@ mod tests {
         let mut tasks = Vec::new();
         for id in ids {
             tasks.push(Some(tokio::spawn(async move {
-                run_capturing_uv_in(&["build", id], None).await
+                run_capturing_uv_in(&["build", id], None, None).await
             })));
         }
 
@@ -7981,6 +8205,57 @@ version = "0.1.0"
             Some("pkg-1.0.0-py3-none-any.whl"),
         );
         assert!(cache.join("pkg-1.0.0-py3-none-any.whl").is_file());
+        remove_owned_cache_entry(&cache).unwrap();
+        let _ = std::fs::remove_dir_all(&output);
+    }
+
+    #[tokio::test]
+    async fn unknown_host_policy_can_probe_pure_wheel_before_hermetic_retry() {
+        if crate::glibc::current_pixi_platform() != "linux-64" {
+            return;
+        }
+        let target = ResolutionTarget::from_parts("3.11", "linux-64", Some((2, 34)))
+            .with_hermetic_builds(true);
+        assert!(hermetic_build_may_engage(&target));
+        let source_identity = hash_fields(
+            b"unknown-host-hermetic-candidate-test\0",
+            &[unique_test_dir("unknown-host-hermetic-candidate")
+                .to_string_lossy()
+                .as_bytes()],
+        );
+        let cache = built_wheel_cache_dir("path", &source_identity, &target);
+        remove_owned_cache_entry(&cache).unwrap();
+        let output = unique_test_dir("unknown-host-hermetic-candidate-output");
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_for_build = Arc::clone(&attempts);
+
+        let wheel = cached_build_with_acceptance(
+            "path",
+            &source_identity,
+            &target,
+            &output,
+            Some(&ExpectedWheel::exact("pkg", "1.0.0")),
+            NativeSourceBuildPolicy::Refuse,
+            BuiltWheelRequirement::TargetCompatible,
+            move |private_out, environment| {
+                let attempts_for_build = Arc::clone(&attempts_for_build);
+                async move {
+                    assert!(matches!(environment, SourceBuildEnvironment::Host));
+                    attempts_for_build.fetch_add(1, Ordering::Relaxed);
+                    write_test_wheel(
+                        &private_out.join("pkg-1.0.0-py3-none-any.whl"),
+                        "pkg",
+                        "1.0.0",
+                    );
+                    Ok(())
+                }
+            },
+        )
+        .await
+        .expect("known-floor linux-64 targets may prove purity when host glibc is unknown");
+
+        assert!(wheel.is_file());
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
         remove_owned_cache_entry(&cache).unwrap();
         let _ = std::fs::remove_dir_all(&output);
     }

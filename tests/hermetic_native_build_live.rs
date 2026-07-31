@@ -351,7 +351,7 @@ dependencies = ["evdev==1.9.3"]
          the test host must have glibc newer than {TARGET_GLIBC} to force the hermetic path"
     );
     let marker_path = test_dir.path().join(
-        "retread-cache/hermetic-build-envs/v4/glibc-2-17__python-3-11__cuda-none/complete.json",
+        "retread-cache/hermetic-build-envs/v5/glibc-2-17__python-3-11__cuda-none/complete.json",
     );
     let marker: serde_json::Value =
         serde_json::from_slice(&fs::read(&marker_path).unwrap_or_else(|error| {

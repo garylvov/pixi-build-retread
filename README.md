@@ -128,6 +128,9 @@ pinned to the newest `sysroot_linux-64` no newer than the target glibc floor.
 Their wheel tag names that exact sysroot (for example, sysroot 2.28 produces
 `manylinux_2_28_x86_64`). Set `retread-hermetic = false` for one pack or
 `RETREAD_HERMETIC_BUILDS=0` for the process to retain host-only builds.
+Archive policy validation admits Linux x86_64 ET_DYN extensions and
+tuple-gated CUDA `.cubin` payloads; standalone ELF executables and static
+objects fail closed because auditwheel cannot completely attest them.
 
 ## Rust toolchain
 

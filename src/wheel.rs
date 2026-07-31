@@ -1252,6 +1252,16 @@ enum WheelNativePayloadKind {
     NativeLibrary,
 }
 
+fn wheel_native_payload_magic(prefix: &[u8]) -> Option<&'static str> {
+    if prefix.starts_with(b"\x7fELF") {
+        Some("ELF")
+    } else if prefix.starts_with(b"!<arch>\n") || prefix.starts_with(b"!<thin>\n") {
+        Some("native archive")
+    } else {
+        None
+    }
+}
+
 fn wheel_native_payload_kind(member: &str, is_dir: bool) -> Option<WheelNativePayloadKind> {
     let lower = member.to_ascii_lowercase();
     let components: Vec<&str> = lower
@@ -1279,10 +1289,11 @@ fn wheel_native_payload_kind(member: &str, is_dir: bool) -> Option<WheelNativePa
 ///
 /// Inspect the payload regardless of its filename: a platform tag, platlib
 /// placement, or native-looking suffix alone is not proof that compilation was
-/// genuinely needed. Linux hermetic builds engage only for an actual ELF
-/// member, including versioned DSOs and extensionless executables. Returning
-/// `false` is intentionally stronger than "no native suffix found": the
-/// existing strict pure-wheel validator must also accept the archive.
+/// genuinely needed. Linux hermetic builds engage only for an actual native
+/// object/archive member, including versioned DSOs, extensionless ELF
+/// executables, and static archives. Returning `false` is intentionally
+/// stronger than "no native suffix found": the existing strict pure-wheel
+/// validator must also accept the archive.
 pub(crate) fn wheel_archive_requires_native_build(wheel_path: &Path) -> Result<bool> {
     let filename = wheel_path
         .file_name()
@@ -1303,8 +1314,9 @@ pub(crate) fn wheel_archive_requires_native_build(wheel_path: &Path) -> Result<b
         if entry.is_dir() {
             continue;
         }
-        let mut magic = [0u8; 4];
-        if entry.read_exact(&mut magic).is_ok() && magic == *b"\x7fELF" {
+        let mut prefix = Vec::with_capacity(8);
+        entry.by_ref().take(8).read_to_end(&mut prefix)?;
+        if wheel_native_payload_magic(&prefix).is_some() {
             return Ok(true);
         }
     }
@@ -1350,6 +1362,26 @@ pub(crate) fn validate_pure_python_wheel_archive(wheel_path: &Path) -> Result<()
             None => {}
         }
 
+        // Native payloads are not required to use a conventional extension.
+        // Versioned DSOs (`libfoo.so.1`) and extensionless executables are
+        // still ELF objects, so suffix/platlib checks alone cannot attest a
+        // `none-any` wheel as pure. Keep the eight consumed bytes for WHEEL
+        // parsing below; other members need no further inflation here.
+        let mut prefix = Vec::with_capacity(8);
+        entry
+            .by_ref()
+            .take(8)
+            .read_to_end(&mut prefix)
+            .with_context(|| {
+                format!(
+                    "reading ZIP member prefix `{member}` in {}",
+                    wheel_path.display()
+                )
+            })?;
+        if let Some(kind) = wheel_native_payload_magic(&prefix) {
+            bail!("wheel archive contains {kind} payload member `{member}`");
+        }
+
         if member.ends_with(".dist-info/METADATA") && member.matches('/').count() == 1 {
             root_metadata_dirs.push(
                 member
@@ -1359,10 +1391,16 @@ pub(crate) fn validate_pure_python_wheel_archive(wheel_path: &Path) -> Result<()
             );
         }
         if member.ends_with(".dist-info/WHEEL") && member.matches('/').count() == 1 {
-            let mut raw = String::new();
-            entry.read_to_string(&mut raw).with_context(|| {
+            let mut raw = prefix;
+            entry.read_to_end(&mut raw).with_context(|| {
                 format!(
                     "reading wheel metadata member `{member}` in {}",
+                    wheel_path.display()
+                )
+            })?;
+            let raw = String::from_utf8(raw).with_context(|| {
+                format!(
+                    "wheel metadata member `{member}` is not UTF-8 in {}",
                     wheel_path.display()
                 )
             })?;
@@ -2783,6 +2821,8 @@ mod tests {
                 || member.ends_with("/native-tool")
             {
                 archive.write_all(b"\x7fELFtest payload").unwrap();
+            } else if member.ends_with(".a") {
+                archive.write_all(b"!<arch>\ntest payload").unwrap();
             } else {
                 archive.write_all(b"test payload").unwrap();
             }
@@ -2855,6 +2895,42 @@ mod tests {
         );
         let error = validate_pure_python_wheel_archive(&path).unwrap_err();
         assert!(format!("{error:#}").contains("native payload"));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn strict_pure_wheel_rejects_versioned_elf_dso() {
+        let path = write_purity_test_wheel(
+            "foo-1.0-py3-none-any.whl",
+            "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+            &["foo/libfoo.so.1"],
+        );
+        let error = validate_pure_python_wheel_archive(&path).unwrap_err();
+        assert!(format!("{error:#}").contains("ELF payload member"));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn strict_pure_wheel_rejects_extensionless_elf_executable() {
+        let path = write_purity_test_wheel(
+            "foo-1.0-py3-none-any.whl",
+            "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+            &["foo/bin/native-tool"],
+        );
+        let error = validate_pure_python_wheel_archive(&path).unwrap_err();
+        assert!(format!("{error:#}").contains("ELF payload member"));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn strict_pure_wheel_rejects_static_native_archive() {
+        let path = write_purity_test_wheel(
+            "foo-1.0-py3-none-any.whl",
+            "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+            &["foo/libfoo.a"],
+        );
+        let error = validate_pure_python_wheel_archive(&path).unwrap_err();
+        assert!(format!("{error:#}").contains("native archive payload member"));
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
@@ -3007,6 +3083,13 @@ mod tests {
         );
         assert!(wheel_archive_requires_native_build(&versioned_dso).unwrap());
 
+        let static_archive = write_purity_test_wheel(
+            "foo-1.0-cp311-cp311-linux_x86_64.whl",
+            "Wheel-Version: 1.0\nRoot-Is-Purelib: false\nTag: cp311-cp311-linux_x86_64\n",
+            &["foo/libfoo.a"],
+        );
+        assert!(wheel_archive_requires_native_build(&static_archive).unwrap());
+
         let data_only = write_purity_test_wheel(
             "foo-1.0-py3-none-linux_x86_64.whl",
             "Wheel-Version: 1.0\nRoot-Is-Purelib: false\nTag: py3-none-linux_x86_64\n",
@@ -3026,6 +3109,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(mistagged.parent().unwrap());
         let _ = std::fs::remove_dir_all(native.parent().unwrap());
         let _ = std::fs::remove_dir_all(versioned_dso.parent().unwrap());
+        let _ = std::fs::remove_dir_all(static_archive.parent().unwrap());
         let _ = std::fs::remove_dir_all(data_only.parent().unwrap());
         let _ = std::fs::remove_dir_all(malformed_pure.parent().unwrap());
     }
