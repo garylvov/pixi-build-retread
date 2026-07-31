@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::relax::{CondaName, CondaTarget, NameMap, PypiKey};
 
+pub(crate) const HERMETIC_BUILDS_ENV: &str = "RETREAD_HERMETIC_BUILDS";
+
 fn deserialize_name_map<'de, D>(deserializer: D) -> std::result::Result<NameMap, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -496,6 +498,17 @@ pub struct RetreadConfig {
     #[serde(default, rename = "retread-sdist-build", alias = "sdist-build")]
     pub sdist_build: SdistBuildPolicy,
 
+    /// Build native source distributions inside a compiler environment pinned
+    /// to the target's glibc sysroot. Enabled by default. Set this to `false`
+    /// for this pack, or set `RETREAD_HERMETIC_BUILDS=0` for the process, to
+    /// retain the host-toolchain-only source-build behavior.
+    #[serde(
+        default = "default_true",
+        rename = "retread-hermetic",
+        alias = "hermetic"
+    )]
+    pub hermetic: bool,
+
     /// Extra root PyPI dependencies pulled from an externally-maintained
     /// requirements, PEP 621 pyproject, or conda environment file, layered on
     /// top of (or instead of)
@@ -752,6 +765,27 @@ impl ShadowPolicy {
 
 fn default_true() -> bool {
     true
+}
+
+/// Resolve the pack-level hermetic-build setting against its process-wide
+/// opt-out without reading or mutating process state. Only the documented,
+/// trimmed value `0` disables the feature; `1` explicitly retains it. Invalid
+/// values are ignored after a warning so a typo cannot silently select a new
+/// build mode.
+pub(crate) fn effective_hermetic_builds(configured: bool, env_value: Option<&str>) -> bool {
+    let env_enabled = match env_value.map(str::trim) {
+        None | Some("1") => true,
+        Some("0") => false,
+        Some(value) => {
+            tracing::warn!(
+                variable = HERMETIC_BUILDS_ENV,
+                value,
+                "invalid hermetic-build environment override; expected 0 or 1; ignoring value",
+            );
+            true
+        }
+    };
+    configured && env_enabled
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -1485,6 +1519,43 @@ mod tests {
         });
         let cfg: RetreadConfig = serde_json::from_value(json).unwrap();
         assert!(!cfg.courier, "explicit false opts out to legacy");
+    }
+
+    #[test]
+    fn parses_retread_hermetic_default_on_false_and_alias() {
+        // Hermetic native builds are default-on, but each pack can opt out.
+        let defaulted: RetreadConfig = serde_json::from_value(serde_json::json!({
+            "retread-wheels": { "foo": { "version": "==1.0" } },
+        }))
+        .unwrap();
+        assert!(defaulted.hermetic, "unset must default to hermetic builds");
+
+        let disabled: RetreadConfig = serde_json::from_value(serde_json::json!({
+            "retread-wheels": { "foo": { "version": "==1.0" } },
+            "retread-hermetic": false,
+        }))
+        .unwrap();
+        assert!(!disabled.hermetic, "retread-hermetic=false must opt out");
+
+        let alias: RetreadConfig = serde_json::from_value(serde_json::json!({
+            "retread-wheels": { "foo": { "version": "==1.0" } },
+            "hermetic": false,
+        }))
+        .unwrap();
+        assert!(!alias.hermetic, "the unprefixed alias must remain accepted");
+    }
+
+    #[test]
+    fn hermetic_env_zero_is_a_global_veto() {
+        assert!(effective_hermetic_builds(true, None));
+        assert!(effective_hermetic_builds(true, Some("1")));
+        assert!(!effective_hermetic_builds(true, Some(" 0\n")));
+        assert!(!effective_hermetic_builds(false, None));
+        assert!(!effective_hermetic_builds(false, Some("1")));
+        assert!(
+            effective_hermetic_builds(true, Some("false")),
+            "invalid values warn and leave the default-on environment gate enabled",
+        );
     }
 
     #[test]

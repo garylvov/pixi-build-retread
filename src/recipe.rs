@@ -1633,6 +1633,7 @@ mod tests {
             keep_pypi: vec![],
             force_conda: vec![],
             sdist_build: Default::default(),
+            hermetic: true,
             retread_wheels: BTreeMap::new(),
             relax: RelaxPolicy::Minor,
             overrides: BTreeMap::new(),

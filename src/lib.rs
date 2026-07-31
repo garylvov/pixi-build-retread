@@ -15,6 +15,7 @@ pub mod emit_pypi;
 pub mod fasttmp;
 pub mod glibc;
 pub mod handler;
+pub mod hermetic_build;
 mod index_chain;
 pub mod installer;
 pub mod lock;

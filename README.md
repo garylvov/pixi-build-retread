@@ -63,6 +63,7 @@ backend = { name = "pixi-build-retread", version = "*", channels = ["https://pre
 retread-python   = "3.12"
 retread-bundle   = "isaac-pack-6"
 retread-resolver = "uv"        # default
+retread-hermetic = true        # default; sysroot-pinned native sdist builds
 [package.build.config.retread-wheels]
 isaacsim = { version = "==6.0.0.1", index = "https://pypi.nvidia.com" }
 ```
@@ -121,6 +122,12 @@ enabled either way.
 The shared wheel store (`~/.cache/retread/wheels`, override
 `RETREAD_WHEEL_STORE`) is independent of `RETREAD_CACHE_DIR` and fast-tmp;
 lock records reference its content SHAs, so do not delete it casually.
+
+Native source builds on `linux-64` use a cached conda compiler environment
+pinned to the newest `sysroot_linux-64` no newer than the target glibc floor.
+Their wheel tag names that exact sysroot (for example, sysroot 2.28 produces
+`manylinux_2_28_x86_64`). Set `retread-hermetic = false` for one pack or
+`RETREAD_HERMETIC_BUILDS=0` for the process to retain host-only builds.
 
 ## Rust toolchain
 

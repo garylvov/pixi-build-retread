@@ -2427,6 +2427,10 @@ impl Handler {
             }
         };
 
+        let hermetic_env = std::env::var(crate::config::HERMETIC_BUILDS_ENV).ok();
+        config.hermetic =
+            crate::config::effective_hermetic_builds(config.hermetic, hermetic_env.as_deref());
+
         if config.retread_wheels.is_empty() {
             return Err(RpcError::invalid_params(
                 "[build.config].wheels must list at least one wheel",
@@ -3392,7 +3396,8 @@ impl Handler {
             RpcError::invalid_params(format!(
                 "invalid Python target `{requested_python}`: {error:#}"
             ))
-        })?;
+        })?
+        .with_hermetic_builds(config.hermetic);
         validate_advertised_non_courier_target_build(
             &config,
             &target,
@@ -4538,6 +4543,12 @@ async fn resolve_all(
     RetreadConfig,
     Vec<auto_bundle::WheelMetadataRelaxation>,
 )> {
+    // Bind the pack-level policy to the target used by every source-build
+    // branch in this resolution. Resolution/cache identity intentionally does
+    // not change: the policy controls how an exact cache miss is produced,
+    // while v7 cache markers attest whether a native artifact was hermetic.
+    let target = target.clone().with_hermetic_builds(config.hermetic);
+    let target = &target;
     let mut bundles = Vec::with_capacity(config.retread_wheels.len());
     let mut route_conflicts = Vec::new();
     let mut pending_relaxations = Vec::new();

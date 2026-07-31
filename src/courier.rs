@@ -195,10 +195,10 @@ pub fn courier_input_specs(config: &RetreadConfig, bundle_name: &str) -> Vec<Str
 ///
 /// Folds in: per-dep overrides and their ledger provenance, the PyPI->conda
 /// name-map, drop-deps, conda-deps, the route policy and include set, the
-/// auto-bundle toggle, the build-number, deps-from source identity, AND the
-/// conda channel list. Each of these changes the emitted
-/// conda specs or the conda/PyPI routing, so omitting any would let a
-/// manifest/workspace edit leave the hash unchanged and replay a stale,
+/// hermetic source-build policy, the auto-bundle toggle, the build-number,
+/// deps-from source identity, AND the conda channel list. Each of these changes
+/// the emitted conda specs or the conda/PyPI routing, so omitting any would let
+/// a manifest/workspace edit leave the hash unchanged and replay a stale,
 /// POISONED lock. (genesis's `retread-name-map` is the canonical config
 /// regression case; a workspace channel addition is the canonical channel
 /// case -- a newly-added channel can make a previously auto-bundled wheel
@@ -273,6 +273,7 @@ pub fn config_fingerprint(
     for name in &route_include {
         parts.push(format!("route-include:{name}"));
     }
+    parts.push(format!("hermetic:{}", config.hermetic));
     parts.push(format!("auto-bundle:{}", config.auto_bundle));
     parts.push(format!("build-number:{}", config.build_number));
     for c in conda_channels {
@@ -2875,6 +2876,26 @@ mod tests {
             validated, aggressive,
             "changing route policy must change the fingerprint"
         );
+    }
+
+    #[test]
+    fn fingerprint_covers_hermetic_build_policy() {
+        let enabled = minimal_config("b");
+        let chans = ["conda-forge".to_string()];
+        let enabled_fp = config_fingerprint(&enabled, &chans, "");
+        assert!(
+            enabled_fp.lines().any(|line| line == "hermetic:true"),
+            "the default-on policy must be encoded explicitly",
+        );
+
+        let mut disabled = enabled;
+        disabled.hermetic = false;
+        let disabled_fp = config_fingerprint(&disabled, &chans, "");
+        assert_ne!(
+            enabled_fp, disabled_fp,
+            "changing hermetic source-build policy must invalidate replay",
+        );
+        assert!(disabled_fp.lines().any(|line| line == "hermetic:false"));
     }
 
     /// `route_include` affects routing under the minimal policy, but its order

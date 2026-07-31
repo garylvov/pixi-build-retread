@@ -684,6 +684,228 @@ async fn load_selected_records_sparse_from_pairs(
     Ok((records, consulted))
 }
 
+/// The sysroot chosen independently of the compiler solve.
+///
+/// Keep both representations: the parsed glibc pair drives wheel tags and
+/// cache identities, while `conda_version` is the exact channel version that
+/// must be pinned in the coherent toolchain solve. Reconstructing the latter
+/// from `(major, minor)` would be wrong if conda-forge publishes `2.34.0`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SelectedSysroot {
+    pub(crate) conda_version: String,
+    pub(crate) glibc_floor: (u32, u32),
+}
+
+/// Concrete coherent solution used to render the rattler-build debug recipe.
+#[derive(Debug, Clone)]
+pub(crate) struct HermeticBuildSolve {
+    pub(crate) sysroot: SelectedSysroot,
+    pub(crate) records: Vec<RepoDataRecord>,
+}
+
+/// Select the newest conda-forge sysroot whose glibc version does not exceed
+/// the requested target floor. This happens *before* the compiler solve: an
+/// all-tools solve is otherwise free to silently downgrade the sysroot to
+/// satisfy another root, weakening the requested "newest <= floor" rule.
+fn select_newest_compatible_sysroot(
+    records: &[RepoDataRecord],
+    target_floor: (u32, u32),
+) -> std::result::Result<SelectedSysroot, String> {
+    let mut candidates = records
+        .iter()
+        .filter(|record| record.package_record.name.as_normalized() == "sysroot_linux-64")
+        .filter_map(|record| {
+            let rendered = record.package_record.version.as_str();
+            let glibc_floor = crate::glibc::parse_glibc_version(&rendered)?;
+            if glibc_floor > target_floor {
+                return None;
+            }
+            let version = match Version::from_str(&rendered) {
+                Ok(version) => version,
+                Err(error) => {
+                    tracing::debug!(
+                        version = %rendered,
+                        error = %error,
+                        "ignoring unparseable sysroot_linux-64 version",
+                    );
+                    return None;
+                }
+            };
+            Some((version, glibc_floor, rendered.to_string()))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| left.0.cmp(&right.0));
+    let Some((_version, glibc_floor, conda_version)) = candidates.pop() else {
+        return Err(format!(
+            "missing compatible sysroot_linux-64: conda-forge has no sysroot at or below target glibc floor {}",
+            crate::glibc::format_glibc(target_floor),
+        ));
+    };
+    Ok(SelectedSysroot {
+        conda_version,
+        glibc_floor,
+    })
+}
+
+fn parse_match_specs_strict(specs: &[String]) -> std::result::Result<Vec<MatchSpec>, Vec<String>> {
+    specs
+        .iter()
+        .map(|raw| {
+            MatchSpec::from_str(raw, ParseStrictness::Lenient)
+                .map_err(|error| format!("invalid hermetic-build match spec `{raw}`: {error}"))
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| vec![error])
+}
+
+fn hermetic_toolchain_specs(
+    python_minor: &str,
+    sysroot_version: &str,
+    cuda_version: Option<&str>,
+) -> Vec<String> {
+    let mut specs = vec![
+        "gcc_linux-64".to_string(),
+        "gxx_linux-64".to_string(),
+        format!("sysroot_linux-64 =={sysroot_version}"),
+        format!("python {python_minor}.*"),
+        "auditwheel".to_string(),
+        "patchelf".to_string(),
+        "cmake <4".to_string(),
+        "make".to_string(),
+        "ninja".to_string(),
+    ];
+    if let Some(version) = cuda_version {
+        specs.push(if version.is_empty() {
+            "cuda-nvcc_linux-64".to_string()
+        } else {
+            format!("cuda-nvcc_linux-64 {version}.*")
+        });
+    }
+    specs
+}
+
+fn solve_hermetic_build_environment_from_records(
+    records: &[RepoDataRecord],
+    target_floor: (u32, u32),
+    python_minor: &str,
+    cuda_version: Option<&str>,
+) -> std::result::Result<HermeticBuildSolve, Vec<String>> {
+    let sysroot =
+        select_newest_compatible_sysroot(records, target_floor).map_err(|error| vec![error])?;
+    let specs = hermetic_toolchain_specs(python_minor, &sysroot.conda_version, cuda_version);
+    let parsed_specs = parse_match_specs_strict(&specs)?;
+    let system_requirements = BTreeMap::new();
+    let solved = solve_selected_records_from_records_for_target(
+        parsed_specs,
+        records,
+        &SolveTarget::new(
+            python_minor,
+            ChannelPriority::Strict,
+            &system_requirements,
+            None,
+            SolveStrategy::Highest,
+        ),
+        Vec::new(),
+    )
+    .map_err(|failure| {
+        vec![format!(
+            "hermetic compiler environment solve failed with sysroot_linux-64 =={}: {}",
+            sysroot.conda_version,
+            failure.into_reasons().join("; "),
+        )]
+    })?;
+
+    let mut required = vec![
+        "gcc_linux-64",
+        "gxx_linux-64",
+        "sysroot_linux-64",
+        "python",
+        "auditwheel",
+        "patchelf",
+        "cmake",
+        "make",
+        "ninja",
+    ];
+    if cuda_version.is_some() {
+        required.push("cuda-nvcc_linux-64");
+    }
+    for name in required {
+        if !solved
+            .iter()
+            .any(|record| record.package_record.name.as_normalized() == name)
+        {
+            return Err(vec![format!(
+                "hermetic compiler environment solve omitted required root `{name}`"
+            )]);
+        }
+    }
+
+    Ok(HermeticBuildSolve {
+        sysroot,
+        records: solved,
+    })
+}
+
+/// Solve the compiler environment against conda-forge's sparse repodata.
+///
+/// Stage one loads all candidate roots and selects the newest compatible
+/// `sysroot_linux-64` independently. Stage two exact-pins that version in one
+/// coherent gcc/gxx/Python/(optional CUDA) solve.
+pub(crate) async fn solve_hermetic_build_environment(
+    target_floor: (u32, u32),
+    python_minor: &str,
+    cuda_version: Option<&str>,
+) -> std::result::Result<HermeticBuildSolve, Vec<String>> {
+    let channels = vec![ChannelUrl::from(
+        url::Url::parse("https://prefix.dev/conda-forge")
+            .expect("the built-in conda-forge channel URL is valid"),
+    )];
+    let mut roots = vec![
+        "gcc_linux-64".to_string(),
+        "gxx_linux-64".to_string(),
+        "sysroot_linux-64".to_string(),
+        format!("python {python_minor}.*"),
+        "auditwheel".to_string(),
+        "patchelf".to_string(),
+        "cmake <4".to_string(),
+        "make".to_string(),
+        "ninja".to_string(),
+    ];
+    if let Some(version) = cuda_version {
+        roots.push(if version.is_empty() {
+            "cuda-nvcc_linux-64".to_string()
+        } else {
+            format!("cuda-nvcc_linux-64 {version}.*")
+        });
+    }
+    let parsed_roots = parse_match_specs_strict(&roots)?;
+    let (records, consulted) =
+        load_selected_records_sparse(&channels, "linux-64", &parsed_roots).await;
+    if records.is_empty() {
+        let detail = if consulted.is_empty() {
+            "no conda-forge sparse repodata was available".to_string()
+        } else {
+            format!("consulted {}", consulted.join(", "))
+        };
+        return Err(vec![format!(
+            "missing sysroot_linux-64: unable to load hermetic-build records ({detail})"
+        )]);
+    }
+
+    let python_minor = python_minor.to_string();
+    let cuda_version = cuda_version.map(str::to_string);
+    tokio::task::spawn_blocking(move || {
+        solve_hermetic_build_environment_from_records(
+            &records,
+            target_floor,
+            &python_minor,
+            cuda_version.as_deref(),
+        )
+    })
+    .await
+    .map_err(|error| vec![format!("hermetic compiler solve task panicked: {error}")])?
+}
+
 /// Solve a spec set against cached repodata and return the concrete
 /// records the solver selected. Callers that need to reason about
 /// transitives must use this instead of "latest matching build"
@@ -826,6 +1048,72 @@ mod tests {
             .unwrap(),
             channel: Some("https://example.invalid".into()),
         }
+    }
+
+    #[test]
+    fn newest_sysroot_at_or_below_floor_is_selected_numerically() {
+        let records = vec![
+            repo_record("sysroot_linux-64", "2.9", &[]),
+            repo_record("sysroot_linux-64", "2.17", &[]),
+            repo_record("sysroot_linux-64", "2.28", &[]),
+            repo_record("sysroot_linux-64", "2.34", &[]),
+            repo_record("sysroot_linux-64", "2.39", &[]),
+        ];
+
+        let selected = select_newest_compatible_sysroot(&records, (2, 34)).unwrap();
+        assert_eq!(selected.conda_version, "2.34");
+        assert_eq!(selected.glibc_floor, (2, 34));
+    }
+
+    #[test]
+    fn missing_compatible_sysroot_names_sysroot_linux_64_and_floor() {
+        let records = vec![repo_record("sysroot_linux-64", "2.39", &[])];
+        let error = select_newest_compatible_sysroot(&records, (2, 34)).unwrap_err();
+
+        assert!(
+            error.contains("sysroot_linux-64"),
+            "unexpected error: {error}"
+        );
+        assert!(error.contains("2.34"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn hermetic_solve_floor_2_34_python_3_11_exact_pins_newest_compatible_sysroot() {
+        let records = vec![
+            repo_record("sysroot_linux-64", "2.17", &[]),
+            repo_record("sysroot_linux-64", "2.28", &[]),
+            repo_record("sysroot_linux-64", "2.39", &[]),
+            repo_record("python", "3.10.15", &[]),
+            repo_record("python", "3.11.15", &[]),
+            repo_record("gcc_linux-64", "13.2.0", &["sysroot_linux-64"]),
+            repo_record(
+                "gxx_linux-64",
+                "13.2.0",
+                &["gcc_linux-64 ==13.2.0", "sysroot_linux-64"],
+            ),
+            repo_record("auditwheel", "6.7.0", &["python >=3.10"]),
+            repo_record("patchelf", "0.18.0", &[]),
+            repo_record("cmake", "3.31.6", &[]),
+            repo_record("make", "4.4.1", &[]),
+            repo_record("ninja", "1.13.1", &[]),
+        ];
+
+        let solved = solve_hermetic_build_environment_from_records(&records, (2, 34), "3.11", None)
+            .expect("synthetic compiler environment should solve");
+        assert_eq!(solved.sysroot.conda_version, "2.28");
+        assert_eq!(solved.sysroot.glibc_floor, (2, 28));
+        assert!(solved.records.iter().any(|record| {
+            record.package_record.name.as_normalized() == "python"
+                && record.package_record.version.as_str() == "3.11.15"
+        }));
+        assert!(solved.records.iter().any(|record| {
+            record.package_record.name.as_normalized() == "sysroot_linux-64"
+                && record.package_record.version.as_str() == "2.28"
+        }));
+        assert!(solved.records.iter().any(|record| {
+            record.package_record.name.as_normalized() == "ninja"
+                && record.package_record.version.as_str() == "1.13.1"
+        }));
     }
 
     fn vp_lookup<'a>(

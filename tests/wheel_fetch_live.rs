@@ -114,6 +114,7 @@ async fn fetch_isaacsim_kernel_end_to_end() {
         ledger_overrides: Default::default(),
         pack_manifest_path: None,
         sdist_build: Default::default(),
+        hermetic: true,
     };
     let recipe = build_bundle_recipe(
         "isaacsim-kernel",
