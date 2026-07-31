@@ -6539,12 +6539,6 @@ async fn uv_group_closure(
     // non-destructive validation edge: use the effective Parselmouth-backed
     // map so a workspace-owned `torch` also protects its conda `pytorch`
     // provider without requiring every pack to repeat retread-name-map.
-    const PROBE_POOL_CAP: usize = 4;
-    let requested_probe_threads = std::num::NonZeroUsize::new(
-        crate::concurrency::max_concurrent_builds().clamp(1, PROBE_POOL_CAP),
-    )
-    .expect("the probe pool cap is nonzero");
-    let probe_pool = crate::thread_budget::acquire_probe_pool(requested_probe_threads).await;
     let conda_co_solve = CondaCoSolveContext::new(
         manifest_opt.as_ref(),
         workspace_dir,
@@ -6555,8 +6549,23 @@ async fn uv_group_closure(
         &workspace_facts.owned_pypi,
         &effective.name_map,
     )
-    .with_probe_metrics(probe_metrics)
-    .with_probe_pool(probe_pool);
+    .with_probe_metrics(probe_metrics);
+    let conda_co_solve = if crate::thread_budget::parallel_probes_enabled() {
+        const PROBE_POOL_CAP: usize = 4;
+        let requested_probe_threads = std::num::NonZeroUsize::new(
+            crate::concurrency::max_concurrent_builds().clamp(1, PROBE_POOL_CAP),
+        )
+        .expect("the probe pool cap is nonzero");
+        let probe_pool = crate::thread_budget::acquire_probe_pool(requested_probe_threads).await;
+        tracing::warn!(
+            threads = probe_pool.threads().get(),
+            "experimental parallel probe solves enabled by RETREAD_PARALLEL_PROBES=1",
+        );
+        conda_co_solve.with_probe_pool(probe_pool)
+    } else {
+        tracing::debug!("parallel probe solves disabled; set RETREAD_PARALLEL_PROBES=1 to opt in");
+        conda_co_solve
+    };
 
     // Rule-3-capable policies receive only precise, solved, agreed facts.
     // Aggressive deliberately retains its legacy declared-constraint input,

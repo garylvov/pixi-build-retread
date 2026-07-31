@@ -4,13 +4,30 @@
 //! Speaks line-delimited JSON-RPC 2.0 over stdin/stdout, per the pixi build
 //! protocol (`crates/pixi_build_types`, API version 4).
 
+use std::io::Write as _;
 use std::path::PathBuf;
 
 use pixi_build_retread::{fasttmp, handler, installer, rpc, solve};
 use tracing_subscriber::EnvFilter;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    pixi_build_retread::panic_hook::install_global_panic_hook();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| {
+            let mut stderr = std::io::stderr().lock();
+            let _ = writeln!(
+                stderr,
+                "retread: fatal: failed to build Tokio runtime: {error}"
+            );
+            let _ = stderr.flush();
+            anyhow::anyhow!("failed to build Tokio runtime: {error}")
+        })?;
+    runtime.block_on(async_main())
+}
+
+async fn async_main() -> anyhow::Result<()> {
     // v2.0.0 courier: `retread install --lock <path> [--prefix <p>]` is
     // invoked from the courier conda package's post-link script to install
     // the bundle's PyPI wheels into the active env. It is NOT the JSON-RPC

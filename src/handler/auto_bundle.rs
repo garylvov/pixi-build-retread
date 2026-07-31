@@ -2615,6 +2615,13 @@ where
     .await
 }
 
+fn should_eagerly_prewarm_probe_routes(
+    probe_parallelism: usize,
+    has_mutable_candidates: bool,
+) -> bool {
+    probe_parallelism > 1 && has_mutable_candidates
+}
+
 async fn jointly_unroute_unsolvable_with_route_precheck<C, CF, W, WF, V, VF, X, XF>(
     bundle: &mut Bundle,
     metadata_routes: &mut ProvisionalMetadataRoutes,
@@ -2778,10 +2785,11 @@ where
         .filter(|route| !mutable_keys.contains(route.conda_name.key().as_str()))
         .cloned()
         .collect();
-    // Load the complete reachable record union before the standalone provider
-    // batch introduces roots one at a time. This is extraction-only: resolvo
-    // still runs exactly where the legacy selector requires a fresh verdict.
-    if !mutable_candidates.is_empty() {
+    // Load the complete reachable record union before a parallel standalone
+    // provider batch introduces roots one at a time. Serial mode keeps the
+    // shared cache but grows it lazily; the eager prewarm was introduced only
+    // to make independent concurrent solves see the same complete snapshot.
+    if should_eagerly_prewarm_probe_routes(probe_parallelism, !mutable_candidates.is_empty()) {
         let full_routes = fixed
             .iter()
             .chain(&mutable_candidates)
@@ -3739,6 +3747,15 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use url::Url;
+
+    #[test]
+    fn serial_probe_mode_skips_eager_prewarm() {
+        assert!(!should_eagerly_prewarm_probe_routes(0, true));
+        assert!(!should_eagerly_prewarm_probe_routes(1, true));
+        assert!(!should_eagerly_prewarm_probe_routes(4, false));
+        assert!(should_eagerly_prewarm_probe_routes(2, true));
+        assert!(should_eagerly_prewarm_probe_routes(4, true));
+    }
 
     #[test]
     fn abi_anchor_cap_completion_has_loud_warning_and_durable_record() {
@@ -6447,7 +6464,7 @@ robotics-root = {{ version = "1.0.0", bundle = "robotics-output" }}
                 favor_lock_prefs: None,
                 uv_closure_wheels: None,
                 channels_consulted: &["conda-forge/linux-64".to_string()],
-                probe_parallelism: 1,
+                probe_parallelism: 3,
                 uv_reresolve: &UvReresolveContext::default(),
             },
             &validated_probe,

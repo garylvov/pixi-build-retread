@@ -146,11 +146,25 @@ async fn build_sparse(channel_url: String, subdir: String) -> Option<Arc<SparseR
     let channel = Channel::from_str(&channel_url, &cfg).ok()?;
     let subdir_clone = subdir.clone();
     let path_clone = path.clone();
-    let built = tokio::task::spawn_blocking(move || {
+    let built = match tokio::task::spawn_blocking(move || {
         SparseRepoData::from_file(channel, subdir_clone, path_clone, None)
     })
     .await
-    .ok()?;
+    {
+        Ok(built) => built,
+        Err(error) => {
+            tracing::error!(
+                channel = %channel_url,
+                subdir = %subdir,
+                error = %error,
+                "repodata: sparse-open blocking task failed",
+            );
+            eprintln!(
+                "retread: fatal worker failure while opening {channel_url}/{subdir}: {error}"
+            );
+            return None;
+        }
+    };
     match built {
         Ok(s) => {
             tracing::info!(

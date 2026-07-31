@@ -29,6 +29,7 @@ use std::sync::atomic::AtomicBool;
 const COMPRESSION_THREADS_ENV: &str = "RETREAD_COMPRESSION_THREADS";
 const COMPRESSION_BUDGET_ENV: &str = "RETREAD_COMPRESSION_BUDGET";
 const THREAD_LEASE_DIR_ENV: &str = "RETREAD_THREAD_LEASE_DIR";
+const PARALLEL_PROBES_ENV: &str = "RETREAD_PARALLEL_PROBES";
 const FALLBACK_AVAILABLE_PARALLELISM: usize = 4;
 const REGISTRY_LOCK_FILE: &str = "registry.lock";
 const LEASE_FILE_PREFIX: &str = "lease-";
@@ -43,6 +44,20 @@ const CAPACITY_RETRY_DELAY: Duration = Duration::from_millis(25);
 static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 static FORCE_REGISTRY_LOCK_FAILURE: AtomicBool = AtomicBool::new(false);
+
+fn parse_parallel_probes(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+/// Parallel resolvo probes are an experimental opt-in.
+///
+/// v4.10.46 enabled this fan-out by default. Some pack resolutions then ended
+/// with a silent process exit while several full solver states were live. Keep
+/// the shared repodata and bisection improvements, but make solver fan-out
+/// serial unless the operator explicitly accepts the risk.
+pub(crate) fn parallel_probes_enabled() -> bool {
+    parse_parallel_probes(std::env::var(PARALLEL_PROBES_ENV).ok().as_deref())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CompressionThreadSource {
@@ -1375,6 +1390,17 @@ mod tests {
     }
 
     #[test]
+    fn parallel_probe_opt_in_is_strict() {
+        for disabled in [None, Some(""), Some("0"), Some("true"), Some(" 1 ")] {
+            assert!(
+                !parse_parallel_probes(disabled),
+                "only RETREAD_PARALLEL_PROBES=1 may enable solver fan-out",
+            );
+        }
+        assert!(parse_parallel_probes(Some("1")));
+    }
+
+    #[test]
     fn probe_pool_clones_share_one_capped_lease() {
         let lease = detached_lease(nonzero(12), nonzero(12), CompressionThreadSource::Override);
         let grant = ProbePoolGrant::from_lease(lease, nonzero(4));
@@ -1428,6 +1454,49 @@ mod tests {
             Arc::ptr_eq(&grant.lease, &resumed._pool.lease),
             "the resumed task must still retain the same registry grant",
         );
+    }
+
+    #[test]
+    fn probe_pool_initializes_under_constrained_runtime_and_budget() {
+        let (_guard, env) = TestEnvironment::new("constrained-probe-pool");
+        env.set(COMPRESSION_BUDGET_ENV, "2");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("the constrained Tokio runtime must build");
+
+        runtime.block_on(async {
+            let grant =
+                tokio::time::timeout(Duration::from_secs(2), acquire_probe_pool(nonzero(4)))
+                    .await
+                    .expect("probe-pool acquisition must not hang");
+            assert_eq!(grant.threads().get(), 2);
+            assert_eq!(grant.lease.decision().budget.get(), 2);
+
+            let first = grant.acquire_task().await;
+            let second = grant.acquire_task().await;
+            let waiting_pool = grant.clone();
+            let mut third = Box::pin(waiting_pool.acquire_task());
+            assert!(
+                tokio::time::timeout(Duration::from_millis(25), &mut third)
+                    .await
+                    .is_err(),
+                "the third task must wait for the two-token grant",
+            );
+
+            drop(first);
+            let third = tokio::time::timeout(Duration::from_secs(1), &mut third)
+                .await
+                .expect("releasing one token must wake the waiting task");
+            let value = tokio::task::spawn_blocking(move || {
+                let _task_grant = third;
+                47
+            })
+            .await
+            .expect("the constrained blocking task must join");
+            assert_eq!(value, 47);
+            drop(second);
+        });
     }
 
     fn test_nonce() -> String {
