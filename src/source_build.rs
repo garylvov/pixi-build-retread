@@ -752,11 +752,39 @@ pub(crate) fn remove_owned_cache_entry(path: &Path) -> Result<()> {
         Err(error) => return Err(error.into()),
     };
     if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
+        // Canonical source trees are published read-only (write bits
+        // stripped from directories too), which makes remove_dir_all fail
+        // with EACCES. Restore owner-write on directories first.
+        restore_directory_write_bits(path);
         std::fs::remove_dir_all(path)
     } else {
         std::fs::remove_file(path)
     }
     .with_context(|| format!("removing invalid owned cache entry {}", path.display()))
+}
+
+/// Best-effort: re-add owner write permission on `path` and every nested
+/// directory so the tree can be deleted. Errors are ignored — the follow-up
+/// remove reports the authoritative failure.
+fn restore_directory_write_bits(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let Ok(metadata) = std::fs::symlink_metadata(path) else {
+            return;
+        };
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return;
+        }
+        let mode = metadata.permissions().mode() | 0o200;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            restore_directory_write_bits(&entry.path());
+        }
+    }
 }
 
 fn validate_wheel_file(
